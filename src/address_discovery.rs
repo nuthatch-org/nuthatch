@@ -123,6 +123,10 @@ impl<R: Rpc> Rpc for Counted<R> {
 pub struct Window {
     size: AtomicU64,
     ceiling: AtomicU64,
+    /// The largest limit the provider has stated. Alchemy states 5,000 and then, for a while, 100
+    /// on Optimism, so the ceiling is the largest stated, not the latest.
+    stated: AtomicU64,
+    start: u64,
     streak: AtomicU64,
     /// Whether the current size has been served once. Spans go out concurrently only then, so an
     /// unlearned size costs one refusal rather than a batch of them.
@@ -144,6 +148,8 @@ impl Window {
         Window {
             size: AtomicU64::new(start.max(1)),
             ceiling: AtomicU64::new(start.max(1)),
+            stated: AtomicU64::new(0),
+            start: start.max(1),
             streak: AtomicU64::new(0),
             proven: AtomicBool::new(false),
             permits: tokio::sync::Semaphore::new(RANGE_CONCURRENCY),
@@ -164,7 +170,8 @@ impl Window {
         self.streak.store(0, Ordering::Relaxed);
         let next = match stated_limit(error).filter(|n| *n >= 1) {
             Some(n) => {
-                self.ceiling.fetch_min(n, Ordering::Relaxed);
+                let most = self.stated.fetch_max(n, Ordering::Relaxed).max(n);
+                self.ceiling.store(most.min(self.start), Ordering::Relaxed);
                 if n < refused {
                     n
                 } else {
@@ -1633,12 +1640,20 @@ mod tests {
             "a refusal of a size already left behind shrinks nothing"
         );
 
-        // Successes grow the span back, never past the stated ceiling.
+        // Successes grow the span back, never past the largest limit stated.
         for _ in 0..REGROW_AFTER {
             w.succeeded(w.get());
         }
         assert_eq!(w.get(), 50);
-        for _ in 0..3 * REGROW_AFTER {
+        for _ in 0..8 * REGROW_AFTER {
+            w.succeeded(w.get());
+        }
+        assert_eq!(w.get(), 500, "capped at the largest stated limit");
+
+        // A provider that only ever states one limit keeps it.
+        let w = Window::new(100_000);
+        assert_eq!(w.refused(100_000, "currently limited to 100 blocks"), 100);
+        for _ in 0..8 * REGROW_AFTER {
             w.succeeded(w.get());
         }
         assert_eq!(w.get(), 100, "capped at the stated limit");
