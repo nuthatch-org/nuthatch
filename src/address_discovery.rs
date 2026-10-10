@@ -306,19 +306,22 @@ async fn ranged_in<R: Rpc>(
                 todo.push_front((end + 1, e, cap));
             }
         }
-        let mut answers = futures::stream::iter(spans.clone())
+        // Judged as they complete, so a fatal answer is never held behind a slower span; the rows
+        // are keyed by where they start, so the order they arrive in does not matter.
+        let mut answers = futures::stream::iter(spans)
             .map(|(s, e)| {
                 let p = params(s, e);
                 async move {
-                    let _permit = window.permits.acquire().await?;
-                    rpc.call(method, p).await
+                    let answer = match window.permits.acquire().await {
+                        Ok(_permit) => rpc.call(method, p).await,
+                        Err(closed) => Err(closed.into()),
+                    };
+                    (s, e, answer)
                 }
             })
-            .buffered(lanes);
-        let mut asked = spans.into_iter();
+            .buffer_unordered(lanes);
         let mut again = Vec::new();
-        while let Some(answer) = answers.next().await {
-            let (s, e) = asked.next().expect("one answer per span");
+        while let Some((s, e, answer)) = answers.next().await {
             match judge(method, s, e, answer)? {
                 Judged::Rows(items) => {
                     window.succeeded(e - s + 1);
@@ -334,6 +337,7 @@ async fn ranged_in<R: Rpc>(
             }
         }
         drop(probing);
+        again.sort_unstable();
         for range in again.into_iter().rev() {
             todo.push_front(range);
         }
@@ -1838,6 +1842,20 @@ mod tests {
         )
         .await
         .expect("the fatal answer ends the call without waiting for [4, 5]");
+        assert!(format!("{:#}", got.unwrap_err()).contains("401"));
+
+        // Nor by a slower span before it.
+        let rpc = Spans(Mutex::default(), |s, e, _| match (s, e) {
+            (2, 3) => None,
+            (4, 5) => Some(Err(anyhow!("401 Unauthorized"))),
+            _ => rows(s, e),
+        });
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ranged(&rpc, &Window::new(2), 0, 5, "trace_filter", blocks),
+        )
+        .await
+        .expect("the fatal answer ends the call without waiting for [2, 3]");
         assert!(format!("{:#}", got.unwrap_err()).contains("401"));
     }
 
