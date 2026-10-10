@@ -15,7 +15,7 @@ use futures::StreamExt;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::address_history::{Action, AddressHistory, Row};
@@ -124,10 +124,17 @@ pub struct Window {
     size: AtomicU64,
     ceiling: AtomicU64,
     streak: AtomicU64,
+    /// Whether the current size has been served once. Spans go out concurrently only then, so an
+    /// unlearned size costs one refusal rather than a batch of them.
+    proven: AtomicBool,
+    /// Calls in flight on this window's provider, across every range sharing it.
+    permits: tokio::sync::Semaphore,
 }
 
 /// Successes at one span before it is tried doubled.
 const REGROW_AFTER: u64 = 32;
+/// Spans in flight at once on one provider. GraphOps refused hydration with 403s past eight.
+const RANGE_CONCURRENCY: usize = 8;
 
 impl Window {
     pub fn new(start: u64) -> Window {
@@ -135,6 +142,8 @@ impl Window {
             size: AtomicU64::new(start.max(1)),
             ceiling: AtomicU64::new(start.max(1)),
             streak: AtomicU64::new(0),
+            proven: AtomicBool::new(false),
+            permits: tokio::sync::Semaphore::new(RANGE_CONCURRENCY),
         }
     }
 
@@ -161,20 +170,23 @@ impl Window {
         }
         .max(1);
         self.size.store(next, Ordering::Relaxed);
+        self.proven.store(false, Ordering::Relaxed);
         Some(next)
     }
 
     fn succeeded(&self) {
+        self.proven.store(true, Ordering::Relaxed);
         if self.streak.fetch_add(1, Ordering::Relaxed) + 1 < REGROW_AFTER {
             return;
         }
         self.streak.store(0, Ordering::Relaxed);
         let ceiling = self.ceiling.load(Ordering::Relaxed);
         let now = self.get();
-        self.size.store(
-            now.saturating_mul(2).min(ceiling).max(now),
-            Ordering::Relaxed,
-        );
+        let next = now.saturating_mul(2).min(ceiling).max(now);
+        if next != now {
+            self.size.store(next, Ordering::Relaxed);
+            self.proven.store(false, Ordering::Relaxed);
+        }
     }
 }
 
@@ -222,7 +234,11 @@ fn stated_limit(error: &str) -> Option<u64> {
     None
 }
 
-/// Run a ranged call over `[from, to]` in spans the provider accepts, concatenating the arrays.
+/// Run a ranged call over `[from, to]` in spans the provider accepts, concatenating the arrays in
+/// block order. Once the window's span has been served, up to `RANGE_CONCURRENCY` spans go out at
+/// once and are judged in order as they arrive: clean answers are kept, a fatal one fails the call
+/// at once, and a span that needs a smaller size sends the rest back to be asked again at the new
+/// size, after their answers are read so that a fatal one among them is never discarded.
 async fn ranged<R: Rpc>(
     rpc: &R,
     window: &Window,
@@ -235,35 +251,84 @@ async fn ranged<R: Rpc>(
     let mut start = from;
     while start <= to {
         let span = window.get();
-        let end = start.saturating_add(span - 1).min(to);
-        match rpc.call(method, params(start, end)).await {
-            Ok(Value::Array(items)) if items.len() >= SUSPICIOUSLY_FULL => {
-                if end == start {
-                    bail!(
-                        "{method} at block {start} answered {} items, which may be a truncated page",
-                        items.len()
-                    );
+        let lanes = if window.proven.load(Ordering::Relaxed) {
+            RANGE_CONCURRENCY
+        } else {
+            1
+        };
+        let mut spans = Vec::with_capacity(lanes);
+        let mut s = start;
+        while s <= to && spans.len() < lanes {
+            let e = s.saturating_add(span - 1).min(to);
+            spans.push((s, e));
+            s = e + 1;
+        }
+        let mut answers = futures::stream::iter(spans.clone())
+            .map(|(s, e)| {
+                let p = params(s, e);
+                async move {
+                    let _permit = window.permits.acquire().await?;
+                    rpc.call(method, p).await
                 }
-                window.shrink("too many results");
-            }
-            Ok(Value::Array(items)) => {
-                window.succeeded();
-                out.extend(items);
-                start = end + 1;
-            }
-            Ok(other) => bail!("{method} [{start}, {end}] answered a non-list: {other}"),
-            Err(e) if end > start => match window.shrink(&format!("{e:#}")) {
-                Some(next) => tracing::debug!(
-                    "{method} [{start}, {end}] refused, retrying in spans of {next}: {e:#}"
-                ),
-                None => return Err(e).with_context(|| format!("{method} [{start}, {end}]")),
-            },
-            Err(e) => {
-                return Err(e).with_context(|| format!("{method} at block {start}"));
+            })
+            .buffered(lanes);
+        let mut asked = spans.into_iter();
+        while let Some(answer) = answers.next().await {
+            let (s, e) = asked.next().expect("one answer per span");
+            match judge(method, s, e, answer)? {
+                Judged::Rows(items) => {
+                    window.succeeded();
+                    out.extend(items);
+                    start = e + 1;
+                }
+                Judged::Smaller(why) => {
+                    while let Some(later) = answers.next().await {
+                        let (s, e) = asked.next().expect("one answer per span");
+                        judge(method, s, e, later)?;
+                    }
+                    if let Some(next) = window.shrink(&why) {
+                        tracing::debug!(
+                            "{method} [{s}, {e}] refused, retrying in spans of {next}: {why}"
+                        );
+                    }
+                    break;
+                }
             }
         }
     }
     Ok(out)
+}
+
+/// One span's answer: its rows, or a refusal about its size that a smaller span may not meet.
+enum Judged {
+    Rows(Vec<Value>),
+    Smaller(String),
+}
+
+/// Judge one span's answer by the rules a sequential scan applies; an error is fatal to the call.
+fn judge(method: &str, s: u64, e: u64, answer: Result<Value>) -> Result<Judged> {
+    match answer {
+        Ok(Value::Array(items)) if items.len() >= SUSPICIOUSLY_FULL => {
+            if e == s {
+                bail!(
+                    "{method} at block {s} answered {} items, which may be a truncated page",
+                    items.len()
+                );
+            }
+            Ok(Judged::Smaller("too many results".into()))
+        }
+        Ok(Value::Array(items)) => Ok(Judged::Rows(items)),
+        Ok(other) => bail!("{method} [{s}, {e}] answered a non-list: {other}"),
+        Err(err) if e > s => {
+            let why = format!("{err:#}");
+            if stated_limit(&why).is_some_and(|n| n >= 1) || range_shaped(&why) {
+                Ok(Judged::Smaller(why))
+            } else {
+                Err(err).with_context(|| format!("{method} [{s}, {e}]"))
+            }
+        }
+        Err(err) => Err(err).with_context(|| format!("{method} at block {s}")),
+    }
 }
 
 pub(crate) fn hex_u64(v: &Value) -> Result<u64> {
@@ -715,13 +780,16 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         from: u64,
         to: u64,
     ) -> Result<(Vec<TxRef>, Vec<String>)> {
-        let mut frames = Vec::new();
-        let mut empty_sides = Vec::new();
-        for side in ["fromAddress", "toAddress"] {
-            let got = ranged(&self.trace, &self.trace_window, from, to, "trace_filter", |s, e| {
+        let sides = ["fromAddress", "toAddress"];
+        let answers = futures::future::try_join_all(sides.map(|side| {
+            ranged(&self.trace, &self.trace_window, from, to, "trace_filter", move |s, e| {
                 json!([{ "fromBlock": format!("0x{s:x}"), "toBlock": format!("0x{e:x}"), side: [a] }])
             })
-            .await?;
+        }))
+        .await?;
+        let mut frames = Vec::new();
+        let mut empty_sides = Vec::new();
+        for (side, got) in sides.into_iter().zip(answers) {
             if got.is_empty() {
                 empty_sides.push(side);
             }
@@ -863,14 +931,16 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             json!([[TRANSFER_SINGLE, TRANSFER_BATCH], null, who]),
             json!([[TRANSFER_SINGLE, TRANSFER_BATCH], null, null, who]),
         ];
+        let answers = futures::future::try_join_all(filters.iter().map(|topics| {
+            ranged(&self.main, &self.log_window, from, to, "eth_getLogs", move |s, e| {
+                json!([{ "fromBlock": format!("0x{s:x}"), "toBlock": format!("0x{e:x}"), "topics": topics }])
+            })
+        }))
+        .await?;
         let mut seen = BTreeSet::new();
         let mut logs = Vec::new();
         let mut empty = Vec::new();
-        for topics in filters {
-            let got = ranged(&self.main, &self.log_window, from, to, "eth_getLogs", |s, e| {
-                json!([{ "fromBlock": format!("0x{s:x}"), "toBlock": format!("0x{e:x}"), "topics": topics }])
-            })
-            .await?;
+        for (topics, got) in filters.into_iter().zip(answers) {
             if got.is_empty() {
                 empty.push(topics.clone());
             }
@@ -1579,6 +1649,143 @@ mod tests {
         .await
         .unwrap_err();
         assert!(format!("{err:#}").contains("truncated page"), "{err:#}");
+    }
+
+    /// A provider that caps spans at 100 blocks, answers one item per block, and finishes later
+    /// spans first, so the concurrent path is out of order underneath.
+    struct Capped {
+        in_flight: AtomicU64,
+        most: AtomicU64,
+        timed_out_once: AtomicBool,
+        fatal_at: Option<u64>,
+    }
+    impl Capped {
+        fn new(fatal_at: Option<u64>) -> Capped {
+            Capped {
+                in_flight: AtomicU64::new(0),
+                most: AtomicU64::new(0),
+                timed_out_once: AtomicBool::new(false),
+                fatal_at,
+            }
+        }
+    }
+    impl Rpc for Capped {
+        async fn call(&self, _: &str, p: Value) -> Result<Value> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            let s = hex_u64(&p[0]["fromBlock"])?;
+            let e = hex_u64(&p[0]["toBlock"])?;
+            tokio::time::sleep(std::time::Duration::from_millis(8 - s / 100 % 8)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            let has = |b: u64| (s..=e).contains(&b);
+            if e - s + 1 > 100 {
+                bail!("-32602: Block range too large; currently limited to 100 blocks");
+            }
+            if self.fatal_at.is_some_and(has) {
+                bail!("401 Unauthorized: invalid API key");
+            }
+            if has(1_250) && !self.timed_out_once.swap(true, Ordering::SeqCst) {
+                bail!("query timed out");
+            }
+            if has(1_700) && e - s + 1 > 25 {
+                return Ok(Value::Array(vec![json!(-1); SUSPICIOUSLY_FULL]));
+            }
+            Ok(Value::Array((s..=e).map(|b| json!(b)).collect()))
+        }
+    }
+
+    fn blocks(s: u64, e: u64) -> Value {
+        json!([{ "fromBlock": format!("0x{s:x}"), "toBlock": format!("0x{e:x}") }])
+    }
+
+    /// Spans run concurrently once the cap is learned, and the answer is still every block once, in
+    /// order, through a stated cap, a mid-range timeout and a page that looks truncated.
+    #[tokio::test]
+    async fn concurrent_spans_answer_exactly_what_sequential_spans_would() {
+        let rpc = Capped::new(None);
+        let got = ranged(
+            &rpc,
+            &Window::new(100_000),
+            0,
+            2_999,
+            "trace_filter",
+            blocks,
+        )
+        .await
+        .unwrap();
+        let want: Vec<Value> = (0..=2_999u64).map(|b| json!(b)).collect();
+        assert_eq!(got, want);
+        let most = rpc.most.load(Ordering::SeqCst);
+        assert!(
+            most > 1 && most <= RANGE_CONCURRENCY as u64,
+            "in flight at once: {most}"
+        );
+    }
+
+    /// An error that says nothing about the range still fails the whole range, concurrent or not.
+    #[tokio::test]
+    async fn a_non_range_error_in_a_concurrent_batch_fails_the_range() {
+        let rpc = Capped::new(Some(2_000));
+        let err = ranged(&rpc, &Window::new(100), 0, 2_999, "trace_filter", blocks)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("401"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("trace_filter [2000, "),
+            "{err:#}"
+        );
+    }
+
+    /// Answers by span: the first time a span is asked, then every time after.
+    struct Spans(
+        Mutex<BTreeSet<(u64, u64)>>,
+        fn(u64, u64, bool) -> Option<Result<Value>>,
+    );
+    impl Rpc for Spans {
+        async fn call(&self, _: &str, p: Value) -> Result<Value> {
+            let s = hex_u64(&p[0]["fromBlock"])?;
+            let e = hex_u64(&p[0]["toBlock"])?;
+            let first = self.0.lock().unwrap().insert((s, e));
+            match (self.1)(s, e, first) {
+                Some(answer) => answer,
+                None => std::future::pending().await,
+            }
+        }
+    }
+    fn rows(s: u64, e: u64) -> Option<Result<Value>> {
+        Some(Ok(Value::Array((s..=e).map(|b| json!(b)).collect())))
+    }
+
+    /// A fatal answer to a span sent alongside one that needs a smaller size fails the call, though
+    /// that span is asked again and answers cleanly the second time.
+    #[tokio::test]
+    async fn a_fatal_answer_behind_a_refusal_is_not_discarded() {
+        let rpc = Spans(Mutex::default(), |s, e, first| match (s, e) {
+            (2, 3) => Some(Err(anyhow!("query timed out"))),
+            (4, 4) if first => Some(Err(anyhow!("401 Unauthorized"))),
+            _ => rows(s, e),
+        });
+        let err = ranged(&rpc, &Window::new(2), 0, 4, "trace_filter", blocks)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("401"), "{err:#}");
+    }
+
+    /// A fatal answer fails the call when it arrives, not when a slower span after it does.
+    #[tokio::test]
+    async fn a_fatal_answer_is_not_held_up_by_a_slower_span() {
+        let rpc = Spans(Mutex::default(), |s, e, _| match (s, e) {
+            (2, 3) => Some(Err(anyhow!("401 Unauthorized"))),
+            (4, 5) => None,
+            _ => rows(s, e),
+        });
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ranged(&rpc, &Window::new(2), 0, 5, "trace_filter", blocks),
+        )
+        .await
+        .expect("the fatal answer ends the call without waiting for [4, 5]");
+        assert!(format!("{:#}", got.unwrap_err()).contains("401"));
     }
 
     #[test]
