@@ -180,7 +180,13 @@ impl Window {
         next
     }
 
-    fn succeeded(&self) {
+    /// A span of `served` blocks was answered. Only an answer at the window's size or above proves
+    /// it or counts towards growing it: a smaller one still in flight from before a regrowth says
+    /// nothing about the new size.
+    fn succeeded(&self, served: u64) {
+        if served < self.get() {
+            return;
+        }
         self.proven.store(true, Ordering::Relaxed);
         if self.streak.fetch_add(1, Ordering::Relaxed) + 1 < REGROW_AFTER {
             return;
@@ -308,7 +314,7 @@ async fn ranged_in<R: Rpc>(
             let (s, e) = asked.next().expect("one answer per span");
             match judge(method, s, e, answer)? {
                 Judged::Rows(items) => {
-                    window.succeeded();
+                    window.succeeded(e - s + 1);
                     parts.insert(s, items);
                 }
                 Judged::Smaller(why) => {
@@ -1629,11 +1635,11 @@ mod tests {
 
         // Successes grow the span back, never past the stated ceiling.
         for _ in 0..REGROW_AFTER {
-            w.succeeded();
+            w.succeeded(w.get());
         }
         assert_eq!(w.get(), 50);
         for _ in 0..3 * REGROW_AFTER {
-            w.succeeded();
+            w.succeeded(w.get());
         }
         assert_eq!(w.get(), 100, "capped at the stated limit");
     }
@@ -1901,11 +1907,9 @@ mod tests {
             "{concurrent} against {sequential}"
         );
 
-        // A stated cap makes the sequential count exact: one refusal, then every span at the cap.
-        // Four filters at once must not each pay for the refusal, nor shrink below the cap.
-        let stated = |most, together| async move {
-            let rpc = Stated(AtomicU64::new(0));
-            let w = Window::new(100_000);
+        let four = |limit, why, start, most, together| async move {
+            let rpc = Stated(AtomicU64::new(0), limit, why);
+            let w = Window::new(start);
             let one = || ranged_in(&rpc, &w, 0, 2_999, "eth_getLogs", blocks, most);
             let got = if together {
                 futures::future::try_join_all([one(), one(), one(), one()])
@@ -1920,23 +1924,38 @@ mod tests {
             };
             (got, rpc.0.load(Ordering::SeqCst))
         };
-        let (want, sequential) = stated(1, false).await;
+        // A stated cap makes the sequential count exact: one refusal, then every span at the cap.
+        // Four filters at once must not each pay for the refusal, nor shrink below the cap.
+        let limited = "currently limited to 100 blocks";
+        let (want, sequential) = four(100, limited, 100_000, 1, false).await;
         assert_eq!(sequential, 1 + 4 * 30);
-        let (got, concurrent) = stated(RANGE_CONCURRENCY, true).await;
+        let (got, concurrent) = four(100, limited, 100_000, RANGE_CONCURRENCY, true).await;
         assert_eq!(got, want);
         assert_eq!(concurrent, sequential);
+
+        // An unstated limit between the halved and the regrown size: the window keeps growing back
+        // to a size that is refused, and a smaller answer still in flight must not prove it.
+        let many = "query returned too many results";
+        let (want, sequential) = four(60, many, 100, 1, false).await;
+        let (got, concurrent) = four(60, many, 100, RANGE_CONCURRENCY, true).await;
+        assert_eq!(got, want);
+        assert!(
+            concurrent <= sequential,
+            "{concurrent} against {sequential}"
+        );
     }
 
-    /// Refuses spans over 100 blocks, stating the limit.
-    struct Stated(AtomicU64);
+    /// Refuses spans over a limit, in the words given.
+    struct Stated(AtomicU64, u64, &'static str);
     impl Rpc for Stated {
         async fn call(&self, _: &str, p: Value) -> Result<Value> {
             self.0.fetch_add(1, Ordering::SeqCst);
             let s = hex_u64(&p[0]["fromBlock"])?;
             let e = hex_u64(&p[0]["toBlock"])?;
             tokio::time::sleep(std::time::Duration::from_millis(s % 3)).await;
-            if e - s + 1 > 100 {
-                bail!("-32602: Block range too large; currently limited to 100 blocks");
+            tokio::task::yield_now().await;
+            if e - s + 1 > self.1 {
+                bail!("-32602: {}", self.2);
             }
             Ok(Value::Array((s..=e).map(|b| json!(b)).collect()))
         }
@@ -1961,7 +1980,7 @@ mod tests {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 for _ in 0..8 * REGROW_AFTER {
-                    self.0.succeeded();
+                    self.0.succeeded(self.0.get());
                 }
                 Ok(Value::Array((s..=e).map(|b| json!(b)).collect()))
             }
