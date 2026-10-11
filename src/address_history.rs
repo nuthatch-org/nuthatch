@@ -1845,6 +1845,14 @@ fn encode_string(s: &str, out: &mut Vec<u8>) {
     put_bytes(out, s.as_bytes());
 }
 
+/// Encode `record` into `buf` and assert it decodes back unchanged.
+#[cfg(test)]
+pub(crate) fn tests_encode_roundtrip(record: &Map<String, Value>, buf: &mut Vec<u8>) {
+    buf.clear();
+    encode_record(record, buf).unwrap();
+    assert_eq!(&decode_record(buf).unwrap(), record);
+}
+
 fn decode_record(mut raw: &[u8]) -> Result<Map<String, Value>> {
     let n = take_varint(&mut raw)?;
     let mut out = Map::new();

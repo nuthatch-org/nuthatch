@@ -264,6 +264,17 @@ while IFS=$'\t' read -r name address block hash _; do
   api "action=txlistinternal&txhash=$hash" | jq -c '.result[]?' > "$WORK/$name-txhash.jsonl"
   same_rows "$name by txhash" "${BYHASH/parent,/}" "$WORK/$name-txhash.jsonl" "$CASES/$name-txhash.jsonl"
   echo "$name: $(wc -l < "$WORK/$name-address.jsonl" | tr -d ' ') by address, $(wc -l < "$WORK/$name-txhash.jsonl" | tr -d ' ') by txhash"
+  if [ -f "$CASES/$name-authorizations.json" ]; then
+    # A type-4 transaction's txlist row carries its authorization list, which Etherscan's omits.
+    got=$(api "action=txlist&address=$address&startblock=$block&endblock=$block" \
+      | jq -c --arg h "$hash" '.result[]? | select(.hash == $h) | .authorizationList')
+    want=$(jq -c . "$CASES/$name-authorizations.json")
+    if [ "$got" != "$want" ]; then
+      echo "FAIL: $name authorizationList is $got, not $want" >&2
+      exit 1
+    fi
+    echo "$name: authorizationList as pinned"
+  fi
   if [ -z "${COLD_DONE:-}" ]; then
     # A transaction this nest never discovered, so the lookup takes the on-demand trace path.
     COLD=0x90efd2d8bd258966e47252dc2180da14ea6160934043b3750a9918b69fed7147

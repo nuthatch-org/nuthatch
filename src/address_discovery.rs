@@ -1393,6 +1393,35 @@ pub fn txlist_record(
         None => trace_failed,
     };
     put("isError", if failed { "1".into() } else { "0".into() });
+    // A type-4 transaction's delegations. Etherscan's txlist leaves them out, so a client decoding
+    // from it cannot tell a delegation or a revocation from any other self-call; quantities are
+    // decimal, as the row's others are.
+    if let Some(list) = tx.get("authorizationList").and_then(Value::as_array) {
+        let entries = list
+            .iter()
+            .map(|a| {
+                let mut e = Map::new();
+                e.insert("chainId".into(), Value::String(dec(a, "chainId")?));
+                e.insert(
+                    "address".into(),
+                    Value::String(str_field(a, "address")?.to_ascii_lowercase()),
+                );
+                e.insert("nonce".into(), Value::String(dec(a, "nonce")?));
+                let parity = a.get("yParity").or_else(|| a.get("v"));
+                if let Some(p) = parity.and_then(Value::as_str) {
+                    e.insert("yParity".into(), Value::String(decimal(p)?));
+                }
+                for k in ["r", "s"] {
+                    e.insert(
+                        k.into(),
+                        Value::String(str_field(a, k)?.to_ascii_lowercase()),
+                    );
+                }
+                Ok(Value::Object(e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        r.insert("authorizationList".into(), Value::Array(entries));
+    }
     Ok(r)
 }
 
@@ -2188,6 +2217,38 @@ mod tests {
         let (ids, values) = batch_arrays(&words.concat()).unwrap();
         assert_eq!(ids, ["1", "2"]);
         assert_eq!(values, ["10", "20"]);
+    }
+
+    /// A type-4 transaction's row carries its authorization list, as rotki's decoder needs to name a
+    /// delegation or a revocation; others carry none. Pinned from mainnet transaction
+    /// 0x63d68742…3f40 at block 23500010 (the eip7702 parity case), whose authorization the RPC
+    /// returned on 2026-10-11. Etherscan's txlist omits the field.
+    #[test]
+    fn a_type_4_row_carries_its_authorizations() {
+        let tx = json!({"blockNumber": "0x166989a", "blockHash": "0xbb", "hash": "0x63d68742e5dc553a4fed594538f17d7b33f84921a51bece08f486d1f7eb73f40",
+            "nonce": "0x0", "transactionIndex": "0x7", "from": "0x689256b5008983673cbdb97a227cf32f38798555",
+            "to": "0x689256b5008983673cbdb97a227cf32f38798555", "value": "0x0", "gas": "0x1", "gasPrice": "0x1",
+            "input": "0x", "type": "0x4", "authorizationList": [{"chainId": "0x1",
+            "address": "0x000000009B1D0aF20D8C6d0A44e162d11F9b8f00", "nonce": "0x1", "yParity": "0x0",
+            "r": "0x4c7ed4bff711025b9ace5cef6df93196ab91b4687f717d0a38ee6224f133ee10",
+            "s": "0x2036c3b1fbd979ac7bd5cfca2603f232974923611b866ef15a1934eaae0da0f2"}]});
+        let receipt = json!({"status": "0x1", "cumulativeGasUsed": "0x1", "gasUsed": "0x1", "contractAddress": null});
+        let r = txlist_record(&tx, &receipt, 1_759_527_755, false).unwrap();
+        assert_eq!(
+            r["authorizationList"],
+            json!([{"chainId": "1", "address": "0x000000009b1d0af20d8c6d0a44e162d11f9b8f00", "nonce": "1",
+                "yParity": "0", "r": "0x4c7ed4bff711025b9ace5cef6df93196ab91b4687f717d0a38ee6224f133ee10",
+                "s": "0x2036c3b1fbd979ac7bd5cfca2603f232974923611b866ef15a1934eaae0da0f2"}])
+        );
+        let mut plain = tx.clone();
+        plain.as_object_mut().unwrap().remove("authorizationList");
+        assert!(txlist_record(&plain, &receipt, 1, false)
+            .unwrap()
+            .get("authorizationList")
+            .is_none());
+        // It survives the store's encoding.
+        let mut buf = Vec::new();
+        crate::address_history::tests_encode_roundtrip(&r, &mut buf);
     }
 
     #[test]
