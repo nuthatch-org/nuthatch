@@ -505,8 +505,8 @@ impl Pending {
         self.named.lock().expect("pending lock").clone()
     }
 
-    /// Commit what was fetched. With `trusted` false (a check after the fetch failed) only what lay
-    /// under the finalized head when the fetch began is kept. Blocking: call it off the async workers.
+    /// Commit what was fetched; nothing if `trusted` is false (a check after the fetch failed).
+    /// Blocking: call it off the async workers.
     pub fn persist(self, history: &AddressHistory, trusted: bool) -> Result<()> {
         history.persist_pending(
             &self.txs.into_inner().expect("pending lock"),
@@ -680,7 +680,20 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         limit: u64,
     ) -> Result<Vec<Row>> {
         let key = alloy_primitives::hex::decode(hash.trim_start_matches("0x"))?;
-        let records = match history.tx_internals(&key)? {
+        // A kept trace is used only with the block hash its provider named, which the main endpoint
+        // is asked to agree with again; one kept without it is traced afresh.
+        let kept = match history.tx_internals_block(&key)? {
+            Some((block, Some(named))) => {
+                pending
+                    .named
+                    .lock()
+                    .expect("pending lock")
+                    .push((block, named));
+                history.tx_internals(&key)?
+            }
+            _ => None,
+        };
+        let records = match kept {
             Some(r) => r,
             None => {
                 let trace = self
@@ -719,11 +732,12 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 }
                 let ts = self.block_timestamp(history, block, pending).await?;
                 let records = internal_records(frames, ts)?;
-                pending
-                    .internals
-                    .lock()
-                    .expect("pending lock")
-                    .push((key, block, records.clone()));
+                pending.internals.lock().expect("pending lock").push((
+                    key,
+                    block,
+                    named,
+                    records.clone(),
+                ));
                 records
             }
         };
@@ -2245,13 +2259,21 @@ mod tests {
                 }
                 "eth_getTransactionByHash" => tx_json(p[0].as_str().unwrap(), 150, 0),
                 "eth_getTransactionReceipt" => receipt_json(),
-                "eth_getBlockByNumber" => json!({"timestamp": "0x10"}),
+                "eth_getBlockByNumber" => {
+                    let b = hex_u64(&p[0])?;
+                    json!({"timestamp": "0x10", "number": format!("0x{b:x}"), "hash": format!("0x{b:064x}")})
+                }
                 "eth_getBlockTransactionCountByNumber" => json!("0x5"),
                 other => bail!("unexpected {other}"),
             })
         });
         let trace = script(move |m, p| {
             Ok(match m {
+                // The trace endpoint is on the main endpoint's chain.
+                "eth_getBlockByNumber" => {
+                    let b = hex_u64(&p[0])?;
+                    json!({"number": format!("0x{b:x}"), "hash": format!("0x{b:064x}")})
+                }
                 "trace_filter" => {
                     let f = &p[0];
                     let s = hex_u64(&f["fromBlock"])?;
@@ -3386,6 +3408,7 @@ mod tests {
                 "eth_getBlockByNumber" => {
                     let b = hex_u64(&p[0])?;
                     let mut h = json!({"number": format!("0x{b:x}"), "timestamp": format!("0x{:x}", 1_000 + b),
+                        "hash": format!("0x{b:064x}"),
                         "miner": if b % 10 == 5 { B } else { "0x0000000000000000000000000000000000000077" },
                         "baseFeePerGas": "0x64", "uncles": [], "withdrawals": [], "transactions": ["0x01", "0x02"]});
                     if b % 10 == 2 {
@@ -3616,8 +3639,9 @@ mod tests {
         );
         assert_eq!(
             bodies_read() - after_first,
-            10,
-            "B's gap read once, A's coverage not reread"
+            11,
+            "B's gap read once, A's coverage not reread, and one hash to check B's discovery window's \
+             trace endpoint is on the main chain"
         );
         let req = crate::address_history::PageRequest {
             address: B.into(),

@@ -310,8 +310,8 @@ enum Read {
     Partition,
 }
 
-/// A transaction hash, its block, and its whole internal list.
-pub type TxInternals = (Vec<u8>, u64, Vec<Map<String, Value>>);
+/// A transaction hash, its block, the block's hash as the trace named it, and its whole internal list.
+pub type TxInternals = (Vec<u8>, u64, [u8; 32], Vec<Map<String, Value>>);
 
 /// One stored record and where it sorts.
 #[derive(Debug, Clone)]
@@ -412,21 +412,6 @@ impl AddressHistory {
         }
     }
 
-    pub fn cache_txs(&self, txs: &[(Vec<u8>, Map<String, Value>)]) -> Result<()> {
-        let wtx = self.store.database().begin_write()?;
-        {
-            let mut t = wtx.open_table(TX_CACHE)?;
-            let mut buf = Vec::new();
-            for (hash, record) in txs {
-                buf.clear();
-                encode_record(record, &mut buf)?;
-                t.insert(hash.as_slice(), buf.as_slice())?;
-            }
-        }
-        wtx.commit()?;
-        Ok(())
-    }
-
     /// Every internal transaction of a transaction already traced, by its 32-byte hash.
     pub fn tx_internals(&self, hash: &[u8]) -> Result<Option<Vec<Map<String, Value>>>> {
         let rtx = self.store.database().begin_read()?;
@@ -448,50 +433,34 @@ impl AddressHistory {
         Ok(Some(rows))
     }
 
-    /// The block a cached trace was read from.
-    pub fn tx_internals_block(&self, hash: &[u8]) -> Result<Option<u64>> {
+    /// The block a cached trace was read from, and that block's hash as the trace named it (absent
+    /// for a trace kept before 5.2, which is traced again rather than trusted).
+    pub fn tx_internals_block(&self, hash: &[u8]) -> Result<Option<(u64, Option<[u8; 32]>)>> {
         let rtx = self.store.database().begin_read()?;
         let Some(v) = rtx.open_table(TX_INTERNAL)?.get(hash)? else {
             return Ok(None);
         };
-        Ok(decode_record(v.value())?
+        let wrapped = decode_record(v.value())?;
+        let Some(block) = wrapped
             .get("blockNumber")
             .and_then(Value::as_str)
-            .and_then(|b| b.parse().ok()))
-    }
-
-    /// Keep each trace whose block is still served; a reorg that lowered the head while the trace
-    /// was in flight leaves it out.
-    pub fn cache_tx_internals(&self, txs: &[TxInternals]) -> Result<()> {
-        let wtx = self.store.database().begin_write()?;
-        {
-            let head = wtx.open_table(META)?.get(HEAD)?.map(|v| v.value());
-            let mut t = wtx.open_table(TX_INTERNAL)?;
-            let mut buf = Vec::new();
-            for (hash, block, rows) in txs {
-                if head.is_none_or(|h| *block > h) {
-                    continue;
-                }
-                let mut wrapped = Map::new();
-                wrapped.insert("blockNumber".into(), Value::String(block.to_string()));
-                wrapped.insert(
-                    "rows".into(),
-                    Value::Array(rows.iter().cloned().map(Value::Object).collect()),
-                );
-                buf.clear();
-                encode_record(&wrapped, &mut buf)?;
-                t.insert(hash.as_slice(), buf.as_slice())?;
-            }
-        }
-        wtx.commit()?;
-        Ok(())
+            .and_then(|b| b.parse().ok())
+        else {
+            return Ok(None);
+        };
+        let named = wrapped
+            .get("blockHash")
+            .and_then(Value::as_str)
+            .and_then(|h| alloy_primitives::hex::decode(h.trim_start_matches("0x")).ok())
+            .and_then(|h| <[u8; 32]>::try_from(h).ok());
+        Ok(Some((block, named)))
     }
 
     /// What a fetch read, in one transaction: transactions, timestamps, traces and the block hashes
-    /// they were read against. What lay under the finalized head when the fetch began is kept; what
-    /// lay above it only if the fetch is `trusted` and the generation has not moved since: a reorg
-    /// handled meanwhile may have replaced its block, even if the new chain has since grown, or
-    /// finalized, back past it.
+    /// they were read against. Nothing from a fetch that failed its check (`trusted` false). Otherwise
+    /// what lay under the finalized head when the fetch began, and what lay above it only if the
+    /// generation has not moved since: a reorg handled meanwhile may have replaced its block, even if
+    /// the new chain has since grown, or finalized, back past it.
     #[allow(clippy::too_many_arguments)]
     pub fn persist_pending(
         &self,
@@ -512,7 +481,8 @@ impl AddressHistory {
                 (head, now)
             };
             let current = trusted && now == generation;
-            let keep = |block: u64| current || finalized_at_start.is_some_and(|h| block <= h);
+            let keep =
+                |block: u64| trusted && (current || finalized_at_start.is_some_and(|h| block <= h));
             let mut buf = Vec::new();
             {
                 let mut t = wtx.open_table(TX_CACHE)?;
@@ -543,12 +513,16 @@ impl AddressHistory {
             }
             {
                 let mut t = wtx.open_table(TX_INTERNAL)?;
-                for (hash, block, rows) in internals {
+                for (hash, block, named, rows) in internals {
                     if !keep(*block) {
                         continue;
                     }
                     let mut wrapped = Map::new();
                     wrapped.insert("blockNumber".into(), Value::String(block.to_string()));
+                    wrapped.insert(
+                        "blockHash".into(),
+                        Value::String(format!("0x{}", alloy_primitives::hex::encode(named))),
+                    );
                     wrapped.insert(
                         "rows".into(),
                         Value::Array(rows.iter().cloned().map(Value::Object).collect()),
@@ -2803,7 +2777,7 @@ mod tests {
         h.persist_pending(
             &[tx(90), tx(160)],
             &[(90, 1), (160, 2)],
-            &[(vec![7; 32], 160, vec![])],
+            &[(vec![7; 32], 160, [3; 32], vec![])],
             &[(160, [1; 32])],
             g,
             Some(100),

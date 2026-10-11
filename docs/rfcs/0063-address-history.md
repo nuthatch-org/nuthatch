@@ -305,7 +305,8 @@ The plan below went through six rounds of review against the code before both re
 
 - **Exact or refused.** An explicit `endblock` is answered whole or refused, never shortened.
   `getblocknobytime` answers from verified headers, else by searching the nest's own RPC, with the
-  answer proven against its neighbour by parent hash; a timestamp newer than the chain head, or a
+  answer proven against its neighbour by parent hash, and above the finalized head linked by parent
+  hashes to the chain head the search began from; a timestamp newer than the chain head, or a
   chain whose blocks can share a second, is refused.
 - **The tip on demand.** The cursor backfills to the finalized head. A request above what is covered
   and at or below the chain head is handed to the cursor, which covers that address and the actions
@@ -323,8 +324,9 @@ The plan below went through six rounds of review against the code before both re
   on a mismatch it walks down to the newest that still matches and takes back everything above it:
   rows, coverage, cached transactions, timestamps, traces and relay answers. A fetch is also checked
   against the newest tracked hash under it, so a window read on a fork cannot hide the stale block
-  beneath its own matching anchor, and every block hash taken from the trace endpoint must be the
-  main endpoint's. A fetch that began before a reorg keeps nothing above the finalized head. Tracked
+  beneath its own matching anchor; every block hash taken from the trace endpoint must be the main
+  endpoint's; the trace endpoint must report the main endpoint's hash at the window's last block;
+  every comparison is made twice; and a fetch that fails any of it keeps nothing. A fetch that began before a reorg keeps nothing above the finalized head. Tracked
   hashes are persisted, so a restart finds a reorg it slept through, even one the chain has since
   finalized past: what was tracked was mutable when it was read. Only a block under the finalized
   head the store committed is a conflict, which stops the cursor. A property test over random reorg

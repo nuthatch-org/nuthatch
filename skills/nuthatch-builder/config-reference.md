@@ -198,8 +198,9 @@ everything read above the fork, rows, coverage and caches, until it is read agai
 under the finalized head stops the cursor and says so; history under it is never rewritten.
 
 `getblocknobytime` answers from verified headers where they bracket the timestamp, and otherwise by
-searching the nest's own RPC, proving the answer against its neighbour block by parent hash. It
-refuses a timestamp newer than the chain head, and refuses on chains whose blocks can share a second
+searching the nest's own RPC, proving the answer against its neighbour block by parent hash and,
+above the finalized head, linking it by parent hashes to the head the search began from. It refuses a
+timestamp newer than the chain head, and refuses on chains whose blocks can share a second
 (Arbitrum, BNB Chain).
 
 On Ethereum mainnet, withdrawals, produced blocks and `getblocknobytime` can come from verified block
