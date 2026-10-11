@@ -448,6 +448,7 @@ async fn discover_window<M: Rpc, T: Rpc>(
     state: &ModeState,
     address: &str,
     (next, end): (u64, u64),
+    deadline: Option<Instant>,
 ) -> Result<()> {
     let pending = crate::address_discovery::Pending::begin(&state.history)?;
     let generation = pending.generation();
@@ -458,9 +459,11 @@ async fn discover_window<M: Rpc, T: Rpc>(
     // The trace endpoint must be on the main chain before the fetch as well as after it: one that
     // catches up in between would otherwise pass with the empty answers it gave from another fork.
     same_chain_at(d, end).await?;
-    let found = d
-        .discover(&state.history, address, next, end, &pending)
-        .await;
+    let found = within(
+        deadline,
+        d.discover(&state.history, address, next, end, &pending),
+    )
+    .await;
     let checked = match check_anchor(d, &state.history, anchor, &pending.named()).await {
         Ok(()) => same_chain_at(d, end).await,
         Err(e) => Err(e),
@@ -494,6 +497,7 @@ async fn body_window<M: Rpc, T: Rpc>(
     state: &ModeState,
     addresses: Vec<String>,
     (from, end): (u64, u64),
+    deadline: Option<Instant>,
 ) -> Result<()> {
     use crate::address_discovery::record_blocks_anchored;
     let pending = crate::address_discovery::Pending::begin(&state.history)?;
@@ -502,7 +506,7 @@ async fn body_window<M: Rpc, T: Rpc>(
     if let Some((b, h)) = anchor {
         pending.anchor(b, h);
     }
-    let found = d.scan_blocks(&addresses, from, end, &pending).await;
+    let found = within(deadline, d.scan_blocks(&addresses, from, end, &pending)).await;
     let checked = check_anchor(d, &state.history, anchor, &pending.named()).await;
     let history = state.history.clone();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -519,6 +523,24 @@ async fn body_window<M: Rpc, T: Rpc>(
     state.set_calls("main", d.main.calls());
     state.set_calls("trace", d.trace.calls());
     outcome
+}
+
+/// A fetch, stopped at `deadline` if it has one. Only fetches go through this: they write nothing,
+/// so stopping one orphans no writer; what a window persists runs after it, to completion.
+async fn within<F, X>(deadline: Option<Instant>, fetch: F) -> Result<X>
+where
+    F: std::future::Future<Output = Result<X>>,
+{
+    match deadline {
+        None => fetch.await,
+        Some(d) => tokio::time::timeout_at(d.into(), fetch)
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "not covered within the deadline; try again shortly"
+                ))
+            }),
+    }
 }
 
 /// The end of the uncovered run starting at `next` in `actions`' coverage of `a`, capped at `to`.
@@ -614,7 +636,7 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 let end = next
                     .saturating_add(crate::address_discovery::OUTER_WINDOW - 1)
                     .min(to);
-                match discover_window(self, state, &address, (next, end)).await {
+                match discover_window(self, state, &address, (next, end), None).await {
                     Ok(()) => {
                         recorded_through = Some(end);
                         state.windows.fetch_add(1, Ordering::Relaxed);
@@ -838,7 +860,7 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
             late()?;
             let end = hole_end(history, address, &DISCOVERED, next, to)?
                 .min(next.saturating_add(COVER_WINDOW - 1));
-            discover_window(self, state, address, (next, end)).await?;
+            discover_window(self, state, address, (next, end), Some(deadline)).await?;
         }
         if need == Need::Discovered {
             history.raise_tip(to)?;
@@ -870,7 +892,14 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
             {
                 end = end.min(first - 1);
             }
-            body_window(self, state, vec![address.to_string()], (next, end)).await?;
+            body_window(
+                self,
+                state,
+                vec![address.to_string()],
+                (next, end),
+                Some(deadline),
+            )
+            .await?;
         }
         if need == Need::Produced {
             let relays = state.relays.as_ref().expect("checked above");
@@ -1071,7 +1100,7 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
             .filter(|(_, n)| *n <= end)
             .map(|(a, _)| a)
             .collect();
-        let outcome = body_window(d, state, addresses, (from, end)).await;
+        let outcome = body_window(d, state, addresses, (from, end), None).await;
         match outcome {
             Ok(()) => {
                 last = Some(end);
@@ -2521,9 +2550,10 @@ mod tests {
         );
         assert_eq!(
             d.main.calls()["eth_getBlockByNumber"],
-            20 + 2 + 2,
-            "twenty bodies before the mirror, its finality check, one anchor, and two hashes to check \
-             the discovery window's trace endpoint is on the main chain, before and after"
+            20 + 2 + 2 + 2,
+            "twenty bodies before the mirror, its finality check, one anchor, two hashes to check the \
+             discovery window's trace endpoint is on the main chain, and the body window's last hash \
+             checked twice"
         );
 
         // Coverage the RPC scan recorded before a mirror was configured does not answer for the
@@ -3025,6 +3055,27 @@ mod tests {
         assert!(matches!(wanted(&s, &q, &answer).await, Want::Serve));
         s.history.invalidate_above(80).unwrap();
         assert!(matches!(wanted(&s, &q, &answer).await, Want::Reread));
+    }
+
+    /// A window's fetch stops at the request's deadline, writing nothing; one without a deadline runs.
+    #[tokio::test]
+    async fn a_fetch_stops_at_its_deadline() {
+        let slow = || async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok::<_, anyhow::Error>(1)
+        };
+        let started = Instant::now();
+        let err = within(Some(Instant::now() + Duration::from_millis(50)), slow())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deadline"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            within(None, async { Ok::<_, anyhow::Error>(2) })
+                .await
+                .unwrap(),
+            2
+        );
     }
 
     /// A tracked block under the committed finalized head, now at another hash, is not rewritten:

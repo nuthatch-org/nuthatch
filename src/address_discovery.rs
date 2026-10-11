@@ -810,8 +810,22 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             .map(|a| (a.clone(), BlockFound::default()))
             .collect();
         let mut timestamps = Vec::new();
+        // The bodies must be one chain, each naming the one before as its parent, and the last one's
+        // hash is named for the caller to hold against the main endpoint: a pool's endpoints can be
+        // on different forks, and a body from another fork would otherwise pass as this chain's.
+        let mut previous: Option<String> = None;
+        let mut last: Option<(u64, [u8; 32])> = None;
         for body in bodies {
             let (b, header) = body?;
+            let hash = str_field(&header, "hash")?.to_ascii_lowercase();
+            let parent = str_field(&header, "parentHash")?.to_ascii_lowercase();
+            if let Some(p) = &previous {
+                if *p != parent {
+                    bail!("block {b} does not name block {} as its parent; the bodies are from two chains", b - 1);
+                }
+            }
+            last = Some((b, word32(&hash)?));
+            previous = Some(hash);
             let ts = hex_u64(header.get("timestamp").unwrap_or(&Value::Null))
                 .with_context(|| format!("block {b} timestamp"))?;
             timestamps.push((b, ts));
@@ -865,6 +879,9 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             .lock()
             .expect("pending lock")
             .extend(timestamps);
+        if let Some(l) = last {
+            pending.named.lock().expect("pending lock").push(l);
+        }
         Ok(found)
     }
 
@@ -3435,7 +3452,7 @@ mod tests {
                 "eth_getBlockByNumber" => {
                     let b = hex_u64(&p[0])?;
                     let mut h = json!({"number": format!("0x{b:x}"), "timestamp": format!("0x{:x}", 1_000 + b),
-                        "hash": format!("0x{b:064x}"),
+                        "hash": format!("0x{b:064x}"), "parentHash": format!("0x{:064x}", b - 1),
                         "miner": if b % 10 == 5 { B } else { "0x0000000000000000000000000000000000000077" },
                         "baseFeePerGas": "0x64", "uncles": [], "withdrawals": [], "transactions": ["0x01", "0x02"]});
                     if b % 10 == 2 {
@@ -3458,6 +3475,41 @@ mod tests {
                 other => bail!("unexpected {other}"),
             })
         })
+    }
+
+    /// A body that does not name the previous one as its parent is from another fork (a pool's
+    /// endpoints can disagree), and fails the scan; the last body's hash is named for the main check.
+    #[tokio::test]
+    async fn a_scan_whose_bodies_are_from_two_chains_fails() {
+        let (_, trace) = chain(false);
+        let good = Discoverer::new(bodies(None), trace);
+        let pending = Pending::default();
+        good.scan_blocks(&[A.into()], 17_100_000, 17_100_009, &pending)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.named(),
+            vec![(
+                17_100_009,
+                word32(&format!("0x{:064x}", 17_100_009u64)).unwrap()
+            )]
+        );
+
+        let (_, trace) = chain(false);
+        let inner = bodies(None);
+        let forked = script(move |m, p| {
+            let mut v = (inner.answer)(m, p)?;
+            if m == "eth_getBlockByNumber" && hex_u64(&p[0])? == 17_100_005 {
+                v["parentHash"] = json!(format!("0x{}", "9".repeat(64)));
+            }
+            Ok(v)
+        });
+        let d = Discoverer::new(forked, trace);
+        let err = d
+            .scan_blocks(&[A.into()], 17_100_000, 17_100_009, &Pending::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("two chains"), "{err:#}");
     }
 
     #[tokio::test]
@@ -3666,9 +3718,9 @@ mod tests {
         );
         assert_eq!(
             bodies_read() - after_first,
-            12,
-            "B's gap read once, A's coverage not reread, and two hashes to check B's discovery \
-             window's trace endpoint is on the main chain, before and after"
+            14,
+            "B's gap read once, A's coverage not reread, two hashes to check B's discovery window's \
+             trace endpoint is on the main chain, and the body window's last hash checked twice"
         );
         let req = crate::address_history::PageRequest {
             address: B.into(),
