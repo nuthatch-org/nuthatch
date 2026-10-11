@@ -495,19 +495,6 @@ pub async fn check_anchor<M: Rpc, T: Rpc>(
 pub async fn hold_final(main: &impl Rpc, history: &AddressHistory) -> Result<()> {
     match history.finals()?.last() {
         Some(&(block, hash)) => hold_hash(main, history, block, hash).await,
-        None => hold_legacy(main, history).await,
-    }
-}
-
-/// A store from before finalized hashes were recorded has none to hold, but its history was still
-/// read on some chain: its newest stored transaction's block hash is held instead, so a first
-/// finalized hash is never recorded over history from another fork.
-async fn hold_legacy(main: &impl Rpc, history: &AddressHistory) -> Result<()> {
-    let Some(head) = history.head()? else {
-        return Ok(());
-    };
-    match history.newest_hashed_row(head)? {
-        Some((block, hash)) => hold_hash(main, history, block, hash).await,
         None => Ok(()),
     }
 }
@@ -994,10 +981,7 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
     async fn check_finals(&self, state: &ModeState, deadline: Option<Instant>) -> Result<()> {
         let finals = state.history.finals()?;
         let Some(&newest) = finals.last() else {
-            // A conflict it finds is in the store, where every answer looks for one.
-            let held = within(deadline, hold_legacy(&self.main, &state.history)).await;
-            state.set_calls("main", self.main.calls());
-            return held;
+            return Ok(());
         };
         let pick = state.sample.fetch_add(1, Ordering::Relaxed) as usize % finals.len();
         let mut checks = vec![newest];
@@ -2127,6 +2111,37 @@ pub fn forward<M: Rpc, T: Rpc>(
     })
 }
 
+/// A store written before finalized hashes were recorded cannot show which chain its finalized
+/// history came from, so it is renamed aside, intact, and the nest reads its history again from
+/// `start_block`. The accounts it watched are kept. Returns the accounts to open the new store with.
+pub fn move_aside_pre_finality(path: &Path, configured: &[String]) -> Result<Vec<String>> {
+    let Some(watched) = crate::address_history::pre_finality(path)? else {
+        return Ok(configured.to_vec());
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".pre-5.2-{stamp}"));
+    let aside = std::path::PathBuf::from(aside);
+    std::fs::rename(path, &aside)
+        .with_context(|| format!("moving {} aside to {}", path.display(), aside.display()))?;
+    tracing::warn!(
+        "address history: {} was written before finalized block hashes were recorded, so it cannot \
+         show its history is this chain's; moved it, untouched, to {} and reading history again \
+         from start_block",
+        path.display(),
+        aside.display()
+    );
+    let mut all = configured.to_vec();
+    for a in watched {
+        if !all.iter().any(|c| c.eq_ignore_ascii_case(&a)) {
+            all.push(a);
+        }
+    }
+    Ok(all)
+}
+
 /// `--poll-interval` wins over `poll_interval` in `[address_history]`, which wins over the default.
 pub fn poll_interval(flag: Option<Duration>, config: &AddressHistoryConfig) -> Result<Duration> {
     match flag {
@@ -2194,9 +2209,10 @@ pub async fn dev(
     }
     // redb caches every page it reads or writes up to its cache size, and a backfill touches all of
     // them; an address-history nest reads by key, so a small cache costs it nothing.
-    let store =
-        crate::store::Store::open_with_cache(&dir.join(crate::config::DB_FILE), STORE_CACHE_BYTES)?;
-    let history = AddressHistory::open(store, config.nest.chain_id, &ah.addresses)?;
+    let path = dir.join(crate::config::DB_FILE);
+    let addresses = move_aside_pre_finality(&path, &ah.addresses)?;
+    let store = crate::store::Store::open_with_cache(&path, STORE_CACHE_BYTES)?;
+    let history = AddressHistory::open(store, config.nest.chain_id, &addresses)?;
 
     let urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
     let trace_urls = if args.trace_rpc.is_empty() {
@@ -3672,73 +3688,45 @@ mod tests {
         assert!(s.conflicted().is_none());
     }
 
-    /// A store from before finalized hashes were recorded holds its newest stored transaction's block
-    /// hash before recording its first: on the same chain the upgrade goes through, and over a fork
-    /// under finality it is a conflict rather than a hash that would bless the old fork's rows.
-    #[tokio::test]
-    async fn an_upgraded_store_holds_its_stored_hashes_before_its_first_final() {
-        for forked in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let s = reorg_state(dir.path());
-            let chain = Chain::new(100, 70);
-            let mut record = serde_json::Map::new();
-            record.insert("blockNumber".into(), json!("60"));
-            record.insert("blockHash".into(), json!(chain.hex(60)));
-            let row = crate::address_history::Row {
-                block: 60,
-                tx_index: 0,
-                position: 0,
-                record,
-            };
-            let g = s.history.generation().unwrap();
-            s.history
-                .record(
-                    crate::address_history::Action::TxList,
-                    ALICE,
-                    &[row],
-                    (0, 70),
-                    g,
-                )
-                .unwrap();
-            s.history.finalize(70).unwrap();
-            assert!(s.history.finals().unwrap().is_empty(), "a 5.1 store");
-            if forked {
-                chain.reorg(45);
-            }
-            let d = chain.node();
-            let polled = d.reconcile(&s, chain.latest()).await;
-            if forked {
-                let err = polled.unwrap_err();
-                assert!(err.to_string().contains("finalized block 60"), "{err:#}");
-                assert!(
-                    s.history.finals().unwrap().is_empty(),
-                    "nothing recorded over it"
-                );
-                let (st, _) = call(router(s.clone()), "GET", "/ready", None).await;
-                assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
-            } else {
-                polled.unwrap();
-                assert_eq!(s.history.finals().unwrap(), vec![(70, chain.hash(70))]);
-            }
-        }
-    }
-
-    /// A head that reads but a backfill that cannot, a trace endpoint down, is reported stalled until
-    /// a window is read again.
-    #[tokio::test]
-    async fn a_failing_backfill_is_stalled_though_the_head_reads() {
+    /// A 5.1 store (a committed head, no finalized hashes) is moved aside intact and a fresh one
+    /// opened, the accounts it watched kept; a current store, and no store, are left where they are.
+    #[test]
+    fn a_pre_finality_store_is_moved_aside_and_rebuilt() {
         let dir = tempfile::tempdir().unwrap();
-        let s = reorg_state(dir.path());
-        let chain = Chain::new(100, 70);
-        let broken = chain.discoverer();
-        broken
-            .catch_up(&s, broken.reconcile(&s, chain.latest()).await.unwrap())
-            .await;
-        assert!(s.stalled(), "the trace endpoint answers nothing");
-        let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
-        assert_eq!(r["stalled"], true, "{r}");
-        s.window_done();
-        assert!(!s.stalled(), "a window read since clears it");
+        let path = dir.path().join(crate::config::DB_FILE);
+        let late = "0x00000000000000000000000000000000000000cc";
+        assert_eq!(
+            move_aside_pre_finality(&path, &[ALICE.into()]).unwrap(),
+            [ALICE]
+        );
+        {
+            let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+            h.watch(late).unwrap();
+            h.finalize(70).unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let addresses = move_aside_pre_finality(&path, &[ALICE.into()]).unwrap();
+        assert_eq!(addresses, [ALICE, late]);
+        assert!(!path.exists());
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert!(
+            aside[0].to_string_lossy().contains(".pre-5.2-"),
+            "{aside:?}"
+        );
+        assert_eq!(std::fs::read(&aside[0]).unwrap(), before, "moved intact");
+        let fresh = AddressHistory::open(Store::open(&path).unwrap(), 1, &addresses).unwrap();
+        assert_eq!(fresh.head().unwrap(), None, "history is read again");
+        fresh.finalize_at(80, [1; 32]).unwrap();
+        drop(fresh);
+        assert_eq!(
+            move_aside_pre_finality(&path, &[ALICE.into()]).unwrap(),
+            [ALICE]
+        );
+        assert!(path.exists(), "a current store stays");
     }
 
     /// A finalized tag that went backwards does not narrow the poll's check: the recorded finalized

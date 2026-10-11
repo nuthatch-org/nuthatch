@@ -376,6 +376,46 @@ pub struct AddressHistory {
     chain_id: u64,
 }
 
+/// Whether the store at `path` holds history from before finalized hashes were recorded (a
+/// committed head and none of them), and if so the accounts it watched. Read without writing, so a
+/// store moved aside for it is moved intact.
+pub fn pre_finality(path: &std::path::Path) -> Result<Option<Vec<String>>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let db = redb::Database::open(path)?;
+    let rtx = db.begin_read()?;
+    let head = match rtx.open_table(META) {
+        Ok(t) => t.get(HEAD)?.map(|v| v.value()),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let finals = match rtx.open_table(FINAL) {
+        Ok(t) => redb::ReadableTableMetadata::len(&t)?,
+        Err(redb::TableError::TableDoesNotExist(_)) => 0,
+        Err(e) => return Err(e.into()),
+    };
+    if head.is_none() || finals > 0 {
+        return Ok(None);
+    }
+    let watched = match rtx.open_table(WATCHED) {
+        Ok(t) => t
+            .iter()?
+            .map(|e| {
+                let (k, _) = e?;
+                let a: Address = k
+                    .value()
+                    .try_into()
+                    .context("watched key is not 20 bytes")?;
+                Ok(address_hex(&a))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(Some(watched))
+}
+
 /// A finalized block the store recorded is now reported at another hash.
 #[derive(Debug)]
 pub struct FinalConflict(pub u64);
@@ -718,37 +758,6 @@ impl AddressHistory {
             .open_table(CONFLICT)?
             .get("why")?
             .map(|v| v.value().to_string()))
-    }
-
-    /// The newest transaction at or under `at_most` among the watched addresses, with the block hash
-    /// it was read in: the evidence a store from before finalized hashes were recorded has of which
-    /// chain its history is.
-    pub fn newest_hashed_row(&self, at_most: u64) -> Result<Option<(u64, [u8; 32])>> {
-        let watched = self.watched()?;
-        let rtx = self.store.database().begin_read()?;
-        let t = rtx.open_table(TXLIST)?;
-        let mut best: Option<(u64, [u8; 32])> = None;
-        for a in watched {
-            let a = parse_address(&a)?;
-            let lo = row_key(&a, 0, 0, 0);
-            let hi = row_key(&a, at_most, u64::MAX, u64::MAX);
-            let Some(e) = t.range(lo.as_slice()..=hi.as_slice())?.next_back() else {
-                continue;
-            };
-            let record = decode_record(e?.1.value())?;
-            let text = |k: &str| record.get(k).and_then(Value::as_str);
-            let (Some(b), Some(h)) = (text("blockNumber"), text("blockHash")) else {
-                continue;
-            };
-            let h = alloy_primitives::hex::decode(h.trim_start_matches("0x")).ok();
-            let (Ok(b), Some(Ok(h))) = (b.parse::<u64>(), h.map(<[u8; 32]>::try_from)) else {
-                continue;
-            };
-            if best.is_none_or(|(n, _)| b > n) {
-                best = Some((b, h));
-            }
-        }
-        Ok(best)
     }
 
     /// The finalized heads' hashes recorded, oldest first.
