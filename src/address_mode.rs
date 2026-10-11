@@ -259,8 +259,22 @@ impl ModeState {
     }
 
     /// Stop the cursor over a conflict with finalized history, and refuse every answer.
+    /// The conflict with finalized history, if one was found: by this cursor, or by any check that
+    /// recorded it in the store.
+    fn conflicted(&self) -> Option<String> {
+        let mut held = self.conflict.lock().expect("conflict lock");
+        if held.is_none() {
+            *held = self.history.conflict().ok().flatten();
+            if let Some(why) = held.clone() {
+                drop(held);
+                self.stop(why.clone());
+                return Some(why);
+            }
+        }
+        held.clone()
+    }
+
     fn conflict(&self, why: String) {
-        let why = format!("{why}; remove the address-history store to read it again");
         if let Err(e) = self.history.set_conflict(&why) {
             tracing::error!("address history: could not record the conflict in the store: {e:#}");
         }
@@ -436,11 +450,6 @@ pub async fn check_anchor<M: Rpc, T: Rpc>(
             checks.insert(newest);
         }
     }
-    // And the newest finalized hash, so a switch to a fork under finality after the request's own
-    // check cannot join a fetch from it to history read on the old one.
-    if let Some(&last) = history.finals()?.last() {
-        checks.insert(last);
-    }
     // Twice over, so a node that moves to another fork between two comparisons cannot pass one
     // block on each.
     for _ in 0..2 {
@@ -452,7 +461,34 @@ pub async fn check_anchor<M: Rpc, T: Rpc>(
             }
         }
     }
+    // And the newest finalized hash, so a switch to a fork under finality after the request's own
+    // check cannot join a fetch from it to history read on the old one.
+    hold_final(&d.main, history).await
+}
+
+/// Hold the newest finalized hash the store recorded against the main endpoint, twice. A mismatch is
+/// a conflict with finalized history, recorded in the store at once, so whatever path found it the
+/// nest stops answering, across restarts too.
+pub async fn hold_final(main: &impl Rpc, history: &AddressHistory) -> Result<()> {
+    let Some(&(block, hash)) = history.finals()?.last() else {
+        return Ok(());
+    };
+    for _ in 0..2 {
+        if block_hash(main, block).await? != hash {
+            let why = final_conflict(block);
+            history.set_conflict(&why)?;
+            bail!(why);
+        }
+    }
     Ok(())
+}
+
+fn final_conflict(block: u64) -> String {
+    format!(
+        "finalized block {block} is now at another hash: a reorg under finality, or an RPC on \
+         another chain with the same id; history under the finalized head is never rewritten, so \
+         the nest answers nothing; remove the address-history store to read it again"
+    )
 }
 
 /// Fail a fetch unless every main and trace endpoint is on one chain at `block`: a trace source on
@@ -739,7 +775,12 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
         // The new finalized hash is read on both sides of the checks: one read on a fork the checks
         // never saw would otherwise become the record every later poll trusts.
         let hash = block_hash(&self.main, finalized).await;
-        let checked = self.check_tracked(state, latest).await;
+        // The recorded finalized hash is held again after the tracked check, whatever the tag says
+        // now: a tag that went backwards would otherwise bracket only blocks under it.
+        let checked = match self.check_tracked(state, latest).await {
+            Ok(()) => hold_final(&self.main, &state.history).await,
+            Err(e) => Err(e),
+        };
         let again = block_hash(&self.main, finalized).await;
         state.set_calls("main", self.main.calls());
         checked?;
@@ -877,11 +918,7 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
         .await;
         state.set_calls("main", self.main.calls());
         if let Some(b) = moved? {
-            let why = format!(
-                "finalized block {b} is now at another hash: a reorg under finality, or an RPC on \
-                 another chain with the same id; history under the finalized head is never \
-                 rewritten, so the nest answers nothing until an operator looks"
-            );
+            let why = final_conflict(b);
             state.conflict(why.clone());
             bail!(why);
         }
@@ -1319,7 +1356,7 @@ pub async fn cursor(state: Arc<ModeState>, source: impl HeadSource, discovery: i
     let mut tick = tokio::time::interval(state.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        if state.conflict.lock().expect("conflict lock").is_some() {
+        if state.conflicted().is_some() {
             tracing::error!(
                 "address history: the cursor stopped over a conflict with finalized history"
             );
@@ -1386,7 +1423,7 @@ async fn api(
     State(s): State<Arc<ModeState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<Value> {
-    let conflict = |s: &ModeState| s.conflict.lock().expect("conflict lock").clone();
+    let conflict = |s: &ModeState| s.conflicted();
     if let Some(why) = conflict(&s) {
         return Json(crate::address_history::incomplete(&why));
     }
@@ -1846,7 +1883,9 @@ async fn ready(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
     // Offline is not unready: covered history still serves, and a cursor that has not polled for
     // three intervals is reported stalled. A store that cannot be read is unready, and so is a
     // cursor stopped for good: covered history still serves, but nothing will ever extend it.
-    let stopped = s.cursor_error.lock().expect("cursor_error lock").clone();
+    let stopped = s
+        .conflicted()
+        .or_else(|| s.cursor_error.lock().expect("cursor_error lock").clone());
     match blocking(&s, |h| Ok((h.head()?, h.watched()?.len()))).await {
         Ok((head, watched)) if stopped.is_some() => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3402,8 +3441,38 @@ mod tests {
                 .unwrap(),
             vec![(0, 90)]
         );
-        d.reconcile(&s, chain.latest()).await.unwrap_err();
-        assert!(s.conflict.lock().unwrap().is_some());
+        // Refused at once, before any poll.
+        let q = format!(
+            "/api?module=account&action=txlistinternal&address={ALICE}&startblock=0&endblock=80"
+        );
+        let (_, a) = call(router(s.clone()), "GET", &q, None).await;
+        assert!(
+            a["result"].as_str().unwrap().contains("finalized block 90"),
+            "{a}"
+        );
+        let (st, _) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A finalized tag that went backwards does not narrow the poll's check: the recorded finalized
+    /// hash is held again after the tracked check, so a switch to a fork under it during the poll is
+    /// a conflict rather than a rollback that keeps the old fork's blocks under the committed head.
+    #[tokio::test]
+    async fn a_regressing_finalized_tag_still_holds_the_recorded_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        let chain = Chain::new(130, 100);
+        let d = chain.node();
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        discover_window(&d, &s, ALICE, (0, 129), None)
+            .await
+            .unwrap();
+        chain.finalized.store(80, Ordering::Relaxed);
+        // 95 onward replaced once the poll's finality check has read 100.
+        *chain.reorg_on_read.lock().unwrap() = Some((100, 1, 35));
+        let err = d.reconcile(&s, chain.latest()).await.unwrap_err();
+        assert!(err.to_string().contains("finalized block 100"), "{err:#}");
+        assert!(s.conflicted().is_some());
     }
 
     /// A finalized hash already recorded is never replaced: another one is a conflict, and the head
@@ -3460,12 +3529,8 @@ mod tests {
             assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{ready}");
             assert!(ready.to_string().contains("finalized block 70"), "{ready}");
             // A restart over the same store, with no RPC to ask, still refuses.
-            let again = Arc::new(ModeState::new(
-                s.history.clone(),
-                1,
-                Duration::from_secs(300),
-                true,
-            ));
+            drop(s);
+            let again = reorg_state(dir.path());
             let (_, after) = call(router(again.clone()), "GET", &q, None).await;
             let r = after["result"].as_str().unwrap();
             assert!(r.contains("reorg under finality"), "{after}");

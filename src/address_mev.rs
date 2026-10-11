@@ -421,10 +421,13 @@ pub async fn produced_window<M: Rpc, T: Rpc>(
     let generation = history.generation()?;
     // Every read under the deadline, headers and rewards included; the record after it runs to
     // completion.
-    let found = crate::address_mode::within(
-        deadline,
-        produced_blocks(d, relays, history, a, (from, to), None, deadline),
-    )
+    let found = crate::address_mode::within(deadline, async {
+        let found = produced_blocks(d, relays, history, a, (from, to), None, deadline).await?;
+        // The headers were read from the chain and the payments from the store: both must be
+        // the finalized chain the store recorded, or a fork switch would join them.
+        crate::address_mode::hold_final(&d.main, history).await?;
+        Ok(found)
+    })
     .await?;
     history.record_produced(
         a,
@@ -538,6 +541,7 @@ async fn reask_block<M: Rpc, T: Rpc>(
                 changes.push((a.clone(), found.rows));
             }
         }
+        crate::address_mode::hold_final(&d.main, history).await?;
         Ok((record, changes, unrecorded))
     })
     .await?;
@@ -1131,6 +1135,34 @@ mod tests {
             view(&h),
             ["100 relay ", "101 relay 0xp101", "102 relay 0xp102"]
         );
+    }
+
+    /// Headers read from a chain that no longer holds the store's finalized hash are never joined to
+    /// the stored payments: neither a produced window nor a re-ask commits, and the conflict is
+    /// recorded in the store.
+    #[tokio::test]
+    async fn produced_blocks_hold_the_finalized_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = evidence_chain(dir.path());
+        evidence_rows(&h);
+        h.mev_absent(101, 0).unwrap();
+        // Recorded on a fork the RPC no longer serves.
+        h.finalize_at(1_000, [7; 32]).unwrap();
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (d, rel) = (evidence_rpc(), late_relays(on));
+        let err = produced_window(&d, &rel, &h, A, (100, 199), 0, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("finalized block 1000"), "{err:#}");
+        assert!(h.coverage(Action::ProducedBlocks, A).unwrap().is_empty());
+        assert!(h.conflict().unwrap().is_some());
+        let g = h.generation().unwrap();
+        let err = reask_pass(&d, &rel, &h, &[A.to_string()], REASK_EVERY_SECS)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("finalized block 1000"), "{err:#}");
+        assert_eq!(h.generation().unwrap(), g);
+        assert_eq!(h.mev_pending().unwrap().len(), 1, "still owed");
     }
 
     /// Produced blocks do not wait behind another address's backfill: a discovery that hangs still
