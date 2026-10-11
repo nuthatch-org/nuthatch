@@ -214,9 +214,13 @@ mirror, and the mirror then sees the nest's IP and the block ranges it downloads
 url = "https://mirror.example/partitions"  # or a local directory of partitions, an import
 chain_id = 1                  # must be the nest's chain
 from_block = 17030000         # the blocks taken from the mirror; the RPC scan never reads them
-to_block = 17309999
+# to_block = 17309999         # optional; omitted, as far as the mirror has published, checked every
+                              # poll, the blocks above it read from the RPC until they are published
 cache_mb = 512                # disk the downloaded partitions may hold; at least 64
 ```
+
+`from_block` bounds what address history reads from the partitions; validator proofs read the
+proposer catalogue from its first span (block 23,551,570) whatever it says.
 
 `mev_relays = true` in `[address_history]` asks the MEV-Boost relays' public data API about each
 block a watched address produced, or was paid for by a relay-built block's builder, and serves the
