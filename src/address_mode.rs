@@ -100,6 +100,10 @@ pub struct ModeState {
     latest: AtomicU64,
     /// `logs/getLogs` requests running at once: each can hold up to a page of logs and its receipts.
     logs: tokio::sync::Semaphore,
+    /// Watched validators and their proven blocks (plan C), on Ethereum mainnet.
+    pub validators: Option<crate::address_validators::Validators>,
+    /// Where proposer catalogue spans the mirror lacks are built from, when `beacon_url` names one.
+    pub beacon: Option<Arc<crate::address_proposers::Beacon>>,
 }
 
 /// How many `logs/getLogs` requests may run at once; one more answers incomplete at once.
@@ -202,6 +206,8 @@ impl ModeState {
             deadline: DEFAULT_DEADLINE,
             latest: AtomicU64::new(0),
             logs: tokio::sync::Semaphore::new(LOGS_AT_ONCE),
+            validators: None,
+            beacon: None,
         }
     }
 
@@ -229,6 +235,23 @@ impl ModeState {
                 self.deadline.as_secs()
             )),
         }
+    }
+
+    pub fn with_validators(
+        mut self,
+        validators: crate::address_validators::Validators,
+        beacon: Option<Arc<crate::address_proposers::Beacon>>,
+    ) -> Self {
+        self.validators = Some(validators);
+        self.beacon = beacon;
+        self
+    }
+
+    /// The first block validators' proposals are proven from: the catalogue's first, or `start_block`
+    /// if later.
+    pub fn proposals_from(&self) -> u64 {
+        self.start_block
+            .max(crate::address_proposers::CATALOGUE_FROM_BLOCK)
     }
 
     pub fn with_relays(mut self, relays: crate::address_mev::Relays) -> Self {
@@ -840,6 +863,7 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             serve_queued(state, self).await;
             scan_bodies(self, state, &watched, to, skip).await;
             mev_passes(self, state, &watched, to).await;
+            validator_pass(self, state).await;
         } else if let Some((source, blocks)) = &state.mirror {
             // Elsewhere a partition is read for its verified headers alone: timestamp to block.
             mirror_pass(self, state, &[], to, source, *blocks).await;
@@ -1323,6 +1347,301 @@ async fn mirror_pass<M: Rpc, T: Rpc>(
     }
 }
 
+/// The validator pass (plan C): each span from [`ModeState::proposals_from`] to the block before the
+/// RPC's finalized one that some watched validator lacks is proven whole, from the mirror's
+/// catalogue and block partition when it has both, else built here from the RPC's blocks and the
+/// configured beacon, and recorded for every validator that lacked it. A span that cannot be proven
+/// records nothing and ends the pass: coverage grows from the start without gaps.
+async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, state: &ModeState) {
+    use crate::address_partitions::{span_of, SPAN};
+    let Some(validators) = state.validators.clone() else {
+        return;
+    };
+    let watched = match validators.watched() {
+        Ok(w) if w.is_empty() => return,
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("address history: reading the watched validators: {e:#}");
+            return;
+        }
+    };
+    // A span's last block is proven by its successor, which must be final: the RPC's finalized tag,
+    // never the serving depth's guess at it.
+    let finalized = match crate::address_partitions::finalized(&d.main).await {
+        Ok(f) => f,
+        Err(e) => {
+            state.window_failed();
+            tracing::warn!(
+                "address history: the RPC's finalized block, for the proposer catalogue: {e:#}"
+            );
+            return;
+        }
+    };
+    let ceiling = state.end_block.map_or(finalized.saturating_sub(1), |e| {
+        e.min(finalized.saturating_sub(1))
+    });
+    let first = state.proposals_from();
+    let mut start = span_of(first).0;
+    while start <= ceiling {
+        serve_queued(state, d).await;
+        let clip = (start.max(first), (start + SPAN - 1).min(ceiling));
+        let lacking: Vec<u64> = watched
+            .iter()
+            .filter(|v| !validators.covers(**v, clip).unwrap_or(false))
+            .copied()
+            .collect();
+        if lacking.is_empty() {
+            start += SPAN;
+            continue;
+        }
+        let outcome = async {
+            let generation = validators.generation()?;
+            let proven = prove_span(d, state, start, clip).await?;
+            let mut found: BTreeMap<u64, Vec<crate::address_validators::Stored>> = BTreeMap::new();
+            for p in proven
+                .iter()
+                .filter(|p| lacking.contains(&p.proposer_index))
+            {
+                let stored = proven_row(d, state, p).await;
+                found.entry(p.proposer_index).or_default().push(stored);
+            }
+            let v = validators.clone();
+            let lacking = lacking.clone();
+            tokio::task::spawn_blocking(move || v.record_span(clip, &lacking, &found, generation))
+                .await?
+        }
+        .await;
+        state.set_calls("main", d.main.calls());
+        match outcome {
+            Ok(()) => {
+                state.window_done();
+                tracing::info!(
+                    "address history: proposers proven over [{}, {}] for {} validator(s)",
+                    clip.0,
+                    clip.1,
+                    lacking.len()
+                );
+            }
+            Err(e) => {
+                state.window_failed();
+                tracing::warn!(
+                    "address history: proposers over [{}, {}] not proven, those validators' blocks stay incomplete: {e:#}",
+                    clip.0,
+                    clip.1
+                );
+                return;
+            }
+        }
+        start += SPAN;
+    }
+    validator_retries(d, state, &validators).await;
+}
+
+/// Every block of `clip` (inside the span starting at `start`) with its proven proposer: from the
+/// mirror's files when they cover the whole span, else built from the RPC and the beacon.
+async fn prove_span<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    start: u64,
+    clip: (u64, u64),
+) -> Result<Vec<crate::address_proposers::Proven>> {
+    use crate::address_proposers as ap;
+    let end = start + crate::address_partitions::SPAN - 1;
+    if let Some((source, (first, last))) = &state.mirror {
+        if *first <= start && end <= *last && clip.1 == end {
+            for fresh in [false, true] {
+                let (Some(blocks), Some(catalogue)) = (
+                    source.fetch(start, fresh).await?,
+                    source.fetch_catalogue(start, fresh).await?,
+                ) else {
+                    break;
+                };
+                let (successor, _) = ap::header_at(&d.main, end + 1).await?;
+                let lo = ap::provable(start).map_or(end + 1, |(lo, _)| lo);
+                let proven = crate::address_partitions::decode(&blocks)
+                    .and_then(|b| {
+                        crate::address_partitions::verify(&b, start, end, successor.parent_hash, 1)
+                    })
+                    .and_then(|b| {
+                        let rows = ap::decode(&catalogue)?;
+                        ap::verify(&rows, &b[(lo - start) as usize..], &successor, (lo, end))
+                    });
+                match proven {
+                    Ok(p) => {
+                        return Ok(p
+                            .into_iter()
+                            .filter(|p| p.block.header.number >= clip.0)
+                            .collect())
+                    }
+                    Err(e) if !fresh => {
+                        tracing::warn!("address history: cached catalogue [{start}, {end}] refused, downloading it again: {e:#}");
+                        source.discard(start);
+                        source.discard_catalogue(start);
+                    }
+                    Err(e) => {
+                        source.discard(start);
+                        source.discard_catalogue(start);
+                        return Err(
+                            e.context(format!("the mirror's catalogue for [{start}, {end}]"))
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let Some(beacon) = &state.beacon else {
+        bail!(
+            "the mirror has no proposer catalogue for [{}, {}] and no beacon_url is configured to build it",
+            clip.0,
+            clip.1
+        );
+    };
+    let blocks = ap::blocks_from_rpc(&d.main, clip, 8).await?;
+    let (successor, _) = ap::header_at(&d.main, clip.1 + 1).await?;
+    let rows = ap::build_rows(beacon, &blocks, &successor, clip, 8).await?;
+    ap::verify(&rows, &blocks, &successor, clip)
+}
+
+/// The served row of one proven block. Its reward comes from the block's own transactions and
+/// receipts, checked against its header; when they cannot be read the reward is owed, never zero.
+/// Relay provenance is asked once here and again later when it is missing.
+async fn proven_row<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    p: &crate::address_proposers::Proven,
+) -> crate::address_validators::Stored {
+    let h = &p.block.header;
+    let mut row = serde_json::Map::new();
+    let mut meta = serde_json::Map::new();
+    let text = |v: String| Value::String(v);
+    row.insert("blockNumber".into(), text(h.number.to_string()));
+    row.insert("blockHash".into(), text(format!("{:#x}", p.block.hash)));
+    row.insert("timeStamp".into(), text(h.timestamp.to_string()));
+    row.insert("slot".into(), text(p.slot.to_string()));
+    row.insert("proposerIndex".into(), text(p.proposer_index.to_string()));
+    row.insert("feeRecipient".into(), text(format!("{:#x}", h.beneficiary)));
+    match crate::address_partitions::verified_reward(&d.main, &p.block).await {
+        Ok(r) => {
+            row.insert("blockReward".into(), text(r.to_string()));
+            row.insert("rewardStatus".into(), text("verified".into()));
+        }
+        Err(e) => {
+            tracing::warn!(
+                "address history: block {}'s reward owed, retried later: {e:#}",
+                h.number
+            );
+            row.insert("blockReward".into(), text(String::new()));
+            row.insert("rewardStatus".into(), text("unavailable".into()));
+        }
+    }
+    let now = unix_now();
+    let mev = match &state.relays {
+        Some(relays) => {
+            crate::address_mev::block_mev(
+                &state.history,
+                relays,
+                h.number,
+                &format!("{:#x}", p.block.hash),
+                false,
+                None,
+            )
+            .await
+        }
+        None => crate::address_mev::no_mev(),
+    };
+    if state.relays.is_some() && mev.get("mev").and_then(Value::as_str) == Some("unrecorded") {
+        meta.insert("mevFirstAsked".into(), json!(now));
+        meta.insert("mevLastAsked".into(), json!(now));
+    }
+    row.extend(mev);
+    crate::address_validators::Stored {
+        block: h.number,
+        row,
+        meta,
+    }
+}
+
+/// Owed rewards read again, and blocks without relay evidence asked again on the re-ask schedule,
+/// a bounded batch per pass.
+async fn validator_retries<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    validators: &crate::address_validators::Validators,
+) {
+    use crate::address_mev::{REASK_EVERY_SECS, REASK_FOR_SECS};
+    let all = match validators.all() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("address history: reading validator blocks to retry: {e:#}");
+            return;
+        }
+    };
+    let now = unix_now();
+    let num = |m: &serde_json::Map<String, Value>, k: &str| m.get(k).and_then(Value::as_u64);
+    let mut done = 0;
+    for (v, mut s) in all {
+        if done >= 64 {
+            break;
+        }
+        let owed = s.row.get("rewardStatus").and_then(Value::as_str) == Some("unavailable");
+        let reask = state.relays.is_some()
+            && s.row.get("mev").and_then(Value::as_str) == Some("unrecorded")
+            && num(&s.meta, "mevFirstAsked").is_some_and(|f| now < f + REASK_FOR_SECS)
+            && num(&s.meta, "mevLastAsked").is_some_and(|l| now >= l + REASK_EVERY_SECS);
+        if !owed && !reask {
+            continue;
+        }
+        done += 1;
+        let hash = s
+            .row
+            .get("blockHash")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if owed {
+            let block = async {
+                let (header, h) = crate::address_proposers::header_at(&d.main, s.block).await?;
+                if format!("{h:#x}") != hash {
+                    bail!("block {} is now at another hash", s.block);
+                }
+                let vb = crate::address_partitions::VerifiedBlock {
+                    hash: h,
+                    header,
+                    withdrawals: Vec::new(),
+                };
+                crate::address_partitions::verified_reward(&d.main, &vb).await
+            };
+            if let Ok(r) = block.await {
+                s.row
+                    .insert("blockReward".into(), Value::String(r.to_string()));
+                s.row
+                    .insert("rewardStatus".into(), Value::String("verified".into()));
+            }
+        }
+        if reask {
+            if let Some(relays) = &state.relays {
+                let mev = crate::address_mev::block_mev(
+                    &state.history,
+                    relays,
+                    s.block,
+                    &hash,
+                    true,
+                    None,
+                )
+                .await;
+                s.meta.insert("mevLastAsked".into(), json!(now));
+                s.row.extend(mev);
+            }
+        }
+        let vs = validators.clone();
+        let saved = tokio::task::spawn_blocking(move || vs.update(v, &s)).await;
+        if let Err(e) = saved.map_err(anyhow::Error::from).and_then(|r| r) {
+            tracing::warn!("address history: saving a validator block's retry: {e:#}");
+        }
+    }
+    state.set_calls("main", d.main.calls());
+}
+
 /// The block-body pass: each window is read once for every watched address that still lacks it,
 /// starting from the least covered, so an address watched later backfills without a second scan
 /// of what the others already have.
@@ -1537,6 +1856,9 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
         }
     }
     let get = |k: &str| q.get(k).map(String::as_str);
+    if get("module") == Some("account") && get("action") == Some("nuthatchValidatorBlocks") {
+        return Json(validator_blocks(&s, &q).await);
+    }
     if get("module") == Some("block") && get("action") == Some("getblocknobytime") {
         return Json(block_by_time(&s, &q).await);
     }
@@ -1616,6 +1938,28 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
             }))
         }
     }
+}
+
+/// `account/nuthatchValidatorBlocks`, from the validators' own store: complete or refused.
+async fn validator_blocks(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value {
+    if let Some(c) = q.get("chainid") {
+        if c.parse::<u64>().ok() != Some(s.chain_id) {
+            return crate::address_history::unsupported(&format!(
+                "chainid {c} is not this nest's chain {}",
+                s.chain_id
+            ));
+        }
+    }
+    let Some(validators) = s.validators.clone() else {
+        return crate::address_history::unsupported(
+            "validator blocks are proven on Ethereum mainnet address-history nests only",
+        );
+    };
+    let from = s.proposals_from();
+    let q = q.clone();
+    tokio::task::spawn_blocking(move || crate::address_validators::respond(&validators, from, &q))
+        .await
+        .unwrap_or_else(|e| crate::address_history::incomplete(&format!("{e}")))
 }
 
 async fn respond(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value {
@@ -1906,12 +2250,27 @@ async fn search_by_time(
 
 #[derive(serde::Deserialize)]
 struct AddressBody {
-    address: String,
+    #[serde(default)]
+    address: Option<String>,
+    /// A validator index, instead of an address.
+    #[serde(default)]
+    validator: Option<u64>,
+}
+
+fn watch_list(s: &ModeState, addresses: Vec<String>) -> Result<Value> {
+    let validators = match &s.validators {
+        Some(v) => v.watched()?,
+        None => Vec::new(),
+    };
+    Ok(json!({ "watched": addresses, "validators": validators }))
 }
 
 async fn watched(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
-    match blocking(&s, |h| h.watched()).await {
-        Ok(w) => (StatusCode::OK, Json(json!({ "watched": w }))),
+    match blocking(&s, |h| h.watched())
+        .await
+        .and_then(|w| watch_list(&s, w))
+    {
+        Ok(v) => (StatusCode::OK, Json(v)),
         Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
@@ -1920,23 +2279,70 @@ async fn watch(
     State(s): State<Arc<ModeState>>,
     Json(b): Json<AddressBody>,
 ) -> (StatusCode, Json<Value>) {
-    change(s, b.address, true).await
+    dispatch(s, b, true).await
 }
 
 async fn unwatch(
     State(s): State<Arc<ModeState>>,
     Json(b): Json<AddressBody>,
 ) -> (StatusCode, Json<Value>) {
-    change(s, b.address, false).await
+    dispatch(s, b, false).await
 }
 
-async fn change(s: Arc<ModeState>, address: String, add: bool) -> (StatusCode, Json<Value>) {
+async fn dispatch(s: Arc<ModeState>, b: AddressBody, add: bool) -> (StatusCode, Json<Value>) {
     if !s.loopback {
         return failed(
             StatusCode::FORBIDDEN,
             "the watched set changes only on a loopback bind",
         );
     }
+    match (b.address, b.validator) {
+        (Some(a), None) => change(s, a, add).await,
+        (None, Some(v)) => change_validator(s, v, add).await,
+        _ => failed(
+            StatusCode::BAD_REQUEST,
+            "give either an address or a validator index",
+        ),
+    }
+}
+
+async fn change_validator(
+    s: Arc<ModeState>,
+    validator: u64,
+    add: bool,
+) -> (StatusCode, Json<Value>) {
+    let Some(validators) = s.validators.clone() else {
+        return failed(
+            StatusCode::BAD_REQUEST,
+            "validators are watched on Ethereum mainnet address-history nests only",
+        );
+    };
+    let done = tokio::task::spawn_blocking(move || {
+        if add {
+            validators.watch(validator)
+        } else {
+            validators.unwatch(validator)
+        }
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|r| r);
+    if let Err(e) = done {
+        return failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+    }
+    if add {
+        s.wake.notify_one();
+    }
+    match blocking(&s, |h| h.watched())
+        .await
+        .and_then(|w| watch_list(&s, w))
+    {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+async fn change(s: Arc<ModeState>, address: String, add: bool) -> (StatusCode, Json<Value>) {
     if let Err(e) = crate::address_history::parse_address(&address) {
         return failed(StatusCode::BAD_REQUEST, format!("address `{address}`: {e}"));
     }
@@ -1949,12 +2355,12 @@ async fn change(s: Arc<ModeState>, address: String, add: bool) -> (StatusCode, J
         h.watched()
     })
     .await;
-    match done {
-        Ok(w) => {
+    match done.and_then(|w| watch_list(&s, w)) {
+        Ok(v) => {
             if add {
                 s.wake.notify_one();
             }
-            (StatusCode::OK, Json(json!({ "watched": w })))
+            (StatusCode::OK, Json(v))
         }
         Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
@@ -2335,6 +2741,27 @@ pub async fn dev(
             m.to_block
         );
         state = state.with_mirror(Arc::new(source), (m.from_block, m.to_block));
+    }
+    if chain_id == 1 {
+        let validators = crate::address_validators::Validators::open(
+            state.history.store().clone(),
+            &ah.validators,
+        )?;
+        let beacon = match &ah.beacon_url {
+            Some(url) => {
+                tracing::info!(
+                    "address history: proposer catalogue spans the mirror lacks are built from the configured beacon, which sees this machine's IP and the beacon roots asked for"
+                );
+                Some(Arc::new(crate::address_proposers::Beacon::new(
+                    Some(url.clone()),
+                    None,
+                )?))
+            }
+            None => None,
+        };
+        state = state.with_validators(validators, beacon);
+    } else if !ah.validators.is_empty() || ah.beacon_url.is_some() {
+        bail!("[address_history] validators and beacon_url are for Ethereum mainnet; this nest is on chain {chain_id}");
     }
     let state = Arc::new(state);
     tracing::info!(
@@ -2721,6 +3148,8 @@ mod tests {
             mirror: None,
             mev_relays: false,
             request_deadline: None,
+            validators: vec![],
+            beacon_url: None,
         };
         assert_eq!(
             poll_interval(None, &cfg).unwrap(),

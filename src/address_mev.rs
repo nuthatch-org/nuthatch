@@ -178,6 +178,81 @@ fn delivery(record: &Map<String, Value>, hash: &str, a: &str) -> Option<Delivery
     })
 }
 
+/// The relays' word on the canonical block `hash`, as the fields a proven block carries: `mev` is
+/// `relay`, `conflict` (they disagree) or `unrecorded` (no delivery for this hash at the queried
+/// relays, or a relay that could not be asked in time, which is not taken as an answer). Relay
+/// provenance only: no relay claim names or overrides the proposer, and none is payment evidence.
+/// `fresh` asks the relays again instead of reading the cached record.
+pub async fn block_mev(
+    history: &AddressHistory,
+    relays: &Relays,
+    block: u64,
+    hash: &str,
+    fresh: bool,
+    deadline: Option<std::time::Instant>,
+) -> Map<String, Value> {
+    let record = if fresh {
+        match ask_relays(relays, block, deadline).await {
+            Ok(r) => {
+                let _ = history.cache_relay_record(block, &r);
+                Ok(r)
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        relay_record(history, relays, block, deadline).await
+    };
+    let mut r = Map::new();
+    let mut put = |k: &str, v: String| {
+        r.insert(k.to_string(), Value::String(v));
+    };
+    match record
+        .ok()
+        .and_then(|rec| delivery(&rec, &hash.to_ascii_lowercase(), ""))
+    {
+        Some(dl) => {
+            put("mevRecipient", dl.recipient);
+            put(
+                "mevReward",
+                if dl.conflict { String::new() } else { dl.value },
+            );
+            put("relays", dl.relays.join(","));
+            put("builderPubkey", dl.builder);
+            put("proposerPubkey", dl.proposer);
+            put("mev", if dl.conflict { "conflict" } else { "relay" }.into());
+        }
+        None => {
+            for k in [
+                "mevRecipient",
+                "mevReward",
+                "relays",
+                "builderPubkey",
+                "proposerPubkey",
+            ] {
+                put(k, String::new());
+            }
+            put("mev", "unrecorded".into());
+        }
+    }
+    r
+}
+
+/// The MEV fields of a block nobody asked the relays about: `unrecorded`, never zero.
+pub fn no_mev() -> Map<String, Value> {
+    let mut r = Map::new();
+    for k in [
+        "mevRecipient",
+        "mevReward",
+        "relays",
+        "builderPubkey",
+        "proposerPubkey",
+    ] {
+        r.insert(k.to_string(), Value::String(String::new()));
+    }
+    r.insert("mev".into(), Value::String("unrecorded".into()));
+    r
+}
+
 /// What a produced-block pass found: the rows, and the blocks it asked the relays about that named no
 /// delivery for the canonical block, which the re-ask schedule takes on.
 #[derive(Debug, Default)]

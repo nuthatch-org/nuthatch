@@ -391,6 +391,38 @@ impl Source {
         let _ = std::fs::remove_file(self.cached(from));
     }
 
+    fn cached_catalogue(&self, from: u64) -> PathBuf {
+        self.cache.join(format!("proposers-{from:010}.parquet"))
+    }
+
+    /// The proposer catalogue file for the span starting at `from`, cached as partitions are; `None`
+    /// when the mirror has none.
+    pub async fn fetch_catalogue(&self, from: u64, fresh: bool) -> Result<Option<Vec<u8>>> {
+        let path = self.cached_catalogue(from);
+        if !fresh {
+            match std::fs::read(&path) {
+                Ok(b) => return Ok(Some(b)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            }
+        }
+        let key = crate::address_proposers::catalogue_key(self.chain_id, from);
+        let Some(bytes) = self.mirror.get(&key).await? else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(&self.cache)
+            .with_context(|| format!("creating {}", self.cache.display()))?;
+        let part = path.with_extension("part");
+        std::fs::write(&part, &bytes).with_context(|| format!("writing {}", part.display()))?;
+        std::fs::rename(&part, &path).with_context(|| format!("renaming {}", part.display()))?;
+        self.evict()?;
+        Ok(Some(bytes))
+    }
+
+    pub fn discard_catalogue(&self, from: u64) {
+        let _ = std::fs::remove_file(self.cached_catalogue(from));
+    }
+
     /// Delete the oldest partitions until the cache is within its budget.
     fn evict(&self) -> Result<()> {
         let mut files = Vec::new();

@@ -61,6 +61,14 @@ pub struct AddressHistoryConfig {
     /// queue, RPC work and the answer together. Default 20 s, under rotki's 30 s read timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_deadline: Option<String>,
+    /// Validator indices whose proposed blocks to prove from Dencun on (RFC-0063 plan C). A client
+    /// such as rotki registers its own through `/api/watch`. Ethereum mainnet only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validators: Vec<u64>,
+    /// A beacon node's API, to build the proposer catalogue for blocks the mirror has not published.
+    /// Off unless named: the beacon sees this machine's IP and the beacon roots asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beacon_url: Option<String>,
 }
 
 /// `[address_history.mirror]`: where verified block partitions come from, which chain and blocks to
@@ -495,6 +503,10 @@ impl AddressHistory {
         }
         wtx.commit()?;
         Ok(AddressHistory { store, chain_id })
+    }
+
+    pub fn store(&self) -> &Store {
+        &self.store
     }
 
     pub fn chain_id(&self) -> u64 {
@@ -3479,6 +3491,8 @@ mod tests {
             mirror: None,
             mev_relays: false,
             request_deadline: None,
+            validators: vec![],
+            beacon_url: None,
         };
         ok.validate().unwrap();
         assert_eq!(ok.poll_interval().unwrap(), DEFAULT_POLL_INTERVAL);

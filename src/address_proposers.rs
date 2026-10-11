@@ -32,6 +32,11 @@ pub const DENEB_SLOT: u64 = 8_626_176;
 /// Mainnet beacon genesis and slot length: a post-merge execution block's timestamp is its slot's.
 pub const GENESIS_TIME: u64 = 1_606_824_023;
 pub const SECONDS_PER_SLOT: u64 = 12;
+/// The first block the catalogue covers: slot 12,777,208 (2025-10-11), about a year before it was
+/// first built. Earlier proposals are provable the same way but not catalogued yet, so a range
+/// before it is refused, never answered empty.
+pub const CATALOGUE_FROM_BLOCK: u64 = 23_551_570;
+pub const CATALOGUE_FROM_SLOT: u64 = 12_777_208;
 /// The mainnet forks the proof is pinned to, by first epoch. Deneb, Electra and Fulu keep the
 /// beacon header and EIP-4788 as they are; a later fork is refused by the execution header's shape.
 pub const FORKS: [(&str, u64); 3] = [("deneb", 269_568), ("electra", 364_032), ("fulu", 411_392)];
@@ -46,10 +51,10 @@ pub fn catalogue_manifest_key(chain_id: u64) -> String {
     format!("{LAYOUT}/{chain_id}/proposers/manifest.json")
 }
 
-/// The blocks of the span starting at `from` that the catalogue can prove, or `None` before Dencun.
+/// The blocks of the span starting at `from` the catalogue covers, or `None` before it starts.
 pub fn provable(from: u64) -> Option<(u64, u64)> {
     let to = from + SPAN - 1;
-    (to >= DENEB_BLOCK).then(|| (from.max(DENEB_BLOCK), to))
+    (to >= CATALOGUE_FROM_BLOCK).then(|| (from.max(CATALOGUE_FROM_BLOCK), to))
 }
 
 /// The pinned fork a slot belongs to.
@@ -730,8 +735,16 @@ pub(crate) mod tests {
         assert_eq!(fork_at(DENEB_SLOT - 1), None);
         assert_eq!(fork_at(364_032 * 32), Some("electra"));
         assert_eq!(fork_at(411_392 * 32 + 5), Some("fulu"));
-        assert_eq!(provable(19_420_000), Some((DENEB_BLOCK, 19_429_999)));
-        assert_eq!(provable(19_410_000), None);
+        assert_eq!(
+            provable(23_550_000),
+            Some((CATALOGUE_FROM_BLOCK, 23_559_999))
+        );
+        assert_eq!(provable(23_540_000), None);
+        assert_eq!(
+            GENESIS_TIME + CATALOGUE_FROM_SLOT * SECONDS_PER_SLOT,
+            0x68e9c3f7,
+            "block 23,551,570's timestamp"
+        );
     }
 
     /// `n` linked execution blocks from Dencun on, every other slot missed, with the beacon headers
