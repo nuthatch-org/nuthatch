@@ -304,12 +304,28 @@ pub fn verify(
     Ok(out)
 }
 
+/// The block `rpc` calls finalized, read by that tag, its header checked to hash to the hash given:
+/// the anchor a locally built span must reach.
+pub async fn finalized_header(rpc: &impl Rpc) -> Result<(Header, B256)> {
+    let v = rpc
+        .call("eth_getBlockByNumber", json!(["finalized", false]))
+        .await
+        .context("the finalized block")?;
+    let n =
+        crate::address_discovery::hex_u64(&v["number"]).context("the finalized block's number")?;
+    checked_header(v, n)
+}
+
 /// Execution block `n`'s header from `rpc`, checked to hash to the hash the RPC gave.
 pub async fn header_at(rpc: &impl Rpc, n: u64) -> Result<(Header, B256)> {
     let v = rpc
         .call("eth_getBlockByNumber", json!([format!("0x{n:x}"), false]))
         .await
         .with_context(|| format!("block {n}"))?;
+    checked_header(v, n)
+}
+
+fn checked_header(v: Value, n: u64) -> Result<(Header, B256)> {
     if v.is_null() {
         bail!("the RPC has no block {n}");
     }
@@ -324,7 +340,7 @@ pub async fn header_at(rpc: &impl Rpc, n: u64) -> Result<(Header, B256)> {
 }
 
 /// The execution blocks `[lo, to]` read one by one from `rpc`, each linked to the next, for spans no
-/// partition covers.
+/// partition covers. Linked only to each other: the caller anchors the last to a finalized successor.
 pub async fn blocks_from_rpc(
     rpc: &impl Rpc,
     (lo, to): (u64, u64),
@@ -902,7 +918,7 @@ pub(crate) mod tests {
         assert!(verify(&rows, &blocks, &successor, span(2)).is_err());
     }
 
-    fn write_cache(dir: &std::path::Path, rows: &[ProposerRow], missed: &[u64]) {
+    pub(crate) fn write_cache(dir: &std::path::Path, rows: &[ProposerRow], missed: &[u64]) {
         use std::io::Write;
         let first = rows[0].slot - rows[0].slot % CACHE_SLOTS;
         let f = std::fs::File::create(dir.join(format!("slots-{first}.jsonl.gz"))).unwrap();

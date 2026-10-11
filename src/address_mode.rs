@@ -1406,10 +1406,25 @@ async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, 
             .min()
             .unwrap_or(first)
             .max(start.max(first));
-        let clip = (from, span_end);
+        let mut clip = (from, span_end);
+        let mut tail = false;
         let outcome = async {
             let generation = validators.generation()?;
-            let proven = prove_span(d, state, start, clip).await?;
+            let proven = match prove_span(d, state, start, clip).await? {
+                Some(p) => p,
+                None => {
+                    let Some(beacon) = &state.beacon else {
+                        bail!("the mirror has no proposer catalogue for this span and no beacon_url is configured to build it");
+                    };
+                    let (to, p) = prove_tail(d, beacon, from, state.end_block).await?;
+                    clip = (from, to);
+                    tail = true;
+                    p
+                }
+            };
+            if clip.1 < clip.0 {
+                return Ok(());
+            }
             let mut found: BTreeMap<u64, Vec<crate::address_validators::Stored>> = BTreeMap::new();
             for p in proven
                 .iter()
@@ -1424,6 +1439,16 @@ async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, 
                 .await?
         }
         .await;
+        if tail && outcome.is_ok() {
+            state.window_done();
+            tracing::info!(
+                "address history: proposers proven over [{}, {}] for {} validator(s), anchored at the finalized block",
+                clip.0,
+                clip.1,
+                lacking.len()
+            );
+            break;
+        }
         state.set_calls("main", d.main.calls());
         match outcome {
             Ok(()) => {
@@ -1450,14 +1475,14 @@ async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, 
     validator_retries(d, state, &validators).await;
 }
 
-/// Every block of `clip` (inside the span starting at `start`) with its proven proposer: from the
-/// mirror's files when they cover the whole span, else built from the RPC and the beacon.
+/// Every block of `clip` (inside the span starting at `start`) with its proven proposer, from the
+/// mirror's files; `None` when the mirror does not hold both for the whole span.
 async fn prove_span<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     state: &ModeState,
     start: u64,
     clip: (u64, u64),
-) -> Result<Vec<crate::address_proposers::Proven>> {
+) -> Result<Option<Vec<crate::address_proposers::Proven>>> {
     use crate::address_proposers as ap;
     let end = start + crate::address_partitions::SPAN - 1;
     if let Some((source, (first, last))) = &state.mirror {
@@ -1481,10 +1506,11 @@ async fn prove_span<M: Rpc, T: Rpc>(
                     });
                 match proven {
                     Ok(p) => {
-                        return Ok(p
-                            .into_iter()
-                            .filter(|p| p.block.header.number >= clip.0)
-                            .collect())
+                        return Ok(Some(
+                            p.into_iter()
+                                .filter(|p| p.block.header.number >= clip.0)
+                                .collect(),
+                        ))
                     }
                     Err(e) if !fresh => {
                         tracing::warn!("address history: cached catalogue [{start}, {end}] refused, downloading it again: {e:#}");
@@ -1502,17 +1528,41 @@ async fn prove_span<M: Rpc, T: Rpc>(
             }
         }
     }
-    let Some(beacon) = &state.beacon else {
+    Ok(None)
+}
+
+/// The most blocks behind finality a nest builds its own proposer catalogue for: enough for the gap
+/// between a mirror's last published span and the finalized head, not for history a mirror should hold.
+const LOCAL_CATALOGUE_MAX: u64 = 50_000;
+
+/// Every block from `from` to the finalized block less one with its proven proposer, built here from
+/// the RPC and the beacon, and anchored: the successor of the last is the block the RPC calls
+/// finalized, read by that tag, so a self-consistent fork the RPC returned for the range cannot
+/// reach it.
+async fn prove_tail<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    beacon: &crate::address_proposers::Beacon,
+    from: u64,
+    end_block: Option<u64>,
+) -> Result<(u64, Vec<crate::address_proposers::Proven>)> {
+    use crate::address_proposers as ap;
+    let (finalized, _) = ap::finalized_header(&d.main).await?;
+    let to = finalized.number.saturating_sub(1);
+    if end_block.is_some_and(|e| e < to) {
+        bail!("a locally built catalogue ends at the finalized block, past end_block");
+    }
+    if to < from {
+        return Ok((to, Vec::new()));
+    }
+    if to - from + 1 > LOCAL_CATALOGUE_MAX {
         bail!(
-            "the mirror has no proposer catalogue for [{}, {}] and no beacon_url is configured to build it",
-            clip.0,
-            clip.1
+            "the mirror has no proposer catalogue from block {from}, and building {} blocks here is over the {LOCAL_CATALOGUE_MAX} a nest builds itself",
+            to - from + 1
         );
-    };
-    let blocks = ap::blocks_from_rpc(&d.main, clip, 8).await?;
-    let (successor, _) = ap::header_at(&d.main, clip.1 + 1).await?;
-    let rows = ap::build_rows(beacon, &blocks, &successor, clip, 8).await?;
-    ap::verify(&rows, &blocks, &successor, clip)
+    }
+    let blocks = ap::blocks_from_rpc(&d.main, (from, to), 8).await?;
+    let rows = ap::build_rows(beacon, &blocks, &finalized, (from, to), 8).await?;
+    Ok((to, ap::verify(&rows, &blocks, &finalized, (from, to))?))
 }
 
 /// The served row of one proven block. Its reward comes from the block's own transactions and
@@ -1543,7 +1593,6 @@ async fn proven_row<M: Rpc, T: Rpc>(
                 "address history: block {}'s reward owed, retried later: {e:#}",
                 h.number
             );
-            row.insert("blockReward".into(), text(String::new()));
             row.insert("rewardStatus".into(), text("unavailable".into()));
         }
     }
@@ -1567,6 +1616,9 @@ async fn proven_row<M: Rpc, T: Rpc>(
         meta.insert("mevLastAsked".into(), json!(now));
     }
     row.extend(mev);
+    // Payment evidence is the fee recipient's own history, not the proposer's: none is claimed here.
+    row.insert("paymentTx".into(), text(String::new()));
+    row.insert("paymentValue".into(), text(String::new()));
     crate::address_validators::Stored {
         block: h.number,
         row,
@@ -2819,6 +2871,62 @@ mod tests {
 
     const ALICE: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
     const BOB: &str = "0x00000000219ab540356cbb839cbe05303d7705fa";
+
+    /// Headers by number, and the one it calls finalized.
+    struct Headers {
+        by_number: BTreeMap<u64, Value>,
+        finalized: Value,
+    }
+    impl Rpc for Headers {
+        async fn call(&self, method: &str, params: Value) -> Result<Value> {
+            assert_eq!(method, "eth_getBlockByNumber");
+            match params[0].as_str() {
+                Some("finalized") => Ok(self.finalized.clone()),
+                Some(n) => {
+                    let n = u64::from_str_radix(n.trim_start_matches("0x"), 16)?;
+                    Ok(self.by_number.get(&n).cloned().unwrap_or(Value::Null))
+                }
+                None => bail!("no block tag"),
+            }
+        }
+    }
+    fn header_json(h: &alloy_consensus::Header) -> Value {
+        let mut v = serde_json::to_value(h).unwrap();
+        v["hash"] = json!(format!("{:#x}", h.hash_slow()));
+        v
+    }
+
+    #[tokio::test]
+    async fn a_locally_built_tail_must_reach_the_finalized_block() {
+        use crate::address_proposers::{tests as pt, Beacon, DENEB_BLOCK};
+        let (blocks, rows, successor) = pt::chain(4);
+        let dir = tempfile::tempdir().unwrap();
+        pt::write_cache(dir.path(), &rows, &[]);
+        let beacon = Beacon::new(None, Some(dir.path().to_path_buf())).unwrap();
+        let by_number: BTreeMap<u64, Value> = blocks
+            .iter()
+            .map(|b| (b.header.number, header_json(&b.header)))
+            .collect();
+        let rpc = |finalized: &alloy_consensus::Header| {
+            let make = || Headers {
+                by_number: by_number.clone(),
+                finalized: header_json(finalized),
+            };
+            Discoverer::new(Counted::new(make()), Counted::new(make()))
+        };
+        let (to, proven) = prove_tail(&rpc(&successor), &beacon, DENEB_BLOCK, None)
+            .await
+            .unwrap();
+        assert_eq!(to, DENEB_BLOCK + 3);
+        assert_eq!(proven.len(), 4);
+        // The RPC served a self-consistent range, but the finalized block is on another chain.
+        let mut other = successor.clone();
+        other.parent_hash = alloy_primitives::B256::repeat_byte(3);
+        let e = prove_tail(&rpc(&other), &beacon, DENEB_BLOCK, None)
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("not the successor"), "{e:#}");
+    }
 
     /// A head source: 0 means down. Each read counts as `per_read` requests, as a failover would.
     struct FixedHead {

@@ -329,7 +329,7 @@ pub fn respond(
     };
     if start < supported_from {
         let mut v = unsupported(&format!(
-            "proposals are proven from block {supported_from}; ask from there and use another source before it"
+            "proposals are proven from block {supported_from} (history starts at block {supported_from}); ask from there and use another source before it"
         ));
         v["supportedFrom"] = json!(supported_from.to_string());
         return v;
