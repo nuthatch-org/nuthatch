@@ -129,7 +129,8 @@ pub fn encode(rows: &[ProposerRow]) -> Result<Vec<u8>> {
     use parquet::arrow::ArrowWriter;
     use parquet::basic::{Compression, ZstdLevel};
     use parquet::file::properties::WriterProperties;
-    let u = |f: fn(&ProposerRow) -> u64| Arc::new(UInt64Array::from_iter_values(rows.iter().map(f)));
+    let u =
+        |f: fn(&ProposerRow) -> u64| Arc::new(UInt64Array::from_iter_values(rows.iter().map(f)));
     let b = |f: fn(&ProposerRow) -> &[u8; 32]| {
         Arc::new(BinaryArray::from_iter_values(
             rows.iter().map(|r| f(r).as_slice()),
@@ -251,7 +252,10 @@ pub fn verify(
         );
     }
     if successor.number != to + 1 || successor.parent_hash != blocks[blocks.len() - 1].hash {
-        bail!("block {} is not the successor of block {to}", successor.number);
+        bail!(
+            "block {} is not the successor of block {to}",
+            successor.number
+        );
     }
     let mut out = Vec::with_capacity(rows.len());
     let mut last_slot = 0u64;
@@ -266,7 +270,10 @@ pub fn verify(
         let next = blocks.get(i + 1).map_or(successor, |b| &b.header);
         let committed = pinned_shape(next)?;
         if header_root(row) != committed.0 {
-            bail!("block {n}'s beacon header does not hash to the root block {} commits to", n + 1);
+            bail!(
+                "block {n}'s beacon header does not hash to the root block {} commits to",
+                n + 1
+            );
         }
         let slot_time = GENESIS_TIME + row.slot * SECONDS_PER_SLOT;
         if row.slot < DENEB_SLOT || slot_time != block.header.timestamp {
@@ -328,7 +335,11 @@ pub async fn blocks_from_rpc(
     for (header, hash) in got {
         if let Some(prev) = out.last() {
             if header.parent_hash != prev.hash {
-                bail!("block {} does not follow block {}", header.number, prev.header.number);
+                bail!(
+                    "block {} does not follow block {}",
+                    header.number,
+                    prev.header.number
+                );
             }
         }
         out.push(VerifiedBlock {
@@ -381,12 +392,17 @@ impl Beacon {
                 .get(k)
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("a beacon header without {k}"))?;
-            let v: B256 = s.parse().with_context(|| format!("a beacon header's {k}"))?;
+            let v: B256 = s
+                .parse()
+                .with_context(|| format!("a beacon header's {k}"))?;
             Ok(v.0)
         };
         let slot = num("slot")?;
         if slot_hint.is_some_and(|h| h != slot) {
-            bail!("asked for slot {}, the beacon answered slot {slot}", slot_hint.unwrap_or(0));
+            bail!(
+                "asked for slot {}, the beacon answered slot {slot}",
+                slot_hint.unwrap_or(0)
+            );
         }
         Ok(ProposerRow {
             number: 0,
@@ -451,7 +467,10 @@ impl Beacon {
         for _ in 0..6 {
             let resp = self
                 .client
-                .get(format!("{url}/eth/v1/beacon/headers/0x{}", hex::encode(root)))
+                .get(format!(
+                    "{url}/eth/v1/beacon/headers/0x{}",
+                    hex::encode(root)
+                ))
                 .send()
                 .await
                 .map_err(|e| e.without_url())
@@ -501,10 +520,9 @@ pub async fn build_rows(
         .collect::<Result<_>>()?;
     let rows: Vec<ProposerRow> = futures::stream::iter(wanted)
         .map(|(n, root, slot, i)| async move {
-            let mut row = beacon
-                .header(slot, root)
-                .await?
-                .ok_or_else(|| anyhow!("no beacon source has the header of block {n} (slot {slot})"))?;
+            let mut row = beacon.header(slot, root).await?.ok_or_else(|| {
+                anyhow!("no beacon source has the header of block {n} (slot {slot})")
+            })?;
             row.number = n;
             row.hash = blocks[i as usize].hash.0;
             Ok::<_, anyhow::Error>(row)
@@ -548,7 +566,9 @@ pub async fn build(
     concurrency: usize,
     mut progress: impl FnMut(u64, u64, u64),
 ) -> Result<BuiltCatalogue> {
-    use crate::address_partitions::{decode as decode_blocks, partition_key, verify as verify_blocks};
+    use crate::address_partitions::{
+        decode as decode_blocks, partition_key, verify as verify_blocks,
+    };
     if chain_id != 1 {
         bail!("the proposer catalogue is for Ethereum mainnet");
     }
@@ -576,7 +596,11 @@ pub async fn build(
         };
         let key = catalogue_key(chain_id, start);
         if let Some(entry) = manifest.files.get(&start) {
-            if mirror.head(&key).await?.is_some_and(|h| h.size == entry.bytes) {
+            if mirror
+                .head(&key)
+                .await?
+                .is_some_and(|h| h.size == entry.bytes)
+            {
                 built.skipped += 1;
                 continue;
             }
@@ -584,10 +608,18 @@ pub async fn build(
         let raw = mirror
             .get(&partition_key(chain_id, start))
             .await?
-            .ok_or_else(|| anyhow!("the mirror has no block partition for [{start}, {end}] to build from"))?;
+            .ok_or_else(|| {
+                anyhow!("the mirror has no block partition for [{start}, {end}] to build from")
+            })?;
         let (successor, _) = header_at(rpc, end + 1).await?;
-        let blocks = verify_blocks(&decode_blocks(&raw)?, start, end, successor.parent_hash, chain_id)
-            .with_context(|| format!("the block partition for [{start}, {end}]"))?;
+        let blocks = verify_blocks(
+            &decode_blocks(&raw)?,
+            start,
+            end,
+            successor.parent_hash,
+            chain_id,
+        )
+        .with_context(|| format!("the block partition for [{start}, {end}]"))?;
         let blocks = &blocks[(lo - start) as usize..];
         let rows = build_rows(beacon, blocks, &successor, (lo, end), concurrency)
             .await
@@ -607,7 +639,10 @@ pub async fn build(
             },
         );
         mirror
-            .put(&catalogue_manifest_key(chain_id), &serde_json::to_vec_pretty(&manifest)?)
+            .put(
+                &catalogue_manifest_key(chain_id),
+                &serde_json::to_vec_pretty(&manifest)?,
+            )
             .await?;
         built.written.push((lo, end));
         built.bytes += bytes.len() as u64;
@@ -682,7 +717,11 @@ pub(crate) mod tests {
         rows.push(second);
         let bytes = encode(&rows).unwrap();
         assert_eq!(decode(&bytes).unwrap(), rows);
-        assert_eq!(encode(&rows).unwrap(), bytes, "the same rows encode to the same bytes");
+        assert_eq!(
+            encode(&rows).unwrap(),
+            bytes,
+            "the same rows encode to the same bytes"
+        );
     }
 
     #[test]
@@ -772,7 +811,10 @@ pub(crate) mod tests {
                 2 => rows[1].state_root[3] ^= 1,
                 _ => rows[1].body_root[3] ^= 1,
             }
-            assert!(verify(&rows, &blocks, &successor, span(4)).is_err(), "field {f}");
+            assert!(
+                verify(&rows, &blocks, &successor, span(4)).is_err(),
+                "field {f}"
+            );
         }
     }
 
@@ -798,7 +840,10 @@ pub(crate) mod tests {
         assert!(verify(&wrong_hash, &blocks, &successor, span(4)).is_err());
         let mut short = rows.clone();
         short.pop();
-        assert!(verify(&short, &blocks, &successor, span(4)).is_err(), "the last row missing");
+        assert!(
+            verify(&short, &blocks, &successor, span(4)).is_err(),
+            "the last row missing"
+        );
         let mut wrong_height = rows;
         wrong_height[1].number += 1;
         assert!(verify(&wrong_height, &blocks, &successor, span(4)).is_err());
@@ -809,9 +854,15 @@ pub(crate) mod tests {
         let (blocks, rows, mut successor) = chain(3);
         let mut other = successor.clone();
         other.parent_beacon_block_root = Some(B256::repeat_byte(1));
-        assert!(verify(&rows, &blocks, &other, span(3)).is_err(), "another root");
+        assert!(
+            verify(&rows, &blocks, &other, span(3)).is_err(),
+            "another root"
+        );
         successor.parent_hash = B256::repeat_byte(2);
-        assert!(verify(&rows, &blocks, &successor, span(3)).is_err(), "not linked");
+        assert!(
+            verify(&rows, &blocks, &successor, span(3)).is_err(),
+            "not linked"
+        );
     }
 
     #[test]
@@ -862,7 +913,9 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_cache(dir.path(), &rows, &[DENEB_SLOT + 1, DENEB_SLOT + 3]);
         let beacon = Beacon::new(None, Some(dir.path().to_path_buf())).unwrap();
-        let built = build_rows(&beacon, &blocks, &successor, span(4), 4).await.unwrap();
+        let built = build_rows(&beacon, &blocks, &successor, span(4), 4)
+            .await
+            .unwrap();
         assert_eq!(built, rows);
     }
 
