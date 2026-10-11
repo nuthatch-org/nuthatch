@@ -139,7 +139,7 @@ impl Pace {
             span: start.clamp(min, max),
             min,
             max,
-            target: deadline / 4,
+            target: deadline / 8,
         }
     }
     pub(crate) fn span(&self) -> u64 {
@@ -250,7 +250,7 @@ impl ModeState {
             validators: None,
             beacon: None,
             hash_at: None,
-            first_window: 1_000,
+            first_window: 128,
         }
     }
 
@@ -5385,9 +5385,9 @@ mod tests {
     #[test]
     fn a_window_shrinks_when_slow_and_grows_back_when_quick() {
         let mut p = Pace::new(1_000, 64, 50_000, Duration::from_secs(20));
-        p.took(Duration::from_secs(6));
-        assert_eq!(p.span(), 500, "over a quarter of the deadline halves it");
         p.took(Duration::from_secs(3));
+        assert_eq!(p.span(), 500, "over an eighth of the deadline halves it");
+        p.took(Duration::from_millis(1_500));
         assert_eq!(p.span(), 500, "between half and the whole target it holds");
         p.took(Duration::from_millis(100));
         assert_eq!(p.span(), 1_000, "a quick window doubles it");
