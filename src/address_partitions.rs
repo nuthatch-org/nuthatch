@@ -678,6 +678,36 @@ pub async fn run(args: &crate::cli::PartitionsArgs) -> Result<()> {
     )?);
     rpc.inner().verify_chain_ids(args.chain_id).await?;
     let started = std::time::Instant::now();
+    if args.proposers {
+        let beacon =
+            crate::address_proposers::Beacon::new(args.beacon_url.clone(), args.beacon_cache.clone())?;
+        let built = crate::address_proposers::build(
+            &rpc,
+            &args.out,
+            args.chain_id,
+            (args.from, args.to),
+            &beacon,
+            args.concurrency,
+            |lo, end, bytes| {
+                let secs = started.elapsed().as_secs_f64();
+                println!("proposers [{lo}, {end}] {bytes} bytes, {secs:.0}s in");
+            },
+        )
+        .await?;
+        let secs = started.elapsed().as_secs_f64().max(0.001);
+        println!(
+            "{} catalogue files written, {} already there; {} bytes for {} blocks, {:.0} blocks/s",
+            built.written.len(),
+            built.skipped,
+            built.bytes,
+            built.blocks,
+            built.blocks as f64 / secs
+        );
+        for (method, n) in rpc.calls() {
+            println!("  {method}: {n}");
+        }
+        return Ok(());
+    }
     let built = build(
         &rpc,
         &args.out,

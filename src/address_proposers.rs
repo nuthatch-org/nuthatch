@@ -516,6 +516,107 @@ pub async fn build_rows(
     Ok(rows)
 }
 
+/// What a catalogue build wrote.
+#[derive(Debug, Default)]
+pub struct BuiltCatalogue {
+    pub written: Vec<(u64, u64)>,
+    pub skipped: usize,
+    pub bytes: u64,
+    pub blocks: u64,
+}
+
+/// The publisher's list of catalogue files. For operators: a nest never reads it.
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Default)]
+pub struct CatalogueManifest {
+    pub version: u32,
+    pub chain_id: u64,
+    pub span: u64,
+    pub files: BTreeMap<u64, crate::address_partitions::ManifestEntry>,
+}
+
+/// Write the proposer catalogue for every span of `[from, to]` from Dencun on that `target` lacks,
+/// each built from the verified block partition already in `target` and `beacon`'s headers, and
+/// verified as a nest verifies it. A span's last block is proven by its successor, which the RPC must
+/// call finalized, so `to + 1` must be. A file already listed and present is left as it is, so an
+/// interrupted build resumes where it stopped.
+pub async fn build(
+    rpc: &impl Rpc,
+    target: &str,
+    chain_id: u64,
+    (from, to): (u64, u64),
+    beacon: &Beacon,
+    concurrency: usize,
+    mut progress: impl FnMut(u64, u64, u64),
+) -> Result<BuiltCatalogue> {
+    use crate::address_partitions::{decode as decode_blocks, partition_key, verify as verify_blocks};
+    if chain_id != 1 {
+        bail!("the proposer catalogue is for Ethereum mainnet");
+    }
+    if from % SPAN != 0 || (to + 1) % SPAN != 0 || to < from {
+        bail!("catalogue files are whole spans of {SPAN} blocks: --from a multiple, --to one less");
+    }
+    let finalized = crate::address_partitions::finalized(rpc).await?;
+    if to + 1 > finalized {
+        bail!("block {} is past the RPC's finalized block {finalized}; the catalogue for block {to} needs its finalized successor", to + 1);
+    }
+    let mirror = crate::publish::open_mirror(target)?;
+    let mut manifest = match mirror.get(&catalogue_manifest_key(chain_id)).await? {
+        Some(raw) => serde_json::from_slice(&raw).context("the mirror's catalogue manifest")?,
+        None => CatalogueManifest {
+            version: 1,
+            chain_id,
+            span: SPAN,
+            files: BTreeMap::new(),
+        },
+    };
+    let mut built = BuiltCatalogue::default();
+    for start in (from..=to).step_by(SPAN as usize) {
+        let Some((lo, end)) = provable(start) else {
+            continue;
+        };
+        let key = catalogue_key(chain_id, start);
+        if let Some(entry) = manifest.files.get(&start) {
+            if mirror.head(&key).await?.is_some_and(|h| h.size == entry.bytes) {
+                built.skipped += 1;
+                continue;
+            }
+        }
+        let raw = mirror
+            .get(&partition_key(chain_id, start))
+            .await?
+            .ok_or_else(|| anyhow!("the mirror has no block partition for [{start}, {end}] to build from"))?;
+        let (successor, _) = header_at(rpc, end + 1).await?;
+        let blocks = verify_blocks(&decode_blocks(&raw)?, start, end, successor.parent_hash, chain_id)
+            .with_context(|| format!("the block partition for [{start}, {end}]"))?;
+        let blocks = &blocks[(lo - start) as usize..];
+        let rows = build_rows(beacon, blocks, &successor, (lo, end), concurrency)
+            .await
+            .with_context(|| format!("the catalogue for [{lo}, {end}]"))?;
+        let bytes = encode(&rows)?;
+        mirror.put(&key, &bytes).await?;
+        let e_tag = mirror.head(&key).await?.and_then(|h| h.e_tag);
+        manifest.files.insert(
+            start,
+            crate::address_partitions::ManifestEntry {
+                to: end,
+                key,
+                bytes: bytes.len() as u64,
+                sha256: crate::publish::sha256_hex(&bytes),
+                last_hash: format!("{:#x}", blocks[blocks.len() - 1].hash),
+                e_tag,
+            },
+        );
+        mirror
+            .put(&catalogue_manifest_key(chain_id), &serde_json::to_vec_pretty(&manifest)?)
+            .await?;
+        built.written.push((lo, end));
+        built.bytes += bytes.len() as u64;
+        built.blocks += end - lo + 1;
+        progress(lo, end, bytes.len() as u64);
+    }
+    Ok(built)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -735,5 +836,48 @@ pub(crate) mod tests {
         rows[0].hash = blocks[0].header.hash_slow().0;
         blocks[0].hash = B256::from(rows[0].hash);
         assert!(verify(&rows, &blocks, &successor, span(2)).is_err());
+    }
+
+    fn write_cache(dir: &std::path::Path, rows: &[ProposerRow], missed: &[u64]) {
+        use std::io::Write;
+        let first = rows[0].slot - rows[0].slot % CACHE_SLOTS;
+        let f = std::fs::File::create(dir.join(format!("slots-{first}.jsonl.gz"))).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        let h = |r: &[u8; 32]| format!("0x{}", hex::encode(r));
+        for r in rows {
+            let line = json!({"slot": r.slot, "root": h(&header_root(r)), "canonical": true, "header": {
+                "slot": r.slot.to_string(), "proposer_index": r.proposer_index.to_string(),
+                "parent_root": h(&r.parent_root), "state_root": h(&r.state_root), "body_root": h(&r.body_root)}});
+            writeln!(gz, "{line}").unwrap();
+        }
+        for s in missed {
+            writeln!(gz, "{}", json!({"slot": s, "missed": true})).unwrap();
+        }
+        gz.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_catalogue_is_built_from_the_header_cache_and_verified() {
+        let (blocks, rows, successor) = chain(4);
+        let dir = tempfile::tempdir().unwrap();
+        write_cache(dir.path(), &rows, &[DENEB_SLOT + 1, DENEB_SLOT + 3]);
+        let beacon = Beacon::new(None, Some(dir.path().to_path_buf())).unwrap();
+        let built = build_rows(&beacon, &blocks, &successor, span(4), 4).await.unwrap();
+        assert_eq!(built, rows);
+    }
+
+    #[tokio::test]
+    async fn a_header_no_source_has_fails_the_span_rather_than_reading_as_no_proposal() {
+        let (blocks, rows, successor) = chain(4);
+        let dir = tempfile::tempdir().unwrap();
+        // The cache holds a forged header for block 2's slot: its root is not the committed one.
+        let mut forged = rows.clone();
+        forged[2].proposer_index = 7;
+        write_cache(dir.path(), &forged, &[]);
+        let beacon = Beacon::new(None, Some(dir.path().to_path_buf())).unwrap();
+        let e = build_rows(&beacon, &blocks, &successor, span(4), 4)
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("no beacon source has"), "{e:#}");
     }
 }

@@ -455,6 +455,18 @@ pub struct PartitionsArgs {
     /// differ. Without it a listed partition is checked by size and the store's ETag alone.
     #[arg(long)]
     pub verify_existing: bool,
+    /// Build the proposer catalogue (which validator proposed each block since Dencun) from the
+    /// block partitions already in `--out`, instead of the block partitions themselves.
+    #[arg(long)]
+    pub proposers: bool,
+    /// With `--proposers`: a beacon node's API to read headers from. It sees this machine's IP and
+    /// the beacon roots asked for.
+    #[arg(long)]
+    pub beacon_url: Option<String>,
+    /// With `--proposers`: a directory of beacon headers by slot (`slots-<first>.jsonl.gz`), read
+    /// before the beacon API. Unverified: every header is checked against the chain like any other.
+    #[arg(long)]
+    pub beacon_cache: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
