@@ -452,32 +452,49 @@ pub async fn check_anchor<M: Rpc, T: Rpc>(
     }
     // Twice over, so a node that moves to another fork between two comparisons cannot pass one
     // block on each.
-    for _ in 0..2 {
-        for &(block, hash) in &checks {
-            if block_hash(&d.main, block).await? != hash {
-                bail!(
-                    "block {block} is no longer the one this was read against; a reorg is under way"
-                );
+    let held = async {
+        for _ in 0..2 {
+            for &(block, hash) in &checks {
+                if block_hash(&d.main, block).await? != hash {
+                    bail!(
+                        "block {block} is no longer the one this was read against; a reorg is under way"
+                    );
+                }
             }
         }
+        Ok(())
     }
-    // And the newest finalized hash, so a switch to a fork under finality after the request's own
-    // check cannot join a fetch from it to history read on the old one.
-    hold_final(&d.main, history).await
+    .await;
+    // And the newest finalized hash, whether or not those held, so a switch to a fork under
+    // finality after the request's own check is recorded as the conflict it is, not as a reorg.
+    hold_final(&d.main, history).await?;
+    held
 }
 
 /// Hold the newest finalized hash the store recorded against the main endpoint, twice. A mismatch is
 /// a conflict with finalized history, recorded in the store at once, so whatever path found it the
 /// nest stops answering, across restarts too.
+/// Every endpoint behind `main` is asked, so a pool with one endpoint on another fork cannot pass on
+/// the others while that one supplies the data.
 pub async fn hold_final(main: &impl Rpc, history: &AddressHistory) -> Result<()> {
     let Some(&(block, hash)) = history.finals()?.last() else {
         return Ok(());
     };
+    let params = json!([format!("0x{block:x}"), false]);
     for _ in 0..2 {
-        if block_hash(main, block).await? != hash {
-            let why = final_conflict(block);
-            history.set_conflict(&why)?;
-            bail!(why);
+        for b in main
+            .call_each("eth_getBlockByNumber", params.clone())
+            .await?
+        {
+            let seen = b
+                .get("hash")
+                .and_then(Value::as_str)
+                .with_context(|| format!("block {block} is not on every main endpoint yet"))?;
+            if crate::address_discovery::word32(seen)? != hash {
+                let why = final_conflict(block);
+                history.set_conflict(&why)?;
+                bail!(why);
+            }
         }
     }
     Ok(())
@@ -3452,6 +3469,47 @@ mod tests {
         );
         let (st, _) = call(router(s.clone()), "GET", "/ready", None).await;
         assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A fetch whose own anchor no longer holds, because the chain switched to a fork under
+    /// finality, records the conflict at once rather than failing as an ordinary reorg.
+    #[tokio::test]
+    async fn a_failed_anchor_over_a_fork_under_finality_is_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        let chain = Chain::new(100, 90);
+        let d = chain.node();
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        let anchor = Some((99, chain.hash(99)));
+        chain.reorg(25);
+        let err = check_anchor(&d, &s.history, anchor, &[]).await.unwrap_err();
+        assert!(err.to_string().contains("finalized block 90"), "{err:#}");
+        let (st, _) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// One endpoint of a pool on another fork under finality is a conflict, though the endpoint a
+    /// plain call reaches agrees.
+    #[tokio::test]
+    async fn one_pool_endpoint_on_another_fork_is_a_conflict() {
+        struct Pool;
+        impl Rpc for Pool {
+            async fn call(&self, _: &str, _: Value) -> Result<Value> {
+                Ok(json!({"hash": format!("0x{}", "11".repeat(32))}))
+            }
+            async fn call_each(&self, m: &str, p: Value) -> Result<Vec<Value>> {
+                Ok(vec![
+                    self.call(m, p).await?,
+                    json!({"hash": format!("0x{}", "22".repeat(32))}),
+                ])
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        s.history.finalize_at(90, [0x11; 32]).unwrap();
+        let err = hold_final(&Pool, &s.history).await.unwrap_err();
+        assert!(err.to_string().contains("finalized block 90"), "{err:#}");
+        assert!(s.history.conflict().unwrap().is_some());
     }
 
     /// A finalized tag that went backwards does not narrow the poll's check: the recorded finalized

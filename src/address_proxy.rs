@@ -196,8 +196,8 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
     let skip = need - usize::try_from(offset).expect("at most MAX_PAGE");
     let mut logs: Vec<Value> = logs.into_iter().skip(skip).collect();
     let full = usize::try_from(offset).expect("at most MAX_PAGE");
-    // One log is a page of one, which any caller pages past by `page`.
-    if logs.len() >= full && full > 1 {
+    // A caller past the first page, or on pages of one, pages by `page`, never from a block.
+    if logs.len() >= full && full > 1 && page == 1 {
         let block = |l: &Value| l.get("blockNumber").cloned();
         if block(&logs[0]) == block(&logs[full - 1]) {
             return Ok(Answer::Unsupported(format!(
