@@ -379,7 +379,7 @@ pub struct AddressHistory {
 /// Whether the store at `path` holds history from before finalized hashes were recorded (a
 /// committed head and none of them), and if so the accounts it watched. Read without writing, so a
 /// store moved aside for it is moved intact.
-pub fn pre_finality(path: &std::path::Path) -> Result<Option<Vec<String>>> {
+pub fn pre_finality(path: &std::path::Path) -> Result<Option<Accounts>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -398,22 +398,33 @@ pub fn pre_finality(path: &std::path::Path) -> Result<Option<Vec<String>>> {
     if head.is_none() || finals > 0 {
         return Ok(None);
     }
-    let watched = match rtx.open_table(WATCHED) {
-        Ok(t) => t
-            .iter()?
-            .map(|e| {
-                let (k, _) = e?;
-                let a: Address = k
-                    .value()
-                    .try_into()
-                    .context("watched key is not 20 bytes")?;
-                Ok(address_hex(&a))
-            })
-            .collect::<Result<Vec<_>>>()?,
-        Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
-        Err(e) => return Err(e.into()),
+    let list = |def: TableDefinition<&[u8], u8>| -> Result<Vec<String>> {
+        match rtx.open_table(def) {
+            Ok(t) => t
+                .iter()?
+                .map(|e| {
+                    let (k, _) = e?;
+                    let a: Address = k
+                        .value()
+                        .try_into()
+                        .context("account key is not 20 bytes")?;
+                    Ok(address_hex(&a))
+                })
+                .collect(),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
     };
-    Ok(Some(watched))
+    Ok(Some(Accounts {
+        watched: list(WATCHED)?,
+        unwatched: list(UNWATCHED)?,
+    }))
+}
+
+/// The accounts a store watched, and those removed from it, which configuration must not bring back.
+pub struct Accounts {
+    pub watched: Vec<String>,
+    pub unwatched: Vec<String>,
 }
 
 /// A finalized block the store recorded is now reported at another hash.

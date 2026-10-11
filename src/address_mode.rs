@@ -2119,26 +2119,38 @@ pub fn move_aside_pre_finality(
     chain_id: u64,
     configured: &[String],
 ) -> Result<Vec<String>> {
-    let Some(watched) = probe_copy(path)? else {
+    if !path.exists() {
+        return Ok(configured.to_vec());
+    }
+    // The lock redb takes, held through the move, so a nest still running on this store is refused
+    // rather than left writing to the copy kept aside.
+    let held = std::fs::File::open(path)?;
+    held.try_lock().map_err(|_| {
+        anyhow::anyhow!(
+            "{} is open in another process; stop it first",
+            path.display()
+        )
+    })?;
+    let Some(accounts) = probe_copy(path)? else {
         return Ok(configured.to_vec());
     };
-    let mut all = configured.to_vec();
-    for a in watched {
-        if !all.iter().any(|c| c.eq_ignore_ascii_case(&a)) {
-            all.push(a);
-        }
-    }
-    // The replacement is built beside the old store, its accounts committed, before anything is
-    // moved: a crash at any step leaves the old store where it was, or linked at both names.
+    // The replacement is built beside the old store, its accounts and removals committed, before
+    // anything is moved: a crash at any step leaves the old store where it was, or linked at both
+    // names.
     let fresh = with_suffix(path, ".new");
     if fresh.exists() {
         std::fs::remove_file(&fresh)?;
     }
-    drop(AddressHistory::open(
-        crate::store::Store::open(&fresh)?,
-        chain_id,
-        &all,
-    )?);
+    {
+        let h = AddressHistory::open(
+            crate::store::Store::open(&fresh)?,
+            chain_id,
+            &accounts.watched,
+        )?;
+        for a in &accounts.unwatched {
+            h.unwatch(a)?;
+        }
+    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
@@ -2161,6 +2173,7 @@ pub fn move_aside_pre_finality(
     };
     std::fs::rename(&fresh, path)
         .with_context(|| format!("putting the new store at {}", path.display()))?;
+    drop(held);
     tracing::warn!(
         "address history: {} was written before finalized block hashes were recorded, so it cannot \
          show its history is this chain's; kept it, untouched, as {} and reading history again from \
@@ -2168,7 +2181,7 @@ pub fn move_aside_pre_finality(
         path.display(),
         aside.display()
     );
-    Ok(all)
+    Ok(configured.to_vec())
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
@@ -2179,10 +2192,7 @@ fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
 
 /// [`crate::address_history::pre_finality`] on a copy, so opening it, which redb may write to,
 /// never touches the store itself.
-fn probe_copy(path: &Path) -> Result<Option<Vec<String>>> {
-    if !path.exists() {
-        return Ok(None);
-    }
+fn probe_copy(path: &Path) -> Result<Option<crate::address_history::Accounts>> {
     let probe = with_suffix(path, ".probe");
     std::fs::copy(path, &probe)?;
     let found = crate::address_history::pre_finality(&probe);
@@ -3781,7 +3791,7 @@ mod tests {
             std::fs::write(with_suffix(&path, &format!(".pre-5.2-{t}")), b"earlier").unwrap();
         }
         let addresses = move_aside_pre_finality(&path, 1, &[ALICE.into()]).unwrap();
-        assert_eq!(addresses, [ALICE, late]);
+        assert_eq!(addresses, [ALICE]);
         let kept: Vec<String> = files()
             .into_iter()
             .filter(|f| f.contains(".pre-5.2-"))
@@ -3815,6 +3825,29 @@ mod tests {
             .any(|f| f.ends_with(".new") || f.ends_with(".probe")));
     }
 
+    /// An account removed through the API stays removed across the move, though configuration still
+    /// names it; and a store another process holds open is refused, not moved.
+    #[test]
+    fn the_move_keeps_removals_and_refuses_a_store_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::config::DB_FILE);
+        let gone = "0x00000000000000000000000000000000000000dd";
+        let seed = [ALICE.to_string(), gone.to_string()];
+        {
+            let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &seed).unwrap();
+            h.unwatch(gone).unwrap();
+            h.finalize(70).unwrap();
+            let err = move_aside_pre_finality(&path, 1, &seed).unwrap_err();
+            assert!(err.to_string().contains("another process"), "{err:#}");
+            assert!(path.exists());
+        }
+        let addresses = move_aside_pre_finality(&path, 1, &seed).unwrap();
+        for _ in 0..2 {
+            let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &addresses).unwrap();
+            assert_eq!(h.watched().unwrap(), [ALICE.to_ascii_lowercase()]);
+        }
+    }
+
     /// A start interrupted after the old store was linked aside, with the replacement half made,
     /// finishes the move on the next start: both names keep the old store, and the accounts come
     /// across.
@@ -3831,8 +3864,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         std::fs::hard_link(&path, with_suffix(&path, ".pre-5.2-1")).unwrap();
         std::fs::write(with_suffix(&path, ".new"), b"half a store").unwrap();
-        let addresses = move_aside_pre_finality(&path, 1, &[]).unwrap();
-        assert!(addresses.iter().any(|a| a == late));
+        move_aside_pre_finality(&path, 1, &[]).unwrap();
         assert_eq!(
             std::fs::read(with_suffix(&path, ".pre-5.2-1")).unwrap(),
             before
