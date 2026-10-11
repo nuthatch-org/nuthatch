@@ -295,8 +295,13 @@ pub fn verify(
             bail!("block {n}'s slot does not follow its parent's");
         }
         last_slot = row.slot;
+        // Without its withdrawals: a span holds 10,000 of these, and nothing downstream reads them.
         out.push(Proven {
-            block: block.clone(),
+            block: VerifiedBlock {
+                hash: block.hash,
+                header: block.header.clone(),
+                withdrawals: Vec::new(),
+            },
             slot: row.slot,
             proposer_index: row.proposer_index,
         });
@@ -370,6 +375,33 @@ pub async fn blocks_from_rpc(
         });
     }
     Ok(out)
+}
+
+/// The header of block `lo`, linked block by block through `hi` to `anchor` (block `hi + 1`), read
+/// from `rpc` a chunk at a time so only one chunk is held.
+pub async fn linked_to(rpc: &impl Rpc, (lo, hi): (u64, u64), anchor: &Header) -> Result<Header> {
+    const CHUNK: u64 = 1_000;
+    let mut first: Option<Header> = None;
+    let mut last: Option<B256> = None;
+    let mut from = lo;
+    while from <= hi {
+        let to = (from + CHUNK - 1).min(hi);
+        let chunk = blocks_from_rpc(rpc, (from, to), 8).await?;
+        if let Some(prev) = last {
+            if chunk[0].header.parent_hash != prev {
+                bail!("block {from} does not follow block {}", from - 1);
+            }
+        }
+        if first.is_none() {
+            first = Some(chunk[0].header.clone());
+        }
+        last = Some(chunk[chunk.len() - 1].hash);
+        from = to + 1;
+    }
+    if last != Some(anchor.parent_hash) {
+        bail!("the RPC's blocks under its finalized block do not lead to it");
+    }
+    first.ok_or_else(|| anyhow!("an empty range [{lo}, {hi}]"))
 }
 
 /// Where beacon headers come from when a catalogue is built: a beacon node's API, a local cache of

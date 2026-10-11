@@ -1535,11 +1535,7 @@ async fn mirror_spans<M: Rpc, T: Rpc>(
                 hi - lo + 1
             );
         }
-        let bridge = ap::blocks_from_rpc(&d.main, (lo, hi), 8).await?;
-        if anchor.parent_hash != bridge[bridge.len() - 1].hash {
-            bail!("the RPC's blocks under its finalized block do not lead to it");
-        }
-        bridge[0].header.clone()
+        ap::linked_to(&d.main, (lo, hi), anchor).await?
     };
     let mut span = top;
     loop {
@@ -3473,6 +3469,32 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!(late.row["mev"], "relay", "the late row was reached");
+    }
+
+    #[tokio::test]
+    async fn the_bridge_is_linked_across_its_chunks() {
+        use crate::address_proposers::{linked_to, tests as pt};
+        let (blocks, _, anchor) = pt::chain_from(23_560_000, 12_800_000, 1_500);
+        let map = |bs: &[crate::address_partitions::VerifiedBlock]| -> BTreeMap<u64, Value> {
+            bs.iter()
+                .map(|b| (b.header.number, header_json(&b.header)))
+                .collect()
+        };
+        let rpc = |by_number: BTreeMap<u64, Value>| Headers {
+            by_number,
+            finalized: Value::Null,
+        };
+        let (lo, hi) = (23_560_000, 23_561_499);
+        let first = linked_to(&rpc(map(&blocks)), (lo, hi), &anchor)
+            .await
+            .unwrap();
+        assert_eq!(first.number, lo);
+        // Block 23,561,000 opens the second chunk; one from another chain there must break it.
+        let mut forked = blocks.clone();
+        forked[1_000].header.parent_hash = alloy_primitives::B256::repeat_byte(5);
+        assert!(linked_to(&rpc(map(&forked)), (lo, hi), &anchor)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
