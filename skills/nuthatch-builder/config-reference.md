@@ -232,6 +232,22 @@ relay's claim: the deliveries for the canonical block hash, in the fixed relay o
 fee recipient is the watched address, else the first; `conflict` compares recipient and value only.
 It is off by default; the relays see this machine's IP and those block numbers.
 
+On Ethereum mainnet a nest can also prove which blocks a validator proposed, whoever received their
+fees: `validators = [1278077]` in `[address_history]`, or `POST /api/watch` with `{"validator":
+1278077}`, and `module=account&action=nuthatchValidatorBlocks&validator=N&startblock=&endblock=`
+answers every block validator N proposed in the range, or `NUTHATCH_INCOMPLETE`. Each row carries
+`blockNumber`, `blockHash`, `timeStamp`, `slot`, `proposerIndex`, `feeRecipient`, `blockReward` with
+`rewardStatus` (`verified`, or `unavailable` and retried, never zero) and the `mev` fields as above;
+the answer carries `supportedFrom` and `verifiedThrough`. The proof is the execution chain's own: block
+N+1's `parent_beacon_block_root` (EIP-4788) commits to the beacon header that produced block N, whose
+`proposer_index` names the proposer, and every row of a span is checked before any is used. The
+catalogue covers slot 12,777,208 (block 23,551,570) onward; a range starting earlier is refused. Spans
+come from the mirror's `proposers/` files beside its partitions; for blocks the mirror has not
+published, `beacon_url = "http://localhost:5052"` builds them here (the beacon sees this machine's IP
+and the roots asked for), and without it they stay incomplete. Like the partitions, the proof is
+relative to the chain the nest's own RPC calls finalized. `nuthatch partitions --proposers
+--beacon-url URL` builds the catalogue for a mirror from its block partitions.
+
 Each partition is verified before use: every header hashed, linked to its parent and anchored to the
 block the nest's own RPC calls finalized, every withdrawal list hashed to its root. One that is
 missing or fails stays `NUTHATCH_INCOMPLETE`. `nuthatch partitions` builds them.
