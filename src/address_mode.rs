@@ -1386,11 +1386,9 @@ async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, 
             return;
         }
     };
-    let ceiling = state
-        .end_block
-        .map_or(anchor.number.saturating_sub(1), |e| {
-            e.min(anchor.number.saturating_sub(1))
-        });
+    // Proofs run to the finalized block whatever `end_block` says: the chain of spans must reach the
+    // anchor. `end_block` bounds what is served, not what is proven.
+    let ceiling = anchor.number.saturating_sub(1);
     let first = state.proposals_from();
     let mut mirror_end = None;
     if let Some((source, blocks)) = &state.mirror {
@@ -2231,11 +2229,13 @@ async fn validator_blocks(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Va
             "validator blocks are proven on Ethereum mainnet address-history nests only",
         );
     };
-    let from = s.proposals_from();
+    let (from, until) = (s.proposals_from(), s.end_block);
     let q = q.clone();
-    tokio::task::spawn_blocking(move || crate::address_validators::respond(&validators, from, &q))
-        .await
-        .unwrap_or_else(|e| crate::address_history::incomplete(&format!("{e}")))
+    tokio::task::spawn_blocking(move || {
+        crate::address_validators::respond(&validators, from, until, &q)
+    })
+    .await
+    .unwrap_or_else(|e| crate::address_history::incomplete(&format!("{e}")))
 }
 
 /// Whether the covered rows of `answer`, which reach block `to` above the finalized head, still

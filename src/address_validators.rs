@@ -288,6 +288,7 @@ fn decode_stored(block: u64, raw: &[u8]) -> Result<Stored> {
 pub fn respond(
     validators: &Validators,
     supported_from: u64,
+    until: Option<u64>,
     params: &std::collections::HashMap<String, String>,
 ) -> Value {
     let get = |k: &str| params.get(k).map(String::as_str).filter(|s| !s.is_empty());
@@ -356,6 +357,8 @@ pub fn respond(
             .into_iter()
             .find(|(f, t)| *f <= start && start <= *t)
             .map(|(_, t)| t);
+        // The configured end bounds what is served, though proofs run past it.
+        let through = through.map(|t| until.map_or(t, |u| t.min(u)));
         let Some(through) = through else {
             return Ok(incomplete(&format!(
                 "validator {validator}'s proposals are not proven from block {start} yet"
@@ -364,6 +367,12 @@ pub fn respond(
         let end = end.unwrap_or(through);
         if end < start {
             return Ok(json!({"status": "0", "message": "No transactions found", "result": []}));
+        }
+        if until.is_some_and(|u| end > u) {
+            return Ok(incomplete(&format!(
+                "history ends at block {}",
+                until.unwrap_or(0)
+            )));
         }
         if end > through {
             let mut v = incomplete(&format!(
@@ -423,7 +432,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        respond(v, 100, &q)
+        respond(v, 100, None, &q)
     }
 
     #[test]
@@ -628,6 +637,33 @@ mod tests {
             .unwrap();
         assert_eq!(v.next_uncovered(7, 100).unwrap(), 150);
         assert_eq!(v.next_uncovered(7, 200).unwrap(), 200);
+    }
+
+    #[test]
+    fn proofs_past_end_block_are_served_only_through_it() {
+        let (_d, v) = open(&[7]);
+        let g = v.generation().unwrap();
+        let mut found = BTreeMap::new();
+        found.insert(7, vec![stored(150), stored(250)]);
+        v.record_span((100, 299), &[7], &found, g).unwrap();
+        let q: HashMap<String, String> = [("validator", "7"), ("startblock", "100")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let a = respond(&v, 100, Some(199), &q);
+        assert_eq!(a["status"], "1", "{a}");
+        assert_eq!(a["verifiedThrough"], "199");
+        assert_eq!(a["result"].as_array().unwrap().len(), 1);
+        let mut past = q.clone();
+        past.insert("endblock".into(), "250".into());
+        let a = respond(&v, 100, Some(199), &past);
+        assert!(
+            a["result"]
+                .as_str()
+                .unwrap()
+                .contains("history ends at block 199"),
+            "{a}"
+        );
     }
 
     #[test]
