@@ -740,10 +740,10 @@ impl AddressHistory {
             let (Some(b), Some(h)) = (text("blockNumber"), text("blockHash")) else {
                 continue;
             };
-            let b: u64 = b.parse()?;
-            let h: [u8; 32] = alloy_primitives::hex::decode(h.trim_start_matches("0x"))?
-                .try_into()
-                .map_err(|_| anyhow!("a stored block hash at {b} is not 32 bytes"))?;
+            let h = alloy_primitives::hex::decode(h.trim_start_matches("0x")).ok();
+            let (Ok(b), Some(Ok(h))) = (b.parse::<u64>(), h.map(<[u8; 32]>::try_from)) else {
+                continue;
+            };
             if best.is_none_or(|(n, _)| b > n) {
                 best = Some((b, h));
             }
