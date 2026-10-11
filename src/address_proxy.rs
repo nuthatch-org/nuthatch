@@ -171,19 +171,18 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
         }
     }
     if logs.len() > MAX_LOGS {
-        // Cut at a block boundary, so a caller restarting from the last block it was given
-        // moves on. A single block past the cap cannot be paged that way at all.
-        let cut = logs[MAX_LOGS].get("blockNumber").cloned();
-        logs.truncate(MAX_LOGS);
-        while logs.last().and_then(|l| l.get("blockNumber")).cloned() == cut {
-            logs.pop();
-        }
-        if logs.is_empty() {
+        // Exactly the first 1,000, mid-block if need be, as Etherscan answers: rotki continues only
+        // on a full page, from its last block, and drops what it already has, so a short page must
+        // only ever mean the range is done. A page that is one block with more behind it would be
+        // asked for again forever, so that is refused.
+        let block = |l: &Value| l.get("blockNumber").cloned();
+        if block(&logs[0]) == block(&logs[MAX_LOGS]) {
             return Ok(Answer::Unsupported(format!(
                 "block {} holds more than {MAX_LOGS} matching logs",
-                cut.unwrap_or(Value::Null)
+                block(&logs[0]).unwrap_or(Value::Null)
             )));
         }
+        logs.truncate(MAX_LOGS);
     }
 
     let mut paid: BTreeMap<String, (Value, Value)> = BTreeMap::new();
@@ -452,14 +451,14 @@ mod tests {
             ("fromBlock", "1"),
             ("toBlock", "9"),
         ]);
-        let mut blocks = vec![1; 600];
-        blocks.extend(vec![2; 600]);
+        // rotki continues only on a full page, from its last block, deduplicating; a short page
+        // means the range is done (rotki-v2 node_inquirer.py). So the page is exactly 1,000.
+        let mut blocks = vec![100; 999];
+        blocks.extend(vec![101; 2]);
         let cut = answer(&ask, 1, &dense(blocks)).await.unwrap();
-        assert_eq!(
-            cut["result"].as_array().unwrap().len(),
-            600,
-            "block 2 is left whole for the next page"
-        );
+        let rows = cut["result"].as_array().unwrap();
+        assert_eq!(rows.len(), 1_000, "a full page, so the caller asks again");
+        assert_eq!(rows[999]["blockNumber"], "0x65", "cut inside block 101");
         let one = answer(&ask, 1, &dense(vec![1; 1001])).await.unwrap();
         assert!(one["result"]
             .as_str()

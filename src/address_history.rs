@@ -1967,7 +1967,7 @@ pub fn respond(
         }
     }
     if let Some(hash) = get("txhash") {
-        return by_txhash(history, act, hash);
+        return by_txhash(history, act, hash, params);
     }
     if act == Action::MinedBlocks && get("blocktype").is_some_and(|t| t != "blocks") {
         return unsupported("getminedblocks is served for blocktype=blocks only");
@@ -2040,7 +2040,12 @@ fn block_no_by_time(
 
 /// A `txhash` lookup: every internal transaction of one transaction, from its cached trace. A
 /// transaction not traced yet answers unsupported here; the rotki-mode server traces it first.
-fn by_txhash(history: &AddressHistory, action: Action, hash: &str) -> Value {
+fn by_txhash(
+    history: &AddressHistory,
+    action: Action,
+    hash: &str,
+    params: &std::collections::HashMap<String, String>,
+) -> Value {
     if action != Action::TxListInternal {
         return unsupported(&format!("{} does not take a txhash", action.etherscan()));
     }
@@ -2052,19 +2057,49 @@ fn by_txhash(history: &AddressHistory, action: Action, hash: &str) -> Value {
         Some(k) => k,
         None => return error("Invalid txhash format"),
     };
+    // Paged as Etherscan pages it: a client walks `page` at a fixed `offset` until a short page.
+    let num = |k: &str, default: u64| -> Result<u64> {
+        match params.get(k).map(String::as_str).filter(|s| !s.is_empty()) {
+            None => Ok(default),
+            Some(s) => s.parse::<u64>().map_err(|_| anyhow!("invalid {k} `{s}`")),
+        }
+    };
+    let (page, offset) = match (num("page", 1), num("offset", MAX_OFFSET)) {
+        (Ok(p), Ok(o)) if p >= 1 && (1..=MAX_OFFSET).contains(&o) => (p, o),
+        (Err(e), _) | (_, Err(e)) => return error(e),
+        _ => {
+            return error(format!(
+                "page and offset start at 1; offset is at most {MAX_OFFSET}"
+            ))
+        }
+    };
+    let descending = match params.get("sort").map(String::as_str) {
+        None | Some("asc") => false,
+        Some("desc") => true,
+        Some(s) => return error(format!("invalid sort `{s}`")),
+    };
     match history.tx_internals(&key) {
-        Ok(Some(rows)) => ok(
-            Value::Array(
-                rows.into_iter()
-                    .map(|mut r| {
-                        // Etherscan's txhash form carries no traceId; rotki reads its absence as 0.
-                        r.remove("traceId");
-                        Value::Object(r)
-                    })
-                    .collect(),
-            ),
-            history.generation().unwrap_or(0),
-        ),
+        Ok(Some(mut rows)) => {
+            if descending {
+                rows.reverse();
+            }
+            let skip = usize::try_from((page - 1).saturating_mul(offset)).unwrap_or(usize::MAX);
+            let take = usize::try_from(offset).unwrap_or(usize::MAX);
+            ok(
+                Value::Array(
+                    rows.into_iter()
+                        .skip(skip)
+                        .take(take)
+                        .map(|mut r| {
+                            // Etherscan's txhash form carries no traceId; rotki reads its absence as 0.
+                            r.remove("traceId");
+                            Value::Object(r)
+                        })
+                        .collect(),
+                ),
+                history.generation().unwrap_or(0),
+            )
+        }
         Ok(None) => unsupported(&format!("{hash} has not been traced")),
         Err(e) => error(format!("{e:#}")),
     }
@@ -2996,6 +3031,65 @@ mod tests {
         );
         assert!(h.mev_pending().unwrap().is_empty());
         assert!(h.generation().unwrap() > g);
+    }
+
+    /// A txhash lookup is paged as Etherscan pages it, reverted frames included: 1,500 rows at an
+    /// offset of 1,000 come back as 1,000, then 500, then none, never a page repeated.
+    #[test]
+    fn a_txhash_lookup_honours_page_and_offset() {
+        let (_d, h) = history();
+        h.set_head(1_000).unwrap();
+        let key = vec![0xab; 32];
+        let rows: Vec<Map<String, Value>> = (0..1_500)
+            .map(|i| {
+                let mut r = Map::new();
+                r.insert("blockNumber".into(), Value::String("500".into()));
+                r.insert("nuthatchTraceIndex".into(), Value::String(i.to_string()));
+                r.insert("isError".into(), Value::String("1".into()));
+                r.insert("traceId".into(), Value::String("0_1".into()));
+                r
+            })
+            .collect();
+        h.persist_pending(
+            &[],
+            &[],
+            &[(key, 500, [9; 32], rows)],
+            &[],
+            h.generation().unwrap(),
+            Some(1_000),
+            true,
+        )
+        .unwrap();
+        let ask = |page: &str| {
+            respond(
+                Some(&h),
+                &params(&[
+                    ("module", "account"),
+                    ("action", "txlistinternal"),
+                    ("txhash", &format!("0x{}", "ab".repeat(32))),
+                    ("page", page),
+                    ("offset", "1000"),
+                ]),
+            )
+        };
+        let index = |v: &Value, i: usize| {
+            v["result"][i]["nuthatchTraceIndex"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let first = ask("1");
+        assert_eq!(first["result"].as_array().unwrap().len(), 1_000);
+        assert_eq!(index(&first, 0), "0");
+        assert!(first["result"][0].get("traceId").is_none());
+        let second = ask("2");
+        assert_eq!(second["result"].as_array().unwrap().len(), 500);
+        assert_eq!(index(&second, 0), "1000");
+        assert_eq!(
+            second["result"][0]["isError"], "1",
+            "reverted frames are served; the client filters"
+        );
+        assert_eq!(ask("3")["result"], serde_json::json!([]));
     }
 
     #[test]
