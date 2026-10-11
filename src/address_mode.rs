@@ -2835,15 +2835,29 @@ async fn search_by_time(
             latest.number, latest.ts
         )));
     }
-    let genesis = header(forward, at(0)).await?;
-    if t < genesis.ts {
-        return Ok(if after {
-            Ok((0, latest, vec![(0, genesis.hash)]))
+    // rotki ends a sync just behind the tip. Bracket that timestamp within the last eight blocks
+    // before searching the whole chain: a genesis-to-head search costs about 25 serial RPC reads
+    // on mainnet, which can exhaust the search budget before reaching an otherwise nearby answer.
+    // This only narrows the search; the same neighbour and ancestry checks still prove its answer.
+    let recent = latest.number.saturating_sub(8);
+    let lower = header(forward, at(recent)).await?;
+    let (mut lo, mut hi) = if t >= lower.ts {
+        (recent, latest.number)
+    } else {
+        let genesis = if recent == 0 {
+            lower
         } else {
-            Err(format!("timestamp {t} is before the first block"))
-        });
-    }
-    let (mut lo, mut hi) = (0, latest.number);
+            header(forward, at(0)).await?
+        };
+        if t < genesis.ts {
+            return Ok(if after {
+                Ok((0, latest, vec![(0, genesis.hash)]))
+            } else {
+                Err(format!("timestamp {t} is before the first block"))
+            });
+        }
+        (0, recent)
+    };
     while lo < hi {
         if after {
             let mid = lo + (hi - lo) / 2;
@@ -6676,6 +6690,46 @@ mod tests {
                 )
             })
         })
+    }
+
+    /// A recent timestamp is found within the four-second search budget on a mainnet-sized chain,
+    /// without assuming its block interval. Both boundaries remain exact and a broken link refuses.
+    #[tokio::test]
+    async fn a_recent_timestamp_is_searched_near_the_head() {
+        let head = 26_000_000;
+        for (timestamp, after, expected) in [
+            (1000 + 12 * (head - 2) + 5, false, head - 2),
+            (1000 + 12 * (head - 2) + 5, true, head - 1),
+            (1000 + 12 * (head - 2), false, head - 2),
+            (1000 + 12 * (head - 2), true, head - 2),
+        ] {
+            let reads = Arc::new(AtomicU64::new(0));
+            let counted = reads.clone();
+            let chain = timed(head, None);
+            let forward: crate::address_proxy::Forward = Arc::new(move |m, p| {
+                let (chain, counted) = (chain.clone(), counted.clone());
+                Box::pin(async move {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    chain(m, p).await
+                })
+            });
+            let result = tokio::time::timeout(Duration::from_secs(4), async {
+                let (block, latest, proof) = search_by_time(&forward, timestamp, after)
+                    .await?
+                    .map_err(anyhow::Error::msg)?;
+                assert_eq!(block, expected);
+                assert!(descends(&forward, block, latest, &proof).await?);
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            assert!(matches!(result, Ok(Ok(()))), "{result:?}");
+            assert!(reads.load(Ordering::Relaxed) <= 10);
+        }
+        let broken = timed(head, Some(head - 1));
+        assert!(search_by_time(&broken, 1000 + 12 * (head - 2) + 5, false)
+            .await
+            .is_err());
     }
 
     /// An answer above the finalized head stands only if parent hashes link it to the head the
