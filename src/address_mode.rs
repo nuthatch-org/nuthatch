@@ -104,7 +104,13 @@ pub struct ModeState {
     pub validators: Option<crate::address_validators::Validators>,
     /// Where proposer catalogue spans the mirror lacks are built from, when `beacon_url` names one.
     pub beacon: Option<Arc<crate::address_proposers::Beacon>>,
+    /// The chain's hash at a height, read for a request without the cursor: one hash check lets a
+    /// covered answer above the finalized head be served without waiting behind the cursor's work.
+    pub hash_at: Option<HashAt>,
 }
+
+pub type HashAt =
+    Arc<dyn Fn(u64) -> futures::future::BoxFuture<'static, Result<[u8; 32]>> + Send + Sync>;
 
 /// How many `logs/getLogs` requests may run at once; one more answers incomplete at once.
 const LOGS_AT_ONCE: usize = 2;
@@ -208,6 +214,7 @@ impl ModeState {
             logs: tokio::sync::Semaphore::new(LOGS_AT_ONCE),
             validators: None,
             beacon: None,
+            hash_at: None,
         }
     }
 
@@ -251,6 +258,11 @@ impl ModeState {
     /// follow `start_block`, which bounds account history: the catalogue costs no RPC to read.
     pub fn proposals_from(&self) -> u64 {
         crate::address_proposers::CATALOGUE_FROM_BLOCK
+    }
+
+    pub fn with_hash_at(mut self, hash_at: HashAt) -> Self {
+        self.hash_at = Some(hash_at);
+        self
     }
 
     pub fn with_relays(mut self, relays: crate::address_mev::Relays) -> Self {
@@ -2121,6 +2133,18 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
         match wanted(&s, &q, &answer).await {
             Want::Serve => return Json(answer),
             Want::Cover(w) => {
+                // Rows already cover the range: only a reorg could change them, and the lowest
+                // tracked hash at or above its end standing proves nothing under it moved.
+                if w.1 != Need::Produced && answer["status"] == "1" {
+                    match stands(&s, w.3, &answer).await {
+                        Some(true) => return Json(answer),
+                        Some(false) => {
+                            answer = respond(&s, &q).await;
+                            continue;
+                        }
+                        None => {}
+                    }
+                }
                 want = Some(w);
                 break;
             }
@@ -2199,6 +2223,28 @@ async fn validator_blocks(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Va
     tokio::task::spawn_blocking(move || crate::address_validators::respond(&validators, from, &q))
         .await
         .unwrap_or_else(|e| crate::address_history::incomplete(&format!("{e}")))
+}
+
+/// Whether the covered rows of `answer`, which reach block `to` above the finalized head, still
+/// stand: the lowest tracked hash at or above `to` matches the chain, and nothing was written since
+/// the answer was read. `Some(false)`: written since, read it again. `None`: ask the cursor.
+async fn stands(s: &Arc<ModeState>, to: u64, answer: &Value) -> Option<bool> {
+    let hash_at = s.hash_at.clone()?;
+    let read_at = answer["generation"].as_str()?.parse::<u64>().ok()?;
+    let (b, h) = blocking(s, move |h| {
+        Ok(h.tracked()?.into_iter().find(|(b, _)| *b >= to))
+    })
+    .await
+    .ok()??;
+    let now = tokio::time::timeout(s.deadline, hash_at(b))
+        .await
+        .ok()?
+        .ok()?;
+    if now != h {
+        return None;
+    }
+    let generation = blocking(s, |h| h.generation()).await.ok()?;
+    Some(generation == read_at)
 }
 
 async fn respond(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value {
@@ -2944,7 +2990,21 @@ pub async fn dev(
         )
         .with_deadline(ah.request_deadline()?)
         .with_forward(forward(discovery.clone(), verified.clone()))
-        .with_counter(counter(discovery.clone()));
+        .with_counter(counter(discovery.clone()))
+        .with_hash_at({
+            let d = discovery.clone();
+            let verified = verified.clone();
+            Arc::new(move |b: u64| {
+                let (d, verified) = (d.clone(), verified.clone());
+                Box::pin(async move {
+                    // Not before the cursor has checked the RPC's chain.
+                    if verified.get().is_none() {
+                        bail!("the RPC's chain is not checked yet");
+                    }
+                    block_hash(&d.main, b).await
+                })
+            })
+        });
     if ah.mev_relays {
         if chain_id != 1 {
             bail!("[address_history] mev_relays is for Ethereum mainnet's relays; this nest is on chain {chain_id}");
@@ -3511,6 +3571,75 @@ mod tests {
                 assert_eq!(n.as_deref(), Some("25700000"), "{action}{start}: {v}");
             }
         }
+    }
+
+    /// A covered range above the finalized head is served after one hash check, without waiting
+    /// for the cursor (none runs here); a moved hash sends it to the cursor, which cannot answer
+    /// within the deadline, so it is refused.
+    #[tokio::test]
+    async fn a_covered_range_above_finality_answers_on_one_hash_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(100).unwrap();
+        let mut record = serde_json::Map::new();
+        record.insert("blockNumber".into(), json!("150"));
+        record.insert("hash".into(), json!("0x01"));
+        let rows = vec![crate::address_history::Row {
+            block: 150,
+            tx_index: 0,
+            position: 0,
+            record,
+        }];
+        let g = history.generation().unwrap();
+        history
+            .record_anchored(
+                crate::address_history::Action::TxList,
+                &ALICE.to_lowercase(),
+                &rows,
+                (0, 200),
+                g,
+                Some((200, [7; 32])),
+            )
+            .unwrap();
+        let asked = Arc::new(AtomicU64::new(0));
+        let make = |hash: [u8; 32]| -> HashAt {
+            let asked = asked.clone();
+            Arc::new(move |_| {
+                asked.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move { Ok(hash) })
+            })
+        };
+        let path =
+            format!("/api?module=account&action=txlist&address={ALICE}&startblock=0&endblock=180");
+        let s = Arc::new(
+            ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_millis(300))
+                .with_hash_at(make([7; 32])),
+        );
+        let started = Instant::now();
+        let (_, v) = call(router(s), "GET", &path, None).await;
+        assert_eq!(v["status"], "1", "{v}");
+        assert_eq!(v["result"][0]["blockNumber"], "150");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), 1, "one hash check");
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_millis(300))
+                .with_hash_at(make([8; 32])),
+        );
+        let (_, v) = call(router(s), "GET", &path, None).await;
+        assert!(
+            v["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_INCOMPLETE"),
+            "{v}"
+        );
     }
 
     /// A conflict found while a request is being answered refuses that answer too.
