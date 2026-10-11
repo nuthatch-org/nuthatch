@@ -72,11 +72,25 @@ impl std::error::Error for NotFinalized {}
 /// One JSON-RPC endpoint pool.
 pub trait Rpc: Send + Sync + 'static {
     fn call(&self, method: &str, params: Value) -> impl Future<Output = Result<Value>> + Send;
+
+    /// The same call asked of every endpoint behind this one, for a question whose answer must hold
+    /// at all of them; one endpoint answers once.
+    fn call_each(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> impl Future<Output = Result<Vec<Value>>> + Send {
+        async move { Ok(vec![self.call(method, params).await?]) }
+    }
 }
 
 impl Rpc for crate::rpc::RpcClient {
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         crate::rpc::RpcClient::call(self, method, params).await
+    }
+
+    async fn call_each(&self, method: &str, params: Value) -> Result<Vec<Value>> {
+        crate::rpc::RpcClient::call_each(self, method, params).await
     }
 }
 
@@ -112,6 +126,19 @@ impl<R: Rpc> Rpc for Counted<R> {
             .entry(method.to_string())
             .or_default() += 1;
         self.inner.call(method, params).await
+    }
+
+    async fn call_each(&self, method: &str, params: Value) -> Result<Vec<Value>> {
+        let answers = self.inner.call_each(method, params).await;
+        if let Ok(a) = &answers {
+            *self
+                .calls
+                .lock()
+                .expect("calls lock")
+                .entry(method.to_string())
+                .or_default() += a.len() as u64;
+        }
+        answers
     }
 }
 

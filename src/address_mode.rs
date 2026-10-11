@@ -414,18 +414,30 @@ pub async fn check_anchor<M: Rpc, T: Rpc>(
     Ok(())
 }
 
-/// Fail a fetch whose trace endpoint is not on the main endpoint's chain at `block`: a trace source
-/// on another fork, or behind, would answer an empty range that the main chain does not have.
+/// Fail a fetch unless every main and trace endpoint is on one chain at `block`: a trace source on
+/// another fork, or behind, would answer an empty range the main chain does not have, and a pool
+/// rotates its calls across its endpoints, so all of them must agree, not the one that was asked.
 async fn same_chain_at<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     block: u64,
 ) -> Result<()> {
-    let (main, trace) = (
-        block_hash(&d.main, block).await?,
-        block_hash(&d.trace, block).await?,
-    );
-    if main != trace {
-        bail!("the trace endpoint is on another chain than the main endpoint at block {block}");
+    let params = json!([format!("0x{block:x}"), false]);
+    let main = d
+        .main
+        .call_each("eth_getBlockByNumber", params.clone())
+        .await?;
+    let trace = d.trace.call_each("eth_getBlockByNumber", params).await?;
+    let hashes: std::collections::BTreeSet<Option<String>> = main
+        .iter()
+        .chain(&trace)
+        .map(|b| {
+            b.get("hash")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase)
+        })
+        .collect();
+    if hashes.len() != 1 || hashes.contains(&None) {
+        bail!("the main and trace endpoints are not all on one chain at block {block}");
     }
     Ok(())
 }
@@ -1221,10 +1233,24 @@ async fn api(
             }
         }
     }
-    let answer = respond(&s, &q).await;
-    // An explicit end above what is covered is covered now, up to the chain head, or refused.
-    let Some(want) = wanted(&s, &q, &answer).await else {
-        return Json(answer);
+    // An answer is served only under the generation it was read in: a reorg taken back between the
+    // read and the checks below would otherwise let the replaced rows out.
+    let mut answer = respond(&s, &q).await;
+    let mut want = None;
+    for _ in 0..3 {
+        match wanted(&s, &q, &answer).await {
+            Want::Serve => return Json(answer),
+            Want::Cover(w) => {
+                want = Some(w);
+                break;
+            }
+            Want::Reread => answer = respond(&s, &q).await,
+        }
+    }
+    let Some(want) = want else {
+        return Json(crate::address_history::incomplete(
+            "the history changed while it was being read; ask again",
+        ));
     };
     match s
         .ask(|deadline, reply| Request::Cover {
@@ -1262,54 +1288,80 @@ async fn respond(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value {
 /// address and a start the configured range allows, and either an answer that is incomplete for an
 /// explicit `endblock`, or one reaching above the finalized head, which is checked against the chain
 /// before it is served.
-async fn wanted(
-    s: &Arc<ModeState>,
-    q: &HashMap<String, String>,
-    answer: &Value,
-) -> Option<(String, Need, u64, u64)> {
+/// What to do with an account answer once read.
+enum Want {
+    /// Serve it as it is.
+    Serve,
+    /// Have the cursor cover (and check) this, then read again.
+    Cover((String, Need, u64, u64)),
+    /// The history changed since it was read: read again.
+    Reread,
+}
+
+async fn wanted(s: &Arc<ModeState>, q: &HashMap<String, String>, answer: &Value) -> Want {
     use crate::address_history::Action;
-    if q.get("module").map(String::as_str) != Some("account") || q.contains_key("txhash") {
-        return None;
-    }
-    let incomplete = answer["result"]
-        .as_str()
-        .is_some_and(|r| r.starts_with("NUTHATCH_INCOMPLETE:"));
     let rows = answer["status"] == "1";
-    if !incomplete && !rows {
-        return None;
-    }
-    let action = Action::from_etherscan(q.get("action")?)?;
-    let address = crate::address_history::parse_address(q.get("address")?).ok()?;
-    let address = format!("0x{}", alloy_primitives::hex::encode(address));
-    let from = q
-        .get("startblock")
-        .map_or(Some(0), |f| f.parse::<u64>().ok())?
-        .max(s.start_block);
-    let explicit = match q.get("endblock") {
-        Some(e) => Some(e.parse::<u64>().ok()?),
-        None => None,
+    let read_at = answer["generation"]
+        .as_str()
+        .and_then(|g| g.parse::<u64>().ok());
+    let decided = async {
+        if q.get("module").map(String::as_str) != Some("account") || q.contains_key("txhash") {
+            return None;
+        }
+        let incomplete = answer["result"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("NUTHATCH_INCOMPLETE:"));
+        if !incomplete && !rows {
+            return None;
+        }
+        let action = Action::from_etherscan(q.get("action")?)?;
+        let address = crate::address_history::parse_address(q.get("address")?).ok()?;
+        let address = format!("0x{}", alloy_primitives::hex::encode(address));
+        let from = q
+            .get("startblock")
+            .map_or(Some(0), |f| f.parse::<u64>().ok())?
+            .max(s.start_block);
+        let explicit = match q.get("endblock") {
+            Some(e) => Some(e.parse::<u64>().ok()?),
+            None => None,
+        };
+        let who = address.clone();
+        let (watched, head, covered, generation) = blocking(s, move |h| {
+            let covered = h
+                .coverage(action, &who)?
+                .into_iter()
+                .find(|(f, t)| *f <= from && from <= *t)
+                .map(|(_, t)| t);
+            Ok((
+                h.watched()?.contains(&who),
+                h.head()?.unwrap_or(0),
+                covered,
+                h.generation()?,
+            ))
+        })
+        .await
+        .ok()?;
+        if rows && read_at != Some(generation) {
+            return Some(Want::Reread);
+        }
+        if !watched {
+            return None;
+        }
+        let to = match (explicit, incomplete) {
+            (Some(e), _) => e,
+            // Without an end, an incomplete answer is a start nobody has covered; the backfill gets
+            // to it.
+            (None, true) => return None,
+            (None, false) => covered?,
+        };
+        (to >= from && (incomplete || to > head)).then_some(Want::Cover((
+            address,
+            Need::of(action),
+            from,
+            to,
+        )))
     };
-    let who = address.clone();
-    let (watched, head, covered) = blocking(s, move |h| {
-        let covered = h
-            .coverage(action, &who)?
-            .into_iter()
-            .find(|(f, t)| *f <= from && from <= *t)
-            .map(|(_, t)| t);
-        Ok((h.watched()?.contains(&who), h.head()?.unwrap_or(0), covered))
-    })
-    .await
-    .ok()?;
-    if !watched {
-        return None;
-    }
-    let to = match (explicit, incomplete) {
-        (Some(e), _) => e,
-        // Without an end, an incomplete answer is a start nobody has covered; the backfill gets to it.
-        (None, true) => return None,
-        (None, false) => covered?,
-    };
-    (to >= from && (incomplete || to > head)).then_some((address, Need::of(action), from, to))
+    decided.await.unwrap_or(Want::Serve)
 }
 
 /// `block/getblocknobytime`: from verified headers where they bracket the timestamp, else searched
@@ -2918,11 +2970,61 @@ mod tests {
         let trace = other.discoverer().main;
         let d = Discoverer::new(main, trace);
         let err = same_chain_at(&d, 119).await.unwrap_err();
-        assert!(err.to_string().contains("another chain"), "{err:#}");
+        assert!(err.to_string().contains("not all on one chain"), "{err:#}");
         assert!(
             same_chain_at(&d, 99).await.is_ok(),
             "below the fork they agree"
         );
+    }
+
+    /// A pool rotates calls across its endpoints, so every endpoint must be on one chain, not only
+    /// the one a single call reached.
+    #[tokio::test]
+    async fn every_endpoint_in_a_pool_must_agree() {
+        struct Pool(Vec<&'static str>);
+        impl Rpc for Pool {
+            async fn call(&self, _: &str, _: Value) -> Result<Value> {
+                Ok(json!({"hash": self.0[0]}))
+            }
+            async fn call_each(&self, _: &str, _: Value) -> Result<Vec<Value>> {
+                Ok(self.0.iter().map(|h| json!({"hash": h})).collect())
+            }
+        }
+        let agree = Discoverer::new(
+            Counted::new(Pool(vec!["0xb"])),
+            Counted::new(Pool(vec!["0xb", "0xb"])),
+        );
+        assert!(same_chain_at(&agree, 7).await.is_ok());
+        let split = Discoverer::new(
+            Counted::new(Pool(vec!["0xb"])),
+            Counted::new(Pool(vec!["0xb", "0xa"])),
+        );
+        assert!(same_chain_at(&split, 7).await.is_err());
+    }
+
+    /// An answer read before a reorg was taken back is read again, not served.
+    #[tokio::test]
+    async fn an_answer_from_a_moved_generation_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        let chain = Chain::new(100, 70);
+        let d = chain.discoverer();
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        cover_from(&chain, &s.history, 0, 60);
+        let q: HashMap<String, String> = [
+            ("module", "account"),
+            ("action", "txlist"),
+            ("address", ALICE),
+            ("startblock", "0"),
+            ("endblock", "60"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let answer = respond(&s, &q).await;
+        assert!(matches!(wanted(&s, &q, &answer).await, Want::Serve));
+        s.history.invalidate_above(80).unwrap();
+        assert!(matches!(wanted(&s, &q, &answer).await, Want::Reread));
     }
 
     /// A tracked block under the committed finalized head, now at another hash, is not rewritten:
@@ -3055,7 +3157,8 @@ mod tests {
         let reads = Arc::new(AtomicU64::new(0));
         let n = reads.clone();
         let inner = timed(100, None);
-        // After the search, block 51 is served at another hash, still linked to its neighbours.
+        // After the search, block 51 is served at another hash and block 52 names it as parent: a
+        // chain as consistent as the one searched, so only the searched headers can tell them apart.
         let forward: crate::address_proxy::Forward = Arc::new(move |m: String, p: Value| {
             let (inner, n) = (inner.clone(), n.clone());
             Box::pin(async move {
@@ -3063,6 +3166,9 @@ mod tests {
                 let calls = n.fetch_add(1, Ordering::Relaxed);
                 if calls > 40 && h["number"] == "0x33" {
                     h["hash"] = json!(format!("0x{:064x}", 777));
+                }
+                if calls > 40 && h["number"] == "0x34" {
+                    h["parentHash"] = json!(format!("0x{:064x}", 777));
                 }
                 Ok(h)
             })

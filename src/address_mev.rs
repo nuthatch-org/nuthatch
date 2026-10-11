@@ -81,30 +81,39 @@ pub fn relays_over_http() -> Result<Relays> {
     }))
 }
 
-/// Every relay's deliveries for `block`, from the cache or asked now (always now when `fresh`). A
-/// relay that cannot be asked fails the lookup: a missing answer is not an absent delivery. Only a
-/// finalized block's answer is cached.
+/// Every relay's deliveries for `block`, from the cache or asked now. A relay that cannot be asked
+/// fails the lookup: a missing answer is not an absent delivery. Only a finalized block's answer is
+/// cached.
 async fn relay_record(
     history: &AddressHistory,
     relays: &Relays,
     block: u64,
-    fresh: bool,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Map<String, Value>> {
-    if !fresh {
-        if let Some(r) = history.relay_record(block)? {
-            return Ok(r);
-        }
+    if let Some(r) = history.relay_record(block)? {
+        return Ok(r);
     }
-    let record = ask_relays(relays, block).await?;
+    let record = ask_relays(relays, block, deadline).await?;
     history.cache_relay_record(block, &record)?;
     Ok(record)
 }
 
-/// Every relay's deliveries for `block`, asked now and kept nowhere.
-async fn ask_relays(relays: &Relays, block: u64) -> Result<Map<String, Value>> {
+/// Every relay's deliveries for `block`, asked now and kept nowhere, each ask within `deadline`.
+async fn ask_relays(
+    relays: &Relays,
+    block: u64,
+    deadline: Option<std::time::Instant>,
+) -> Result<Map<String, Value>> {
     let mut delivered = Vec::new();
     for (name, _) in RELAYS {
-        for trace in relays(name, block).await? {
+        let ask = relays(name, block);
+        let traces = match deadline {
+            None => ask.await?,
+            Some(d) => tokio::time::timeout_at(d.into(), ask)
+                .await
+                .map_err(|_| anyhow!("not covered within the deadline; try again shortly"))??,
+        };
+        for trace in traces {
             if trace.get("block_number").and_then(Value::as_str) != Some(block.to_string().as_str())
             {
                 continue;
@@ -259,7 +268,7 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
         }
         let record = match asked.and_then(|m| m.get(&b)) {
             Some(r) => r.clone(),
-            None => relay_record(history, relays, b, false).await?,
+            None => relay_record(history, relays, b, deadline).await?,
         };
         let found = delivery(&record, &hash, &a);
         if found.is_none() {
@@ -431,7 +440,7 @@ pub async fn reask_pass<M: Rpc, T: Rpc>(
     let more = due.len() > REASK_BATCH;
     for (block, first) in due.into_iter().take(REASK_BATCH) {
         let generation = history.generation()?;
-        let record = ask_relays(relays, block).await?;
+        let record = ask_relays(relays, block, None).await?;
         let asked = BTreeMap::from([(block, record.clone())]);
         let mut changes = Vec::new();
         let mut unrecorded = false;
@@ -657,14 +666,14 @@ mod tests {
                 Ok(vec![])
             })
         });
-        assert!(relay_record(&h, &down, 100, false).await.is_err());
+        assert!(relay_record(&h, &down, 100, None).await.is_err());
         assert!(h.relay_record(100).unwrap().is_none());
 
         // A block past what the nest serves is asked about but not kept: a relay may yet learn
         // of it.
         let (rel, asked) = relays(vec![]);
-        relay_record(&h, &rel, 2_000, false).await.unwrap();
-        relay_record(&h, &rel, 2_000, false).await.unwrap();
+        relay_record(&h, &rel, 2_000, None).await.unwrap();
+        relay_record(&h, &rel, 2_000, None).await.unwrap();
         assert_eq!(*asked.lock().unwrap(), 2 * 6);
         assert!(h.relay_record(2_000).unwrap().is_none());
     }

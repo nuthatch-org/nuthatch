@@ -1355,6 +1355,20 @@ impl RpcClient {
             .ok_or_else(|| anyhow!("rpc response had no result"))
     }
 
+    /// One call asked of every endpoint in the pool, fallbacks included, in order. Any endpoint that
+    /// cannot answer fails the whole: the question is one whose answer must hold at all of them.
+    pub(crate) async fn call_each(&self, method: &str, params: Value) -> Result<Vec<Value>> {
+        let mut answers = Vec::with_capacity(self.urls.len());
+        for url in &self.urls {
+            answers.push(
+                self.call_one(url, method, &params, None)
+                    .await
+                    .with_context(|| format!("{method} at {}", redact_url(url)))?,
+            );
+        }
+        Ok(answers)
+    }
+
     pub async fn block_number(&self) -> Result<u64> {
         let (result, j) = self
             .call_holding("eth_blockNumber", json!([]), None)
