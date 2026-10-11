@@ -80,6 +80,9 @@ pub struct ModeState {
     discovery_errors: AtomicU64,
     /// Forwards `proxy` and `logs` requests to the nest's RPC.
     pub forward: Option<crate::address_proxy::Forward>,
+    /// Reads the RPC counters as they stand, so calls forwarded for a request show at once rather
+    /// than when the cursor next reports.
+    counter: Option<Counter>,
     /// The MEV-Boost relays, when `mev_relays` turns them on.
     pub relays: Option<crate::address_mev::Relays>,
     /// Verified block partitions, and the blocks `[address_history.mirror]` takes from them.
@@ -179,6 +182,7 @@ impl ModeState {
             end_block: None,
             wake: tokio::sync::Notify::new(),
             cursor_error: Mutex::new(None),
+            counter: None,
             conflict: Mutex::new(None),
             sample: AtomicU64::new(0),
             calls: Mutex::new(BTreeMap::new()),
@@ -228,6 +232,11 @@ impl ModeState {
 
     pub fn with_forward(mut self, forward: crate::address_proxy::Forward) -> Self {
         self.forward = Some(forward);
+        self
+    }
+
+    pub fn with_counter(mut self, counter: Counter) -> Self {
+        self.counter = Some(counter);
         self
     }
 
@@ -1850,6 +1859,11 @@ async fn ready(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
 }
 
 async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
+    if let Some(counter) = &s.counter {
+        for (endpoint, calls) in counter() {
+            s.set_calls(endpoint, calls);
+        }
+    }
     let (head, watched) = match blocking(&s, |h| Ok((h.head()?, h.watched()?.len()))).await {
         Ok((head, watched)) => (head.unwrap_or(0), watched),
         Err(e) => {
@@ -1903,6 +1917,19 @@ async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
         )],
         body,
     )
+}
+
+/// Each endpoint role's calls by method, read live.
+pub type Counter = Arc<dyn Fn() -> Vec<(&'static str, BTreeMap<String, u64>)> + Send + Sync>;
+
+/// The live [`Counter`] over `discovery`'s endpoints.
+pub fn counter<M: Rpc, T: Rpc>(discovery: Arc<Discoverer<Counted<M>, Counted<T>>>) -> Counter {
+    Arc::new(move || {
+        vec![
+            ("main", discovery.main.calls()),
+            ("trace", discovery.trace.calls()),
+        ]
+    })
 }
 
 /// Forwards a `proxy` or `logs` call to the nest's main RPC, once `verified` says it is on the
@@ -2019,7 +2046,8 @@ pub async fn dev(
             depth,
         )
         .with_deadline(ah.request_deadline()?)
-        .with_forward(forward(discovery.clone(), verified.clone()));
+        .with_forward(forward(discovery.clone(), verified.clone()))
+        .with_counter(counter(discovery.clone()));
     if ah.mev_relays {
         if chain_id != 1 {
             bail!("[address_history] mev_relays is for Ethereum mainnet's relays; this nest is on chain {chain_id}");
@@ -2239,6 +2267,36 @@ mod tests {
 
     /// The counter is the source's own request count, so a read that failed over to a second
     /// endpoint shows as two requests, not one poll.
+    #[tokio::test]
+    async fn forwarded_calls_show_in_the_metrics_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Chain::new(10, 5);
+        let d = Arc::new(chain.discoverer());
+        let s = Arc::new(
+            ModeState::new(
+                state(dir.path(), true).history.clone(),
+                1,
+                Duration::from_secs(300),
+                true,
+            )
+            .with_counter(counter(d.clone())),
+        );
+        // A forwarded request's calls, with no cursor to report them.
+        for _ in 0..4 {
+            d.main.call("eth_blockNumber", json!([])).await.unwrap();
+        }
+        let (_, m) = call(router(s), "GET", "/metrics", None).await;
+        let m = m.as_str().unwrap().to_string();
+        assert!(
+            m.contains("nuthatch_address_history_rpc_requests_total 4\n"),
+            "{m}"
+        );
+        assert!(
+            m.contains("{endpoint=\"main\",method=\"eth_blockNumber\"} 4"),
+            "{m}"
+        );
+    }
+
     #[tokio::test]
     async fn metrics_count_requests_not_polls() {
         let dir = tempfile::tempdir().unwrap();
