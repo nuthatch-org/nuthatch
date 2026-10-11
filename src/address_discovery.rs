@@ -477,6 +477,10 @@ impl Pending {
             .push((block, hash));
     }
 
+    pub fn anchors(&self) -> Vec<(u64, [u8; 32])> {
+        self.anchors.lock().expect("pending lock").clone()
+    }
+
     /// Commit what was fetched, as of `generation`. Blocking: call it off the async workers.
     pub fn persist(self, history: &AddressHistory, generation: u64) -> Result<()> {
         history.persist_pending(
@@ -3088,9 +3092,14 @@ mod tests {
         ]);
         let latest = std::sync::Arc::new(AtomicU64::new(299));
         let head = latest.clone();
+        // The main endpoint's block 300; a trace naming another hash for it is of a fork.
+        let canonical = std::sync::Arc::new(Mutex::new(block_hash.clone()));
+        let main_300 = canonical.clone();
         let main = script(move |m, _| match m {
             "eth_blockNumber" => Ok(json!(format!("0x{:x}", head.load(Ordering::Relaxed)))),
-            "eth_getBlockByNumber" => Ok(json!({"timestamp": "0x10"})),
+            "eth_getBlockByNumber" => {
+                Ok(json!({"timestamp": "0x10", "hash": main_300.lock().unwrap().clone()}))
+            }
             other => bail!("unexpected {other}"),
         });
         let trace = script(move |m, _| match m {
@@ -3155,6 +3164,21 @@ mod tests {
         assert!(h.tx_internals(&key).unwrap().is_none());
 
         latest.store(400, Ordering::Relaxed);
+        // The trace endpoint is still on a fork the main endpoint has left.
+        *canonical.lock().unwrap() = format!("0x{}", "cd".repeat(32));
+        let forked = get(path("")).await;
+        assert!(
+            forked["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_INCOMPLETE:"),
+            "{forked}"
+        );
+        assert!(
+            h.tx_internals(&key).unwrap().is_none(),
+            "a forked trace is not kept"
+        );
+        *canonical.lock().unwrap() = block_hash.clone();
         let first = get(path("")).await;
         assert_eq!(first["result"][0]["value"], "9", "{first}");
         assert_eq!(

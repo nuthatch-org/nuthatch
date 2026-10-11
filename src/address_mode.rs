@@ -88,6 +88,11 @@ pub struct ModeState {
     latest: AtomicU64,
 }
 
+/// Blocks one on-demand discovery window covers, and one body window: small enough that a window
+/// started near a request's deadline does not hold the cursor long past it.
+const COVER_WINDOW: u64 = 5_000;
+const COVER_BODIES: u64 = 500;
+
 /// The address-history store's page cache.
 const STORE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -356,26 +361,42 @@ async fn block_hash(rpc: &impl Rpc, block: u64) -> Result<[u8; 32]> {
     crate::address_discovery::word32(hash)
 }
 
-/// The anchor for a fetch ending at `to`: its hash, if `to` is above the finalized head.
+/// What a fetch reaching above the finalized head is read against: the hash of its last block, and
+/// the newest tracked hash under it. Both must still be canonical when the fetch ends, which is what
+/// makes them one chain: a window recorded on a fork that replaced the tracked block would otherwise
+/// hide that block behind a newer anchor that matches.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Anchor {
+    pub at: Option<(u64, [u8; 32])>,
+    prior: Option<(u64, [u8; 32])>,
+}
+
+/// The anchor for a fetch ending at `to`, if `to` is above the finalized head.
 pub async fn anchor_for<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     history: &AddressHistory,
     to: u64,
-) -> Result<Option<(u64, [u8; 32])>> {
+) -> Result<Anchor> {
     if history.head()?.is_some_and(|h| to <= h) {
-        return Ok(None);
+        return Ok(Anchor::default());
     }
-    Ok(Some((to, block_hash(&d.main, to).await?)))
+    let prior = history.tracked()?.into_iter().rev().find(|(b, _)| *b < to);
+    Ok(Anchor {
+        at: Some((to, block_hash(&d.main, to).await?)),
+        prior,
+    })
 }
 
-/// Fail a fetch whose anchor block changed hash while it ran.
+/// Fail a fetch if any block it was read against is no longer canonical on the main endpoint: its
+/// anchor, the tracked hash under it, and every block hash it took from the trace endpoint.
 pub async fn check_anchor<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
-    anchor: Option<(u64, [u8; 32])>,
+    anchor: Anchor,
+    read: &[(u64, [u8; 32])],
 ) -> Result<()> {
-    if let Some((block, hash)) = anchor {
-        if block_hash(&d.main, block).await? != hash {
-            bail!("block {block} was reorganised during the fetch");
+    for (block, hash) in anchor.at.iter().chain(&anchor.prior).chain(read) {
+        if block_hash(&d.main, *block).await? != *hash {
+            bail!("block {block} is no longer the one this was read against; a reorg is under way");
         }
     }
     Ok(())
@@ -391,13 +412,13 @@ async fn discover_window<M: Rpc, T: Rpc>(
     let generation = state.history.generation()?;
     let anchor = anchor_for(d, &state.history, end).await?;
     let pending = crate::address_discovery::Pending::default();
-    if let Some((b, h)) = anchor {
+    if let Some((b, h)) = anchor.at {
         pending.anchor(b, h);
     }
     let found = d
         .discover(&state.history, address, next, end, &pending)
         .await;
-    let checked = check_anchor(d, anchor).await;
+    let checked = check_anchor(d, anchor, &pending.anchors()).await;
     // What was fetched is kept even when the window fails, so its retry refetches only what it
     // still lacks; but nothing above the finalized head is kept from a window whose anchor moved.
     let cached_as = if checked.is_ok() {
@@ -416,7 +437,7 @@ async fn discover_window<M: Rpc, T: Rpc>(
             (next, end),
             found?,
             generation,
-            anchor,
+            anchor.at,
         )
     })
     .await?;
@@ -437,11 +458,11 @@ async fn body_window<M: Rpc, T: Rpc>(
     let generation = state.history.generation()?;
     let anchor = anchor_for(d, &state.history, end).await?;
     let pending = crate::address_discovery::Pending::default();
-    if let Some((b, h)) = anchor {
+    if let Some((b, h)) = anchor.at {
         pending.anchor(b, h);
     }
     let found = d.scan_blocks(&addresses, from, end, &pending).await;
-    let checked = check_anchor(d, anchor).await;
+    let checked = check_anchor(d, anchor, &pending.anchors()).await;
     let cached_as = if checked.is_ok() {
         generation
     } else {
@@ -454,7 +475,7 @@ async fn body_window<M: Rpc, T: Rpc>(
         let mut found = found?;
         for a in addresses {
             let f = found.remove(&a.to_ascii_lowercase()).unwrap_or_default();
-            record_blocks_anchored(&history, &a, (from, end), f, generation, false, anchor)?;
+            record_blocks_anchored(&history, &a, (from, end), f, generation, false, anchor.at)?;
         }
         Ok::<_, anyhow::Error>(())
     })
@@ -620,40 +641,8 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             Ok(f) if f <= latest => f,
             _ => by_depth,
         };
-        let history = state.history.clone();
-        let tracked = {
-            let h = history.clone();
-            tokio::task::spawn_blocking(move || h.tracked()).await??
-        };
-        // The highest tracked block the RPC has reached anchors every one under it.
-        if let Some(&(top, hash)) = tracked.iter().rev().find(|(b, _)| *b <= latest) {
-            if block_hash(&self.main, top).await? != hash {
-                let mut base = history.head()?.unwrap_or(0);
-                let mut lowest_moved = top;
-                for &(b, h) in tracked.iter().rev().filter(|(b, _)| *b <= top) {
-                    if block_hash(&self.main, b).await? == h {
-                        base = b;
-                        break;
-                    }
-                    lowest_moved = b;
-                }
-                if lowest_moved <= finalized {
-                    let why = format!(
-                        "block {lowest_moved} was read at one hash and is now finalized at another; \
-                         history under the finalized head is never rewritten, so this needs an operator"
-                    );
-                    state.stop(why.clone());
-                    bail!(why);
-                }
-                tracing::warn!(
-                    "address history: a reorg replaced blocks above {base}; taking back what was read there"
-                );
-                let h = history.clone();
-                tokio::task::spawn_blocking(move || h.invalidate_above(base)).await??;
-            }
-        }
-        state.set_calls("main", self.main.calls());
-        let h = history.clone();
+        self.check_tracked(state, latest).await?;
+        let h = state.history.clone();
         tokio::task::spawn_blocking(move || h.finalize(finalized)).await??;
         Ok(finalized)
     }
@@ -692,8 +681,56 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
 }
 
 impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
-    /// Cover `[from, to]` of `address` for `need`, holes included, a window at a time, stopping at
+    /// Compare the newest tracked hash the RPC has reached with the RPC's, and on a mismatch take back
+    /// everything above the newest tracked block that still matches. Every tracked block lies above
+    /// the finalized head this store committed, so it was mutable when it was read, however far the
+    /// chain has finalized since; only a block under that committed head is a conflict, and that
+    /// stops the cursor.
+    async fn check_tracked(&self, state: &ModeState, latest: u64) -> Result<()> {
+        let history = state.history.clone();
+        let (tracked, committed) = {
+            let h = history.clone();
+            tokio::task::spawn_blocking(move || Ok::<_, anyhow::Error>((h.tracked()?, h.head()?)))
+                .await??
+        };
+        let committed = committed.unwrap_or(0);
+        let Some(&(top, hash)) = tracked.iter().rev().find(|(b, _)| *b <= latest) else {
+            return Ok(());
+        };
+        let now = block_hash(&self.main, top).await;
+        state.set_calls("main", self.main.calls());
+        if now? == hash {
+            return Ok(());
+        }
+        let mut base = committed;
+        let mut lowest_moved = top;
+        for &(b, h) in tracked.iter().rev().filter(|(b, _)| *b <= top) {
+            if block_hash(&self.main, b).await? == h {
+                base = b;
+                break;
+            }
+            lowest_moved = b;
+        }
+        state.set_calls("main", self.main.calls());
+        if lowest_moved <= committed {
+            let why = format!(
+                "block {lowest_moved}, under the finalized head {committed}, is now at another hash; \
+                 history under the finalized head is never rewritten, so this needs an operator"
+            );
+            state.stop(why.clone());
+            bail!(why);
+        }
+        tracing::warn!(
+            "address history: a reorg replaced blocks above {base}; taking back what was read there"
+        );
+        tokio::task::spawn_blocking(move || history.invalidate_above(base)).await??;
+        Ok(())
+    }
+
+    /// Cover `[from, to]` of `address` for `need`, holes included, a window at a time, within
     /// `deadline`. Never past the chain head, the configured range, or the chain's traceable start.
+    /// A reorg found first is taken back before anything above the finalized head is served or
+    /// extended.
     async fn cover(
         &self,
         state: &ModeState,
@@ -702,8 +739,6 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
         (from, to): (u64, u64),
         deadline: Instant,
     ) -> Result<()> {
-        use crate::address_discovery::{BLOCK_SCANNED, BLOCK_WINDOW, DISCOVERED, OUTER_WINDOW};
-        use crate::address_history::Action;
         if from < state.start_block {
             bail!("history starts at block {}", state.start_block);
         }
@@ -716,26 +751,47 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
         if need == Need::Produced && state.relays.is_none() {
             bail!("produced blocks need mev_relays = true");
         }
+        if need == Need::Produced {
+            let head = state.history.head()?.unwrap_or(0);
+            if to > head {
+                bail!("produced blocks are served through the finalized block {head}, not {to}");
+            }
+        }
+        tokio::time::timeout_at(
+            deadline.into(),
+            self.cover_within(state, address, need, (from, to)),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "not covered within the deadline; try again shortly"
+            ))
+        })
+    }
+
+    async fn cover_within(
+        &self,
+        state: &ModeState,
+        address: &str,
+        need: Need,
+        (from, to): (u64, u64),
+    ) -> Result<()> {
+        use crate::address_discovery::{BLOCK_SCANNED, DISCOVERED};
+        use crate::address_history::Action;
         let latest = self.main.head().await?;
         state.latest.store(latest, Ordering::Relaxed);
         if to > latest {
             bail!("block {to} is past the chain head {latest}");
         }
-        let late = || {
-            if Instant::now() >= deadline {
-                bail!("not covered within the deadline; try again shortly");
-            }
-            Ok(())
-        };
+        self.check_tracked(state, latest).await?;
         let history = &state.history;
         loop {
             let next = crate::address_discovery::next_uncovered(history, address, from)?;
             if next > to {
                 break;
             }
-            late()?;
             let end = hole_end(history, address, &DISCOVERED, next, to)?
-                .min(next.saturating_add(OUTER_WINDOW - 1));
+                .min(next.saturating_add(COVER_WINDOW - 1));
             discover_window(self, state, address, (next, end)).await?;
         }
         if need == Need::Discovered {
@@ -752,14 +808,13 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
             if next > to {
                 break;
             }
-            late()?;
             if let Some((first, last)) = state.mirror.as_ref().map(|(_, b)| *b) {
                 if first <= next && next <= last {
                     bail!("blocks {first} to {last} are read from the mirror's partitions, which have not reached block {next} yet");
                 }
             }
             let mut end = hole_end(history, address, &BLOCK_SCANNED, next, to)?
-                .min(next.saturating_add(BLOCK_WINDOW - 1));
+                .min(next.saturating_add(COVER_BODIES - 1));
             if let Some((first, _)) = state
                 .mirror
                 .as_ref()
@@ -782,7 +837,6 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                 if next > to {
                     break;
                 }
-                late()?;
                 let end = hole_end(history, address, &[Action::ProducedBlocks], next, to)?;
                 crate::address_mev::produced_window(
                     self,
@@ -804,9 +858,13 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
         let latest = self.main.head().await?;
         state.latest.store(latest, Ordering::Relaxed);
         let generation = state.history.generation()?;
+        self.check_tracked(state, latest).await?;
         let pending = crate::address_discovery::Pending::default();
         self.internal_rows_of(&state.history, hash, &pending, latest)
             .await?;
+        // The trace endpoint names the block it traced; above the finalized head it must be the
+        // main endpoint's block, or the trace is of a fork.
+        check_anchor(self, Anchor::default(), &pending.anchors()).await?;
         let history = state.history.clone();
         tokio::task::spawn_blocking(move || pending.persist(&history, generation)).await?
     }
@@ -1153,39 +1211,58 @@ async fn respond(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value {
         )
 }
 
-/// The coverage an incomplete account answer asks for, when the cursor could supply it: a watched
-/// address, an explicit `endblock`, a start the configured range allows.
+/// The coverage an account answer needs the cursor for, when the cursor could supply it: a watched
+/// address and a start the configured range allows, and either an answer that is incomplete for an
+/// explicit `endblock`, or one reaching above the finalized head, which is checked against the chain
+/// before it is served.
 async fn wanted(
     s: &Arc<ModeState>,
     q: &HashMap<String, String>,
     answer: &Value,
 ) -> Option<(String, Need, u64, u64)> {
     use crate::address_history::Action;
+    if q.get("module").map(String::as_str) != Some("account") || q.contains_key("txhash") {
+        return None;
+    }
     let incomplete = answer["result"]
         .as_str()
         .is_some_and(|r| r.starts_with("NUTHATCH_INCOMPLETE:"));
-    if !incomplete
-        || q.get("module").map(String::as_str) != Some("account")
-        || q.contains_key("txhash")
-    {
+    let rows = answer["status"] == "1";
+    if !incomplete && !rows {
         return None;
     }
     let action = Action::from_etherscan(q.get("action")?)?;
     let address = crate::address_history::parse_address(q.get("address")?).ok()?;
     let address = format!("0x{}", alloy_primitives::hex::encode(address));
-    let to = q.get("endblock")?.parse::<u64>().ok()?;
     let from = q
         .get("startblock")
         .map_or(Some(0), |f| f.parse::<u64>().ok())?
         .max(s.start_block);
-    if to < from {
+    let explicit = match q.get("endblock") {
+        Some(e) => Some(e.parse::<u64>().ok()?),
+        None => None,
+    };
+    let who = address.clone();
+    let (watched, head, covered) = blocking(s, move |h| {
+        let covered = h
+            .coverage(action, &who)?
+            .into_iter()
+            .find(|(f, t)| *f <= from && from <= *t)
+            .map(|(_, t)| t);
+        Ok((h.watched()?.contains(&who), h.head()?.unwrap_or(0), covered))
+    })
+    .await
+    .ok()?;
+    if !watched {
         return None;
     }
-    let who = address.clone();
-    let watched = blocking(s, move |h| Ok(h.watched()?.contains(&who)))
-        .await
-        .ok()?;
-    watched.then_some((address, Need::of(action), from, to))
+    let to = match (explicit, incomplete) {
+        (Some(e), _) => e,
+        // Without an end, an incomplete answer is a start nobody has covered; the backfill gets to it.
+        (None, true) => return None,
+        (None, false) => covered?,
+    };
+    (to >= from && (incomplete || to > head)).then_some((address, Need::of(action), from, to))
 }
 
 /// `block/getblocknobytime`: from verified headers where they bracket the timestamp, else searched
@@ -1203,13 +1280,17 @@ async fn block_by_time(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value
         .and_then(|t| t.parse::<u64>().ok())
         .expect("respond validated the timestamp");
     let after = q.get("closest").map(String::as_str) == Some("after");
-    match search_by_time(&forward, t, after).await {
-        Ok(Ok(b)) => crate::address_history::ok(
+    match tokio::time::timeout(s.deadline, search_by_time(&forward, t, after)).await {
+        Ok(Ok(Ok(b))) => crate::address_history::ok(
             Value::String(b.to_string()),
             s.history.generation().unwrap_or(0),
         ),
-        Ok(Err(why)) => crate::address_history::incomplete(&why),
-        Err(e) => crate::address_history::incomplete(&format!("searching the RPC: {e:#}")),
+        Ok(Ok(Err(why))) => crate::address_history::incomplete(&why),
+        Ok(Err(e)) => crate::address_history::incomplete(&format!("searching the RPC: {e:#}")),
+        Err(_) => crate::address_history::incomplete(&format!(
+            "the RPC search did not finish within the {}s deadline",
+            s.deadline.as_secs()
+        )),
     }
 }
 
@@ -2403,8 +2484,15 @@ mod tests {
             .is_none_or(|f| to > f)
             .then(|| (to, chain.hash(to)));
         let g = h.generation().unwrap();
-        h.record_anchored(Action::TxList, ALICE, &rows, (from, to), g, anchor)
-            .unwrap();
+        for action in crate::address_discovery::DISCOVERED {
+            let rows = if action == Action::TxList {
+                rows.clone()
+            } else {
+                Vec::new()
+            };
+            h.record_anchored(action, ALICE, &rows, (from, to), g, anchor)
+                .unwrap();
+        }
     }
 
     /// What the store holds for ALICE over its covered blocks, and what the chain says it should.
@@ -2481,24 +2569,26 @@ mod tests {
         }
     }
 
-    /// A served answer from blocks a reorg then replaces is taken back at the next poll: the range
-    /// reads incomplete until it is read again, and then answers the new chain.
+    /// A read reaching above the finalized head is checked against the chain before it is served: a
+    /// reorg since the last poll is taken back first, so the replaced rows are never answered, and
+    /// the range is refused until it is read again.
     #[tokio::test]
-    async fn a_reorg_after_serving_takes_the_answer_back() {
+    async fn a_reorg_after_serving_is_found_before_the_next_answer() {
         let dir = tempfile::tempdir().unwrap();
         let s = reorg_state(dir.path());
         let chain = Chain::new(100, 70);
-        let d = chain.discoverer();
+        let d = Arc::new(chain.discoverer());
         d.reconcile(&s, chain.latest()).await.unwrap();
         cover_from(&chain, &s.history, 0, 99);
+        let cursor = tokio::spawn(serve_forever(s.clone(), d.clone()));
         let q = |end: u64| {
             format!("/api?module=account&action=txlist&address={ALICE}&startblock=0&endblock={end}")
         };
         let (_, before) = call(router(s.clone()), "GET", &q(99), None).await;
         assert_eq!(before["status"], "1", "{before}");
 
+        // No poll between the reorg and the next request.
         chain.reorg(5);
-        d.reconcile(&s, chain.latest()).await.unwrap();
         let (_, during) = call(router(s.clone()), "GET", &q(99), None).await;
         assert!(
             during["result"]
@@ -2524,6 +2614,26 @@ mod tests {
             wanted.len(),
             "{after}"
         );
+        cursor.abort();
+    }
+
+    /// A window read on a fork that replaced a tracked block must not be recorded: its own anchor
+    /// would match the chain at the next poll and hide the stale block under it.
+    #[tokio::test]
+    async fn a_window_on_a_fork_under_its_anchor_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        let chain = Chain::new(112, 100);
+        let d = chain.discoverer();
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        cover_from(&chain, &s.history, 0, 110);
+        // The reorg lands before the window's anchor is read, so the anchor itself is on the fork
+        // and matches; only the tracked block under it says the window is not on the chain the
+        // store holds.
+        chain.reorg(8);
+        let anchor = anchor_for(&d, &s.history, 111).await.unwrap();
+        let err = check_anchor(&d, anchor, &[]).await.unwrap_err();
+        assert!(err.to_string().contains("block 110"), "{err:#}");
     }
 
     /// The tracked hashes outlive the process: a nest restarted after a reorg it never saw finds it
@@ -2552,10 +2662,10 @@ mod tests {
         assert!(s.history.tracked().unwrap().is_empty());
     }
 
-    /// A tracked block that is now finalized at another hash is not rewritten: the cursor stops and
-    /// says why, and /ready reports it.
+    /// A reorg while the nest was down, which the chain has since finalized past, is still a reorg of
+    /// blocks that were mutable when they were read: it is taken back, not mistaken for a conflict.
     #[tokio::test]
-    async fn a_conflict_under_the_finalized_head_stops_the_cursor() {
+    async fn a_reorg_finalized_during_downtime_is_taken_back() {
         let dir = tempfile::tempdir().unwrap();
         let s = reorg_state(dir.path());
         let chain = Chain::new(100, 70);
@@ -2563,16 +2673,37 @@ mod tests {
         d.reconcile(&s, chain.latest()).await.unwrap();
         cover_from(&chain, &s.history, 0, 80);
         chain.reorg(25);
-        chain.finalized.store(90, Ordering::Relaxed);
+        chain.grow(20);
+        chain.finalized.store(100, Ordering::Relaxed);
+        assert_eq!(d.reconcile(&s, chain.latest()).await.unwrap(), 100);
+        assert!(s.cursor_error.lock().unwrap().is_none());
+        assert_eq!(
+            s.history
+                .coverage(crate::address_history::Action::TxList, ALICE)
+                .unwrap(),
+            vec![(0, 70)]
+        );
+        assert_eq!(s.history.head().unwrap(), Some(100));
+    }
+
+    /// A tracked block under the committed finalized head, now at another hash, is not rewritten:
+    /// the cursor stops and says why, and /ready reports it.
+    #[tokio::test]
+    async fn a_conflict_under_the_committed_finalized_head_stops_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        let chain = Chain::new(100, 70);
+        let d = chain.discoverer();
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        cover_from(&chain, &s.history, 0, 80);
+        // A store whose committed head passed a block it still tracks: not a state the cursor
+        // writes, but the check must hold if one is ever found.
+        s.history.set_head(90).unwrap();
+        chain.reorg(25);
         let err = d.reconcile(&s, chain.latest()).await.unwrap_err();
-        assert!(err.to_string().contains("finalized"), "{err:#}");
+        assert!(err.to_string().contains("finalized head"), "{err:#}");
         let (st, r) = call(router(s.clone()), "GET", "/ready", None).await;
         assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{r}");
-        assert_eq!(
-            s.history.head().unwrap(),
-            Some(70),
-            "the finalized head did not move past it"
-        );
     }
 
     /// A request the cursor cannot get to within the deadline answers incomplete when the deadline

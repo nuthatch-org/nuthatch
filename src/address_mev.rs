@@ -366,7 +366,9 @@ pub async fn mev_pass<M: Rpc, T: Rpc>(
 }
 
 /// Cover `[from, to]` of `a`'s produced blocks, its prerequisites covered, and put the blocks without
-/// relay evidence on the re-ask schedule.
+/// relay evidence on the re-ask schedule in the same transaction, so a crash between the two cannot
+/// leave a covered block nothing will ask about again. Only through the finalized head: a relay's
+/// answer about a block is used only once the block is final.
 pub async fn produced_window<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     relays: &Relays,
@@ -375,22 +377,20 @@ pub async fn produced_window<M: Rpc, T: Rpc>(
     (from, to): (u64, u64),
     now: u64,
 ) -> Result<()> {
+    let head = history.head()?.unwrap_or(0);
+    if to > head {
+        anyhow::bail!("produced blocks are served through the finalized block {head}, not {to}");
+    }
     let generation = history.generation()?;
-    let anchor = crate::address_mode::anchor_for(d, history, to).await?;
     let found = produced_blocks(d, relays, history, a, (from, to), false).await?;
-    crate::address_mode::check_anchor(d, anchor).await?;
-    history.record_anchored(
-        Action::ProducedBlocks,
+    history.record_produced(
         a,
         &found.rows,
         (from, to),
         generation,
-        anchor,
-    )?;
-    for b in found.unrecorded {
-        history.mev_absent(b, now)?;
-    }
-    Ok(())
+        &found.unrecorded,
+        now,
+    )
 }
 
 /// Ask the relays again about each block on the re-ask schedule that is due: one whose last ask is a
@@ -804,6 +804,14 @@ mod tests {
             "the upgrade moved the generation"
         );
         assert!(h.mev_pending().unwrap().is_empty());
+
+        // Produced blocks are served only through the finalized head.
+        h.set_head(150).unwrap();
+        let err = produced_window(&d, &rel, &h, A, (200, 299), t0)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("finalized block 150"), "{err:#}");
+        h.set_head(1_000).unwrap();
 
         // A block whose evidence never comes is dropped from the schedule after thirty days, with
         // its row left unrecorded, not zero.

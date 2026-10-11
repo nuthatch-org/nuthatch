@@ -385,6 +385,7 @@ impl AddressHistory {
         wtx.open_table(RELAY_CACHE)?;
         wtx.open_table(CANON)?;
         wtx.open_table(MEV_PENDING)?;
+        reset_produced_blocks(&wtx)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
             let mut w = wtx.open_table(WATCHED)?;
@@ -1046,6 +1047,56 @@ impl AddressHistory {
         Ok(())
     }
 
+    /// [`AddressHistory::record`] for produced blocks, with the blocks the relays named no delivery
+    /// for put on the re-ask schedule in the same transaction.
+    pub fn record_produced(
+        &self,
+        address: &str,
+        rows: &[Row],
+        (from, to): (u64, u64),
+        generation: u64,
+        unrecorded: &[u64],
+        now: u64,
+    ) -> Result<()> {
+        if to < from {
+            bail!("coverage interval [{from}, {to}] is empty");
+        }
+        let a = parse_address(address)?;
+        let wtx = self.store.database().begin_write()?;
+        {
+            if wtx.open_table(WATCHED)?.get(a.as_slice())?.is_none() {
+                bail!("{} is not watched", address_hex(&a));
+            }
+            let current = wtx
+                .open_table(META)?
+                .get(GENERATION)?
+                .map_or(0, |v| v.value());
+            if current != generation {
+                bail!("address history changed during the fetch (generation {generation} -> {current}); refetch");
+            }
+            if let Some(r) = rows.iter().find(|r| r.block < from || r.block > to) {
+                bail!("a row at block {} lies outside [{from}, {to}]", r.block);
+            }
+            drain(
+                &mut wtx.open_table(Action::ProducedBlocks.table())?,
+                &row_key(&a, from, 0, 0),
+                &row_key(&a, to, u64::MAX, u64::MAX),
+            )?;
+            put_rows(&wtx, Action::ProducedBlocks, &a, rows)?;
+            cover(&wtx, Action::ProducedBlocks, &a, from, to)?;
+            let mut p = wtx.open_table(MEV_PENDING)?;
+            for &b in unrecorded {
+                let first = match p.get(b)? {
+                    Some(v) => decode_asked(v.value())?.0,
+                    None => now,
+                };
+                p.insert(b, encode_asked(first, now).as_slice())?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
     pub fn mev_settled(&self, block: u64) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
         wtx.open_table(MEV_PENDING)?.remove(block)?;
@@ -1297,6 +1348,14 @@ impl AddressHistory {
         if req.end_block.is_some_and(|e| e < start) {
             return answer(Answer::Rows(Vec::new()));
         }
+        // Without an end, page 1 reads to the end of what is covered, which moves as coverage grows;
+        // a later page could then repeat or skip rows.
+        if req.page > 1 && req.end_block.is_none() {
+            return answer(Answer::Incomplete(
+                "a page past the first needs an endblock, so every page reads the same blocks"
+                    .into(),
+            ));
+        }
         let Some(&(_, covered_to)) = spans.iter().find(|(f, t)| *f <= start && start <= *t) else {
             return answer(Answer::Incomplete(format!(
                 "{} for {} is not indexed at block {start}",
@@ -1335,14 +1394,7 @@ impl AddressHistory {
             .take(take)
             .map(|e| {
                 let (_, v) = e?;
-                let mut r = decode_record(v.value())?;
-                // 5.1 stored `none` for what is now `unrecorded`; both mean no delivery was found.
-                if action == Action::ProducedBlocks
-                    && r.get("mev").and_then(Value::as_str) == Some("none")
-                {
-                    r.insert("mev".into(), Value::String("unrecorded".into()));
-                }
-                Ok(Value::Object(r))
+                decode_record(v.value()).map(Value::Object)
             })
             .collect::<Result<Vec<_>>>()?;
         answer(Answer::Rows(rows))
@@ -1403,6 +1455,42 @@ fn cover(
     };
     spans.push((from, to));
     t.insert(key.as_slice(), encode_spans(&merge(spans)).as_slice())?;
+    Ok(())
+}
+
+/// The produced-block contract a store's rows were read under. 5.1 stored no relay delivery as
+/// `none` and kept no re-ask schedule, and skipped payout-contract payments, so its rows are dropped
+/// and read again rather than carried into a contract they were not read under.
+const PRODUCED_CONTRACT: &str = "produced_contract";
+const PRODUCED_CONTRACT_NOW: u64 = 2;
+
+fn reset_produced_blocks(wtx: &redb::WriteTransaction) -> Result<()> {
+    use redb::ReadableTableMetadata;
+    let read_under = wtx
+        .open_table(META)?
+        .get(PRODUCED_CONTRACT)?
+        .map(|v| v.value());
+    if read_under == Some(PRODUCED_CONTRACT_NOW) {
+        return Ok(());
+    }
+    let mut rows = wtx.open_table(Action::ProducedBlocks.table())?;
+    let had_rows = !rows.is_empty()?;
+    rows.retain(|_, _| false)?;
+    let mut c = wtx.open_table(COVERAGE)?;
+    let stale: Vec<Vec<u8>> = c
+        .iter()?
+        .filter_map(|e| e.ok())
+        .map(|(k, _)| k.value().to_vec())
+        .filter(|k| k[20] == Action::ProducedBlocks.code())
+        .collect();
+    for k in &stale {
+        c.remove(k.as_slice())?;
+    }
+    if had_rows || !stale.is_empty() {
+        bump_generation(wtx)?;
+    }
+    wtx.open_table(META)?
+        .insert(PRODUCED_CONTRACT, PRODUCED_CONTRACT_NOW)?;
     Ok(())
 }
 
@@ -2706,6 +2794,63 @@ mod tests {
                 .starts_with("NUTHATCH_UNSUPPORTED:"),
             "{a}"
         );
+    }
+
+    /// Page 1 without an end reads to the end of what is covered, which moves as coverage grows, so a
+    /// later page without one is refused rather than repeating or skipping rows.
+    #[test]
+    fn a_page_past_the_first_needs_an_endblock() {
+        let (_d, h) = history();
+        h.mark_covered(Action::TxList, ALICE, 0, 100).unwrap();
+        let mut r = req(0, 0, 2, 1);
+        r.end_block = None;
+        assert!(matches!(h.page(Action::TxList, &r).unwrap(), Answer::Incomplete(_)));
+        r.end_block = Some(100);
+        assert_eq!(h.page(Action::TxList, &r).unwrap(), Answer::Rows(vec![]));
+    }
+
+    /// Produced-block coverage and the re-ask entries for blocks without relay evidence land in one
+    /// transaction; a refused record writes neither.
+    #[test]
+    fn produced_coverage_and_its_reasks_commit_together() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        h.record_produced(ALICE, &[], (100, 199), g, &[150, 160], 7).unwrap();
+        assert_eq!(h.coverage(Action::ProducedBlocks, ALICE).unwrap(), vec![(100, 199)]);
+        assert_eq!(h.mev_pending().unwrap(), vec![(150, 7, 7), (160, 7, 7)]);
+        assert!(h.record_produced(ALICE, &[], (200, 299), g + 1, &[250], 8).is_err());
+        assert_eq!(h.coverage(Action::ProducedBlocks, ALICE).unwrap(), vec![(100, 199)]);
+        assert_eq!(h.mev_pending().unwrap().len(), 2);
+    }
+
+    /// A store written under 5.1's produced-block contract (`none`, no re-ask schedule, payout
+    /// contracts missed) has those rows and their coverage dropped once, at open, to be read again.
+    #[test]
+    fn produced_rows_from_the_old_contract_are_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        {
+            let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+            let mut r = tx(150, 0);
+            r.record.insert("mev".into(), Value::String("none".into()));
+            h.insert(Action::ProducedBlocks, ALICE, &[r]).unwrap();
+            h.mark_covered(Action::ProducedBlocks, ALICE, 100, 199).unwrap();
+            h.mark_covered(Action::TxList, ALICE, 100, 199).unwrap();
+            // As 5.1 left it: no contract recorded.
+            let wtx = h.store.database().begin_write().unwrap();
+            wtx.open_table(META).unwrap().remove(PRODUCED_CONTRACT).unwrap();
+            wtx.commit().unwrap();
+        }
+        let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+        assert!(h.coverage(Action::ProducedBlocks, ALICE).unwrap().is_empty());
+        assert!(h.rows_in(Action::ProducedBlocks, ALICE, (0, 1_000)).unwrap().is_empty());
+        assert_eq!(h.coverage(Action::TxList, ALICE).unwrap(), vec![(100, 199)], "others untouched");
+        let g = h.generation().unwrap();
+        h.mark_covered(Action::ProducedBlocks, ALICE, 100, 199).unwrap();
+        drop(h);
+        let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+        assert_eq!(h.coverage(Action::ProducedBlocks, ALICE).unwrap(), vec![(100, 199)], "only once");
+        assert_eq!(h.generation().unwrap(), g);
     }
 
     #[test]

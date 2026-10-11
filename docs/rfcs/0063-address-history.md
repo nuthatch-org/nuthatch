@@ -312,19 +312,30 @@ The plan below went through six rounds of review against the code before both re
   the request needs (produced blocks need mined blocks and transactions first), up to the block
   asked for, holes included, and answers within a deadline (20 s, under rotki's 30 s read timeout).
   The cursor stays the only writer: requests wait on a bounded queue and are served between its
-  windows, so none waits behind another address's backfill.
+  windows, so none waits behind another address's backfill. A read reaching above the finalized head
+  goes through the cursor as well, which checks for a reorg before it answers. Produced blocks are
+  the exception: they are served through the finalized head only, because a relay's answer about a
+  block is used only once the block is final, and their coverage commits in one transaction with the
+  re-ask entries for blocks without evidence.
 - **Reorgs in the mutable store.** Anything read above the finalized head is read against the hash
   of its window's last block, checked before and after the fetch and tracked with the record. Each
-  poll compares the newest tracked hash with the RPC's; on a mismatch it walks down to the newest
-  that still matches and takes back everything above it: rows, coverage, cached transactions,
-  timestamps, traces and relay answers. A fetch that began before a reorg keeps nothing above the
-  finalized head. Tracked hashes are persisted, so a restart finds a reorg it slept through. A
-  tracked block now finalized at another hash stops the cursor and reports it: history under the
-  finalized head is never rewritten. A property test over random reorg depths gates it.
+  poll, and each request above the finalized head, compares the newest tracked hash with the RPC's;
+  on a mismatch it walks down to the newest that still matches and takes back everything above it:
+  rows, coverage, cached transactions, timestamps, traces and relay answers. A fetch is also checked
+  against the newest tracked hash under it, so a window read on a fork cannot hide the stale block
+  beneath its own matching anchor, and every block hash taken from the trace endpoint must be the
+  main endpoint's. A fetch that began before a reorg keeps nothing above the finalized head. Tracked
+  hashes are persisted, so a restart finds a reorg it slept through, even one the chain has since
+  finalized past: what was tracked was mutable when it was read. Only a block under the finalized
+  head the store committed is a conflict, which stops the cursor. A property test over random reorg
+  depths gates it.
 - **The bar.** rotki's ordinary Etherscan sync can import unfinalized history and does not
   automatically reconcile already imported history after a reorg. The nest integration retains this
   shared limitation for this handover; the nest itself converges.
 - **Also from the cold tests.** `logs/getLogs` is asked in spans the provider accepts, at most 64
   calls a request, and answers incomplete beyond that (M3); a failing span retry logs at warn and a
-  failed reconcile counts as a failed poll (silent stall); the store's page cache is 32 MiB, since
-  redb otherwise holds every page a backfill wrote, up to 1 GiB (M5).
+  failed reconcile counts as a failed poll (silent stall). On M5 (a mirrored nest idling at 240 MB
+  RSS): the store's page cache is now 32 MiB rather than redb's 1 GiB default, but on macOS that was
+  not what held the memory. After a 26-partition ingest the physical footprint idles at 68 MB while
+  RSS reads 143 MB, the difference being freed allocator regions macOS keeps resident until it needs
+  them; a restart on the same store idles at 32 MB.

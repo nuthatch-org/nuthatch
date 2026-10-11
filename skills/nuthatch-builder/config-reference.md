@@ -188,9 +188,11 @@ request_deadline = "20s"      # optional, default 20s: how long a request may wa
 The cursor backfills each address up to the finalized head (the RPC's `finalized` tag, else the
 registry's depth under the head). A request whose `endblock` lies above what is covered, and at or
 below the chain head, is covered on demand by the cursor, up to the block asked for, within
-`request_deadline`; otherwise it answers `NUTHATCH_INCOMPLETE`. An explicit `endblock` is answered
-whole or refused, never shortened to what is covered; one past the chain head is refused. Without
-`endblock` the answer runs to the end of the covered run the start is in. Blocks above the finalized
+`request_deadline`; otherwise it answers `NUTHATCH_INCOMPLETE`. A read reaching above the finalized
+head goes through the cursor too, which checks the chain for a reorg before it answers. An explicit
+`endblock` is answered whole or refused, never shortened to what is covered; one past the chain head
+is refused. Without `endblock` the answer runs to the end of the covered run the start is in, and a
+page past the first needs an `endblock`, so every page reads the same blocks. Blocks above the finalized
 head are read against their block hash: each poll checks the newest such hash, and a reorg takes back
 everything read above the fork, rows, coverage and caches, until it is read again. A conflict at or
 under the finalized head stops the cursor and says so; history under it is never rewritten.
@@ -217,7 +219,9 @@ cache_mb = 512                # disk the downloaded partitions may hold; at leas
 block a watched address produced, or was paid for by a relay-built block's builder, and serves the
 result as `module=account&action=nuthatchProducedBlocks`: fee recipient, block reward, the relays'
 recipient and value, the builder's payment transaction, and `mev` of `relay`, `conflict` or
-`unrecorded`. The rows come from the chain: every block the address received the fees of is one. A
+`unrecorded`, through the finalized head only, since a relay's answer about a block is used only
+once the block is final. The rows come from the chain: every block the address received the fees of
+is one. A
 builder's payment, whether a transaction from the builder or an internal transfer in the block's last
 transaction (a payout contract), becomes a row only on a relay's word. `unrecorded` means no delivery
 at the queried relays when last asked, never zero MEV: a relay saves its record after the block is
