@@ -58,7 +58,7 @@ pub struct AddressHistoryConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mev_relays: bool,
     /// How long a request for history above what is covered may wait while the nest covers it:
-    /// queue, RPC work and the answer together. Default 20 s, under rotki's 30 s read timeout.
+    /// queue, RPC work and the answer together. Default 8 s, under rotki's 30 s read timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_deadline: Option<String>,
     /// Validator indices whose proposed blocks to prove from Dencun on (RFC-0063 plan C). A client

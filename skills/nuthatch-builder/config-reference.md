@@ -182,7 +182,7 @@ start_block = 0               # optional: history before it is never fetched, an
 end_block = 20000000          # optional: stop here
 poll_interval = "5m"          # optional, default 5m; `--poll-interval` overrides it
 mev_relays = false            # optional, default off: ask the MEV-Boost relays, see below
-request_deadline = "20s"      # optional, default 20s: how long a request may wait while the nest covers it
+request_deadline = "8s"       # optional, default 8s: the most a request waits, queue and background work included
 validators = [2259472]        # optional, Ethereum only: validators whose proposed blocks to prove, see below
 beacon_url = "http://127.0.0.1:5052"  # optional: a beacon API for blocks the mirror has not published
 ```

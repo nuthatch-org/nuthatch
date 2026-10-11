@@ -111,9 +111,10 @@ pub struct ModeState {
     pub first_window: u64,
     /// The discovery window [`Pace`] last settled on, kept across polls; 0 before the first.
     backfill_span: AtomicU64,
-    /// Blocks per second the last discovery window covered; 0 before the first.
+    /// Blocks per minute the last discovery window covered, at least 1 once measured; 0 before the
+    /// first. Per minute so a slow measured layer never truncates to "unmeasured".
     backfill_rate: AtomicU64,
-    /// Blocks per second the last body window and the last produced-block step covered; 0 before.
+    /// The same for the last body window and the last produced-block step.
     body_rate: AtomicU64,
     produced_rate: AtomicU64,
     /// How long the last timestamp search on the RPC took, in milliseconds; 0 before the first.
@@ -219,8 +220,9 @@ pub enum Request {
     },
 }
 
-/// The default for `[address_history] request_deadline`: under rotki's 30 s read timeout.
-pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(20);
+/// The default for `[address_history] request_deadline`: the most any request waits, queue and
+/// background work included, well under rotki's 30 s read timeout.
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(8);
 
 impl ModeState {
     pub fn new(
@@ -282,13 +284,14 @@ impl ModeState {
         self
     }
 
-    /// Hand `make(deadline, reply)` to the cursor and wait for it, all within the deadline. `Err`
-    /// says why it was not done; nothing is partly answered.
+    /// Hand `make(deadline, reply)` to the cursor and wait for it, no later than `deadline`: the
+    /// request's own, set when it arrived, so queue time counts against it. `Err` says why it was not
+    /// done; nothing is partly answered.
     async fn ask(
         &self,
+        deadline: Instant,
         make: impl FnOnce(Instant, Reply) -> Request,
     ) -> std::result::Result<(), String> {
-        let deadline = Instant::now() + self.deadline;
         let (reply, done) = tokio::sync::oneshot::channel();
         if self.requests.try_send(make(deadline, reply)).is_err() {
             return Err("the nest is busy with other requests; try again shortly".into());
@@ -1007,10 +1010,9 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 state.backfill_span.store(pace.span(), Ordering::Relaxed);
                 match done {
                     Ok(()) => {
-                        let ms = took.as_millis().max(1) as u64;
                         state
                             .backfill_rate
-                            .store((end - next + 1) * 1000 / ms, Ordering::Relaxed);
+                            .store(per_minute(end - next + 1, took), Ordering::Relaxed);
                         recorded_through.insert(address.clone(), end);
                         advanced = true;
                         state.window_done();
@@ -1030,7 +1032,9 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             }
         }
         // Withdrawals and produced blocks come from bodies, and the definitions they are matched to
-        // are Ethereum mainnet's, so only there is the block scan run.
+        // are Ethereum mainnet's, so only there is the block scan run. An account added during the
+        // backfill joins these passes too.
+        let watched = state.history.watched().unwrap_or(watched);
         state.refresh_mirror().await;
         if state.chain_id == 1 {
             let skip = state.mirror_blocks().map(|(_, blocks)| blocks);
@@ -1404,10 +1408,11 @@ async fn mev_passes<M: Rpc, T: Rpc>(
                     break;
                 }
                 if let (Some(b), Some(t)) = (before, through(&state.history)) {
-                    let ms = started.elapsed().as_millis().max(1) as u64;
-                    state
-                        .produced_rate
-                        .store(t.saturating_sub(b) * 1000 / ms, Ordering::Relaxed);
+                    if t > b {
+                        state
+                            .produced_rate
+                            .store(per_minute(t - b, started.elapsed()), Ordering::Relaxed);
+                    }
                 }
                 state.window_done();
             }
@@ -2118,10 +2123,10 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
         let outcome = body_window(d, state, addresses, (from, end), None).await;
         pace.took(started.elapsed());
         if outcome.is_ok() {
-            let ms = started.elapsed().as_millis().max(1) as u64;
-            state
-                .body_rate
-                .store((end - from + 1) * 1000 / ms, Ordering::Relaxed);
+            state.body_rate.store(
+                per_minute(end - from + 1, started.elapsed()),
+                Ordering::Relaxed,
+            );
         }
         match outcome {
             Ok(()) => {
@@ -2265,6 +2270,9 @@ async fn api(
 }
 
 async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
+    // One ceiling for the whole request, whatever it waits on: the hash check, the queue, a window
+    // the cursor is part way through, a trace and a cover in turn.
+    let deadline = Instant::now() + s.deadline;
     let s = s.clone();
     // The RPC behind the nest is the operator's; only a loopback bind lends it out.
     if let Some(forward) = s.forward.clone().filter(|_| s.loopback) {
@@ -2281,8 +2289,8 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
             None
         };
         // Within the request deadline, or refused: a client's read timeout is not much longer.
-        match tokio::time::timeout(
-            s.deadline,
+        match tokio::time::timeout_at(
+            deadline.into(),
             crate::address_proxy::answer(&q, s.chain_id, &forward),
         )
         .await
@@ -2330,7 +2338,7 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
         .await;
         if matches!(fresh, Ok(true)) {
             if let Err(e) = s
-                .ask(|deadline, reply| Request::Trace {
+                .ask(deadline, |deadline, reply| Request::Trace {
                     hash,
                     deadline,
                     reply,
@@ -2352,7 +2360,7 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
                 // Rows already cover the range: only a reorg could change them, and the lowest
                 // tracked hash at or above its end standing proves nothing under it moved.
                 if w.1 != Need::Produced && answer["status"] == "1" {
-                    match stands(&s, w.3, &answer).await {
+                    match stands(&s, w.3, &answer, deadline).await {
                         Some(true) => return Json(answer),
                         Some(false) => {
                             answer = respond(&s, &q).await;
@@ -2378,7 +2386,7 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
         return Json(crate::address_history::incomplete(&why));
     }
     match s
-        .ask(|deadline, reply| Request::Cover {
+        .ask(deadline, |deadline, reply| Request::Cover {
             address: want.0,
             need: want.1,
             from: want.2,
@@ -2390,6 +2398,12 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
     {
         Ok(()) => Json(respond(&s, &q).await),
         Err(e) => {
+            // The cursor may have finished just as the ceiling passed: what is now covered is served,
+            // anything else is refused, and nothing waits past the ceiling for either.
+            let now = respond(&s, &q).await;
+            if matches!(wanted(&s, &q, &now).await, Want::Serve) {
+                return Json(now);
+            }
             let why = answer["result"]
                 .as_str()
                 .unwrap_or("")
@@ -2433,8 +2447,13 @@ fn before_history(s: &ModeState, q: &HashMap<String, String>) -> Option<String> 
 fn reach(s: &ModeState, rate: &AtomicU64, unmeasured: u64) -> u64 {
     match rate.load(Ordering::Relaxed) {
         0 => unmeasured,
-        r => r * s.deadline.as_secs() / 2,
+        per_minute => (per_minute as u128 * s.deadline.as_millis() / 2 / 60_000) as u64,
     }
+}
+
+/// `blocks` covered in `took`, per minute: at least 1, so a measured rate is never read as none.
+fn per_minute(blocks: u64, took: Duration) -> u64 {
+    ((blocks as u128 * 60_000) / took.as_millis().max(1)).max(1) as u64
 }
 
 /// Why `want`'s uncovered blocks are too many to cover within the deadline, if they are.
@@ -2456,10 +2475,19 @@ async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Op
     }
     let sets: Vec<&'static [Action]> = layers.iter().map(|(set, _)| *set).collect();
     let who = address.clone();
-    let nexts = blocking(s, move |h| {
-        sets.into_iter()
+    // Overdue relay re-asks run in the same request, one per block owed: they cost the produced-block
+    // layer as much as blocks it has yet to cover.
+    let (nexts, owed) = blocking(s, move |h| {
+        let nexts = sets
+            .into_iter()
             .map(|set| next_uncovered_for(h, &who, from, set))
-            .collect::<Result<Vec<u64>>>()
+            .collect::<Result<Vec<u64>>>()?;
+        let owed = if need == Need::Produced {
+            crate::address_mev::overdue(h, unix_now(), Some((from, to)))?.len() as u64
+        } else {
+            0
+        };
+        Ok((nexts, owed))
     })
     .await
     .ok()?;
@@ -2468,7 +2496,11 @@ async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Op
     let load: f64 = layers
         .iter()
         .zip(&nexts)
-        .map(|((_, reach), next)| (to + 1).saturating_sub(*next) as f64 / (*reach).max(1) as f64)
+        .enumerate()
+        .map(|(i, ((_, reach), next))| {
+            let owed = if i == 2 { owed } else { 0 };
+            ((to + 1).saturating_sub(*next) + owed) as f64 / (*reach).max(1) as f64
+        })
         .sum();
     if load <= 1.0 {
         return None;
@@ -2512,7 +2544,7 @@ async fn validator_blocks(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Va
 /// Whether the covered rows of `answer`, which reach block `to` above the finalized head, still
 /// stand: the lowest tracked hash at or above `to` matches the chain, and nothing was written since
 /// the answer was read. `Some(false)`: written since, read it again. `None`: ask the cursor.
-async fn stands(s: &Arc<ModeState>, to: u64, answer: &Value) -> Option<bool> {
+async fn stands(s: &Arc<ModeState>, to: u64, answer: &Value, deadline: Instant) -> Option<bool> {
     let hash_at = s.hash_at.clone()?;
     let read_at = answer["generation"].as_str()?.parse::<u64>().ok()?;
     let (b, h) = blocking(s, move |h| {
@@ -2520,7 +2552,7 @@ async fn stands(s: &Arc<ModeState>, to: u64, answer: &Value) -> Option<bool> {
     })
     .await
     .ok()??;
-    let now = tokio::time::timeout(s.deadline, hash_at(b))
+    let now = tokio::time::timeout_at(deadline.into(), hash_at(b))
         .await
         .ok()?
         .ok()?;
@@ -4112,6 +4144,66 @@ mod tests {
         }
     }
 
+    /// The deadline is one ceiling from the request's arrival: a slow hash check, then a queue behind
+    /// a background window that overruns, together end in a refusal at the ceiling and never later.
+    #[tokio::test]
+    async fn a_request_is_refused_at_its_ceiling_while_a_window_overruns() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(100).unwrap();
+        let mut record = serde_json::Map::new();
+        record.insert("blockNumber".into(), json!("150"));
+        let rows = vec![crate::address_history::Row {
+            block: 150,
+            tx_index: 0,
+            position: 0,
+            record,
+        }];
+        let g = history.generation().unwrap();
+        history
+            .record_anchored(
+                crate::address_history::Action::TxList,
+                &ALICE.to_lowercase(),
+                &rows,
+                (0, 200),
+                g,
+                Some((200, [7; 32])),
+            )
+            .unwrap();
+        // The hash moved, after 600 ms of the 1 s ceiling: the request goes to the cursor.
+        let moved: HashAt = Arc::new(|_| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                Ok([8; 32])
+            })
+        });
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_secs(1))
+                .with_hash_at(moved),
+        );
+        // The cursor is three seconds into a window before it looks at the queue.
+        let cursor = s.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            serve_queued(&cursor, &()).await;
+        });
+        let path =
+            format!("/api?module=account&action=txlist&address={ALICE}&startblock=0&endblock=180");
+        let started = Instant::now();
+        let (_, v) = call(router(s), "GET", &path, None).await;
+        let took = started.elapsed();
+        assert!(
+            v["result"].as_str().unwrap().contains("deadline"),
+            "{v} after {took:?}"
+        );
+        assert!(
+            took >= Duration::from_secs(1) && took < Duration::from_millis(1_300),
+            "{took:?}"
+        );
+    }
+
     /// A covered range above the finalized head is served after one hash check, without waiting
     /// for the cursor (none runs here); a moved hash sends it to the cursor, which cannot answer
     /// within the deadline, so it is refused.
@@ -4262,6 +4354,62 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(500));
     }
 
+    /// The produced-block pass measures its rate in blocks per minute, and admission reads it: a gap
+    /// within reach goes to the cursor, a slow rate refuses it, and owed relay re-asks count as blocks.
+    #[tokio::test]
+    async fn the_produced_block_rate_is_measured_and_admits_by_it() {
+        use crate::address_history::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(300_000).unwrap();
+        let alice = ALICE.to_lowercase();
+        for action in crate::address_discovery::DISCOVERED
+            .into_iter()
+            .chain(crate::address_discovery::BLOCK_SCANNED)
+        {
+            let g = history.generation().unwrap();
+            history
+                .record(action, &alice, &[], (0, 300_000), g)
+                .unwrap();
+        }
+        let relays: crate::address_mev::Relays = Arc::new(|_, _| Box::pin(async { Ok(vec![]) }));
+        let s = Arc::new(
+            ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_secs(2))
+                .with_relays(relays),
+        );
+        let make = || Headers {
+            by_number: BTreeMap::new(),
+            finalized: Value::Null,
+        };
+        let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+        mev_passes(&d, &s, std::slice::from_ref(&alice), 199_999).await;
+        assert_eq!(
+            history.coverage(Action::ProducedBlocks, &alice).unwrap(),
+            vec![(0, 199_999)]
+        );
+        // Four whole 50,000-block steps, each well under a minute.
+        assert!(
+            s.produced_rate.load(Ordering::Relaxed) > 50_000,
+            "{}",
+            s.produced_rate.load(Ordering::Relaxed)
+        );
+        let want = |to: u64| (alice.clone(), Need::Produced, 0, to);
+        // 6,000,000 a minute reaches 100,000 blocks in half of 2 s: a 50,000-block gap is admitted.
+        s.produced_rate.store(6_000_000, Ordering::Relaxed);
+        assert_eq!(beyond_reach(&s, &want(249_999)).await, None);
+        // One block a minute is slow, not unmeasured: a 1,000-block gap is refused, where the
+        // unmeasured floor would admit it.
+        s.produced_rate.store(1, Ordering::Relaxed);
+        assert!(beyond_reach(&s, &want(200_999)).await.is_some());
+        s.produced_rate.store(0, Ordering::Relaxed);
+        assert_eq!(beyond_reach(&s, &want(200_999)).await, None);
+        // An owed re-ask costs as much as a block: one overdue tips the 1,000-block gap past reach.
+        history.mev_absent(5, 0).unwrap();
+        assert!(beyond_reach(&s, &want(200_999)).await.is_some());
+    }
+
     /// Admission is by the slowest layer a request needs: fast trace discovery does not admit a
     /// withdrawals request the slow body scan cannot finish in time.
     #[tokio::test]
@@ -4274,8 +4422,9 @@ mod tests {
             ModeState::new(history, 1, Duration::from_secs(300), true)
                 .with_deadline(Duration::from_secs(2)),
         );
-        s.backfill_rate.store(100_000, Ordering::Relaxed);
-        s.body_rate.store(10, Ordering::Relaxed);
+        // Blocks per minute: with a 2 s deadline a layer reaches its rate / 60 blocks.
+        s.backfill_rate.store(6_000_000, Ordering::Relaxed);
+        s.body_rate.store(600, Ordering::Relaxed);
         let ask = |action: &str| {
             format!("/api?module=account&action={action}&address={ALICE}&startblock=190000&endblock=190999")
         };
@@ -4304,8 +4453,8 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_secs(2));
         // Each layer alone could cover its 1,000 blocks in 60% of the time, but they run one after
         // the other: together they cannot, and the request is refused at once.
-        s2.backfill_rate.store(1_666, Ordering::Relaxed);
-        s2.body_rate.store(1_666, Ordering::Relaxed);
+        s2.backfill_rate.store(99_960, Ordering::Relaxed);
+        s2.body_rate.store(99_960, Ordering::Relaxed);
         let started = Instant::now();
         let (_, v) = call(router(s2), "GET", &ask("txsBeaconWithdrawal"), None).await;
         assert!(
