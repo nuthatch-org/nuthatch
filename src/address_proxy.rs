@@ -173,10 +173,10 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
     if logs.len() > MAX_LOGS {
         // Exactly the first 1,000, mid-block if need be, as Etherscan answers: rotki continues only
         // on a full page, from its last block, and drops what it already has, so a short page must
-        // only ever mean the range is done. A page that is one block with more behind it would be
-        // asked for again forever, so that is refused.
+        // only ever mean the range is done. A full page inside one block would be asked for again
+        // from that block forever, so that is refused.
         let block = |l: &Value| l.get("blockNumber").cloned();
-        if block(&logs[0]) == block(&logs[MAX_LOGS]) {
+        if block(&logs[0]) == block(&logs[MAX_LOGS - 1]) {
             return Ok(Answer::Unsupported(format!(
                 "block {} holds more than {MAX_LOGS} matching logs",
                 block(&logs[0]).unwrap_or(Value::Null)
@@ -464,6 +464,18 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("NUTHATCH_UNSUPPORTED:"));
+        // Exactly a page's worth in one block with more after it: continuing from that block would
+        // return the same page forever.
+        let mut full = vec![7; 1_000];
+        full.push(8);
+        let looped = answer(&ask, 1, &dense(full)).await.unwrap();
+        assert!(
+            looped["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_UNSUPPORTED:"),
+            "{looped}"
+        );
 
         let or = answer(
             &q(&[

@@ -2078,7 +2078,14 @@ fn by_txhash(
         Some("desc") => true,
         Some(s) => return error(format!("invalid sort `{s}`")),
     };
+    let unpaged = !params.contains_key("page") && !params.contains_key("offset");
     match history.tx_internals(&key) {
+        // Unpaged, the whole list or nothing: cut at the offset cap, a client asking once would take
+        // the first 10,000 for all of them.
+        Ok(Some(rows)) if unpaged && rows.len() as u64 > MAX_OFFSET => unsupported(&format!(
+            "{hash} has {} internal transactions, over the {MAX_OFFSET} one page holds; ask for it by page",
+            rows.len()
+        )),
         Ok(Some(mut rows)) => {
             if descending {
                 rows.reverse();
@@ -3090,6 +3097,64 @@ mod tests {
             "reverted frames are served; the client filters"
         );
         assert_eq!(ask("3")["result"], serde_json::json!([]));
+        // Asked once without paging, the whole list comes back.
+        let whole = respond(
+            Some(&h),
+            &params(&[
+                ("module", "account"),
+                ("action", "txlistinternal"),
+                ("txhash", &format!("0x{}", "ab".repeat(32))),
+            ]),
+        );
+        assert_eq!(whole["result"].as_array().unwrap().len(), 1_500);
+    }
+
+    /// Unpaged, a list over one page's cap is refused rather than cut: asked once, a client would
+    /// take the first page for all of it.
+    #[test]
+    fn an_unpaged_txhash_lookup_over_the_cap_is_refused() {
+        let (_d, h) = history();
+        h.set_head(1_000).unwrap();
+        let rows: Vec<Map<String, Value>> = (0..=MAX_OFFSET)
+            .map(|i| {
+                let mut r = Map::new();
+                r.insert("nuthatchTraceIndex".into(), Value::String(i.to_string()));
+                r
+            })
+            .collect();
+        h.persist_pending(
+            &[],
+            &[],
+            &[(vec![0xcd; 32], 500, [9; 32], rows)],
+            &[],
+            h.generation().unwrap(),
+            Some(1_000),
+            true,
+        )
+        .unwrap();
+        let hash = format!("0x{}", "cd".repeat(32));
+        let base = [
+            ("module", "account"),
+            ("action", "txlistinternal"),
+            ("txhash", hash.as_str()),
+        ];
+        let a = respond(Some(&h), &params(&base));
+        assert!(
+            a["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_UNSUPPORTED:"),
+            "{a}"
+        );
+        let mut paged = base.to_vec();
+        paged.extend([("page", "2"), ("offset", "10000")]);
+        assert_eq!(
+            respond(Some(&h), &params(&paged))["result"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
