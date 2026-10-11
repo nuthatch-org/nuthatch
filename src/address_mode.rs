@@ -393,6 +393,13 @@ pub async fn check_anchor<M: Rpc, T: Rpc>(
             checks.insert(under);
         }
     }
+    // And the newest tracked hash of all, which anchors every block under it: a fetch recorded
+    // beneath an anchor on a fork that has since been replaced would otherwise outlive it.
+    if !checks.is_empty() {
+        if let Some(&newest) = tracked.last() {
+            checks.insert(newest);
+        }
+    }
     // Twice over, so a node that moves to another fork between two comparisons cannot pass one
     // block on each.
     for _ in 0..2 {
@@ -436,6 +443,9 @@ async fn discover_window<M: Rpc, T: Rpc>(
     if let Some((b, h)) = anchor {
         pending.anchor(b, h);
     }
+    // The trace endpoint must be on the main chain before the fetch as well as after it: one that
+    // catches up in between would otherwise pass with the empty answers it gave from another fork.
+    same_chain_at(d, end).await?;
     let found = d
         .discover(&state.history, address, next, end, &pending)
         .await;
@@ -872,6 +882,7 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                     address,
                     (next, end),
                     unix_now(),
+                    Some(deadline),
                 )
                 .await?;
             }
@@ -1319,10 +1330,12 @@ async fn block_by_time(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value
     let committed = s.history.head().ok().flatten();
     let search = async {
         match search_by_time(&forward, t, after).await? {
-            Ok((b, latest)) => {
+            Ok((b, latest, proof)) => {
                 // Above the finalized head an answer read from one node may be on a fork another has
                 // left: it stands only if parent hashes link it to the head the search began from.
-                if committed.is_none_or(|c| b + 1 > c) && !descends(&forward, b, latest).await? {
+                if committed.is_none_or(|c| b + 1 > c)
+                    && !descends(&forward, b, latest, &proof).await?
+                {
                     return Ok(Err(format!(
                         "block {b} does not link to the chain head the search began from; ask again"
                     )));
@@ -1380,7 +1393,12 @@ const MAX_LINK: u64 = 512;
 /// Whether block `b` and the block after it are on the chain ending at `latest`: every header from
 /// the head down to `b` names the one before it as its parent. A chain of hashes proves ancestry
 /// whichever node served each header.
-async fn descends(forward: &crate::address_proxy::Forward, b: u64, latest: Header) -> Result<bool> {
+async fn descends(
+    forward: &crate::address_proxy::Forward,
+    b: u64,
+    latest: Header,
+    proof: &[(u64, String)],
+) -> Result<bool> {
     if latest.number < b {
         return Ok(false);
     }
@@ -1390,10 +1408,18 @@ async fn descends(forward: &crate::address_proxy::Forward, b: u64, latest: Heade
             latest.number - b
         );
     }
+    // The headers the search proved its answer with must be the ones on the head's chain, or the
+    // walk could pass on headers a node served after moving to another fork.
+    if proof
+        .iter()
+        .any(|(n, h)| *n == latest.number && *h != latest.hash)
+    {
+        return Ok(false);
+    }
     let mut parent = latest.parent;
     for n in (b..latest.number).rev() {
         let h = header(forward, json!(format!("0x{n:x}"))).await?;
-        if h.hash != parent {
+        if h.hash != parent || proof.iter().any(|(m, ph)| *m == n && *ph != h.hash) {
             return Ok(false);
         }
         parent = h.parent;
@@ -1401,8 +1427,8 @@ async fn descends(forward: &crate::address_proxy::Forward, b: u64, latest: Heade
     Ok(true)
 }
 
-/// The answer, and the head the search began from.
-type Found = (u64, Header);
+/// The answer, the head the search began from, and the headers that proved the answer.
+type Found = (u64, Header, Vec<(u64, String)>);
 
 async fn search_by_time(
     forward: &crate::address_proxy::Forward,
@@ -1420,7 +1446,7 @@ async fn search_by_time(
     let genesis = header(forward, at(0)).await?;
     if t < genesis.ts {
         return Ok(if after {
-            Ok((0, latest))
+            Ok((0, latest, vec![(0, genesis.hash)]))
         } else {
             Err(format!("timestamp {t} is before the first block"))
         });
@@ -1444,10 +1470,12 @@ async fn search_by_time(
         }
     }
     let b = header(forward, at(lo)).await?;
+    let mut proof = vec![(lo, b.hash.clone())];
     let proven = if after {
         b.ts >= t
             && (lo == 0 || {
                 let prev = header(forward, at(lo - 1)).await?;
+                proof.push((lo - 1, prev.hash.clone()));
                 prev.ts < t && b.parent == prev.hash
             })
     } else {
@@ -1457,13 +1485,14 @@ async fn search_by_time(
                 b.ts == t
             } else {
                 let next = header(forward, at(lo + 1)).await?;
+                proof.push((lo + 1, next.hash.clone()));
                 next.ts > t && next.parent == b.hash
             }
     };
     if !proven {
         bail!("the chain moved during the search; ask again");
     }
-    Ok(Ok((lo, latest)))
+    Ok(Ok((lo, latest, proof)))
 }
 
 #[derive(serde::Deserialize)]
@@ -2214,9 +2243,9 @@ mod tests {
         assert_eq!(history.header_coverage().unwrap(), covered);
         assert_eq!(
             d.main.calls().get("eth_getBlockByNumber"),
-            Some(&5),
-            "the finality check, one anchor per partition, no body, and one hash per address's \
-             discovery window to check its trace endpoint is on the main chain"
+            Some(&7),
+            "the finality check, one anchor per partition, no body, and two hashes per address's \
+             discovery window to check its trace endpoint is on the main chain, before and after"
         );
         assert_eq!(
             d.main.calls().get("eth_getBlockByHash"),
@@ -2440,9 +2469,9 @@ mod tests {
         );
         assert_eq!(
             d.main.calls()["eth_getBlockByNumber"],
-            20 + 2 + 1,
-            "twenty bodies before the mirror, its finality check, one anchor, and one hash to check \
-             the discovery window's trace endpoint is on the main chain"
+            20 + 2 + 2,
+            "twenty bodies before the mirror, its finality check, one anchor, and two hashes to check \
+             the discovery window's trace endpoint is on the main chain, before and after"
         );
 
         // Coverage the RPC scan recorded before a mirror was configured does not answer for the
@@ -2858,6 +2887,25 @@ mod tests {
         assert_eq!(s.history.head().unwrap(), Some(100));
     }
 
+    /// A fetch anchored below the newest tracked block is checked against that block too: on a fork
+    /// that replaced it, the new anchor would match and the old rows beneath it survive.
+    #[tokio::test]
+    async fn a_fetch_below_the_newest_anchor_is_checked_against_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        let chain = Chain::new(121, 100);
+        let d = chain.discoverer();
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        cover_from(&chain, &s.history, 0, 120);
+        // A fork from 118: block 119 on it is what a trace now names.
+        chain.reorg(3);
+        let named = [(119, chain.hash(119))];
+        let err = check_anchor(&d, &s.history, None, &named)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("block 120"), "{err:#}");
+    }
+
     /// A trace endpoint on another fork, or behind, than the main endpoint answers ranges the main
     /// chain does not have; a window whose last block the two disagree on is refused.
     #[tokio::test]
@@ -2999,6 +3047,34 @@ mod tests {
         assert_eq!(a["result"], "20", "{a}");
     }
 
+    /// The walk to the head must pass through the very headers the search proved its answer with:
+    /// a node that moves to another fork between the search and the walk cannot have the walk pass on
+    /// headers the search never saw.
+    #[tokio::test]
+    async fn the_timestamp_walk_is_bound_to_the_searched_headers() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let n = reads.clone();
+        let inner = timed(100, None);
+        // After the search, block 51 is served at another hash, still linked to its neighbours.
+        let forward: crate::address_proxy::Forward = Arc::new(move |m: String, p: Value| {
+            let (inner, n) = (inner.clone(), n.clone());
+            Box::pin(async move {
+                let mut h = inner(m, p).await?;
+                let calls = n.fetch_add(1, Ordering::Relaxed);
+                if calls > 40 && h["number"] == "0x33" {
+                    h["hash"] = json!(format!("0x{:064x}", 777));
+                }
+                Ok(h)
+            })
+        });
+        let (b, latest, proof) = search_by_time(&forward, 1000 + 12 * 50 + 5, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b, 50);
+        assert!(!descends(&forward, b, latest, &proof).await.unwrap());
+    }
+
     #[tokio::test]
     async fn the_timestamp_search_is_exact_at_its_edges_and_refuses_what_it_cannot_prove() {
         let f = timed(100, None);
@@ -3014,7 +3090,10 @@ mod tests {
             (at(100), true, Ok(100)),
         ] {
             assert_eq!(
-                search_by_time(&f, t, after).await.unwrap().map(|(b, _)| b),
+                search_by_time(&f, t, after)
+                    .await
+                    .unwrap()
+                    .map(|(b, _, _)| b),
                 want,
                 "t={t} after={after}"
             );

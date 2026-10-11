@@ -186,6 +186,7 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
     address: &str,
     (from, to): (u64, u64),
     asked: Option<&BTreeMap<u64, Map<String, Value>>>,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Produced> {
     let a = address.to_ascii_lowercase();
     let mined = history.rows_in(Action::MinedBlocks, &a, (from, to))?;
@@ -218,6 +219,10 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
 
     let mut out = Produced::default();
     for b in blocks {
+        // A request's deadline stops the work between candidates, before anything is written.
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            anyhow::bail!("not covered within the deadline; try again shortly");
+        }
         let header = d
             .main
             .call("eth_getBlockByNumber", json!([format!("0x{b:x}"), false]))
@@ -367,7 +372,7 @@ pub async fn mev_step<M: Rpc, T: Rpc>(
     if to < from {
         return Ok(false);
     }
-    produced_window(d, relays, history, a, (from, to), now).await?;
+    produced_window(d, relays, history, a, (from, to), now, None).await?;
     Ok(true)
 }
 
@@ -382,13 +387,14 @@ pub async fn produced_window<M: Rpc, T: Rpc>(
     a: &str,
     (from, to): (u64, u64),
     now: u64,
+    deadline: Option<std::time::Instant>,
 ) -> Result<()> {
     let head = history.head()?.unwrap_or(0);
     if to > head {
         anyhow::bail!("produced blocks are served through the finalized block {head}, not {to}");
     }
     let generation = history.generation()?;
-    let found = produced_blocks(d, relays, history, a, (from, to), None).await?;
+    let found = produced_blocks(d, relays, history, a, (from, to), None, deadline).await?;
     history.record_produced(
         a,
         &found.rows,
@@ -438,7 +444,7 @@ pub async fn reask_pass<M: Rpc, T: Rpc>(
                 continue;
             }
             let found =
-                produced_blocks(d, relays, history, a, (block, block), Some(&asked)).await?;
+                produced_blocks(d, relays, history, a, (block, block), Some(&asked), None).await?;
             unrecorded |= !found.unrecorded.is_empty();
             let before = history.rows_in(Action::ProducedBlocks, a, (block, block))?;
             let after: Vec<Map<String, Value>> =
@@ -586,7 +592,7 @@ mod tests {
             ("ultrasound", 106, trace(106, A, "13")),
             ("aestus", 107, trace(107, A, "3")),
         ]);
-        let found = produced_blocks(&d, &rel, &h, A, (100, 199), None)
+        let found = produced_blocks(&d, &rel, &h, A, (100, 199), None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -630,7 +636,7 @@ mod tests {
         assert_eq!(first, 6 * 7, "every block but 102, every relay once");
 
         // Asked again, the relays' answers come from the store.
-        produced_blocks(&d, &rel, &h, A, (100, 199), None)
+        produced_blocks(&d, &rel, &h, A, (100, 199), None, None)
             .await
             .unwrap();
         assert_eq!(*asked.lock().unwrap(), first);
@@ -783,6 +789,7 @@ mod tests {
                 A,
                 (100, 199),
                 t0,
+                None,
             )
             .await
             .unwrap();
@@ -817,9 +824,18 @@ mod tests {
         );
         assert!(h.mev_pending().unwrap().is_empty());
 
+        // A request's deadline stops the work between candidates, before anything is written.
+        let g = h.generation().unwrap();
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let err = produced_window(&d, &rel, &h, A, (100, 199), t0, Some(past))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deadline"), "{err:#}");
+        assert_eq!(h.generation().unwrap(), g, "nothing written");
+
         // Produced blocks are served only through the finalized head.
         h.set_head(150).unwrap();
-        let err = produced_window(&d, &rel, &h, A, (200, 299), t0)
+        let err = produced_window(&d, &rel, &h, A, (200, 299), t0, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("finalized block 150"), "{err:#}");

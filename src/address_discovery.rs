@@ -3639,9 +3639,9 @@ mod tests {
         );
         assert_eq!(
             bodies_read() - after_first,
-            11,
-            "B's gap read once, A's coverage not reread, and one hash to check B's discovery window's \
-             trace endpoint is on the main chain"
+            12,
+            "B's gap read once, A's coverage not reread, and two hashes to check B's discovery \
+             window's trace endpoint is on the main chain, before and after"
         );
         let req = crate::address_history::PageRequest {
             address: B.into(),
