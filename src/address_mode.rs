@@ -355,7 +355,24 @@ impl ModeState {
             crate::address_partitions::span_of(*first).0
         };
         match source.published_end(from).await {
-            Ok(Some(end)) => self.mirror_last.store(end.max(known), Ordering::Relaxed),
+            Ok(Some(end)) if end > known => {
+                // Unverified coverage in the newly published blocks goes before they count as the
+                // mirror's: a request read meanwhile must not be answered from it.
+                let (h, range) = (self.history.clone(), (*first, end));
+                let revoked = tokio::task::spawn_blocking(move || {
+                    h.keep_verified_only(&crate::address_discovery::BLOCK_SCANNED, range)
+                })
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r);
+                match revoked {
+                    Ok(()) => self.mirror_last.store(end, Ordering::Relaxed),
+                    Err(e) => tracing::warn!(
+                        "address history: setting the newly published blocks aside: {e:#}"
+                    ),
+                }
+            }
+            Ok(Some(_)) => {}
             Ok(None) => {}
             Err(e) => tracing::warn!("address history: how far the mirror has published: {e:#}"),
         }
@@ -3750,18 +3767,35 @@ mod tests {
         );
         assert_eq!(source.published_end(0).await.unwrap(), Some(38 * SPAN - 1));
         assert_eq!(source.published_end(40 * SPAN).await.unwrap(), None);
-        let history =
-            AddressHistory::open(Store::open(&dir.path().join("t.redb")).unwrap(), 1, &[]).unwrap();
-        let s = ModeState::new(history, 1, Duration::from_secs(300), true).with_open_mirror(
-            source.clone(),
-            0,
-            Some(38 * SPAN - 1),
-        );
+        let history = AddressHistory::open(
+            Store::open(&dir.path().join("t.redb")).unwrap(),
+            1,
+            &[ALICE.into()],
+        )
+        .unwrap();
+        // Withdrawals the RPC scan covered above what the mirror had published.
+        let g = history.generation().unwrap();
+        history
+            .record(
+                crate::address_history::Action::BeaconWithdrawals,
+                ALICE,
+                &[],
+                (38 * SPAN, 41 * SPAN - 1),
+                g,
+            )
+            .unwrap();
+        let s = ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+            .with_open_mirror(source.clone(), 0, Some(38 * SPAN - 1));
         assert_eq!(s.mirror_blocks().unwrap().1, (0, 38 * SPAN - 1));
         // The publisher extends the mirror; the next poll reads further.
         publish(38..41);
         s.refresh_mirror().await;
         assert_eq!(s.mirror_blocks().unwrap().1, (0, 41 * SPAN - 1));
+        // The RPC-scanned coverage there is set aside as the mirror takes those blocks over.
+        assert!(history
+            .coverage(crate::address_history::Action::BeaconWithdrawals, ALICE)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

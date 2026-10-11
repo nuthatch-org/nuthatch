@@ -1136,6 +1136,9 @@ impl AddressHistory {
     pub fn keep_verified_only(&self, actions: &[Action], (first, last): (u64, u64)) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
         let mut changed = false;
+        // Produced blocks are derived from mined blocks: where unverified mined-block coverage goes,
+        // the produced-block coverage built on it goes too.
+        let mut unmined: Vec<(Address, Vec<(u64, u64)>)> = Vec::new();
         {
             let mut c = wtx.open_table(COVERAGE)?;
             let v = wtx.open_table(VERIFIED_COV)?;
@@ -1160,8 +1163,12 @@ impl AddressHistory {
                 }
                 changed = true;
                 let a: Address = key[..20].try_into().expect("coverage keys are 21 bytes");
+                let removed = subtract_all(&intersect(&spans, &[(first, last)]), &verified);
+                if action == Action::MinedBlocks && !removed.is_empty() {
+                    unmined.push((a, removed.clone()));
+                }
                 let mut rows = wtx.open_table(action.table())?;
-                for (f, t) in subtract_all(&intersect(&spans, &[(first, last)]), &verified) {
+                for (f, t) in removed {
                     drain(
                         &mut rows,
                         &row_key(&a, f, 0, 0),
@@ -1172,6 +1179,28 @@ impl AddressHistory {
                     c.remove(key.as_slice())?;
                 } else {
                     c.insert(key.as_slice(), encode_spans(&kept).as_slice())?;
+                }
+            }
+            let mut produced = wtx.open_table(Action::ProducedBlocks.table())?;
+            for (a, removed) in unmined {
+                let key = coverage_key(&a, Action::ProducedBlocks);
+                let Some(spans) = c.get(key.as_slice())?.map(|s| s.value().to_vec()) else {
+                    continue;
+                };
+                let mut kept = decode_spans(&spans)?;
+                for &(f, t) in &removed {
+                    kept = subtract(&kept, (f, t));
+                    drain(
+                        &mut produced,
+                        &row_key(&a, f, 0, 0),
+                        &row_key(&a, t, u64::MAX, u64::MAX),
+                    )?;
+                }
+                changed = true;
+                if kept.is_empty() {
+                    c.remove(key.as_slice())?;
+                } else {
+                    c.insert(key.as_slice(), encode_spans(&merge(kept)).as_slice())?;
                 }
             }
             if changed {
@@ -2954,8 +2983,17 @@ mod tests {
         .unwrap();
         h.record_verified(Action::MinedBlocks, ALICE, &[at(55)], (50, 70), g)
             .unwrap();
+        // Produced blocks built on that mined-block coverage.
+        h.record_produced(ALICE, &[at(10), at(60), at(90)], (0, 100), g, &[], 0)
+            .unwrap();
         h.keep_verified_only(&[Action::MinedBlocks], (40, 80))
             .unwrap();
+        // Where unverified mined-block coverage went, the produced-block coverage built on it went too;
+        // over verified blocks it stays.
+        assert_eq!(
+            h.coverage(Action::ProducedBlocks, ALICE).unwrap(),
+            vec![(0, 39), (50, 70), (81, 100)]
+        );
         assert_eq!(
             h.coverage(Action::MinedBlocks, ALICE).unwrap(),
             vec![(0, 39), (50, 70), (81, 100)]
