@@ -597,4 +597,144 @@ pub(crate) mod tests {
         assert_eq!(provable(19_420_000), Some((DENEB_BLOCK, 19_429_999)));
         assert_eq!(provable(19_410_000), None);
     }
+
+    /// `n` linked execution blocks from Dencun on, every other slot missed, with the beacon headers
+    /// that produced them, and the successor of the last. Block i is proposed by validator 100 + i.
+    pub(crate) fn chain(n: usize) -> (Vec<VerifiedBlock>, Vec<ProposerRow>, Header) {
+        let mut blocks: Vec<VerifiedBlock> = Vec::new();
+        let mut rows: Vec<ProposerRow> = Vec::new();
+        let mut beacon_parent = [7u8; 32];
+        let mut parent_hash = B256::repeat_byte(9);
+        for i in 0..=n {
+            let slot = DENEB_SLOT + 2 * i as u64;
+            let header = Header {
+                number: DENEB_BLOCK + i as u64,
+                parent_hash,
+                timestamp: GENESIS_TIME + slot * SECONDS_PER_SLOT,
+                beneficiary: alloy_primitives::Address::repeat_byte(i as u8 + 1),
+                parent_beacon_block_root: Some(B256::from(beacon_parent)),
+                base_fee_per_gas: Some(1),
+                withdrawals_root: Some(B256::ZERO),
+                blob_gas_used: Some(0),
+                excess_blob_gas: Some(0),
+                ..Default::default()
+            };
+            let hash = header.hash_slow();
+            if i == n {
+                return (blocks, rows, header);
+            }
+            let row = ProposerRow {
+                number: header.number,
+                hash: hash.0,
+                slot,
+                proposer_index: 100 + i as u64,
+                parent_root: beacon_parent,
+                state_root: [i as u8; 32],
+                body_root: [i as u8 + 50; 32],
+            };
+            beacon_parent = header_root(&row);
+            parent_hash = hash;
+            rows.push(row);
+            blocks.push(VerifiedBlock {
+                hash,
+                header,
+                withdrawals: Vec::new(),
+            });
+        }
+        unreachable!()
+    }
+
+    fn span(n: usize) -> (u64, u64) {
+        (DENEB_BLOCK, DENEB_BLOCK + n as u64 - 1)
+    }
+
+    #[test]
+    fn a_consistent_catalogue_proves_every_proposer() {
+        let (blocks, rows, successor) = chain(5);
+        let proven = verify(&rows, &blocks, &successor, span(5)).unwrap();
+        let who: Vec<u64> = proven.iter().map(|p| p.proposer_index).collect();
+        assert_eq!(who, vec![100, 101, 102, 103, 104]);
+    }
+
+    #[test]
+    fn a_tampered_row_naming_another_validator_fails_the_whole_span() {
+        // The tampered row is not one a watched validator would match: the span must still fail,
+        // or a filter-first reader would serve a falsely complete empty answer.
+        let (blocks, mut rows, successor) = chain(5);
+        rows[2].proposer_index = 999;
+        assert!(verify(&rows, &blocks, &successor, span(5)).is_err());
+    }
+
+    #[test]
+    fn every_corrupted_header_field_is_refused() {
+        for f in 0..4 {
+            let (blocks, mut rows, successor) = chain(4);
+            match f {
+                0 => rows[1].slot += 2,
+                1 => rows[1].parent_root[0] ^= 1,
+                2 => rows[1].state_root[3] ^= 1,
+                _ => rows[1].body_root[3] ^= 1,
+            }
+            assert!(verify(&rows, &blocks, &successor, span(4)).is_err(), "field {f}");
+        }
+    }
+
+    #[test]
+    fn missing_duplicate_and_substituted_rows_are_refused() {
+        let (blocks, rows, successor) = chain(4);
+        let mut missing = rows.clone();
+        missing.remove(2);
+        assert!(verify(&missing, &blocks, &successor, span(4)).is_err());
+        let mut duplicated = rows.clone();
+        duplicated[2] = duplicated[1].clone();
+        assert!(verify(&duplicated, &blocks, &successor, span(4)).is_err());
+        // A real header from another block, renumbered: its root is not the one committed here.
+        let mut substituted = rows.clone();
+        substituted[2] = ProposerRow {
+            number: rows[2].number,
+            hash: rows[2].hash,
+            ..rows[3].clone()
+        };
+        assert!(verify(&substituted, &blocks, &successor, span(4)).is_err());
+        let mut wrong_hash = rows.clone();
+        wrong_hash[1].hash[0] ^= 1;
+        assert!(verify(&wrong_hash, &blocks, &successor, span(4)).is_err());
+        let mut wrong_height = rows;
+        wrong_height[1].number += 1;
+        assert!(verify(&wrong_height, &blocks, &successor, span(4)).is_err());
+    }
+
+    #[test]
+    fn the_last_block_needs_its_real_successor() {
+        let (blocks, rows, mut successor) = chain(3);
+        let mut other = successor.clone();
+        other.parent_beacon_block_root = Some(B256::repeat_byte(1));
+        assert!(verify(&rows, &blocks, &other, span(3)).is_err(), "another root");
+        successor.parent_hash = B256::repeat_byte(2);
+        assert!(verify(&rows, &blocks, &successor, span(3)).is_err(), "not linked");
+    }
+
+    #[test]
+    fn a_header_from_a_later_fork_is_refused() {
+        let (blocks, rows, mut successor) = chain(2);
+        successor.block_access_list_hash = Some(B256::ZERO);
+        let e = verify(&rows, &blocks, &successor, span(2)).unwrap_err();
+        assert!(format!("{e:#}").contains("after Fulu"), "{e:#}");
+    }
+
+    #[test]
+    fn nothing_before_dencun_is_proven() {
+        let (blocks, rows, successor) = chain(2);
+        assert!(verify(&rows, &blocks, &successor, (DENEB_BLOCK - 1, DENEB_BLOCK)).is_err());
+    }
+
+    #[test]
+    fn a_slot_that_is_not_the_blocks_timestamp_is_refused() {
+        // A consistent beacon chain whose slots are shifted against the execution timestamps.
+        let (mut blocks, mut rows, successor) = chain(2);
+        blocks[0].header.timestamp += SECONDS_PER_SLOT;
+        rows[0].hash = blocks[0].header.hash_slow().0;
+        blocks[0].hash = B256::from(rows[0].hash);
+        assert!(verify(&rows, &blocks, &successor, span(2)).is_err());
+    }
 }
