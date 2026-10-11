@@ -247,11 +247,10 @@ impl ModeState {
         self
     }
 
-    /// The first block validators' proposals are proven from: the catalogue's first, or `start_block`
-    /// if later.
+    /// The first block validators' proposals are proven from: the catalogue's first. It does not
+    /// follow `start_block`, which bounds account history: the catalogue costs no RPC to read.
     pub fn proposals_from(&self) -> u64 {
-        self.start_block
-            .max(crate::address_proposers::CATALOGUE_FROM_BLOCK)
+        crate::address_proposers::CATALOGUE_FROM_BLOCK
     }
 
     pub fn with_relays(mut self, relays: crate::address_mev::Relays) -> Self {
@@ -2077,6 +2076,11 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
     if get("module") == Some("block") && get("action") == Some("getblocknobytime") {
         return Json(block_by_time(&s, &q).await);
     }
+    // A range from before the configured history is refused in the one wording a client reads to ask
+    // again from the start, whatever the action and whether or not it named a start.
+    if let Some(why) = before_history(&s, &q) {
+        return Json(crate::address_history::incomplete(&why));
+    }
     // A txhash lookup needs no coverage: a transaction the store has not traced is traced now, by
     // the cursor, once the request is one `respond` would answer.
     let traceable = get("module") == Some("account")
@@ -2153,6 +2157,26 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
             }))
         }
     }
+}
+
+/// Why an account request starts before the configured history, if it does: `startblock`, or 0
+/// when absent, under `start_block`.
+fn before_history(s: &ModeState, q: &HashMap<String, String>) -> Option<String> {
+    use crate::address_history::Action;
+    if q.get("module").map(String::as_str) != Some("account") || q.contains_key("txhash") {
+        return None;
+    }
+    Action::from_etherscan(q.get("action")?)?;
+    let start = match q.get("startblock").filter(|v| !v.is_empty()) {
+        None => 0,
+        Some(v) => v.parse::<u64>().ok()?,
+    };
+    (start < s.start_block).then(|| {
+        format!(
+            "history starts at block {}; ask from there and use another source before it",
+            s.start_block
+        )
+    })
 }
 
 /// `account/nuthatchValidatorBlocks`, from the validators' own store: complete or refused.
@@ -2962,7 +2986,12 @@ pub async fn dev(
             state.history.store().clone(),
             &ah.validators,
         )?;
-        let beacon = match &ah.beacon_url {
+        // From the environment first, so a keyed URL stays out of nuthatch.toml.
+        let beacon_url = std::env::var("NUTHATCH_BEACON_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .or_else(|| ah.beacon_url.clone());
+        let beacon = match &beacon_url {
             Some(url) => {
                 tracing::info!(
                     "address history: proposer catalogue spans the mirror lacks are built from the configured beacon, which sees this machine's IP and the beacon roots asked for"
@@ -3441,6 +3470,47 @@ mod tests {
         let v = serde_json::from_slice(&bytes)
             .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into()));
         (status, v)
+    }
+
+    /// rotki asks from block 0, or names no start: every account action must answer in the wording
+    /// rotki reads to ask again from the configured start.
+    #[tokio::test]
+    async fn a_range_before_the_configured_history_names_where_it_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(25_700_000, None, 64),
+        );
+        for action in [
+            "txlist",
+            "txlistinternal",
+            "tokentx",
+            "tokennfttx",
+            "token1155tx",
+            "txsBeaconWithdrawal",
+            "getminedblocks",
+            "nuthatchProducedBlocks",
+        ] {
+            for start in ["", "&startblock=0", "&startblock=25699999"] {
+                let (_, v) = call(
+                    router(s.clone()),
+                    "GET",
+                    &format!("/api?module=account&action={action}&address={ALICE}{start}"),
+                    None,
+                )
+                .await;
+                let result = v["result"].as_str().unwrap_or_default().to_string();
+                // rotki's pattern: `history starts at block (\d+)`.
+                let n = result.split("history starts at block ").nth(1).map(|r| {
+                    r.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                });
+                assert_eq!(n.as_deref(), Some("25700000"), "{action}{start}: {v}");
+            }
+        }
     }
 
     /// A conflict found while a request is being answered refuses that answer too.
