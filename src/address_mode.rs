@@ -153,9 +153,9 @@ impl Pace {
             span: start.clamp(min, max),
             min,
             max,
-            // Half the deadline: a window carries a fixed cost of checks whatever its span, so a
-            // smaller target never lets it grow, and the backfill crawls.
-            target: deadline / 2,
+            // A quarter of the deadline: a request waits for the window in hand. Much smaller and the
+            // fixed cost of a window's checks never lets it grow, and the backfill crawls.
+            target: deadline / 4,
         }
     }
     pub(crate) fn span(&self) -> u64 {
@@ -5906,12 +5906,12 @@ mod tests {
     #[test]
     fn a_window_shrinks_when_slow_and_grows_back_when_quick() {
         let mut p = Pace::new(1_000, 64, 50_000, Duration::from_secs(20));
-        p.took(Duration::from_secs(11));
-        assert_eq!(p.span(), 500, "over half the deadline halves it");
-        p.took(Duration::from_secs(7));
+        p.took(Duration::from_secs(6));
+        assert_eq!(p.span(), 500, "over a quarter of the deadline halves it");
+        p.took(Duration::from_secs(3));
         assert_eq!(p.span(), 500, "between half and the whole target it holds");
         // A window that took 2 s, as the fixed checks alone can on a slow RPC, still grows it.
-        p.took(Duration::from_secs(2));
+        p.took(Duration::from_millis(2_000));
         assert_eq!(p.span(), 1_000);
         p.took(Duration::from_millis(100));
         assert_eq!(p.span(), 2_000, "a quick window doubles it");
