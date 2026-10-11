@@ -11,7 +11,11 @@ hole (#725, #745). Two for two is not luck; it is a measurement of how much of a
 
 `.github/workflows/mutants.yml`, weekly (Sundays 03:00 UTC) and on demand, as one matrix job per file shard
 (two for `chunker.rs`, eight for `seal.rs`, one for `registry.rs`), each running `cargo mutants
---file <file> --shard <n/m> -- --lib`. **Not on pull requests**, and the reason is measured rather
+--file <file> --shard <n/m> -- --lib -- --skip a_wide_batch_stays_under_the_cursor`. The skipped
+test measures one wide query's RSS in a child process. On a loaded runner it sits a few tens of
+megabytes over its 512 MiB ceiling and aborts the unmutated baseline before a mutant is scored
+(#2030). A baseline entry does not apply to that, and the ordinary suite still runs the test.
+**Not on pull requests**, and the reason is measured rather
 than assumed. On an 18-core machine, when the job landed (2026-08-23):
 
 | | |
