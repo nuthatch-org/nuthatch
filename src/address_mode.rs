@@ -70,6 +70,10 @@ pub struct ModeState {
     pub wake: tokio::sync::Notify,
     /// Why the cursor stopped for good, e.g. an RPC on the wrong chain.
     cursor_error: Mutex<Option<String>>,
+    /// A conflict with history under the finalized head: nothing is answered while it stands.
+    conflict: Mutex<Option<String>>,
+    /// Which recorded finalized hash the next poll samples, beside the newest.
+    sample: AtomicU64,
     /// RPC calls by endpoint and method.
     calls: Mutex<BTreeMap<(String, String), u64>>,
     windows: AtomicU64,
@@ -175,6 +179,8 @@ impl ModeState {
             end_block: None,
             wake: tokio::sync::Notify::new(),
             cursor_error: Mutex::new(None),
+            conflict: Mutex::new(None),
+            sample: AtomicU64::new(0),
             calls: Mutex::new(BTreeMap::new()),
             windows: AtomicU64::new(0),
             discovery_errors: AtomicU64::new(0),
@@ -239,6 +245,12 @@ impl ModeState {
         self.end_block = end_block;
         self.depth = depth;
         self
+    }
+
+    /// Stop the cursor over a conflict with finalized history, and refuse every answer.
+    fn conflict(&self, why: String) {
+        *self.conflict.lock().expect("conflict lock") = Some(why.clone());
+        self.stop(why);
     }
 
     fn stop(&self, why: String) {
@@ -705,8 +717,14 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             _ => by_depth,
         };
         self.check_tracked(state, latest).await?;
+        let hash = block_hash(&self.main, finalized).await?;
+        state.set_calls("main", self.main.calls());
         let h = state.history.clone();
-        tokio::task::spawn_blocking(move || h.finalize(finalized)).await??;
+        tokio::task::spawn_blocking(move || {
+            h.finalize(finalized)?;
+            h.record_final(finalized, hash)
+        })
+        .await??;
         Ok(finalized)
     }
 
@@ -767,6 +785,7 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                 .await??
         };
         let committed = committed.unwrap_or(0);
+        self.check_finals(state, deadline).await?;
         let found = within(deadline, async {
             let mut moved: Option<u64> = tracked.iter().map(|(b, _)| *b).find(|b| *b > latest);
             let mut base = committed;
@@ -790,13 +809,48 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                 "block {lowest_moved}, under the finalized head {committed}, is now at another hash; \
                  history under the finalized head is never rewritten, so this needs an operator"
             );
-            state.stop(why.clone());
+            state.conflict(why.clone());
             bail!(why);
         }
         tracing::warn!(
             "address history: a reorg replaced blocks above {base}; taking back what was read there"
         );
         tokio::task::spawn_blocking(move || history.invalidate_above(base)).await??;
+        Ok(())
+    }
+
+    /// Hold the newest recorded finalized hash, and one older one in turn, against the chain. A
+    /// mismatch is history under the finalized head that changed, a reorg under finality or an RPC
+    /// that came back on another chain with the same id, and nothing is answered while it stands.
+    async fn check_finals(&self, state: &ModeState, deadline: Option<Instant>) -> Result<()> {
+        let finals = state.history.finals()?;
+        let Some(&newest) = finals.last() else {
+            return Ok(());
+        };
+        let pick = state.sample.fetch_add(1, Ordering::Relaxed) as usize % finals.len();
+        let mut checks = vec![newest];
+        if finals[pick] != newest {
+            checks.push(finals[pick]);
+        }
+        let moved = within(deadline, async {
+            for (b, h) in checks {
+                if block_hash(&self.main, b).await? != h {
+                    return Ok(Some(b));
+                }
+            }
+            Ok(None)
+        })
+        .await;
+        state.set_calls("main", self.main.calls());
+        if let Some(b) = moved? {
+            let why = format!(
+                "finalized block {b} is now at another hash: a reorg under finality, or an RPC on \
+                 another chain with the same id; history under the finalized head is never \
+                 rewritten, so the nest answers nothing until an operator looks"
+            );
+            state.conflict(why.clone());
+            bail!(why);
+        }
         Ok(())
     }
 
@@ -1292,6 +1346,9 @@ async fn api(
     State(s): State<Arc<ModeState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<Value> {
+    if let Some(why) = s.conflict.lock().expect("conflict lock").clone() {
+        return Json(crate::address_history::incomplete(&why));
+    }
     // The RPC behind the nest is the operator's; only a loopback bind lends it out.
     if let Some(forward) = s.forward.clone().filter(|_| s.loopback) {
         let _permit = if q.get("module").map(String::as_str) == Some("logs") {
@@ -2699,6 +2756,8 @@ mod tests {
         hashes: std::sync::Mutex<Vec<[u8; 32]>>,
         finalized: AtomicU64,
         seed: AtomicU64,
+        /// A reorg of this depth lands as soon as the next trace_filter has answered.
+        reorg_next: AtomicU64,
     }
 
     impl Chain {
@@ -2762,6 +2821,98 @@ mod tests {
             let trace = crate::address_partitions::tests::Fake::new(|m, _| bail!("unexpected {m}"));
             Discoverer::new(Counted::new(main), Counted::new(trace))
         }
+        fn hex(&self, b: u64) -> String {
+            format!("0x{}", alloy_primitives::hex::encode(self.hash(b)))
+        }
+        fn block_json(&self, b: u64) -> Value {
+            json!({"number": format!("0x{b:x}"), "hash": self.hex(b), "timestamp": "0x10",
+                   "parentHash": if b == 0 { format!("0x{:064x}", 0) } else { self.hex(b - 1) }})
+        }
+        /// A discoverer that answers the production window as a node would: ALICE receives an
+        /// internal call in every block [`Chain::row_at`] marks, the transaction hash being that
+        /// block's, and a transaction a reorg took away is no longer found.
+        fn node(
+            self: &Arc<Chain>,
+        ) -> Discoverer<
+            Counted<crate::address_partitions::tests::Fake>,
+            Counted<crate::address_partitions::tests::Fake>,
+        > {
+            let c = self.clone();
+            let main = crate::address_partitions::tests::Fake::new(move |m, p| match m {
+                "eth_blockNumber" => Ok(json!(format!("0x{:x}", c.latest()))),
+                "eth_getBlockByNumber" if p[0] == "finalized" => {
+                    Ok(json!({"number": format!("0x{:x}", c.finalized.load(Ordering::Relaxed))}))
+                }
+                "eth_getBlockByNumber" => {
+                    let b = crate::address_discovery::hex_u64(&p[0])?;
+                    Ok(if b > c.latest() {
+                        Value::Null
+                    } else {
+                        c.block_json(b)
+                    })
+                }
+                "eth_getCode" => Ok(json!("0x")),
+                "eth_getTransactionCount" => Ok(json!("0x0")),
+                "eth_getLogs" => Ok(json!([])),
+                "eth_getBlockTransactionCountByNumber" => Ok(json!("0x1")),
+                other => bail!("unexpected {other}"),
+            });
+            let c = self.clone();
+            let trace = crate::address_partitions::tests::Fake::new(move |m, p| match m {
+                "eth_getBlockByNumber" => {
+                    let b = crate::address_discovery::hex_u64(&p[0])?;
+                    Ok(if b > c.latest() {
+                        Value::Null
+                    } else {
+                        c.block_json(b)
+                    })
+                }
+                "trace_filter" => {
+                    let f = &p[0];
+                    let s = crate::address_discovery::hex_u64(&f["fromBlock"])?;
+                    let e = crate::address_discovery::hex_u64(&f["toBlock"])?.min(c.latest());
+                    let frames: Vec<Value> = if f.get("toAddress").is_some() {
+                        (s..=e)
+                            .filter(|b| c.row_at(*b))
+                            .map(|b| {
+                                json!({"transactionHash": c.hex(b), "blockNumber": b,
+                                       "traceAddress": [0], "type": "call",
+                                       "action": {"from": "0x03", "to": ALICE.to_ascii_lowercase(),
+                                                  "value": "0x5", "callType": "call", "gas": "0x0"},
+                                       "result": {"gasUsed": "0x0"}})
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let depth = c.reorg_next.swap(0, Ordering::Relaxed);
+                    if depth > 0 {
+                        c.reorg(depth);
+                    }
+                    Ok(json!(frames))
+                }
+                "trace_transaction" => {
+                    let tx = p[0].as_str().unwrap().to_ascii_lowercase();
+                    let Some(b) = (0..=c.latest()).find(|b| c.row_at(*b) && c.hex(*b) == tx) else {
+                        bail!("transaction {tx} not found");
+                    };
+                    let a = ALICE.to_ascii_lowercase();
+                    Ok(json!([
+                        {"traceAddress": [], "type": "call", "transactionHash": tx, "blockNumber": b,
+                         "blockHash": c.hex(b), "transactionPosition": 0,
+                         "action": {"from": "0x02", "to": "0x03", "value": "0x0", "callType": "call"}},
+                        {"traceAddress": [0], "type": "call", "transactionHash": tx, "blockNumber": b,
+                         "blockHash": c.hex(b), "transactionPosition": 0,
+                         "action": {"from": "0x03", "to": a, "value": "0x5", "callType": "call",
+                                    "gas": "0x0"},
+                         "result": {"gasUsed": "0x0"}},
+                    ]))
+                }
+                "trace_block" => Ok(json!([{"x": 1}])),
+                other => bail!("unexpected {other}"),
+            });
+            Discoverer::new(Counted::new(main), Counted::new(trace))
+        }
     }
 
     /// Record `[from, to]` for ALICE as discovery would have read it from `chain` now, anchored at
@@ -2810,12 +2961,19 @@ mod tests {
 
     /// What the store holds for ALICE over its covered blocks, and what the chain says it should.
     fn held_and_wanted(chain: &Chain, h: &AddressHistory) -> (Vec<String>, Vec<String>) {
-        use crate::address_history::Action;
+        held_and_wanted_of(chain, h, crate::address_history::Action::TxList)
+    }
+
+    fn held_and_wanted_of(
+        chain: &Chain,
+        h: &AddressHistory,
+        action: crate::address_history::Action,
+    ) -> (Vec<String>, Vec<String>) {
         let mut held = Vec::new();
         let mut wanted = Vec::new();
-        for (f, t) in h.coverage(Action::TxList, ALICE).unwrap() {
+        for (f, t) in h.coverage(action, ALICE).unwrap() {
             assert!(t <= chain.latest(), "coverage past the chain head");
-            for r in h.rows_in(Action::TxList, ALICE, (f, t)).unwrap() {
+            for r in h.rows_in(action, ALICE, (f, t)).unwrap() {
                 held.push(r["hash"].as_str().unwrap().to_string());
             }
             for b in (f..=t).filter(|b| chain.row_at(*b)) {
@@ -2936,6 +3094,129 @@ mod tests {
                 proptest::prop_assert!(s.cursor_error.lock().unwrap().is_none());
                 Ok(())
             })?;
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        /// The same property through the cursor's own window, [`discover_window`], against a node
+        /// whose traces follow the chain, with reorgs that may also cross finality. One that reaches
+        /// a finalized head the store committed stops the cursor and refuses every answer; short of
+        /// that, after the last poll every covered block holds exactly the canonical rows, and the
+        /// run must have covered something, so a fetch path that records nothing cannot pass.
+        #[test]
+        fn reorgs_through_the_cursors_window_converge_or_stop(
+            ops in proptest::collection::vec((0u8..6, 1u64..12), 1..40)
+        ) {
+            use crate::address_history::Action;
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let s = reorg_state(dir.path());
+                let chain = Chain::new(60, 30);
+                let d = chain.node();
+                d.reconcile(&s, chain.latest()).await.unwrap();
+                let tail = |chain: &Chain| chain.latest() - chain.finalized.load(Ordering::Relaxed);
+                let window = |s: &ModeState, chain: &Chain| {
+                    let next = crate::address_discovery::next_uncovered_for(
+                        &s.history, ALICE, 0, &[Action::TxListInternal],
+                    ).unwrap();
+                    (next, chain.latest())
+                };
+                let mut crossed = false;
+                for (op, n) in ops {
+                    match op {
+                        0 => chain.reorg(n.min(tail(&chain))),
+                        1 => {
+                            chain.grow(n);
+                            chain.finalized.store(chain.latest() - 20, Ordering::Relaxed);
+                        }
+                        2 => {
+                            let w = window(&s, &chain);
+                            if w.0 <= w.1 {
+                                let _ = discover_window(&d, &s, ALICE, w, None).await;
+                            }
+                        }
+                        3 => {
+                            let w = window(&s, &chain);
+                            if w.0 <= w.1 {
+                                chain.reorg_next.store(n.min(tail(&chain)), Ordering::Relaxed);
+                                let _ = discover_window(&d, &s, ALICE, w, None).await;
+                                chain.reorg_next.store(0, Ordering::Relaxed);
+                            }
+                        }
+                        4 => d.reconcile(&s, chain.latest()).await.map(|_| ()).unwrap(),
+                        _ => {
+                            // Past the chain's own finalized tag: the replaced blocks start at
+                            // `point`, a finalized block the store may already have committed.
+                            let depth = (tail(&chain) + n).min(chain.latest());
+                            let point = chain.latest() + 1 - depth;
+                            chain.reorg(depth);
+                            let committed = s.history.finals().unwrap().last().map(|f| f.0);
+                            if committed.is_some_and(|f| point <= f) {
+                                crossed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if crossed {
+                    let err = d.reconcile(&s, chain.latest()).await.unwrap_err();
+                    proptest::prop_assert!(err.to_string().contains("finalized"), "{err:#}");
+                    let q = format!("/api?module=account&action=txlistinternal&address={ALICE}&startblock=0&endblock=10");
+                    let (_, a) = call(router(s.clone()), "GET", &q, None).await;
+                    let r = a["result"].as_str().unwrap_or_default().to_string();
+                    proptest::prop_assert!(r.starts_with("NUTHATCH_INCOMPLETE:") && r.contains("finalized"), "{a}");
+                    let (st, _) = call(router(s.clone()), "GET", "/ready", None).await;
+                    proptest::prop_assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+                    return Ok(());
+                }
+                d.reconcile(&s, chain.latest()).await.unwrap();
+                let w = window(&s, &chain);
+                if w.0 <= w.1 {
+                    discover_window(&d, &s, ALICE, w, None).await.unwrap();
+                }
+                d.reconcile(&s, chain.latest()).await.unwrap();
+                let (held, wanted) = held_and_wanted_of(&chain, &s.history, Action::TxListInternal);
+                proptest::prop_assert!(!s.history.coverage(Action::TxListInternal, ALICE).unwrap().is_empty());
+                proptest::prop_assert!(!wanted.is_empty(), "the chain gave ALICE no rows to hold");
+                proptest::prop_assert_eq!(held, wanted);
+                proptest::prop_assert!(s.cursor_error.lock().unwrap().is_none());
+                Ok(())
+            })?;
+        }
+    }
+
+    /// A reorg that replaces a finalized head the store committed, even with nothing tracked there,
+    /// stops the cursor at the next poll and every answer is refused with the reason, as is an RPC
+    /// that comes back on another chain under the same id.
+    #[tokio::test]
+    async fn a_reorg_under_finality_or_another_chain_stops_the_cursor() {
+        for depth in [35, 100] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = reorg_state(dir.path());
+            let chain = Chain::new(100, 70);
+            let d = chain.node();
+            d.reconcile(&s, chain.latest()).await.unwrap();
+            discover_window(&d, &s, ALICE, (0, 70), None).await.unwrap();
+            let q = format!(
+                "/api?module=account&action=txlistinternal&address={ALICE}&startblock=0&endblock=70"
+            );
+            let (_, before) = call(router(s.clone()), "GET", &q, None).await;
+            assert_eq!(before["status"], "1", "{before}");
+            // 65 to 99 replaced, under the finalized 70; or every block, another chain entirely.
+            chain.reorg(depth);
+            let err = d.reconcile(&s, chain.latest()).await.unwrap_err();
+            assert!(err.to_string().contains("finalized block 70"), "{err:#}");
+            let (_, after) = call(router(s.clone()), "GET", &q, None).await;
+            let r = after["result"].as_str().unwrap();
+            assert!(
+                r.starts_with("NUTHATCH_INCOMPLETE:") && r.contains("reorg under finality"),
+                "{after}"
+            );
+            let (st, ready) = call(router(s.clone()), "GET", "/ready", None).await;
+            assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{ready}");
+            assert!(ready.to_string().contains("finalized block 70"), "{ready}");
         }
     }
 

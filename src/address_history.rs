@@ -281,6 +281,11 @@ const CANON: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_canon");
 /// Blocks whose relay answer lacked a delivery, re-asked on a slow schedule: a relay can save its
 /// record after the block is published, or fail to.
 const MEV_PENDING: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_mev_pending");
+/// The hashes of the newest finalized heads this store committed. History under them is never
+/// rewritten, so each poll holds the newest and a sample against the chain: a reorg reaching under
+/// finality, or an RPC that came back on another chain under the same id, stops the cursor.
+const FINAL: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_final");
+const FINAL_KEEP: usize = 32;
 const META: TableDefinition<&str, u64> = TableDefinition::new("ah_meta");
 /// The finalized head: what the cursor backfills to and the line under which nothing is re-checked.
 const HEAD: &str = "head";
@@ -393,6 +398,7 @@ impl AddressHistory {
         wtx.open_table(CANON)?;
         wtx.open_table(MEV_PENDING)?;
         wtx.open_table(BODY_SUMMARY)?;
+        wtx.open_table(FINAL)?;
         reset_produced_blocks(&wtx)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
@@ -645,6 +651,39 @@ impl AddressHistory {
         }
         wtx.commit()?;
         Ok(())
+    }
+
+    /// Record `hash` as the finalized head `block`'s, keeping the newest [`FINAL_KEEP`].
+    pub fn record_final(&self, block: u64, hash: [u8; 32]) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let mut t = wtx.open_table(FINAL)?;
+            t.insert(block, hash.as_slice())?;
+            let all: Vec<u64> = t
+                .iter()?
+                .map(|e| e.map(|(k, _)| k.value()))
+                .collect::<std::result::Result<_, _>>()?;
+            for b in all.iter().take(all.len().saturating_sub(FINAL_KEEP)) {
+                t.remove(*b)?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// The finalized heads' hashes recorded, oldest first.
+    pub fn finals(&self) -> Result<Vec<(u64, [u8; 32])>> {
+        let rtx = self.store.database().begin_read()?;
+        rtx.open_table(FINAL)?
+            .iter()?
+            .map(|e| {
+                let (k, v) = e?;
+                let h: [u8; 32] = v.value().try_into().map_err(|_| {
+                    anyhow!("a finalized hash at block {} is not 32 bytes", k.value())
+                })?;
+                Ok((k.value(), h))
+            })
+            .collect()
     }
 
     /// The newest block served on demand, if any was. Only ever rises, except under a reorg.
