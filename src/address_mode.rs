@@ -3298,6 +3298,35 @@ mod tests {
         let (done, covered, _dir) = run(anchor.clone()).await;
         done.unwrap();
         assert!(covered);
+        // A whole validator pass with end_block inside the partition still proves the span: proofs
+        // run to the finalized block, and end_block bounds only what is served.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("t.redb")).unwrap();
+            let history = AddressHistory::open(store.clone(), 1, &[]).unwrap();
+            let validators =
+                crate::address_validators::Validators::open(store, &[validator]).unwrap();
+            let source = Arc::new(
+                Source::open(
+                    mirror.path().to_str().unwrap(),
+                    1,
+                    dir.path().join("cache"),
+                    1 << 30,
+                )
+                .unwrap(),
+            );
+            let state = ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(start, Some(start + 5), 64)
+                .with_validators(validators.clone(), None)
+                .with_mirror(source, (start, end));
+            let make = || Headers {
+                by_number: bridge.clone(),
+                finalized: header_json(&anchor),
+            };
+            let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+            validator_pass(&d, &state).await;
+            assert!(validators.covers(validator, (start, end)).unwrap());
+        }
         // The mirror and the numbered blocks agree with each other, but the finalized block is on
         // another chain: nothing is proven.
         let mut other = anchor.clone();
