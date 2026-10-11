@@ -720,6 +720,37 @@ impl AddressHistory {
             .map(|v| v.value().to_string()))
     }
 
+    /// The newest transaction at or under `at_most` among the watched addresses, with the block hash
+    /// it was read in: the evidence a store from before finalized hashes were recorded has of which
+    /// chain its history is.
+    pub fn newest_hashed_row(&self, at_most: u64) -> Result<Option<(u64, [u8; 32])>> {
+        let watched = self.watched()?;
+        let rtx = self.store.database().begin_read()?;
+        let t = rtx.open_table(TXLIST)?;
+        let mut best: Option<(u64, [u8; 32])> = None;
+        for a in watched {
+            let a = parse_address(&a)?;
+            let lo = row_key(&a, 0, 0, 0);
+            let hi = row_key(&a, at_most, u64::MAX, u64::MAX);
+            let Some(e) = t.range(lo.as_slice()..=hi.as_slice())?.next_back() else {
+                continue;
+            };
+            let record = decode_record(e?.1.value())?;
+            let text = |k: &str| record.get(k).and_then(Value::as_str);
+            let (Some(b), Some(h)) = (text("blockNumber"), text("blockHash")) else {
+                continue;
+            };
+            let b: u64 = b.parse()?;
+            let h: [u8; 32] = alloy_primitives::hex::decode(h.trim_start_matches("0x"))?
+                .try_into()
+                .map_err(|_| anyhow!("a stored block hash at {b} is not 32 bytes"))?;
+            if best.is_none_or(|(n, _)| b > n) {
+                best = Some((b, h));
+            }
+        }
+        Ok(best)
+    }
+
     /// The finalized heads' hashes recorded, oldest first.
     pub fn finals(&self) -> Result<Vec<(u64, [u8; 32])>> {
         let rtx = self.store.database().begin_read()?;
