@@ -3036,12 +3036,16 @@ mod tests {
             Discoverer::new(Counted::new(main), Counted::new(trace))
         };
         let first = failing(false);
-        first.catch_up(&mode(&h, 99_999).with_first_window(OUTER_WINDOW), 1_000_000).await;
+        first
+            .catch_up(&mode(&h, 99_999).with_first_window(OUTER_WINDOW), 1_000_000)
+            .await;
         assert!(h.coverage(Action::TxList, A).unwrap().is_empty());
         assert_eq!(first.main.calls().get("eth_getTransactionByHash"), Some(&1));
 
         let second = failing(true);
-        second.catch_up(&mode(&h, 99_999).with_first_window(OUTER_WINDOW), 1_000_000).await;
+        second
+            .catch_up(&mode(&h, 99_999).with_first_window(OUTER_WINDOW), 1_000_000)
+            .await;
         assert_eq!(h.coverage(Action::TxList, A).unwrap(), vec![(0, 99_999)]);
         assert_eq!(
             second.main.calls().get("eth_getTransactionByHash"),
