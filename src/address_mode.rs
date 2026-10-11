@@ -4354,6 +4354,19 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(500));
     }
 
+    /// A measured rate under a block a minute is still measured: it is never read as no rate.
+    #[test]
+    fn a_slow_measured_rate_is_never_read_as_unmeasured() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[]).unwrap();
+        let s = ModeState::new(history, 1, Duration::from_secs(300), true);
+        let rate = AtomicU64::new(per_minute(1, Duration::from_secs(600)));
+        assert_eq!(rate.load(Ordering::Relaxed), 1);
+        assert_eq!(reach(&s, &rate, COVER_PRODUCED), 0);
+        assert_eq!(per_minute(50, Duration::from_secs(30)), 100);
+    }
+
     /// The produced-block pass measures its rate in blocks per minute, and admission reads it: a gap
     /// within reach goes to the cursor, a slow rate refuses it, and owed relay re-asks count as blocks.
     #[tokio::test]
