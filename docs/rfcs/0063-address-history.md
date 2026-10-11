@@ -52,8 +52,9 @@ user, so one headers nest per chain on our boxes answers it for every rotki user
 Hosted section of nuthatch-indexer.com/nests. Per-address history is never hosted: a hosted service
 would have to index every transfer and transaction on a chain, and would see every user's wallet.
 
-**Polling.** Rotki reads history, not the tip. A rotki-mode nest polls every **5 minutes** by default
-(Chief, 2026-10-09), so an idle nest costs a handful of calls an hour.
+**Polling.** A rotki-mode nest polls every **5 minutes** by default (Chief, 2026-10-09), so an idle
+nest costs a handful of calls an hour. The poll backfills to the finalized head; rotki's sync ends
+15 seconds behind now, so the blocks above it are covered when a request asks for them (§12).
 
 ## 4. Discovery
 
@@ -158,13 +159,18 @@ receipts' priority fees. **MEV comes from the MEV-Boost relays' public data API*
 answered on 2026-10-10: Flashbots, ultrasound, bloXroute regulated, Agnostic, Aestus and Titan
 (bloXroute max-profit, Eden and Manifold no longer do). It is off unless `[address_history]` sets
 `mev_relays = true`, since the relays see the nest's IP and the block numbers it asks about, which
-name the validator. For a watched address the candidates are the blocks it was fee recipient of
-(slice 5) and the blocks where it received a value transfer from the block's miner or in the
-block's last transaction (a builder's payment). A candidate becomes a row only on a relay's word:
-deliveries are matched to the canonical block by hash, a claim naming the address is preferred, no
-relay record means no MEV figure (empty, never zero), and relays that disagree make the row a
-`conflict` with no value. Relay answers are cached only at or below the served head and dropped above
-a reorg; a relay that cannot be asked fails the window rather than reading as no delivery. The rows
+name the validator. The rows come from the chain: every block a watched address was fee recipient
+of (slice 5) is a row. A builder's payment, a value transfer to the address from the block's miner or
+in the block's last transaction, directly or as an internal transfer from a payout contract (cold
+test M1, 2026-10-11), becomes a row only on a relay's word. MEV is a label on a row, never a claim
+about the row set: deliveries are matched to the canonical block by hash, a claim naming the address
+is preferred, relays that disagree make the row a `conflict` with no value, and no delivery at the
+queried relays is `unrecorded`, never zero. A relay saves its delivery record after the block is
+published and only logs a failure to (mev-boost-relay `service.go`), so neither finality nor an
+empty answer proves there was none: such blocks, and builder payments without a row, are asked again
+daily for 30 days, and a delivery found then upgrades or inserts the row and moves the generation.
+Relay answers are cached only at or below the finalized head and dropped above a reorg; a relay that
+cannot be asked fails the window rather than reading as no delivery. The rows
 are served as `module=account&action=nuthatchProducedBlocks`: block, timestamp, fee recipient and its
 block reward, the relays' recipient, value, builder and proposer keys, and the builder's payment
 transaction and value. rotki's adapter reads them ahead of beaconcha.in when the nest is in
@@ -286,3 +292,39 @@ Figures marked (target) are confirmed by the first measurement, then frozen as b
    relays, which see the IP and the block numbers of the address's produced and relay-paid blocks
    (§8). Both are off until named.
 9. **Offline.** Covered history serves with the RPC down; gaps answer `NUTHATCH_INCOMPLETE`.
+
+## 12. The tip, reorgs and rotki's sync end (2026-10-11)
+
+Two cold tests of 5.1.1 (Codex, and a Claude agent with no build history) found that the nest and
+rotki's sync did not meet. rotki ends a sync at now minus 15 seconds (`CHAIN_TOP_LAG`, set by rotki's
+maintainers), resolves that time with `getblocknobytime`, and asks every account action up to the
+block it got. 5.1.1 answered `getblocknobytime` only from verified partitions, so a nest without them
+failed every nest-only sync; and it shortened an `endblock` above its head to the head and answered
+`status 1`, so rotki recorded history it never received (17 of Etherscan's 65 rows, cold test B1).
+The plan below went through six rounds of review against the code before both reviewers agreed.
+
+- **Exact or refused.** An explicit `endblock` is answered whole or refused, never shortened.
+  `getblocknobytime` answers from verified headers, else by searching the nest's own RPC, with the
+  answer proven against its neighbour by parent hash; a timestamp newer than the chain head, or a
+  chain whose blocks can share a second, is refused.
+- **The tip on demand.** The cursor backfills to the finalized head. A request above what is covered
+  and at or below the chain head is handed to the cursor, which covers that address and the actions
+  the request needs (produced blocks need mined blocks and transactions first), up to the block
+  asked for, holes included, and answers within a deadline (20 s, under rotki's 30 s read timeout).
+  The cursor stays the only writer: requests wait on a bounded queue and are served between its
+  windows, so none waits behind another address's backfill.
+- **Reorgs in the mutable store.** Anything read above the finalized head is read against the hash
+  of its window's last block, checked before and after the fetch and tracked with the record. Each
+  poll compares the newest tracked hash with the RPC's; on a mismatch it walks down to the newest
+  that still matches and takes back everything above it: rows, coverage, cached transactions,
+  timestamps, traces and relay answers. A fetch that began before a reorg keeps nothing above the
+  finalized head. Tracked hashes are persisted, so a restart finds a reorg it slept through. A
+  tracked block now finalized at another hash stops the cursor and reports it: history under the
+  finalized head is never rewritten. A property test over random reorg depths gates it.
+- **The bar.** rotki's ordinary Etherscan sync can import unfinalized history and does not
+  automatically reconcile already imported history after a reorg. The nest integration retains this
+  shared limitation for this handover; the nest itself converges.
+- **Also from the cold tests.** `logs/getLogs` is asked in spans the provider accepts, at most 64
+  calls a request, and answers incomplete beyond that (M3); a failing span retry logs at warn and a
+  failed reconcile counts as a failed poll (silent stall); the store's page cache is 32 MiB, since
+  redb otherwise holds every page a backfill wrote, up to 1 GiB (M5).

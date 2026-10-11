@@ -182,7 +182,23 @@ start_block = 0               # optional: history before it is never fetched, an
 end_block = 20000000          # optional: stop here
 poll_interval = "5m"          # optional, default 5m; `--poll-interval` overrides it
 mev_relays = false            # optional, default off: ask the MEV-Boost relays, see below
+request_deadline = "20s"      # optional, default 20s: how long a request may wait while the nest covers it
 ```
+
+The cursor backfills each address up to the finalized head (the RPC's `finalized` tag, else the
+registry's depth under the head). A request whose `endblock` lies above what is covered, and at or
+below the chain head, is covered on demand by the cursor, up to the block asked for, within
+`request_deadline`; otherwise it answers `NUTHATCH_INCOMPLETE`. An explicit `endblock` is answered
+whole or refused, never shortened to what is covered; one past the chain head is refused. Without
+`endblock` the answer runs to the end of the covered run the start is in. Blocks above the finalized
+head are read against their block hash: each poll checks the newest such hash, and a reorg takes back
+everything read above the fork, rows, coverage and caches, until it is read again. A conflict at or
+under the finalized head stops the cursor and says so; history under it is never rewritten.
+
+`getblocknobytime` answers from verified headers where they bracket the timestamp, and otherwise by
+searching the nest's own RPC, proving the answer against its neighbour block by parent hash. It
+refuses a timestamp newer than the chain head, and refuses on chains whose blocks can share a second
+(Arbitrum, BNB Chain).
 
 On Ethereum mainnet, withdrawals, produced blocks and `getblocknobytime` can come from verified block
 partitions (RFC-0063 §8) instead of one RPC call per block. It is off unless this table names a
@@ -200,7 +216,15 @@ cache_mb = 512                # disk the downloaded partitions may hold; at leas
 `mev_relays = true` in `[address_history]` asks the MEV-Boost relays' public data API about each
 block a watched address produced, or was paid for by a relay-built block's builder, and serves the
 result as `module=account&action=nuthatchProducedBlocks`: fee recipient, block reward, the relays'
-recipient and value, the builder's payment transaction, and `mev` of `relay`, `none` or `conflict`.
+recipient and value, the builder's payment transaction, and `mev` of `relay`, `conflict` or
+`unrecorded`. The rows come from the chain: every block the address received the fees of is one. A
+builder's payment, whether a transaction from the builder or an internal transfer in the block's last
+transaction (a payout contract), becomes a row only on a relay's word. `unrecorded` means no delivery
+at the queried relays when last asked, never zero MEV: a relay saves its record after the block is
+published and can fail to, so such blocks are asked again daily for 30 days, and a delivery found
+then upgrades the row or inserts the missing one. `builderPubkey` and `proposerPubkey` come from one
+relay's claim: the deliveries for the canonical block hash, in the fixed relay order, the first whose
+fee recipient is the watched address, else the first; `conflict` compares recipient and value only.
 It is off by default; the relays see this machine's IP and those block numbers.
 
 Each partition is verified before use: every header hashed, linked to its parent and anchored to the
@@ -210,6 +234,17 @@ missing or fails stays `NUTHATCH_INCOMPLETE`. `nuthatch partitions` builds them.
 The table stays out of the nest's identity and its bundle: the accounts are private and change at
 runtime through `POST /api/watch` and `POST /api/unwatch` with `{"address": "0x…"}`, accepted only on
 a loopback bind. A range the nest has not fetched answers `NUTHATCH_INCOMPLETE`, never an empty list.
+`/ready` answers 503 until the first finalized head is read, and still carries `chain_id`.
+
+The rows are Etherscan's account records with a narrower field set on two row types: token rows
+(`tokentx`, `tokennfttx`, `token1155tx`) omit `tokenName`, `tokenSymbol`, `tokenDecimal`, `gasUsed`
+and `functionName`, and internal rows carry an empty `input`. rotki's readers of those row types use
+none of them. `logs/getLogs` asks the RPC in spans it accepts, at most 64 calls a request, and answers
+`NUTHATCH_INCOMPLETE` for a range that would need more.
+
+What leaves the machine: the RPC provider sees the watched addresses in its trace and log filters
+(history stays local; the provider's view does not); the mirror, if named, sees the IP and block
+ranges; the relays, if turned on, see the IP and block numbers.
 
 ## `entities.toml` - authored incremental relations (RFC-0041)
 

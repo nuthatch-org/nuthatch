@@ -1335,7 +1335,14 @@ impl AddressHistory {
             .take(take)
             .map(|e| {
                 let (_, v) = e?;
-                decode_record(v.value()).map(Value::Object)
+                let mut r = decode_record(v.value())?;
+                // 5.1 stored `none` for what is now `unrecorded`; both mean no delivery was found.
+                if action == Action::ProducedBlocks
+                    && r.get("mev").and_then(Value::as_str) == Some("none")
+                {
+                    r.insert("mev".into(), Value::String("unrecorded".into()));
+                }
+                Ok(Value::Object(r))
             })
             .collect::<Result<Vec<_>>>()?;
         answer(Answer::Rows(rows))
