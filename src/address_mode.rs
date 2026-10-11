@@ -2507,7 +2507,10 @@ async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Op
         .enumerate()
         .map(|(i, ((_, reach), next))| {
             let owed = if i == 2 { owed } else { 0 };
-            let work = (to + 1).saturating_sub(*next) + owed;
+            let work = to
+                .saturating_sub(*next)
+                .saturating_add(u64::from(*next <= to))
+                .saturating_add(owed);
             match (work, *reach) {
                 (0, _) => 0.0,
                 // A measured rate too slow to reach one block in time reaches none.
@@ -2520,7 +2523,9 @@ async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Op
         return None;
     }
     let next = *nexts.iter().min()?;
-    let gap = (to + 1).saturating_sub(next);
+    let gap = to
+        .saturating_sub(next)
+        .saturating_add(u64::from(next <= to));
     Some(()).map(|()| {
         format!(
             "covered through block {}; the {gap} blocks above it are being backfilled, more than can \
@@ -4457,6 +4462,8 @@ mod tests {
         // 6,000,000 a minute reaches 100,000 blocks in half of 2 s: a 50,000-block gap is admitted.
         s.produced_rate.store(6_000_000, Ordering::Relaxed);
         assert_eq!(beyond_reach(&s, &want(249_999)).await, None);
+        // A valid u64 range boundary is refused without overflowing the work estimate.
+        assert!(beyond_reach(&s, &want(u64::MAX)).await.is_some());
         // One block a minute is slow, not unmeasured: a 1,000-block gap is refused, where the
         // unmeasured floor would admit it.
         s.produced_rate.store(1, Ordering::Relaxed);
