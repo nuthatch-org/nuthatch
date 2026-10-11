@@ -377,6 +377,10 @@ pub async fn blocks_from_rpc(
     Ok(out)
 }
 
+/// Blocks read at once while proving or linking: small enough that a caller serving its waiting
+/// requests between chunks keeps them well under their deadline on a slow RPC.
+pub const CHUNK: u64 = 128;
+
 /// The header of block `lo`, linked block by block through `hi` to `anchor` (block `hi + 1`), read
 /// from `rpc` a chunk at a time so only one chunk is held, running `between` after each so a caller
 /// can serve its waiting requests.
@@ -386,7 +390,6 @@ pub async fn linked_to<'b>(
     anchor: &Header,
     between: &(dyn Fn() -> futures::future::BoxFuture<'b, ()> + Sync),
 ) -> Result<Header> {
-    const CHUNK: u64 = 1_000;
     let mut first: Option<Header> = None;
     let mut last: Option<B256> = None;
     let mut from = lo;

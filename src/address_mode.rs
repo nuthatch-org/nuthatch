@@ -1471,7 +1471,10 @@ async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, 
         if from <= ceiling {
             let outcome = async {
                 let generation = validators.generation()?;
-                let (to, proven) = prove_tail(d, beacon, from, ceiling, &anchor).await?;
+                let (to, proven) = prove_tail(d, beacon, from, ceiling, &anchor, &watched, &|| {
+                    Box::pin(serve_queued(state, d))
+                })
+                .await?;
                 let lacking: Vec<u64> = watched
                     .iter()
                     .filter(|v| !validators.covers(**v, (from, to)).unwrap_or(false))
@@ -1673,12 +1676,14 @@ const RETRY_EVERY_SECS: u64 = 60 * 60;
 /// Every block of `[from, to]` (`to` at most `anchor`'s parent) with its proven proposer, built here
 /// from the RPC and the beacon and linked to `anchor`, the block the RPC calls finalized, through
 /// every block between: a self-consistent fork the RPC returned for the range cannot reach it.
-async fn prove_tail<M: Rpc, T: Rpc>(
+async fn prove_tail<'b, M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     beacon: &crate::address_proposers::Beacon,
     from: u64,
     to: u64,
     anchor: &alloy_consensus::Header,
+    keep: &[u64],
+    between: &(dyn Fn() -> futures::future::BoxFuture<'b, ()> + Sync),
 ) -> Result<(u64, Vec<crate::address_proposers::Proven>)> {
     use crate::address_proposers as ap;
     let last = anchor.number.saturating_sub(1);
@@ -1694,17 +1699,31 @@ async fn prove_tail<M: Rpc, T: Rpc>(
             last - from + 1
         );
     }
-    // Read through to the finalized block whatever `to` is, so the range hangs from it.
-    let blocks = ap::blocks_from_rpc(&d.main, (from, last), 8).await?;
-    let rows = ap::build_rows(beacon, &blocks, anchor, (from, last), 8).await?;
-    let proven = ap::verify(&rows, &blocks, anchor, (from, last))?;
-    Ok((
-        to,
-        proven
-            .into_iter()
-            .filter(|p| p.block.header.number <= to)
-            .collect(),
-    ))
+    // Read through to the finalized block whatever `to` is, so the range hangs from it: newest chunk
+    // first, each linked to the chunk above it, the top one to the anchor, and the cursor's waiting
+    // requests served between chunks.
+    let mut successor = anchor.clone();
+    let mut proven = Vec::new();
+    let mut hi = last;
+    loop {
+        let lo = hi.saturating_sub(ap::CHUNK - 1).max(from);
+        let blocks = ap::blocks_from_rpc(&d.main, (lo, hi), 8).await?;
+        let rows = ap::build_rows(beacon, &blocks, &successor, (lo, hi), 8).await?;
+        let chunk = ap::verify(&rows, &blocks, &successor, (lo, hi))?;
+        successor = blocks[0].header.clone();
+        proven.extend(
+            chunk
+                .into_iter()
+                .filter(|p| keep.contains(&p.proposer_index) && p.block.header.number <= to),
+        );
+        if lo == from {
+            break;
+        }
+        hi = lo - 1;
+        between().await;
+    }
+    proven.sort_by_key(|p| p.block.header.number);
+    Ok((to, proven))
 }
 
 /// The served row of one proven block. Its reward comes from the block's own transactions and
@@ -3548,11 +3567,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first.number, lo);
-        // Block 23,561,000 opens the second chunk. The second chunk is a chain of its own leading to
+        // Block 23,561,024 opens a chunk. The second chunk is a chain of its own leading to
         // its own anchor: only the link between the chunks is broken.
         let mut forked = blocks.clone();
         let mut parent = alloy_primitives::B256::repeat_byte(5);
-        for b in forked[1_000..].iter_mut() {
+        for b in forked[1_024..].iter_mut() {
             b.header.parent_hash = parent;
             b.hash = b.header.hash_slow();
             parent = b.hash;
@@ -3568,7 +3587,9 @@ mod tests {
     #[tokio::test]
     async fn a_locally_built_tail_must_reach_the_finalized_block() {
         use crate::address_proposers::{tests as pt, Beacon, DENEB_BLOCK};
-        let (blocks, rows, successor) = pt::chain(4);
+        // Three chunks: 128, 128 and 44 blocks, newest first.
+        let (blocks, rows, successor) = pt::chain(300);
+        let keep: Vec<u64> = rows.iter().map(|r| r.proposer_index).collect();
         let dir = tempfile::tempdir().unwrap();
         pt::write_cache(dir.path(), &rows, &[]);
         let beacon = Beacon::new(None, Some(dir.path().to_path_buf())).unwrap();
@@ -3583,23 +3604,43 @@ mod tests {
             };
             Discoverer::new(Counted::new(make()), Counted::new(make()))
         };
+        let served = AtomicU64::new(0);
+        let between = || -> futures::future::BoxFuture<'_, ()> {
+            served.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {})
+        };
         let (to, proven) = prove_tail(
             &rpc(&successor),
             &beacon,
             DENEB_BLOCK,
-            DENEB_BLOCK + 3,
+            DENEB_BLOCK + 299,
             &successor,
+            &keep,
+            &between,
         )
         .await
         .unwrap();
-        assert_eq!(to, DENEB_BLOCK + 3);
-        assert_eq!(proven.len(), 4);
+        assert_eq!(to, DENEB_BLOCK + 299);
+        assert_eq!(proven.len(), 300);
+        assert_eq!(
+            served.load(Ordering::Relaxed),
+            2,
+            "waiting requests served between the chunks"
+        );
         // The RPC served a self-consistent range, but the finalized block is on another chain.
         let mut other = successor.clone();
         other.parent_hash = alloy_primitives::B256::repeat_byte(3);
-        let e = prove_tail(&rpc(&other), &beacon, DENEB_BLOCK, DENEB_BLOCK + 3, &other)
-            .await
-            .unwrap_err();
+        let e = prove_tail(
+            &rpc(&other),
+            &beacon,
+            DENEB_BLOCK,
+            DENEB_BLOCK + 299,
+            &other,
+            &keep,
+            &|| Box::pin(async {}),
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{e:#}").contains("not the successor"), "{e:#}");
     }
 
