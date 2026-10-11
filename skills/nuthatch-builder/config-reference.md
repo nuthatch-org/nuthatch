@@ -243,7 +243,8 @@ serves timestamp lookups and accounts added later. A range the nest has not fetc
 `NUTHATCH_INCOMPLETE`, never an empty list. `/ready` answers 503 until the first finalized head is
 read, and still carries `chain_id`; it reports `stalled: true` while the last poll failed, and 503 with
 the reason once a finalized block the nest committed changes hash (a reorg under finality, or an RPC
-on another chain with the same id), after which nothing is answered until an operator looks.
+on another chain with the same id), after which nothing is answered. The conflict is kept in the
+store across restarts; removing the address-history store is how a nest reads its history again.
 
 The rows are Etherscan's account records with a narrower field set on two row types: token rows
 (`tokentx`, `tokennfttx`, `token1155tx`) omit `tokenName`, `tokenSymbol`, `tokenDecimal`, `gasUsed`

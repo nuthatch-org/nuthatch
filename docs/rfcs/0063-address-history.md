@@ -356,7 +356,8 @@ followed:
   every poll, the first after a restart included, compares the newest and one older one in turn with
   the RPC. A mismatch is a reorg under finality or an RPC on another chain under the same id; either
   way the cursor stops, `/ready` gives the reason and every answer is refused, one in flight
-  included. A new finalized head's hash is read on both sides of the checks, so a fork switch during
+  included; the conflict is kept in the store, so only removing the store clears it. Every fetch is
+  held against the newest finalized hash too, so a switch after a request's own check is caught. A new finalized head's hash is read on both sides of the checks, so a fork switch during
   the poll cannot become the record, and is committed with the head in one transaction. The reorg property
   test now also runs through the cursor's own window against a node whose traces follow the chain,
   with reorgs that cross finality, and fails if the run covered nothing.
