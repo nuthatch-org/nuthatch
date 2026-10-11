@@ -3558,15 +3558,17 @@ mod tests {
             finalized: Value::Null,
         };
         let (lo, hi) = (23_560_000, 23_561_499);
-        let first = linked_to(
-            &rpc(map(&blocks)),
-            (lo, hi),
-            &anchor,
-            &|| Box::pin(async {}),
-        )
-        .await
-        .unwrap();
+        let served = AtomicU64::new(0);
+        let between = || -> futures::future::BoxFuture<'_, ()> {
+            served.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {})
+        };
+        let first = linked_to(&rpc(map(&blocks)), (lo, hi), &anchor, &between)
+            .await
+            .unwrap();
         assert_eq!(first.number, lo);
+        // 1,500 blocks in chunks of 128: waiting requests are served after each of the 12.
+        assert_eq!(served.load(Ordering::Relaxed), 12);
         // Block 23,561,024 opens a chunk. The second chunk is a chain of its own leading to
         // its own anchor: only the link between the chunks is broken.
         let mut forked = blocks.clone();
