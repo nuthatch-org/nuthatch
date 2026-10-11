@@ -2341,7 +2341,7 @@ mod tests {
         }
         /// Whether the watched address has a row at `b` on the chain as it stands.
         fn row_at(&self, b: u64) -> bool {
-            self.hash(b)[0] % 3 == 0
+            self.hash(b)[0].is_multiple_of(3)
         }
         fn discoverer(
             self: &Arc<Chain>,

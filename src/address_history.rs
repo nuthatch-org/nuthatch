@@ -302,6 +302,14 @@ fn coverage_key(a: &Address, action: Action) -> [u8; 21] {
     k
 }
 
+/// Where a recorded span was read from: the RPC, against an anchor block when above the finalized
+/// head, or a verified partition.
+#[derive(Debug, Clone, Copy)]
+enum Read {
+    Rpc(Option<(u64, [u8; 32])>),
+    Partition,
+}
+
 /// A transaction hash, its block, and its whole internal list.
 pub type TxInternals = (Vec<u8>, u64, Vec<Map<String, Value>>);
 
@@ -792,7 +800,7 @@ impl AddressHistory {
         span: (u64, u64),
         generation: u64,
     ) -> Result<()> {
-        self.record_with(action, address, rows, span, generation, false, None)
+        self.record_with(action, address, rows, span, generation, Read::Rpc(None))
     }
 
     /// [`AddressHistory::record`] for a span read against the chain as it stood at block `anchor.0`,
@@ -807,7 +815,7 @@ impl AddressHistory {
         generation: u64,
         anchor: Option<(u64, [u8; 32])>,
     ) -> Result<()> {
-        self.record_with(action, address, rows, span, generation, false, anchor)
+        self.record_with(action, address, rows, span, generation, Read::Rpc(anchor))
     }
 
     /// [`AddressHistory::record`] for rows read from a verified partition: the span is marked
@@ -820,7 +828,7 @@ impl AddressHistory {
         span: (u64, u64),
         generation: u64,
     ) -> Result<()> {
-        self.record_with(action, address, rows, span, generation, true, None)
+        self.record_with(action, address, rows, span, generation, Read::Partition)
     }
 
     fn record_with(
@@ -830,9 +838,12 @@ impl AddressHistory {
         rows: &[Row],
         (from, to): (u64, u64),
         generation: u64,
-        verified: bool,
-        anchored: Option<(u64, [u8; 32])>,
+        read: Read,
     ) -> Result<()> {
+        let (verified, anchored) = match read {
+            Read::Partition => (true, None),
+            Read::Rpc(anchor) => (false, anchor),
+        };
         if to < from {
             bail!("coverage interval [{from}, {to}] is empty");
         }
