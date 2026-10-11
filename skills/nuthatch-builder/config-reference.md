@@ -254,7 +254,7 @@ N+1's `parent_beacon_block_root` (EIP-4788) commits to the beacon header that pr
 `proposer_index` names the proposer, and every row of a span is checked before any is used. The
 catalogue covers slot 12,777,208 (block 23,551,570) onward; a range starting earlier is refused. Spans
 come from the mirror's `proposers/` files beside its partitions; for blocks the mirror has not
-published, `beacon_url = "http://localhost:5052"` builds them here (the beacon sees this machine's IP
+published, `beacon_url = "http://localhost:5052"` builds them here (or `NUTHATCH_BEACON_URL` in the environment, which wins and keeps a keyed URL out of `nuthatch.toml`) (the beacon sees this machine's IP
 and the roots asked for), and without it they stay incomplete. Like the partitions, the proof is
 relative to the chain the nest's own RPC calls finalized. `nuthatch partitions --proposers
 --beacon-url URL` builds the catalogue for a mirror from its block partitions.
