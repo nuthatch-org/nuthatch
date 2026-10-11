@@ -264,6 +264,9 @@ const RELAY_CACHE: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_relay_
 const TX_CACHE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tx_cache");
 /// Block timestamps already read.
 const BLOCK_TS: TableDefinition<u64, u64> = TableDefinition::new("ah_block_ts");
+/// The header hash a `BLOCK_TS` row was read against. A separate table so the timestamp value
+/// stays what `getblocknobytime` reads. No row means the timestamp is not tied to a fork.
+const BLOCK_HASH: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_block_hash");
 /// A transaction's whole internal list, by hash, as `txhash` lookups answer it.
 const TX_INTERNAL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tx_internal");
 /// The blocks whose headers came from a verified partition, as merged `[from, to]` pairs under one key.
@@ -484,6 +487,7 @@ impl AddressHistory {
         wtx.open_table(META)?;
         wtx.open_table(TX_CACHE)?;
         wtx.open_table(BLOCK_TS)?;
+        wtx.open_table(BLOCK_HASH)?;
         wtx.open_table(TX_INTERNAL)?;
         wtx.open_table(HEADERS)?;
         wtx.open_table(VERIFIED_COV)?;
@@ -577,7 +581,7 @@ impl AddressHistory {
     pub fn persist_pending(
         &self,
         txs: &[(Vec<u8>, Map<String, Value>)],
-        timestamps: &[(u64, u64)],
+        timestamps: &[(u64, u64, Option<[u8; 32]>)],
         internals: &[TxInternals],
         anchors: &[(u64, [u8; 32])],
         summaries: &[Summary],
@@ -618,9 +622,15 @@ impl AddressHistory {
                     None => Vec::new(),
                 };
                 let mut t = wtx.open_table(BLOCK_TS)?;
-                for (b, s) in timestamps {
+                let mut hashes = wtx.open_table(BLOCK_HASH)?;
+                for (b, s, hash) in timestamps {
                     if keep(*b) && !verified.iter().any(|(f, l)| f <= b && b <= l) {
                         t.insert(*b, *s)?;
+                        // A timestamp written without a hash must not keep an older fork's hash.
+                        match hash {
+                            Some(h) => hashes.insert(*b, h.as_slice())?,
+                            None => hashes.remove(*b)?,
+                        };
                     }
                 }
             }
@@ -839,6 +849,38 @@ impl AddressHistory {
         Ok(rtx.open_table(BLOCK_TS)?.get(block)?.map(|v| v.value()))
     }
 
+    /// A cached timestamp for `block` read against header `expected`. A row with no stored hash is
+    /// trusted only inside a verified header span: elsewhere it may be the block this number had
+    /// on another fork, and a same-number reorg does not drop the row at the base.
+    pub fn timestamp_on_fork(&self, block: u64, expected: [u8; 32]) -> Result<Option<u64>> {
+        let rtx = self.store.database().begin_read()?;
+        let Some(ts) = rtx.open_table(BLOCK_TS)?.get(block)?.map(|v| v.value()) else {
+            return Ok(None);
+        };
+        let stored = match rtx.open_table(BLOCK_HASH)?.get(block)? {
+            Some(v) if v.value().len() == 32 => {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(v.value());
+                Some(h)
+            }
+            _ => None,
+        };
+        if stored == Some(expected) {
+            return Ok(Some(ts));
+        }
+        if stored.is_some() {
+            return Ok(None);
+        }
+        let spans = match rtx.open_table(HEADERS)?.get(VERIFIED)? {
+            Some(v) => decode_spans(v.value())?,
+            None => Vec::new(),
+        };
+        Ok(spans
+            .iter()
+            .any(|(from, to)| *from <= block && block <= *to)
+            .then_some(ts))
+    }
+
     /// Timestamps read over RPC. A block with a verified header keeps the verified one: a slow read
     /// landing after a partition was recorded must not replace it.
     pub fn cache_block_timestamps(&self, ts: &[(u64, u64)]) -> Result<()> {
@@ -870,8 +912,12 @@ impl AddressHistory {
         let wtx = self.store.database().begin_write()?;
         {
             let mut t = wtx.open_table(BLOCK_TS)?;
+            let mut hashes = wtx.open_table(BLOCK_HASH)?;
             for (b, s) in ts {
                 t.insert(*b, *s)?;
+                // The partition's timestamp replaces a cached one. A side hash from before the
+                // partition would disagree with it, and the span is the record of the chain.
+                hashes.remove(*b)?;
             }
             let mut h = wtx.open_table(HEADERS)?;
             let mut spans = match h.get(VERIFIED)? {
@@ -1558,6 +1604,16 @@ impl AddressHistory {
             }
             {
                 let mut t = wtx.open_table(BLOCK_TS)?;
+                let above: Vec<u64> = t
+                    .range(block.saturating_add(1)..)?
+                    .map(|e| e.map(|(k, _)| k.value()))
+                    .collect::<std::result::Result<_, _>>()?;
+                for b in above {
+                    t.remove(b)?;
+                }
+            }
+            {
+                let mut t = wtx.open_table(BLOCK_HASH)?;
                 let above: Vec<u64> = t
                     .range(block.saturating_add(1)..)?
                     .map(|e| e.map(|(k, _)| k.value()))
@@ -3110,7 +3166,7 @@ mod tests {
         h.invalidate_above(150).unwrap();
         h.persist_pending(
             &[tx(90), tx(160)],
-            &[(90, 1), (160, 2)],
+            &[(90, 1, None), (160, 2, None)],
             &[(vec![7; 32], 160, [3; 32], vec![])],
             &[(160, [1; 32])],
             &[],
@@ -3131,7 +3187,7 @@ mod tests {
         // A fetch whose check after it failed keeps only what was finalized when it began.
         h.persist_pending(
             &[tx(160)],
-            &[(160, 2)],
+            &[(160, 2, None)],
             &[],
             &[(160, [1; 32])],
             &[],
@@ -3144,7 +3200,7 @@ mod tests {
         assert!(h.tracked().unwrap().is_empty());
         h.persist_pending(
             &[tx(160)],
-            &[(160, 2)],
+            &[(160, 2, None)],
             &[],
             &[(160, [1; 32])],
             &[],
@@ -3174,7 +3230,7 @@ mod tests {
         h.finalize(200).unwrap();
         h.persist_pending(
             &[tx(155)],
-            &[(155, 9)],
+            &[(155, 9, None)],
             &[],
             &[],
             &[],

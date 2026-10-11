@@ -8,7 +8,8 @@
 //! A window is recorded as covered only when every call in it succeeded and nothing looked like a
 //! silent empty answer. Two checks catch the latter: an empty trace window is sampled against
 //! `trace_block`, and for an externally owned account the outgoing transactions found must match the
-//! nonce's movement across the window.
+//! nonce's movement across the window, except a rise of one at the block where an EIP-7702
+//! delegation appeared or was cleared.
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
@@ -502,6 +503,23 @@ pub(crate) fn word32(s: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow!("not a 32-byte hash: {s}"))
 }
 
+/// EIP-7702 delegation designator: `0xef0100` and a 20-byte address, nothing else.
+fn delegation_designator(code: &str) -> bool {
+    let hex = code.trim_start_matches("0x");
+    hex.len() == 46
+        && hex
+            .get(..6)
+            .is_some_and(|p| p.eq_ignore_ascii_case("ef0100"))
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// One applied authorisation changes the designator. Two in one block change it at most once, and
+/// an authorisation that leaves the same delegate in place does not change it at all.
+fn explains_one_auth(before: &str, after: &str) -> bool {
+    !before.eq_ignore_ascii_case(after)
+        && (delegation_designator(before) || delegation_designator(after))
+}
+
 fn padded(address: &str) -> String {
     format!("0x{:0>64}", address.trim_start_matches("0x"))
 }
@@ -535,7 +553,7 @@ type CachedTx = (Vec<u8>, Map<String, Value>);
 #[derive(Default)]
 pub struct Pending {
     txs: Mutex<Vec<CachedTx>>,
-    timestamps: Mutex<Vec<(u64, u64)>>,
+    timestamps: Mutex<Vec<(u64, u64, Option<[u8; 32]>)>>,
     /// A transaction's whole internal list, by hash, for `txhash` lookups.
     internals: Mutex<Vec<crate::address_history::TxInternals>>,
     /// Block hashes above the finalized head that what was fetched was read against, tracked once
@@ -604,6 +622,8 @@ struct TxRef {
     block: u64,
     outgoing: bool,
     failed: bool,
+    /// The trace's block hash, when it named one. Absent, the cache matches on the block number.
+    block_hash: Option<[u8; 32]>,
 }
 
 /// What a block body holds for any address: its fee recipient, timestamp, hash and every
@@ -837,7 +857,9 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 if history.head()?.is_none_or(|h| block > h) {
                     pending.anchor(block, named);
                 }
-                let ts = self.block_timestamp(history, block, pending).await?;
+                let ts = self
+                    .block_timestamp(history, block, Some(named), pending)
+                    .await?;
                 let records = internal_records(frames, ts)?;
                 pending.internals.lock().expect("pending lock").push((
                     key,
@@ -879,6 +901,25 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         to: u64,
         pending: &Pending,
     ) -> Result<BTreeMap<String, BlockFound>> {
+        Ok(self
+            .scan_blocks_in(addresses, from, to, pending, false)
+            .await?
+            .0)
+    }
+
+    /// [`scan_blocks`], and the blocks themselves when `keep` is set, so a proof can use the bodies
+    /// already read. A body that will not parse as a header drops the kept list; the scan stands.
+    async fn scan_blocks_in(
+        &self,
+        addresses: &[String],
+        from: u64,
+        to: u64,
+        pending: &Pending,
+        mut keep: bool,
+    ) -> Result<(
+        BTreeMap<String, BlockFound>,
+        Vec<crate::address_partitions::VerifiedBlock>,
+    )> {
         let watched: BTreeSet<String> = addresses.iter().map(|a| a.to_ascii_lowercase()).collect();
         let bodies: Vec<Result<(u64, Value)>> = futures::stream::iter(from..=to)
             .map(|b| self.body(b))
@@ -891,6 +932,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             .collect();
         let mut timestamps = Vec::new();
         let mut summaries = Vec::new();
+        let mut kept = Vec::new();
         // The bodies must be one chain, each naming the one before as its parent, and the last one's
         // hash is named for the caller to hold against the main endpoint: a pool's endpoints can be
         // on different forks, and a body from another fork would otherwise pass as this chain's.
@@ -905,11 +947,12 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                     bail!("block {b} does not name block {} as its parent; the bodies are from two chains", b - 1);
                 }
             }
-            last = Some((b, word32(&hash)?));
+            let hash_bytes = word32(&hash)?;
+            last = Some((b, hash_bytes));
             previous = Some(hash);
             let ts = hex_u64(header.get("timestamp").unwrap_or(&Value::Null))
                 .with_context(|| format!("block {b} timestamp"))?;
-            timestamps.push((b, ts));
+            timestamps.push((b, ts, Some(hash_bytes)));
             summaries.push((b, summary(&header, ts)?));
             match header.get("withdrawals").and_then(Value::as_array) {
                 Some(ws) => {
@@ -955,6 +998,15 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                     record: r,
                 });
             }
+            if keep {
+                match crate::address_proposers::block_from_rpc_value(header.clone(), b) {
+                    Ok(block) => kept.push(block),
+                    Err(_) => {
+                        keep = false;
+                        kept.clear();
+                    }
+                }
+            }
         }
         pending
             .timestamps
@@ -971,7 +1023,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         if let Some(l) = last {
             pending.named.lock().expect("pending lock").push(l);
         }
-        Ok(found)
+        Ok((found, kept))
     }
 
     /// [`Discoverer::scan_blocks`], from the summaries of bodies already scanned for other addresses
@@ -985,8 +1037,30 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         to: u64,
         pending: &Pending,
     ) -> Result<BTreeMap<String, BlockFound>> {
+        Ok(self
+            .scan_with_blocks(history, addresses, from, to, pending, false)
+            .await?
+            .0)
+    }
+
+    /// [`scan_with`], plus the parsed blocks when `keep` is set. A window replayed from summaries
+    /// has no body in hand and keeps none.
+    pub(crate) async fn scan_with_blocks(
+        &self,
+        history: &AddressHistory,
+        addresses: &[String],
+        from: u64,
+        to: u64,
+        pending: &Pending,
+        keep: bool,
+    ) -> Result<(
+        BTreeMap<String, BlockFound>,
+        Vec<crate::address_partitions::VerifiedBlock>,
+    )> {
         let Some(sums) = history.summaries(from, to)? else {
-            return self.scan_blocks(addresses, from, to, pending).await;
+            return self
+                .scan_blocks_in(addresses, from, to, pending, keep)
+                .await;
         };
         let watched: BTreeSet<String> = addresses.iter().map(|a| a.to_ascii_lowercase()).collect();
         let mut found: BTreeMap<String, BlockFound> = watched
@@ -1054,7 +1128,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 .expect("pending lock")
                 .push((*b, word32(&text(sum, "hash"))?));
         }
-        Ok(found)
+        Ok((found, Vec::new()))
     }
 
     async fn body(&self, b: u64) -> Result<(u64, Value)> {
@@ -1183,17 +1257,34 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 continue;
             }
             let block = hex_u64(f.get("blockNumber").unwrap_or(&Value::Null))?;
+            let named = match f.get("blockHash").and_then(Value::as_str) {
+                Some(h) => Some(word32(h).with_context(|| {
+                    format!("trace blockHash of {}", hash.to_ascii_lowercase())
+                })?),
+                None => None,
+            };
             let hash = hash.to_ascii_lowercase();
             let e = roots.entry(hash.clone()).or_insert(TxRef {
                 hash,
                 block,
                 outgoing: false,
                 failed: f.get("error").is_some_and(|e| !e.is_null()),
+                block_hash: named,
             });
             e.outgoing |= outgoing;
+            if e.block_hash.is_none() {
+                e.block_hash = named;
+            } else if named.is_some_and(|h| e.block_hash != Some(h)) {
+                bail!("{} traces name two block hashes", e.hash);
+            }
         }
-        let outgoing = roots.values().filter(|r| r.outgoing).count() as u64;
-        self.check_nonce(a, from, to, outgoing).await?;
+        let mut outgoing_at = BTreeMap::new();
+        for r in roots.values() {
+            if r.outgoing {
+                *outgoing_at.entry(r.block).or_default() += 1;
+            }
+        }
+        self.check_nonce(a, from, to, &outgoing_at).await?;
         Ok((
             roots.into_values().collect(),
             internal.into_iter().collect(),
@@ -1244,9 +1335,17 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
     }
 
     /// For an EOA every sent transaction moves the nonce by one, so the outgoing root frames found
-    /// must equal the nonce's movement. A contract's nonce counts its creations instead, and a
-    /// delegated account (EIP-7702) can move without sending, so neither is checked.
-    async fn check_nonce(&self, a: &str, from: u64, to: u64, outgoing: u64) -> Result<()> {
+    /// must equal the nonce's movement. A contract's nonce counts its creations instead, and an
+    /// account that is still delegated at the window's end can move without sending, so neither is
+    /// checked. A delegation set and then cleared inside the window leaves code empty at both ends;
+    /// each rise of one is kept only when the code changed across that block.
+    async fn check_nonce(
+        &self,
+        a: &str,
+        from: u64,
+        to: u64,
+        outgoing_at: &BTreeMap<u64, u64>,
+    ) -> Result<()> {
         // Code is read at the window's end, not today: an account delegated under EIP-7702 since
         // was a plain EOA through all of its earlier history.
         let code = self
@@ -1256,27 +1355,115 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         if code.as_str() != Some("0x") {
             return Ok(());
         }
-        let nonce_at = |b: u64| async move {
-            let n = self
-                .main
-                .call("eth_getTransactionCount", json!([a, format!("0x{b:x}")]))
-                .await?;
-            hex_u64(&n)
-        };
         let before = if from == 0 {
             0
         } else {
-            nonce_at(from - 1).await?
+            self.nonce_at(a, from - 1).await?
         };
-        let after = nonce_at(to).await?;
+        let after = self.nonce_at(a, to).await?;
         let moved = after.saturating_sub(before);
-        if moved != outgoing {
-            bail!(
-                "{a} sent {moved} transactions in [{from}, {to}] by its nonce, and the traces show \
-                 {outgoing}; not recording the window as covered"
-            );
+        let outgoing = outgoing_at.values().sum();
+        if moved == outgoing {
+            return Ok(());
         }
-        Ok(())
+        // A set and a clear in the same block leave code empty on both sides and raise the nonce
+        // by two. Post-state code cannot see that, so the window stays refused.
+        if moved > outgoing
+            && self
+                .auths_explain(a, from, to, before, after, outgoing_at)
+                .await?
+        {
+            return Ok(());
+        }
+        bail!(
+            "{a} sent {moved} transactions in [{from}, {to}] by its nonce, and the traces show \
+             {outgoing}; not recording the window as covered"
+        )
+    }
+
+    async fn nonce_at(&self, a: &str, block: u64) -> Result<u64> {
+        let n = self
+            .main
+            .call(
+                "eth_getTransactionCount",
+                json!([a, format!("0x{block:x}")]),
+            )
+            .await?;
+        hex_u64(&n)
+    }
+
+    async fn code_at(&self, a: &str, block: u64) -> Result<String> {
+        let code = self
+            .main
+            .call("eth_getCode", json!([a, format!("0x{block:x}")]))
+            .await?;
+        Ok(code.as_str().unwrap_or("").to_string())
+    }
+
+    /// Smallest block in `[lo, hi]` whose nonce is above `prev`. Nonce is the count after the block.
+    async fn first_block_above_nonce(
+        &self,
+        a: &str,
+        mut lo: u64,
+        mut hi: u64,
+        prev: u64,
+    ) -> Result<u64> {
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.nonce_at(a, mid).await? > prev {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Ok(lo)
+    }
+
+    /// Each nonce rise above the outgoing transactions in that block is one applied authorisation,
+    /// and only when the delegation designator changed across the block. Two rises in one block, or
+    /// one that leaves the code unchanged, are not explained.
+    async fn auths_explain(
+        &self,
+        a: &str,
+        from: u64,
+        to: u64,
+        mut prev: u64,
+        after: u64,
+        outgoing_at: &BTreeMap<u64, u64>,
+    ) -> Result<bool> {
+        let mut cursor = from;
+        while prev < after {
+            if cursor > to {
+                return Ok(false);
+            }
+            let b = self.first_block_above_nonce(a, cursor, to, prev).await?;
+            let now = self.nonce_at(a, b).await?;
+            if now <= prev {
+                return Ok(false);
+            }
+            let sent = outgoing_at.get(&b).copied().unwrap_or(0);
+            let Some(extra) = now
+                .checked_sub(prev)
+                .and_then(|rise| rise.checked_sub(sent))
+            else {
+                return Ok(false);
+            };
+            if extra == 1 {
+                let before_code = if b == 0 {
+                    "0x".to_string()
+                } else {
+                    self.code_at(a, b - 1).await?
+                };
+                if !explains_one_auth(&before_code, &self.code_at(a, b).await?) {
+                    return Ok(false);
+                }
+            } else if extra != 0 {
+                return Ok(false);
+            }
+            prev = now;
+            cursor = b.saturating_add(1);
+        }
+        Ok(true)
     }
 
     async fn token_logs(&self, a: &str, from: u64, to: u64) -> Result<Vec<Value>> {
@@ -1362,7 +1549,8 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
     }
 
     /// Block timestamps for the logs' blocks: from the log when the provider includes it, else the
-    /// cache, else one header read per block.
+    /// cache, else one header read per block. A log that names its block hash trusts a cached
+    /// timestamp only when that hash was the one stored with it.
     async fn timestamps(
         &self,
         history: &AddressHistory,
@@ -1370,7 +1558,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         pending: &Pending,
     ) -> Result<BTreeMap<u64, u64>> {
         let mut ts = BTreeMap::new();
-        let mut missing = BTreeSet::new();
+        let mut missing: BTreeMap<u64, Option<[u8; 32]>> = BTreeMap::new();
         for log in logs {
             let block = hex_u64(log.get("blockNumber").unwrap_or(&Value::Null))?;
             match log.get("blockTimestamp") {
@@ -1378,13 +1566,25 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                     ts.insert(block, hex_u64(t)?);
                 }
                 None => {
-                    missing.insert(block);
+                    // Not 32 bytes: it cannot name a fork, so the block number is all there is.
+                    let named = log
+                        .get("blockHash")
+                        .and_then(Value::as_str)
+                        .and_then(|h| word32(h).ok());
+                    missing
+                        .entry(block)
+                        .and_modify(|h| {
+                            if h.is_none() {
+                                *h = named;
+                            }
+                        })
+                        .or_insert(named);
                 }
             }
         }
-        for b in missing {
+        for (b, named) in missing {
             if let std::collections::btree_map::Entry::Vacant(slot) = ts.entry(b) {
-                slot.insert(self.block_timestamp(history, b, pending).await?);
+                slot.insert(self.block_timestamp(history, b, named, pending).await?);
             }
         }
         Ok(ts)
@@ -1394,9 +1594,14 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         &self,
         history: &AddressHistory,
         block: u64,
+        expected: Option<[u8; 32]>,
         pending: &Pending,
     ) -> Result<u64> {
-        if let Some(t) = history.block_timestamp(block)? {
+        let cached = match expected {
+            Some(h) => history.timestamp_on_fork(block, h)?,
+            None => history.block_timestamp(block)?,
+        };
+        if let Some(t) = cached {
             return Ok(t);
         }
         let header = self
@@ -1408,11 +1613,15 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             .await?;
         let t = hex_u64(header.get("timestamp").unwrap_or(&Value::Null))
             .with_context(|| format!("block {block} header"))?;
+        let read = match header.get("hash").and_then(Value::as_str) {
+            Some(h) => Some(word32(h)?),
+            None => None,
+        };
         pending
             .timestamps
             .lock()
             .expect("pending lock")
-            .push((block, t));
+            .push((block, t, read));
         Ok(t)
     }
 
@@ -1424,18 +1633,35 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
     ) -> Result<Map<String, Value>> {
         let hash = r.hash;
         let key = alloy_primitives::hex::decode(hash.trim_start_matches("0x"))?;
-        // A copy cached at another block is from before a re-inclusion; read it again.
+        // A copy cached at another block is from before a re-inclusion; read it again. The same
+        // block number on another fork is the same hole: returning the stale row fails the anchor
+        // check while the cache stays, and the window retries forever.
         if let Some(cached) = history.cached_tx(&key)? {
-            if cached.get("blockNumber").and_then(Value::as_str)
-                == Some(r.block.to_string().as_str())
-            {
-                return Ok(cached);
+            let same_number = cached.get("blockNumber").and_then(Value::as_str)
+                == Some(r.block.to_string().as_str());
+            if same_number {
+                let cached_hash = cached
+                    .get("blockHash")
+                    .and_then(Value::as_str)
+                    .and_then(|h| word32(h).ok());
+                match (r.block_hash, cached_hash) {
+                    (Some(want), Some(have)) if want == have => {
+                        pending
+                            .named
+                            .lock()
+                            .expect("pending lock")
+                            .push((r.block, want));
+                        return Ok(cached);
+                    }
+                    (None, _) => return Ok(cached),
+                    _ => {}
+                }
             }
         }
         let (tx, receipt, ts) = futures::try_join!(
             self.main.call("eth_getTransactionByHash", json!([hash])),
             self.main.call("eth_getTransactionReceipt", json!([hash])),
-            self.block_timestamp(history, r.block, pending)
+            self.block_timestamp(history, r.block, r.block_hash, pending)
         )?;
         if tx.is_null() || receipt.is_null() {
             bail!("{hash} has no transaction or receipt at the main endpoint");
@@ -1766,6 +1992,9 @@ fn address_mode_order(mut row: Row) -> Row {
 /// One log's Etherscan rows: an ERC-20 `Transfer` (three topics) goes to `tokentx`, an ERC-721
 /// `Transfer` (four, the token id indexed) to `tokennfttx`, an ERC-1155 transfer to `token1155tx`
 /// with one row per id. Rows sort by log index, then by element within a batch.
+///
+/// Three topics stay `tokentx`: that is the ERC-20 log shape. Etherscan files by its token
+/// tracker, which this nest does not have. A one-topic `Transfer` (CryptoKitties) is skipped.
 fn transfer_rows(
     log: &Value,
     a: &str,
@@ -2835,6 +3064,75 @@ mod tests {
         assert!(format!("{err:#}").contains("by its nonce"), "{err:#}");
     }
 
+    /// A delegation set at 150 and cleared at 179 moves the nonce twice with no outgoing
+    /// transaction. Each rise of one is the block where the code changed. The same rises with empty
+    /// code, and both authorisations in one block, stay refused: post-state code is empty on both
+    /// sides of a same-block set and clear.
+    #[tokio::test]
+    async fn a_delegation_set_and_cleared_inside_the_window_is_explained_by_the_code() {
+        let designator = format!("0xef0100{}", "ab".repeat(20));
+        let main_for = |nonce_of: fn(u64) -> u64, code_of: fn(u64) -> bool| {
+            let designator = designator.clone();
+            script(move |m, p| {
+                Ok(match m {
+                    "eth_getCode" => {
+                        let b = hex_u64(&p[1])?;
+                        json!(if code_of(b) {
+                            designator.as_str()
+                        } else {
+                            "0x"
+                        })
+                    }
+                    "eth_getTransactionCount" => {
+                        json!(format!("0x{:x}", nonce_of(hex_u64(&p[1])?)))
+                    }
+                    "eth_getBlockTransactionCountByNumber" => json!("0x5"),
+                    "eth_getLogs" => json!([]),
+                    other => bail!("unexpected {other}"),
+                })
+            })
+        };
+        let trace = || {
+            script(|m, _| match m {
+                "trace_filter" => Ok(json!([])),
+                "trace_block" => Ok(json!([{"x": 1}])),
+                other => bail!("unexpected {other}"),
+            })
+        };
+        let run = |nonce_of: fn(u64) -> u64, code_of: fn(u64) -> bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let h = history(dir.path());
+            let d = Discoverer::new(main_for(nonce_of, code_of), trace());
+            async move {
+                let _dir = dir;
+                d.discover_now(&h, A, 100, 199).await
+            }
+        };
+        let hump = |b: u64| {
+            if b >= 179 {
+                2
+            } else if b >= 150 {
+                1
+            } else {
+                0
+            }
+        };
+        let delegated = |b: u64| (150..=178).contains(&b);
+        run(hump, delegated)
+            .await
+            .expect("each rise is one block where the delegation changed");
+
+        let err = run(hump, |_| false).await.unwrap_err();
+        assert!(format!("{err:#}").contains("by its nonce"), "{err:#}");
+
+        let same_block = |b: u64| u64::from(b >= 150) * 2;
+        let err = run(same_block, |_| false).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("by its nonce"),
+            "a set and a clear in one block: {err:#}"
+        );
+    }
+
     /// A removed log in a range past finality means the provider's view moved under us: the window
     /// fails rather than quietly losing the row.
     #[tokio::test]
@@ -3668,6 +3966,7 @@ mod tests {
             block: 150,
             outgoing: true,
             failed: false,
+            block_hash: None,
         };
         let got = d.hydrate_one(&h, r, &pending).await.unwrap();
         assert_eq!(got["blockNumber"], "150", "read again at its new block");
@@ -3686,6 +3985,89 @@ mod tests {
             h.cached_tx(&key).unwrap().is_none(),
             "a reorg under 149 drops the old copy"
         );
+    }
+
+    /// The same block number on another fork is not the cached transaction. Reading it again also
+    /// re-reads the timestamp, which was stored against the old header. The same fork hits neither.
+    #[tokio::test]
+    async fn a_cached_transaction_from_another_fork_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let hash_hex = format!("0x{}", "aa".repeat(32));
+        let key = alloy_primitives::hex::decode("aa".repeat(32)).unwrap();
+        let fork = |n: u8| {
+            let mut x = [0u8; 32];
+            x[31] = n;
+            x
+        };
+        let a = fork(1);
+        let b = fork(2);
+        let hex_hash = |h: [u8; 32]| format!("0x{}", alloy_primitives::hex::encode(h));
+        let mut stale = Map::new();
+        stale.insert("blockNumber".into(), json!("150"));
+        stale.insert("hash".into(), json!(hash_hex));
+        stale.insert("blockHash".into(), json!(hex_hash(a)));
+        stale.insert("timeStamp".into(), json!("16"));
+        h.persist_pending(
+            &[(key, stale)],
+            &[(150, 16, Some(a))],
+            &[],
+            &[],
+            &[],
+            0,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let (main, trace) = chain(false);
+        let bb = hex_hash(b);
+        let main = script(move |m, p| {
+            let mut v = (main.answer)(m, p)?;
+            if m == "eth_getTransactionByHash" || m == "eth_getTransactionReceipt" {
+                v["blockHash"] = json!(bb.clone());
+            }
+            if m == "eth_getBlockByNumber" {
+                v["hash"] = json!(bb.clone());
+            }
+            Ok(v)
+        });
+        let d = Discoverer::new(main, trace);
+        let pending = Pending::begin(&h).unwrap();
+        let r = TxRef {
+            hash: hash_hex,
+            block: 150,
+            outgoing: true,
+            failed: false,
+            block_hash: Some(b),
+        };
+        let got = d.hydrate_one(&h, r.clone(), &pending).await.unwrap();
+        assert_eq!(got["blockNumber"], "150");
+        let asked = |method: &str| {
+            d.main
+                .asked
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| m == method)
+                .count()
+        };
+        assert_eq!(asked("eth_getTransactionByHash"), 1);
+        assert_eq!(
+            asked("eth_getBlockByNumber"),
+            1,
+            "the timestamp was read against the other fork"
+        );
+        pending.persist(&h, true).unwrap();
+
+        let pending = Pending::begin(&h).unwrap();
+        let before_tx = asked("eth_getTransactionByHash");
+        let before_hdr = asked("eth_getBlockByNumber");
+        let got = d.hydrate_one(&h, r, &pending).await.unwrap();
+        assert_eq!(got["blockHash"], hex_hash(b));
+        assert_eq!(asked("eth_getTransactionByHash"), before_tx);
+        assert_eq!(asked("eth_getBlockByNumber"), before_hdr);
+        assert_eq!(pending.named(), vec![(150, b)]);
     }
 
     const B: &str = "0x00000000219ab540356cbb839cbe05303d7705fa";
