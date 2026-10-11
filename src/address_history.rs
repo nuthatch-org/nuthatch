@@ -2987,6 +2987,43 @@ mod tests {
         assert_eq!(h.generation().unwrap(), g);
     }
 
+    /// A re-ask's evidence, rows and schedule commit together or not at all.
+    #[test]
+    fn a_reask_commits_its_evidence_with_its_rows_or_not_at_all() {
+        let (_d, h) = history();
+        h.set_head(1_000).unwrap();
+        let g = h.generation().unwrap();
+        h.record_produced(ALICE, &[], (100, 199), g, &[150], 7)
+            .unwrap();
+        let mut record = Map::new();
+        record.insert("delivered".into(), Value::Array(vec![]));
+        let mut row = tx(150, 0);
+        row.record
+            .insert("mev".into(), Value::String("relay".into()));
+        let changes = vec![(ALICE.to_string(), vec![row])];
+        let stale = h.generation().unwrap() + 1;
+        assert!(h
+            .apply_reask(150, &record, &changes, false, 9, stale)
+            .is_err());
+        assert!(h.relay_record(150).unwrap().is_none());
+        assert!(h
+            .rows_in(Action::ProducedBlocks, ALICE, (150, 150))
+            .unwrap()
+            .is_empty());
+        assert_eq!(h.mev_pending().unwrap().len(), 1);
+        let g = h.generation().unwrap();
+        h.apply_reask(150, &record, &changes, false, 9, g).unwrap();
+        assert!(h.relay_record(150).unwrap().is_some());
+        assert_eq!(
+            h.rows_in(Action::ProducedBlocks, ALICE, (150, 150))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(h.mev_pending().unwrap().is_empty());
+        assert!(h.generation().unwrap() > g);
+    }
+
     #[test]
     fn config_validation() {
         let ok = AddressHistoryConfig {

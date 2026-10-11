@@ -2676,18 +2676,17 @@ mod tests {
         d.reconcile(&s, chain.latest()).await.unwrap();
         cover_from(&chain, &s.history, 0, 110);
         cover_from(&chain, &s.history, 111, 120);
-        // A shorter fork from 105: the chain now ends at 115.
-        let keep = 105;
-        chain.hashes.lock().unwrap().truncate(keep);
-        chain.grow(11);
+        // A shorter fork from 112: 110 still stands, but the chain now ends at 115, under 120.
+        chain.hashes.lock().unwrap().truncate(112);
+        chain.grow(4);
         assert_eq!(chain.latest(), 115);
         d.check_tracked(&s, chain.latest()).await.unwrap();
         assert_eq!(
             s.history
                 .coverage(crate::address_history::Action::TxList, ALICE)
                 .unwrap(),
-            vec![(0, 100)],
-            "110 moved and 120 is out of reach, so everything above the finalized head goes"
+            vec![(0, 110)],
+            "110 still matches; 120 is out of reach, so what was read above 110 goes"
         );
     }
 
