@@ -141,6 +141,15 @@ impl Validators {
         read_spans(raw.as_ref().map(|v| v.value()))
     }
 
+    /// The first block at or after `from` that `validator` lacks.
+    pub fn next_uncovered(&self, validator: u64, from: u64) -> Result<u64> {
+        Ok(self
+            .coverage(validator)?
+            .into_iter()
+            .find(|(f, t)| *f <= from && from <= *t)
+            .map_or(from, |(_, t)| t + 1))
+    }
+
     /// Whether `validator` is covered over all of `[lo, hi]`.
     pub fn covers(&self, validator: u64, (lo, hi): (u64, u64)) -> Result<bool> {
         Ok(self
@@ -543,6 +552,17 @@ mod tests {
         }
         let v = Validators::open(Store::open(&path).unwrap(), &[7]).unwrap();
         assert!(v.watched().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_next_uncovered_block_follows_the_span_holding_the_start() {
+        let (_d, v) = open(&[7]);
+        assert_eq!(v.next_uncovered(7, 100).unwrap(), 100);
+        let g = v.generation().unwrap();
+        v.record_span((100, 149), &[7], &BTreeMap::new(), g)
+            .unwrap();
+        assert_eq!(v.next_uncovered(7, 100).unwrap(), 150);
+        assert_eq!(v.next_uncovered(7, 200).unwrap(), 200);
     }
 
     #[test]

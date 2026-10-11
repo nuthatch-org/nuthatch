@@ -1384,16 +1384,29 @@ async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, 
     let mut start = span_of(first).0;
     while start <= ceiling {
         serve_queued(state, d).await;
-        let clip = (start.max(first), (start + SPAN - 1).min(ceiling));
+        let span_end = (start + SPAN - 1).min(ceiling);
         let lacking: Vec<u64> = watched
             .iter()
-            .filter(|v| !validators.covers(**v, clip).unwrap_or(false))
+            .filter(|v| {
+                !validators
+                    .covers(**v, (start.max(first), span_end))
+                    .unwrap_or(false)
+            })
             .copied()
             .collect();
         if lacking.is_empty() {
             start += SPAN;
             continue;
         }
+        // From the first block any of them lacks: the tail span grows every poll, and re-reading
+        // what is already proven would cost a block read each time.
+        let from = lacking
+            .iter()
+            .filter_map(|v| validators.next_uncovered(*v, first).ok())
+            .min()
+            .unwrap_or(first)
+            .max(start.max(first));
+        let clip = (from, span_end);
         let outcome = async {
             let generation = validators.generation()?;
             let proven = prove_span(d, state, start, clip).await?;
