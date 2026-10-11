@@ -80,7 +80,10 @@ pub struct MirrorConfig {
     pub url: String,
     pub chain_id: u64,
     pub from_block: u64,
-    pub to_block: u64,
+    /// The last block to take from the mirror; omitted, as far as the mirror has published, found
+    /// again every poll, the blocks above it read from the RPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_block: Option<u64>,
     pub cache_mb: u64,
 }
 
@@ -102,10 +105,9 @@ impl AddressHistoryConfig {
             }
         }
         if let Some(m) = &self.mirror {
-            if m.to_block < m.from_block {
+            if let Some(to) = m.to_block.filter(|t| *t < m.from_block) {
                 bail!(
-                    "[address_history.mirror] to_block {} is before from_block {}",
-                    m.to_block,
+                    "[address_history.mirror] to_block {to} is before from_block {}",
                     m.from_block
                 );
             }
@@ -3521,7 +3523,7 @@ mod tests {
             url: "https://example.org".into(),
             chain_id: 1,
             from_block: 10,
-            to_block: 20,
+            to_block: Some(20),
             cache_mb: MIN_CACHE_MB,
         };
         AddressHistoryConfig {
@@ -3532,7 +3534,7 @@ mod tests {
         .unwrap();
         bad(AddressHistoryConfig {
             mirror: Some(MirrorConfig {
-                to_block: 9,
+                to_block: Some(9),
                 ..mirror.clone()
             }),
             ..ok.clone()

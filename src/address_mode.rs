@@ -113,6 +113,11 @@ pub struct ModeState {
     backfill_span: AtomicU64,
     /// Blocks per second the last discovery window covered; 0 before the first.
     backfill_rate: AtomicU64,
+    /// Whether the mirror's last block is as far as it has published, found again every poll, rather
+    /// than a configured `to_block`.
+    mirror_open: bool,
+    /// The mirror's last block as last found, when it is open.
+    mirror_last: AtomicU64,
 }
 
 pub type HashAt =
@@ -259,6 +264,8 @@ impl ModeState {
             first_window: 128,
             backfill_span: AtomicU64::new(0),
             backfill_rate: AtomicU64::new(0),
+            mirror_open: false,
+            mirror_last: AtomicU64::new(0),
         }
     }
 
@@ -302,6 +309,56 @@ impl ModeState {
     /// follow `start_block`, which bounds account history: the catalogue costs no RPC to read.
     pub fn proposals_from(&self) -> u64 {
         crate::address_proposers::CATALOGUE_FROM_BLOCK
+    }
+
+    /// A mirror without a `to_block`: its last block is as far as it has published, `published`
+    /// for now (`None`: nothing yet).
+    pub fn with_open_mirror(
+        mut self,
+        source: Arc<crate::address_partitions::Source>,
+        first: u64,
+        published: Option<u64>,
+    ) -> Self {
+        self.mirror_last.store(
+            published.unwrap_or(first.saturating_sub(1)),
+            Ordering::Relaxed,
+        );
+        self.mirror = Some((
+            source,
+            (first, published.unwrap_or(first.saturating_sub(1))),
+        ));
+        self.mirror_open = true;
+        self
+    }
+
+    /// The blocks the mirror serves: its configured range, or up to what it has published when open.
+    /// An empty range is `None`.
+    pub fn mirror_blocks(&self) -> Option<(Arc<crate::address_partitions::Source>, (u64, u64))> {
+        let (source, (first, last)) = self.mirror.as_ref()?;
+        let last = if self.mirror_open {
+            self.mirror_last.load(Ordering::Relaxed)
+        } else {
+            *last
+        };
+        (last >= *first).then(|| (source.clone(), (*first, last)))
+    }
+
+    /// Find how far an open mirror has published now: one request when it has not moved.
+    async fn refresh_mirror(&self) {
+        let Some((source, (first, _))) = self.mirror.as_ref().filter(|_| self.mirror_open) else {
+            return;
+        };
+        let known = self.mirror_last.load(Ordering::Relaxed);
+        let from = if known >= *first {
+            crate::address_partitions::span_of(known).0
+        } else {
+            crate::address_partitions::span_of(*first).0
+        };
+        match source.published_end(from).await {
+            Ok(Some(end)) => self.mirror_last.store(end.max(known), Ordering::Relaxed),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("address history: how far the mirror has published: {e:#}"),
+        }
     }
 
     pub fn with_first_window(mut self, blocks: u64) -> Self {
@@ -931,18 +988,19 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
         }
         // Withdrawals and produced blocks come from bodies, and the definitions they are matched to
         // are Ethereum mainnet's, so only there is the block scan run.
+        state.refresh_mirror().await;
         if state.chain_id == 1 {
-            let skip = state.mirror.as_ref().map(|(_, blocks)| *blocks);
-            if let Some((source, blocks)) = &state.mirror {
-                mirror_pass(self, state, &watched, to, source, *blocks).await;
+            let skip = state.mirror_blocks().map(|(_, blocks)| blocks);
+            if let Some((source, blocks)) = state.mirror_blocks() {
+                mirror_pass(self, state, &watched, to, &source, blocks).await;
             }
             serve_queued(state, self).await;
             scan_bodies(self, state, &watched, to, skip).await;
             mev_passes(self, state, &watched, to).await;
             validator_pass(self, state).await;
-        } else if let Some((source, blocks)) = &state.mirror {
+        } else if let Some((source, blocks)) = state.mirror_blocks() {
             // Elsewhere a partition is read for its verified headers alone: timestamp to block.
-            mirror_pass(self, state, &[], to, source, *blocks).await;
+            mirror_pass(self, state, &[], to, &source, blocks).await;
         }
     }
 
@@ -1179,7 +1237,7 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                 break;
             }
             late()?;
-            if let Some((first, last)) = state.mirror.as_ref().map(|(_, b)| *b) {
+            if let Some((first, last)) = state.mirror_blocks().map(|(_, b)| b) {
                 if first <= next && next <= last {
                     bail!("blocks {first} to {last} are read from the mirror's partitions, which have not reached block {next} yet");
                 }
@@ -1187,9 +1245,8 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
             let mut end = hole_end(history, address, &BLOCK_SCANNED, next, to)?
                 .min(next.saturating_add(COVER_BODIES - 1));
             if let Some((first, _)) = state
-                .mirror
-                .as_ref()
-                .map(|(_, b)| *b)
+                .mirror_blocks()
+                .map(|(_, b)| b)
                 .filter(|(f, _)| next < *f)
             {
                 end = end.min(first - 1);
@@ -1456,15 +1513,15 @@ async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, 
     let ceiling = anchor.number.saturating_sub(1);
     let first = state.proposals_from();
     let mut mirror_end = None;
-    if let Some((source, blocks)) = &state.mirror {
+    if let Some((source, blocks)) = state.mirror_blocks() {
         mirror_end = Some(blocks.1);
         if let Err(e) = mirror_spans(
             d,
             state,
             &validators,
             &watched,
-            source,
-            *blocks,
+            &source,
+            blocks,
             &anchor,
             ceiling,
         )
@@ -1563,7 +1620,7 @@ async fn mirror_spans<M: Rpc, T: Rpc>(
     validators: &crate::address_validators::Validators,
     watched: &[u64],
     source: &crate::address_partitions::Source,
-    (mirror_first, mirror_last): (u64, u64),
+    (_, mirror_last): (u64, u64),
     anchor: &alloy_consensus::Header,
     ceiling: u64,
 ) -> Result<()> {
@@ -1577,10 +1634,9 @@ async fn mirror_spans<M: Rpc, T: Rpc>(
             .copied()
             .collect()
     };
-    let mut start = span_of(first.max(mirror_first)).0;
-    if start < mirror_first {
-        start += SPAN;
-    }
+    // From the catalogue's first span whatever the mirror's `from_block`, which bounds only what
+    // address history reads from partitions.
+    let mut start = span_of(first).0;
     let mut needed = Vec::new();
     while start + SPAN - 1 <= mirror_last.min(ceiling) {
         if !lacking(start.max(first), start + SPAN - 1).is_empty() {
@@ -2292,6 +2348,9 @@ fn before_history(s: &ModeState, q: &HashMap<String, String>) -> Option<String> 
         None => 0,
         Some(v) => v.parse::<u64>().ok()?,
     };
+    if let Some(end) = s.end_block.filter(|e| start > *e) {
+        return Some(format!("history ends at block {end}"));
+    }
     (start < s.start_block).then(|| {
         format!(
             "history starts at block {}; ask from there and use another source before it",
@@ -3122,23 +3181,42 @@ pub async fn dev(
         }
         // Before anything is served: RPC-scanned rows in the mirror's blocks must not answer while the
         // cursor, which may never get past its chain check, has yet to replace them.
-        state.history.keep_verified_only(
-            &crate::address_discovery::BLOCK_SCANNED,
-            (m.from_block, m.to_block),
-        )?;
-        let source = crate::address_partitions::Source::open(
+        let source = Arc::new(crate::address_partitions::Source::open(
             &m.url,
             chain_id,
             dir.join("partitions"),
             m.cache_mb * 1024 * 1024,
+        )?);
+        // Without a `to_block`, as far as the mirror has published now; the cursor looks again
+        // every poll, and the blocks above it are read from the RPC meanwhile.
+        let to = match m.to_block {
+            Some(t) => Some(t),
+            None => source
+                .published_end(crate::address_partitions::span_of(m.from_block).0)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("address history: how far the mirror has published: {e:#}");
+                    None
+                }),
+        };
+        state.history.keep_verified_only(
+            &crate::address_discovery::BLOCK_SCANNED,
+            (m.from_block, to.unwrap_or(m.from_block.saturating_sub(1))),
         )?;
         tracing::info!(
             "address history: blocks {} to {} from verified partitions at the configured mirror, which \
              sees this machine's IP and the block ranges asked for, never an address",
             m.from_block,
-            m.to_block
+            match (m.to_block, to) {
+                (Some(t), _) => t.to_string(),
+                (None, Some(t)) => format!("{t} (as far as it has published, checked every poll)"),
+                (None, None) => "none yet (checked every poll)".into(),
+            }
         );
-        state = state.with_mirror(Arc::new(source), (m.from_block, m.to_block));
+        state = match m.to_block {
+            Some(t) => state.with_mirror(source, (m.from_block, t)),
+            None => state.with_open_mirror(source, m.from_block, to),
+        };
     }
     if chain_id == 1 {
         let validators = crate::address_validators::Validators::open(
@@ -3735,7 +3813,7 @@ mod tests {
             ModeState::new(history, 1, Duration::from_secs(300), true)
                 .with_range(25_700_000, None, 64),
         );
-        for action in [
+        let actions = [
             "txlist",
             "txlistinternal",
             "tokentx",
@@ -3744,7 +3822,32 @@ mod tests {
             "txsBeaconWithdrawal",
             "getminedblocks",
             "nuthatchProducedBlocks",
-        ] {
+        ];
+        // A start above end_block is refused too, never answered "No transactions found".
+        let ended = Arc::new(
+            ModeState::new(s.history.clone(), 1, Duration::from_secs(300), true).with_range(
+                25_700_000,
+                Some(25_800_000),
+                64,
+            ),
+        );
+        for action in actions {
+            let (_, v) = call(
+                router(ended.clone()),
+                "GET",
+                &format!("/api?module=account&action={action}&address={ALICE}&startblock=25800001"),
+                None,
+            )
+            .await;
+            assert!(
+                v["result"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("history ends at block 25800000"),
+                "{action}: {v}"
+            );
+        }
+        for action in actions {
             for start in ["", "&startblock=0", "&startblock=25699999"] {
                 let (_, v) = call(
                     router(s.clone()),

@@ -352,6 +352,9 @@ pub fn respond(
         if !validators.watched()?.contains(&validator) {
             return Ok(incomplete(&format!("validator {validator} is not watched")));
         }
+        if let Some(u) = until.filter(|u| start > *u) {
+            return Ok(incomplete(&format!("history ends at block {u}")));
+        }
         let through = validators
             .coverage(validator)?
             .into_iter()
@@ -657,6 +660,16 @@ mod tests {
         let mut past = q.clone();
         past.insert("endblock".into(), "250".into());
         let a = respond(&v, 100, Some(199), &past);
+        assert!(
+            a["result"]
+                .as_str()
+                .unwrap()
+                .contains("history ends at block 199"),
+            "{a}"
+        );
+        let mut above = q.clone();
+        above.insert("startblock".into(), "250".into());
+        let a = respond(&v, 100, Some(199), &above);
         assert!(
             a["result"]
                 .as_str()

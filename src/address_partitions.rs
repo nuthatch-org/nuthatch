@@ -391,6 +391,45 @@ impl Source {
         let _ = std::fs::remove_file(self.cached(from));
     }
 
+    /// Whether the mirror holds the partition starting at `from`.
+    pub async fn published(&self, from: u64) -> Result<bool> {
+        Ok(self
+            .mirror
+            .head(&partition_key(self.chain_id, from))
+            .await?
+            .is_some())
+    }
+
+    /// The last block of the mirror's published run of partitions that holds the span starting at
+    /// `from`, or `None` when that span is not published. Partitions are published in order, so the
+    /// end is found by doubling a stride past it and halving back: about 2·log2 of the run in
+    /// requests, and one when it has not moved.
+    pub async fn published_end(&self, from: u64) -> Result<Option<u64>> {
+        if !self.published(from).await? {
+            return Ok(None);
+        }
+        let (mut have, mut stride) = (from, 1u64);
+        let missing = loop {
+            let probe = have + stride * SPAN;
+            if self.published(probe).await? {
+                have = probe;
+                stride *= 2;
+            } else {
+                break probe;
+            }
+        };
+        let (mut lo, mut hi) = (have, missing);
+        while hi - lo > SPAN {
+            let mid = lo + (hi - lo) / SPAN / 2 * SPAN;
+            if self.published(mid).await? {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(Some(lo + SPAN - 1))
+    }
+
     fn cached_catalogue(&self, from: u64) -> PathBuf {
         self.cache.join(format!("proposers-{from:010}.parquet"))
     }
