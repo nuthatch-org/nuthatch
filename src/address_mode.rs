@@ -1382,10 +1382,12 @@ async fn mev_passes<M: Rpc, T: Rpc>(
         for a in watched {
             loop {
                 serve_queued(state, d).await;
+                // Blocks covered in all, so a step that starts the coverage or joins two spans counts
+                // exactly what it added.
                 let through = |h: &AddressHistory| {
                     h.coverage(crate::address_history::Action::ProducedBlocks, a)
                         .ok()
-                        .and_then(|c| c.first().map(|(_, t)| *t))
+                        .map(|c| c.iter().map(|(f, t)| t - f + 1).sum::<u64>())
                 };
                 let (before, started) = (through(&state.history), Instant::now());
                 let more = crate::address_mev::mev_step(
@@ -2461,12 +2463,17 @@ async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Op
     })
     .await
     .ok()?;
-    let short = layers
+    // The layers run one after another, so their times add up: each layer's share of its own
+    // half-deadline reach, summed, must fit in one half-deadline.
+    let load: f64 = layers
         .iter()
         .zip(&nexts)
-        .find(|((_, reach), next)| (to + 1).saturating_sub(**next) > *reach)
-        .map(|(_, next)| *next)?;
-    let next = *nexts.iter().min().unwrap_or(&short);
+        .map(|((_, reach), next)| (to + 1).saturating_sub(*next) as f64 / (*reach).max(1) as f64)
+        .sum();
+    if load <= 1.0 {
+        return None;
+    }
+    let next = *nexts.iter().min()?;
     let gap = (to + 1).saturating_sub(next);
     Some(()).map(|()| {
         format!(
