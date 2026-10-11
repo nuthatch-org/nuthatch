@@ -498,6 +498,8 @@ pub struct Pending {
     /// Block hashes another provider named (a trace's block), at any height, which the main
     /// endpoint must agree with before anything is kept.
     named: Mutex<Vec<(u64, [u8; 32])>>,
+    /// What each body scanned holds for any address, so an address watched later reads it here.
+    summaries: Mutex<Vec<(u64, Map<String, Value>)>>,
     /// The generation and finalized head the fetch began under.
     generation: u64,
     finalized: Option<u64>,
@@ -540,6 +542,7 @@ impl Pending {
             &self.timestamps.into_inner().expect("pending lock"),
             &self.internals.into_inner().expect("pending lock"),
             &self.anchors.into_inner().expect("pending lock"),
+            &self.summaries.into_inner().expect("pending lock"),
             self.generation,
             self.finalized,
             trusted,
@@ -555,6 +558,37 @@ struct TxRef {
     block: u64,
     outgoing: bool,
     failed: bool,
+}
+
+/// What a block body holds for any address: its fee recipient, timestamp, hash and every
+/// withdrawal as (index, validator, recipient, amount), decimal.
+fn summary(header: &Value, ts: u64) -> Result<Map<String, Value>> {
+    let mut m = Map::new();
+    m.insert("ts".into(), Value::String(ts.to_string()));
+    m.insert(
+        "hash".into(),
+        Value::String(str_field(header, "hash")?.to_ascii_lowercase()),
+    );
+    m.insert(
+        "miner".into(),
+        Value::String(str_field(header, "miner")?.to_ascii_lowercase()),
+    );
+    let mut w = Vec::new();
+    for x in header
+        .get("withdrawals")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        w.push(json!([
+            decimal(str_field(x, "index")?)?,
+            decimal(str_field(x, "validatorIndex")?)?,
+            str_field(x, "address")?.to_ascii_lowercase(),
+            decimal(str_field(x, "amount")?)?,
+        ]));
+    }
+    m.insert("w".into(), Value::Array(w));
+    Ok(m)
 }
 
 /// What a block scan found for one address.
@@ -829,6 +863,11 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             let ts = hex_u64(header.get("timestamp").unwrap_or(&Value::Null))
                 .with_context(|| format!("block {b} timestamp"))?;
             timestamps.push((b, ts));
+            pending
+                .summaries
+                .lock()
+                .expect("pending lock")
+                .push((b, summary(&header, ts)?));
             match header.get("withdrawals").and_then(Value::as_array) {
                 Some(ws) => {
                     for (i, w) in ws.iter().enumerate() {
@@ -881,6 +920,89 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             .extend(timestamps);
         if let Some(l) = last {
             pending.named.lock().expect("pending lock").push(l);
+        }
+        Ok(found)
+    }
+
+    /// [`Discoverer::scan_blocks`], from the summaries of bodies already scanned for other addresses
+    /// where they cover the window: only a block one of `addresses` received the fees of is read
+    /// again, for its reward. The window's last summary hash is named for the main endpoint's check.
+    pub async fn scan_with(
+        &self,
+        history: &AddressHistory,
+        addresses: &[String],
+        from: u64,
+        to: u64,
+        pending: &Pending,
+    ) -> Result<BTreeMap<String, BlockFound>> {
+        let Some(sums) = history.summaries(from, to)? else {
+            return self.scan_blocks(addresses, from, to, pending).await;
+        };
+        let watched: BTreeSet<String> = addresses.iter().map(|a| a.to_ascii_lowercase()).collect();
+        let mut found: BTreeMap<String, BlockFound> = watched
+            .iter()
+            .map(|a| (a.clone(), BlockFound::default()))
+            .collect();
+        let text = |m: &Map<String, Value>, k: &str| {
+            m.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+        };
+        for (b, sum) in &sums {
+            let ts = text(sum, "ts");
+            for (i, w) in sum
+                .get("w")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let field = |n: usize| w.get(n).and_then(Value::as_str).unwrap_or("").to_string();
+                let Some(f) = found.get_mut(&field(2)) else {
+                    continue;
+                };
+                let mut r = Map::new();
+                for (k, v) in [
+                    ("withdrawalIndex", field(0)),
+                    ("validatorIndex", field(1)),
+                    ("address", field(2)),
+                    ("amount", field(3)),
+                    ("blockNumber", b.to_string()),
+                    ("timestamp", ts.clone()),
+                ] {
+                    r.insert(k.into(), Value::String(v));
+                }
+                f.withdrawals.push(Row {
+                    block: *b,
+                    tx_index: 0,
+                    position: i as u64,
+                    record: r,
+                });
+            }
+            if let Some(f) = found.get_mut(&text(sum, "miner")) {
+                let (_, header) = self.body(*b).await?;
+                if str_field(&header, "hash")?.to_ascii_lowercase() != text(sum, "hash") {
+                    bail!("block {b} is no longer the block its summary was read from");
+                }
+                let mut r = Map::new();
+                r.insert("blockNumber".into(), Value::String(b.to_string()));
+                r.insert("timeStamp".into(), Value::String(ts.clone()));
+                r.insert(
+                    "blockReward".into(),
+                    Value::String(self.block_reward(*b, &header).await?),
+                );
+                f.mined.push(Row {
+                    block: *b,
+                    tx_index: 0,
+                    position: 0,
+                    record: r,
+                });
+            }
+        }
+        if let Some((b, sum)) = sums.last() {
+            pending
+                .named
+                .lock()
+                .expect("pending lock")
+                .push((*b, word32(&text(sum, "hash"))?));
         }
         Ok(found)
     }
@@ -3476,7 +3598,7 @@ mod tests {
         let mut stale = Map::new();
         stale.insert("blockNumber".into(), json!("149"));
         stale.insert("hash".into(), json!(format!("0x{}", "aa".repeat(32))));
-        h.persist_pending(&[(key.clone(), stale)], &[], &[], &[], 0, None, true)
+        h.persist_pending(&[(key.clone(), stale)], &[], &[], &[], &[], 0, None, true)
             .unwrap();
         let pending = Pending::default();
         let r = TxRef {
@@ -3779,9 +3901,10 @@ mod tests {
         );
         assert_eq!(
             bodies_read() - after_first,
-            14,
-            "B's gap read once, A's coverage not reread, two hashes to check B's discovery window's \
-             trace endpoint is on the main chain, and the body window's last hash checked twice"
+            5,
+            "no body read again for B, its summaries kept from A's scan: one header for the reward \
+             of the block B produced, two hashes to check B's discovery window's trace endpoint is on \
+             the main chain, and the window's last hash checked twice (cold test M3)"
         );
         let req = crate::address_history::PageRequest {
             address: B.into(),

@@ -260,6 +260,13 @@ const TX_INTERNAL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tx_i
 /// Only within them does `BLOCK_TS` answer `getblocknobytime`.
 const HEADERS: TableDefinition<&str, &[u8]> = TableDefinition::new("ah_headers");
 const VERIFIED: &str = "verified";
+/// Under `HEADERS`, the blocks whose body summaries `BODY_SUMMARY` holds, as merged spans.
+const SUMMARIZED: &str = "summarized";
+/// Each RPC-scanned body's summary: fee recipient, timestamp, hash, withdrawals. Kept for the most
+/// recent [`SUMMARY_KEEP`] blocks, so an address watched later reads them rather than the chain;
+/// older history comes from the partitions.
+const BODY_SUMMARY: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_body_summary");
+pub const SUMMARY_KEEP: u64 = 100_000;
 /// The part of each (address, action) coverage that came from verified partitions, in the same shape
 /// as `COVERAGE`. With a mirror configured, only this part of its blocks may answer.
 const VERIFIED_COV: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_verified_coverage");
@@ -306,6 +313,9 @@ enum Read {
     Rpc(Option<(u64, [u8; 32])>),
     Partition,
 }
+
+/// A block and its body summary.
+pub type Summary = (u64, Map<String, Value>);
 
 /// A transaction hash, its block, the block's hash as the trace named it, and its whole internal list.
 pub type TxInternals = (Vec<u8>, u64, [u8; 32], Vec<Map<String, Value>>);
@@ -382,6 +392,7 @@ impl AddressHistory {
         wtx.open_table(RELAY_CACHE)?;
         wtx.open_table(CANON)?;
         wtx.open_table(MEV_PENDING)?;
+        wtx.open_table(BODY_SUMMARY)?;
         reset_produced_blocks(&wtx)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
@@ -465,6 +476,7 @@ impl AddressHistory {
         timestamps: &[(u64, u64)],
         internals: &[TxInternals],
         anchors: &[(u64, [u8; 32])],
+        summaries: &[Summary],
         generation: u64,
         finalized_at_start: Option<u64>,
         trusted: bool,
@@ -529,6 +541,40 @@ impl AddressHistory {
                     t.insert(hash.as_slice(), buf.as_slice())?;
                 }
             }
+            {
+                let kept: Vec<&(u64, Map<String, Value>)> =
+                    summaries.iter().filter(|(b, _)| keep(*b)).collect();
+                if !kept.is_empty() {
+                    let mut t = wtx.open_table(BODY_SUMMARY)?;
+                    let mut h = wtx.open_table(HEADERS)?;
+                    let mut spans = match h.get(SUMMARIZED)? {
+                        Some(v) => decode_spans(v.value())?,
+                        None => Vec::new(),
+                    };
+                    for (b, sum) in kept {
+                        buf.clear();
+                        encode_record(sum, &mut buf)?;
+                        t.insert(*b, buf.as_slice())?;
+                        spans.push((*b, *b));
+                    }
+                    let mut spans = merge(spans);
+                    // Only the newest blocks are kept.
+                    if let Some(&(_, newest)) = spans.last() {
+                        let floor = newest.saturating_sub(SUMMARY_KEEP - 1);
+                        if spans.first().is_some_and(|(f, _)| *f < floor) {
+                            let old: Vec<u64> = t
+                                .range(..floor)?
+                                .map(|e| e.map(|(k, _)| k.value()))
+                                .collect::<std::result::Result<_, _>>()?;
+                            for b in old {
+                                t.remove(b)?;
+                            }
+                            spans = subtract(&spans, (0, floor - 1));
+                        }
+                    }
+                    h.insert(SUMMARIZED, encode_spans(&spans).as_slice())?;
+                }
+            }
             if current {
                 let mut c = wtx.open_table(CANON)?;
                 for (block, hash) in anchors {
@@ -540,6 +586,27 @@ impl AddressHistory {
         }
         wtx.commit()?;
         Ok(())
+    }
+
+    /// The body summaries of `[from, to]`, if every block in it has one.
+    pub fn summaries(&self, from: u64, to: u64) -> Result<Option<Vec<Summary>>> {
+        let rtx = self.store.database().begin_read()?;
+        let spans = match rtx.open_table(HEADERS)?.get(SUMMARIZED)? {
+            Some(v) => decode_spans(v.value())?,
+            None => return Ok(None),
+        };
+        if !spans.iter().any(|(f, t)| *f <= from && to <= *t) {
+            return Ok(None);
+        }
+        let t = rtx.open_table(BODY_SUMMARY)?;
+        let rows = t
+            .range(from..=to)?
+            .map(|e| {
+                let (k, v) = e?;
+                Ok((k.value(), decode_record(v.value())?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((rows.len() as u64 == to - from + 1).then_some(rows))
     }
 
     /// The tracked block hashes above the finalized head, lowest first.
@@ -1315,6 +1382,27 @@ impl AddressHistory {
                     .collect::<std::result::Result<_, _>>()?;
                 for b in above {
                     t.remove(b)?;
+                }
+            }
+            {
+                let mut t = wtx.open_table(BODY_SUMMARY)?;
+                let above: Vec<u64> = t
+                    .range(block.saturating_add(1)..)?
+                    .map(|e| e.map(|(k, _)| k.value()))
+                    .collect::<std::result::Result<_, _>>()?;
+                for b in above {
+                    t.remove(b)?;
+                }
+                let mut h = wtx.open_table(HEADERS)?;
+                let kept = match h.get(SUMMARIZED)? {
+                    Some(v) => Some(subtract(
+                        &decode_spans(v.value())?,
+                        (block.saturating_add(1), u64::MAX),
+                    )),
+                    None => None,
+                };
+                if let Some(kept) = kept {
+                    h.insert(SUMMARIZED, encode_spans(&kept).as_slice())?;
                 }
             }
             for table in [CANON, MEV_PENDING] {
@@ -2834,6 +2922,7 @@ mod tests {
             &[(90, 1), (160, 2)],
             &[(vec![7; 32], 160, [3; 32], vec![])],
             &[(160, [1; 32])],
+            &[],
             g,
             Some(100),
             true,
@@ -2854,6 +2943,7 @@ mod tests {
             &[(160, 2)],
             &[],
             &[(160, [1; 32])],
+            &[],
             g,
             Some(100),
             false,
@@ -2866,6 +2956,7 @@ mod tests {
             &[(160, 2)],
             &[],
             &[(160, [1; 32])],
+            &[],
             g,
             Some(100),
             true,
@@ -2890,8 +2981,17 @@ mod tests {
         let g_old = h.generation().unwrap();
         h.invalidate_above(150).unwrap();
         h.finalize(200).unwrap();
-        h.persist_pending(&[tx(155)], &[(155, 9)], &[], &[], g_old, Some(150), true)
-            .unwrap();
+        h.persist_pending(
+            &[tx(155)],
+            &[(155, 9)],
+            &[],
+            &[],
+            &[],
+            g_old,
+            Some(150),
+            true,
+        )
+        .unwrap();
         assert!(h.cached_tx(&[155; 32]).unwrap().is_none());
         assert_eq!(h.block_timestamp(155).unwrap(), None);
         // Finalizing past a tracked block stops tracking it, and never lowers the head.
@@ -3075,6 +3175,7 @@ mod tests {
             &[],
             &[(key, 500, [9; 32], rows)],
             &[],
+            &[],
             h.generation().unwrap(),
             Some(1_000),
             true,
@@ -3140,6 +3241,7 @@ mod tests {
             &[],
             &[(vec![0xcd; 32], 500, [9; 32], rows)],
             &[],
+            &[],
             h.generation().unwrap(),
             Some(1_000),
             true,
@@ -3184,6 +3286,48 @@ mod tests {
             h.record(Action::TxList, BOB, &[], (0, 10), g).is_err(),
             "not watched"
         );
+    }
+
+    /// Body summaries answer only for a window they wholly cover, go with a reorg above them, and
+    /// keep only the newest blocks.
+    #[test]
+    fn body_summaries_cover_whole_windows_follow_reorgs_and_stay_bounded() {
+        let (_d, h) = history();
+        let sum = |b: u64| {
+            let mut m = Map::new();
+            m.insert("ts".into(), Value::String(b.to_string()));
+            (b, m)
+        };
+        let g = h.generation().unwrap();
+        let some: Vec<Summary> = (100..=110).map(sum).collect();
+        h.persist_pending(&[], &[], &[], &[], &some, g, None, true)
+            .unwrap();
+        assert_eq!(h.summaries(100, 110).unwrap().unwrap().len(), 11);
+        assert!(
+            h.summaries(100, 111).unwrap().is_none(),
+            "not wholly covered"
+        );
+        h.invalidate_above(105).unwrap();
+        assert!(h.summaries(100, 110).unwrap().is_none());
+        assert_eq!(h.summaries(100, 105).unwrap().unwrap().len(), 6);
+        // A summary far above pushes the old ones out.
+        let g = h.generation().unwrap();
+        h.persist_pending(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[sum(105 + SUMMARY_KEEP)],
+            g,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(h.summaries(100, 105).unwrap().is_none());
+        assert!(h
+            .summaries(105 + SUMMARY_KEEP, 105 + SUMMARY_KEEP)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

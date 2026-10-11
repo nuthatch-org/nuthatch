@@ -521,7 +521,9 @@ async fn body_window<M: Rpc, T: Rpc>(
         if let Some((b, h)) = anchor {
             pending.anchor(b, h);
         }
-        let found = d.scan_blocks(&addresses, from, end, &pending).await;
+        let found = d
+            .scan_with(&state.history, &addresses, from, end, &pending)
+            .await;
         let checked = check_anchor(d, &state.history, anchor, &pending.named()).await;
         Ok((anchor, found, checked))
     })
