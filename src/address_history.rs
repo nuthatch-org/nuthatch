@@ -57,6 +57,10 @@ pub struct AddressHistoryConfig {
     /// numbers, which name the validator.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mev_relays: bool,
+    /// How long a request for history above what is covered may wait while the nest covers it:
+    /// queue, RPC work and the answer together. Default 20 s, under rotki's 30 s read timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_deadline: Option<String>,
 }
 
 /// `[address_history.mirror]`: where verified block partitions come from, which chain and blocks to
@@ -74,11 +78,8 @@ pub struct MirrorConfig {
 
 impl AddressHistoryConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.addresses.is_empty() {
-            bail!(
-                "[address_history] names no addresses - list the accounts to watch in `addresses`"
-            );
-        }
+        // An empty list is allowed: a client such as rotki registers its own accounts through
+        // `/api/watch`.
         let mut seen = std::collections::HashSet::new();
         for a in &self.addresses {
             let key =
@@ -108,7 +109,16 @@ impl AddressHistoryConfig {
             }
         }
         self.poll_interval()?;
+        self.request_deadline()?;
         Ok(())
+    }
+
+    pub fn request_deadline(&self) -> Result<Duration> {
+        match &self.request_deadline {
+            None => Ok(crate::address_mode::DEFAULT_DEADLINE),
+            Some(s) => crate::freshness::parse_duration(s)
+                .map_err(|e| anyhow!("[address_history] request_deadline `{s}`: {e}")),
+        }
     }
 
     pub fn poll_interval(&self) -> Result<Duration> {
@@ -250,6 +260,13 @@ const TX_INTERNAL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_tx_i
 /// Only within them does `BLOCK_TS` answer `getblocknobytime`.
 const HEADERS: TableDefinition<&str, &[u8]> = TableDefinition::new("ah_headers");
 const VERIFIED: &str = "verified";
+/// Under `HEADERS`, the blocks whose body summaries `BODY_SUMMARY` holds, as merged spans.
+const SUMMARIZED: &str = "summarized";
+/// Each RPC-scanned body's summary: fee recipient, timestamp, hash, withdrawals. Kept for the most
+/// recent [`SUMMARY_KEEP`] blocks, so an address watched later reads them rather than the chain;
+/// older history comes from the partitions.
+const BODY_SUMMARY: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_body_summary");
+pub const SUMMARY_KEEP: u64 = 100_000;
 /// The part of each (address, action) coverage that came from verified partitions, in the same shape
 /// as `COVERAGE`. With a mirror configured, only this part of its blocks may answer.
 const VERIFIED_COV: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_verified_coverage");
@@ -258,8 +275,25 @@ const COVERAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_coverag
 const WATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_watched");
 /// Addresses removed at runtime, so a restart does not re-seed them from the config.
 const UNWATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_unwatched");
+/// Block hashes above the finalized head that stored history was read against. The highest anchors
+/// everything below it, so one comparison per poll finds a reorg.
+const CANON: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_canon");
+/// Blocks whose relay answer lacked a delivery, re-asked on a slow schedule: a relay can save its
+/// record after the block is published, or fail to.
+const MEV_PENDING: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_mev_pending");
+/// The hashes of the newest finalized heads this store committed. History under them is never
+/// rewritten, so each poll holds the newest and a sample against the chain: a reorg reaching under
+/// finality, or an RPC that came back on another chain under the same id, stops the cursor.
+const FINAL: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_final");
+const FINAL_KEEP: usize = 32;
+/// Why finalized history stopped matching the chain, once it has: it outlives a restart, because the
+/// rows it concerns do, and only removing the store clears it.
+const CONFLICT: TableDefinition<&str, &str> = TableDefinition::new("ah_conflict");
 const META: TableDefinition<&str, u64> = TableDefinition::new("ah_meta");
+/// The finalized head: what the cursor backfills to and the line under which nothing is re-checked.
 const HEAD: &str = "head";
+/// The newest block served on demand above the finalized head.
+const TIP: &str = "tip";
 const GENERATION: &str = "generation";
 
 const KEY_LEN: usize = 20 + 8 * 3;
@@ -280,8 +314,19 @@ fn coverage_key(a: &Address, action: Action) -> [u8; 21] {
     k
 }
 
-/// A transaction hash, its block, and its whole internal list.
-pub type TxInternals = (Vec<u8>, u64, Vec<Map<String, Value>>);
+/// Where a recorded span was read from: the RPC, against an anchor block when above the finalized
+/// head, or a verified partition.
+#[derive(Debug, Clone, Copy)]
+enum Read {
+    Rpc(Option<(u64, [u8; 32])>),
+    Partition,
+}
+
+/// A block and its body summary.
+pub type Summary = (u64, Map<String, Value>);
+
+/// A transaction hash, its block, the block's hash as the trace named it, and its whole internal list.
+pub type TxInternals = (Vec<u8>, u64, [u8; 32], Vec<Map<String, Value>>);
 
 /// One stored record and where it sorts.
 #[derive(Debug, Clone)]
@@ -331,6 +376,86 @@ pub struct AddressHistory {
     chain_id: u64,
 }
 
+/// Whether the store at `path` holds history from before finalized hashes were recorded (a
+/// committed head and none of them), and if so the accounts it watched. Read without writing, so a
+/// store moved aside for it is moved intact.
+pub fn pre_finality(path: &std::path::Path) -> Result<Option<Accounts>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let db = redb::Database::open(path)?;
+    let rtx = db.begin_read()?;
+    let head = match rtx.open_table(META) {
+        Ok(t) => t.get(HEAD)?.map(|v| v.value()),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let finals = match rtx.open_table(FINAL) {
+        Ok(t) => redb::ReadableTableMetadata::len(&t)?,
+        Err(redb::TableError::TableDoesNotExist(_)) => 0,
+        Err(e) => return Err(e.into()),
+    };
+    if head.is_none() || finals > 0 {
+        return Ok(None);
+    }
+    let list = |def: TableDefinition<&[u8], u8>| -> Result<Vec<String>> {
+        match rtx.open_table(def) {
+            Ok(t) => t
+                .iter()?
+                .map(|e| {
+                    let (k, _) = e?;
+                    let a: Address = k
+                        .value()
+                        .try_into()
+                        .context("account key is not 20 bytes")?;
+                    Ok(address_hex(&a))
+                })
+                .collect(),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    };
+    Ok(Some(Accounts {
+        watched: list(WATCHED)?,
+        unwatched: list(UNWATCHED)?,
+    }))
+}
+
+/// The accounts a store watched, and those removed from it, which configuration must not bring back.
+pub struct Accounts {
+    pub watched: Vec<String>,
+    pub unwatched: Vec<String>,
+}
+
+/// A finalized block the store recorded is now reported at another hash.
+#[derive(Debug)]
+pub struct FinalConflict(pub u64);
+
+impl std::fmt::Display for FinalConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "finalized block {} is now at another hash", self.0)
+    }
+}
+
+impl std::error::Error for FinalConflict {}
+
+fn finalize_in(wtx: &redb::WriteTransaction, block: u64) -> Result<()> {
+    let mut m = wtx.open_table(META)?;
+    let head = m.get(HEAD)?.map(|v| v.value());
+    if head.is_none_or(|h| block > h) {
+        m.insert(HEAD, block)?;
+    }
+    let mut c = wtx.open_table(CANON)?;
+    let done: Vec<u64> = c
+        .range(..=block)?
+        .map(|e| e.map(|(k, _)| k.value()))
+        .collect::<std::result::Result<_, _>>()?;
+    for b in done {
+        c.remove(b)?;
+    }
+    Ok(())
+}
+
 impl AddressHistory {
     /// Open the tables, and add `seed` (the configured addresses) to the watched set. Addresses
     /// already watched are left alone, none are removed, and one unwatched at runtime is not brought
@@ -353,6 +478,12 @@ impl AddressHistory {
         wtx.open_table(HEADERS)?;
         wtx.open_table(VERIFIED_COV)?;
         wtx.open_table(RELAY_CACHE)?;
+        wtx.open_table(CANON)?;
+        wtx.open_table(MEV_PENDING)?;
+        wtx.open_table(BODY_SUMMARY)?;
+        wtx.open_table(FINAL)?;
+        wtx.open_table(CONFLICT)?;
+        reset_produced_blocks(&wtx)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
             let mut w = wtx.open_table(WATCHED)?;
@@ -379,21 +510,6 @@ impl AddressHistory {
         }
     }
 
-    pub fn cache_txs(&self, txs: &[(Vec<u8>, Map<String, Value>)]) -> Result<()> {
-        let wtx = self.store.database().begin_write()?;
-        {
-            let mut t = wtx.open_table(TX_CACHE)?;
-            let mut buf = Vec::new();
-            for (hash, record) in txs {
-                buf.clear();
-                encode_record(record, &mut buf)?;
-                t.insert(hash.as_slice(), buf.as_slice())?;
-            }
-        }
-        wtx.commit()?;
-        Ok(())
-    }
-
     /// Every internal transaction of a transaction already traced, by its 32-byte hash.
     pub fn tx_internals(&self, hash: &[u8]) -> Result<Option<Vec<Map<String, Value>>>> {
         let rtx = self.store.database().begin_read()?;
@@ -415,31 +531,293 @@ impl AddressHistory {
         Ok(Some(rows))
     }
 
-    /// Keep each trace whose block is still served; a reorg that lowered the head while the trace
-    /// was in flight leaves it out.
-    pub fn cache_tx_internals(&self, txs: &[TxInternals]) -> Result<()> {
+    /// The block a cached trace was read from, and that block's hash as the trace named it (absent
+    /// for a trace kept before 5.2, which is traced again rather than trusted).
+    pub fn tx_internals_block(&self, hash: &[u8]) -> Result<Option<(u64, Option<[u8; 32]>)>> {
+        let rtx = self.store.database().begin_read()?;
+        let Some(v) = rtx.open_table(TX_INTERNAL)?.get(hash)? else {
+            return Ok(None);
+        };
+        let wrapped = decode_record(v.value())?;
+        let Some(block) = wrapped
+            .get("blockNumber")
+            .and_then(Value::as_str)
+            .and_then(|b| b.parse().ok())
+        else {
+            return Ok(None);
+        };
+        let named = wrapped
+            .get("blockHash")
+            .and_then(Value::as_str)
+            .and_then(|h| alloy_primitives::hex::decode(h.trim_start_matches("0x")).ok())
+            .and_then(|h| <[u8; 32]>::try_from(h).ok());
+        Ok(Some((block, named)))
+    }
+
+    /// What a fetch read, in one transaction: transactions, timestamps, traces and the block hashes
+    /// they were read against. Nothing from a fetch that failed its check (`trusted` false). Otherwise
+    /// what lay under the finalized head when the fetch began, and what lay above it only if the
+    /// generation has not moved since: a reorg handled meanwhile may have replaced its block, even if
+    /// the new chain has since grown, or finalized, back past it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn persist_pending(
+        &self,
+        txs: &[(Vec<u8>, Map<String, Value>)],
+        timestamps: &[(u64, u64)],
+        internals: &[TxInternals],
+        anchors: &[(u64, [u8; 32])],
+        summaries: &[Summary],
+        generation: u64,
+        finalized_at_start: Option<u64>,
+        trusted: bool,
+    ) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
         {
-            let head = wtx.open_table(META)?.get(HEAD)?.map(|v| v.value());
-            let mut t = wtx.open_table(TX_INTERNAL)?;
+            let (head, now) = {
+                let m = wtx.open_table(META)?;
+                let head = m.get(HEAD)?.map(|v| v.value());
+                let now = m.get(GENERATION)?.map_or(0, |v| v.value());
+                (head, now)
+            };
+            let current = trusted && now == generation;
+            let keep =
+                |block: u64| trusted && (current || finalized_at_start.is_some_and(|h| block <= h));
             let mut buf = Vec::new();
-            for (hash, block, rows) in txs {
-                if head.is_none_or(|h| *block > h) {
-                    continue;
+            {
+                let mut t = wtx.open_table(TX_CACHE)?;
+                for (hash, record) in txs {
+                    let block = record
+                        .get("blockNumber")
+                        .and_then(Value::as_str)
+                        .and_then(|b| b.parse::<u64>().ok());
+                    if !block.is_some_and(keep) {
+                        continue;
+                    }
+                    buf.clear();
+                    encode_record(record, &mut buf)?;
+                    t.insert(hash.as_slice(), buf.as_slice())?;
                 }
-                let mut wrapped = Map::new();
-                wrapped.insert("blockNumber".into(), Value::String(block.to_string()));
-                wrapped.insert(
-                    "rows".into(),
-                    Value::Array(rows.iter().cloned().map(Value::Object).collect()),
-                );
-                buf.clear();
-                encode_record(&wrapped, &mut buf)?;
-                t.insert(hash.as_slice(), buf.as_slice())?;
+            }
+            {
+                let verified = match wtx.open_table(HEADERS)?.get(VERIFIED)? {
+                    Some(v) => decode_spans(v.value())?,
+                    None => Vec::new(),
+                };
+                let mut t = wtx.open_table(BLOCK_TS)?;
+                for (b, s) in timestamps {
+                    if keep(*b) && !verified.iter().any(|(f, l)| f <= b && b <= l) {
+                        t.insert(*b, *s)?;
+                    }
+                }
+            }
+            {
+                let mut t = wtx.open_table(TX_INTERNAL)?;
+                for (hash, block, named, rows) in internals {
+                    if !keep(*block) {
+                        continue;
+                    }
+                    let mut wrapped = Map::new();
+                    wrapped.insert("blockNumber".into(), Value::String(block.to_string()));
+                    wrapped.insert(
+                        "blockHash".into(),
+                        Value::String(format!("0x{}", alloy_primitives::hex::encode(named))),
+                    );
+                    wrapped.insert(
+                        "rows".into(),
+                        Value::Array(rows.iter().cloned().map(Value::Object).collect()),
+                    );
+                    buf.clear();
+                    encode_record(&wrapped, &mut buf)?;
+                    t.insert(hash.as_slice(), buf.as_slice())?;
+                }
+            }
+            {
+                let kept: Vec<&(u64, Map<String, Value>)> =
+                    summaries.iter().filter(|(b, _)| keep(*b)).collect();
+                if !kept.is_empty() {
+                    let mut t = wtx.open_table(BODY_SUMMARY)?;
+                    let mut h = wtx.open_table(HEADERS)?;
+                    let mut spans = match h.get(SUMMARIZED)? {
+                        Some(v) => decode_spans(v.value())?,
+                        None => Vec::new(),
+                    };
+                    for (b, sum) in kept {
+                        buf.clear();
+                        encode_record(sum, &mut buf)?;
+                        t.insert(*b, buf.as_slice())?;
+                        spans.push((*b, *b));
+                    }
+                    let mut spans = merge(spans);
+                    // Only the newest blocks are kept.
+                    if let Some(&(_, newest)) = spans.last() {
+                        let floor = newest.saturating_sub(SUMMARY_KEEP - 1);
+                        if spans.first().is_some_and(|(f, _)| *f < floor) {
+                            let old: Vec<u64> = t
+                                .range(..floor)?
+                                .map(|e| e.map(|(k, _)| k.value()))
+                                .collect::<std::result::Result<_, _>>()?;
+                            for b in old {
+                                t.remove(b)?;
+                            }
+                            spans = subtract(&spans, (0, floor - 1));
+                        }
+                    }
+                    h.insert(SUMMARIZED, encode_spans(&spans).as_slice())?;
+                }
+            }
+            if current {
+                let mut c = wtx.open_table(CANON)?;
+                for (block, hash) in anchors {
+                    if head.is_none_or(|h| *block > h) {
+                        anchor(&mut c, *block, hash)?;
+                    }
+                }
             }
         }
         wtx.commit()?;
         Ok(())
+    }
+
+    /// The body summaries of `[from, to]`, if every block in it has one.
+    pub fn summaries(&self, from: u64, to: u64) -> Result<Option<Vec<Summary>>> {
+        let rtx = self.store.database().begin_read()?;
+        let spans = match rtx.open_table(HEADERS)?.get(SUMMARIZED)? {
+            Some(v) => decode_spans(v.value())?,
+            None => return Ok(None),
+        };
+        if !spans.iter().any(|(f, t)| *f <= from && to <= *t) {
+            return Ok(None);
+        }
+        let t = rtx.open_table(BODY_SUMMARY)?;
+        let rows = t
+            .range(from..=to)?
+            .map(|e| {
+                let (k, v) = e?;
+                Ok((k.value(), decode_record(v.value())?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((rows.len() as u64 == to - from + 1).then_some(rows))
+    }
+
+    /// The tracked block hashes above the finalized head, lowest first.
+    pub fn tracked(&self) -> Result<Vec<(u64, [u8; 32])>> {
+        let rtx = self.store.database().begin_read()?;
+        rtx.open_table(CANON)?
+            .iter()?
+            .map(|e| {
+                let (k, v) = e?;
+                let hash: [u8; 32] = v.value().try_into().map_err(|_| {
+                    anyhow!("a tracked hash at block {} is not 32 bytes", k.value())
+                })?;
+                Ok((k.value(), hash))
+            })
+            .collect()
+    }
+
+    /// Move the finalized head up to `block` and stop tracking hashes at or under it. Never lowers
+    /// the head: an RPC failing over to a lagging node must not unfinalize anything.
+    pub fn finalize(&self, block: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        finalize_in(&wtx, block)?;
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// [`AddressHistory::finalize`] `block`, recording `hash` as its own in the same transaction and
+    /// keeping the newest [`FINAL_KEEP`], so no crash can leave a committed head without its hash.
+    /// A block already recorded at another hash is a [`FinalConflict`], and nothing is written.
+    pub fn finalize_at(&self, block: u64, hash: [u8; 32]) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let mut t = wtx.open_table(FINAL)?;
+            if let Some(old) = t.get(block)? {
+                if old.value() != hash.as_slice() {
+                    return Err(FinalConflict(block).into());
+                }
+            }
+            t.insert(block, hash.as_slice())?;
+            let all: Vec<u64> = t
+                .iter()?
+                .map(|e| e.map(|(k, _)| k.value()))
+                .collect::<std::result::Result<_, _>>()?;
+            for b in all.iter().take(all.len().saturating_sub(FINAL_KEEP)) {
+                t.remove(*b)?;
+            }
+            finalize_in(&wtx, block)?;
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// Record the first conflict with finalized history; a later one keeps the first reason.
+    pub fn set_conflict(&self, why: &str) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let mut t = wtx.open_table(CONFLICT)?;
+            if t.get("why")?.is_none() {
+                t.insert("why", why)?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// The conflict with finalized history this store recorded, if any.
+    pub fn conflict(&self) -> Result<Option<String>> {
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx
+            .open_table(CONFLICT)?
+            .get("why")?
+            .map(|v| v.value().to_string()))
+    }
+
+    /// The finalized heads' hashes recorded, oldest first.
+    pub fn finals(&self) -> Result<Vec<(u64, [u8; 32])>> {
+        let rtx = self.store.database().begin_read()?;
+        rtx.open_table(FINAL)?
+            .iter()?
+            .map(|e| {
+                let (k, v) = e?;
+                let h: [u8; 32] = v.value().try_into().map_err(|_| {
+                    anyhow!("a finalized hash at block {} is not 32 bytes", k.value())
+                })?;
+                Ok((k.value(), h))
+            })
+            .collect()
+    }
+
+    /// The newest block served on demand, if any was. Only ever rises, except under a reorg.
+    pub fn tip(&self) -> Result<Option<u64>> {
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx.open_table(META)?.get(TIP)?.map(|v| v.value()))
+    }
+
+    pub fn raise_tip(&self, block: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let mut m = wtx.open_table(META)?;
+            if m.get(TIP)?.is_none_or(|v| block > v.value()) {
+                m.insert(TIP, block)?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// The blocks of `[from, to]` that (address, action) has no coverage for, lowest first.
+    pub fn uncovered(
+        &self,
+        action: Action,
+        address: &str,
+        (from, to): (u64, u64),
+    ) -> Result<Vec<(u64, u64)>> {
+        if to < from {
+            return Ok(Vec::new());
+        }
+        Ok(subtract_all(
+            &[(from, to)],
+            &self.coverage(action, address)?,
+        ))
     }
 
     pub fn block_timestamp(&self, block: u64) -> Result<Option<u64>> {
@@ -599,10 +977,18 @@ impl AddressHistory {
                 wtx.open_table(VERIFIED_COV)?
                     .remove(coverage_key(&a, action).as_slice())?;
             }
-            bump_generation(&wtx)?;
+            // No generation change: the address's rows and coverage go with it, so its pages read
+            // incomplete, and a fetch for it is refused as not watched; a window in flight for every
+            // other address stays good.
         }
         wtx.commit()?;
         Ok(())
+    }
+
+    pub fn is_watched(&self, address: &str) -> Result<bool> {
+        let a = parse_address(address)?;
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx.open_table(WATCHED)?.get(a.as_slice())?.is_some())
     }
 
     /// Store a fetch's result: `rows`, replacing what `[from, to]` held, and the claim that the span
@@ -617,7 +1003,22 @@ impl AddressHistory {
         span: (u64, u64),
         generation: u64,
     ) -> Result<()> {
-        self.record_with(action, address, rows, span, generation, false)
+        self.record_with(action, address, rows, span, generation, Read::Rpc(None))
+    }
+
+    /// [`AddressHistory::record`] for a span read against the chain as it stood at block `anchor.0`,
+    /// whose hash was `anchor.1`. Above the finalized head the hash is tracked, so a reorg found
+    /// later takes the span back out; a conflicting tracked hash refuses the record.
+    pub fn record_anchored(
+        &self,
+        action: Action,
+        address: &str,
+        rows: &[Row],
+        span: (u64, u64),
+        generation: u64,
+        anchor: Option<(u64, [u8; 32])>,
+    ) -> Result<()> {
+        self.record_with(action, address, rows, span, generation, Read::Rpc(anchor))
     }
 
     /// [`AddressHistory::record`] for rows read from a verified partition: the span is marked
@@ -630,7 +1031,7 @@ impl AddressHistory {
         span: (u64, u64),
         generation: u64,
     ) -> Result<()> {
-        self.record_with(action, address, rows, span, generation, true)
+        self.record_with(action, address, rows, span, generation, Read::Partition)
     }
 
     fn record_with(
@@ -640,8 +1041,12 @@ impl AddressHistory {
         rows: &[Row],
         (from, to): (u64, u64),
         generation: u64,
-        verified: bool,
+        read: Read,
     ) -> Result<()> {
+        let (verified, anchored) = match read {
+            Read::Partition => (true, None),
+            Read::Rpc(anchor) => (false, anchor),
+        };
         if to < from {
             bail!("coverage interval [{from}, {to}] is empty");
         }
@@ -684,6 +1089,12 @@ impl AddressHistory {
                 };
                 if let Some(kept) = kept {
                     v.insert(key.as_slice(), encode_spans(&kept).as_slice())?;
+                }
+            }
+            if let Some((block, hash)) = anchored {
+                let head = wtx.open_table(META)?.get(HEAD)?.map(|v| v.value());
+                if head.is_none_or(|h| block > h) {
+                    anchor(&mut wtx.open_table(CANON)?, block, &hash)?;
                 }
             }
             put_rows(&wtx, action, &a, rows)?;
@@ -809,8 +1220,189 @@ impl AddressHistory {
         }
     }
 
-    /// The newest block the cursor has seen. An `endblock` past it is answered up to it, as
-    /// Etherscan answers rotki's `99999999`.
+    /// Blocks awaiting a relay re-ask: (block, first asked, last asked), in unix seconds.
+    pub fn mev_pending(&self) -> Result<Vec<(u64, u64, u64)>> {
+        let rtx = self.store.database().begin_read()?;
+        rtx.open_table(MEV_PENDING)?
+            .iter()?
+            .map(|e| {
+                let (k, v) = e?;
+                let (first, last) = decode_asked(v.value())?;
+                Ok((k.value(), first, last))
+            })
+            .collect()
+    }
+
+    /// Note that the relays were asked about `block` at `now` and named no delivery for it; the
+    /// first such ask is kept, so the re-ask schedule runs from it.
+    pub fn mev_absent(&self, block: u64, now: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let mut t = wtx.open_table(MEV_PENDING)?;
+            let first = match t.get(block)? {
+                Some(v) => decode_asked(v.value())?.0,
+                None => now,
+            };
+            t.insert(block, encode_asked(first, now).as_slice())?;
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// [`AddressHistory::record`] for produced blocks, with the blocks the relays named no delivery
+    /// for put on the re-ask schedule in the same transaction.
+    pub fn record_produced(
+        &self,
+        address: &str,
+        rows: &[Row],
+        (from, to): (u64, u64),
+        generation: u64,
+        unrecorded: &[u64],
+        now: u64,
+    ) -> Result<()> {
+        if to < from {
+            bail!("coverage interval [{from}, {to}] is empty");
+        }
+        let a = parse_address(address)?;
+        let wtx = self.store.database().begin_write()?;
+        {
+            if wtx.open_table(WATCHED)?.get(a.as_slice())?.is_none() {
+                bail!("{} is not watched", address_hex(&a));
+            }
+            let current = wtx
+                .open_table(META)?
+                .get(GENERATION)?
+                .map_or(0, |v| v.value());
+            if current != generation {
+                bail!("address history changed during the fetch (generation {generation} -> {current}); refetch");
+            }
+            if let Some(r) = rows.iter().find(|r| r.block < from || r.block > to) {
+                bail!("a row at block {} lies outside [{from}, {to}]", r.block);
+            }
+            drain(
+                &mut wtx.open_table(Action::ProducedBlocks.table())?,
+                &row_key(&a, from, 0, 0),
+                &row_key(&a, to, u64::MAX, u64::MAX),
+            )?;
+            put_rows(&wtx, Action::ProducedBlocks, &a, rows)?;
+            cover(&wtx, Action::ProducedBlocks, &a, from, to)?;
+            let mut p = wtx.open_table(MEV_PENDING)?;
+            for &b in unrecorded {
+                let first = match p.get(b)? {
+                    Some(v) => decode_asked(v.value())?.0,
+                    None => now,
+                };
+                p.insert(b, encode_asked(first, now).as_slice())?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// A re-ask's outcome, in one transaction: the relays' answer cached (the block is finalized),
+    /// each address's changed rows at the block replaced, and the block kept on the schedule or taken
+    /// off it. Refused if the generation moved since the re-ask began.
+    pub fn apply_reask(
+        &self,
+        block: u64,
+        record: &Map<String, Value>,
+        changes: &[(String, Vec<Row>)],
+        keep_asking: bool,
+        now: u64,
+        generation: u64,
+    ) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let current = wtx
+                .open_table(META)?
+                .get(GENERATION)?
+                .map_or(0, |v| v.value());
+            if current != generation {
+                bail!("address history changed during the re-ask (generation {generation} -> {current}); ask again");
+            }
+            let mut buf = Vec::new();
+            encode_record(record, &mut buf)?;
+            wtx.open_table(RELAY_CACHE)?.insert(block, buf.as_slice())?;
+            for (address, rows) in changes {
+                let a = parse_address(address)?;
+                if let Some(r) = rows.iter().find(|r| r.block != block) {
+                    bail!("a row at block {} is not at block {block}", r.block);
+                }
+                drain(
+                    &mut wtx.open_table(Action::ProducedBlocks.table())?,
+                    &row_key(&a, block, 0, 0),
+                    &row_key(&a, block, u64::MAX, u64::MAX),
+                )?;
+                put_rows(&wtx, Action::ProducedBlocks, &a, rows)?;
+            }
+            if !changes.is_empty() {
+                bump_generation(&wtx)?;
+            }
+            let mut p = wtx.open_table(MEV_PENDING)?;
+            if keep_asking {
+                let first = match p.get(block)? {
+                    Some(v) => decode_asked(v.value())?.0,
+                    None => now,
+                };
+                p.insert(block, encode_asked(first, now).as_slice())?;
+            } else {
+                p.remove(block)?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    pub fn mev_settled(&self, block: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        wtx.open_table(MEV_PENDING)?.remove(block)?;
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// Replace (address, action)'s rows at `block` with `rows`, in a span already covered: late relay
+    /// evidence upgrading a row, or inserting one that had none. The generation moves, so a client
+    /// paging across it starts again rather than reading half of each.
+    pub fn replace_block_rows(
+        &self,
+        action: Action,
+        address: &str,
+        block: u64,
+        rows: &[Row],
+    ) -> Result<()> {
+        let a = parse_address(address)?;
+        if let Some(r) = rows.iter().find(|r| r.block != block) {
+            bail!("a row at block {} is not at block {block}", r.block);
+        }
+        let wtx = self.store.database().begin_write()?;
+        {
+            if wtx.open_table(WATCHED)?.get(a.as_slice())?.is_none() {
+                bail!("{} is not watched", address_hex(&a));
+            }
+            let covered = match wtx
+                .open_table(COVERAGE)?
+                .get(coverage_key(&a, action).as_slice())?
+            {
+                Some(v) => decode_spans(v.value())?,
+                None => Vec::new(),
+            };
+            if !covered.iter().any(|(f, t)| *f <= block && block <= *t) {
+                bail!("{} block {block} is not covered", action.etherscan());
+            }
+            drain(
+                &mut wtx.open_table(action.table())?,
+                &row_key(&a, block, 0, 0),
+                &row_key(&a, block, u64::MAX, u64::MAX),
+            )?;
+            put_rows(&wtx, action, &a, rows)?;
+            bump_generation(&wtx)?;
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// Set the finalized head outright, lower included; the cursor uses
+    /// [`AddressHistory::finalize`].
     pub fn set_head(&self, block: u64) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
         wtx.open_table(META)?.insert(HEAD, block)?;
@@ -903,6 +1495,72 @@ impl AddressHistory {
                 }
             }
             {
+                // A transaction re-included elsewhere keeps its hash, so a cached copy would bring
+                // back its old block, index and receipt.
+                let mut txs = wtx.open_table(TX_CACHE)?;
+                let mut stale = Vec::new();
+                for e in txs.iter()? {
+                    let (k, v) = e?;
+                    let cached = decode_record(v.value())?
+                        .get("blockNumber")
+                        .and_then(Value::as_str)
+                        .and_then(|b| b.parse::<u64>().ok());
+                    if cached.is_none_or(|b| b > block) {
+                        stale.push(k.value().to_vec());
+                    }
+                }
+                for k in stale {
+                    txs.remove(k.as_slice())?;
+                }
+            }
+            {
+                let mut t = wtx.open_table(BLOCK_TS)?;
+                let above: Vec<u64> = t
+                    .range(block.saturating_add(1)..)?
+                    .map(|e| e.map(|(k, _)| k.value()))
+                    .collect::<std::result::Result<_, _>>()?;
+                for b in above {
+                    t.remove(b)?;
+                }
+            }
+            {
+                let mut t = wtx.open_table(BODY_SUMMARY)?;
+                let above: Vec<u64> = t
+                    .range(block.saturating_add(1)..)?
+                    .map(|e| e.map(|(k, _)| k.value()))
+                    .collect::<std::result::Result<_, _>>()?;
+                for b in above {
+                    t.remove(b)?;
+                }
+                let mut h = wtx.open_table(HEADERS)?;
+                let kept = match h.get(SUMMARIZED)? {
+                    Some(v) => Some(subtract(
+                        &decode_spans(v.value())?,
+                        (block.saturating_add(1), u64::MAX),
+                    )),
+                    None => None,
+                };
+                if let Some(kept) = kept {
+                    h.insert(SUMMARIZED, encode_spans(&kept).as_slice())?;
+                }
+            }
+            for table in [CANON, MEV_PENDING] {
+                let mut t = wtx.open_table(table)?;
+                let above: Vec<u64> = t
+                    .range(block.saturating_add(1)..)?
+                    .map(|e| e.map(|(k, _)| k.value()))
+                    .collect::<std::result::Result<_, _>>()?;
+                for b in above {
+                    t.remove(b)?;
+                }
+            }
+            {
+                let mut m = wtx.open_table(META)?;
+                if m.get(TIP)?.is_some_and(|v| v.value() > block) {
+                    m.insert(TIP, block)?;
+                }
+            }
+            {
                 let mut v = wtx.open_table(VERIFIED_COV)?;
                 let entries: Vec<(Vec<u8>, Vec<u8>)> = v
                     .iter()?
@@ -957,7 +1615,6 @@ impl AddressHistory {
             ));
         }
         let start = req.start_block.unwrap_or(0);
-        let head = meta.get(HEAD)?.map(|v| v.value());
         let spans = match rtx
             .open_table(COVERAGE)?
             .get(coverage_key(&a, action).as_slice())?
@@ -968,6 +1625,14 @@ impl AddressHistory {
         if req.end_block.is_some_and(|e| e < start) {
             return answer(Answer::Rows(Vec::new()));
         }
+        // Without an end, page 1 reads to the end of what is covered, which moves as coverage grows;
+        // a later page could then repeat or skip rows.
+        if req.page > 1 && req.end_block.is_none() {
+            return answer(Answer::Incomplete(
+                "a page past the first needs an endblock, so every page reads the same blocks"
+                    .into(),
+            ));
+        }
         let Some(&(_, covered_to)) = spans.iter().find(|(f, t)| *f <= start && start <= *t) else {
             return answer(Answer::Incomplete(format!(
                 "{} for {} is not indexed at block {start}",
@@ -975,17 +1640,10 @@ impl AddressHistory {
                 address_hex(&a)
             )));
         };
-        // Etherscan reads an absent or far-future `endblock` as "up to now". The nest's now is the
-        // head it has seen; without one it cannot say where history ends.
-        let end = match (req.end_block, head) {
-            (Some(e), Some(h)) => e.min(h),
-            (Some(e), None) => e,
-            (None, Some(h)) => h,
-            (None, None) => {
-                return answer(Answer::Incomplete("the chain head is not known yet".into()));
-            }
-        };
-        if end < start || end > covered_to {
+        // An explicit end is answered whole or refused: shortening it to what is covered would let a
+        // client record history it never received. No end means everything covered.
+        let end = req.end_block.unwrap_or(covered_to);
+        if end > covered_to {
             return answer(Answer::Incomplete(format!(
                 "{} for {} is indexed through block {covered_to}, not {}",
                 action.etherscan(),
@@ -1074,6 +1732,72 @@ fn cover(
     };
     spans.push((from, to));
     t.insert(key.as_slice(), encode_spans(&merge(spans)).as_slice())?;
+    Ok(())
+}
+
+/// The produced-block contract a store's rows were read under. 5.1 stored no relay delivery as
+/// `none` and kept no re-ask schedule, and skipped payout-contract payments, so its rows are dropped
+/// and read again rather than carried into a contract they were not read under.
+const PRODUCED_CONTRACT: &str = "produced_contract";
+const PRODUCED_CONTRACT_NOW: u64 = 2;
+
+fn reset_produced_blocks(wtx: &redb::WriteTransaction) -> Result<()> {
+    use redb::ReadableTableMetadata;
+    let read_under = wtx
+        .open_table(META)?
+        .get(PRODUCED_CONTRACT)?
+        .map(|v| v.value());
+    if read_under == Some(PRODUCED_CONTRACT_NOW) {
+        return Ok(());
+    }
+    let mut rows = wtx.open_table(Action::ProducedBlocks.table())?;
+    let had_rows = !rows.is_empty()?;
+    rows.retain(|_, _| false)?;
+    let mut c = wtx.open_table(COVERAGE)?;
+    let stale: Vec<Vec<u8>> = c
+        .iter()?
+        .filter_map(|e| e.ok())
+        .map(|(k, _)| k.value().to_vec())
+        .filter(|k| k[20] == Action::ProducedBlocks.code())
+        .collect();
+    for k in &stale {
+        c.remove(k.as_slice())?;
+    }
+    if had_rows || !stale.is_empty() {
+        bump_generation(wtx)?;
+    }
+    wtx.open_table(META)?
+        .insert(PRODUCED_CONTRACT, PRODUCED_CONTRACT_NOW)?;
+    Ok(())
+}
+
+fn encode_asked(first: u64, last: u64) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&first.to_be_bytes());
+    out[8..].copy_from_slice(&last.to_be_bytes());
+    out
+}
+
+fn decode_asked(raw: &[u8]) -> Result<(u64, u64)> {
+    let raw: [u8; 16] = raw
+        .try_into()
+        .map_err(|_| anyhow!("a pending relay entry is not 16 bytes"))?;
+    Ok((
+        u64::from_be_bytes(raw[..8].try_into().expect("8 bytes")),
+        u64::from_be_bytes(raw[8..].try_into().expect("8 bytes")),
+    ))
+}
+
+/// Track `hash` at `block`; a different hash already tracked there means the chain moved under the
+/// fetch, which must not be recorded as if it had not.
+fn anchor(c: &mut redb::Table<u64, &'static [u8]>, block: u64, hash: &[u8; 32]) -> Result<()> {
+    if let Some(v) = c.get(block)? {
+        if v.value() != hash.as_slice() {
+            bail!("block {block} changed hash during the fetch; refetch");
+        }
+        return Ok(());
+    }
+    c.insert(block, hash.as_slice())?;
     Ok(())
 }
 
@@ -1353,6 +2077,14 @@ fn encode_string(s: &str, out: &mut Vec<u8>) {
     put_bytes(out, s.as_bytes());
 }
 
+/// Encode `record` into `buf` and assert it decodes back unchanged.
+#[cfg(test)]
+pub(crate) fn tests_encode_roundtrip(record: &Map<String, Value>, buf: &mut Vec<u8>) {
+    buf.clear();
+    encode_record(record, buf).unwrap();
+    assert_eq!(&decode_record(buf).unwrap(), record);
+}
+
 fn decode_record(mut raw: &[u8]) -> Result<Map<String, Value>> {
     let n = take_varint(&mut raw)?;
     let mut out = Map::new();
@@ -1475,7 +2207,7 @@ pub fn respond(
         }
     }
     if let Some(hash) = get("txhash") {
-        return by_txhash(history, act, hash);
+        return by_txhash(history, act, hash, params);
     }
     if act == Action::MinedBlocks && get("blocktype").is_some_and(|t| t != "blocks") {
         return unsupported("getminedblocks is served for blocktype=blocks only");
@@ -1497,7 +2229,15 @@ pub fn respond(
     }
 }
 
-/// `block/getblocknobytime`, from verified headers only.
+/// Whether every block's timestamp is strictly greater than its parent's, which is what lets
+/// `getblocknobytime` prove an answer from one neighbour. Arbitrum's and BNB Chain's blocks can share a
+/// second, so they are refused rather than answered from a guess.
+pub fn strictly_increasing_timestamps(chain_id: u64) -> bool {
+    matches!(chain_id, 1 | 10 | 100 | 8453)
+}
+
+/// `block/getblocknobytime` from verified headers. The rotki-mode server searches its RPC when
+/// none bracket the timestamp.
 fn block_no_by_time(
     history: Option<&AddressHistory>,
     params: &std::collections::HashMap<String, String>,
@@ -1513,6 +2253,12 @@ fn block_no_by_time(
                 history.chain_id
             ));
         }
+    }
+    if !strictly_increasing_timestamps(history.chain_id) {
+        return unsupported(&format!(
+            "chain {}'s blocks can share a timestamp, so a block by time cannot be proven",
+            history.chain_id
+        ));
     }
     let Some(t) = get("timestamp").and_then(|t| t.parse::<u64>().ok()) else {
         return error("Invalid timestamp");
@@ -1534,7 +2280,12 @@ fn block_no_by_time(
 
 /// A `txhash` lookup: every internal transaction of one transaction, from its cached trace. A
 /// transaction not traced yet answers unsupported here; the rotki-mode server traces it first.
-fn by_txhash(history: &AddressHistory, action: Action, hash: &str) -> Value {
+fn by_txhash(
+    history: &AddressHistory,
+    action: Action,
+    hash: &str,
+    params: &std::collections::HashMap<String, String>,
+) -> Value {
     if action != Action::TxListInternal {
         return unsupported(&format!("{} does not take a txhash", action.etherscan()));
     }
@@ -1546,19 +2297,56 @@ fn by_txhash(history: &AddressHistory, action: Action, hash: &str) -> Value {
         Some(k) => k,
         None => return error("Invalid txhash format"),
     };
+    // Paged as Etherscan pages it: a client walks `page` at a fixed `offset` until a short page.
+    let num = |k: &str, default: u64| -> Result<u64> {
+        match params.get(k).map(String::as_str).filter(|s| !s.is_empty()) {
+            None => Ok(default),
+            Some(s) => s.parse::<u64>().map_err(|_| anyhow!("invalid {k} `{s}`")),
+        }
+    };
+    let (page, offset) = match (num("page", 1), num("offset", MAX_OFFSET)) {
+        (Ok(p), Ok(o)) if p >= 1 && (1..=MAX_OFFSET).contains(&o) => (p, o),
+        (Err(e), _) | (_, Err(e)) => return error(e),
+        _ => {
+            return error(format!(
+                "page and offset start at 1; offset is at most {MAX_OFFSET}"
+            ))
+        }
+    };
+    let descending = match params.get("sort").map(String::as_str) {
+        None | Some("asc") => false,
+        Some("desc") => true,
+        Some(s) => return error(format!("invalid sort `{s}`")),
+    };
+    let unpaged = !params.contains_key("page") && !params.contains_key("offset");
     match history.tx_internals(&key) {
-        Ok(Some(rows)) => ok(
-            Value::Array(
-                rows.into_iter()
-                    .map(|mut r| {
-                        // Etherscan's txhash form carries no traceId; rotki reads its absence as 0.
-                        r.remove("traceId");
-                        Value::Object(r)
-                    })
-                    .collect(),
-            ),
-            history.generation().unwrap_or(0),
-        ),
+        // Unpaged, the whole list or nothing: cut at the offset cap, a client asking once would take
+        // the first 10,000 for all of them.
+        Ok(Some(rows)) if unpaged && rows.len() as u64 > MAX_OFFSET => unsupported(&format!(
+            "{hash} has {} internal transactions, over the {MAX_OFFSET} one page holds; ask for it by page",
+            rows.len()
+        )),
+        Ok(Some(mut rows)) => {
+            if descending {
+                rows.reverse();
+            }
+            let skip = usize::try_from((page - 1).saturating_mul(offset)).unwrap_or(usize::MAX);
+            let take = usize::try_from(offset).unwrap_or(usize::MAX);
+            ok(
+                Value::Array(
+                    rows.into_iter()
+                        .skip(skip)
+                        .take(take)
+                        .map(|mut r| {
+                            // Etherscan's txhash form carries no traceId; rotki reads its absence as 0.
+                            r.remove("traceId");
+                            Value::Object(r)
+                        })
+                        .collect(),
+                ),
+                history.generation().unwrap_or(0),
+            )
+        }
         Ok(None) => unsupported(&format!("{hash} has not been traced")),
         Err(e) => error(format!("{e:#}")),
     }
@@ -1834,22 +2622,38 @@ mod tests {
         assert_eq!(h.page(Action::TxList, &r).unwrap(), Answer::Rows(vec![]));
     }
 
+    /// An explicit end past what is covered is refused whole, never answered short: a client that
+    /// asked through block N records that it has history through N (cold test B1, 2026-10-11: 17 of
+    /// Etherscan's 65 rows came back as a complete answer).
     #[test]
-    fn an_endblock_past_the_head_is_answered_to_the_head() {
+    fn an_endblock_past_coverage_is_refused_not_shortened() {
         let (_d, h) = history();
-        h.insert(Action::TxList, ALICE, &[tx(50, 0)]).unwrap();
+        h.insert(Action::TxList, ALICE, &[tx(50, 0), tx(150, 0)])
+            .unwrap();
         h.mark_covered(Action::TxList, ALICE, 0, 100).unwrap();
-        h.set_head(100).unwrap();
-        let a = respond(
-            Some(&h),
-            &params(&[
-                ("module", "account"),
-                ("action", "txlist"),
-                ("address", ALICE),
-                ("endblock", "99999999"),
-            ]),
-        );
-        assert_eq!(hashes(&a).len(), 1, "{a}");
+        h.set_head(200).unwrap();
+        let ask = |end: &str| {
+            respond(
+                Some(&h),
+                &params(&[
+                    ("module", "account"),
+                    ("action", "txlist"),
+                    ("address", ALICE),
+                    ("endblock", end),
+                ]),
+            )
+        };
+        for end in ["101", "200", "99999999"] {
+            let a = ask(end);
+            assert!(
+                a["result"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("NUTHATCH_INCOMPLETE:"),
+                "{end}: {a}"
+            );
+        }
+        assert_eq!(hashes(&ask("100")).len(), 1);
     }
 
     #[test]
@@ -2238,6 +3042,433 @@ mod tests {
             .starts_with("NUTHATCH_INCOMPLETE:"));
     }
 
+    /// What a fetch read is kept against the generation it began in: if a reorg was handled
+    /// meanwhile, nothing above the finalized head is kept, anchors included, even though the new
+    /// chain may have grown back past those blocks; what is under it is kept.
+    #[test]
+    fn a_stale_fetch_keeps_nothing_above_the_finalized_head() {
+        let (_d, h) = history();
+        h.finalize(100).unwrap();
+        let g = h.generation().unwrap();
+        let tx = |b: u64| {
+            let mut r = Map::new();
+            r.insert("blockNumber".into(), Value::String(b.to_string()));
+            (vec![b as u8; 32], r)
+        };
+        h.invalidate_above(150).unwrap();
+        h.persist_pending(
+            &[tx(90), tx(160)],
+            &[(90, 1), (160, 2)],
+            &[(vec![7; 32], 160, [3; 32], vec![])],
+            &[(160, [1; 32])],
+            &[],
+            g,
+            Some(100),
+            true,
+        )
+        .unwrap();
+        assert!(h.cached_tx(&[90; 32]).unwrap().is_some());
+        assert!(h.cached_tx(&[160; 32]).unwrap().is_none());
+        assert_eq!(h.block_timestamp(90).unwrap(), Some(1));
+        assert_eq!(h.block_timestamp(160).unwrap(), None);
+        assert!(h.tx_internals(&[7; 32]).unwrap().is_none());
+        assert!(h.tracked().unwrap().is_empty());
+
+        // The same fetch under the current generation keeps all of it.
+        let g = h.generation().unwrap();
+        // A fetch whose check after it failed keeps only what was finalized when it began.
+        h.persist_pending(
+            &[tx(160)],
+            &[(160, 2)],
+            &[],
+            &[(160, [1; 32])],
+            &[],
+            g,
+            Some(100),
+            false,
+        )
+        .unwrap();
+        assert!(h.cached_tx(&[160; 32]).unwrap().is_none());
+        assert!(h.tracked().unwrap().is_empty());
+        h.persist_pending(
+            &[tx(160)],
+            &[(160, 2)],
+            &[],
+            &[(160, [1; 32])],
+            &[],
+            g,
+            Some(100),
+            true,
+        )
+        .unwrap();
+        assert!(h.cached_tx(&[160; 32]).unwrap().is_some());
+        assert_eq!(h.tracked().unwrap(), vec![(160, [1; 32])]);
+        // A record anchored at a hash other than the tracked one is refused.
+        let err = h
+            .record_anchored(
+                Action::TxList,
+                ALICE,
+                &[],
+                (101, 160),
+                g,
+                Some((160, [2; 32])),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("changed hash"), "{err:#}");
+        // Stale data does not become acceptable because the replacement chain has since finalized
+        // past its block: what matters is the head when the fetch began.
+        let g_old = h.generation().unwrap();
+        h.invalidate_above(150).unwrap();
+        h.finalize(200).unwrap();
+        h.persist_pending(
+            &[tx(155)],
+            &[(155, 9)],
+            &[],
+            &[],
+            &[],
+            g_old,
+            Some(150),
+            true,
+        )
+        .unwrap();
+        assert!(h.cached_tx(&[155; 32]).unwrap().is_none());
+        assert_eq!(h.block_timestamp(155).unwrap(), None);
+        // Finalizing past a tracked block stops tracking it, and never lowers the head.
+        h.finalize(170).unwrap();
+        h.finalize(120).unwrap();
+        assert!(h.tracked().unwrap().is_empty());
+        assert_eq!(h.head().unwrap(), Some(200));
+    }
+
+    #[test]
+    fn a_block_by_time_is_refused_where_timestamps_can_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = AddressHistory::open(
+            Store::open(&dir.path().join("t.redb")).unwrap(),
+            42161,
+            &[ALICE.into()],
+        )
+        .unwrap();
+        let a = respond(
+            Some(&h),
+            &params(&[
+                ("module", "block"),
+                ("action", "getblocknobytime"),
+                ("timestamp", "1"),
+                ("closest", "before"),
+            ]),
+        );
+        assert!(
+            a["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_UNSUPPORTED:"),
+            "{a}"
+        );
+    }
+
+    /// Page 1 without an end reads to the end of what is covered, which moves as coverage grows, so a
+    /// later page without one is refused rather than repeating or skipping rows.
+    #[test]
+    fn a_page_past_the_first_needs_an_endblock() {
+        let (_d, h) = history();
+        h.mark_covered(Action::TxList, ALICE, 0, 100).unwrap();
+        let mut r = req(0, 0, 2, 1);
+        r.end_block = None;
+        assert!(matches!(
+            h.page(Action::TxList, &r).unwrap(),
+            Answer::Incomplete(_)
+        ));
+        r.end_block = Some(100);
+        assert_eq!(h.page(Action::TxList, &r).unwrap(), Answer::Rows(vec![]));
+    }
+
+    /// Produced-block coverage and the re-ask entries for blocks without relay evidence land in one
+    /// transaction; a refused record writes neither.
+    #[test]
+    fn produced_coverage_and_its_reasks_commit_together() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        h.record_produced(ALICE, &[], (100, 199), g, &[150, 160], 7)
+            .unwrap();
+        assert_eq!(
+            h.coverage(Action::ProducedBlocks, ALICE).unwrap(),
+            vec![(100, 199)]
+        );
+        assert_eq!(h.mev_pending().unwrap(), vec![(150, 7, 7), (160, 7, 7)]);
+        assert!(h
+            .record_produced(ALICE, &[], (200, 299), g + 1, &[250], 8)
+            .is_err());
+        assert_eq!(
+            h.coverage(Action::ProducedBlocks, ALICE).unwrap(),
+            vec![(100, 199)]
+        );
+        assert_eq!(h.mev_pending().unwrap().len(), 2);
+    }
+
+    /// A store written under 5.1's produced-block contract (`none`, no re-ask schedule, payout
+    /// contracts missed) has those rows and their coverage dropped once, at open, to be read again.
+    #[test]
+    fn produced_rows_from_the_old_contract_are_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        {
+            let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+            let mut r = tx(150, 0);
+            r.record.insert("mev".into(), Value::String("none".into()));
+            h.insert(Action::ProducedBlocks, ALICE, &[r]).unwrap();
+            h.mark_covered(Action::ProducedBlocks, ALICE, 100, 199)
+                .unwrap();
+            h.mark_covered(Action::TxList, ALICE, 100, 199).unwrap();
+            // As 5.1 left it: no contract recorded.
+            let wtx = h.store.database().begin_write().unwrap();
+            wtx.open_table(META)
+                .unwrap()
+                .remove(PRODUCED_CONTRACT)
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+        assert!(h
+            .coverage(Action::ProducedBlocks, ALICE)
+            .unwrap()
+            .is_empty());
+        assert!(h
+            .rows_in(Action::ProducedBlocks, ALICE, (0, 1_000))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            h.coverage(Action::TxList, ALICE).unwrap(),
+            vec![(100, 199)],
+            "others untouched"
+        );
+        let g = h.generation().unwrap();
+        h.mark_covered(Action::ProducedBlocks, ALICE, 100, 199)
+            .unwrap();
+        drop(h);
+        let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+        assert_eq!(
+            h.coverage(Action::ProducedBlocks, ALICE).unwrap(),
+            vec![(100, 199)],
+            "only once"
+        );
+        assert_eq!(h.generation().unwrap(), g);
+    }
+
+    /// A re-ask's evidence, rows and schedule commit together or not at all.
+    #[test]
+    fn a_reask_commits_its_evidence_with_its_rows_or_not_at_all() {
+        let (_d, h) = history();
+        h.set_head(1_000).unwrap();
+        let g = h.generation().unwrap();
+        h.record_produced(ALICE, &[], (100, 199), g, &[150], 7)
+            .unwrap();
+        let mut record = Map::new();
+        record.insert("delivered".into(), Value::Array(vec![]));
+        let mut row = tx(150, 0);
+        row.record
+            .insert("mev".into(), Value::String("relay".into()));
+        let changes = vec![(ALICE.to_string(), vec![row])];
+        let stale = h.generation().unwrap() + 1;
+        assert!(h
+            .apply_reask(150, &record, &changes, false, 9, stale)
+            .is_err());
+        assert!(h.relay_record(150).unwrap().is_none());
+        assert!(h
+            .rows_in(Action::ProducedBlocks, ALICE, (150, 150))
+            .unwrap()
+            .is_empty());
+        assert_eq!(h.mev_pending().unwrap().len(), 1);
+        let g = h.generation().unwrap();
+        h.apply_reask(150, &record, &changes, false, 9, g).unwrap();
+        assert!(h.relay_record(150).unwrap().is_some());
+        assert_eq!(
+            h.rows_in(Action::ProducedBlocks, ALICE, (150, 150))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(h.mev_pending().unwrap().is_empty());
+        assert!(h.generation().unwrap() > g);
+    }
+
+    /// A txhash lookup is paged as Etherscan pages it, reverted frames included: 1,500 rows at an
+    /// offset of 1,000 come back as 1,000, then 500, then none, never a page repeated.
+    #[test]
+    fn a_txhash_lookup_honours_page_and_offset() {
+        let (_d, h) = history();
+        h.set_head(1_000).unwrap();
+        let key = vec![0xab; 32];
+        let rows: Vec<Map<String, Value>> = (0..1_500)
+            .map(|i| {
+                let mut r = Map::new();
+                r.insert("blockNumber".into(), Value::String("500".into()));
+                r.insert("nuthatchTraceIndex".into(), Value::String(i.to_string()));
+                r.insert("isError".into(), Value::String("1".into()));
+                r.insert("traceId".into(), Value::String("0_1".into()));
+                r
+            })
+            .collect();
+        h.persist_pending(
+            &[],
+            &[],
+            &[(key, 500, [9; 32], rows)],
+            &[],
+            &[],
+            h.generation().unwrap(),
+            Some(1_000),
+            true,
+        )
+        .unwrap();
+        let ask = |page: &str| {
+            respond(
+                Some(&h),
+                &params(&[
+                    ("module", "account"),
+                    ("action", "txlistinternal"),
+                    ("txhash", &format!("0x{}", "ab".repeat(32))),
+                    ("page", page),
+                    ("offset", "1000"),
+                ]),
+            )
+        };
+        let index = |v: &Value, i: usize| {
+            v["result"][i]["nuthatchTraceIndex"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let first = ask("1");
+        assert_eq!(first["result"].as_array().unwrap().len(), 1_000);
+        assert_eq!(index(&first, 0), "0");
+        assert!(first["result"][0].get("traceId").is_none());
+        let second = ask("2");
+        assert_eq!(second["result"].as_array().unwrap().len(), 500);
+        assert_eq!(index(&second, 0), "1000");
+        assert_eq!(
+            second["result"][0]["isError"], "1",
+            "reverted frames are served; the client filters"
+        );
+        assert_eq!(ask("3")["result"], serde_json::json!([]));
+        // Asked once without paging, the whole list comes back.
+        let whole = respond(
+            Some(&h),
+            &params(&[
+                ("module", "account"),
+                ("action", "txlistinternal"),
+                ("txhash", &format!("0x{}", "ab".repeat(32))),
+            ]),
+        );
+        assert_eq!(whole["result"].as_array().unwrap().len(), 1_500);
+    }
+
+    /// Unpaged, a list over one page's cap is refused rather than cut: asked once, a client would
+    /// take the first page for all of it.
+    #[test]
+    fn an_unpaged_txhash_lookup_over_the_cap_is_refused() {
+        let (_d, h) = history();
+        h.set_head(1_000).unwrap();
+        let rows: Vec<Map<String, Value>> = (0..=MAX_OFFSET)
+            .map(|i| {
+                let mut r = Map::new();
+                r.insert("nuthatchTraceIndex".into(), Value::String(i.to_string()));
+                r
+            })
+            .collect();
+        h.persist_pending(
+            &[],
+            &[],
+            &[(vec![0xcd; 32], 500, [9; 32], rows)],
+            &[],
+            &[],
+            h.generation().unwrap(),
+            Some(1_000),
+            true,
+        )
+        .unwrap();
+        let hash = format!("0x{}", "cd".repeat(32));
+        let base = [
+            ("module", "account"),
+            ("action", "txlistinternal"),
+            ("txhash", hash.as_str()),
+        ];
+        let a = respond(Some(&h), &params(&base));
+        assert!(
+            a["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_UNSUPPORTED:"),
+            "{a}"
+        );
+        let mut paged = base.to_vec();
+        paged.extend([("page", "2"), ("offset", "10000")]);
+        assert_eq!(
+            respond(Some(&h), &params(&paged))["result"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Unwatching one address leaves the generation alone, so a window in flight for any other
+    /// address is still recorded (cold test: a watch change mid-scan discarded a whole window).
+    #[test]
+    fn unwatching_one_address_does_not_move_the_generation() {
+        let (_d, h) = history();
+        h.watch(BOB).unwrap();
+        let g = h.generation().unwrap();
+        h.unwatch(BOB).unwrap();
+        assert_eq!(h.generation().unwrap(), g);
+        h.record(Action::TxList, ALICE, &[], (0, 10), g).unwrap();
+        assert!(
+            h.record(Action::TxList, BOB, &[], (0, 10), g).is_err(),
+            "not watched"
+        );
+    }
+
+    /// Body summaries answer only for a window they wholly cover, go with a reorg above them, and
+    /// keep only the newest blocks.
+    #[test]
+    fn body_summaries_cover_whole_windows_follow_reorgs_and_stay_bounded() {
+        let (_d, h) = history();
+        let sum = |b: u64| {
+            let mut m = Map::new();
+            m.insert("ts".into(), Value::String(b.to_string()));
+            (b, m)
+        };
+        let g = h.generation().unwrap();
+        let some: Vec<Summary> = (100..=110).map(sum).collect();
+        h.persist_pending(&[], &[], &[], &[], &some, g, None, true)
+            .unwrap();
+        assert_eq!(h.summaries(100, 110).unwrap().unwrap().len(), 11);
+        assert!(
+            h.summaries(100, 111).unwrap().is_none(),
+            "not wholly covered"
+        );
+        h.invalidate_above(105).unwrap();
+        assert!(h.summaries(100, 110).unwrap().is_none());
+        assert_eq!(h.summaries(100, 105).unwrap().unwrap().len(), 6);
+        // A summary far above pushes the old ones out.
+        let g = h.generation().unwrap();
+        h.persist_pending(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[sum(105 + SUMMARY_KEEP)],
+            g,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(h.summaries(100, 105).unwrap().is_none());
+        assert!(h
+            .summaries(105 + SUMMARY_KEEP, 105 + SUMMARY_KEEP)
+            .unwrap()
+            .is_some());
+    }
+
     #[test]
     fn config_validation() {
         let ok = AddressHistoryConfig {
@@ -2247,14 +3478,18 @@ mod tests {
             poll_interval: None,
             mirror: None,
             mev_relays: false,
+            request_deadline: None,
         };
         ok.validate().unwrap();
         assert_eq!(ok.poll_interval().unwrap(), DEFAULT_POLL_INTERVAL);
         let bad = |c: AddressHistoryConfig| assert!(c.validate().is_err(), "{c:?}");
-        bad(AddressHistoryConfig {
+        // No addresses is valid: rotki registers its own through /api/watch.
+        AddressHistoryConfig {
             addresses: vec![],
             ..ok.clone()
-        });
+        }
+        .validate()
+        .unwrap();
         bad(AddressHistoryConfig {
             addresses: vec![ALICE.into(), ALICE.to_lowercase()],
             ..ok.clone()
@@ -2308,25 +3543,20 @@ mod tests {
         .unwrap()
     }
 
-    /// An absent `endblock` means up to the head, and coverage short of the head is incomplete,
-    /// not a shorter history.
+    /// An absent `endblock` answers everything covered from the start onward; a start that is not
+    /// covered is still incomplete.
     #[test]
-    fn an_absent_endblock_needs_coverage_through_the_head() {
+    fn an_absent_endblock_answers_everything_covered() {
         let (_d, h) = history();
-        h.mark_covered(Action::TxList, ALICE, 0, 99).unwrap();
-        assert!(
-            matches!(open_ended(&h), Answer::Incomplete(_)),
-            "no head, no end"
-        );
-        h.set_head(200).unwrap();
         assert!(matches!(open_ended(&h), Answer::Incomplete(_)));
-        h.mark_covered(Action::TxList, ALICE, 101, 200).unwrap();
-        assert!(
-            matches!(open_ended(&h), Answer::Incomplete(_)),
-            "a gap at 100"
-        );
-        h.mark_covered(Action::TxList, ALICE, 100, 100).unwrap();
+        h.mark_covered(Action::TxList, ALICE, 0, 99).unwrap();
         assert_eq!(open_ended(&h), Answer::Rows(vec![]));
+        h.mark_covered(Action::TxList, ALICE, 101, 200).unwrap();
+        assert_eq!(
+            open_ended(&h),
+            Answer::Rows(vec![]),
+            "through 99, the run the start is in"
+        );
     }
 
     #[test]

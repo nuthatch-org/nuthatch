@@ -652,6 +652,17 @@ impl Store {
         Ok(store)
     }
 
+    /// [`Store::open`] with a page cache of at most `cache_bytes`, for a store whose reads are point
+    /// lookups and short ranges and whose cache would otherwise hold every page a backfill wrote.
+    pub fn open_with_cache(path: &Path, cache_bytes: usize) -> Result<Store> {
+        let mut b = Builder::new();
+        b.set_cache_size(cache_bytes.clamp(HOT_STORE_CACHE_FLOOR, hot_store_cache_bytes()));
+        let db = b
+            .create(path)
+            .with_context(|| format!("failed to open redb at {}", path.display()))?;
+        Store::from_db(db)
+    }
+
     /// Open a store that **already exists**, and fail rather than bring one into being.
     ///
     /// The distinction is the whole of issue #413. [`Store::open`] is `Database::create`, so a caller

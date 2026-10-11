@@ -14,8 +14,17 @@ use std::sync::Arc;
 pub type Forward =
     Arc<dyn Fn(String, Value) -> futures::future::BoxFuture<'static, Result<Value>> + Send + Sync>;
 
-/// Etherscan's `getLogs` answers at most this many logs; a caller pages by block past them.
-const MAX_LOGS: usize = 1000;
+/// The widest block span a `getLogs` range is asked in. Spans start at [`FIRST_SPAN`] and double
+/// while answers stay small, so one answer never holds a dense range: a 10,000-block span of a busy
+/// token's transfers is a gigabyte, for a page of a thousand.
+const LOG_SPAN: u64 = 10_000;
+const FIRST_SPAN: u64 = 16;
+/// Etherscan's most logs one page may hold, and the deepest a page may reach.
+const MAX_PAGE: u64 = 1_000;
+const MAX_DEPTH: u64 = 10_000;
+/// The most `eth_getLogs` calls one `getLogs` may cost. A range that needs more answers incomplete
+/// rather than half of itself.
+const MAX_LOG_CALLS: usize = 64;
 
 /// The answer to a `proxy` or `logs` request, or `None` for any other module.
 pub async fn answer(
@@ -38,7 +47,11 @@ pub async fn answer(
     let result = if module == "proxy" {
         proxy(q, action, forward).await
     } else if action == "getLogs" {
-        logs(q, forward).await
+        // A failed range is one the nest could not answer, never an error in the caller's request,
+        // so it reads incomplete and the caller asks its next source.
+        logs(q, forward)
+            .await
+            .or_else(|e| Ok(Answer::Incomplete(format!("getLogs: {e:#}"))))
     } else {
         return Some(crate::address_history::unsupported(&format!(
             "logs/{action} is not served by this nest"
@@ -48,6 +61,7 @@ pub async fn answer(
         Ok(Answer::Rpc(result)) => json!({ "jsonrpc": "2.0", "id": 1, "result": result }),
         Ok(Answer::Logs(rows)) => json!({ "status": "1", "message": "OK", "result": rows }),
         Ok(Answer::Unsupported(why)) => crate::address_history::unsupported(&why),
+        Ok(Answer::Incomplete(why)) => crate::address_history::incomplete(&why),
         Err(e) => json!({ "status": "0", "message": "NOTOK", "result": format!("Error! {e:#}") }),
     })
 }
@@ -56,6 +70,7 @@ enum Answer {
     Rpc(Value),
     Logs(Vec<Value>),
     Unsupported(String),
+    Incomplete(String),
 }
 
 async fn proxy(q: &HashMap<String, String>, action: &str, forward: &Forward) -> Result<Answer> {
@@ -83,16 +98,15 @@ async fn proxy(q: &HashMap<String, String>, action: &str, forward: &Forward) -> 
 /// `logs/getLogs` in Etherscan's shape: every quantity hex, with the block's timestamp and the
 /// transaction's gas price and gas used, which `eth_getLogs` does not carry.
 async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> {
-    let block = |k: &str| -> Result<Value> {
+    let block = |k: &str| -> Result<Option<u64>> {
         let v = q.get(k).map_or("latest", String::as_str);
         Ok(match v {
-            "latest" | "earliest" | "pending" | "finalized" | "safe" => json!(v),
-            n => json!(format!(
-                "0x{:x}",
-                n.parse::<u64>().map_err(|_| anyhow!("invalid {k} `{n}`"))?
-            )),
+            "earliest" => Some(0),
+            "latest" | "pending" | "finalized" | "safe" => None,
+            n => Some(n.parse::<u64>().map_err(|_| anyhow!("invalid {k} `{n}`"))?),
         })
     };
+    let tag = |k: &str| q.get(k).map_or("latest", String::as_str).to_string();
     // Etherscan combines topics with and/or operators; eth_getLogs can only AND them.
     if q.iter()
         .any(|(k, v)| k.starts_with("topic") && k.ends_with("_opr") && v != "and")
@@ -111,32 +125,87 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
         .iter()
         .rposition(|t| !t.is_null())
         .map_or(0, |i| i + 1);
-    let mut filter = Map::new();
-    filter.insert("fromBlock".into(), block("fromBlock")?);
-    filter.insert("toBlock".into(), block("toBlock")?);
-    if let Some(a) = q.get("address") {
-        filter.insert("address".into(), json!(a));
-    }
-    filter.insert("topics".into(), Value::Array(topics[..last].to_vec()));
-    let found = forward("eth_getLogs".into(), json!([filter])).await?;
-    let mut logs = found
-        .as_array()
-        .ok_or_else(|| anyhow!("eth_getLogs answered a non-list"))?
-        .clone();
-    if logs.len() > MAX_LOGS {
-        // Cut at a block boundary, so a caller restarting from the last block it was given
-        // moves on. A single block past the cap cannot be paged that way at all.
-        let cut = logs[MAX_LOGS].get("blockNumber").cloned();
-        logs.truncate(MAX_LOGS);
-        while logs.last().and_then(|l| l.get("blockNumber")).cloned() == cut {
-            logs.pop();
+    let number_of = |t: String| async move {
+        let b = forward("eth_getBlockByNumber".into(), json!([t, false])).await?;
+        crate::address_discovery::hex_u64(&b["number"])
+    };
+    let from = match block("fromBlock")? {
+        Some(n) => n,
+        None => number_of(tag("fromBlock")).await?,
+    };
+    let to = match block("toBlock")? {
+        Some(n) => n,
+        None => number_of(tag("toBlock")).await?,
+    };
+    // `page` and `offset` as Etherscan takes them; a caller that sends neither gets the first 1,000.
+    let num = |k: &str, default: u64| -> Result<u64> {
+        match q.get(k).map(String::as_str).filter(|v| !v.is_empty()) {
+            None => Ok(default),
+            Some(v) => v.parse::<u64>().map_err(|_| anyhow!("invalid {k} `{v}`")),
         }
-        if logs.is_empty() {
-            return Ok(Answer::Unsupported(format!(
-                "block {} holds more than {MAX_LOGS} matching logs",
-                cut.unwrap_or(Value::Null)
+    };
+    let (page, offset) = (num("page", 1)?, num("offset", MAX_PAGE)?);
+    if page == 0 || offset == 0 || offset > MAX_PAGE || page.saturating_mul(offset) > MAX_DEPTH {
+        return Ok(Answer::Unsupported(format!(
+            "getLogs pages hold 1 to {MAX_PAGE} logs and reach at most {MAX_DEPTH} deep"
+        )));
+    }
+    let need = usize::try_from(page * offset).expect("at most MAX_DEPTH");
+    // A range is asked in spans the provider takes, oldest first, and stops once past what the page
+    // needs: whatever lies beyond it a caller asks for next.
+    let mut logs = Vec::new();
+    let (mut start, mut span, mut calls) = (from, FIRST_SPAN, 0);
+    while start <= to && logs.len() < need {
+        if calls == MAX_LOG_CALLS {
+            return Ok(Answer::Incomplete(format!(
+                "getLogs over [{from}, {to}] needs more than {MAX_LOG_CALLS} calls to the RPC; ask for a narrower range"
             )));
         }
+        calls += 1;
+        let end = start.saturating_add(span - 1).min(to);
+        let mut filter = Map::new();
+        filter.insert("fromBlock".into(), json!(format!("0x{start:x}")));
+        filter.insert("toBlock".into(), json!(format!("0x{end:x}")));
+        if let Some(a) = q.get("address") {
+            filter.insert("address".into(), json!(a));
+        }
+        filter.insert("topics".into(), Value::Array(topics[..last].to_vec()));
+        match forward("eth_getLogs".into(), json!([filter])).await {
+            Ok(found) => {
+                let Value::Array(found) = found else {
+                    bail!("eth_getLogs answered a non-list");
+                };
+                if found.len() < (need / 4).max(1) {
+                    span = span.saturating_mul(2).min(LOG_SPAN);
+                }
+                let room = need - logs.len();
+                logs.extend(found.into_iter().take(room));
+                start = end + 1;
+            }
+            Err(e) if end > start && crate::address_discovery::range_shaped(&format!("{e:#}")) => {
+                let stated = crate::address_discovery::stated_limit(&format!("{e:#}"));
+                span = stated.filter(|n| *n < span).unwrap_or(span / 2).max(1);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // The page, exactly, mid-block if need be, as Etherscan answers: rotki continues only on a full
+    // page, from its last block, and drops what it already has, so a short page must only ever mean
+    // the range is done. A full page inside one block would be asked for again from that block
+    // forever, so that is refused.
+    let skip = need - usize::try_from(offset).expect("at most MAX_PAGE");
+    let mut logs: Vec<Value> = logs.into_iter().skip(skip).collect();
+    let full = usize::try_from(offset).expect("at most MAX_PAGE");
+    // A caller past the first page, or on pages of one, pages by `page`, never from a block.
+    if logs.len() >= full && full > 1 && page == 1 {
+        let block = |l: &Value| l.get("blockNumber").cloned();
+        if block(&logs[0]) == block(&logs[full - 1]) {
+            return Ok(Answer::Unsupported(format!(
+                "block {} holds at least {full} matching logs, a whole page, so it cannot be paged past",
+                block(&logs[0]).unwrap_or(Value::Null)
+            )));
+        }
+        logs.truncate(full);
     }
 
     let mut paid: BTreeMap<String, (Value, Value)> = BTreeMap::new();
@@ -405,19 +474,40 @@ mod tests {
             ("fromBlock", "1"),
             ("toBlock", "9"),
         ]);
-        let mut blocks = vec![1; 600];
-        blocks.extend(vec![2; 600]);
+        // rotki continues only on a full page, from its last block, deduplicating; a short page
+        // means the range is done (rotki-v2 node_inquirer.py). So the page is exactly 1,000.
+        let mut blocks = vec![100; 999];
+        blocks.extend(vec![101; 2]);
         let cut = answer(&ask, 1, &dense(blocks)).await.unwrap();
-        assert_eq!(
-            cut["result"].as_array().unwrap().len(),
-            600,
-            "block 2 is left whole for the next page"
-        );
+        let rows = cut["result"].as_array().unwrap();
+        assert_eq!(rows.len(), 1_000, "a full page, so the caller asks again");
+        assert_eq!(rows[999]["blockNumber"], "0x65", "cut inside block 101");
         let one = answer(&ask, 1, &dense(vec![1; 1001])).await.unwrap();
         assert!(one["result"]
             .as_str()
             .unwrap()
             .starts_with("NUTHATCH_UNSUPPORTED:"));
+        // Exactly a page's worth in one block with more after it: continuing from that block would
+        // return the same page forever.
+        let mut full = vec![7; 1_000];
+        full.push(8);
+        let looped = answer(&ask, 1, &dense(full)).await.unwrap();
+        assert!(
+            looped["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_UNSUPPORTED:"),
+            "{looped}"
+        );
+        // And with nothing after it: a full page is always continued from its last block.
+        let exact = answer(&ask, 1, &dense(vec![7; 1_000])).await.unwrap();
+        assert!(
+            exact["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_UNSUPPORTED:"),
+            "{exact}"
+        );
 
         let or = answer(
             &q(&[
@@ -436,5 +526,174 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("NUTHATCH_UNSUPPORTED:"));
+    }
+
+    /// A forwarder whose `eth_getLogs` refuses spans over `limit` blocks, with one log every 50,000
+    /// blocks, counting its calls.
+    fn capped(limit: u64) -> (Forward, Arc<Mutex<u64>>) {
+        let calls = Arc::new(Mutex::new(0));
+        let n = calls.clone();
+        let forward: Forward = Arc::new(move |m: String, p: Value| {
+            let n = n.clone();
+            Box::pin(async move {
+                if m != "eth_getLogs" {
+                    return Ok(json!({"effectiveGasPrice": "0x1", "gasUsed": "0x1"}));
+                }
+                *n.lock().unwrap() += 1;
+                let from = crate::address_discovery::hex_u64(&p[0]["fromBlock"])?;
+                let to = crate::address_discovery::hex_u64(&p[0]["toBlock"])?;
+                if to - from + 1 > limit {
+                    bail!("query exceeds max range of {limit} blocks");
+                }
+                Ok(json!((from..=to).filter(|b| b % 50_000 == 0).map(|b| json!({
+                    "address": "0xc0", "topics": [], "data": "0x", "blockNumber": format!("0x{b:x}"),
+                    "blockHash": "0xbh", "logIndex": "0x0", "transactionHash": format!("0x{b:x}"),
+                    "transactionIndex": "0x0", "blockTimestamp": "0x1"})).collect::<Vec<_>>()))
+            })
+        });
+        (forward, calls)
+    }
+
+    /// rotki asks for ranges of ~300,000 blocks, and a provider refuses more than it allows in one
+    /// call (cold test M3, 2026-10-11). The range is asked in spans the provider takes and answered
+    /// whole; one that would cost more calls than allowed is refused, never answered in part.
+    #[tokio::test]
+    async fn a_long_getlogs_range_is_split_within_the_providers_limit() {
+        let ask = q(&[
+            ("module", "logs"),
+            ("action", "getLogs"),
+            ("fromBlock", "1"),
+            ("toBlock", "300000"),
+        ]);
+        let (forward, calls) = capped(10_000);
+        let got = answer(&ask, 1, &forward).await.unwrap();
+        assert_eq!(got["status"], "1", "{got}");
+        let blocks: Vec<&str> = got["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["blockNumber"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            blocks,
+            ["0xc350", "0x186a0", "0x249f0", "0x30d40", "0x3d090", "0x493e0"]
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            39,
+            "spans of 16 blocks doubling to the 10,000 the provider takes, then 10,000 at a time"
+        );
+
+        let (forward, calls) = capped(2_000);
+        let refused = answer(&ask, 1, &forward).await.unwrap();
+        let r = refused["result"].as_str().unwrap();
+        assert!(r.starts_with("NUTHATCH_INCOMPLETE:"), "{refused}");
+        assert_eq!(*calls.lock().unwrap() as usize, MAX_LOG_CALLS);
+    }
+
+    /// A dense range (a busy token's transfers, fifty logs a block over 400,000 blocks) is asked in
+    /// spans that start small, so no single answer holds more than a few pages, and the request
+    /// stops at the page (cold test B1, 2026-10-11: one request held 1.2 GB for 1,000 rows).
+    #[tokio::test]
+    async fn a_dense_range_never_holds_more_than_a_few_pages() {
+        let largest = Arc::new(Mutex::new(0usize));
+        let seen = largest.clone();
+        let forward: Forward = Arc::new(move |m: String, p: Value| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                if m != "eth_getLogs" {
+                    return Ok(json!({"effectiveGasPrice": "0x1", "gasUsed": "0x1"}));
+                }
+                let from = crate::address_discovery::hex_u64(&p[0]["fromBlock"])?;
+                let to = crate::address_discovery::hex_u64(&p[0]["toBlock"])?;
+                let logs: Vec<Value> = (from..=to)
+                    .flat_map(|b| (0..50).map(move |i| json!({
+                        "address": "0xc0", "topics": [], "data": "0x", "blockNumber": format!("0x{b:x}"),
+                        "blockHash": "0xbh", "logIndex": format!("0x{i:x}"), "transactionHash": format!("0x{b:x}{i:02x}"),
+                        "transactionIndex": "0x0", "blockTimestamp": "0x1"})))
+                    .collect();
+                let mut l = seen.lock().unwrap();
+                *l = (*l).max(logs.len());
+                Ok(json!(logs))
+            })
+        });
+        let ask = q(&[
+            ("module", "logs"),
+            ("action", "getLogs"),
+            ("fromBlock", "25700000"),
+            ("toBlock", "26100000"),
+        ]);
+        let got = answer(&ask, 1, &forward).await.unwrap();
+        assert_eq!(got["result"].as_array().unwrap().len(), 1_000);
+        assert!(
+            *largest.lock().unwrap() <= 1_600,
+            "{} logs in one answer",
+            largest.lock().unwrap()
+        );
+
+        // `page` reaches past the first thousand.
+        let second = answer(
+            &q(&[
+                ("module", "logs"),
+                ("action", "getLogs"),
+                ("fromBlock", "25700000"),
+                ("toBlock", "26100000"),
+                ("page", "2"),
+                ("offset", "100"),
+            ]),
+            1,
+            &forward,
+        )
+        .await
+        .unwrap();
+        let rows = second["result"].as_array().unwrap();
+        assert_eq!(rows.len(), 100);
+        assert_eq!(
+            rows[0]["blockNumber"], "0x18826a2",
+            "the 101st log: block 25700002, its first"
+        );
+    }
+
+    /// A sparse stretch widens the span to the provider's limit; the dense stretch after it is then
+    /// refused by the body cap, as the RPC client refuses it, and narrowed rather than held whole.
+    #[tokio::test]
+    async fn a_dense_stretch_after_a_sparse_one_is_narrowed_by_the_body_cap() {
+        let largest = Arc::new(Mutex::new(0usize));
+        let seen = largest.clone();
+        let forward: Forward = Arc::new(move |m: String, p: Value| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                if m != "eth_getLogs" {
+                    return Ok(json!({"effectiveGasPrice": "0x1", "gasUsed": "0x1"}));
+                }
+                let from = crate::address_discovery::hex_u64(&p[0]["fromBlock"])?;
+                let to = crate::address_discovery::hex_u64(&p[0]["toBlock"])?;
+                // Empty under 50,000, then 200 logs a block; the cap passes 4,000 in one body.
+                let logs: Vec<Value> = (from.max(50_000)..=to)
+                    .flat_map(|b| (0..200).map(move |i| json!({
+                        "address": "0xc0", "topics": [], "data": "0x", "blockNumber": format!("0x{b:x}"),
+                        "blockHash": "0xbh", "logIndex": format!("0x{i:x}"), "transactionHash": format!("0x{b:x}{i:02x}"),
+                        "transactionIndex": "0x0", "blockTimestamp": "0x1"})))
+                    .take(4_001)
+                    .collect();
+                if logs.len() > 4_000 && from < to {
+                    bail!("response passed the 4194304-byte getLogs body cap; narrowing the range");
+                }
+                let mut l = seen.lock().unwrap();
+                *l = (*l).max(logs.len());
+                Ok(json!(logs))
+            })
+        });
+        let ask = q(&[
+            ("module", "logs"),
+            ("action", "getLogs"),
+            ("fromBlock", "0"),
+            ("toBlock", "60000"),
+        ]);
+        let got = answer(&ask, 1, &forward).await.unwrap();
+        let rows = got["result"].as_array().unwrap();
+        assert_eq!(rows.len(), 1_000, "{got}");
+        assert_eq!(rows[0]["blockNumber"], format!("0x{:x}", 50_000));
+        assert!(*largest.lock().unwrap() <= 4_000);
     }
 }

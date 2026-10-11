@@ -1061,6 +1061,19 @@ impl RpcClient {
             .map(|(v, _)| v)
     }
 
+    /// [`Self::call`], refusing a response body past `cap` bytes as too large, so the caller
+    /// narrows the range rather than holding it whole.
+    pub(crate) async fn call_capped(
+        &self,
+        method: &str,
+        params: Value,
+        cap: usize,
+    ) -> Result<Value> {
+        self.call_holding_capped(method, params, None, Some(cap))
+            .await
+            .map(|(v, _)| v)
+    }
+
     /// [`Self::call`], preferring endpoints known to hold block `need`; also returns which endpoint
     /// answered.
     async fn call_holding(
@@ -1353,6 +1366,37 @@ impl RpcClient {
         resp.get("result")
             .cloned()
             .ok_or_else(|| anyhow!("rpc response had no result"))
+    }
+
+    /// One call asked of every endpoint in the pool, fallbacks included, in order. Any endpoint that
+    /// cannot answer fails the whole: the question is one whose answer must hold at all of them.
+    pub(crate) async fn call_each(&self, method: &str, params: Value) -> Result<Vec<Value>> {
+        let mut answers = Vec::with_capacity(self.urls.len());
+        for url in &self.urls {
+            answers.push(
+                self.call_one(url, method, &params, None)
+                    .await
+                    .with_context(|| format!("{method} at {}", redact_url(url)))?,
+            );
+        }
+        Ok(answers)
+    }
+
+    /// [`Self::call_each`], handing each endpoint's outcome to `seen` as it arrives, so one answer is
+    /// acted on before the next endpoint is awaited, and is not lost to its failure or a timeout.
+    pub(crate) async fn visit_each(
+        &self,
+        method: &str,
+        params: Value,
+        seen: &mut (dyn FnMut(Result<Value>) + Send),
+    ) {
+        for url in &self.urls {
+            seen(
+                self.call_one(url, method, &params, None)
+                    .await
+                    .with_context(|| format!("{method} at {}", redact_url(url))),
+            );
+        }
     }
 
     pub async fn block_number(&self) -> Result<u64> {
@@ -2323,6 +2367,26 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle)
+    }
+
+    /// Address history's getLogs is capped the same way, at its own smaller cap, with an error its
+    /// span narrowing reads as a range refusal, and one block past it is refused too.
+    #[tokio::test]
+    async fn address_history_getlogs_bodies_are_capped() {
+        use crate::address_discovery::Rpc;
+        let (url, server) = uncapped_logs_rpc(25_000).await;
+        let client = super::RpcClient::new(vec![url]).unwrap();
+        let ask = |from: &str, to: &str| serde_json::json!([{"fromBlock": from, "toBlock": to, "topics": []}]);
+        let err = Rpc::call(&client, "eth_getLogs", ask("0x1", "0x2"))
+            .await
+            .unwrap_err();
+        assert!(
+            crate::address_discovery::range_shaped(&format!("{err:#}")),
+            "{err:#}"
+        );
+        let one = Rpc::call(&client, "eth_getLogs", ask("0x1", "0x1")).await;
+        server.abort();
+        assert!(format!("{:#}", one.unwrap_err()).contains("body cap"));
     }
 
     /// #1788: a node with no result cap answers a multi-block range whole, however large. Past the
