@@ -67,9 +67,15 @@ async fn spawn_indexed(
     .expect("spawn_nest");
     let store = rt.state.store.clone();
     let tip_str = tip.to_string();
-    let landed = wait_until(within, || {
-        store.get_meta("last_block").ok().flatten().as_deref() == Some(tip_str.as_str())
-    })
+    // `within` is how long last_block may sit still. A padded window does not move it until the
+    // window commits, so that caller passes the seal budget; a cursor that is still advancing is
+    // not a hang either way (#2017).
+    let landed = wait_until_progress(
+        within,
+        SEAL_POLL_TIMEOUT.max(within),
+        || store.get_meta("last_block").ok().flatten().as_deref() == Some(tip_str.as_str()),
+        || store.get_meta("last_block").ok().flatten(),
+    )
     .await;
     assert!(landed, "nest did not index to block {tip} in time");
     (rt, store)
@@ -267,9 +273,13 @@ async fn nest_with_a_sealed_range(
     tape.advance_tip_to(14);
     let sealed = wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 8).await;
     assert!(sealed, "range [1,8] did not seal in time");
-    let landed = wait_until(POLL_TIMEOUT, || {
-        store.get_meta("last_block").ok().flatten().as_deref() == Some("14")
-    })
+    // The cursor sits still while the padded window's seal batch is written (#2017).
+    let landed = wait_until_progress(
+        SEAL_POLL_TIMEOUT,
+        SEAL_POLL_TIMEOUT,
+        || store.get_meta("last_block").ok().flatten().as_deref() == Some("14"),
+        || store.get_meta("last_block").ok().flatten(),
+    )
     .await;
     assert!(landed, "nest did not index to block 14 in time");
 
@@ -464,9 +474,14 @@ async fn reorg_below_finality_halts() {
     let store = rt.state.store.clone();
     let ingest = rt.ingest;
 
-    let landed = wait_until(POLL_TIMEOUT, || {
-        store.get_meta("last_block").ok().flatten().as_deref() == Some("10")
-    })
+    // Block 8 is padded out to a seal batch, and last_block does not move until that window
+    // commits, so a 20 s idle reads as a hang on a busy runner (#2017).
+    let landed = wait_until_progress(
+        SEAL_POLL_TIMEOUT,
+        SEAL_POLL_TIMEOUT,
+        || store.get_meta("last_block").ok().flatten().as_deref() == Some("10"),
+        || store.get_meta("last_block").ok().flatten(),
+    )
     .await;
     assert!(landed, "nest did not index to the tip in time");
 
@@ -484,9 +499,12 @@ async fn reorg_below_finality_halts() {
     // against a stale snapshot and reports a rollback that never happened. Observed in CI on
     // 2026-09-02 as `left: Some("12"), right: Some("10")` under a message about a rollback, which is
     // the opposite direction to what the numbers say (#1119).
-    let settled = wait_until(POLL_TIMEOUT, || {
-        store.get_meta("last_block").ok().flatten().as_deref() == Some("12")
-    })
+    let settled = wait_until_progress(
+        POLL_TIMEOUT,
+        SEAL_POLL_TIMEOUT,
+        || store.get_meta("last_block").ok().flatten().as_deref() == Some("12"),
+        || store.get_meta("last_block").ok().flatten(),
+    )
     .await;
     assert!(
         settled,
