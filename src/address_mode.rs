@@ -1699,9 +1699,7 @@ async fn proven_row<M: Rpc, T: Rpc>(
         meta.insert("mevLastAsked".into(), json!(now));
     }
     row.extend(mev);
-    // Payment evidence is the fee recipient's own history, not the proposer's: none is claimed here.
-    row.insert("paymentTx".into(), text(String::new()));
-    row.insert("paymentValue".into(), text(String::new()));
+    payment_into(d, h.number, &mut row, &mut meta).await;
     crate::address_validators::Stored {
         block: h.number,
         row,
@@ -1709,8 +1707,45 @@ async fn proven_row<M: Rpc, T: Rpc>(
     }
 }
 
-/// Owed rewards read again, and blocks without relay evidence asked again on the re-ask schedule,
-/// a bounded batch per pass.
+/// The builder's payment to the relays' recipient in block `b`, as `nuthatchProducedBlocks` carries it,
+/// read from the block's traces. Without a recipient there is nothing to look for; a trace that cannot
+/// be read leaves the payment owed, retried later, never claimed absent.
+async fn payment_into<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    b: u64,
+    row: &mut serde_json::Map<String, Value>,
+    meta: &mut serde_json::Map<String, Value>,
+) {
+    let get = |k: &str| row.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let (recipient, hash, miner) = (get("mevRecipient"), get("blockHash"), get("feeRecipient"));
+    let mut found = (String::new(), String::new());
+    meta.remove("paymentOwed");
+    if !recipient.is_empty() {
+        let frames = d
+            .trace
+            .call("trace_block", json!([format!("0x{b:x}")]))
+            .await;
+        match frames.and_then(|f| {
+            let f = f.as_array().cloned().unwrap_or_default();
+            crate::address_mev::payment_legs(&f, &hash, &miner, &recipient)
+        }) {
+            Ok((hashes, total)) if !hashes.is_empty() => {
+                found = (hashes.join(","), total.to_string())
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("address history: block {b}'s payment owed, retried later: {e:#}");
+                meta.insert("paymentOwed".into(), Value::Bool(true));
+            }
+        }
+    }
+    row.insert("paymentTx".into(), Value::String(found.0));
+    row.insert("paymentValue".into(), Value::String(found.1));
+}
+
+/// Owed rewards and payments read again, and blocks without relay evidence asked again on the re-ask
+/// schedule, a bounded batch per pass. A block first written while relays were off is asked as soon
+/// as they are on.
 async fn validator_retries<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     state: &ModeState,
@@ -1732,11 +1767,18 @@ async fn validator_retries<M: Rpc, T: Rpc>(
             break;
         }
         let owed = s.row.get("rewardStatus").and_then(Value::as_str) == Some("unavailable");
+        let first = num(&s.meta, "mevFirstAsked");
         let reask = state.relays.is_some()
             && s.row.get("mev").and_then(Value::as_str) == Some("unrecorded")
-            && num(&s.meta, "mevFirstAsked").is_some_and(|f| now < f + REASK_FOR_SECS)
-            && num(&s.meta, "mevLastAsked").is_some_and(|l| now >= l + REASK_EVERY_SECS);
-        if !owed && !reask {
+            && match first {
+                None => true,
+                Some(f) => {
+                    now < f + REASK_FOR_SECS
+                        && num(&s.meta, "mevLastAsked").is_some_and(|l| now >= l + REASK_EVERY_SECS)
+                }
+            };
+        let payment_owed = s.meta.get("paymentOwed").and_then(Value::as_bool) == Some(true);
+        if !owed && !reask && !payment_owed {
             continue;
         }
         done += 1;
@@ -1778,8 +1820,12 @@ async fn validator_retries<M: Rpc, T: Rpc>(
                 )
                 .await;
                 s.meta.insert("mevLastAsked".into(), json!(now));
+                s.meta.entry("mevFirstAsked").or_insert(json!(now));
                 s.row.extend(mev);
             }
+        }
+        if reask || payment_owed {
+            payment_into(d, s.block, &mut s.row, &mut s.meta).await;
         }
         let vs = validators.clone();
         let saved = tokio::task::spawn_blocking(move || vs.update(v, &s)).await;
@@ -3072,6 +3118,73 @@ mod tests {
         let (done, covered, _dir) = run(other).await;
         assert!(format!("{:#}", done.unwrap_err()).contains("do not lead to it"));
         assert!(!covered);
+    }
+
+    #[tokio::test]
+    async fn a_block_written_with_relays_off_is_asked_once_they_are_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store.clone(), 1, &[]).unwrap();
+        let validators = crate::address_validators::Validators::open(store, &[7]).unwrap();
+        let mut row = crate::address_mev::no_mev();
+        row.insert("blockHash".into(), json!("0xbb"));
+        row.insert(
+            "feeRecipient".into(),
+            json!("0x00000000000000000000000000000000000000f1"),
+        );
+        row.insert("rewardStatus".into(), json!("verified"));
+        let mut found = BTreeMap::new();
+        found.insert(
+            7,
+            vec![crate::address_validators::Stored {
+                block: 100,
+                row,
+                meta: serde_json::Map::new(),
+            }],
+        );
+        validators
+            .record_span((100, 199), &[7], &found, validators.generation().unwrap())
+            .unwrap();
+        let relays: crate::address_mev::Relays = Arc::new(|name: &'static str, block: u64| {
+            Box::pin(async move {
+                Ok(if name == "ultrasound" {
+                    vec![
+                        json!({"block_number": block.to_string(), "block_hash": "0xbb",
+                        "proposer_fee_recipient": "0x00000000000000000000000000000000000000a1",
+                        "value": "9", "builder_pubkey": "0xb", "proposer_pubkey": "0xp"}),
+                    ]
+                } else {
+                    vec![]
+                })
+            })
+        });
+        let make = || Headers {
+            by_number: BTreeMap::new(),
+            finalized: Value::Null,
+        };
+        let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+        let mev = |v: &crate::address_validators::Validators| {
+            v.all().unwrap()[0].1.row["mev"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // Relays off: nothing to ask, nothing changes.
+        let off = ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+            .with_validators(validators.clone(), None);
+        validator_retries(&d, &off, &validators).await;
+        assert_eq!(mev(&validators), "unrecorded");
+        // Relays on: the block that was never asked is asked now.
+        let on = ModeState::new(history, 1, Duration::from_secs(300), true)
+            .with_validators(validators.clone(), None)
+            .with_relays(relays);
+        validator_retries(&d, &on, &validators).await;
+        let stored = &validators.all().unwrap()[0].1;
+        assert_eq!(stored.row["mev"], "relay");
+        assert_eq!(stored.row["mevReward"], "9");
+        assert!(stored.meta.contains_key("mevFirstAsked"));
+        // The trace for its payment could not be read: owed, not claimed absent.
+        assert_eq!(stored.meta["paymentOwed"], true);
     }
 
     #[tokio::test]

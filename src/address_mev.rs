@@ -237,6 +237,91 @@ pub async fn block_mev(
     r
 }
 
+/// The payment legs to `recipient` in one block, from its `trace_block` frames: value transfers to it
+/// from the block's fee recipient `miner` (when that is someone else) or anywhere in the block's last
+/// transaction, top-level or internal (a payout contract), as `nuthatchProducedBlocks` counts them. A
+/// frame under a reverted one moved nothing. Every frame must belong to block `hash`.
+pub fn payment_legs(
+    frames: &[Value],
+    hash: &str,
+    miner: &str,
+    recipient: &str,
+) -> Result<(Vec<String>, alloy_primitives::U256)> {
+    let text = |v: &Value, k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    let (miner, recipient, hash) = (
+        miner.to_ascii_lowercase(),
+        recipient.to_ascii_lowercase(),
+        hash.to_ascii_lowercase(),
+    );
+    let path = |f: &Value| -> Vec<u64> {
+        f.get("traceAddress")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default()
+    };
+    let mut reverted: BTreeMap<String, Vec<Vec<u64>>> = BTreeMap::new();
+    let mut last: Option<u64> = None;
+    for f in frames {
+        if text(f, "blockHash") != hash {
+            anyhow::bail!("a trace frame of another block");
+        }
+        let Some(pos) = f.get("transactionPosition").and_then(Value::as_u64) else {
+            continue;
+        };
+        last = Some(last.map_or(pos, |l| l.max(pos)));
+        if f.get("error").is_some_and(|e| !e.is_null()) {
+            reverted
+                .entry(text(f, "transactionHash"))
+                .or_default()
+                .push(path(f));
+        }
+    }
+    let mut hashes: Vec<String> = Vec::new();
+    let mut total = alloy_primitives::U256::ZERO;
+    for f in frames {
+        let Some(pos) = f.get("transactionPosition").and_then(Value::as_u64) else {
+            continue;
+        };
+        let action = f.get("action").cloned().unwrap_or(Value::Null);
+        if text(f, "type") != "call" || text(&action, "callType") != "call" {
+            continue;
+        }
+        if text(&action, "to") != recipient {
+            continue;
+        }
+        let value = alloy_primitives::U256::from_str_radix(
+            text(&action, "value").trim_start_matches("0x"),
+            16,
+        )
+        .context("a trace frame's value")?;
+        if value.is_zero() {
+            continue;
+        }
+        let tx = text(f, "transactionHash");
+        let here = path(f);
+        if reverted
+            .get(&tx)
+            .is_some_and(|ps| ps.iter().any(|p| here.starts_with(p)))
+        {
+            continue;
+        }
+        let from_miner = text(&action, "from") == miner && miner != recipient;
+        if !(from_miner || Some(pos) == last) {
+            continue;
+        }
+        total += value;
+        if !hashes.contains(&tx) {
+            hashes.push(tx);
+        }
+    }
+    Ok((hashes, total))
+}
+
 /// The MEV fields of a block nobody asked the relays about: `unrecorded`, never zero.
 pub fn no_mev() -> Map<String, Value> {
     let mut r = Map::new();
@@ -1284,5 +1369,80 @@ mod tests {
             h.coverage(Action::ProducedBlocks, A).unwrap(),
             vec![(100, 199)]
         );
+    }
+
+    fn frame(
+        pos: u64,
+        tx: &str,
+        path: &[u64],
+        from: &str,
+        to: &str,
+        value: u64,
+        error: bool,
+    ) -> Value {
+        let mut f = json!({
+            "blockHash": "0xbb",
+            "transactionPosition": pos,
+            "transactionHash": tx,
+            "traceAddress": path,
+            "type": "call",
+            "action": {"callType": "call", "from": from, "to": to, "value": format!("0x{value:x}")},
+        });
+        if error {
+            f["error"] = json!("Reverted");
+        }
+        f
+    }
+
+    const PAYOUT: &str = "0x00000000000000000000000000000000000000c1";
+    const PROPOSER: &str = "0x00000000000000000000000000000000000000a1";
+
+    #[test]
+    fn every_leg_of_a_split_payment_is_counted() {
+        let frames = vec![
+            // The builder pays part from its fee recipient mid-block...
+            frame(3, "0x03", &[], BUILDER, PROPOSER, 5, false),
+            // ...and the rest through a payout contract in the last transaction.
+            frame(9, "0x09", &[], BUILDER, PAYOUT, 0, false),
+            frame(9, "0x09", &[0], PAYOUT, PROPOSER, 7, false),
+            // An unrelated transfer to the proposer from someone else is not a payment.
+            frame(5, "0x05", &[], PAYOUT, PROPOSER, 100, false),
+        ];
+        let (txs, total) = payment_legs(&frames, "0xbb", BUILDER, PROPOSER).unwrap();
+        assert_eq!(txs, vec!["0x03", "0x09"]);
+        assert_eq!(total, alloy_primitives::U256::from(12));
+    }
+
+    #[test]
+    fn a_leg_under_a_reverted_frame_moved_nothing() {
+        let frames = vec![
+            frame(9, "0x09", &[], BUILDER, PAYOUT, 0, false),
+            frame(9, "0x09", &[0], PAYOUT, PAYOUT, 0, true),
+            frame(9, "0x09", &[0, 0], PAYOUT, PROPOSER, 7, false),
+            frame(9, "0x09", &[1], PAYOUT, PROPOSER, 2, false),
+        ];
+        let (_, total) = payment_legs(&frames, "0xbb", BUILDER, PROPOSER).unwrap();
+        assert_eq!(total, alloy_primitives::U256::from(2));
+    }
+
+    #[test]
+    fn a_self_paid_block_counts_only_its_last_transaction() {
+        // The proposer is the block's fee recipient: its own transfers are not a builder's payment.
+        let frames = vec![
+            frame(1, "0x01", &[], PROPOSER, PROPOSER, 4, false),
+            frame(2, "0x02", &[], BUILDER, PROPOSER, 6, false),
+        ];
+        let (txs, total) = payment_legs(&frames, "0xbb", PROPOSER, PROPOSER).unwrap();
+        assert_eq!(
+            (txs, total),
+            (vec!["0x02".to_string()], alloy_primitives::U256::from(6))
+        );
+    }
+
+    #[test]
+    fn a_frame_of_another_block_is_refused() {
+        let mut f = frame(1, "0x01", &[], BUILDER, PROPOSER, 4, false);
+        f["blockHash"] = json!("0xcc");
+        assert!(payment_legs(&[f], "0xbb", BUILDER, PROPOSER).is_err());
     }
 }
