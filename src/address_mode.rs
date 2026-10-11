@@ -2077,8 +2077,21 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
         } else {
             None
         };
-        if let Some(v) = crate::address_proxy::answer(&q, s.chain_id, &forward).await {
-            return Json(v);
+        // Within the request deadline, or refused: a client's read timeout is not much longer.
+        match tokio::time::timeout(
+            s.deadline,
+            crate::address_proxy::answer(&q, s.chain_id, &forward),
+        )
+        .await
+        {
+            Ok(Some(v)) => return Json(v),
+            Ok(None) => {}
+            Err(_) => {
+                return Json(crate::address_history::incomplete(&format!(
+                    "not answered within the {}s deadline; ask for a narrower range",
+                    s.deadline.as_secs()
+                )))
+            }
         }
     }
     let get = |k: &str| q.get(k).map(String::as_str);

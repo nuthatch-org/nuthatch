@@ -25,6 +25,8 @@ const MAX_DEPTH: u64 = 10_000;
 /// The most `eth_getLogs` calls one `getLogs` may cost. A range that needs more answers incomplete
 /// rather than half of itself.
 const MAX_LOG_CALLS: usize = 64;
+/// Receipts and headers a getLogs page fetches at once.
+const AT_ONCE: usize = 16;
 
 /// The answer to a `proxy` or `logs` request, or `None` for any other module.
 pub async fn answer(
@@ -208,8 +210,54 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
         logs.truncate(full);
     }
 
-    let mut paid: BTreeMap<String, (Value, Value)> = BTreeMap::new();
-    let mut stamped: BTreeMap<String, Value> = BTreeMap::new();
+    // Receipts and block timestamps fetched together, a bounded number at once: one after another a
+    // dense page of 1,000 logs outran a client's read timeout.
+    use futures::{StreamExt, TryStreamExt};
+    let mut txs: Vec<String> = logs
+        .iter()
+        .filter_map(|l| {
+            l.get("transactionHash")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    txs.sort();
+    txs.dedup();
+    let paid: BTreeMap<String, (Value, Value)> = futures::stream::iter(txs)
+        .map(|tx| async move {
+            let receipt = forward("eth_getTransactionReceipt".into(), json!([tx])).await?;
+            let get = |k: &str| {
+                receipt
+                    .get(k)
+                    .filter(|v| !v.is_null())
+                    .cloned()
+                    .ok_or_else(|| anyhow!("the receipt of {tx} has no {k}"))
+            };
+            Ok::<_, anyhow::Error>((tx.clone(), (get("effectiveGasPrice")?, get("gasUsed")?)))
+        })
+        .buffer_unordered(AT_ONCE)
+        .try_collect()
+        .await?;
+    let mut unstamped: Vec<Value> = logs
+        .iter()
+        .filter(|l| l.get("blockTimestamp").is_none_or(Value::is_null))
+        .filter_map(|l| l.get("blockNumber").filter(|v| !v.is_null()).cloned())
+        .collect();
+    unstamped.sort_by_key(|v| v.as_str().unwrap_or_default().to_string());
+    unstamped.dedup();
+    let stamped: BTreeMap<String, Value> = futures::stream::iter(unstamped)
+        .map(|number| async move {
+            let key = number.as_str().unwrap_or_default().to_string();
+            let header = forward("eth_getBlockByNumber".into(), json!([number, false])).await?;
+            let ts = header
+                .get("timestamp")
+                .cloned()
+                .ok_or_else(|| anyhow!("block {key} has no timestamp"))?;
+            Ok::<_, anyhow::Error>((key, ts))
+        })
+        .buffer_unordered(AT_ONCE)
+        .try_collect()
+        .await?;
     let mut rows = Vec::with_capacity(logs.len());
     for log in logs {
         let field = |k: &str| -> Result<Value> {
@@ -222,39 +270,22 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
             .as_str()
             .ok_or_else(|| anyhow!("a log's transactionHash is not a string"))?
             .to_string();
-        if !paid.contains_key(&tx) {
-            let receipt = forward("eth_getTransactionReceipt".into(), json!([tx])).await?;
-            let get = |k: &str| {
-                receipt
-                    .get(k)
-                    .filter(|v| !v.is_null())
-                    .cloned()
-                    .ok_or_else(|| anyhow!("the receipt of {tx} has no {k}"))
-            };
-            paid.insert(tx.clone(), (get("effectiveGasPrice")?, get("gasUsed")?));
-        }
         let number = field("blockNumber")?;
         let key = number.as_str().unwrap_or_default().to_string();
         let ts = match log.get("blockTimestamp").filter(|v| !v.is_null()) {
             Some(ts) => ts.clone(),
-            None => match stamped.get(&key) {
-                Some(ts) => ts.clone(),
-                None => {
-                    let header =
-                        forward("eth_getBlockByNumber".into(), json!([number, false])).await?;
-                    let ts = header
-                        .get("timestamp")
-                        .cloned()
-                        .ok_or_else(|| anyhow!("block {key} has no timestamp"))?;
-                    stamped.insert(key, ts.clone());
-                    ts
-                }
-            },
+            None => stamped
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| anyhow!("block {key} has no timestamp"))?,
         };
         if log.get("removed").and_then(Value::as_bool) == Some(true) {
             bail!("the RPC answered a removed log in {tx}");
         }
-        let (gas_price, gas_used) = paid[&tx].clone();
+        let (gas_price, gas_used) = paid
+            .get(&tx)
+            .cloned()
+            .ok_or_else(|| anyhow!("no receipt for {tx}"))?;
         rows.push(json!({
             "address": field("address")?,
             "topics": field("topics")?,
@@ -276,6 +307,7 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     type Calls = Arc<Mutex<Vec<(String, Value)>>>;
 
@@ -297,6 +329,53 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// A dense page's receipts are fetched together: 64 receipts of 40 ms each one after another
+    /// take 2.5 s; a bounded number at once must take a fraction of it.
+    #[tokio::test]
+    async fn a_dense_pages_receipts_are_fetched_together() {
+        let logs: Vec<Value> = (0..64)
+            .map(|i| {
+                json!({"address": "0xc0", "topics": ["0xt0"], "data": "0x", "blockNumber": "0x64",
+                    "blockHash": "0xbh", "logIndex": format!("0x{i:x}"), "blockTimestamp": "0x5f",
+                    "transactionHash": format!("0x{i:x}"), "transactionIndex": "0x2", "removed": false})
+            })
+            .collect();
+        let logs = Value::Array(logs);
+        let forward: Forward = Arc::new(move |m: String, _p: Value| {
+            let logs = logs.clone();
+            Box::pin(async move {
+                Ok(match m.as_str() {
+                    "eth_getLogs" => logs,
+                    "eth_getTransactionReceipt" => {
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        json!({"effectiveGasPrice": "0x1", "gasUsed": "0x1"})
+                    }
+                    other => panic!("unexpected {other}"),
+                })
+            })
+        });
+        let started = std::time::Instant::now();
+        let got = answer(
+            &q(&[
+                ("module", "logs"),
+                ("action", "getLogs"),
+                ("fromBlock", "100"),
+                ("toBlock", "100"),
+                ("address", "0xc0"),
+            ]),
+            1,
+            &forward,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got["result"].as_array().unwrap().len(), 64, "{got}");
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
