@@ -231,9 +231,8 @@ fn pinned_shape(h: &Header) -> Result<B256> {
 
 /// Check `rows` against `blocks` (the verified execution blocks `[lo, to]`) and `successor` (block
 /// `to + 1`, authenticated and linked to block `to` by the caller): exactly one row per height, each
-/// naming its block's hash, each hashing to the root the next execution header commits to, each
-/// beacon header's parent the root its own block commits to, and its slot the one its block's
-/// timestamp names. Every row is checked before any is used.
+/// naming its block's hash, each hashing to the root the next execution header commits to, and each
+/// slot the one its block's timestamp names. Every row is checked before any is used.
 pub fn verify(
     rows: &[ProposerRow],
     blocks: &[VerifiedBlock],
@@ -268,9 +267,6 @@ pub fn verify(
         let committed = pinned_shape(next)?;
         if header_root(row) != committed.0 {
             bail!("block {n}'s beacon header does not hash to the root block {} commits to", n + 1);
-        }
-        if row.parent_root != pinned_shape(&block.header)?.0 {
-            bail!("block {n}'s beacon header does not follow the beacon block its parent named");
         }
         let slot_time = GENESIS_TIME + row.slot * SECONDS_PER_SLOT;
         if row.slot < DENEB_SLOT || slot_time != block.header.timestamp {
@@ -699,6 +695,9 @@ pub(crate) mod tests {
         let mut wrong_hash = rows.clone();
         wrong_hash[1].hash[0] ^= 1;
         assert!(verify(&wrong_hash, &blocks, &successor, span(4)).is_err());
+        let mut short = rows.clone();
+        short.pop();
+        assert!(verify(&short, &blocks, &successor, span(4)).is_err(), "the last row missing");
         let mut wrong_height = rows;
         wrong_height[1].number += 1;
         assert!(verify(&wrong_height, &blocks, &successor, span(4)).is_err());
