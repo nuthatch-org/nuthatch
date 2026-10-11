@@ -166,6 +166,8 @@ impl ModeState {
         loopback: bool,
     ) -> ModeState {
         let (tx, rx) = tokio::sync::mpsc::channel(QUEUE);
+        // A store that is unreadable here fails its first request instead, with the reason.
+        let conflict = history.conflict().ok().flatten();
         ModeState {
             history,
             chain_id,
@@ -181,9 +183,9 @@ impl ModeState {
             start_block: 0,
             end_block: None,
             wake: tokio::sync::Notify::new(),
-            cursor_error: Mutex::new(None),
             counter: None,
-            conflict: Mutex::new(None),
+            cursor_error: Mutex::new(conflict.clone()),
+            conflict: Mutex::new(conflict),
             sample: AtomicU64::new(0),
             calls: Mutex::new(BTreeMap::new()),
             windows: AtomicU64::new(0),
@@ -258,6 +260,10 @@ impl ModeState {
 
     /// Stop the cursor over a conflict with finalized history, and refuse every answer.
     fn conflict(&self, why: String) {
+        let why = format!("{why}; remove the address-history store to read it again");
+        if let Err(e) = self.history.set_conflict(&why) {
+            tracing::error!("address history: could not record the conflict in the store: {e:#}");
+        }
         *self.conflict.lock().expect("conflict lock") = Some(why.clone());
         self.stop(why);
     }
@@ -429,6 +435,11 @@ pub async fn check_anchor<M: Rpc, T: Rpc>(
         if let Some(&newest) = tracked.last() {
             checks.insert(newest);
         }
+    }
+    // And the newest finalized hash, so a switch to a fork under finality after the request's own
+    // check cannot join a fetch from it to history read on the old one.
+    if let Some(&last) = history.finals()?.last() {
+        checks.insert(last);
     }
     // Twice over, so a node that moves to another fork between two comparisons cannot pass one
     // block on each.
@@ -1308,6 +1319,12 @@ pub async fn cursor(state: Arc<ModeState>, source: impl HeadSource, discovery: i
     let mut tick = tokio::time::interval(state.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        if state.conflict.lock().expect("conflict lock").is_some() {
+            tracing::error!(
+                "address history: the cursor stopped over a conflict with finalized history"
+            );
+            return;
+        }
         let request = {
             let mut q = state.queue.lock().await;
             tokio::select! {
@@ -2935,22 +2952,26 @@ mod tests {
                     }
                     let answer = json!({"number": format!("0x{b:x}"),
                               "hash": format!("0x{}", alloy_primitives::hex::encode(c.hash(b)))});
-                    let mut hook = c.reorg_on_read.lock().unwrap();
-                    if let Some((at, n, depth)) = *hook {
-                        if at == b {
-                            *hook = (n > 1).then_some((at, n - 1, depth));
-                            if n == 1 {
-                                drop(hook);
-                                c.reorg(depth);
-                            }
-                        }
-                    }
+                    c.after_read(b);
                     Ok(answer)
                 }
                 other => bail!("unexpected {other}"),
             });
             let trace = crate::address_partitions::tests::Fake::new(|m, _| bail!("unexpected {m}"));
             Discoverer::new(Counted::new(main), Counted::new(trace))
+        }
+        /// Land the reorg [`Chain::reorg_on_read`] waits for, if this read of `b` is the one.
+        fn after_read(&self, b: u64) {
+            let mut hook = self.reorg_on_read.lock().unwrap();
+            if let Some((at, n, depth)) = *hook {
+                if at == b {
+                    *hook = (n > 1).then_some((at, n - 1, depth));
+                    if n == 1 {
+                        drop(hook);
+                        self.reorg(depth);
+                    }
+                }
+            }
         }
         fn hex(&self, b: u64) -> String {
             format!("0x{}", alloy_primitives::hex::encode(self.hash(b)))
@@ -2976,11 +2997,13 @@ mod tests {
                 }
                 "eth_getBlockByNumber" => {
                     let b = crate::address_discovery::hex_u64(&p[0])?;
-                    Ok(if b > c.latest() {
+                    let answer = if b > c.latest() {
                         Value::Null
                     } else {
                         c.block_json(b)
-                    })
+                    };
+                    c.after_read(b);
+                    Ok(answer)
                 }
                 "eth_getCode" => Ok(json!("0x")),
                 "eth_getTransactionCount" => Ok(json!("0x0")),
@@ -3348,6 +3371,41 @@ mod tests {
         }
     }
 
+    /// A switch to a fork under finality landing after a request's own finality check, but before
+    /// its fetch, cannot join that fetch to history read on the old fork: the fetch is held against
+    /// the newest finalized hash as well, fails, and the next poll stops the cursor.
+    #[tokio::test]
+    async fn a_fork_under_finality_after_the_request_check_never_joins_two_forks() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        let chain = Chain::new(100, 70);
+        let d = chain.node();
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        discover_window(&d, &s, ALICE, (0, 99), None).await.unwrap();
+        chain.grow(10);
+        chain.finalized.store(90, Ordering::Relaxed);
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        // The request's check reads finalized 90 on the old fork; then 75 onward is replaced.
+        *chain.reorg_on_read.lock().unwrap() = Some((90, 1, 35));
+        d.check_tracked(&s, chain.latest()).await.unwrap();
+        assert!(
+            chain.reorg_on_read.lock().unwrap().is_none(),
+            "the switch landed"
+        );
+        let err = discover_window(&d, &s, ALICE, (91, chain.latest()), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("block 90"), "{err:#}");
+        assert_eq!(
+            s.history
+                .coverage(crate::address_history::Action::TxListInternal, ALICE)
+                .unwrap(),
+            vec![(0, 90)]
+        );
+        d.reconcile(&s, chain.latest()).await.unwrap_err();
+        assert!(s.conflict.lock().unwrap().is_some());
+    }
+
     /// A finalized hash already recorded is never replaced: another one is a conflict, and the head
     /// does not move.
     #[test]
@@ -3401,6 +3459,18 @@ mod tests {
             let (st, ready) = call(router(s.clone()), "GET", "/ready", None).await;
             assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{ready}");
             assert!(ready.to_string().contains("finalized block 70"), "{ready}");
+            // A restart over the same store, with no RPC to ask, still refuses.
+            let again = Arc::new(ModeState::new(
+                s.history.clone(),
+                1,
+                Duration::from_secs(300),
+                true,
+            ));
+            let (_, after) = call(router(again.clone()), "GET", &q, None).await;
+            let r = after["result"].as_str().unwrap();
+            assert!(r.contains("reorg under finality"), "{after}");
+            let (st, _) = call(router(again), "GET", "/ready", None).await;
+            assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 

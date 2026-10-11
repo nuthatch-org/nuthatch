@@ -2353,7 +2353,7 @@ mod tests {
     }
 
     /// Address history's getLogs is capped the same way, at its own smaller cap, with an error its
-    /// span narrowing reads as a range refusal; one block is still read whole.
+    /// span narrowing reads as a range refusal, and one block past it is refused too.
     #[tokio::test]
     async fn address_history_getlogs_bodies_are_capped() {
         use crate::address_discovery::Rpc;
@@ -2367,11 +2367,9 @@ mod tests {
             crate::address_discovery::range_shaped(&format!("{err:#}")),
             "{err:#}"
         );
-        let one = Rpc::call(&client, "eth_getLogs", ask("0x1", "0x1"))
-            .await
-            .unwrap();
+        let one = Rpc::call(&client, "eth_getLogs", ask("0x1", "0x1")).await;
         server.abort();
-        assert_eq!(one.as_array().unwrap().len(), 25_000);
+        assert!(format!("{:#}", one.unwrap_err()).contains("body cap"));
     }
 
     /// #1788: a node with no result cap answers a multi-block range whole, however large. Past the

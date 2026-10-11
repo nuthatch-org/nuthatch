@@ -175,7 +175,7 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
                 let Value::Array(found) = found else {
                     bail!("eth_getLogs answered a non-list");
                 };
-                if found.len() < need / 4 {
+                if found.len() < (need / 4).max(1) {
                     span = span.saturating_mul(2).min(LOG_SPAN);
                 }
                 let room = need - logs.len();

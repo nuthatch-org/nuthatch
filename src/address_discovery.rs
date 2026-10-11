@@ -84,15 +84,14 @@ pub trait Rpc: Send + Sync + 'static {
     }
 }
 
-/// The most of one multi-block `eth_getLogs` body address history reads before narrowing the range:
-/// about 7,000 transfers, so a sparse stretch that widened the span cannot hand a dense one back
-/// whole.
+/// The most of one `eth_getLogs` body address history reads before refusing it: about 7,000
+/// transfers, so a sparse stretch that widened the span cannot hand a dense one back whole. A range is
+/// narrowed; one block, which a block's gas limit keeps far under it, is refused.
 pub const LOGS_BODY_CAP: usize = 4 << 20;
 
 impl Rpc for crate::rpc::RpcClient {
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        let f = &params[0];
-        if method == "eth_getLogs" && f.get("fromBlock") != f.get("toBlock") {
+        if method == "eth_getLogs" {
             return self.call_capped(method, params, LOGS_BODY_CAP).await;
         }
         crate::rpc::RpcClient::call(self, method, params).await

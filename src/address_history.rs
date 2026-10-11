@@ -286,6 +286,9 @@ const MEV_PENDING: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_mev_pe
 /// finality, or an RPC that came back on another chain under the same id, stops the cursor.
 const FINAL: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_final");
 const FINAL_KEEP: usize = 32;
+/// Why finalized history stopped matching the chain, once it has: it outlives a restart, because the
+/// rows it concerns do, and only removing the store clears it.
+const CONFLICT: TableDefinition<&str, &str> = TableDefinition::new("ah_conflict");
 const META: TableDefinition<&str, u64> = TableDefinition::new("ah_meta");
 /// The finalized head: what the cursor backfills to and the line under which nothing is re-checked.
 const HEAD: &str = "head";
@@ -428,6 +431,7 @@ impl AddressHistory {
         wtx.open_table(MEV_PENDING)?;
         wtx.open_table(BODY_SUMMARY)?;
         wtx.open_table(FINAL)?;
+        wtx.open_table(CONFLICT)?;
         reset_produced_blocks(&wtx)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
@@ -692,6 +696,28 @@ impl AddressHistory {
         }
         wtx.commit()?;
         Ok(())
+    }
+
+    /// Record the first conflict with finalized history; a later one keeps the first reason.
+    pub fn set_conflict(&self, why: &str) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let mut t = wtx.open_table(CONFLICT)?;
+            if t.get("why")?.is_none() {
+                t.insert("why", why)?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// The conflict with finalized history this store recorded, if any.
+    pub fn conflict(&self) -> Result<Option<String>> {
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx
+            .open_table(CONFLICT)?
+            .get("why")?
+            .map(|v| v.value().to_string()))
     }
 
     /// The finalized heads' hashes recorded, oldest first.
