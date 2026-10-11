@@ -2309,6 +2309,11 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
             "the history changed while it was being read; ask again",
         ));
     };
+    // A gap the cursor cannot cover within the deadline at its measured pace is refused at once,
+    // not after holding the request for the whole deadline: the backfill reaches it in the background.
+    if let Some(why) = beyond_reach(&s, &want).await {
+        return Json(crate::address_history::incomplete(&why));
+    }
     match s
         .ask(|deadline, reply| Request::Cover {
             address: want.0,
@@ -2355,6 +2360,44 @@ fn before_history(s: &ModeState, q: &HashMap<String, String>) -> Option<String> 
         format!(
             "history starts at block {}; ask from there and use another source before it",
             s.start_block
+        )
+    })
+}
+
+/// The blocks a request may ask the cursor to cover: what it covers in half the deadline at the
+/// backfill's measured pace, and at least a window's worth before any pace is measured.
+fn reach(s: &ModeState) -> u64 {
+    let rate = s.backfill_rate.load(Ordering::Relaxed);
+    (rate * s.deadline.as_secs() / 2).max(COVER_WINDOW)
+}
+
+/// Why `want`'s uncovered blocks are too many to cover within the deadline, if they are.
+async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Option<String> {
+    use crate::address_discovery::{next_uncovered_for, BLOCK_SCANNED, DISCOVERED};
+    use crate::address_history::Action;
+    let (address, need, from, to) = want.clone();
+    let next = blocking(s, move |h| {
+        let mut sets: Vec<&[Action]> = vec![&DISCOVERED];
+        if need != Need::Discovered {
+            sets.push(&BLOCK_SCANNED);
+        }
+        if need == Need::Produced {
+            sets.push(&[Action::ProducedBlocks]);
+        }
+        sets.into_iter()
+            .map(|set| next_uncovered_for(h, &address, from, set))
+            .try_fold(u64::MAX, |m, n| n.map(|n| m.min(n)))
+    })
+    .await
+    .ok()?;
+    let gap = (to + 1).saturating_sub(next);
+    let reach = reach(s);
+    (gap > reach).then(|| {
+        format!(
+            "covered through block {}; the {gap} blocks above it are being backfilled, more than can \
+             be covered within the {}s deadline; ask again later",
+            next.saturating_sub(1),
+            s.deadline.as_secs()
         )
     })
 }
@@ -4056,6 +4099,50 @@ mod tests {
         );
     }
 
+    /// A request whose uncovered gap the cursor cannot cover in time is refused at once with how far
+    /// history is covered; a tip-sized gap still goes to the cursor.
+    #[tokio::test]
+    async fn a_gap_beyond_the_deadline_is_refused_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(200_000).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_millis(500)),
+        );
+        let ask = |from: u64, to: u64| {
+            format!(
+                "/api?module=account&action=txlist&address={ALICE}&startblock={from}&endblock={to}"
+            )
+        };
+        let started = Instant::now();
+        let (_, v) = call(router(s.clone()), "GET", &ask(0, 100_000), None).await;
+        assert!(
+            v["result"]
+                .as_str()
+                .unwrap()
+                .contains("covered through block"),
+            "{v}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        // A tip-sized gap waits for the cursor (none runs here, so it is refused at the deadline).
+        let started = Instant::now();
+        let (_, v) = call(router(s), "GET", &ask(199_990, 199_999), None).await;
+        assert!(
+            !v["result"]
+                .as_str()
+                .unwrap()
+                .contains("covered through block"),
+            "{v}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(500));
+    }
+
     /// A conflict found while a request is being answered refuses that answer too.
     #[tokio::test]
     async fn a_conflict_found_mid_request_refuses_its_answer() {
@@ -5688,6 +5775,8 @@ mod tests {
         );
         assert!(waited < Duration::from_secs(2), "{waited:?}");
         assert!(!backfill.is_finished(), "the backfill was still running");
+        // The pace the backfill settled on is kept for the next poll.
+        assert!(s.backfill_span.load(Ordering::Relaxed) > s.first_window);
         backfill.abort();
     }
 
