@@ -253,15 +253,21 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
         // A relay-built block pays the proposer from the builder's fee recipient or, for builders
         // that pay from another account or a payout contract, in the block's last transaction,
         // directly or as an internal transfer.
-        let payment = incoming.get(&b).and_then(|paid| {
-            paid.iter()
-                .rev()
-                .find(|t| {
-                    (text(t, "from") == miner && miner != a)
-                        || Some(text(t, "transactionIndex")) == last
-                })
-                .copied()
-        });
+        // Every leg of the payment: a builder can pay part from its fee recipient and part through a
+        // payout contract in the last transaction, and the relay's value is their sum.
+        let legs: Vec<&Map<String, Value>> = incoming
+            .get(&b)
+            .map(|paid| {
+                paid.iter()
+                    .filter(|t| {
+                        (text(t, "from") == miner && miner != a)
+                            || Some(text(t, "transactionIndex")) == last
+                    })
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let payment = legs.first().copied();
         let self_built = mined.get(&b);
         if self_built.is_none() && payment.is_none() {
             continue;
@@ -302,13 +308,23 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
                 put("blockReward", d.block_reward(b, &header).await?);
             }
         }
-        put(
-            "paymentTx",
-            payment.map(|p| text(p, "hash")).unwrap_or_default(),
-        );
+        let mut hashes: Vec<String> = legs.iter().map(|p| text(p, "hash")).collect();
+        hashes.dedup();
+        put("paymentTx", hashes.join(","));
+        let total = legs
+            .iter()
+            .try_fold(alloy_primitives::U256::ZERO, |sum, p| {
+                alloy_primitives::U256::from_str_radix(&text(p, "value"), 10)
+                    .map(|v| sum + v)
+                    .with_context(|| format!("block {b} payment value"))
+            })?;
         put(
             "paymentValue",
-            payment.map(|p| text(p, "value")).unwrap_or_default(),
+            if legs.is_empty() {
+                String::new()
+            } else {
+                total.to_string()
+            },
         );
         match found {
             Some(dl) => {
@@ -1031,5 +1047,51 @@ mod tests {
         assert_eq!(mev, ["100 relay", "101 relay", "102 relay"], "{a}");
         assert!(h.mev_pending().unwrap().is_empty());
         cursor.abort();
+    }
+
+    /// A builder that pays part from its fee recipient and part through a payout contract in the last
+    /// transaction has both legs reported, their sum the payment, as the relay's value is (cold test,
+    /// block 26156804).
+    #[tokio::test]
+    async fn every_leg_of_a_split_payment_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = evidence_chain(dir.path());
+        evidence_rows(&h);
+        let g = h.generation().unwrap();
+        // Block 102 also has a direct transfer from its miner.
+        h.record(
+            Action::TxList,
+            A,
+            &[
+                row(
+                    101,
+                    json!({"timeStamp": "1012", "hash": "0xp101", "from": BUILDER, "to": A,
+                                "value": "9000", "isError": "0", "transactionIndex": "0"}),
+                ),
+                row(
+                    102,
+                    json!({"timeStamp": "1024", "hash": "0xq102", "from": MINER, "to": A,
+                                "value": "23", "isError": "0", "transactionIndex": "0"}),
+                ),
+            ],
+            (100, 199),
+            g,
+        )
+        .unwrap();
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let found = produced_blocks(
+            &evidence_rpc(),
+            &late_relays(on),
+            &h,
+            A,
+            (102, 102),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let r = &found.rows[0].record;
+        assert_eq!(r["paymentTx"], "0xq102,0xp102", "{r:?}");
+        assert_eq!(r["paymentValue"], "100");
     }
 }

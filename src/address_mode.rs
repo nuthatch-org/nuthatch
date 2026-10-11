@@ -58,6 +58,8 @@ pub struct ModeState {
     last_poll: AtomicU64,
     polls: AtomicU64,
     poll_errors: AtomicU64,
+    /// Whether the last poll, its head read or its reconcile, failed: the RPC is down or hanging.
+    failing: std::sync::atomic::AtomicBool,
     rpc_requests: AtomicU64,
     /// Blocks behind the chain head the nest serves through, so nothing it records can be reorged.
     pub depth: u64,
@@ -166,6 +168,7 @@ impl ModeState {
             last_poll: AtomicU64::new(0),
             polls: AtomicU64::new(0),
             poll_errors: AtomicU64::new(0),
+            failing: std::sync::atomic::AtomicBool::new(false),
             rpc_requests: AtomicU64::new(0),
             depth: 0,
             start_block: 0,
@@ -258,7 +261,7 @@ impl ModeState {
         } else {
             since_start.saturating_sub(Duration::from_millis(last - 1))
         };
-        since_poll > 3 * self.poll_interval
+        since_poll > 3 * self.poll_interval || self.failing.load(Ordering::Relaxed)
     }
 }
 
@@ -532,6 +535,10 @@ async fn body_window<M: Rpc, T: Rpc>(
         checked?;
         let mut found = found?;
         for a in addresses {
+            // An address unwatched while the window was read is passed over, not the window.
+            if !history.is_watched(&a)? {
+                continue;
+            }
             let f = found.remove(&a.to_ascii_lowercase()).unwrap_or_default();
             record_blocks_anchored(&history, &a, (from, end), f, generation, false, anchor)?;
         }
@@ -1188,10 +1195,14 @@ pub async fn step(
     source: &impl HeadSource,
     discovery: &impl Discovery,
 ) -> Result<u64> {
-    let latest = poll_once(state, source).await?;
-    discovery.reconcile(state, latest).await.inspect_err(|_| {
-        state.poll_errors.fetch_add(1, Ordering::Relaxed);
-    })
+    let stepped = match poll_once(state, source).await {
+        Ok(latest) => discovery.reconcile(state, latest).await.inspect_err(|_| {
+            state.poll_errors.fetch_add(1, Ordering::Relaxed);
+        }),
+        Err(e) => Err(e),
+    };
+    state.failing.store(stepped.is_err(), Ordering::Relaxed);
+    stepped
 }
 
 /// Poll forever, the first poll at once, and catch up after each. A failed poll is logged and
@@ -1353,7 +1364,11 @@ async fn api(
                 .unwrap_or("")
                 .trim_start_matches("NUTHATCH_INCOMPLETE: ")
                 .to_string();
-            Json(crate::address_history::incomplete(&format!("{why}; {e}")))
+            Json(crate::address_history::incomplete(&if why.is_empty() {
+                e
+            } else {
+                format!("{why}; {e}")
+            }))
         }
     }
 }
@@ -1797,7 +1812,10 @@ async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
          nuthatch_address_history_watched {watched}\n",
         s.windows.load(Ordering::Relaxed),
         s.discovery_errors.load(Ordering::Relaxed),
-        s.rpc_requests.load(Ordering::Relaxed),
+        // Every call counted so far, not only those made by the last head read.
+        s.rpc_requests
+            .load(Ordering::Relaxed)
+            .max(s.calls.lock().expect("calls lock").values().sum::<u64>()),
         s.polls.load(Ordering::Relaxed),
         s.poll_errors.load(Ordering::Relaxed),
     );
@@ -1886,6 +1904,13 @@ pub async fn dev(
         .await
         .with_context(|| format!("cannot bind {}", args.listen))?;
     let loopback = listener.local_addr()?.ip().is_loopback();
+    if !loopback {
+        tracing::warn!(
+            "address history: listening on {}, not loopback: anyone who can reach it can read /api and \
+             GET /api/watch, which lists the accounts watched",
+            listener.local_addr()?
+        );
+    }
     // redb caches every page it reads or writes up to its cache size, and a backfill touches all of
     // them; an address-history nest reads by key, so a small cache costs it nothing.
     let store =
@@ -3238,6 +3263,57 @@ mod tests {
         let fresh = respond(&s, &q).await;
         assert!(matches!(wanted(&s, &q, &fresh).await, Want::Serve));
         assert_eq!(fresh["result"][0]["mev"], "relay");
+    }
+
+    /// A failing RPC shows on /ready at once as stalled, though covered history still serves; the
+    /// RPC calls counter is current between polls; a refusal always names its reason.
+    #[tokio::test]
+    async fn a_failing_rpc_shows_at_once_and_refusals_name_their_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        let source = fixed(100, 1);
+        step(&s, &source, &()).await.unwrap();
+        let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert_eq!(r["stalled"], false, "{r}");
+        source.head.store(0, Ordering::Relaxed);
+        assert!(step(&s, &source, &()).await.is_err());
+        let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert_eq!(
+            (r["ready"].clone(), r["stalled"].clone()),
+            (json!(true), json!(true)),
+            "{r}"
+        );
+
+        s.set_calls("main", BTreeMap::from([("eth_getLogs".to_string(), 40)]));
+        let (_, m) = call(router(s.clone()), "GET", "/metrics", None).await;
+        assert!(
+            m.as_str()
+                .unwrap()
+                .contains("nuthatch_address_history_rpc_requests_total 40\n"),
+            "{m}"
+        );
+
+        // A covered read above the finalized head goes to the cursor; with none running it times
+        // out, and the refusal says so without an empty reason before it.
+        s.history.set_head(50).unwrap();
+        s.history
+            .record(
+                crate::address_history::Action::TxList,
+                ALICE,
+                &[],
+                (0, 100),
+                s.history.generation().unwrap(),
+            )
+            .unwrap();
+        let s2 = Arc::new(
+            ModeState::new(s.history.clone(), 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_millis(50)),
+        );
+        let q =
+            format!("/api?module=account&action=txlist&address={ALICE}&startblock=0&endblock=100");
+        let (_, a) = call(router(s2), "GET", &q, None).await;
+        let r = a["result"].as_str().unwrap();
+        assert!(r.starts_with("NUTHATCH_INCOMPLETE: not covered"), "{a}");
     }
 
     /// A tracked block under the committed finalized head, now at another hash, is not rewritten:

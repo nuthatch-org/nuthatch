@@ -78,11 +78,8 @@ pub struct MirrorConfig {
 
 impl AddressHistoryConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.addresses.is_empty() {
-            bail!(
-                "[address_history] names no addresses - list the accounts to watch in `addresses`"
-            );
-        }
+        // An empty list is allowed: a client such as rotki registers its own accounts through
+        // `/api/watch`.
         let mut seen = std::collections::HashSet::new();
         for a in &self.addresses {
             let key =
@@ -774,10 +771,18 @@ impl AddressHistory {
                 wtx.open_table(VERIFIED_COV)?
                     .remove(coverage_key(&a, action).as_slice())?;
             }
-            bump_generation(&wtx)?;
+            // No generation change: the address's rows and coverage go with it, so its pages read
+            // incomplete, and a fetch for it is refused as not watched; a window in flight for every
+            // other address stays good.
         }
         wtx.commit()?;
         Ok(())
+    }
+
+    pub fn is_watched(&self, address: &str) -> Result<bool> {
+        let a = parse_address(address)?;
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx.open_table(WATCHED)?.get(a.as_slice())?.is_some())
     }
 
     /// Store a fetch's result: `rows`, replacing what `[from, to]` held, and the claim that the span
@@ -3165,6 +3170,22 @@ mod tests {
         );
     }
 
+    /// Unwatching one address leaves the generation alone, so a window in flight for any other
+    /// address is still recorded (cold test: a watch change mid-scan discarded a whole window).
+    #[test]
+    fn unwatching_one_address_does_not_move_the_generation() {
+        let (_d, h) = history();
+        h.watch(BOB).unwrap();
+        let g = h.generation().unwrap();
+        h.unwatch(BOB).unwrap();
+        assert_eq!(h.generation().unwrap(), g);
+        h.record(Action::TxList, ALICE, &[], (0, 10), g).unwrap();
+        assert!(
+            h.record(Action::TxList, BOB, &[], (0, 10), g).is_err(),
+            "not watched"
+        );
+    }
+
     #[test]
     fn config_validation() {
         let ok = AddressHistoryConfig {
@@ -3179,10 +3200,13 @@ mod tests {
         ok.validate().unwrap();
         assert_eq!(ok.poll_interval().unwrap(), DEFAULT_POLL_INTERVAL);
         let bad = |c: AddressHistoryConfig| assert!(c.validate().is_err(), "{c:?}");
-        bad(AddressHistoryConfig {
+        // No addresses is valid: rotki registers its own through /api/watch.
+        AddressHistoryConfig {
             addresses: vec![],
             ..ok.clone()
-        });
+        }
+        .validate()
+        .unwrap();
         bad(AddressHistoryConfig {
             addresses: vec![ALICE.into(), ALICE.to_lowercase()],
             ..ok.clone()
