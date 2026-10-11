@@ -3628,7 +3628,7 @@ mod tests {
         );
         assert_eq!(asked.load(Ordering::Relaxed), 1, "one hash check");
         let s = Arc::new(
-            ModeState::new(history, 1, Duration::from_secs(300), true)
+            ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
                 .with_deadline(Duration::from_millis(300))
                 .with_hash_at(make([8; 32])),
         );
@@ -3639,6 +3639,43 @@ mod tests {
                 .unwrap()
                 .starts_with("NUTHATCH_INCOMPLETE"),
             "{v}"
+        );
+        // A write lands while the hash is checked: the answer read before it is read again.
+        let writes = Arc::new(AtomicU64::new(0));
+        let racing: HashAt = {
+            let (h, writes, asked) = (history.clone(), writes.clone(), asked.clone());
+            Arc::new(move |_| {
+                asked.fetch_add(1, Ordering::Relaxed);
+                if writes.fetch_add(1, Ordering::Relaxed) == 0 {
+                    let mut record = serde_json::Map::new();
+                    record.insert("delivered".into(), json!([]));
+                    let mut row = serde_json::Map::new();
+                    row.insert("blockNumber".into(), json!("150"));
+                    let rows = vec![crate::address_history::Row {
+                        block: 150,
+                        tx_index: 0,
+                        position: 0,
+                        record: row,
+                    }];
+                    let g = h.generation().unwrap();
+                    h.apply_reask(150, &record, &[(ALICE.to_lowercase(), rows)], false, 1, g)
+                        .unwrap();
+                }
+                Box::pin(async move { Ok([7; 32]) })
+            })
+        };
+        asked.store(0, Ordering::Relaxed);
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_millis(300))
+                .with_hash_at(racing),
+        );
+        let (_, v) = call(router(s), "GET", &path, None).await;
+        assert_eq!(v["status"], "1", "{v}");
+        assert_eq!(
+            asked.load(Ordering::Relaxed),
+            2,
+            "checked again after the write"
         );
     }
 
