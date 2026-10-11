@@ -170,7 +170,7 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
             Err(e) => return Err(e),
         }
     }
-    if logs.len() > MAX_LOGS {
+    if logs.len() >= MAX_LOGS {
         // Exactly the first 1,000, mid-block if need be, as Etherscan answers: rotki continues only
         // on a full page, from its last block, and drops what it already has, so a short page must
         // only ever mean the range is done. A full page inside one block would be asked for again
