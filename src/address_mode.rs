@@ -3008,6 +3008,11 @@ mod tests {
     }
     impl Rpc for Headers {
         async fn call(&self, method: &str, params: Value) -> Result<Value> {
+            if method == "trace_block" {
+                if let Some(t) = TRACES.with(|t| t.borrow().clone()) {
+                    return Ok(t);
+                }
+            }
             if method != "eth_getBlockByNumber" {
                 bail!("{method} is not scripted");
             }
@@ -3021,6 +3026,59 @@ mod tests {
             }
         }
     }
+    thread_local! {
+        static TRACES: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_proven_block_carries_the_builders_payment() {
+        use crate::address_proposers::{tests as pt, Proven};
+        let (blocks, _, _) = pt::chain(1);
+        let block = blocks[0].clone();
+        let hash = format!("{:#x}", block.hash);
+        let builder = format!("{:#x}", block.header.beneficiary);
+        let proposer = "0x00000000000000000000000000000000000000a1";
+        TRACES.with(|t| {
+            *t.borrow_mut() = Some(json!([{
+                "blockHash": hash, "transactionPosition": 0, "transactionHash": "0x01",
+                "traceAddress": [], "type": "call",
+                "action": {"callType": "call", "from": builder, "to": proposer, "value": "0x9"},
+            }]))
+        });
+        let relay_hash = hash.clone();
+        let relays: crate::address_mev::Relays = Arc::new(move |name: &'static str, b: u64| {
+            let h = relay_hash.clone();
+            Box::pin(async move {
+                Ok(if name == "ultrasound" {
+                    vec![json!({"block_number": b.to_string(), "block_hash": h,
+                        "proposer_fee_recipient": proposer, "value": "9",
+                        "builder_pubkey": "0xb", "proposer_pubkey": "0xp"})]
+                } else {
+                    vec![]
+                })
+            })
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[]).unwrap();
+        let state = ModeState::new(history, 1, Duration::from_secs(300), true).with_relays(relays);
+        let make = || Headers {
+            by_number: BTreeMap::new(),
+            finalized: Value::Null,
+        };
+        let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+        let p = Proven {
+            block,
+            slot: 1,
+            proposer_index: 7,
+        };
+        let stored = proven_row(&d, &state, &p).await;
+        assert_eq!(stored.row["mev"], "relay");
+        assert_eq!(stored.row["paymentTx"], "0x01");
+        assert_eq!(stored.row["paymentValue"], "9");
+        TRACES.with(|t| *t.borrow_mut() = None);
+    }
+
     fn header_json(h: &alloy_consensus::Header) -> Value {
         let mut v = serde_json::to_value(h).unwrap();
         v["hash"] = json!(format!("{:#x}", h.hash_slow()));
