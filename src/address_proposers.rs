@@ -378,8 +378,14 @@ pub async fn blocks_from_rpc(
 }
 
 /// The header of block `lo`, linked block by block through `hi` to `anchor` (block `hi + 1`), read
-/// from `rpc` a chunk at a time so only one chunk is held.
-pub async fn linked_to(rpc: &impl Rpc, (lo, hi): (u64, u64), anchor: &Header) -> Result<Header> {
+/// from `rpc` a chunk at a time so only one chunk is held, running `between` after each so a caller
+/// can serve its waiting requests.
+pub async fn linked_to<'b>(
+    rpc: &impl Rpc,
+    (lo, hi): (u64, u64),
+    anchor: &Header,
+    between: &(dyn Fn() -> futures::future::BoxFuture<'b, ()> + Sync),
+) -> Result<Header> {
     const CHUNK: u64 = 1_000;
     let mut first: Option<Header> = None;
     let mut last: Option<B256> = None;
@@ -397,6 +403,7 @@ pub async fn linked_to(rpc: &impl Rpc, (lo, hi): (u64, u64), anchor: &Header) ->
         }
         last = Some(chunk[chunk.len() - 1].hash);
         from = to + 1;
+        between().await;
     }
     if last != Some(anchor.parent_hash) {
         bail!("the RPC's blocks under its finalized block do not lead to it");

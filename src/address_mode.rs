@@ -121,6 +121,39 @@ const COVER_WINDOW: u64 = 5_000;
 const COVER_BODIES: u64 = 500;
 const COVER_PRODUCED: u64 = 1_000;
 
+/// How many blocks a backfill window covers, set by how long the last one took: requests for history
+/// above what is covered wait for the window in hand, so a window must stay well under their deadline.
+/// It starts small, doubles while windows are quick, and halves when one runs long.
+pub(crate) struct Pace {
+    span: u64,
+    min: u64,
+    max: u64,
+    target: Duration,
+}
+
+impl Pace {
+    pub(crate) fn new(start: u64, min: u64, max: u64, deadline: Duration) -> Pace {
+        Pace {
+            span: start.clamp(min, max),
+            min,
+            max,
+            target: deadline / 4,
+        }
+    }
+    pub(crate) fn span(&self) -> u64 {
+        self.span
+    }
+    pub(crate) fn took(&mut self, elapsed: Duration) {
+        self.span = if elapsed > self.target {
+            (self.span / 2).max(self.min)
+        } else if elapsed < self.target / 2 {
+            (self.span * 2).min(self.max)
+        } else {
+            self.span
+        };
+    }
+}
+
 /// The address-history store's page cache.
 const STORE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -818,6 +851,12 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
         if state.chain_id == 1 {
             mev_passes(self, state, &watched, to).await;
         }
+        let mut pace = Pace::new(
+            1_000,
+            64,
+            crate::address_discovery::OUTER_WINDOW,
+            state.deadline,
+        );
         for address in watched.clone() {
             let mut recorded_through: Option<u64> = None;
             loop {
@@ -845,10 +884,11 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                     );
                     break;
                 }
-                let end = next
-                    .saturating_add(crate::address_discovery::OUTER_WINDOW - 1)
-                    .min(to);
-                match discover_window(self, state, &address, (next, end), None).await {
+                let end = next.saturating_add(pace.span() - 1).min(to);
+                let started = Instant::now();
+                let done = discover_window(self, state, &address, (next, end), None).await;
+                pace.took(started.elapsed());
+                match done {
                     Ok(()) => {
                         recorded_through = Some(end);
                         state.window_done();
@@ -1535,7 +1575,10 @@ async fn mirror_spans<M: Rpc, T: Rpc>(
                 hi - lo + 1
             );
         }
-        ap::linked_to(&d.main, (lo, hi), anchor).await?
+        ap::linked_to(&d.main, (lo, hi), anchor, &|| {
+            Box::pin(serve_queued(state, d))
+        })
+        .await?
     };
     let mut span = top;
     loop {
@@ -1876,6 +1919,7 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
     use crate::address_discovery::{next_uncovered_for, BLOCK_SCANNED, BLOCK_WINDOW};
     let mut last: Option<u64> = None;
     let mut cursor = state.start_block;
+    let mut pace = Pace::new(250, 16, BLOCK_WINDOW, state.deadline);
     loop {
         serve_queued(state, d).await;
         let mut next = Vec::new();
@@ -1902,7 +1946,7 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
             );
             return;
         }
-        let mut end = from.saturating_add(BLOCK_WINDOW - 1).min(to);
+        let mut end = from.saturating_add(pace.span() - 1).min(to);
         if let Some((first, _)) = skip.filter(|(f, _)| from < *f) {
             end = end.min(first - 1);
         }
@@ -1913,7 +1957,9 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
             .filter(|(_, n)| *n <= end)
             .map(|(a, _)| a)
             .collect();
+        let started = Instant::now();
         let outcome = body_window(d, state, addresses, (from, end), None).await;
+        pace.took(started.elapsed());
         match outcome {
             Ok(()) => {
                 last = Some(end);
@@ -3485,9 +3531,14 @@ mod tests {
             finalized: Value::Null,
         };
         let (lo, hi) = (23_560_000, 23_561_499);
-        let first = linked_to(&rpc(map(&blocks)), (lo, hi), &anchor)
-            .await
-            .unwrap();
+        let first = linked_to(
+            &rpc(map(&blocks)),
+            (lo, hi),
+            &anchor,
+            &|| Box::pin(async {}),
+        )
+        .await
+        .unwrap();
         assert_eq!(first.number, lo);
         // Block 23,561,000 opens the second chunk. The second chunk is a chain of its own leading to
         // its own anchor: only the link between the chunks is broken.
@@ -3500,7 +3551,7 @@ mod tests {
         }
         let mut other = anchor.clone();
         other.parent_hash = parent;
-        let e = linked_to(&rpc(map(&forked)), (lo, hi), &other)
+        let e = linked_to(&rpc(map(&forked)), (lo, hi), &other, &|| Box::pin(async {}))
             .await
             .unwrap_err();
         assert!(format!("{e:#}").contains("does not follow"), "{e:#}");
@@ -4418,6 +4469,10 @@ mod tests {
         reorg_next: AtomicU64,
         /// `(block, n, depth)`: a reorg of `depth` lands once block `block` has been read `n` times.
         reorg_on_read: std::sync::Mutex<Option<(u64, u64, u64)>>,
+        /// No rows anywhere: discovery finds nothing to hydrate.
+        quiet: std::sync::atomic::AtomicBool,
+        /// Microseconds a trace_filter call takes per block of its span, as a provider's does.
+        trace_us_per_block: AtomicU64,
     }
 
     impl Chain {
@@ -4454,7 +4509,7 @@ mod tests {
         }
         /// Whether the watched address has a row at `b` on the chain as it stands.
         fn row_at(&self, b: u64) -> bool {
-            self.hash(b)[0].is_multiple_of(3)
+            !self.quiet.load(Ordering::Relaxed) && self.hash(b)[0].is_multiple_of(3)
         }
         fn discoverer(
             self: &Arc<Chain>,
@@ -4557,6 +4612,8 @@ mod tests {
                     let f = &p[0];
                     let s = crate::address_discovery::hex_u64(&f["fromBlock"])?;
                     let e = crate::address_discovery::hex_u64(&f["toBlock"])?.min(c.latest());
+                    let per = c.trace_us_per_block.load(Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_micros(per * (e + 1).saturating_sub(s)));
                     let frames: Vec<Value> = if f.get("toAddress").is_some() {
                         (s..=e)
                             .filter(|b| c.row_at(*b))
@@ -5313,6 +5370,52 @@ mod tests {
             vec![(0, 110)],
             "110 still matches; 120 is out of reach, so what was read above 110 goes"
         );
+    }
+
+    /// A request for history above what is covered is served inside a long backfill: the cursor's
+    /// windows are paced to stay well under the deadline, so the request waits for one short window,
+    /// not for a window spanning the whole backlog.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tip_request_is_served_inside_a_long_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(0, None, 20)
+                .with_deadline(Duration::from_secs(2)),
+        );
+        let chain = Chain::new(30_000, 29_000);
+        chain.quiet.store(true, Ordering::Relaxed);
+        // A 29,000-block window would take about 6 s a side: three times the deadline.
+        chain.trace_us_per_block.store(200, Ordering::Relaxed);
+        let d = Arc::new(chain.node());
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        let backfill = tokio::spawn({
+            let (d, s) = (d.clone(), s.clone());
+            async move { d.catch_up(&s, 29_000).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = Instant::now();
+        let (_, v) = call(
+            router(s.clone()),
+            "GET",
+            &format!(
+                "/api?module=account&action=txlist&address={ALICE}&startblock=29990&endblock=29999"
+            ),
+            None,
+        )
+        .await;
+        let waited = started.elapsed();
+        assert!(
+            !v["result"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("NUTHATCH_INCOMPLETE")),
+            "{v}"
+        );
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        assert!(!backfill.is_finished(), "the backfill was still running");
+        backfill.abort();
     }
 
     /// A read reaching above the finalized head is checked against the chain before it is served: a
