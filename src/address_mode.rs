@@ -361,41 +361,39 @@ async fn block_hash(rpc: &impl Rpc, block: u64) -> Result<[u8; 32]> {
     crate::address_discovery::word32(hash)
 }
 
-/// What a fetch reaching above the finalized head is read against: the hash of its last block, and
-/// the newest tracked hash under it. Both must still be canonical when the fetch ends, which is what
-/// makes them one chain: a window recorded on a fork that replaced the tracked block would otherwise
-/// hide that block behind a newer anchor that matches.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Anchor {
-    pub at: Option<(u64, [u8; 32])>,
-    prior: Option<(u64, [u8; 32])>,
-}
-
-/// The anchor for a fetch ending at `to`, if `to` is above the finalized head.
+/// The anchor for a fetch ending at `to`: its last block's hash, if `to` is above the finalized head.
 pub async fn anchor_for<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     history: &AddressHistory,
     to: u64,
-) -> Result<Anchor> {
+) -> Result<Option<(u64, [u8; 32])>> {
     if history.head()?.is_some_and(|h| to <= h) {
-        return Ok(Anchor::default());
+        return Ok(None);
     }
-    let prior = history.tracked()?.into_iter().rev().find(|(b, _)| *b < to);
-    Ok(Anchor {
-        at: Some((to, block_hash(&d.main, to).await?)),
-        prior,
-    })
+    Ok(Some((to, block_hash(&d.main, to).await?)))
 }
 
-/// Fail a fetch if any block it was read against is no longer canonical on the main endpoint: its
-/// anchor, the tracked hash under it, and every block hash it took from the trace endpoint.
+/// Fail a fetch if any block it was read against is not canonical on the main endpoint now: its
+/// anchor, every block hash another provider named, and, under each of those, the newest tracked
+/// hash. Checking the tracked hash under a new anchor is what makes them one chain: a window read on
+/// a fork that replaced a tracked block would otherwise hide that block behind a newer anchor that
+/// matches.
 pub async fn check_anchor<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
-    anchor: Anchor,
-    read: &[(u64, [u8; 32])],
+    history: &AddressHistory,
+    anchor: Option<(u64, [u8; 32])>,
+    named: &[(u64, [u8; 32])],
 ) -> Result<()> {
-    for (block, hash) in anchor.at.iter().chain(&anchor.prior).chain(read) {
-        if block_hash(&d.main, *block).await? != *hash {
+    let tracked = history.tracked()?;
+    let mut checks: std::collections::BTreeSet<(u64, [u8; 32])> = std::collections::BTreeSet::new();
+    for &(block, hash) in anchor.iter().chain(named) {
+        checks.insert((block, hash));
+        if let Some(&under) = tracked.iter().rev().find(|(b, _)| *b < block) {
+            checks.insert(under);
+        }
+    }
+    for (block, hash) in checks {
+        if block_hash(&d.main, block).await? != hash {
             bail!("block {block} is no longer the one this was read against; a reorg is under way");
         }
     }
@@ -409,27 +407,22 @@ async fn discover_window<M: Rpc, T: Rpc>(
     address: &str,
     (next, end): (u64, u64),
 ) -> Result<()> {
-    let generation = state.history.generation()?;
+    let pending = crate::address_discovery::Pending::begin(&state.history)?;
+    let generation = pending.generation();
     let anchor = anchor_for(d, &state.history, end).await?;
-    let pending = crate::address_discovery::Pending::default();
-    if let Some((b, h)) = anchor.at {
+    if let Some((b, h)) = anchor {
         pending.anchor(b, h);
     }
     let found = d
         .discover(&state.history, address, next, end, &pending)
         .await;
-    let checked = check_anchor(d, anchor, &pending.anchors()).await;
+    let checked = check_anchor(d, &state.history, anchor, &pending.named()).await;
     // What was fetched is kept even when the window fails, so its retry refetches only what it
-    // still lacks; but nothing above the finalized head is kept from a window whose anchor moved.
-    let cached_as = if checked.is_ok() {
-        generation
-    } else {
-        u64::MAX
-    };
+    // still lacks; nothing above the finalized head is kept from a window that failed its check.
     let history = state.history.clone();
     let who = address.to_string();
     let outcome = tokio::task::spawn_blocking(move || {
-        pending.persist(&history, cached_as)?;
+        pending.persist(&history, checked.is_ok())?;
         checked?;
         crate::address_discovery::record_anchored(
             &history,
@@ -437,7 +430,7 @@ async fn discover_window<M: Rpc, T: Rpc>(
             (next, end),
             found?,
             generation,
-            anchor.at,
+            anchor,
         )
     })
     .await?;
@@ -455,27 +448,22 @@ async fn body_window<M: Rpc, T: Rpc>(
     (from, end): (u64, u64),
 ) -> Result<()> {
     use crate::address_discovery::record_blocks_anchored;
-    let generation = state.history.generation()?;
+    let pending = crate::address_discovery::Pending::begin(&state.history)?;
+    let generation = pending.generation();
     let anchor = anchor_for(d, &state.history, end).await?;
-    let pending = crate::address_discovery::Pending::default();
-    if let Some((b, h)) = anchor.at {
+    if let Some((b, h)) = anchor {
         pending.anchor(b, h);
     }
     let found = d.scan_blocks(&addresses, from, end, &pending).await;
-    let checked = check_anchor(d, anchor, &pending.anchors()).await;
-    let cached_as = if checked.is_ok() {
-        generation
-    } else {
-        u64::MAX
-    };
+    let checked = check_anchor(d, &state.history, anchor, &pending.named()).await;
     let history = state.history.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        pending.persist(&history, cached_as)?;
+        pending.persist(&history, checked.is_ok())?;
         checked?;
         let mut found = found?;
         for a in addresses {
             let f = found.remove(&a.to_ascii_lowercase()).unwrap_or_default();
-            record_blocks_anchored(&history, &a, (from, end), f, generation, false, anchor.at)?;
+            record_blocks_anchored(&history, &a, (from, end), f, generation, false, anchor)?;
         }
         Ok::<_, anyhow::Error>(())
     })
@@ -604,21 +592,41 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             serve_queued(state, self).await;
             scan_bodies(self, state, &watched, to, skip).await;
             if let Some(relays) = &state.relays {
-                serve_queued(state, self).await;
                 let now = unix_now();
                 let passes = async {
-                    crate::address_mev::mev_pass(
-                        self,
-                        relays,
-                        &state.history,
-                        &watched,
-                        state.start_block,
-                        to,
-                        now,
-                    )
-                    .await?;
-                    crate::address_mev::reask_pass(self, relays, &state.history, &watched, now)
-                        .await
+                    for a in &watched {
+                        loop {
+                            serve_queued(state, self).await;
+                            let more = crate::address_mev::mev_step(
+                                self,
+                                relays,
+                                &state.history,
+                                a,
+                                state.start_block,
+                                to,
+                                now,
+                            )
+                            .await?;
+                            if !more {
+                                break;
+                            }
+                        }
+                    }
+                    loop {
+                        serve_queued(state, self).await;
+                        let more = crate::address_mev::reask_pass(
+                            self,
+                            relays,
+                            &state.history,
+                            &watched,
+                            now,
+                        )
+                        .await?;
+                        if !more {
+                            break;
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(())
                 };
                 if let Err(e) = passes.await {
                     state.discovery_errors.fetch_add(1, Ordering::Relaxed);
@@ -681,11 +689,12 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
 }
 
 impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
-    /// Compare the newest tracked hash the RPC has reached with the RPC's, and on a mismatch take back
-    /// everything above the newest tracked block that still matches. Every tracked block lies above
-    /// the finalized head this store committed, so it was mutable when it was read, however far the
-    /// chain has finalized since; only a block under that committed head is a conflict, and that
-    /// stops the cursor.
+    /// Check the tracked hashes against the chain under `latest`, and take back everything above the
+    /// newest one that still matches. A tracked block the chain no longer reaches (the head fell under
+    /// it) cannot be shown to stand, so it counts as moved. Every tracked block lies above the
+    /// finalized head this store committed, so it was mutable when it was read, however far the chain
+    /// has finalized since; only a block under that committed head is a conflict, which stops the
+    /// cursor.
     async fn check_tracked(&self, state: &ModeState, latest: u64) -> Result<()> {
         let history = state.history.clone();
         let (tracked, committed) = {
@@ -694,24 +703,19 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                 .await??
         };
         let committed = committed.unwrap_or(0);
-        let Some(&(top, hash)) = tracked.iter().rev().find(|(b, _)| *b <= latest) else {
-            return Ok(());
-        };
-        let now = block_hash(&self.main, top).await;
-        state.set_calls("main", self.main.calls());
-        if now? == hash {
-            return Ok(());
-        }
+        let mut moved: Option<u64> = tracked.iter().map(|(b, _)| *b).find(|b| *b > latest);
         let mut base = committed;
-        let mut lowest_moved = top;
-        for &(b, h) in tracked.iter().rev().filter(|(b, _)| *b <= top) {
+        for &(b, h) in tracked.iter().rev().filter(|(b, _)| *b <= latest) {
             if block_hash(&self.main, b).await? == h {
                 base = b;
                 break;
             }
-            lowest_moved = b;
+            moved = Some(b);
         }
         state.set_calls("main", self.main.calls());
+        let Some(lowest_moved) = moved else {
+            return Ok(());
+        };
         if lowest_moved <= committed {
             let why = format!(
                 "block {lowest_moved}, under the finalized head {committed}, is now at another hash; \
@@ -757,27 +761,16 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                 bail!("produced blocks are served through the finalized block {head}, not {to}");
             }
         }
-        tokio::time::timeout_at(
-            deadline.into(),
-            self.cover_within(state, address, need, (from, to)),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(anyhow::anyhow!(
-                "not covered within the deadline; try again shortly"
-            ))
-        })
-    }
-
-    async fn cover_within(
-        &self,
-        state: &ModeState,
-        address: &str,
-        need: Need,
-        (from, to): (u64, u64),
-    ) -> Result<()> {
         use crate::address_discovery::{BLOCK_SCANNED, DISCOVERED};
         use crate::address_history::Action;
+        // The deadline is checked between windows, never by cancelling one: a window's write runs
+        // on a blocking thread a cancellation would orphan, and the cursor must stay the only writer.
+        let late = || {
+            if Instant::now() >= deadline {
+                bail!("not covered within the deadline; try again shortly");
+            }
+            Ok(())
+        };
         let latest = self.main.head().await?;
         state.latest.store(latest, Ordering::Relaxed);
         if to > latest {
@@ -790,6 +783,7 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
             if next > to {
                 break;
             }
+            late()?;
             let end = hole_end(history, address, &DISCOVERED, next, to)?
                 .min(next.saturating_add(COVER_WINDOW - 1));
             discover_window(self, state, address, (next, end)).await?;
@@ -808,6 +802,7 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
             if next > to {
                 break;
             }
+            late()?;
             if let Some((first, last)) = state.mirror.as_ref().map(|(_, b)| *b) {
                 if first <= next && next <= last {
                     bail!("blocks {first} to {last} are read from the mirror's partitions, which have not reached block {next} yet");
@@ -837,6 +832,7 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                 if next > to {
                     break;
                 }
+                late()?;
                 let end = hole_end(history, address, &[Action::ProducedBlocks], next, to)?;
                 crate::address_mev::produced_window(
                     self,
@@ -857,16 +853,15 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
     async fn trace_one(&self, state: &ModeState, hash: &str) -> Result<()> {
         let latest = self.main.head().await?;
         state.latest.store(latest, Ordering::Relaxed);
-        let generation = state.history.generation()?;
         self.check_tracked(state, latest).await?;
-        let pending = crate::address_discovery::Pending::default();
+        let pending = crate::address_discovery::Pending::begin(&state.history)?;
         self.internal_rows_of(&state.history, hash, &pending, latest)
             .await?;
-        // The trace endpoint names the block it traced; above the finalized head it must be the
-        // main endpoint's block, or the trace is of a fork.
-        check_anchor(self, Anchor::default(), &pending.anchors()).await?;
+        // The trace endpoint names the block it traced: it must be the main endpoint's, at any
+        // height, and so must the tracked block under it.
+        check_anchor(self, &state.history, None, &pending.named()).await?;
         let history = state.history.clone();
-        tokio::task::spawn_blocking(move || pending.persist(&history, generation)).await?
+        tokio::task::spawn_blocking(move || pending.persist(&history, true)).await?
     }
 }
 
@@ -901,6 +896,7 @@ async fn mirror_pass<M: Rpc, T: Rpc>(
     let mut ceiling: Option<u64> = None;
     let mut start = span_of(lo).0;
     while start <= hi {
+        serve_queued(state, d).await;
         let end = start + SPAN - 1;
         let clip = (start.max(lo), end.min(hi));
         let verified = |a: &String| {
@@ -985,6 +981,7 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
     let mut last: Option<u64> = None;
     let mut cursor = state.start_block;
     loop {
+        serve_queued(state, d).await;
         let mut next = Vec::new();
         for a in watched {
             match next_uncovered_for(&state.history, a, cursor, &BLOCK_SCANNED) {
@@ -1160,8 +1157,16 @@ async fn api(
         .and_then(|h| alloy_primitives::hex::decode(h).ok())
         .filter(|k| k.len() == 32);
     if let (true, Some(key), Some(hash)) = (traceable, key, q.get("txhash").cloned()) {
-        let known = blocking(&s, move |h| Ok(h.tx_internals(&key)?.is_some())).await;
-        if matches!(known, Ok(false)) {
+        // A trace not kept yet is traced; one kept from above the finalized head is checked against
+        // the chain first, since a reorg since the last poll may have taken its block.
+        let fresh = blocking(&s, move |h| {
+            Ok(match h.tx_internals_block(&key)? {
+                None => true,
+                Some(b) => h.head()?.is_none_or(|f| b > f),
+            })
+        })
+        .await;
+        if matches!(fresh, Ok(true)) {
             if let Err(e) = s
                 .ask(|deadline, reply| Request::Trace {
                     hash,
@@ -1280,7 +1285,25 @@ async fn block_by_time(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value
         .and_then(|t| t.parse::<u64>().ok())
         .expect("respond validated the timestamp");
     let after = q.get("closest").map(String::as_str) == Some("after");
-    match tokio::time::timeout(s.deadline, search_by_time(&forward, t, after)).await {
+    let committed = s.history.head().ok().flatten();
+    let search = async {
+        match search_by_time(&forward, t, after).await? {
+            Ok((b, proof)) => {
+                // Above the finalized head an answer read from one node may be on a fork another
+                // node has left: each block that proves it must be canonical where it is asked.
+                for (n, hash) in proof {
+                    if committed.is_none_or(|c| n > c) && !canonical(&forward, &hash).await? {
+                        return Ok(Err(format!(
+                            "block {n} is not canonical; the chain moved during the search, ask again"
+                        )));
+                    }
+                }
+                Ok(Ok(b))
+            }
+            Err(why) => Ok::<_, anyhow::Error>(Err(why)),
+        }
+    };
+    match tokio::time::timeout(s.deadline, search).await {
         Ok(Ok(Ok(b))) => crate::address_history::ok(
             Value::String(b.to_string()),
             s.history.generation().unwrap_or(0),
@@ -1322,11 +1345,24 @@ async fn header(forward: &crate::address_proxy::Forward, at: Value) -> Result<He
 /// with timestamp >= `t`. The answer is proven against its neighbour, linked by parent hash, so a
 /// search that straddled a reorg is refused rather than answered. The inner `Err` says why it was
 /// refused. Only on a chain whose timestamps rise strictly from block to block.
+/// Whether the block with `hash` is canonical, by EIP-1898's `requireCanonical`.
+async fn canonical(forward: &crate::address_proxy::Forward, hash: &str) -> Result<bool> {
+    let asked = forward(
+        "eth_getBalance".into(),
+        json!(["0x0000000000000000000000000000000000000000", {"blockHash": hash, "requireCanonical": true}]),
+    )
+    .await;
+    Ok(asked.is_ok())
+}
+
+/// The answer and the blocks that prove it, by number and hash.
+type Found = (u64, Vec<(u64, String)>);
+
 async fn search_by_time(
     forward: &crate::address_proxy::Forward,
     t: u64,
     after: bool,
-) -> Result<std::result::Result<u64, String>> {
+) -> Result<std::result::Result<Found, String>> {
     let at = |n: u64| json!(format!("0x{n:x}"));
     let latest = header(forward, json!("latest")).await?;
     if t > latest.ts {
@@ -1338,7 +1374,7 @@ async fn search_by_time(
     let genesis = header(forward, at(0)).await?;
     if t < genesis.ts {
         return Ok(if after {
-            Ok(0)
+            Ok((0, vec![(0, genesis.hash)]))
         } else {
             Err(format!("timestamp {t} is before the first block"))
         });
@@ -1362,10 +1398,12 @@ async fn search_by_time(
         }
     }
     let b = header(forward, at(lo)).await?;
+    let mut proof = vec![(lo, b.hash.clone())];
     let proven = if after {
         b.ts >= t
             && (lo == 0 || {
                 let prev = header(forward, at(lo - 1)).await?;
+                proof.push((lo - 1, prev.hash.clone()));
                 prev.ts < t && b.parent == prev.hash
             })
     } else {
@@ -1375,13 +1413,14 @@ async fn search_by_time(
                 b.ts == t
             } else {
                 let next = header(forward, at(lo + 1)).await?;
+                proof.push((lo + 1, next.hash.clone()));
                 next.ts > t && next.parent == b.hash
             }
     };
     if !proven {
         bail!("the chain moved during the search; ask again");
     }
-    Ok(Ok(lo))
+    Ok(Ok((lo, proof)))
 }
 
 #[derive(serde::Deserialize)]
@@ -2521,14 +2560,72 @@ mod tests {
         Arc::new(ModeState::new(history, 1, Duration::from_secs(300), true).with_range(0, None, 20))
     }
 
+    /// [`cover_from`] as the cursor's windows run it: anchored, and refused if the check after the
+    /// fetch finds the chain moved.
+    async fn fetch_from<M: Rpc, T: Rpc>(
+        d: &Discoverer<Counted<M>, Counted<T>>,
+        chain: &Chain,
+        h: &AddressHistory,
+        from: u64,
+        to: u64,
+        reorg_during: Option<u64>,
+    ) {
+        if to < from {
+            return;
+        }
+        let anchor = anchor_for(d, h, to).await.unwrap();
+        let rows_chain_hashes: Vec<[u8; 32]> = (0..=to).map(|b| chain.hash(b)).collect();
+        if let Some(depth) = reorg_during {
+            chain.reorg(depth);
+        }
+        if check_anchor(d, h, anchor, &[]).await.is_err() {
+            return;
+        }
+        use crate::address_history::{Action, Row};
+        let rows: Vec<Row> = (from..=to)
+            .filter(|b| rows_chain_hashes[*b as usize][0].is_multiple_of(3))
+            .map(|b| {
+                let mut record = serde_json::Map::new();
+                record.insert("blockNumber".into(), json!(b.to_string()));
+                record.insert(
+                    "hash".into(),
+                    json!(format!(
+                        "0x{}",
+                        alloy_primitives::hex::encode(rows_chain_hashes[b as usize])
+                    )),
+                );
+                Row {
+                    block: b,
+                    tx_index: 0,
+                    position: 0,
+                    record,
+                }
+            })
+            .collect();
+        let g = h.generation().unwrap();
+        for action in crate::address_discovery::DISCOVERED {
+            let rows = if action == Action::TxList {
+                rows.clone()
+            } else {
+                Vec::new()
+            };
+            if h.record_anchored(action, ALICE, &rows, (from, to), g, anchor)
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
     proptest::proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
-        /// Random reorgs of random depth above the finalized head, polls, finality moving and
-        /// windows read at the tip in any order: after the last poll, every covered block holds
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(96))]
+        /// Random reorgs of random depth above the chain's finalized tag, finality moving, windows read
+        /// at the tip, reorgs landing between a window's fetch and its check, and polls, in any order
+        /// and without a poll after every change: after the last poll, every covered block holds
         /// exactly the rows the canonical chain has (CLAUDE.md's reorg property).
         #[test]
         fn reorgs_of_any_depth_converge_to_the_canonical_chain(
-            ops in proptest::collection::vec((0u8..4, 1u64..10), 1..40)
+            ops in proptest::collection::vec((0u8..5, 1u64..10), 1..48)
         ) {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             rt.block_on(async {
@@ -2537,27 +2634,26 @@ mod tests {
                 let chain = Chain::new(60, 30);
                 let d = chain.discoverer();
                 d.reconcile(&s, chain.latest()).await.unwrap();
+                let tail = |chain: &Chain| chain.latest() - chain.finalized.load(Ordering::Relaxed);
                 for (op, n) in ops {
+                    let next = crate::address_discovery::next_uncovered_for(
+                        &s.history, ALICE, 0, &[crate::address_history::Action::TxList],
+                    ).unwrap();
                     match op {
-                        // A reorg never reaches the finalized tag, which trails the head by 20.
-                        0 => chain.reorg(n.min(chain.latest() - chain.finalized.load(Ordering::Relaxed))),
+                        // A reorg never reaches the chain's finalized tag, which trails the head by 20.
+                        0 => chain.reorg(n.min(tail(&chain))),
                         1 => {
                             chain.grow(n);
                             chain.finalized.store(chain.latest() - 20, Ordering::Relaxed);
                         }
-                        2 => {
-                            let from = crate::address_discovery::next_uncovered_for(
-                                &s.history, ALICE, 0, &[crate::address_history::Action::TxList],
-                            ).unwrap();
-                            cover_from(&chain, &s.history, from, chain.latest());
+                        2 => fetch_from(&d, &chain, &s.history, next, chain.latest(), None).await,
+                        3 => {
+                            let depth = n.min(tail(&chain));
+                            fetch_from(&d, &chain, &s.history, next, chain.latest(), Some(depth)).await
                         }
                         _ => {
                             d.reconcile(&s, chain.latest()).await.unwrap();
                         }
-                    }
-                    // A poll follows every change to the chain, as the cursor's interval would.
-                    if op < 2 {
-                        d.reconcile(&s, chain.latest()).await.unwrap();
                     }
                 }
                 d.reconcile(&s, chain.latest()).await.unwrap();
@@ -2567,6 +2663,32 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    /// A chain whose head fell under the newest tracked block (a reorg to a shorter fork) cannot show
+    /// that block still stands, so what was read above the newest one it can show is taken back.
+    #[tokio::test]
+    async fn a_head_fallen_under_the_newest_anchor_takes_back_what_it_cannot_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        let chain = Chain::new(121, 100);
+        let d = chain.discoverer();
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        cover_from(&chain, &s.history, 0, 110);
+        cover_from(&chain, &s.history, 111, 120);
+        // A shorter fork from 105: the chain now ends at 115.
+        let keep = 105;
+        chain.hashes.lock().unwrap().truncate(keep);
+        chain.grow(11);
+        assert_eq!(chain.latest(), 115);
+        d.check_tracked(&s, chain.latest()).await.unwrap();
+        assert_eq!(
+            s.history
+                .coverage(crate::address_history::Action::TxList, ALICE)
+                .unwrap(),
+            vec![(0, 100)],
+            "110 moved and 120 is out of reach, so everything above the finalized head goes"
+        );
     }
 
     /// A read reaching above the finalized head is checked against the chain before it is served: a
@@ -2632,7 +2754,7 @@ mod tests {
         // store holds.
         chain.reorg(8);
         let anchor = anchor_for(&d, &s.history, 111).await.unwrap();
-        let err = check_anchor(&d, anchor, &[]).await.unwrap_err();
+        let err = check_anchor(&d, &s.history, anchor, &[]).await.unwrap_err();
         assert!(err.to_string().contains("block 110"), "{err:#}");
     }
 
@@ -2768,6 +2890,51 @@ mod tests {
         })
     }
 
+    /// An answer above the finalized head is proven canonical where it is asked (EIP-1898), so a
+    /// node still on a fork cannot hand rotki a boundary on it.
+    #[tokio::test]
+    async fn a_timestamp_answer_above_finality_must_be_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.finalize(40).unwrap();
+        let on_fork = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fork = on_fork.clone();
+        let inner = timed(100, None);
+        let forward: crate::address_proxy::Forward = Arc::new(move |m: String, p: Value| {
+            let (inner, fork) = (inner.clone(), fork.clone());
+            Box::pin(async move {
+                if m == "eth_getBalance" {
+                    if fork.load(Ordering::Relaxed) {
+                        bail!("hash is not currently canonical");
+                    }
+                    return Ok(json!("0x0"));
+                }
+                inner(m, p).await
+            })
+        });
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true).with_forward(forward),
+        );
+        let q = |t: u64| {
+            format!("/api?module=block&action=getblocknobytime&timestamp={t}&closest=before")
+        };
+        let (_, a) = call(router(s.clone()), "GET", &q(1000 + 12 * 50 + 5), None).await;
+        assert_eq!(a["result"], "50", "{a}");
+        on_fork.store(true, Ordering::Relaxed);
+        let (_, a) = call(router(s.clone()), "GET", &q(1000 + 12 * 50 + 5), None).await;
+        assert!(
+            a["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_INCOMPLETE:"),
+            "{a}"
+        );
+        // Under the finalized head the answer needs no such proof.
+        let (_, a) = call(router(s.clone()), "GET", &q(1000 + 12 * 20 + 5), None).await;
+        assert_eq!(a["result"], "20", "{a}");
+    }
+
     #[tokio::test]
     async fn the_timestamp_search_is_exact_at_its_edges_and_refuses_what_it_cannot_prove() {
         let f = timed(100, None);
@@ -2783,7 +2950,7 @@ mod tests {
             (at(100), true, Ok(100)),
         ] {
             assert_eq!(
-                search_by_time(&f, t, after).await.unwrap(),
+                search_by_time(&f, t, after).await.unwrap().map(|(b, _)| b),
                 want,
                 "t={t} after={after}"
             );

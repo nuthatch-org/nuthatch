@@ -448,6 +448,18 @@ impl AddressHistory {
         Ok(Some(rows))
     }
 
+    /// The block a cached trace was read from.
+    pub fn tx_internals_block(&self, hash: &[u8]) -> Result<Option<u64>> {
+        let rtx = self.store.database().begin_read()?;
+        let Some(v) = rtx.open_table(TX_INTERNAL)?.get(hash)? else {
+            return Ok(None);
+        };
+        Ok(decode_record(v.value())?
+            .get("blockNumber")
+            .and_then(Value::as_str)
+            .and_then(|b| b.parse().ok()))
+    }
+
     /// Keep each trace whose block is still served; a reorg that lowered the head while the trace
     /// was in flight leaves it out.
     pub fn cache_tx_internals(&self, txs: &[TxInternals]) -> Result<()> {
@@ -476,9 +488,11 @@ impl AddressHistory {
     }
 
     /// What a fetch read, in one transaction: transactions, timestamps, traces and the block hashes
-    /// they were read against. Anything above the finalized head is dropped when the generation
-    /// moved since `generation`: a reorg handled meanwhile may have replaced the block it came from,
-    /// even if the new chain has since grown back past it.
+    /// they were read against. What lay under the finalized head when the fetch began is kept; what
+    /// lay above it only if the fetch is `trusted` and the generation has not moved since: a reorg
+    /// handled meanwhile may have replaced its block, even if the new chain has since grown, or
+    /// finalized, back past it.
+    #[allow(clippy::too_many_arguments)]
     pub fn persist_pending(
         &self,
         txs: &[(Vec<u8>, Map<String, Value>)],
@@ -486,6 +500,8 @@ impl AddressHistory {
         internals: &[TxInternals],
         anchors: &[(u64, [u8; 32])],
         generation: u64,
+        finalized_at_start: Option<u64>,
+        trusted: bool,
     ) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
         {
@@ -495,7 +511,8 @@ impl AddressHistory {
                 let now = m.get(GENERATION)?.map_or(0, |v| v.value());
                 (head, now)
             };
-            let keep = |block: u64| now == generation || head.is_some_and(|h| block <= h);
+            let current = trusted && now == generation;
+            let keep = |block: u64| current || finalized_at_start.is_some_and(|h| block <= h);
             let mut buf = Vec::new();
             {
                 let mut t = wtx.open_table(TX_CACHE)?;
@@ -541,7 +558,7 @@ impl AddressHistory {
                     t.insert(hash.as_slice(), buf.as_slice())?;
                 }
             }
-            if now == generation {
+            if current {
                 let mut c = wtx.open_table(CANON)?;
                 for (block, hash) in anchors {
                     if head.is_none_or(|h| *block > h) {
@@ -1091,6 +1108,60 @@ impl AddressHistory {
                     None => now,
                 };
                 p.insert(b, encode_asked(first, now).as_slice())?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// A re-ask's outcome, in one transaction: the relays' answer cached (the block is finalized),
+    /// each address's changed rows at the block replaced, and the block kept on the schedule or taken
+    /// off it. Refused if the generation moved since the re-ask began.
+    pub fn apply_reask(
+        &self,
+        block: u64,
+        record: &Map<String, Value>,
+        changes: &[(String, Vec<Row>)],
+        keep_asking: bool,
+        now: u64,
+        generation: u64,
+    ) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let current = wtx
+                .open_table(META)?
+                .get(GENERATION)?
+                .map_or(0, |v| v.value());
+            if current != generation {
+                bail!("address history changed during the re-ask (generation {generation} -> {current}); ask again");
+            }
+            let mut buf = Vec::new();
+            encode_record(record, &mut buf)?;
+            wtx.open_table(RELAY_CACHE)?.insert(block, buf.as_slice())?;
+            for (address, rows) in changes {
+                let a = parse_address(address)?;
+                if let Some(r) = rows.iter().find(|r| r.block != block) {
+                    bail!("a row at block {} is not at block {block}", r.block);
+                }
+                drain(
+                    &mut wtx.open_table(Action::ProducedBlocks.table())?,
+                    &row_key(&a, block, 0, 0),
+                    &row_key(&a, block, u64::MAX, u64::MAX),
+                )?;
+                put_rows(&wtx, Action::ProducedBlocks, &a, rows)?;
+            }
+            if !changes.is_empty() {
+                bump_generation(&wtx)?;
+            }
+            let mut p = wtx.open_table(MEV_PENDING)?;
+            if keep_asking {
+                let first = match p.get(block)? {
+                    Some(v) => decode_asked(v.value())?.0,
+                    None => now,
+                };
+                p.insert(block, encode_asked(first, now).as_slice())?;
+            } else {
+                p.remove(block)?;
             }
         }
         wtx.commit()?;
@@ -2735,6 +2806,8 @@ mod tests {
             &[(vec![7; 32], 160, vec![])],
             &[(160, [1; 32])],
             g,
+            Some(100),
+            true,
         )
         .unwrap();
         assert!(h.cached_tx(&[90; 32]).unwrap().is_some());
@@ -2746,8 +2819,29 @@ mod tests {
 
         // The same fetch under the current generation keeps all of it.
         let g = h.generation().unwrap();
-        h.persist_pending(&[tx(160)], &[(160, 2)], &[], &[(160, [1; 32])], g)
-            .unwrap();
+        // A fetch whose check after it failed keeps only what was finalized when it began.
+        h.persist_pending(
+            &[tx(160)],
+            &[(160, 2)],
+            &[],
+            &[(160, [1; 32])],
+            g,
+            Some(100),
+            false,
+        )
+        .unwrap();
+        assert!(h.cached_tx(&[160; 32]).unwrap().is_none());
+        assert!(h.tracked().unwrap().is_empty());
+        h.persist_pending(
+            &[tx(160)],
+            &[(160, 2)],
+            &[],
+            &[(160, [1; 32])],
+            g,
+            Some(100),
+            true,
+        )
+        .unwrap();
         assert!(h.cached_tx(&[160; 32]).unwrap().is_some());
         assert_eq!(h.tracked().unwrap(), vec![(160, [1; 32])]);
         // A record anchored at a hash other than the tracked one is refused.
@@ -2762,11 +2856,20 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("changed hash"), "{err:#}");
+        // Stale data does not become acceptable because the replacement chain has since finalized
+        // past its block: what matters is the head when the fetch began.
+        let g_old = h.generation().unwrap();
+        h.invalidate_above(150).unwrap();
+        h.finalize(200).unwrap();
+        h.persist_pending(&[tx(155)], &[(155, 9)], &[], &[], g_old, Some(150), true)
+            .unwrap();
+        assert!(h.cached_tx(&[155; 32]).unwrap().is_none());
+        assert_eq!(h.block_timestamp(155).unwrap(), None);
         // Finalizing past a tracked block stops tracking it, and never lowers the head.
         h.finalize(170).unwrap();
         h.finalize(120).unwrap();
         assert!(h.tracked().unwrap().is_empty());
-        assert_eq!(h.head().unwrap(), Some(170));
+        assert_eq!(h.head().unwrap(), Some(200));
     }
 
     #[test]
@@ -2804,7 +2907,10 @@ mod tests {
         h.mark_covered(Action::TxList, ALICE, 0, 100).unwrap();
         let mut r = req(0, 0, 2, 1);
         r.end_block = None;
-        assert!(matches!(h.page(Action::TxList, &r).unwrap(), Answer::Incomplete(_)));
+        assert!(matches!(
+            h.page(Action::TxList, &r).unwrap(),
+            Answer::Incomplete(_)
+        ));
         r.end_block = Some(100);
         assert_eq!(h.page(Action::TxList, &r).unwrap(), Answer::Rows(vec![]));
     }
@@ -2815,11 +2921,20 @@ mod tests {
     fn produced_coverage_and_its_reasks_commit_together() {
         let (_d, h) = history();
         let g = h.generation().unwrap();
-        h.record_produced(ALICE, &[], (100, 199), g, &[150, 160], 7).unwrap();
-        assert_eq!(h.coverage(Action::ProducedBlocks, ALICE).unwrap(), vec![(100, 199)]);
+        h.record_produced(ALICE, &[], (100, 199), g, &[150, 160], 7)
+            .unwrap();
+        assert_eq!(
+            h.coverage(Action::ProducedBlocks, ALICE).unwrap(),
+            vec![(100, 199)]
+        );
         assert_eq!(h.mev_pending().unwrap(), vec![(150, 7, 7), (160, 7, 7)]);
-        assert!(h.record_produced(ALICE, &[], (200, 299), g + 1, &[250], 8).is_err());
-        assert_eq!(h.coverage(Action::ProducedBlocks, ALICE).unwrap(), vec![(100, 199)]);
+        assert!(h
+            .record_produced(ALICE, &[], (200, 299), g + 1, &[250], 8)
+            .is_err());
+        assert_eq!(
+            h.coverage(Action::ProducedBlocks, ALICE).unwrap(),
+            vec![(100, 199)]
+        );
         assert_eq!(h.mev_pending().unwrap().len(), 2);
     }
 
@@ -2834,22 +2949,41 @@ mod tests {
             let mut r = tx(150, 0);
             r.record.insert("mev".into(), Value::String("none".into()));
             h.insert(Action::ProducedBlocks, ALICE, &[r]).unwrap();
-            h.mark_covered(Action::ProducedBlocks, ALICE, 100, 199).unwrap();
+            h.mark_covered(Action::ProducedBlocks, ALICE, 100, 199)
+                .unwrap();
             h.mark_covered(Action::TxList, ALICE, 100, 199).unwrap();
             // As 5.1 left it: no contract recorded.
             let wtx = h.store.database().begin_write().unwrap();
-            wtx.open_table(META).unwrap().remove(PRODUCED_CONTRACT).unwrap();
+            wtx.open_table(META)
+                .unwrap()
+                .remove(PRODUCED_CONTRACT)
+                .unwrap();
             wtx.commit().unwrap();
         }
         let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
-        assert!(h.coverage(Action::ProducedBlocks, ALICE).unwrap().is_empty());
-        assert!(h.rows_in(Action::ProducedBlocks, ALICE, (0, 1_000)).unwrap().is_empty());
-        assert_eq!(h.coverage(Action::TxList, ALICE).unwrap(), vec![(100, 199)], "others untouched");
+        assert!(h
+            .coverage(Action::ProducedBlocks, ALICE)
+            .unwrap()
+            .is_empty());
+        assert!(h
+            .rows_in(Action::ProducedBlocks, ALICE, (0, 1_000))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            h.coverage(Action::TxList, ALICE).unwrap(),
+            vec![(100, 199)],
+            "others untouched"
+        );
         let g = h.generation().unwrap();
-        h.mark_covered(Action::ProducedBlocks, ALICE, 100, 199).unwrap();
+        h.mark_covered(Action::ProducedBlocks, ALICE, 100, 199)
+            .unwrap();
         drop(h);
         let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
-        assert_eq!(h.coverage(Action::ProducedBlocks, ALICE).unwrap(), vec![(100, 199)], "only once");
+        assert_eq!(
+            h.coverage(Action::ProducedBlocks, ALICE).unwrap(),
+            vec![(100, 199)],
+            "only once"
+        );
         assert_eq!(h.generation().unwrap(), g);
     }
 

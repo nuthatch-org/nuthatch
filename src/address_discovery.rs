@@ -465,11 +465,31 @@ pub struct Pending {
     timestamps: Mutex<Vec<(u64, u64)>>,
     /// A transaction's whole internal list, by hash, for `txhash` lookups.
     internals: Mutex<Vec<crate::address_history::TxInternals>>,
-    /// Block hashes above the finalized head that what was fetched was read against.
+    /// Block hashes above the finalized head that what was fetched was read against, tracked once
+    /// the fetch is recorded.
     anchors: Mutex<Vec<(u64, [u8; 32])>>,
+    /// Block hashes another provider named (a trace's block), at any height, which the main
+    /// endpoint must agree with before anything is kept.
+    named: Mutex<Vec<(u64, [u8; 32])>>,
+    /// The generation and finalized head the fetch began under.
+    generation: u64,
+    finalized: Option<u64>,
 }
 
 impl Pending {
+    /// A fetch beginning now, against `history` as it stands.
+    pub fn begin(history: &AddressHistory) -> Result<Pending> {
+        Ok(Pending {
+            generation: history.generation()?,
+            finalized: history.head()?,
+            ..Pending::default()
+        })
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn anchor(&self, block: u64, hash: [u8; 32]) {
         self.anchors
             .lock()
@@ -481,14 +501,21 @@ impl Pending {
         self.anchors.lock().expect("pending lock").clone()
     }
 
-    /// Commit what was fetched, as of `generation`. Blocking: call it off the async workers.
-    pub fn persist(self, history: &AddressHistory, generation: u64) -> Result<()> {
+    pub fn named(&self) -> Vec<(u64, [u8; 32])> {
+        self.named.lock().expect("pending lock").clone()
+    }
+
+    /// Commit what was fetched. With `trusted` false (a check after the fetch failed) only what lay
+    /// under the finalized head when the fetch began is kept. Blocking: call it off the async workers.
+    pub fn persist(self, history: &AddressHistory, trusted: bool) -> Result<()> {
         history.persist_pending(
             &self.txs.into_inner().expect("pending lock"),
             &self.timestamps.into_inner().expect("pending lock"),
             &self.internals.into_inner().expect("pending lock"),
             &self.anchors.into_inner().expect("pending lock"),
-            generation,
+            self.generation,
+            self.finalized,
+            trusted,
         )
     }
 }
@@ -679,8 +706,16 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 if block > limit {
                     return Err(anyhow!(NotFinalized(block)));
                 }
+                // The trace endpoint names the block it traced; the main endpoint must agree, at any
+                // height, and above the finalized head the hash is tracked too.
+                let named = word32(str_field(root, "blockHash")?)?;
+                pending
+                    .named
+                    .lock()
+                    .expect("pending lock")
+                    .push((block, named));
                 if history.head()?.is_none_or(|h| block > h) {
-                    pending.anchor(block, word32(str_field(root, "blockHash")?)?);
+                    pending.anchor(block, named);
                 }
                 let ts = self.block_timestamp(history, block, pending).await?;
                 let records = internal_records(frames, ts)?;
@@ -2162,10 +2197,9 @@ mod tests {
             from: u64,
             to: u64,
         ) -> Result<Found> {
-            let generation = history.generation()?;
-            let pending = Pending::default();
+            let pending = Pending::begin(history)?;
             let found = self.discover(history, address, from, to, &pending).await;
-            pending.persist(history, generation)?;
+            pending.persist(history, true)?;
             found
         }
     }
@@ -3002,12 +3036,11 @@ mod tests {
         assert!(h.tx_internals(&key).unwrap().is_none());
 
         // A trace fetched before a reorg and persisted after it is not kept.
-        h.set_head(400).unwrap();
-        let generation = h.generation().unwrap();
-        let pending = Pending::default();
+        h.set_head(299).unwrap();
+        let pending = Pending::begin(&h).unwrap();
         d.internal_rows_of(&h, tx, &pending, 400).await.unwrap();
         h.invalidate_above(299).unwrap();
-        pending.persist(&h, generation).unwrap();
+        pending.persist(&h, true).unwrap();
         assert!(h.tx_internals(&key).unwrap().is_none());
     }
 
@@ -3180,6 +3213,7 @@ mod tests {
         );
         *canonical.lock().unwrap() = block_hash.clone();
         let first = get(path("")).await;
+        let kept_first = first.clone();
         assert_eq!(first["result"][0]["value"], "9", "{first}");
         assert_eq!(
             h.tracked().unwrap(),
@@ -3194,6 +3228,33 @@ mod tests {
             calls,
             "the second lookup is answered from the store"
         );
+
+        // A reorg since the last poll takes block 300: the kept trace is checked before it is
+        // served, taken back, and the fork the trace endpoint still serves is refused.
+        *canonical.lock().unwrap() = format!("0x{}", "ef".repeat(32));
+        let after = get(path("")).await;
+        assert!(
+            after["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_INCOMPLETE:"),
+            "{after}"
+        );
+        assert!(h.tx_internals(&key).unwrap().is_none());
+        assert_ne!(after, kept_first);
+
+        // Under the finalized head a trace naming a block the main endpoint does not have is
+        // refused too: finality says which history stands, not that another provider returned it.
+        h.finalize(400).unwrap();
+        let finalized = get(path("")).await;
+        assert!(
+            finalized["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_INCOMPLETE:"),
+            "{finalized}"
+        );
+        assert!(h.tx_internals(&key).unwrap().is_none());
         cursor.abort();
     }
 
@@ -3288,7 +3349,7 @@ mod tests {
         let mut stale = Map::new();
         stale.insert("blockNumber".into(), json!("149"));
         stale.insert("hash".into(), json!(format!("0x{}", "aa".repeat(32))));
-        h.persist_pending(&[(key.clone(), stale)], &[], &[], &[], 0)
+        h.persist_pending(&[(key.clone(), stale)], &[], &[], &[], 0, None, true)
             .unwrap();
         let pending = Pending::default();
         let r = TxRef {
