@@ -83,13 +83,15 @@ pub trait Rpc: Send + Sync + 'static {
         async move { Ok(vec![self.call(method, params).await?]) }
     }
 
-    /// [`Rpc::call_each`], keeping each endpoint's outcome rather than failing on the first error.
-    fn call_every(
+    /// [`Rpc::call_each`], handing each endpoint's outcome to `seen` as it arrives rather than
+    /// failing on the first error.
+    fn visit_each(
         &self,
         method: &str,
         params: Value,
-    ) -> impl Future<Output = Vec<Result<Value>>> + Send {
-        async move { vec![self.call(method, params).await] }
+        seen: &mut (dyn FnMut(Result<Value>) + Send),
+    ) -> impl Future<Output = ()> + Send {
+        async move { seen(self.call(method, params).await) }
     }
 }
 
@@ -110,8 +112,13 @@ impl Rpc for crate::rpc::RpcClient {
         crate::rpc::RpcClient::call_each(self, method, params).await
     }
 
-    async fn call_every(&self, method: &str, params: Value) -> Vec<Result<Value>> {
-        crate::rpc::RpcClient::call_every(self, method, params).await
+    async fn visit_each(
+        &self,
+        method: &str,
+        params: Value,
+        seen: &mut (dyn FnMut(Result<Value>) + Send),
+    ) {
+        crate::rpc::RpcClient::visit_each(self, method, params, seen).await
     }
 }
 
@@ -162,15 +169,22 @@ impl<R: Rpc> Rpc for Counted<R> {
         answers
     }
 
-    async fn call_every(&self, method: &str, params: Value) -> Vec<Result<Value>> {
-        let answers = self.inner.call_every(method, params).await;
-        *self
-            .calls
-            .lock()
-            .expect("calls lock")
-            .entry(method.to_string())
-            .or_default() += answers.len() as u64;
-        answers
+    async fn visit_each(
+        &self,
+        method: &str,
+        params: Value,
+        seen: &mut (dyn FnMut(Result<Value>) + Send),
+    ) {
+        let calls = &self.calls;
+        let mut counted = |a: Result<Value>| {
+            *calls
+                .lock()
+                .expect("calls lock")
+                .entry(method.to_string())
+                .or_default() += 1;
+            seen(a);
+        };
+        self.inner.visit_each(method, params, &mut counted).await
     }
 }
 

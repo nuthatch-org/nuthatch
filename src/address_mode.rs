@@ -481,24 +481,32 @@ pub async fn hold_final(main: &impl Rpc, history: &AddressHistory) -> Result<()>
         return Ok(());
     };
     let params = json!([format!("0x{block:x}"), false]);
+    let why = final_conflict(block);
     for _ in 0..2 {
-        let answers = main
-            .call_every("eth_getBlockByNumber", params.clone())
+        let (mut conflict, mut missing) = (None, false);
+        // Each answer is judged as it arrives: a mismatch one endpoint confirmed is the conflict,
+        // recorded before the next endpoint is awaited, so neither its failure nor a deadline that
+        // ends the wait can lose it.
+        let mut judge = |a: Result<Value>| {
+            let seen = a.ok().and_then(|b| {
+                let h = b.get("hash")?.as_str()?.to_string();
+                crate::address_discovery::word32(&h).ok()
+            });
+            match seen {
+                Some(h) if h != hash && conflict.is_none() => {
+                    conflict = Some(history.set_conflict(&why));
+                }
+                Some(_) => {}
+                None => missing = true,
+            }
+        };
+        main.visit_each("eth_getBlockByNumber", params.clone(), &mut judge)
             .await;
-        let seen: Vec<Option<[u8; 32]>> = answers
-            .iter()
-            .map(|a| {
-                let h = a.as_ref().ok()?.get("hash")?.as_str()?;
-                crate::address_discovery::word32(h).ok()
-            })
-            .collect();
-        // A mismatch one endpoint confirmed is the conflict, whatever the others managed.
-        if seen.iter().flatten().any(|h| *h != hash) {
-            let why = final_conflict(block);
-            history.set_conflict(&why)?;
+        if let Some(recorded) = conflict {
+            recorded?;
             bail!(why);
         }
-        if seen.contains(&None) {
+        if missing {
             bail!("block {block} could not be read from every main endpoint");
         }
     }
@@ -3536,24 +3544,48 @@ mod tests {
             async fn call(&self, _: &str, _: Value) -> Result<Value> {
                 Ok(json!({"hash": format!("0x{}", "11".repeat(32))}))
             }
-            async fn call_every(&self, m: &str, p: Value) -> Vec<Result<Value>> {
-                let other = Ok(json!({"hash": format!("0x{}", "22".repeat(32))}));
+            async fn visit_each(
+                &self,
+                m: &str,
+                p: Value,
+                seen: &mut (dyn FnMut(Result<Value>) + Send),
+            ) {
+                let other = || Ok(json!({"hash": format!("0x{}", "22".repeat(32))}));
                 match self.0 {
-                    0 => vec![self.call(m, p).await, other],
-                    1 => vec![other, Err(anyhow::anyhow!("timed out"))],
-                    _ => vec![Ok(Value::Null), other],
+                    0 => {
+                        seen(self.call(m, p).await);
+                        seen(other());
+                    }
+                    1 => {
+                        seen(other());
+                        seen(Err(anyhow::anyhow!("timed out")));
+                    }
+                    2 => {
+                        seen(Ok(Value::Null));
+                        seen(other());
+                    }
+                    // The mismatch, then an endpoint that does not answer before the deadline.
+                    _ => {
+                        seen(other());
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    }
                 }
             }
         }
-        for case in 0..3 {
+        for case in 0..4 {
             let dir = tempfile::tempdir().unwrap();
             let s = reorg_state(dir.path());
             s.history.finalize_at(90, [0x11; 32]).unwrap();
-            let err = hold_final(&Pool(case), &s.history).await.unwrap_err();
-            assert!(
-                err.to_string().contains("finalized block 90"),
-                "{case}: {err:#}"
-            );
+            let deadline = Some(Instant::now() + Duration::from_millis(200));
+            let err = within(deadline, hold_final(&Pool(case), &s.history))
+                .await
+                .unwrap_err();
+            let want = if case == 3 {
+                "deadline"
+            } else {
+                "finalized block 90"
+            };
+            assert!(err.to_string().contains(want), "{case}: {err:#}");
             drop(s);
             let again = reorg_state(dir.path());
             assert!(

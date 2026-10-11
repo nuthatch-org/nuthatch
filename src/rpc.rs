@@ -1382,18 +1382,21 @@ impl RpcClient {
         Ok(answers)
     }
 
-    /// [`Self::call_each`], keeping each endpoint's outcome, so one endpoint's answer is not lost to
-    /// another's failure.
-    pub(crate) async fn call_every(&self, method: &str, params: Value) -> Vec<Result<Value>> {
-        let mut answers = Vec::with_capacity(self.urls.len());
+    /// [`Self::call_each`], handing each endpoint's outcome to `seen` as it arrives, so one answer is
+    /// acted on before the next endpoint is awaited, and is not lost to its failure or a timeout.
+    pub(crate) async fn visit_each(
+        &self,
+        method: &str,
+        params: Value,
+        seen: &mut (dyn FnMut(Result<Value>) + Send),
+    ) {
         for url in &self.urls {
-            answers.push(
+            seen(
                 self.call_one(url, method, &params, None)
                     .await
                     .with_context(|| format!("{method} at {}", redact_url(url))),
             );
         }
-        answers
     }
 
     pub async fn block_number(&self) -> Result<u64> {
