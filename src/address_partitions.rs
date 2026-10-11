@@ -711,9 +711,11 @@ pub async fn run(args: &crate::cli::PartitionsArgs) -> Result<()> {
     rpc.inner().verify_chain_ids(args.chain_id).await?;
     let started = std::time::Instant::now();
     if args.proposers {
-        let beacon = crate::address_proposers::Beacon::new(
+        // A publisher waits out a refusing beacon; no request is waiting on it.
+        let beacon = crate::address_proposers::Beacon::with_patience(
             args.beacon_url.clone(),
             args.beacon_cache.clone(),
+            std::time::Duration::from_secs(120),
         )?;
         let built = crate::address_proposers::build(
             &rpc,

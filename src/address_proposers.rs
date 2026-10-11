@@ -421,7 +421,13 @@ pub struct Beacon {
     client: reqwest::Client,
     cache: Option<PathBuf>,
     loaded: std::sync::Mutex<BTreeMap<u64, Option<BTreeMap<u64, ProposerRow>>>>,
+    /// How long one header may take, retries included: a nest's cursor waits on it, so a refusing
+    /// beacon fails the chunk quickly and the next poll tries again.
+    patience: std::time::Duration,
 }
+
+/// A nest's patience with the beacon for one header.
+pub const NEST_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Slots per file of the local header cache, `slots-<first>.jsonl.gz`.
 const CACHE_SLOTS: u64 = 10_000;
@@ -431,14 +437,27 @@ impl Beacon {
         if url.is_none() && cache.is_none() {
             bail!("a beacon source needs a URL or a header cache");
         }
+        Beacon::with_patience(url, cache, NEST_PATIENCE)
+    }
+
+    /// [`Beacon::new`] that waits up to `patience` for each header, retries included.
+    pub fn with_patience(
+        url: Option<String>,
+        cache: Option<PathBuf>,
+        patience: std::time::Duration,
+    ) -> Result<Beacon> {
+        if url.is_none() && cache.is_none() {
+            bail!("a beacon source needs a URL or a header cache");
+        }
         Ok(Beacon {
             url: url.map(|u| u.trim_end_matches('/').to_string()),
             client: reqwest::Client::builder()
                 .user_agent(concat!("nuthatch/", env!("CARGO_PKG_VERSION")))
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(patience)
                 .build()?,
             cache,
             loaded: std::sync::Mutex::new(BTreeMap::new()),
+            patience,
         })
     }
 
@@ -526,8 +545,9 @@ impl Beacon {
         let Some(url) = &self.url else {
             return Ok(None);
         };
-        let mut pause = std::time::Duration::from_secs(2);
-        for _ in 0..6 {
+        let give_up = std::time::Instant::now() + self.patience;
+        let mut pause = (self.patience / 8).max(std::time::Duration::from_millis(100));
+        loop {
             let resp = self
                 .client
                 .get(format!(
@@ -544,14 +564,16 @@ impl Beacon {
                     return Beacon::parse(Some(slot), &body["data"]["header"]["message"]).map(Some);
                 }
                 404 => return Ok(None),
-                429 | 500..=599 => {
+                429 | 500..=599 if std::time::Instant::now() + pause < give_up => {
                     tokio::time::sleep(pause).await;
                     pause *= 2;
+                }
+                429 | 500..=599 => {
+                    bail!("the beacon kept refusing the header of slot {slot}")
                 }
                 s => bail!("the beacon answered {s} for the header of slot {slot}"),
             }
         }
-        bail!("the beacon kept refusing the header of slot {slot}")
     }
 }
 
@@ -1012,5 +1034,25 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert!(format!("{e:#}").contains("no beacon source has"), "{e:#}");
+    }
+
+    #[tokio::test]
+    async fn a_beacon_that_keeps_refusing_is_given_up_within_its_patience() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app =
+            axum::Router::new().fallback(|| async { axum::http::StatusCode::TOO_MANY_REQUESTS });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let beacon =
+            Beacon::with_patience(Some(url), None, std::time::Duration::from_secs(1)).unwrap();
+        let started = std::time::Instant::now();
+        let e = beacon.header(DENEB_SLOT, [1; 32]).await.unwrap_err();
+        assert!(format!("{e:#}").contains("kept refusing"), "{e:#}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_500),
+            "{:?}",
+            started.elapsed()
+        );
+        server.abort();
     }
 }
