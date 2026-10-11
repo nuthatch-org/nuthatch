@@ -6,7 +6,7 @@
 //! discovers every watched address up to the finalized head ([`Discovery`]).
 
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use crate::address_discovery::{Counted, Discoverer, Rpc};
@@ -113,6 +113,11 @@ pub struct ModeState {
     backfill_span: AtomicU64,
     /// Blocks per second the last discovery window covered; 0 before the first.
     backfill_rate: AtomicU64,
+    /// Blocks per second the last body window and the last produced-block step covered; 0 before.
+    body_rate: AtomicU64,
+    produced_rate: AtomicU64,
+    /// How long the last timestamp search on the RPC took, in milliseconds; 0 before the first.
+    search_ms: AtomicU64,
     /// Whether the mirror's last block is as far as it has published, found again every poll, rather
     /// than a configured `to_block`.
     mirror_open: bool,
@@ -264,6 +269,9 @@ impl ModeState {
             first_window: 128,
             backfill_span: AtomicU64::new(0),
             backfill_rate: AtomicU64::new(0),
+            body_rate: AtomicU64::new(0),
+            produced_rate: AtomicU64::new(0),
+            search_ms: AtomicU64::new(0),
             mirror_open: false,
             mirror_last: AtomicU64::new(0),
         }
@@ -948,9 +956,23 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             crate::address_discovery::OUTER_WINDOW,
             state.deadline,
         );
-        for address in watched.clone() {
-            let mut recorded_through: Option<u64> = None;
-            loop {
+        // One window per account per round, the watched set read again every round: an account rotki
+        // adds mid-backfill gets its first window within a round, not after the others' whole backlog.
+        let mut recorded_through: BTreeMap<String, u64> = BTreeMap::new();
+        let mut stopped: BTreeSet<String> = BTreeSet::new();
+        loop {
+            let round = match state.history.watched() {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!("address history: reading the watched set: {e:#}");
+                    break;
+                }
+            };
+            let mut advanced = false;
+            for address in round {
+                if stopped.contains(&address) {
+                    continue;
+                }
                 serve_queued(state, self).await;
                 let next = match crate::address_discovery::next_uncovered(
                     &state.history,
@@ -960,20 +982,22 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                     Ok(n) => n,
                     Err(e) => {
                         tracing::warn!("address history: coverage for {address}: {e:#}");
-                        break;
+                        stopped.insert(address);
+                        continue;
                     }
                 };
                 if next > to {
-                    break;
+                    continue;
                 }
                 // A recorded window must move coverage past it; one that did not would be fetched
                 // again forever, at the provider's expense.
-                if recorded_through.is_some_and(|r| next <= r) {
+                if recorded_through.get(&address).is_some_and(|r| next <= *r) {
                     state.window_failed();
                     tracing::error!(
                         "address history: coverage for {address} did not advance past {next}; stopping this pass"
                     );
-                    break;
+                    stopped.insert(address);
+                    continue;
                 }
                 let end = next.saturating_add(pace.span() - 1).min(to);
                 let started = Instant::now();
@@ -981,15 +1005,14 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 let took = started.elapsed();
                 pace.took(took);
                 state.backfill_span.store(pace.span(), Ordering::Relaxed);
-                if done.is_ok() {
-                    let ms = took.as_millis().max(1) as u64;
-                    state
-                        .backfill_rate
-                        .store((end - next + 1) * 1000 / ms, Ordering::Relaxed);
-                }
                 match done {
                     Ok(()) => {
-                        recorded_through = Some(end);
+                        let ms = took.as_millis().max(1) as u64;
+                        state
+                            .backfill_rate
+                            .store((end - next + 1) * 1000 / ms, Ordering::Relaxed);
+                        recorded_through.insert(address.clone(), end);
+                        advanced = true;
                         state.window_done();
                         tracing::info!("address history: {address} covered through {end}");
                     }
@@ -998,9 +1021,12 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                         tracing::warn!(
                             "address history: [{next}, {end}] for {address} not recorded, retrying next poll: {e:#}"
                         );
-                        break;
+                        stopped.insert(address);
                     }
                 }
+            }
+            if !advanced {
+                break;
             }
         }
         // Withdrawals and produced blocks come from bodies, and the definitions they are matched to
@@ -1356,6 +1382,12 @@ async fn mev_passes<M: Rpc, T: Rpc>(
         for a in watched {
             loop {
                 serve_queued(state, d).await;
+                let through = |h: &AddressHistory| {
+                    h.coverage(crate::address_history::Action::ProducedBlocks, a)
+                        .ok()
+                        .and_then(|c| c.first().map(|(_, t)| *t))
+                };
+                let (before, started) = (through(&state.history), Instant::now());
                 let more = crate::address_mev::mev_step(
                     d,
                     relays,
@@ -1368,6 +1400,12 @@ async fn mev_passes<M: Rpc, T: Rpc>(
                 .await?;
                 if !more {
                     break;
+                }
+                if let (Some(b), Some(t)) = (before, through(&state.history)) {
+                    let ms = started.elapsed().as_millis().max(1) as u64;
+                    state
+                        .produced_rate
+                        .store(t.saturating_sub(b) * 1000 / ms, Ordering::Relaxed);
                 }
                 state.window_done();
             }
@@ -2077,6 +2115,12 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
         let started = Instant::now();
         let outcome = body_window(d, state, addresses, (from, end), None).await;
         pace.took(started.elapsed());
+        if outcome.is_ok() {
+            let ms = started.elapsed().as_millis().max(1) as u64;
+            state
+                .body_rate
+                .store((end - from + 1) * 1000 / ms, Ordering::Relaxed);
+        }
         match outcome {
             Ok(()) => {
                 last = Some(end);
@@ -2381,11 +2425,14 @@ fn before_history(s: &ModeState, q: &HashMap<String, String>) -> Option<String> 
     })
 }
 
-/// The blocks a request may ask the cursor to cover: what it covers in half the deadline at the
-/// backfill's measured pace, and at least a window's worth before any pace is measured.
-fn reach(s: &ModeState) -> u64 {
-    let rate = s.backfill_rate.load(Ordering::Relaxed);
-    (rate * s.deadline.as_secs() / 2).max(COVER_WINDOW)
+/// The blocks one layer can cover for a request: what it covers in half the deadline at its own
+/// measured rate, or `unmeasured` before it has a rate. Layers differ by orders of magnitude: trace
+/// discovery tens of thousands of blocks a minute, a block-body scan a few thousand.
+fn reach(s: &ModeState, rate: &AtomicU64, unmeasured: u64) -> u64 {
+    match rate.load(Ordering::Relaxed) {
+        0 => unmeasured,
+        r => r * s.deadline.as_secs() / 2,
+    }
 }
 
 /// Why `want`'s uncovered blocks are too many to cover within the deadline, if they are.
@@ -2393,23 +2440,35 @@ async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Op
     use crate::address_discovery::{next_uncovered_for, BLOCK_SCANNED, DISCOVERED};
     use crate::address_history::Action;
     let (address, need, from, to) = want.clone();
-    let next = blocking(s, move |h| {
-        let mut sets: Vec<&[Action]> = vec![&DISCOVERED];
-        if need != Need::Discovered {
-            sets.push(&BLOCK_SCANNED);
-        }
-        if need == Need::Produced {
-            sets.push(&[Action::ProducedBlocks]);
-        }
+    // Each layer the request needs, its first uncovered block, and how far it can reach in time.
+    let mut layers: Vec<(&'static [Action], u64)> =
+        vec![(&DISCOVERED, reach(s, &s.backfill_rate, COVER_WINDOW))];
+    if need != Need::Discovered {
+        layers.push((&BLOCK_SCANNED, reach(s, &s.body_rate, COVER_BODIES)));
+    }
+    if need == Need::Produced {
+        layers.push((
+            &[Action::ProducedBlocks],
+            reach(s, &s.produced_rate, COVER_PRODUCED),
+        ));
+    }
+    let sets: Vec<&'static [Action]> = layers.iter().map(|(set, _)| *set).collect();
+    let who = address.clone();
+    let nexts = blocking(s, move |h| {
         sets.into_iter()
-            .map(|set| next_uncovered_for(h, &address, from, set))
-            .try_fold(u64::MAX, |m, n| n.map(|n| m.min(n)))
+            .map(|set| next_uncovered_for(h, &who, from, set))
+            .collect::<Result<Vec<u64>>>()
     })
     .await
     .ok()?;
+    let short = layers
+        .iter()
+        .zip(&nexts)
+        .find(|((_, reach), next)| (to + 1).saturating_sub(**next) > *reach)
+        .map(|(_, next)| *next)?;
+    let next = *nexts.iter().min().unwrap_or(&short);
     let gap = (to + 1).saturating_sub(next);
-    let reach = reach(s);
-    (gap > reach).then(|| {
+    Some(()).map(|()| {
         format!(
             "covered through block {}; the {gap} blocks above it are being backfilled, more than can \
              be covered within the {}s deadline; ask again later",
@@ -2583,6 +2642,21 @@ async fn block_by_time(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value
         .and_then(|t| t.parse::<u64>().ok())
         .expect("respond validated the timestamp");
     let after = q.get("closest").map(String::as_str) == Some("after");
+    // A search gets half the deadline; when the last one needed more, the RPC is too busy to finish
+    // this one in time either, and it is refused at once rather than held.
+    let budget = s.deadline / 2;
+    let last = Duration::from_millis(s.search_ms.load(Ordering::Relaxed));
+    if last > budget {
+        s.search_ms.store(
+            last.as_millis().saturating_sub(budget.as_millis() / 2) as u64,
+            Ordering::Relaxed,
+        );
+        return crate::address_history::incomplete(&format!(
+            "the RPC took {}s for the last timestamp search, over the {}s this one may take; ask again shortly",
+            last.as_secs(),
+            budget.as_secs()
+        ));
+    }
     let committed = s.history.head().ok().flatten();
     let search = async {
         match search_by_time(&forward, t, after).await? {
@@ -2601,7 +2675,11 @@ async fn block_by_time(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value
             Err(why) => Ok::<_, anyhow::Error>(Err(why)),
         }
     };
-    match tokio::time::timeout(s.deadline, search).await {
+    let started = Instant::now();
+    let searched = tokio::time::timeout(budget, search).await;
+    s.search_ms
+        .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    match searched {
         Ok(Ok(Ok(b))) => crate::address_history::ok(
             Value::String(b.to_string()),
             s.history.generation().unwrap_or(0),
@@ -2609,8 +2687,8 @@ async fn block_by_time(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value
         Ok(Ok(Err(why))) => crate::address_history::incomplete(&why),
         Ok(Err(e)) => crate::address_history::incomplete(&format!("searching the RPC: {e:#}")),
         Err(_) => crate::address_history::incomplete(&format!(
-            "the RPC search did not finish within the {}s deadline",
-            s.deadline.as_secs()
+            "the RPC search did not finish within {}s; ask again shortly",
+            budget.as_secs()
         )),
     }
 }
@@ -4175,6 +4253,83 @@ mod tests {
             "{v}"
         );
         assert!(started.elapsed() >= Duration::from_millis(500));
+    }
+
+    /// Admission is by the slowest layer a request needs: fast trace discovery does not admit a
+    /// withdrawals request the slow body scan cannot finish in time.
+    #[tokio::test]
+    async fn each_layer_admits_only_what_it_can_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(200_000).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_secs(2)),
+        );
+        s.backfill_rate.store(100_000, Ordering::Relaxed);
+        s.body_rate.store(10, Ordering::Relaxed);
+        let ask = |action: &str| {
+            format!("/api?module=account&action={action}&address={ALICE}&startblock=190000&endblock=190999")
+        };
+        let started = Instant::now();
+        let (_, v) = call(router(s.clone()), "GET", &ask("txsBeaconWithdrawal"), None).await;
+        assert!(
+            v["result"]
+                .as_str()
+                .unwrap()
+                .contains("covered through block"),
+            "{v}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        // The same gap for transactions alone is within discovery's reach: it goes to the cursor
+        // (none runs here, so it waits out the deadline).
+        let started = Instant::now();
+        let (_, v) = call(router(s), "GET", &ask("txlist"), None).await;
+        assert!(
+            !v["result"]
+                .as_str()
+                .unwrap()
+                .contains("covered through block"),
+            "{v}"
+        );
+        assert!(started.elapsed() >= Duration::from_secs(2));
+    }
+
+    /// A timestamp search after one that outran its half of the deadline is refused at once.
+    #[tokio::test]
+    async fn a_timestamp_search_is_refused_at_once_when_the_last_ran_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let forward: crate::address_proxy::Forward = Arc::new(|_m: String, _p: Value| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(Value::Null)
+            })
+        });
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_secs(2))
+                .with_forward(forward),
+        );
+        s.search_ms.store(5_000, Ordering::Relaxed);
+        let started = Instant::now();
+        let (_, v) = call(
+            router(s),
+            "GET",
+            "/api?module=block&action=getblocknobytime&timestamp=1700000000&closest=before",
+            None,
+        )
+        .await;
+        assert!(
+            v["result"]
+                .as_str()
+                .unwrap()
+                .contains("last timestamp search"),
+            "{v}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 
     /// A conflict found while a request is being answered refuses that answer too.
@@ -5764,6 +5919,45 @@ mod tests {
             p.took(Duration::from_secs(60));
         }
         assert_eq!(p.span(), 64, "never under the floor");
+    }
+
+    /// Accounts take turns: a second account gets coverage while the first still has a backlog.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn accounts_take_turns_in_the_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into(), BOB.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true).with_range(0, None, 20),
+        );
+        let chain = Chain::new(30_000, 29_000);
+        chain.quiet.store(true, Ordering::Relaxed);
+        chain.trace_us_per_block.store(100, Ordering::Relaxed);
+        let d = Arc::new(chain.node());
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        let backfill = tokio::spawn({
+            let (d, s) = (d.clone(), s.clone());
+            async move { d.catch_up(&s, 29_000).await }
+        });
+        let covered = |a: &str| {
+            s.history
+                .coverage(crate::address_history::Action::TxList, a)
+                .unwrap()
+                .first()
+                .map(|(_, t)| *t)
+        };
+        // BOB sorts first. When ALICE gets her first window, BOB must still have a backlog: one
+        // account's whole backlog first would have taken BOB to 29,000.
+        let started = Instant::now();
+        while covered(ALICE).is_none() && started.elapsed() < Duration::from_secs(20) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let (a, b) = (covered(ALICE), covered(BOB));
+        assert!(
+            a.is_some() && b.is_some_and(|b| b < 29_000),
+            "ALICE started while BOB still had a backlog: {a:?} {b:?}"
+        );
+        backfill.abort();
     }
 
     /// A request for history above what is covered is served inside a long backfill: the cursor's
