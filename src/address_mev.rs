@@ -403,7 +403,13 @@ pub async fn produced_window<M: Rpc, T: Rpc>(
         anyhow::bail!("produced blocks are served through the finalized block {head}, not {to}");
     }
     let generation = history.generation()?;
-    let found = produced_blocks(d, relays, history, a, (from, to), None, deadline).await?;
+    // Every read under the deadline, headers and rewards included; the record after it runs to
+    // completion.
+    let found = crate::address_mode::within(
+        deadline,
+        produced_blocks(d, relays, history, a, (from, to), None, deadline),
+    )
+    .await?;
     history.record_produced(
         a,
         &found.rows,
@@ -858,5 +864,33 @@ mod tests {
             .await
             .unwrap();
         assert!(h.mev_pending().unwrap().is_empty());
+    }
+
+    /// A produced-block demand's reads, headers and rewards included, stop at its deadline and leave
+    /// nothing written, so a slow RPC cannot hold the cursor past it.
+    #[tokio::test]
+    async fn a_produced_demand_stops_at_its_deadline() {
+        struct Slow;
+        impl Rpc for Slow {
+            async fn call(&self, _: &str, _: Value) -> Result<Value> {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                Ok(Value::Null)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let h = evidence_chain(dir.path());
+        evidence_rows(&h);
+        let d = Discoverer::new(Counted::new(Slow), Counted::new(Slow));
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let g = h.generation().unwrap();
+        let started = std::time::Instant::now();
+        let deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
+        let err = produced_window(&d, &late_relays(on), &h, A, (100, 199), 0, deadline)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deadline"), "{err:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(h.generation().unwrap(), g);
+        assert!(h.coverage(Action::ProducedBlocks, A).unwrap().is_empty());
     }
 }

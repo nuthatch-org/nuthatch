@@ -536,7 +536,7 @@ async fn body_window<M: Rpc, T: Rpc>(
 
 /// A read, stopped at `deadline` if it has one. Only reads go through this: they write nothing, so
 /// stopping one orphans no writer; what a window persists runs after it, to completion.
-async fn within<F, X>(deadline: Option<Instant>, fetch: F) -> Result<X>
+pub(crate) async fn within<F, X>(deadline: Option<Instant>, fetch: F) -> Result<X>
 where
     F: std::future::Future<Output = Result<X>>,
 {
