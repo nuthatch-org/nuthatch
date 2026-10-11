@@ -249,7 +249,8 @@ The rows are Etherscan's account records with a narrower field set on two row ty
 (`tokentx`, `tokennfttx`, `token1155tx`) omit `tokenName`, `tokenSymbol`, `tokenDecimal`, `gasUsed`
 and `functionName`, and internal rows carry an empty `input`. rotki's readers of those row types use
 none of them. `logs/getLogs` honours `page` and `offset` (at most 1,000), asks the RPC in spans that
-start at 16 blocks and grow while they come back sparse, stops once it holds the page, and runs two
+start at 16 blocks and grow while they come back sparse, narrows any answer past 4 MiB, stops once
+it holds the page, and runs two
 requests at a time; a range that needs more than 64 calls, or a page that falls inside one block,
 answers `NUTHATCH_INCOMPLETE`.
 

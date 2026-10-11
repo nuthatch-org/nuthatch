@@ -347,14 +347,17 @@ followed:
 
 - **Memory per request (B1).** One `getLogs` over 400,000 blocks of USDC transfers took the physical
   footprint to 1.2 GB: spans were as wide as the provider allowed and every log was held before the
-  page was cut. Spans now start at 16 blocks and double only while the answer is sparse, the read
-  stops once it holds the page asked for (`page` and `offset` are honoured), and two run at a time,
-  a third answering incomplete.
+  page was cut. Spans now start at 16 blocks and double only while the answer is sparse, an answer
+  past 4 MiB is refused as it streams in and its span narrowed, the read stops once it holds the
+  page asked for (`page` and `offset` are honoured), and two run at a time, a third answering
+  incomplete.
 - **Finality (M1).** A reorg reaching under the finalized head went unseen, because only hashes above
   it were tracked. The store now keeps the hashes of the last 32 finalized heads it committed, and
   every poll, the first after a restart included, compares the newest and one older one in turn with
   the RPC. A mismatch is a reorg under finality or an RPC on another chain under the same id; either
-  way the cursor stops, `/ready` gives the reason and every answer is refused. The reorg property
+  way the cursor stops, `/ready` gives the reason and every answer is refused, one in flight
+  included. A new finalized head's hash is read on both sides of the checks, so a fork switch during
+  the poll cannot become the record, and is committed with the head in one transaction. The reorg property
   test now also runs through the cursor's own window against a node whose traces follow the chain,
   with reorgs that cross finality, and fails if the run covered nothing.
 - **Produced blocks first (M2).** Each pass covers produced blocks and the relay re-asks before the
