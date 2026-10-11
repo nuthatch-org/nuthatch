@@ -14,10 +14,14 @@ use std::sync::Arc;
 pub type Forward =
     Arc<dyn Fn(String, Value) -> futures::future::BoxFuture<'static, Result<Value>> + Send + Sync>;
 
-/// Etherscan's `getLogs` answers at most this many logs; a caller pages by block past them.
-const MAX_LOGS: usize = 1000;
-/// The block span a `getLogs` range is first split into, before the provider names its own limit.
+/// The widest block span a `getLogs` range is asked in. Spans start at [`FIRST_SPAN`] and double
+/// while answers stay small, so one answer never holds a dense range: a 10,000-block span of a busy
+/// token's transfers is a gigabyte, for a page of a thousand.
 const LOG_SPAN: u64 = 10_000;
+const FIRST_SPAN: u64 = 16;
+/// Etherscan's most logs one page may hold, and the deepest a page may reach.
+const MAX_PAGE: u64 = 1_000;
+const MAX_DEPTH: u64 = 10_000;
 /// The most `eth_getLogs` calls one `getLogs` may cost. A range that needs more answers incomplete
 /// rather than half of itself.
 const MAX_LOG_CALLS: usize = 64;
@@ -133,11 +137,25 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
         Some(n) => n,
         None => number_of(tag("toBlock")).await?,
     };
-    // A range is asked in spans the provider takes, oldest first, and stops once past the cap:
-    // whatever lies beyond it a caller asks for next.
+    // `page` and `offset` as Etherscan takes them; a caller that sends neither gets the first 1,000.
+    let num = |k: &str, default: u64| -> Result<u64> {
+        match q.get(k).map(String::as_str).filter(|v| !v.is_empty()) {
+            None => Ok(default),
+            Some(v) => v.parse::<u64>().map_err(|_| anyhow!("invalid {k} `{v}`")),
+        }
+    };
+    let (page, offset) = (num("page", 1)?, num("offset", MAX_PAGE)?);
+    if page == 0 || offset == 0 || offset > MAX_PAGE || page.saturating_mul(offset) > MAX_DEPTH {
+        return Ok(Answer::Unsupported(format!(
+            "getLogs pages hold 1 to {MAX_PAGE} logs and reach at most {MAX_DEPTH} deep"
+        )));
+    }
+    let need = usize::try_from(page * offset).expect("at most MAX_DEPTH");
+    // A range is asked in spans the provider takes, oldest first, and stops once past what the page
+    // needs: whatever lies beyond it a caller asks for next.
     let mut logs = Vec::new();
-    let (mut start, mut span, mut calls) = (from, LOG_SPAN, 0);
-    while start <= to && logs.len() <= MAX_LOGS {
+    let (mut start, mut span, mut calls) = (from, FIRST_SPAN, 0);
+    while start <= to && logs.len() <= need {
         if calls == MAX_LOG_CALLS {
             return Ok(Answer::Incomplete(format!(
                 "getLogs over [{from}, {to}] needs more than {MAX_LOG_CALLS} calls to the RPC; ask for a narrower range"
@@ -154,13 +172,13 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
         filter.insert("topics".into(), Value::Array(topics[..last].to_vec()));
         match forward("eth_getLogs".into(), json!([filter])).await {
             Ok(found) => {
-                logs.extend(
-                    found
-                        .as_array()
-                        .ok_or_else(|| anyhow!("eth_getLogs answered a non-list"))?
-                        .iter()
-                        .cloned(),
-                );
+                let found = found
+                    .as_array()
+                    .ok_or_else(|| anyhow!("eth_getLogs answered a non-list"))?;
+                if found.len() < need / 4 {
+                    span = span.saturating_mul(2).min(LOG_SPAN);
+                }
+                logs.extend(found.iter().cloned());
                 start = end + 1;
             }
             Err(e) if end > start && crate::address_discovery::range_shaped(&format!("{e:#}")) => {
@@ -170,19 +188,22 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
             Err(e) => return Err(e),
         }
     }
-    if logs.len() >= MAX_LOGS {
-        // Exactly the first 1,000, mid-block if need be, as Etherscan answers: rotki continues only
-        // on a full page, from its last block, and drops what it already has, so a short page must
-        // only ever mean the range is done. A full page inside one block would be asked for again
-        // from that block forever, so that is refused.
+    // The page, exactly, mid-block if need be, as Etherscan answers: rotki continues only on a full
+    // page, from its last block, and drops what it already has, so a short page must only ever mean
+    // the range is done. A full page inside one block would be asked for again from that block
+    // forever, so that is refused.
+    let skip = need - usize::try_from(offset).expect("at most MAX_PAGE");
+    let mut logs: Vec<Value> = logs.into_iter().skip(skip).collect();
+    let full = usize::try_from(offset).expect("at most MAX_PAGE");
+    if logs.len() >= full {
         let block = |l: &Value| l.get("blockNumber").cloned();
-        if block(&logs[0]) == block(&logs[MAX_LOGS - 1]) {
+        if block(&logs[0]) == block(&logs[full - 1]) {
             return Ok(Answer::Unsupported(format!(
-                "block {} holds at least {MAX_LOGS} matching logs, a whole page, so it cannot be paged past",
+                "block {} holds at least {full} matching logs, a whole page, so it cannot be paged past",
                 block(&logs[0]).unwrap_or(Value::Null)
             )));
         }
-        logs.truncate(MAX_LOGS);
+        logs.truncate(full);
     }
 
     let mut paid: BTreeMap<String, (Value, Value)> = BTreeMap::new();
@@ -555,12 +576,79 @@ mod tests {
             blocks,
             ["0xc350", "0x186a0", "0x249f0", "0x30d40", "0x3d090", "0x493e0"]
         );
-        assert_eq!(*calls.lock().unwrap(), 30);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            39,
+            "spans of 16 blocks doubling to the 10,000 the provider takes, then 10,000 at a time"
+        );
 
         let (forward, calls) = capped(2_000);
         let refused = answer(&ask, 1, &forward).await.unwrap();
         let r = refused["result"].as_str().unwrap();
         assert!(r.starts_with("NUTHATCH_INCOMPLETE:"), "{refused}");
         assert_eq!(*calls.lock().unwrap() as usize, MAX_LOG_CALLS);
+    }
+
+    /// A dense range (a busy token's transfers, fifty logs a block over 400,000 blocks) is asked in
+    /// spans that start small, so no single answer holds more than a few pages, and the request
+    /// stops at the page (cold test B1, 2026-10-11: one request held 1.2 GB for 1,000 rows).
+    #[tokio::test]
+    async fn a_dense_range_never_holds_more_than_a_few_pages() {
+        let largest = Arc::new(Mutex::new(0usize));
+        let seen = largest.clone();
+        let forward: Forward = Arc::new(move |m: String, p: Value| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                if m != "eth_getLogs" {
+                    return Ok(json!({"effectiveGasPrice": "0x1", "gasUsed": "0x1"}));
+                }
+                let from = crate::address_discovery::hex_u64(&p[0]["fromBlock"])?;
+                let to = crate::address_discovery::hex_u64(&p[0]["toBlock"])?;
+                let logs: Vec<Value> = (from..=to)
+                    .flat_map(|b| (0..50).map(move |i| json!({
+                        "address": "0xc0", "topics": [], "data": "0x", "blockNumber": format!("0x{b:x}"),
+                        "blockHash": "0xbh", "logIndex": format!("0x{i:x}"), "transactionHash": format!("0x{b:x}{i:02x}"),
+                        "transactionIndex": "0x0", "blockTimestamp": "0x1"})))
+                    .collect();
+                let mut l = seen.lock().unwrap();
+                *l = (*l).max(logs.len());
+                Ok(json!(logs))
+            })
+        });
+        let ask = q(&[
+            ("module", "logs"),
+            ("action", "getLogs"),
+            ("fromBlock", "25700000"),
+            ("toBlock", "26100000"),
+        ]);
+        let got = answer(&ask, 1, &forward).await.unwrap();
+        assert_eq!(got["result"].as_array().unwrap().len(), 1_000);
+        assert!(
+            *largest.lock().unwrap() <= 1_600,
+            "{} logs in one answer",
+            largest.lock().unwrap()
+        );
+
+        // `page` reaches past the first thousand.
+        let second = answer(
+            &q(&[
+                ("module", "logs"),
+                ("action", "getLogs"),
+                ("fromBlock", "25700000"),
+                ("toBlock", "26100000"),
+                ("page", "2"),
+                ("offset", "100"),
+            ]),
+            1,
+            &forward,
+        )
+        .await
+        .unwrap();
+        let rows = second["result"].as_array().unwrap();
+        assert_eq!(rows.len(), 100);
+        assert_eq!(
+            rows[0]["blockNumber"], "0x18826a2",
+            "the 101st log: block 25700002, its first"
+        );
     }
 }

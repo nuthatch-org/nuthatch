@@ -86,7 +86,12 @@ pub struct ModeState {
     pub deadline: Duration,
     /// The chain head as last read, 0 for none yet.
     latest: AtomicU64,
+    /// `logs/getLogs` requests running at once: each can hold up to a page of logs and its receipts.
+    logs: tokio::sync::Semaphore,
 }
+
+/// How many `logs/getLogs` requests may run at once; one more answers incomplete at once.
+const LOGS_AT_ONCE: usize = 2;
 
 /// Blocks one on-demand discovery window covers, and one body window: small enough that a window
 /// started near a request's deadline does not hold the cursor long past it.
@@ -177,6 +182,7 @@ impl ModeState {
             queue: tokio::sync::Mutex::new(rx),
             deadline: DEFAULT_DEADLINE,
             latest: AtomicU64::new(0),
+            logs: tokio::sync::Semaphore::new(LOGS_AT_ONCE),
         }
     }
 
@@ -1258,6 +1264,18 @@ async fn api(
 ) -> Json<Value> {
     // The RPC behind the nest is the operator's; only a loopback bind lends it out.
     if let Some(forward) = s.forward.clone().filter(|_| s.loopback) {
+        let _permit = if q.get("module").map(String::as_str) == Some("logs") {
+            match s.logs.try_acquire() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    return Json(crate::address_history::incomplete(
+                        "the nest is answering other getLogs requests; try again shortly",
+                    ))
+                }
+            }
+        } else {
+            None
+        };
         if let Some(v) = crate::address_proxy::answer(&q, s.chain_id, &forward).await {
             return Json(v);
         }
