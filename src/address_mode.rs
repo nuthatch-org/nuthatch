@@ -60,6 +60,9 @@ pub struct ModeState {
     poll_errors: AtomicU64,
     /// Whether the last poll, its head read or its reconcile, failed: the RPC is down or hanging.
     failing: std::sync::atomic::AtomicBool,
+    /// Whether the last window read failed: a working head with a failing trace endpoint still
+    /// stalls the backfill.
+    backfill_failing: std::sync::atomic::AtomicBool,
     rpc_requests: AtomicU64,
     /// Blocks behind the chain head the nest serves through, so nothing it records can be reorged.
     pub depth: u64,
@@ -178,6 +181,7 @@ impl ModeState {
             polls: AtomicU64::new(0),
             poll_errors: AtomicU64::new(0),
             failing: std::sync::atomic::AtomicBool::new(false),
+            backfill_failing: std::sync::atomic::AtomicBool::new(false),
             rpc_requests: AtomicU64::new(0),
             depth: 0,
             start_block: 0,
@@ -302,7 +306,19 @@ impl ModeState {
         } else {
             since_start.saturating_sub(Duration::from_millis(last - 1))
         };
-        since_poll > 3 * self.poll_interval || self.failing.load(Ordering::Relaxed)
+        since_poll > 3 * self.poll_interval
+            || self.failing.load(Ordering::Relaxed)
+            || self.backfill_failing.load(Ordering::Relaxed)
+    }
+
+    fn window_done(&self) {
+        self.windows.fetch_add(1, Ordering::Relaxed);
+        self.backfill_failing.store(false, Ordering::Relaxed);
+    }
+
+    fn window_failed(&self) {
+        self.discovery_errors.fetch_add(1, Ordering::Relaxed);
+        self.backfill_failing.store(true, Ordering::Relaxed);
     }
 }
 
@@ -802,7 +818,7 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 // A recorded window must move coverage past it; one that did not would be fetched
                 // again forever, at the provider's expense.
                 if recorded_through.is_some_and(|r| next <= r) {
-                    state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+                    state.window_failed();
                     tracing::error!(
                         "address history: coverage for {address} did not advance past {next}; stopping this pass"
                     );
@@ -814,11 +830,11 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 match discover_window(self, state, &address, (next, end), None).await {
                     Ok(()) => {
                         recorded_through = Some(end);
-                        state.windows.fetch_add(1, Ordering::Relaxed);
+                        state.window_done();
                         tracing::info!("address history: {address} covered through {end}");
                     }
                     Err(e) => {
-                        state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+                        state.window_failed();
                         tracing::warn!(
                             "address history: [{next}, {end}] for {address} not recorded, retrying next poll: {e:#}"
                         );
@@ -1195,7 +1211,7 @@ async fn mev_passes<M: Rpc, T: Rpc>(
                 if !more {
                     break;
                 }
-                state.windows.fetch_add(1, Ordering::Relaxed);
+                state.window_done();
             }
             if let Some(&(_, t)) = state
                 .history
@@ -1216,7 +1232,7 @@ async fn mev_passes<M: Rpc, T: Rpc>(
         Ok::<_, anyhow::Error>(())
     };
     if let Err(e) = passes.await {
-        state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+        state.window_failed();
         tracing::warn!("address history: MEV pass not recorded, retrying next poll: {e:#}");
     }
     state.set_calls("main", d.main.calls());
@@ -1279,7 +1295,7 @@ async fn mirror_pass<M: Rpc, T: Rpc>(
             match finalized(&d.main).await {
                 Ok(f) => ceiling = Some(f),
                 Err(e) => {
-                    state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+                    state.window_failed();
                     tracing::warn!("address history: the RPC's finalized block: {e:#}");
                     return;
                 }
@@ -1309,11 +1325,11 @@ async fn mirror_pass<M: Rpc, T: Rpc>(
         state.set_calls("main", d.main.calls());
         match outcome {
             Ok(()) => {
-                state.windows.fetch_add(1, Ordering::Relaxed);
+                state.window_done();
                 tracing::info!("address history: partition [{start}, {end}] verified and read");
             }
             Err(e) => {
-                state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+                state.window_failed();
                 tracing::warn!(
                     "address history: partition [{start}, {end}] not used, its blocks stay incomplete: {e:#}"
                 );
@@ -1357,7 +1373,7 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
             continue;
         }
         if last.is_some_and(|l| from <= l) {
-            state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+            state.window_failed();
             tracing::error!(
                 "address history: block coverage did not advance past {from}; stopping this pass"
             );
@@ -1378,11 +1394,11 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
         match outcome {
             Ok(()) => {
                 last = Some(end);
-                state.windows.fetch_add(1, Ordering::Relaxed);
+                state.window_done();
                 tracing::info!("address history: block bodies read through {end}");
             }
             Err(e) => {
-                state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+                state.window_failed();
                 tracing::warn!(
                     "address history: bodies [{from}, {end}] not recorded, retrying next poll: {e:#}"
                 );
@@ -3705,6 +3721,24 @@ mod tests {
                 assert_eq!(s.history.finals().unwrap(), vec![(70, chain.hash(70))]);
             }
         }
+    }
+
+    /// A head that reads but a backfill that cannot, a trace endpoint down, is reported stalled until
+    /// a window is read again.
+    #[tokio::test]
+    async fn a_failing_backfill_is_stalled_though_the_head_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        let chain = Chain::new(100, 70);
+        let broken = chain.discoverer();
+        broken
+            .catch_up(&s, broken.reconcile(&s, chain.latest()).await.unwrap())
+            .await;
+        assert!(s.stalled(), "the trace endpoint answers nothing");
+        let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert_eq!(r["stalled"], true, "{r}");
+        s.window_done();
+        assert!(!s.stalled(), "a window read since clears it");
     }
 
     /// A finalized tag that went backwards does not narrow the poll's check: the recorded finalized
