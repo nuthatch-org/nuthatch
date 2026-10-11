@@ -484,4 +484,63 @@ mod tests {
             .unwrap()
             .starts_with("NUTHATCH_UNSUPPORTED:"));
     }
+
+    /// A forwarder whose `eth_getLogs` refuses spans over `limit` blocks, with one log every 50,000
+    /// blocks, counting its calls.
+    fn capped(limit: u64) -> (Forward, Arc<Mutex<u64>>) {
+        let calls = Arc::new(Mutex::new(0));
+        let n = calls.clone();
+        let forward: Forward = Arc::new(move |m: String, p: Value| {
+            let n = n.clone();
+            Box::pin(async move {
+                if m != "eth_getLogs" {
+                    return Ok(json!({"effectiveGasPrice": "0x1", "gasUsed": "0x1"}));
+                }
+                *n.lock().unwrap() += 1;
+                let from = crate::address_discovery::hex_u64(&p[0]["fromBlock"])?;
+                let to = crate::address_discovery::hex_u64(&p[0]["toBlock"])?;
+                if to - from + 1 > limit {
+                    bail!("query exceeds max range of {limit} blocks");
+                }
+                Ok(json!((from..=to).filter(|b| b % 50_000 == 0).map(|b| json!({
+                    "address": "0xc0", "topics": [], "data": "0x", "blockNumber": format!("0x{b:x}"),
+                    "blockHash": "0xbh", "logIndex": "0x0", "transactionHash": format!("0x{b:x}"),
+                    "transactionIndex": "0x0", "blockTimestamp": "0x1"})).collect::<Vec<_>>()))
+            })
+        });
+        (forward, calls)
+    }
+
+    /// rotki asks for ranges of ~300,000 blocks, and a provider refuses more than it allows in one
+    /// call (cold test M3, 2026-10-11). The range is asked in spans the provider takes and answered
+    /// whole; one that would cost more calls than allowed is refused, never answered in part.
+    #[tokio::test]
+    async fn a_long_getlogs_range_is_split_within_the_providers_limit() {
+        let ask = q(&[
+            ("module", "logs"),
+            ("action", "getLogs"),
+            ("fromBlock", "1"),
+            ("toBlock", "300000"),
+        ]);
+        let (forward, calls) = capped(10_000);
+        let got = answer(&ask, 1, &forward).await.unwrap();
+        assert_eq!(got["status"], "1", "{got}");
+        let blocks: Vec<&str> = got["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["blockNumber"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            blocks,
+            ["0xc350", "0x186a0", "0x249f0", "0x30d40", "0x3d090", "0x493e0"]
+        );
+        assert_eq!(*calls.lock().unwrap(), 30);
+
+        let (forward, calls) = capped(2_000);
+        let refused = answer(&ask, 1, &forward).await.unwrap();
+        let r = refused["result"].as_str().unwrap();
+        assert!(r.starts_with("NUTHATCH_INCOMPLETE:"), "{refused}");
+        assert_eq!(*calls.lock().unwrap() as usize, MAX_LOG_CALLS);
+    }
 }

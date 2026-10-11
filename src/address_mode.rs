@@ -2298,4 +2298,379 @@ mod tests {
             vec![]
         );
     }
+
+    /// A chain the tests can reorganise: one hash per block, a finalized tag, and a head.
+    #[derive(Default)]
+    struct Chain {
+        hashes: std::sync::Mutex<Vec<[u8; 32]>>,
+        finalized: AtomicU64,
+        seed: AtomicU64,
+    }
+
+    impl Chain {
+        fn new(len: u64, finalized: u64) -> Arc<Chain> {
+            let c = Arc::new(Chain::default());
+            c.grow(len);
+            c.finalized.store(finalized, Ordering::Relaxed);
+            c
+        }
+        fn fresh(&self) -> [u8; 32] {
+            let n = self.seed.fetch_add(1, Ordering::Relaxed) + 1;
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&n.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
+            h[31] = 1;
+            h
+        }
+        fn grow(&self, n: u64) {
+            for _ in 0..n {
+                let h = self.fresh();
+                self.hashes.lock().unwrap().push(h);
+            }
+        }
+        fn latest(&self) -> u64 {
+            self.hashes.lock().unwrap().len() as u64 - 1
+        }
+        /// Replace the newest `depth` blocks with new ones.
+        fn reorg(&self, depth: u64) {
+            let keep = self.hashes.lock().unwrap().len() as u64 - depth;
+            self.hashes.lock().unwrap().truncate(keep as usize);
+            self.grow(depth);
+        }
+        fn hash(&self, b: u64) -> [u8; 32] {
+            self.hashes.lock().unwrap()[b as usize]
+        }
+        /// Whether the watched address has a row at `b` on the chain as it stands.
+        fn row_at(&self, b: u64) -> bool {
+            self.hash(b)[0] % 3 == 0
+        }
+        fn discoverer(
+            self: &Arc<Chain>,
+        ) -> Discoverer<
+            Counted<crate::address_partitions::tests::Fake>,
+            Counted<crate::address_partitions::tests::Fake>,
+        > {
+            let c = self.clone();
+            let main = crate::address_partitions::tests::Fake::new(move |m, p| match m {
+                "eth_blockNumber" => Ok(json!(format!("0x{:x}", c.latest()))),
+                "eth_getBlockByNumber" if p[0] == "finalized" => {
+                    Ok(json!({"number": format!("0x{:x}", c.finalized.load(Ordering::Relaxed))}))
+                }
+                "eth_getBlockByNumber" => {
+                    let b = crate::address_discovery::hex_u64(&p[0])?;
+                    if b > c.latest() {
+                        return Ok(Value::Null);
+                    }
+                    Ok(json!({"number": format!("0x{b:x}"),
+                              "hash": format!("0x{}", alloy_primitives::hex::encode(c.hash(b)))}))
+                }
+                other => bail!("unexpected {other}"),
+            });
+            let trace = crate::address_partitions::tests::Fake::new(|m, _| bail!("unexpected {m}"));
+            Discoverer::new(Counted::new(main), Counted::new(trace))
+        }
+    }
+
+    /// Record `[from, to]` for ALICE as discovery would have read it from `chain` now, anchored at
+    /// `to` when it is above the finalized head.
+    fn cover_from(chain: &Chain, h: &AddressHistory, from: u64, to: u64) {
+        use crate::address_history::{Action, Row};
+        if to < from {
+            return;
+        }
+        let rows: Vec<Row> = (from..=to)
+            .filter(|b| chain.row_at(*b))
+            .map(|b| {
+                let mut record = serde_json::Map::new();
+                record.insert("blockNumber".into(), json!(b.to_string()));
+                record.insert(
+                    "hash".into(),
+                    json!(format!(
+                        "0x{}",
+                        alloy_primitives::hex::encode(chain.hash(b))
+                    )),
+                );
+                Row {
+                    block: b,
+                    tx_index: 0,
+                    position: 0,
+                    record,
+                }
+            })
+            .collect();
+        let anchor = h
+            .head()
+            .unwrap()
+            .is_none_or(|f| to > f)
+            .then(|| (to, chain.hash(to)));
+        let g = h.generation().unwrap();
+        h.record_anchored(Action::TxList, ALICE, &rows, (from, to), g, anchor)
+            .unwrap();
+    }
+
+    /// What the store holds for ALICE over its covered blocks, and what the chain says it should.
+    fn held_and_wanted(chain: &Chain, h: &AddressHistory) -> (Vec<String>, Vec<String>) {
+        use crate::address_history::Action;
+        let mut held = Vec::new();
+        let mut wanted = Vec::new();
+        for (f, t) in h.coverage(Action::TxList, ALICE).unwrap() {
+            assert!(t <= chain.latest(), "coverage past the chain head");
+            for r in h.rows_in(Action::TxList, ALICE, (f, t)).unwrap() {
+                held.push(r["hash"].as_str().unwrap().to_string());
+            }
+            for b in (f..=t).filter(|b| chain.row_at(*b)) {
+                wanted.push(format!(
+                    "0x{}",
+                    alloy_primitives::hex::encode(chain.hash(b))
+                ));
+            }
+        }
+        (held, wanted)
+    }
+
+    fn reorg_state(dir: &Path) -> Arc<ModeState> {
+        let store = Store::open(&dir.join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        Arc::new(ModeState::new(history, 1, Duration::from_secs(300), true).with_range(0, None, 20))
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        /// Random reorgs of random depth above the finalized head, polls, finality moving and
+        /// windows read at the tip in any order: after the last poll, every covered block holds
+        /// exactly the rows the canonical chain has (CLAUDE.md's reorg property).
+        #[test]
+        fn reorgs_of_any_depth_converge_to_the_canonical_chain(
+            ops in proptest::collection::vec((0u8..4, 1u64..10), 1..40)
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let s = reorg_state(dir.path());
+                let chain = Chain::new(60, 30);
+                let d = chain.discoverer();
+                d.reconcile(&s, chain.latest()).await.unwrap();
+                for (op, n) in ops {
+                    match op {
+                        // A reorg never reaches the finalized tag, which trails the head by 20.
+                        0 => chain.reorg(n.min(chain.latest() - chain.finalized.load(Ordering::Relaxed))),
+                        1 => {
+                            chain.grow(n);
+                            chain.finalized.store(chain.latest() - 20, Ordering::Relaxed);
+                        }
+                        2 => {
+                            let from = crate::address_discovery::next_uncovered_for(
+                                &s.history, ALICE, 0, &[crate::address_history::Action::TxList],
+                            ).unwrap();
+                            cover_from(&chain, &s.history, from, chain.latest());
+                        }
+                        _ => {
+                            d.reconcile(&s, chain.latest()).await.unwrap();
+                        }
+                    }
+                    // A poll follows every change to the chain, as the cursor's interval would.
+                    if op < 2 {
+                        d.reconcile(&s, chain.latest()).await.unwrap();
+                    }
+                }
+                d.reconcile(&s, chain.latest()).await.unwrap();
+                let (held, wanted) = held_and_wanted(&chain, &s.history);
+                proptest::prop_assert_eq!(held, wanted);
+                proptest::prop_assert!(s.cursor_error.lock().unwrap().is_none());
+                Ok(())
+            })?;
+        }
+    }
+
+    /// A served answer from blocks a reorg then replaces is taken back at the next poll: the range
+    /// reads incomplete until it is read again, and then answers the new chain.
+    #[tokio::test]
+    async fn a_reorg_after_serving_takes_the_answer_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        let chain = Chain::new(100, 70);
+        let d = chain.discoverer();
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        cover_from(&chain, &s.history, 0, 99);
+        let q = |end: u64| {
+            format!("/api?module=account&action=txlist&address={ALICE}&startblock=0&endblock={end}")
+        };
+        let (_, before) = call(router(s.clone()), "GET", &q(99), None).await;
+        assert_eq!(before["status"], "1", "{before}");
+
+        chain.reorg(5);
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        let (_, during) = call(router(s.clone()), "GET", &q(99), None).await;
+        assert!(
+            during["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_INCOMPLETE:"),
+            "{during}"
+        );
+        assert_eq!(
+            s.history
+                .coverage(crate::address_history::Action::TxList, ALICE)
+                .unwrap(),
+            vec![(0, 70)],
+            "the window was anchored at 99 alone, so all of it above the finalized head goes"
+        );
+
+        cover_from(&chain, &s.history, 71, 99);
+        let (held, wanted) = held_and_wanted(&chain, &s.history);
+        assert_eq!(held, wanted);
+        let (_, after) = call(router(s.clone()), "GET", &q(99), None).await;
+        assert_eq!(
+            after["result"].as_array().unwrap().len(),
+            wanted.len(),
+            "{after}"
+        );
+    }
+
+    /// The tracked hashes outlive the process: a nest restarted after a reorg it never saw finds it
+    /// at its first poll.
+    #[tokio::test]
+    async fn a_reorg_during_a_restart_is_found_at_the_first_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Chain::new(100, 70);
+        let d = chain.discoverer();
+        {
+            let s = reorg_state(dir.path());
+            d.reconcile(&s, chain.latest()).await.unwrap();
+            cover_from(&chain, &s.history, 0, 99);
+            assert_eq!(s.history.tracked().unwrap(), vec![(99, chain.hash(99))]);
+        }
+        chain.reorg(3);
+        let s = reorg_state(dir.path());
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        assert_eq!(
+            s.history
+                .coverage(crate::address_history::Action::TxList, ALICE)
+                .unwrap(),
+            vec![(0, 70)],
+            "the only anchor moved, so everything above the finalized head goes"
+        );
+        assert!(s.history.tracked().unwrap().is_empty());
+    }
+
+    /// A tracked block that is now finalized at another hash is not rewritten: the cursor stops and
+    /// says why, and /ready reports it.
+    #[tokio::test]
+    async fn a_conflict_under_the_finalized_head_stops_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        let chain = Chain::new(100, 70);
+        let d = chain.discoverer();
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        cover_from(&chain, &s.history, 0, 80);
+        chain.reorg(25);
+        chain.finalized.store(90, Ordering::Relaxed);
+        let err = d.reconcile(&s, chain.latest()).await.unwrap_err();
+        assert!(err.to_string().contains("finalized"), "{err:#}");
+        let (st, r) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{r}");
+        assert_eq!(
+            s.history.head().unwrap(),
+            Some(70),
+            "the finalized head did not move past it"
+        );
+    }
+
+    /// A request the cursor cannot get to within the deadline answers incomplete when the deadline
+    /// passes, queue time included, and the nest does not answer half of it.
+    #[tokio::test]
+    async fn a_request_past_its_deadline_answers_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.finalize(100).unwrap();
+        history
+            .record(
+                crate::address_history::Action::TxList,
+                ALICE,
+                &[],
+                (0, 100),
+                0,
+            )
+            .unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_millis(200)),
+        );
+        // No cursor is running, so nothing takes the request off the queue.
+        let started = Instant::now();
+        let q =
+            format!("/api?module=account&action=txlist&address={ALICE}&startblock=0&endblock=150");
+        let (_, a) = call(router(s.clone()), "GET", &q, None).await;
+        let took = started.elapsed();
+        let r = a["result"].as_str().unwrap();
+        assert!(
+            r.starts_with("NUTHATCH_INCOMPLETE:") && r.contains("deadline"),
+            "{a}"
+        );
+        assert!(
+            took >= Duration::from_millis(200) && took < Duration::from_secs(2),
+            "{took:?}"
+        );
+    }
+
+    /// A made-up chain for timestamp search: block b at timestamp 1000 + 12 b, `head` blocks long,
+    /// each linked to its parent unless `broken` names a block whose parent link is wrong.
+    fn timed(head: u64, broken: Option<u64>) -> crate::address_proxy::Forward {
+        Arc::new(move |method: String, params: Value| {
+            Box::pin(async move {
+                assert_eq!(method, "eth_getBlockByNumber");
+                let b = match params[0].as_str().unwrap() {
+                    "latest" => head,
+                    n => crate::address_discovery::hex_u64(&json!(n))?,
+                };
+                let hash = |n: u64| format!("0x{n:064x}");
+                let parent = if Some(b) == broken {
+                    hash(999_999)
+                } else {
+                    hash(b.saturating_sub(1))
+                };
+                Ok(
+                    json!({"number": format!("0x{b:x}"), "timestamp": format!("0x{:x}", 1000 + 12 * b),
+                          "hash": hash(b), "parentHash": parent}),
+                )
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn the_timestamp_search_is_exact_at_its_edges_and_refuses_what_it_cannot_prove() {
+        let f = timed(100, None);
+        let at = |b: u64| 1000 + 12 * b;
+        for (t, after, want) in [
+            (at(50), false, Ok(50)),
+            (at(50), true, Ok(50)),
+            (at(50) + 5, false, Ok(50)),
+            (at(50) + 5, true, Ok(51)),
+            (at(0), false, Ok(0)),
+            (999, true, Ok(0)),
+            (at(100), false, Ok(100)),
+            (at(100), true, Ok(100)),
+        ] {
+            assert_eq!(
+                search_by_time(&f, t, after).await.unwrap(),
+                want,
+                "t={t} after={after}"
+            );
+        }
+        // Newer than the head: a block at or before it may still come.
+        assert!(search_by_time(&f, at(100) + 1, false)
+            .await
+            .unwrap()
+            .is_err());
+        assert!(search_by_time(&f, at(100) + 1, true)
+            .await
+            .unwrap()
+            .is_err());
+        // Before the first block nothing is at or before it.
+        assert!(search_by_time(&f, 999, false).await.unwrap().is_err());
+        // An answer whose neighbour does not link to it was read across a reorg.
+        let moved = timed(100, Some(51));
+        assert!(search_by_time(&moved, at(50) + 5, false).await.is_err());
+        assert!(search_by_time(&moved, at(50) + 5, true).await.is_err());
+    }
 }

@@ -3173,6 +3173,125 @@ mod tests {
         cursor.abort();
     }
 
+    /// An explicit `endblock` above what the cursor has covered is covered on demand, by the cursor,
+    /// and answered exactly; past the chain head it is refused. Cold test B1 (2026-10-11): the nest
+    /// answered 17 of Etherscan's 65 rows as complete for an end above its head.
+    #[tokio::test]
+    async fn an_endblock_above_coverage_is_covered_on_demand_and_answered_exactly() {
+        use crate::address_mode::Discovery;
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let (main, trace) = chain(false);
+        let main = script(move |m, p| match m {
+            "eth_blockNumber" => Ok(json!("0x12c")),
+            "eth_getBlockByNumber" => {
+                let b = hex_u64(&p[0])?;
+                Ok(
+                    json!({"number": format!("0x{b:x}"), "timestamp": "0x10", "hash": format!("0x{b:064x}")}),
+                )
+            }
+            _ => (main.answer)(m, p),
+        });
+        let d = std::sync::Arc::new(Discoverer::new(Counted::new(main), Counted::new(trace)));
+        h.finalize(100).unwrap();
+        let state = std::sync::Arc::new(crate::address_mode::ModeState::new(
+            h.clone(),
+            1,
+            std::time::Duration::from_secs(300),
+            true,
+        ));
+        d.catch_up(&state, 100).await;
+        assert_eq!(h.coverage(Action::TxList, A).unwrap(), vec![(0, 100)]);
+        let cursor = tokio::spawn(crate::address_mode::serve_forever(state.clone(), d.clone()));
+        let get = |end: u64| {
+            let app = crate::address_mode::router(state.clone());
+            async move {
+                let path = format!(
+                    "/api?module=account&action=txlist&address={A}&startblock=0&endblock={end}"
+                );
+                let resp = app
+                    .oneshot(
+                        axum::http::Request::get(path)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            }
+        };
+        let a = get(200).await;
+        assert_eq!(a["status"], "1", "{a}");
+        assert_eq!(
+            a["result"].as_array().unwrap().len(),
+            1,
+            "the transaction at 150: {a}"
+        );
+        assert_eq!(h.coverage(Action::TxList, A).unwrap(), vec![(0, 200)]);
+        assert_eq!(
+            h.tracked().unwrap(),
+            vec![(200, word32(&format!("0x{:064x}", 200)).unwrap())]
+        );
+        assert_eq!(
+            h.head().unwrap(),
+            Some(100),
+            "on-demand coverage finalizes nothing"
+        );
+
+        let past = get(400).await;
+        let r = past["result"].as_str().unwrap();
+        assert!(
+            r.starts_with("NUTHATCH_INCOMPLETE:") && r.contains("past the chain head"),
+            "{past}"
+        );
+        assert_eq!(h.coverage(Action::TxList, A).unwrap(), vec![(0, 200)]);
+        cursor.abort();
+    }
+
+    /// A transaction re-included in another block keeps its hash; the copy cached at its old block
+    /// is not used, and a reorg past it removes it.
+    #[tokio::test]
+    async fn a_reincluded_transaction_is_read_again_not_served_from_its_old_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let (main, trace) = chain(false);
+        let d = Discoverer::new(main, trace);
+        let key = alloy_primitives::hex::decode("aa".repeat(32)).unwrap();
+        let mut stale = Map::new();
+        stale.insert("blockNumber".into(), json!("149"));
+        stale.insert("hash".into(), json!(format!("0x{}", "aa".repeat(32))));
+        h.persist_pending(&[(key.clone(), stale)], &[], &[], &[], 0)
+            .unwrap();
+        let pending = Pending::default();
+        let r = TxRef {
+            hash: format!("0x{}", "aa".repeat(32)),
+            block: 150,
+            outgoing: true,
+            failed: false,
+        };
+        let got = d.hydrate_one(&h, r, &pending).await.unwrap();
+        assert_eq!(got["blockNumber"], "150", "read again at its new block");
+        let asked = d
+            .main
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _)| m == "eth_getTransactionByHash")
+            .count();
+        assert_eq!(asked, 1);
+
+        h.invalidate_above(148).unwrap();
+        assert!(
+            h.cached_tx(&key).unwrap().is_none(),
+            "a reorg under 149 drops the old copy"
+        );
+    }
+
     const B: &str = "0x00000000219ab540356cbb839cbe05303d7705fa";
 
     /// Bodies for blocks past Shanghai: block x02 pays A twice and B once, block x05 is B's.

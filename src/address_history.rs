@@ -1838,7 +1838,15 @@ pub fn respond(
     }
 }
 
-/// `block/getblocknobytime`, from verified headers only.
+/// Whether every block's timestamp is strictly greater than its parent's, which is what lets
+/// `getblocknobytime` prove an answer from one neighbour. Arbitrum's and BNB Chain's blocks can share a
+/// second, so they are refused rather than answered from a guess.
+pub fn strictly_increasing_timestamps(chain_id: u64) -> bool {
+    matches!(chain_id, 1 | 10 | 100 | 8453)
+}
+
+/// `block/getblocknobytime` from verified headers. The rotki-mode server searches its RPC when
+/// none bracket the timestamp.
 fn block_no_by_time(
     history: Option<&AddressHistory>,
     params: &std::collections::HashMap<String, String>,
@@ -1854,6 +1862,12 @@ fn block_no_by_time(
                 history.chain_id
             ));
         }
+    }
+    if !strictly_increasing_timestamps(history.chain_id) {
+        return unsupported(&format!(
+            "chain {}'s blocks can share a timestamp, so a block by time cannot be proven",
+            history.chain_id
+        ));
     }
     let Some(t) = get("timestamp").and_then(|t| t.parse::<u64>().ok()) else {
         return error("Invalid timestamp");
@@ -2593,6 +2607,87 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("NUTHATCH_INCOMPLETE:"));
+    }
+
+    /// What a fetch read is kept against the generation it began in: if a reorg was handled
+    /// meanwhile, nothing above the finalized head is kept, anchors included, even though the new
+    /// chain may have grown back past those blocks; what is under it is kept.
+    #[test]
+    fn a_stale_fetch_keeps_nothing_above_the_finalized_head() {
+        let (_d, h) = history();
+        h.finalize(100).unwrap();
+        let g = h.generation().unwrap();
+        let tx = |b: u64| {
+            let mut r = Map::new();
+            r.insert("blockNumber".into(), Value::String(b.to_string()));
+            (vec![b as u8; 32], r)
+        };
+        h.invalidate_above(150).unwrap();
+        h.persist_pending(
+            &[tx(90), tx(160)],
+            &[(90, 1), (160, 2)],
+            &[(vec![7; 32], 160, vec![])],
+            &[(160, [1; 32])],
+            g,
+        )
+        .unwrap();
+        assert!(h.cached_tx(&[90; 32]).unwrap().is_some());
+        assert!(h.cached_tx(&[160; 32]).unwrap().is_none());
+        assert_eq!(h.block_timestamp(90).unwrap(), Some(1));
+        assert_eq!(h.block_timestamp(160).unwrap(), None);
+        assert!(h.tx_internals(&[7; 32]).unwrap().is_none());
+        assert!(h.tracked().unwrap().is_empty());
+
+        // The same fetch under the current generation keeps all of it.
+        let g = h.generation().unwrap();
+        h.persist_pending(&[tx(160)], &[(160, 2)], &[], &[(160, [1; 32])], g)
+            .unwrap();
+        assert!(h.cached_tx(&[160; 32]).unwrap().is_some());
+        assert_eq!(h.tracked().unwrap(), vec![(160, [1; 32])]);
+        // A record anchored at a hash other than the tracked one is refused.
+        let err = h
+            .record_anchored(
+                Action::TxList,
+                ALICE,
+                &[],
+                (101, 160),
+                g,
+                Some((160, [2; 32])),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("changed hash"), "{err:#}");
+        // Finalizing past a tracked block stops tracking it, and never lowers the head.
+        h.finalize(170).unwrap();
+        h.finalize(120).unwrap();
+        assert!(h.tracked().unwrap().is_empty());
+        assert_eq!(h.head().unwrap(), Some(170));
+    }
+
+    #[test]
+    fn a_block_by_time_is_refused_where_timestamps_can_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = AddressHistory::open(
+            Store::open(&dir.path().join("t.redb")).unwrap(),
+            42161,
+            &[ALICE.into()],
+        )
+        .unwrap();
+        let a = respond(
+            Some(&h),
+            &params(&[
+                ("module", "block"),
+                ("action", "getblocknobytime"),
+                ("timestamp", "1"),
+                ("closest", "before"),
+            ]),
+        );
+        assert!(
+            a["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_UNSUPPORTED:"),
+            "{a}"
+        );
     }
 
     #[test]

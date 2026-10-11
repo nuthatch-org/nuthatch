@@ -650,4 +650,168 @@ mod tests {
         assert_eq!(*asked.lock().unwrap(), 2 * 6);
         assert!(h.relay_record(2_000).unwrap().is_none());
     }
+
+    /// A chain for the re-ask tests: A built block 100 itself; block 101 was built by BUILDER, who
+    /// paid A directly; block 102 was built by a builder paying A through a payout contract, an
+    /// internal transfer in the block's last transaction.
+    fn evidence_chain(dir: &std::path::Path) -> AddressHistory {
+        let store = crate::store::Store::open(&dir.join("t.redb")).unwrap();
+        let h = AddressHistory::open(store, 1, &[A.into()]).unwrap();
+        h.set_head(1_000).unwrap();
+        h
+    }
+
+    fn evidence_rows(h: &AddressHistory) {
+        let g = h.generation().unwrap();
+        h.record(
+            Action::MinedBlocks,
+            A,
+            &[row(100, json!({"timeStamp": "1000", "blockReward": "5"}))],
+            (100, 199),
+            g,
+        )
+        .unwrap();
+        h.record(
+            Action::TxList,
+            A,
+            &[row(
+                101,
+                json!({"timeStamp": "1012", "hash": "0xp101", "from": BUILDER, "to": A,
+                              "value": "9000", "isError": "0", "transactionIndex": "0"}),
+            )],
+            (100, 199),
+            g,
+        )
+        .unwrap();
+        h.record(
+            Action::TxListInternal,
+            A,
+            &[row(
+                102,
+                json!({"timeStamp": "1024", "hash": "0xp102",
+                              "from": "0xfeeeeee44046c3f61a8cc081e0918ef0de0a7ffc", "to": A,
+                              "value": "77", "isError": "0", "transactionIndex": "1"}),
+            )],
+            (100, 199),
+            g,
+        )
+        .unwrap();
+    }
+
+    fn evidence_rpc() -> Discoverer<Counted<Fake>, Counted<Fake>> {
+        let main = Fake::new(|m, p| {
+            let b = crate::address_discovery::hex_u64(&p[0]).unwrap_or(0);
+            Ok(match m {
+                "eth_getBlockByNumber" => {
+                    json!({"miner": match b { 100 => A, 101 => BUILDER, _ => MINER },
+                    "hash": hash(b), "baseFeePerGas": "0x1",
+                    "transactions": if b == 102 { json!(["0x01", "0x02"]) } else { json!([]) },
+                    "uncles": []})
+                }
+                "eth_getBlockReceipts" if b == 102 => json!([
+                    {"transactionHash": "0x01", "gasUsed": "0x1", "effectiveGasPrice": "0x1"},
+                    {"transactionHash": "0x02", "gasUsed": "0x1", "effectiveGasPrice": "0x1"},
+                ]),
+                "eth_getBlockReceipts" => json!([]),
+                other => anyhow::bail!("unexpected {other}"),
+            })
+        });
+        Discoverer::new(
+            Counted::new(main),
+            Counted::new(Fake::new(|_, _| Ok(json!([])))),
+        )
+    }
+
+    /// Relays that know nothing until `on` is set, then deliveries to A for 100, 101 and 102.
+    fn late_relays(on: Arc<std::sync::atomic::AtomicBool>) -> Relays {
+        Arc::new(move |name, block| {
+            let on = on.load(std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move {
+                Ok(
+                    if on && name == "ultrasound" && (100..=102).contains(&block) {
+                        vec![trace(block, A, "18665203633316530")]
+                    } else {
+                        vec![]
+                    },
+                )
+            })
+        })
+    }
+
+    fn view(h: &AddressHistory) -> Vec<String> {
+        h.rows_in(Action::ProducedBlocks, A, (100, 199))
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {} {}",
+                    r["blockNumber"].as_str().unwrap(),
+                    r["mev"].as_str().unwrap(),
+                    r["paymentTx"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+
+    /// A relay that saved its record late is asked again on the schedule, across a restart: the
+    /// self-built block's row is upgraded and the builder payments, the payout contract's included,
+    /// gain the rows they had none of. Never before a day has passed; never after thirty.
+    #[tokio::test]
+    async fn late_relay_evidence_upgrades_and_inserts_rows_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let t0 = 1_800_000_000;
+        {
+            let h = evidence_chain(dir.path());
+            evidence_rows(&h);
+            produced_window(
+                &evidence_rpc(),
+                &late_relays(on.clone()),
+                &h,
+                A,
+                (100, 199),
+                t0,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                view(&h),
+                ["100 unrecorded "],
+                "only the self-built block is a row yet"
+            );
+            let pending: Vec<u64> = h.mev_pending().unwrap().iter().map(|p| p.0).collect();
+            assert_eq!(pending, [100, 101, 102]);
+        }
+        on.store(true, std::sync::atomic::Ordering::Relaxed);
+        let h = evidence_chain(dir.path());
+        let d = evidence_rpc();
+        let rel = late_relays(on.clone());
+        let watched = [A.to_string()];
+        reask_pass(&d, &rel, &h, &watched, t0 + 3_600)
+            .await
+            .unwrap();
+        assert_eq!(view(&h), ["100 unrecorded "], "not due within the day");
+        let g = h.generation().unwrap();
+        reask_pass(&d, &rel, &h, &watched, t0 + REASK_EVERY_SECS)
+            .await
+            .unwrap();
+        assert_eq!(
+            view(&h),
+            ["100 relay ", "101 relay 0xp101", "102 relay 0xp102"]
+        );
+        assert!(
+            h.generation().unwrap() > g,
+            "the upgrade moved the generation"
+        );
+        assert!(h.mev_pending().unwrap().is_empty());
+
+        // A block whose evidence never comes is dropped from the schedule after thirty days, with
+        // its row left unrecorded, not zero.
+        h.mev_absent(150, t0).unwrap();
+        on.store(false, std::sync::atomic::Ordering::Relaxed);
+        reask_pass(&d, &rel, &h, &watched, t0 + REASK_FOR_SECS)
+            .await
+            .unwrap();
+        assert!(h.mev_pending().unwrap().is_empty());
+    }
 }
