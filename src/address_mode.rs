@@ -109,6 +109,10 @@ pub struct ModeState {
     pub hash_at: Option<HashAt>,
     /// The blocks a backfill's first discovery window covers, before [`Pace`] adjusts it.
     pub first_window: u64,
+    /// The discovery window [`Pace`] last settled on, kept across polls; 0 before the first.
+    backfill_span: AtomicU64,
+    /// Blocks per second the last discovery window covered; 0 before the first.
+    backfill_rate: AtomicU64,
 }
 
 pub type HashAt =
@@ -139,7 +143,9 @@ impl Pace {
             span: start.clamp(min, max),
             min,
             max,
-            target: deadline / 8,
+            // Half the deadline: a window carries a fixed cost of checks whatever its span, so a
+            // smaller target never lets it grow, and the backfill crawls.
+            target: deadline / 2,
         }
     }
     pub(crate) fn span(&self) -> u64 {
@@ -251,6 +257,8 @@ impl ModeState {
             beacon: None,
             hash_at: None,
             first_window: 128,
+            backfill_span: AtomicU64::new(0),
+            backfill_rate: AtomicU64::new(0),
         }
     }
 
@@ -859,8 +867,9 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
         if state.chain_id == 1 {
             mev_passes(self, state, &watched, to).await;
         }
+        let kept = state.backfill_span.load(Ordering::Relaxed);
         let mut pace = Pace::new(
-            state.first_window,
+            if kept == 0 { state.first_window } else { kept },
             64,
             crate::address_discovery::OUTER_WINDOW,
             state.deadline,
@@ -895,7 +904,15 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 let end = next.saturating_add(pace.span() - 1).min(to);
                 let started = Instant::now();
                 let done = discover_window(self, state, &address, (next, end), None).await;
-                pace.took(started.elapsed());
+                let took = started.elapsed();
+                pace.took(took);
+                state.backfill_span.store(pace.span(), Ordering::Relaxed);
+                if done.is_ok() {
+                    let ms = took.as_millis().max(1) as u64;
+                    state
+                        .backfill_rate
+                        .store((end - next + 1) * 1000 / ms, Ordering::Relaxed);
+                }
                 match done {
                     Ok(()) => {
                         recorded_through = Some(end);
@@ -5428,12 +5445,15 @@ mod tests {
     #[test]
     fn a_window_shrinks_when_slow_and_grows_back_when_quick() {
         let mut p = Pace::new(1_000, 64, 50_000, Duration::from_secs(20));
-        p.took(Duration::from_secs(3));
-        assert_eq!(p.span(), 500, "over an eighth of the deadline halves it");
-        p.took(Duration::from_millis(1_500));
+        p.took(Duration::from_secs(11));
+        assert_eq!(p.span(), 500, "over half the deadline halves it");
+        p.took(Duration::from_secs(7));
         assert_eq!(p.span(), 500, "between half and the whole target it holds");
+        // A window that took 2 s, as the fixed checks alone can on a slow RPC, still grows it.
+        p.took(Duration::from_secs(2));
+        assert_eq!(p.span(), 1_000);
         p.took(Duration::from_millis(100));
-        assert_eq!(p.span(), 1_000, "a quick window doubles it");
+        assert_eq!(p.span(), 2_000, "a quick window doubles it");
         for _ in 0..20 {
             p.took(Duration::from_secs(60));
         }
