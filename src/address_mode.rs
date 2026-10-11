@@ -4292,6 +4292,7 @@ mod tests {
         // The same gap for transactions alone is within discovery's reach: it goes to the cursor
         // (none runs here, so it waits out the deadline).
         let started = Instant::now();
+        let s2 = s.clone();
         let (_, v) = call(router(s), "GET", &ask("txlist"), None).await;
         assert!(
             !v["result"]
@@ -4301,6 +4302,20 @@ mod tests {
             "{v}"
         );
         assert!(started.elapsed() >= Duration::from_secs(2));
+        // Each layer alone could cover its 1,000 blocks in 60% of the time, but they run one after
+        // the other: together they cannot, and the request is refused at once.
+        s2.backfill_rate.store(1_666, Ordering::Relaxed);
+        s2.body_rate.store(1_666, Ordering::Relaxed);
+        let started = Instant::now();
+        let (_, v) = call(router(s2), "GET", &ask("txsBeaconWithdrawal"), None).await;
+        assert!(
+            v["result"]
+                .as_str()
+                .unwrap()
+                .contains("covered through block"),
+            "{v}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 
     /// A timestamp search after one that outran its half of the deadline is refused at once.
