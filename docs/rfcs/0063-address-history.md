@@ -311,7 +311,7 @@ The plan below went through six rounds of review against the code before both re
 - **The tip on demand.** The cursor backfills to the finalized head. A request above what is covered
   and at or below the chain head is handed to the cursor, which covers that address and the actions
   the request needs (produced blocks need mined blocks and transactions first), up to the block
-  asked for, holes included, and answers within a deadline (20 s, under rotki's 30 s read timeout).
+  asked for, holes included, and answers within a deadline (8 s by default, under rotki's 30 s read timeout).
   The cursor stays the only writer: requests wait on a bounded queue and are served between its
   windows, so none waits behind another address's backfill. A read reaching above the finalized head
   goes through the cursor as well, which checks for a reorg before it answers. Produced blocks are

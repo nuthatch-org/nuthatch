@@ -391,6 +391,77 @@ impl Source {
         let _ = std::fs::remove_file(self.cached(from));
     }
 
+    /// Whether the mirror holds the partition starting at `from`.
+    pub async fn published(&self, from: u64) -> Result<bool> {
+        Ok(self
+            .mirror
+            .head(&partition_key(self.chain_id, from))
+            .await?
+            .is_some())
+    }
+
+    /// The last block of the mirror's published run of partitions that holds the span starting at
+    /// `from`, or `None` when that span is not published. Partitions are published in order, so the
+    /// end is found by doubling a stride past it and halving back: about 2·log2 of the run in
+    /// requests, and one when it has not moved.
+    pub async fn published_end(&self, from: u64) -> Result<Option<u64>> {
+        if !self.published(from).await? {
+            return Ok(None);
+        }
+        let (mut have, mut stride) = (from, 1u64);
+        let missing = loop {
+            let probe = have + stride * SPAN;
+            if self.published(probe).await? {
+                have = probe;
+                stride *= 2;
+            } else {
+                break probe;
+            }
+        };
+        let (mut lo, mut hi) = (have, missing);
+        while hi - lo > SPAN {
+            let mid = lo + (hi - lo) / SPAN / 2 * SPAN;
+            if self.published(mid).await? {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(Some(lo + SPAN - 1))
+    }
+
+    fn cached_catalogue(&self, from: u64) -> PathBuf {
+        self.cache.join(format!("proposers-{from:010}.parquet"))
+    }
+
+    /// The proposer catalogue file for the span starting at `from`, cached as partitions are; `None`
+    /// when the mirror has none.
+    pub async fn fetch_catalogue(&self, from: u64, fresh: bool) -> Result<Option<Vec<u8>>> {
+        let path = self.cached_catalogue(from);
+        if !fresh {
+            match std::fs::read(&path) {
+                Ok(b) => return Ok(Some(b)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            }
+        }
+        let key = crate::address_proposers::catalogue_key(self.chain_id, from);
+        let Some(bytes) = self.mirror.get(&key).await? else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(&self.cache)
+            .with_context(|| format!("creating {}", self.cache.display()))?;
+        let part = path.with_extension("part");
+        std::fs::write(&part, &bytes).with_context(|| format!("writing {}", part.display()))?;
+        std::fs::rename(&part, &path).with_context(|| format!("renaming {}", part.display()))?;
+        self.evict()?;
+        Ok(Some(bytes))
+    }
+
+    pub fn discard_catalogue(&self, from: u64) {
+        let _ = std::fs::remove_file(self.cached_catalogue(from));
+    }
+
     /// Delete the oldest partitions until the cache is within its budget.
     fn evict(&self) -> Result<()> {
         let mut files = Vec::new();
@@ -678,6 +749,40 @@ pub async fn run(args: &crate::cli::PartitionsArgs) -> Result<()> {
     )?);
     rpc.inner().verify_chain_ids(args.chain_id).await?;
     let started = std::time::Instant::now();
+    if args.proposers {
+        // A publisher waits out a refusing beacon; no request is waiting on it.
+        let beacon = crate::address_proposers::Beacon::with_patience(
+            args.beacon_url.clone(),
+            args.beacon_cache.clone(),
+            std::time::Duration::from_secs(120),
+        )?;
+        let built = crate::address_proposers::build(
+            &rpc,
+            &args.out,
+            args.chain_id,
+            (args.from, args.to),
+            &beacon,
+            args.concurrency,
+            |lo, end, bytes| {
+                let secs = started.elapsed().as_secs_f64();
+                println!("proposers [{lo}, {end}] {bytes} bytes, {secs:.0}s in");
+            },
+        )
+        .await?;
+        let secs = started.elapsed().as_secs_f64().max(0.001);
+        println!(
+            "{} catalogue files written, {} already there; {} bytes for {} blocks, {:.0} blocks/s",
+            built.written.len(),
+            built.skipped,
+            built.bytes,
+            built.blocks,
+            built.blocks as f64 / secs
+        );
+        for (method, n) in rpc.calls() {
+            println!("  {method}: {n}");
+        }
+        return Ok(());
+    }
     let built = build(
         &rpc,
         &args.out,

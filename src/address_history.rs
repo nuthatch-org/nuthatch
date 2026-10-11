@@ -58,9 +58,17 @@ pub struct AddressHistoryConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mev_relays: bool,
     /// How long a request for history above what is covered may wait while the nest covers it:
-    /// queue, RPC work and the answer together. Default 20 s, under rotki's 30 s read timeout.
+    /// queue, RPC work and the answer together. Default 8 s, under rotki's 30 s read timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_deadline: Option<String>,
+    /// Validator indices whose proposed blocks to prove from Dencun on (RFC-0063 plan C). A client
+    /// such as rotki registers its own through `/api/watch`. Ethereum mainnet only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validators: Vec<u64>,
+    /// A beacon node's API, to build the proposer catalogue for blocks the mirror has not published.
+    /// Off unless named: the beacon sees this machine's IP and the beacon roots asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beacon_url: Option<String>,
 }
 
 /// `[address_history.mirror]`: where verified block partitions come from, which chain and blocks to
@@ -72,7 +80,10 @@ pub struct MirrorConfig {
     pub url: String,
     pub chain_id: u64,
     pub from_block: u64,
-    pub to_block: u64,
+    /// The last block to take from the mirror; omitted, as far as the mirror has published, found
+    /// again every poll, the blocks above it read from the RPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_block: Option<u64>,
     pub cache_mb: u64,
 }
 
@@ -94,10 +105,9 @@ impl AddressHistoryConfig {
             }
         }
         if let Some(m) = &self.mirror {
-            if m.to_block < m.from_block {
+            if let Some(to) = m.to_block.filter(|t| *t < m.from_block) {
                 bail!(
-                    "[address_history.mirror] to_block {} is before from_block {}",
-                    m.to_block,
+                    "[address_history.mirror] to_block {to} is before from_block {}",
                     m.from_block
                 );
             }
@@ -495,6 +505,10 @@ impl AddressHistory {
         }
         wtx.commit()?;
         Ok(AddressHistory { store, chain_id })
+    }
+
+    pub fn store(&self) -> &Store {
+        &self.store
     }
 
     pub fn chain_id(&self) -> u64 {
@@ -1122,6 +1136,9 @@ impl AddressHistory {
     pub fn keep_verified_only(&self, actions: &[Action], (first, last): (u64, u64)) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
         let mut changed = false;
+        // Produced blocks are derived from mined blocks: where unverified mined-block coverage goes,
+        // the produced-block coverage built on it goes too.
+        let mut unmined: Vec<(Address, Vec<(u64, u64)>)> = Vec::new();
         {
             let mut c = wtx.open_table(COVERAGE)?;
             let v = wtx.open_table(VERIFIED_COV)?;
@@ -1146,8 +1163,12 @@ impl AddressHistory {
                 }
                 changed = true;
                 let a: Address = key[..20].try_into().expect("coverage keys are 21 bytes");
+                let removed = subtract_all(&intersect(&spans, &[(first, last)]), &verified);
+                if action == Action::MinedBlocks && !removed.is_empty() {
+                    unmined.push((a, removed.clone()));
+                }
                 let mut rows = wtx.open_table(action.table())?;
-                for (f, t) in subtract_all(&intersect(&spans, &[(first, last)]), &verified) {
+                for (f, t) in removed {
                     drain(
                         &mut rows,
                         &row_key(&a, f, 0, 0),
@@ -1158,6 +1179,28 @@ impl AddressHistory {
                     c.remove(key.as_slice())?;
                 } else {
                     c.insert(key.as_slice(), encode_spans(&kept).as_slice())?;
+                }
+            }
+            let mut produced = wtx.open_table(Action::ProducedBlocks.table())?;
+            for (a, removed) in unmined {
+                let key = coverage_key(&a, Action::ProducedBlocks);
+                let Some(spans) = c.get(key.as_slice())?.map(|s| s.value().to_vec()) else {
+                    continue;
+                };
+                let mut kept = decode_spans(&spans)?;
+                for &(f, t) in &removed {
+                    kept = subtract(&kept, (f, t));
+                    drain(
+                        &mut produced,
+                        &row_key(&a, f, 0, 0),
+                        &row_key(&a, t, u64::MAX, u64::MAX),
+                    )?;
+                }
+                changed = true;
+                if kept.is_empty() {
+                    c.remove(key.as_slice())?;
+                } else {
+                    c.insert(key.as_slice(), encode_spans(&merge(kept)).as_slice())?;
                 }
             }
             if changed {
@@ -2940,8 +2983,17 @@ mod tests {
         .unwrap();
         h.record_verified(Action::MinedBlocks, ALICE, &[at(55)], (50, 70), g)
             .unwrap();
+        // Produced blocks built on that mined-block coverage.
+        h.record_produced(ALICE, &[at(10), at(60), at(90)], (0, 100), g, &[], 0)
+            .unwrap();
         h.keep_verified_only(&[Action::MinedBlocks], (40, 80))
             .unwrap();
+        // Where unverified mined-block coverage went, the produced-block coverage built on it went too;
+        // over verified blocks it stays.
+        assert_eq!(
+            h.coverage(Action::ProducedBlocks, ALICE).unwrap(),
+            vec![(0, 39), (50, 70), (81, 100)]
+        );
         assert_eq!(
             h.coverage(Action::MinedBlocks, ALICE).unwrap(),
             vec![(0, 39), (50, 70), (81, 100)]
@@ -3479,6 +3531,8 @@ mod tests {
             mirror: None,
             mev_relays: false,
             request_deadline: None,
+            validators: vec![],
+            beacon_url: None,
         };
         ok.validate().unwrap();
         assert_eq!(ok.poll_interval().unwrap(), DEFAULT_POLL_INTERVAL);
@@ -3507,7 +3561,7 @@ mod tests {
             url: "https://example.org".into(),
             chain_id: 1,
             from_block: 10,
-            to_block: 20,
+            to_block: Some(20),
             cache_mb: MIN_CACHE_MB,
         };
         AddressHistoryConfig {
@@ -3518,7 +3572,7 @@ mod tests {
         .unwrap();
         bad(AddressHistoryConfig {
             mirror: Some(MirrorConfig {
-                to_block: 9,
+                to_block: Some(9),
                 ..mirror.clone()
             }),
             ..ok.clone()

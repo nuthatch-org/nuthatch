@@ -6,7 +6,7 @@
 //! discovers every watched address up to the finalized head ([`Discovery`]).
 
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use crate::address_discovery::{Counted, Discoverer, Rpc};
@@ -100,7 +100,34 @@ pub struct ModeState {
     latest: AtomicU64,
     /// `logs/getLogs` requests running at once: each can hold up to a page of logs and its receipts.
     logs: tokio::sync::Semaphore,
+    /// Watched validators and their proven blocks (plan C), on Ethereum mainnet.
+    pub validators: Option<crate::address_validators::Validators>,
+    /// Where proposer catalogue spans the mirror lacks are built from, when `beacon_url` names one.
+    pub beacon: Option<Arc<crate::address_proposers::Beacon>>,
+    /// The chain's hash at a height, read for a request without the cursor: one hash check lets a
+    /// covered answer above the finalized head be served without waiting behind the cursor's work.
+    pub hash_at: Option<HashAt>,
+    /// The blocks a backfill's first discovery window covers, before [`Pace`] adjusts it.
+    pub first_window: u64,
+    /// The discovery window [`Pace`] last settled on, kept across polls; 0 before the first.
+    backfill_span: AtomicU64,
+    /// Blocks per minute the last discovery window covered, at least 1 once measured; 0 before the
+    /// first. Per minute so a slow measured layer never truncates to "unmeasured".
+    backfill_rate: AtomicU64,
+    /// The same for the last body window and the last produced-block step.
+    body_rate: AtomicU64,
+    produced_rate: AtomicU64,
+    /// How long the last timestamp search on the RPC took, in milliseconds; 0 before the first.
+    search_ms: AtomicU64,
+    /// Whether the mirror's last block is as far as it has published, found again every poll, rather
+    /// than a configured `to_block`.
+    mirror_open: bool,
+    /// The mirror's last block as last found, when it is open.
+    mirror_last: AtomicU64,
 }
+
+pub type HashAt =
+    Arc<dyn Fn(u64) -> futures::future::BoxFuture<'static, Result<[u8; 32]>> + Send + Sync>;
 
 /// How many `logs/getLogs` requests may run at once; one more answers incomplete at once.
 const LOGS_AT_ONCE: usize = 2;
@@ -110,6 +137,41 @@ const LOGS_AT_ONCE: usize = 2;
 const COVER_WINDOW: u64 = 5_000;
 const COVER_BODIES: u64 = 500;
 const COVER_PRODUCED: u64 = 1_000;
+
+/// How many blocks a backfill window covers, set by how long the last one took: requests for history
+/// above what is covered wait for the window in hand, so a window must stay well under their deadline.
+/// It starts small, doubles while windows are quick, and halves when one runs long.
+pub(crate) struct Pace {
+    span: u64,
+    min: u64,
+    max: u64,
+    target: Duration,
+}
+
+impl Pace {
+    pub(crate) fn new(start: u64, min: u64, max: u64, deadline: Duration) -> Pace {
+        Pace {
+            span: start.clamp(min, max),
+            min,
+            max,
+            // A quarter of the deadline: a request waits for the window in hand. Much smaller and the
+            // fixed cost of a window's checks never lets it grow, and the backfill crawls.
+            target: deadline / 4,
+        }
+    }
+    pub(crate) fn span(&self) -> u64 {
+        self.span
+    }
+    pub(crate) fn took(&mut self, elapsed: Duration) {
+        self.span = if elapsed > self.target {
+            (self.span / 2).max(self.min)
+        } else if elapsed < self.target / 2 {
+            (self.span * 2).min(self.max)
+        } else {
+            self.span
+        };
+    }
+}
 
 /// The address-history store's page cache.
 const STORE_CACHE_BYTES: usize = 32 * 1024 * 1024;
@@ -158,8 +220,9 @@ pub enum Request {
     },
 }
 
-/// The default for `[address_history] request_deadline`: under rotki's 30 s read timeout.
-pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(20);
+/// The default for `[address_history] request_deadline`: the most any request waits, queue and
+/// background work included, well under rotki's 30 s read timeout.
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(8);
 
 impl ModeState {
     pub fn new(
@@ -202,6 +265,17 @@ impl ModeState {
             deadline: DEFAULT_DEADLINE,
             latest: AtomicU64::new(0),
             logs: tokio::sync::Semaphore::new(LOGS_AT_ONCE),
+            validators: None,
+            beacon: None,
+            hash_at: None,
+            first_window: 128,
+            backfill_span: AtomicU64::new(0),
+            backfill_rate: AtomicU64::new(0),
+            body_rate: AtomicU64::new(0),
+            produced_rate: AtomicU64::new(0),
+            search_ms: AtomicU64::new(0),
+            mirror_open: false,
+            mirror_last: AtomicU64::new(0),
         }
     }
 
@@ -210,13 +284,14 @@ impl ModeState {
         self
     }
 
-    /// Hand `make(deadline, reply)` to the cursor and wait for it, all within the deadline. `Err`
-    /// says why it was not done; nothing is partly answered.
+    /// Hand `make(deadline, reply)` to the cursor and wait for it, no later than `deadline`: the
+    /// request's own, set when it arrived, so queue time counts against it. `Err` says why it was not
+    /// done; nothing is partly answered.
     async fn ask(
         &self,
+        deadline: Instant,
         make: impl FnOnce(Instant, Reply) -> Request,
     ) -> std::result::Result<(), String> {
-        let deadline = Instant::now() + self.deadline;
         let (reply, done) = tokio::sync::oneshot::channel();
         if self.requests.try_send(make(deadline, reply)).is_err() {
             return Err("the nest is busy with other requests; try again shortly".into());
@@ -229,6 +304,99 @@ impl ModeState {
                 self.deadline.as_secs()
             )),
         }
+    }
+
+    pub fn with_validators(
+        mut self,
+        validators: crate::address_validators::Validators,
+        beacon: Option<Arc<crate::address_proposers::Beacon>>,
+    ) -> Self {
+        self.validators = Some(validators);
+        self.beacon = beacon;
+        self
+    }
+
+    /// The first block validators' proposals are proven from: the catalogue's first. It does not
+    /// follow `start_block`, which bounds account history: the catalogue costs no RPC to read.
+    pub fn proposals_from(&self) -> u64 {
+        crate::address_proposers::CATALOGUE_FROM_BLOCK
+    }
+
+    /// A mirror without a `to_block`: its last block is as far as it has published, `published`
+    /// for now (`None`: nothing yet).
+    pub fn with_open_mirror(
+        mut self,
+        source: Arc<crate::address_partitions::Source>,
+        first: u64,
+        published: Option<u64>,
+    ) -> Self {
+        self.mirror_last.store(
+            published.unwrap_or(first.saturating_sub(1)),
+            Ordering::Relaxed,
+        );
+        self.mirror = Some((
+            source,
+            (first, published.unwrap_or(first.saturating_sub(1))),
+        ));
+        self.mirror_open = true;
+        self
+    }
+
+    /// The blocks the mirror serves: its configured range, or up to what it has published when open.
+    /// An empty range is `None`.
+    pub fn mirror_blocks(&self) -> Option<(Arc<crate::address_partitions::Source>, (u64, u64))> {
+        let (source, (first, last)) = self.mirror.as_ref()?;
+        let last = if self.mirror_open {
+            self.mirror_last.load(Ordering::Relaxed)
+        } else {
+            *last
+        };
+        (last >= *first).then(|| (source.clone(), (*first, last)))
+    }
+
+    /// Find how far an open mirror has published now: one request when it has not moved.
+    async fn refresh_mirror(&self) {
+        let Some((source, (first, _))) = self.mirror.as_ref().filter(|_| self.mirror_open) else {
+            return;
+        };
+        let known = self.mirror_last.load(Ordering::Relaxed);
+        let from = if known >= *first {
+            crate::address_partitions::span_of(known).0
+        } else {
+            crate::address_partitions::span_of(*first).0
+        };
+        match source.published_end(from).await {
+            Ok(Some(end)) if end > known => {
+                // Unverified coverage in the newly published blocks goes before they count as the
+                // mirror's: a request read meanwhile must not be answered from it.
+                let (h, range) = (self.history.clone(), (*first, end));
+                let revoked = tokio::task::spawn_blocking(move || {
+                    h.keep_verified_only(&crate::address_discovery::BLOCK_SCANNED, range)
+                })
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r);
+                match revoked {
+                    Ok(()) => self.mirror_last.store(end, Ordering::Relaxed),
+                    Err(e) => tracing::warn!(
+                        "address history: setting the newly published blocks aside: {e:#}"
+                    ),
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {}
+            Err(e) => tracing::warn!("address history: how far the mirror has published: {e:#}"),
+        }
+    }
+
+    pub fn with_first_window(mut self, blocks: u64) -> Self {
+        self.first_window = blocks;
+        self
+    }
+
+    pub fn with_hash_at(mut self, hash_at: HashAt) -> Self {
+        self.hash_at = Some(hash_at);
+        self
     }
 
     pub fn with_relays(mut self, relays: crate::address_mev::Relays) -> Self {
@@ -784,9 +952,30 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
         if state.chain_id == 1 {
             mev_passes(self, state, &watched, to).await;
         }
-        for address in watched.clone() {
-            let mut recorded_through: Option<u64> = None;
-            loop {
+        let kept = state.backfill_span.load(Ordering::Relaxed);
+        let mut pace = Pace::new(
+            if kept == 0 { state.first_window } else { kept },
+            64,
+            crate::address_discovery::OUTER_WINDOW,
+            state.deadline,
+        );
+        // One window per account per round, the watched set read again every round: an account rotki
+        // adds mid-backfill gets its first window within a round, not after the others' whole backlog.
+        let mut recorded_through: BTreeMap<String, u64> = BTreeMap::new();
+        let mut stopped: BTreeSet<String> = BTreeSet::new();
+        loop {
+            let round = match state.history.watched() {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!("address history: reading the watched set: {e:#}");
+                    break;
+                }
+            };
+            let mut advanced = false;
+            for address in round {
+                if stopped.contains(&address) {
+                    continue;
+                }
                 serve_queued(state, self).await;
                 let next = match crate::address_discovery::next_uncovered(
                     &state.history,
@@ -796,27 +985,36 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                     Ok(n) => n,
                     Err(e) => {
                         tracing::warn!("address history: coverage for {address}: {e:#}");
-                        break;
+                        stopped.insert(address);
+                        continue;
                     }
                 };
                 if next > to {
-                    break;
+                    continue;
                 }
                 // A recorded window must move coverage past it; one that did not would be fetched
                 // again forever, at the provider's expense.
-                if recorded_through.is_some_and(|r| next <= r) {
+                if recorded_through.get(&address).is_some_and(|r| next <= *r) {
                     state.window_failed();
                     tracing::error!(
                         "address history: coverage for {address} did not advance past {next}; stopping this pass"
                     );
-                    break;
+                    stopped.insert(address);
+                    continue;
                 }
-                let end = next
-                    .saturating_add(crate::address_discovery::OUTER_WINDOW - 1)
-                    .min(to);
-                match discover_window(self, state, &address, (next, end), None).await {
+                let end = next.saturating_add(pace.span() - 1).min(to);
+                let started = Instant::now();
+                let done = discover_window(self, state, &address, (next, end), None).await;
+                let took = started.elapsed();
+                pace.took(took);
+                state.backfill_span.store(pace.span(), Ordering::Relaxed);
+                match done {
                     Ok(()) => {
-                        recorded_through = Some(end);
+                        state
+                            .backfill_rate
+                            .store(per_minute(end - next + 1, took), Ordering::Relaxed);
+                        recorded_through.insert(address.clone(), end);
+                        advanced = true;
                         state.window_done();
                         tracing::info!("address history: {address} covered through {end}");
                     }
@@ -825,24 +1023,31 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                         tracing::warn!(
                             "address history: [{next}, {end}] for {address} not recorded, retrying next poll: {e:#}"
                         );
-                        break;
+                        stopped.insert(address);
                     }
                 }
             }
+            if !advanced {
+                break;
+            }
         }
         // Withdrawals and produced blocks come from bodies, and the definitions they are matched to
-        // are Ethereum mainnet's, so only there is the block scan run.
+        // are Ethereum mainnet's, so only there is the block scan run. An account added during the
+        // backfill joins these passes too.
+        let watched = state.history.watched().unwrap_or(watched);
+        state.refresh_mirror().await;
         if state.chain_id == 1 {
-            let skip = state.mirror.as_ref().map(|(_, blocks)| *blocks);
-            if let Some((source, blocks)) = &state.mirror {
-                mirror_pass(self, state, &watched, to, source, *blocks).await;
+            let skip = state.mirror_blocks().map(|(_, blocks)| blocks);
+            if let Some((source, blocks)) = state.mirror_blocks() {
+                mirror_pass(self, state, &watched, to, &source, blocks).await;
             }
             serve_queued(state, self).await;
             scan_bodies(self, state, &watched, to, skip).await;
             mev_passes(self, state, &watched, to).await;
-        } else if let Some((source, blocks)) = &state.mirror {
+            validator_pass(self, state).await;
+        } else if let Some((source, blocks)) = state.mirror_blocks() {
             // Elsewhere a partition is read for its verified headers alone: timestamp to block.
-            mirror_pass(self, state, &[], to, source, *blocks).await;
+            mirror_pass(self, state, &[], to, &source, blocks).await;
         }
     }
 
@@ -1079,7 +1284,7 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                 break;
             }
             late()?;
-            if let Some((first, last)) = state.mirror.as_ref().map(|(_, b)| *b) {
+            if let Some((first, last)) = state.mirror_blocks().map(|(_, b)| b) {
                 if first <= next && next <= last {
                     bail!("blocks {first} to {last} are read from the mirror's partitions, which have not reached block {next} yet");
                 }
@@ -1087,9 +1292,8 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
             let mut end = hole_end(history, address, &BLOCK_SCANNED, next, to)?
                 .min(next.saturating_add(COVER_BODIES - 1));
             if let Some((first, _)) = state
-                .mirror
-                .as_ref()
-                .map(|(_, b)| *b)
+                .mirror_blocks()
+                .map(|(_, b)| b)
                 .filter(|(f, _)| next < *f)
             {
                 end = end.min(first - 1);
@@ -1182,6 +1386,14 @@ async fn mev_passes<M: Rpc, T: Rpc>(
         for a in watched {
             loop {
                 serve_queued(state, d).await;
+                // Blocks covered in all, so a step that starts the coverage or joins two spans counts
+                // exactly what it added.
+                let through = |h: &AddressHistory| {
+                    h.coverage(crate::address_history::Action::ProducedBlocks, a)
+                        .ok()
+                        .map(|c| c.iter().map(|(f, t)| t - f + 1).sum::<u64>())
+                };
+                let (before, started) = (through(&state.history), Instant::now());
                 let more = crate::address_mev::mev_step(
                     d,
                     relays,
@@ -1194,6 +1406,13 @@ async fn mev_passes<M: Rpc, T: Rpc>(
                 .await?;
                 if !more {
                     break;
+                }
+                if let (Some(b), Some(t)) = (before, through(&state.history)) {
+                    if t > b {
+                        state
+                            .produced_rate
+                            .store(per_minute(t - b, started.elapsed()), Ordering::Relaxed);
+                    }
                 }
                 state.window_done();
             }
@@ -1323,6 +1542,531 @@ async fn mirror_pass<M: Rpc, T: Rpc>(
     }
 }
 
+/// The validator pass (plan C). Everything is anchored at the block the RPC calls finalized, read
+/// by that tag once per pass: the mirror's spans newest first, each span's successor the first block
+/// of the span above it (already verified) and the newest one's linked to the finalized block by
+/// parent hashes; then the blocks above the mirror up to the finalized block less one, built here
+/// from the RPC and the beacon. A span that cannot be proven records nothing and ends its part of
+/// the pass.
+async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, state: &ModeState) {
+    let Some(validators) = state.validators.clone() else {
+        return;
+    };
+    let watched = match validators.watched() {
+        Ok(w) if w.is_empty() => return,
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("address history: reading the watched validators: {e:#}");
+            return;
+        }
+    };
+    let anchor = match crate::address_proposers::finalized_header(&d.main).await {
+        Ok((h, _)) => h,
+        Err(e) => {
+            state.window_failed();
+            tracing::warn!(
+                "address history: the RPC's finalized block, for the proposer catalogue: {e:#}"
+            );
+            return;
+        }
+    };
+    // Proofs run to the finalized block whatever `end_block` says: the chain of spans must reach the
+    // anchor. `end_block` bounds what is served, not what is proven.
+    let ceiling = anchor.number.saturating_sub(1);
+    let first = state.proposals_from();
+    let mut mirror_end = None;
+    if let Some((source, blocks)) = state.mirror_blocks() {
+        mirror_end = Some(blocks.1);
+        if let Err(e) = mirror_spans(
+            d,
+            state,
+            &validators,
+            &watched,
+            &source,
+            blocks,
+            &anchor,
+            ceiling,
+        )
+        .await
+        {
+            state.window_failed();
+            tracing::warn!(
+                "address history: proposers from the mirror not proven, those validators' blocks stay incomplete: {e:#}"
+            );
+        }
+    }
+    serve_queued(state, d).await;
+    if let Some(beacon) = &state.beacon {
+        // Above the mirror, from the first block any watched validator lacks there.
+        let floor = mirror_end.map_or(first, |m| first.max(m + 1));
+        let from = watched
+            .iter()
+            .filter_map(|v| validators.next_uncovered(*v, floor).ok())
+            .min()
+            .unwrap_or(floor);
+        if from <= ceiling {
+            let outcome = async {
+                let generation = validators.generation()?;
+                let (to, proven) = prove_tail(d, beacon, from, ceiling, &anchor, &watched, &|| {
+                    Box::pin(serve_queued(state, d))
+                })
+                .await?;
+                let lacking: Vec<u64> = watched
+                    .iter()
+                    .filter(|v| !validators.covers(**v, (from, to)).unwrap_or(false))
+                    .copied()
+                    .collect();
+                record_proven(
+                    d,
+                    state,
+                    &validators,
+                    &lacking,
+                    (from, to),
+                    &proven,
+                    generation,
+                )
+                .await
+            }
+            .await;
+            state.set_calls("main", d.main.calls());
+            match outcome {
+                Ok(()) => {
+                    state.window_done();
+                    tracing::info!("address history: proposers proven over [{from}, {ceiling}], anchored at the finalized block");
+                }
+                Err(e) => {
+                    state.window_failed();
+                    tracing::warn!(
+                        "address history: proposers over [{from}, {ceiling}] not proven: {e:#}"
+                    );
+                }
+            }
+        }
+    }
+    validator_retries(d, state, &validators).await;
+}
+
+/// Build the rows of `proven` for `lacking` and record `span` for them, under `generation`.
+async fn record_proven<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    validators: &crate::address_validators::Validators,
+    lacking: &[u64],
+    span: (u64, u64),
+    proven: &[crate::address_proposers::Proven],
+    generation: u64,
+) -> Result<()> {
+    let mut found: BTreeMap<u64, Vec<crate::address_validators::Stored>> = BTreeMap::new();
+    for p in proven
+        .iter()
+        .filter(|p| lacking.contains(&p.proposer_index))
+    {
+        found
+            .entry(p.proposer_index)
+            .or_default()
+            .push(proven_row(d, state, p).await);
+    }
+    let v = validators.clone();
+    let lacking = lacking.to_vec();
+    tokio::task::spawn_blocking(move || v.record_span(span, &lacking, &found, generation)).await?
+}
+
+/// The mirror's whole spans inside `[first, ceiling]` that some watched validator lacks, proven newest
+/// first. The newest span's successor is linked to `anchor` by the RPC's headers between them; every
+/// older span's successor is the first block of the span above it, verified in the step before, so
+/// the whole run hangs from the finalized block.
+#[allow(clippy::too_many_arguments)]
+async fn mirror_spans<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    validators: &crate::address_validators::Validators,
+    watched: &[u64],
+    source: &crate::address_partitions::Source,
+    (_, mirror_last): (u64, u64),
+    anchor: &alloy_consensus::Header,
+    ceiling: u64,
+) -> Result<()> {
+    use crate::address_partitions::{span_of, SPAN};
+    use crate::address_proposers as ap;
+    let first = state.proposals_from();
+    let lacking = |lo: u64, hi: u64| -> Vec<u64> {
+        watched
+            .iter()
+            .filter(|v| !validators.covers(**v, (lo, hi)).unwrap_or(false))
+            .copied()
+            .collect()
+    };
+    // From the catalogue's first span whatever the mirror's `from_block`, which bounds only what
+    // address history reads from partitions.
+    let mut start = span_of(first).0;
+    let mut needed = Vec::new();
+    while start + SPAN - 1 <= mirror_last.min(ceiling) {
+        if !lacking(start.max(first), start + SPAN - 1).is_empty() {
+            needed.push(start);
+        }
+        start += SPAN;
+    }
+    let (Some(&lowest), Some(&top)) = (needed.first(), needed.last()) else {
+        return Ok(());
+    };
+    // The newest needed span's successor, linked by parent hashes to the finalized block.
+    let top_end = top + SPAN - 1;
+    let mut successor = if top_end + 1 == anchor.number {
+        anchor.clone()
+    } else {
+        let (lo, hi) = (top_end + 1, anchor.number - 1);
+        if hi - lo + 1 > LOCAL_CATALOGUE_MAX {
+            bail!(
+                "the mirror's spans end {} blocks under the finalized block, over the {LOCAL_CATALOGUE_MAX} a nest links itself",
+                hi - lo + 1
+            );
+        }
+        ap::linked_to(&d.main, (lo, hi), anchor, &|| {
+            Box::pin(serve_queued(state, d))
+        })
+        .await?
+    };
+    let mut span = top;
+    loop {
+        serve_queued(state, d).await;
+        let end = span + SPAN - 1;
+        let generation = validators.generation()?;
+        let mut verified = None;
+        for fresh in [false, true] {
+            let Some(raw) = source.fetch(span, fresh).await? else {
+                bail!("the mirror has no block partition for [{span}, {end}]");
+            };
+            match crate::address_partitions::decode(&raw).and_then(|b| {
+                crate::address_partitions::verify(&b, span, end, successor.parent_hash, 1)
+            }) {
+                Ok(b) => {
+                    verified = Some(b);
+                    break;
+                }
+                Err(e) if !fresh => {
+                    tracing::warn!("address history: cached partition [{span}, {end}] refused, downloading it again: {e:#}");
+                    source.discard(span);
+                }
+                Err(e) => return Err(e.context(format!("the partition for [{span}, {end}]"))),
+            }
+        }
+        let blocks = verified.expect("the loop verifies or returns");
+        if needed.contains(&span) {
+            let lo = ap::provable(span).map_or(end + 1, |(lo, _)| lo);
+            let clip = (span.max(first), end);
+            let who = lacking(clip.0, clip.1);
+            let mut proven = None;
+            for fresh in [false, true] {
+                let Some(raw) = source.fetch_catalogue(span, fresh).await? else {
+                    bail!("the mirror has no proposer catalogue for [{span}, {end}]");
+                };
+                match ap::decode(&raw).and_then(|rows| {
+                    ap::verify(
+                        &rows,
+                        &blocks[(lo - span) as usize..],
+                        &successor,
+                        (lo, end),
+                    )
+                }) {
+                    Ok(p) => {
+                        proven = Some(p);
+                        break;
+                    }
+                    Err(e) if !fresh => {
+                        tracing::warn!("address history: cached catalogue [{span}, {end}] refused, downloading it again: {e:#}");
+                        source.discard_catalogue(span);
+                    }
+                    Err(e) => return Err(e.context(format!("the catalogue for [{span}, {end}]"))),
+                }
+            }
+            let proven: Vec<ap::Proven> = proven
+                .expect("the loop proves or returns")
+                .into_iter()
+                .filter(|p| p.block.header.number >= clip.0)
+                .collect();
+            record_proven(d, state, validators, &who, clip, &proven, generation).await?;
+            state.set_calls("main", d.main.calls());
+            state.window_done();
+            tracing::info!(
+                "address history: proposers proven over [{}, {end}] for {} validator(s)",
+                clip.0,
+                who.len()
+            );
+        }
+        if span == lowest {
+            return Ok(());
+        }
+        successor = blocks[0].header.clone();
+        span -= SPAN;
+    }
+}
+
+/// The most blocks behind finality a nest reads itself for the proposer catalogue: enough for the gap
+/// between a mirror's last published span and the finalized block, not for history a mirror holds.
+const LOCAL_CATALOGUE_MAX: u64 = 50_000;
+
+/// How often a validator block's owed reward or payment is read again.
+const RETRY_EVERY_SECS: u64 = 60 * 60;
+
+/// Every block of `[from, to]` (`to` at most `anchor`'s parent) with its proven proposer, built here
+/// from the RPC and the beacon and linked to `anchor`, the block the RPC calls finalized, through
+/// every block between: a self-consistent fork the RPC returned for the range cannot reach it.
+async fn prove_tail<'b, M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    beacon: &crate::address_proposers::Beacon,
+    from: u64,
+    to: u64,
+    anchor: &alloy_consensus::Header,
+    keep: &[u64],
+    between: &(dyn Fn() -> futures::future::BoxFuture<'b, ()> + Sync),
+) -> Result<(u64, Vec<crate::address_proposers::Proven>)> {
+    use crate::address_proposers as ap;
+    let last = anchor.number.saturating_sub(1);
+    if to < from || to > last {
+        bail!(
+            "the range [{from}, {to}] is not under the finalized block {}",
+            anchor.number
+        );
+    }
+    if last - from + 1 > LOCAL_CATALOGUE_MAX {
+        bail!(
+            "building {} blocks here is over the {LOCAL_CATALOGUE_MAX} a nest builds itself; the mirror should hold them",
+            last - from + 1
+        );
+    }
+    // Read through to the finalized block whatever `to` is, so the range hangs from it: newest chunk
+    // first, each linked to the chunk above it, the top one to the anchor, and the cursor's waiting
+    // requests served between chunks.
+    let mut successor = anchor.clone();
+    let mut proven = Vec::new();
+    let mut hi = last;
+    loop {
+        let lo = hi.saturating_sub(ap::CHUNK - 1).max(from);
+        let blocks = ap::blocks_from_rpc(&d.main, (lo, hi), 8).await?;
+        let rows = ap::build_rows(beacon, &blocks, &successor, (lo, hi), 8).await?;
+        let chunk = ap::verify(&rows, &blocks, &successor, (lo, hi))?;
+        successor = blocks[0].header.clone();
+        proven.extend(
+            chunk
+                .into_iter()
+                .filter(|p| keep.contains(&p.proposer_index) && p.block.header.number <= to),
+        );
+        if lo == from {
+            break;
+        }
+        hi = lo - 1;
+        between().await;
+    }
+    proven.sort_by_key(|p| p.block.header.number);
+    Ok((to, proven))
+}
+
+/// The served row of one proven block. Its reward comes from the block's own transactions and
+/// receipts, checked against its header; when they cannot be read the reward is owed, never zero.
+/// Relay provenance is asked once here and again later when it is missing.
+async fn proven_row<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    p: &crate::address_proposers::Proven,
+) -> crate::address_validators::Stored {
+    let h = &p.block.header;
+    let mut row = serde_json::Map::new();
+    let mut meta = serde_json::Map::new();
+    let text = |v: String| Value::String(v);
+    row.insert("blockNumber".into(), text(h.number.to_string()));
+    row.insert("blockHash".into(), text(format!("{:#x}", p.block.hash)));
+    row.insert("timeStamp".into(), text(h.timestamp.to_string()));
+    row.insert("slot".into(), text(p.slot.to_string()));
+    row.insert("proposerIndex".into(), text(p.proposer_index.to_string()));
+    row.insert("feeRecipient".into(), text(format!("{:#x}", h.beneficiary)));
+    match crate::address_partitions::verified_reward(&d.main, &p.block).await {
+        Ok(r) => {
+            row.insert("blockReward".into(), text(r.to_string()));
+            row.insert("rewardStatus".into(), text("verified".into()));
+        }
+        Err(e) => {
+            tracing::warn!(
+                "address history: block {}'s reward owed, retried later: {e:#}",
+                h.number
+            );
+            row.insert("rewardStatus".into(), text("unavailable".into()));
+        }
+    }
+    let now = unix_now();
+    let mev = match &state.relays {
+        Some(relays) => {
+            crate::address_mev::block_mev(
+                &state.history,
+                relays,
+                h.number,
+                &format!("{:#x}", p.block.hash),
+                false,
+                None,
+            )
+            .await
+        }
+        None => crate::address_mev::no_mev(),
+    };
+    if state.relays.is_some() && mev.get("mev").and_then(Value::as_str) == Some("unrecorded") {
+        meta.insert("mevFirstAsked".into(), json!(now));
+        meta.insert("mevLastAsked".into(), json!(now));
+    }
+    row.extend(mev);
+    payment_into(d, h.number, &mut row, &mut meta).await;
+    crate::address_validators::Stored {
+        block: h.number,
+        row,
+        meta,
+    }
+}
+
+/// The builder's payment to the relays' recipient in block `b`, as `nuthatchProducedBlocks` carries it,
+/// read from the block's traces. Without a recipient there is nothing to look for; a trace that cannot
+/// be read leaves the payment owed, retried later, never claimed absent.
+async fn payment_into<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    b: u64,
+    row: &mut serde_json::Map<String, Value>,
+    meta: &mut serde_json::Map<String, Value>,
+) {
+    let get = |k: &str| row.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let (recipient, hash, miner) = (get("mevRecipient"), get("blockHash"), get("feeRecipient"));
+    let mut found = (String::new(), String::new());
+    meta.remove("paymentOwed");
+    if !recipient.is_empty() {
+        let frames = d
+            .trace
+            .call("trace_block", json!([format!("0x{b:x}")]))
+            .await;
+        match frames.and_then(|f| {
+            let f = f
+                .as_array()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("trace_block answered no list for block {b}"))?;
+            crate::address_mev::payment_legs(&f, &hash, &miner, &recipient)
+        }) {
+            Ok((hashes, total)) if !hashes.is_empty() => {
+                found = (hashes.join(","), total.to_string())
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("address history: block {b}'s payment owed, retried later: {e:#}");
+                meta.insert("paymentOwed".into(), Value::Bool(true));
+            }
+        }
+    }
+    row.insert("paymentTx".into(), Value::String(found.0));
+    row.insert("paymentValue".into(), Value::String(found.1));
+}
+
+/// Owed rewards and payments read again, and blocks without relay evidence asked again on the re-ask
+/// schedule, a bounded batch per pass. A block first written while relays were off is asked as soon
+/// as they are on.
+async fn validator_retries<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    validators: &crate::address_validators::Validators,
+) {
+    use crate::address_mev::{REASK_EVERY_SECS, REASK_FOR_SECS};
+    let all = match validators.all() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("address history: reading validator blocks to retry: {e:#}");
+            return;
+        }
+    };
+    let now = unix_now();
+    let num = |m: &serde_json::Map<String, Value>, k: &str| m.get(k).and_then(Value::as_u64);
+    // Owed reads are tried at most hourly, least recently tried first, so rows whose data stays
+    // unavailable cannot hold every batch.
+    let tried = |s: &crate::address_validators::Stored| num(&s.meta, "retriedAt").unwrap_or(0);
+    let reask_due = |s: &crate::address_validators::Stored| {
+        state.relays.is_some()
+            && s.row.get("mev").and_then(Value::as_str) == Some("unrecorded")
+            && match num(&s.meta, "mevFirstAsked") {
+                None => true,
+                Some(f) => {
+                    now < f + REASK_FOR_SECS
+                        && num(&s.meta, "mevLastAsked").is_some_and(|l| now >= l + REASK_EVERY_SECS)
+                }
+            }
+    };
+    let mut due: Vec<(u64, crate::address_validators::Stored)> = all
+        .into_iter()
+        .filter(|(_, s)| {
+            let owed = s.row.get("rewardStatus").and_then(Value::as_str) == Some("unavailable")
+                || s.meta.get("paymentOwed").and_then(Value::as_bool) == Some(true);
+            (owed && now >= tried(s) + RETRY_EVERY_SECS) || reask_due(s)
+        })
+        .collect();
+    // Least recently tried or asked first.
+    due.sort_by_key(|(_, s)| tried(s).max(num(&s.meta, "mevLastAsked").unwrap_or(0)));
+    for (v, mut s) in due.into_iter().take(64) {
+        let owed = s.row.get("rewardStatus").and_then(Value::as_str) == Some("unavailable");
+        let reask = reask_due(&s);
+        let payment_owed = s.meta.get("paymentOwed").and_then(Value::as_bool) == Some(true);
+        let owed = owed && now >= tried(&s) + RETRY_EVERY_SECS;
+        let payment_owed = payment_owed && now >= tried(&s) + RETRY_EVERY_SECS;
+        if !owed && !reask && !payment_owed {
+            continue;
+        }
+        if owed || payment_owed {
+            s.meta.insert("retriedAt".into(), json!(now));
+        }
+        let hash = s
+            .row
+            .get("blockHash")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if owed {
+            let block = async {
+                let (header, h) = crate::address_proposers::header_at(&d.main, s.block).await?;
+                if format!("{h:#x}") != hash {
+                    bail!("block {} is now at another hash", s.block);
+                }
+                let vb = crate::address_partitions::VerifiedBlock {
+                    hash: h,
+                    header,
+                    withdrawals: Vec::new(),
+                };
+                crate::address_partitions::verified_reward(&d.main, &vb).await
+            };
+            if let Ok(r) = block.await {
+                s.row
+                    .insert("blockReward".into(), Value::String(r.to_string()));
+                s.row
+                    .insert("rewardStatus".into(), Value::String("verified".into()));
+            }
+        }
+        if reask {
+            if let Some(relays) = &state.relays {
+                let mev = crate::address_mev::block_mev(
+                    &state.history,
+                    relays,
+                    s.block,
+                    &hash,
+                    true,
+                    None,
+                )
+                .await;
+                s.meta.insert("mevLastAsked".into(), json!(now));
+                s.meta.entry("mevFirstAsked").or_insert(json!(now));
+                s.row.extend(mev);
+            }
+        }
+        if reask || payment_owed {
+            payment_into(d, s.block, &mut s.row, &mut s.meta).await;
+        }
+        let vs = validators.clone();
+        let saved = tokio::task::spawn_blocking(move || vs.update(v, &s)).await;
+        if let Err(e) = saved.map_err(anyhow::Error::from).and_then(|r| r) {
+            tracing::warn!("address history: saving a validator block's retry: {e:#}");
+        }
+    }
+    state.set_calls("main", d.main.calls());
+}
+
 /// The block-body pass: each window is read once for every watched address that still lacks it,
 /// starting from the least covered, so an address watched later backfills without a second scan
 /// of what the others already have.
@@ -1337,6 +2081,7 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
     use crate::address_discovery::{next_uncovered_for, BLOCK_SCANNED, BLOCK_WINDOW};
     let mut last: Option<u64> = None;
     let mut cursor = state.start_block;
+    let mut pace = Pace::new(250, 16, BLOCK_WINDOW, state.deadline);
     loop {
         serve_queued(state, d).await;
         let mut next = Vec::new();
@@ -1363,7 +2108,7 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
             );
             return;
         }
-        let mut end = from.saturating_add(BLOCK_WINDOW - 1).min(to);
+        let mut end = from.saturating_add(pace.span() - 1).min(to);
         if let Some((first, _)) = skip.filter(|(f, _)| from < *f) {
             end = end.min(first - 1);
         }
@@ -1374,7 +2119,15 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
             .filter(|(_, n)| *n <= end)
             .map(|(a, _)| a)
             .collect();
+        let started = Instant::now();
         let outcome = body_window(d, state, addresses, (from, end), None).await;
+        pace.took(started.elapsed());
+        if outcome.is_ok() {
+            state.body_rate.store(
+                per_minute(end - from + 1, started.elapsed()),
+                Ordering::Relaxed,
+            );
+        }
         match outcome {
             Ok(()) => {
                 last = Some(end);
@@ -1508,7 +2261,18 @@ async fn api(
     if let Some(why) = conflict(&s) {
         return Json(crate::address_history::incomplete(&why));
     }
-    let answer = answer(&s, q).await;
+    // One ceiling for the whole request, whatever it waits on: reads, the hash check, the queue, a
+    // window the cursor is part way through, a trace and a cover in turn. The work inside stops a
+    // little short of it, so a range covered by then is still read and served under it.
+    let ceiling = Instant::now() + s.deadline;
+    let work = ceiling - s.deadline / 20;
+    let answer = match tokio::time::timeout_at(ceiling.into(), answer(&s, q, work)).await {
+        Ok(a) => a,
+        Err(_) => Json(crate::address_history::incomplete(&format!(
+            "not answered within the {}s deadline; try again shortly",
+            s.deadline.as_secs()
+        ))),
+    };
     // A conflict found while this request was answered may concern what it read.
     match conflict(&s) {
         Some(why) => Json(crate::address_history::incomplete(&why)),
@@ -1516,7 +2280,7 @@ async fn api(
     }
 }
 
-async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
+async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>, deadline: Instant) -> Json<Value> {
     let s = s.clone();
     // The RPC behind the nest is the operator's; only a loopback bind lends it out.
     if let Some(forward) = s.forward.clone().filter(|_| s.loopback) {
@@ -1532,13 +2296,34 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
         } else {
             None
         };
-        if let Some(v) = crate::address_proxy::answer(&q, s.chain_id, &forward).await {
-            return Json(v);
+        // Within the request deadline, or refused: a client's read timeout is not much longer.
+        match tokio::time::timeout_at(
+            deadline.into(),
+            crate::address_proxy::answer(&q, s.chain_id, &forward),
+        )
+        .await
+        {
+            Ok(Some(v)) => return Json(v),
+            Ok(None) => {}
+            Err(_) => {
+                return Json(crate::address_history::incomplete(&format!(
+                    "not answered within the {}s deadline; ask for a narrower range",
+                    s.deadline.as_secs()
+                )))
+            }
         }
     }
     let get = |k: &str| q.get(k).map(String::as_str);
+    if get("module") == Some("account") && get("action") == Some("nuthatchValidatorBlocks") {
+        return Json(validator_blocks(&s, &q).await);
+    }
     if get("module") == Some("block") && get("action") == Some("getblocknobytime") {
-        return Json(block_by_time(&s, &q).await);
+        return Json(block_by_time(&s, &q, deadline).await);
+    }
+    // A range from before the configured history is refused in the one wording a client reads to ask
+    // again from the start, whatever the action and whether or not it named a start.
+    if let Some(why) = before_history(&s, &q) {
+        return Json(crate::address_history::incomplete(&why));
     }
     // A txhash lookup needs no coverage: a transaction the store has not traced is traced now, by
     // the cursor, once the request is one `respond` would answer.
@@ -1561,7 +2346,7 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
         .await;
         if matches!(fresh, Ok(true)) {
             if let Err(e) = s
-                .ask(|deadline, reply| Request::Trace {
+                .ask(deadline, |deadline, reply| Request::Trace {
                     hash,
                     deadline,
                     reply,
@@ -1580,6 +2365,18 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
         match wanted(&s, &q, &answer).await {
             Want::Serve => return Json(answer),
             Want::Cover(w) => {
+                // Rows already cover the range: only a reorg could change them, and the lowest
+                // tracked hash at or above its end standing proves nothing under it moved.
+                if w.1 != Need::Produced && answer["status"] == "1" {
+                    match stands(&s, w.3, &answer, deadline).await {
+                        Some(true) => return Json(answer),
+                        Some(false) => {
+                            answer = respond(&s, &q).await;
+                            continue;
+                        }
+                        None => {}
+                    }
+                }
                 want = Some(w);
                 break;
             }
@@ -1591,8 +2388,13 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
             "the history changed while it was being read; ask again",
         ));
     };
+    // A gap the cursor cannot cover within the deadline at its measured pace is refused at once,
+    // not after holding the request for the whole deadline: the backfill reaches it in the background.
+    if let Some(why) = beyond_reach(&s, &want).await {
+        return Json(crate::address_history::incomplete(&why));
+    }
     match s
-        .ask(|deadline, reply| Request::Cover {
+        .ask(deadline, |deadline, reply| Request::Cover {
             address: want.0,
             need: want.1,
             from: want.2,
@@ -1604,6 +2406,12 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
     {
         Ok(()) => Json(respond(&s, &q).await),
         Err(e) => {
+            // The cursor may have finished just as the ceiling passed: what is now covered is served,
+            // anything else is refused, and nothing waits past the ceiling for either.
+            let now = respond(&s, &q).await;
+            if matches!(wanted(&s, &q, &now).await, Want::Serve) {
+                return Json(now);
+            }
             let why = answer["result"]
                 .as_str()
                 .unwrap_or("")
@@ -1616,6 +2424,162 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
             }))
         }
     }
+}
+
+/// Why an account request starts before the configured history, if it does: `startblock`, or 0
+/// when absent, under `start_block`.
+fn before_history(s: &ModeState, q: &HashMap<String, String>) -> Option<String> {
+    use crate::address_history::Action;
+    if q.get("module").map(String::as_str) != Some("account") || q.contains_key("txhash") {
+        return None;
+    }
+    Action::from_etherscan(q.get("action")?)?;
+    let start = match q.get("startblock").filter(|v| !v.is_empty()) {
+        None => 0,
+        Some(v) => v.parse::<u64>().ok()?,
+    };
+    if let Some(end) = s.end_block.filter(|e| start > *e) {
+        return Some(format!("history ends at block {end}"));
+    }
+    (start < s.start_block).then(|| {
+        format!(
+            "history starts at block {}; ask from there and use another source before it",
+            s.start_block
+        )
+    })
+}
+
+/// The blocks one layer can cover for a request: what it covers in half the deadline at its own
+/// measured rate, or `unmeasured` before it has a rate. Layers differ by orders of magnitude: trace
+/// discovery tens of thousands of blocks a minute, a block-body scan a few thousand.
+fn reach(s: &ModeState, rate: &AtomicU64, unmeasured: u64) -> u64 {
+    match rate.load(Ordering::Relaxed) {
+        0 => unmeasured,
+        per_minute => (per_minute as u128 * s.deadline.as_millis() / 2 / 60_000) as u64,
+    }
+}
+
+/// `blocks` covered in `took`, per minute: at least 1, so a measured rate is never read as none.
+fn per_minute(blocks: u64, took: Duration) -> u64 {
+    ((blocks as u128 * 60_000) / took.as_millis().max(1)).max(1) as u64
+}
+
+/// Why `want`'s uncovered blocks are too many to cover within the deadline, if they are.
+async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Option<String> {
+    use crate::address_discovery::{next_uncovered_for, BLOCK_SCANNED, DISCOVERED};
+    use crate::address_history::Action;
+    let (address, need, from, to) = want.clone();
+    // Each layer the request needs, its first uncovered block, and how far it can reach in time.
+    let mut layers: Vec<(&'static [Action], u64)> =
+        vec![(&DISCOVERED, reach(s, &s.backfill_rate, COVER_WINDOW))];
+    if need != Need::Discovered {
+        layers.push((&BLOCK_SCANNED, reach(s, &s.body_rate, COVER_BODIES)));
+    }
+    if need == Need::Produced {
+        layers.push((
+            &[Action::ProducedBlocks],
+            reach(s, &s.produced_rate, COVER_PRODUCED),
+        ));
+    }
+    let sets: Vec<&'static [Action]> = layers.iter().map(|(set, _)| *set).collect();
+    let who = address.clone();
+    // Overdue relay re-asks run in the same request, one per block owed: they cost the produced-block
+    // layer as much as blocks it has yet to cover.
+    let (nexts, owed) = blocking(s, move |h| {
+        let nexts = sets
+            .into_iter()
+            .map(|set| next_uncovered_for(h, &who, from, set))
+            .collect::<Result<Vec<u64>>>()?;
+        let owed = if need == Need::Produced {
+            crate::address_mev::overdue(h, unix_now(), Some((from, to)))?.len() as u64
+        } else {
+            0
+        };
+        Ok((nexts, owed))
+    })
+    .await
+    .ok()?;
+    // The layers run one after another, so their times add up: each layer's share of its own
+    // half-deadline reach, summed, must fit in one half-deadline.
+    let load: f64 = layers
+        .iter()
+        .zip(&nexts)
+        .enumerate()
+        .map(|(i, ((_, reach), next))| {
+            let owed = if i == 2 { owed } else { 0 };
+            let work = to
+                .saturating_sub(*next)
+                .saturating_add(u64::from(*next <= to))
+                .saturating_add(owed);
+            match (work, *reach) {
+                (0, _) => 0.0,
+                // A measured rate too slow to reach one block in time reaches none.
+                (_, 0) => f64::INFINITY,
+                (w, r) => w as f64 / r as f64,
+            }
+        })
+        .sum();
+    if load <= 1.0 {
+        return None;
+    }
+    let next = *nexts.iter().min()?;
+    let gap = to
+        .saturating_sub(next)
+        .saturating_add(u64::from(next <= to));
+    Some(()).map(|()| {
+        format!(
+            "covered through block {}; the {gap} blocks above it are being backfilled, more than can \
+             be covered within the {}s deadline; ask again later",
+            next.saturating_sub(1),
+            s.deadline.as_secs()
+        )
+    })
+}
+
+/// `account/nuthatchValidatorBlocks`, from the validators' own store: complete or refused.
+async fn validator_blocks(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value {
+    if let Some(c) = q.get("chainid") {
+        if c.parse::<u64>().ok() != Some(s.chain_id) {
+            return crate::address_history::unsupported(&format!(
+                "chainid {c} is not this nest's chain {}",
+                s.chain_id
+            ));
+        }
+    }
+    let Some(validators) = s.validators.clone() else {
+        return crate::address_history::unsupported(
+            "validator blocks are proven on Ethereum mainnet address-history nests only",
+        );
+    };
+    let (from, until) = (s.proposals_from(), s.end_block);
+    let q = q.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::address_validators::respond(&validators, from, until, &q)
+    })
+    .await
+    .unwrap_or_else(|e| crate::address_history::incomplete(&format!("{e}")))
+}
+
+/// Whether the covered rows of `answer`, which reach block `to` above the finalized head, still
+/// stand: the lowest tracked hash at or above `to` matches the chain, and nothing was written since
+/// the answer was read. `Some(false)`: written since, read it again. `None`: ask the cursor.
+async fn stands(s: &Arc<ModeState>, to: u64, answer: &Value, deadline: Instant) -> Option<bool> {
+    let hash_at = s.hash_at.clone()?;
+    let read_at = answer["generation"].as_str()?.parse::<u64>().ok()?;
+    let (b, h) = blocking(s, move |h| {
+        Ok(h.tracked()?.into_iter().find(|(b, _)| *b >= to))
+    })
+    .await
+    .ok()??;
+    let now = tokio::time::timeout_at(deadline.into(), hash_at(b))
+        .await
+        .ok()?
+        .ok()?;
+    if now != h {
+        return None;
+    }
+    let generation = blocking(s, |h| h.generation()).await.ok()?;
+    Some(generation == read_at)
 }
 
 async fn respond(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value {
@@ -1723,7 +2687,11 @@ async fn wanted(s: &Arc<ModeState>, q: &HashMap<String, String>, answer: &Value)
 
 /// `block/getblocknobytime`: from verified headers where they bracket the timestamp, else searched
 /// on the nest's own RPC, exact or refused.
-async fn block_by_time(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value {
+async fn block_by_time(
+    s: &Arc<ModeState>,
+    q: &HashMap<String, String>,
+    deadline: Instant,
+) -> Value {
     let first = respond(s, q).await;
     let unbracketed = first["result"]
         .as_str()
@@ -1736,6 +2704,21 @@ async fn block_by_time(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value
         .and_then(|t| t.parse::<u64>().ok())
         .expect("respond validated the timestamp");
     let after = q.get("closest").map(String::as_str) == Some("after");
+    // A search gets half the deadline; when the last one needed more, the RPC is too busy to finish
+    // this one in time either, and it is refused at once rather than held.
+    let budget = s.deadline / 2;
+    let last = Duration::from_millis(s.search_ms.load(Ordering::Relaxed));
+    if last > budget {
+        s.search_ms.store(
+            last.as_millis().saturating_sub(budget.as_millis() / 2) as u64,
+            Ordering::Relaxed,
+        );
+        return crate::address_history::incomplete(&format!(
+            "the RPC took {}s for the last timestamp search, over the {}s this one may take; ask again shortly",
+            last.as_secs(),
+            budget.as_secs()
+        ));
+    }
     let committed = s.history.head().ok().flatten();
     let search = async {
         match search_by_time(&forward, t, after).await? {
@@ -1754,7 +2737,12 @@ async fn block_by_time(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value
             Err(why) => Ok::<_, anyhow::Error>(Err(why)),
         }
     };
-    match tokio::time::timeout(s.deadline, search).await {
+    let started = Instant::now();
+    let left = deadline.saturating_duration_since(Instant::now());
+    let searched = tokio::time::timeout(budget.min(left), search).await;
+    s.search_ms
+        .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    match searched {
         Ok(Ok(Ok(b))) => crate::address_history::ok(
             Value::String(b.to_string()),
             s.history.generation().unwrap_or(0),
@@ -1762,8 +2750,8 @@ async fn block_by_time(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value
         Ok(Ok(Err(why))) => crate::address_history::incomplete(&why),
         Ok(Err(e)) => crate::address_history::incomplete(&format!("searching the RPC: {e:#}")),
         Err(_) => crate::address_history::incomplete(&format!(
-            "the RPC search did not finish within the {}s deadline",
-            s.deadline.as_secs()
+            "the RPC search did not finish within {}s; ask again shortly",
+            budget.as_secs()
         )),
     }
 }
@@ -1852,15 +2840,29 @@ async fn search_by_time(
             latest.number, latest.ts
         )));
     }
-    let genesis = header(forward, at(0)).await?;
-    if t < genesis.ts {
-        return Ok(if after {
-            Ok((0, latest, vec![(0, genesis.hash)]))
+    // rotki ends a sync just behind the tip. Bracket that timestamp within the last eight blocks
+    // before searching the whole chain: a genesis-to-head search costs about 25 serial RPC reads
+    // on mainnet, which can exhaust the search budget before reaching an otherwise nearby answer.
+    // This only narrows the search; the same neighbour and ancestry checks still prove its answer.
+    let recent = latest.number.saturating_sub(8);
+    let lower = header(forward, at(recent)).await?;
+    let (mut lo, mut hi) = if t >= lower.ts {
+        (recent, latest.number)
+    } else {
+        let genesis = if recent == 0 {
+            lower
         } else {
-            Err(format!("timestamp {t} is before the first block"))
-        });
-    }
-    let (mut lo, mut hi) = (0, latest.number);
+            header(forward, at(0)).await?
+        };
+        if t < genesis.ts {
+            return Ok(if after {
+                Ok((0, latest, vec![(0, genesis.hash)]))
+            } else {
+                Err(format!("timestamp {t} is before the first block"))
+            });
+        }
+        (0, recent)
+    };
     while lo < hi {
         if after {
             let mid = lo + (hi - lo) / 2;
@@ -1906,12 +2908,27 @@ async fn search_by_time(
 
 #[derive(serde::Deserialize)]
 struct AddressBody {
-    address: String,
+    #[serde(default)]
+    address: Option<String>,
+    /// A validator index, instead of an address.
+    #[serde(default)]
+    validator: Option<u64>,
+}
+
+fn watch_list(s: &ModeState, addresses: Vec<String>) -> Result<Value> {
+    let validators = match &s.validators {
+        Some(v) => v.watched()?,
+        None => Vec::new(),
+    };
+    Ok(json!({ "watched": addresses, "validators": validators }))
 }
 
 async fn watched(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
-    match blocking(&s, |h| h.watched()).await {
-        Ok(w) => (StatusCode::OK, Json(json!({ "watched": w }))),
+    match blocking(&s, |h| h.watched())
+        .await
+        .and_then(|w| watch_list(&s, w))
+    {
+        Ok(v) => (StatusCode::OK, Json(v)),
         Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
@@ -1920,23 +2937,70 @@ async fn watch(
     State(s): State<Arc<ModeState>>,
     Json(b): Json<AddressBody>,
 ) -> (StatusCode, Json<Value>) {
-    change(s, b.address, true).await
+    dispatch(s, b, true).await
 }
 
 async fn unwatch(
     State(s): State<Arc<ModeState>>,
     Json(b): Json<AddressBody>,
 ) -> (StatusCode, Json<Value>) {
-    change(s, b.address, false).await
+    dispatch(s, b, false).await
 }
 
-async fn change(s: Arc<ModeState>, address: String, add: bool) -> (StatusCode, Json<Value>) {
+async fn dispatch(s: Arc<ModeState>, b: AddressBody, add: bool) -> (StatusCode, Json<Value>) {
     if !s.loopback {
         return failed(
             StatusCode::FORBIDDEN,
             "the watched set changes only on a loopback bind",
         );
     }
+    match (b.address, b.validator) {
+        (Some(a), None) => change(s, a, add).await,
+        (None, Some(v)) => change_validator(s, v, add).await,
+        _ => failed(
+            StatusCode::BAD_REQUEST,
+            "give either an address or a validator index",
+        ),
+    }
+}
+
+async fn change_validator(
+    s: Arc<ModeState>,
+    validator: u64,
+    add: bool,
+) -> (StatusCode, Json<Value>) {
+    let Some(validators) = s.validators.clone() else {
+        return failed(
+            StatusCode::BAD_REQUEST,
+            "validators are watched on Ethereum mainnet address-history nests only",
+        );
+    };
+    let done = tokio::task::spawn_blocking(move || {
+        if add {
+            validators.watch(validator)
+        } else {
+            validators.unwatch(validator)
+        }
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|r| r);
+    if let Err(e) = done {
+        return failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+    }
+    if add {
+        s.wake.notify_one();
+    }
+    match blocking(&s, |h| h.watched())
+        .await
+        .and_then(|w| watch_list(&s, w))
+    {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+async fn change(s: Arc<ModeState>, address: String, add: bool) -> (StatusCode, Json<Value>) {
     if let Err(e) = crate::address_history::parse_address(&address) {
         return failed(StatusCode::BAD_REQUEST, format!("address `{address}`: {e}"));
     }
@@ -1949,12 +3013,12 @@ async fn change(s: Arc<ModeState>, address: String, add: bool) -> (StatusCode, J
         h.watched()
     })
     .await;
-    match done {
-        Ok(w) => {
+    match done.and_then(|w| watch_list(&s, w)) {
+        Ok(v) => {
             if add {
                 s.wake.notify_one();
             }
-            (StatusCode::OK, Json(json!({ "watched": w })))
+            (StatusCode::OK, Json(v))
         }
         Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
@@ -2299,7 +3363,21 @@ pub async fn dev(
         )
         .with_deadline(ah.request_deadline()?)
         .with_forward(forward(discovery.clone(), verified.clone()))
-        .with_counter(counter(discovery.clone()));
+        .with_counter(counter(discovery.clone()))
+        .with_hash_at({
+            let d = discovery.clone();
+            let verified = verified.clone();
+            Arc::new(move |b: u64| {
+                let (d, verified) = (d.clone(), verified.clone());
+                Box::pin(async move {
+                    // Not before the cursor has checked the RPC's chain.
+                    if verified.get().is_none() {
+                        bail!("the RPC's chain is not checked yet");
+                    }
+                    block_hash(&d.main, b).await
+                })
+            })
+        });
     if ah.mev_relays {
         if chain_id != 1 {
             bail!("[address_history] mev_relays is for Ethereum mainnet's relays; this nest is on chain {chain_id}");
@@ -2318,23 +3396,68 @@ pub async fn dev(
         }
         // Before anything is served: RPC-scanned rows in the mirror's blocks must not answer while the
         // cursor, which may never get past its chain check, has yet to replace them.
-        state.history.keep_verified_only(
-            &crate::address_discovery::BLOCK_SCANNED,
-            (m.from_block, m.to_block),
-        )?;
-        let source = crate::address_partitions::Source::open(
+        let source = Arc::new(crate::address_partitions::Source::open(
             &m.url,
             chain_id,
             dir.join("partitions"),
             m.cache_mb * 1024 * 1024,
+        )?);
+        // Without a `to_block`, as far as the mirror has published now; the cursor looks again
+        // every poll, and the blocks above it are read from the RPC meanwhile.
+        let to = match m.to_block {
+            Some(t) => Some(t),
+            None => source
+                .published_end(crate::address_partitions::span_of(m.from_block).0)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("address history: how far the mirror has published: {e:#}");
+                    None
+                }),
+        };
+        state.history.keep_verified_only(
+            &crate::address_discovery::BLOCK_SCANNED,
+            (m.from_block, to.unwrap_or(m.from_block.saturating_sub(1))),
         )?;
         tracing::info!(
             "address history: blocks {} to {} from verified partitions at the configured mirror, which \
              sees this machine's IP and the block ranges asked for, never an address",
             m.from_block,
-            m.to_block
+            match (m.to_block, to) {
+                (Some(t), _) => t.to_string(),
+                (None, Some(t)) => format!("{t} (as far as it has published, checked every poll)"),
+                (None, None) => "none yet (checked every poll)".into(),
+            }
         );
-        state = state.with_mirror(Arc::new(source), (m.from_block, m.to_block));
+        state = match m.to_block {
+            Some(t) => state.with_mirror(source, (m.from_block, t)),
+            None => state.with_open_mirror(source, m.from_block, to),
+        };
+    }
+    if chain_id == 1 {
+        let validators = crate::address_validators::Validators::open(
+            state.history.store().clone(),
+            &ah.validators,
+        )?;
+        // From the environment first, so a keyed URL stays out of nuthatch.toml.
+        let beacon_url = std::env::var("NUTHATCH_BEACON_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .or_else(|| ah.beacon_url.clone());
+        let beacon = match &beacon_url {
+            Some(url) => {
+                tracing::info!(
+                    "address history: proposer catalogue spans the mirror lacks are built from the configured beacon, which sees this machine's IP and the beacon roots asked for"
+                );
+                Some(Arc::new(crate::address_proposers::Beacon::new(
+                    Some(url.clone()),
+                    None,
+                )?))
+            }
+            None => None,
+        };
+        state = state.with_validators(validators, beacon);
+    } else if !ah.validators.is_empty() || ah.beacon_url.is_some() {
+        bail!("[address_history] validators and beacon_url are for Ethereum mainnet; this nest is on chain {chain_id}");
     }
     let state = Arc::new(state);
     tracing::info!(
@@ -2379,6 +3502,558 @@ mod tests {
 
     const ALICE: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
     const BOB: &str = "0x00000000219ab540356cbb839cbe05303d7705fa";
+
+    /// Headers by number, and the one it calls finalized.
+    struct Headers {
+        by_number: BTreeMap<u64, Value>,
+        finalized: Value,
+    }
+    impl Rpc for Headers {
+        async fn call(&self, method: &str, params: Value) -> Result<Value> {
+            if method == "trace_block" {
+                if let Some(t) = TRACES.with(|t| t.borrow().clone()) {
+                    return Ok(t);
+                }
+            }
+            if method != "eth_getBlockByNumber" {
+                bail!("{method} is not scripted");
+            }
+            match params[0].as_str() {
+                Some("finalized") => Ok(self.finalized.clone()),
+                Some(n) => {
+                    let n = u64::from_str_radix(n.trim_start_matches("0x"), 16)?;
+                    Ok(self.by_number.get(&n).cloned().unwrap_or(Value::Null))
+                }
+                None => bail!("no block tag"),
+            }
+        }
+    }
+    thread_local! {
+        static TRACES: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_proven_block_carries_the_builders_payment() {
+        use crate::address_proposers::{tests as pt, Proven};
+        let (blocks, _, _) = pt::chain(1);
+        let block = blocks[0].clone();
+        let hash = format!("{:#x}", block.hash);
+        let builder = format!("{:#x}", block.header.beneficiary);
+        let proposer = "0x00000000000000000000000000000000000000a1";
+        TRACES.with(|t| {
+            *t.borrow_mut() = Some(json!([{
+                "blockHash": hash, "transactionPosition": 0, "transactionHash": "0x01",
+                "traceAddress": [], "type": "call",
+                "action": {"callType": "call", "from": builder, "to": proposer, "value": "0x9"},
+            }]))
+        });
+        let relay_hash = hash.clone();
+        let relays: crate::address_mev::Relays = Arc::new(move |name: &'static str, b: u64| {
+            let h = relay_hash.clone();
+            Box::pin(async move {
+                Ok(if name == "ultrasound" {
+                    vec![json!({"block_number": b.to_string(), "block_hash": h,
+                        "proposer_fee_recipient": proposer, "value": "9",
+                        "builder_pubkey": "0xb", "proposer_pubkey": "0xp"})]
+                } else {
+                    vec![]
+                })
+            })
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[]).unwrap();
+        let state = ModeState::new(history, 1, Duration::from_secs(300), true).with_relays(relays);
+        let make = || Headers {
+            by_number: BTreeMap::new(),
+            finalized: Value::Null,
+        };
+        let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+        let p = Proven {
+            block,
+            slot: 1,
+            proposer_index: 7,
+        };
+        let stored = proven_row(&d, &state, &p).await;
+        assert_eq!(stored.row["mev"], "relay");
+        assert_eq!(stored.row["paymentTx"], "0x01");
+        assert_eq!(stored.row["paymentValue"], "9");
+        assert!(!stored.meta.contains_key("paymentOwed"));
+        // A trace answer that is not a list is no evidence: the payment stays owed.
+        TRACES.with(|t| *t.borrow_mut() = Some(Value::Null));
+        let stored = proven_row(&d, &state, &p).await;
+        assert_eq!(stored.row["paymentValue"], "");
+        assert_eq!(stored.meta["paymentOwed"], true);
+        TRACES.with(|t| *t.borrow_mut() = None);
+    }
+
+    fn header_json(h: &alloy_consensus::Header) -> Value {
+        let mut v = serde_json::to_value(h).unwrap();
+        v["hash"] = json!(format!("{:#x}", h.hash_slow()));
+        v
+    }
+
+    #[tokio::test]
+    async fn mirror_spans_hang_from_the_finalized_block() {
+        use crate::address_partitions::{encode, partition_key, Published, Source, SPAN};
+        use crate::address_proposers::{catalogue_key, encode as encode_catalogue, tests as pt};
+        let start = 23_560_000u64;
+        let end = start + SPAN - 1;
+        // The span, two blocks above it, and the finalized block.
+        let (blocks, rows, anchor) = pt::chain_from(start, 12_800_000, SPAN as usize + 2);
+        let mirror = tempfile::tempdir().unwrap();
+        let put = |key: String, bytes: Vec<u8>| {
+            let path = mirror.path().join(key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        let published: Vec<Published> = blocks[..SPAN as usize]
+            .iter()
+            .map(|b| {
+                let mut header = Vec::new();
+                alloy_rlp::Encodable::encode(&b.header, &mut header);
+                let mut empty = Vec::new();
+                alloy_rlp::encode_list::<alloy_rpc_types_eth::Withdrawal, _>(&[], &mut empty);
+                Published {
+                    number: b.header.number,
+                    header,
+                    withdrawals: Some(empty),
+                }
+            })
+            .collect();
+        put(partition_key(1, start), encode(&published).unwrap());
+        put(
+            catalogue_key(1, start),
+            encode_catalogue(&rows[..SPAN as usize]).unwrap(),
+        );
+        let bridge: BTreeMap<u64, Value> = blocks[SPAN as usize..]
+            .iter()
+            .map(|b| (b.header.number, header_json(&b.header)))
+            .collect();
+        let validator = rows[5].proposer_index;
+        let run = |finalized: alloy_consensus::Header| {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("t.redb")).unwrap();
+            let history = AddressHistory::open(store.clone(), 1, &[]).unwrap();
+            let validators =
+                crate::address_validators::Validators::open(store, &[validator]).unwrap();
+            let source = Arc::new(
+                Source::open(
+                    mirror.path().to_str().unwrap(),
+                    1,
+                    dir.path().join("cache"),
+                    1 << 30,
+                )
+                .unwrap(),
+            );
+            let state = ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(start, None, 64)
+                .with_validators(validators.clone(), None)
+                .with_mirror(source.clone(), (start, end));
+            let make = || Headers {
+                by_number: bridge.clone(),
+                finalized: header_json(&finalized),
+            };
+            let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+            async move {
+                let done = mirror_spans(
+                    &d,
+                    &state,
+                    &validators,
+                    &[validator],
+                    &source,
+                    (start, end),
+                    &finalized,
+                    finalized.number - 1,
+                )
+                .await;
+                (
+                    done,
+                    validators.covers(validator, (start, end)).unwrap(),
+                    dir,
+                )
+            }
+        };
+        let (done, covered, _dir) = run(anchor.clone()).await;
+        // The span is proven; the catalogue's first span, under it, is not in this test mirror.
+        assert!(covered);
+        assert!(
+            format!("{:#}", done.unwrap_err()).contains("no block partition for [23550000"),
+            "only the absent first span fails"
+        );
+        // A mirror whose from_block starts inside the span still proves it: from_block bounds only
+        // what address history reads.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("t.redb")).unwrap();
+            let history = AddressHistory::open(store.clone(), 1, &[]).unwrap();
+            let validators =
+                crate::address_validators::Validators::open(store, &[validator]).unwrap();
+            let source = Arc::new(
+                Source::open(
+                    mirror.path().to_str().unwrap(),
+                    1,
+                    dir.path().join("cache"),
+                    1 << 30,
+                )
+                .unwrap(),
+            );
+            let state = ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(start + 5_000, None, 64)
+                .with_validators(validators.clone(), None)
+                .with_mirror(source.clone(), (start + 5_000, end));
+            let make = || Headers {
+                by_number: bridge.clone(),
+                finalized: header_json(&anchor),
+            };
+            let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+            // The spans under this one are not in the test mirror; this one is proven first.
+            let _ = mirror_spans(
+                &d,
+                &state,
+                &validators,
+                &[validator],
+                &source,
+                (start + 5_000, end),
+                &anchor,
+                anchor.number - 1,
+            )
+            .await;
+            assert!(validators.covers(validator, (start, end)).unwrap());
+        }
+        // A whole validator pass with end_block inside the partition still proves the span: proofs
+        // run to the finalized block, and end_block bounds only what is served.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("t.redb")).unwrap();
+            let history = AddressHistory::open(store.clone(), 1, &[]).unwrap();
+            let validators =
+                crate::address_validators::Validators::open(store, &[validator]).unwrap();
+            let source = Arc::new(
+                Source::open(
+                    mirror.path().to_str().unwrap(),
+                    1,
+                    dir.path().join("cache"),
+                    1 << 30,
+                )
+                .unwrap(),
+            );
+            let state = ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(start, Some(start + 5), 64)
+                .with_validators(validators.clone(), None)
+                .with_mirror(source, (start, end));
+            let make = || Headers {
+                by_number: bridge.clone(),
+                finalized: header_json(&anchor),
+            };
+            let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+            validator_pass(&d, &state).await;
+            assert!(validators.covers(validator, (start, end)).unwrap());
+        }
+        // The mirror and the numbered blocks agree with each other, but the finalized block is on
+        // another chain: nothing is proven.
+        let mut other = anchor.clone();
+        other.parent_hash = alloy_primitives::B256::repeat_byte(4);
+        let (done, covered, _dir) = run(other).await;
+        assert!(format!("{:#}", done.unwrap_err()).contains("do not lead to it"));
+        assert!(!covered);
+    }
+
+    #[tokio::test]
+    async fn a_block_written_with_relays_off_is_asked_once_they_are_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store.clone(), 1, &[]).unwrap();
+        let validators = crate::address_validators::Validators::open(store, &[7]).unwrap();
+        let mut row = crate::address_mev::no_mev();
+        row.insert("blockHash".into(), json!("0xbb"));
+        row.insert(
+            "feeRecipient".into(),
+            json!("0x00000000000000000000000000000000000000f1"),
+        );
+        row.insert("rewardStatus".into(), json!("verified"));
+        let mut found = BTreeMap::new();
+        found.insert(
+            7,
+            vec![crate::address_validators::Stored {
+                block: 100,
+                row,
+                meta: serde_json::Map::new(),
+            }],
+        );
+        validators
+            .record_span((100, 199), &[7], &found, validators.generation().unwrap())
+            .unwrap();
+        let relays: crate::address_mev::Relays = Arc::new(|name: &'static str, block: u64| {
+            Box::pin(async move {
+                Ok(if name == "ultrasound" {
+                    vec![
+                        json!({"block_number": block.to_string(), "block_hash": "0xbb",
+                        "proposer_fee_recipient": "0x00000000000000000000000000000000000000a1",
+                        "value": "9", "builder_pubkey": "0xb", "proposer_pubkey": "0xp"}),
+                    ]
+                } else {
+                    vec![]
+                })
+            })
+        });
+        let make = || Headers {
+            by_number: BTreeMap::new(),
+            finalized: Value::Null,
+        };
+        let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+        let mev = |v: &crate::address_validators::Validators| {
+            v.all().unwrap()[0].1.row["mev"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // Relays off: nothing to ask, nothing changes.
+        let off = ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+            .with_validators(validators.clone(), None);
+        validator_retries(&d, &off, &validators).await;
+        assert_eq!(mev(&validators), "unrecorded");
+        // Relays on: the block that was never asked is asked now.
+        let on = ModeState::new(history, 1, Duration::from_secs(300), true)
+            .with_validators(validators.clone(), None)
+            .with_relays(relays);
+        validator_retries(&d, &on, &validators).await;
+        let stored = &validators.all().unwrap()[0].1;
+        assert_eq!(stored.row["mev"], "relay");
+        assert_eq!(stored.row["mevReward"], "9");
+        assert!(stored.meta.contains_key("mevFirstAsked"));
+        // The trace for its payment could not be read: owed, not claimed absent.
+        assert_eq!(stored.meta["paymentOwed"], true);
+    }
+
+    #[tokio::test]
+    async fn rows_that_keep_failing_do_not_starve_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store.clone(), 1, &[]).unwrap();
+        let validators = crate::address_validators::Validators::open(store, &[7]).unwrap();
+        let row = |owed: bool| {
+            let mut row = crate::address_mev::no_mev();
+            row.insert("blockHash".into(), json!("0xbb"));
+            row.insert("rewardStatus".into(), json!("verified"));
+            let mut meta = serde_json::Map::new();
+            if owed {
+                // Relay evidence already in, its payment unreadable for good.
+                row.insert("mev".into(), json!("relay"));
+                row.insert("mevRecipient".into(), json!("0xa1"));
+                meta.insert("paymentOwed".into(), json!(true));
+            }
+            (row, meta)
+        };
+        let mut stored: Vec<crate::address_validators::Stored> = (1..=70)
+            .map(|b| {
+                let (row, meta) = row(true);
+                crate::address_validators::Stored {
+                    block: b,
+                    row,
+                    meta,
+                }
+            })
+            .collect();
+        let (row, meta) = row(false);
+        stored.push(crate::address_validators::Stored {
+            block: 150,
+            row,
+            meta,
+        });
+        let mut found = BTreeMap::new();
+        found.insert(7, stored);
+        validators
+            .record_span((1, 199), &[7], &found, validators.generation().unwrap())
+            .unwrap();
+        let relays: crate::address_mev::Relays = Arc::new(|name: &'static str, b: u64| {
+            Box::pin(async move {
+                Ok(if name == "titan" {
+                    vec![json!({"block_number": b.to_string(), "block_hash": "0xbb",
+                        "proposer_fee_recipient": "0xa1", "value": "3",
+                        "builder_pubkey": "0xb", "proposer_pubkey": "0xp"})]
+                } else {
+                    vec![]
+                })
+            })
+        });
+        let state = ModeState::new(history, 1, Duration::from_secs(300), true)
+            .with_validators(validators.clone(), None)
+            .with_relays(relays);
+        let make = || Headers {
+            by_number: BTreeMap::new(),
+            finalized: Value::Null,
+        };
+        let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+        for _ in 0..2 {
+            validator_retries(&d, &state, &validators).await;
+        }
+        let late = validators
+            .all()
+            .unwrap()
+            .into_iter()
+            .find(|(_, s)| s.block == 150)
+            .unwrap()
+            .1;
+        assert_eq!(late.row["mev"], "relay", "the late row was reached");
+    }
+
+    #[tokio::test]
+    async fn an_open_mirror_reads_as_far_as_it_has_published() {
+        use crate::address_partitions::{partition_key, Source, SPAN};
+        let mirror = tempfile::tempdir().unwrap();
+        let publish = |spans: std::ops::Range<u64>| {
+            for i in spans {
+                let path = mirror.path().join(partition_key(1, i * SPAN));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"x").unwrap();
+            }
+        };
+        publish(0..38);
+        let dir = tempfile::tempdir().unwrap();
+        let source = Arc::new(
+            Source::open(
+                mirror.path().to_str().unwrap(),
+                1,
+                dir.path().join("c"),
+                1 << 30,
+            )
+            .unwrap(),
+        );
+        assert_eq!(source.published_end(0).await.unwrap(), Some(38 * SPAN - 1));
+        assert_eq!(source.published_end(40 * SPAN).await.unwrap(), None);
+        let history = AddressHistory::open(
+            Store::open(&dir.path().join("t.redb")).unwrap(),
+            1,
+            &[ALICE.into()],
+        )
+        .unwrap();
+        // Withdrawals the RPC scan covered above what the mirror had published.
+        let g = history.generation().unwrap();
+        history
+            .record(
+                crate::address_history::Action::BeaconWithdrawals,
+                ALICE,
+                &[],
+                (38 * SPAN, 41 * SPAN - 1),
+                g,
+            )
+            .unwrap();
+        let s = ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+            .with_open_mirror(source.clone(), 0, Some(38 * SPAN - 1));
+        assert_eq!(s.mirror_blocks().unwrap().1, (0, 38 * SPAN - 1));
+        // The publisher extends the mirror; the next poll reads further.
+        publish(38..41);
+        s.refresh_mirror().await;
+        assert_eq!(s.mirror_blocks().unwrap().1, (0, 41 * SPAN - 1));
+        // The RPC-scanned coverage there is set aside as the mirror takes those blocks over.
+        assert!(history
+            .coverage(crate::address_history::Action::BeaconWithdrawals, ALICE)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_bridge_is_linked_across_its_chunks() {
+        use crate::address_proposers::{linked_to, tests as pt};
+        let (blocks, _, anchor) = pt::chain_from(23_560_000, 12_800_000, 1_500);
+        let map = |bs: &[crate::address_partitions::VerifiedBlock]| -> BTreeMap<u64, Value> {
+            bs.iter()
+                .map(|b| (b.header.number, header_json(&b.header)))
+                .collect()
+        };
+        let rpc = |by_number: BTreeMap<u64, Value>| Headers {
+            by_number,
+            finalized: Value::Null,
+        };
+        let (lo, hi) = (23_560_000, 23_561_499);
+        let served = AtomicU64::new(0);
+        let between = || -> futures::future::BoxFuture<'_, ()> {
+            served.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {})
+        };
+        let first = linked_to(&rpc(map(&blocks)), (lo, hi), &anchor, &between)
+            .await
+            .unwrap();
+        assert_eq!(first.number, lo);
+        // 1,500 blocks in chunks of 128: waiting requests are served after each of the 12.
+        assert_eq!(served.load(Ordering::Relaxed), 12);
+        // Block 23,561,024 opens a chunk. The second chunk is a chain of its own leading to
+        // its own anchor: only the link between the chunks is broken.
+        let mut forked = blocks.clone();
+        let mut parent = alloy_primitives::B256::repeat_byte(5);
+        for b in forked[1_024..].iter_mut() {
+            b.header.parent_hash = parent;
+            b.hash = b.header.hash_slow();
+            parent = b.hash;
+        }
+        let mut other = anchor.clone();
+        other.parent_hash = parent;
+        let e = linked_to(&rpc(map(&forked)), (lo, hi), &other, &|| Box::pin(async {}))
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("does not follow"), "{e:#}");
+    }
+
+    #[tokio::test]
+    async fn a_locally_built_tail_must_reach_the_finalized_block() {
+        use crate::address_proposers::{tests as pt, Beacon, DENEB_BLOCK};
+        // Three chunks: 128, 128 and 44 blocks, newest first.
+        let (blocks, rows, successor) = pt::chain(300);
+        let keep: Vec<u64> = rows.iter().map(|r| r.proposer_index).collect();
+        let dir = tempfile::tempdir().unwrap();
+        pt::write_cache(dir.path(), &rows, &[]);
+        let beacon = Beacon::new(None, Some(dir.path().to_path_buf())).unwrap();
+        let by_number: BTreeMap<u64, Value> = blocks
+            .iter()
+            .map(|b| (b.header.number, header_json(&b.header)))
+            .collect();
+        let rpc = |finalized: &alloy_consensus::Header| {
+            let make = || Headers {
+                by_number: by_number.clone(),
+                finalized: header_json(finalized),
+            };
+            Discoverer::new(Counted::new(make()), Counted::new(make()))
+        };
+        let served = AtomicU64::new(0);
+        let between = || -> futures::future::BoxFuture<'_, ()> {
+            served.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {})
+        };
+        let (to, proven) = prove_tail(
+            &rpc(&successor),
+            &beacon,
+            DENEB_BLOCK,
+            DENEB_BLOCK + 299,
+            &successor,
+            &keep,
+            &between,
+        )
+        .await
+        .unwrap();
+        assert_eq!(to, DENEB_BLOCK + 299);
+        assert_eq!(proven.len(), 300);
+        assert_eq!(
+            served.load(Ordering::Relaxed),
+            2,
+            "waiting requests served between the chunks"
+        );
+        // The RPC served a self-consistent range, but the finalized block is on another chain.
+        let mut other = successor.clone();
+        other.parent_hash = alloy_primitives::B256::repeat_byte(3);
+        let e = prove_tail(
+            &rpc(&other),
+            &beacon,
+            DENEB_BLOCK,
+            DENEB_BLOCK + 299,
+            &other,
+            &keep,
+            &|| Box::pin(async {}),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("not the successor"), "{e:#}");
+    }
 
     /// A head source: 0 means down. Each read counts as `per_read` requests, as a failover would.
     struct FixedHead {
@@ -2439,6 +4114,460 @@ mod tests {
         let v = serde_json::from_slice(&bytes)
             .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into()));
         (status, v)
+    }
+
+    /// rotki asks from block 0, or names no start: every account action must answer in the wording
+    /// rotki reads to ask again from the configured start.
+    #[tokio::test]
+    async fn a_range_before_the_configured_history_names_where_it_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(25_700_000, None, 64),
+        );
+        let actions = [
+            "txlist",
+            "txlistinternal",
+            "tokentx",
+            "tokennfttx",
+            "token1155tx",
+            "txsBeaconWithdrawal",
+            "getminedblocks",
+            "nuthatchProducedBlocks",
+        ];
+        // A start above end_block is refused too, never answered "No transactions found".
+        let ended = Arc::new(
+            ModeState::new(s.history.clone(), 1, Duration::from_secs(300), true).with_range(
+                25_700_000,
+                Some(25_800_000),
+                64,
+            ),
+        );
+        for action in actions {
+            let (_, v) = call(
+                router(ended.clone()),
+                "GET",
+                &format!("/api?module=account&action={action}&address={ALICE}&startblock=25800001"),
+                None,
+            )
+            .await;
+            assert!(
+                v["result"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("history ends at block 25800000"),
+                "{action}: {v}"
+            );
+        }
+        for action in actions {
+            for start in ["", "&startblock=0", "&startblock=25699999"] {
+                let (_, v) = call(
+                    router(s.clone()),
+                    "GET",
+                    &format!("/api?module=account&action={action}&address={ALICE}{start}"),
+                    None,
+                )
+                .await;
+                let result = v["result"].as_str().unwrap_or_default().to_string();
+                // rotki's pattern: `history starts at block (\d+)`.
+                let n = result.split("history starts at block ").nth(1).map(|r| {
+                    r.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                });
+                assert_eq!(n.as_deref(), Some("25700000"), "{action}{start}: {v}");
+            }
+        }
+    }
+
+    /// The deadline is one ceiling from the request's arrival: a slow hash check, then a queue behind
+    /// a background window that overruns, together end in a refusal at the ceiling and never later.
+    #[tokio::test]
+    async fn a_request_is_refused_at_its_ceiling_while_a_window_overruns() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(100).unwrap();
+        let mut record = serde_json::Map::new();
+        record.insert("blockNumber".into(), json!("150"));
+        let rows = vec![crate::address_history::Row {
+            block: 150,
+            tx_index: 0,
+            position: 0,
+            record,
+        }];
+        let g = history.generation().unwrap();
+        history
+            .record_anchored(
+                crate::address_history::Action::TxList,
+                &ALICE.to_lowercase(),
+                &rows,
+                (0, 200),
+                g,
+                Some((200, [7; 32])),
+            )
+            .unwrap();
+        // The hash moved, after 600 ms of the 1 s ceiling: the request goes to the cursor.
+        let moved: HashAt = Arc::new(|_| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                Ok([8; 32])
+            })
+        });
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_secs(1))
+                .with_hash_at(moved),
+        );
+        // The cursor is three seconds into a window before it looks at the queue.
+        let cursor = s.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            serve_queued(&cursor, &()).await;
+        });
+        let path =
+            format!("/api?module=account&action=txlist&address={ALICE}&startblock=0&endblock=180");
+        let started = Instant::now();
+        let (_, v) = call(router(s), "GET", &path, None).await;
+        let took = started.elapsed();
+        assert!(
+            v["result"].as_str().unwrap().contains("deadline"),
+            "{v} after {took:?}"
+        );
+        assert!(
+            took >= Duration::from_millis(900) && took < Duration::from_millis(1_300),
+            "{took:?}"
+        );
+    }
+
+    /// A covered range above the finalized head is served after one hash check, without waiting
+    /// for the cursor (none runs here); a moved hash sends it to the cursor, which cannot answer
+    /// within the deadline, so it is refused.
+    #[tokio::test]
+    async fn a_covered_range_above_finality_answers_on_one_hash_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(100).unwrap();
+        let mut record = serde_json::Map::new();
+        record.insert("blockNumber".into(), json!("150"));
+        record.insert("hash".into(), json!("0x01"));
+        let rows = vec![crate::address_history::Row {
+            block: 150,
+            tx_index: 0,
+            position: 0,
+            record,
+        }];
+        let g = history.generation().unwrap();
+        history
+            .record_anchored(
+                crate::address_history::Action::TxList,
+                &ALICE.to_lowercase(),
+                &rows,
+                (0, 200),
+                g,
+                Some((200, [7; 32])),
+            )
+            .unwrap();
+        let asked = Arc::new(AtomicU64::new(0));
+        let make = |hash: [u8; 32]| -> HashAt {
+            let asked = asked.clone();
+            Arc::new(move |_| {
+                asked.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move { Ok(hash) })
+            })
+        };
+        let path =
+            format!("/api?module=account&action=txlist&address={ALICE}&startblock=0&endblock=180");
+        let s = Arc::new(
+            ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_millis(300))
+                .with_hash_at(make([7; 32])),
+        );
+        let started = Instant::now();
+        let (_, v) = call(router(s), "GET", &path, None).await;
+        assert_eq!(v["status"], "1", "{v}");
+        assert_eq!(v["result"][0]["blockNumber"], "150");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), 1, "one hash check");
+        let s = Arc::new(
+            ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_millis(300))
+                .with_hash_at(make([8; 32])),
+        );
+        let (_, v) = call(router(s), "GET", &path, None).await;
+        assert!(
+            v["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_INCOMPLETE"),
+            "{v}"
+        );
+        // A write lands while the hash is checked: the answer read before it is read again.
+        let writes = Arc::new(AtomicU64::new(0));
+        let racing: HashAt = {
+            let (h, writes, asked) = (history.clone(), writes.clone(), asked.clone());
+            Arc::new(move |_| {
+                asked.fetch_add(1, Ordering::Relaxed);
+                if writes.fetch_add(1, Ordering::Relaxed) == 0 {
+                    let mut record = serde_json::Map::new();
+                    record.insert("delivered".into(), json!([]));
+                    let mut row = serde_json::Map::new();
+                    row.insert("blockNumber".into(), json!("150"));
+                    let rows = vec![crate::address_history::Row {
+                        block: 150,
+                        tx_index: 0,
+                        position: 0,
+                        record: row,
+                    }];
+                    let g = h.generation().unwrap();
+                    h.apply_reask(150, &record, &[(ALICE.to_lowercase(), rows)], false, 1, g)
+                        .unwrap();
+                }
+                Box::pin(async move { Ok([7; 32]) })
+            })
+        };
+        asked.store(0, Ordering::Relaxed);
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_millis(300))
+                .with_hash_at(racing),
+        );
+        let (_, v) = call(router(s), "GET", &path, None).await;
+        assert_eq!(v["status"], "1", "{v}");
+        assert_eq!(
+            asked.load(Ordering::Relaxed),
+            2,
+            "checked again after the write"
+        );
+    }
+
+    /// A request whose uncovered gap the cursor cannot cover in time is refused at once with how far
+    /// history is covered; a tip-sized gap still goes to the cursor.
+    #[tokio::test]
+    async fn a_gap_beyond_the_deadline_is_refused_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(200_000).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_millis(500)),
+        );
+        let ask = |from: u64, to: u64| {
+            format!(
+                "/api?module=account&action=txlist&address={ALICE}&startblock={from}&endblock={to}"
+            )
+        };
+        let started = Instant::now();
+        let (_, v) = call(router(s.clone()), "GET", &ask(0, 100_000), None).await;
+        assert!(
+            v["result"]
+                .as_str()
+                .unwrap()
+                .contains("covered through block"),
+            "{v}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        // A tip-sized gap waits for the cursor (none runs here, so it is refused at the deadline).
+        let started = Instant::now();
+        let (_, v) = call(router(s), "GET", &ask(199_990, 199_999), None).await;
+        assert!(
+            !v["result"]
+                .as_str()
+                .unwrap()
+                .contains("covered through block"),
+            "{v}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(475));
+    }
+
+    /// A measured rate under a block a minute is still measured: it is never read as no rate.
+    #[test]
+    fn a_slow_measured_rate_is_never_read_as_unmeasured() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[]).unwrap();
+        let s = ModeState::new(history, 1, Duration::from_secs(300), true);
+        let rate = AtomicU64::new(per_minute(1, Duration::from_secs(600)));
+        assert_eq!(rate.load(Ordering::Relaxed), 1);
+        assert_eq!(reach(&s, &rate, COVER_PRODUCED), 0);
+        assert_eq!(per_minute(50, Duration::from_secs(30)), 100);
+    }
+
+    /// The produced-block pass measures its rate in blocks per minute, and admission reads it: a gap
+    /// within reach goes to the cursor, a slow rate refuses it, and owed relay re-asks count as blocks.
+    #[tokio::test]
+    async fn the_produced_block_rate_is_measured_and_admits_by_it() {
+        use crate::address_history::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(300_000).unwrap();
+        let alice = ALICE.to_lowercase();
+        for action in crate::address_discovery::DISCOVERED
+            .into_iter()
+            .chain(crate::address_discovery::BLOCK_SCANNED)
+        {
+            let g = history.generation().unwrap();
+            history
+                .record(action, &alice, &[], (0, 300_000), g)
+                .unwrap();
+        }
+        let relays: crate::address_mev::Relays = Arc::new(|_, _| Box::pin(async { Ok(vec![]) }));
+        let s = Arc::new(
+            ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_secs(2))
+                .with_relays(relays),
+        );
+        let make = || Headers {
+            by_number: BTreeMap::new(),
+            finalized: Value::Null,
+        };
+        let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+        let started = Instant::now();
+        mev_passes(&d, &s, std::slice::from_ref(&alice), 199_999).await;
+        let took = started.elapsed().as_millis().max(1) as u64;
+        assert_eq!(
+            history.coverage(Action::ProducedBlocks, &alice).unwrap(),
+            vec![(0, 199_999)]
+        );
+        // Four whole 50,000-block steps: the last took no longer than all four, so its rate in blocks
+        // per minute is at least this.
+        let measured = s.produced_rate.load(Ordering::Relaxed);
+        assert!(
+            measured >= 50_000 * 60_000 / took,
+            "{measured} after {took} ms"
+        );
+        // Admission reads the measured rate: a gap within its reach goes to the cursor.
+        let want = |to: u64| (alice.clone(), Need::Produced, 0, to);
+        let r = reach(&s, &s.produced_rate, COVER_PRODUCED);
+        assert_eq!(
+            beyond_reach(&s, &want(199_999 + r.min(100_000))).await,
+            None
+        );
+        if r < 100_000 {
+            assert!(beyond_reach(&s, &want(199_999 + r + 1)).await.is_some());
+        }
+        // 6,000,000 a minute reaches 100,000 blocks in half of 2 s: a 50,000-block gap is admitted.
+        s.produced_rate.store(6_000_000, Ordering::Relaxed);
+        assert_eq!(beyond_reach(&s, &want(249_999)).await, None);
+        // A valid u64 range boundary is refused without overflowing the work estimate.
+        assert!(beyond_reach(&s, &want(u64::MAX)).await.is_some());
+        // One block a minute is slow, not unmeasured: a 1,000-block gap is refused, where the
+        // unmeasured floor would admit it.
+        s.produced_rate.store(1, Ordering::Relaxed);
+        assert!(beyond_reach(&s, &want(200_999)).await.is_some());
+        // It reaches no block at all in time, so not even one is admitted.
+        assert!(beyond_reach(&s, &want(200_000)).await.is_some());
+        s.produced_rate.store(0, Ordering::Relaxed);
+        assert_eq!(beyond_reach(&s, &want(200_999)).await, None);
+        // An owed re-ask costs as much as a block: one overdue tips the 1,000-block gap past reach.
+        history.mev_absent(5, 0).unwrap();
+        assert!(beyond_reach(&s, &want(200_999)).await.is_some());
+    }
+
+    /// Admission is by the slowest layer a request needs: fast trace discovery does not admit a
+    /// withdrawals request the slow body scan cannot finish in time.
+    #[tokio::test]
+    async fn each_layer_admits_only_what_it_can_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(200_000).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_secs(2)),
+        );
+        // Blocks per minute: with a 2 s deadline a layer reaches its rate / 60 blocks.
+        s.backfill_rate.store(6_000_000, Ordering::Relaxed);
+        s.body_rate.store(600, Ordering::Relaxed);
+        let ask = |action: &str| {
+            format!("/api?module=account&action={action}&address={ALICE}&startblock=190000&endblock=190999")
+        };
+        let started = Instant::now();
+        let (_, v) = call(router(s.clone()), "GET", &ask("txsBeaconWithdrawal"), None).await;
+        assert!(
+            v["result"]
+                .as_str()
+                .unwrap()
+                .contains("covered through block"),
+            "{v}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        // The same gap for transactions alone is within discovery's reach: it goes to the cursor
+        // (none runs here, so it waits out the deadline).
+        let started = Instant::now();
+        let s2 = s.clone();
+        let (_, v) = call(router(s), "GET", &ask("txlist"), None).await;
+        assert!(
+            !v["result"]
+                .as_str()
+                .unwrap()
+                .contains("covered through block"),
+            "{v}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(1_900));
+        // Each layer alone could cover its 1,000 blocks in 60% of the time, but they run one after
+        // the other: together they cannot, and the request is refused at once.
+        s2.backfill_rate.store(99_960, Ordering::Relaxed);
+        s2.body_rate.store(99_960, Ordering::Relaxed);
+        let started = Instant::now();
+        let (_, v) = call(router(s2), "GET", &ask("txsBeaconWithdrawal"), None).await;
+        assert!(
+            v["result"]
+                .as_str()
+                .unwrap()
+                .contains("covered through block"),
+            "{v}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+    }
+
+    /// A timestamp search after one that outran its half of the deadline is refused at once.
+    #[tokio::test]
+    async fn a_timestamp_search_is_refused_at_once_when_the_last_ran_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let forward: crate::address_proxy::Forward = Arc::new(|_m: String, _p: Value| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(Value::Null)
+            })
+        });
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_secs(2))
+                .with_forward(forward),
+        );
+        s.search_ms.store(5_000, Ordering::Relaxed);
+        let started = Instant::now();
+        let (_, v) = call(
+            router(s),
+            "GET",
+            "/api?module=block&action=getblocknobytime&timestamp=1700000000&closest=before",
+            None,
+        )
+        .await;
+        assert!(
+            v["result"]
+                .as_str()
+                .unwrap()
+                .contains("last timestamp search"),
+            "{v}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 
     /// A conflict found while a request is being answered refuses that answer too.
@@ -2721,6 +4850,8 @@ mod tests {
             mirror: None,
             mev_relays: false,
             request_deadline: None,
+            validators: vec![],
+            beacon_url: None,
         };
         assert_eq!(
             poll_interval(None, &cfg).unwrap(),
@@ -2820,9 +4951,11 @@ mod tests {
             u64::MAX,
         )
         .unwrap();
+        // One discovery window per address, as the call count below assumes.
         let state = ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
             .with_range(5, Some(2 * SPAN - 1), 0)
-            .with_mirror(Arc::new(source), (0, 2 * SPAN - 1));
+            .with_mirror(Arc::new(source), (0, 2 * SPAN - 1))
+            .with_first_window(crate::address_discovery::OUTER_WINDOW);
         state.history.finalize(2 * SPAN + 5).unwrap();
         d.catch_up(&state, 2 * SPAN + 5).await;
 
@@ -3105,6 +5238,10 @@ mod tests {
         reorg_next: AtomicU64,
         /// `(block, n, depth)`: a reorg of `depth` lands once block `block` has been read `n` times.
         reorg_on_read: std::sync::Mutex<Option<(u64, u64, u64)>>,
+        /// No rows anywhere: discovery finds nothing to hydrate.
+        quiet: std::sync::atomic::AtomicBool,
+        /// Microseconds a trace_filter call takes per block of its span, as a provider's does.
+        trace_us_per_block: AtomicU64,
     }
 
     impl Chain {
@@ -3141,7 +5278,7 @@ mod tests {
         }
         /// Whether the watched address has a row at `b` on the chain as it stands.
         fn row_at(&self, b: u64) -> bool {
-            self.hash(b)[0].is_multiple_of(3)
+            !self.quiet.load(Ordering::Relaxed) && self.hash(b)[0].is_multiple_of(3)
         }
         fn discoverer(
             self: &Arc<Chain>,
@@ -3244,6 +5381,8 @@ mod tests {
                     let f = &p[0];
                     let s = crate::address_discovery::hex_u64(&f["fromBlock"])?;
                     let e = crate::address_discovery::hex_u64(&f["toBlock"])?.min(c.latest());
+                    let per = c.trace_us_per_block.load(Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_micros(per * (e + 1).saturating_sub(s)));
                     let frames: Vec<Value> = if f.get("toAddress").is_some() {
                         (s..=e)
                             .filter(|b| c.row_at(*b))
@@ -4002,6 +6141,111 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_window_shrinks_when_slow_and_grows_back_when_quick() {
+        let mut p = Pace::new(1_000, 64, 50_000, Duration::from_secs(20));
+        p.took(Duration::from_secs(6));
+        assert_eq!(p.span(), 500, "over a quarter of the deadline halves it");
+        p.took(Duration::from_secs(3));
+        assert_eq!(p.span(), 500, "between half and the whole target it holds");
+        // A window that took 2 s, as the fixed checks alone can on a slow RPC, still grows it.
+        p.took(Duration::from_millis(2_000));
+        assert_eq!(p.span(), 1_000);
+        p.took(Duration::from_millis(100));
+        assert_eq!(p.span(), 2_000, "a quick window doubles it");
+        for _ in 0..20 {
+            p.took(Duration::from_secs(60));
+        }
+        assert_eq!(p.span(), 64, "never under the floor");
+    }
+
+    /// Accounts take turns: a second account gets coverage while the first still has a backlog.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn accounts_take_turns_in_the_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into(), BOB.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true).with_range(0, None, 20),
+        );
+        let chain = Chain::new(30_000, 29_000);
+        chain.quiet.store(true, Ordering::Relaxed);
+        chain.trace_us_per_block.store(100, Ordering::Relaxed);
+        let d = Arc::new(chain.node());
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        let backfill = tokio::spawn({
+            let (d, s) = (d.clone(), s.clone());
+            async move { d.catch_up(&s, 29_000).await }
+        });
+        let covered = |a: &str| {
+            s.history
+                .coverage(crate::address_history::Action::TxList, a)
+                .unwrap()
+                .first()
+                .map(|(_, t)| *t)
+        };
+        // BOB sorts first. When ALICE gets her first window, BOB must still have a backlog: one
+        // account's whole backlog first would have taken BOB to 29,000.
+        let started = Instant::now();
+        while covered(ALICE).is_none() && started.elapsed() < Duration::from_secs(20) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let (a, b) = (covered(ALICE), covered(BOB));
+        assert!(
+            a.is_some() && b.is_some_and(|b| b < 29_000),
+            "ALICE started while BOB still had a backlog: {a:?} {b:?}"
+        );
+        backfill.abort();
+    }
+
+    /// A request for history above what is covered is served inside a long backfill: the cursor's
+    /// windows are paced to stay well under the deadline, so the request waits for one short window,
+    /// not for a window spanning the whole backlog.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tip_request_is_served_inside_a_long_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(0, None, 20)
+                .with_deadline(Duration::from_secs(2)),
+        );
+        let chain = Chain::new(30_000, 29_000);
+        chain.quiet.store(true, Ordering::Relaxed);
+        // A 29,000-block window would take about 6 s a side: three times the deadline.
+        chain.trace_us_per_block.store(200, Ordering::Relaxed);
+        let d = Arc::new(chain.node());
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        let backfill = tokio::spawn({
+            let (d, s) = (d.clone(), s.clone());
+            async move { d.catch_up(&s, 29_000).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = Instant::now();
+        let (_, v) = call(
+            router(s.clone()),
+            "GET",
+            &format!(
+                "/api?module=account&action=txlist&address={ALICE}&startblock=29990&endblock=29999"
+            ),
+            None,
+        )
+        .await;
+        let waited = started.elapsed();
+        assert!(
+            !v["result"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("NUTHATCH_INCOMPLETE")),
+            "{v}"
+        );
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        assert!(!backfill.is_finished(), "the backfill was still running");
+        // The pace the backfill settled on is kept for the next poll.
+        assert!(s.backfill_span.load(Ordering::Relaxed) > s.first_window);
+        backfill.abort();
+    }
+
     /// A read reaching above the finalized head is checked against the chain before it is served: a
     /// reorg since the last poll is taken back first, so the replaced rows are never answered, and
     /// the range is refused until it is read again.
@@ -4426,7 +6670,7 @@ mod tests {
             "{a}"
         );
         assert!(
-            took >= Duration::from_millis(200) && took < Duration::from_secs(2),
+            took >= Duration::from_millis(190) && took < Duration::from_secs(2),
             "{took:?}"
         );
     }
@@ -4453,6 +6697,46 @@ mod tests {
                 )
             })
         })
+    }
+
+    /// A recent timestamp is found within the four-second search budget on a mainnet-sized chain,
+    /// without assuming its block interval. Both boundaries remain exact and a broken link refuses.
+    #[tokio::test]
+    async fn a_recent_timestamp_is_searched_near_the_head() {
+        let head = 26_000_000;
+        for (timestamp, after, expected) in [
+            (1000 + 12 * (head - 2) + 5, false, head - 2),
+            (1000 + 12 * (head - 2) + 5, true, head - 1),
+            (1000 + 12 * (head - 2), false, head - 2),
+            (1000 + 12 * (head - 2), true, head - 2),
+        ] {
+            let reads = Arc::new(AtomicU64::new(0));
+            let counted = reads.clone();
+            let chain = timed(head, None);
+            let forward: crate::address_proxy::Forward = Arc::new(move |m, p| {
+                let (chain, counted) = (chain.clone(), counted.clone());
+                Box::pin(async move {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    chain(m, p).await
+                })
+            });
+            let result = tokio::time::timeout(Duration::from_secs(4), async {
+                let (block, latest, proof) = search_by_time(&forward, timestamp, after)
+                    .await?
+                    .map_err(anyhow::Error::msg)?;
+                assert_eq!(block, expected);
+                assert!(descends(&forward, block, latest, &proof).await?);
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            assert!(matches!(result, Ok(Ok(()))), "{result:?}");
+            assert!(reads.load(Ordering::Relaxed) <= 10);
+        }
+        let broken = timed(head, Some(head - 1));
+        assert!(search_by_time(&broken, 1000 + 12 * (head - 2) + 5, false)
+            .await
+            .is_err());
     }
 
     /// An answer above the finalized head stands only if parent hashes link it to the head the

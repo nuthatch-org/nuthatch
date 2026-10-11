@@ -301,6 +301,10 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "src/address_partitions.rs",
         "the partition manifest a publisher writes, not nest config",
     ),
+    (
+        "src/address_proposers.rs",
+        "the proposer catalogue manifest a publisher writes, not nest config",
+    ),
     ("src/tape.rs", "RFC-0039 tape bytes, not nest config"),
     (
         "src/mount_jobs.rs",
