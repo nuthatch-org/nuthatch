@@ -766,20 +766,29 @@ pub(crate) mod tests {
     /// `n` linked execution blocks from Dencun on, every other slot missed, with the beacon headers
     /// that produced them, and the successor of the last. Block i is proposed by validator 100 + i.
     pub(crate) fn chain(n: usize) -> (Vec<VerifiedBlock>, Vec<ProposerRow>, Header) {
+        chain_from(DENEB_BLOCK, DENEB_SLOT, n)
+    }
+
+    /// [`chain`] from execution block `first`, produced at slot `slot`.
+    pub(crate) fn chain_from(
+        first: u64,
+        slot0: u64,
+        n: usize,
+    ) -> (Vec<VerifiedBlock>, Vec<ProposerRow>, Header) {
         let mut blocks: Vec<VerifiedBlock> = Vec::new();
         let mut rows: Vec<ProposerRow> = Vec::new();
         let mut beacon_parent = [7u8; 32];
         let mut parent_hash = B256::repeat_byte(9);
         for i in 0..=n {
-            let slot = DENEB_SLOT + 2 * i as u64;
+            let slot = slot0 + 2 * i as u64;
             let header = Header {
-                number: DENEB_BLOCK + i as u64,
+                number: first + i as u64,
                 parent_hash,
                 timestamp: GENESIS_TIME + slot * SECONDS_PER_SLOT,
                 beneficiary: alloy_primitives::Address::repeat_byte(i as u8 + 1),
                 parent_beacon_block_root: Some(B256::from(beacon_parent)),
                 base_fee_per_gas: Some(1),
-                withdrawals_root: Some(B256::ZERO),
+                withdrawals_root: Some(alloy_consensus::constants::EMPTY_WITHDRAWALS),
                 blob_gas_used: Some(0),
                 excess_blob_gas: Some(0),
                 ..Default::default()

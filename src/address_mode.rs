@@ -1347,13 +1347,13 @@ async fn mirror_pass<M: Rpc, T: Rpc>(
     }
 }
 
-/// The validator pass (plan C): each span from [`ModeState::proposals_from`] to the block before the
-/// RPC's finalized one that some watched validator lacks is proven whole, from the mirror's
-/// catalogue and block partition when it has both, else built here from the RPC's blocks and the
-/// configured beacon, and recorded for every validator that lacked it. A span that cannot be proven
-/// records nothing and ends the pass: coverage grows from the start without gaps.
+/// The validator pass (plan C). Everything is anchored at the block the RPC calls finalized, read
+/// by that tag once per pass: the mirror's spans newest first, each span's successor the first block
+/// of the span above it (already verified) and the newest one's linked to the finalized block by
+/// parent hashes; then the blocks above the mirror up to the finalized block less one, built here
+/// from the RPC and the beacon. A span that cannot be proven records nothing and ends its part of
+/// the pass.
 async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, state: &ModeState) {
-    use crate::address_partitions::{span_of, SPAN};
     let Some(validators) = state.validators.clone() else {
         return;
     };
@@ -1365,10 +1365,8 @@ async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, 
             return;
         }
     };
-    // A span's last block is proven by its successor, which must be final: the RPC's finalized tag,
-    // never the serving depth's guess at it.
-    let finalized = match crate::address_partitions::finalized(&d.main).await {
-        Ok(f) => f,
+    let anchor = match crate::address_proposers::finalized_header(&d.main).await {
+        Ok((h, _)) => h,
         Err(e) => {
             state.window_failed();
             tracing::warn!(
@@ -1377,192 +1375,277 @@ async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, 
             return;
         }
     };
-    let ceiling = state.end_block.map_or(finalized.saturating_sub(1), |e| {
-        e.min(finalized.saturating_sub(1))
-    });
+    let ceiling = state
+        .end_block
+        .map_or(anchor.number.saturating_sub(1), |e| {
+            e.min(anchor.number.saturating_sub(1))
+        });
     let first = state.proposals_from();
-    let mut start = span_of(first).0;
-    while start <= ceiling {
-        serve_queued(state, d).await;
-        let span_end = (start + SPAN - 1).min(ceiling);
-        let lacking: Vec<u64> = watched
-            .iter()
-            .filter(|v| {
-                !validators
-                    .covers(**v, (start.max(first), span_end))
-                    .unwrap_or(false)
-            })
-            .copied()
-            .collect();
-        if lacking.is_empty() {
-            start += SPAN;
-            continue;
-        }
-        // From the first block any of them lacks: the tail span grows every poll, and re-reading
-        // what is already proven would cost a block read each time.
-        let from = lacking
-            .iter()
-            .filter_map(|v| validators.next_uncovered(*v, first).ok())
-            .min()
-            .unwrap_or(first)
-            .max(start.max(first));
-        let mut clip = (from, span_end);
-        let mut tail = false;
-        let outcome = async {
-            let generation = validators.generation()?;
-            let proven = match prove_span(d, state, start, clip).await? {
-                Some(p) => p,
-                None => {
-                    let Some(beacon) = &state.beacon else {
-                        bail!("the mirror has no proposer catalogue for this span and no beacon_url is configured to build it");
-                    };
-                    let (to, p) = prove_tail(d, beacon, from, state.end_block).await?;
-                    clip = (from, to);
-                    tail = true;
-                    p
-                }
-            };
-            if clip.1 < clip.0 {
-                return Ok(());
-            }
-            let mut found: BTreeMap<u64, Vec<crate::address_validators::Stored>> = BTreeMap::new();
-            for p in proven
-                .iter()
-                .filter(|p| lacking.contains(&p.proposer_index))
-            {
-                let stored = proven_row(d, state, p).await;
-                found.entry(p.proposer_index).or_default().push(stored);
-            }
-            let v = validators.clone();
-            let lacking = lacking.clone();
-            tokio::task::spawn_blocking(move || v.record_span(clip, &lacking, &found, generation))
-                .await?
-        }
-        .await;
-        if tail && outcome.is_ok() {
-            state.window_done();
-            tracing::info!(
-                "address history: proposers proven over [{}, {}] for {} validator(s), anchored at the finalized block",
-                clip.0,
-                clip.1,
-                lacking.len()
+    let mut mirror_end = None;
+    if let Some((source, blocks)) = &state.mirror {
+        mirror_end = Some(blocks.1);
+        if let Err(e) = mirror_spans(
+            d,
+            state,
+            &validators,
+            &watched,
+            source,
+            *blocks,
+            &anchor,
+            ceiling,
+        )
+        .await
+        {
+            state.window_failed();
+            tracing::warn!(
+                "address history: proposers from the mirror not proven, those validators' blocks stay incomplete: {e:#}"
             );
-            break;
         }
-        state.set_calls("main", d.main.calls());
-        match outcome {
-            Ok(()) => {
-                state.window_done();
-                tracing::info!(
-                    "address history: proposers proven over [{}, {}] for {} validator(s)",
-                    clip.0,
-                    clip.1,
-                    lacking.len()
-                );
+    }
+    serve_queued(state, d).await;
+    if let Some(beacon) = &state.beacon {
+        // Above the mirror, from the first block any watched validator lacks there.
+        let floor = mirror_end.map_or(first, |m| first.max(m + 1));
+        let from = watched
+            .iter()
+            .filter_map(|v| validators.next_uncovered(*v, floor).ok())
+            .min()
+            .unwrap_or(floor);
+        if from <= ceiling {
+            let outcome = async {
+                let generation = validators.generation()?;
+                let (to, proven) = prove_tail(d, beacon, from, ceiling, &anchor).await?;
+                let lacking: Vec<u64> = watched
+                    .iter()
+                    .filter(|v| !validators.covers(**v, (from, to)).unwrap_or(false))
+                    .copied()
+                    .collect();
+                record_proven(
+                    d,
+                    state,
+                    &validators,
+                    &lacking,
+                    (from, to),
+                    &proven,
+                    generation,
+                )
+                .await
             }
-            Err(e) => {
-                state.window_failed();
-                tracing::warn!(
-                    "address history: proposers over [{}, {}] not proven, those validators' blocks stay incomplete: {e:#}",
-                    clip.0,
-                    clip.1
-                );
-                return;
+            .await;
+            state.set_calls("main", d.main.calls());
+            match outcome {
+                Ok(()) => {
+                    state.window_done();
+                    tracing::info!("address history: proposers proven over [{from}, {ceiling}], anchored at the finalized block");
+                }
+                Err(e) => {
+                    state.window_failed();
+                    tracing::warn!(
+                        "address history: proposers over [{from}, {ceiling}] not proven: {e:#}"
+                    );
+                }
             }
         }
-        start += SPAN;
     }
     validator_retries(d, state, &validators).await;
 }
 
-/// Every block of `clip` (inside the span starting at `start`) with its proven proposer, from the
-/// mirror's files; `None` when the mirror does not hold both for the whole span.
-async fn prove_span<M: Rpc, T: Rpc>(
+/// Build the rows of `proven` for `lacking` and record `span` for them, under `generation`.
+async fn record_proven<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     state: &ModeState,
-    start: u64,
-    clip: (u64, u64),
-) -> Result<Option<Vec<crate::address_proposers::Proven>>> {
-    use crate::address_proposers as ap;
-    let end = start + crate::address_partitions::SPAN - 1;
-    if let Some((source, (first, last))) = &state.mirror {
-        if *first <= start && end <= *last && clip.1 == end {
-            for fresh in [false, true] {
-                let (Some(blocks), Some(catalogue)) = (
-                    source.fetch(start, fresh).await?,
-                    source.fetch_catalogue(start, fresh).await?,
-                ) else {
-                    break;
-                };
-                let (successor, _) = ap::header_at(&d.main, end + 1).await?;
-                let lo = ap::provable(start).map_or(end + 1, |(lo, _)| lo);
-                let proven = crate::address_partitions::decode(&blocks)
-                    .and_then(|b| {
-                        crate::address_partitions::verify(&b, start, end, successor.parent_hash, 1)
-                    })
-                    .and_then(|b| {
-                        let rows = ap::decode(&catalogue)?;
-                        ap::verify(&rows, &b[(lo - start) as usize..], &successor, (lo, end))
-                    });
-                match proven {
-                    Ok(p) => {
-                        return Ok(Some(
-                            p.into_iter()
-                                .filter(|p| p.block.header.number >= clip.0)
-                                .collect(),
-                        ))
-                    }
-                    Err(e) if !fresh => {
-                        tracing::warn!("address history: cached catalogue [{start}, {end}] refused, downloading it again: {e:#}");
-                        source.discard(start);
-                        source.discard_catalogue(start);
-                    }
-                    Err(e) => {
-                        source.discard(start);
-                        source.discard_catalogue(start);
-                        return Err(
-                            e.context(format!("the mirror's catalogue for [{start}, {end}]"))
-                        );
-                    }
-                }
-            }
-        }
+    validators: &crate::address_validators::Validators,
+    lacking: &[u64],
+    span: (u64, u64),
+    proven: &[crate::address_proposers::Proven],
+    generation: u64,
+) -> Result<()> {
+    let mut found: BTreeMap<u64, Vec<crate::address_validators::Stored>> = BTreeMap::new();
+    for p in proven
+        .iter()
+        .filter(|p| lacking.contains(&p.proposer_index))
+    {
+        found
+            .entry(p.proposer_index)
+            .or_default()
+            .push(proven_row(d, state, p).await);
     }
-    Ok(None)
+    let v = validators.clone();
+    let lacking = lacking.to_vec();
+    tokio::task::spawn_blocking(move || v.record_span(span, &lacking, &found, generation)).await?
 }
 
-/// The most blocks behind finality a nest builds its own proposer catalogue for: enough for the gap
-/// between a mirror's last published span and the finalized head, not for history a mirror should hold.
+/// The mirror's whole spans inside `[first, ceiling]` that some watched validator lacks, proven newest
+/// first. The newest span's successor is linked to `anchor` by the RPC's headers between them; every
+/// older span's successor is the first block of the span above it, verified in the step before, so
+/// the whole run hangs from the finalized block.
+#[allow(clippy::too_many_arguments)]
+async fn mirror_spans<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    validators: &crate::address_validators::Validators,
+    watched: &[u64],
+    source: &crate::address_partitions::Source,
+    (mirror_first, mirror_last): (u64, u64),
+    anchor: &alloy_consensus::Header,
+    ceiling: u64,
+) -> Result<()> {
+    use crate::address_partitions::{span_of, SPAN};
+    use crate::address_proposers as ap;
+    let first = state.proposals_from();
+    let lacking = |lo: u64, hi: u64| -> Vec<u64> {
+        watched
+            .iter()
+            .filter(|v| !validators.covers(**v, (lo, hi)).unwrap_or(false))
+            .copied()
+            .collect()
+    };
+    let mut start = span_of(first.max(mirror_first)).0;
+    if start < mirror_first {
+        start += SPAN;
+    }
+    let mut needed = Vec::new();
+    while start + SPAN - 1 <= mirror_last.min(ceiling) {
+        if !lacking(start.max(first), start + SPAN - 1).is_empty() {
+            needed.push(start);
+        }
+        start += SPAN;
+    }
+    let (Some(&lowest), Some(&top)) = (needed.first(), needed.last()) else {
+        return Ok(());
+    };
+    // The newest needed span's successor, linked by parent hashes to the finalized block.
+    let top_end = top + SPAN - 1;
+    let mut successor = if top_end + 1 == anchor.number {
+        anchor.clone()
+    } else {
+        let (lo, hi) = (top_end + 1, anchor.number - 1);
+        if hi - lo + 1 > LOCAL_CATALOGUE_MAX {
+            bail!(
+                "the mirror's spans end {} blocks under the finalized block, over the {LOCAL_CATALOGUE_MAX} a nest links itself",
+                hi - lo + 1
+            );
+        }
+        let bridge = ap::blocks_from_rpc(&d.main, (lo, hi), 8).await?;
+        if anchor.parent_hash != bridge[bridge.len() - 1].hash {
+            bail!("the RPC's blocks under its finalized block do not lead to it");
+        }
+        bridge[0].header.clone()
+    };
+    let mut span = top;
+    loop {
+        serve_queued(state, d).await;
+        let end = span + SPAN - 1;
+        let generation = validators.generation()?;
+        let mut verified = None;
+        for fresh in [false, true] {
+            let Some(raw) = source.fetch(span, fresh).await? else {
+                bail!("the mirror has no block partition for [{span}, {end}]");
+            };
+            match crate::address_partitions::decode(&raw).and_then(|b| {
+                crate::address_partitions::verify(&b, span, end, successor.parent_hash, 1)
+            }) {
+                Ok(b) => {
+                    verified = Some(b);
+                    break;
+                }
+                Err(e) if !fresh => {
+                    tracing::warn!("address history: cached partition [{span}, {end}] refused, downloading it again: {e:#}");
+                    source.discard(span);
+                }
+                Err(e) => return Err(e.context(format!("the partition for [{span}, {end}]"))),
+            }
+        }
+        let blocks = verified.expect("the loop verifies or returns");
+        if needed.contains(&span) {
+            let lo = ap::provable(span).map_or(end + 1, |(lo, _)| lo);
+            let clip = (span.max(first), end);
+            let who = lacking(clip.0, clip.1);
+            let mut proven = None;
+            for fresh in [false, true] {
+                let Some(raw) = source.fetch_catalogue(span, fresh).await? else {
+                    bail!("the mirror has no proposer catalogue for [{span}, {end}]");
+                };
+                match ap::decode(&raw).and_then(|rows| {
+                    ap::verify(
+                        &rows,
+                        &blocks[(lo - span) as usize..],
+                        &successor,
+                        (lo, end),
+                    )
+                }) {
+                    Ok(p) => {
+                        proven = Some(p);
+                        break;
+                    }
+                    Err(e) if !fresh => {
+                        tracing::warn!("address history: cached catalogue [{span}, {end}] refused, downloading it again: {e:#}");
+                        source.discard_catalogue(span);
+                    }
+                    Err(e) => return Err(e.context(format!("the catalogue for [{span}, {end}]"))),
+                }
+            }
+            let proven: Vec<ap::Proven> = proven
+                .expect("the loop proves or returns")
+                .into_iter()
+                .filter(|p| p.block.header.number >= clip.0)
+                .collect();
+            record_proven(d, state, validators, &who, clip, &proven, generation).await?;
+            state.set_calls("main", d.main.calls());
+            state.window_done();
+            tracing::info!(
+                "address history: proposers proven over [{}, {end}] for {} validator(s)",
+                clip.0,
+                who.len()
+            );
+        }
+        if span == lowest {
+            return Ok(());
+        }
+        successor = blocks[0].header.clone();
+        span -= SPAN;
+    }
+}
+
+/// The most blocks behind finality a nest reads itself for the proposer catalogue: enough for the gap
+/// between a mirror's last published span and the finalized block, not for history a mirror holds.
 const LOCAL_CATALOGUE_MAX: u64 = 50_000;
 
-/// Every block from `from` to the finalized block less one with its proven proposer, built here from
-/// the RPC and the beacon, and anchored: the successor of the last is the block the RPC calls
-/// finalized, read by that tag, so a self-consistent fork the RPC returned for the range cannot
-/// reach it.
+/// Every block of `[from, to]` (`to` at most `anchor`'s parent) with its proven proposer, built here
+/// from the RPC and the beacon and linked to `anchor`, the block the RPC calls finalized, through
+/// every block between: a self-consistent fork the RPC returned for the range cannot reach it.
 async fn prove_tail<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     beacon: &crate::address_proposers::Beacon,
     from: u64,
-    end_block: Option<u64>,
+    to: u64,
+    anchor: &alloy_consensus::Header,
 ) -> Result<(u64, Vec<crate::address_proposers::Proven>)> {
     use crate::address_proposers as ap;
-    let (finalized, _) = ap::finalized_header(&d.main).await?;
-    let to = finalized.number.saturating_sub(1);
-    if end_block.is_some_and(|e| e < to) {
-        bail!("a locally built catalogue ends at the finalized block, past end_block");
-    }
-    if to < from {
-        return Ok((to, Vec::new()));
-    }
-    if to - from + 1 > LOCAL_CATALOGUE_MAX {
+    let last = anchor.number.saturating_sub(1);
+    if to < from || to > last {
         bail!(
-            "the mirror has no proposer catalogue from block {from}, and building {} blocks here is over the {LOCAL_CATALOGUE_MAX} a nest builds itself",
-            to - from + 1
+            "the range [{from}, {to}] is not under the finalized block {}",
+            anchor.number
         );
     }
-    let blocks = ap::blocks_from_rpc(&d.main, (from, to), 8).await?;
-    let rows = ap::build_rows(beacon, &blocks, &finalized, (from, to), 8).await?;
-    Ok((to, ap::verify(&rows, &blocks, &finalized, (from, to))?))
+    if last - from + 1 > LOCAL_CATALOGUE_MAX {
+        bail!(
+            "building {} blocks here is over the {LOCAL_CATALOGUE_MAX} a nest builds itself; the mirror should hold them",
+            last - from + 1
+        );
+    }
+    // Read through to the finalized block whatever `to` is, so the range hangs from it.
+    let blocks = ap::blocks_from_rpc(&d.main, (from, last), 8).await?;
+    let rows = ap::build_rows(beacon, &blocks, anchor, (from, last), 8).await?;
+    let proven = ap::verify(&rows, &blocks, anchor, (from, last))?;
+    Ok((
+        to,
+        proven
+            .into_iter()
+            .filter(|p| p.block.header.number <= to)
+            .collect(),
+    ))
 }
 
 /// The served row of one proven block. Its reward comes from the block's own transactions and
@@ -2914,15 +2997,21 @@ mod tests {
             };
             Discoverer::new(Counted::new(make()), Counted::new(make()))
         };
-        let (to, proven) = prove_tail(&rpc(&successor), &beacon, DENEB_BLOCK, None)
-            .await
-            .unwrap();
+        let (to, proven) = prove_tail(
+            &rpc(&successor),
+            &beacon,
+            DENEB_BLOCK,
+            DENEB_BLOCK + 3,
+            &successor,
+        )
+        .await
+        .unwrap();
         assert_eq!(to, DENEB_BLOCK + 3);
         assert_eq!(proven.len(), 4);
         // The RPC served a self-consistent range, but the finalized block is on another chain.
         let mut other = successor.clone();
         other.parent_hash = alloy_primitives::B256::repeat_byte(3);
-        let e = prove_tail(&rpc(&other), &beacon, DENEB_BLOCK, None)
+        let e = prove_tail(&rpc(&other), &beacon, DENEB_BLOCK, DENEB_BLOCK + 3, &other)
             .await
             .unwrap_err();
         assert!(format!("{e:#}").contains("not the successor"), "{e:#}");
