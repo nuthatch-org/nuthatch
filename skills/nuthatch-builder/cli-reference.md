@@ -357,6 +357,9 @@ Build verifiable block partitions for address-history nests (RFC-0063 §8)
 - `--out <OUT>` - A directory, or `s3://bucket/prefix`
 - `--concurrency <CONCURRENCY>` - Blocks fetched at once
 - `--verify-existing` - Download every partition the manifest already lists and check its sha256, rebuilding any that differ. Without it a listed partition is checked by size and the store's ETag alone
+- `--proposers` - Build the proposer catalogue (which validator proposed each block since Dencun) from the block partitions already in `--out`, instead of the block partitions themselves
+- `--beacon-url <BEACON_URL>` - With `--proposers`: a beacon node's API to read headers from. It sees this machine's IP and the beacon roots asked for
+- `--beacon-cache <BEACON_CACHE>` - With `--proposers`: a directory of beacon headers by slot (`slots-<first>.jsonl.gz`), read before the beacon API. Unverified: every header is checked against the chain like any other
 
 ## `nuthatch prune`
 

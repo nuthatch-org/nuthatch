@@ -183,6 +183,8 @@ end_block = 20000000          # optional: stop here
 poll_interval = "5m"          # optional, default 5m; `--poll-interval` overrides it
 mev_relays = false            # optional, default off: ask the MEV-Boost relays, see below
 request_deadline = "20s"      # optional, default 20s: how long a request may wait while the nest covers it
+validators = [2259472]        # optional, Ethereum only: validators whose proposed blocks to prove, see below
+beacon_url = "http://127.0.0.1:5052"  # optional: a beacon API for blocks the mirror has not published
 ```
 
 The cursor backfills each address up to the finalized head (the RPC's `finalized` tag, else the
@@ -230,6 +232,15 @@ published and can fail to, so such blocks are asked again daily for 30 days, and
 then upgrades the row or inserts the missing one. `builderPubkey` and `proposerPubkey` come from one
 relay's claim: the deliveries for the canonical block hash, in the fixed relay order, the first whose
 fee recipient is the watched address, else the first; `conflict` compares recipient and value only.
+
+`validators` (or `POST /api/watch` with `{"validator": N}`, on a loopback bind) names validator indices
+whose proposed blocks the nest proves, served as `module=account&action=nuthatchValidatorBlocks&validator=N`:
+every block the validator proposed in the range, wherever its fees went, complete or refused, with
+`supportedFrom` and `verifiedThrough`. The proposer of block N is proven by the beacon header the next
+execution block commits to (EIP-4788), read from the proposer catalogue the mirror publishes and checked
+against the chain like the partitions; `beacon_url` lets the nest build the catalogue itself above what
+the mirror has published, and that beacon sees the machine's IP and the roots asked for. Ethereum
+mainnet only, from the first block the catalogue covers; earlier ranges are refused.
 It is off by default; the relays see this machine's IP and those block numbers.
 
 On Ethereum mainnet a nest can also prove which blocks a validator proposed, whoever received their
