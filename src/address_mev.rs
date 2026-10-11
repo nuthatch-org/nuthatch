@@ -2,8 +2,11 @@
 //! a relay, with what the relays say each delivered and the on-chain payment that delivered it.
 //!
 //! A relay's record is a claim, so it is set beside the payment transaction rather than trusted
-//! alone. A block no relay knows of has no MEV figure, never a zero one; two relays that disagree
-//! about a block are a conflict, served as such.
+//! alone. The rows come from the chain: every block a watched address received the fees of is one.
+//! MEV is a label on a row, never a claim about the row set: `relay`, `conflict` (relays disagree), or
+//! `unrecorded` (no delivery at the queried relays when last asked). A relay saves its record after
+//! the block is published, and can fail to, so `unrecorded` is never zero MEV and is asked again on a
+//! slow schedule ([`reask_pass`]).
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Map, Value};
@@ -29,6 +32,10 @@ pub const RELAYS: [(&str, &str); 6] = [
 
 /// Blocks a pass covers at once for one address.
 const MEV_WINDOW: u64 = 50_000;
+/// A block without relay evidence is asked again at most this often...
+pub const REASK_EVERY_SECS: u64 = 24 * 60 * 60;
+/// ...for this long after it was first asked.
+pub const REASK_FOR_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// One relay's deliveries for one block: relay name and block in, the bid traces out.
 pub type Relays = Arc<
@@ -74,15 +81,19 @@ pub fn relays_over_http() -> Result<Relays> {
     }))
 }
 
-/// Every relay's deliveries for `block`, from the cache or asked now. A relay that cannot be asked
-/// fails the lookup: a missing answer is not an absent delivery.
+/// Every relay's deliveries for `block`, from the cache or asked now (always now when `fresh`). A
+/// relay that cannot be asked fails the lookup: a missing answer is not an absent delivery. Only a
+/// finalized block's answer is cached.
 async fn relay_record(
     history: &AddressHistory,
     relays: &Relays,
     block: u64,
+    fresh: bool,
 ) -> Result<Map<String, Value>> {
-    if let Some(r) = history.relay_record(block)? {
-        return Ok(r);
+    if !fresh {
+        if let Some(r) = history.relay_record(block)? {
+            return Ok(r);
+        }
     }
     let mut delivered = Vec::new();
     for (name, _) in RELAYS {
@@ -152,18 +163,30 @@ fn delivery(record: &Map<String, Value>, hash: &str, a: &str) -> Option<Delivery
     })
 }
 
-/// The produced-block rows of `address` over `[from, to]`, from its stored produced blocks and
-/// normal transactions, both of which must be covered there.
+/// What a produced-block pass found: the rows, and the blocks it asked the relays about that named no
+/// delivery for the canonical block, which the re-ask schedule takes on.
+#[derive(Debug, Default)]
+pub struct Produced {
+    pub rows: Vec<Row>,
+    pub unrecorded: Vec<u64>,
+}
+
+/// The produced-block rows of `address` over `[from, to]`, from its stored mined blocks and its
+/// normal and internal transactions, all of which must be covered there.
 pub async fn produced_blocks<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     relays: &Relays,
     history: &AddressHistory,
     address: &str,
     (from, to): (u64, u64),
-) -> Result<Vec<Row>> {
+    fresh: bool,
+) -> Result<Produced> {
     let a = address.to_ascii_lowercase();
     let mined = history.rows_in(Action::MinedBlocks, &a, (from, to))?;
     let txs = history.rows_in(Action::TxList, &a, (from, to))?;
+    // Builders that pay through a payout contract pay as an internal transfer inside the block's
+    // last transaction, so internal transfers are payments too.
+    let internals = history.rows_in(Action::TxListInternal, &a, (from, to))?;
     let text = |r: &Map<String, Value>, k: &str| {
         r.get(k).and_then(Value::as_str).unwrap_or("").to_string()
     };
@@ -177,7 +200,7 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
         .map(|m| Ok((number(m, "blockNumber")?, m)))
         .collect::<Result<_>>()?;
     let mut incoming: BTreeMap<u64, Vec<&Map<String, Value>>> = BTreeMap::new();
-    for t in &txs {
+    for t in txs.iter().chain(&internals) {
         if text(t, "to") == a && text(t, "value") != "0" && text(t, "isError") != "1" {
             incoming
                 .entry(number(t, "blockNumber")?)
@@ -187,7 +210,7 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
     }
     let blocks: BTreeSet<u64> = mined.keys().chain(incoming.keys()).copied().collect();
 
-    let mut out = Vec::new();
+    let mut out = Produced::default();
     for b in blocks {
         let header = d
             .main
@@ -207,9 +230,9 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
             .and_then(Value::as_array)
             .and_then(|t| t.len().checked_sub(1))
             .map(|i| i.to_string());
-        // A relay-built block pays the proposer in a transaction of its own, from the builder's
-        // fee recipient or, for builders that pay from another account, as the block's last
-        // transaction.
+        // A relay-built block pays the proposer from the builder's fee recipient or, for builders
+        // that pay from another account or a payout contract, in the block's last transaction,
+        // directly or as an internal transfer.
         let payment = incoming.get(&b).and_then(|paid| {
             paid.iter()
                 .rev()
@@ -223,9 +246,13 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
         if self_built.is_none() && payment.is_none() {
             continue;
         }
-        let record = relay_record(history, relays, b).await?;
+        let record = relay_record(history, relays, b, fresh).await?;
         let found = delivery(&record, &hash, &a);
-        // A payment makes a block this address's only on a relay's word.
+        if found.is_none() {
+            out.unrecorded.push(b);
+        }
+        // A payment makes a block this address's only on a relay's word; without one it waits on
+        // the re-ask schedule, which inserts the row if the word comes.
         if self_built.is_none()
             && !found
                 .as_ref()
@@ -282,10 +309,10 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
                 ] {
                     put(k, String::new());
                 }
-                put("mev", "none".into());
+                put("mev", "unrecorded".into());
             }
         }
-        out.push(Row {
+        out.rows.push(Row {
             block: b,
             tx_index: 0,
             position: 0,
@@ -295,14 +322,16 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
     Ok(out)
 }
 
-/// The cursor's MEV pass: each watched address is covered as far as both its produced blocks and
-/// its normal transactions are, a window at a time.
+/// The cursor's MEV pass: each watched address is covered as far as both its mined blocks and its
+/// normal transactions are, up to `limit`, a window at a time.
 pub async fn mev_pass<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     relays: &Relays,
     history: &AddressHistory,
     watched: &[String],
     start: u64,
+    limit: u64,
+    now: u64,
 ) -> Result<()> {
     use crate::address_discovery::next_uncovered_for;
     for a in watched {
@@ -315,15 +344,99 @@ pub async fn mev_pass<M: Rpc, T: Rpc>(
                     .find(|(f, t)| *f <= from && from <= *t)
                     .map(|(_, t)| t))
             };
-            let (Some(mined), Some(txs)) =
-                (through(Action::MinedBlocks)?, through(Action::TxList)?)
-            else {
+            let (Some(mined), Some(txs), Some(internals)) = (
+                through(Action::MinedBlocks)?,
+                through(Action::TxList)?,
+                through(Action::TxListInternal)?,
+            ) else {
                 break;
             };
-            let to = mined.min(txs).min(from.saturating_add(MEV_WINDOW - 1));
-            let generation = history.generation()?;
-            let rows = produced_blocks(d, relays, history, a, (from, to)).await?;
-            history.record(Action::ProducedBlocks, a, &rows, (from, to), generation)?;
+            let to = mined
+                .min(txs)
+                .min(internals)
+                .min(from.saturating_add(MEV_WINDOW - 1))
+                .min(limit);
+            if to < from {
+                break;
+            }
+            produced_window(d, relays, history, a, (from, to), now).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Cover `[from, to]` of `a`'s produced blocks, its prerequisites covered, and put the blocks without
+/// relay evidence on the re-ask schedule.
+pub async fn produced_window<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    relays: &Relays,
+    history: &AddressHistory,
+    a: &str,
+    (from, to): (u64, u64),
+    now: u64,
+) -> Result<()> {
+    let generation = history.generation()?;
+    let anchor = crate::address_mode::anchor_for(d, history, to).await?;
+    let found = produced_blocks(d, relays, history, a, (from, to), false).await?;
+    crate::address_mode::check_anchor(d, anchor).await?;
+    history.record_anchored(
+        Action::ProducedBlocks,
+        a,
+        &found.rows,
+        (from, to),
+        generation,
+        anchor,
+    )?;
+    for b in found.unrecorded {
+        history.mev_absent(b, now)?;
+    }
+    Ok(())
+}
+
+/// Ask the relays again about each block on the re-ask schedule that is due: one whose last ask is a
+/// day old and whose first is under 30 days old. A delivery found now upgrades the row, or inserts
+/// one for a builder payment that had none; either way the generation moves.
+pub async fn reask_pass<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    relays: &Relays,
+    history: &AddressHistory,
+    watched: &[String],
+    now: u64,
+) -> Result<()> {
+    for (block, first, last) in history.mev_pending()? {
+        if now.saturating_sub(first) >= REASK_FOR_SECS {
+            history.mev_settled(block)?;
+            continue;
+        }
+        if now.saturating_sub(last) < REASK_EVERY_SECS {
+            continue;
+        }
+        // Asked fresh, so the cache holds the newest answer for the rows below.
+        relay_record(history, relays, block, true).await?;
+        let mut settled = true;
+        for a in watched {
+            let covered = history
+                .coverage(Action::ProducedBlocks, a)?
+                .iter()
+                .any(|(f, t)| *f <= block && block <= *t);
+            if !covered {
+                continue;
+            }
+            let found = produced_blocks(d, relays, history, a, (block, block), false).await?;
+            if !found.unrecorded.is_empty() {
+                settled = false;
+            }
+            let before = history.rows_in(Action::ProducedBlocks, a, (block, block))?;
+            let after: Vec<Map<String, Value>> =
+                found.rows.iter().map(|r| r.record.clone()).collect();
+            if before != after {
+                history.replace_block_rows(Action::ProducedBlocks, a, block, &found.rows)?;
+            }
+        }
+        if settled {
+            history.mev_settled(block)?;
+        } else {
+            history.mev_absent(block, now)?;
         }
     }
     Ok(())
@@ -461,7 +574,15 @@ mod tests {
             ("ultrasound", 106, trace(106, A, "13")),
             ("aestus", 107, trace(107, A, "3")),
         ]);
-        let rows = produced_blocks(&d, &rel, &h, A, (100, 199)).await.unwrap();
+        let found = produced_blocks(&d, &rel, &h, A, (100, 199), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            found.unrecorded,
+            [100, 103],
+            "100 is self-built without a delivery; 103's payment has none either, and waits for one"
+        );
+        let rows = found.rows;
         let view: Vec<String> = rows
             .iter()
             .map(|r| {
@@ -479,7 +600,7 @@ mod tests {
         assert_eq!(
             view,
             [
-                "100 aa none  ",
+                "100 aa unrecorded  ",
                 "101 b1 relay 9000 0xp101",
                 "104 aa conflict  ",
                 "105 d9 relay 11 0xp105",
@@ -497,7 +618,9 @@ mod tests {
         assert_eq!(first, 6 * 7, "every block but 102, every relay once");
 
         // Asked again, the relays' answers come from the store.
-        produced_blocks(&d, &rel, &h, A, (100, 199)).await.unwrap();
+        produced_blocks(&d, &rel, &h, A, (100, 199), false)
+            .await
+            .unwrap();
         assert_eq!(*asked.lock().unwrap(), first);
     }
 
@@ -516,14 +639,14 @@ mod tests {
                 Ok(vec![])
             })
         });
-        assert!(relay_record(&h, &down, 100).await.is_err());
+        assert!(relay_record(&h, &down, 100, false).await.is_err());
         assert!(h.relay_record(100).unwrap().is_none());
 
         // A block past what the nest serves is asked about but not kept: a relay may yet learn
         // of it.
         let (rel, asked) = relays(vec![]);
-        relay_record(&h, &rel, 2_000).await.unwrap();
-        relay_record(&h, &rel, 2_000).await.unwrap();
+        relay_record(&h, &rel, 2_000, false).await.unwrap();
+        relay_record(&h, &rel, 2_000, false).await.unwrap();
         assert_eq!(*asked.lock().unwrap(), 2 * 6);
         assert!(h.relay_record(2_000).unwrap().is_none());
     }

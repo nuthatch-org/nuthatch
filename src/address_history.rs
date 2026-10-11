@@ -57,6 +57,10 @@ pub struct AddressHistoryConfig {
     /// numbers, which name the validator.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mev_relays: bool,
+    /// How long a request for history above what is covered may wait while the nest covers it:
+    /// queue, RPC work and the answer together. Default 20 s, under rotki's 30 s read timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_deadline: Option<String>,
 }
 
 /// `[address_history.mirror]`: where verified block partitions come from, which chain and blocks to
@@ -108,7 +112,16 @@ impl AddressHistoryConfig {
             }
         }
         self.poll_interval()?;
+        self.request_deadline()?;
         Ok(())
+    }
+
+    pub fn request_deadline(&self) -> Result<Duration> {
+        match &self.request_deadline {
+            None => Ok(crate::address_mode::DEFAULT_DEADLINE),
+            Some(s) => crate::freshness::parse_duration(s)
+                .map_err(|e| anyhow!("[address_history] request_deadline `{s}`: {e}")),
+        }
     }
 
     pub fn poll_interval(&self) -> Result<Duration> {
@@ -258,8 +271,17 @@ const COVERAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_coverag
 const WATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_watched");
 /// Addresses removed at runtime, so a restart does not re-seed them from the config.
 const UNWATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_unwatched");
+/// Block hashes above the finalized head that stored history was read against. The highest anchors
+/// everything below it, so one comparison per poll finds a reorg.
+const CANON: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_canon");
+/// Blocks whose relay answer lacked a delivery, re-asked on a slow schedule: a relay can save its
+/// record after the block is published, or fail to.
+const MEV_PENDING: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_mev_pending");
 const META: TableDefinition<&str, u64> = TableDefinition::new("ah_meta");
+/// The finalized head: what the cursor backfills to and the line under which nothing is re-checked.
 const HEAD: &str = "head";
+/// The newest block served on demand above the finalized head.
+const TIP: &str = "tip";
 const GENERATION: &str = "generation";
 
 const KEY_LEN: usize = 20 + 8 * 3;
@@ -353,6 +375,8 @@ impl AddressHistory {
         wtx.open_table(HEADERS)?;
         wtx.open_table(VERIFIED_COV)?;
         wtx.open_table(RELAY_CACHE)?;
+        wtx.open_table(CANON)?;
+        wtx.open_table(MEV_PENDING)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
             let mut w = wtx.open_table(WATCHED)?;
@@ -440,6 +464,157 @@ impl AddressHistory {
         }
         wtx.commit()?;
         Ok(())
+    }
+
+    /// What a fetch read, in one transaction: transactions, timestamps, traces and the block hashes
+    /// they were read against. Anything above the finalized head is dropped when the generation
+    /// moved since `generation`: a reorg handled meanwhile may have replaced the block it came from,
+    /// even if the new chain has since grown back past it.
+    pub fn persist_pending(
+        &self,
+        txs: &[(Vec<u8>, Map<String, Value>)],
+        timestamps: &[(u64, u64)],
+        internals: &[TxInternals],
+        anchors: &[(u64, [u8; 32])],
+        generation: u64,
+    ) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let (head, now) = {
+                let m = wtx.open_table(META)?;
+                let head = m.get(HEAD)?.map(|v| v.value());
+                let now = m.get(GENERATION)?.map_or(0, |v| v.value());
+                (head, now)
+            };
+            let keep = |block: u64| now == generation || head.is_some_and(|h| block <= h);
+            let mut buf = Vec::new();
+            {
+                let mut t = wtx.open_table(TX_CACHE)?;
+                for (hash, record) in txs {
+                    let block = record
+                        .get("blockNumber")
+                        .and_then(Value::as_str)
+                        .and_then(|b| b.parse::<u64>().ok());
+                    if !block.is_some_and(keep) {
+                        continue;
+                    }
+                    buf.clear();
+                    encode_record(record, &mut buf)?;
+                    t.insert(hash.as_slice(), buf.as_slice())?;
+                }
+            }
+            {
+                let verified = match wtx.open_table(HEADERS)?.get(VERIFIED)? {
+                    Some(v) => decode_spans(v.value())?,
+                    None => Vec::new(),
+                };
+                let mut t = wtx.open_table(BLOCK_TS)?;
+                for (b, s) in timestamps {
+                    if keep(*b) && !verified.iter().any(|(f, l)| f <= b && b <= l) {
+                        t.insert(*b, *s)?;
+                    }
+                }
+            }
+            {
+                let mut t = wtx.open_table(TX_INTERNAL)?;
+                for (hash, block, rows) in internals {
+                    if !keep(*block) {
+                        continue;
+                    }
+                    let mut wrapped = Map::new();
+                    wrapped.insert("blockNumber".into(), Value::String(block.to_string()));
+                    wrapped.insert(
+                        "rows".into(),
+                        Value::Array(rows.iter().cloned().map(Value::Object).collect()),
+                    );
+                    buf.clear();
+                    encode_record(&wrapped, &mut buf)?;
+                    t.insert(hash.as_slice(), buf.as_slice())?;
+                }
+            }
+            if now == generation {
+                let mut c = wtx.open_table(CANON)?;
+                for (block, hash) in anchors {
+                    if head.is_none_or(|h| *block > h) {
+                        anchor(&mut c, *block, hash)?;
+                    }
+                }
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// The tracked block hashes above the finalized head, lowest first.
+    pub fn tracked(&self) -> Result<Vec<(u64, [u8; 32])>> {
+        let rtx = self.store.database().begin_read()?;
+        rtx.open_table(CANON)?
+            .iter()?
+            .map(|e| {
+                let (k, v) = e?;
+                let hash: [u8; 32] = v.value().try_into().map_err(|_| {
+                    anyhow!("a tracked hash at block {} is not 32 bytes", k.value())
+                })?;
+                Ok((k.value(), hash))
+            })
+            .collect()
+    }
+
+    /// Move the finalized head up to `block` and stop tracking hashes at or under it. Never lowers
+    /// the head: an RPC failing over to a lagging node must not unfinalize anything.
+    pub fn finalize(&self, block: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let mut m = wtx.open_table(META)?;
+            let head = m.get(HEAD)?.map(|v| v.value());
+            if head.is_none_or(|h| block > h) {
+                m.insert(HEAD, block)?;
+            }
+            let mut c = wtx.open_table(CANON)?;
+            let done: Vec<u64> = c
+                .range(..=block)?
+                .map(|e| e.map(|(k, _)| k.value()))
+                .collect::<std::result::Result<_, _>>()?;
+            for b in done {
+                c.remove(b)?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// The newest block served on demand, if any was. Only ever rises, except under a reorg.
+    pub fn tip(&self) -> Result<Option<u64>> {
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx.open_table(META)?.get(TIP)?.map(|v| v.value()))
+    }
+
+    pub fn raise_tip(&self, block: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let mut m = wtx.open_table(META)?;
+            if m.get(TIP)?.is_none_or(|v| block > v.value()) {
+                m.insert(TIP, block)?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// The blocks of `[from, to]` that (address, action) has no coverage for, lowest first.
+    pub fn uncovered(
+        &self,
+        action: Action,
+        address: &str,
+        (from, to): (u64, u64),
+    ) -> Result<Vec<(u64, u64)>> {
+        if to < from {
+            return Ok(Vec::new());
+        }
+        Ok(subtract_all(
+            &[(from, to)],
+            &self.coverage(action, address)?,
+        ))
     }
 
     pub fn block_timestamp(&self, block: u64) -> Result<Option<u64>> {
@@ -617,7 +792,22 @@ impl AddressHistory {
         span: (u64, u64),
         generation: u64,
     ) -> Result<()> {
-        self.record_with(action, address, rows, span, generation, false)
+        self.record_with(action, address, rows, span, generation, false, None)
+    }
+
+    /// [`AddressHistory::record`] for a span read against the chain as it stood at block `anchor.0`,
+    /// whose hash was `anchor.1`. Above the finalized head the hash is tracked, so a reorg found
+    /// later takes the span back out; a conflicting tracked hash refuses the record.
+    pub fn record_anchored(
+        &self,
+        action: Action,
+        address: &str,
+        rows: &[Row],
+        span: (u64, u64),
+        generation: u64,
+        anchor: Option<(u64, [u8; 32])>,
+    ) -> Result<()> {
+        self.record_with(action, address, rows, span, generation, false, anchor)
     }
 
     /// [`AddressHistory::record`] for rows read from a verified partition: the span is marked
@@ -630,7 +820,7 @@ impl AddressHistory {
         span: (u64, u64),
         generation: u64,
     ) -> Result<()> {
-        self.record_with(action, address, rows, span, generation, true)
+        self.record_with(action, address, rows, span, generation, true, None)
     }
 
     fn record_with(
@@ -641,6 +831,7 @@ impl AddressHistory {
         (from, to): (u64, u64),
         generation: u64,
         verified: bool,
+        anchored: Option<(u64, [u8; 32])>,
     ) -> Result<()> {
         if to < from {
             bail!("coverage interval [{from}, {to}] is empty");
@@ -684,6 +875,12 @@ impl AddressHistory {
                 };
                 if let Some(kept) = kept {
                     v.insert(key.as_slice(), encode_spans(&kept).as_slice())?;
+                }
+            }
+            if let Some((block, hash)) = anchored {
+                let head = wtx.open_table(META)?.get(HEAD)?.map(|v| v.value());
+                if head.is_none_or(|h| block > h) {
+                    anchor(&mut wtx.open_table(CANON)?, block, &hash)?;
                 }
             }
             put_rows(&wtx, action, &a, rows)?;
@@ -809,8 +1006,85 @@ impl AddressHistory {
         }
     }
 
-    /// The newest block the cursor has seen. An `endblock` past it is answered up to it, as
-    /// Etherscan answers rotki's `99999999`.
+    /// Blocks awaiting a relay re-ask: (block, first asked, last asked), in unix seconds.
+    pub fn mev_pending(&self) -> Result<Vec<(u64, u64, u64)>> {
+        let rtx = self.store.database().begin_read()?;
+        rtx.open_table(MEV_PENDING)?
+            .iter()?
+            .map(|e| {
+                let (k, v) = e?;
+                let (first, last) = decode_asked(v.value())?;
+                Ok((k.value(), first, last))
+            })
+            .collect()
+    }
+
+    /// Note that the relays were asked about `block` at `now` and named no delivery for it; the
+    /// first such ask is kept, so the re-ask schedule runs from it.
+    pub fn mev_absent(&self, block: u64, now: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        {
+            let mut t = wtx.open_table(MEV_PENDING)?;
+            let first = match t.get(block)? {
+                Some(v) => decode_asked(v.value())?.0,
+                None => now,
+            };
+            t.insert(block, encode_asked(first, now).as_slice())?;
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    pub fn mev_settled(&self, block: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        wtx.open_table(MEV_PENDING)?.remove(block)?;
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// Replace (address, action)'s rows at `block` with `rows`, in a span already covered: late relay
+    /// evidence upgrading a row, or inserting one that had none. The generation moves, so a client
+    /// paging across it starts again rather than reading half of each.
+    pub fn replace_block_rows(
+        &self,
+        action: Action,
+        address: &str,
+        block: u64,
+        rows: &[Row],
+    ) -> Result<()> {
+        let a = parse_address(address)?;
+        if let Some(r) = rows.iter().find(|r| r.block != block) {
+            bail!("a row at block {} is not at block {block}", r.block);
+        }
+        let wtx = self.store.database().begin_write()?;
+        {
+            if wtx.open_table(WATCHED)?.get(a.as_slice())?.is_none() {
+                bail!("{} is not watched", address_hex(&a));
+            }
+            let covered = match wtx
+                .open_table(COVERAGE)?
+                .get(coverage_key(&a, action).as_slice())?
+            {
+                Some(v) => decode_spans(v.value())?,
+                None => Vec::new(),
+            };
+            if !covered.iter().any(|(f, t)| *f <= block && block <= *t) {
+                bail!("{} block {block} is not covered", action.etherscan());
+            }
+            drain(
+                &mut wtx.open_table(action.table())?,
+                &row_key(&a, block, 0, 0),
+                &row_key(&a, block, u64::MAX, u64::MAX),
+            )?;
+            put_rows(&wtx, action, &a, rows)?;
+            bump_generation(&wtx)?;
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// Set the finalized head outright, lower included; the cursor uses
+    /// [`AddressHistory::finalize`].
     pub fn set_head(&self, block: u64) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
         wtx.open_table(META)?.insert(HEAD, block)?;
@@ -903,6 +1177,51 @@ impl AddressHistory {
                 }
             }
             {
+                // A transaction re-included elsewhere keeps its hash, so a cached copy would bring
+                // back its old block, index and receipt.
+                let mut txs = wtx.open_table(TX_CACHE)?;
+                let mut stale = Vec::new();
+                for e in txs.iter()? {
+                    let (k, v) = e?;
+                    let cached = decode_record(v.value())?
+                        .get("blockNumber")
+                        .and_then(Value::as_str)
+                        .and_then(|b| b.parse::<u64>().ok());
+                    if cached.is_none_or(|b| b > block) {
+                        stale.push(k.value().to_vec());
+                    }
+                }
+                for k in stale {
+                    txs.remove(k.as_slice())?;
+                }
+            }
+            {
+                let mut t = wtx.open_table(BLOCK_TS)?;
+                let above: Vec<u64> = t
+                    .range(block.saturating_add(1)..)?
+                    .map(|e| e.map(|(k, _)| k.value()))
+                    .collect::<std::result::Result<_, _>>()?;
+                for b in above {
+                    t.remove(b)?;
+                }
+            }
+            for table in [CANON, MEV_PENDING] {
+                let mut t = wtx.open_table(table)?;
+                let above: Vec<u64> = t
+                    .range(block.saturating_add(1)..)?
+                    .map(|e| e.map(|(k, _)| k.value()))
+                    .collect::<std::result::Result<_, _>>()?;
+                for b in above {
+                    t.remove(b)?;
+                }
+            }
+            {
+                let mut m = wtx.open_table(META)?;
+                if m.get(TIP)?.is_some_and(|v| v.value() > block) {
+                    m.insert(TIP, block)?;
+                }
+            }
+            {
                 let mut v = wtx.open_table(VERIFIED_COV)?;
                 let entries: Vec<(Vec<u8>, Vec<u8>)> = v
                     .iter()?
@@ -957,7 +1276,6 @@ impl AddressHistory {
             ));
         }
         let start = req.start_block.unwrap_or(0);
-        let head = meta.get(HEAD)?.map(|v| v.value());
         let spans = match rtx
             .open_table(COVERAGE)?
             .get(coverage_key(&a, action).as_slice())?
@@ -975,17 +1293,10 @@ impl AddressHistory {
                 address_hex(&a)
             )));
         };
-        // Etherscan reads an absent or far-future `endblock` as "up to now". The nest's now is the
-        // head it has seen; without one it cannot say where history ends.
-        let end = match (req.end_block, head) {
-            (Some(e), Some(h)) => e.min(h),
-            (Some(e), None) => e,
-            (None, Some(h)) => h,
-            (None, None) => {
-                return answer(Answer::Incomplete("the chain head is not known yet".into()));
-            }
-        };
-        if end < start || end > covered_to {
+        // An explicit end is answered whole or refused: shortening it to what is covered would let a
+        // client record history it never received. No end means everything covered.
+        let end = req.end_block.unwrap_or(covered_to);
+        if end > covered_to {
             return answer(Answer::Incomplete(format!(
                 "{} for {} is indexed through block {covered_to}, not {}",
                 action.etherscan(),
@@ -1074,6 +1385,36 @@ fn cover(
     };
     spans.push((from, to));
     t.insert(key.as_slice(), encode_spans(&merge(spans)).as_slice())?;
+    Ok(())
+}
+
+fn encode_asked(first: u64, last: u64) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&first.to_be_bytes());
+    out[8..].copy_from_slice(&last.to_be_bytes());
+    out
+}
+
+fn decode_asked(raw: &[u8]) -> Result<(u64, u64)> {
+    let raw: [u8; 16] = raw
+        .try_into()
+        .map_err(|_| anyhow!("a pending relay entry is not 16 bytes"))?;
+    Ok((
+        u64::from_be_bytes(raw[..8].try_into().expect("8 bytes")),
+        u64::from_be_bytes(raw[8..].try_into().expect("8 bytes")),
+    ))
+}
+
+/// Track `hash` at `block`; a different hash already tracked there means the chain moved under the
+/// fetch, which must not be recorded as if it had not.
+fn anchor(c: &mut redb::Table<u64, &'static [u8]>, block: u64, hash: &[u8; 32]) -> Result<()> {
+    if let Some(v) = c.get(block)? {
+        if v.value() != hash.as_slice() {
+            bail!("block {block} changed hash during the fetch; refetch");
+        }
+        return Ok(());
+    }
+    c.insert(block, hash.as_slice())?;
     Ok(())
 }
 
@@ -1834,22 +2175,38 @@ mod tests {
         assert_eq!(h.page(Action::TxList, &r).unwrap(), Answer::Rows(vec![]));
     }
 
+    /// An explicit end past what is covered is refused whole, never answered short: a client that
+    /// asked through block N records that it has history through N (cold test B1, 2026-10-11: 17 of
+    /// Etherscan's 65 rows came back as a complete answer).
     #[test]
-    fn an_endblock_past_the_head_is_answered_to_the_head() {
+    fn an_endblock_past_coverage_is_refused_not_shortened() {
         let (_d, h) = history();
-        h.insert(Action::TxList, ALICE, &[tx(50, 0)]).unwrap();
+        h.insert(Action::TxList, ALICE, &[tx(50, 0), tx(150, 0)])
+            .unwrap();
         h.mark_covered(Action::TxList, ALICE, 0, 100).unwrap();
-        h.set_head(100).unwrap();
-        let a = respond(
-            Some(&h),
-            &params(&[
-                ("module", "account"),
-                ("action", "txlist"),
-                ("address", ALICE),
-                ("endblock", "99999999"),
-            ]),
-        );
-        assert_eq!(hashes(&a).len(), 1, "{a}");
+        h.set_head(200).unwrap();
+        let ask = |end: &str| {
+            respond(
+                Some(&h),
+                &params(&[
+                    ("module", "account"),
+                    ("action", "txlist"),
+                    ("address", ALICE),
+                    ("endblock", end),
+                ]),
+            )
+        };
+        for end in ["101", "200", "99999999"] {
+            let a = ask(end);
+            assert!(
+                a["result"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("NUTHATCH_INCOMPLETE:"),
+                "{end}: {a}"
+            );
+        }
+        assert_eq!(hashes(&ask("100")).len(), 1);
     }
 
     #[test]
@@ -2247,6 +2604,7 @@ mod tests {
             poll_interval: None,
             mirror: None,
             mev_relays: false,
+            request_deadline: None,
         };
         ok.validate().unwrap();
         assert_eq!(ok.poll_interval().unwrap(), DEFAULT_POLL_INTERVAL);
@@ -2308,25 +2666,20 @@ mod tests {
         .unwrap()
     }
 
-    /// An absent `endblock` means up to the head, and coverage short of the head is incomplete,
-    /// not a shorter history.
+    /// An absent `endblock` answers everything covered from the start onward; a start that is not
+    /// covered is still incomplete.
     #[test]
-    fn an_absent_endblock_needs_coverage_through_the_head() {
+    fn an_absent_endblock_answers_everything_covered() {
         let (_d, h) = history();
-        h.mark_covered(Action::TxList, ALICE, 0, 99).unwrap();
-        assert!(
-            matches!(open_ended(&h), Answer::Incomplete(_)),
-            "no head, no end"
-        );
-        h.set_head(200).unwrap();
         assert!(matches!(open_ended(&h), Answer::Incomplete(_)));
-        h.mark_covered(Action::TxList, ALICE, 101, 200).unwrap();
-        assert!(
-            matches!(open_ended(&h), Answer::Incomplete(_)),
-            "a gap at 100"
-        );
-        h.mark_covered(Action::TxList, ALICE, 100, 100).unwrap();
+        h.mark_covered(Action::TxList, ALICE, 0, 99).unwrap();
         assert_eq!(open_ended(&h), Answer::Rows(vec![]));
+        h.mark_covered(Action::TxList, ALICE, 101, 200).unwrap();
+        assert_eq!(
+            open_ended(&h),
+            Answer::Rows(vec![]),
+            "through 99, the run the start is in"
+        );
     }
 
     #[test]

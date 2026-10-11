@@ -16,6 +16,11 @@ pub type Forward =
 
 /// Etherscan's `getLogs` answers at most this many logs; a caller pages by block past them.
 const MAX_LOGS: usize = 1000;
+/// The block span a `getLogs` range is first split into, before the provider names its own limit.
+const LOG_SPAN: u64 = 10_000;
+/// The most `eth_getLogs` calls one `getLogs` may cost. A range that needs more answers incomplete
+/// rather than half of itself.
+const MAX_LOG_CALLS: usize = 64;
 
 /// The answer to a `proxy` or `logs` request, or `None` for any other module.
 pub async fn answer(
@@ -38,7 +43,11 @@ pub async fn answer(
     let result = if module == "proxy" {
         proxy(q, action, forward).await
     } else if action == "getLogs" {
-        logs(q, forward).await
+        // A failed range is one the nest could not answer, never an error in the caller's request,
+        // so it reads incomplete and the caller asks its next source.
+        logs(q, forward)
+            .await
+            .or_else(|e| Ok(Answer::Incomplete(format!("getLogs: {e:#}"))))
     } else {
         return Some(crate::address_history::unsupported(&format!(
             "logs/{action} is not served by this nest"
@@ -48,6 +57,7 @@ pub async fn answer(
         Ok(Answer::Rpc(result)) => json!({ "jsonrpc": "2.0", "id": 1, "result": result }),
         Ok(Answer::Logs(rows)) => json!({ "status": "1", "message": "OK", "result": rows }),
         Ok(Answer::Unsupported(why)) => crate::address_history::unsupported(&why),
+        Ok(Answer::Incomplete(why)) => crate::address_history::incomplete(&why),
         Err(e) => json!({ "status": "0", "message": "NOTOK", "result": format!("Error! {e:#}") }),
     })
 }
@@ -56,6 +66,7 @@ enum Answer {
     Rpc(Value),
     Logs(Vec<Value>),
     Unsupported(String),
+    Incomplete(String),
 }
 
 async fn proxy(q: &HashMap<String, String>, action: &str, forward: &Forward) -> Result<Answer> {
@@ -83,16 +94,15 @@ async fn proxy(q: &HashMap<String, String>, action: &str, forward: &Forward) -> 
 /// `logs/getLogs` in Etherscan's shape: every quantity hex, with the block's timestamp and the
 /// transaction's gas price and gas used, which `eth_getLogs` does not carry.
 async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> {
-    let block = |k: &str| -> Result<Value> {
+    let block = |k: &str| -> Result<Option<u64>> {
         let v = q.get(k).map_or("latest", String::as_str);
         Ok(match v {
-            "latest" | "earliest" | "pending" | "finalized" | "safe" => json!(v),
-            n => json!(format!(
-                "0x{:x}",
-                n.parse::<u64>().map_err(|_| anyhow!("invalid {k} `{n}`"))?
-            )),
+            "earliest" => Some(0),
+            "latest" | "pending" | "finalized" | "safe" => None,
+            n => Some(n.parse::<u64>().map_err(|_| anyhow!("invalid {k} `{n}`"))?),
         })
     };
+    let tag = |k: &str| q.get(k).map_or("latest", String::as_str).to_string();
     // Etherscan combines topics with and/or operators; eth_getLogs can only AND them.
     if q.iter()
         .any(|(k, v)| k.starts_with("topic") && k.ends_with("_opr") && v != "and")
@@ -111,18 +121,55 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
         .iter()
         .rposition(|t| !t.is_null())
         .map_or(0, |i| i + 1);
-    let mut filter = Map::new();
-    filter.insert("fromBlock".into(), block("fromBlock")?);
-    filter.insert("toBlock".into(), block("toBlock")?);
-    if let Some(a) = q.get("address") {
-        filter.insert("address".into(), json!(a));
+    let number_of = |t: String| async move {
+        let b = forward("eth_getBlockByNumber".into(), json!([t, false])).await?;
+        crate::address_discovery::hex_u64(&b["number"])
+    };
+    let from = match block("fromBlock")? {
+        Some(n) => n,
+        None => number_of(tag("fromBlock")).await?,
+    };
+    let to = match block("toBlock")? {
+        Some(n) => n,
+        None => number_of(tag("toBlock")).await?,
+    };
+    // A range is asked in spans the provider takes, oldest first, and stops once past the cap:
+    // whatever lies beyond it a caller asks for next.
+    let mut logs = Vec::new();
+    let (mut start, mut span, mut calls) = (from, LOG_SPAN, 0);
+    while start <= to && logs.len() <= MAX_LOGS {
+        if calls == MAX_LOG_CALLS {
+            return Ok(Answer::Incomplete(format!(
+                "getLogs over [{from}, {to}] needs more than {MAX_LOG_CALLS} calls to the RPC; ask for a narrower range"
+            )));
+        }
+        calls += 1;
+        let end = start.saturating_add(span - 1).min(to);
+        let mut filter = Map::new();
+        filter.insert("fromBlock".into(), json!(format!("0x{start:x}")));
+        filter.insert("toBlock".into(), json!(format!("0x{end:x}")));
+        if let Some(a) = q.get("address") {
+            filter.insert("address".into(), json!(a));
+        }
+        filter.insert("topics".into(), Value::Array(topics[..last].to_vec()));
+        match forward("eth_getLogs".into(), json!([filter])).await {
+            Ok(found) => {
+                logs.extend(
+                    found
+                        .as_array()
+                        .ok_or_else(|| anyhow!("eth_getLogs answered a non-list"))?
+                        .iter()
+                        .cloned(),
+                );
+                start = end + 1;
+            }
+            Err(e) if end > start && crate::address_discovery::range_shaped(&format!("{e:#}")) => {
+                let stated = crate::address_discovery::stated_limit(&format!("{e:#}"));
+                span = stated.filter(|n| *n < span).unwrap_or(span / 2).max(1);
+            }
+            Err(e) => return Err(e),
+        }
     }
-    filter.insert("topics".into(), Value::Array(topics[..last].to_vec()));
-    let found = forward("eth_getLogs".into(), json!([filter])).await?;
-    let mut logs = found
-        .as_array()
-        .ok_or_else(|| anyhow!("eth_getLogs answered a non-list"))?
-        .clone();
     if logs.len() > MAX_LOGS {
         // Cut at a block boundary, so a caller restarting from the last block it was given
         // moves on. A single block past the cap cannot be paged that way at all.

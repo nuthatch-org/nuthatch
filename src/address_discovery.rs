@@ -211,7 +211,7 @@ impl Window {
 
 /// Whether an error reads like a span the provider would not serve, as opposed to one it could not
 /// reach or would not authorise.
-fn range_shaped(error: &str) -> bool {
+pub(crate) fn range_shaped(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     [
         "range",
@@ -231,7 +231,7 @@ fn range_shaped(error: &str) -> bool {
 
 /// The block-span limit an error message states, in the forms providers use:
 /// `limited to 100 blocks`, `"maxAllowedRange":16384`, `max range of 2000`.
-fn stated_limit(error: &str) -> Option<u64> {
+pub(crate) fn stated_limit(error: &str) -> Option<u64> {
     let lower = error.to_ascii_lowercase();
     for marker in [
         "limited to ",
@@ -329,9 +329,17 @@ async fn ranged_in<R: Rpc>(
                 }
                 Judged::Smaller(why) => {
                     let next = window.refused(e - s + 1, &why);
-                    tracing::debug!(
-                        "{method} [{s}, {e}] refused, retrying in spans of {next}: {why}"
-                    );
+                    // A provider naming its limit is routine; a timeout or a failure is not, and a
+                    // dead RPC halving its way down to single blocks must be visible.
+                    if stated_limit(&why).is_some() {
+                        tracing::debug!(
+                            "{method} [{s}, {e}] refused, retrying in spans of {next}: {why}"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "{method} [{s}, {e}] failed, retrying in spans of {next}: {why}"
+                        );
+                    }
                     again.push((s, e, next));
                 }
             }
@@ -413,6 +421,14 @@ fn topic_address(word: &str) -> Result<String> {
     Ok(format!("0x{}", &hex[24..]))
 }
 
+/// A 32-byte hash written as `0x` and 64 hex digits.
+pub(crate) fn word32(s: &str) -> Result<[u8; 32]> {
+    let raw = alloy_primitives::hex::decode(s.trim_start_matches("0x"))
+        .with_context(|| format!("not hex: {s}"))?;
+    raw.try_into()
+        .map_err(|_| anyhow!("not a 32-byte hash: {s}"))
+}
+
 fn padded(address: &str) -> String {
     format!("0x{:0>64}", address.trim_start_matches("0x"))
 }
@@ -449,15 +465,27 @@ pub struct Pending {
     timestamps: Mutex<Vec<(u64, u64)>>,
     /// A transaction's whole internal list, by hash, for `txhash` lookups.
     internals: Mutex<Vec<crate::address_history::TxInternals>>,
+    /// Block hashes above the finalized head that what was fetched was read against.
+    anchors: Mutex<Vec<(u64, [u8; 32])>>,
 }
 
 impl Pending {
-    /// Commit what was fetched. Blocking: call it off the async workers.
-    pub fn persist(self, history: &AddressHistory) -> Result<()> {
-        history.cache_txs(&self.txs.into_inner().expect("pending lock"))?;
-        history.cache_block_timestamps(&self.timestamps.into_inner().expect("pending lock"))?;
-        history.cache_tx_internals(&self.internals.into_inner().expect("pending lock"))?;
-        Ok(())
+    pub fn anchor(&self, block: u64, hash: [u8; 32]) {
+        self.anchors
+            .lock()
+            .expect("pending lock")
+            .push((block, hash));
+    }
+
+    /// Commit what was fetched, as of `generation`. Blocking: call it off the async workers.
+    pub fn persist(self, history: &AddressHistory, generation: u64) -> Result<()> {
+        history.persist_pending(
+            &self.txs.into_inner().expect("pending lock"),
+            &self.timestamps.into_inner().expect("pending lock"),
+            &self.internals.into_inner().expect("pending lock"),
+            &self.anchors.into_inner().expect("pending lock"),
+            generation,
+        )
     }
 }
 
@@ -503,32 +531,43 @@ pub fn record_blocks(
     generation: u64,
     verified: bool,
 ) -> Result<()> {
-    let record = if verified {
-        AddressHistory::record_verified
-    } else {
-        AddressHistory::record
-    };
+    record_blocks_anchored(
+        history,
+        address,
+        (from, to),
+        found,
+        generation,
+        verified,
+        None,
+    )
+}
+
+/// [`record_blocks`] for bodies read against block `anchor.0` with hash `anchor.1`.
+pub fn record_blocks_anchored(
+    history: &AddressHistory,
+    address: &str,
+    (from, to): (u64, u64),
+    found: BlockFound,
+    generation: u64,
+    verified: bool,
+    anchor: Option<(u64, [u8; 32])>,
+) -> Result<()> {
     let within = |rows: Vec<Row>| -> Vec<Row> {
         rows.into_iter()
             .filter(|r| from <= r.block && r.block <= to)
             .collect()
     };
-    record(
-        history,
-        Action::BeaconWithdrawals,
-        address,
-        &within(found.withdrawals),
-        (from, to),
-        generation,
-    )?;
-    record(
-        history,
-        Action::MinedBlocks,
-        address,
-        &within(found.mined),
-        (from, to),
-        generation,
-    )
+    for (action, rows) in [
+        (Action::BeaconWithdrawals, within(found.withdrawals)),
+        (Action::MinedBlocks, within(found.mined)),
+    ] {
+        if verified {
+            history.record_verified(action, address, &rows, (from, to), generation)?;
+        } else {
+            history.record_anchored(action, address, &rows, (from, to), generation, anchor)?;
+        }
+    }
+    Ok(())
 }
 
 /// What one window found for one address, ready to record.
@@ -579,12 +618,10 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             txlist: self.hydrate(history, &txs, pending).await?,
             ..Found::default()
         };
-        // Only traces of blocks the nest serves through are cached; a window is never past them.
-        let finalized = history.head()?.unwrap_or(0);
+        // A window above the finalized head is anchored at its last block, which covers its traces.
+        let limit = history.head()?.unwrap_or(0).max(to);
         for hash in &internal {
-            let rows = self
-                .internal_rows_of(history, hash, pending, finalized)
-                .await?;
+            let rows = self.internal_rows_of(history, hash, pending, limit).await?;
             found.txlistinternal.extend(
                 rows.into_iter()
                     .filter(|row| touches(&row.record, &a))
@@ -609,7 +646,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         history: &AddressHistory,
         hash: &str,
         pending: &Pending,
-        finalized: u64,
+        limit: u64,
     ) -> Result<Vec<Row>> {
         let key = alloy_primitives::hex::decode(hash.trim_start_matches("0x"))?;
         let records = match history.tx_internals(&key)? {
@@ -633,9 +670,13 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                     );
                 }
                 let block = hex_u64(root.get("blockNumber").unwrap_or(&Value::Null))?;
-                // Cached traces are never revisited, so only a finalized block's may be cached.
-                if block > finalized {
+                // A cached trace is revisited only if a reorg takes its block, so a block above the
+                // finalized head is cached only with its hash tracked.
+                if block > limit {
                     return Err(anyhow!(NotFinalized(block)));
+                }
+                if history.head()?.is_none_or(|h| block > h) {
+                    pending.anchor(block, word32(str_field(root, "blockHash")?)?);
                 }
                 let ts = self.block_timestamp(history, block, pending).await?;
                 let records = internal_records(frames, ts)?;
@@ -1114,8 +1155,13 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
     ) -> Result<Map<String, Value>> {
         let hash = r.hash;
         let key = alloy_primitives::hex::decode(hash.trim_start_matches("0x"))?;
-        if let Some(r) = history.cached_tx(&key)? {
-            return Ok(r);
+        // A copy cached at another block is from before a re-inclusion; read it again.
+        if let Some(cached) = history.cached_tx(&key)? {
+            if cached.get("blockNumber").and_then(Value::as_str)
+                == Some(r.block.to_string().as_str())
+            {
+                return Ok(cached);
+            }
         }
         let (tx, receipt, ts) = futures::try_join!(
             self.main.call("eth_getTransactionByHash", json!([hash])),
@@ -1597,6 +1643,18 @@ pub fn record(
     found: Found,
     generation: u64,
 ) -> Result<()> {
+    record_anchored(history, address, (from, to), found, generation, None)
+}
+
+/// [`record`] for a window read against block `anchor.0` with hash `anchor.1`.
+pub fn record_anchored(
+    history: &AddressHistory,
+    address: &str,
+    (from, to): (u64, u64),
+    found: Found,
+    generation: u64,
+    anchor: Option<(u64, [u8; 32])>,
+) -> Result<()> {
     for (action, rows) in [
         (Action::TxList, found.txlist),
         (Action::TxListInternal, found.txlistinternal),
@@ -1604,7 +1662,7 @@ pub fn record(
         (Action::TokenNftTx, found.tokennfttx),
         (Action::Token1155Tx, found.token1155tx),
     ] {
-        history.record(action, address, &rows, (from, to), generation)?;
+        history.record_anchored(action, address, &rows, (from, to), generation, anchor)?;
     }
     Ok(())
 }
@@ -2100,9 +2158,10 @@ mod tests {
             from: u64,
             to: u64,
         ) -> Result<Found> {
+            let generation = history.generation()?;
             let pending = Pending::default();
             let found = self.discover(history, address, from, to, &pending).await;
-            pending.persist(history)?;
+            pending.persist(history, generation)?;
             found
         }
     }
@@ -2544,7 +2603,10 @@ mod tests {
         );
     }
 
+    /// A cursor's state over `[0, end]`, with the finalized head the cursor's reconcile would have
+    /// set before its catch-up, so nothing it backfills needs anchoring.
     fn mode(h: &AddressHistory, end: u64) -> crate::address_mode::ModeState {
+        h.finalize(1_000_000).unwrap();
         crate::address_mode::ModeState::new(h.clone(), 1, std::time::Duration::from_secs(300), true)
             .with_range(0, Some(end), 0)
     }
@@ -2828,6 +2890,8 @@ mod tests {
         );
     }
 
+    const BLOCK_300: &str = "0x3000000000000000000000000000000000000000000000000000000000000300";
+
     /// A window finds an internal transfer to the watched address, traces its transaction once, and
     /// answers the same frame by address and by txhash under the same position.
     #[tokio::test]
@@ -2837,7 +2901,7 @@ mod tests {
         let (main, _) = chain(false);
         let tx = "0x00000000000000000000000000000000000000000000000000000000000000ee";
         let whole = json!([
-            {"traceAddress": [], "type": "call", "transactionHash": tx, "blockNumber": 300,
+            {"traceAddress": [], "type": "call", "transactionHash": tx, "blockNumber": 300, "blockHash": BLOCK_300,
              "transactionPosition": 2, "action": {"from": "0x02", "to": "0x03", "value": "0x0", "callType": "call"}},
             {"traceAddress": [0], "type": "call", "transactionHash": tx, "blockNumber": 300,
              "transactionPosition": 2, "action": {"from": "0x03", "to": "0x04", "value": "0x0", "callType": "call"}},
@@ -2862,11 +2926,22 @@ mod tests {
         });
         let d = Discoverer::new(main, trace);
         let key = alloy_primitives::hex::decode(&tx[2..]).unwrap();
-        // Served only through block 299, the trace of block 300 is neither used nor kept.
+        // Finalized only through block 299, the trace of block 300 is kept with its block's hash
+        // tracked, so a reorg found later takes it back out.
         h.set_head(299).unwrap();
-        let err = d.discover_now(&h, A, 300, 399).await.unwrap_err();
-        assert!(err.downcast_ref::<NotFinalized>().is_some(), "{err:#}");
+        d.discover_now(&h, A, 300, 399).await.unwrap();
+        assert!(h.tx_internals(&key).unwrap().is_some());
+        assert_eq!(
+            h.tracked().unwrap(),
+            vec![(300, word32(BLOCK_300).unwrap())]
+        );
+        h.invalidate_above(299).unwrap();
         assert!(h.tx_internals(&key).unwrap().is_none());
+        assert!(h.tracked().unwrap().is_empty());
+        // A standalone lookup is refused past the limit it is given, and nothing is kept.
+        let pending = Pending::default();
+        let err = d.internal_rows_of(&h, tx, &pending, 299).await.unwrap_err();
+        assert!(err.downcast_ref::<NotFinalized>().is_some(), "{err:#}");
 
         h.set_head(400).unwrap();
         let found = d.discover_now(&h, A, 300, 399).await.unwrap();
@@ -2911,7 +2986,10 @@ mod tests {
             .iter()
             .filter(|(m, _)| m == "trace_transaction")
             .count();
-        assert_eq!(traced_calls, 2, "once refused as not final, once kept");
+        assert_eq!(
+            traced_calls, 3,
+            "kept with its hash tracked, refused past a standalone limit after the reorg, kept again"
+        );
 
         // A reorg below block 300 takes the trace with it; one above leaves it.
         h.invalidate_above(300).unwrap();
@@ -2921,10 +2999,11 @@ mod tests {
 
         // A trace fetched before a reorg and persisted after it is not kept.
         h.set_head(400).unwrap();
+        let generation = h.generation().unwrap();
         let pending = Pending::default();
         d.internal_rows_of(&h, tx, &pending, 400).await.unwrap();
         h.invalidate_above(299).unwrap();
-        pending.persist(&h).unwrap();
+        pending.persist(&h, generation).unwrap();
         assert!(h.tx_internals(&key).unwrap().is_none());
     }
 
@@ -2990,38 +3069,42 @@ mod tests {
         assert_eq!(ask("txlistinternal", "0x12")["status"], "0");
     }
 
-    /// The server traces a txhash it has not seen, once, keeps it only if its block is final, and
-    /// traces nothing for a request it would refuse anyway.
+    /// The cursor traces a txhash the store has not seen, once, up to the chain head; a block above
+    /// the finalized head is kept with its hash tracked. Nothing is traced for a request `respond`
+    /// would refuse anyway.
     #[tokio::test]
-    async fn a_cold_txhash_is_traced_once_and_only_when_final() {
+    async fn a_cold_txhash_is_traced_once_up_to_the_head() {
         use tower::ServiceExt;
         let dir = tempfile::tempdir().unwrap();
         let h = history(dir.path());
         let tx = format!("0x{}", "ee".repeat(32));
+        let block_hash = format!("0x{}", "ab".repeat(32));
         let whole = json!([
-            {"traceAddress": [], "type": "call", "blockNumber": 300, "transactionPosition": 1,
+            {"traceAddress": [], "type": "call", "blockNumber": 300, "blockHash": block_hash, "transactionPosition": 1,
              "action": {"from": "0x02", "to": "0x03", "value": "0x0", "callType": "call"}},
-            {"traceAddress": [0], "type": "call", "blockNumber": 300, "transactionPosition": 1,
+            {"traceAddress": [0], "type": "call", "blockNumber": 300, "blockHash": block_hash, "transactionPosition": 1,
              "action": {"from": "0x03", "to": "0x04", "value": "0x9", "callType": "call", "gas": "0x1"},
              "result": {"gasUsed": "0x0"}},
         ]);
-        let (main, _) = chain(false);
+        let latest = std::sync::Arc::new(AtomicU64::new(299));
+        let head = latest.clone();
+        let main = script(move |m, _| match m {
+            "eth_blockNumber" => Ok(json!(format!("0x{:x}", head.load(Ordering::Relaxed)))),
+            "eth_getBlockByNumber" => Ok(json!({"timestamp": "0x10"})),
+            other => bail!("unexpected {other}"),
+        });
         let trace = script(move |m, _| match m {
             "trace_transaction" => Ok(whole.clone()),
             other => bail!("unexpected {other}"),
         });
         let d = std::sync::Arc::new(Discoverer::new(Counted::new(main), Counted::new(trace)));
-        let verified = std::sync::Arc::new(tokio::sync::OnceCell::new());
-        verified.set(()).unwrap();
-        let state = std::sync::Arc::new(
-            crate::address_mode::ModeState::new(
-                h.clone(),
-                1,
-                std::time::Duration::from_secs(300),
-                true,
-            )
-            .with_tracer(crate::address_mode::tracer(d.clone(), h.clone(), verified)),
-        );
+        let state = std::sync::Arc::new(crate::address_mode::ModeState::new(
+            h.clone(),
+            1,
+            std::time::Duration::from_secs(300),
+            true,
+        ));
+        let cursor = tokio::spawn(crate::address_mode::serve_forever(state.clone(), d.clone()));
         let get = |path: String| {
             let app = crate::address_mode::router(state.clone());
             async move {
@@ -3058,7 +3141,8 @@ mod tests {
         assert_eq!(wrong_chain["status"], "0");
         assert_eq!(traced(), 0, "nothing traced for requests respond refuses");
 
-        h.set_head(299).unwrap();
+        // The chain head is under the transaction's block, so it is not kept.
+        h.set_head(200).unwrap();
         let young = get(path("")).await;
         assert!(
             young["result"]
@@ -3067,14 +3151,17 @@ mod tests {
                 .starts_with("NUTHATCH_INCOMPLETE:"),
             "{young}"
         );
-        assert!(h
-            .tx_internals(&alloy_primitives::hex::decode(&tx[2..]).unwrap())
-            .unwrap()
-            .is_none());
+        let key = alloy_primitives::hex::decode(&tx[2..]).unwrap();
+        assert!(h.tx_internals(&key).unwrap().is_none());
 
-        h.set_head(400).unwrap();
+        latest.store(400, Ordering::Relaxed);
         let first = get(path("")).await;
         assert_eq!(first["result"][0]["value"], "9", "{first}");
+        assert_eq!(
+            h.tracked().unwrap(),
+            vec![(300, word32(&block_hash).unwrap())],
+            "above the finalized head the trace's block hash is tracked"
+        );
         let calls = traced();
         let again = get(path("")).await;
         assert_eq!(again["result"], first["result"]);
@@ -3083,6 +3170,7 @@ mod tests {
             calls,
             "the second lookup is answered from the store"
         );
+        cursor.abort();
     }
 
     const B: &str = "0x00000000219ab540356cbb839cbe05303d7705fa";
@@ -3301,6 +3389,7 @@ mod tests {
             true,
         )
         .with_range(17_100_000, Some(17_100_009), 0);
+        h.finalize(17_200_000).unwrap();
         d.catch_up(&state, 17_200_000).await;
         assert_eq!(
             h.coverage(Action::BeaconWithdrawals, A).unwrap(),
