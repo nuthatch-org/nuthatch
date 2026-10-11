@@ -208,6 +208,8 @@ impl Validators {
                 merge(&mut spans, span);
                 cov.insert(*v, serde_json::to_vec(&spans)?.as_slice())?;
             }
+            // New rows or coverage change what a page walk sees: a walk begun before must restart.
+            wtx.open_table(META)?.insert(GENERATION, now + 1)?;
         }
         wtx.commit()?;
         Ok(())
@@ -336,6 +338,11 @@ pub fn respond(
         // The generation is read first and again last: a removal or late update between the two
         // reads the answer again rather than serving a mix.
         let before = validators.generation()?;
+        if page > 1 && generation.is_none() {
+            return Ok(incomplete(
+                "pages after the first carry the generation page 1 returned",
+            ));
+        }
         if generation.is_some_and(|g| g != before) {
             return Ok(incomplete(
                 "the validator's blocks changed between pages; start again from page 1",
@@ -533,6 +540,64 @@ mod tests {
                 .unwrap()
                 .contains("changed between pages"),
             "{second}"
+        );
+    }
+
+    #[test]
+    fn coverage_extended_between_pages_restarts_the_walk() {
+        let (_d, v) = open(&[7]);
+        let g = v.generation().unwrap();
+        let mut found = BTreeMap::new();
+        found.insert(7, vec![stored(110), stored(120), stored(130)]);
+        v.record_span((100, 149), &[7], &found, g).unwrap();
+        let first = ask(
+            &v,
+            &[
+                ("validator", "7"),
+                ("startblock", "100"),
+                ("sort", "desc"),
+                ("offset", "2"),
+            ],
+        );
+        assert_eq!(first["status"], "1", "{first}");
+        let gen = first["generation"].as_str().unwrap().to_string();
+        let mut later = BTreeMap::new();
+        later.insert(7, vec![stored(160)]);
+        v.record_span((150, 199), &[7], &later, v.generation().unwrap())
+            .unwrap();
+        let second = ask(
+            &v,
+            &[
+                ("validator", "7"),
+                ("startblock", "100"),
+                ("sort", "desc"),
+                ("offset", "2"),
+                ("page", "2"),
+                ("generation", &gen),
+            ],
+        );
+        assert!(
+            second["result"]
+                .as_str()
+                .unwrap()
+                .contains("changed between pages"),
+            "{second}"
+        );
+        let bare = ask(
+            &v,
+            &[
+                ("validator", "7"),
+                ("startblock", "100"),
+                ("offset", "2"),
+                ("page", "2"),
+            ],
+        );
+        assert!(
+            bare["result"]
+                .as_str()
+                .unwrap()
+                .contains("carry the generation"),
+            "{bare}"
         );
     }
 
