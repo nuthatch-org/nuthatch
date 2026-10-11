@@ -2962,7 +2962,9 @@ mod tests {
     }
     impl Rpc for Headers {
         async fn call(&self, method: &str, params: Value) -> Result<Value> {
-            assert_eq!(method, "eth_getBlockByNumber");
+            if method != "eth_getBlockByNumber" {
+                bail!("{method} is not scripted");
+            }
             match params[0].as_str() {
                 Some("finalized") => Ok(self.finalized.clone()),
                 Some(n) => {
@@ -2977,6 +2979,99 @@ mod tests {
         let mut v = serde_json::to_value(h).unwrap();
         v["hash"] = json!(format!("{:#x}", h.hash_slow()));
         v
+    }
+
+    #[tokio::test]
+    async fn mirror_spans_hang_from_the_finalized_block() {
+        use crate::address_partitions::{encode, partition_key, Published, Source, SPAN};
+        use crate::address_proposers::{catalogue_key, encode as encode_catalogue, tests as pt};
+        let start = 23_560_000u64;
+        let end = start + SPAN - 1;
+        // The span, two blocks above it, and the finalized block.
+        let (blocks, rows, anchor) = pt::chain_from(start, 12_800_000, SPAN as usize + 2);
+        let mirror = tempfile::tempdir().unwrap();
+        let put = |key: String, bytes: Vec<u8>| {
+            let path = mirror.path().join(key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        let published: Vec<Published> = blocks[..SPAN as usize]
+            .iter()
+            .map(|b| {
+                let mut header = Vec::new();
+                alloy_rlp::Encodable::encode(&b.header, &mut header);
+                let mut empty = Vec::new();
+                alloy_rlp::encode_list::<alloy_rpc_types_eth::Withdrawal, _>(&[], &mut empty);
+                Published {
+                    number: b.header.number,
+                    header,
+                    withdrawals: Some(empty),
+                }
+            })
+            .collect();
+        put(partition_key(1, start), encode(&published).unwrap());
+        put(
+            catalogue_key(1, start),
+            encode_catalogue(&rows[..SPAN as usize]).unwrap(),
+        );
+        let bridge: BTreeMap<u64, Value> = blocks[SPAN as usize..]
+            .iter()
+            .map(|b| (b.header.number, header_json(&b.header)))
+            .collect();
+        let validator = rows[5].proposer_index;
+        let run = |finalized: alloy_consensus::Header| {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("t.redb")).unwrap();
+            let history = AddressHistory::open(store.clone(), 1, &[]).unwrap();
+            let validators =
+                crate::address_validators::Validators::open(store, &[validator]).unwrap();
+            let source = Arc::new(
+                Source::open(
+                    mirror.path().to_str().unwrap(),
+                    1,
+                    dir.path().join("cache"),
+                    1 << 30,
+                )
+                .unwrap(),
+            );
+            let state = ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(start, None, 64)
+                .with_validators(validators.clone(), None)
+                .with_mirror(source.clone(), (start, end));
+            let make = || Headers {
+                by_number: bridge.clone(),
+                finalized: header_json(&finalized),
+            };
+            let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+            async move {
+                let done = mirror_spans(
+                    &d,
+                    &state,
+                    &validators,
+                    &[validator],
+                    &source,
+                    (start, end),
+                    &finalized,
+                    finalized.number - 1,
+                )
+                .await;
+                (
+                    done,
+                    validators.covers(validator, (start, end)).unwrap(),
+                    dir,
+                )
+            }
+        };
+        let (done, covered, _dir) = run(anchor.clone()).await;
+        done.unwrap();
+        assert!(covered);
+        // The mirror and the numbered blocks agree with each other, but the finalized block is on
+        // another chain: nothing is proven.
+        let mut other = anchor.clone();
+        other.parent_hash = alloy_primitives::B256::repeat_byte(4);
+        let (done, covered, _dir) = run(other).await;
+        assert!(format!("{:#}", done.unwrap_err()).contains("do not lead to it"));
+        assert!(!covered);
     }
 
     #[tokio::test]

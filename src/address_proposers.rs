@@ -785,7 +785,7 @@ pub(crate) mod tests {
                 number: first + i as u64,
                 parent_hash,
                 timestamp: GENESIS_TIME + slot * SECONDS_PER_SLOT,
-                beneficiary: alloy_primitives::Address::repeat_byte(i as u8 + 1),
+                beneficiary: alloy_primitives::Address::repeat_byte((i % 250) as u8 + 1),
                 parent_beacon_block_root: Some(B256::from(beacon_parent)),
                 base_fee_per_gas: Some(1),
                 withdrawals_root: Some(alloy_consensus::constants::EMPTY_WITHDRAWALS),
@@ -803,8 +803,8 @@ pub(crate) mod tests {
                 slot,
                 proposer_index: 100 + i as u64,
                 parent_root: beacon_parent,
-                state_root: [i as u8; 32],
-                body_root: [i as u8 + 50; 32],
+                state_root: [(i % 250) as u8; 32],
+                body_root: [(i % 200) as u8 + 50; 32],
             };
             beacon_parent = header_root(&row);
             parent_hash = hash;
