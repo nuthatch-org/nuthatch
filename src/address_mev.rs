@@ -1094,4 +1094,88 @@ mod tests {
         assert_eq!(r["paymentTx"], "0xq102,0xp102", "{r:?}");
         assert_eq!(r["paymentValue"], "100");
     }
+
+    /// The background pass builds produced-block coverage as it does every other action's, up to the
+    /// finalized head, without waiting for a request (cold test M2: a staker's coverage moved only
+    /// inside request deadlines).
+    #[tokio::test]
+    async fn the_background_pass_builds_produced_blocks() {
+        use crate::address_mode::Discovery;
+        let dir = tempfile::tempdir().unwrap();
+        let h = evidence_chain(dir.path());
+        evidence_rows(&h);
+        let g = h.generation().unwrap();
+        for action in [
+            Action::TokenTx,
+            Action::TokenNftTx,
+            Action::Token1155Tx,
+            Action::BeaconWithdrawals,
+        ] {
+            h.record(action, A, &[], (100, 199), g).unwrap();
+        }
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let state = crate::address_mode::ModeState::new(
+            h.clone(),
+            1,
+            std::time::Duration::from_secs(300),
+            true,
+        )
+        .with_range(100, Some(199), 0)
+        .with_relays(late_relays(on));
+        evidence_rpc().catch_up(&state, 1_000).await;
+        assert_eq!(
+            h.coverage(Action::ProducedBlocks, A).unwrap(),
+            vec![(100, 199)]
+        );
+        assert_eq!(
+            view(&h),
+            ["100 relay ", "101 relay 0xp101", "102 relay 0xp102"]
+        );
+    }
+
+    /// Produced blocks do not wait behind another address's backfill: a discovery that hangs still
+    /// leaves the covered address's produced blocks built in the same pass.
+    #[tokio::test]
+    async fn produced_blocks_do_not_wait_behind_a_backfill() {
+        use crate::address_mode::Discovery;
+        struct Hangs;
+        impl Rpc for Hangs {
+            async fn call(&self, _: &str, _: Value) -> Result<Value> {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                Ok(Value::Null)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let h = evidence_chain(dir.path());
+        evidence_rows(&h);
+        let g = h.generation().unwrap();
+        for action in [
+            Action::TokenTx,
+            Action::TokenNftTx,
+            Action::Token1155Tx,
+            Action::BeaconWithdrawals,
+        ] {
+            h.record(action, A, &[], (100, 199), g).unwrap();
+        }
+        // A second address with nothing covered: its discovery would hang on the trace endpoint.
+        h.watch("0x00000000000000000000000000000000000000cc")
+            .unwrap();
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let state = crate::address_mode::ModeState::new(
+            h.clone(),
+            1,
+            std::time::Duration::from_secs(300),
+            true,
+        )
+        .with_range(100, Some(199), 0)
+        .with_relays(late_relays(on));
+        let main = evidence_rpc().main;
+        let d = Discoverer::new(main, Counted::new(Hangs));
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), d.catch_up(&state, 1_000))
+            .await;
+        assert_eq!(
+            h.coverage(Action::ProducedBlocks, A).unwrap(),
+            vec![(100, 199)]
+        );
+    }
 }

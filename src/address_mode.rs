@@ -628,6 +628,11 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 return;
             }
         };
+        // Produced blocks first, on what is already covered: they are cheap, and a long backfill of
+        // other actions would otherwise hold them back for whole polls.
+        if state.chain_id == 1 {
+            mev_passes(self, state, &watched, to).await;
+        }
         for address in watched.clone() {
             let mut recorded_through: Option<u64> = None;
             loop {
@@ -683,51 +688,7 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             }
             serve_queued(state, self).await;
             scan_bodies(self, state, &watched, to, skip).await;
-            if let Some(relays) = &state.relays {
-                let now = unix_now();
-                let passes = async {
-                    for a in &watched {
-                        loop {
-                            serve_queued(state, self).await;
-                            let more = crate::address_mev::mev_step(
-                                self,
-                                relays,
-                                &state.history,
-                                a,
-                                state.start_block,
-                                to,
-                                now,
-                            )
-                            .await?;
-                            if !more {
-                                break;
-                            }
-                        }
-                    }
-                    loop {
-                        serve_queued(state, self).await;
-                        let more = crate::address_mev::reask_pass(
-                            self,
-                            relays,
-                            &state.history,
-                            &watched,
-                            now,
-                        )
-                        .await?;
-                        if !more {
-                            break;
-                        }
-                    }
-                    Ok::<_, anyhow::Error>(())
-                };
-                if let Err(e) = passes.await {
-                    state.discovery_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        "address history: MEV pass not recorded, retrying next poll: {e:#}"
-                    );
-                }
-                state.set_calls("main", self.main.calls());
-            }
+            mev_passes(self, state, &watched, to).await;
         } else if let Some((source, blocks)) = &state.mirror {
             // Elsewhere a partition is read for its verified headers alone: timestamp to block.
             mirror_pass(self, state, &[], to, source, *blocks).await;
@@ -995,6 +956,62 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
         let history = state.history.clone();
         tokio::task::spawn_blocking(move || pending.persist(&history, true)).await?
     }
+}
+
+/// The MEV passes: each watched address's produced blocks as far as their prerequisites are covered,
+/// up to `to`, then the relay re-asks that are due; requests are served between windows.
+async fn mev_passes<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    watched: &[String],
+    to: u64,
+) {
+    let Some(relays) = &state.relays else {
+        return;
+    };
+    let now = unix_now();
+    let passes = async {
+        for a in watched {
+            loop {
+                serve_queued(state, d).await;
+                let more = crate::address_mev::mev_step(
+                    d,
+                    relays,
+                    &state.history,
+                    a,
+                    state.start_block,
+                    to,
+                    now,
+                )
+                .await?;
+                if !more {
+                    break;
+                }
+                state.windows.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(&(_, t)) = state
+                .history
+                .coverage(crate::address_history::Action::ProducedBlocks, a)?
+                .first()
+            {
+                tracing::info!("address history: {a} produced blocks covered through {t}");
+            }
+        }
+        loop {
+            serve_queued(state, d).await;
+            let more =
+                crate::address_mev::reask_pass(d, relays, &state.history, watched, now).await?;
+            if !more {
+                break;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    if let Err(e) = passes.await {
+        state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!("address history: MEV pass not recorded, retrying next poll: {e:#}");
+    }
+    state.set_calls("main", d.main.calls());
 }
 
 /// The partition pass: each partition in the mirror's blocks that some watched address, or the
