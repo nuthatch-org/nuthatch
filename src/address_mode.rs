@@ -107,6 +107,8 @@ pub struct ModeState {
     /// The chain's hash at a height, read for a request without the cursor: one hash check lets a
     /// covered answer above the finalized head be served without waiting behind the cursor's work.
     pub hash_at: Option<HashAt>,
+    /// The blocks a backfill's first discovery window covers, before [`Pace`] adjusts it.
+    pub first_window: u64,
 }
 
 pub type HashAt =
@@ -248,6 +250,7 @@ impl ModeState {
             validators: None,
             beacon: None,
             hash_at: None,
+            first_window: 1_000,
         }
     }
 
@@ -291,6 +294,11 @@ impl ModeState {
     /// follow `start_block`, which bounds account history: the catalogue costs no RPC to read.
     pub fn proposals_from(&self) -> u64 {
         crate::address_proposers::CATALOGUE_FROM_BLOCK
+    }
+
+    pub fn with_first_window(mut self, blocks: u64) -> Self {
+        self.first_window = blocks;
+        self
     }
 
     pub fn with_hash_at(mut self, hash_at: HashAt) -> Self {
@@ -852,7 +860,7 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             mev_passes(self, state, &watched, to).await;
         }
         let mut pace = Pace::new(
-            1_000,
+            state.first_window,
             64,
             crate::address_discovery::OUTER_WINDOW,
             state.deadline,
@@ -4184,9 +4192,11 @@ mod tests {
             u64::MAX,
         )
         .unwrap();
+        // One discovery window per address, as the call count below assumes.
         let state = ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
             .with_range(5, Some(2 * SPAN - 1), 0)
-            .with_mirror(Arc::new(source), (0, 2 * SPAN - 1));
+            .with_mirror(Arc::new(source), (0, 2 * SPAN - 1))
+            .with_first_window(crate::address_discovery::OUTER_WINDOW);
         state.history.finalize(2 * SPAN + 5).unwrap();
         d.catch_up(&state, 2 * SPAN + 5).await;
 
@@ -5370,6 +5380,21 @@ mod tests {
             vec![(0, 110)],
             "110 still matches; 120 is out of reach, so what was read above 110 goes"
         );
+    }
+
+    #[test]
+    fn a_window_shrinks_when_slow_and_grows_back_when_quick() {
+        let mut p = Pace::new(1_000, 64, 50_000, Duration::from_secs(20));
+        p.took(Duration::from_secs(6));
+        assert_eq!(p.span(), 500, "over a quarter of the deadline halves it");
+        p.took(Duration::from_secs(3));
+        assert_eq!(p.span(), 500, "between half and the whole target it holds");
+        p.took(Duration::from_millis(100));
+        assert_eq!(p.span(), 1_000, "a quick window doubles it");
+        for _ in 0..20 {
+            p.took(Duration::from_secs(60));
+        }
+        assert_eq!(p.span(), 64, "never under the floor");
     }
 
     /// A request for history above what is covered is served inside a long backfill: the cursor's

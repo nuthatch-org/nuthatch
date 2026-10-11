@@ -3019,7 +3019,15 @@ mod tests {
             let (main, trace) = chain(false);
             let log = log.clone();
             let main = script(move |m, p| match m {
-                "eth_getLogs" => Ok(json!([log])),
+                // Only to a request whose range holds block 0x10, as a node answers.
+                "eth_getLogs" => {
+                    let (from, to) = (hex_u64(&p[0]["fromBlock"])?, hex_u64(&p[0]["toBlock"])?);
+                    Ok(if from <= 0x10 && 0x10 <= to {
+                        json!([log])
+                    } else {
+                        json!([])
+                    })
+                }
                 "eth_getBlockByNumber" if hex_u64(&p[0])? == 0x10 && !headers_ok => {
                     bail!("header unavailable")
                 }
