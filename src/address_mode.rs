@@ -3489,12 +3489,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.number, lo);
-        // Block 23,561,000 opens the second chunk; one from another chain there must break it.
+        // Block 23,561,000 opens the second chunk. The second chunk is a chain of its own leading to
+        // its own anchor: only the link between the chunks is broken.
         let mut forked = blocks.clone();
-        forked[1_000].header.parent_hash = alloy_primitives::B256::repeat_byte(5);
-        assert!(linked_to(&rpc(map(&forked)), (lo, hi), &anchor)
+        let mut parent = alloy_primitives::B256::repeat_byte(5);
+        for b in forked[1_000..].iter_mut() {
+            b.header.parent_hash = parent;
+            b.hash = b.header.hash_slow();
+            parent = b.hash;
+        }
+        let mut other = anchor.clone();
+        other.parent_hash = parent;
+        let e = linked_to(&rpc(map(&forked)), (lo, hi), &other)
             .await
-            .is_err());
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("does not follow"), "{e:#}");
     }
 
     #[tokio::test]
