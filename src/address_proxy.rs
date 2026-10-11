@@ -178,7 +178,7 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
         let block = |l: &Value| l.get("blockNumber").cloned();
         if block(&logs[0]) == block(&logs[MAX_LOGS - 1]) {
             return Ok(Answer::Unsupported(format!(
-                "block {} holds more than {MAX_LOGS} matching logs",
+                "block {} holds at least {MAX_LOGS} matching logs, a whole page, so it cannot be paged past",
                 block(&logs[0]).unwrap_or(Value::Null)
             )));
         }
