@@ -1391,16 +1391,27 @@ async fn wanted(s: &Arc<ModeState>, q: &HashMap<String, String>, answer: &Value)
             None => None,
         };
         let who = address.clone();
-        let (watched, head, covered, generation) = blocking(s, move |h| {
+        // One pass over the store, the generation read last: a re-ask or reorg committed while the
+        // rest is read moves it, and the answer is read again.
+        let (watched, head, covered, owed, generation) = blocking(s, move |h| {
             let covered = h
                 .coverage(action, &who)?
                 .into_iter()
                 .find(|(f, t)| *f <= from && from <= *t)
                 .map(|(_, t)| t);
+            // A produced-blocks row whose relay check is owed is not settled.
+            let owed = match explicit.or(covered) {
+                Some(end) if action == Action::ProducedBlocks => {
+                    (!crate::address_mev::overdue(h, unix_now(), Some((from, end)))?.is_empty())
+                        .then_some(end)
+                }
+                _ => None,
+            };
             Ok((
                 h.watched()?.contains(&who),
                 h.head()?.unwrap_or(0),
                 covered,
+                owed,
                 h.generation()?,
             ))
         })
@@ -1409,18 +1420,8 @@ async fn wanted(s: &Arc<ModeState>, q: &HashMap<String, String>, answer: &Value)
         if rows && read_at != Some(generation) {
             return Some(Want::Reread);
         }
-        // A produced-blocks row whose relay check is owed is not settled: the cursor runs the check
-        // before it is served.
-        let owed = || -> Option<u64> {
-            let end = explicit.or(covered)?;
-            let due =
-                crate::address_mev::overdue(&s.history, unix_now(), Some((from, end))).ok()?;
-            (!due.is_empty()).then_some(end)
-        };
-        if rows && action == Action::ProducedBlocks && watched {
-            if let Some(end) = owed() {
-                return Some(Want::Cover((address, Need::of(action), from, end)));
-            }
+        if let (true, true, Some(end)) = (rows, watched, owed) {
+            return Some(Want::Cover((address, Need::of(action), from, end)));
         }
         if !watched {
             return None;
@@ -3161,6 +3162,64 @@ mod tests {
             assert!(s.history.coverage(action, ALICE).unwrap().is_empty());
         }
         assert!(s.history.tracked().unwrap().is_empty());
+    }
+
+    /// A produced-blocks answer read before a re-ask committed is read again, and one whose range
+    /// still has a check owed goes to the cursor: neither is served as settled.
+    #[tokio::test]
+    async fn a_produced_answer_is_served_only_when_settled_and_current() {
+        use crate::address_history::Row;
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        s.history.finalize(1_000).unwrap();
+        let g = s.history.generation().unwrap();
+        let long_ago = unix_now() - 3 * 24 * 3600;
+        s.history
+            .record_produced(ALICE, &[], (100, 199), g, &[150], long_ago)
+            .unwrap();
+        let q: HashMap<String, String> = [
+            ("module", "account"),
+            ("action", "nuthatchProducedBlocks"),
+            ("address", ALICE),
+            ("startblock", "100"),
+            ("endblock", "199"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let answer = respond(&s, &q).await;
+        assert!(
+            matches!(wanted(&s, &q, &answer).await, Want::Cover(_)),
+            "a check is owed"
+        );
+
+        // The re-ask commits after the answer was read: the answer is stale.
+        let mut record = serde_json::Map::new();
+        record.insert("delivered".into(), json!([]));
+        let mut row = serde_json::Map::new();
+        row.insert("blockNumber".into(), json!("150"));
+        row.insert("mev".into(), json!("relay"));
+        let rows = vec![Row {
+            block: 150,
+            tx_index: 0,
+            position: 0,
+            record: row,
+        }];
+        let g = s.history.generation().unwrap();
+        s.history
+            .apply_reask(
+                150,
+                &record,
+                &[(ALICE.to_lowercase(), rows)],
+                false,
+                unix_now(),
+                g,
+            )
+            .unwrap();
+        assert!(matches!(wanted(&s, &q, &answer).await, Want::Reread));
+        let fresh = respond(&s, &q).await;
+        assert!(matches!(wanted(&s, &q, &fresh).await, Want::Serve));
+        assert_eq!(fresh["result"][0]["mev"], "relay");
     }
 
     /// A tracked block under the committed finalized head, now at another hash, is not rewritten:
