@@ -2261,7 +2261,18 @@ async fn api(
     if let Some(why) = conflict(&s) {
         return Json(crate::address_history::incomplete(&why));
     }
-    let answer = answer(&s, q).await;
+    // One ceiling for the whole request, whatever it waits on: reads, the hash check, the queue, a
+    // window the cursor is part way through, a trace and a cover in turn. The work inside stops a
+    // little short of it, so a range covered by then is still read and served under it.
+    let ceiling = Instant::now() + s.deadline;
+    let work = ceiling - s.deadline / 20;
+    let answer = match tokio::time::timeout_at(ceiling.into(), answer(&s, q, work)).await {
+        Ok(a) => a,
+        Err(_) => Json(crate::address_history::incomplete(&format!(
+            "not answered within the {}s deadline; try again shortly",
+            s.deadline.as_secs()
+        ))),
+    };
     // A conflict found while this request was answered may concern what it read.
     match conflict(&s) {
         Some(why) => Json(crate::address_history::incomplete(&why)),
@@ -2269,10 +2280,7 @@ async fn api(
     }
 }
 
-async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
-    // One ceiling for the whole request, whatever it waits on: the hash check, the queue, a window
-    // the cursor is part way through, a trace and a cover in turn.
-    let deadline = Instant::now() + s.deadline;
+async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>, deadline: Instant) -> Json<Value> {
     let s = s.clone();
     // The RPC behind the nest is the operator's; only a loopback bind lends it out.
     if let Some(forward) = s.forward.clone().filter(|_| s.loopback) {
@@ -2310,7 +2318,7 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
         return Json(validator_blocks(&s, &q).await);
     }
     if get("module") == Some("block") && get("action") == Some("getblocknobytime") {
-        return Json(block_by_time(&s, &q).await);
+        return Json(block_by_time(&s, &q, deadline).await);
     }
     // A range from before the configured history is refused in the one wording a client reads to ask
     // again from the start, whatever the action and whether or not it named a start.
@@ -2499,7 +2507,13 @@ async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Op
         .enumerate()
         .map(|(i, ((_, reach), next))| {
             let owed = if i == 2 { owed } else { 0 };
-            ((to + 1).saturating_sub(*next) + owed) as f64 / (*reach).max(1) as f64
+            let work = (to + 1).saturating_sub(*next) + owed;
+            match (work, *reach) {
+                (0, _) => 0.0,
+                // A measured rate too slow to reach one block in time reaches none.
+                (_, 0) => f64::INFINITY,
+                (w, r) => w as f64 / r as f64,
+            }
         })
         .sum();
     if load <= 1.0 {
@@ -2668,7 +2682,11 @@ async fn wanted(s: &Arc<ModeState>, q: &HashMap<String, String>, answer: &Value)
 
 /// `block/getblocknobytime`: from verified headers where they bracket the timestamp, else searched
 /// on the nest's own RPC, exact or refused.
-async fn block_by_time(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value {
+async fn block_by_time(
+    s: &Arc<ModeState>,
+    q: &HashMap<String, String>,
+    deadline: Instant,
+) -> Value {
     let first = respond(s, q).await;
     let unbracketed = first["result"]
         .as_str()
@@ -2715,7 +2733,8 @@ async fn block_by_time(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Value
         }
     };
     let started = Instant::now();
-    let searched = tokio::time::timeout(budget, search).await;
+    let left = deadline.saturating_duration_since(Instant::now());
+    let searched = tokio::time::timeout(budget.min(left), search).await;
     s.search_ms
         .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
     match searched {
@@ -4199,7 +4218,7 @@ mod tests {
             "{v} after {took:?}"
         );
         assert!(
-            took >= Duration::from_secs(1) && took < Duration::from_millis(1_300),
+            took >= Duration::from_millis(900) && took < Duration::from_millis(1_300),
             "{took:?}"
         );
     }
@@ -4351,7 +4370,7 @@ mod tests {
                 .contains("covered through block"),
             "{v}"
         );
-        assert!(started.elapsed() >= Duration::from_millis(500));
+        assert!(started.elapsed() >= Duration::from_millis(475));
     }
 
     /// A measured rate under a block a minute is still measured: it is never read as no rate.
@@ -4397,18 +4416,30 @@ mod tests {
             finalized: Value::Null,
         };
         let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+        let started = Instant::now();
         mev_passes(&d, &s, std::slice::from_ref(&alice), 199_999).await;
+        let took = started.elapsed().as_millis().max(1) as u64;
         assert_eq!(
             history.coverage(Action::ProducedBlocks, &alice).unwrap(),
             vec![(0, 199_999)]
         );
-        // Four whole 50,000-block steps, each well under a minute.
+        // Four whole 50,000-block steps: the last took no longer than all four, so its rate in blocks
+        // per minute is at least this.
+        let measured = s.produced_rate.load(Ordering::Relaxed);
         assert!(
-            s.produced_rate.load(Ordering::Relaxed) > 50_000,
-            "{}",
-            s.produced_rate.load(Ordering::Relaxed)
+            measured >= 50_000 * 60_000 / took,
+            "{measured} after {took} ms"
         );
+        // Admission reads the measured rate: a gap within its reach goes to the cursor.
         let want = |to: u64| (alice.clone(), Need::Produced, 0, to);
+        let r = reach(&s, &s.produced_rate, COVER_PRODUCED);
+        assert_eq!(
+            beyond_reach(&s, &want(199_999 + r.min(100_000))).await,
+            None
+        );
+        if r < 100_000 {
+            assert!(beyond_reach(&s, &want(199_999 + r + 1)).await.is_some());
+        }
         // 6,000,000 a minute reaches 100,000 blocks in half of 2 s: a 50,000-block gap is admitted.
         s.produced_rate.store(6_000_000, Ordering::Relaxed);
         assert_eq!(beyond_reach(&s, &want(249_999)).await, None);
@@ -4416,6 +4447,8 @@ mod tests {
         // unmeasured floor would admit it.
         s.produced_rate.store(1, Ordering::Relaxed);
         assert!(beyond_reach(&s, &want(200_999)).await.is_some());
+        // It reaches no block at all in time, so not even one is admitted.
+        assert!(beyond_reach(&s, &want(200_000)).await.is_some());
         s.produced_rate.store(0, Ordering::Relaxed);
         assert_eq!(beyond_reach(&s, &want(200_999)).await, None);
         // An owed re-ask costs as much as a block: one overdue tips the 1,000-block gap past reach.
@@ -4463,7 +4496,7 @@ mod tests {
                 .contains("covered through block"),
             "{v}"
         );
-        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert!(started.elapsed() >= Duration::from_millis(1_900));
         // Each layer alone could cover its 1,000 blocks in 60% of the time, but they run one after
         // the other: together they cannot, and the request is refused at once.
         s2.backfill_rate.store(99_960, Ordering::Relaxed);
@@ -6616,7 +6649,7 @@ mod tests {
             "{a}"
         );
         assert!(
-            took >= Duration::from_millis(200) && took < Duration::from_secs(2),
+            took >= Duration::from_millis(190) && took < Duration::from_secs(2),
             "{took:?}"
         );
     }
