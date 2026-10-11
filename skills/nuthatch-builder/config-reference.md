@@ -238,14 +238,20 @@ missing or fails stays `NUTHATCH_INCOMPLETE`. `nuthatch partitions` builds them.
 
 The table stays out of the nest's identity and its bundle: the accounts are private and change at
 runtime through `POST /api/watch` and `POST /api/unwatch` with `{"address": "0x…"}`, accepted only on
-a loopback bind. A range the nest has not fetched answers `NUTHATCH_INCOMPLETE`, never an empty list.
-`/ready` answers 503 until the first finalized head is read, and still carries `chain_id`.
+a loopback bind; any other bind logs a warning at start. `addresses = []` is valid, for a nest that
+serves timestamp lookups and accounts added later. A range the nest has not fetched answers
+`NUTHATCH_INCOMPLETE`, never an empty list. `/ready` answers 503 until the first finalized head is
+read, and still carries `chain_id`; it reports `stalled: true` while the last poll failed, and 503 with
+the reason once a finalized block the nest committed changes hash (a reorg under finality, or an RPC
+on another chain with the same id), after which nothing is answered until an operator looks.
 
 The rows are Etherscan's account records with a narrower field set on two row types: token rows
 (`tokentx`, `tokennfttx`, `token1155tx`) omit `tokenName`, `tokenSymbol`, `tokenDecimal`, `gasUsed`
 and `functionName`, and internal rows carry an empty `input`. rotki's readers of those row types use
-none of them. `logs/getLogs` asks the RPC in spans it accepts, at most 64 calls a request, and answers
-`NUTHATCH_INCOMPLETE` for a range that would need more.
+none of them. `logs/getLogs` honours `page` and `offset` (at most 1,000), asks the RPC in spans that
+start at 16 blocks and grow while they come back sparse, stops once it holds the page, and runs two
+requests at a time; a range that needs more than 64 calls, or a page that falls inside one block,
+answers `NUTHATCH_INCOMPLETE`.
 
 What leaves the machine: the RPC provider sees the watched addresses in its trace and log filters
 (history stays local; the provider's view does not); the mirror, if named, sees the IP and block

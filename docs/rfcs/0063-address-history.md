@@ -341,3 +341,29 @@ The plan below went through six rounds of review against the code before both re
   not what held the memory. After a 26-partition ingest the physical footprint idles at 68 MB while
   RSS reads 143 MB, the difference being freed allocator regions macOS keeps resident until it needs
   them; a restart on the same store idles at 32 MB.
+
+**Second round (2026-10-11).** Two more cold tests of the 5.2.0 candidate said not ready, and these
+followed:
+
+- **Memory per request (B1).** One `getLogs` over 400,000 blocks of USDC transfers took the physical
+  footprint to 1.2 GB: spans were as wide as the provider allowed and every log was held before the
+  page was cut. Spans now start at 16 blocks and double only while the answer is sparse, the read
+  stops once it holds the page asked for (`page` and `offset` are honoured), and two run at a time,
+  a third answering incomplete.
+- **Finality (M1).** A reorg reaching under the finalized head went unseen, because only hashes above
+  it were tracked. The store now keeps the hashes of the last 32 finalized heads it committed, and
+  every poll, the first after a restart included, compares the newest and one older one in turn with
+  the RPC. A mismatch is a reorg under finality or an RPC on another chain under the same id; either
+  way the cursor stops, `/ready` gives the reason and every answer is refused. The reorg property
+  test now also runs through the cursor's own window against a node whose traces follow the chain,
+  with reorgs that cross finality, and fails if the run covered nothing.
+- **Produced blocks first (M2).** Each pass covers produced blocks and the relay re-asks before the
+  backfill and the body scan, so a long backlog cannot starve them.
+- **One body scan for every address (M3).** A block's miner, hash, timestamp and withdrawals are the
+  same whoever asks, so the scan keeps that summary for the newest 100,000 blocks, reorgs taking it
+  back with everything else. An address watched later reads the summaries and re-reads only the
+  bodies of blocks it mined.
+- **Smaller.** `paymentTx` and `paymentValue` report every leg of a split payment; unwatching an
+  address no longer discards other addresses' windows in flight; `/ready` shows a failing RPC at
+  once; `rpc_requests_total` is current; a refusal always names its reason; `addresses = []` is
+  valid; a non-loopback bind warns.
