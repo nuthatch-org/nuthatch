@@ -947,6 +947,17 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                 )
                 .await?;
             }
+            let watched = history.watched()?;
+            crate::address_mev::reask_range(
+                self,
+                relays,
+                history,
+                &watched,
+                (from, to),
+                unix_now(),
+                Some(deadline),
+            )
+            .await?;
         }
         history.raise_tip(to)?;
         Ok(())
@@ -1397,6 +1408,19 @@ async fn wanted(s: &Arc<ModeState>, q: &HashMap<String, String>, answer: &Value)
         .ok()?;
         if rows && read_at != Some(generation) {
             return Some(Want::Reread);
+        }
+        // A produced-blocks row whose relay check is owed is not settled: the cursor runs the check
+        // before it is served.
+        let owed = || -> Option<u64> {
+            let end = explicit.or(covered)?;
+            let due =
+                crate::address_mev::overdue(&s.history, unix_now(), Some((from, end))).ok()?;
+            (!due.is_empty()).then_some(end)
+        };
+        if rows && action == Action::ProducedBlocks && watched {
+            if let Some(end) = owed() {
+                return Some(Want::Cover((address, Need::of(action), from, end)));
+            }
         }
         if !watched {
             return None;

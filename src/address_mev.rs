@@ -434,19 +434,65 @@ pub async fn reask_pass<M: Rpc, T: Rpc>(
     watched: &[String],
     now: u64,
 ) -> Result<bool> {
-    let due: Vec<(u64, u64)> = history
+    let due = overdue(history, now, None)?;
+    let more = due.len() > REASK_BATCH;
+    for (block, first) in due.into_iter().take(REASK_BATCH) {
+        reask_block(d, relays, history, watched, now, block, first, None).await?;
+    }
+    Ok(more)
+}
+
+/// The blocks on the re-ask schedule whose next ask is owed at `now`, within `range` if given.
+pub fn overdue(
+    history: &AddressHistory,
+    now: u64,
+    range: Option<(u64, u64)>,
+) -> Result<Vec<(u64, u64)>> {
+    Ok(history
         .mev_pending()?
         .into_iter()
+        .filter(|(b, _, _)| range.is_none_or(|(f, t)| f <= *b && *b <= t))
         .filter(|(_, first, last)| {
             now.saturating_sub(*first) >= REASK_FOR_SECS
                 || now.saturating_sub(*last) >= REASK_EVERY_SECS
         })
         .map(|(b, first, _)| (b, first))
-        .collect();
-    let more = due.len() > REASK_BATCH;
-    for (block, first) in due.into_iter().take(REASK_BATCH) {
-        let generation = history.generation()?;
-        let record = ask_relays(relays, block, None).await?;
+        .collect())
+}
+
+/// Every owed re-ask in `[from, to]`, before produced blocks there are answered: a row whose check
+/// is owed is not settled, however long the nest was down. Each block's reads run under `deadline`.
+pub async fn reask_range<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    relays: &Relays,
+    history: &AddressHistory,
+    watched: &[String],
+    (from, to): (u64, u64),
+    now: u64,
+    deadline: Option<std::time::Instant>,
+) -> Result<()> {
+    for (block, first) in overdue(history, now, Some((from, to)))? {
+        reask_block(d, relays, history, watched, now, block, first, deadline).await?;
+    }
+    Ok(())
+}
+
+/// One block's re-ask: the relays asked fresh and the rows recomputed under `deadline`, then the
+/// outcome committed in one transaction.
+#[allow(clippy::too_many_arguments)]
+async fn reask_block<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    relays: &Relays,
+    history: &AddressHistory,
+    watched: &[String],
+    now: u64,
+    block: u64,
+    first: u64,
+    deadline: Option<std::time::Instant>,
+) -> Result<()> {
+    let generation = history.generation()?;
+    let (record, changes, unrecorded) = crate::address_mode::within(deadline, async {
+        let record = ask_relays(relays, block, deadline).await?;
         let asked = BTreeMap::from([(block, record.clone())]);
         let mut changes = Vec::new();
         let mut unrecorded = false;
@@ -458,8 +504,16 @@ pub async fn reask_pass<M: Rpc, T: Rpc>(
             if !covered {
                 continue;
             }
-            let found =
-                produced_blocks(d, relays, history, a, (block, block), Some(&asked), None).await?;
+            let found = produced_blocks(
+                d,
+                relays,
+                history,
+                a,
+                (block, block),
+                Some(&asked),
+                deadline,
+            )
+            .await?;
             unrecorded |= !found.unrecorded.is_empty();
             let before = history.rows_in(Action::ProducedBlocks, a, (block, block))?;
             let after: Vec<Map<String, Value>> =
@@ -468,11 +522,12 @@ pub async fn reask_pass<M: Rpc, T: Rpc>(
                 changes.push((a.clone(), found.rows));
             }
         }
-        // Past thirty days a block leaves the schedule whatever the relays said.
-        let keep_asking = unrecorded && now.saturating_sub(first) < REASK_FOR_SECS;
-        history.apply_reask(block, &record, &changes, keep_asking, now, generation)?;
-    }
-    Ok(more)
+        Ok((record, changes, unrecorded))
+    })
+    .await?;
+    // Past thirty days a block leaves the schedule whatever the relays said.
+    let keep_asking = unrecorded && now.saturating_sub(first) < REASK_FOR_SECS;
+    history.apply_reask(block, &record, &changes, keep_asking, now, generation)
 }
 
 #[cfg(test)]
@@ -741,6 +796,7 @@ mod tests {
                     "transactions": if b == 102 { json!(["0x01", "0x02"]) } else { json!([]) },
                     "uncles": []})
                 }
+                "eth_blockNumber" => json!("0x3e8"),
                 "eth_getBlockReceipts" if b == 102 => json!([
                     {"transactionHash": "0x01", "gasUsed": "0x1", "effectiveGasPrice": "0x1"},
                     {"transactionHash": "0x02", "gasUsed": "0x1", "effectiveGasPrice": "0x1"},
@@ -892,5 +948,88 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(h.generation().unwrap(), g);
         assert!(h.coverage(Action::ProducedBlocks, A).unwrap().is_empty());
+    }
+
+    /// After downtime past a scheduled relay re-ask, a produced-blocks request for the range runs the
+    /// owed check first, through the cursor, before the background pass has: a row whose check is
+    /// owed is never served as settled.
+    #[tokio::test]
+    async fn an_owed_reask_runs_before_its_range_is_served() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let two_days_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 2 * REASK_EVERY_SECS;
+        {
+            let h = evidence_chain(dir.path());
+            evidence_rows(&h);
+            let g = h.generation().unwrap();
+            for action in [
+                Action::TokenTx,
+                Action::TokenNftTx,
+                Action::Token1155Tx,
+                Action::BeaconWithdrawals,
+            ] {
+                h.record(action, A, &[], (100, 199), g).unwrap();
+            }
+            produced_window(
+                &evidence_rpc(),
+                &late_relays(on.clone()),
+                &h,
+                A,
+                (100, 199),
+                two_days_ago,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(view(&h), ["100 unrecorded "]);
+        }
+        // The relays have since saved their records; the nest restarts and is asked at once.
+        on.store(true, std::sync::atomic::Ordering::Relaxed);
+        let h = evidence_chain(dir.path());
+        let state = Arc::new(
+            crate::address_mode::ModeState::new(
+                h.clone(),
+                1,
+                std::time::Duration::from_secs(300),
+                true,
+            )
+            .with_relays(late_relays(on.clone())),
+        );
+        let d = Arc::new(evidence_rpc());
+        let cursor = tokio::spawn(crate::address_mode::serve_forever(state.clone(), d));
+        let resp = crate::address_mode::router(state.clone())
+            .oneshot(
+                axum::http::Request::get(format!(
+                    "/api?module=account&action=nuthatchProducedBlocks&address={A}&startblock=100&endblock=199"
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let a: Value = serde_json::from_slice(&bytes).unwrap();
+        let mev: Vec<String> = a["result"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{a}"))
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {}",
+                    r["blockNumber"].as_str().unwrap(),
+                    r["mev"].as_str().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(mev, ["100 relay", "101 relay", "102 relay"], "{a}");
+        assert!(h.mev_pending().unwrap().is_empty());
+        cursor.abort();
     }
 }
