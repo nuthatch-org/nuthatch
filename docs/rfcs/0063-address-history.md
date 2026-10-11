@@ -239,9 +239,13 @@ free key, whose answers cap at 1,000 rows, so the pinning splits ranges at that 
    and unbounded requests, partition boundaries and pagination are covered. The producer's RSS is
    measured while it builds.
 3. **Token transfers and normal transactions.** vitalik.eth (`0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045`),
-   Ethereum blocks 18,000,000 to 20,000,000: `txlist` (2,929 rows) and `tokentx` (7,614) hash sets
-   equal Etherscan's, with `txlist` field parity; `tokennfttx` (669) and `token1155tx` (55) likewise
-   once the union question is settled. A non-empty wallet and range is pinned per further chain.
+   Ethereum blocks 18,000,000 to 20,000,000. The pinned files are multisets: the 1,000-row cap
+   overlaps at each split, so `txlist` has 2,929 rows for 2,318 transactions, and the token files
+   are larger than their hash sets for the same reason and because one transaction can carry
+   several logs. The gate compares hash sets, not those row counts: `txlist` (2,318) and `tokentx`
+   (3,334) equal Etherscan's, with `txlist` field parity; `tokennfttx` (106) and `token1155tx` (53)
+   likewise. `docs/releases/v5.1.0.md` records the run. A non-empty wallet and range is pinned per
+   further chain.
 4. **Internal transactions.** The same wallet and range (`txlistinternal`, 15 rows), plus pinned
    fixtures for an internal-only receipt, a failed ancestor, a creation, a selfdestruct and an EIP-7702
    authorisation. Field parity and identical `traceId`s by address and by `txhash`.
