@@ -3460,8 +3460,52 @@ mod tests {
             }
         };
         let (done, covered, _dir) = run(anchor.clone()).await;
-        done.unwrap();
+        // The span is proven; the catalogue's first span, under it, is not in this test mirror.
         assert!(covered);
+        assert!(
+            format!("{:#}", done.unwrap_err()).contains("no block partition for [23550000"),
+            "only the absent first span fails"
+        );
+        // A mirror whose from_block starts inside the span still proves it: from_block bounds only
+        // what address history reads.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("t.redb")).unwrap();
+            let history = AddressHistory::open(store.clone(), 1, &[]).unwrap();
+            let validators =
+                crate::address_validators::Validators::open(store, &[validator]).unwrap();
+            let source = Arc::new(
+                Source::open(
+                    mirror.path().to_str().unwrap(),
+                    1,
+                    dir.path().join("cache"),
+                    1 << 30,
+                )
+                .unwrap(),
+            );
+            let state = ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(start + 5_000, None, 64)
+                .with_validators(validators.clone(), None)
+                .with_mirror(source.clone(), (start + 5_000, end));
+            let make = || Headers {
+                by_number: bridge.clone(),
+                finalized: header_json(&anchor),
+            };
+            let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+            // The spans under this one are not in the test mirror; this one is proven first.
+            let _ = mirror_spans(
+                &d,
+                &state,
+                &validators,
+                &[validator],
+                &source,
+                (start + 5_000, end),
+                &anchor,
+                anchor.number - 1,
+            )
+            .await;
+            assert!(validators.covers(validator, (start, end)).unwrap());
+        }
         // A whole validator pass with end_block inside the partition still proves the span: proofs
         // run to the finalized block, and end_block bounds only what is served.
         {
@@ -3637,6 +3681,44 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!(late.row["mev"], "relay", "the late row was reached");
+    }
+
+    #[tokio::test]
+    async fn an_open_mirror_reads_as_far_as_it_has_published() {
+        use crate::address_partitions::{partition_key, Source, SPAN};
+        let mirror = tempfile::tempdir().unwrap();
+        let publish = |spans: std::ops::Range<u64>| {
+            for i in spans {
+                let path = mirror.path().join(partition_key(1, i * SPAN));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"x").unwrap();
+            }
+        };
+        publish(0..38);
+        let dir = tempfile::tempdir().unwrap();
+        let source = Arc::new(
+            Source::open(
+                mirror.path().to_str().unwrap(),
+                1,
+                dir.path().join("c"),
+                1 << 30,
+            )
+            .unwrap(),
+        );
+        assert_eq!(source.published_end(0).await.unwrap(), Some(38 * SPAN - 1));
+        assert_eq!(source.published_end(40 * SPAN).await.unwrap(), None);
+        let history =
+            AddressHistory::open(Store::open(&dir.path().join("t.redb")).unwrap(), 1, &[]).unwrap();
+        let s = ModeState::new(history, 1, Duration::from_secs(300), true).with_open_mirror(
+            source.clone(),
+            0,
+            Some(38 * SPAN - 1),
+        );
+        assert_eq!(s.mirror_blocks().unwrap().1, (0, 38 * SPAN - 1));
+        // The publisher extends the mirror; the next poll reads further.
+        publish(38..41);
+        s.refresh_mirror().await;
+        assert_eq!(s.mirror_blocks().unwrap().1, (0, 41 * SPAN - 1));
     }
 
     #[tokio::test]
