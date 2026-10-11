@@ -452,27 +452,35 @@ async fn discover_window<M: Rpc, T: Rpc>(
 ) -> Result<()> {
     let pending = crate::address_discovery::Pending::begin(&state.history)?;
     let generation = pending.generation();
-    let anchor = anchor_for(d, &state.history, end).await?;
-    if let Some((b, h)) = anchor {
-        pending.anchor(b, h);
-    }
-    // The trace endpoint must be on the main chain before the fetch as well as after it: one that
-    // catches up in between would otherwise pass with the empty answers it gave from another fork.
-    same_chain_at(d, end).await?;
-    let found = within(
-        deadline,
-        d.discover(&state.history, address, next, end, &pending),
-    )
+    // The whole read, checks included, is one phase under the deadline: it writes nothing, so a
+    // deadline that ends it discards it whole, and the cursor is free again.
+    let read = within(deadline, async {
+        let anchor = anchor_for(d, &state.history, end).await?;
+        if let Some((b, h)) = anchor {
+            pending.anchor(b, h);
+        }
+        // The trace endpoints must be on the main chain before the fetch as well as after it: one
+        // that catches up in between would otherwise pass with the empty answers it gave from
+        // another fork.
+        same_chain_at(d, end).await?;
+        let found = d
+            .discover(&state.history, address, next, end, &pending)
+            .await;
+        let checked = match check_anchor(d, &state.history, anchor, &pending.named()).await {
+            Ok(()) => same_chain_at(d, end).await,
+            Err(e) => Err(e),
+        };
+        Ok((anchor, found, checked))
+    })
     .await;
-    let checked = match check_anchor(d, &state.history, anchor, &pending.named()).await {
-        Ok(()) => same_chain_at(d, end).await,
-        Err(e) => Err(e),
-    };
+    state.set_calls("main", d.main.calls());
+    state.set_calls("trace", d.trace.calls());
+    let (anchor, found, checked) = read?;
     // What was fetched is kept even when the window fails, so its retry refetches only what it
     // still lacks; nothing is kept from a window that failed its check.
     let history = state.history.clone();
     let who = address.to_string();
-    let outcome = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         pending.persist(&history, checked.is_ok())?;
         checked?;
         crate::address_discovery::record_anchored(
@@ -484,10 +492,7 @@ async fn discover_window<M: Rpc, T: Rpc>(
             anchor,
         )
     })
-    .await?;
-    state.set_calls("main", d.main.calls());
-    state.set_calls("trace", d.trace.calls());
-    outcome
+    .await?
 }
 
 /// Read one window of bodies for `addresses` and record it for each, anchored as
@@ -502,14 +507,21 @@ async fn body_window<M: Rpc, T: Rpc>(
     use crate::address_discovery::record_blocks_anchored;
     let pending = crate::address_discovery::Pending::begin(&state.history)?;
     let generation = pending.generation();
-    let anchor = anchor_for(d, &state.history, end).await?;
-    if let Some((b, h)) = anchor {
-        pending.anchor(b, h);
-    }
-    let found = within(deadline, d.scan_blocks(&addresses, from, end, &pending)).await;
-    let checked = check_anchor(d, &state.history, anchor, &pending.named()).await;
+    let read = within(deadline, async {
+        let anchor = anchor_for(d, &state.history, end).await?;
+        if let Some((b, h)) = anchor {
+            pending.anchor(b, h);
+        }
+        let found = d.scan_blocks(&addresses, from, end, &pending).await;
+        let checked = check_anchor(d, &state.history, anchor, &pending.named()).await;
+        Ok((anchor, found, checked))
+    })
+    .await;
+    state.set_calls("main", d.main.calls());
+    state.set_calls("trace", d.trace.calls());
+    let (anchor, found, checked) = read?;
     let history = state.history.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         pending.persist(&history, checked.is_ok())?;
         checked?;
         let mut found = found?;
@@ -519,14 +531,11 @@ async fn body_window<M: Rpc, T: Rpc>(
         }
         Ok::<_, anyhow::Error>(())
     })
-    .await?;
-    state.set_calls("main", d.main.calls());
-    state.set_calls("trace", d.trace.calls());
-    outcome
+    .await?
 }
 
-/// A fetch, stopped at `deadline` if it has one. Only fetches go through this: they write nothing,
-/// so stopping one orphans no writer; what a window persists runs after it, to completion.
+/// A read, stopped at `deadline` if it has one. Only reads go through this: they write nothing, so
+/// stopping one orphans no writer; what a window persists runs after it, to completion.
 async fn within<F, X>(deadline: Option<Instant>, fetch: F) -> Result<X>
 where
     F: std::future::Future<Output = Result<X>>,
@@ -747,13 +756,7 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 deadline,
                 reply,
             } => {
-                // Never cancelled once started: its write runs on a blocking thread a cancellation
-                // would orphan. One trace is short; a request that waited past its deadline is skipped.
-                let done = if Instant::now() >= deadline {
-                    Err(anyhow::anyhow!("not traced within the deadline"))
-                } else {
-                    self.trace_one(state, &hash).await
-                };
+                let done = self.trace_one(state, &hash, deadline).await;
                 state.set_calls("main", self.main.calls());
                 state.set_calls("trace", self.trace.calls());
                 let _ = reply.send(done.map_err(|e| format!("{e:#}")));
@@ -770,6 +773,17 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
     /// has finalized since; only a block under that committed head is a conflict, which stops the
     /// cursor.
     async fn check_tracked(&self, state: &ModeState, latest: u64) -> Result<()> {
+        self.check_tracked_within(state, latest, None).await
+    }
+
+    /// [`Self::check_tracked`] with its RPC reads under `deadline`; taking back what a reorg replaced,
+    /// once found, always runs to completion.
+    async fn check_tracked_within(
+        &self,
+        state: &ModeState,
+        latest: u64,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         let history = state.history.clone();
         let (tracked, committed) = {
             let h = history.clone();
@@ -777,16 +791,21 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                 .await??
         };
         let committed = committed.unwrap_or(0);
-        let mut moved: Option<u64> = tracked.iter().map(|(b, _)| *b).find(|b| *b > latest);
-        let mut base = committed;
-        for &(b, h) in tracked.iter().rev().filter(|(b, _)| *b <= latest) {
-            if block_hash(&self.main, b).await? == h {
-                base = b;
-                break;
+        let found = within(deadline, async {
+            let mut moved: Option<u64> = tracked.iter().map(|(b, _)| *b).find(|b| *b > latest);
+            let mut base = committed;
+            for &(b, h) in tracked.iter().rev().filter(|(b, _)| *b <= latest) {
+                if block_hash(&self.main, b).await? == h {
+                    base = b;
+                    break;
+                }
+                moved = Some(b);
             }
-            moved = Some(b);
-        }
+            Ok((moved, base))
+        })
+        .await;
         state.set_calls("main", self.main.calls());
+        let (moved, base) = found?;
         let Some(lowest_moved) = moved else {
             return Ok(());
         };
@@ -845,12 +864,13 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
             }
             Ok(())
         };
-        let latest = self.main.head().await?;
+        let latest = within(Some(deadline), self.main.head()).await?;
         state.latest.store(latest, Ordering::Relaxed);
         if to > latest {
             bail!("block {to} is past the chain head {latest}");
         }
-        self.check_tracked(state, latest).await?;
+        self.check_tracked_within(state, latest, Some(deadline))
+            .await?;
         let history = &state.history;
         loop {
             let next = crate::address_discovery::next_uncovered(history, address, from)?;
@@ -932,17 +952,22 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
         Ok(())
     }
 
-    /// Trace one transaction for a `txhash` lookup, up to the chain head, and keep it.
-    async fn trace_one(&self, state: &ModeState, hash: &str) -> Result<()> {
-        let latest = self.main.head().await?;
+    /// Trace one transaction for a `txhash` lookup, up to the chain head, and keep it. Its reads run
+    /// under `deadline`; the write after them runs to completion.
+    async fn trace_one(&self, state: &ModeState, hash: &str, deadline: Instant) -> Result<()> {
+        let latest = within(Some(deadline), self.main.head()).await?;
         state.latest.store(latest, Ordering::Relaxed);
-        self.check_tracked(state, latest).await?;
-        let pending = crate::address_discovery::Pending::begin(&state.history)?;
-        self.internal_rows_of(&state.history, hash, &pending, latest)
+        self.check_tracked_within(state, latest, Some(deadline))
             .await?;
-        // The trace endpoint names the block it traced: it must be the main endpoint's, at any
-        // height, and so must the tracked block under it.
-        check_anchor(self, &state.history, None, &pending.named()).await?;
+        let pending = crate::address_discovery::Pending::begin(&state.history)?;
+        within(Some(deadline), async {
+            self.internal_rows_of(&state.history, hash, &pending, latest)
+                .await?;
+            // The trace endpoint names the block it traced: it must be the main endpoint's, at any
+            // height, and so must the tracked block under it.
+            check_anchor(self, &state.history, None, &pending.named()).await
+        })
+        .await?;
         let history = state.history.clone();
         tokio::task::spawn_blocking(move || pending.persist(&history, true)).await?
     }
@@ -3076,6 +3101,42 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    /// A window's whole read phase, checks included, stops at the request's deadline and leaves
+    /// nothing behind, so a slow RPC cannot hold the cursor past it.
+    #[tokio::test]
+    async fn a_window_past_its_deadline_releases_the_cursor_and_writes_nothing() {
+        struct Slow;
+        impl Rpc for Slow {
+            async fn call(&self, _: &str, _: Value) -> Result<Value> {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok(Value::Null)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        s.history.finalize(100).unwrap();
+        let d = Discoverer::new(Counted::new(Slow), Counted::new(Slow));
+        let started = Instant::now();
+        let deadline = Some(Instant::now() + Duration::from_millis(100));
+        let err = discover_window(&d, &s, ALICE, (101, 120), deadline)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deadline"), "{err:#}");
+        let err = body_window(&d, &s, vec![ALICE.to_string()], (101, 120), deadline)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deadline"), "{err:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        for action in crate::address_history::Action::ALL {
+            assert!(s.history.coverage(action, ALICE).unwrap().is_empty());
+        }
+        assert!(s.history.tracked().unwrap().is_empty());
     }
 
     /// A tracked block under the committed finalized head, now at another hash, is not rewritten:
