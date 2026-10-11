@@ -2114,32 +2114,80 @@ pub fn forward<M: Rpc, T: Rpc>(
 /// A store written before finalized hashes were recorded cannot show which chain its finalized
 /// history came from, so it is renamed aside, intact, and the nest reads its history again from
 /// `start_block`. The accounts it watched are kept. Returns the accounts to open the new store with.
-pub fn move_aside_pre_finality(path: &Path, configured: &[String]) -> Result<Vec<String>> {
-    let Some(watched) = crate::address_history::pre_finality(path)? else {
+pub fn move_aside_pre_finality(
+    path: &Path,
+    chain_id: u64,
+    configured: &[String],
+) -> Result<Vec<String>> {
+    let Some(watched) = probe_copy(path)? else {
         return Ok(configured.to_vec());
     };
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-    let mut aside = path.as_os_str().to_owned();
-    aside.push(format!(".pre-5.2-{stamp}"));
-    let aside = std::path::PathBuf::from(aside);
-    std::fs::rename(path, &aside)
-        .with_context(|| format!("moving {} aside to {}", path.display(), aside.display()))?;
-    tracing::warn!(
-        "address history: {} was written before finalized block hashes were recorded, so it cannot \
-         show its history is this chain's; moved it, untouched, to {} and reading history again \
-         from start_block",
-        path.display(),
-        aside.display()
-    );
     let mut all = configured.to_vec();
     for a in watched {
         if !all.iter().any(|c| c.eq_ignore_ascii_case(&a)) {
             all.push(a);
         }
     }
+    // The replacement is built beside the old store, its accounts committed, before anything is
+    // moved: a crash at any step leaves the old store where it was, or linked at both names.
+    let fresh = with_suffix(path, ".new");
+    if fresh.exists() {
+        std::fs::remove_file(&fresh)?;
+    }
+    drop(AddressHistory::open(
+        crate::store::Store::open(&fresh)?,
+        chain_id,
+        &all,
+    )?);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    // A hard link never replaces an existing file, so an earlier copy kept under the same second
+    // survives.
+    let mut n = 0;
+    let aside = loop {
+        let name = match n {
+            0 => with_suffix(path, &format!(".pre-5.2-{stamp}")),
+            _ => with_suffix(path, &format!(".pre-5.2-{stamp}-{n}")),
+        };
+        match std::fs::hard_link(path, &name) {
+            Ok(()) => break name,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("keeping {} as {}", path.display(), name.display()))
+            }
+        }
+    };
+    std::fs::rename(&fresh, path)
+        .with_context(|| format!("putting the new store at {}", path.display()))?;
+    tracing::warn!(
+        "address history: {} was written before finalized block hashes were recorded, so it cannot \
+         show its history is this chain's; kept it, untouched, as {} and reading history again from \
+         start_block",
+        path.display(),
+        aside.display()
+    );
     Ok(all)
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(suffix);
+    p.into()
+}
+
+/// [`crate::address_history::pre_finality`] on a copy, so opening it, which redb may write to,
+/// never touches the store itself.
+fn probe_copy(path: &Path) -> Result<Option<Vec<String>>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let probe = with_suffix(path, ".probe");
+    std::fs::copy(path, &probe)?;
+    let found = crate::address_history::pre_finality(&probe);
+    std::fs::remove_file(&probe)?;
+    found
 }
 
 /// `--poll-interval` wins over `poll_interval` in `[address_history]`, which wins over the default.
@@ -2210,7 +2258,7 @@ pub async fn dev(
     // redb caches every page it reads or writes up to its cache size, and a backfill touches all of
     // them; an address-history nest reads by key, so a small cache costs it nothing.
     let path = dir.join(crate::config::DB_FILE);
-    let addresses = move_aside_pre_finality(&path, &ah.addresses)?;
+    let addresses = move_aside_pre_finality(&path, config.nest.chain_id, &ah.addresses)?;
     let store = crate::store::Store::open_with_cache(&path, STORE_CACHE_BYTES)?;
     let history = AddressHistory::open(store, config.nest.chain_id, &addresses)?;
 
@@ -3688,16 +3736,35 @@ mod tests {
         assert!(s.conflicted().is_none());
     }
 
-    /// A 5.1 store (a committed head, no finalized hashes) is moved aside intact and a fresh one
-    /// opened, the accounts it watched kept; a current store, and no store, are left where they are.
+    /// A 5.1 store (a committed head, no finalized hashes) is kept aside intact and a fresh one put
+    /// in its place, the accounts it watched kept; a current store, a store with no head, and no
+    /// store, are left where they are, and the probe leaves nothing behind.
     #[test]
     fn a_pre_finality_store_is_moved_aside_and_rebuilt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(crate::config::DB_FILE);
         let late = "0x00000000000000000000000000000000000000cc";
+        let files = || {
+            let mut f: Vec<String> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            f.sort();
+            f
+        };
         assert_eq!(
-            move_aside_pre_finality(&path, &[ALICE.into()]).unwrap(),
+            move_aside_pre_finality(&path, 1, &[ALICE.into()]).unwrap(),
             [ALICE]
+        );
+        drop(AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap());
+        assert_eq!(
+            move_aside_pre_finality(&path, 1, &[ALICE.into()]).unwrap(),
+            [ALICE]
+        );
+        assert_eq!(
+            files(),
+            [crate::config::DB_FILE],
+            "no head: left alone, no probe left"
         );
         {
             let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
@@ -3705,28 +3772,92 @@ mod tests {
             h.finalize(70).unwrap();
         }
         let before = std::fs::read(&path).unwrap();
-        let addresses = move_aside_pre_finality(&path, &[ALICE.into()]).unwrap();
-        assert_eq!(addresses, [ALICE, late]);
-        assert!(!path.exists());
-        let aside: Vec<_> = std::fs::read_dir(dir.path())
+        // Copies kept in the seconds around this one are never replaced.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .map(|e| e.unwrap().path())
+            .as_secs();
+        for t in now - 1..now + 3 {
+            std::fs::write(with_suffix(&path, &format!(".pre-5.2-{t}")), b"earlier").unwrap();
+        }
+        let addresses = move_aside_pre_finality(&path, 1, &[ALICE.into()]).unwrap();
+        assert_eq!(addresses, [ALICE, late]);
+        let kept: Vec<String> = files()
+            .into_iter()
+            .filter(|f| f.contains(".pre-5.2-"))
             .collect();
-        assert_eq!(aside.len(), 1);
-        assert!(
-            aside[0].to_string_lossy().contains(".pre-5.2-"),
-            "{aside:?}"
+        assert_eq!(kept.len(), 5, "{kept:?}");
+        let moved: Vec<&String> = kept
+            .iter()
+            .filter(|f| std::fs::read(dir.path().join(f)).unwrap() != b"earlier")
+            .collect();
+        assert_eq!(moved.len(), 1, "{kept:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join(moved[0])).unwrap(),
+            before,
+            "kept intact"
         );
-        assert_eq!(std::fs::read(&aside[0]).unwrap(), before, "moved intact");
-        let fresh = AddressHistory::open(Store::open(&path).unwrap(), 1, &addresses).unwrap();
+        let fresh = AddressHistory::open(Store::open(&path).unwrap(), 1, &[]).unwrap();
         assert_eq!(fresh.head().unwrap(), None, "history is read again");
+        assert_eq!(
+            fresh.watched().unwrap().len(),
+            2,
+            "the accounts came across"
+        );
         fresh.finalize_at(80, [1; 32]).unwrap();
         drop(fresh);
         assert_eq!(
-            move_aside_pre_finality(&path, &[ALICE.into()]).unwrap(),
+            move_aside_pre_finality(&path, 1, &[ALICE.into()]).unwrap(),
             [ALICE]
         );
-        assert!(path.exists(), "a current store stays");
+        assert!(!files()
+            .iter()
+            .any(|f| f.ends_with(".new") || f.ends_with(".probe")));
+    }
+
+    /// A start interrupted after the old store was linked aside, with the replacement half made,
+    /// finishes the move on the next start: both names keep the old store, and the accounts come
+    /// across.
+    #[test]
+    fn an_interrupted_move_finishes_on_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::config::DB_FILE);
+        let late = "0x00000000000000000000000000000000000000cc";
+        {
+            let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+            h.watch(late).unwrap();
+            h.finalize(70).unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        std::fs::hard_link(&path, with_suffix(&path, ".pre-5.2-1")).unwrap();
+        std::fs::write(with_suffix(&path, ".new"), b"half a store").unwrap();
+        let addresses = move_aside_pre_finality(&path, 1, &[]).unwrap();
+        assert!(addresses.iter().any(|a| a == late));
+        assert_eq!(
+            std::fs::read(with_suffix(&path, ".pre-5.2-1")).unwrap(),
+            before
+        );
+        let fresh = AddressHistory::open(Store::open(&path).unwrap(), 1, &[]).unwrap();
+        assert_eq!(fresh.head().unwrap(), None);
+        assert!(fresh.watched().unwrap().iter().any(|a| a == late));
+    }
+
+    /// A head that reads but a backfill that cannot, a trace endpoint down, is reported stalled until
+    /// a window is read again.
+    #[tokio::test]
+    async fn a_failing_backfill_is_stalled_though_the_head_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        let chain = Chain::new(100, 70);
+        let broken = chain.discoverer();
+        broken
+            .catch_up(&s, broken.reconcile(&s, chain.latest()).await.unwrap())
+            .await;
+        assert!(s.stalled(), "the trace endpoint answers nothing");
+        let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert_eq!(r["stalled"], true, "{r}");
+        s.window_done();
+        assert!(!s.stalled(), "a window read since clears it");
     }
 
     /// A finalized tag that went backwards does not narrow the poll's check: the recorded finalized
