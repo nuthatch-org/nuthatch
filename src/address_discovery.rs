@@ -82,6 +82,15 @@ pub trait Rpc: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Vec<Value>>> + Send {
         async move { Ok(vec![self.call(method, params).await?]) }
     }
+
+    /// [`Rpc::call_each`], keeping each endpoint's outcome rather than failing on the first error.
+    fn call_every(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> impl Future<Output = Vec<Result<Value>>> + Send {
+        async move { vec![self.call(method, params).await] }
+    }
 }
 
 /// The most of one `eth_getLogs` body address history reads before refusing it: about 7,000
@@ -99,6 +108,10 @@ impl Rpc for crate::rpc::RpcClient {
 
     async fn call_each(&self, method: &str, params: Value) -> Result<Vec<Value>> {
         crate::rpc::RpcClient::call_each(self, method, params).await
+    }
+
+    async fn call_every(&self, method: &str, params: Value) -> Vec<Result<Value>> {
+        crate::rpc::RpcClient::call_every(self, method, params).await
     }
 }
 
@@ -146,6 +159,17 @@ impl<R: Rpc> Rpc for Counted<R> {
                 .entry(method.to_string())
                 .or_default() += a.len() as u64;
         }
+        answers
+    }
+
+    async fn call_every(&self, method: &str, params: Value) -> Vec<Result<Value>> {
+        let answers = self.inner.call_every(method, params).await;
+        *self
+            .calls
+            .lock()
+            .expect("calls lock")
+            .entry(method.to_string())
+            .or_default() += answers.len() as u64;
         answers
     }
 }

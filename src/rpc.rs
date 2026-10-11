@@ -1382,6 +1382,20 @@ impl RpcClient {
         Ok(answers)
     }
 
+    /// [`Self::call_each`], keeping each endpoint's outcome, so one endpoint's answer is not lost to
+    /// another's failure.
+    pub(crate) async fn call_every(&self, method: &str, params: Value) -> Vec<Result<Value>> {
+        let mut answers = Vec::with_capacity(self.urls.len());
+        for url in &self.urls {
+            answers.push(
+                self.call_one(url, method, &params, None)
+                    .await
+                    .with_context(|| format!("{method} at {}", redact_url(url))),
+            );
+        }
+        answers
+    }
+
     pub async fn block_number(&self) -> Result<u64> {
         let (result, j) = self
             .call_holding("eth_blockNumber", json!([]), None)

@@ -482,22 +482,52 @@ pub async fn hold_final(main: &impl Rpc, history: &AddressHistory) -> Result<()>
     };
     let params = json!([format!("0x{block:x}"), false]);
     for _ in 0..2 {
-        for b in main
-            .call_each("eth_getBlockByNumber", params.clone())
-            .await?
-        {
-            let seen = b
-                .get("hash")
-                .and_then(Value::as_str)
-                .with_context(|| format!("block {block} is not on every main endpoint yet"))?;
-            if crate::address_discovery::word32(seen)? != hash {
-                let why = final_conflict(block);
-                history.set_conflict(&why)?;
-                bail!(why);
-            }
+        let answers = main
+            .call_every("eth_getBlockByNumber", params.clone())
+            .await;
+        let seen: Vec<Option<[u8; 32]>> = answers
+            .iter()
+            .map(|a| {
+                let h = a.as_ref().ok()?.get("hash")?.as_str()?;
+                crate::address_discovery::word32(h).ok()
+            })
+            .collect();
+        // A mismatch one endpoint confirmed is the conflict, whatever the others managed.
+        if seen.iter().flatten().any(|h| *h != hash) {
+            let why = final_conflict(block);
+            history.set_conflict(&why)?;
+            bail!(why);
+        }
+        if seen.contains(&None) {
+            bail!("block {block} could not be read from every main endpoint");
         }
     }
     Ok(())
+}
+
+/// The hash every main endpoint reports for `block`. Endpoints that disagree above the committed
+/// head are a reorg still settling, not a conflict: the head is not advanced until they agree.
+async fn agreed_hash(main: &impl Rpc, block: u64) -> Result<[u8; 32]> {
+    let answers = main
+        .call_each(
+            "eth_getBlockByNumber",
+            json!([format!("0x{block:x}"), false]),
+        )
+        .await?;
+    let hashes: std::collections::BTreeSet<Option<String>> = answers
+        .iter()
+        .map(|b| {
+            b.get("hash")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase)
+        })
+        .collect();
+    match &hashes.into_iter().collect::<Vec<_>>()[..] {
+        [Some(h)] => crate::address_discovery::word32(h),
+        _ => bail!(
+            "the main endpoints do not agree on block {block}; not advancing the finalized head"
+        ),
+    }
 }
 
 fn final_conflict(block: u64) -> String {
@@ -791,14 +821,14 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
         };
         // The new finalized hash is read on both sides of the checks: one read on a fork the checks
         // never saw would otherwise become the record every later poll trusts.
-        let hash = block_hash(&self.main, finalized).await;
+        let hash = agreed_hash(&self.main, finalized).await;
         // The recorded finalized hash is held again after the tracked check, whatever the tag says
         // now: a tag that went backwards would otherwise bracket only blocks under it.
         let checked = match self.check_tracked(state, latest).await {
             Ok(()) => hold_final(&self.main, &state.history).await,
             Err(e) => Err(e),
         };
-        let again = block_hash(&self.main, finalized).await;
+        let again = agreed_hash(&self.main, finalized).await;
         state.set_calls("main", self.main.calls());
         checked?;
         let hash = hash?;
@@ -3045,6 +3075,15 @@ mod tests {
             Counted<crate::address_partitions::tests::Fake>,
             Counted<crate::address_partitions::tests::Fake>,
         > {
+            let (main, trace) = self.node_rpcs();
+            Discoverer::new(Counted::new(main), Counted::new(trace))
+        }
+        fn node_rpcs(
+            self: &Arc<Chain>,
+        ) -> (
+            crate::address_partitions::tests::Fake,
+            crate::address_partitions::tests::Fake,
+        ) {
             let c = self.clone();
             let main = crate::address_partitions::tests::Fake::new(move |m, p| match m {
                 "eth_blockNumber" => Ok(json!(format!("0x{:x}", c.latest()))),
@@ -3121,7 +3160,7 @@ mod tests {
                 "trace_block" => Ok(json!([{"x": 1}])),
                 other => bail!("unexpected {other}"),
             });
-            Discoverer::new(Counted::new(main), Counted::new(trace))
+            (main, trace)
         }
     }
 
@@ -3489,27 +3528,74 @@ mod tests {
     }
 
     /// One endpoint of a pool on another fork under finality is a conflict, though the endpoint a
-    /// plain call reaches agrees.
+    /// plain call reaches agrees, and though another endpoint failed or has no such block.
     #[tokio::test]
     async fn one_pool_endpoint_on_another_fork_is_a_conflict() {
-        struct Pool;
+        struct Pool(u8);
         impl Rpc for Pool {
             async fn call(&self, _: &str, _: Value) -> Result<Value> {
                 Ok(json!({"hash": format!("0x{}", "11".repeat(32))}))
             }
+            async fn call_every(&self, m: &str, p: Value) -> Vec<Result<Value>> {
+                let other = Ok(json!({"hash": format!("0x{}", "22".repeat(32))}));
+                match self.0 {
+                    0 => vec![self.call(m, p).await, other],
+                    1 => vec![other, Err(anyhow::anyhow!("timed out"))],
+                    _ => vec![Ok(Value::Null), other],
+                }
+            }
+        }
+        for case in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let s = reorg_state(dir.path());
+            s.history.finalize_at(90, [0x11; 32]).unwrap();
+            let err = hold_final(&Pool(case), &s.history).await.unwrap_err();
+            assert!(
+                err.to_string().contains("finalized block 90"),
+                "{case}: {err:#}"
+            );
+            drop(s);
+            let again = reorg_state(dir.path());
+            assert!(
+                again.conflicted().is_some(),
+                "{case}: kept across a restart"
+            );
+        }
+    }
+
+    /// Endpoints that disagree about a block the chain calls finalized, above what the store
+    /// committed, hold the head back rather than commit one side or call it a conflict.
+    #[tokio::test]
+    async fn endpoints_split_over_a_new_finalized_head_hold_it_back() {
+        struct Split(crate::address_partitions::tests::Fake, u64);
+        impl Rpc for Split {
+            async fn call(&self, m: &str, p: Value) -> Result<Value> {
+                self.0.call(m, p).await
+            }
             async fn call_each(&self, m: &str, p: Value) -> Result<Vec<Value>> {
-                Ok(vec![
-                    self.call(m, p).await?,
-                    json!({"hash": format!("0x{}", "22".repeat(32))}),
-                ])
+                let a = self.0.call(m, p.clone()).await?;
+                let mut b = a.clone();
+                if m == "eth_getBlockByNumber" && p[0] == json!(format!("0x{:x}", self.1)) {
+                    b["hash"] = json!(format!("0x{}", "ee".repeat(32)));
+                }
+                Ok(vec![a, b])
             }
         }
         let dir = tempfile::tempdir().unwrap();
         let s = reorg_state(dir.path());
-        s.history.finalize_at(90, [0x11; 32]).unwrap();
-        let err = hold_final(&Pool, &s.history).await.unwrap_err();
-        assert!(err.to_string().contains("finalized block 90"), "{err:#}");
-        assert!(s.history.conflict().unwrap().is_some());
+        let chain = Chain::new(100, 70);
+        let (main, trace) = chain.node_rpcs();
+        let d = Discoverer::new(Counted::new(Split(main, 80)), Counted::new(trace));
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        chain.grow(10);
+        chain.finalized.store(80, Ordering::Relaxed);
+        let err = d.reconcile(&s, chain.latest()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("do not agree on block 80"),
+            "{err:#}"
+        );
+        assert_eq!(s.history.head().unwrap(), Some(70));
+        assert!(s.conflicted().is_none());
     }
 
     /// A finalized tag that went backwards does not narrow the poll's check: the recorded finalized
