@@ -461,7 +461,7 @@ pub struct PartitionsArgs {
     pub proposers: bool,
     /// With `--proposers`: a beacon node's API to read headers from. It sees this machine's IP and
     /// the beacon roots asked for.
-    #[arg(long)]
+    #[arg(long, env = "NUTHATCH_BEACON_URL", hide_env_values = true)]
     pub beacon_url: Option<String>,
     /// With `--proposers`: a directory of beacon headers by slot (`slots-<first>.jsonl.gz`), read
     /// before the beacon API. Unverified: every header is checked against the chain like any other.
