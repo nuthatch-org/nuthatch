@@ -476,6 +476,15 @@ mod tests {
                 .starts_with("NUTHATCH_UNSUPPORTED:"),
             "{looped}"
         );
+        // And with nothing after it: a full page is always continued from its last block.
+        let exact = answer(&ask, 1, &dense(vec![7; 1_000])).await.unwrap();
+        assert!(
+            exact["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_UNSUPPORTED:"),
+            "{exact}"
+        );
 
         let or = answer(
             &q(&[
