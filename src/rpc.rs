@@ -1061,6 +1061,19 @@ impl RpcClient {
             .map(|(v, _)| v)
     }
 
+    /// [`Self::call`], refusing a response body past `cap` bytes as too large, so the caller
+    /// narrows the range rather than holding it whole.
+    pub(crate) async fn call_capped(
+        &self,
+        method: &str,
+        params: Value,
+        cap: usize,
+    ) -> Result<Value> {
+        self.call_holding_capped(method, params, None, Some(cap))
+            .await
+            .map(|(v, _)| v)
+    }
+
     /// [`Self::call`], preferring endpoints known to hold block `need`; also returns which endpoint
     /// answered.
     async fn call_holding(
@@ -2337,6 +2350,28 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle)
+    }
+
+    /// Address history's getLogs is capped the same way, at its own smaller cap, with an error its
+    /// span narrowing reads as a range refusal; one block is still read whole.
+    #[tokio::test]
+    async fn address_history_getlogs_bodies_are_capped() {
+        use crate::address_discovery::Rpc;
+        let (url, server) = uncapped_logs_rpc(25_000).await;
+        let client = super::RpcClient::new(vec![url]).unwrap();
+        let ask = |from: &str, to: &str| serde_json::json!([{"fromBlock": from, "toBlock": to, "topics": []}]);
+        let err = Rpc::call(&client, "eth_getLogs", ask("0x1", "0x2"))
+            .await
+            .unwrap_err();
+        assert!(
+            crate::address_discovery::range_shaped(&format!("{err:#}")),
+            "{err:#}"
+        );
+        let one = Rpc::call(&client, "eth_getLogs", ask("0x1", "0x1"))
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(one.as_array().unwrap().len(), 25_000);
     }
 
     /// #1788: a node with no result cap answers a multi-block range whole, however large. Past the

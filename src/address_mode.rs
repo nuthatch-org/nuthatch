@@ -725,15 +725,29 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             Ok(f) if f <= latest => f,
             _ => by_depth,
         };
-        self.check_tracked(state, latest).await?;
-        let hash = block_hash(&self.main, finalized).await?;
+        // The new finalized hash is read on both sides of the checks: one read on a fork the checks
+        // never saw would otherwise become the record every later poll trusts.
+        let hash = block_hash(&self.main, finalized).await;
+        let checked = self.check_tracked(state, latest).await;
+        let again = block_hash(&self.main, finalized).await;
         state.set_calls("main", self.main.calls());
+        checked?;
+        let hash = hash?;
+        if again? != hash {
+            bail!("finalized block {finalized} changed hash during the poll; trying again");
+        }
         let h = state.history.clone();
-        tokio::task::spawn_blocking(move || {
-            h.finalize(finalized)?;
-            h.record_final(finalized, hash)
-        })
-        .await??;
+        let done = tokio::task::spawn_blocking(move || h.finalize_at(finalized, hash)).await?;
+        if let Err(e) = done {
+            if let Some(c) = e.downcast_ref::<crate::address_history::FinalConflict>() {
+                state.conflict(format!(
+                    "{c}: a reorg under finality, or an RPC on another chain with the same id; \
+                     history under the finalized head is never rewritten, so the nest answers \
+                     nothing until an operator looks"
+                ));
+            }
+            return Err(e);
+        }
         Ok(finalized)
     }
 
@@ -1355,9 +1369,20 @@ async fn api(
     State(s): State<Arc<ModeState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<Value> {
-    if let Some(why) = s.conflict.lock().expect("conflict lock").clone() {
+    let conflict = |s: &ModeState| s.conflict.lock().expect("conflict lock").clone();
+    if let Some(why) = conflict(&s) {
         return Json(crate::address_history::incomplete(&why));
     }
+    let answer = answer(&s, q).await;
+    // A conflict found while this request was answered may concern what it read.
+    match conflict(&s) {
+        Some(why) => Json(crate::address_history::incomplete(&why)),
+        None => answer,
+    }
+}
+
+async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
+    let s = s.clone();
     // The RPC behind the nest is the operator's; only a loopback bind lends it out.
     if let Some(forward) = s.forward.clone().filter(|_| s.loopback) {
         let _permit = if q.get("module").map(String::as_str) == Some("logs") {
@@ -2189,6 +2214,41 @@ mod tests {
         (status, v)
     }
 
+    /// A conflict found while a request is being answered refuses that answer too.
+    #[tokio::test]
+    async fn a_conflict_found_mid_request_refuses_its_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let cell: Arc<std::sync::OnceLock<Arc<ModeState>>> = Arc::default();
+        let seen = cell.clone();
+        let forward: crate::address_proxy::Forward = Arc::new(move |_, _| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                seen.get()
+                    .unwrap()
+                    .conflict("finalized block 9 is now at another hash".into());
+                Ok(json!("0x10"))
+            })
+        });
+        let state = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true).with_forward(forward),
+        );
+        let _ = cell.set(state.clone());
+        let (_, v) = call(
+            router(state),
+            "GET",
+            "/api?module=proxy&action=eth_blockNumber",
+            None,
+        )
+        .await;
+        let r = v["result"].as_str().unwrap();
+        assert!(
+            r.starts_with("NUTHATCH_INCOMPLETE:") && r.contains("finalized block 9"),
+            "{v}"
+        );
+    }
+
     /// The nest's RPC is lent out through `proxy` only on a loopback bind.
     #[tokio::test]
     async fn the_proxy_answers_only_on_loopback() {
@@ -2816,6 +2876,8 @@ mod tests {
         seed: AtomicU64,
         /// A reorg of this depth lands as soon as the next trace_filter has answered.
         reorg_next: AtomicU64,
+        /// `(block, n, depth)`: a reorg of `depth` lands once block `block` has been read `n` times.
+        reorg_on_read: std::sync::Mutex<Option<(u64, u64, u64)>>,
     }
 
     impl Chain {
@@ -2871,8 +2933,19 @@ mod tests {
                     if b > c.latest() {
                         return Ok(Value::Null);
                     }
-                    Ok(json!({"number": format!("0x{b:x}"),
-                              "hash": format!("0x{}", alloy_primitives::hex::encode(c.hash(b)))}))
+                    let answer = json!({"number": format!("0x{b:x}"),
+                              "hash": format!("0x{}", alloy_primitives::hex::encode(c.hash(b)))});
+                    let mut hook = c.reorg_on_read.lock().unwrap();
+                    if let Some((at, n, depth)) = *hook {
+                        if at == b {
+                            *hook = (n > 1).then_some((at, n - 1, depth));
+                            if n == 1 {
+                                drop(hook);
+                                c.reorg(depth);
+                            }
+                        }
+                    }
+                    Ok(answer)
                 }
                 other => bail!("unexpected {other}"),
             });
@@ -3243,6 +3316,59 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    /// A fork switch during a poll, before the new finalized head's hash is read or after the checks
+    /// that would have seen it, never records a hash the checks did not hold: the poll fails, the
+    /// next one takes back what was read on the old fork, and no false conflict follows.
+    #[tokio::test]
+    async fn a_fork_switch_during_a_poll_never_records_an_unchecked_finalized_hash() {
+        // Block 80 read once (the new head's first read), or 99 read once (the tracked check).
+        for (at, n) in [(80, 1), (99, 1)] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = reorg_state(dir.path());
+            let chain = Chain::new(100, 70);
+            let d = chain.discoverer();
+            d.reconcile(&s, chain.latest()).await.unwrap();
+            cover_from(&chain, &s.history, 0, 99);
+            chain.grow(10);
+            chain.finalized.store(80, Ordering::Relaxed);
+            // 75 onward replaced: past the new finalized head, above the recorded one.
+            *chain.reorg_on_read.lock().unwrap() = Some((at, n, 35));
+            let err = d.reconcile(&s, chain.latest()).await.unwrap_err();
+            assert!(s.conflict.lock().unwrap().is_none(), "({at}, {n}): {err:#}");
+            d.reconcile(&s, chain.latest()).await.unwrap();
+            d.reconcile(&s, chain.latest()).await.unwrap();
+            let (held, wanted) = held_and_wanted(&chain, &s.history);
+            assert_eq!(held, wanted, "({at}, {n})");
+            assert_eq!(
+                s.history.finals().unwrap().last().unwrap(),
+                &(80, chain.hash(80))
+            );
+        }
+    }
+
+    /// A finalized hash already recorded is never replaced: another one is a conflict, and the head
+    /// does not move.
+    #[test]
+    fn a_recorded_finalized_hash_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = reorg_state(dir.path());
+        s.history.finalize_at(80, [1; 32]).unwrap();
+        s.history.finalize_at(80, [1; 32]).unwrap();
+        let err = s
+            .history
+            .finalize_at(90, [2; 32])
+            .and_then(|_| s.history.finalize_at(90, [3; 32]));
+        assert!(err
+            .unwrap_err()
+            .downcast_ref::<crate::address_history::FinalConflict>()
+            .is_some());
+        assert_eq!(
+            s.history.finals().unwrap(),
+            vec![(80, [1; 32]), (90, [2; 32])]
+        );
+        assert_eq!(s.history.head().unwrap(), Some(90));
     }
 
     /// A reorg that replaces a finalized head the store committed, even with nothing tracked there,

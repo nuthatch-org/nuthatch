@@ -373,6 +373,35 @@ pub struct AddressHistory {
     chain_id: u64,
 }
 
+/// A finalized block the store recorded is now reported at another hash.
+#[derive(Debug)]
+pub struct FinalConflict(pub u64);
+
+impl std::fmt::Display for FinalConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "finalized block {} is now at another hash", self.0)
+    }
+}
+
+impl std::error::Error for FinalConflict {}
+
+fn finalize_in(wtx: &redb::WriteTransaction, block: u64) -> Result<()> {
+    let mut m = wtx.open_table(META)?;
+    let head = m.get(HEAD)?.map(|v| v.value());
+    if head.is_none_or(|h| block > h) {
+        m.insert(HEAD, block)?;
+    }
+    let mut c = wtx.open_table(CANON)?;
+    let done: Vec<u64> = c
+        .range(..=block)?
+        .map(|e| e.map(|(k, _)| k.value()))
+        .collect::<std::result::Result<_, _>>()?;
+    for b in done {
+        c.remove(b)?;
+    }
+    Ok(())
+}
+
 impl AddressHistory {
     /// Open the tables, and add `seed` (the configured addresses) to the watched set. Addresses
     /// already watched are left alone, none are removed, and one unwatched at runtime is not brought
@@ -634,30 +663,23 @@ impl AddressHistory {
     /// the head: an RPC failing over to a lagging node must not unfinalize anything.
     pub fn finalize(&self, block: u64) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
-        {
-            let mut m = wtx.open_table(META)?;
-            let head = m.get(HEAD)?.map(|v| v.value());
-            if head.is_none_or(|h| block > h) {
-                m.insert(HEAD, block)?;
-            }
-            let mut c = wtx.open_table(CANON)?;
-            let done: Vec<u64> = c
-                .range(..=block)?
-                .map(|e| e.map(|(k, _)| k.value()))
-                .collect::<std::result::Result<_, _>>()?;
-            for b in done {
-                c.remove(b)?;
-            }
-        }
+        finalize_in(&wtx, block)?;
         wtx.commit()?;
         Ok(())
     }
 
-    /// Record `hash` as the finalized head `block`'s, keeping the newest [`FINAL_KEEP`].
-    pub fn record_final(&self, block: u64, hash: [u8; 32]) -> Result<()> {
+    /// [`AddressHistory::finalize`] `block`, recording `hash` as its own in the same transaction and
+    /// keeping the newest [`FINAL_KEEP`], so no crash can leave a committed head without its hash.
+    /// A block already recorded at another hash is a [`FinalConflict`], and nothing is written.
+    pub fn finalize_at(&self, block: u64, hash: [u8; 32]) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
         {
             let mut t = wtx.open_table(FINAL)?;
+            if let Some(old) = t.get(block)? {
+                if old.value() != hash.as_slice() {
+                    return Err(FinalConflict(block).into());
+                }
+            }
             t.insert(block, hash.as_slice())?;
             let all: Vec<u64> = t
                 .iter()?
@@ -666,6 +688,7 @@ impl AddressHistory {
             for b in all.iter().take(all.len().saturating_sub(FINAL_KEEP)) {
                 t.remove(*b)?;
             }
+            finalize_in(&wtx, block)?;
         }
         wtx.commit()?;
         Ok(())

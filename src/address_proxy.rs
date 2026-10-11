@@ -155,7 +155,7 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
     // needs: whatever lies beyond it a caller asks for next.
     let mut logs = Vec::new();
     let (mut start, mut span, mut calls) = (from, FIRST_SPAN, 0);
-    while start <= to && logs.len() <= need {
+    while start <= to && logs.len() < need {
         if calls == MAX_LOG_CALLS {
             return Ok(Answer::Incomplete(format!(
                 "getLogs over [{from}, {to}] needs more than {MAX_LOG_CALLS} calls to the RPC; ask for a narrower range"
@@ -172,13 +172,14 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
         filter.insert("topics".into(), Value::Array(topics[..last].to_vec()));
         match forward("eth_getLogs".into(), json!([filter])).await {
             Ok(found) => {
-                let found = found
-                    .as_array()
-                    .ok_or_else(|| anyhow!("eth_getLogs answered a non-list"))?;
+                let Value::Array(found) = found else {
+                    bail!("eth_getLogs answered a non-list");
+                };
                 if found.len() < need / 4 {
                     span = span.saturating_mul(2).min(LOG_SPAN);
                 }
-                logs.extend(found.iter().cloned());
+                let room = need - logs.len();
+                logs.extend(found.into_iter().take(room));
                 start = end + 1;
             }
             Err(e) if end > start && crate::address_discovery::range_shaped(&format!("{e:#}")) => {
@@ -195,7 +196,8 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
     let skip = need - usize::try_from(offset).expect("at most MAX_PAGE");
     let mut logs: Vec<Value> = logs.into_iter().skip(skip).collect();
     let full = usize::try_from(offset).expect("at most MAX_PAGE");
-    if logs.len() >= full {
+    // One log is a page of one, which any caller pages past by `page`.
+    if logs.len() >= full && full > 1 {
         let block = |l: &Value| l.get("blockNumber").cloned();
         if block(&logs[0]) == block(&logs[full - 1]) {
             return Ok(Answer::Unsupported(format!(
@@ -650,5 +652,48 @@ mod tests {
             rows[0]["blockNumber"], "0x18826a2",
             "the 101st log: block 25700002, its first"
         );
+    }
+
+    /// A sparse stretch widens the span to the provider's limit; the dense stretch after it is then
+    /// refused by the body cap, as the RPC client refuses it, and narrowed rather than held whole.
+    #[tokio::test]
+    async fn a_dense_stretch_after_a_sparse_one_is_narrowed_by_the_body_cap() {
+        let largest = Arc::new(Mutex::new(0usize));
+        let seen = largest.clone();
+        let forward: Forward = Arc::new(move |m: String, p: Value| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                if m != "eth_getLogs" {
+                    return Ok(json!({"effectiveGasPrice": "0x1", "gasUsed": "0x1"}));
+                }
+                let from = crate::address_discovery::hex_u64(&p[0]["fromBlock"])?;
+                let to = crate::address_discovery::hex_u64(&p[0]["toBlock"])?;
+                // Empty under 50,000, then 200 logs a block; the cap passes 4,000 in one body.
+                let logs: Vec<Value> = (from.max(50_000)..=to)
+                    .flat_map(|b| (0..200).map(move |i| json!({
+                        "address": "0xc0", "topics": [], "data": "0x", "blockNumber": format!("0x{b:x}"),
+                        "blockHash": "0xbh", "logIndex": format!("0x{i:x}"), "transactionHash": format!("0x{b:x}{i:02x}"),
+                        "transactionIndex": "0x0", "blockTimestamp": "0x1"})))
+                    .take(4_001)
+                    .collect();
+                if logs.len() > 4_000 && from < to {
+                    bail!("response passed the 4194304-byte getLogs body cap; narrowing the range");
+                }
+                let mut l = seen.lock().unwrap();
+                *l = (*l).max(logs.len());
+                Ok(json!(logs))
+            })
+        });
+        let ask = q(&[
+            ("module", "logs"),
+            ("action", "getLogs"),
+            ("fromBlock", "0"),
+            ("toBlock", "60000"),
+        ]);
+        let got = answer(&ask, 1, &forward).await.unwrap();
+        let rows = got["result"].as_array().unwrap();
+        assert_eq!(rows.len(), 1_000, "{got}");
+        assert_eq!(rows[0]["blockNumber"], format!("0x{:x}", 50_000));
+        assert!(*largest.lock().unwrap() <= 4_000);
     }
 }

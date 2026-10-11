@@ -84,8 +84,17 @@ pub trait Rpc: Send + Sync + 'static {
     }
 }
 
+/// The most of one multi-block `eth_getLogs` body address history reads before narrowing the range:
+/// about 7,000 transfers, so a sparse stretch that widened the span cannot hand a dense one back
+/// whole.
+pub const LOGS_BODY_CAP: usize = 4 << 20;
+
 impl Rpc for crate::rpc::RpcClient {
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let f = &params[0];
+        if method == "eth_getLogs" && f.get("fromBlock") != f.get("toBlock") {
+            return self.call_capped(method, params, LOGS_BODY_CAP).await;
+        }
         crate::rpc::RpcClient::call(self, method, params).await
     }
 
@@ -844,6 +853,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             .map(|a| (a.clone(), BlockFound::default()))
             .collect();
         let mut timestamps = Vec::new();
+        let mut summaries = Vec::new();
         // The bodies must be one chain, each naming the one before as its parent, and the last one's
         // hash is named for the caller to hold against the main endpoint: a pool's endpoints can be
         // on different forks, and a body from another fork would otherwise pass as this chain's.
@@ -863,11 +873,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             let ts = hex_u64(header.get("timestamp").unwrap_or(&Value::Null))
                 .with_context(|| format!("block {b} timestamp"))?;
             timestamps.push((b, ts));
-            pending
-                .summaries
-                .lock()
-                .expect("pending lock")
-                .push((b, summary(&header, ts)?));
+            summaries.push((b, summary(&header, ts)?));
             match header.get("withdrawals").and_then(Value::as_array) {
                 Some(ws) => {
                     for (i, w) in ws.iter().enumerate() {
@@ -918,6 +924,13 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             .lock()
             .expect("pending lock")
             .extend(timestamps);
+        // Kept only from a scan that read every body whole, so a retry never takes a failed body's
+        // summary for a complete one.
+        pending
+            .summaries
+            .lock()
+            .expect("pending lock")
+            .extend(summaries);
         if let Some(l) = last {
             pending.named.lock().expect("pending lock").push(l);
         }
@@ -3848,6 +3861,29 @@ mod tests {
                 .unwrap_err();
             assert!(format!("{err:#}").contains(want), "{want}: {err:#}");
         }
+    }
+
+    /// A scan that fails on any body keeps no summary, so its retry reads the bodies again rather
+    /// than taking a summary of a body without its withdrawals for a complete, empty one.
+    #[tokio::test]
+    async fn a_failed_scan_keeps_no_summary() {
+        let good = bodies(None);
+        let main = script(move |m, p| {
+            let mut v = (good.answer)(m, p)?;
+            if m == "eth_getBlockByNumber" && v["number"] == json!(format!("0x{:x}", 17_100_005)) {
+                v.as_object_mut().unwrap().remove("withdrawals");
+            }
+            Ok(v)
+        });
+        let (_, trace) = chain(false);
+        let d = Discoverer::new(main, trace);
+        let pending = Pending::default();
+        let err = d
+            .scan_blocks(&[B.into()], 17_100_004, 17_100_005, &pending)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no withdrawals"), "{err:#}");
+        assert!(pending.summaries.lock().unwrap().is_empty());
     }
 
     /// The cursor's block pass reads each body once for every address that lacks it, and an address
