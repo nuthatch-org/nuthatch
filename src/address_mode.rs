@@ -1611,6 +1611,9 @@ async fn mirror_spans<M: Rpc, T: Rpc>(
 /// between a mirror's last published span and the finalized block, not for history a mirror holds.
 const LOCAL_CATALOGUE_MAX: u64 = 50_000;
 
+/// How often a validator block's owed reward or payment is read again.
+const RETRY_EVERY_SECS: u64 = 60 * 60;
+
 /// Every block of `[from, to]` (`to` at most `anchor`'s parent) with its proven proposer, built here
 /// from the RPC and the beacon and linked to `anchor`, the block the RPC calls finalized, through
 /// every block between: a self-consistent fork the RPC returned for the range cannot reach it.
@@ -1726,7 +1729,10 @@ async fn payment_into<M: Rpc, T: Rpc>(
             .call("trace_block", json!([format!("0x{b:x}")]))
             .await;
         match frames.and_then(|f| {
-            let f = f.as_array().cloned().unwrap_or_default();
+            let f = f
+                .as_array()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("trace_block answered no list for block {b}"))?;
             crate::address_mev::payment_legs(&f, &hash, &miner, &recipient)
         }) {
             Ok((hashes, total)) if !hashes.is_empty() => {
@@ -1761,27 +1767,42 @@ async fn validator_retries<M: Rpc, T: Rpc>(
     };
     let now = unix_now();
     let num = |m: &serde_json::Map<String, Value>, k: &str| m.get(k).and_then(Value::as_u64);
-    let mut done = 0;
-    for (v, mut s) in all {
-        if done >= 64 {
-            break;
-        }
-        let owed = s.row.get("rewardStatus").and_then(Value::as_str) == Some("unavailable");
-        let first = num(&s.meta, "mevFirstAsked");
-        let reask = state.relays.is_some()
+    // Owed reads are tried at most hourly, least recently tried first, so rows whose data stays
+    // unavailable cannot hold every batch.
+    let tried = |s: &crate::address_validators::Stored| num(&s.meta, "retriedAt").unwrap_or(0);
+    let reask_due = |s: &crate::address_validators::Stored| {
+        state.relays.is_some()
             && s.row.get("mev").and_then(Value::as_str) == Some("unrecorded")
-            && match first {
+            && match num(&s.meta, "mevFirstAsked") {
                 None => true,
                 Some(f) => {
                     now < f + REASK_FOR_SECS
                         && num(&s.meta, "mevLastAsked").is_some_and(|l| now >= l + REASK_EVERY_SECS)
                 }
-            };
+            }
+    };
+    let mut due: Vec<(u64, crate::address_validators::Stored)> = all
+        .into_iter()
+        .filter(|(_, s)| {
+            let owed = s.row.get("rewardStatus").and_then(Value::as_str) == Some("unavailable")
+                || s.meta.get("paymentOwed").and_then(Value::as_bool) == Some(true);
+            (owed && now >= tried(s) + RETRY_EVERY_SECS) || reask_due(s)
+        })
+        .collect();
+    // Least recently tried or asked first.
+    due.sort_by_key(|(_, s)| tried(s).max(num(&s.meta, "mevLastAsked").unwrap_or(0)));
+    for (v, mut s) in due.into_iter().take(64) {
+        let owed = s.row.get("rewardStatus").and_then(Value::as_str) == Some("unavailable");
+        let reask = reask_due(&s);
         let payment_owed = s.meta.get("paymentOwed").and_then(Value::as_bool) == Some(true);
+        let owed = owed && now >= tried(&s) + RETRY_EVERY_SECS;
+        let payment_owed = payment_owed && now >= tried(&s) + RETRY_EVERY_SECS;
         if !owed && !reask && !payment_owed {
             continue;
         }
-        done += 1;
+        if owed || payment_owed {
+            s.meta.insert("retriedAt".into(), json!(now));
+        }
         let hash = s
             .row
             .get("blockHash")
@@ -3076,6 +3097,12 @@ mod tests {
         assert_eq!(stored.row["mev"], "relay");
         assert_eq!(stored.row["paymentTx"], "0x01");
         assert_eq!(stored.row["paymentValue"], "9");
+        assert!(!stored.meta.contains_key("paymentOwed"));
+        // A trace answer that is not a list is no evidence: the payment stays owed.
+        TRACES.with(|t| *t.borrow_mut() = Some(Value::Null));
+        let stored = proven_row(&d, &state, &p).await;
+        assert_eq!(stored.row["paymentValue"], "");
+        assert_eq!(stored.meta["paymentOwed"], true);
         TRACES.with(|t| *t.borrow_mut() = None);
     }
 
@@ -3243,6 +3270,78 @@ mod tests {
         assert!(stored.meta.contains_key("mevFirstAsked"));
         // The trace for its payment could not be read: owed, not claimed absent.
         assert_eq!(stored.meta["paymentOwed"], true);
+    }
+
+    #[tokio::test]
+    async fn rows_that_keep_failing_do_not_starve_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store.clone(), 1, &[]).unwrap();
+        let validators = crate::address_validators::Validators::open(store, &[7]).unwrap();
+        let row = |owed: bool| {
+            let mut row = crate::address_mev::no_mev();
+            row.insert("blockHash".into(), json!("0xbb"));
+            row.insert("rewardStatus".into(), json!("verified"));
+            let mut meta = serde_json::Map::new();
+            if owed {
+                // Relay evidence already in, its payment unreadable for good.
+                row.insert("mev".into(), json!("relay"));
+                row.insert("mevRecipient".into(), json!("0xa1"));
+                meta.insert("paymentOwed".into(), json!(true));
+            }
+            (row, meta)
+        };
+        let mut stored: Vec<crate::address_validators::Stored> = (1..=70)
+            .map(|b| {
+                let (row, meta) = row(true);
+                crate::address_validators::Stored {
+                    block: b,
+                    row,
+                    meta,
+                }
+            })
+            .collect();
+        let (row, meta) = row(false);
+        stored.push(crate::address_validators::Stored {
+            block: 150,
+            row,
+            meta,
+        });
+        let mut found = BTreeMap::new();
+        found.insert(7, stored);
+        validators
+            .record_span((1, 199), &[7], &found, validators.generation().unwrap())
+            .unwrap();
+        let relays: crate::address_mev::Relays = Arc::new(|name: &'static str, b: u64| {
+            Box::pin(async move {
+                Ok(if name == "titan" {
+                    vec![json!({"block_number": b.to_string(), "block_hash": "0xbb",
+                        "proposer_fee_recipient": "0xa1", "value": "3",
+                        "builder_pubkey": "0xb", "proposer_pubkey": "0xp"})]
+                } else {
+                    vec![]
+                })
+            })
+        });
+        let state = ModeState::new(history, 1, Duration::from_secs(300), true)
+            .with_validators(validators.clone(), None)
+            .with_relays(relays);
+        let make = || Headers {
+            by_number: BTreeMap::new(),
+            finalized: Value::Null,
+        };
+        let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+        for _ in 0..2 {
+            validator_retries(&d, &state, &validators).await;
+        }
+        let late = validators
+            .all()
+            .unwrap()
+            .into_iter()
+            .find(|(_, s)| s.block == 150)
+            .unwrap()
+            .1;
+        assert_eq!(late.row["mev"], "relay", "the late row was reached");
     }
 
     #[tokio::test]

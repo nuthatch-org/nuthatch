@@ -288,17 +288,26 @@ pub fn payment_legs(
             continue;
         };
         let action = f.get("action").cloned().unwrap_or(Value::Null);
-        if text(f, "type") != "call" || text(&action, "callType") != "call" {
+        // A value call, or a self-destruct paying out its balance, as the internal transfers are read.
+        let (from, to, value) = match (text(f, "type").as_str(), text(&action, "callType").as_str())
+        {
+            ("call", "call") => (
+                text(&action, "from"),
+                text(&action, "to"),
+                text(&action, "value"),
+            ),
+            ("suicide", _) => (
+                text(&action, "address"),
+                text(&action, "refundAddress"),
+                text(&action, "balance"),
+            ),
+            _ => continue,
+        };
+        if to != recipient {
             continue;
         }
-        if text(&action, "to") != recipient {
-            continue;
-        }
-        let value = alloy_primitives::U256::from_str_radix(
-            text(&action, "value").trim_start_matches("0x"),
-            16,
-        )
-        .context("a trace frame's value")?;
+        let value = alloy_primitives::U256::from_str_radix(value.trim_start_matches("0x"), 16)
+            .context("a trace frame's value")?;
         if value.is_zero() {
             continue;
         }
@@ -310,7 +319,7 @@ pub fn payment_legs(
         {
             continue;
         }
-        let from_miner = text(&action, "from") == miner && miner != recipient;
+        let from_miner = from == miner && miner != recipient;
         if !(from_miner || Some(pos) == last) {
             continue;
         }
@@ -1436,6 +1445,21 @@ mod tests {
         assert_eq!(
             (txs, total),
             (vec!["0x02".to_string()], alloy_primitives::U256::from(6))
+        );
+    }
+
+    #[test]
+    fn a_payout_contract_self_destructing_to_the_proposer_pays_it() {
+        let frames = vec![
+            frame(9, "0x09", &[], BUILDER, PAYOUT, 0, false),
+            json!({"blockHash": "0xbb", "transactionPosition": 9, "transactionHash": "0x09",
+                "traceAddress": [0], "type": "suicide",
+                "action": {"address": PAYOUT, "refundAddress": PROPOSER, "balance": "0x5"}}),
+        ];
+        let (txs, total) = payment_legs(&frames, "0xbb", BUILDER, PROPOSER).unwrap();
+        assert_eq!(
+            (txs, total),
+            (vec!["0x09".to_string()], alloy_primitives::U256::from(5))
         );
     }
 
