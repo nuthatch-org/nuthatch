@@ -3341,6 +3341,24 @@ mod tests {
         drop(after);
     }
 
+    /// Two datasets do not share a lease. One key for every directory would let a reader of the
+    /// first pin a file the second has already replaced.
+    #[test]
+    fn a_lease_on_one_dataset_does_not_pin_another() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let gone = b.path().join("gone.parquet");
+        std::fs::write(&gone, b"x").unwrap();
+        let _lease = read_lease(a.path());
+        retire(b.path(), vec![gone.clone()]);
+        assert!(
+            !gone.exists(),
+            "a lease on {} pinned a file retired from {}",
+            a.path().display(),
+            b.path().display()
+        );
+    }
+
     #[test]
     fn an_unreadable_manifest_is_an_error_not_an_empty_catalogue() {
         let dir = tempfile::tempdir().unwrap();

@@ -344,6 +344,17 @@ fn checked_header(v: Value, n: u64) -> Result<(Header, B256)> {
     Ok((header, claimed))
 }
 
+/// A block from an `eth_getBlockByNumber` answer already in hand. Its withdrawals are not kept:
+/// the caller read the ones it wanted, and a proof does not.
+pub(crate) fn block_from_rpc_value(v: Value, n: u64) -> Result<VerifiedBlock> {
+    let (header, hash) = checked_header(v, n)?;
+    Ok(VerifiedBlock {
+        hash,
+        header,
+        withdrawals: Vec::new(),
+    })
+}
+
 /// The execution blocks `[lo, to]` read one by one from `rpc`, each linked to the next, for spans no
 /// partition covers. Linked only to each other: the caller anchors the last to a finalized successor.
 pub async fn blocks_from_rpc(
@@ -548,16 +559,31 @@ impl Beacon {
         let give_up = std::time::Instant::now() + self.patience;
         let mut pause = (self.patience / 8).max(std::time::Duration::from_millis(100));
         loop {
+            // What is left of the one patience, not a fresh one: the client timeout is the whole
+            // budget, so a retry that started late would otherwise run a second full patience.
+            let left = give_up.saturating_duration_since(std::time::Instant::now());
+            if left < std::time::Duration::from_millis(50) {
+                bail!("the beacon kept refusing the header of slot {slot}");
+            }
             let resp = self
                 .client
                 .get(format!(
                     "{url}/eth/v1/beacon/headers/0x{}",
                     hex::encode(root)
                 ))
+                .timeout(left)
                 .send()
                 .await
-                .map_err(|e| e.without_url())
-                .with_context(|| format!("the beacon header of slot {slot}"))?;
+                .map_err(|e| e.without_url());
+            let resp = match resp {
+                Ok(r) => r,
+                Err(e) if e.is_timeout() => {
+                    bail!("the beacon kept refusing the header of slot {slot}")
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("the beacon header of slot {slot}"))
+                }
+            };
             match resp.status().as_u16() {
                 200 => {
                     let body: Value = resp.json().await.map_err(|e| e.without_url())?;
@@ -1052,6 +1078,45 @@ pub(crate) mod tests {
             started.elapsed() < std::time::Duration::from_millis(1_500),
             "{:?}",
             started.elapsed()
+        );
+        server.abort();
+    }
+
+    /// A retry does not get its own patience. The first answer arrives late and refuses; the next
+    /// would hang. The whole read still ends inside the one patience.
+    #[tokio::test]
+    async fn a_retried_beacon_read_stays_inside_one_patience() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seen = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(move || {
+            let seen = seen.clone();
+            async move {
+                let n = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    axum::http::StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    axum::http::StatusCode::OK
+                }
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let beacon =
+            Beacon::with_patience(Some(url), None, std::time::Duration::from_secs(1)).unwrap();
+        let started = std::time::Instant::now();
+        let e = beacon.header(DENEB_SLOT, [1; 32]).await.unwrap_err();
+        assert!(format!("{e:#}").contains("kept refusing"), "{e:#}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_400),
+            "a second attempt ran past the patience: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            hits.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "the late refusal was retried"
         );
         server.abort();
     }

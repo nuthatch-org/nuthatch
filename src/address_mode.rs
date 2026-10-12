@@ -124,6 +124,22 @@ pub struct ModeState {
     mirror_open: bool,
     /// The mirror's last block as last found, when it is open.
     mirror_last: AtomicU64,
+    /// The pass that currently has the cursor, and when it took it. Empty between passes.
+    /// A long pass polls and serves while it runs; this is how `/ready` says which one is doing it.
+    holding: Mutex<Option<(&'static str, Instant)>>,
+    /// Blocks the body scan has read, held until the validator pass can hang them from the
+    /// finalized tag. A window proved only against its neighbour is not recorded on its own.
+    held: Mutex<Option<HeldBridge>>,
+}
+
+/// One tip block from the body scan, and the watched proposers' rows for the blocks before it.
+struct HeldBridge {
+    /// The first catalogue block this proof covers.
+    from: Option<u64>,
+    /// That block's header: the block under it hangs from this, once the tip is the finalized block.
+    head: Option<alloy_consensus::Header>,
+    tip: crate::address_partitions::VerifiedBlock,
+    proven: Vec<crate::address_proposers::Proven>,
 }
 
 pub type HashAt =
@@ -276,6 +292,8 @@ impl ModeState {
             search_ms: AtomicU64::new(0),
             mirror_open: false,
             mirror_last: AtomicU64::new(0),
+            holding: Mutex::new(None),
+            held: Mutex::new(None),
         }
     }
 
@@ -488,6 +506,44 @@ impl ModeState {
         self.discovery_errors.fetch_add(1, Ordering::Relaxed);
         self.backfill_failing.store(true, Ordering::Relaxed);
     }
+
+    /// Name the pass that has the cursor, until the guard drops.
+    fn begin_pass(&self, name: &'static str) -> Pass<'_> {
+        *self.holding.lock().expect("holding") = Some((name, Instant::now()));
+        Pass { state: self }
+    }
+
+    /// The pass holding the cursor, and how many seconds it has held it.
+    fn holding(&self) -> Option<(&'static str, u64)> {
+        self.holding
+            .lock()
+            .expect("holding")
+            .as_ref()
+            .map(|(name, since)| (*name, since.elapsed().as_secs()))
+    }
+
+    fn take_held(&self) -> Option<HeldBridge> {
+        self.held.lock().expect("held bridge").take()
+    }
+
+    fn clear_held(&self) {
+        self.held.lock().expect("held bridge").take();
+    }
+
+    fn set_held(&self, held: HeldBridge) {
+        *self.held.lock().expect("held bridge") = Some(held);
+    }
+}
+
+/// Clears the pass `/ready` is reporting, including when the pass returns early.
+struct Pass<'a> {
+    state: &'a ModeState,
+}
+
+impl Drop for Pass<'_> {
+    fn drop(&mut self) {
+        *self.state.holding.lock().expect("holding") = None;
+    }
 }
 
 impl<R: Rpc> HeadSource for Counted<R> {
@@ -566,6 +622,63 @@ async fn serve_queued(state: &ModeState, d: &impl Discovery) {
     };
     for r in waiting {
         d.serve(state, r).await;
+    }
+}
+
+/// Whether a pass owes the cursor a poll: the last one is a full interval behind. None yet does not
+/// count. The cursor polls before a pass starts, and a pass must not take that first one itself.
+fn poll_due(state: &ModeState) -> bool {
+    let last = state.last_poll.load(Ordering::Relaxed);
+    if last == 0 {
+        return false;
+    }
+    let now = u64::try_from(state.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let since = now.saturating_sub(last.saturating_sub(1));
+    since >= u64::try_from(state.poll_interval.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// One poll and its reconcile, when one is due. A pass runs on the cursor, so without this the head
+/// stays where the pass started for as long as the pass runs.
+async fn resume_head(state: &ModeState, source: &impl HeadSource, discovery: &impl Discovery) {
+    if !poll_due(state) {
+        return;
+    }
+    match poll_once(state, source).await {
+        Ok(latest) => match discovery.reconcile(state, latest).await {
+            Ok(_) => state.failing.store(false, Ordering::Relaxed),
+            Err(e) => {
+                state.poll_errors.fetch_add(1, Ordering::Relaxed);
+                state.failing.store(true, Ordering::Relaxed);
+                tracing::warn!("address history: poll during a pass failed, retrying: {e:#}");
+            }
+        },
+        Err(e) => {
+            state.failing.store(true, Ordering::Relaxed);
+            tracing::warn!("address history: poll during a pass failed, retrying: {e:#}");
+        }
+    }
+}
+
+/// Serve what is waiting, and poll when a poll is due. The cursor's passes call this instead of
+/// running to the end with the queue behind them.
+async fn yield_cursor<M: Rpc, T: Rpc>(state: &ModeState, d: &Discoverer<Counted<M>, Counted<T>>) {
+    serve_queued(state, d).await;
+    resume_head(state, &d.main, d).await;
+}
+
+/// Run `read` while calling `between` every 50 ms it is still pending. A beacon read or a partition
+/// download that succeeds slowly otherwise holds every tip request queued behind that one chunk.
+async fn while_serving<'b, T>(
+    read: impl std::future::Future<Output = T>,
+    between: &(dyn Fn() -> futures::future::BoxFuture<'b, ()> + Sync),
+) -> T {
+    tokio::pin!(read);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut read => return out,
+            _ = tokio::time::sleep(Duration::from_millis(50)) => between().await,
+        }
     }
 }
 
@@ -822,14 +935,16 @@ async fn discover_window<M: Rpc, T: Rpc>(
 }
 
 /// Read one window of bodies for `addresses` and record it for each, anchored as
-/// [`discover_window`] is.
+/// [`discover_window`] is. When `keep` is set, the parsed blocks come back with it so a proof can
+/// use the bodies already read; a window that fails its check keeps none.
 async fn body_window<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     state: &ModeState,
     addresses: Vec<String>,
     (from, end): (u64, u64),
     deadline: Option<Instant>,
-) -> Result<()> {
+    keep: bool,
+) -> Result<Vec<crate::address_partitions::VerifiedBlock>> {
     use crate::address_discovery::record_blocks_anchored;
     let pending = crate::address_discovery::Pending::begin(&state.history)?;
     let generation = pending.generation();
@@ -838,16 +953,20 @@ async fn body_window<M: Rpc, T: Rpc>(
         if let Some((b, h)) = anchor {
             pending.anchor(b, h);
         }
-        let found = d
-            .scan_with(&state.history, &addresses, from, end, &pending)
+        let scanned = d
+            .scan_with_blocks(&state.history, &addresses, from, end, &pending, keep)
             .await;
         let checked = check_anchor(d, &state.history, anchor, &pending.named()).await;
-        Ok((anchor, found, checked))
+        Ok((anchor, scanned, checked))
     })
     .await;
     state.set_calls("main", d.main.calls());
     state.set_calls("trace", d.trace.calls());
-    let (anchor, found, checked) = read?;
+    let (anchor, scanned, checked) = read?;
+    let (found, blocks) = match scanned {
+        Ok((found, blocks)) => (Ok(found), blocks),
+        Err(e) => (Err(e), Vec::new()),
+    };
     let history = state.history.clone();
     tokio::task::spawn_blocking(move || {
         pending.persist(&history, checked.is_ok())?;
@@ -863,7 +982,8 @@ async fn body_window<M: Rpc, T: Rpc>(
         }
         Ok::<_, anyhow::Error>(())
     })
-    .await?
+    .await??;
+    Ok(blocks)
 }
 
 /// A read, stopped at `deadline` if it has one. Only reads go through this: they write nothing, so
@@ -976,7 +1096,7 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 if stopped.contains(&address) {
                     continue;
                 }
-                serve_queued(state, self).await;
+                yield_cursor(state, self).await;
                 let next = match crate::address_discovery::next_uncovered(
                     &state.history,
                     &address,
@@ -1041,7 +1161,7 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             if let Some((source, blocks)) = state.mirror_blocks() {
                 mirror_pass(self, state, &watched, to, &source, blocks).await;
             }
-            serve_queued(state, self).await;
+            yield_cursor(state, self).await;
             scan_bodies(self, state, &watched, to, skip).await;
             mev_passes(self, state, &watched, to).await;
             validator_pass(self, state).await;
@@ -1304,6 +1424,7 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                 vec![address.to_string()],
                 (next, end),
                 Some(deadline),
+                false,
             )
             .await?;
         }
@@ -1381,11 +1502,12 @@ async fn mev_passes<M: Rpc, T: Rpc>(
     let Some(relays) = &state.relays else {
         return;
     };
+    let _pass = state.begin_pass("mev");
     let now = unix_now();
     let passes = async {
         for a in watched {
             loop {
-                serve_queued(state, d).await;
+                yield_cursor(state, d).await;
                 // Blocks covered in all, so a step that starts the coverage or joins two spans counts
                 // exactly what it added.
                 let through = |h: &AddressHistory| {
@@ -1425,7 +1547,7 @@ async fn mev_passes<M: Rpc, T: Rpc>(
             }
         }
         loop {
-            serve_queued(state, d).await;
+            yield_cursor(state, d).await;
             let more =
                 crate::address_mev::reask_pass(d, relays, &state.history, watched, now).await?;
             if !more {
@@ -1469,10 +1591,11 @@ async fn mirror_pass<M: Rpc, T: Rpc>(
     if lo > hi {
         return;
     }
+    let _pass = state.begin_pass("mirror");
     let mut ceiling: Option<u64> = None;
     let mut start = span_of(lo).0;
     while start <= hi {
-        serve_queued(state, d).await;
+        yield_cursor(state, d).await;
         let end = start + SPAN - 1;
         let clip = (start.max(lo), end.min(hi));
         let verified = |a: &String| {
@@ -1529,7 +1652,16 @@ async fn mirror_pass<M: Rpc, T: Rpc>(
         match outcome {
             Ok(()) => {
                 state.window_done();
-                tracing::info!("address history: partition [{start}, {end}] verified and read");
+                // `end` is the partition's last block. `end_block` can fall inside it, and the
+                // nest only read the clip: logging the partition would claim blocks past its end.
+                if clip.0 == start && clip.1 == end {
+                    tracing::info!("address history: partition [{start}, {end}] verified and read");
+                } else {
+                    tracing::info!(
+                        "address history: partition [{start}, {end}] verified and read through [{}, {}]",
+                        clip.0, clip.1
+                    );
+                }
             }
             Err(e) => {
                 state.window_failed();
@@ -1542,12 +1674,11 @@ async fn mirror_pass<M: Rpc, T: Rpc>(
     }
 }
 
-/// The validator pass (plan C). Everything is anchored at the block the RPC calls finalized, read
-/// by that tag once per pass: the mirror's spans newest first, each span's successor the first block
-/// of the span above it (already verified) and the newest one's linked to the finalized block by
-/// parent hashes; then the blocks above the mirror up to the finalized block less one, built here
-/// from the RPC and the beacon. A span that cannot be proven records nothing and ends its part of
-/// the pass.
+/// The validator pass (plan C). Anchored at the block the RPC calls finalized, read by that tag
+/// once per pass. A beacon proves the uncovered bridge above the mirror first and the spans hang
+/// from that header, so the bridge is fetched once; otherwise the newest span is linked to the
+/// finalized block by parent hashes and the tail is proven after. A span that cannot be proven
+/// records nothing and ends its part of the pass.
 async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, state: &ModeState) {
     let Some(validators) = state.validators.clone() else {
         return;
@@ -1560,6 +1691,7 @@ async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, 
             return;
         }
     };
+    let _pass = state.begin_pass("validators");
     let anchor = match crate::address_proposers::finalized_header(&d.main).await {
         Ok((h, _)) => h,
         Err(e) => {
@@ -1574,9 +1706,53 @@ async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, 
     // anchor. `end_block` bounds what is served, not what is proven.
     let ceiling = anchor.number.saturating_sub(1);
     let first = state.proposals_from();
+    let gap_from = |floor: u64| {
+        watched
+            .iter()
+            .filter_map(|v| validators.next_uncovered(*v, floor).ok())
+            .min()
+            .unwrap_or(floor)
+    };
     let mut mirror_end = None;
+    // Header of the first block above the mirror, once that whole bridge has been proven.
+    let mut bridge_header = None;
+    // The body scan already read these headers. Record them only when the newest is this
+    // finalized block and the oldest is the uncovered one: a shorter proof is read again from
+    // the hole, so it is not kept.
+    if let Some(held) = state.take_held() {
+        let floor = state
+            .mirror_blocks()
+            .map_or(first, |(_, blocks)| first.max(blocks.1 + 1));
+        let from = gap_from(floor);
+        if held.tip.header.number == anchor.number
+            && held.tip.hash == anchor.hash_slow()
+            && held.from == Some(from)
+            && from <= ceiling
+            && commit_scanned(d, state, &validators, &watched, &held.proven, from, ceiling).await
+        {
+            bridge_header = held.head;
+        }
+    }
     if let Some((source, blocks)) = state.mirror_blocks() {
         mirror_end = Some(blocks.1);
+        if let Some(beacon) = state.beacon.clone() {
+            let bridge_from = blocks.1 + 1;
+            let from = gap_from(first.max(bridge_from));
+            // A hole partway along the bridge is left to the link walk, which reads the whole gap.
+            if bridge_from <= ceiling && from == bridge_from {
+                bridge_header = prove_range(
+                    d,
+                    state,
+                    &validators,
+                    &watched,
+                    &beacon,
+                    from,
+                    ceiling,
+                    &anchor,
+                )
+                .await;
+            }
+        }
         if let Err(e) = mirror_spans(
             d,
             state,
@@ -1586,6 +1762,7 @@ async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, 
             blocks,
             &anchor,
             ceiling,
+            bridge_header.as_ref(),
         )
         .await
         {
@@ -1595,52 +1772,23 @@ async fn validator_pass<M: Rpc, T: Rpc>(d: &Discoverer<Counted<M>, Counted<T>>, 
             );
         }
     }
-    serve_queued(state, d).await;
+    yield_cursor(state, d).await;
     if let Some(beacon) = &state.beacon {
         // Above the mirror, from the first block any watched validator lacks there.
         let floor = mirror_end.map_or(first, |m| first.max(m + 1));
-        let from = watched
-            .iter()
-            .filter_map(|v| validators.next_uncovered(*v, floor).ok())
-            .min()
-            .unwrap_or(floor);
+        let from = gap_from(floor);
         if from <= ceiling {
-            let outcome = async {
-                let generation = validators.generation()?;
-                let (to, proven) = prove_tail(d, beacon, from, ceiling, &anchor, &watched, &|| {
-                    Box::pin(serve_queued(state, d))
-                })
-                .await?;
-                let lacking: Vec<u64> = watched
-                    .iter()
-                    .filter(|v| !validators.covers(**v, (from, to)).unwrap_or(false))
-                    .copied()
-                    .collect();
-                record_proven(
-                    d,
-                    state,
-                    &validators,
-                    &lacking,
-                    (from, to),
-                    &proven,
-                    generation,
-                )
-                .await
-            }
+            let _ = prove_range(
+                d,
+                state,
+                &validators,
+                &watched,
+                beacon,
+                from,
+                ceiling,
+                &anchor,
+            )
             .await;
-            state.set_calls("main", d.main.calls());
-            match outcome {
-                Ok(()) => {
-                    state.window_done();
-                    tracing::info!("address history: proposers proven over [{from}, {ceiling}], anchored at the finalized block");
-                }
-                Err(e) => {
-                    state.window_failed();
-                    tracing::warn!(
-                        "address history: proposers over [{from}, {ceiling}] not proven: {e:#}"
-                    );
-                }
-            }
         }
     }
     validator_retries(d, state, &validators).await;
@@ -1672,9 +1820,9 @@ async fn record_proven<M: Rpc, T: Rpc>(
 }
 
 /// The mirror's whole spans inside `[first, ceiling]` that some watched validator lacks, proven newest
-/// first. The newest span's successor is linked to `anchor` by the RPC's headers between them; every
-/// older span's successor is the first block of the span above it, verified in the step before, so
-/// the whole run hangs from the finalized block.
+/// first. `prelinked` is the header of the first block above the mirror when that bridge was just
+/// proven: the newest span hangs from it, or is linked only up to it. Without it, the newest span
+/// is linked to `anchor`. Every older span's successor is the first block of the span above it.
 #[allow(clippy::too_many_arguments)]
 async fn mirror_spans<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
@@ -1685,6 +1833,7 @@ async fn mirror_spans<M: Rpc, T: Rpc>(
     (_, mirror_last): (u64, u64),
     anchor: &alloy_consensus::Header,
     ceiling: u64,
+    prelinked: Option<&alloy_consensus::Header>,
 ) -> Result<()> {
     use crate::address_partitions::{span_of, SPAN};
     use crate::address_proposers as ap;
@@ -1709,26 +1858,32 @@ async fn mirror_spans<M: Rpc, T: Rpc>(
     let (Some(&lowest), Some(&top)) = (needed.first(), needed.last()) else {
         return Ok(());
     };
-    // The newest needed span's successor, linked by parent hashes to the finalized block.
+    // The newest needed span's successor. A proven bridge's first header already reaches the
+    // finalized block, so the span hangs from it and those headers are not read again.
     let top_end = top + SPAN - 1;
     let mut successor = if top_end + 1 == anchor.number {
         anchor.clone()
+    } else if let Some(h) = prelinked.filter(|h| h.number == top_end + 1) {
+        h.clone()
     } else {
-        let (lo, hi) = (top_end + 1, anchor.number - 1);
+        let hang = prelinked
+            .filter(|h| top_end + 1 < h.number)
+            .unwrap_or(anchor);
+        let (lo, hi) = (top_end + 1, hang.number - 1);
         if hi - lo + 1 > LOCAL_CATALOGUE_MAX {
             bail!(
                 "the mirror's spans end {} blocks under the finalized block, over the {LOCAL_CATALOGUE_MAX} a nest links itself",
                 hi - lo + 1
             );
         }
-        ap::linked_to(&d.main, (lo, hi), anchor, &|| {
-            Box::pin(serve_queued(state, d))
+        ap::linked_to(&d.main, (lo, hi), hang, &|| {
+            Box::pin(yield_cursor(state, d))
         })
         .await?
     };
     let mut span = top;
     loop {
-        serve_queued(state, d).await;
+        yield_cursor(state, d).await;
         let end = span + SPAN - 1;
         let generation = validators.generation()?;
         let mut verified = None;
@@ -1811,6 +1966,7 @@ const RETRY_EVERY_SECS: u64 = 60 * 60;
 /// Every block of `[from, to]` (`to` at most `anchor`'s parent) with its proven proposer, built here
 /// from the RPC and the beacon and linked to `anchor`, the block the RPC calls finalized, through
 /// every block between: a self-consistent fork the RPC returned for the range cannot reach it.
+/// The header of block `from` is what the block under it hangs from.
 async fn prove_tail<'b, M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     beacon: &crate::address_proposers::Beacon,
@@ -1819,7 +1975,11 @@ async fn prove_tail<'b, M: Rpc, T: Rpc>(
     anchor: &alloy_consensus::Header,
     keep: &[u64],
     between: &(dyn Fn() -> futures::future::BoxFuture<'b, ()> + Sync),
-) -> Result<(u64, Vec<crate::address_proposers::Proven>)> {
+) -> Result<(
+    u64,
+    Vec<crate::address_proposers::Proven>,
+    alloy_consensus::Header,
+)> {
     use crate::address_proposers as ap;
     let last = anchor.number.saturating_sub(1);
     if to < from || to > last {
@@ -1842,8 +2002,14 @@ async fn prove_tail<'b, M: Rpc, T: Rpc>(
     let mut hi = last;
     loop {
         let lo = hi.saturating_sub(ap::CHUNK - 1).max(from);
-        let blocks = ap::blocks_from_rpc(&d.main, (lo, hi), 8).await?;
-        let rows = ap::build_rows(beacon, &blocks, &successor, (lo, hi), 8).await?;
+        // Served while the chunk is in flight, not only after it: a slow beacon read that succeeds
+        // holds every tip request queued behind this one chunk.
+        let blocks = while_serving(ap::blocks_from_rpc(&d.main, (lo, hi), 8), between).await?;
+        let rows = while_serving(
+            ap::build_rows(beacon, &blocks, &successor, (lo, hi), 8),
+            between,
+        )
+        .await?;
         let chunk = ap::verify(&rows, &blocks, &successor, (lo, hi))?;
         successor = blocks[0].header.clone();
         proven.extend(
@@ -1858,7 +2024,114 @@ async fn prove_tail<'b, M: Rpc, T: Rpc>(
         between().await;
     }
     proven.sort_by_key(|p| p.block.header.number);
-    Ok((to, proven))
+    Ok((to, proven, successor))
+}
+
+/// Prove `[from, ceiling]` and record it for the watched validators who lack it. The header of
+/// block `from` lets a mirror span hang from the bridge without reading it again. `None` on
+/// failure: the caller links and proves the range as it did without this.
+#[allow(clippy::too_many_arguments)]
+async fn prove_range<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    validators: &crate::address_validators::Validators,
+    watched: &[u64],
+    beacon: &crate::address_proposers::Beacon,
+    from: u64,
+    ceiling: u64,
+    anchor: &alloy_consensus::Header,
+) -> Option<alloy_consensus::Header> {
+    let outcome = async {
+        let generation = validators.generation()?;
+        let (to, proven, header) = prove_tail(d, beacon, from, ceiling, anchor, watched, &|| {
+            Box::pin(yield_cursor(state, d))
+        })
+        .await?;
+        let lacking: Vec<u64> = watched
+            .iter()
+            .filter(|v| !validators.covers(**v, (from, to)).unwrap_or(false))
+            .copied()
+            .collect();
+        record_proven(
+            d,
+            state,
+            validators,
+            &lacking,
+            (from, to),
+            &proven,
+            generation,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(header)
+    }
+    .await;
+    state.set_calls("main", d.main.calls());
+    match outcome {
+        Ok(header) => {
+            state.window_done();
+            tracing::info!(
+                "address history: proposers proven over [{from}, {ceiling}], anchored at the finalized block"
+            );
+            Some(header)
+        }
+        Err(e) => {
+            state.window_failed();
+            tracing::warn!("address history: proposers over [{from}, {ceiling}] not proven: {e:#}");
+            None
+        }
+    }
+}
+
+/// Record a proof the body scan already built, the same way [`prove_range`] records one it read.
+/// False when it was not recorded, so the caller reads the range itself.
+async fn commit_scanned<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    validators: &crate::address_validators::Validators,
+    watched: &[u64],
+    proven: &[crate::address_proposers::Proven],
+    from: u64,
+    ceiling: u64,
+) -> bool {
+    let lacking: Vec<u64> = watched
+        .iter()
+        .filter(|v| !validators.covers(**v, (from, ceiling)).unwrap_or(false))
+        .copied()
+        .collect();
+    // An empty slice still moves the generation, and a proof read against the old one is then refused.
+    if lacking.is_empty() {
+        return false;
+    }
+    let outcome = async {
+        let generation = validators.generation()?;
+        record_proven(
+            d,
+            state,
+            validators,
+            &lacking,
+            (from, ceiling),
+            proven,
+            generation,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    state.set_calls("main", d.main.calls());
+    match outcome {
+        Ok(()) => {
+            state.window_done();
+            tracing::info!(
+                "address history: proposers proven over [{from}, {ceiling}], anchored at the finalized block"
+            );
+            true
+        }
+        Err(e) => {
+            state.window_failed();
+            tracing::warn!("address history: proposers over [{from}, {ceiling}] not proven: {e:#}");
+            false
+        }
+    }
 }
 
 /// The served row of one proven block. Its reward comes from the block's own transactions and
@@ -2067,6 +2340,127 @@ async fn validator_retries<M: Rpc, T: Rpc>(
     state.set_calls("main", d.main.calls());
 }
 
+/// Fold `blocks` into the held proof. The last stays the tip the next window must follow; the rest
+/// are proven from the beacon, in chunks, and only the watched proposers' rows are kept. A gap or a
+/// beacon failure drops the hold. The body record is the caller's, and is left as it is.
+async fn note_scanned<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    blocks: Vec<crate::address_partitions::VerifiedBlock>,
+) -> Result<()> {
+    use crate::address_proposers::{build_rows, verify, CHUNK};
+    let prev = state.take_held();
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    let follows = prev.as_ref().is_some_and(|prev| {
+        blocks[0].header.number == prev.tip.header.number + 1
+            && blocks[0].header.parent_hash == prev.tip.hash
+    });
+    let (carried, mut chain) = if follows {
+        let HeldBridge {
+            from,
+            head,
+            tip,
+            proven,
+        } = prev.expect("follows");
+        let mut chain = blocks;
+        chain.insert(0, tip);
+        (Some((from, head, proven)), chain)
+    } else {
+        (None, blocks)
+    };
+    let (mut from, mut head, mut proven) = carried.unwrap_or((None, None, Vec::new()));
+    if chain.len() < 2 {
+        state.set_held(HeldBridge {
+            from,
+            head,
+            tip: chain.pop().expect("one block"),
+            proven,
+        });
+        return Ok(());
+    }
+    let tip = chain.pop().expect("the last block");
+    let cat = state.proposals_from();
+    if chain.last().is_none_or(|b| b.header.number < cat) {
+        state.set_held(HeldBridge {
+            from,
+            head,
+            tip,
+            proven,
+        });
+        return Ok(());
+    }
+    let clip: Vec<_> = chain
+        .into_iter()
+        .filter(|b| b.header.number >= cat)
+        .collect();
+    let last = clip.last().expect("a block at or after the catalogue");
+    if tip.header.number != last.header.number + 1 || tip.header.parent_hash != last.hash {
+        bail!(
+            "block {} does not follow block {}",
+            tip.header.number,
+            last.header.number
+        );
+    }
+    for pair in clip.windows(2) {
+        if pair[1].header.number != pair[0].header.number + 1
+            || pair[1].header.parent_hash != pair[0].hash
+        {
+            bail!(
+                "block {} does not follow block {}",
+                pair[1].header.number,
+                pair[0].header.number
+            );
+        }
+    }
+    let beacon = state
+        .beacon
+        .clone()
+        .context("the proposer proof has no beacon")?;
+    let watched = state
+        .validators
+        .as_ref()
+        .context("the proposer proof has no validators")?
+        .watched()?;
+    let mut start = 0;
+    while start < clip.len() {
+        let end = (start + CHUNK as usize).min(clip.len());
+        let chunk = &clip[start..end];
+        let successor = if end == clip.len() {
+            &tip.header
+        } else {
+            &clip[end].header
+        };
+        let lo = chunk[0].header.number;
+        let hi = chunk[chunk.len() - 1].header.number;
+        let rows = while_serving(build_rows(&beacon, chunk, successor, (lo, hi), 8), &|| {
+            Box::pin(yield_cursor(state, d))
+        })
+        .await?;
+        let got = verify(&rows, chunk, successor, (lo, hi))?;
+        proven.extend(
+            got.into_iter()
+                .filter(|p| watched.contains(&p.proposer_index)),
+        );
+        if from.is_none() {
+            from = Some(lo);
+            head = Some(chunk[0].header.clone());
+        }
+        start = end;
+        if start < clip.len() {
+            yield_cursor(state, d).await;
+        }
+    }
+    state.set_held(HeldBridge {
+        from,
+        head,
+        tip,
+        proven,
+    });
+    Ok(())
+}
+
 /// The block-body pass: each window is read once for every watched address that still lacks it,
 /// starting from the least covered, so an address watched later backfills without a second scan
 /// of what the others already have.
@@ -2079,17 +2473,22 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
     skip: Option<(u64, u64)>,
 ) {
     use crate::address_discovery::{next_uncovered_for, BLOCK_SCANNED, BLOCK_WINDOW};
+    // A hold from an earlier pass must not be committed: this pass may not reach the finalized block.
+    state.clear_held();
+    let mut keep = state.beacon.is_some() && state.validators.is_some();
+    let _pass = state.begin_pass("bodies");
     let mut last: Option<u64> = None;
     let mut cursor = state.start_block;
     let mut pace = Pace::new(250, 16, BLOCK_WINDOW, state.deadline);
     loop {
-        serve_queued(state, d).await;
+        yield_cursor(state, d).await;
         let mut next = Vec::new();
         for a in watched {
             match next_uncovered_for(&state.history, a, cursor, &BLOCK_SCANNED) {
                 Ok(n) => next.push((a.clone(), n)),
                 Err(e) => {
                     tracing::warn!("address history: block coverage for {a}: {e:#}");
+                    state.clear_held();
                     return;
                 }
             }
@@ -2103,6 +2502,7 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
         }
         if last.is_some_and(|l| from <= l) {
             state.window_failed();
+            state.clear_held();
             tracing::error!(
                 "address history: block coverage did not advance past {from}; stopping this pass"
             );
@@ -2120,7 +2520,7 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
             .map(|(a, _)| a)
             .collect();
         let started = Instant::now();
-        let outcome = body_window(d, state, addresses, (from, end), None).await;
+        let outcome = body_window(d, state, addresses, (from, end), None, keep).await;
         pace.took(started.elapsed());
         if outcome.is_ok() {
             state.body_rate.store(
@@ -2129,12 +2529,22 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
             );
         }
         match outcome {
-            Ok(()) => {
+            Ok(blocks) => {
+                if keep {
+                    if let Err(e) = note_scanned(d, state, blocks).await {
+                        tracing::warn!(
+                            "address history: scanned blocks not kept for the proposer proof: {e:#}"
+                        );
+                        state.clear_held();
+                        keep = false;
+                    }
+                }
                 last = Some(end);
                 state.window_done();
                 tracing::info!("address history: block bodies read through {end}");
             }
             Err(e) => {
+                state.clear_held();
                 state.window_failed();
                 tracing::warn!(
                     "address history: bodies [{from}, {end}] not recorded, retrying next poll: {e:#}"
@@ -2519,6 +2929,14 @@ async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Op
             }
         })
         .sum();
+    // The polled chain tip, and only that. A zero means the tip has not been read yet: the
+    // finalized head sits behind it by the finality depth, and a tip request is not above the chain.
+    let chain = s.latest.load(Ordering::Relaxed);
+    if chain > 0 && from > chain {
+        return Some(format!(
+            "the chain head is block {chain}; this range starts at block {from}, above it"
+        ));
+    }
     if load <= 1.0 {
         return None;
     }
@@ -2526,11 +2944,16 @@ async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Op
     let gap = to
         .saturating_sub(next)
         .saturating_add(u64::from(next <= to));
+    let covered = next.saturating_sub(1);
+    let covered = if chain > 0 {
+        covered.min(chain)
+    } else {
+        covered
+    };
     Some(()).map(|()| {
         format!(
-            "covered through block {}; the {gap} blocks above it are being backfilled, more than can \
+            "covered through block {covered}; the {gap} blocks above it are being backfilled, more than can \
              be covered within the {}s deadline; ask again later",
-            next.saturating_sub(1),
             s.deadline.as_secs()
         )
     })
@@ -3069,6 +3492,10 @@ async fn ready(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
                 "tip": s.history.tip().ok().flatten(),
                 "poll_interval_secs": s.poll_interval.as_secs(),
                 "stalled": s.stalled(),
+                "holding": match s.holding() {
+                    Some((pass, secs)) => json!({"pass": pass, "secs": secs}),
+                    None => Value::Null,
+                },
                 "watched": watched,
             })),
         ),
@@ -3104,6 +3531,7 @@ async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
         "# HELP nuthatch_address_history_rpc_calls_total RPC calls by endpoint role and method.\n\
          # TYPE nuthatch_address_history_rpc_calls_total counter\n",
     );
+    let holding = s.holding().map(|(_, secs)| secs).unwrap_or(0);
     for ((endpoint, method), n) in s.calls.lock().expect("calls lock").iter() {
         by_method.push_str(&format!(
             "nuthatch_address_history_rpc_calls_total{{endpoint=\"{endpoint}\",method=\"{method}\"}} {n}\n"
@@ -3124,6 +3552,9 @@ async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
          nuthatch_address_history_poll_errors_total {}\n\
          # TYPE nuthatch_address_history_head gauge\n\
          nuthatch_address_history_head {head}\n\
+         # HELP nuthatch_address_history_holding_seconds Seconds the current pass has held the cursor; 0 when none does.\n\
+         # TYPE nuthatch_address_history_holding_seconds gauge\n\
+         nuthatch_address_history_holding_seconds {holding}\n\
          # TYPE nuthatch_address_history_watched gauge\n\
          nuthatch_address_history_watched {watched}\n",
         s.windows.load(Ordering::Relaxed),
@@ -3665,6 +4096,7 @@ mod tests {
                     (start, end),
                     &finalized,
                     finalized.number - 1,
+                    None,
                 )
                 .await;
                 (
@@ -3717,6 +4149,7 @@ mod tests {
                 (start + 5_000, end),
                 &anchor,
                 anchor.number - 1,
+                None,
             )
             .await;
             assert!(validators.covers(validator, (start, end)).unwrap());
@@ -3757,6 +4190,148 @@ mod tests {
         let (done, covered, _dir) = run(other).await;
         assert!(format!("{:#}", done.unwrap_err()).contains("do not lead to it"));
         assert!(!covered);
+    }
+
+    #[tokio::test]
+    async fn the_bridge_above_the_mirror_is_read_once() {
+        use crate::address_partitions::{encode, partition_key, Published, Source, SPAN};
+        use crate::address_proposers::{
+            catalogue_key, encode as encode_catalogue, tests as pt, Beacon,
+        };
+        let start = 23_560_000u64;
+        let end = start + SPAN - 1;
+        // The span, the two blocks above it, and the finalized block.
+        let (blocks, rows, anchor) = pt::chain_from(start, 12_800_000, SPAN as usize + 2);
+        let mirror = tempfile::tempdir().unwrap();
+        let put = |key: String, bytes: Vec<u8>| {
+            let path = mirror.path().join(key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        let published: Vec<Published> = blocks[..SPAN as usize]
+            .iter()
+            .map(|b| {
+                let mut header = Vec::new();
+                alloy_rlp::Encodable::encode(&b.header, &mut header);
+                let mut empty = Vec::new();
+                alloy_rlp::encode_list::<alloy_rpc_types_eth::Withdrawal, _>(&[], &mut empty);
+                Published {
+                    number: b.header.number,
+                    header,
+                    withdrawals: Some(empty),
+                }
+            })
+            .collect();
+        put(partition_key(1, start), encode(&published).unwrap());
+        put(
+            catalogue_key(1, start),
+            encode_catalogue(&rows[..SPAN as usize]).unwrap(),
+        );
+        let bridge: BTreeMap<u64, Value> = blocks[SPAN as usize..]
+            .iter()
+            .map(|b| (b.header.number, header_json(&b.header)))
+            .collect();
+        // The file is named from the first row's slot, and the span's slots are an earlier window.
+        let cache = tempfile::tempdir().unwrap();
+        pt::write_cache(cache.path(), &rows[SPAN as usize..], &[]);
+        let beacon = Arc::new(Beacon::new(None, Some(cache.path().to_path_buf())).unwrap());
+        // Proposed none of these blocks, so the proof records coverage and reads no reward.
+        let validator = 1;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store.clone(), 1, &[]).unwrap();
+        let validators = crate::address_validators::Validators::open(store, &[validator]).unwrap();
+        let source = Arc::new(
+            Source::open(
+                mirror.path().to_str().unwrap(),
+                1,
+                dir.path().join("cache"),
+                1 << 30,
+            )
+            .unwrap(),
+        );
+        let state = ModeState::new(history, 1, Duration::from_secs(300), true)
+            .with_range(start, None, 64)
+            .with_validators(validators.clone(), Some(beacon))
+            .with_mirror(source, (start, end));
+        let make = || Headers {
+            by_number: bridge.clone(),
+            finalized: header_json(&anchor),
+        };
+        let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+        validator_pass(&d, &state).await;
+        assert_eq!(
+            d.main.calls().get("eth_getBlockByNumber").copied(),
+            Some(3),
+            "the finalized block, then the two above the mirror, and not again to link them"
+        );
+        assert_eq!(d.main.calls().get("eth_getBlockByHash").copied(), None);
+        assert!(validators.covers(validator, (start, end)).unwrap());
+        assert!(validators
+            .covers(validator, (end + 1, anchor.number - 1))
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_scanned_bridge_is_not_fetched_again() {
+        use crate::address_proposers::{
+            tests as pt, Beacon, CATALOGUE_FROM_BLOCK, CATALOGUE_FROM_SLOT,
+        };
+        // At the catalogue, not at Dencun: a scan below the catalogue never starts a proof.
+        // The body pace starts at 250, so the finalized block is a second window.
+        let (blocks, rows, anchor) = pt::chain_from(CATALOGUE_FROM_BLOCK, CATALOGUE_FROM_SLOT, 250);
+        let cache = tempfile::tempdir().unwrap();
+        pt::write_cache(cache.path(), &rows, &[]);
+        let beacon = Arc::new(Beacon::new(None, Some(cache.path().to_path_buf())).unwrap());
+        let mut by_number: BTreeMap<u64, Value> = blocks
+            .iter()
+            .map(|b| (b.header.number, header_json(&b.header)))
+            .collect();
+        by_number.insert(anchor.number, header_json(&anchor));
+        for v in by_number.values_mut() {
+            // Past Shanghai a body without its withdrawals array fails the scan.
+            v["withdrawals"] = json!([]);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store.clone(), 1, &[ALICE.into()]).unwrap();
+        // Proposed none of these blocks, so the proof records coverage and reads no reward.
+        let validators = crate::address_validators::Validators::open(store, &[1]).unwrap();
+        let state = ModeState::new(history, 1, Duration::from_secs(300), true)
+            .with_range(CATALOGUE_FROM_BLOCK, None, 64)
+            .with_validators(validators.clone(), Some(beacon));
+        let make = || Headers {
+            by_number: by_number.clone(),
+            finalized: {
+                let mut v = header_json(&anchor);
+                v["withdrawals"] = json!([]);
+                v
+            },
+        };
+        let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+        scan_bodies(&d, &state, &[ALICE.to_string()], anchor.number, None).await;
+        let before = d
+            .main
+            .calls()
+            .get("eth_getBlockByNumber")
+            .copied()
+            .unwrap_or(0);
+        validator_pass(&d, &state).await;
+        let after = d
+            .main
+            .calls()
+            .get("eth_getBlockByNumber")
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            after - before,
+            1,
+            "the finalized tag, and not the blocks the body scan already read"
+        );
+        assert_eq!(d.main.calls().get("eth_getBlockByHash").copied(), None);
+        assert!(validators
+            .covers(1, (CATALOGUE_FROM_BLOCK, anchor.number - 1))
+            .unwrap());
     }
 
     #[tokio::test]
@@ -4020,7 +4595,7 @@ mod tests {
             served.fetch_add(1, Ordering::Relaxed);
             Box::pin(async {})
         };
-        let (to, proven) = prove_tail(
+        let (to, proven, _) = prove_tail(
             &rpc(&successor),
             &beacon,
             DENEB_BLOCK,
@@ -4392,6 +4967,35 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(475));
     }
 
+    /// A startblock above the chain head is not coverage and not a backfill. The blocks are not
+    /// there, and the refusal must not name a block above the head.
+    #[tokio::test]
+    async fn a_start_above_the_chain_head_is_not_called_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(100).unwrap();
+        let s = Arc::new(ModeState::new(history, 1, Duration::from_secs(300), true));
+        s.latest.store(100, Ordering::Relaxed);
+        s.backfill_rate.store(1, Ordering::Relaxed);
+        let path = format!(
+            "/api?module=account&action=txlist&address={ALICE}&startblock=150&endblock=400"
+        );
+        let started = Instant::now();
+        let (_, v) = call(router(s), "GET", &path, None).await;
+        let msg = v["result"].as_str().unwrap();
+        assert!(msg.contains("chain head is block 100"), "{v}");
+        assert!(msg.contains("starts at block 150"), "{v}");
+        assert!(!msg.contains("covered through block"), "{v}");
+        // 200ms of wall clock fails on a full shard. The deadline is 8s; a second still proves
+        // this did not wait it out.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     /// A measured rate under a block a minute is still measured: it is never read as no rate.
     #[test]
     fn a_slow_measured_rate_is_never_read_as_unmeasured() {
@@ -4504,7 +5108,13 @@ mod tests {
                 .contains("covered through block"),
             "{v}"
         );
-        assert!(started.elapsed() < Duration::from_millis(200));
+        // 200ms of wall clock fails on a full shard. The admitted path waits out the 2s
+        // deadline, so a second and a half still shows this was refused without that wait.
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "{:?}",
+            started.elapsed()
+        );
         // The same gap for transactions alone is within discovery's reach: it goes to the cursor
         // (none runs here, so it waits out the deadline).
         let started = Instant::now();
@@ -4531,7 +5141,11 @@ mod tests {
                 .contains("covered through block"),
             "{v}"
         );
-        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// A timestamp search after one that outran its half of the deadline is refused at once.
@@ -4567,7 +5181,13 @@ mod tests {
                 .contains("last timestamp search"),
             "{v}"
         );
-        assert!(started.elapsed() < Duration::from_millis(200));
+        // The busy path would wait the one-second search budget. A full shard spent about half
+        // a second on the refusal itself.
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// A conflict found while a request is being answered refuses that answer too.
@@ -4769,6 +5389,87 @@ mod tests {
         let ms = u64::try_from(fresh.started.elapsed().as_millis()).unwrap();
         fresh.last_poll.store(ms + 1, Ordering::Relaxed);
         assert!(!fresh.stalled(), "a poll just now");
+    }
+
+    /// A pass that has the cursor is named on /ready, and a poll that is due runs during it, so the
+    /// head does not sit where the pass started.
+    #[tokio::test]
+    async fn a_pass_is_named_and_a_due_poll_runs_during_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // Long enough that opening the store and one reconcile do not look like three missed polls,
+        // and that the second call is still inside the interval the first one just started.
+        let interval = Duration::from_secs(2);
+        let s = Arc::new(ModeState::new(
+            state(dir.path(), true).history.clone(),
+            1,
+            interval,
+            true,
+        ));
+        s.history.set_head(4).unwrap();
+        let hold = s.begin_pass("validators");
+        let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert_eq!(r["holding"]["pass"], "validators", "{r}");
+        assert_eq!(r["stalled"], false, "{r}");
+        drop(hold);
+        let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert!(r["holding"].is_null(), "{r}");
+
+        // 1 is "polled as the cursor started". Waiting out the interval is what makes the next one due.
+        s.last_poll.store(1, Ordering::Relaxed);
+        tokio::time::sleep(interval).await;
+        let source = fixed(50, 1);
+        resume_head(&s, source.as_ref(), &()).await;
+        assert_eq!(
+            source.reads.load(Ordering::Relaxed),
+            1,
+            "one poll, once due"
+        );
+        assert_eq!(s.history.head().unwrap(), Some(50));
+        assert_eq!(s.polls.load(Ordering::Relaxed), 1);
+        resume_head(&s, source.as_ref(), &()).await;
+        assert_eq!(
+            source.reads.load(Ordering::Relaxed),
+            1,
+            "not again before the interval"
+        );
+    }
+
+    /// A read that is still in flight does not hold the queue until it finishes.
+    #[tokio::test]
+    async fn a_slow_read_serves_what_is_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        s.requests
+            .send(Request::Cover {
+                address: ALICE.into(),
+                need: Need::Discovered,
+                from: 1,
+                to: 2,
+                deadline: Instant::now() + Duration::from_secs(2),
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        let served = AtomicU64::new(0);
+        let out = while_serving(
+            async {
+                tokio::time::sleep(Duration::from_millis(180)).await;
+                7
+            },
+            &|| {
+                served.fetch_add(1, Ordering::Relaxed);
+                Box::pin(serve_queued(&s, &()))
+            },
+        )
+        .await;
+        assert_eq!(out, 7);
+        assert!(
+            served.load(Ordering::Relaxed) >= 2,
+            "the queue was served while the read was in flight"
+        );
+        let answer = rx.await.unwrap();
+        assert!(answer.is_err(), "{answer:?}");
     }
 
     #[tokio::test]
@@ -6493,7 +7194,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("deadline"), "{err:#}");
-        let err = body_window(&d, &s, vec![ALICE.to_string()], (101, 120), deadline)
+        let err = body_window(&d, &s, vec![ALICE.to_string()], (101, 120), deadline, false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("deadline"), "{err:#}");
@@ -6606,9 +7307,11 @@ mod tests {
                 s.history.generation().unwrap(),
             )
             .unwrap();
+        // Fifty milliseconds loses to the blocking read on a full shard, and the outer
+        // timeout then says "0s". Two seconds lets the cursor's own refusal answer.
         let s2 = Arc::new(
             ModeState::new(s.history.clone(), 1, Duration::from_secs(300), true)
-                .with_deadline(Duration::from_millis(50)),
+                .with_deadline(Duration::from_secs(2)),
         );
         let q =
             format!("/api?module=account&action=txlist&address={ALICE}&startblock=0&endblock=100");

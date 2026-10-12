@@ -111,7 +111,11 @@ jobs:
         # a run with survivors were equally invisible. The verdict now comes from the artifact, which
         # can tell those two apart; the raw status stays visible in this step's log.
         continue-on-error: true
-        run: cargo mutants --no-shuffle -j 2 --file ${{ matrix.file }} --shard ${{ matrix.shard }} -- --lib
+        # The wide-batch RSS test measures the child process, and on a loaded runner it sits a few
+        # tens of megabytes over its 512 MiB ceiling before any mutant is scored (#2030, run
+        # 38128606532). Skipping it here leaves it in the ordinary suite. A baseline entry cannot
+        # help: the failure is the unmutated tree, not a survivor.
+        run: cargo mutants --no-shuffle -j 2 --file ${{ matrix.file }} --shard ${{ matrix.shard }} -- --lib -- --skip a_wide_batch_stays_under_the_cursor
 
       # `if: always()` so the reading survives the failure it explains - the whole point of #733's
       # trailing `df` in `ci.yml`. Without it, the run that runs out of disk is the one run with no

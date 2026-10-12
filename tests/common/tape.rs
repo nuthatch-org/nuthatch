@@ -622,13 +622,46 @@ pub async fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> b
     }
 }
 
+/// Wait until `cond` holds. `stall` is how long `progress` may sit still, not a cap on a run that
+/// is still moving: a busy runner that keeps indexing keeps its time. `ceiling` stops a hang.
+pub async fn wait_until_progress<F, P, T>(
+    stall: Duration,
+    ceiling: Duration,
+    mut cond: F,
+    mut progress: P,
+) -> bool
+where
+    F: FnMut() -> bool,
+    P: FnMut() -> T,
+    T: PartialEq,
+{
+    let start = Instant::now();
+    let mut since_move = Instant::now();
+    let mut last = progress();
+    loop {
+        if cond() {
+            return true;
+        }
+        let now = progress();
+        if now != last {
+            last = now;
+            since_move = Instant::now();
+        }
+        if since_move.elapsed() >= stall || start.elapsed() >= ceiling {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// A generous ceiling for a bounded poll. The loop's own idle re-poll is ~2 s, so this comfortably
 /// covers reorg detection + reconvergence while still failing fast on a genuine hang.
 pub const POLL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Waiting for a tip-path seal now means decoding and writing
 /// [`nuthatch::indexer::SEAL_DIRECT_BATCH`] rows, which is more than [`POLL_TIMEOUT`] on a
-/// debug build. Last-block waits stay on [`POLL_TIMEOUT`].
+/// debug build. A last-block wait inside that window uses this too: `last_block` does not move
+/// until the window commits (#1989, #2017).
 pub const SEAL_POLL_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Seal `from..=to` through the public seal API and prune the hot store.
