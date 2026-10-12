@@ -4987,8 +4987,10 @@ mod tests {
         assert!(msg.contains("chain head is block 100"), "{v}");
         assert!(msg.contains("starts at block 150"), "{v}");
         assert!(!msg.contains("covered through block"), "{v}");
+        // 200ms of wall clock fails on a full shard. The deadline is 8s; a second still proves
+        // this did not wait it out.
         assert!(
-            started.elapsed() < Duration::from_millis(200),
+            started.elapsed() < Duration::from_secs(1),
             "{:?}",
             started.elapsed()
         );
@@ -5169,7 +5171,13 @@ mod tests {
                 .contains("last timestamp search"),
             "{v}"
         );
-        assert!(started.elapsed() < Duration::from_millis(200));
+        // The busy path would wait the one-second search budget. A full shard spent about half
+        // a second on the refusal itself.
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// A conflict found while a request is being answered refuses that answer too.
