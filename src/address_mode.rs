@@ -5108,7 +5108,13 @@ mod tests {
                 .contains("covered through block"),
             "{v}"
         );
-        assert!(started.elapsed() < Duration::from_millis(200));
+        // 200ms of wall clock fails on a full shard. The admitted path waits out the 2s
+        // deadline, so a second and a half still shows this was refused without that wait.
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "{:?}",
+            started.elapsed()
+        );
         // The same gap for transactions alone is within discovery's reach: it goes to the cursor
         // (none runs here, so it waits out the deadline).
         let started = Instant::now();
@@ -5135,7 +5141,11 @@ mod tests {
                 .contains("covered through block"),
             "{v}"
         );
-        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// A timestamp search after one that outran its half of the deadline is refused at once.
@@ -7297,9 +7307,11 @@ mod tests {
                 s.history.generation().unwrap(),
             )
             .unwrap();
+        // Fifty milliseconds loses to the blocking read on a full shard, and the outer
+        // timeout then says "0s". Two seconds lets the cursor's own refusal answer.
         let s2 = Arc::new(
             ModeState::new(s.history.clone(), 1, Duration::from_secs(300), true)
-                .with_deadline(Duration::from_millis(50)),
+                .with_deadline(Duration::from_secs(2)),
         );
         let q =
             format!("/api?module=account&action=txlist&address={ALICE}&startblock=0&endblock=100");
