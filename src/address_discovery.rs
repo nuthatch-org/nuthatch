@@ -549,11 +549,12 @@ fn frame_side_is(f: &Value, side: &str, a: &str) -> bool {
 /// Cache entries a window fetched, committed once at its end rather than one commit per fetch,
 /// and committed whether or not the window is recorded, so a retried window refetches nothing.
 type CachedTx = (Vec<u8>, Map<String, Value>);
+type CachedStamp = (u64, u64, Option<[u8; 32]>);
 
 #[derive(Default)]
 pub struct Pending {
     txs: Mutex<Vec<CachedTx>>,
-    timestamps: Mutex<Vec<(u64, u64, Option<[u8; 32]>)>>,
+    timestamps: Mutex<Vec<CachedStamp>>,
     /// A transaction's whole internal list, by hash, for `txhash` lookups.
     internals: Mutex<Vec<crate::address_history::TxInternals>>,
     /// Block hashes above the finalized head that what was fetched was read against, tracked once
