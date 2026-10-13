@@ -249,12 +249,16 @@ const BSC: Chain = Chain {
 /// getLogs over a range (`-32701 Please specify an address`) and ten or more addresses (HTTP 403
 /// `Request blocked`; nine served), as its BSC sibling does. `polygon.drpc.org` takes both, so
 /// `topic0_only_getlogs` stays true and a refusal fails over to it.
+///
+/// Measured 2026-10-13 (#2040): publicnode now fails even a 10-block getLogs a few thousand blocks
+/// behind tip, so it is gone. `polygon.gateway.tenderly.co` replaces it: archive state, a
+/// 163,840-block window, batch 10, topic0-only getLogs served. Twelve other keyless endpoints refused.
 const POLYGON: Chain = Chain {
     name: "polygon",
     chain_id: 137,
     rpc_urls: &[
         "https://polygon.drpc.org",
-        "https://polygon-bor-rpc.publicnode.com",
+        "https://polygon.gateway.tenderly.co",
     ],
     // Heimdall checkpoints are the real finality signal and the tag reflects them; the fallback is
     // sized for a checkpoint interval rather than a block time.
