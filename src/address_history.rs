@@ -291,6 +291,11 @@ const UNWATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_unwatched
 /// Addresses a request has asked for withdrawals or produced blocks. Only these are body-scanned in
 /// the background: a plain wallet is never asked, and the scan costs one body a block.
 const BODIES_ASKED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_bodies_asked");
+/// RFC-0064's sweep: the span of blocks it has read, held once for every swept address, and the
+/// block each address joined it at. An address's sweep coverage is that span from its joined block on.
+const SWEEP: TableDefinition<&str, &[u8]> = TableDefinition::new("ah_sweep");
+const SWEPT: &str = "swept";
+const JOINED: TableDefinition<&[u8], u64> = TableDefinition::new("ah_joined");
 /// Block hashes above the finalized head that stored history was read against. The highest anchors
 /// everything below it, so one comparison per poll finds a reorg.
 const CANON: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_canon");
@@ -501,6 +506,8 @@ impl AddressHistory {
         wtx.open_table(FINAL)?;
         wtx.open_table(CONFLICT)?;
         wtx.open_table(BODIES_ASKED)?;
+        wtx.open_table(SWEEP)?;
+        wtx.open_table(JOINED)?;
         reset_produced_blocks(&wtx)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
@@ -1032,6 +1039,7 @@ impl AddressHistory {
             wtx.open_table(WATCHED)?.remove(a.as_slice())?;
             wtx.open_table(UNWATCHED)?.insert(a.as_slice(), 1)?;
             wtx.open_table(BODIES_ASKED)?.remove(a.as_slice())?;
+            wtx.open_table(JOINED)?.remove(a.as_slice())?;
             let lo = row_key(&a, 0, 0, 0);
             let hi = row_key(&a, u64::MAX, u64::MAX, u64::MAX);
             for action in Action::ALL {
@@ -1344,10 +1352,100 @@ impl AddressHistory {
         let a = parse_address(address)?;
         let rtx = self.store.database().begin_read()?;
         let t = rtx.open_table(COVERAGE)?;
-        match t.get(coverage_key(&a, action).as_slice())? {
-            Some(v) => decode_spans(v.value()),
-            None => Ok(Vec::new()),
+        let mut spans = match t.get(coverage_key(&a, action).as_slice())? {
+            Some(v) => decode_spans(v.value())?,
+            None => Vec::new(),
+        };
+        spans.extend(swept_for(
+            &rtx.open_table(SWEEP)?,
+            &rtx.open_table(JOINED)?,
+            &a,
+            action,
+        )?);
+        Ok(merge(spans))
+    }
+
+    /// The span the sweep has read, from the first block it read to the last.
+    pub fn swept(&self) -> Result<Option<(u64, u64)>> {
+        let rtx = self.store.database().begin_read()?;
+        let spans = match rtx.open_table(SWEEP)?.get(SWEPT)? {
+            Some(v) => decode_spans(v.value())?,
+            None => Vec::new(),
+        };
+        Ok(spans.last().map(|(_, t)| (spans[0].0, *t)))
+    }
+
+    /// Record one swept window (RFC-0064): the rows found for each matched address, the sweep's span
+    /// extended over `[from, to]`, and `from` as the joined block of every address in `swept` that
+    /// had none, in one transaction. No per-address coverage is written: an address's sweep
+    /// coverage is the shared span from its joined block on. The span must continue the last one.
+    pub fn record_sweep(
+        &self,
+        found: &std::collections::BTreeMap<String, crate::address_discovery::Found>,
+        swept: &[String],
+        (from, to): (u64, u64),
+        generation: u64,
+        anchored: Option<(u64, [u8; 32])>,
+    ) -> Result<()> {
+        if to < from {
+            bail!("sweep interval [{from}, {to}] is empty");
         }
+        let wtx = self.store.database().begin_write()?;
+        {
+            let now = wtx
+                .open_table(META)?
+                .get(GENERATION)?
+                .map_or(0, |v| v.value());
+            if now != generation {
+                bail!("address history changed during the sweep (generation {generation} -> {now}); sweep again");
+            }
+            let mut sweep = wtx.open_table(SWEEP)?;
+            let mut spans = match sweep.get(SWEPT)? {
+                Some(v) => decode_spans(v.value())?,
+                None => Vec::new(),
+            };
+            if let Some((_, last)) = spans.last() {
+                if from != last + 1 {
+                    bail!("a sweep of [{from}, {to}] does not continue the swept span ending at {last}");
+                }
+            }
+            let watched = wtx.open_table(WATCHED)?;
+            let mut joined = wtx.open_table(JOINED)?;
+            for address in swept {
+                let a = parse_address(address)?;
+                if watched.get(a.as_slice())?.is_some() && joined.get(a.as_slice())?.is_none() {
+                    joined.insert(a.as_slice(), from)?;
+                }
+            }
+            for (address, f) in found {
+                let a = parse_address(address)?;
+                // An address unwatched while the window was read is passed over, not the window.
+                if watched.get(a.as_slice())?.is_none() {
+                    continue;
+                }
+                for (action, rows) in [
+                    (Action::TxList, &f.txlist),
+                    (Action::TokenTx, &f.tokentx),
+                    (Action::TokenNftTx, &f.tokennfttx),
+                    (Action::Token1155Tx, &f.token1155tx),
+                ] {
+                    if let Some(r) = rows.iter().find(|r| r.block < from || r.block > to) {
+                        bail!("a row at block {} lies outside [{from}, {to}]", r.block);
+                    }
+                    put_rows(&wtx, action, &a, rows)?;
+                }
+            }
+            if let Some((block, hash)) = anchored {
+                let head = wtx.open_table(META)?.get(HEAD)?.map(|v| v.value());
+                if head.is_none_or(|h| block > h) {
+                    anchor(&mut wtx.open_table(CANON)?, block, &hash)?;
+                }
+            }
+            spans.push((from, to));
+            sweep.insert(SWEPT, encode_spans(&merge(spans)).as_slice())?;
+        }
+        wtx.commit()?;
+        Ok(())
     }
 
     /// Blocks awaiting a relay re-ask: (block, first asked, last asked), in unix seconds.
@@ -1589,6 +1687,23 @@ impl AddressHistory {
                 }
             }
             {
+                let mut sweep = wtx.open_table(SWEEP)?;
+                let spans = match sweep.get(SWEPT)? {
+                    Some(v) => decode_spans(v.value())?,
+                    None => Vec::new(),
+                };
+                let kept: Vec<(u64, u64)> = spans
+                    .into_iter()
+                    .filter(|(from, _)| *from <= block)
+                    .map(|(from, to)| (from, to.min(block)))
+                    .collect();
+                if kept.is_empty() {
+                    sweep.remove(SWEPT)?;
+                } else {
+                    sweep.insert(SWEPT, encode_spans(&kept).as_slice())?;
+                }
+            }
+            {
                 let mut m = wtx.open_table(META)?;
                 let head = m.get(HEAD)?.map(|v| v.value());
                 if head.is_some_and(|h| h > block) {
@@ -1755,13 +1870,20 @@ impl AddressHistory {
             ));
         }
         let start = req.start_block.unwrap_or(0);
-        let spans = match rtx
+        let mut spans = match rtx
             .open_table(COVERAGE)?
             .get(coverage_key(&a, action).as_slice())?
         {
             Some(v) => decode_spans(v.value())?,
             None => Vec::new(),
         };
+        spans.extend(swept_for(
+            &rtx.open_table(SWEEP)?,
+            &rtx.open_table(JOINED)?,
+            &a,
+            action,
+        )?);
+        let spans = merge(spans);
         if req.end_block.is_some_and(|e| e < start) {
             return answer(Answer::Rows(Vec::new()));
         }
@@ -1855,6 +1977,38 @@ fn put_rows(wtx: &redb::WriteTransaction, action: Action, a: &Address, rows: &[R
         )?;
     }
     Ok(())
+}
+
+/// The actions a sweep fills. Internal transactions wait for its traces (RFC-0064 S2).
+pub const SWEPT_ACTIONS: [Action; 4] = [
+    Action::TxList,
+    Action::TokenTx,
+    Action::TokenNftTx,
+    Action::Token1155Tx,
+];
+
+/// `a`'s coverage of `action` from the sweep: the shared span from the block `a` joined it on.
+fn swept_for(
+    sweep: &impl ReadableTable<&'static str, &'static [u8]>,
+    joined: &impl ReadableTable<&'static [u8], u64>,
+    a: &Address,
+    action: Action,
+) -> Result<Vec<(u64, u64)>> {
+    if !SWEPT_ACTIONS.contains(&action) {
+        return Ok(Vec::new());
+    }
+    let Some(j) = joined.get(a.as_slice())?.map(|v| v.value()) else {
+        return Ok(Vec::new());
+    };
+    let spans = match sweep.get(SWEPT)? {
+        Some(v) => decode_spans(v.value())?,
+        None => Vec::new(),
+    };
+    Ok(spans
+        .into_iter()
+        .filter(|(_, t)| *t >= j)
+        .map(|(f, t)| (f.max(j), t))
+        .collect())
 }
 
 fn cover(
@@ -3814,6 +3968,57 @@ mod tests {
                 .starts_with("NUTHATCH_INCOMPLETE:"),
             "{second}"
         );
+    }
+
+    /// RFC-0064 S1: the sweep's span is held once and covers every swept address from the block it
+    /// joined; a gap is refused, and a reorg cuts the shared span as it cuts any other.
+    #[test]
+    fn a_sweep_covers_every_address_from_the_block_it_joined() {
+        const CAROL: &str = "0x00000000000000000000000000000000000000ca";
+        let (_d, h) = history();
+        h.watch(BOB).unwrap();
+        let g = h.generation().unwrap();
+        let mut found = std::collections::BTreeMap::new();
+        found.insert(
+            ALICE.to_ascii_lowercase(),
+            crate::address_discovery::Found {
+                txlist: vec![tx(105, 0)],
+                ..Default::default()
+            },
+        );
+        let first = [ALICE.to_string(), BOB.to_string()];
+        h.record_sweep(&found, &first, (100, 110), g, None).unwrap();
+        for who in [ALICE, BOB] {
+            assert_eq!(h.coverage(Action::TxList, who).unwrap(), vec![(100, 110)]);
+            assert_eq!(
+                h.coverage(Action::Token1155Tx, who).unwrap(),
+                vec![(100, 110)]
+            );
+        }
+        assert!(
+            h.coverage(Action::TxListInternal, ALICE)
+                .unwrap()
+                .is_empty(),
+            "internal transactions are not swept yet"
+        );
+
+        h.watch(CAROL).unwrap();
+        let all = [ALICE.to_string(), BOB.to_string(), CAROL.to_string()];
+        h.record_sweep(&Default::default(), &all, (111, 120), g, None)
+            .unwrap();
+        assert_eq!(h.coverage(Action::TxList, ALICE).unwrap(), vec![(100, 120)]);
+        assert_eq!(
+            h.coverage(Action::TxList, CAROL).unwrap(),
+            vec![(111, 120)],
+            "nothing before the block it joined is claimed"
+        );
+        assert!(h
+            .record_sweep(&Default::default(), &all, (130, 140), g, None)
+            .is_err());
+
+        h.invalidate_above(115).unwrap();
+        assert_eq!(h.swept().unwrap(), Some((100, 115)));
+        assert_eq!(h.coverage(Action::TxList, CAROL).unwrap(), vec![(111, 115)]);
     }
 
     #[test]
