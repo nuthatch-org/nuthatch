@@ -4347,11 +4347,6 @@ mod tests {
         )
         .with_range(17_100_000, Some(17_100_009), 0);
         h.finalize(17_200_000).unwrap();
-        d.catch_up(&state, 17_200_000).await;
-        assert_eq!(
-            h.coverage(Action::BeaconWithdrawals, A).unwrap(),
-            vec![(17_100_000, 17_100_009)]
-        );
         let bodies_read = || {
             d.main
                 .calls()
@@ -4359,9 +4354,22 @@ mod tests {
                 .copied()
                 .unwrap_or(0)
         };
+        // Nothing asked for A's withdrawals or produced blocks yet, so no body is read for it.
+        d.catch_up(&state, 17_200_000).await;
+        assert!(h.coverage(Action::BeaconWithdrawals, A).unwrap().is_empty());
+        let unasked = bodies_read();
+
+        h.ask_bodies(A).unwrap();
+        d.catch_up(&state, 17_200_000).await;
+        assert_eq!(
+            h.coverage(Action::BeaconWithdrawals, A).unwrap(),
+            vec![(17_100_000, 17_100_009)]
+        );
+        assert!(bodies_read() >= unasked + 10, "{unasked} {}", bodies_read());
         let after_first = bodies_read();
 
         h.watch(B).unwrap();
+        h.ask_bodies(B).unwrap();
         d.catch_up(&state, 17_200_000).await;
         assert_eq!(
             h.coverage(Action::MinedBlocks, B).unwrap(),
