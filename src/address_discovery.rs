@@ -4500,6 +4500,102 @@ mod tests {
         assert!(pending.summaries.lock().unwrap().is_empty());
     }
 
+    /// A call that fails, of any kind the sweep makes, leaves its window unswept: no span, no
+    /// coverage, no rows. The next poll reads the window again and covers it whole (RFC-0064 S1).
+    #[tokio::test]
+    async fn a_failed_call_leaves_the_window_unswept_and_retried() {
+        use crate::address_mode::Discovery;
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let n = 17_000_000u64;
+        let sent = format!("0x{:0>64}", "a1");
+        for failing in [
+            "eth_getBlockByNumber",
+            "eth_getLogs",
+            "eth_getTransactionReceipt",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = history(dir.path());
+            let fail = std::sync::Arc::new(AtomicBool::new(true));
+            let main = script({
+                let (fail, sent) = (fail.clone(), sent.clone());
+                move |m, p| {
+                    if m == failing && fail.load(Relaxed) {
+                        bail!("injected failure of {m}");
+                    }
+                    let tx = |b: u64| {
+                        json!({"blockNumber": format!("0x{b:x}"), "blockHash": format!("0x{b:064x}"),
+                               "hash": sent, "nonce": "0x0", "transactionIndex": "0x0", "from": A,
+                               "to": "0x01", "value": "0x1", "gas": "0x5208", "gasPrice": "0x1",
+                               "input": "0x"})
+                    };
+                    Ok(match m {
+                        "eth_getBlockByNumber" => {
+                            let b = hex_u64(&p[0])?;
+                            let txs = if b == n + 5 { vec![tx(b)] } else { vec![] };
+                            json!({"number": format!("0x{b:x}"), "hash": format!("0x{b:064x}"),
+                                   "parentHash": format!("0x{:064x}", b - 1),
+                                   "timestamp": "0x64", "transactions": txs})
+                        }
+                        "eth_getLogs" => json!([]),
+                        "eth_getTransactionByHash" => tx(n + 5),
+                        "eth_getTransactionReceipt" => json!({"status": "0x1",
+                            "gasUsed": "0x5208", "cumulativeGasUsed": "0x5208",
+                            "effectiveGasPrice": "0x1", "contractAddress": null,
+                            "blockHash": format!("0x{:064x}", n + 5)}),
+                        other => bail!("unexpected {other}"),
+                    })
+                }
+            });
+            let d = Discoverer::new(
+                Counted::new(main),
+                Counted::new(script(|m, _| bail!("no trace call expected: {m}"))),
+            );
+            let state = crate::address_mode::ModeState::new(
+                h.clone(),
+                1,
+                std::time::Duration::from_secs(300),
+                true,
+            )
+            .with_range(n, None, 0)
+            .with_sweep(Some(crate::address_history::SweepConfig {
+                from_block: Some(n),
+            }));
+            h.finalize(n + 100).unwrap();
+            d.catch_up(&state, n + 9).await;
+            assert_eq!(
+                h.swept().unwrap(),
+                None,
+                "{failing}: nothing past a failed window"
+            );
+            assert!(
+                h.coverage(Action::TxList, A).unwrap().is_empty(),
+                "{failing}"
+            );
+
+            fail.store(false, Relaxed);
+            d.catch_up(&state, n + 9).await;
+            assert_eq!(
+                h.swept().unwrap(),
+                Some((n, n + 9)),
+                "{failing}: retried whole"
+            );
+            let req = crate::address_history::PageRequest {
+                address: A.into(),
+                start_block: Some(n),
+                end_block: Some(n + 9),
+                sort: crate::address_history::Sort::Asc,
+                page: 1,
+                offset: 10,
+                generation: None,
+            };
+            let crate::address_history::Answer::Rows(rows) = h.page(Action::TxList, &req).unwrap()
+            else {
+                panic!("{failing}: covered after the retry")
+            };
+            assert_eq!(rows.len(), 1, "{failing}: the transaction at {}", n + 5);
+        }
+    }
+
     /// A sweeping nest covers its whole set from the configured block with block reads and one log
     /// query per window, and never discovers an address on its own (RFC-0064 S1).
     #[tokio::test]
