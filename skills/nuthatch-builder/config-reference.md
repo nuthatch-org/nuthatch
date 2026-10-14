@@ -212,14 +212,16 @@ is per block, not per account:
 ```toml
 [address_history.sweep]
 from_block = 21000000         # optional: where the sweep starts; omitted, the finalized head at first start
+internal = true               # optional, default off: trace each block for internal transfers; needs trace_block
 ```
 
 A sweeping nest covers normal transactions and ERC-20, ERC-721 and ERC-1155 transfers for every watched
 account from the block it joined; nothing before that block is claimed, so a read below it answers
 `NUTHATCH_INCOMPLETE`. Accounts join at runtime in bulk, on a loopback bind only:
 `POST /api/watch` with `{"addresses": ["0x…", …]}` adds them in one transaction, all or none, and answers
-`{"added": n, "watched": total}`. The sweep follows the finalized head, and does not yet read internal
-transactions.
+`{"added": n, "watched": total}`. With `internal = true` each block is traced once and internal
+transfers, such as value a smart wallet or contract sends from inside a call, are served too, but
+only over blocks swept with tracing on. The sweep follows the finalized head.
 
 On Ethereum mainnet, withdrawals, produced blocks and `getblocknobytime` can come from verified block
 partitions (RFC-0063 §8) instead of one RPC call per block. It is off unless this table names a
