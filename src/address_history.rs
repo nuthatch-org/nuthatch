@@ -1476,10 +1476,10 @@ impl AddressHistory {
     /// extended over `[from, to]`, and `from` as the joined block of every address in `swept` that
     /// had none, in one transaction. No per-address coverage is written: an address's sweep
     /// coverage is the shared span from its joined block on. The span must continue the last one.
-    pub fn record_sweep(
+    pub fn record_sweep<S: AsRef<str>>(
         &self,
         found: &std::collections::BTreeMap<String, crate::address_discovery::Found>,
-        swept: &[String],
+        swept: impl IntoIterator<Item = S>,
         (from, to): (u64, u64),
         generation: u64,
         anchored: Option<(u64, [u8; 32])>,
@@ -1509,10 +1509,15 @@ impl AddressHistory {
             }
             let watched = wtx.open_table(WATCHED)?;
             let mut joined = wtx.open_table(JOINED)?;
-            for address in swept {
-                let a = parse_address(address)?;
-                if watched.get(a.as_slice())?.is_some() && joined.get(a.as_slice())?.is_none() {
-                    joined.insert(a.as_slice(), from)?;
+            // Every watched address joined already in the usual window: skip a lookup per address,
+            // a million of them at a million addresses (2 s a window, measured 2026-10-14).
+            use redb::ReadableTableMetadata;
+            if joined.len()? < watched.len()? {
+                for address in swept {
+                    let a = parse_address(address.as_ref())?;
+                    if watched.get(a.as_slice())?.is_some() && joined.get(a.as_slice())?.is_none() {
+                        joined.insert(a.as_slice(), from)?;
+                    }
                 }
             }
             for (address, f) in found {

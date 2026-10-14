@@ -1073,8 +1073,9 @@ async fn sweep_pass<M: Rpc, T: Rpc>(
     let mut pace = Pace::new(16, 1, SWEEP_WINDOW, state.deadline);
     while next <= to {
         yield_cursor(state, d).await;
-        let set: std::collections::HashSet<String> = match state.history.watched() {
-            Ok(w) => w.into_iter().map(|a| a.to_ascii_lowercase()).collect(),
+        let reading = Instant::now();
+        let set: Arc<std::collections::HashSet<String>> = match state.history.watched() {
+            Ok(w) => Arc::new(w.into_iter().map(|a| a.to_ascii_lowercase()).collect()),
             Err(e) => {
                 tracing::warn!("address history: reading the watched set: {e:#}");
                 return;
@@ -1091,8 +1092,10 @@ async fn sweep_pass<M: Rpc, T: Rpc>(
             Ok(()) => {
                 state.window_done();
                 tracing::info!(
-                    "address history: swept through {end} for {} addresses",
-                    set.len()
+                    "address history: swept through {end} for {} addresses in {} ms, the set read in {} ms",
+                    set.len(),
+                    started.elapsed().as_millis(),
+                    started.duration_since(reading).as_millis()
                 );
                 next = end + 1;
             }
@@ -1111,7 +1114,7 @@ async fn sweep_pass<M: Rpc, T: Rpc>(
 async fn sweep_window<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     state: &ModeState,
-    set: &std::collections::HashSet<String>,
+    set: &Arc<std::collections::HashSet<String>>,
     (from, end): (u64, u64),
     traced: bool,
 ) -> Result<()> {
@@ -1133,11 +1136,18 @@ async fn sweep_window<M: Rpc, T: Rpc>(
     state.set_calls("trace", d.trace.calls());
     let (anchor, found, checked) = read?;
     let history = state.history.clone();
-    let swept: Vec<String> = set.iter().cloned().collect();
+    let swept = set.clone();
     tokio::task::spawn_blocking(move || {
         pending.persist(&history, checked.is_ok())?;
         checked?;
-        history.record_sweep(&found?, &swept, (from, end), generation, anchor, traced)
+        history.record_sweep(
+            &found?,
+            swept.iter(),
+            (from, end),
+            generation,
+            anchor,
+            traced,
+        )
     })
     .await?
 }
@@ -2872,7 +2882,13 @@ fn supervise(
 pub fn router(state: Arc<ModeState>) -> Router {
     Router::new()
         .route("/api", get(api))
-        .route("/api/watch", get(watched).post(watch))
+        // A batch of addresses is about 45 bytes each: 16 MB takes some 350,000 in one call.
+        .route(
+            "/api/watch",
+            get(watched)
+                .post(watch)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
         .route("/api/unwatch", post(unwatch))
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(ready))
@@ -6563,8 +6579,8 @@ mod tests {
                 );
                 let chain = Chain::new(60, 30);
                 let d = sweep_node(&chain);
-                let set: std::collections::HashSet<String> =
-                    [ALICE.to_ascii_lowercase()].into();
+                let set: Arc<std::collections::HashSet<String>> =
+                    Arc::new([ALICE.to_ascii_lowercase()].into());
                 d.reconcile(&s, chain.latest()).await.unwrap();
                 let tail = |chain: &Chain| chain.latest() - chain.finalized.load(Ordering::Relaxed);
                 let mut swept_any = false;
@@ -6634,7 +6650,7 @@ mod tests {
             },
         );
         let g = h.generation().unwrap();
-        h.record_sweep(&found, &[me.clone()], (100, 110), g, None, false)
+        h.record_sweep(&found, [&me], (100, 110), g, None, false)
             .unwrap();
 
         let received = std::sync::Mutex::new(Vec::<u64>::new());
