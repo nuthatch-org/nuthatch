@@ -4167,8 +4167,8 @@ mod tests {
         let (_d, h) = history();
         let g = h.generation().unwrap();
         let set = [ALICE.to_string()];
-        let row = |to: &str, i: u64| {
-            let mut r = tx(105, i);
+        let row = |to: &str, block: u64, i: u64| {
+            let mut r = tx(block, i);
             r.record.insert("to".into(), Value::String(to.into()));
             r
         };
@@ -4183,8 +4183,13 @@ mod tests {
             );
             f
         };
-        let deposit_and_send = || found(vec![row(&ALICE.to_ascii_lowercase(), 0), row(BOB, 1)]);
-        h.record_sweep(&deposit_and_send(), &set, (100, 110), g, None, false)
+        let deposit_and_send = |block| {
+            found(vec![
+                row(&ALICE.to_ascii_lowercase(), block, 0),
+                row(BOB, block, 1),
+            ])
+        };
+        h.record_sweep(&deposit_and_send(105), &set, (100, 110), g, None, false)
             .unwrap();
         let feed = h.deposits_after(0, 100).unwrap();
         assert_eq!(feed.len(), 1, "the incoming row only: {feed:?}");
@@ -4193,7 +4198,8 @@ mod tests {
 
         h.invalidate_above(100).unwrap();
         let g = h.generation().unwrap();
-        h.record_sweep(&deposit_and_send(), &set, (101, 110), g, None, false)
+        // The replacement lands elsewhere, as one usually does after a reorg.
+        h.record_sweep(&deposit_and_send(106), &set, (101, 110), g, None, false)
             .unwrap();
         h.invalidate_above(100).unwrap();
         let events: Vec<(String, Option<u64>)> = h
