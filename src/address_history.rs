@@ -69,6 +69,19 @@ pub struct AddressHistoryConfig {
     /// Off unless named: the beacon sees this machine's IP and the beacon roots asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub beacon_url: Option<String>,
+    /// Read every block once for the whole watched set, rather than each address on its own
+    /// (RFC-0064). Off unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep: Option<SweepConfig>,
+}
+
+/// `[address_history.sweep]`: where the sweep starts. Omitted, at the finalized head when it first
+/// runs; history before it comes from per-address discovery, if asked for.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SweepConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_block: Option<u64>,
 }
 
 /// `[address_history.mirror]`: where verified block partitions come from, which chain and blocks to
@@ -1018,6 +1031,34 @@ impl AddressHistory {
                 Ok(address_hex(&a))
             })
             .collect()
+    }
+
+    /// Start watching every one of `addresses` in one transaction, all or none: a bad address refuses
+    /// the batch before anything is written. Returns how many were not watched before.
+    pub fn watch_many(&self, addresses: &[String]) -> Result<usize> {
+        let parsed = addresses
+            .iter()
+            .map(|a| parse_address(a).with_context(|| format!("address `{a}`")))
+            .collect::<Result<Vec<_>>>()?;
+        let wtx = self.store.database().begin_write()?;
+        let mut added = 0;
+        {
+            let mut w = wtx.open_table(WATCHED)?;
+            let mut u = wtx.open_table(UNWATCHED)?;
+            for a in &parsed {
+                if w.insert(a.as_slice(), 1)?.is_none() {
+                    added += 1;
+                }
+                u.remove(a.as_slice())?;
+            }
+        }
+        wtx.commit()?;
+        Ok(added)
+    }
+
+    pub fn watched_count(&self) -> Result<u64> {
+        let rtx = self.store.database().begin_read()?;
+        Ok(redb::ReadableTableMetadata::len(&rtx.open_table(WATCHED)?)?)
     }
 
     /// Start watching `address`. It has no coverage until a backfill records some, so `/api` reads
@@ -3784,6 +3825,7 @@ mod tests {
             request_deadline: None,
             validators: vec![],
             beacon_url: None,
+            sweep: None,
         };
         ok.validate().unwrap();
         assert_eq!(ok.poll_interval().unwrap(), DEFAULT_POLL_INTERVAL);

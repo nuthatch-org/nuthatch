@@ -47,6 +47,8 @@ impl HeadSource for RpcClient {
 
 pub struct ModeState {
     pub history: AddressHistory,
+    /// Set when the nest sweeps every block for the whole watched set (RFC-0064).
+    pub sweep: Option<crate::address_history::SweepConfig>,
     pub chain_id: u64,
     pub poll_interval: Duration,
     /// Whether the bound socket is a loopback address. Watch and unwatch change what the nest asks its
@@ -319,6 +321,7 @@ impl ModeState {
             beacon: None,
             hash_at: None,
             first_window: 128,
+            sweep: None,
             backfill_span: AtomicU64::new(0),
             backfill_rate: AtomicU64::new(0),
             body_rate: AtomicU64::new(0),
@@ -443,6 +446,11 @@ impl ModeState {
 
     pub fn with_first_window(mut self, blocks: u64) -> Self {
         self.first_window = blocks;
+        self
+    }
+
+    pub fn with_sweep(mut self, sweep: Option<crate::address_history::SweepConfig>) -> Self {
+        self.sweep = sweep;
         self
     }
 
@@ -968,6 +976,95 @@ async fn discover_window<M: Rpc, T: Rpc>(
     .await?
 }
 
+/// Blocks one sweep window may cover. A mainnet block with its logs is about 0.5 MB in flight.
+const SWEEP_WINDOW: u64 = 256;
+
+/// RFC-0064's pass: every block from where the sweep stopped, for the whole watched set, a window
+/// at a time. A window that fails records nothing and is read again at the next poll; nothing past it
+/// is swept, so coverage stays contiguous.
+async fn sweep_pass<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    to: u64,
+    cfg: &crate::address_history::SweepConfig,
+) {
+    let mut next = match state.history.swept() {
+        Ok(Some((_, last))) => last + 1,
+        Ok(None) => cfg.from_block.unwrap_or(to),
+        Err(e) => {
+            tracing::warn!("address history: reading the swept span: {e:#}");
+            return;
+        }
+    };
+    let mut pace = Pace::new(16, 1, SWEEP_WINDOW, state.deadline);
+    while next <= to {
+        yield_cursor(state, d).await;
+        let set: std::collections::HashSet<String> = match state.history.watched() {
+            Ok(w) => w.into_iter().map(|a| a.to_ascii_lowercase()).collect(),
+            Err(e) => {
+                tracing::warn!("address history: reading the watched set: {e:#}");
+                return;
+            }
+        };
+        if set.is_empty() {
+            return;
+        }
+        let end = next.saturating_add(pace.span() - 1).min(to);
+        let started = Instant::now();
+        let done = sweep_window(d, state, &set, (next, end)).await;
+        pace.took(started.elapsed());
+        match done {
+            Ok(()) => {
+                state.window_done();
+                tracing::info!(
+                    "address history: swept through {end} for {} addresses",
+                    set.len()
+                );
+                next = end + 1;
+            }
+            Err(e) => {
+                state.window_failed();
+                tracing::warn!(
+                    "address history: [{next}, {end}] not swept, retrying next poll: {e:#}"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Sweep one window and record it, anchored as [`body_window`] is.
+async fn sweep_window<M: Rpc, T: Rpc>(
+    d: &Discoverer<Counted<M>, Counted<T>>,
+    state: &ModeState,
+    set: &std::collections::HashSet<String>,
+    (from, end): (u64, u64),
+) -> Result<()> {
+    let pending = crate::address_discovery::Pending::begin(&state.history)?;
+    let generation = pending.generation();
+    let read = async {
+        let anchor = anchor_for(d, &state.history, end).await?;
+        if let Some((b, h)) = anchor {
+            pending.anchor(b, h);
+        }
+        let found = d.sweep(&state.history, set, from, end, &pending).await;
+        let checked = check_anchor(d, &state.history, anchor, &pending.named()).await;
+        Ok::<_, anyhow::Error>((anchor, found, checked))
+    }
+    .await;
+    state.set_calls("main", d.main.calls());
+    state.set_calls("trace", d.trace.calls());
+    let (anchor, found, checked) = read?;
+    let history = state.history.clone();
+    let swept: Vec<String> = set.iter().cloned().collect();
+    tokio::task::spawn_blocking(move || {
+        pending.persist(&history, checked.is_ok())?;
+        checked?;
+        history.record_sweep(&found?, &swept, (from, end), generation, anchor)
+    })
+    .await?
+}
+
 /// Read one window of bodies for `addresses` and record it for each, anchored as
 /// [`discover_window`] is. When `keep` is set, the parsed blocks come back with it so a proof can
 /// use the bodies already read; a window that fails its check keeps none.
@@ -1117,7 +1214,12 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
         // adds mid-backfill gets its first window within a round, not after the others' whole backlog.
         let mut recorded_through: BTreeMap<String, u64> = BTreeMap::new();
         let mut stopped: BTreeSet<String> = BTreeSet::new();
-        loop {
+        if let Some(cfg) = state.sweep.clone() {
+            sweep_pass(self, state, to, &cfg).await;
+        }
+        // A sweeping nest covers its set block by block; discovering each address too would cost
+        // per address what the sweep exists to avoid.
+        while state.sweep.is_none() {
             let round = match state.history.watched() {
                 Ok(w) => w,
                 Err(e) => {
@@ -1382,6 +1484,9 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
         }
         if let Some(e) = state.end_block.filter(|e| to > *e) {
             bail!("history ends at block {e}");
+        }
+        if state.sweep.is_some() {
+            bail!("this nest sweeps every block for its whole set and is not there yet; ask again shortly");
         }
         if need != Need::Discovered && state.chain_id != 1 {
             bail!("withdrawals and produced blocks are served on Ethereum mainnet only");
@@ -3390,6 +3495,9 @@ struct AddressBody {
     /// A validator index, instead of an address.
     #[serde(default)]
     validator: Option<u64>,
+    /// Many addresses at once, added in one transaction (RFC-0064). Added only: a deposit set grows.
+    #[serde(default)]
+    addresses: Option<Vec<String>>,
 }
 
 fn watch_list(s: &ModeState, addresses: Vec<String>) -> Result<Value> {
@@ -3431,12 +3539,17 @@ async fn dispatch(s: Arc<ModeState>, b: AddressBody, add: bool) -> (StatusCode, 
             "the watched set changes only on a loopback bind",
         );
     }
-    match (b.address, b.validator) {
-        (Some(a), None) => change(s, a, add).await,
-        (None, Some(v)) => change_validator(s, v, add).await,
+    match (b.address, b.validator, b.addresses) {
+        (Some(a), None, None) => change(s, a, add).await,
+        (None, Some(v), None) => change_validator(s, v, add).await,
+        (None, None, Some(many)) if add => watch_many(s, many).await,
+        (None, None, Some(_)) => failed(
+            StatusCode::BAD_REQUEST,
+            "a list of addresses is added only; unwatch them one at a time",
+        ),
         _ => failed(
             StatusCode::BAD_REQUEST,
-            "give either an address or a validator index",
+            "give one of an address, a validator index or a list of addresses",
         ),
     }
 }
@@ -3474,6 +3587,25 @@ async fn change_validator(
     {
         Ok(v) => (StatusCode::OK, Json(v)),
         Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+/// Add a batch of addresses. The answer is counts, not the list: at a deposit set's size the list
+/// would be megabytes per call.
+async fn watch_many(s: Arc<ModeState>, addresses: Vec<String>) -> (StatusCode, Json<Value>) {
+    let done = blocking(&s, move |h| {
+        Ok((h.watch_many(&addresses)?, h.watched_count()?))
+    })
+    .await;
+    match done {
+        Ok((added, watched)) => {
+            s.wake.notify_one();
+            (
+                StatusCode::OK,
+                Json(json!({ "added": added, "watched": watched })),
+            )
+        }
+        Err(e) => failed(StatusCode::BAD_REQUEST, format!("{e:#}")),
     }
 }
 
@@ -3847,6 +3979,7 @@ pub async fn dev(
             depth,
         )
         .with_deadline(ah.request_deadline()?)
+        .with_sweep(ah.sweep.clone())
         .with_forward(forward(discovery.clone(), verified.clone()))
         .with_counter(counter(discovery.clone()))
         .with_hash_at({
@@ -5551,6 +5684,37 @@ mod tests {
         assert!(s.history.bodies_wanted(ALICE).unwrap());
     }
 
+    /// A batch is added in one go and answered with counts; one bad address refuses the whole batch
+    /// before anything is written (RFC-0064 S1).
+    #[tokio::test]
+    async fn a_batch_of_addresses_is_watched_all_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        let carol = "0x00000000000000000000000000000000000000ca";
+        let (st, r) = call(
+            router(s.clone()),
+            "POST",
+            "/api/watch",
+            Some(json!({"addresses": [BOB, carol, BOB]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        assert_eq!(r, json!({"added": 2, "watched": 3}));
+        let (st, r) = call(
+            router(s.clone()),
+            "POST",
+            "/api/watch",
+            Some(json!({"addresses": ["0x00000000000000000000000000000000000000dd", "nope"]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+        assert_eq!(
+            s.history.watched_count().unwrap(),
+            3,
+            "nothing from the refused batch"
+        );
+    }
+
     #[tokio::test]
     async fn watch_and_unwatch_take_effect_without_a_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -5621,6 +5785,7 @@ mod tests {
             request_deadline: None,
             validators: vec![],
             beacon_url: None,
+            sweep: None,
         };
         assert_eq!(
             poll_interval(None, &cfg).unwrap(),

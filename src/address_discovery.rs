@@ -4500,6 +4500,51 @@ mod tests {
         assert!(pending.summaries.lock().unwrap().is_empty());
     }
 
+    /// A sweeping nest covers its whole set from the configured block with block reads and one log
+    /// query per window, and never discovers an address on its own (RFC-0064 S1).
+    #[tokio::test]
+    async fn a_sweeping_nest_covers_its_set_without_per_address_discovery() {
+        use crate::address_mode::Discovery;
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let n = 17_000_000u64;
+        let main = script(move |m, p| {
+            Ok(match m {
+                "eth_getBlockByNumber" => {
+                    let b = hex_u64(&p[0])?;
+                    json!({"number": format!("0x{b:x}"), "hash": format!("0x{b:064x}"),
+                           "parentHash": format!("0x{:064x}", b - 1),
+                           "timestamp": "0x64", "transactions": []})
+                }
+                "eth_getLogs" => json!([]),
+                other => bail!("unexpected {other}"),
+            })
+        });
+        let d = Discoverer::new(
+            Counted::new(main),
+            Counted::new(script(|m, _| bail!("no trace call expected: {m}"))),
+        );
+        let state = crate::address_mode::ModeState::new(
+            h.clone(),
+            1,
+            std::time::Duration::from_secs(300),
+            true,
+        )
+        .with_range(n, None, 0)
+        .with_sweep(Some(crate::address_history::SweepConfig {
+            from_block: Some(n),
+        }));
+        h.finalize(n + 100).unwrap();
+        d.catch_up(&state, n + 9).await;
+        assert_eq!(h.swept().unwrap(), Some((n, n + 9)));
+        assert_eq!(h.coverage(Action::TokenTx, A).unwrap(), vec![(n, n + 9)]);
+        let calls = d.main.calls();
+        assert!(
+            !calls.contains_key("eth_getTransactionCount") && !calls.contains_key("eth_getCode"),
+            "no per-address discovery: {calls:?}"
+        );
+    }
+
     /// The cursor's block pass reads each body once for every address that lacks it, and an address
     /// watched after a window was read gets only its own gap.
     #[tokio::test]
