@@ -4722,6 +4722,7 @@ mod tests {
                 from_block: Some(n),
                 internal: false,
                 confirmations: None,
+                webhook: None,
             }));
             h.finalize(n + 100).unwrap();
             d.catch_up(&state, n + 9).await;
@@ -4803,6 +4804,7 @@ mod tests {
             from_block: Some(n),
             internal: false,
             confirmations: None,
+            webhook: None,
         }));
         h.finalize(n + 100).unwrap();
         d.catch_up(&state, n + 9).await;

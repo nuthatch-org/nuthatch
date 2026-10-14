@@ -976,6 +976,73 @@ async fn discover_window<M: Rpc, T: Rpc>(
     .await?
 }
 
+/// Feed entries one webhook delivery carries.
+const DELIVERY_BATCH: usize = 100;
+
+/// Push the deposits feed through `post`, oldest first, until it is drained or `post` fails
+/// (RFC-0064 S3). The delivered number moves only after `post` succeeds, so a failure or a crash
+/// sends the batch again rather than skipping it: at least once, and every entry carries its `seq`
+/// for the consumer to drop a repeat. Returns how many entries were delivered.
+pub async fn deliver_deposits<F, Fut>(history: &AddressHistory, post: F) -> Result<usize>
+where
+    F: Fn(Vec<Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut sent = 0;
+    loop {
+        let after = history.deposits_delivered()?;
+        let batch = history.deposits_after(after, DELIVERY_BATCH)?;
+        let Some(last) = batch.last().and_then(|e| e["seq"].as_u64()) else {
+            return Ok(sent);
+        };
+        let n = batch.len();
+        post(batch).await?;
+        history.set_deposits_delivered(last)?;
+        sent += n;
+    }
+}
+
+/// Deliver the feed to `url` for as long as the nest runs: every few seconds, and after a failure
+/// again after a longer pause, the undelivered entries staying in the feed meanwhile.
+async fn deposit_webhook(state: Arc<ModeState>, url: String) {
+    let client = match reqwest::Client::builder()
+        .user_agent(concat!("nuthatch/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("address history: the deposits webhook client: {e:#}");
+            return;
+        }
+    };
+    loop {
+        let sent = deliver_deposits(&state.history, |batch| {
+            let (client, url) = (client.clone(), url.clone());
+            async move {
+                client
+                    .post(&url)
+                    .json(&json!({ "deposits": batch }))
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e.without_url()))?
+                    .error_for_status()
+                    .map_err(|e| anyhow::anyhow!("{}", e.without_url()))?;
+                Ok(())
+            }
+        })
+        .await;
+        let pause = match sent {
+            Ok(_) => Duration::from_secs(5),
+            Err(e) => {
+                tracing::warn!("address history: deposits webhook, retrying: {e:#}");
+                Duration::from_secs(30)
+            }
+        };
+        tokio::time::sleep(pause).await;
+    }
+}
+
 /// Blocks one sweep window may cover. A mainnet block with its logs is about 0.5 MB in flight.
 const SWEEP_WINDOW: u64 = 256;
 
@@ -4115,10 +4182,18 @@ pub async fn dev(
         cursor(task_state, MainHead(discovery.clone()), discovery).await;
     });
     let work_abort = work.abort_handle();
+    let webhook = state
+        .sweep
+        .as_ref()
+        .and_then(|s| s.webhook.clone())
+        .map(|url| tokio::spawn(deposit_webhook(state.clone(), url)));
     let cursor = supervise(state.clone(), work);
     let served = crate::serve::serve_bound(listener, router(state), cors).await;
     cursor.abort();
     work_abort.abort();
+    if let Some(w) = webhook {
+        w.abort();
+    }
     served
 }
 
@@ -6526,6 +6601,73 @@ mod tests {
         }
     }
 
+    /// The webhook delivers the feed oldest first and marks only what the endpoint accepted: a
+    /// failed batch stays undelivered and is sent next time, so every deposit arrives, none skipped
+    /// (RFC-0064 S3).
+    #[tokio::test]
+    async fn the_webhook_marks_only_what_the_endpoint_accepted() {
+        use crate::address_history::Row;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let h = AddressHistory::open(store, 100, &[ALICE.into()]).unwrap();
+        let me = ALICE.to_ascii_lowercase();
+        let rows: Vec<Row> = (0..150u64)
+            .map(|i| {
+                let mut record = serde_json::Map::new();
+                record.insert("blockNumber".into(), json!("105"));
+                record.insert("hash".into(), json!(format!("0x{i:064x}")));
+                record.insert("to".into(), json!(me));
+                Row {
+                    block: 105,
+                    tx_index: i,
+                    position: 0,
+                    record,
+                }
+            })
+            .collect();
+        let mut found = BTreeMap::new();
+        found.insert(
+            me.clone(),
+            crate::address_discovery::Found {
+                txlist: rows,
+                ..Default::default()
+            },
+        );
+        let g = h.generation().unwrap();
+        h.record_sweep(&found, &[me.clone()], (100, 110), g, None, false)
+            .unwrap();
+
+        let received = std::sync::Mutex::new(Vec::<u64>::new());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let post = |batch: Vec<Value>| {
+            let call = calls.fetch_add(1, Ordering::Relaxed);
+            let seqs: Vec<u64> = batch.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+            let accepted = call != 1;
+            if accepted {
+                received.lock().unwrap().extend(seqs);
+            }
+            async move {
+                if accepted {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("the endpoint answered 503"))
+                }
+            }
+        };
+        assert!(
+            deliver_deposits(&h, post).await.is_err(),
+            "the second batch fails"
+        );
+        assert_eq!(
+            h.deposits_delivered().unwrap(),
+            100,
+            "only the accepted batch is marked"
+        );
+        assert_eq!(deliver_deposits(&h, post).await.unwrap(), 50);
+        assert_eq!(h.deposits_delivered().unwrap(), 150);
+        assert_eq!(*received.lock().unwrap(), (1..=150).collect::<Vec<u64>>());
+    }
+
     /// With `confirmations`, the sweep runs that many blocks under the head rather than stopping at
     /// the finalized head, which on mainnet is about 13 minutes behind (RFC-0064 S3).
     #[tokio::test]
@@ -6540,6 +6682,7 @@ mod tests {
                     from_block: Some(0),
                     internal: false,
                     confirmations: Some(2),
+                    webhook: None,
                 })),
         );
         let chain = Chain::new(60, 30);

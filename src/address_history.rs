@@ -89,6 +89,10 @@ pub struct SweepConfig {
     /// (RFC-0064 S3). A reorg above finality takes back what it replaced, and the feed retracts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmations: Option<u64>,
+    /// POST the deposits feed here as it grows, at least once, oldest first (RFC-0064 S3). The
+    /// feed stays the record: a delivery that fails is sent again, never skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<String>,
 }
 
 /// `[address_history.mirror]`: where verified block partitions come from, which chain and blocks to
@@ -136,6 +140,11 @@ impl AddressHistoryConfig {
                     "[address_history.mirror] cache_mb {} cannot hold one partition; give it at least {MIN_CACHE_MB}",
                     m.cache_mb
                 );
+            }
+        }
+        if let Some(url) = self.sweep.as_ref().and_then(|s| s.webhook.as_deref()) {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                bail!("[address_history.sweep] webhook `{url}` is not an http(s) URL");
             }
         }
         self.poll_interval()?;
@@ -326,6 +335,8 @@ const DEPOSITS: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_deposits"
 /// so the ones above a fork are one range read.
 const LIVE_DEPOSITS: TableDefinition<&[u8], u64> = TableDefinition::new("ah_live_deposits");
 const DEPOSIT_NEXT: &str = "deposit_next";
+/// The last feed sequence number the webhook endpoint accepted.
+const DEPOSIT_DELIVERED: &str = "deposit_delivered";
 /// Block hashes above the finalized head that stored history was read against. The highest anchors
 /// everything below it, so one comparison per poll finds a reorg.
 const CANON: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_canon");
@@ -1423,6 +1434,22 @@ impl AddressHistory {
             action,
         )?);
         Ok(merge(spans))
+    }
+
+    /// The last feed sequence number the webhook endpoint accepted; 0 before any.
+    pub fn deposits_delivered(&self) -> Result<u64> {
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx
+            .open_table(META)?
+            .get(DEPOSIT_DELIVERED)?
+            .map_or(0, |v| v.value()))
+    }
+
+    pub fn set_deposits_delivered(&self, seq: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        wtx.open_table(META)?.insert(DEPOSIT_DELIVERED, seq)?;
+        wtx.commit()?;
+        Ok(())
     }
 
     /// Up to `limit` feed entries after sequence number `after`, in order (RFC-0064 S3).
