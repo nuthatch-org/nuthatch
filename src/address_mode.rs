@@ -1011,7 +1011,7 @@ async fn sweep_pass<M: Rpc, T: Rpc>(
         }
         let end = next.saturating_add(pace.span() - 1).min(to);
         let started = Instant::now();
-        let done = sweep_window(d, state, &set, (next, end)).await;
+        let done = sweep_window(d, state, &set, (next, end), cfg.internal).await;
         pace.took(started.elapsed());
         match done {
             Ok(()) => {
@@ -1039,6 +1039,7 @@ async fn sweep_window<M: Rpc, T: Rpc>(
     state: &ModeState,
     set: &std::collections::HashSet<String>,
     (from, end): (u64, u64),
+    traced: bool,
 ) -> Result<()> {
     let pending = crate::address_discovery::Pending::begin(&state.history)?;
     let generation = pending.generation();
@@ -1047,7 +1048,9 @@ async fn sweep_window<M: Rpc, T: Rpc>(
         if let Some((b, h)) = anchor {
             pending.anchor(b, h);
         }
-        let found = d.sweep(&state.history, set, from, end, &pending).await;
+        let found = d
+            .sweep(&state.history, set, from, end, &pending, traced)
+            .await;
         let checked = check_anchor(d, &state.history, anchor, &pending.named()).await;
         Ok::<_, anyhow::Error>((anchor, found, checked))
     }
@@ -1060,7 +1063,7 @@ async fn sweep_window<M: Rpc, T: Rpc>(
     tokio::task::spawn_blocking(move || {
         pending.persist(&history, checked.is_ok())?;
         checked?;
-        history.record_sweep(&found?, &swept, (from, end), generation, anchor)
+        history.record_sweep(&found?, &swept, (from, end), generation, anchor, traced)
     })
     .await?
 }
@@ -6497,7 +6500,7 @@ mod tests {
                                     Some((chain.latest(), 1, n.min(tail(&chain))));
                             }
                             let latest = chain.latest();
-                            swept_any |= sweep_window(&d, &s, &set, (next, latest)).await.is_ok();
+                            swept_any |= sweep_window(&d, &s, &set, (next, latest), false).await.is_ok();
                             *chain.reorg_on_read.lock().unwrap() = None;
                         }
                         2 | 3 => {}

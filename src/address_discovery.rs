@@ -801,8 +801,8 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
     }
 
     /// RFC-0064's sweep: read `[from, to]` once for every address in `set` (lowercase `0x…`), each
-    /// block's transactions and the range's transfer logs, matched in memory, so the cost is per
-    /// block rather than per address. Internal transfers are not read here.
+    /// block's transactions and the range's transfer logs, and with `traced` each block's trace,
+    /// matched in memory, so the cost is per block rather than per address.
     pub async fn sweep(
         &self,
         history: &AddressHistory,
@@ -810,6 +810,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         from: u64,
         to: u64,
         pending: &Pending,
+        traced: bool,
     ) -> Result<BTreeMap<String, Found>> {
         if history.chain_id() == 1 && from < BYZANTIUM {
             bail!("a sweep reads success from receipts, which carry no status before block {BYZANTIUM}");
@@ -831,10 +832,12 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             .await;
         let mut refs: BTreeMap<String, Vec<TxRef>> = BTreeMap::new();
         let mut timestamps = BTreeMap::new();
+        let mut hashes = BTreeMap::new();
         for block in blocks {
             let block = block?;
             let number = hex_u64(block.get("number").unwrap_or(&Value::Null))?;
             let hash = word32(str_field(&block, "hash")?)?;
+            hashes.insert(number, hash);
             timestamps.insert(
                 number,
                 hex_u64(block.get("timestamp").unwrap_or(&Value::Null))?,
@@ -906,10 +909,96 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 transfer_rows(log, &p, &timestamps, found.entry(p.clone()).or_default())?;
             }
         }
+        if traced {
+            self.sweep_traces(set, &hashes, &timestamps, &mut found)
+                .await?;
+        }
         for (a, r) in refs {
             found.entry(a).or_default().txlist = self.hydrate(history, &r, pending).await?;
         }
         Ok(found)
+    }
+
+    /// The sweep's internal transfers: one `trace_block` per block, each transaction's frames turned
+    /// into Etherscan's internal rows and kept for every swept address a row names. A frame naming
+    /// another block hash than the main endpoint's refuses the window rather than mix two forks.
+    async fn sweep_traces(
+        &self,
+        set: &std::collections::HashSet<String>,
+        hashes: &BTreeMap<u64, [u8; 32]>,
+        timestamps: &BTreeMap<u64, u64>,
+        found: &mut BTreeMap<String, Found>,
+    ) -> Result<()> {
+        let traces: Vec<Result<(u64, Value)>> = futures::stream::iter(hashes.keys().copied())
+            .map(|b| async move {
+                let t = self
+                    .trace
+                    .call("trace_block", json!([format!("0x{b:x}")]))
+                    .await
+                    .with_context(|| format!("trace_block {b}"))?;
+                Ok((b, t))
+            })
+            .buffered(SWEEP_CONCURRENCY)
+            .collect()
+            .await;
+        for t in traces {
+            let (b, t) = t?;
+            let frames = t
+                .as_array()
+                .ok_or_else(|| anyhow!("trace_block {b} answered a non-list"))?;
+            let mut by_tx: Vec<(String, Vec<Value>)> = Vec::new();
+            for f in frames {
+                // A block reward frame belongs to no transaction.
+                let Some(hash) = f.get("transactionHash").and_then(Value::as_str) else {
+                    continue;
+                };
+                if word32(str_field(f, "blockHash")?)? != hashes[&b] {
+                    bail!("trace_block {b} answered for another block than the main endpoint's");
+                }
+                let hash = hash.to_ascii_lowercase();
+                match by_tx.last_mut() {
+                    Some((h, fs)) if *h == hash => fs.push(f.clone()),
+                    _ => by_tx.push((hash, vec![f.clone()])),
+                }
+            }
+            for (hash, frames) in by_tx {
+                for mut record in internal_records(&frames, timestamps[&b])? {
+                    let parties: BTreeSet<String> = ["from", "to", "contractAddress"]
+                        .iter()
+                        .filter_map(|k| record.get(*k).and_then(Value::as_str))
+                        .map(str::to_ascii_lowercase)
+                        .filter(|p| set.contains(p))
+                        .collect();
+                    if parties.is_empty() {
+                        continue;
+                    }
+                    let num = |k: &str| -> Result<u64> {
+                        record
+                            .get(k)
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| anyhow!("internal record lacks {k}"))?
+                            .parse()
+                            .with_context(|| format!("internal record {k}"))
+                    };
+                    let (block, tx_index, position) = (
+                        num("blockNumber")?,
+                        num("transactionIndex")?,
+                        num(TRACE_INDEX)?,
+                    );
+                    record.insert("hash".into(), Value::String(hash.clone()));
+                    let row = address_mode_order(Row {
+                        block,
+                        tx_index,
+                        position,
+                        record,
+                    });
+                    for p in parties {
+                        found.entry(p).or_default().txlistinternal.push(row.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Every internal transaction of `hash`, as Etherscan's `txhash` form lists them: from the cache,
@@ -3291,6 +3380,78 @@ mod tests {
         );
     }
 
+    /// A traced sweep finds value a contract sends a watched address from inside a call, which no
+    /// top-level read shows: how smart-wallet deposits arrive. A trace naming another block hash than
+    /// the main endpoint's refuses the window (RFC-0064 S2).
+    #[tokio::test]
+    async fn a_traced_sweep_finds_value_sent_from_inside_a_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        const C: &str = "0x00000000000000000000000000000000000000c0";
+        const OUT: &str = "0x00000000000000000000000000000000000000ee";
+        let n = 17_000_000u64;
+        let bh = format!("0x{:0>64}", "b1");
+        let main = || {
+            let bh = bh.clone();
+            script(move |m, _| {
+                Ok(match m {
+                    "eth_getBlockByNumber" => json!({"number": format!("0x{n:x}"), "hash": bh,
+                        "timestamp": "0x64", "transactions": []}),
+                    "eth_getLogs" => json!([]),
+                    other => bail!("unexpected {other}"),
+                })
+            })
+        };
+        let frame = |tx: &str,
+                     pos: u64,
+                     path: Value,
+                     from: &str,
+                     to: &str,
+                     value: &str,
+                     block: &str| {
+            json!({"type": "call", "traceAddress": path, "blockHash": block, "transactionHash": tx,
+                   "transactionPosition": pos, "blockNumber": n,
+                   "action": {"from": from, "to": to, "value": value, "callType": "call",
+                              "gas": "0x0"},
+                   "result": {"gasUsed": "0x0"}})
+        };
+        let (h1, h2) = (format!("0x{:0>64}", "1"), format!("0x{:0>64}", "2"));
+        let frames = |block: &str| {
+            json!([
+                frame(&h1, 0, json!([]), OUT, C, "0x0", block),
+                frame(&h1, 0, json!([0]), C, A, "0x5", block),
+                frame(&h2, 1, json!([]), OUT, C, "0x0", block),
+                frame(&h2, 1, json!([0]), C, OUT, "0x1", block),
+                {"type": "reward", "action": {"author": OUT, "value": "0x1"}, "blockHash": block,
+                 "blockNumber": n, "traceAddress": []},
+            ])
+        };
+        let set: std::collections::HashSet<String> = [A.to_string()].into();
+        for (named, refused) in [(bh.clone(), false), (format!("0x{:0>64}", "ff"), true)] {
+            let answer = frames(&named);
+            let d = Discoverer::new(
+                main(),
+                script(move |m, _| match m {
+                    "trace_block" => Ok(answer.clone()),
+                    other => bail!("unexpected {other}"),
+                }),
+            );
+            let pending = Pending::begin(&h).unwrap();
+            let swept = d.sweep(&h, &set, n, n, &pending, true).await;
+            if refused {
+                assert!(swept.is_err(), "a trace of another block is refused");
+                continue;
+            }
+            let found = swept.unwrap();
+            assert_eq!(found.keys().collect::<Vec<_>>(), [A]);
+            let rows = &found[A].txlistinternal;
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].record["hash"], h1);
+            assert_eq!(rows[0].record["from"], C);
+            assert_eq!(rows[0].record["value"], "5");
+        }
+    }
+
     /// One pass over a block finds every watched address's transactions and transfers, both
     /// directions, and nothing for anyone outside the set (RFC-0064 S1).
     #[tokio::test]
@@ -3338,7 +3499,7 @@ mod tests {
         let d = Discoverer::new(main, script(|m, _| bail!("no trace call expected: {m}")));
         let set: std::collections::HashSet<String> = [A, B].map(String::from).into();
         let pending = Pending::begin(&h).unwrap();
-        let found = d.sweep(&h, &set, n, n, &pending).await.unwrap();
+        let found = d.sweep(&h, &set, n, n, &pending, false).await.unwrap();
         assert_eq!(
             found.keys().collect::<Vec<_>>(),
             [B, A],
@@ -4559,6 +4720,7 @@ mod tests {
             .with_range(n, None, 0)
             .with_sweep(Some(crate::address_history::SweepConfig {
                 from_block: Some(n),
+                internal: false,
             }));
             h.finalize(n + 100).unwrap();
             d.catch_up(&state, n + 9).await;
@@ -4638,6 +4800,7 @@ mod tests {
         .with_range(n - 50, None, 0)
         .with_sweep(Some(crate::address_history::SweepConfig {
             from_block: Some(n),
+            internal: false,
         }));
         h.finalize(n + 100).unwrap();
         d.catch_up(&state, n + 9).await;

@@ -82,6 +82,9 @@ pub struct AddressHistoryConfig {
 pub struct SweepConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_block: Option<u64>,
+    /// Trace each block for internal transfers (RFC-0064 S2). Needs a trace-capable RPC; off unless set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub internal: bool,
 }
 
 /// `[address_history.mirror]`: where verified block partitions come from, which chain and blocks to
@@ -308,6 +311,9 @@ const BODIES_ASKED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_bodies
 /// block each address joined it at. An address's sweep coverage is that span from its joined block on.
 const SWEEP: TableDefinition<&str, &[u8]> = TableDefinition::new("ah_sweep");
 const SWEPT: &str = "swept";
+/// The part of the swept span that was also traced, so internal transactions are claimed only where
+/// they were read.
+const SWEPT_INTERNAL: &str = "swept_internal";
 const JOINED: TableDefinition<&[u8], u64> = TableDefinition::new("ah_joined");
 /// Block hashes above the finalized head that stored history was read against. The highest anchors
 /// everything below it, so one comparison per poll finds a reorg.
@@ -1427,6 +1433,7 @@ impl AddressHistory {
         (from, to): (u64, u64),
         generation: u64,
         anchored: Option<(u64, [u8; 32])>,
+        traced: bool,
     ) -> Result<()> {
         if to < from {
             bail!("sweep interval [{from}, {to}] is empty");
@@ -1469,12 +1476,25 @@ impl AddressHistory {
                     (Action::TokenTx, &f.tokentx),
                     (Action::TokenNftTx, &f.tokennfttx),
                     (Action::Token1155Tx, &f.token1155tx),
+                    (Action::TxListInternal, &f.txlistinternal),
                 ] {
+                    if action == Action::TxListInternal && !traced && !rows.is_empty() {
+                        bail!("internal rows from a window that was not traced");
+                    }
                     if let Some(r) = rows.iter().find(|r| r.block < from || r.block > to) {
                         bail!("a row at block {} lies outside [{from}, {to}]", r.block);
                     }
                     put_rows(&wtx, action, &a, rows)?;
                 }
+            }
+            if traced {
+                // Its own span: a window swept before tracing was turned on claims no internals.
+                let mut internal = match sweep.get(SWEPT_INTERNAL)? {
+                    Some(v) => decode_spans(v.value())?,
+                    None => Vec::new(),
+                };
+                internal.push((from, to));
+                sweep.insert(SWEPT_INTERNAL, encode_spans(&merge(internal)).as_slice())?;
             }
             if let Some((block, hash)) = anchored {
                 let head = wtx.open_table(META)?.get(HEAD)?.map(|v| v.value());
@@ -1729,19 +1749,21 @@ impl AddressHistory {
             }
             {
                 let mut sweep = wtx.open_table(SWEEP)?;
-                let spans = match sweep.get(SWEPT)? {
-                    Some(v) => decode_spans(v.value())?,
-                    None => Vec::new(),
-                };
-                let kept: Vec<(u64, u64)> = spans
-                    .into_iter()
-                    .filter(|(from, _)| *from <= block)
-                    .map(|(from, to)| (from, to.min(block)))
-                    .collect();
-                if kept.is_empty() {
-                    sweep.remove(SWEPT)?;
-                } else {
-                    sweep.insert(SWEPT, encode_spans(&kept).as_slice())?;
+                for key in [SWEPT, SWEPT_INTERNAL] {
+                    let spans = match sweep.get(key)? {
+                        Some(v) => decode_spans(v.value())?,
+                        None => Vec::new(),
+                    };
+                    let kept: Vec<(u64, u64)> = spans
+                        .into_iter()
+                        .filter(|(from, _)| *from <= block)
+                        .map(|(from, to)| (from, to.min(block)))
+                        .collect();
+                    if kept.is_empty() {
+                        sweep.remove(key)?;
+                    } else {
+                        sweep.insert(key, encode_spans(&kept).as_slice())?;
+                    }
                 }
             }
             {
@@ -2020,7 +2042,8 @@ fn put_rows(wtx: &redb::WriteTransaction, action: Action, a: &Address, rows: &[R
     Ok(())
 }
 
-/// The actions a sweep fills. Internal transactions wait for its traces (RFC-0064 S2).
+/// The actions every sweep fills. Internal transactions are filled only where the sweep traced,
+/// under their own span (RFC-0064 S2).
 pub const SWEPT_ACTIONS: [Action; 4] = [
     Action::TxList,
     Action::TokenTx,
@@ -2035,13 +2058,17 @@ fn swept_for(
     a: &Address,
     action: Action,
 ) -> Result<Vec<(u64, u64)>> {
-    if !SWEPT_ACTIONS.contains(&action) {
+    let key = if SWEPT_ACTIONS.contains(&action) {
+        SWEPT
+    } else if action == Action::TxListInternal {
+        SWEPT_INTERNAL
+    } else {
         return Ok(Vec::new());
-    }
+    };
     let Some(j) = joined.get(a.as_slice())?.map(|v| v.value()) else {
         return Ok(Vec::new());
     };
-    let spans = match sweep.get(SWEPT)? {
+    let spans = match sweep.get(key)? {
         Some(v) => decode_spans(v.value())?,
         None => Vec::new(),
     };
@@ -4012,6 +4039,33 @@ mod tests {
         );
     }
 
+    /// RFC-0064 S2: internal transactions are claimed only over windows the sweep traced, so turning
+    /// tracing on later claims nothing for what was swept before it; a reorg cuts both spans.
+    #[test]
+    fn internal_coverage_is_claimed_only_where_the_sweep_traced() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        let set = [ALICE.to_string()];
+        h.record_sweep(&Default::default(), &set, (100, 110), g, None, false)
+            .unwrap();
+        assert_eq!(h.coverage(Action::TxList, ALICE).unwrap(), vec![(100, 110)]);
+        assert!(h
+            .coverage(Action::TxListInternal, ALICE)
+            .unwrap()
+            .is_empty());
+        h.record_sweep(&Default::default(), &set, (111, 120), g, None, true)
+            .unwrap();
+        assert_eq!(
+            h.coverage(Action::TxListInternal, ALICE).unwrap(),
+            vec![(111, 120)]
+        );
+        h.invalidate_above(115).unwrap();
+        assert_eq!(
+            h.coverage(Action::TxListInternal, ALICE).unwrap(),
+            vec![(111, 115)]
+        );
+    }
+
     /// RFC-0064 S1: the sweep's span is held once and covers every swept address from the block it
     /// joined; a gap is refused, and a reorg cuts the shared span as it cuts any other.
     #[test]
@@ -4029,7 +4083,8 @@ mod tests {
             },
         );
         let first = [ALICE.to_string(), BOB.to_string()];
-        h.record_sweep(&found, &first, (100, 110), g, None).unwrap();
+        h.record_sweep(&found, &first, (100, 110), g, None, false)
+            .unwrap();
         for who in [ALICE, BOB] {
             assert_eq!(h.coverage(Action::TxList, who).unwrap(), vec![(100, 110)]);
             assert_eq!(
@@ -4046,7 +4101,7 @@ mod tests {
 
         h.watch(CAROL).unwrap();
         let all = [ALICE.to_string(), BOB.to_string(), CAROL.to_string()];
-        h.record_sweep(&Default::default(), &all, (111, 120), g, None)
+        h.record_sweep(&Default::default(), &all, (111, 120), g, None, false)
             .unwrap();
         assert_eq!(h.coverage(Action::TxList, ALICE).unwrap(), vec![(100, 120)]);
         assert_eq!(
@@ -4055,7 +4110,7 @@ mod tests {
             "nothing before the block it joined is claimed"
         );
         assert!(h
-            .record_sweep(&Default::default(), &all, (130, 140), g, None)
+            .record_sweep(&Default::default(), &all, (130, 140), g, None, false)
             .is_err());
 
         h.invalidate_above(115).unwrap();
