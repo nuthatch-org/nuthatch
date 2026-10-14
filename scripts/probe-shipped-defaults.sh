@@ -71,7 +71,7 @@ done
 # Additionally confirm the archive endpoint is still archive: a non-archive URL listed first
 # silently breaks backfill even when its getLogs window is wide. That is what broke on
 # 2026-08-20 - polygon-bor-rpc.publicnode.com (non-archive) was first.
-for u in https://polygon.drpc.org https://polygon-bor-rpc.publicnode.com; do
+for u in https://polygon.drpc.org https://polygon.gateway.tenderly.co; do
   probe polygon 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270 "$u"
 done
 # Archive-depth gate for the first (archive) endpoint. Allowlist, not denylist, for the same
