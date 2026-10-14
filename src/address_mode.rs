@@ -203,6 +203,10 @@ impl Pace {
         let target = self.fixed.map_or(self.target, |f| {
             (f * 3).clamp(self.target, self.deadline.max(self.target))
         });
+        // Growth is judged on the per-block part alone: a fixed cost past half the target would
+        // otherwise never let a window grow (GraphOps' getLogs, 4.5 s a window, 2026-10-14).
+        let fixed = self.fixed.unwrap_or_default().min(target);
+        let quick = elapsed.saturating_sub(fixed) < (target - fixed) / 2;
         self.span = if elapsed > target {
             if self.span == self.min && self.fixed.is_none() {
                 // Slow at the floor with nothing to compare: one larger window tells fixed cost from
@@ -211,7 +215,7 @@ impl Pace {
             } else {
                 (self.span / 2).max(self.min)
             }
-        } else if elapsed < target / 2 {
+        } else if quick {
             (self.span * 2).min(self.max)
         } else {
             self.span
@@ -6936,6 +6940,21 @@ mod tests {
             p.took(cost(span));
         }
         assert!(p.span() >= 4_096, "{}", p.span());
+        assert!(cost(p.span()) <= deadline, "{}", p.span());
+    }
+
+    /// Measured 2026-10-14 over GraphOps: three getLogs at about 1.5 s each put 4.5 s on every
+    /// window, more than half the deadline, and the window stayed at its floor.
+    #[test]
+    fn a_fixed_cost_over_half_the_deadline_still_lets_a_window_grow() {
+        let deadline = DEFAULT_DEADLINE;
+        let mut p = Pace::new(128, 64, 50_000, deadline);
+        let cost = |span: u64| Duration::from_millis(4_500) + Duration::from_micros(500 * span);
+        for _ in 0..20 {
+            let span = p.span();
+            p.took(cost(span));
+        }
+        assert!(p.span() >= 2_048, "{}", p.span());
         assert!(cost(p.span()) <= deadline, "{}", p.span());
     }
 
