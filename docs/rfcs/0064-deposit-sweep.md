@@ -19,6 +19,25 @@ He found fystack/multichain-indexer, which does this across 14 chains with a blo
 JetStream and Redis. Nuthatch's case is EVM only: one binary, nothing beside it, answers in the
 Etherscan shapes and SQL nuthatch already serves, and rows checked against Etherscan.
 
+## 1a. The bar: where fystack loses deposits, and what this must do instead
+
+Read from fystack/multichain-indexer at `03b0449` (2026-10-08); the first two rows checked line by
+line. Each row is a commitment with a gate in §9, not a claim.
+
+| fystack, EVM | This RFC |
+|---|---|
+| Bloom filter only, no exact check, 1% false positives by default (`pkg/store/pubkeystore/store.go:31-43`): deposits for addresses that are not yours | Exact set membership; zero false positives by construction |
+| Publish errors discarded (`internal/worker/base.go:243,260`), block still marked processed; whole stream capped at 10 KB (`pkg/infra/message_queue.go:21,69`) | A block is swept only when every call for it succeeded; rows and their outbox entries are written in one transaction; the feed is the record and can be re-read from any block, so a slow consumer loses nothing |
+| No retraction on reorg; the replacement deposit gets a new id and the orphan stays credited; 0 confirmations by default | Every delivered deposit that a reorg takes back is retracted, once; a configurable confirmation depth before first delivery |
+| Skips to the head after a restart or lag, catch-up off by default: ranges never scanned | Coverage is contiguous; a gap is answered `NUTHATCH_INCOMPLETE`, never skipped |
+| A failed `eth_getLogs`, receipt or trace is a warning, and the deposit is silently missed | Any failure fails the block, which is retried; nothing is recorded past it |
+| Native value only top-level with empty calldata, unless per-transaction tracing is switched on; Safe MultiSend, 4337 and other smart accounts missed | One trace per block (`trace_block`), every frame that credits a watched address, any wallet kind |
+| ERC-20 only; ERC-721 reported as ERC-20 with amount 0; no ERC-1155 | ERC-20, ERC-721 with token id, ERC-1155 single and batch |
+| Any contract's `Transfer` credited, no allowlist | Rows carry the token contract; an optional allowlist, and unlisted tokens marked, never dropped silently |
+| New addresses polled from Postgres every 1 s, off by default, with a startup gap; no history for them | Appended through the API, live at the next block, recorded `joined_at`; optional history for that address through RFC-0063 discovery |
+| No reorg tests, no explorer parity | Reorg property tests over the sweep and Etherscan parity on pinned addresses, both release gates |
+| Redis, NATS JetStream, a KV store and Postgres beside it | One binary |
+
 ## 2. Why RFC-0063's discovery does not fit
 
 Address mode discovers each address on its own: `trace_filter` both ways and `eth_getLogs` with the
@@ -76,6 +95,12 @@ across the set:
   at-least-once, with a retraction when a reorg takes a delivered row back. A processor credits on
   delivery and reverses on retraction, or waits for the confirmation depth it chooses.
 
+**The feed is the record; a webhook is a nudge.** The existing outbox sheds its oldest entries when a
+sink stays down, which is right for alerts and wrong for money. So every deposit row and its sequence
+number live in the store, a consumer acknowledges by sequence number, and anything a webhook failed to
+deliver is read back from `nuthatchDeposits` from the last acknowledged number. Nothing is lost while
+the consumer is away, however long.
+
 ## 6. Reorgs and finality
 
 Unchanged from RFC-0063. Rows above the finalized head are anchored by block hash and taken back
@@ -108,13 +133,18 @@ Absent the table, a nest behaves exactly as today. `addresses` may stay empty; t
 - **S0, the spike, which can stop the programme.** A standalone sweep following the mainnet tip for
   an hour against a set of 100,000 addresses, a few of them real and active. Gate: every row for the
   real addresses equals Etherscan's for the same blocks; peak RSS and calls per block recorded.
-- **S1, the sweep in the binary.** Normal transactions and token transfers, the set from config and
-  `/api/watch` with bulk append, sweep coverage and `joined_at`. Gate: Etherscan parity for pinned
-  addresses over a pinned block range; a reorg property test over the sweep span.
+- **S1, the sweep in the binary.** Normal transactions and token transfers (ERC-20, ERC-721 with
+  token id, ERC-1155 single and batch), the set from config and `/api/watch` with bulk append, sweep
+  coverage and `joined_at`. Gates: Etherscan parity for pinned addresses over a pinned block range; a
+  reorg property test over the sweep span; failure injected into each call kind leaves the block
+  unswept and retried, never skipped; no row for an address outside the set, including addresses
+  chosen to collide in a bloom filter.
 - **S2, internal transfers.** `trace_block` per block behind `internal = true`. Gate: `txlistinternal`
   parity on pinned cases.
-- **S3, the feed.** `nuthatchDeposits` and webhook delivery with retraction. Gate: a reorg in a test
-  chain retracts exactly the rows it took back, once each.
+- **S3, the feed.** `nuthatchDeposits` with sequence numbers and acknowledgement, and webhook delivery
+  with retraction and a confirmation depth. Gates: a reorg in a test chain retracts exactly the rows it
+  took back, once each; a consumer stopped for an hour while deposits arrive reads every one of them
+  back afterwards, none missing and none twice.
 - **S4, scale.** 100,000 and 1,000,000 addresses: RSS under the cursor budget, tip lag measured,
   append latency measured. Gate: the budget.
 - **S5, more chains.** Base, BSC, Polygon, Arbitrum, each with its own trace method (RFC-0063 §7's
