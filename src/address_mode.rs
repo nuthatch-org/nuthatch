@@ -6405,6 +6405,117 @@ mod tests {
         }
     }
 
+    /// A node for the sweep: full blocks, and a `Transfer` to ALICE in every block
+    /// [`Chain::row_at`] marks, its transaction hash that block's, so a reorg changes both.
+    fn sweep_node(
+        chain: &Arc<Chain>,
+    ) -> Discoverer<
+        Counted<crate::address_partitions::tests::Fake>,
+        Counted<crate::address_partitions::tests::Fake>,
+    > {
+        let c = chain.clone();
+        let main = crate::address_partitions::tests::Fake::new(move |m, p| match m {
+            "eth_blockNumber" => Ok(json!(format!("0x{:x}", c.latest()))),
+            "eth_getBlockByNumber" if p[0] == "finalized" => {
+                Ok(json!({"number": format!("0x{:x}", c.finalized.load(Ordering::Relaxed))}))
+            }
+            "eth_getBlockByNumber" => {
+                let b = crate::address_discovery::hex_u64(&p[0])?;
+                let answer = if b > c.latest() {
+                    Value::Null
+                } else {
+                    let mut block = c.block_json(b);
+                    block["transactions"] = json!([]);
+                    block
+                };
+                c.after_read(b);
+                Ok(answer)
+            }
+            "eth_getLogs" => {
+                let f = &p[0];
+                let s = crate::address_discovery::hex_u64(&f["fromBlock"])?;
+                let e = crate::address_discovery::hex_u64(&f["toBlock"])?.min(c.latest());
+                let to = format!(
+                    "0x{:0>64}",
+                    ALICE.trim_start_matches("0x").to_ascii_lowercase()
+                );
+                Ok(json!((s..=e)
+                    .filter(|b| c.row_at(*b))
+                    .map(|b| json!({"address": "0x00000000000000000000000000000000000000c0",
+                        "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+                                   format!("0x{:0>64}", "3"), to],
+                        "data": format!("0x{:0>64}", "5"), "blockNumber": format!("0x{b:x}"),
+                        "transactionHash": c.hex(b), "transactionIndex": "0x0", "logIndex": "0x0",
+                        "blockHash": c.hex(b), "removed": false}))
+                    .collect::<Vec<_>>()))
+            }
+            other => bail!("unexpected {other}"),
+        });
+        let trace = crate::address_partitions::tests::Fake::new(|m, _| bail!("unexpected {m}"));
+        Discoverer::new(Counted::new(main), Counted::new(trace))
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        /// RFC-0064's reorg gate: random reorgs above finality, finality moving, sweeps read at the
+        /// tip, some with a reorg landing during the read, and polls, in any order. After the last
+        /// poll every swept block holds exactly the canonical chain's transfers, and the run swept
+        /// something, so a sweep that records nothing cannot pass.
+        #[test]
+        fn a_sweep_under_reorgs_converges_to_the_canonical_chain(
+            ops in proptest::collection::vec((0u8..5, 1u64..10), 1..40)
+        ) {
+            use crate::address_history::Action;
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let store = Store::open(&dir.path().join("t.redb")).unwrap();
+                // Chain 100: the mock chain is shorter than mainnet's Byzantium guard.
+                let history = AddressHistory::open(store, 100, &[ALICE.into()]).unwrap();
+                let s = Arc::new(
+                    ModeState::new(history, 100, Duration::from_secs(300), true)
+                        .with_range(0, None, 20),
+                );
+                let chain = Chain::new(60, 30);
+                let d = sweep_node(&chain);
+                let set: std::collections::HashSet<String> =
+                    [ALICE.to_ascii_lowercase()].into();
+                d.reconcile(&s, chain.latest()).await.unwrap();
+                let tail = |chain: &Chain| chain.latest() - chain.finalized.load(Ordering::Relaxed);
+                let mut swept_any = false;
+                for (op, n) in ops.into_iter().chain([(2, 1)]) {
+                    let next = s.history.swept().unwrap().map_or(0, |(_, t)| t + 1);
+                    match op {
+                        0 => chain.reorg(n.min(tail(&chain))),
+                        1 => {
+                            chain.grow(n);
+                            chain.finalized.store(chain.latest() - 20, Ordering::Relaxed);
+                        }
+                        2 | 3 if next <= chain.latest() => {
+                            if op == 3 {
+                                *chain.reorg_on_read.lock().unwrap() =
+                                    Some((chain.latest(), 1, n.min(tail(&chain))));
+                            }
+                            let latest = chain.latest();
+                            swept_any |= sweep_window(&d, &s, &set, (next, latest)).await.is_ok();
+                            *chain.reorg_on_read.lock().unwrap() = None;
+                        }
+                        2 | 3 => {}
+                        _ => {
+                            d.reconcile(&s, chain.latest()).await.unwrap();
+                        }
+                    }
+                }
+                d.reconcile(&s, chain.latest()).await.unwrap();
+                let (held, wanted) = held_and_wanted_of(&chain, &s.history, Action::TokenTx);
+                proptest::prop_assert_eq!(held, wanted);
+                proptest::prop_assert!(swept_any, "nothing was ever swept");
+                proptest::prop_assert!(s.cursor_error.lock().unwrap().is_none());
+                Ok(())
+            })?;
+        }
+    }
+
     /// What the store holds for ALICE over its covered blocks, and what the chain says it should.
     fn held_and_wanted(chain: &Chain, h: &AddressHistory) -> (Vec<String>, Vec<String>) {
         held_and_wanted_of(chain, h, crate::address_history::Action::TxList)
