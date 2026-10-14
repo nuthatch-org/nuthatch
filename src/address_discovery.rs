@@ -53,6 +53,8 @@ const SUSPICIOUSLY_FULL: usize = 10_000;
 const MAX_TRACE_FRAMES: usize = 100_000;
 /// Hashes hydrated at once.
 const HYDRATE_CONCURRENCY: usize = 8;
+/// Blocks a sweep fetches at once: Arbitrum makes four a second and one takes 0.13-0.38 s to read.
+const SWEEP_CONCURRENCY: usize = 8;
 
 const TRANSFER: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const TRANSFER_SINGLE: &str = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62";
@@ -796,6 +798,207 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             transfer_rows(log, &a, &timestamps, &mut found)?;
         }
         Ok(found)
+    }
+
+    /// RFC-0064's sweep: read `[from, to]` once for every address in `set` (lowercase `0x…`), each
+    /// block's transactions and the range's transfer logs, and with `traced` each block's trace,
+    /// matched in memory, so the cost is per block rather than per address.
+    pub async fn sweep(
+        &self,
+        history: &AddressHistory,
+        set: &std::collections::HashSet<String>,
+        from: u64,
+        to: u64,
+        pending: &Pending,
+        traced: bool,
+    ) -> Result<BTreeMap<String, Found>> {
+        if history.chain_id() == 1 && from < BYZANTIUM {
+            bail!("a sweep reads success from receipts, which carry no status before block {BYZANTIUM}");
+        }
+        let blocks: Vec<Result<Value>> = futures::stream::iter(from..=to)
+            .map(|b| async move {
+                let block = self
+                    .main
+                    .call("eth_getBlockByNumber", json!([format!("0x{b:x}"), true]))
+                    .await
+                    .with_context(|| format!("eth_getBlockByNumber {b}"))?;
+                if block.is_null() {
+                    bail!("block {b} is missing at the main endpoint");
+                }
+                Ok(block)
+            })
+            .buffered(SWEEP_CONCURRENCY)
+            .collect()
+            .await;
+        let mut refs: BTreeMap<String, Vec<TxRef>> = BTreeMap::new();
+        let mut timestamps = BTreeMap::new();
+        let mut hashes = BTreeMap::new();
+        for block in blocks {
+            let block = block?;
+            let number = hex_u64(block.get("number").unwrap_or(&Value::Null))?;
+            let hash = word32(str_field(&block, "hash")?)?;
+            hashes.insert(number, hash);
+            timestamps.insert(
+                number,
+                hex_u64(block.get("timestamp").unwrap_or(&Value::Null))?,
+            );
+            let txs = block
+                .get("transactions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("block {number} came without its transactions"))?;
+            for tx in txs {
+                let sender = str_field(tx, "from")?.to_ascii_lowercase();
+                let receiver = tx
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                for (party, outgoing) in [(&sender, true), (&receiver, false)] {
+                    if !set.contains(party) || (!outgoing && receiver == sender) {
+                        continue;
+                    }
+                    refs.entry(party.clone()).or_default().push(TxRef {
+                        hash: str_field(tx, "hash")?.to_ascii_lowercase(),
+                        block: number,
+                        outgoing,
+                        failed: false,
+                        block_hash: Some(hash),
+                    });
+                }
+            }
+        }
+        let logs = ranged(
+            &self.main,
+            &self.log_window,
+            from,
+            to,
+            "eth_getLogs",
+            |s, e| {
+                json!([{ "fromBlock": format!("0x{s:x}"), "toBlock": format!("0x{e:x}"),
+                     "topics": [[TRANSFER, TRANSFER_SINGLE, TRANSFER_BATCH]] }])
+            },
+        )
+        .await?;
+        let mut found: BTreeMap<String, Found> = BTreeMap::new();
+        for log in &logs {
+            if log.get("removed").and_then(Value::as_bool) == Some(true) {
+                bail!("a removed log in a swept range [{from}, {to}]: {log}");
+            }
+            let topics: Vec<&str> = log
+                .get("topics")
+                .and_then(Value::as_array)
+                .map(|t| t.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let parties = match topics.first().copied() {
+                Some(TRANSFER) if topics.len() >= 3 => [topics[1], topics[2]],
+                Some(TRANSFER_SINGLE | TRANSFER_BATCH) if topics.len() == 4 => {
+                    [topics[2], topics[3]]
+                }
+                _ => continue,
+            };
+            let mut matched: Vec<String> = Vec::new();
+            for word in parties {
+                let Ok(p) = topic_address(word).map(|p| p.to_ascii_lowercase()) else {
+                    continue;
+                };
+                if set.contains(&p) && !matched.contains(&p) {
+                    matched.push(p);
+                }
+            }
+            for p in matched {
+                transfer_rows(log, &p, &timestamps, found.entry(p.clone()).or_default())?;
+            }
+        }
+        if traced {
+            self.sweep_traces(set, &hashes, &timestamps, &mut found)
+                .await?;
+        }
+        for (a, r) in refs {
+            found.entry(a).or_default().txlist = self.hydrate(history, &r, pending).await?;
+        }
+        Ok(found)
+    }
+
+    /// The sweep's internal transfers: one `trace_block` per block, each transaction's frames turned
+    /// into Etherscan's internal rows and kept for every swept address a row names. A frame naming
+    /// another block hash than the main endpoint's refuses the window rather than mix two forks.
+    async fn sweep_traces(
+        &self,
+        set: &std::collections::HashSet<String>,
+        hashes: &BTreeMap<u64, [u8; 32]>,
+        timestamps: &BTreeMap<u64, u64>,
+        found: &mut BTreeMap<String, Found>,
+    ) -> Result<()> {
+        let traces: Vec<Result<(u64, Value)>> = futures::stream::iter(hashes.keys().copied())
+            .map(|b| async move {
+                let t = self
+                    .trace
+                    .call("trace_block", json!([format!("0x{b:x}")]))
+                    .await
+                    .with_context(|| format!("trace_block {b}"))?;
+                Ok((b, t))
+            })
+            .buffered(SWEEP_CONCURRENCY)
+            .collect()
+            .await;
+        for t in traces {
+            let (b, t) = t?;
+            let frames = t
+                .as_array()
+                .ok_or_else(|| anyhow!("trace_block {b} answered a non-list"))?;
+            let mut by_tx: Vec<(String, Vec<Value>)> = Vec::new();
+            for f in frames {
+                // A block reward frame belongs to no transaction.
+                let Some(hash) = f.get("transactionHash").and_then(Value::as_str) else {
+                    continue;
+                };
+                if word32(str_field(f, "blockHash")?)? != hashes[&b] {
+                    bail!("trace_block {b} answered for another block than the main endpoint's");
+                }
+                let hash = hash.to_ascii_lowercase();
+                match by_tx.last_mut() {
+                    Some((h, fs)) if *h == hash => fs.push(f.clone()),
+                    _ => by_tx.push((hash, vec![f.clone()])),
+                }
+            }
+            for (hash, frames) in by_tx {
+                for mut record in internal_records(&frames, timestamps[&b])? {
+                    let parties: BTreeSet<String> = ["from", "to", "contractAddress"]
+                        .iter()
+                        .filter_map(|k| record.get(*k).and_then(Value::as_str))
+                        .map(str::to_ascii_lowercase)
+                        .filter(|p| set.contains(p))
+                        .collect();
+                    if parties.is_empty() {
+                        continue;
+                    }
+                    let num = |k: &str| -> Result<u64> {
+                        record
+                            .get(k)
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| anyhow!("internal record lacks {k}"))?
+                            .parse()
+                            .with_context(|| format!("internal record {k}"))
+                    };
+                    let (block, tx_index, position) = (
+                        num("blockNumber")?,
+                        num("transactionIndex")?,
+                        num(TRACE_INDEX)?,
+                    );
+                    record.insert("hash".into(), Value::String(hash.clone()));
+                    let row = address_mode_order(Row {
+                        block,
+                        tx_index,
+                        position,
+                        record,
+                    });
+                    for p in parties {
+                        found.entry(p).or_default().txlistinternal.push(row.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Every internal transaction of `hash`, as Etherscan's `txhash` form lists them: from the cache,
@@ -3177,6 +3380,146 @@ mod tests {
         );
     }
 
+    /// A traced sweep finds value a contract sends a watched address from inside a call, which no
+    /// top-level read shows: how smart-wallet deposits arrive. A trace naming another block hash than
+    /// the main endpoint's refuses the window (RFC-0064 S2).
+    #[tokio::test]
+    async fn a_traced_sweep_finds_value_sent_from_inside_a_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        const C: &str = "0x00000000000000000000000000000000000000c0";
+        const OUT: &str = "0x00000000000000000000000000000000000000ee";
+        let n = 17_000_000u64;
+        let bh = format!("0x{:0>64}", "b1");
+        let main = || {
+            let bh = bh.clone();
+            script(move |m, _| {
+                Ok(match m {
+                    "eth_getBlockByNumber" => json!({"number": format!("0x{n:x}"), "hash": bh,
+                        "timestamp": "0x64", "transactions": []}),
+                    "eth_getLogs" => json!([]),
+                    other => bail!("unexpected {other}"),
+                })
+            })
+        };
+        let frame = |tx: &str,
+                     pos: u64,
+                     path: Value,
+                     from: &str,
+                     to: &str,
+                     value: &str,
+                     block: &str| {
+            json!({"type": "call", "traceAddress": path, "blockHash": block, "transactionHash": tx,
+                   "transactionPosition": pos, "blockNumber": n,
+                   "action": {"from": from, "to": to, "value": value, "callType": "call",
+                              "gas": "0x0"},
+                   "result": {"gasUsed": "0x0"}})
+        };
+        let (h1, h2) = (format!("0x{:0>64}", "1"), format!("0x{:0>64}", "2"));
+        let frames = |block: &str| {
+            json!([
+                frame(&h1, 0, json!([]), OUT, C, "0x0", block),
+                frame(&h1, 0, json!([0]), C, A, "0x5", block),
+                frame(&h2, 1, json!([]), OUT, C, "0x0", block),
+                frame(&h2, 1, json!([0]), C, OUT, "0x1", block),
+                {"type": "reward", "action": {"author": OUT, "value": "0x1"}, "blockHash": block,
+                 "blockNumber": n, "traceAddress": []},
+            ])
+        };
+        let set: std::collections::HashSet<String> = [A.to_string()].into();
+        for (named, refused) in [(bh.clone(), false), (format!("0x{:0>64}", "ff"), true)] {
+            let answer = frames(&named);
+            let d = Discoverer::new(
+                main(),
+                script(move |m, _| match m {
+                    "trace_block" => Ok(answer.clone()),
+                    other => bail!("unexpected {other}"),
+                }),
+            );
+            let pending = Pending::begin(&h).unwrap();
+            let swept = d.sweep(&h, &set, n, n, &pending, true).await;
+            if refused {
+                assert!(swept.is_err(), "a trace of another block is refused");
+                continue;
+            }
+            let found = swept.unwrap();
+            assert_eq!(found.keys().collect::<Vec<_>>(), [A]);
+            let rows = &found[A].txlistinternal;
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].record["hash"], h1);
+            assert_eq!(rows[0].record["from"], C);
+            assert_eq!(rows[0].record["value"], "5");
+        }
+    }
+
+    /// One pass over a block finds every watched address's transactions and transfers, both
+    /// directions, and nothing for anyone outside the set (RFC-0064 S1).
+    #[tokio::test]
+    async fn a_sweep_matches_a_block_against_the_whole_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        const B: &str = "0x00000000000000000000000000000000000000b0";
+        const OUT: &str = "0x00000000000000000000000000000000000000ee";
+        let n = 17_000_000u64;
+        let bh = format!("0x{:0>64}", "b1");
+        let tx = |hash: &str, from: &str, to: &str, i: u64| {
+            json!({"blockNumber": format!("0x{n:x}"), "blockHash": bh, "hash": hash,
+                   "nonce": "0x0", "transactionIndex": format!("0x{i:x}"), "from": from, "to": to,
+                   "value": "0x1", "gas": "0x5208", "gasPrice": "0x1", "input": "0x"})
+        };
+        let hashes = [1, 2, 3].map(|i| format!("0x{:0>64}", i));
+        let txs = vec![
+            tx(&hashes[0], A, OUT, 0),
+            tx(&hashes[1], OUT, B, 1),
+            tx(&hashes[2], OUT, OUT, 2),
+        ];
+        let log = |from: &str, to: &str, index: u64| {
+            json!({"address": "0x00000000000000000000000000000000000000c0",
+                   "topics": [TRANSFER, padded(from), padded(to)],
+                   "data": format!("0x{:0>64}", "64"), "blockNumber": format!("0x{n:x}"),
+                   "transactionHash": hashes[2], "transactionIndex": "0x2",
+                   "logIndex": format!("0x{index:x}"), "blockHash": bh, "removed": false})
+        };
+        let logs = vec![log(OUT, A, 0), log(OUT, OUT, 1)];
+        let (block_txs, by_hash, bh2) = (txs.clone(), txs, bh.clone());
+        let main = script(move |m, p| {
+            Ok(match m {
+                "eth_getBlockByNumber" => json!({"number": format!("0x{n:x}"), "hash": bh2,
+                    "timestamp": "0x64", "transactions": block_txs}),
+                "eth_getLogs" => json!(logs),
+                "eth_getTransactionByHash" => {
+                    by_hash.iter().find(|t| t["hash"] == p[0]).cloned().unwrap()
+                }
+                "eth_getTransactionReceipt" => json!({"status": "0x1", "gasUsed": "0x5208",
+                    "cumulativeGasUsed": "0x5208", "effectiveGasPrice": "0x1",
+                    "contractAddress": null, "blockHash": bh2}),
+                other => bail!("unexpected {other}"),
+            })
+        });
+        let d = Discoverer::new(main, script(|m, _| bail!("no trace call expected: {m}")));
+        let set: std::collections::HashSet<String> = [A, B].map(String::from).into();
+        let pending = Pending::begin(&h).unwrap();
+        let found = d.sweep(&h, &set, n, n, &pending, false).await.unwrap();
+        assert_eq!(
+            found.keys().collect::<Vec<_>>(),
+            [B, A],
+            "only watched addresses"
+        );
+        let a = &found[A];
+        assert_eq!(a.txlist.len(), 1);
+        assert_eq!(a.txlist[0].record["hash"], hashes[0]);
+        assert_eq!(
+            a.tokentx.len(),
+            1,
+            "the transfer to A, not the one between others"
+        );
+        assert_eq!(a.tokentx[0].record["to"], A);
+        let b = &found[B];
+        assert_eq!(b.txlist.len(), 1);
+        assert_eq!(b.txlist[0].record["hash"], hashes[1]);
+        assert!(b.tokentx.is_empty());
+    }
+
     #[tokio::test]
     async fn token_logs_become_rows_by_standard_and_dedupe() {
         let dir = tempfile::tempdir().unwrap();
@@ -4316,6 +4659,166 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("no withdrawals"), "{err:#}");
         assert!(pending.summaries.lock().unwrap().is_empty());
+    }
+
+    /// A call that fails, of any kind the sweep makes, leaves its window unswept: no span, no
+    /// coverage, no rows. The next poll reads the window again and covers it whole (RFC-0064 S1).
+    #[tokio::test]
+    async fn a_failed_call_leaves_the_window_unswept_and_retried() {
+        use crate::address_mode::Discovery;
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let n = 17_000_000u64;
+        let sent = format!("0x{:0>64}", "a1");
+        for failing in [
+            "eth_getBlockByNumber",
+            "eth_getLogs",
+            "eth_getTransactionReceipt",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = history(dir.path());
+            let fail = std::sync::Arc::new(AtomicBool::new(true));
+            let main = script({
+                let (fail, sent) = (fail.clone(), sent.clone());
+                move |m, p| {
+                    if m == failing && fail.load(Relaxed) {
+                        bail!("injected failure of {m}");
+                    }
+                    let tx = |b: u64| {
+                        json!({"blockNumber": format!("0x{b:x}"), "blockHash": format!("0x{b:064x}"),
+                               "hash": sent, "nonce": "0x0", "transactionIndex": "0x0", "from": A,
+                               "to": "0x01", "value": "0x1", "gas": "0x5208", "gasPrice": "0x1",
+                               "input": "0x"})
+                    };
+                    Ok(match m {
+                        "eth_getBlockByNumber" => {
+                            let b = hex_u64(&p[0])?;
+                            let txs = if b == n + 5 { vec![tx(b)] } else { vec![] };
+                            json!({"number": format!("0x{b:x}"), "hash": format!("0x{b:064x}"),
+                                   "parentHash": format!("0x{:064x}", b - 1),
+                                   "timestamp": "0x64", "transactions": txs})
+                        }
+                        "eth_getLogs" => json!([]),
+                        "eth_getTransactionByHash" => tx(n + 5),
+                        "eth_getTransactionReceipt" => json!({"status": "0x1",
+                            "gasUsed": "0x5208", "cumulativeGasUsed": "0x5208",
+                            "effectiveGasPrice": "0x1", "contractAddress": null,
+                            "blockHash": format!("0x{:064x}", n + 5)}),
+                        other => bail!("unexpected {other}"),
+                    })
+                }
+            });
+            let d = Discoverer::new(
+                Counted::new(main),
+                Counted::new(script(|m, _| bail!("no trace call expected: {m}"))),
+            );
+            let state = crate::address_mode::ModeState::new(
+                h.clone(),
+                1,
+                std::time::Duration::from_secs(300),
+                true,
+            )
+            .with_range(n, None, 0)
+            .with_sweep(Some(crate::address_history::SweepConfig {
+                from_block: Some(n),
+                internal: false,
+                confirmations: None,
+                webhook: None,
+            }));
+            h.finalize(n + 100).unwrap();
+            d.catch_up(&state, n + 9).await;
+            assert_eq!(
+                h.swept().unwrap(),
+                None,
+                "{failing}: nothing past a failed window"
+            );
+            assert!(
+                h.coverage(Action::TxList, A).unwrap().is_empty(),
+                "{failing}"
+            );
+
+            fail.store(false, Relaxed);
+            d.catch_up(&state, n + 9).await;
+            assert_eq!(
+                h.swept().unwrap(),
+                Some((n, n + 9)),
+                "{failing}: retried whole"
+            );
+            let req = crate::address_history::PageRequest {
+                address: A.into(),
+                start_block: Some(n),
+                end_block: Some(n + 9),
+                sort: crate::address_history::Sort::Asc,
+                page: 1,
+                offset: 10,
+                generation: None,
+            };
+            let crate::address_history::Answer::Rows(rows) = h.page(Action::TxList, &req).unwrap()
+            else {
+                panic!("{failing}: covered after the retry")
+            };
+            assert_eq!(rows.len(), 1, "{failing}: the transaction at {}", n + 5);
+        }
+    }
+
+    /// A sweeping nest covers its whole set from the configured block with block reads and one log
+    /// query per window, and never discovers an address on its own (RFC-0064 S1).
+    #[tokio::test]
+    async fn a_sweeping_nest_covers_its_set_without_per_address_discovery() {
+        use crate::address_mode::Discovery;
+        // Counted inside the script: `call_each` counts only calls that answered.
+        let traced = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let n = 17_000_000u64;
+        let main = script(move |m, p| {
+            Ok(match m {
+                "eth_getBlockByNumber" => {
+                    let b = hex_u64(&p[0])?;
+                    json!({"number": format!("0x{b:x}"), "hash": format!("0x{b:064x}"),
+                           "parentHash": format!("0x{:064x}", b - 1),
+                           "timestamp": "0x64", "transactions": []})
+                }
+                "eth_getLogs" => json!([]),
+                other => bail!("unexpected {other}"),
+            })
+        });
+        let d = Discoverer::new(
+            Counted::new(main),
+            Counted::new(script({
+                let asked = traced.clone();
+                move |m, _| {
+                    asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    bail!("no trace call expected: {m}")
+                }
+            })),
+        );
+        let state = crate::address_mode::ModeState::new(
+            h.clone(),
+            1,
+            std::time::Duration::from_secs(300),
+            true,
+        )
+        // History starts 50 blocks before the sweep: a per-address pass would try to fill that gap.
+        .with_range(n - 50, None, 0)
+        .with_sweep(Some(crate::address_history::SweepConfig {
+            from_block: Some(n),
+            internal: false,
+            confirmations: None,
+            webhook: None,
+        }));
+        h.finalize(n + 100).unwrap();
+        d.catch_up(&state, n + 9).await;
+        assert_eq!(h.swept().unwrap(), Some((n, n + 9)));
+        assert_eq!(h.coverage(Action::TokenTx, A).unwrap(), vec![(n, n + 9)]);
+        let calls = d.main.calls();
+        assert!(
+            !calls.contains_key("eth_getTransactionCount") && !calls.contains_key("eth_getCode"),
+            "no per-address discovery: {calls:?}"
+        );
+        assert!(
+            traced.load(std::sync::atomic::Ordering::Relaxed) == 0,
+            "per-address discovery asks the trace endpoint; the sweep never does"
+        );
     }
 
     /// The cursor's block pass reads each body once for every address that lacks it, and an address

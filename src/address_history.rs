@@ -69,6 +69,30 @@ pub struct AddressHistoryConfig {
     /// Off unless named: the beacon sees this machine's IP and the beacon roots asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub beacon_url: Option<String>,
+    /// Read every block once for the whole watched set, rather than each address on its own
+    /// (RFC-0064). Off unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep: Option<SweepConfig>,
+}
+
+/// `[address_history.sweep]`: where the sweep starts. Omitted, at the finalized head when it first
+/// runs; history before it comes from per-address discovery, if asked for.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SweepConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_block: Option<u64>,
+    /// Trace each block for internal transfers (RFC-0064 S2). Needs a trace-capable RPC; off unless set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub internal: bool,
+    /// Sweep up to this many blocks under the chain head, rather than up to the finalized head
+    /// (RFC-0064 S3). A reorg above finality takes back what it replaced, and the feed retracts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmations: Option<u64>,
+    /// POST the deposits feed here as it grows, at least once, oldest first (RFC-0064 S3). The
+    /// feed stays the record: a delivery that fails is sent again, never skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<String>,
 }
 
 /// `[address_history.mirror]`: where verified block partitions come from, which chain and blocks to
@@ -116,6 +140,11 @@ impl AddressHistoryConfig {
                     "[address_history.mirror] cache_mb {} cannot hold one partition; give it at least {MIN_CACHE_MB}",
                     m.cache_mb
                 );
+            }
+        }
+        if let Some(url) = self.sweep.as_ref().and_then(|s| s.webhook.as_deref()) {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                bail!("[address_history.sweep] webhook `{url}` is not an http(s) URL");
             }
         }
         self.poll_interval()?;
@@ -291,6 +320,23 @@ const UNWATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_unwatched
 /// Addresses a request has asked for withdrawals or produced blocks. Only these are body-scanned in
 /// the background: a plain wallet is never asked, and the scan costs one body a block.
 const BODIES_ASKED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_bodies_asked");
+/// RFC-0064's sweep: the span of blocks it has read, held once for every swept address, and the
+/// block each address joined it at. An address's sweep coverage is that span from its joined block on.
+const SWEEP: TableDefinition<&str, &[u8]> = TableDefinition::new("ah_sweep");
+const SWEPT: &str = "swept";
+/// The part of the swept span that was also traced, so internal transactions are claimed only where
+/// they were read.
+const SWEPT_INTERNAL: &str = "swept_internal";
+const JOINED: TableDefinition<&[u8], u64> = TableDefinition::new("ah_joined");
+/// RFC-0064's deposits feed: every incoming row the sweep recorded, and every retraction a reorg
+/// made of one, by sequence number. A consumer reads it from the last number it saw.
+const DEPOSITS: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_deposits");
+/// Deposits a reorg could still take back, keyed `block | action | address | tx index | position`
+/// so the ones above a fork are one range read.
+const LIVE_DEPOSITS: TableDefinition<&[u8], u64> = TableDefinition::new("ah_live_deposits");
+const DEPOSIT_NEXT: &str = "deposit_next";
+/// The last feed sequence number the webhook endpoint accepted.
+const DEPOSIT_DELIVERED: &str = "deposit_delivered";
 /// Block hashes above the finalized head that stored history was read against. The highest anchors
 /// everything below it, so one comparison per poll finds a reorg.
 const CANON: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_canon");
@@ -501,6 +547,10 @@ impl AddressHistory {
         wtx.open_table(FINAL)?;
         wtx.open_table(CONFLICT)?;
         wtx.open_table(BODIES_ASKED)?;
+        wtx.open_table(SWEEP)?;
+        wtx.open_table(JOINED)?;
+        wtx.open_table(DEPOSITS)?;
+        wtx.open_table(LIVE_DEPOSITS)?;
         reset_produced_blocks(&wtx)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
@@ -1013,6 +1063,34 @@ impl AddressHistory {
             .collect()
     }
 
+    /// Start watching every one of `addresses` in one transaction, all or none: a bad address refuses
+    /// the batch before anything is written. Returns how many were not watched before.
+    pub fn watch_many(&self, addresses: &[String]) -> Result<usize> {
+        let parsed = addresses
+            .iter()
+            .map(|a| parse_address(a).with_context(|| format!("address `{a}`")))
+            .collect::<Result<Vec<_>>>()?;
+        let wtx = self.store.database().begin_write()?;
+        let mut added = 0;
+        {
+            let mut w = wtx.open_table(WATCHED)?;
+            let mut u = wtx.open_table(UNWATCHED)?;
+            for a in &parsed {
+                if w.insert(a.as_slice(), 1)?.is_none() {
+                    added += 1;
+                }
+                u.remove(a.as_slice())?;
+            }
+        }
+        wtx.commit()?;
+        Ok(added)
+    }
+
+    pub fn watched_count(&self) -> Result<u64> {
+        let rtx = self.store.database().begin_read()?;
+        Ok(redb::ReadableTableMetadata::len(&rtx.open_table(WATCHED)?)?)
+    }
+
     /// Start watching `address`. It has no coverage until a backfill records some, so `/api` reads
     /// incomplete for it meanwhile.
     pub fn watch(&self, address: &str) -> Result<()> {
@@ -1032,6 +1110,7 @@ impl AddressHistory {
             wtx.open_table(WATCHED)?.remove(a.as_slice())?;
             wtx.open_table(UNWATCHED)?.insert(a.as_slice(), 1)?;
             wtx.open_table(BODIES_ASKED)?.remove(a.as_slice())?;
+            wtx.open_table(JOINED)?.remove(a.as_slice())?;
             let lo = row_key(&a, 0, 0, 0);
             let hi = row_key(&a, u64::MAX, u64::MAX, u64::MAX);
             for action in Action::ALL {
@@ -1344,10 +1423,165 @@ impl AddressHistory {
         let a = parse_address(address)?;
         let rtx = self.store.database().begin_read()?;
         let t = rtx.open_table(COVERAGE)?;
-        match t.get(coverage_key(&a, action).as_slice())? {
-            Some(v) => decode_spans(v.value()),
-            None => Ok(Vec::new()),
+        let mut spans = match t.get(coverage_key(&a, action).as_slice())? {
+            Some(v) => decode_spans(v.value())?,
+            None => Vec::new(),
+        };
+        spans.extend(swept_for(
+            &rtx.open_table(SWEEP)?,
+            &rtx.open_table(JOINED)?,
+            &a,
+            action,
+        )?);
+        Ok(merge(spans))
+    }
+
+    /// The last feed sequence number the webhook endpoint accepted; 0 before any.
+    pub fn deposits_delivered(&self) -> Result<u64> {
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx
+            .open_table(META)?
+            .get(DEPOSIT_DELIVERED)?
+            .map_or(0, |v| v.value()))
+    }
+
+    pub fn set_deposits_delivered(&self, seq: u64) -> Result<()> {
+        let wtx = self.store.database().begin_write()?;
+        wtx.open_table(META)?.insert(DEPOSIT_DELIVERED, seq)?;
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// Up to `limit` feed entries after sequence number `after`, in order (RFC-0064 S3).
+    pub fn deposits_after(&self, after: u64, limit: usize) -> Result<Vec<Value>> {
+        let rtx = self.store.database().begin_read()?;
+        rtx.open_table(DEPOSITS)?
+            .range(after.saturating_add(1)..)?
+            .take(limit)
+            .map(|e| Ok(serde_json::from_slice(e?.1.value())?))
+            .collect()
+    }
+
+    /// The span the sweep has read, from the first block it read to the last.
+    pub fn swept(&self) -> Result<Option<(u64, u64)>> {
+        let rtx = self.store.database().begin_read()?;
+        let spans = match rtx.open_table(SWEEP)?.get(SWEPT)? {
+            Some(v) => decode_spans(v.value())?,
+            None => Vec::new(),
+        };
+        Ok(spans.last().map(|(_, t)| (spans[0].0, *t)))
+    }
+
+    /// Record one swept window (RFC-0064): the rows found for each matched address, the sweep's span
+    /// extended over `[from, to]`, and `from` as the joined block of every address in `swept` that
+    /// had none, in one transaction. No per-address coverage is written: an address's sweep
+    /// coverage is the shared span from its joined block on. The span must continue the last one.
+    pub fn record_sweep<S: AsRef<str>>(
+        &self,
+        found: &std::collections::BTreeMap<String, crate::address_discovery::Found>,
+        swept: impl IntoIterator<Item = S>,
+        (from, to): (u64, u64),
+        generation: u64,
+        anchored: Option<(u64, [u8; 32])>,
+        traced: bool,
+    ) -> Result<()> {
+        if to < from {
+            bail!("sweep interval [{from}, {to}] is empty");
         }
+        let wtx = self.store.database().begin_write()?;
+        {
+            let now = wtx
+                .open_table(META)?
+                .get(GENERATION)?
+                .map_or(0, |v| v.value());
+            if now != generation {
+                bail!("address history changed during the sweep (generation {generation} -> {now}); sweep again");
+            }
+            let mut sweep = wtx.open_table(SWEEP)?;
+            let mut spans = match sweep.get(SWEPT)? {
+                Some(v) => decode_spans(v.value())?,
+                None => Vec::new(),
+            };
+            if let Some((_, last)) = spans.last() {
+                if from != last + 1 {
+                    bail!("a sweep of [{from}, {to}] does not continue the swept span ending at {last}");
+                }
+            }
+            let watched = wtx.open_table(WATCHED)?;
+            let mut joined = wtx.open_table(JOINED)?;
+            // Every watched address joined already in the usual window: skip a lookup per address,
+            // a million of them at a million addresses (2 s a window, measured 2026-10-14).
+            use redb::ReadableTableMetadata;
+            if joined.len()? < watched.len()? {
+                for address in swept {
+                    let a = parse_address(address.as_ref())?;
+                    if watched.get(a.as_slice())?.is_some() && joined.get(a.as_slice())?.is_none() {
+                        joined.insert(a.as_slice(), from)?;
+                    }
+                }
+            }
+            for (address, f) in found {
+                let a = parse_address(address)?;
+                // An address unwatched while the window was read is passed over, not the window.
+                if watched.get(a.as_slice())?.is_none() {
+                    continue;
+                }
+                for (action, rows) in [
+                    (Action::TxList, &f.txlist),
+                    (Action::TokenTx, &f.tokentx),
+                    (Action::TokenNftTx, &f.tokennfttx),
+                    (Action::Token1155Tx, &f.token1155tx),
+                    (Action::TxListInternal, &f.txlistinternal),
+                ] {
+                    if action == Action::TxListInternal && !traced && !rows.is_empty() {
+                        bail!("internal rows from a window that was not traced");
+                    }
+                    if let Some(r) = rows.iter().find(|r| r.block < from || r.block > to) {
+                        bail!("a row at block {} lies outside [{from}, {to}]", r.block);
+                    }
+                    put_rows(&wtx, action, &a, rows)?;
+                    for r in rows {
+                        let incoming = r
+                            .record
+                            .get("to")
+                            .and_then(Value::as_str)
+                            .is_some_and(|t| t.eq_ignore_ascii_case(address));
+                        if !incoming {
+                            continue;
+                        }
+                        let seq = append_feed(
+                            &wtx,
+                            serde_json::json!({"event": "deposit", "address": address_hex(&a),
+                                "action": action.etherscan(), "blockNumber": r.block,
+                                "row": r.record}),
+                        )?;
+                        wtx.open_table(LIVE_DEPOSITS)?.insert(
+                            live_key(r.block, action, &a, r.tx_index, r.position).as_slice(),
+                            seq,
+                        )?;
+                    }
+                }
+            }
+            if traced {
+                // Its own span: a window swept before tracing was turned on claims no internals.
+                let mut internal = match sweep.get(SWEPT_INTERNAL)? {
+                    Some(v) => decode_spans(v.value())?,
+                    None => Vec::new(),
+                };
+                internal.push((from, to));
+                sweep.insert(SWEPT_INTERNAL, encode_spans(&merge(internal)).as_slice())?;
+            }
+            if let Some((block, hash)) = anchored {
+                let head = wtx.open_table(META)?.get(HEAD)?.map(|v| v.value());
+                if head.is_none_or(|h| block > h) {
+                    anchor(&mut wtx.open_table(CANON)?, block, &hash)?;
+                }
+            }
+            spans.push((from, to));
+            sweep.insert(SWEPT, encode_spans(&merge(spans)).as_slice())?;
+        }
+        wtx.commit()?;
+        Ok(())
     }
 
     /// Blocks awaiting a relay re-ask: (block, first asked, last asked), in unix seconds.
@@ -1589,6 +1823,47 @@ impl AddressHistory {
                 }
             }
             {
+                // Every deposit the reorg takes back is retracted in the feed, once: a consumer
+                // that credited it learns the chain took it back.
+                let above: Vec<(Vec<u8>, u64)> = wtx
+                    .open_table(LIVE_DEPOSITS)?
+                    .range(block.saturating_add(1).to_be_bytes().as_slice()..)?
+                    .map(|e| e.map(|(k, v)| (k.value().to_vec(), v.value())))
+                    .collect::<std::result::Result<_, _>>()?;
+                for (key, seq) in above {
+                    wtx.open_table(LIVE_DEPOSITS)?.remove(key.as_slice())?;
+                    let original: Value = match wtx.open_table(DEPOSITS)?.get(seq)? {
+                        Some(v) => serde_json::from_slice(v.value())?,
+                        None => bail!("live deposit {seq} is missing from the feed"),
+                    };
+                    append_feed(
+                        &wtx,
+                        serde_json::json!({"event": "retraction", "retracts": seq,
+                            "address": original["address"], "action": original["action"],
+                            "blockNumber": original["blockNumber"], "row": original["row"]}),
+                    )?;
+                }
+            }
+            {
+                let mut sweep = wtx.open_table(SWEEP)?;
+                for key in [SWEPT, SWEPT_INTERNAL] {
+                    let spans = match sweep.get(key)? {
+                        Some(v) => decode_spans(v.value())?,
+                        None => Vec::new(),
+                    };
+                    let kept: Vec<(u64, u64)> = spans
+                        .into_iter()
+                        .filter(|(from, _)| *from <= block)
+                        .map(|(from, to)| (from, to.min(block)))
+                        .collect();
+                    if kept.is_empty() {
+                        sweep.remove(key)?;
+                    } else {
+                        sweep.insert(key, encode_spans(&kept).as_slice())?;
+                    }
+                }
+            }
+            {
                 let mut m = wtx.open_table(META)?;
                 let head = m.get(HEAD)?.map(|v| v.value());
                 if head.is_some_and(|h| h > block) {
@@ -1755,13 +2030,20 @@ impl AddressHistory {
             ));
         }
         let start = req.start_block.unwrap_or(0);
-        let spans = match rtx
+        let mut spans = match rtx
             .open_table(COVERAGE)?
             .get(coverage_key(&a, action).as_slice())?
         {
             Some(v) => decode_spans(v.value())?,
             None => Vec::new(),
         };
+        spans.extend(swept_for(
+            &rtx.open_table(SWEEP)?,
+            &rtx.open_table(JOINED)?,
+            &a,
+            action,
+        )?);
+        let spans = merge(spans);
         if req.end_block.is_some_and(|e| e < start) {
             return answer(Answer::Rows(Vec::new()));
         }
@@ -1855,6 +2137,64 @@ fn put_rows(wtx: &redb::WriteTransaction, action: Action, a: &Address, rows: &[R
         )?;
     }
     Ok(())
+}
+
+/// The actions every sweep fills. Internal transactions are filled only where the sweep traced,
+/// under their own span (RFC-0064 S2).
+pub const SWEPT_ACTIONS: [Action; 4] = [
+    Action::TxList,
+    Action::TokenTx,
+    Action::TokenNftTx,
+    Action::Token1155Tx,
+];
+
+fn live_key(block: u64, action: Action, a: &Address, tx_index: u64, position: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(45);
+    k.extend_from_slice(&block.to_be_bytes());
+    k.push(action.code());
+    k.extend_from_slice(a.as_slice());
+    k.extend_from_slice(&tx_index.to_be_bytes());
+    k.extend_from_slice(&position.to_be_bytes());
+    k
+}
+
+/// Append `entry` to the deposits feed under the next sequence number, which it returns.
+fn append_feed(wtx: &redb::WriteTransaction, mut entry: Value) -> Result<u64> {
+    let mut meta = wtx.open_table(META)?;
+    let seq = meta.get(DEPOSIT_NEXT)?.map_or(1, |v| v.value());
+    entry["seq"] = Value::from(seq);
+    wtx.open_table(DEPOSITS)?
+        .insert(seq, serde_json::to_vec(&entry)?.as_slice())?;
+    meta.insert(DEPOSIT_NEXT, seq + 1)?;
+    Ok(seq)
+}
+
+/// `a`'s coverage of `action` from the sweep: the shared span from the block `a` joined it on.
+fn swept_for(
+    sweep: &impl ReadableTable<&'static str, &'static [u8]>,
+    joined: &impl ReadableTable<&'static [u8], u64>,
+    a: &Address,
+    action: Action,
+) -> Result<Vec<(u64, u64)>> {
+    let key = if SWEPT_ACTIONS.contains(&action) {
+        SWEPT
+    } else if action == Action::TxListInternal {
+        SWEPT_INTERNAL
+    } else {
+        return Ok(Vec::new());
+    };
+    let Some(j) = joined.get(a.as_slice())?.map(|v| v.value()) else {
+        return Ok(Vec::new());
+    };
+    let spans = match sweep.get(key)? {
+        Some(v) => decode_spans(v.value())?,
+        None => Vec::new(),
+    };
+    Ok(spans
+        .into_iter()
+        .filter(|(_, t)| *t >= j)
+        .map(|(f, t)| (f.max(j), t))
+        .collect())
 }
 
 fn cover(
@@ -2332,6 +2672,9 @@ pub fn respond(
     if module == "block" && action == "getblocknobytime" {
         return block_no_by_time(history, params);
     }
+    if module == "account" && action == "nuthatchDeposits" {
+        return deposits_feed(history, params);
+    }
     let Some(act) = Action::from_etherscan(action).filter(|_| module == "account") else {
         return unsupported(&format!("{module}/{action} is not served by this nest"));
     };
@@ -2374,6 +2717,38 @@ pub fn respond(
 /// second, so they are refused rather than answered from a guess.
 pub fn strictly_increasing_timestamps(chain_id: u64) -> bool {
     matches!(chain_id, 1 | 10 | 100 | 8453)
+}
+
+/// `account/nuthatchDeposits`: the deposits feed after sequence number `after`, at most `offset`
+/// entries, and how far the sweep has read, so a consumer knows the feed is complete up to there.
+fn deposits_feed(
+    history: Option<&AddressHistory>,
+    params: &std::collections::HashMap<String, String>,
+) -> Value {
+    let Some(history) = history else {
+        return unsupported("this nest has no [address_history]");
+    };
+    let num = |k: &str, default: u64| -> std::result::Result<u64, String> {
+        match params.get(k) {
+            None => Ok(default),
+            Some(v) => v.parse().map_err(|_| format!("{k} `{v}` is not a number")),
+        }
+    };
+    let (after, limit) = match (num("after", 0), num("offset", DEFAULT_OFFSET)) {
+        (Ok(a), Ok(l)) if (1..=MAX_OFFSET).contains(&l) => (a, l),
+        (Ok(_), Ok(l)) => return error(format!("offset {l} is outside 1 to {MAX_OFFSET}")),
+        (Err(e), _) | (_, Err(e)) => return error(e),
+    };
+    match (
+        history.deposits_after(after, limit as usize),
+        history.swept(),
+    ) {
+        (Ok(entries), Ok(swept)) => serde_json::json!({
+            "status": "1", "message": "OK", "result": entries,
+            "sweptThrough": swept.map(|(_, t)| t),
+        }),
+        (Err(e), _) | (_, Err(e)) => error(format!("{e:#}")),
+    }
 }
 
 /// `block/getblocknobytime` from verified headers. The rotki-mode server searches its RPC when
@@ -3630,6 +4005,7 @@ mod tests {
             request_deadline: None,
             validators: vec![],
             beacon_url: None,
+            sweep: None,
         };
         ok.validate().unwrap();
         assert_eq!(ok.poll_interval().unwrap(), DEFAULT_POLL_INTERVAL);
@@ -3814,6 +4190,156 @@ mod tests {
                 .starts_with("NUTHATCH_INCOMPLETE:"),
             "{second}"
         );
+    }
+
+    /// RFC-0064 S3: the feed carries each incoming row once as a deposit, a reorg that takes it back
+    /// as one retraction naming it, and the replacement as a new deposit; nothing is retracted twice.
+    #[test]
+    fn the_feed_carries_deposits_and_retracts_each_once() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        let set = [ALICE.to_string()];
+        let row = |to: &str, block: u64, i: u64| {
+            let mut r = tx(block, i);
+            r.record.insert("to".into(), Value::String(to.into()));
+            r
+        };
+        let found = |rows: Vec<Row>| {
+            let mut f = std::collections::BTreeMap::new();
+            f.insert(
+                ALICE.to_ascii_lowercase(),
+                crate::address_discovery::Found {
+                    txlist: rows,
+                    ..Default::default()
+                },
+            );
+            f
+        };
+        let deposit_and_send = |block| {
+            found(vec![
+                row(&ALICE.to_ascii_lowercase(), block, 0),
+                row(BOB, block, 1),
+            ])
+        };
+        h.record_sweep(&deposit_and_send(105), &set, (100, 110), g, None, false)
+            .unwrap();
+        let feed = h.deposits_after(0, 100).unwrap();
+        assert_eq!(feed.len(), 1, "the incoming row only: {feed:?}");
+        assert_eq!(feed[0]["event"], "deposit");
+        assert_eq!(feed[0]["seq"], 1);
+
+        h.invalidate_above(100).unwrap();
+        let g = h.generation().unwrap();
+        // The replacement lands elsewhere, as one usually does after a reorg.
+        h.record_sweep(&deposit_and_send(106), &set, (101, 110), g, None, false)
+            .unwrap();
+        h.invalidate_above(100).unwrap();
+        let events: Vec<(String, Option<u64>)> = h
+            .deposits_after(0, 100)
+            .unwrap()
+            .iter()
+            .map(|e| (e["event"].as_str().unwrap().into(), e["retracts"].as_u64()))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                ("deposit".into(), None),
+                ("retraction".into(), Some(1)),
+                ("deposit".into(), None),
+                ("retraction".into(), Some(3)),
+            ]
+        );
+        let mut q = std::collections::HashMap::new();
+        for (k, v) in [
+            ("module", "account"),
+            ("action", "nuthatchDeposits"),
+            ("after", "2"),
+        ] {
+            q.insert(k.to_string(), v.to_string());
+        }
+        let answer = respond(Some(&h), &q);
+        assert_eq!(answer["status"], "1", "{answer}");
+        assert_eq!(answer["result"].as_array().unwrap().len(), 2);
+        assert_eq!(answer["result"][0]["seq"], 3);
+    }
+
+    /// RFC-0064 S2: internal transactions are claimed only over windows the sweep traced, so turning
+    /// tracing on later claims nothing for what was swept before it; a reorg cuts both spans.
+    #[test]
+    fn internal_coverage_is_claimed_only_where_the_sweep_traced() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        let set = [ALICE.to_string()];
+        h.record_sweep(&Default::default(), &set, (100, 110), g, None, false)
+            .unwrap();
+        assert_eq!(h.coverage(Action::TxList, ALICE).unwrap(), vec![(100, 110)]);
+        assert!(h
+            .coverage(Action::TxListInternal, ALICE)
+            .unwrap()
+            .is_empty());
+        h.record_sweep(&Default::default(), &set, (111, 120), g, None, true)
+            .unwrap();
+        assert_eq!(
+            h.coverage(Action::TxListInternal, ALICE).unwrap(),
+            vec![(111, 120)]
+        );
+        h.invalidate_above(115).unwrap();
+        assert_eq!(
+            h.coverage(Action::TxListInternal, ALICE).unwrap(),
+            vec![(111, 115)]
+        );
+    }
+
+    /// RFC-0064 S1: the sweep's span is held once and covers every swept address from the block it
+    /// joined; a gap is refused, and a reorg cuts the shared span as it cuts any other.
+    #[test]
+    fn a_sweep_covers_every_address_from_the_block_it_joined() {
+        const CAROL: &str = "0x00000000000000000000000000000000000000ca";
+        let (_d, h) = history();
+        h.watch(BOB).unwrap();
+        let g = h.generation().unwrap();
+        let mut found = std::collections::BTreeMap::new();
+        found.insert(
+            ALICE.to_ascii_lowercase(),
+            crate::address_discovery::Found {
+                txlist: vec![tx(105, 0)],
+                ..Default::default()
+            },
+        );
+        let first = [ALICE.to_string(), BOB.to_string()];
+        h.record_sweep(&found, &first, (100, 110), g, None, false)
+            .unwrap();
+        for who in [ALICE, BOB] {
+            assert_eq!(h.coverage(Action::TxList, who).unwrap(), vec![(100, 110)]);
+            assert_eq!(
+                h.coverage(Action::Token1155Tx, who).unwrap(),
+                vec![(100, 110)]
+            );
+        }
+        assert!(
+            h.coverage(Action::TxListInternal, ALICE)
+                .unwrap()
+                .is_empty(),
+            "internal transactions are not swept yet"
+        );
+
+        h.watch(CAROL).unwrap();
+        let all = [ALICE.to_string(), BOB.to_string(), CAROL.to_string()];
+        h.record_sweep(&Default::default(), &all, (111, 120), g, None, false)
+            .unwrap();
+        assert_eq!(h.coverage(Action::TxList, ALICE).unwrap(), vec![(100, 120)]);
+        assert_eq!(
+            h.coverage(Action::TxList, CAROL).unwrap(),
+            vec![(111, 120)],
+            "nothing before the block it joined is claimed"
+        );
+        assert!(h
+            .record_sweep(&Default::default(), &all, (130, 140), g, None, false)
+            .is_err());
+
+        h.invalidate_above(115).unwrap();
+        assert_eq!(h.swept().unwrap(), Some((100, 115)));
+        assert_eq!(h.coverage(Action::TxList, CAROL).unwrap(), vec![(111, 115)]);
     }
 
     #[test]
