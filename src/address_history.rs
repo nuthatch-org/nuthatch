@@ -288,6 +288,9 @@ const COVERAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ah_coverag
 const WATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_watched");
 /// Addresses removed at runtime, so a restart does not re-seed them from the config.
 const UNWATCHED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_unwatched");
+/// Addresses a request has asked for withdrawals or produced blocks. Only these are body-scanned in
+/// the background: a plain wallet is never asked, and the scan costs one body a block.
+const BODIES_ASKED: TableDefinition<&[u8], u8> = TableDefinition::new("ah_bodies_asked");
 /// Block hashes above the finalized head that stored history was read against. The highest anchors
 /// everything below it, so one comparison per poll finds a reorg.
 const CANON: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_canon");
@@ -497,6 +500,7 @@ impl AddressHistory {
         wtx.open_table(BODY_SUMMARY)?;
         wtx.open_table(FINAL)?;
         wtx.open_table(CONFLICT)?;
+        wtx.open_table(BODIES_ASKED)?;
         reset_produced_blocks(&wtx)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
@@ -1027,6 +1031,7 @@ impl AddressHistory {
         {
             wtx.open_table(WATCHED)?.remove(a.as_slice())?;
             wtx.open_table(UNWATCHED)?.insert(a.as_slice(), 1)?;
+            wtx.open_table(BODIES_ASKED)?.remove(a.as_slice())?;
             let lo = row_key(&a, 0, 0, 0);
             let hi = row_key(&a, u64::MAX, u64::MAX, u64::MAX);
             for action in Action::ALL {
@@ -1043,6 +1048,42 @@ impl AddressHistory {
         }
         wtx.commit()?;
         Ok(())
+    }
+
+    pub fn ask_bodies(&self, address: &str) -> Result<()> {
+        let a = parse_address(address)?;
+        // Every withdrawals request lands here; a commit each time would be a write per read.
+        if self
+            .store
+            .database()
+            .begin_read()?
+            .open_table(BODIES_ASKED)?
+            .get(a.as_slice())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let wtx = self.store.database().begin_write()?;
+        wtx.open_table(BODIES_ASKED)?.insert(a.as_slice(), 1)?;
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// Whether the background body scan covers `address`: it was asked for withdrawals or produced
+    /// blocks, or has body coverage from before the scan waited to be asked.
+    pub fn bodies_wanted(&self, address: &str) -> Result<bool> {
+        let a = parse_address(address)?;
+        let rtx = self.store.database().begin_read()?;
+        if rtx.open_table(BODIES_ASKED)?.get(a.as_slice())?.is_some() {
+            return Ok(true);
+        }
+        let cov = rtx.open_table(COVERAGE)?;
+        for action in [Action::BeaconWithdrawals, Action::MinedBlocks] {
+            if cov.get(coverage_key(&a, action).as_slice())?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn is_watched(&self, address: &str) -> Result<bool> {

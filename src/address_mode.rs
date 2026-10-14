@@ -162,6 +162,10 @@ pub(crate) struct Pace {
     min: u64,
     max: u64,
     target: Duration,
+    deadline: Duration,
+    last: Option<(u64, Duration)>,
+    /// What a window costs whatever its size, from the last two windows of different sizes.
+    fixed: Option<Duration>,
 }
 
 impl Pace {
@@ -170,18 +174,44 @@ impl Pace {
             span: start.clamp(min, max),
             min,
             max,
-            // A quarter of the deadline: a request waits for the window in hand. Much smaller and the
-            // fixed cost of a window's checks never lets it grow, and the backfill crawls.
+            // A quarter of the deadline: a request waits for the window in hand.
             target: deadline / 4,
+            deadline,
+            last: None,
+            fixed: None,
         }
     }
     pub(crate) fn span(&self) -> u64 {
         self.span
     }
     pub(crate) fn took(&mut self, elapsed: Duration) {
-        self.span = if elapsed > self.target {
-            (self.span / 2).max(self.min)
-        } else if elapsed < self.target / 2 {
+        if let Some((s, e)) = self.last.filter(|(s, _)| *s != self.span) {
+            let ((s_lo, e_lo), (s_hi, e_hi)) = if s < self.span {
+                ((s, e), (self.span, elapsed))
+            } else {
+                ((self.span, elapsed), (s, e))
+            };
+            let per_block = e_hi.saturating_sub(e_lo).as_secs_f64() / (s_hi - s_lo) as f64;
+            self.fixed = Some(Duration::from_secs_f64(
+                (e_lo.as_secs_f64() - per_block * s_lo as f64).max(0.0),
+            ));
+        }
+        self.last = Some((self.span, elapsed));
+        // Over a remote RPC a window's fixed checks alone can outrun a quarter of the deadline, and
+        // halving then only multiplies them: 64 blocks per 2.3 s turned a 16-minute backfill into 12
+        // hours. The target makes room for them, never past the deadline.
+        let target = self.fixed.map_or(self.target, |f| {
+            (f * 3).clamp(self.target, self.deadline.max(self.target))
+        });
+        self.span = if elapsed > target {
+            if self.span == self.min && self.fixed.is_none() {
+                // Slow at the floor with nothing to compare: one larger window tells fixed cost from
+                // per-block cost.
+                (self.span * 2).min(self.max)
+            } else {
+                (self.span / 2).max(self.min)
+            }
+        } else if elapsed < target / 2 {
             (self.span * 2).min(self.max)
         } else {
             self.span
@@ -2476,6 +2506,20 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
     // A hold from an earlier pass must not be committed: this pass may not reach the finalized block.
     state.clear_held();
     let mut keep = state.beacon.is_some() && state.validators.is_some();
+    // rotki asks for withdrawals and produced blocks only by a tracked validator's withdrawal
+    // address, so a plain wallet would pay one body a block for nothing. The proposer proof reads
+    // every scanned block, so with validators watched the scan stays whole.
+    let asked: Vec<String>;
+    let watched = if keep {
+        watched
+    } else {
+        asked = watched
+            .iter()
+            .filter(|a| state.history.bodies_wanted(a).unwrap_or(true))
+            .cloned()
+            .collect();
+        &asked[..]
+    };
     let _pass = state.begin_pass("bodies");
     let mut last: Option<u64> = None;
     let mut cursor = state.start_block;
@@ -3072,8 +3116,14 @@ async fn wanted(s: &Arc<ModeState>, q: &HashMap<String, String>, answer: &Value)
                 }
                 _ => None,
             };
+            let watched = h.watched()?.contains(&who);
+            if watched && Need::of(action) != Need::Discovered {
+                // Here rather than in `cover`: a request beyond reach never gets that far, and its
+                // address must still join the background body scan.
+                h.ask_bodies(&who)?;
+            }
             Ok((
-                h.watched()?.contains(&who),
+                watched,
                 h.head()?.unwrap_or(0),
                 covered,
                 owed,
@@ -5483,6 +5533,20 @@ mod tests {
         assert!(r["error"].as_str().unwrap().contains("panicked"), "{r}");
     }
 
+    /// Only an address asked for withdrawals or produced blocks joins the background body scan.
+    #[tokio::test]
+    async fn a_withdrawals_request_asks_for_bodies_and_a_txlist_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        let q = |action: &str| {
+            format!("/api?module=account&action={action}&address={ALICE}&startblock=0&endblock=1")
+        };
+        call(router(s.clone()), "GET", &q("txlist"), None).await;
+        assert!(!s.history.bodies_wanted(ALICE).unwrap());
+        call(router(s.clone()), "GET", &q("txsBeaconWithdrawal"), None).await;
+        assert!(s.history.bodies_wanted(ALICE).unwrap());
+    }
+
     #[tokio::test]
     async fn watch_and_unwatch_take_effect_without_a_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -6858,6 +6922,21 @@ mod tests {
             p.took(Duration::from_secs(60));
         }
         assert_eq!(p.span(), 64, "never under the floor");
+    }
+
+    /// Measured 2026-10-14 over Alchemy: 2.3 s a window whatever its size, plus 0.32 ms a block.
+    /// On the default deadline that pinned the backfill at 64 blocks a window.
+    #[test]
+    fn a_window_whose_cost_is_fixed_grows_on_the_default_deadline() {
+        let deadline = DEFAULT_DEADLINE;
+        let mut p = Pace::new(128, 64, 50_000, deadline);
+        let cost = |span: u64| Duration::from_millis(2_300) + Duration::from_micros(320 * span);
+        for _ in 0..20 {
+            let span = p.span();
+            p.took(cost(span));
+        }
+        assert!(p.span() >= 4_096, "{}", p.span());
+        assert!(cost(p.span()) <= deadline, "{}", p.span());
     }
 
     /// Accounts take turns: a second account gets coverage while the first still has a backlog.
