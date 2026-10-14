@@ -4505,6 +4505,8 @@ mod tests {
     #[tokio::test]
     async fn a_sweeping_nest_covers_its_set_without_per_address_discovery() {
         use crate::address_mode::Discovery;
+        // Counted inside the script: `call_each` counts only calls that answered.
+        let traced = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let dir = tempfile::tempdir().unwrap();
         let h = history(dir.path());
         let n = 17_000_000u64;
@@ -4522,7 +4524,13 @@ mod tests {
         });
         let d = Discoverer::new(
             Counted::new(main),
-            Counted::new(script(|m, _| bail!("no trace call expected: {m}"))),
+            Counted::new(script({
+                let asked = traced.clone();
+                move |m, _| {
+                    asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    bail!("no trace call expected: {m}")
+                }
+            })),
         );
         let state = crate::address_mode::ModeState::new(
             h.clone(),
@@ -4545,9 +4553,8 @@ mod tests {
             "no per-address discovery: {calls:?}"
         );
         assert!(
-            d.trace.calls().is_empty(),
-            "per-address discovery starts with traces: {:?}",
-            d.trace.calls()
+            traced.load(std::sync::atomic::Ordering::Relaxed) == 0,
+            "per-address discovery asks the trace endpoint; the sweep never does"
         );
     }
 
