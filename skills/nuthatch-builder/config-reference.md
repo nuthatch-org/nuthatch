@@ -213,6 +213,8 @@ is per block, not per account:
 [address_history.sweep]
 from_block = 21000000         # optional: where the sweep starts; omitted, the finalized head at first start
 internal = true               # optional, default off: trace each block for internal transfers; needs trace_block
+confirmations = 12            # optional: sweep to this many blocks under the head, not the finalized head
+webhook = "https://processor.example/deposits"  # optional: POST the deposits feed here, at least once
 ```
 
 A sweeping nest covers normal transactions and ERC-20, ERC-721 and ERC-1155 transfers for every watched
@@ -221,7 +223,18 @@ account from the block it joined; nothing before that block is claimed, so a rea
 `POST /api/watch` with `{"addresses": ["0x…", …]}` adds them in one transaction, all or none, and answers
 `{"added": n, "watched": total}`. With `internal = true` each block is traced once and internal
 transfers, such as value a smart wallet or contract sends from inside a call, are served too, but
-only over blocks swept with tracing on. The sweep follows the finalized head.
+only over blocks swept with tracing on. The sweep follows the finalized head, or with
+`confirmations` that many blocks under the chain head; set `poll_interval` near the block time to see
+deposits soon after they land.
+
+Every incoming row the sweep records is a deposit in one feed across the whole set, read with
+`GET /api?module=account&action=nuthatchDeposits&after=<seq>&offset=<n>`: entries in sequence order,
+each `{"seq", "event": "deposit", "address", "action", "blockNumber", "row"}`, and `sweptThrough`, the
+last block the feed is complete to. A reorg above finality adds `{"event": "retraction", "retracts":
+<seq>, …}` for each deposit it took back, once, and the replacement arrives as a new deposit. With
+`webhook` set the feed is POSTed as `{"deposits": [...]}`, oldest first; a batch counts as delivered
+only after a 2xx, so a failed delivery is sent again, never skipped, and a consumer drops repeats by
+`seq`.
 
 On Ethereum mainnet, withdrawals, produced blocks and `getblocknobytime` can come from verified block
 partitions (RFC-0063 §8) instead of one RPC call per block. It is off unless this table names a
