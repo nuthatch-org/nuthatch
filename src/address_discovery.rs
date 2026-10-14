@@ -4544,6 +4544,11 @@ mod tests {
             !calls.contains_key("eth_getTransactionCount") && !calls.contains_key("eth_getCode"),
             "no per-address discovery: {calls:?}"
         );
+        assert!(
+            d.trace.calls().is_empty(),
+            "per-address discovery starts with traces: {:?}",
+            d.trace.calls()
+        );
     }
 
     /// The cursor's block pass reads each body once for every address that lacks it, and an address
