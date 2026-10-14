@@ -4721,6 +4721,7 @@ mod tests {
             .with_sweep(Some(crate::address_history::SweepConfig {
                 from_block: Some(n),
                 internal: false,
+                confirmations: None,
             }));
             h.finalize(n + 100).unwrap();
             d.catch_up(&state, n + 9).await;
@@ -4801,6 +4802,7 @@ mod tests {
         .with_sweep(Some(crate::address_history::SweepConfig {
             from_block: Some(n),
             internal: false,
+            confirmations: None,
         }));
         h.finalize(n + 100).unwrap();
         d.catch_up(&state, n + 9).await;

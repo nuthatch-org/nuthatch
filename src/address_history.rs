@@ -85,6 +85,10 @@ pub struct SweepConfig {
     /// Trace each block for internal transfers (RFC-0064 S2). Needs a trace-capable RPC; off unless set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub internal: bool,
+    /// Sweep up to this many blocks under the chain head, rather than up to the finalized head
+    /// (RFC-0064 S3). A reorg above finality takes back what it replaced, and the feed retracts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmations: Option<u64>,
 }
 
 /// `[address_history.mirror]`: where verified block partitions come from, which chain and blocks to

@@ -988,6 +988,13 @@ async fn sweep_pass<M: Rpc, T: Rpc>(
     to: u64,
     cfg: &crate::address_history::SweepConfig,
 ) {
+    let to = match cfg.confirmations {
+        Some(c) => {
+            let head = state.latest.load(Ordering::Relaxed).saturating_sub(c);
+            state.end_block.map_or(head, |e| e.min(head))
+        }
+        None => to,
+    };
     let mut next = match state.history.swept() {
         Ok(Some((_, last))) => last + 1,
         Ok(None) => cfg.from_block.unwrap_or(to),
@@ -6517,6 +6524,37 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    /// With `confirmations`, the sweep runs that many blocks under the head rather than stopping at
+    /// the finalized head, which on mainnet is about 13 minutes behind (RFC-0064 S3).
+    #[tokio::test]
+    async fn a_sweep_with_confirmations_runs_past_finality_to_the_head_less_its_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 100, &[ALICE.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 100, Duration::from_secs(300), true)
+                .with_range(0, None, 20)
+                .with_sweep(Some(crate::address_history::SweepConfig {
+                    from_block: Some(0),
+                    internal: false,
+                    confirmations: Some(2),
+                })),
+        );
+        let chain = Chain::new(60, 30);
+        let d = sweep_node(&chain);
+        s.latest.store(chain.latest(), Ordering::Relaxed);
+        let finalized = d.reconcile(&s, chain.latest()).await.unwrap();
+        assert!(
+            finalized < chain.latest() - 2,
+            "the test needs finality under the target"
+        );
+        d.catch_up(&s, finalized).await;
+        assert_eq!(s.history.swept().unwrap(), Some((0, chain.latest() - 2)));
+        let (held, wanted) =
+            held_and_wanted_of(&chain, &s.history, crate::address_history::Action::TokenTx);
+        assert_eq!(held, wanted);
     }
 
     /// What the store holds for ALICE over its covered blocks, and what the chain says it should.
