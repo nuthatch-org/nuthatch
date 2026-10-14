@@ -319,6 +319,13 @@ const SWEPT: &str = "swept";
 /// they were read.
 const SWEPT_INTERNAL: &str = "swept_internal";
 const JOINED: TableDefinition<&[u8], u64> = TableDefinition::new("ah_joined");
+/// RFC-0064's deposits feed: every incoming row the sweep recorded, and every retraction a reorg
+/// made of one, by sequence number. A consumer reads it from the last number it saw.
+const DEPOSITS: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_deposits");
+/// Deposits a reorg could still take back, keyed `block | action | address | tx index | position`
+/// so the ones above a fork are one range read.
+const LIVE_DEPOSITS: TableDefinition<&[u8], u64> = TableDefinition::new("ah_live_deposits");
+const DEPOSIT_NEXT: &str = "deposit_next";
 /// Block hashes above the finalized head that stored history was read against. The highest anchors
 /// everything below it, so one comparison per poll finds a reorg.
 const CANON: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_canon");
@@ -531,6 +538,8 @@ impl AddressHistory {
         wtx.open_table(BODIES_ASKED)?;
         wtx.open_table(SWEEP)?;
         wtx.open_table(JOINED)?;
+        wtx.open_table(DEPOSITS)?;
+        wtx.open_table(LIVE_DEPOSITS)?;
         reset_produced_blocks(&wtx)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
@@ -1416,6 +1425,16 @@ impl AddressHistory {
         Ok(merge(spans))
     }
 
+    /// Up to `limit` feed entries after sequence number `after`, in order (RFC-0064 S3).
+    pub fn deposits_after(&self, after: u64, limit: usize) -> Result<Vec<Value>> {
+        let rtx = self.store.database().begin_read()?;
+        rtx.open_table(DEPOSITS)?
+            .range(after.saturating_add(1)..)?
+            .take(limit)
+            .map(|e| Ok(serde_json::from_slice(e?.1.value())?))
+            .collect()
+    }
+
     /// The span the sweep has read, from the first block it read to the last.
     pub fn swept(&self) -> Result<Option<(u64, u64)>> {
         let rtx = self.store.database().begin_read()?;
@@ -1489,6 +1508,26 @@ impl AddressHistory {
                         bail!("a row at block {} lies outside [{from}, {to}]", r.block);
                     }
                     put_rows(&wtx, action, &a, rows)?;
+                    for r in rows {
+                        let incoming = r
+                            .record
+                            .get("to")
+                            .and_then(Value::as_str)
+                            .is_some_and(|t| t.eq_ignore_ascii_case(address));
+                        if !incoming {
+                            continue;
+                        }
+                        let seq = append_feed(
+                            &wtx,
+                            serde_json::json!({"event": "deposit", "address": address_hex(&a),
+                                "action": action.etherscan(), "blockNumber": r.block,
+                                "row": r.record}),
+                        )?;
+                        wtx.open_table(LIVE_DEPOSITS)?.insert(
+                            live_key(r.block, action, &a, r.tx_index, r.position).as_slice(),
+                            seq,
+                        )?;
+                    }
                 }
             }
             if traced {
@@ -1749,6 +1788,28 @@ impl AddressHistory {
                     c.remove(key.as_slice())?;
                 } else {
                     c.insert(key.as_slice(), encode_spans(&kept).as_slice())?;
+                }
+            }
+            {
+                // Every deposit the reorg takes back is retracted in the feed, once: a consumer
+                // that credited it learns the chain took it back.
+                let above: Vec<(Vec<u8>, u64)> = wtx
+                    .open_table(LIVE_DEPOSITS)?
+                    .range(block.saturating_add(1).to_be_bytes().as_slice()..)?
+                    .map(|e| e.map(|(k, v)| (k.value().to_vec(), v.value())))
+                    .collect::<std::result::Result<_, _>>()?;
+                for (key, seq) in above {
+                    wtx.open_table(LIVE_DEPOSITS)?.remove(key.as_slice())?;
+                    let original: Value = match wtx.open_table(DEPOSITS)?.get(seq)? {
+                        Some(v) => serde_json::from_slice(v.value())?,
+                        None => bail!("live deposit {seq} is missing from the feed"),
+                    };
+                    append_feed(
+                        &wtx,
+                        serde_json::json!({"event": "retraction", "retracts": seq,
+                            "address": original["address"], "action": original["action"],
+                            "blockNumber": original["blockNumber"], "row": original["row"]}),
+                    )?;
                 }
             }
             {
@@ -2054,6 +2115,27 @@ pub const SWEPT_ACTIONS: [Action; 4] = [
     Action::TokenNftTx,
     Action::Token1155Tx,
 ];
+
+fn live_key(block: u64, action: Action, a: &Address, tx_index: u64, position: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(45);
+    k.extend_from_slice(&block.to_be_bytes());
+    k.push(action.code());
+    k.extend_from_slice(a.as_slice());
+    k.extend_from_slice(&tx_index.to_be_bytes());
+    k.extend_from_slice(&position.to_be_bytes());
+    k
+}
+
+/// Append `entry` to the deposits feed under the next sequence number, which it returns.
+fn append_feed(wtx: &redb::WriteTransaction, mut entry: Value) -> Result<u64> {
+    let mut meta = wtx.open_table(META)?;
+    let seq = meta.get(DEPOSIT_NEXT)?.map_or(1, |v| v.value());
+    entry["seq"] = Value::from(seq);
+    wtx.open_table(DEPOSITS)?
+        .insert(seq, serde_json::to_vec(&entry)?.as_slice())?;
+    meta.insert(DEPOSIT_NEXT, seq + 1)?;
+    Ok(seq)
+}
 
 /// `a`'s coverage of `action` from the sweep: the shared span from the block `a` joined it on.
 fn swept_for(
@@ -2558,6 +2640,9 @@ pub fn respond(
     if module == "block" && action == "getblocknobytime" {
         return block_no_by_time(history, params);
     }
+    if module == "account" && action == "nuthatchDeposits" {
+        return deposits_feed(history, params);
+    }
     let Some(act) = Action::from_etherscan(action).filter(|_| module == "account") else {
         return unsupported(&format!("{module}/{action} is not served by this nest"));
     };
@@ -2600,6 +2685,38 @@ pub fn respond(
 /// second, so they are refused rather than answered from a guess.
 pub fn strictly_increasing_timestamps(chain_id: u64) -> bool {
     matches!(chain_id, 1 | 10 | 100 | 8453)
+}
+
+/// `account/nuthatchDeposits`: the deposits feed after sequence number `after`, at most `offset`
+/// entries, and how far the sweep has read, so a consumer knows the feed is complete up to there.
+fn deposits_feed(
+    history: Option<&AddressHistory>,
+    params: &std::collections::HashMap<String, String>,
+) -> Value {
+    let Some(history) = history else {
+        return unsupported("this nest has no [address_history]");
+    };
+    let num = |k: &str, default: u64| -> std::result::Result<u64, String> {
+        match params.get(k) {
+            None => Ok(default),
+            Some(v) => v.parse().map_err(|_| format!("{k} `{v}` is not a number")),
+        }
+    };
+    let (after, limit) = match (num("after", 0), num("offset", DEFAULT_OFFSET)) {
+        (Ok(a), Ok(l)) if (1..=MAX_OFFSET).contains(&l) => (a, l),
+        (Ok(_), Ok(l)) => return error(format!("offset {l} is outside 1 to {MAX_OFFSET}")),
+        (Err(e), _) | (_, Err(e)) => return error(e),
+    };
+    match (
+        history.deposits_after(after, limit as usize),
+        history.swept(),
+    ) {
+        (Ok(entries), Ok(swept)) => serde_json::json!({
+            "status": "1", "message": "OK", "result": entries,
+            "sweptThrough": swept.map(|(_, t)| t),
+        }),
+        (Err(e), _) | (_, Err(e)) => error(format!("{e:#}")),
+    }
 }
 
 /// `block/getblocknobytime` from verified headers. The rotki-mode server searches its RPC when
@@ -4041,6 +4158,71 @@ mod tests {
                 .starts_with("NUTHATCH_INCOMPLETE:"),
             "{second}"
         );
+    }
+
+    /// RFC-0064 S3: the feed carries each incoming row once as a deposit, a reorg that takes it back
+    /// as one retraction naming it, and the replacement as a new deposit; nothing is retracted twice.
+    #[test]
+    fn the_feed_carries_deposits_and_retracts_each_once() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        let set = [ALICE.to_string()];
+        let row = |to: &str, i: u64| {
+            let mut r = tx(105, i);
+            r.record.insert("to".into(), Value::String(to.into()));
+            r
+        };
+        let found = |rows: Vec<Row>| {
+            let mut f = std::collections::BTreeMap::new();
+            f.insert(
+                ALICE.to_ascii_lowercase(),
+                crate::address_discovery::Found {
+                    txlist: rows,
+                    ..Default::default()
+                },
+            );
+            f
+        };
+        let deposit_and_send = || found(vec![row(&ALICE.to_ascii_lowercase(), 0), row(BOB, 1)]);
+        h.record_sweep(&deposit_and_send(), &set, (100, 110), g, None, false)
+            .unwrap();
+        let feed = h.deposits_after(0, 100).unwrap();
+        assert_eq!(feed.len(), 1, "the incoming row only: {feed:?}");
+        assert_eq!(feed[0]["event"], "deposit");
+        assert_eq!(feed[0]["seq"], 1);
+
+        h.invalidate_above(100).unwrap();
+        let g = h.generation().unwrap();
+        h.record_sweep(&deposit_and_send(), &set, (101, 110), g, None, false)
+            .unwrap();
+        h.invalidate_above(100).unwrap();
+        let events: Vec<(String, Option<u64>)> = h
+            .deposits_after(0, 100)
+            .unwrap()
+            .iter()
+            .map(|e| (e["event"].as_str().unwrap().into(), e["retracts"].as_u64()))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                ("deposit".into(), None),
+                ("retraction".into(), Some(1)),
+                ("deposit".into(), None),
+                ("retraction".into(), Some(3)),
+            ]
+        );
+        let mut q = std::collections::HashMap::new();
+        for (k, v) in [
+            ("module", "account"),
+            ("action", "nuthatchDeposits"),
+            ("after", "2"),
+        ] {
+            q.insert(k.to_string(), v.to_string());
+        }
+        let answer = respond(Some(&h), &q);
+        assert_eq!(answer["status"], "1", "{answer}");
+        assert_eq!(answer["result"].as_array().unwrap().len(), 2);
+        assert_eq!(answer["result"][0]["seq"], 3);
     }
 
     /// RFC-0064 S2: internal transactions are claimed only over windows the sweep traced, so turning
