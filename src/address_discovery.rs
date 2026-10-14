@@ -4530,7 +4530,8 @@ mod tests {
             std::time::Duration::from_secs(300),
             true,
         )
-        .with_range(n, None, 0)
+        // History starts 50 blocks before the sweep: a per-address pass would try to fill that gap.
+        .with_range(n - 50, None, 0)
         .with_sweep(Some(crate::address_history::SweepConfig {
             from_block: Some(n),
         }));
