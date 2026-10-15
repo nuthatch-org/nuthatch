@@ -601,6 +601,10 @@ mod tests {
         reverted.inner = vec![(A, 99, true)];
         let mut paid = tx(600, B, C, 0);
         paid.inner = vec![(A, 30, false), (B, 1, false)];
+        // In a block traced for a real credit, a credit under a reverted parent moved nothing.
+        let mut ghost = tx(600, B, C, 0);
+        ghost.ok = false;
+        ghost.inner = vec![(A, 50, false)];
         let mut deposit = tx(700, A, A, 0);
         deposit.mint = Some(1_000);
         let txs = vec![
@@ -612,7 +616,8 @@ mod tests {
             paid,              // 0x6 credits inside
             deposit,           // 0x7 a deposit from L1
             tx(800, A, A, 3),  // 0x8 a self-send
-            tx(900, B, C, 77), // 0x9 not ours
+            tx(900, B, C, 77),
+            ghost, // 0x9 not ours
         ];
         let d = discoverer(Sim::new(txs));
         let r = d.residual_transactions(A, 0, 10_000).await.unwrap();
