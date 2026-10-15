@@ -39,9 +39,26 @@ impl std::error::Error for Unprovable {}
 /// windows put one Base account at 7 hours (2026-10-15).
 pub const RESIDUAL_MIN_SPAN: u64 = 16_384;
 
-/// Chains discovered by the residual: OP-stack chains, whose `trace_filter` re-executes.
+/// Chains discovered by the residual, where `trace_filter` re-executes or is not served. Each had its
+/// fee rule balance to the wei across its history (2026-10-15, plans/rotki/l2-history.md).
 pub fn residual_chain(chain_id: u64) -> bool {
-    matches!(chain_id, 10 | 8453)
+    matches!(chain_id, 10 | 56 | 100 | 137 | 8453 | 42161)
+}
+
+/// A log that records native value minted to an account outside any call frame, so no trace shows
+/// it: `(emitter, topic0)`, with the recipient and the value as the data's first two words.
+pub type MintLog = (&'static str, &'static str);
+
+/// Gnosis's xDAI bridge mints to the recipient in the block of `AffirmationCompleted(address,
+/// uint256, bytes32)`, which equalled the balance's rise to the wei in every case measured.
+pub fn mint_logs(chain_id: u64) -> &'static [MintLog] {
+    match chain_id {
+        100 => &[(
+            "0x7301cfa0e1756b71869e93d4e4dca5c7d0eb0aa6",
+            "0x6fc115a803b8703117d9a3956c5a15401cb42401f91630f015eb6b043fa76253",
+        )],
+        _ => &[],
+    }
 }
 
 fn wei(v: Option<&Value>) -> Result<u128> {
@@ -316,21 +333,22 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
 
         // Trace only those blocks; the books must balance.
         let mut internal: BTreeSet<String> = BTreeSet::new();
-        let traced: Vec<(u64, u128, Value, Value)> = futures::stream::iter(incoming)
+        let traced: Vec<(u64, u128, Value, Value, u128)> = futures::stream::iter(incoming)
             .map(|(b, r)| async move {
-                let (block, trace) = futures::try_join!(
+                let (block, trace, minted) = futures::try_join!(
                     self.block_with_txs(b),
                     self.trace.call(
                         "debug_traceBlockByNumber",
                         json!([format!("0x{b:x}"), {"tracer": "callTracer"}])
-                    )
+                    ),
+                    self.minted(a, b)
                 )?;
-                Ok::<_, anyhow::Error>((b, r, block, trace))
+                Ok::<_, anyhow::Error>((b, r, block, trace, minted))
             })
             .buffered(RESIDUAL_CONCURRENCY)
             .try_collect()
             .await?;
-        for (b, r, block, trace) in traced {
+        for (b, r, block, trace, minted) in traced {
             let txs = block
                 .get("transactions")
                 .and_then(Value::as_array)
@@ -346,7 +364,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 );
             }
             let block_hash = word32(field(&block, "hash"))?;
-            let mut credited = 0u128;
+            let mut credited = minted;
             for (t, f) in txs.iter().zip(frames) {
                 let hash = field(t, "hash").to_ascii_lowercase();
                 if let Some(h) = f.get("txHash").and_then(Value::as_str) {
@@ -385,6 +403,42 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             roots.into_values().collect(),
             internal.into_iter().collect(),
         ))
+    }
+
+    /// Native value the chain's mint logs credit `a` in block `b`.
+    async fn minted(&self, a: &str, b: u64) -> Result<u128> {
+        let mut sum = 0u128;
+        for (emitter, topic) in self.mint_logs {
+            let logs = self
+                .main
+                .call(
+                    "eth_getLogs",
+                    json!([{ "fromBlock": format!("0x{b:x}"), "toBlock": format!("0x{b:x}"),
+                             "address": emitter, "topics": [topic] }]),
+                )
+                .await?;
+            for log in logs
+                .as_array()
+                .ok_or_else(|| anyhow!("eth_getLogs answered a non-list"))?
+            {
+                let data = field(log, "data").trim_start_matches("0x");
+                if data.len() < 128 {
+                    bail!(
+                        "a mint log in block {b} carries {} hex digits of data",
+                        data.len()
+                    );
+                }
+                if data[24..64].eq_ignore_ascii_case(a.trim_start_matches("0x")) {
+                    let word = &data[64..128];
+                    if word[..32].bytes().any(|c| c != b'0') {
+                        bail!("a mint log in block {b} carries a value past 128 bits");
+                    }
+                    sum += u128::from_str_radix(&word[32..], 16)
+                        .with_context(|| format!("a mint log's value in block {b}"))?;
+                }
+            }
+        }
+        Ok(sum)
     }
 
     async fn balance_at(&self, a: &str, block: u64) -> Result<u128> {
@@ -460,6 +514,8 @@ mod tests {
         hide: Option<(usize, usize)>,
         /// What the receipt claims for `l1Fee` less than was charged.
         understate_l1: u128,
+        /// Native value minted to the account by a log, outside any call frame: (block, value).
+        mints: Vec<(u64, u128)>,
         asked: Mutex<Vec<String>>,
     }
 
@@ -471,6 +527,7 @@ mod tests {
                 code_from: None,
                 hide: None,
                 understate_l1: 0,
+                mints: vec![],
                 asked: Mutex::new(vec![]),
             }
         }
@@ -505,6 +562,12 @@ mod tests {
         }
         fn balance(&self, b: u64) -> u128 {
             1_000_000_000
+                + self
+                    .mints
+                    .iter()
+                    .filter(|(m, _)| *m <= b)
+                    .map(|(_, v)| v)
+                    .sum::<u128>()
                 + self
                     .txs
                     .iter()
@@ -590,6 +653,13 @@ mod tests {
                     }).collect();
                     json!(frames)
                 }
+                "eth_getLogs" => {
+                    let b = block_of(&params[0]["fromBlock"]);
+                    let logs: Vec<Value> = self.mints.iter().filter(|(m, _)| *m == b).map(|(_, v)| {
+                        json!({"data": format!("0x{:0>64}{:064x}{:064x}", A.trim_start_matches("0x"), v, 0)})
+                    }).collect();
+                    json!(logs)
+                }
                 other => bail!("unexpected {other}"),
             })
         }
@@ -666,6 +736,34 @@ mod tests {
             [200, 400, 600],
             "only the blocks whose balance rose past the account's own flows"
         );
+    }
+
+    /// A mint no trace shows, Gnosis's bridge, balances the books once its log is read, and is refused
+    /// without it.
+    #[tokio::test]
+    async fn a_mint_read_from_its_log_balances_the_books() {
+        let build = |logs: bool| {
+            let mut sim = Sim::new(vec![tx(100, A, B, 10)]);
+            sim.mints = vec![(300, 5_000)];
+            let mut d = discoverer(sim);
+            if logs {
+                d.mint_logs = &[("0x01", "0x02")];
+            }
+            d
+        };
+        let d = build(true);
+        let r = d.residual_transactions(A, 0, 1_000).await.unwrap();
+        assert_eq!(
+            found(&r).0.len(),
+            1,
+            "the mint is a credit, not a transaction"
+        );
+        assert_eq!(d.main.traced(), [300]);
+        let err = build(false)
+            .residual_transactions(A, 0, 1_000)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("block 300 credits"), "{err:#}");
     }
 
     /// A trace that leaves out a credit cannot balance the block's books, and nothing is recorded.

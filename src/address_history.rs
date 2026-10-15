@@ -34,6 +34,8 @@ pub const MIN_CACHE_MB: u64 = 64;
 pub fn traced_from(chain_id: u64) -> u64 {
     match chain_id {
         10 => 105_235_063,
+        // Arbitrum's Nitro genesis: the classic chain before it has no state a node can read.
+        42161 => 22_207_817,
         _ => 0,
     }
 }

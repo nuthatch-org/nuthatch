@@ -4107,6 +4107,7 @@ pub async fn dev(
     };
     let mut discoverer = Discoverer::new(Counted::new(main), Counted::new(trace));
     discoverer.residual = crate::address_residual::residual_chain(chain_id);
+    discoverer.mint_logs = crate::address_residual::mint_logs(chain_id);
     let discovery = Arc::new(discoverer);
     // Forwarded calls wait on the same chain check the cursor does.
     let verified = Arc::new(tokio::sync::OnceCell::<()>::new());

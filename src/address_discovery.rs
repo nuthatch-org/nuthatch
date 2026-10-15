@@ -753,6 +753,8 @@ pub struct Discoverer<M, T> {
     pub log_window: Window,
     /// Find normal transactions by the balance residual instead of `trace_filter`.
     pub residual: bool,
+    /// Logs that mint native value outside any call frame, read as credits by the residual.
+    pub mint_logs: &'static [crate::address_residual::MintLog],
 }
 
 impl<M: Rpc, T: Rpc> Discoverer<M, T> {
@@ -763,6 +765,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             trace_window: Window::new(100_000),
             log_window: Window::new(100_000),
             residual: false,
+            mint_logs: &[],
         }
     }
 
