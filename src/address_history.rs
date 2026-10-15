@@ -328,8 +328,9 @@ const SWEPT: &str = "swept";
 /// they were read.
 const SWEPT_INTERNAL: &str = "swept_internal";
 const JOINED: TableDefinition<&[u8], u64> = TableDefinition::new("ah_joined");
-/// RFC-0064's deposits feed: every incoming row the sweep recorded, and every retraction a reorg
-/// made of one, by sequence number. A consumer reads it from the last number it saw.
+/// RFC-0064's deposits feed: every incoming row the sweep recorded that moved value, and every
+/// retraction a reorg made of one, by sequence number. A consumer reads it from the last number it
+/// saw.
 const DEPOSITS: TableDefinition<u64, &[u8]> = TableDefinition::new("ah_deposits");
 /// Deposits a reorg could still take back, keyed `block | action | address | tx index | position`
 /// so the ones above a fork are one range read.
@@ -1546,7 +1547,7 @@ impl AddressHistory {
                             .get("to")
                             .and_then(Value::as_str)
                             .is_some_and(|t| t.eq_ignore_ascii_case(address));
-                        if !incoming {
+                        if !incoming || !arrived(action, r, &f.callcode) {
                             continue;
                         }
                         let seq = append_feed(
@@ -2156,6 +2157,23 @@ fn live_key(block: u64, action: Action, a: &Address, tx_index: u64, position: u6
     k.extend_from_slice(&tx_index.to_be_bytes());
     k.extend_from_slice(&position.to_be_bytes());
     k
+}
+
+/// Whether an incoming row moved value to the address. Etherscan lists failed transactions, zero
+/// transfers and `callcode` frames too; the feed is for money that arrived.
+fn arrived(
+    action: Action,
+    r: &Row,
+    callcode: &std::collections::BTreeSet<(u64, u64, u64)>,
+) -> bool {
+    let field = |k: &str| r.record.get(k).and_then(Value::as_str);
+    if field("isError") == Some("1") || field("txreceipt_status") == Some("0") {
+        return false;
+    }
+    if field("value") == Some("0") || field("tokenValue") == Some("0") {
+        return false;
+    }
+    !(action == Action::TxListInternal && callcode.contains(&(r.block, r.tx_index, r.position)))
 }
 
 /// Append `entry` to the deposits feed under the next sequence number, which it returns.
@@ -4189,6 +4207,83 @@ mod tests {
                 .unwrap()
                 .starts_with("NUTHATCH_INCOMPLETE:"),
             "{second}"
+        );
+    }
+
+    /// A deposit is value that arrived: a failed transaction, a frame inside a reverted call, a zero
+    /// transfer and a `callcode` frame are served as Etherscan serves them, and are not deposits.
+    #[test]
+    fn the_feed_carries_only_value_that_arrived() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        let set = [ALICE.to_string()];
+        let to_alice = |block: u64, i: u64, fields: &[(&str, &str)]| {
+            let mut r = tx(block, i);
+            r.record
+                .insert("to".into(), Value::String(ALICE.to_ascii_lowercase()));
+            for (k, v) in fields {
+                r.record.insert((*k).into(), Value::String((*v).into()));
+            }
+            r
+        };
+        let callcode = to_alice(105, 4, &[("value", "7"), ("isError", "0")]);
+        let mut found = std::collections::BTreeMap::new();
+        found.insert(
+            ALICE.to_ascii_lowercase(),
+            crate::address_discovery::Found {
+                txlist: vec![
+                    to_alice(
+                        105,
+                        0,
+                        &[("value", "5"), ("isError", "0"), ("txreceipt_status", "1")],
+                    ),
+                    to_alice(
+                        105,
+                        1,
+                        &[("value", "5"), ("isError", "1"), ("txreceipt_status", "0")],
+                    ),
+                    to_alice(105, 2, &[("value", "0"), ("isError", "0")]),
+                ],
+                txlistinternal: vec![
+                    to_alice(105, 3, &[("value", "6"), ("isError", "1")]),
+                    callcode.clone(),
+                ],
+                tokentx: vec![
+                    to_alice(105, 5, &[("value", "0")]),
+                    to_alice(105, 6, &[("value", "9")]),
+                ],
+                callcode: [(callcode.block, callcode.tx_index, callcode.position)].into(),
+                ..Default::default()
+            },
+        );
+        h.record_sweep(&found, &set, (100, 110), g, None, true)
+            .unwrap();
+        let feed: Vec<(String, u64)> = h
+            .deposits_after(0, 100)
+            .unwrap()
+            .iter()
+            .map(|e| {
+                // tx() writes the transaction index into the hash's last digits.
+                let hash = e["row"]["hash"].as_str().unwrap();
+                let i = u64::from_str_radix(&hash[hash.len() - 2..], 16).unwrap();
+                (e["action"].as_str().unwrap().into(), i)
+            })
+            .collect();
+        assert_eq!(feed, [("txlist".into(), 0), ("tokentx".into(), 6)]);
+        let served = respond(
+            Some(&h),
+            &params(&[
+                ("module", "account"),
+                ("action", "txlist"),
+                ("address", ALICE),
+                ("startblock", "100"),
+                ("endblock", "110"),
+            ]),
+        );
+        assert_eq!(
+            served["result"].as_array().unwrap().len(),
+            3,
+            "txlist still lists all three"
         );
     }
 
