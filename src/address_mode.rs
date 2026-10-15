@@ -3626,7 +3626,7 @@ async fn search_by_time(
     Ok(Ok((lo, latest, proof)))
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 struct AddressBody {
     #[serde(default)]
     address: Option<String>,
@@ -4064,24 +4064,361 @@ pub async fn dev(
     let Some(ah) = &config.address_history else {
         bail!("not an address-history nest");
     };
-    if !config.contracts.is_empty() {
-        bail!(
-            "{} declares both [address_history] and [[contracts]]; an address-history nest watches \
-             accounts and indexes no contract, so give each its own nest",
-            crate::config::CONFIG_FILE
-        );
-    }
     refuse_event_flags(args)?;
     let poll_interval = poll_interval(args.poll_interval, ah)?;
-    let listener = tokio::net::TcpListener::bind(&args.listen)
+    let (listener, loopback) = bind(&args.listen).await?;
+    let urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
+    let trace = if args.trace_rpc.is_empty() {
+        urls.clone()
+    } else {
+        args.trace_rpc.clone()
+    };
+    let rpcs = Rpcs {
+        main: urls,
+        fallback: args.rpc_fallback.clone(),
+        trace,
+    };
+    let nest = start_nest(dir, &config, rpcs, poll_interval, loopback).await?;
+    let served = crate::serve::serve_bound(listener, router(nest.state.clone()), cors).await;
+    nest.stop();
+    served
+}
+
+/// A directory whose subdirectories are address-history nests, one per chain, served at one `/api`
+/// (RFC-0063 S4); `None` when `dir` is itself a nest or a mounts directory, or holds no nests.
+pub fn chain_dirs(dir: &Path) -> Result<Option<Vec<(std::path::PathBuf, Config)>>> {
+    if dir.join(crate::config::CONFIG_FILE).exists() || dir.join("mounts.toml").exists() {
+        return Ok(None);
+    }
+    let mut chains = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let sub = entry?.path();
+        if !sub.join(crate::config::CONFIG_FILE).is_file() {
+            continue;
+        }
+        let config = Config::load(&sub)?;
+        if config.address_history.is_none() {
+            bail!(
+                "{} is not an address-history nest; a directory of chains holds only those",
+                sub.display()
+            );
+        }
+        chains.push((sub, config));
+    }
+    if chains.is_empty() {
+        return Ok(None);
+    }
+    chains.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut seen = BTreeSet::new();
+    for (sub, config) in &chains {
+        if !seen.insert(config.nest.chain_id) {
+            bail!(
+                "{} is a second nest on chain {}; a directory of chains holds one nest per chain",
+                sub.display(),
+                config.nest.chain_id
+            );
+        }
+    }
+    Ok(Some(chains))
+}
+
+/// `nuthatch dev` on a directory of chain nests: each runs its own cursor, as it would solo, and one
+/// listener serves them all, `/api` by `chainid`.
+pub async fn dev_chains(
+    chains: Vec<(std::path::PathBuf, Config)>,
+    args: &crate::cli::DevArgs,
+    cors: Option<tower_http::cors::CorsLayer>,
+) -> Result<()> {
+    refuse_event_flags(args)?;
+    if !args.rpc.is_empty() || !args.trace_rpc.is_empty() || !args.rpc_fallback.is_empty() {
+        bail!(
+            "a directory of chains reads each chain's RPCs from NUTHATCH_RPC_<chain id> and \
+             NUTHATCH_TRACE_RPC_<chain id>, else from its nest's rpc_urls; --rpc, --trace-rpc and \
+             --rpc-fallback name one chain's"
+        );
+    }
+    let (listener, loopback) = bind(&args.listen).await?;
+    let mut nests: BTreeMap<u64, Nest> = BTreeMap::new();
+    for (sub, config) in &chains {
+        let id = config.nest.chain_id;
+        // From the environment, so a keyed URL stays out of nuthatch.toml.
+        let env = |name: &str| {
+            std::env::var(format!("{name}_{id}"))
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(|v| v.split(',').map(str::to_string).collect::<Vec<_>>())
+        };
+        let main = env("NUTHATCH_RPC").unwrap_or_else(|| config.nest.rpc_urls.clone());
+        let trace = env("NUTHATCH_TRACE_RPC").unwrap_or_else(|| main.clone());
+        let ah = config
+            .address_history
+            .as_ref()
+            .expect("chain_dirs keeps address-history nests only");
+        let started = match poll_interval(args.poll_interval, ah) {
+            Ok(poll) => {
+                let rpcs = Rpcs {
+                    main,
+                    fallback: Vec::new(),
+                    trace,
+                };
+                start_nest(sub, config, rpcs, poll, loopback).await
+            }
+            Err(e) => Err(e),
+        };
+        match started {
+            Ok(nest) => {
+                nests.insert(id, nest);
+            }
+            Err(e) => {
+                for n in nests.values() {
+                    n.stop();
+                }
+                return Err(e.context(format!("starting {}", sub.display())));
+            }
+        }
+    }
+    tracing::info!(
+        "address history: one /api for chains {}",
+        nests
+            .keys()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let states: BTreeMap<u64, Arc<ModeState>> =
+        nests.iter().map(|(id, n)| (*id, n.state.clone())).collect();
+    let served = crate::serve::serve_bound(listener, chains_router(Arc::new(states)), cors).await;
+    for n in nests.values() {
+        n.stop();
+    }
+    served
+}
+
+type Chains = Arc<BTreeMap<u64, Arc<ModeState>>>;
+
+/// One listener for a directory of chain nests: each route is the solo nest's, asked of the chain
+/// `chainid` names, or of every chain where the answer spans them.
+pub fn chains_router(chains: Chains) -> Router {
+    Router::new()
+        .route("/api", get(chains_api))
+        .route(
+            "/api/watch",
+            get(chains_watched)
+                .post(chains_watch)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route("/api/unwatch", post(chains_unwatch))
+        .route("/health", get(|| async { "ok" }))
+        .route("/ready", get(chains_ready))
+        .route("/metrics", get(chains_metrics))
+        .with_state(chains)
+}
+
+fn chain_list(c: &Chains) -> String {
+    c.keys().map(u64::to_string).collect::<Vec<_>>().join(", ")
+}
+
+async fn chains_api(
+    State(c): State<Chains>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let asked = match q.get("chainid") {
+        None if c.len() == 1 => c.values().next().cloned(),
+        None => {
+            return Json(crate::address_history::unsupported(&format!(
+                "this endpoint serves chains {}; name one with chainid",
+                chain_list(&c)
+            )))
+        }
+        Some(id) => id.parse::<u64>().ok().and_then(|id| c.get(&id).cloned()),
+    };
+    match asked {
+        Some(s) => api(State(s), Query(q)).await,
+        // Worded with `chainid`, which rotki reads as "not this indexer for that chain".
+        None => Json(crate::address_history::unsupported(&format!(
+            "chainid {} is not served here; this endpoint serves chains {}",
+            q.get("chainid").map_or("", String::as_str),
+            chain_list(&c)
+        ))),
+    }
+}
+
+async fn chains_watched(State(c): State<Chains>) -> (StatusCode, Json<Value>) {
+    let mut addresses = BTreeSet::new();
+    let mut validators = Value::Array(Vec::new());
+    for (id, s) in c.iter() {
+        let (code, Json(v)) = watched(State(s.clone())).await;
+        if code != StatusCode::OK {
+            return (code, Json(v));
+        }
+        for a in v["watched"].as_array().into_iter().flatten() {
+            if let Some(a) = a.as_str() {
+                addresses.insert(a.to_string());
+            }
+        }
+        if *id == 1 {
+            validators = v["validators"].clone();
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "watched": addresses, "validators": validators })),
+    )
+}
+
+/// A body for every chain, or a validator's for Ethereum alone; the answer is the first chain's,
+/// with each chain's beside it.
+async fn chains_dispatch(c: Chains, b: AddressBody, add: bool) -> (StatusCode, Json<Value>) {
+    let targets: Vec<(u64, Arc<ModeState>)> = if b.validator.is_some() {
+        c.get(&1).map(|s| (1, s.clone())).into_iter().collect()
+    } else {
+        c.iter().map(|(id, s)| (*id, s.clone())).collect()
+    };
+    if targets.is_empty() {
+        return failed(
+            StatusCode::BAD_REQUEST,
+            "validators are watched on Ethereum, which this endpoint does not serve",
+        );
+    }
+    let mut per_chain = serde_json::Map::new();
+    let mut first: Option<Value> = None;
+    for (id, s) in targets {
+        let (code, Json(v)) = dispatch(s, b.clone(), add).await;
+        if code != StatusCode::OK {
+            return (
+                code,
+                Json(json!({ "chain_id": id, "error": v.get("error").cloned().unwrap_or(v) })),
+            );
+        }
+        first.get_or_insert_with(|| v.clone());
+        per_chain.insert(id.to_string(), v);
+    }
+    let mut out = first.unwrap_or_else(|| json!({}));
+    if let Some(o) = out.as_object_mut() {
+        o.insert("chains".into(), Value::Object(per_chain));
+    }
+    (StatusCode::OK, Json(out))
+}
+
+async fn chains_watch(
+    State(c): State<Chains>,
+    Json(b): Json<AddressBody>,
+) -> (StatusCode, Json<Value>) {
+    chains_dispatch(c, b, true).await
+}
+
+async fn chains_unwatch(
+    State(c): State<Chains>,
+    Json(b): Json<AddressBody>,
+) -> (StatusCode, Json<Value>) {
+    chains_dispatch(c, b, false).await
+}
+
+async fn chains_ready(State(c): State<Chains>) -> (StatusCode, Json<Value>) {
+    let mut code = StatusCode::OK;
+    let mut per_chain = serde_json::Map::new();
+    for (id, s) in c.iter() {
+        let (each, Json(v)) = ready(State(s.clone())).await;
+        if each != StatusCode::OK && code == StatusCode::OK {
+            code = each;
+        }
+        per_chain.insert(id.to_string(), v);
+    }
+    (
+        code,
+        Json(json!({ "chain_ids": c.keys().collect::<Vec<_>>(), "chains": per_chain })),
+    )
+}
+
+/// Each chain's metrics, every sample labelled with its chain, each family's help printed once.
+async fn chains_metrics(State(c): State<Chains>) -> impl IntoResponse {
+    let mut seen = BTreeSet::new();
+    let mut out = String::new();
+    for (id, s) in c.iter() {
+        let body = metrics(State(s.clone())).await.into_response().into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .unwrap_or_default();
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            if line.starts_with('#') {
+                if seen.insert(line.to_string()) {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                continue;
+            }
+            let labelled = match line.find('{') {
+                Some(i) => format!("{}{{chain_id=\"{id}\",{}", &line[..i], &line[i + 1..]),
+                None => match line.find(' ') {
+                    Some(i) => format!("{}{{chain_id=\"{id}\"}}{}", &line[..i], &line[i..]),
+                    None => line.to_string(),
+                },
+            };
+            out.push_str(&labelled);
+            out.push('\n');
+        }
+    }
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        out,
+    )
+}
+
+async fn bind(listen: &str) -> Result<(tokio::net::TcpListener, bool)> {
+    let listener = tokio::net::TcpListener::bind(listen)
         .await
-        .with_context(|| format!("cannot bind {}", args.listen))?;
+        .with_context(|| format!("cannot bind {listen}"))?;
     let loopback = listener.local_addr()?.ip().is_loopback();
     if !loopback {
         tracing::warn!(
             "address history: listening on {}, not loopback: anyone who can reach it can read /api and \
              GET /api/watch, which lists the accounts watched",
             listener.local_addr()?
+        );
+    }
+    Ok((listener, loopback))
+}
+
+/// The endpoints one address-history nest reads.
+pub struct Rpcs {
+    pub main: Vec<String>,
+    pub fallback: Vec<String>,
+    pub trace: Vec<String>,
+}
+
+/// A running address-history nest: its state, and the tasks to stop when it is done.
+pub struct Nest {
+    pub state: Arc<ModeState>,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Nest {
+    pub fn stop(&self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+/// Open one address-history nest's store and start its cursor, serving nothing yet.
+pub async fn start_nest(
+    dir: &Path,
+    config: &Config,
+    rpcs: Rpcs,
+    poll_interval: Duration,
+    loopback: bool,
+) -> Result<Nest> {
+    let Some(ah) = &config.address_history else {
+        bail!("{} is not an address-history nest", dir.display());
+    };
+    if !config.contracts.is_empty() {
+        bail!(
+            "{} declares both [address_history] and [[contracts]]; an address-history nest watches \
+             accounts and indexes no contract, so give each its own nest",
+            dir.join(crate::config::CONFIG_FILE).display()
         );
     }
     // redb caches every page it reads or writes up to its cache size, and a backfill touches all of
@@ -4091,14 +4428,8 @@ pub async fn dev(
     let store = crate::store::Store::open_with_cache(&path, STORE_CACHE_BYTES)?;
     let history = AddressHistory::open(store, config.nest.chain_id, &addresses)?;
 
-    let urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
-    let trace_urls = if args.trace_rpc.is_empty() {
-        urls.clone()
-    } else {
-        args.trace_rpc.clone()
-    };
-    let main = RpcClient::with_fallbacks(urls, args.rpc_fallback.clone())?;
-    let trace = RpcClient::with_fallbacks(trace_urls, Vec::new())?;
+    let main = RpcClient::with_fallbacks(rpcs.main, rpcs.fallback)?;
+    let trace = RpcClient::with_fallbacks(rpcs.trace, Vec::new())?;
     let chain_id = config.nest.chain_id;
     let depth = match crate::chains::lookup_by_id(chain_id).map(|c| c.finality) {
         Some(crate::chains::Finality::Depth(n)) => n,
@@ -4252,13 +4583,9 @@ pub async fn dev(
         .and_then(|s| s.webhook.clone())
         .map(|url| tokio::spawn(deposit_webhook(state.clone(), url)));
     let cursor = supervise(state.clone(), work);
-    let served = crate::serve::serve_bound(listener, router(state), cors).await;
-    cursor.abort();
-    work_abort.abort();
-    if let Some(w) = webhook {
-        w.abort();
-    }
-    served
+    let mut tasks = vec![cursor.abort_handle(), work_abort];
+    tasks.extend(webhook.map(|w| w.abort_handle()));
+    Ok(Nest { state, tasks })
 }
 
 #[cfg(test)]
@@ -5025,6 +5352,79 @@ mod tests {
         let v = serde_json::from_slice(&bytes)
             .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into()));
         (status, v)
+    }
+
+    fn chain_state(dir: &Path, chain_id: u64) -> Arc<ModeState> {
+        let store = Store::open(&dir.join(format!("{chain_id}.redb"))).unwrap();
+        let history = AddressHistory::open(store, chain_id, &[ALICE.into()]).unwrap();
+        Arc::new(ModeState::new(
+            history,
+            chain_id,
+            Duration::from_secs(300),
+            true,
+        ))
+    }
+
+    /// RFC-0063 S4: one listener for several chains. `/api` answers as the chain `chainid` names, an
+    /// unknown or missing `chainid` is refused in the wording rotki reads as "not this indexer", a
+    /// watch reaches every chain, readiness lists them, and metrics carry each chain's label.
+    #[tokio::test]
+    async fn one_endpoint_serves_each_chain_as_its_own_nest() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains: Chains = Arc::new(
+            [1, 100]
+                .into_iter()
+                .map(|id| (id, chain_state(dir.path(), id)))
+                .collect(),
+        );
+        let app = || chains_router(chains.clone());
+        let q = "module=account&action=txlist&address=0x0000000000000000000000000000000000000abc";
+        for id in [1, 100] {
+            let (_, via_endpoint) =
+                call(app(), "GET", &format!("/api?chainid={id}&{q}"), None).await;
+            let (_, solo) = call(
+                router(chains[&id].clone()),
+                "GET",
+                &format!("/api?chainid={id}&{q}"),
+                None,
+            )
+            .await;
+            assert_eq!(via_endpoint, solo, "chain {id} answers as its own nest");
+        }
+        for path in [format!("/api?chainid=8453&{q}"), format!("/api?{q}")] {
+            let (_, v) = call(app(), "GET", &path, None).await;
+            let r = v["result"].as_str().unwrap();
+            assert!(
+                r.starts_with("NUTHATCH_UNSUPPORTED:") && r.contains("chainid"),
+                "{path}: {r}"
+            );
+        }
+        let bob = "0x0000000000000000000000000000000000000b0b";
+        let (code, v) = call(app(), "POST", "/api/watch", Some(json!({ "address": bob }))).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        for id in [1, 100] {
+            assert!(
+                chains[&id]
+                    .history
+                    .watched()
+                    .unwrap()
+                    .contains(&bob.to_string()),
+                "chain {id}"
+            );
+        }
+        let (_, v) = call(app(), "GET", "/api/watch", None).await;
+        assert_eq!(v["watched"].as_array().unwrap().len(), 2, "the union: {v}");
+        let (_, v) = call(app(), "GET", "/ready", None).await;
+        assert_eq!(v["chain_ids"], json!([1, 100]));
+        let (_, v) = call(app(), "GET", "/metrics", None).await;
+        let text = v.as_str().unwrap();
+        assert!(
+            text.lines()
+                .filter(|l| !l.starts_with('#'))
+                .all(|l| l.contains("chain_id=")),
+            "{text}"
+        );
+        assert!(text.contains("chain_id=\"1\"") && text.contains("chain_id=\"100\""));
     }
 
     /// rotki asks from block 0, or names no start: every account action must answer in the wording
