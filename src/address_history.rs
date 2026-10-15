@@ -34,6 +34,8 @@ pub const MIN_CACHE_MB: u64 = 64;
 pub fn traced_from(chain_id: u64) -> u64 {
     match chain_id {
         10 => 105_235_063,
+        // Arbitrum's Nitro genesis: the classic chain before it has no state a node can read.
+        42161 => 22_207_817,
         _ => 0,
     }
 }
@@ -328,6 +330,9 @@ const SWEPT: &str = "swept";
 /// they were read.
 const SWEPT_INTERNAL: &str = "swept_internal";
 const JOINED: TableDefinition<&[u8], u64> = TableDefinition::new("ah_joined");
+/// The first block from which an address's history cannot be proved: where it had code, so another
+/// account's code could spend its balance and the residual (RFC-0063, L2) proves nothing.
+const UNPROVABLE: TableDefinition<&[u8], u64> = TableDefinition::new("ah_unprovable");
 /// RFC-0064's deposits feed: every incoming row the sweep recorded that moved value, and every
 /// retraction a reorg made of one, by sequence number. A consumer reads it from the last number it
 /// saw.
@@ -405,6 +410,8 @@ pub struct Row {
 pub enum Answer {
     Rows(Vec<Value>),
     Incomplete(String),
+    /// Never servable here, however long one waits: the caller should ask elsewhere.
+    Unsupported(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -550,6 +557,7 @@ impl AddressHistory {
         wtx.open_table(BODIES_ASKED)?;
         wtx.open_table(SWEEP)?;
         wtx.open_table(JOINED)?;
+        wtx.open_table(UNPROVABLE)?;
         wtx.open_table(DEPOSITS)?;
         wtx.open_table(LIVE_DEPOSITS)?;
         reset_produced_blocks(&wtx)?;
@@ -1085,6 +1093,28 @@ impl AddressHistory {
         }
         wtx.commit()?;
         Ok(added)
+    }
+
+    /// Record that `address`'s history cannot be proved from `block` on; the earliest block wins.
+    pub fn mark_unprovable(&self, address: &str, block: u64) -> Result<()> {
+        let a = parse_address(address)?;
+        let wtx = self.store.database().begin_write()?;
+        {
+            let mut t = wtx.open_table(UNPROVABLE)?;
+            let keep = t.get(a.as_slice())?.map_or(block, |v| v.value().min(block));
+            t.insert(a.as_slice(), keep)?;
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    pub fn unprovable_from(&self, address: &str) -> Result<Option<u64>> {
+        let a = parse_address(address)?;
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx
+            .open_table(UNPROVABLE)?
+            .get(a.as_slice())?
+            .map(|v| v.value()))
     }
 
     pub fn watched_count(&self) -> Result<u64> {
@@ -2010,6 +2040,19 @@ impl AddressHistory {
             }
             bump_generation(&wtx)?;
         }
+        {
+            // A marker above the fork came from code a reorg may have taken away.
+            let mut t = wtx.open_table(UNPROVABLE)?;
+            let marks: Vec<(Vec<u8>, u64)> = t
+                .iter()?
+                .map(|e| e.map(|(k, v)| (k.value().to_vec(), v.value())))
+                .collect::<std::result::Result<_, _>>()?;
+            for (k, from) in marks {
+                if from > block {
+                    t.remove(k.as_slice())?;
+                }
+            }
+        }
         wtx.commit()?;
         Ok(())
     }
@@ -2031,6 +2074,19 @@ impl AddressHistory {
             ));
         }
         let start = req.start_block.unwrap_or(0);
+        if let Some(from) = rtx
+            .open_table(UNPROVABLE)?
+            .get(a.as_slice())?
+            .map(|v| v.value())
+        {
+            if req.end_block.is_none_or(|e| e >= from) {
+                return answer(Answer::Unsupported(format!(
+                    "{} had code from block {from}, and this chain's history is proved by its balance, \
+                     which another account's code can spend; ask another source for blocks from {from}",
+                    req.address
+                )));
+            }
+        }
         let mut spans = match rtx
             .open_table(COVERAGE)?
             .get(coverage_key(&a, action).as_slice())?
@@ -2725,6 +2781,7 @@ pub fn respond(
         Ok(req) => match history.page_at(act, &req) {
             Ok((Answer::Rows(rows), generation)) => ok(Value::Array(rows), generation),
             Ok((Answer::Incomplete(why), _)) => incomplete(&why),
+            Ok((Answer::Unsupported(why), _)) => unsupported(&why),
             Err(e) => error(format!("{e:#}")),
         },
     }
@@ -4284,6 +4341,47 @@ mod tests {
             served["result"].as_array().unwrap().len(),
             3,
             "txlist still lists all three"
+        );
+    }
+
+    /// An address marked unprovable from a block answers unsupported for any page reaching it, is
+    /// served below it, keeps the earliest mark, and loses a mark a reorg took the block of.
+    #[test]
+    fn an_unprovable_mark_refuses_pages_from_its_block() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        h.record(Action::TxList, ALICE, &[tx(10, 0)], (0, 99), g)
+            .unwrap();
+        let page = |end: Option<u64>| {
+            h.page(
+                Action::TxList,
+                &PageRequest {
+                    address: ALICE.into(),
+                    start_block: Some(0),
+                    end_block: end,
+                    sort: Sort::Asc,
+                    page: 1,
+                    offset: 100,
+                    generation: None,
+                },
+            )
+            .unwrap()
+        };
+        h.mark_unprovable(ALICE, 80).unwrap();
+        h.mark_unprovable(ALICE, 90).unwrap();
+        assert_eq!(
+            h.unprovable_from(ALICE).unwrap(),
+            Some(80),
+            "the earliest mark wins"
+        );
+        assert!(matches!(page(None), Answer::Unsupported(_)));
+        assert!(matches!(page(Some(80)), Answer::Unsupported(_)));
+        assert!(matches!(page(Some(79)), Answer::Rows(r) if r.len() == 1));
+        h.invalidate_above(79).unwrap();
+        assert_eq!(
+            h.unprovable_from(ALICE).unwrap(),
+            None,
+            "a reorg below the mark removes it"
         );
     }
 

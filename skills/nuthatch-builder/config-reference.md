@@ -199,6 +199,17 @@ head are read against their block hash: each poll checks the newest such hash, a
 everything read above the fork, rows, coverage and caches, until it is read again. A conflict at or
 under the finalized head stops the cursor and says so; history under it is never rewritten.
 
+On Optimism, Base, Arbitrum, Polygon, BNB Chain and Gnosis the nest finds an account's normal and
+internal transactions without `trace_filter`, which on these chains replays every block it covers or is
+not served. Outgoing transactions are the blocks where the account's nonce rises; incoming value is
+found where its balance rises by more than its own transactions explain, and only those blocks are
+traced, with `debug_traceBlockByNumber`, which the trace RPC must serve. Each traced block's credits
+must equal the balance's rise to the wei, or the window is not recorded. This proves the history of an
+externally owned account: for a contract, or an account with EIP-7702 delegated code, every account
+action answers `NUTHATCH_UNSUPPORTED` from the first block it had code, so the caller asks another
+source. An incoming transaction that moves no value, a zero-value call or a failed transfer to the
+account, is not listed, though Etherscan lists it; token transfers are found from logs as everywhere.
+
 `getblocknobytime` answers from verified headers where they bracket the timestamp, and otherwise by
 searching the nest's own RPC, proving the answer against its neighbour block by parent hash and,
 above the finalized head, linking it by parent hashes to the head the search began from. It refuses a

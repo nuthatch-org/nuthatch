@@ -375,3 +375,63 @@ followed:
   address no longer discards other addresses' windows in flight; `/ready` shows a failing RPC at
   once; `rpc_requests_total` is current; a refusal always names its reason; `addresses = []` is
   valid; a non-loopback bind warns.
+
+## 13. Chains where `trace_filter` is not the source (2026-10-15)
+
+§7's filtered traces do not hold off Ethereum. reth caps `trace_filter` at 100 blocks and replays each
+block it covers: Base took 47 s per 100 blocks on GraphOps (2026-10-14), so one account's history there
+is about a million calls; Polygon and Arbitrum do not serve it at all. On chains 10, 56, 100, 137, 8453
+and 42161 the nest therefore finds an account's normal and internal transactions by **the balance
+residual**:
+
+- **Outgoing** transactions are the blocks where the account's nonce rises, found by bisection.
+- **Incoming value**: an externally owned account's balance falls only through what it sends, so over
+  any range `balance(end) - balance(before) + own spending - own known income` is exactly what others
+  sent it, and zero proves nothing came. A positive residual is bisected to single blocks, and only
+  those are traced, with `debug_traceBlockByNumber`.
+- **The books must balance.** Each traced block's credits, from call frames and from what the chain
+  mints outside them (the OP stack's deposit `mint`, Gnosis's bridge `AffirmationCompleted`), must
+  equal the balance's rise to the wei, or the window is not recorded.
+- **Accounts it cannot prove** are a contract or an account with EIP-7702 delegated code, whose balance
+  another account's code can spend. They are found at the first block with code, or the block whose
+  nonce rose for an authorisation, and every account action answers `NUTHATCH_UNSUPPORTED` from there,
+  so rotki asks another source. A reorg below that block removes the mark.
+- **What it does not list**: an incoming transaction that moves no value, a zero-value call or a
+  failed transfer to the account. Etherscan lists them; they change nothing in rotki's books.
+- **A contract that comes and goes.** `CREATE` cannot target an address with a nonce or code
+  (EIP-684), so an account that ever sent cannot become one, and a contract present at a block
+  boundary has a nonce, which the bisection sees rise with no transaction behind it. What remains is a
+  never-used address a contract is created at and destroyed again inside one window. When its code
+  spent more than came in, the balance falls with no transaction and the account is unprovable from
+  that range. When it spent exactly what came in, the residual is zero and both are missed: a known
+  limit, on an address no key has ever sent from.
+
+The fee rule, `gasUsed × effectiveGasPrice + l1Fee + operator fee`, was checked on senders a block's
+trace credits nothing, sampled across each chain's history: Base 211, Optimism 166, Polygon 98,
+Arbitrum since Nitro 64, BSC 106, Gnosis 56, none off by a wei after Gnosis's merge. Credits made
+outside an ordinary transaction were checked on the receiving side: Polygon state-sync deposits (8 of
+8) and Arbitrum deposits from L1 (5 of 5) are in the trace and balance; Gnosis's bridge mints have no
+frame at all and equalled their event's value in 4 of 4, which is why that event is read.
+
+Gated through the binary, 2026-10-15:
+
+| Chain | Account | Reference | Outgoing | Incoming value | Fields |
+|---|---|---|---|---|---|
+| Optimism | small EOA | Blockscout | 5 / 5 | 4 / 4 | 50, identical |
+| Optimism | busy EOA, 1,411 sent | Blockscout | 1,411 / 1,411 | 20 / 20 | 14,110, identical |
+| Optimism | 7702-delegated | Blockscout, to delegation | 231 / 231 | 3 / 3 | 2,310, identical; unsupported from block 155,556,863 |
+| Base | busy EOA, 905 sent | the S0 spike (same method) | 905 / 905 | 11 / 11 | |
+| Arbitrum | EOA, 594 sent | Blockscout | 594 / 594 | 10 / 10 | 5,940, identical; one zero-value incoming row, the stated gap |
+| Gnosis | EOA, 238 sent | Blockscout | 238 / 238 | 2 / 2 | 2,380, identical |
+| Gnosis | small EOA | Blockscout | 16 / 16 | 1 / 1 | 160, identical |
+| Gnosis | a bridge-mint recipient | Blockscout | 3 / 3 | 0 / 0 | 30, identical; the mint's window balanced only with its event read |
+| BNB Chain | EOA, 200,000 blocks | none free; its nonce | 165, nonce moved 165 | 48, from 48 traced blocks | books balanced |
+| Polygon | EOA, 200,000 blocks | none free; its nonce | 13, nonce moved 13 | none in range | |
+
+Three rows have no independent reference, because Base, Polygon and BNB Chain need a paid plan at
+Blockscout and Etherscan or are not served there. Base was checked against the S0 spike, the same
+method implemented a second time; BNB Chain and Polygon are a smoke run whose only checks are the
+nonce and the books. Their proof is Optimism's gate on the same method and the books, which balanced on
+every block traced. A backfill window on these chains has a 16,384-block floor, because its cost is
+round trips per bisection level and per transaction, not per block; the Base account above took
+1 h 52 min and about 18,200 calls, 8,047 of them GraphOps `eth_getLogs`.
