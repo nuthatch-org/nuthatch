@@ -1528,14 +1528,23 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         // cannot be skipped on the retry.
         let mid = from + (to - from) / 2;
         for probe in [mid, from, to] {
-            let count = self
+            // The header with its hash list, not eth_getBlockTransactionCountByNumber, which
+            // GraphOps took 12.4 s to answer against 0.13 s for this (2026-10-15).
+            let block = self
                 .main
                 .call(
-                    "eth_getBlockTransactionCountByNumber",
-                    json!([format!("0x{probe:x}")]),
+                    "eth_getBlockByNumber",
+                    json!([format!("0x{probe:x}"), false]),
                 )
                 .await?;
-            if hex_u64(&count)? == 0 {
+            let count = block
+                .get("transactions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    anyhow!("block {probe} has no transaction list at the main endpoint")
+                })?
+                .len();
+            if count == 0 {
                 continue;
             }
             let traced = self
@@ -3017,9 +3026,9 @@ mod tests {
                 "eth_getTransactionReceipt" => receipt_json(),
                 "eth_getBlockByNumber" => {
                     let b = hex_u64(&p[0])?;
-                    json!({"timestamp": "0x10", "number": format!("0x{b:x}"), "hash": format!("0x{b:064x}")})
+                    json!({"timestamp": "0x10", "number": format!("0x{b:x}"), "hash": format!("0x{b:064x}"),
+                           "transactions": ["0x1", "0x2", "0x3", "0x4", "0x5"]})
                 }
-                "eth_getBlockTransactionCountByNumber" => json!("0x5"),
                 other => bail!("unexpected {other}"),
             })
         });
@@ -3163,11 +3172,15 @@ mod tests {
         let (main, _) = chain(false);
         // Blocks 1,000 to 1,099 have no transactions except the first; only it has traces.
         let main = script(move |m, p| match m {
-            "eth_getBlockTransactionCountByNumber" => Ok(json!(if hex_u64(&p[0])? == 1_000 {
-                "0x3"
-            } else {
-                "0x0"
-            })),
+            "eth_getBlockByNumber" => {
+                let mut block = (main.answer)(m, p)?;
+                block["transactions"] = if hex_u64(&p[0])? == 1_000 {
+                    json!(["0x1", "0x2", "0x3"])
+                } else {
+                    json!([])
+                };
+                Ok(block)
+            }
             _ => (main.answer)(m, p),
         });
         let trace = script(|m, p| match m {
@@ -3380,7 +3393,10 @@ mod tests {
                     "eth_getTransactionCount" => {
                         json!(format!("0x{:x}", nonce_of(hex_u64(&p[1])?)))
                     }
-                    "eth_getBlockTransactionCountByNumber" => json!("0x5"),
+                    "eth_getBlockByNumber" => {
+                        json!({"number": p[0], "hash": format!("0x{:064x}", hex_u64(&p[0])?),
+                                                     "transactions": ["0x1", "0x2", "0x3", "0x4", "0x5"]})
+                    }
                     "eth_getLogs" => json!([]),
                     other => bail!("unexpected {other}"),
                 })
@@ -4335,7 +4351,8 @@ mod tests {
             "eth_getBlockByNumber" => {
                 let b = hex_u64(&p[0])?;
                 Ok(
-                    json!({"number": format!("0x{b:x}"), "timestamp": "0x10", "hash": format!("0x{b:064x}")}),
+                    json!({"number": format!("0x{b:x}"), "timestamp": "0x10", "hash": format!("0x{b:064x}"),
+                           "transactions": ["0x1"]}),
                 )
             }
             _ => (main.answer)(m, p),
@@ -4943,7 +4960,6 @@ mod tests {
             "eth_getLogs" => Ok(json!([])),
             "eth_getCode" => Ok(json!("0x")),
             "eth_getTransactionCount" => Ok(json!("0x0")),
-            "eth_getBlockTransactionCountByNumber" => Ok(json!("0x1")),
             _ => (main.answer)(m, p),
         });
         let trace = script(move |m, p| match m {
@@ -4989,10 +5005,11 @@ mod tests {
         );
         assert_eq!(
             bodies_read() - after_first,
-            5,
+            6,
             "no body read again for B, its summaries kept from A's scan: one header for the reward \
              of the block B produced, two hashes to check B's discovery window's trace endpoint is on \
-             the main chain, and the window's last hash checked twice (cold test M3)"
+             the main chain, the window's last hash checked twice (cold test M3), and one empty-trace \
+             probe"
         );
         let req = crate::address_history::PageRequest {
             address: B.into(),

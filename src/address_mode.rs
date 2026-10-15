@@ -6474,7 +6474,13 @@ mod tests {
             "eth_getLogs" => Ok(json!([])),
             "eth_getCode" => Ok(json!("0x")),
             "eth_getTransactionCount" => Ok(json!("0x0")),
-            "eth_getBlockTransactionCountByNumber" => Ok(json!("0x1")),
+            "eth_getBlockByNumber" => {
+                let mut block = (chain.answer)(m, p)?;
+                if p[1] == json!(false) {
+                    block["transactions"] = json!(["0x1"]);
+                }
+                Ok(block)
+            }
             _ => (chain.answer)(m, p),
         });
         let twin = chain_rpc(2 * SPAN + 5);
@@ -6520,9 +6526,10 @@ mod tests {
         assert_eq!(history.header_coverage().unwrap(), covered);
         assert_eq!(
             d.main.calls().get("eth_getBlockByNumber"),
-            Some(&7),
-            "the finality check, one anchor per partition, no body, and two hashes per address's \
-             discovery window to check its trace endpoint is on the main chain, before and after"
+            Some(&9),
+            "the finality check, one anchor per partition, no body, two hashes per address's \
+             discovery window to check its trace endpoint is on the main chain, before and after, \
+             and one empty-trace probe per window"
         );
         assert_eq!(
             d.main.calls().get("eth_getBlockByHash"),
@@ -6695,7 +6702,13 @@ mod tests {
                 "eth_getLogs" => Ok(json!([])),
                 "eth_getCode" => Ok(json!("0x")),
                 "eth_getTransactionCount" => Ok(json!("0x0")),
-                "eth_getBlockTransactionCountByNumber" => Ok(json!("0x1")),
+                "eth_getBlockByNumber" => {
+                    let mut block = (chain.answer)(m, p)?;
+                    if p[1] == json!(false) {
+                        block["transactions"] = json!(["0x1"]);
+                    }
+                    Ok(block)
+                }
                 _ => (chain.answer)(m, p),
             });
             let twin = chain_rpc(2 * SPAN + 5);
@@ -6746,9 +6759,9 @@ mod tests {
         );
         assert_eq!(
             d.main.calls()["eth_getBlockByNumber"],
-            20 + 2 + 2 + 2,
+            20 + 2 + 2 + 2 + 1,
             "twenty bodies before the mirror, its finality check, one anchor, two hashes to check the \
-             discovery window's trace endpoint is on the main chain, and the body window's last hash \
+             discovery window's trace endpoint is on the main chain, one empty-trace probe, and the body window's last hash \
              checked twice"
         );
 
@@ -6874,7 +6887,8 @@ mod tests {
         }
         fn block_json(&self, b: u64) -> Value {
             json!({"number": format!("0x{b:x}"), "hash": self.hex(b), "timestamp": "0x10",
-                   "parentHash": if b == 0 { format!("0x{:064x}", 0) } else { self.hex(b - 1) }})
+                   "parentHash": if b == 0 { format!("0x{:064x}", 0) } else { self.hex(b - 1) },
+                   "transactions": [self.hex(b)]})
         }
         /// A discoverer that answers the production window as a node would: ALICE receives an
         /// internal call in every block [`Chain::row_at`] marks, the transaction hash being that
@@ -6913,7 +6927,6 @@ mod tests {
                 "eth_getCode" => Ok(json!("0x")),
                 "eth_getTransactionCount" => Ok(json!("0x0")),
                 "eth_getLogs" => Ok(json!([])),
-                "eth_getBlockTransactionCountByNumber" => Ok(json!("0x1")),
                 other => bail!("unexpected {other}"),
             });
             let c = self.clone();
