@@ -1350,7 +1350,22 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                     stopped.insert(address);
                     continue;
                 }
-                let end = next.saturating_add(pace.span() - 1).min(to);
+                // Past where the account's history stops being provable there is nothing to fetch.
+                let limit = match state.history.unprovable_from(&address) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::warn!("address history: reading {address}'s marker: {e:#}");
+                        stopped.insert(address);
+                        continue;
+                    }
+                };
+                if limit.is_some_and(|l| next >= l) {
+                    continue;
+                }
+                let end = next
+                    .saturating_add(pace.span() - 1)
+                    .min(to)
+                    .min(limit.map_or(u64::MAX, |l| l - 1));
                 let started = Instant::now();
                 let done = discover_window(self, state, &address, (next, end), None).await;
                 let took = started.elapsed();
@@ -1366,13 +1381,26 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                         state.window_done();
                         tracing::info!("address history: {address} covered through {end}");
                     }
-                    Err(e) => {
-                        state.window_failed();
-                        tracing::warn!(
-                            "address history: [{next}, {end}] for {address} not recorded, retrying next poll: {e:#}"
-                        );
-                        stopped.insert(address);
-                    }
+                    Err(e) => match e.downcast_ref::<crate::address_residual::Unprovable>() {
+                        Some(u) => {
+                            tracing::info!(
+                                "address history: {address}: {u}; ranges from there answer NUTHATCH_UNSUPPORTED"
+                            );
+                            if let Err(e) = state.history.mark_unprovable(&address, u.0) {
+                                tracing::warn!("address history: marking {address}: {e:#}");
+                                stopped.insert(address);
+                            } else {
+                                advanced = true;
+                            }
+                        }
+                        None => {
+                            state.window_failed();
+                            tracing::warn!(
+                                "address history: [{next}, {end}] for {address} not recorded, retrying next poll: {e:#}"
+                            );
+                            stopped.insert(address);
+                        }
+                    },
                 }
             }
             if !advanced {
@@ -1615,10 +1643,22 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
             if next > to {
                 break;
             }
+            // The page answers unsupported from the marker on; nothing past it is fetched.
+            let limit = history.unprovable_from(address)?;
+            if limit.is_some_and(|l| next >= l) {
+                break;
+            }
             late()?;
             let end = hole_end(history, address, &DISCOVERED, next, to)?
-                .min(next.saturating_add(COVER_WINDOW - 1));
-            discover_window(self, state, address, (next, end), Some(deadline)).await?;
+                .min(next.saturating_add(COVER_WINDOW - 1))
+                .min(limit.map_or(u64::MAX, |l| l - 1));
+            if let Err(e) = discover_window(self, state, address, (next, end), Some(deadline)).await
+            {
+                match e.downcast_ref::<crate::address_residual::Unprovable>() {
+                    Some(u) => history.mark_unprovable(address, u.0)?,
+                    None => return Err(e),
+                }
+            }
         }
         if need == Need::Discovered {
             history.raise_tip(to)?;

@@ -17,6 +17,23 @@ use crate::address_discovery::{hex_u64, word32, Discoverer, Rpc, TxRef};
 
 const RESIDUAL_CONCURRENCY: usize = 8;
 
+/// The account's history cannot be proved from this block on: it had code there, or signed an
+/// authorisation, so another account's code could spend its balance.
+#[derive(Debug)]
+pub struct Unprovable(pub u64);
+
+impl std::fmt::Display for Unprovable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the balance residual cannot prove this account's history from block {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Unprovable {}
+
 /// The smallest backfill window on a residual chain. A window's cost is its activity plus one round
 /// trip per bisection level, so halving a busy one saves little and doubles the windows: 64-block
 /// windows put one Base account at 7 hours (2026-10-15).
@@ -106,13 +123,21 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             self.balance_at(a, prior),
             self.balance_at(a, to),
         )?;
-        for (b, code) in [(from, code_from), (to, code_to)] {
-            if code != "0x" {
-                bail!(
-                    "{a} has code at block {b}; the balance residual proves nothing for a contract or \
-                     a delegated account, so [{from}, {to}] is not recorded"
-                );
+        if code_from != "0x" {
+            return Err(Unprovable(from).into());
+        }
+        if code_to != "0x" {
+            // The first block with code: the window up to it is still provable.
+            let (mut lo_c, mut hi_c) = (from, to);
+            while hi_c - lo_c > 1 {
+                let m = lo_c + (hi_c - lo_c) / 2;
+                if self.code_at(a, m).await? == "0x" {
+                    lo_c = m;
+                } else {
+                    hi_c = m;
+                }
             }
+            return Err(Unprovable(hi_c).into());
         }
         if to < lo {
             return Ok((Vec::new(), Vec::new()));
@@ -172,12 +197,14 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                     .collect();
                 // An EIP-7702 authorisation the account signed raises its nonce too, from anyone's
                 // transaction, and leaves its balance open to the delegate's code.
-                if mine.len() as u64 != rise {
+                if mine.len() as u64 > rise {
                     bail!(
-                        "{a}'s nonce rose by {rise} in block {b}, which holds {} transactions from it; \
-                         an authorisation or something else moved it, so [{from}, {to}] is not recorded",
+                        "{a}'s nonce rose by {rise} in block {b}, which holds {} transactions from it",
                         mine.len()
                     );
+                }
+                if (mine.len() as u64) < rise {
+                    return Err(Unprovable(b).into());
                 }
                 let mut receipts = Vec::with_capacity(mine.len());
                 for t in &mine {
@@ -670,7 +697,8 @@ mod tests {
         );
     }
 
-    /// A nonce that rises without a transaction from the account is an authorisation it signed.
+    /// A nonce that rises without a transaction from the account is an authorisation it signed, and
+    /// the history from that block is unprovable.
     #[tokio::test]
     async fn an_unexplained_nonce_rise_is_refused() {
         let mut sim = Sim::new(vec![tx(100, A, B, 10)]);
@@ -679,24 +707,35 @@ mod tests {
             .residual_transactions(A, 0, 1_000)
             .await
             .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("nonce rose by 2 in block 100"),
+        assert_eq!(
+            err.downcast_ref::<Unprovable>().map(|u| u.0),
+            Some(100),
             "{err:#}"
         );
     }
 
-    /// Delegated code lets another account's code spend the balance, so the window is refused.
+    /// Delegated code lets another account's code spend the balance: unprovable from the first block
+    /// with code, provable before it.
     #[tokio::test]
     async fn an_account_with_code_is_refused() {
         let mut sim = Sim::new(vec![tx(100, A, B, 10)]);
         sim.code_from = Some(500);
-        let err = discoverer(sim)
-            .residual_transactions(A, 0, 1_000)
-            .await
-            .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("has code at block 1000"),
+        let d = discoverer(sim);
+        let err = d.residual_transactions(A, 0, 1_000).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<Unprovable>().map(|u| u.0),
+            Some(500),
+            "the first block with code: {err:#}"
+        );
+        let err = d.residual_transactions(A, 600, 1_000).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<Unprovable>().map(|u| u.0),
+            Some(600),
             "{err:#}"
+        );
+        assert!(
+            d.residual_transactions(A, 0, 499).await.is_ok(),
+            "before the code it is provable"
         );
     }
 
