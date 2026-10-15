@@ -3566,8 +3566,9 @@ async fn search_by_time(
     // This only narrows the search; the same neighbour and ancestry checks still prove its answer.
     let recent = latest.number.saturating_sub(8);
     let lower = header(forward, at(recent)).await?;
-    let (mut lo, mut hi) = if t >= lower.ts {
-        (recent, latest.number)
+    let lower_ts = lower.ts;
+    let (mut lo, mut hi, mut lo_ts, mut hi_ts) = if t >= lower_ts {
+        (recent, latest.number, lower_ts, latest.ts)
     } else {
         let genesis = if recent == 0 {
             lower
@@ -3581,24 +3582,44 @@ async fn search_by_time(
                 Err(format!("timestamp {t} is before the first block"))
             });
         }
-        (0, recent)
+        (0, recent, genesis.ts, lower_ts)
     };
+    // Blocks come at a near-regular pace, so the block is guessed from the timestamps either side and
+    // a bisection step follows any guess that did not halve the range: a genesis-to-head bisection
+    // was 26 serial reads on Gnosis, over the search budget. The update rule, and so the answer and
+    // its proof, are a bisection's.
+    let mut bisect = false;
     while lo < hi {
+        let width = hi - lo;
+        let guess = if bisect || hi_ts <= lo_ts {
+            lo + width / 2
+        } else {
+            let span = u128::from(hi_ts - lo_ts);
+            let into = u128::from(t.saturating_sub(lo_ts).min(hi_ts - lo_ts));
+            lo + u64::try_from(into * u128::from(width) / span).unwrap_or(width)
+        };
         if after {
-            let mid = lo + (hi - lo) / 2;
-            if header(forward, at(mid)).await?.ts >= t {
-                hi = mid;
+            let probe = guess.clamp(lo, hi - 1);
+            let ts = header(forward, at(probe)).await?.ts;
+            if ts >= t {
+                hi = probe;
+                hi_ts = ts;
             } else {
-                lo = mid + 1;
+                lo = probe + 1;
+                lo_ts = ts;
             }
         } else {
-            let mid = lo + (hi - lo).div_ceil(2);
-            if header(forward, at(mid)).await?.ts <= t {
-                lo = mid;
+            let probe = guess.clamp(lo + 1, hi);
+            let ts = header(forward, at(probe)).await?.ts;
+            if ts <= t {
+                lo = probe;
+                lo_ts = ts;
             } else {
-                hi = mid - 1;
+                hi = probe - 1;
+                hi_ts = ts;
             }
         }
+        bisect = hi - lo > width / 2;
     }
     let b = header(forward, at(lo)).await?;
     let mut proof = vec![(lo, b.hash.clone())];
@@ -8134,6 +8155,82 @@ mod tests {
             .unwrap();
         assert_eq!(b, 50);
         assert!(!descends(&forward, b, latest, &proof).await.unwrap());
+    }
+
+    /// A Gnosis-sized chain whose block time changes partway and jitters: every answer equals the
+    /// exact one, in a third of bisection's reads.
+    #[tokio::test]
+    async fn an_interpolated_timestamp_search_is_exact_and_short() {
+        const HEAD: u64 = 48_000_000;
+        // 5 s blocks, then 2 s from block 20,000,000, each nudged by up to a second, strictly rising.
+        fn ts(b: u64) -> u64 {
+            let jitter = (b.wrapping_mul(2654435761) >> 7) % 2;
+            if b < 20_000_000 {
+                1000 + 5 * b + jitter
+            } else {
+                1000 + 5 * 20_000_000 + 2 * (b - 20_000_000) + jitter
+            }
+        }
+        let exact = |t: u64, after: bool| -> u64 {
+            let (mut lo, mut hi) = (0, HEAD);
+            while lo < hi {
+                if after {
+                    let mid = lo + (hi - lo) / 2;
+                    if ts(mid) >= t {
+                        hi = mid
+                    } else {
+                        lo = mid + 1
+                    }
+                } else {
+                    let mid = lo + (hi - lo).div_ceil(2);
+                    if ts(mid) <= t {
+                        lo = mid
+                    } else {
+                        hi = mid - 1
+                    }
+                }
+            }
+            lo
+        };
+        let reads = Arc::new(AtomicU64::new(0));
+        let n = reads.clone();
+        let forward: crate::address_proxy::Forward = Arc::new(move |_m: String, p: Value| {
+            let n = n.clone();
+            Box::pin(async move {
+                n.fetch_add(1, Ordering::Relaxed);
+                let b = match p[0].as_str().unwrap() {
+                    "latest" => HEAD,
+                    x => crate::address_discovery::hex_u64(&json!(x))?,
+                };
+                let hash = |n: u64| format!("0x{n:064x}");
+                Ok(
+                    json!({"number": format!("0x{b:x}"), "timestamp": format!("0x{:x}", ts(b)),
+                          "hash": hash(b), "parentHash": hash(b.saturating_sub(1))}),
+                )
+            })
+        });
+        let mut seed: u64 = 7;
+        let mut most = 0;
+        let mut total = 0;
+        for _ in 0..200 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let t = ts(0) + (seed >> 11) % (ts(HEAD) - ts(0));
+            for after in [false, true] {
+                reads.store(0, Ordering::Relaxed);
+                let (b, _, _) = search_by_time(&forward, t, after).await.unwrap().unwrap();
+                assert_eq!(b, exact(t, after), "t={t} after={after}");
+                most = most.max(reads.load(Ordering::Relaxed));
+                total += reads.load(Ordering::Relaxed);
+            }
+        }
+        // Bisection on this chain: a mean of 30 reads and at most 32 (2026-10-15).
+        assert!(
+            most <= 20 && total / 400 <= 11,
+            "at most {most} reads, a mean of {}",
+            total / 400
+        );
     }
 
     #[tokio::test]
