@@ -4243,9 +4243,12 @@ async fn chains_api(
     }
 }
 
+/// The union, and each chain's own list: an address watched on one chain is not watched on the
+/// others, and a caller registering per chain must see which.
 async fn chains_watched(State(c): State<Chains>) -> (StatusCode, Json<Value>) {
     let mut addresses = BTreeSet::new();
     let mut validators = Value::Array(Vec::new());
+    let mut by_chain = serde_json::Map::new();
     for (id, s) in c.iter() {
         let (code, Json(v)) = watched(State(s.clone())).await;
         if code != StatusCode::OK {
@@ -4256,13 +4259,14 @@ async fn chains_watched(State(c): State<Chains>) -> (StatusCode, Json<Value>) {
                 addresses.insert(a.to_string());
             }
         }
+        by_chain.insert(id.to_string(), v["watched"].clone());
         if *id == 1 {
             validators = v["validators"].clone();
         }
     }
     (
         StatusCode::OK,
-        Json(json!({ "watched": addresses, "validators": validators })),
+        Json(json!({ "watched": addresses, "validators": validators, "chains": by_chain })),
     )
 }
 
@@ -5464,6 +5468,18 @@ mod tests {
         }
         let (_, v) = call(app(), "GET", "/api/watch", None).await;
         assert_eq!(v["watched"].as_array().unwrap().len(), 2, "the union: {v}");
+        // Each chain's own list, so a caller sees an address watched on one chain only.
+        let carol = "0x0000000000000000000000000000000000000ca1";
+        chains[&100].history.watch(carol).unwrap();
+        let (_, v) = call(app(), "GET", "/api/watch", None).await;
+        let on = |id: &str| {
+            v["chains"][id]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == carol)
+        };
+        assert!(on("100") && !on("1"), "{v}");
         let (_, v) = call(app(), "GET", "/ready", None).await;
         assert_eq!(v["chain_ids"], json!([1, 100]));
         let (_, v) = call(app(), "GET", "/metrics", None).await;
