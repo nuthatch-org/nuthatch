@@ -1736,28 +1736,50 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
     /// looked means the filter's empty answer was false. Rows from the filter at the other
     /// position say nothing about this one.
     async fn check_empty_logs(&self, who: &str, empty: &[Value], from: u64, to: u64) -> Result<()> {
-        let probe = from + (to - from) / 2;
-        let mut probed: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        let mut probed: BTreeMap<String, (u64, Vec<Value>)> = BTreeMap::new();
         for topics in empty {
             let sig = topics[0].clone();
             let position = topics.as_array().map_or(0, |t| t.len().saturating_sub(1));
             let key = sig.to_string();
             if !probed.contains_key(&key) {
-                let got = self
-                    .main
-                    .call(
-                        "eth_getLogs",
-                        json!([{ "fromBlock": format!("0x{probe:x}"), "toBlock": format!("0x{probe:x}"), "topics": [sig] }]),
-                    )
-                    .await
-                    .context("eth_getLogs, checking an empty positional filter")?;
-                let got = got
-                    .as_array()
-                    .cloned()
-                    .ok_or_else(|| anyhow!("eth_getLogs answered a non-list"))?;
-                probed.insert(key.clone(), got);
+                // One block can hold more of a signature's logs than one answer may carry (an
+                // Optimism block passed 4 MiB of Transfers), so a refused probe moves to another
+                // block, as check_empty_traces does, rather than refuse the window on every poll.
+                let mut answered = None;
+                let mut refused = None;
+                for probe in [from + (to - from) / 2, from, to] {
+                    match self
+                        .main
+                        .call(
+                            "eth_getLogs",
+                            json!([{ "fromBlock": format!("0x{probe:x}"), "toBlock": format!("0x{probe:x}"), "topics": [sig] }]),
+                        )
+                        .await
+                    {
+                        Ok(got) => {
+                            let got = got
+                                .as_array()
+                                .cloned()
+                                .ok_or_else(|| anyhow!("eth_getLogs answered a non-list"))?;
+                            answered = Some((probe, got));
+                            break;
+                        }
+                        Err(e) if range_shaped(&format!("{e:#}")) => refused = Some(e),
+                        Err(e) => {
+                            return Err(e).context("eth_getLogs, checking an empty positional filter")
+                        }
+                    }
+                }
+                match answered {
+                    Some(a) => probed.insert(key.clone(), a),
+                    None => {
+                        return Err(refused.expect("a probe was refused"))
+                            .context("eth_getLogs, checking an empty positional filter")
+                    }
+                };
             }
-            let hit = probed[&key].iter().any(|log| {
+            let (probe, logs) = &probed[&key];
+            let hit = logs.iter().any(|log| {
                 log.get("topics")
                     .and_then(|t| t.get(position))
                     .and_then(Value::as_str)
@@ -3222,6 +3244,50 @@ mod tests {
         let err = d.discover_now(&h, A, 0, 63).await.unwrap_err();
         assert!(format!("{err:#}").contains("eth_getLogs"), "{err:#}");
         assert!(format!("{err:#}").contains("answered nothing"), "{err:#}");
+    }
+
+    /// A probe block whose logs are too many for one answer moves the check to another block, which
+    /// is checked just as strictly; only when every probe is refused does the window fail.
+    #[tokio::test]
+    async fn a_refused_log_probe_moves_to_another_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let who = padded(A);
+        let other = padded("0x0000000000000000000000000000000000000009");
+        let received = json!({"address": "0x7070", "topics": [TRANSFER, other, who],
+            "data": format!("0x{:0>64}", "1"), "blockNumber": "0x0", "blockTimestamp": "0x20",
+            "transactionHash": "0xcc", "transactionIndex": "0x0", "logIndex": "0x0",
+            "blockHash": "0xbb", "removed": false});
+        for refuse_all in [false, true] {
+            let (main, trace) = chain(false);
+            let received = received.clone();
+            let main = script(move |m, p| match m {
+                "eth_getLogs" => {
+                    let f = &p[0];
+                    let single = f["fromBlock"] == f["toBlock"];
+                    let topics = f["topics"].as_array().unwrap();
+                    if single && topics.len() == 1 {
+                        // Block 31, the midpoint, carries too many transfers to answer.
+                        if refuse_all || f["fromBlock"] == json!("0x1f") {
+                            bail!("response passed the 4194304-byte getLogs body cap; narrowing the range");
+                        }
+                        return Ok(json!([received.clone()]));
+                    }
+                    Ok(json!([]))
+                }
+                _ => (main.answer)(m, p),
+            });
+            let d = Discoverer::new(main, trace);
+            let err = format!("{:#}", d.discover_now(&h, A, 0, 63).await.unwrap_err());
+            if refuse_all {
+                assert!(err.contains("body cap"), "{err}");
+            } else {
+                assert!(
+                    err.contains("but block 0 has"),
+                    "the next probe is still checked: {err}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
