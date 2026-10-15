@@ -111,8 +111,9 @@ pub struct ModeState {
     pub hash_at: Option<HashAt>,
     /// The blocks a backfill's first discovery window covers, before [`Pace`] adjusts it.
     pub first_window: u64,
-    /// The discovery window [`Pace`] last settled on, kept across polls; 0 before the first.
-    backfill_span: AtomicU64,
+    /// Each address's discovery [`Pace`], kept across polls: windows of a quiet and a dense account
+    /// cost unrelated amounts, so one pace judged on both settles on neither (#2061).
+    backfill_paces: Mutex<HashMap<String, Pace>>,
     /// Blocks per minute the last discovery window covered, at least 1 once measured; 0 before the
     /// first. Per minute so a slow measured layer never truncates to "unmeasured".
     backfill_rate: AtomicU64,
@@ -322,7 +323,7 @@ impl ModeState {
             hash_at: None,
             first_window: 128,
             sweep: None,
-            backfill_span: AtomicU64::new(0),
+            backfill_paces: Mutex::new(HashMap::new()),
             backfill_rate: AtomicU64::new(0),
             body_rate: AtomicU64::new(0),
             produced_rate: AtomicU64::new(0),
@@ -1290,18 +1291,19 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
         if state.chain_id == 1 {
             mev_passes(self, state, &watched, to).await;
         }
-        let kept = state.backfill_span.load(Ordering::Relaxed);
         let min = if self.residual {
             crate::address_residual::RESIDUAL_MIN_SPAN
         } else {
             64
         };
-        let mut pace = Pace::new(
-            if kept == 0 { state.first_window } else { kept },
-            min,
-            crate::address_discovery::OUTER_WINDOW,
-            state.deadline,
-        );
+        let fresh = || {
+            Pace::new(
+                state.first_window,
+                min,
+                crate::address_discovery::OUTER_WINDOW,
+                state.deadline,
+            )
+        };
         // One window per account per round, the watched set read again every round: an account rotki
         // adds mid-backfill gets its first window within a round, not after the others' whole backlog.
         let mut recorded_through: BTreeMap<String, u64> = BTreeMap::new();
@@ -1362,15 +1364,23 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 if limit.is_some_and(|l| next >= l) {
                     continue;
                 }
+                let span = state
+                    .backfill_paces
+                    .lock()
+                    .unwrap()
+                    .entry(address.clone())
+                    .or_insert_with(fresh)
+                    .span();
                 let end = next
-                    .saturating_add(pace.span() - 1)
+                    .saturating_add(span - 1)
                     .min(to)
                     .min(limit.map_or(u64::MAX, |l| l - 1));
                 let started = Instant::now();
                 let done = discover_window(self, state, &address, (next, end), None).await;
                 let took = started.elapsed();
-                pace.took(took);
-                state.backfill_span.store(pace.span(), Ordering::Relaxed);
+                if let Some(p) = state.backfill_paces.lock().unwrap().get_mut(&address) {
+                    p.took(took);
+                }
                 match done {
                     Ok(()) => {
                         state
@@ -6825,6 +6835,9 @@ mod tests {
         quiet: std::sync::atomic::AtomicBool,
         /// Microseconds a trace_filter call takes per block of its span, as a provider's does.
         trace_us_per_block: AtomicU64,
+        /// Microseconds on top for every trace_filter naming one of these addresses, as a dense
+        /// account's take, and how many such calls were made.
+        trace_fixed_us: std::sync::Mutex<HashMap<String, (u64, u64)>>,
     }
 
     impl Chain {
@@ -6965,7 +6978,20 @@ mod tests {
                     let s = crate::address_discovery::hex_u64(&f["fromBlock"])?;
                     let e = crate::address_discovery::hex_u64(&f["toBlock"])?.min(c.latest());
                     let per = c.trace_us_per_block.load(Ordering::Relaxed);
-                    std::thread::sleep(Duration::from_micros(per * (e + 1).saturating_sub(s)));
+                    let fixed = ["fromAddress", "toAddress"]
+                        .iter()
+                        .find_map(|k| f[*k][0].as_str())
+                        .and_then(|a| {
+                            let mut m = c.trace_fixed_us.lock().unwrap();
+                            m.get_mut(&a.to_ascii_lowercase()).map(|(us, n)| {
+                                *n += 1;
+                                *us
+                            })
+                        })
+                        .unwrap_or(0);
+                    std::thread::sleep(Duration::from_micros(
+                        fixed + per * (e + 1).saturating_sub(s),
+                    ));
                     let frames: Vec<Value> = if f.get("toAddress").is_some() {
                         (s..=e)
                             .filter(|b| c.row_at(*b))
@@ -8021,6 +8047,39 @@ mod tests {
         backfill.abort();
     }
 
+    /// A quiet account backfilled beside a slow one grows its windows as it would alone: one pace
+    /// judged on both settled at the floor for both (#2061).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn each_account_keeps_its_own_pace() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into(), BOB.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(0, None, 20)
+                .with_deadline(Duration::from_secs(2)),
+        );
+        let chain = Chain::new(100_000, 99_000);
+        chain.quiet.store(true, Ordering::Relaxed);
+        chain.trace_us_per_block.store(5, Ordering::Relaxed);
+        {
+            let mut fixed = chain.trace_fixed_us.lock().unwrap();
+            fixed.insert(ALICE.to_ascii_lowercase(), (400_000, 0));
+            fixed.insert(BOB.to_ascii_lowercase(), (0, 0));
+        }
+        let d = Arc::new(chain.node());
+        d.reconcile(&s, chain.latest()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(120), d.catch_up(&s, 99_000))
+            .await
+            .unwrap();
+        // Alone, 128-block windows doubling to 50,000 cover 99,000 blocks in 11, two calls each.
+        let calls = chain.trace_fixed_us.lock().unwrap()[&BOB.to_ascii_lowercase()].1;
+        assert!(
+            calls <= 30,
+            "{calls} trace_filter calls for the quiet account"
+        );
+    }
+
     /// A request for history above what is covered is served inside a long backfill: the cursor's
     /// windows are paced to stay well under the deadline, so the request waits for one short window,
     /// not for a window spanning the whole backlog.
@@ -8065,7 +8124,15 @@ mod tests {
         assert!(waited < Duration::from_secs(2), "{waited:?}");
         assert!(!backfill.is_finished(), "the backfill was still running");
         // The pace the backfill settled on is kept for the next poll.
-        assert!(s.backfill_span.load(Ordering::Relaxed) > s.first_window);
+        let span = s
+            .backfill_paces
+            .lock()
+            .unwrap()
+            .values()
+            .map(Pace::span)
+            .max()
+            .unwrap();
+        assert!(span > s.first_window, "{span}");
         backfill.abort();
     }
 
