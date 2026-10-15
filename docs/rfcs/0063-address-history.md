@@ -415,9 +415,16 @@ Gated through the binary, 2026-10-15:
 | Optimism | 7702-delegated | Blockscout, to delegation | 231 / 231 | 3 / 3 | 2,310, identical; unsupported from block 155,556,863 |
 | Base | busy EOA, 905 sent | the S0 spike (same method) | 905 / 905 | 11 / 11 | |
 | Arbitrum | EOA, 594 sent | Blockscout | 594 / 594 | 10 / 10 | 5,940, identical; one zero-value incoming row, the stated gap |
+| Gnosis | EOA, 238 sent | Blockscout | 238 / 238 | 2 / 2 | 2,380, identical |
+| Gnosis | small EOA | Blockscout | 16 / 16 | 1 / 1 | 160, identical |
+| Gnosis | a bridge-mint recipient | Blockscout | 3 / 3 | 0 / 0 | 30, identical; the mint's window balanced only with its event read |
+| BNB Chain | EOA, 200,000 blocks | none free; its nonce | 165, nonce moved 165 | 48, from 48 traced blocks | books balanced |
+| Polygon | EOA, 200,000 blocks | none free; its nonce | 13, nonce moved 13 | none in range | |
 
-The Base row is the same method implemented twice, not an independent reference: Base needs a paid
-plan at Blockscout and Etherscan. Its proof is Optimism's gate on the same stack and the books, which
-balanced on every block traced. A backfill window on these chains has a 16,384-block floor, because its
-cost is round trips per bisection level and per transaction, not per block; the Base account above
-took 1 h 52 min and about 18,200 calls, 8,047 of them GraphOps `eth_getLogs`.
+Three rows have no independent reference, because Base, Polygon and BNB Chain need a paid plan at
+Blockscout and Etherscan or are not served there. Base was checked against the S0 spike, the same
+method implemented a second time; BNB Chain and Polygon are a smoke run whose only checks are the
+nonce and the books. Their proof is Optimism's gate on the same method and the books, which balanced on
+every block traced. A backfill window on these chains has a 16,384-block floor, because its cost is
+round trips per bisection level and per transaction, not per block; the Base account above took
+1 h 52 min and about 18,200 calls, 8,047 of them GraphOps `eth_getLogs`.
