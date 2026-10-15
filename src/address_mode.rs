@@ -1291,9 +1291,14 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             mev_passes(self, state, &watched, to).await;
         }
         let kept = state.backfill_span.load(Ordering::Relaxed);
+        let min = if self.residual {
+            crate::address_residual::RESIDUAL_MIN_SPAN
+        } else {
+            64
+        };
         let mut pace = Pace::new(
             if kept == 0 { state.first_window } else { kept },
-            64,
+            min,
             crate::address_discovery::OUTER_WINDOW,
             state.deadline,
         );
@@ -4060,7 +4065,9 @@ pub async fn dev(
         Some(crate::chains::Finality::FinalizedTag { fallback_depth }) => fallback_depth,
         None => 64,
     };
-    let discovery = Arc::new(Discoverer::new(Counted::new(main), Counted::new(trace)));
+    let mut discoverer = Discoverer::new(Counted::new(main), Counted::new(trace));
+    discoverer.residual = crate::address_residual::residual_chain(chain_id);
+    let discovery = Arc::new(discoverer);
     // Forwarded calls wait on the same chain check the cursor does.
     let verified = Arc::new(tokio::sync::OnceCell::<()>::new());
     let mut state = ModeState::new(history, chain_id, poll_interval, loopback)

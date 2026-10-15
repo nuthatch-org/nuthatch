@@ -620,13 +620,13 @@ impl Pending {
 /// A normal transaction a trace root names: its hash, its block, whether the watched address sent
 /// it, and whether it failed, which pre-Byzantium receipts do not say.
 #[derive(Debug, Clone)]
-struct TxRef {
-    hash: String,
-    block: u64,
-    outgoing: bool,
-    failed: bool,
+pub(crate) struct TxRef {
+    pub(crate) hash: String,
+    pub(crate) block: u64,
+    pub(crate) outgoing: bool,
+    pub(crate) failed: bool,
     /// The trace's block hash, when it named one. Absent, the cache matches on the block number.
-    block_hash: Option<[u8; 32]>,
+    pub(crate) block_hash: Option<[u8; 32]>,
 }
 
 /// What a block body holds for any address: its fee recipient, timestamp, hash and every
@@ -751,6 +751,8 @@ pub struct Discoverer<M, T> {
     pub trace: T,
     pub trace_window: Window,
     pub log_window: Window,
+    /// Find normal transactions by the balance residual instead of `trace_filter`.
+    pub residual: bool,
 }
 
 impl<M: Rpc, T: Rpc> Discoverer<M, T> {
@@ -760,6 +762,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             trace,
             trace_window: Window::new(100_000),
             log_window: Window::new(100_000),
+            residual: false,
         }
     }
 
@@ -775,7 +778,13 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
     ) -> Result<Found> {
         let a = address.to_ascii_lowercase();
         let ((txs, internal), logs) = futures::try_join!(
-            self.normal_transactions(&a, from, to),
+            async {
+                if self.residual {
+                    self.residual_transactions(&a, from, to).await
+                } else {
+                    self.normal_transactions(&a, from, to).await
+                }
+            },
             self.token_logs(&a, from, to)
         )?;
         let mut found = Found {
@@ -1597,7 +1606,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         )
     }
 
-    async fn nonce_at(&self, a: &str, block: u64) -> Result<u64> {
+    pub(crate) async fn nonce_at(&self, a: &str, block: u64) -> Result<u64> {
         let n = self
             .main
             .call(
@@ -1608,7 +1617,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         hex_u64(&n)
     }
 
-    async fn code_at(&self, a: &str, block: u64) -> Result<String> {
+    pub(crate) async fn code_at(&self, a: &str, block: u64) -> Result<String> {
         let code = self
             .main
             .call("eth_getCode", json!([a, format!("0x{block:x}")]))
