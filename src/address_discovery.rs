@@ -739,6 +739,9 @@ pub struct Found {
     pub tokentx: Vec<Row>,
     pub tokennfttx: Vec<Row>,
     pub token1155tx: Vec<Row>,
+    /// Internal rows from a `callcode` frame, by (block, tx index, position): Etherscan lists them,
+    /// but the value never leaves the caller, so they are not deposits.
+    pub callcode: BTreeSet<(u64, u64, u64)>,
 }
 
 /// Discovery over a main endpoint pool (logs, hydration, nonces) and a trace one, which may be the
@@ -985,6 +988,11 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                         num("transactionIndex")?,
                         num(TRACE_INDEX)?,
                     );
+                    let callcode = frames
+                        .get(position as usize)
+                        .and_then(|f| f.pointer("/action/callType"))
+                        .and_then(Value::as_str)
+                        == Some("callcode");
                     record.insert("hash".into(), Value::String(hash.clone()));
                     let row = address_mode_order(Row {
                         block,
@@ -993,7 +1001,11 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                         record,
                     });
                     for p in parties {
-                        found.entry(p).or_default().txlistinternal.push(row.clone());
+                        let f = found.entry(p).or_default();
+                        f.txlistinternal.push(row.clone());
+                        if callcode {
+                            f.callcode.insert((block, tx_index, position));
+                        }
                     }
                 }
             }
@@ -3415,13 +3427,21 @@ mod tests {
                               "gas": "0x0"},
                    "result": {"gasUsed": "0x0"}})
         };
-        let (h1, h2) = (format!("0x{:0>64}", "1"), format!("0x{:0>64}", "2"));
+        let (h1, h2, h3) = (
+            format!("0x{:0>64}", "1"),
+            format!("0x{:0>64}", "2"),
+            format!("0x{:0>64}", "3"),
+        );
         let frames = |block: &str| {
+            let mut callcode = frame(&h3, 2, json!([0]), C, A, "0x7", block);
+            callcode["action"]["callType"] = json!("callcode");
             json!([
                 frame(&h1, 0, json!([]), OUT, C, "0x0", block),
                 frame(&h1, 0, json!([0]), C, A, "0x5", block),
                 frame(&h2, 1, json!([]), OUT, C, "0x0", block),
                 frame(&h2, 1, json!([0]), C, OUT, "0x1", block),
+                frame(&h3, 2, json!([]), OUT, C, "0x0", block),
+                callcode,
                 {"type": "reward", "action": {"author": OUT, "value": "0x1"}, "blockHash": block,
                  "blockNumber": n, "traceAddress": []},
             ])
@@ -3445,10 +3465,21 @@ mod tests {
             let found = swept.unwrap();
             assert_eq!(found.keys().collect::<Vec<_>>(), [A]);
             let rows = &found[A].txlistinternal;
-            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(
+                rows.len(),
+                2,
+                "Etherscan lists the callcode frame too: {rows:?}"
+            );
             assert_eq!(rows[0].record["hash"], h1);
             assert_eq!(rows[0].record["from"], C);
             assert_eq!(rows[0].record["value"], "5");
+            assert_eq!(rows[1].record["hash"], h3);
+            let marked: Vec<_> = found[A].callcode.iter().copied().collect();
+            assert_eq!(
+                marked,
+                [(n, 2, rows[1].position)],
+                "only the callcode frame is marked"
+            );
         }
     }
 

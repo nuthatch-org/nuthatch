@@ -227,7 +227,9 @@ only over blocks swept with tracing on. The sweep follows the finalized head, or
 `confirmations` that many blocks under the chain head; set `poll_interval` near the block time to see
 deposits soon after they land.
 
-Every incoming row the sweep records is a deposit in one feed across the whole set, read with
+Every incoming row that moved value is a deposit in one feed across the whole set; a failed
+transaction, a frame inside a reverted call, a zero transfer and a `callcode` frame are served by the
+account actions as Etherscan serves them, but are not deposits. The feed is read with
 `GET /api?module=account&action=nuthatchDeposits&after=<seq>&offset=<n>`: entries in sequence order,
 each `{"seq", "event": "deposit", "address", "action", "blockNumber", "row"}`, and `sweptThrough`, the
 last block the feed is complete to. A reorg above finality adds `{"event": "retraction", "retracts":
