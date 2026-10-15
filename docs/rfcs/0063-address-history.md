@@ -398,6 +398,13 @@ residual**:
   so rotki asks another source. A reorg below that block removes the mark.
 - **What it does not list**: an incoming transaction that moves no value, a zero-value call or a
   failed transfer to the account. Etherscan lists them; they change nothing in rotki's books.
+- **A contract that comes and goes.** `CREATE` cannot target an address with a nonce or code
+  (EIP-684), so an account that ever sent cannot become one, and a contract present at a block
+  boundary has a nonce, which the bisection sees rise with no transaction behind it. What remains is a
+  never-used address a contract is created at and destroyed again inside one window. When its code
+  spent more than came in, the balance falls with no transaction and the account is unprovable from
+  that range. When it spent exactly what came in, the residual is zero and both are missed: a known
+  limit, on an address no key has ever sent from.
 
 The fee rule, `gasUsed × effectiveGasPrice + l1Fee + operator fee`, was checked on senders a block's
 trace credits nothing, sampled across each chain's history: Base 211, Optimism 166, Polygon 98,

@@ -295,6 +295,12 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             let mut split = Vec::new();
             for (s, e, bb, be) in level {
                 let r = residual(s, e, bb, be);
+                // An account that never sent cannot spend, so its balance fell to code: a contract
+                // created at the address and destroyed again inside the window, which endpoint
+                // code and nonce reads cannot see. Unprovable from the range it fell in.
+                if r < 0 && after == 0 {
+                    return Err(Unprovable(s).into());
+                }
                 if r < 0 {
                     bail!(
                         "{a} spent {} wei more in [{s}, {e}] than its own transactions explain; the \
@@ -516,6 +522,8 @@ mod tests {
         understate_l1: u128,
         /// Native value minted to the account by a log, outside any call frame: (block, value).
         mints: Vec<(u64, u128)>,
+        /// Value taken from the account by code no transaction of its own sent: (block, value).
+        drain: Option<(u64, u128)>,
         asked: Mutex<Vec<String>>,
     }
 
@@ -528,6 +536,7 @@ mod tests {
                 hide: None,
                 understate_l1: 0,
                 mints: vec![],
+                drain: None,
                 asked: Mutex::new(vec![]),
             }
         }
@@ -561,7 +570,7 @@ mod tests {
             fee + if t.ok { t.value } else { 0 }
         }
         fn balance(&self, b: u64) -> u128 {
-            1_000_000_000
+            1_000_000_000 - self.drain.filter(|(d, _)| *d <= b).map_or(0, |(_, v)| v)
                 + self
                     .mints
                     .iter()
@@ -810,6 +819,19 @@ mod tests {
             Some(100),
             "{err:#}"
         );
+    }
+
+    /// A never-used address a contract was created at and destroyed again inside the window: its
+    /// balance fell with no transaction and no code at either end, so it is unprovable there.
+    #[tokio::test]
+    async fn a_balance_spent_by_code_that_came_and_went_is_unprovable() {
+        let mut sim = Sim::new(vec![tx(300, B, A, 40)]);
+        sim.drain = Some((600, 30));
+        let err = discoverer(sim)
+            .residual_transactions(A, 0, 1_000)
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<Unprovable>().is_some(), "{err:#}");
     }
 
     /// Delegated code lets another account's code spend the balance: unprovable from the first block
