@@ -435,3 +435,18 @@ nonce and the books. Their proof is Optimism's gate on the same method and the b
 every block traced. A backfill window on these chains has a 16,384-block floor, because its cost is
 round trips per bisection level and per transaction, not per block; the Base account above took
 1 h 52 min and about 18,200 calls, 8,047 of them GraphOps `eth_getLogs`.
+
+## 14. One endpoint for several chains (2026-10-15)
+
+rotki takes one nest address, sends `chainid` with every call, and drops an indexer for a chain whose
+answer says that `chainid` is not served. So `nuthatch dev --dir` on a directory of address-history
+nests, one subdirectory per chain, serves them all at one `/api`, dispatched on `chainid`. Each chain
+keeps its own cursor, store and RPCs, so the single-cursor law holds per chain and one chain's stall or
+reorg touches no other. Watching reaches every chain; readiness and metrics are per chain.
+
+Checked with Gnosis and Base in one directory: every Gnosis answer through the shared endpoint was the
+solo nest's, byte for byte apart from the per-store `generation`; Base matched the S0 spike; an unknown
+`chainid` was refused in rotki's wording.
+
+rotki's half is separate. Its `sync_watched` registers accounts with a nest on Ethereum only, so until it
+learns `/ready`'s `chain_ids` a non-Ethereum nest lists its accounts in its own `addresses`.

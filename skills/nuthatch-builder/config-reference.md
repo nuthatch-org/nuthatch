@@ -210,6 +210,16 @@ action answers `NUTHATCH_UNSUPPORTED` from the first block it had code, so the c
 source. An incoming transaction that moves no value, a zero-value call or a failed transfer to the
 account, is not listed, though Etherscan lists it; token transfers are found from logs as everywhere.
 
+One `nuthatch dev` can serve several chains at one address: point `--dir` at a directory holding no
+`nuthatch.toml` of its own, only one subdirectory per chain, each an address-history nest. Each runs its
+own cursor and store as it would alone; `/api` answers as the nest `chainid` names, and a `chainid` no
+nest serves answers `NUTHATCH_UNSUPPORTED`. `POST /api/watch` and `/api/unwatch` reach every chain (a
+`validator` only Ethereum's); one chain refusing does not stop the others, and the answer, failed if any
+chain refused, lists each chain's result, so a repeat converges them. `GET /api/watch` lists the union and, under `chains`, each chain's own list, `/ready` lists `chain_ids` and each
+chain's state, and `/metrics` labels each sample with `chain_id`. Each chain reads its RPCs from
+`NUTHATCH_RPC_<chain id>` and `NUTHATCH_TRACE_RPC_<chain id>`, else from its nest's `rpc_urls`;
+`--rpc`, `--trace-rpc` and `--rpc-fallback` are refused there, because each names one chain's.
+
 `getblocknobytime` answers from verified headers where they bracket the timestamp, and otherwise by
 searching the nest's own RPC, proving the answer against its neighbour block by parent hash and,
 above the finalized head, linking it by parent hashes to the head the search began from. It refuses a

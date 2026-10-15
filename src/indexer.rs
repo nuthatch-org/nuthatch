@@ -53,6 +53,10 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     // value should cost the operator a second, not a chain-id verification.
     let cors = crate::serve::cors_layer(&args.cors)?;
     let dir = PathBuf::from(&args.dir);
+    // RFC-0063 S4: a directory of address-history nests, one per chain, served at one `/api`.
+    if let Some(chains) = crate::address_mode::chain_dirs(&dir)? {
+        return crate::address_mode::dev_chains(chains, &args, cors).await;
+    }
     let mut config = Config::load(&dir)?;
     // RFC-0063: an address-history nest runs its own light path and none of what follows.
     if config.address_history.is_some() {
