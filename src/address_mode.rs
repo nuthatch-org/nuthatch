@@ -4266,8 +4266,9 @@ async fn chains_watched(State(c): State<Chains>) -> (StatusCode, Json<Value>) {
     )
 }
 
-/// A body for every chain, or a validator's for Ethereum alone; the answer is the first chain's,
-/// with each chain's beside it.
+/// A body for every chain, or a validator's for Ethereum alone. Every chain is asked even when one
+/// fails, because separate stores cannot change atomically: the answer reports each chain, fails if
+/// any did, and a repeat (watch and unwatch are idempotent) converges the rest.
 async fn chains_dispatch(c: Chains, b: AddressBody, add: bool) -> (StatusCode, Json<Value>) {
     let targets: Vec<(u64, Arc<ModeState>)> = if b.validator.is_some() {
         c.get(&1).map(|s| (1, s.clone())).into_iter().collect()
@@ -4281,23 +4282,33 @@ async fn chains_dispatch(c: Chains, b: AddressBody, add: bool) -> (StatusCode, J
         );
     }
     let mut per_chain = serde_json::Map::new();
-    let mut first: Option<Value> = None;
+    let mut first_ok: Option<Value> = None;
+    let mut first_failure: Option<(StatusCode, u64)> = None;
     for (id, s) in targets {
         let (code, Json(v)) = dispatch(s, b.clone(), add).await;
-        if code != StatusCode::OK {
-            return (
-                code,
-                Json(json!({ "chain_id": id, "error": v.get("error").cloned().unwrap_or(v) })),
-            );
+        if code == StatusCode::OK {
+            first_ok.get_or_insert_with(|| v.clone());
+        } else {
+            first_failure.get_or_insert((code, id));
         }
-        first.get_or_insert_with(|| v.clone());
         per_chain.insert(id.to_string(), v);
     }
-    let mut out = first.unwrap_or_else(|| json!({}));
-    if let Some(o) = out.as_object_mut() {
-        o.insert("chains".into(), Value::Object(per_chain));
+    match first_failure {
+        Some((code, id)) => (
+            code,
+            Json(json!({
+                "error": format!("chain {id} refused the change; the other chains' answers are in chains"),
+                "chains": per_chain,
+            })),
+        ),
+        None => {
+            let mut out = first_ok.unwrap_or_else(|| json!({}));
+            if let Some(o) = out.as_object_mut() {
+                o.insert("chains".into(), Value::Object(per_chain));
+            }
+            (StatusCode::OK, Json(out))
+        }
     }
-    (StatusCode::OK, Json(out))
 }
 
 async fn chains_watch(
@@ -5363,6 +5374,45 @@ mod tests {
             Duration::from_secs(300),
             true,
         ))
+    }
+
+    /// A watch that one chain refuses still reaches the others, and the answer names each chain:
+    /// separate stores cannot change atomically, so a repeat converges them.
+    #[tokio::test]
+    async fn a_watch_one_chain_refuses_still_reaches_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        // Chain 1 is asked first and refuses: a non-loopback state answers 403.
+        let refusing = {
+            let store = Store::open(&dir.path().join("1.redb")).unwrap();
+            let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+            Arc::new(ModeState::new(history, 1, Duration::from_secs(300), false))
+        };
+        let chains: Chains = Arc::new([(1, refusing), (100, chain_state(dir.path(), 100))].into());
+        let bob = "0x0000000000000000000000000000000000000b0b";
+        let (code, v) = call(
+            chains_router(chains.clone()),
+            "POST",
+            "/api/watch",
+            Some(json!({ "address": bob })),
+        )
+        .await;
+        assert_ne!(code, StatusCode::OK, "{v}");
+        assert!(
+            v["chains"]["1"].is_object() && v["chains"]["100"].is_object(),
+            "{v}"
+        );
+        let watches = |id: u64| {
+            chains[&id]
+                .history
+                .watched()
+                .unwrap()
+                .contains(&bob.to_string())
+        };
+        assert!(!watches(1), "the refusing chain is unchanged");
+        assert!(
+            watches(100),
+            "the chain asked after the refusal still changed"
+        );
     }
 
     /// RFC-0063 S4: one listener for several chains. `/api` answers as the chain `chainid` names, an
