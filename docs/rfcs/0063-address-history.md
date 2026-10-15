@@ -414,6 +414,7 @@ Gated through the binary, 2026-10-15:
 | Optimism | busy EOA, 1,411 sent | Blockscout | 1,411 / 1,411 | 20 / 20 | 14,110, identical |
 | Optimism | 7702-delegated | Blockscout, to delegation | 231 / 231 | 3 / 3 | 2,310, identical; unsupported from block 155,556,863 |
 | Base | busy EOA, 905 sent | the S0 spike (same method) | 905 / 905 | 11 / 11 | |
+| Arbitrum | EOA, 594 sent | Blockscout | 594 / 594 | 10 / 10 | 5,940, identical; one zero-value incoming row, the stated gap |
 
 The Base row is the same method implemented twice, not an independent reference: Base needs a paid
 plan at Blockscout and Etherscan. Its proof is Optimism's gate on the same stack and the books, which
