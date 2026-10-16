@@ -101,12 +101,12 @@ pub struct Key([u8; 32]);
 /// restore, arbitrarily later than the seal that wrote the file. What remains undetectable is a
 /// same-length rewrite landing inside the same timestamp tick as the write before it, which for a
 /// rotting sector is not a case that occurs; the periodic integrity sweep is what covers the rest.
-pub fn segment_stamps(
-    dir: &Path,
-    tables: Option<&std::collections::BTreeSet<String>>,
-) -> Vec<(PathBuf, u64, i64)> {
+///
+/// Returned as a digest: an entry kept the list itself, a path per segment, which on a nest of
+/// thousands of segments outweighed the rows it was remembering (#2072).
+pub fn segment_stamps(dir: &Path, tables: Option<&std::collections::BTreeSet<String>>) -> [u8; 32] {
     let Ok(manifest) = crate::seal::load_manifest(dir) else {
-        return Vec::new();
+        return Sha256::digest([]).into();
     };
     let mut out = Vec::new();
     for (table, segs) in &manifest.tables {
@@ -132,7 +132,15 @@ pub fn segment_stamps(
         }
     }
     out.sort();
-    out
+    let mut h = Sha256::new();
+    for (path, len, mtime) in &out {
+        let path = path.as_os_str().as_encoded_bytes();
+        h.update((path.len() as u64).to_le_bytes());
+        h.update(path);
+        h.update(len.to_le_bytes());
+        h.update(mtime.to_le_bytes());
+    }
+    h.finalize().into()
 }
 
 /// A digest of the segments a statement served at `sealed_through` reads from: every manifest
@@ -203,12 +211,14 @@ impl Inputs<'_> {
 /// A remembered answer: the output and the entity watermarks it was answered from, which ride out
 /// in the provenance exactly as they did the first time. The head it cites is read on the hit.
 pub struct Entry {
+    /// The answer without its rows, which are kept serialized in `rows` (#2072).
     pub out: QueryOutput,
+    pub rows: Box<serde_json::value::RawValue>,
+    pub count: usize,
     pub watermarks: crate::entity_view::Watermarks,
-    /// The tables this answer read, and a stamp of every sealed segment behind them at the moment it
-    /// was computed - see [`segment_stamps`]. Re-taken on a hit; any difference recomputes.
-    pub tables: Option<std::collections::BTreeSet<String>>,
-    pub segments: Vec<(PathBuf, u64, i64)>,
+    /// A stamp of every sealed segment behind the tables `out` names, at the moment the answer was
+    /// computed - see [`segment_stamps`]. Re-taken on a hit; any difference recomputes.
+    pub segments: [u8; 32],
     bytes: usize,
 }
 
@@ -278,13 +288,16 @@ impl Memo {
         key: Key,
         out: &QueryOutput,
         watermarks: &crate::entity_view::Watermarks,
-        segments: Vec<(PathBuf, u64, i64)>,
+        segments: [u8; 32],
         cap: usize,
     ) -> bool {
         if cap == 0 || out.degraded() || out.tip_unavailable {
             return false;
         }
-        let bytes = size_of(out);
+        let Ok(rows) = serde_json::value::to_raw_value(&out.rows) else {
+            return false;
+        };
+        let bytes = size_of(out, &rows, watermarks);
         if bytes > cap / MAX_ENTRY_SHARE {
             return false;
         }
@@ -312,9 +325,10 @@ impl Memo {
             key,
             (
                 Arc::new(Entry {
-                    out: out.clone(),
+                    out: out.without_rows(),
+                    rows,
+                    count: out.rows.len(),
                     watermarks: watermarks.clone(),
-                    tables: out.referenced_tables.clone(),
                     segments,
                     bytes,
                 }),
@@ -361,7 +375,7 @@ pub fn put(
     key: Key,
     out: &QueryOutput,
     watermarks: &crate::entity_view::Watermarks,
-    segments: Vec<(PathBuf, u64, i64)>,
+    segments: [u8; 32],
 ) -> bool {
     GLOBAL.put(key, out, watermarks, segments, max_bytes())
 }
@@ -382,9 +396,46 @@ pub fn misses() -> u64 {
     GLOBAL.misses()
 }
 
-/// Serialized size of the rows, which is what the response carries and what the ceiling is about.
-fn size_of(out: &QueryOutput) -> usize {
-    serde_json::to_vec(&out.rows).map(|v| v.len()).unwrap_or(0) + 64
+/// What an entry holds: the serialized rows, which is also what the response carries, and what
+/// rides beside them in the entry. Each string is charged its header and a share of its node.
+fn size_of(
+    out: &QueryOutput,
+    rows: &serde_json::value::RawValue,
+    watermarks: &crate::entity_view::Watermarks,
+) -> usize {
+    const PER_STRING: usize = 48;
+    let s = |t: &String| t.len() + PER_STRING;
+    let names = |set: &std::collections::BTreeSet<String>| set.iter().map(s).sum::<usize>();
+    let offchain = out.offchain.as_ref().map_or(0, |m| {
+        m.iter()
+            .map(|(k, v)| s(k) + v.iter().map(s).sum::<usize>())
+            .sum()
+    });
+    let bound = out.scan_bound.as_ref().map_or(0, |b| {
+        b.catalogue_hash.as_ref().map_or(0, s)
+            + b.tables
+                .keys()
+                .map(|k| s(k) + std::mem::size_of::<crate::analytics::TableScan>())
+                .sum::<usize>()
+    });
+    let marks: usize = watermarks
+        .iter()
+        .map(|(k, a)| {
+            s(k) + std::mem::size_of::<crate::entity_view::Applied>()
+                + a.offchain
+                    .iter()
+                    .map(|(t, m)| s(t) + s(&m.latest) + s(&m.digest) + 8)
+                    .sum::<usize>()
+        })
+        .sum();
+    rows.get().len()
+        + out.columns.iter().map(s).sum::<usize>()
+        + out.referenced_tables.as_ref().map_or(0, names)
+        + names(&out.degraded_tables)
+        + offchain
+        + bound
+        + marks
+        + std::mem::size_of::<Entry>()
 }
 
 #[cfg(test)]
@@ -432,6 +483,14 @@ mod tests {
             entity_watermarks: wm,
             files,
         }
+    }
+
+    fn held(out: &QueryOutput) -> usize {
+        size_of(
+            out,
+            &serde_json::value::to_raw_value(&out.rows).unwrap(),
+            &BTreeMap::new(),
+        )
     }
 
     fn rows(n: usize) -> QueryOutput {
@@ -544,10 +603,10 @@ mod tests {
         let wm = BTreeMap::new();
         let mut out = rows(1);
         out.degraded_tables.insert("t".into());
-        assert!(!put(Key([1; 32]), &out, &wm, Vec::new()));
+        assert!(!put(Key([1; 32]), &out, &wm, [0; 32]));
         let mut out = rows(1);
         out.tip_unavailable = true;
-        assert!(!put(Key([2; 32]), &out, &wm, Vec::new()));
+        assert!(!put(Key([2; 32]), &out, &wm, [0; 32]));
         assert!(get(&Key([1; 32])).is_none());
         assert!(get(&Key([2; 32])).is_none());
     }
@@ -559,18 +618,18 @@ mod tests {
         let m = Memo::new();
         let wm = BTreeMap::new();
         let k = |n: u8| Key([n; 32]);
-        let one = size_of(&rows(10));
+        let one = held(&rows(10));
         // Room for four entries and a little, never five; each is under a quarter of it.
         let cap = one * 4 + one / 2;
         for n in 1..=4 {
-            assert!(m.put(k(n), &rows(10), &wm, Vec::new(), cap));
+            assert!(m.put(k(n), &rows(10), &wm, [0; 32], cap));
         }
         assert_eq!(m.entries(), 4);
         assert!(
             m.get(&k(1), cap).is_some(),
             "touching 1 makes 2 the least recently used"
         );
-        assert!(m.put(k(5), &rows(10), &wm, Vec::new(), cap));
+        assert!(m.put(k(5), &rows(10), &wm, [0; 32], cap));
         assert!(m.bytes() <= cap, "the ceiling holds");
         assert_eq!(m.entries(), 4, "exactly one entry made room");
         assert!(
@@ -583,6 +642,39 @@ mod tests {
         assert_eq!((m.hits(), m.misses()), (5, 1));
     }
 
+    /// What rides beside the rows is charged too: table names, offchain provenance and the entity
+    /// watermarks an entry keeps (#2072).
+    #[test]
+    fn an_entry_is_charged_for_what_it_keeps_beside_its_rows() {
+        let bare = rows(10);
+        let raw = serde_json::value::to_raw_value(&bare.rows).unwrap();
+        let base = size_of(&bare, &raw, &BTreeMap::new());
+        let mut out = rows(10);
+        let names: std::collections::BTreeSet<String> =
+            (0..100).map(|i| format!("table_{i:0>40}")).collect();
+        out.referenced_tables = Some(names.clone());
+        out.degraded_tables = names;
+        out.offchain = Some(
+            [("prices".to_string(), vec!["h".repeat(64); 50])]
+                .into_iter()
+                .collect(),
+        );
+        let wm: crate::entity_view::Watermarks = (0..20)
+            .map(|i| {
+                (
+                    format!("entity_{i}"),
+                    crate::entity_view::Applied::default(),
+                )
+            })
+            .collect();
+        let charged = size_of(&out, &raw, &wm);
+        // 200 names of 46 bytes and 50 hashes of 64, before any per-string overhead.
+        assert!(
+            charged >= base + 200 * 46 + 50 * 64,
+            "{charged} against {base}"
+        );
+    }
+
     /// One answer may not take the whole memo: an entry over a quarter of the ceiling is declined
     /// rather than evicting everything else for one caller. And a ceiling of zero is the off switch.
     #[test]
@@ -590,12 +682,12 @@ mod tests {
         let m = Memo::new();
         let wm = BTreeMap::new();
         let out = rows(10);
-        let cap = size_of(&out) * MAX_ENTRY_SHARE - 1;
-        assert!(!m.put(Key([0xb1; 32]), &out, &wm, Vec::new(), cap));
+        let cap = held(&out) * MAX_ENTRY_SHARE - 1;
+        assert!(!m.put(Key([0xb1; 32]), &out, &wm, [0; 32], cap));
         assert!(m.get(&Key([0xb1; 32]), cap).is_none());
-        assert!(m.put(Key([0xb2; 32]), &out, &wm, Vec::new(), cap + 1));
+        assert!(m.put(Key([0xb2; 32]), &out, &wm, [0; 32], cap + 1));
         assert!(
-            !m.put(Key([0xb3; 32]), &out, &wm, Vec::new(), 0),
+            !m.put(Key([0xb3; 32]), &out, &wm, [0; 32], 0),
             "zero disables"
         );
         assert!(

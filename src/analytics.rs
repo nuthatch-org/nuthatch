@@ -320,6 +320,20 @@ pub struct QueryOutput {
 }
 
 impl QueryOutput {
+    /// Everything but the rows, for a holder that keeps them in another form.
+    pub fn without_rows(&self) -> QueryOutput {
+        QueryOutput {
+            rows: Vec::new(),
+            columns: self.columns.clone(),
+            truncated: self.truncated,
+            degraded_tables: self.degraded_tables.clone(),
+            tip_unavailable: self.tip_unavailable,
+            referenced_tables: self.referenced_tables.clone(),
+            offchain: self.offchain.clone(),
+            scan_bound: self.scan_bound.clone(),
+        }
+    }
+
     /// Whether any table's cold data was incomplete for this query. The one-bit form of
     /// `degraded_tables`, for surfaces with room to say only yes or no.
     pub fn degraded(&self) -> bool {
