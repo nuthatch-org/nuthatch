@@ -101,12 +101,12 @@ pub struct Key([u8; 32]);
 /// restore, arbitrarily later than the seal that wrote the file. What remains undetectable is a
 /// same-length rewrite landing inside the same timestamp tick as the write before it, which for a
 /// rotting sector is not a case that occurs; the periodic integrity sweep is what covers the rest.
-pub fn segment_stamps(
-    dir: &Path,
-    tables: Option<&std::collections::BTreeSet<String>>,
-) -> Vec<(PathBuf, u64, i64)> {
+///
+/// Returned as a digest: an entry kept the list itself, a path per segment, which on a nest of
+/// thousands of segments outweighed the rows it was remembering (#2072).
+pub fn segment_stamps(dir: &Path, tables: Option<&std::collections::BTreeSet<String>>) -> [u8; 32] {
     let Ok(manifest) = crate::seal::load_manifest(dir) else {
-        return Vec::new();
+        return Sha256::digest([]).into();
     };
     let mut out = Vec::new();
     for (table, segs) in &manifest.tables {
@@ -132,7 +132,15 @@ pub fn segment_stamps(
         }
     }
     out.sort();
-    out
+    let mut h = Sha256::new();
+    for (path, len, mtime) in &out {
+        let path = path.as_os_str().as_encoded_bytes();
+        h.update((path.len() as u64).to_le_bytes());
+        h.update(path);
+        h.update(len.to_le_bytes());
+        h.update(mtime.to_le_bytes());
+    }
+    h.finalize().into()
 }
 
 /// A digest of the segments a statement served at `sealed_through` reads from: every manifest
@@ -211,7 +219,7 @@ pub struct Entry {
     /// The tables this answer read, and a stamp of every sealed segment behind them at the moment it
     /// was computed - see [`segment_stamps`]. Re-taken on a hit; any difference recomputes.
     pub tables: Option<std::collections::BTreeSet<String>>,
-    pub segments: Vec<(PathBuf, u64, i64)>,
+    pub segments: [u8; 32],
     bytes: usize,
 }
 
@@ -281,7 +289,7 @@ impl Memo {
         key: Key,
         out: &QueryOutput,
         watermarks: &crate::entity_view::Watermarks,
-        segments: Vec<(PathBuf, u64, i64)>,
+        segments: [u8; 32],
         cap: usize,
     ) -> bool {
         if cap == 0 || out.degraded() || out.tip_unavailable {
@@ -369,7 +377,7 @@ pub fn put(
     key: Key,
     out: &QueryOutput,
     watermarks: &crate::entity_view::Watermarks,
-    segments: Vec<(PathBuf, u64, i64)>,
+    segments: [u8; 32],
 ) -> bool {
     GLOBAL.put(key, out, watermarks, segments, max_bytes())
 }
@@ -557,10 +565,10 @@ mod tests {
         let wm = BTreeMap::new();
         let mut out = rows(1);
         out.degraded_tables.insert("t".into());
-        assert!(!put(Key([1; 32]), &out, &wm, Vec::new()));
+        assert!(!put(Key([1; 32]), &out, &wm, [0; 32]));
         let mut out = rows(1);
         out.tip_unavailable = true;
-        assert!(!put(Key([2; 32]), &out, &wm, Vec::new()));
+        assert!(!put(Key([2; 32]), &out, &wm, [0; 32]));
         assert!(get(&Key([1; 32])).is_none());
         assert!(get(&Key([2; 32])).is_none());
     }
@@ -576,14 +584,14 @@ mod tests {
         // Room for four entries and a little, never five; each is under a quarter of it.
         let cap = one * 4 + one / 2;
         for n in 1..=4 {
-            assert!(m.put(k(n), &rows(10), &wm, Vec::new(), cap));
+            assert!(m.put(k(n), &rows(10), &wm, [0; 32], cap));
         }
         assert_eq!(m.entries(), 4);
         assert!(
             m.get(&k(1), cap).is_some(),
             "touching 1 makes 2 the least recently used"
         );
-        assert!(m.put(k(5), &rows(10), &wm, Vec::new(), cap));
+        assert!(m.put(k(5), &rows(10), &wm, [0; 32], cap));
         assert!(m.bytes() <= cap, "the ceiling holds");
         assert_eq!(m.entries(), 4, "exactly one entry made room");
         assert!(
@@ -604,11 +612,11 @@ mod tests {
         let wm = BTreeMap::new();
         let out = rows(10);
         let cap = held(&out) * MAX_ENTRY_SHARE - 1;
-        assert!(!m.put(Key([0xb1; 32]), &out, &wm, Vec::new(), cap));
+        assert!(!m.put(Key([0xb1; 32]), &out, &wm, [0; 32], cap));
         assert!(m.get(&Key([0xb1; 32]), cap).is_none());
-        assert!(m.put(Key([0xb2; 32]), &out, &wm, Vec::new(), cap + 1));
+        assert!(m.put(Key([0xb2; 32]), &out, &wm, [0; 32], cap + 1));
         assert!(
-            !m.put(Key([0xb3; 32]), &out, &wm, Vec::new(), 0),
+            !m.put(Key([0xb3; 32]), &out, &wm, [0; 32], 0),
             "zero disables"
         );
         assert!(
