@@ -298,7 +298,7 @@ impl Memo {
         let Ok(rows) = serde_json::value::to_raw_value(&out.rows) else {
             return false;
         };
-        let bytes = size_of(out, &rows);
+        let bytes = size_of(out, &rows, watermarks);
         if bytes > cap / MAX_ENTRY_SHARE {
             return false;
         }
@@ -398,10 +398,46 @@ pub fn misses() -> u64 {
     GLOBAL.misses()
 }
 
-/// What an entry holds: the serialized rows, which is also what the response carries, and the
-/// column names beside them.
-fn size_of(out: &QueryOutput, rows: &serde_json::value::RawValue) -> usize {
-    rows.get().len() + out.columns.iter().map(String::len).sum::<usize>() + 64
+/// What an entry holds: the serialized rows, which is also what the response carries, and what
+/// rides beside them in the entry. Each string is charged its header and a share of its node.
+fn size_of(
+    out: &QueryOutput,
+    rows: &serde_json::value::RawValue,
+    watermarks: &crate::entity_view::Watermarks,
+) -> usize {
+    const PER_STRING: usize = 48;
+    let s = |t: &String| t.len() + PER_STRING;
+    let names = |set: &std::collections::BTreeSet<String>| set.iter().map(s).sum::<usize>();
+    let offchain = out.offchain.as_ref().map_or(0, |m| {
+        m.iter()
+            .map(|(k, v)| s(k) + v.iter().map(s).sum::<usize>())
+            .sum()
+    });
+    let bound = out.scan_bound.as_ref().map_or(0, |b| {
+        b.catalogue_hash.as_ref().map_or(0, s)
+            + b.tables
+                .keys()
+                .map(|k| s(k) + std::mem::size_of::<crate::analytics::TableScan>())
+                .sum::<usize>()
+    });
+    let marks: usize = watermarks
+        .iter()
+        .map(|(k, a)| {
+            s(k) + std::mem::size_of::<crate::entity_view::Applied>()
+                + a.offchain
+                    .iter()
+                    .map(|(t, m)| s(t) + s(&m.latest) + s(&m.digest) + 8)
+                    .sum::<usize>()
+        })
+        .sum();
+    rows.get().len()
+        + out.columns.iter().map(s).sum::<usize>()
+        + out.referenced_tables.as_ref().map_or(0, names)
+        + names(&out.degraded_tables)
+        + offchain
+        + bound
+        + marks
+        + std::mem::size_of::<Entry>()
 }
 
 #[cfg(test)]
@@ -452,7 +488,11 @@ mod tests {
     }
 
     fn held(out: &QueryOutput) -> usize {
-        size_of(out, &serde_json::value::to_raw_value(&out.rows).unwrap())
+        size_of(
+            out,
+            &serde_json::value::to_raw_value(&out.rows).unwrap(),
+            &BTreeMap::new(),
+        )
     }
 
     fn rows(n: usize) -> QueryOutput {
@@ -602,6 +642,39 @@ mod tests {
             assert!(m.get(&k(n), cap).is_some(), "entry {n} survives");
         }
         assert_eq!((m.hits(), m.misses()), (5, 1));
+    }
+
+    /// What rides beside the rows is charged too: table names, offchain provenance and the entity
+    /// watermarks an entry keeps (#2072).
+    #[test]
+    fn an_entry_is_charged_for_what_it_keeps_beside_its_rows() {
+        let bare = rows(10);
+        let raw = serde_json::value::to_raw_value(&bare.rows).unwrap();
+        let base = size_of(&bare, &raw, &BTreeMap::new());
+        let mut out = rows(10);
+        let names: std::collections::BTreeSet<String> =
+            (0..100).map(|i| format!("table_{i:0>40}")).collect();
+        out.referenced_tables = Some(names.clone());
+        out.degraded_tables = names;
+        out.offchain = Some(
+            [("prices".to_string(), vec!["h".repeat(64); 50])]
+                .into_iter()
+                .collect(),
+        );
+        let wm: crate::entity_view::Watermarks = (0..20)
+            .map(|i| {
+                (
+                    format!("entity_{i}"),
+                    crate::entity_view::Applied::default(),
+                )
+            })
+            .collect();
+        let charged = size_of(&out, &raw, &wm);
+        // 200 names of 46 bytes and 50 hashes of 64, before any per-string overhead.
+        assert!(
+            charged >= base + 200 * 46 + 50 * 64,
+            "{charged} against {base}"
+        );
     }
 
     /// One answer may not take the whole memo: an entry over a quarter of the ceiling is declined
