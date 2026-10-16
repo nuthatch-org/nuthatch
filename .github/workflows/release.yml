@@ -66,15 +66,21 @@ jobs:
           draft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
 
+  # #2035: one job per (target, variant), so a tag takes the slowest single `dist` link rather than
+  # the sum of three in series. Asset names are unchanged: `nuthatch-[<variant>-]<target>.tar.gz`.
   build:
-    name: ${{ matrix.target }}
+    name: ${{ matrix.target }} ${{ matrix.variant }}
     needs: release-notes
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [macos-15, ubuntu-22.04, ubuntu-22.04-arm]
+        variant: [default, scaled, graph]
         include:
-          - os: macos-14        # Apple Silicon
+          # Apple Silicon. #2037: off `macos-14`, which GitHub retires on 2 November 2026. macOS swaps
+          # on its own, so the Linux swap step below has no counterpart here.
+          - os: macos-15
             target: aarch64-apple-darwin
           # Pinned to 22.04 (glibc 2.35), NOT `ubuntu-latest`. A dynamically-linked binary requires the
           # glibc it was built against *or newer*, so the builder's glibc is the floor for every system
@@ -89,12 +95,35 @@ jobs:
             target: x86_64-unknown-linux-gnu
           # #1961: native arm64, not cross-compiled, on the 22.04 image for the same 2.35 floor. An
           # arm64 host otherwise runs the x86_64 binary under qemu, too slow to serve a stopgap nest.
-          # Default and graph builds only: scaled, and the container image, stay x86_64.
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
           # x86_64-apple-darwin (Intel Mac) is intentionally omitted: macos-13 runners are scarce
           # and Intel Macs are a shrinking minority; those users build from source (cargo install)
           # or run under a future addition. The installer routes them to the build-from-source path.
+          - variant: default
+            prefix: ''
+            features: ''
+          # The **scaled-mode** binary: `--features postgres-store`, which is what a fleet operator
+          # needs (`nuthatch worker`, `nuthatch control`, `serve --hot-store`). Shipped separately
+          # because non-negotiable 1 says the primary artifact runs with zero external services, and a
+          # binary carrying a Postgres driver is a different promise even if it behaves identically.
+          - variant: scaled
+            prefix: 'scaled-'
+            features: '--features postgres-store'
+          # The **graph** binary (#1950): `--features graph`, which serves a nest's Graph-dialect
+          # GraphQL (RFC-0053) and the RFC-0060 facade. Kept out of the default binary by the
+          # 2026-09-21 rule, but shipped, so a stopgap operator does not have to build from source.
+          - variant: graph
+            prefix: 'graph-'
+            features: '--features graph'
+        # Scaled, and the container image, stay x86_64 Linux.
+        exclude:
+          - os: macos-15
+            variant: scaled
+          - os: ubuntu-22.04-arm
+            variant: scaled
+    env:
+      TARBALL: nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
@@ -119,48 +148,20 @@ jobs:
           sudo swapon /swapfile.lto
           free -h
       - name: build
-        run: cargo build --profile dist --locked --target ${{ matrix.target }}
+        run: cargo build --profile dist --locked ${{ matrix.features }} --target ${{ matrix.target }}
       - name: package
         run: |
-          tarball="nuthatch-${{ matrix.target }}.tar.gz"
-          tar czf "$tarball" -C "target/${{ matrix.target }}/dist" nuthatch
-          shasum -a 256 "$tarball" > "$tarball.sha256"
-          ls -lh "$tarball"
+          tar czf "$TARBALL" -C "target/${{ matrix.target }}/dist" nuthatch
+          shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
+          ls -lh "$TARBALL"
       - name: attach to release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
-            nuthatch-${{ matrix.target }}.tar.gz
-            nuthatch-${{ matrix.target }}.tar.gz.sha256
-          fail_on_unmatched_files: true
-      # The **scaled-mode** binary: the same source with `--features postgres-store`, which is what a
-      # fleet operator needs (`nuthatch worker`, `nuthatch control`, `serve --hot-store`). Built and
-      # shipped separately rather than folded into the default one, because non-negotiable 1 says the
-      # primary artifact runs with zero external services - and a binary carrying a Postgres driver is
-      # a different promise even if it behaves identically when you do not use it.
-      #
-      # Without this, scaled mode was build-from-source only, which is not a deployment story.
-      - name: build (scaled)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --profile dist --locked --features postgres-store --target ${{ matrix.target }}
-      - name: package (scaled)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          tarball="nuthatch-scaled-${{ matrix.target }}.tar.gz"
-          tar czf "$tarball" -C "target/${{ matrix.target }}/dist" nuthatch
-          shasum -a 256 "$tarball" > "$tarball.sha256"
-          ls -lh "$tarball"
-      - name: attach scaled build to release
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          draft: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            nuthatch-scaled-${{ matrix.target }}.tar.gz
-            nuthatch-scaled-${{ matrix.target }}.tar.gz.sha256
+            nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz
+            nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz.sha256
           fail_on_unmatched_files: true
 
       # **#830: a checksum from the same release proves nothing.** A `.sha256` sidecar downloaded
@@ -175,59 +176,17 @@ jobs:
       # Attested **here**, on the machine that produced the file, not in `publish`: attesting a file
       # downloaded back from the release would certify only that we successfully downloaded whatever
       # is sitting there.
-      - name: attest the built artifacts
+      - name: attest the built artifact
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: nuthatch-${{ matrix.target }}.tar.gz
-
-      - name: attest the scaled artifact
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: nuthatch-scaled-${{ matrix.target }}.tar.gz
-      - name: keep the scaled binary for the image
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+          subject-path: nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz
+      # Hand the x86_64 Linux default and scaled binaries to the container job, so the images ship the
+      # same artifacts attached to the release rather than a second build nobody diffed.
+      - name: keep the binary for the image
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && matrix.variant != 'graph'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: nuthatch-scaled-binary
-          path: target/${{ matrix.target }}/dist/nuthatch
-          retention-days: 1
-      # The **graph** binary (#1950): `--features graph`, which serves a nest's Graph-dialect GraphQL
-      # (RFC-0053) and the RFC-0060 facade. Kept out of the default binary by the 2026-09-21 rule, but
-      # shipped, so an operator serving a stopgap nest does not have to build from source. Built after
-      # the scaled binary was kept, because it overwrites the same path.
-      - name: build (graph)
-        run: cargo build --profile dist --locked --features graph --target ${{ matrix.target }}
-      - name: package (graph)
-        run: |
-          tarball="nuthatch-graph-${{ matrix.target }}.tar.gz"
-          tar czf "$tarball" -C "target/${{ matrix.target }}/dist" nuthatch
-          shasum -a 256 "$tarball" > "$tarball.sha256"
-          ls -lh "$tarball"
-      - name: attach graph build to release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          draft: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            nuthatch-graph-${{ matrix.target }}.tar.gz
-            nuthatch-graph-${{ matrix.target }}.tar.gz.sha256
-          fail_on_unmatched_files: true
-      - name: attest the graph artifact
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: nuthatch-graph-${{ matrix.target }}.tar.gz
-      # Hand the *default* Linux binary to the container job so the image ships the same artifact that
-      # is attached to the release, rather than a second build nobody diffed. Note this step runs after
-      # the scaled and graph builds overwrote the binary, so it re-runs the default build first.
-      - name: rebuild the default binary for the image
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --profile dist --locked --target ${{ matrix.target }}
-      - name: keep the linux binary for the image
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: nuthatch-linux-binary
+          name: ${{ matrix.variant == 'scaled' && 'nuthatch-scaled-binary' || 'nuthatch-linux-binary' }}
           path: target/${{ matrix.target }}/dist/nuthatch
           retention-days: 1
 
@@ -292,8 +251,9 @@ jobs:
           docker push "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-scaled"
 
   # The release goes public here and nowhere else (#626). Everything above builds against a draft:
-  # three binary targets, the scaled binary, and two container images that are smoke-tested before they
-  # are pushed. Only when all of that has succeeded does the release stop being a draft.
+  # three binary targets with their scaled and graph variants, and two container images that are
+  # smoke-tested before they are pushed. Only when all of that has succeeded does the release stop
+  # being a draft.
   #
   # `needs: container` rather than `needs: build`, and that is a deliberate choice rather than an
   # oversight: an image is part of what a release promises (RFC-0005), so a green matrix with a failed
