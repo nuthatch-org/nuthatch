@@ -57,6 +57,13 @@ ignore = [
   # (checked 2026-08-19); the fix shipped in 0.4.16 only. Clearing it needs actix-web to move to h2 0.4
   # or dbsp to drop actix-web. Re-check on the next dbsp bump, same as the quick-xml and rkyv entries.
   "RUSTSEC-2026-0258", # h2 (0.3 line only): unbounded empty DATA frames against an HTTP/2 server
+  #
+  # zip 6.0.0 (transitive: dbsp and feldera-ir). Upstream yanked every release but 9.0.3 on 2026-10-16
+  # (zip-rs/zip2#1075) for GHSA-vv5m-jxxh-4627, GHSA-4v9h-p7m9-rh26 and GHSA-4684-h2q9-2vcp, all in
+  # extraction. dbsp only writes zips (`ZipWriter` in profile.rs, feldera-ir's lir.rs) and nothing here
+  # reads one. dbsp 0.320 requires zip ^6; 0.366 moves to ^9. More advisories are due this month:
+  # re-check them against this entry when they land, and drop it on the dbsp bump.
+  { crate = "zip@6.0.0", reason = "yanked for extraction flaws; dbsp only writes zips" },
 ]
 
 [licenses]
