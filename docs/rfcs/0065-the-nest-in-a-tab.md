@@ -81,6 +81,16 @@ means the tab needs no rollback: a reorg can only touch unsealed rows, which are
 the core is deterministic, a range the tab seals must hash to exactly what native nuthatch seals for
 it. That equality is the test that the tab is running nuthatch and not an imitation of it.
 
+**Where finality comes from.** "Below finality" is only as good as the source that says a block is
+final, and a public RPC's word is not authenticated. Before S5 the tab seals a range only when two
+independent RPCs both report its end at or below their `finalized` block, with the same hash for
+every block in the range and its parent chaining to the last sealed block; a disagreement, a missing
+`finalized` tag, or a hash that differs withholds the seal and the rows stay in the tail. Segments
+sealed this way are marked in OPFS and on the page as sealed against unauthenticated finality. From
+S5, Helios's beacon light client verifies the finalized checkpoint through the sync committee, so the
+boundary comes from consensus rather than from an RPC, and the mark is dropped. Either way a tab
+segment whose hash later disagrees with the mirror's for the same range is discarded and refetched.
+
 ## 5. Browser constraints, measured 2026-10-16
 
 | RPC (mainnet) | CORS | `eth_getLogs` |
@@ -158,10 +168,12 @@ and by whoever sealed it, which is no change from today.
 - **S3, the live tail, decode only.** The worker fetches `sealed_through..head`, decodes it in wasm,
   and answers views over sealed and tail rows. Gate: once native nuthatch seals a range the tab
   decoded, the tab's rows for that range equal the sealed rows, as multisets of nuthatch-encoded rows.
-- **S4, sealing in the tab.** Below finality, to OPFS, resumed after a discard. Gate: for every range
-  the tab sealed, its segment hash equals the hash on the mirror.
-- **S5, the verified head.** Helios in the same worker. Gates: a log altered in the RPC response is
-  refused; for blocks marked complete, a log removed from the response is detected; peak memory with
+- **S4, sealing in the tab.** Below finality, to OPFS, resumed after a discard. Gates: for every range
+  the tab sealed, its segment hash equals the hash on the mirror; against a scripted RPC pair, a range
+  one RPC reports finalized and the other does not, or reports with a different block hash, or that is
+  reorged before the second RPC finalizes it, is never sealed and stays in the tail.
+- **S5, the verified head.** Helios in the same worker. Gates: a `finalized` block the light client
+  cannot verify is not sealed below; a log altered in the RPC response is refused; for blocks marked complete, a log removed from the response is detected; peak memory with
   Helios and Burrmill together recorded. The page says which blocks are complete and which are only
   included.
 
