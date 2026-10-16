@@ -8123,16 +8123,24 @@ mod tests {
         );
         assert!(waited < Duration::from_secs(2), "{waited:?}");
         assert!(!backfill.is_finished(), "the backfill was still running");
-        // The pace the backfill settled on is kept for the next poll.
-        let span = s
-            .backfill_paces
-            .lock()
-            .unwrap()
-            .values()
-            .map(Pace::span)
-            .max()
-            .unwrap();
-        assert!(span > s.first_window, "{span}");
+        // The pace the backfill measured is kept for the next poll. Whether it grew by now depends on
+        // the runner's speed (#2049); growth itself is the `Pace` tests' job.
+        let kept = async {
+            loop {
+                if s.backfill_paces
+                    .lock()
+                    .unwrap()
+                    .get(&ALICE.to_ascii_lowercase())
+                    .is_some_and(|p| p.last.is_some())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), kept)
+            .await
+            .expect("no measured pace kept for the account");
         backfill.abort();
     }
 
