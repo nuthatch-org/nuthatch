@@ -188,7 +188,9 @@ beacon_url = "http://127.0.0.1:5052"  # optional: a beacon API for blocks the mi
 ```
 
 The cursor backfills each address up to the finalized head (the RPC's `finalized` tag, else the
-registry's depth under the head). A request whose `endblock` lies above what is covered, and at or
+registry's depth under the head), spending at most a poll interval a pass on address windows before
+block bodies and produced blocks take their turn. An address whose window fails is retried at half the
+span, down to the floor, then after 1, 2, 4 and up to 32 polls, while the others carry on. A request whose `endblock` lies above what is covered, and at or
 below the chain head, is covered on demand by the cursor, up to the block asked for, within
 `request_deadline`; otherwise it answers `NUTHATCH_INCOMPLETE`. Withdrawals and mined blocks need only
 the block bodies covered, whatever trace discovery has reached, and their refusal names how far the
@@ -332,7 +334,9 @@ read, and still carries `chain_id`; `served_through` gives, per action family th
 every watched account is covered through, `null` before any is: `transactions` (the five discovered
 actions), `bodies` (withdrawals and mined blocks, Ethereum) and `produced` (with `mev_relays`); a
 sweeping nest reports its swept span as `transactions`. A client that stops there is answered without
-waiting. It reports `stalled: true` while the last poll failed, and 503 with
+waiting. It reports `stalled: true` while the last poll failed or no window advances, lists each address
+whose windows keep failing under `stalled_backfill` (failures, span, `retry_in_polls`, the last error),
+and 503 with
 the reason once a finalized block the nest committed changes hash (a reorg under finality, or an RPC
 on another chain with the same id), after which nothing is answered. The conflict is kept in the
 store across restarts; removing the address-history store is how a nest reads its history again.
