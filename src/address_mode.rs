@@ -169,7 +169,16 @@ pub(crate) struct Pace {
     last: Option<(u64, Duration)>,
     /// What a window costs whatever its size, from the last two windows of different sizes.
     fixed: Option<Duration>,
+    /// Windows failed in a row, the last one's error, and the poll before which the next is not
+    /// tried: a window that fails at the floor waits 1, 2, 4 ... polls, up to [`MAX_IDLE_POLLS`].
+    failures: u32,
+    error: Option<String>,
+    idle: u64,
+    resume_poll: u64,
 }
+
+/// The most polls a window failing at the floor waits before it is tried again.
+const MAX_IDLE_POLLS: u64 = 32;
 
 impl Pace {
     pub(crate) fn new(start: u64, min: u64, max: u64, deadline: Duration) -> Pace {
@@ -182,12 +191,36 @@ impl Pace {
             deadline,
             last: None,
             fixed: None,
+            failures: 0,
+            error: None,
+            idle: 0,
+            resume_poll: 0,
         }
     }
     pub(crate) fn span(&self) -> u64 {
         self.span
     }
+    /// A window failed at `poll`: the next is tried at half the span, and once the span is at the
+    /// floor, only after a wait that doubles with each failure there.
+    pub(crate) fn failed(&mut self, poll: u64, error: String) {
+        self.failures += 1;
+        self.error = Some(error);
+        if self.span > self.min {
+            self.span = (self.span / 2).max(self.min);
+        } else {
+            self.idle = (self.idle * 2).clamp(1, MAX_IDLE_POLLS);
+            self.resume_poll = poll + self.idle + 1;
+        }
+    }
+    /// Whether a window may be tried at `poll`.
+    pub(crate) fn due(&self, poll: u64) -> bool {
+        poll >= self.resume_poll
+    }
     pub(crate) fn took(&mut self, elapsed: Duration) {
+        self.failures = 0;
+        self.error = None;
+        self.idle = 0;
+        self.resume_poll = 0;
         if let Some((s, e)) = self.last.filter(|(s, _)| *s != self.span) {
             let ((s_lo, e_lo), (s_hi, e_hi)) = if s < self.span {
                 ((s, e), (self.span, elapsed))
@@ -538,6 +571,26 @@ impl ModeState {
         since_poll > 3 * self.poll_interval
             || self.failing.load(Ordering::Relaxed)
             || self.backfill_failing.load(Ordering::Relaxed)
+    }
+
+    /// The accounts whose backfill windows are failing, each with how often, at what span, how many
+    /// polls until the next try, and the last error: what `stalled` alone cannot name.
+    fn stalled_backfill(&self) -> Vec<Value> {
+        let poll = self.polls.load(Ordering::Relaxed);
+        let paces = self.backfill_paces.lock().unwrap();
+        let mut out: Vec<(&String, &Pace)> = paces.iter().filter(|(_, p)| p.failures > 0).collect();
+        out.sort_by_key(|(a, _)| *a);
+        out.into_iter()
+            .map(|(address, p)| {
+                json!({
+                    "address": address,
+                    "failures": p.failures,
+                    "span": p.span,
+                    "retry_in_polls": p.resume_poll.saturating_sub(poll),
+                    "error": p.error,
+                })
+            })
+            .collect()
     }
 
     fn window_done(&self) {
@@ -1311,9 +1364,14 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
         if let Some(cfg) = state.sweep.clone() {
             sweep_pass(self, state, to, &cfg).await;
         }
+        // Discovery yields after a poll interval: bodies and produced blocks need no traces, and a
+        // long trace backlog would otherwise hold them back for its whole length (#2078).
+        let budget = Instant::now() + state.poll_interval;
+        let poll = state.polls.load(Ordering::Relaxed);
+        let (mut advanced_any, mut failed_any) = (false, false);
         // A sweeping nest covers its set block by block; discovering each address too would cost
         // per address what the sweep exists to avoid.
-        while state.sweep.is_none() {
+        while state.sweep.is_none() && Instant::now() < budget {
             let round = match state.history.watched() {
                 Ok(w) => w,
                 Err(e) => {
@@ -1323,6 +1381,9 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             };
             let mut advanced = false;
             for address in round {
+                if Instant::now() >= budget {
+                    break;
+                }
                 if stopped.contains(&address) {
                     continue;
                 }
@@ -1364,13 +1425,16 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 if limit.is_some_and(|l| next >= l) {
                     continue;
                 }
-                let span = state
-                    .backfill_paces
-                    .lock()
-                    .unwrap()
-                    .entry(address.clone())
-                    .or_insert_with(fresh)
-                    .span();
+                let span = {
+                    let mut paces = state.backfill_paces.lock().unwrap();
+                    let pace = paces.entry(address.clone()).or_insert_with(fresh);
+                    // An account whose windows keep failing waits out its own backoff; the others go on.
+                    if !pace.due(poll) {
+                        stopped.insert(address);
+                        continue;
+                    }
+                    pace.span()
+                };
                 let end = next
                     .saturating_add(span - 1)
                     .min(to)
@@ -1379,7 +1443,15 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 let done = discover_window(self, state, &address, (next, end), None).await;
                 let took = started.elapsed();
                 if let Some(p) = state.backfill_paces.lock().unwrap().get_mut(&address) {
-                    p.took(took);
+                    match &done {
+                        Err(e)
+                            if e.downcast_ref::<crate::address_residual::Unprovable>()
+                                .is_none() =>
+                        {
+                            p.failed(poll, format!("{e:#}"))
+                        }
+                        _ => p.took(took),
+                    }
                 }
                 match done {
                     Ok(()) => {
@@ -1388,6 +1460,7 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                             .store(per_minute(end - next + 1, took), Ordering::Relaxed);
                         recorded_through.insert(address.clone(), end);
                         advanced = true;
+                        advanced_any = true;
                         state.window_done();
                         tracing::info!("address history: {address} covered through {end}");
                     }
@@ -1404,9 +1477,11 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                             }
                         }
                         None => {
-                            state.window_failed();
+                            // One account's failing window is that account's, not the cursor's.
+                            state.discovery_errors.fetch_add(1, Ordering::Relaxed);
+                            failed_any = true;
                             tracing::warn!(
-                                "address history: [{next}, {end}] for {address} not recorded, retrying next poll: {e:#}"
+                                "address history: [{next}, {end}] for {address} not recorded, retrying on its own schedule: {e:#}"
                             );
                             stopped.insert(address);
                         }
@@ -1416,6 +1491,9 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
             if !advanced {
                 break;
             }
+        }
+        if failed_any && !advanced_any {
+            state.window_failed();
         }
         // Withdrawals and produced blocks come from bodies, and the definitions they are matched to
         // are Ethereum mainnet's, so only there is the block scan run. An account added during the
@@ -3847,6 +3925,7 @@ async fn ready(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
                 "tip": s.history.tip().ok().flatten(),
                 "poll_interval_secs": s.poll_interval.as_secs(),
                 "stalled": s.stalled(),
+                "stalled_backfill": s.stalled_backfill(),
                 "holding": match s.holding() {
                     Some((pass, secs)) => json!({"pass": pass, "secs": secs}),
                     None => Value::Null,
@@ -6838,6 +6917,8 @@ mod tests {
         /// Microseconds on top for every trace_filter naming one of these addresses, as a dense
         /// account's take, and how many such calls were made.
         trace_fixed_us: std::sync::Mutex<HashMap<String, (u64, u64)>>,
+        /// Addresses every trace_filter naming them times out for, and how many such calls came.
+        trace_fails: std::sync::Mutex<HashMap<String, u64>>,
     }
 
     impl Chain {
@@ -6922,6 +7003,7 @@ mod tests {
         fn block_json(&self, b: u64) -> Value {
             json!({"number": format!("0x{b:x}"), "hash": self.hex(b), "timestamp": "0x10",
                    "parentHash": if b == 0 { format!("0x{:064x}", 0) } else { self.hex(b - 1) },
+                   "miner": "0x0000000000000000000000000000000000000077", "uncles": [],
                    "transactions": [self.hex(b)]})
         }
         /// A discoverer that answers the production window as a node would: ALICE receives an
@@ -6975,6 +7057,18 @@ mod tests {
                 }
                 "trace_filter" => {
                     let f = &p[0];
+                    let named = ["fromAddress", "toAddress"]
+                        .iter()
+                        .find_map(|k| f[*k][0].as_str())
+                        .map(str::to_ascii_lowercase);
+                    if let Some(n) = named.and_then(|a| {
+                        c.trace_fails.lock().unwrap().get_mut(&a).map(|n| {
+                            *n += 1;
+                            *n
+                        })
+                    }) {
+                        bail!("transport error: timed out: trace_filter call {n}");
+                    }
                     let s = crate::address_discovery::hex_u64(&f["fromBlock"])?;
                     let e = crate::address_discovery::hex_u64(&f["toBlock"])?.min(c.latest());
                     let per = c.trace_us_per_block.load(Ordering::Relaxed);
@@ -8045,6 +8139,126 @@ mod tests {
             "ALICE started while BOB still had a backlog: {a:?} {b:?}"
         );
         backfill.abort();
+    }
+
+    /// A trace window that times out every time is one account's trouble (#2078): its windows shrink
+    /// to the floor and then wait 1, 2, 4 polls between tries, while the other account is backfilled
+    /// and its own block bodies are read, and /ready names it rather than calling the cursor stalled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failing_trace_window_backs_off_while_the_rest_carries_on() {
+        use crate::address_history::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into(), BOB.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(0, None, 20)
+                .with_first_window(512),
+        );
+        let chain = Chain::new(3_000, 2_900);
+        chain.quiet.store(true, Ordering::Relaxed);
+        let alice = ALICE.to_ascii_lowercase();
+        chain.trace_fails.lock().unwrap().insert(alice.clone(), 0);
+        s.history.ask_bodies(ALICE).unwrap();
+        let d = chain.node();
+        let safe = d.reconcile(&s, chain.latest()).await.unwrap();
+        let backfill = |s: &ModeState| -> Value {
+            let all = s.stalled_backfill();
+            assert!(all.len() <= 1, "{all:?}");
+            all.into_iter().next().unwrap_or(Value::Null)
+        };
+
+        d.catch_up(&s, safe).await;
+        assert_eq!(
+            s.history.coverage(Action::TxList, BOB).unwrap(),
+            vec![(0, safe)],
+            "the healthy account is backfilled whole"
+        );
+        assert_eq!(
+            s.history
+                .coverage(Action::BeaconWithdrawals, ALICE)
+                .unwrap(),
+            vec![(0, safe)],
+            "the failing account's bodies are read: they need no traces"
+        );
+        assert!(s
+            .history
+            .coverage(Action::TxList, ALICE)
+            .unwrap()
+            .is_empty());
+        assert!(
+            !s.stalled(),
+            "one account failing is not the cursor stalled"
+        );
+        let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert_eq!(r["stalled"], false, "{r}");
+        let named = &r["stalled_backfill"][0];
+        assert!(
+            named["address"]
+                .as_str()
+                .unwrap()
+                .eq_ignore_ascii_case(ALICE),
+            "{r}"
+        );
+        assert_eq!(named["failures"], 1, "{r}");
+        assert!(
+            named["error"].as_str().unwrap().contains("timed out"),
+            "{r}"
+        );
+
+        // Polls 1 to 12: shrink 256, 128, 64, then wait 1, 2 and 4 polls at the floor.
+        let mut tried = vec![0];
+        for poll in 1..=12u64 {
+            s.polls.store(poll, Ordering::Relaxed);
+            let before = chain.trace_fails.lock().unwrap()[&alice];
+            d.catch_up(&s, safe).await;
+            if chain.trace_fails.lock().unwrap()[&alice] > before {
+                tried.push(poll);
+            }
+        }
+        assert_eq!(tried, vec![0, 1, 2, 3, 5, 8], "{:?}", backfill(&s));
+        let last = backfill(&s);
+        assert_eq!(last["span"], 64, "{last}");
+        assert_eq!(last["failures"], 6, "{last}");
+        assert_eq!(last["retry_in_polls"], 1, "{last}");
+
+        // The endpoint recovers: the next due window succeeds and the account is named no more.
+        chain.trace_fails.lock().unwrap().clear();
+        s.polls.store(13, Ordering::Relaxed);
+        d.catch_up(&s, safe).await;
+        assert_eq!(
+            s.history.coverage(Action::TxList, ALICE).unwrap(),
+            vec![(0, safe)]
+        );
+        assert!(s.stalled_backfill().is_empty());
+    }
+
+    /// Discovery yields to the body scan once a poll interval is spent (#2078): with none to spend,
+    /// no trace window runs this pass, and the bodies are read all the same.
+    #[tokio::test]
+    async fn discovery_yields_to_the_body_scan_when_its_time_is_up() {
+        use crate::address_history::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let s = ModeState::new(history, 1, Duration::ZERO, true).with_range(0, None, 20);
+        let chain = Chain::new(500, 400);
+        chain.quiet.store(true, Ordering::Relaxed);
+        s.history.ask_bodies(ALICE).unwrap();
+        let d = chain.node();
+        let safe = d.reconcile(&s, chain.latest()).await.unwrap();
+        d.catch_up(&s, safe).await;
+        assert!(s
+            .history
+            .coverage(Action::TxList, ALICE)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            s.history
+                .coverage(Action::BeaconWithdrawals, ALICE)
+                .unwrap(),
+            vec![(0, safe)]
+        );
     }
 
     /// A quiet account backfilled beside a slow one grows its windows as it would alone: one pace
