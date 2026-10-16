@@ -1727,6 +1727,10 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
             .await?;
         let history = &state.history;
         loop {
+            // Withdrawals and mined blocks come from bodies alone: discovery is not theirs to wait on.
+            if need == Need::Bodies {
+                break;
+            }
             let next = crate::address_discovery::next_uncovered(history, address, from)?;
             if next > to {
                 break;
@@ -3259,8 +3263,11 @@ async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Op
     use crate::address_history::Action;
     let (address, need, from, to) = want.clone();
     // Each layer the request needs, its first uncovered block, and how far it can reach in time.
-    let mut layers: Vec<(&'static [Action], u64)> =
-        vec![(&DISCOVERED, reach(s, &s.backfill_rate, COVER_WINDOW))];
+    // Withdrawals and mined blocks come from block bodies alone, whatever discovery has reached.
+    let mut layers: Vec<(&'static [Action], u64)> = Vec::new();
+    if need != Need::Bodies {
+        layers.push((&DISCOVERED, reach(s, &s.backfill_rate, COVER_WINDOW)));
+    }
     if need != Need::Discovered {
         layers.push((&BLOCK_SCANNED, reach(s, &s.body_rate, COVER_BODIES)));
     }
@@ -3293,9 +3300,12 @@ async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Op
     let load: f64 = layers
         .iter()
         .zip(&nexts)
-        .enumerate()
-        .map(|(i, ((_, reach), next))| {
-            let owed = if i == 2 { owed } else { 0 };
+        .map(|((set, reach), next)| {
+            let owed = if *set == [Action::ProducedBlocks] {
+                owed
+            } else {
+                0
+            };
             let work = to
                 .saturating_sub(*next)
                 .saturating_add(u64::from(*next <= to))
@@ -3880,6 +3890,43 @@ async fn change(s: Arc<ModeState>, address: String, add: bool) -> (StatusCode, J
     }
 }
 
+/// Per action family this nest serves, the block every watched account is covered through, so a
+/// client can stop asking there (#2077); `null` before any is. A family the nest does not serve is
+/// absent. A sweep covers its whole set as one span.
+fn served_through(s: &ModeState, h: &AddressHistory) -> Result<Value> {
+    use crate::address_discovery::{next_uncovered_for, BLOCK_SCANNED, DISCOVERED};
+    use crate::address_history::Action;
+    let mut out = serde_json::Map::new();
+    if let Some(cfg) = &s.sweep {
+        let mut through = h.swept()?.map(|(_, t)| t);
+        if cfg.internal {
+            through = through.min(h.swept_internal()?.map(|(_, t)| t));
+        }
+        out.insert("transactions".into(), json!(through));
+        return Ok(Value::Object(out));
+    }
+    let watched = h.watched()?;
+    let through = |set: &[Action]| -> Result<Value> {
+        let mut next = u64::MAX;
+        for a in &watched {
+            next = next.min(next_uncovered_for(h, a, s.start_block, set)?);
+        }
+        Ok(match next {
+            u64::MAX => Value::Null,
+            n if n <= s.start_block => Value::Null,
+            n => json!(n - 1),
+        })
+    };
+    out.insert("transactions".into(), through(&DISCOVERED)?);
+    if s.chain_id == 1 {
+        out.insert("bodies".into(), through(&BLOCK_SCANNED)?);
+        if s.relays.is_some() {
+            out.insert("produced".into(), through(&[Action::ProducedBlocks])?);
+        }
+    }
+    Ok(Value::Object(out))
+}
+
 async fn ready(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
     // Offline is not unready: covered history still serves, and a cursor that has not polled for
     // three intervals is reported stalled. A store that cannot be read is unready, and so is a
@@ -3887,8 +3934,13 @@ async fn ready(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
     let stopped = s
         .conflicted()
         .or_else(|| s.cursor_error.lock().expect("cursor_error lock").clone());
-    match blocking(&s, |h| Ok((h.head()?, h.watched()?.len()))).await {
-        Ok((head, watched)) if stopped.is_some() => (
+    let st = s.clone();
+    match blocking(&s, move |h| {
+        Ok((h.head()?, h.watched()?.len(), served_through(&st, h)?))
+    })
+    .await
+    {
+        Ok((head, watched, _)) if stopped.is_some() => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
                 "version": env!("CARGO_PKG_VERSION"),
@@ -3902,7 +3954,7 @@ async fn ready(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
         ),
         // Before the first finalized head nothing can be answered, but the chain is known, so a
         // client can still register its addresses.
-        Ok((None, watched)) => (
+        Ok((None, watched, _)) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
                 "version": env!("CARGO_PKG_VERSION"),
@@ -3914,7 +3966,7 @@ async fn ready(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
                 "error": "the chain head has not been read yet",
             })),
         ),
-        Ok((head, watched)) => (
+        Ok((head, watched, served)) => (
             StatusCode::OK,
             Json(json!({
                 "version": env!("CARGO_PKG_VERSION"),
@@ -3931,6 +3983,7 @@ async fn ready(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
                     None => Value::Null,
                 },
                 "watched": watched,
+                "served_through": served,
             })),
         ),
         Err(e) => (
@@ -5993,6 +6046,115 @@ mod tests {
         assert!(beyond_reach(&s, &want(200_999)).await.is_some());
     }
 
+    /// Withdrawals come from block bodies alone (#2076): a request for them is admitted by the body
+    /// scan's reach whatever discovery has covered, and a refusal names the bodies' coverage.
+    #[tokio::test]
+    async fn a_withdrawals_request_is_judged_by_bodies_alone() {
+        use crate::address_history::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(200_000).unwrap();
+        let alice = ALICE.to_lowercase();
+        for action in crate::address_discovery::BLOCK_SCANNED {
+            let g = history.generation().unwrap();
+            history
+                .record(action, &alice, &[], (0, 199_968), g)
+                .unwrap();
+        }
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_deadline(Duration::from_secs(2)),
+        );
+        // Discovery reaches nothing in time; the body scan reaches 100,000 blocks.
+        s.backfill_rate.store(1, Ordering::Relaxed);
+        s.body_rate.store(6_000_000, Ordering::Relaxed);
+        let want = |need: Need| (alice.clone(), need, 0, 200_000);
+        assert_eq!(beyond_reach(&s, &want(Need::Bodies)).await, None);
+        assert!(beyond_reach(&s, &want(Need::Discovered)).await.is_some());
+        // A body scan too slow for the 32-block tail refuses, naming where bodies are covered.
+        s.body_rate.store(1, Ordering::Relaxed);
+        let why = beyond_reach(&s, &want(Need::Bodies)).await.unwrap();
+        assert!(
+            why.starts_with("covered through block 199968; the 32 blocks above it"),
+            "{why}"
+        );
+        assert!(Need::of(Action::MinedBlocks) == Need::Bodies);
+    }
+
+    /// The tail above the bodies' coverage is read on demand without discovery: no trace call is
+    /// made for a withdrawals request, however far discovery is behind (#2076).
+    #[tokio::test]
+    async fn covering_withdrawals_reads_bodies_without_tracing() {
+        use crate::address_history::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        let chain = Chain::new(200, 150);
+        let d = chain.node();
+        let g = s.history.generation().unwrap();
+        for action in crate::address_discovery::BLOCK_SCANNED {
+            s.history.record(action, ALICE, &[], (0, 100), g).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        d.cover(&s, ALICE, Need::Bodies, (0, 140), deadline)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.history
+                .coverage(Action::BeaconWithdrawals, ALICE)
+                .unwrap(),
+            vec![(0, 140)]
+        );
+        assert_eq!(
+            d.trace.calls().get("trace_filter"),
+            None,
+            "{:?}",
+            d.trace.calls()
+        );
+        assert!(s
+            .history
+            .coverage(Action::TxList, ALICE)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// `/ready` names, per family it serves, the block every watched account is covered through
+    /// (#2077); a family nothing has covered yet is null, and one the nest does not serve is absent.
+    #[tokio::test]
+    async fn ready_reports_what_each_family_is_served_through() {
+        use crate::address_history::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        s.history.set_head(500).unwrap();
+        let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert_eq!(
+            r["served_through"],
+            json!({"transactions": null, "bodies": null}),
+            "{r}"
+        );
+        let g = s.history.generation().unwrap();
+        for action in crate::address_discovery::DISCOVERED {
+            s.history.record(action, ALICE, &[], (0, 300), g).unwrap();
+        }
+        for action in crate::address_discovery::BLOCK_SCANNED {
+            s.history.record(action, ALICE, &[], (0, 450), g).unwrap();
+        }
+        // One action short holds its family back.
+        s.history
+            .record(Action::TxListInternal, ALICE, &[], (301, 320), g)
+            .unwrap();
+        s.history
+            .record(Action::TxList, ALICE, &[], (301, 400), g)
+            .unwrap();
+        let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert_eq!(
+            r["served_through"],
+            json!({"transactions": 300, "bodies": 450}),
+            "{r}"
+        );
+        assert_eq!(r["head"], 500, "head is unchanged: {r}");
+    }
+
     /// Admission is by the slowest layer a request needs: fast trace discovery does not admit a
     /// withdrawals request the slow body scan cannot finish in time.
     #[tokio::test]
@@ -6040,12 +6202,14 @@ mod tests {
             "{v}"
         );
         assert!(started.elapsed() >= Duration::from_millis(1_900));
-        // Each layer alone could cover its 1,000 blocks in 60% of the time, but they run one after
-        // the other: together they cannot, and the request is refused at once.
+        // Each layer alone could cover its 1,000 blocks in 60% of the time, but produced blocks need
+        // all three, run one after the other: together they cannot, and the request is refused at
+        // once.
         s2.backfill_rate.store(99_960, Ordering::Relaxed);
         s2.body_rate.store(99_960, Ordering::Relaxed);
+        s2.produced_rate.store(99_960, Ordering::Relaxed);
         let started = Instant::now();
-        let (_, v) = call(router(s2), "GET", &ask("txsBeaconWithdrawal"), None).await;
+        let (_, v) = call(router(s2), "GET", &ask("nuthatchProducedBlocks"), None).await;
         assert!(
             v["result"]
                 .as_str()
