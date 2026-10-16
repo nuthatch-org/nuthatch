@@ -1495,8 +1495,17 @@ impl AddressHistory {
 
     /// The span the sweep has read, from the first block it read to the last.
     pub fn swept(&self) -> Result<Option<(u64, u64)>> {
+        self.swept_span(SWEPT)
+    }
+
+    /// The span the sweep has traced for internal transfers, when it traces them.
+    pub fn swept_internal(&self) -> Result<Option<(u64, u64)>> {
+        self.swept_span(SWEPT_INTERNAL)
+    }
+
+    fn swept_span(&self, key: &str) -> Result<Option<(u64, u64)>> {
         let rtx = self.store.database().begin_read()?;
-        let spans = match rtx.open_table(SWEEP)?.get(SWEPT)? {
+        let spans = match rtx.open_table(SWEEP)?.get(key)? {
             Some(v) => decode_spans(v.value())?,
             None => Vec::new(),
         };

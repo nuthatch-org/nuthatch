@@ -190,7 +190,9 @@ beacon_url = "http://127.0.0.1:5052"  # optional: a beacon API for blocks the mi
 The cursor backfills each address up to the finalized head (the RPC's `finalized` tag, else the
 registry's depth under the head). A request whose `endblock` lies above what is covered, and at or
 below the chain head, is covered on demand by the cursor, up to the block asked for, within
-`request_deadline`; otherwise it answers `NUTHATCH_INCOMPLETE`. A read reaching above the finalized
+`request_deadline`; otherwise it answers `NUTHATCH_INCOMPLETE`. Withdrawals and mined blocks need only
+the block bodies covered, whatever trace discovery has reached, and their refusal names how far the
+bodies are. A read reaching above the finalized
 head goes through the cursor too, which checks the chain for a reorg before it answers. An explicit
 `endblock` is answered whole or refused, never shortened to what is covered; one past the chain head
 is refused. Without `endblock` the answer runs to the end of the covered run the start is in, and a
@@ -326,7 +328,11 @@ runtime through `POST /api/watch` and `POST /api/unwatch` with `{"address": "0xâ
 a loopback bind; any other bind logs a warning at start. `addresses = []` is valid, for a nest that
 serves timestamp lookups and accounts added later. A range the nest has not fetched answers
 `NUTHATCH_INCOMPLETE`, never an empty list. `/ready` answers 503 until the first finalized head is
-read, and still carries `chain_id`; it reports `stalled: true` while the last poll failed, and 503 with
+read, and still carries `chain_id`; `served_through` gives, per action family the nest serves, the block
+every watched account is covered through, `null` before any is: `transactions` (the five discovered
+actions), `bodies` (withdrawals and mined blocks, Ethereum) and `produced` (with `mev_relays`); a
+sweeping nest reports its swept span as `transactions`. A client that stops there is answered without
+waiting. It reports `stalled: true` while the last poll failed, and 503 with
 the reason once a finalized block the nest committed changes hash (a reorg under finality, or an RPC
 on another chain with the same id), after which nothing is answered. The conflict is kept in the
 store across restarts; removing the address-history store is how a nest reads its history again.
