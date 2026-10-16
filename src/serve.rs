@@ -4207,7 +4207,8 @@ async fn run_sql_query_at(
                 // it, but a disk fault or a half-finished restore does - and the answer over it
                 // then differs while every input the node knows about is unchanged. See
                 // `sqlmemo::segment_stamps`.
-                && crate::sqlmemo::segment_stamps(&s.dir, hit.tables.as_ref()) == hit.segments
+                && crate::sqlmemo::segment_stamps(&s.dir, hit.out.referenced_tables.as_ref())
+                    == hit.segments
             {
                 METRICS.inc_sql();
                 return sql_response(

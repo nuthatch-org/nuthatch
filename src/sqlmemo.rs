@@ -216,9 +216,8 @@ pub struct Entry {
     pub rows: Box<serde_json::value::RawValue>,
     pub count: usize,
     pub watermarks: crate::entity_view::Watermarks,
-    /// The tables this answer read, and a stamp of every sealed segment behind them at the moment it
-    /// was computed - see [`segment_stamps`]. Re-taken on a hit; any difference recomputes.
-    pub tables: Option<std::collections::BTreeSet<String>>,
+    /// A stamp of every sealed segment behind the tables `out` names, at the moment the answer was
+    /// computed - see [`segment_stamps`]. Re-taken on a hit; any difference recomputes.
     pub segments: [u8; 32],
     bytes: usize,
 }
@@ -330,7 +329,6 @@ impl Memo {
                     rows,
                     count: out.rows.len(),
                     watermarks: watermarks.clone(),
-                    tables: out.referenced_tables.clone(),
                     segments,
                     bytes,
                 }),
