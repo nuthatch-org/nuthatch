@@ -273,6 +273,16 @@ config file, `GATE_NESTS`, which the ThinkPad holds at `~/release-gate/nests.con
 | `data-services-nest` | data-services-nest, Helsinki | from Helsinki |
 | `staking-archive-nest` | graph-staking-legacy-readonly (serve-only), Helsinki | from Helsinki |
 
+**Since 2026-10-16 the copies are frozen.** The Helsinki nests stopped with the Lodestar withdrawal on
+2026-10-13 and the QoS nest is gone, so every refresh failed and every release from 5.4.0 to 5.6.3
+carried `error` on all six contexts. Each line in the ThinkPad's `nests.conf` now has refresh `none`,
+gating against the copies taken on 2026-10-12, and each copy's `PROVENANCE` is kept as
+`PROVENANCE.helsinki-20261012`, so the baseline is the latest full release that is not the candidate
+rather than the 5.0.1 production last ran. A poll skips a release that already has a status, `error`
+included, so a release that errored is gated by naming it: `GATE_NESTS=~/release-gate/nests.conf
+scripts/release-gate-run.sh v<x.y.z>`. With no production nest left, the roll's gate check has
+nothing to vouch for; the gate is what a release is measured against.
+
 The runner reads the whole file first, so a bad line gates nothing, then runs itself once per nest
 with that nest's copy, set, environment and refresh. Each nest is gated exactly as the allocations
 nest is above, under its own copy lock, against the production version its own copy's
