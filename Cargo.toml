@@ -104,7 +104,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 # The parser role: entities and lowering read its AST.
 sqlparser = { version = "0.62", features = ["visitor"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 csv = "1"
 # Subgraph manifests are YAML (`init --from-subgraph`). yaml-rust2 rather than
 # serde_yaml, which is archived (RUSTSEC-2024-0320) and would trip the

@@ -3842,7 +3842,14 @@ async fn named_query(
         crate::metrics::METRICS
             .observe_named_scan(bound.cold_bytes.saturating_add(bound.hot_bytes));
     }
-    sql_response(&s, &run.out, &run.watermarks, run.provenance, false)
+    sql_response(
+        &s,
+        &run.out,
+        SqlRows::Values(&run.out.rows),
+        &run.watermarks,
+        run.provenance,
+        false,
+    )
 }
 
 /// A declared query taken through RFC-0048 admission.
@@ -4203,7 +4210,17 @@ async fn run_sql_query_at(
                 && crate::sqlmemo::segment_stamps(&s.dir, hit.tables.as_ref()) == hit.segments
             {
                 METRICS.inc_sql();
-                return sql_response(&s, &hit.out, &hit.watermarks, (as_of, sealed_through), true);
+                return sql_response(
+                    &s,
+                    &hit.out,
+                    SqlRows::Serialized {
+                        json: &hit.rows,
+                        count: hit.count,
+                    },
+                    &hit.watermarks,
+                    (as_of, sealed_through),
+                    true,
+                );
             }
         }
     }
@@ -4386,7 +4403,14 @@ async fn run_sql_query_at(
                     crate::sqlmemo::put(key, &out, &watermarks, segments);
                 }
             }
-            sql_response(&s, &out, &watermarks, provenance, false)
+            sql_response(
+                &s,
+                &out,
+                SqlRows::Values(&out.rows),
+                &watermarks,
+                provenance,
+                false,
+            )
         }
         Ok(Err(e)) => sql_error_response(&s, e, &q.q),
         Err(e) => error(format!("{e}")),
@@ -4743,12 +4767,13 @@ fn dataset_head(s: &AppState) -> u64 {
 fn sql_response(
     s: &AppState,
     out: &crate::analytics::QueryOutput,
+    rows: SqlRows<'_>,
     watermarks: &crate::entity_view::Watermarks,
     (as_of, sealed_through): (Option<u64>, u64),
     cached: bool,
 ) -> axum::response::Response {
     let mut response = json!({
-        "count": out.rows.len(),
+        "count": rows.count(),
         "truncated": out.truncated,
         // Cold data was incomplete when this answer was computed (#435): a sealed segment the
         // manifest lists could not be read, so its table was *reduced* and the query succeeded
@@ -4770,7 +4795,11 @@ fn sql_response(
         "tip_unavailable": out.tip_unavailable,
         // The query's column order (#1609), which the row objects do not keep.
         "columns": out.columns,
-        "rows": out.rows,
+        "rows": match rows {
+            SqlRows::Values(v) => json!(v),
+            // Written in place when the body is serialized, below.
+            SqlRows::Serialized { .. } => Value::Null,
+        },
         // Answered from the deterministic memo (#1186): the same rows this statement produced the
         // last time every input it reads was in this state. Never stale by construction; here so a
         // caller measuring the nest can tell a computed answer from a remembered one.
@@ -4813,7 +4842,61 @@ fn sql_response(
             provenance.insert("offchain".into(), read);
         }
     }
-    Json(response).into_response()
+    match rows {
+        SqlRows::Values(_) => Json(response).into_response(),
+        SqlRows::Serialized { json, .. } => match serde_json::to_vec(&WithRows(&response, json)) {
+            Ok(body) => (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("serializing a remembered answer: {e}") })),
+            )
+                .into_response(),
+        },
+    }
+}
+
+/// The rows of a `/sql` answer: computed, or remembered already serialized (#2072).
+#[derive(Clone, Copy)]
+enum SqlRows<'a> {
+    Values(&'a [Value]),
+    Serialized {
+        json: &'a serde_json::value::RawValue,
+        count: usize,
+    },
+}
+
+impl SqlRows<'_> {
+    fn count(&self) -> usize {
+        match self {
+            SqlRows::Values(v) => v.len(),
+            SqlRows::Serialized { count, .. } => *count,
+        }
+    }
+}
+
+/// A response object with its `rows` key's value written from stored JSON, in the key's own place.
+struct WithRows<'a>(&'a Value, &'a serde_json::value::RawValue);
+
+impl serde::Serialize for WithRows<'_> {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let Some(fields) = self.0.as_object() else {
+            return self.0.serialize(ser);
+        };
+        let mut map = ser.serialize_map(Some(fields.len()))?;
+        for (k, v) in fields {
+            if k == "rows" {
+                map.serialize_entry(k, self.1)?;
+            } else {
+                map.serialize_entry(k, v)?;
+            }
+        }
+        map.end()
+    }
 }
 
 fn sql_entity_provenance(
@@ -9482,6 +9565,51 @@ mod tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// A remembered answer is the computed one byte for byte bar `cached`, rows written from the
+    /// stored JSON in the same place (#2072).
+    #[tokio::test]
+    async fn a_memo_hit_is_the_computed_body_but_for_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 2);
+        for (b, who) in [(1u64, "a \"quoted\" \\ name\n"), (2, "ünïcode")] {
+            state
+                .store
+                .put_entity(
+                    &format!("k{b}"),
+                    &json!({"table": "t", "block_number": b, "who": who, "v": "123456789012345678901234567890"}).to_string(),
+                )
+                .unwrap();
+        }
+        let q =
+            "SELECT block_number, who, CAST(v AS DECIMAL(38, 0)) AS v FROM t ORDER BY block_number";
+        let raw = |state: AppState| async move {
+            let resp = sql(
+                State(state),
+                Query(SqlQuery {
+                    q: q.into(),
+                    max_rows: None,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()[axum::http::header::CONTENT_TYPE],
+                "application/json"
+            );
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        };
+        let first = raw(state.clone()).await;
+        let second = raw(state.clone()).await;
+        let first = String::from_utf8(first.to_vec()).unwrap();
+        let second = String::from_utf8(second.to_vec()).unwrap();
+        assert!(first.contains("\"cached\":false"), "{first}");
+        assert!(second.contains("\"cached\":true"), "{second}");
+        assert_eq!(second.replace("\"cached\":true", "\"cached\":false"), first);
     }
 
     /// **#1186, the memo's contract.** A repeated statement over an unchanged store is answered from

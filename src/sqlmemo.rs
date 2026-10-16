@@ -203,7 +203,10 @@ impl Inputs<'_> {
 /// A remembered answer: the output and the entity watermarks it was answered from, which ride out
 /// in the provenance exactly as they did the first time. The head it cites is read on the hit.
 pub struct Entry {
+    /// The answer without its rows, which are kept serialized in `rows` (#2072).
     pub out: QueryOutput,
+    pub rows: Box<serde_json::value::RawValue>,
+    pub count: usize,
     pub watermarks: crate::entity_view::Watermarks,
     /// The tables this answer read, and a stamp of every sealed segment behind them at the moment it
     /// was computed - see [`segment_stamps`]. Re-taken on a hit; any difference recomputes.
@@ -284,7 +287,10 @@ impl Memo {
         if cap == 0 || out.degraded() || out.tip_unavailable {
             return false;
         }
-        let bytes = size_of(out);
+        let Ok(rows) = serde_json::value::to_raw_value(&out.rows) else {
+            return false;
+        };
+        let bytes = size_of(out, &rows);
         if bytes > cap / MAX_ENTRY_SHARE {
             return false;
         }
@@ -312,7 +318,9 @@ impl Memo {
             key,
             (
                 Arc::new(Entry {
-                    out: out.clone(),
+                    out: out.without_rows(),
+                    rows,
+                    count: out.rows.len(),
                     watermarks: watermarks.clone(),
                     tables: out.referenced_tables.clone(),
                     segments,
@@ -382,9 +390,10 @@ pub fn misses() -> u64 {
     GLOBAL.misses()
 }
 
-/// Serialized size of the rows, which is what the response carries and what the ceiling is about.
-fn size_of(out: &QueryOutput) -> usize {
-    serde_json::to_vec(&out.rows).map(|v| v.len()).unwrap_or(0) + 64
+/// What an entry holds: the serialized rows, which is also what the response carries, and the
+/// column names beside them.
+fn size_of(out: &QueryOutput, rows: &serde_json::value::RawValue) -> usize {
+    rows.get().len() + out.columns.iter().map(String::len).sum::<usize>() + 64
 }
 
 #[cfg(test)]
@@ -432,6 +441,10 @@ mod tests {
             entity_watermarks: wm,
             files,
         }
+    }
+
+    fn held(out: &QueryOutput) -> usize {
+        size_of(out, &serde_json::value::to_raw_value(&out.rows).unwrap())
     }
 
     fn rows(n: usize) -> QueryOutput {
@@ -559,7 +572,7 @@ mod tests {
         let m = Memo::new();
         let wm = BTreeMap::new();
         let k = |n: u8| Key([n; 32]);
-        let one = size_of(&rows(10));
+        let one = held(&rows(10));
         // Room for four entries and a little, never five; each is under a quarter of it.
         let cap = one * 4 + one / 2;
         for n in 1..=4 {
@@ -590,7 +603,7 @@ mod tests {
         let m = Memo::new();
         let wm = BTreeMap::new();
         let out = rows(10);
-        let cap = size_of(&out) * MAX_ENTRY_SHARE - 1;
+        let cap = held(&out) * MAX_ENTRY_SHARE - 1;
         assert!(!m.put(Key([0xb1; 32]), &out, &wm, Vec::new(), cap));
         assert!(m.get(&Key([0xb1; 32]), cap).is_none());
         assert!(m.put(Key([0xb2; 32]), &out, &wm, Vec::new(), cap + 1));
