@@ -26,6 +26,8 @@ use crate::source::{LogFilter, Source};
 use crate::store::Store;
 use crate::velocity::{self, VelocityView};
 use crate::views::{self, BalanceView};
+use nuthatch_seal::cut::CutScan;
+pub use nuthatch_seal::cut::{SEAL_DIRECT_BATCH, SEAL_DIRECT_BYTES};
 
 pub(crate) const LAST_BLOCK_KEY: &str = "last_block";
 /// What this nest's stored data was indexed *with*: `"1"` if rows carry `block_timestamp`, `"0"` if
@@ -3578,17 +3580,6 @@ fn shorten_store(url: &str) -> &str {
     }
 }
 
-/// Batch size (rows) at which both seal paths cut a segment: `backfill_direct` via
-/// [`take_sealable`], the tip path via [`tip_seal_cut`]. Public so integration tests can pad a
-/// finalized range to the same threshold without duplicating the number.
-pub const SEAL_DIRECT_BATCH: usize = 20_000;
-
-/// Bytes of row JSON at which both seal paths cut a segment, beside the row threshold and the span
-/// (RFC-0028 §4, amended 2026-09-13). A constant, not a knob: a boundary an operator could move would
-/// give two operators different segments over identical rows. Rows averaging under ~3.3 KB reach the
-/// row threshold first, so event nests cut where they always did; rows carrying documents cut here.
-pub const SEAL_DIRECT_BYTES: usize = 64 * 1024 * 1024;
-
 /// How many blocks at the end of every fetched window are asked for **again** with the next one
 /// (#1144, RFC-0049 §1).
 ///
@@ -3760,88 +3751,6 @@ fn take_sealable(
     let n = buf.partition_point(|r| r.0 <= cut_block);
     let rows = buf.drain(..n).map(|(_, _, j)| j).collect();
     Some((rows, cut_block))
-}
-
-/// The shared cut rule for both seal paths, fed one row at a time in chain order so a caller stops
-/// reading once the cut is known. The cut is the earliest of:
-///
-/// - **Row cut**: the block carrying the rows past [`SEAL_DIRECT_BATCH`] (RFC-0028 §4).
-/// - **Byte cut**: the block carrying the rows' JSON past [`SEAL_DIRECT_BYTES`].
-/// - **Span cut** (#1199): `first + seal_span - 1`, once `frontier` has reached it.
-///
-/// All three are anchored on the oldest held row, so they are properties of the data and both paths,
-/// seeing the same rows, cut at the same blocks. Taking the earliest is what makes them agree: a
-/// backfill holding the whole history would otherwise reach a size cut inside a range the tip path
-/// had already cut on span. A row past a known span end cannot move the cut, since it could only cross
-/// a size threshold at a block the span cut already precedes, so a scan holding each row's block stops
-/// there ([`CutScan::push_at`]) rather than reading a sparse range to its ceiling.
-struct CutScan {
-    frontier: u64,
-    seal_span: u64,
-    first: Option<u64>,
-    rows: usize,
-    bytes: usize,
-    size_cut: Option<u64>,
-}
-
-impl CutScan {
-    fn new(frontier: u64, seal_span: u64) -> Self {
-        Self {
-            frontier,
-            seal_span,
-            first: None,
-            rows: 0,
-            bytes: 0,
-            size_cut: None,
-        }
-    }
-
-    /// The next row; `false` once no later row can move the cut. `block` is read only for the first
-    /// row and the row that crosses a threshold.
-    fn push(&mut self, json_len: usize, block: impl FnOnce() -> u64) -> bool {
-        if self.size_cut.is_some() {
-            return false;
-        }
-        let mut block = Some(block);
-        let mut read = || (block.take().expect("a row's block is read once"))();
-        let mut this = None;
-        if self.first.is_none() {
-            let b = read();
-            this = Some(b);
-            self.first = Some(b);
-        }
-        self.rows += 1;
-        self.bytes = self.bytes.saturating_add(json_len);
-        if self.rows >= SEAL_DIRECT_BATCH || self.bytes >= SEAL_DIRECT_BYTES {
-            self.size_cut = Some(this.unwrap_or_else(read));
-            return false;
-        }
-        true
-    }
-
-    /// [`push`](Self::push) for a caller that already holds the row's block, stopping at the first row
-    /// past a span end already known.
-    fn push_at(&mut self, json_len: usize, block: u64) -> bool {
-        if let Some(end) = self.first.and_then(|f| self.span_end(f)) {
-            if block > end {
-                return false;
-            }
-        }
-        self.push(json_len, || block)
-    }
-
-    fn span_end(&self, first: u64) -> Option<u64> {
-        let end = first.saturating_add(self.seal_span.saturating_sub(1));
-        (self.seal_span > 0 && self.frontier >= end).then_some(end)
-    }
-
-    fn cut(&self) -> Option<u64> {
-        let span_cut = self.span_end(self.first?);
-        match (self.size_cut, span_cut) {
-            (Some(s), Some(e)) => Some(s.min(e)),
-            (s, e) => s.or(e),
-        }
-    }
 }
 
 /// Every buffered row, in order - the final flush when a range ends.
@@ -8149,7 +8058,7 @@ async fn maybe_seal(
         // which is vacuously true of a range holding no rows. The checkpoint is pinned for the same
         // reason the empty arm pins one: a later reorg walk must not skip past the watermark to an
         // older sparse checkpoint and trip the finality guard on a block it never touched (#461).
-        if let Some(first) = scan.first {
+        if let Some(first) = scan.first() {
             if first > from {
                 if !pin_checkpoint(store, source, first - 1).await? {
                     return Ok(());
@@ -8166,7 +8075,7 @@ async fn maybe_seal(
             }
         }
         let cut = match scan.cut() {
-            None if scan.first.is_none() => {
+            None if scan.first().is_none() => {
                 // Finalized range with no transfers - just advance the watermark. Pinning a
                 // checkpoint at the new watermark is what stops a later reorg from walking past it
                 // to an older surviving checkpoint and tripping the finality guard on a block the
@@ -8201,7 +8110,7 @@ async fn maybe_seal(
                     }
                 }
                 tracing::debug!(
-                    rows = scan.rows,
+                    rows = scan.rows(),
                     threshold = SEAL_DIRECT_BATCH,
                     from,
                     ceiling,
