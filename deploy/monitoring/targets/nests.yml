@@ -1,8 +1,8 @@
 # One line per nest. The target is the box's tailnet address and the unit's local --listen port.
 # box=helsinki targets are scraped through the tailnet-only Caddy site on :9180 (see README);
 # box=thinkpad targets listen on the tailnet themselves, except DeFi Pulse, which binds loopback only:
-# Prometheus runs on the ThinkPad with host networking, so 127.0.0.1 is that box. role=archive is a `serve`-only frozen
-# nest: it has no cursor, so the ingest and readiness rules skip it (docs/lodestar-lifecycle.md).
+# Prometheus runs on the ThinkPad with host networking, so 127.0.0.1 is that box. role=archive
+# is a `serve`-only frozen nest: it has no cursor, so the ingest and readiness rules skip it (docs/lodestar-lifecycle.md).
 # role=address-history is a rotki-mode nest (RFC-0063), which exports none of the cursor series.
 - {targets: ["100.82.188.91:8107"], labels: {unit: graph-allocations-nest-next, box: helsinki, role: cursor}}
 - {targets: ["100.82.188.91:8113"], labels: {unit: graph-gns-nest-next, box: helsinki, role: cursor}}
