@@ -233,6 +233,31 @@ jobs:
           cargo fmt --check --manifest-path count/receiver/Cargo.toml
           cargo clippy --locked --all-targets --manifest-path count/receiver/Cargo.toml -- -D warnings
           cargo test --locked --manifest-path count/receiver/Cargo.toml
+      # RFC-0065 S2. The bytes sealing writes, in their own crate so a browser tab can seal to the
+      # same address; `seal::tests::sealed_bytes_are_pinned` in the root crate holds the hashes.
+      - name: fmt · clippy · test (seal)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo fmt --check --manifest-path seal/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path seal/Cargo.toml -- -D warnings
+          cargo test --locked --manifest-path seal/Cargo.toml
+      # RFC-0065: decode and seal must keep building for a tab. zstd-sys compiles C for the target,
+      # which needs a clang with the WebAssembly backend; the runner's LLVM clang has one.
+      - name: wasm check (decode, seal)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          rustup target add wasm32-unknown-unknown wasm32-wasip2
+          ar=$(command -v llvm-ar || ls /usr/bin/llvm-ar-* | sort -V | tail -1)
+          for t in wasm32_unknown_unknown wasm32_wasip2; do
+            export "CC_$t=clang" "AR_$t=$ar"
+          done
+          for crate in decode seal; do
+            for target in wasm32-unknown-unknown wasm32-wasip2; do
+              cargo check --locked --manifest-path "$crate/Cargo.toml" --target "$target"
+            done
+          done
       # What was left when the longest step finished, or when it died. A job that can fail of
       # exhaustion has to report what it had, or the next failure is guessed at like the last two.
       - name: disk after the builds
