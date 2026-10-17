@@ -3609,4 +3609,43 @@ mod tests {
             .unwrap();
         assert!(parent_at < manifest_at, "trace: {trace:?}");
     }
+
+    /// RFC-0065 S2: the segment bytes sealing writes, pinned. Moving the writer into `nuthatch-seal`
+    /// must leave every hash here unchanged; a parquet or arrow bump that moves them is a re-seal.
+    #[test]
+    fn sealed_bytes_are_pinned() {
+        let rows = vec![
+            transfer(10, 1, "2"),
+            transfer(10, 0, "1"),
+            approval(10, 2),
+            r#"{"table":"usdc__transfer","from":"0xaaaa","to":"0xbbbb","value":"7","block_number":10,"tx_hash":"0xcc","log_index":1}"#.to_string(),
+            r#"{"table":"mixed","block_number":11,"log_index":0,"_seq":3,"block_timestamp":1767225611,"pool_address":"0x01","parent_hash":"0x02","amount":12,"flag":true}"#.to_string(),
+            r#"{"table":"mixed","block_number":11,"log_index":1,"_seq":4,"block_timestamp":1767225611,"pool_address":"0x03","note":null}"#.to_string(),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &rows, 10, 11).unwrap();
+        seal_range(dir.path(), &[transfer(12, 0, "9")], 12, 12).unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        let got: Vec<(&str, &str)> = ["mixed", "usdc__approval", "usdc__transfer"]
+            .into_iter()
+            .map(|t| (t, only(&m, t).hash.leak() as &str))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "mixed",
+                    "c2b562dc24a46706f9d66711586a92fe0baaa3a34b9d30cc4cfb68a86e4bf76d"
+                ),
+                (
+                    "usdc__approval",
+                    "f60fdcd1eca002cd2a665a4a222bedb7c657ec45662b7720101b5076cff17f2f"
+                ),
+                (
+                    "usdc__transfer",
+                    "057c0549505745d150c4426b9170825999b573f042c88912f130aac1bfccdc9f"
+                )
+            ]
+        );
+    }
 }
