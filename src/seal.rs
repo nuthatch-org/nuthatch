@@ -148,6 +148,23 @@ pub const SEAL_TABLE_FLOOR: usize = 1_000;
 /// the reason the row floor gives.
 pub const SEAL_TABLE_BYTES_FLOOR: usize = 16 * 1024 * 1024;
 
+/// Block time after which a provisional tail is final however few rows it holds (#2084). Under the
+/// row floor alone a sparse table's tail waited for months, and the mirror withholds a provisional
+/// segment, so a seed or a browser tab read stale answers. Age is chain time, never the clock: the
+/// newest `block_timestamp` in the cut against the oldest in the tail, so two operators still seal
+/// identical files. A table whose rows carry no timestamp keeps the row floor alone.
+pub const SEAL_TABLE_AGE_SECS: u64 = 3 * 60 * 60;
+
+fn block_timestamp(row: &Value) -> Option<u64> {
+    row.get("block_timestamp").and_then(Value::as_u64)
+}
+
+/// The tail spans at least [`SEAL_TABLE_AGE_SECS`] of chain time up to the cut.
+fn aged(rows: &[Value], cut_time: Option<u64>) -> bool {
+    let oldest = rows.iter().filter_map(block_timestamp).min();
+    matches!((cut_time, oldest), (Some(c), Some(o)) if c.saturating_sub(o) >= SEAL_TABLE_AGE_SECS)
+}
+
 /// The floor `seal_range` applies for `dir`: the constant, unless a test has set otherwise.
 fn table_floor(dir: &Path) -> usize {
     #[cfg(test)]
@@ -217,10 +234,12 @@ pub fn seal_range_with_snapshot(
     registry_snapshot: Option<&str>,
 ) -> Result<Option<SealSummary>> {
     let mut by_table: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let mut cut_time: Option<u64> = None;
     for j in entity_json {
         let Ok(v) = serde_json::from_str::<Value>(j) else {
             continue;
         };
+        cut_time = cut_time.max(block_timestamp(&v));
         let table = v
             .get("table")
             .and_then(Value::as_str)
@@ -243,6 +262,7 @@ pub fn seal_range_with_snapshot(
     // names them is durably installed (below), never before: a crash between the two would leave
     // a manifest pointing at a file that is gone, and the folded rows would read as missing.
     let mut folded_away: Vec<PathBuf> = Vec::new();
+    let touched: BTreeSet<String> = by_table.keys().cloned().collect();
 
     for (table, mut rows) in by_table {
         sort_rows_for_seal(&mut rows);
@@ -286,7 +306,8 @@ pub fn seal_range_with_snapshot(
             }
         };
         let provisional = rows.len() < table_floor(dir)
-            && rows.iter().map(|v| v.to_string().len()).sum::<usize>() < SEAL_TABLE_BYTES_FLOOR;
+            && rows.iter().map(|v| v.to_string().len()).sum::<usize>() < SEAL_TABLE_BYTES_FLOOR
+            && !aged(&rows, cut_time);
         let file = format!("{table}-{hash}.parquet");
 
         // Write once, into the shared store when this dataset belongs to a runtime (RFC-0033 §11a).
@@ -331,6 +352,22 @@ pub fn seal_range_with_snapshot(
             writer_profile: WRITER_PROFILE.to_string(),
             input_hash: Some(input_hash),
         });
+    }
+
+    // A table with no rows in this cut is otherwise never revisited, so a contract that has gone
+    // quiet would hold its tail for ever. The file is kept; only the flag changes, as in
+    // `finalise_provisional`.
+    for (table, segments) in &mut manifest.tables {
+        if cut_time.is_none() || touched.contains(table) {
+            continue;
+        }
+        for s in segments.iter_mut().filter(|s| s.provisional) {
+            let rows = read_segment_rows(&segment_path(dir, &s.file, &s.hash))
+                .with_context(|| format!("reading provisional segment {} to age it", s.file))?;
+            if aged(&rows, cut_time) {
+                s.provisional = false;
+            }
+        }
     }
 
     manifest.manifest_version = MANIFEST_VERSION;
@@ -2767,6 +2804,84 @@ mod tests {
             !seg.provisional,
             "20 MiB of rows is past SEAL_TABLE_BYTES_FLOOR, so the segment must be final however few \
              rows it holds"
+        );
+    }
+
+    fn stamped(table: &str, block: u64, ts: u64) -> String {
+        format!(
+            r#"{{"table":"{table}","value":"1","block_number":{block},"block_timestamp":{ts},"tx_hash":"0xcc","log_index":0}}"#
+        )
+    }
+
+    const T0: u64 = 1_790_000_000;
+
+    /// #2084: a sparse table's tail held back the mirror for months. One that reaches the age limit
+    /// in a cut of its own rows is final, and its next row starts a new segment.
+    #[test]
+    fn a_tail_that_reaches_the_age_limit_is_final() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[stamped("t__sparse", 10, T0)], 10, 10).unwrap();
+        assert!(only(&load_manifest(dir.path()).unwrap(), "t__sparse").provisional);
+
+        let later = T0 + SEAL_TABLE_AGE_SECS;
+        seal_range(dir.path(), &[stamped("t__sparse", 900, later)], 900, 900).unwrap();
+        let seg = only(&load_manifest(dir.path()).unwrap(), "t__sparse");
+        assert!(
+            !seg.provisional,
+            "the tail's oldest row is SEAL_TABLE_AGE_SECS older than the cut, so it must be final"
+        );
+        assert_eq!((seg.from_block, seg.to_block, seg.rows), (10, 900, 2));
+
+        seal_range(
+            dir.path(),
+            &[stamped("t__sparse", 901, later + 12)],
+            901,
+            901,
+        )
+        .unwrap();
+        let segs = &load_manifest(dir.path()).unwrap().tables["t__sparse"];
+        assert_eq!(segs.len(), 2, "a final tail is never folded: {segs:?}");
+        assert!(segs[1].provisional);
+    }
+
+    /// A contract that has gone quiet has no rows in later cuts, so its tail is aged by the cuts of
+    /// the nest's other tables, with its file untouched.
+    #[test]
+    fn a_quiet_tables_tail_is_aged_by_other_tables_cuts() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[stamped("t__quiet", 10, T0)], 10, 10).unwrap();
+        let tail = only(&load_manifest(dir.path()).unwrap(), "t__quiet");
+        let bytes = std::fs::read(dir.path().join(SEGMENTS_DIR).join(&tail.file)).unwrap();
+
+        let later = T0 + SEAL_TABLE_AGE_SECS;
+        seal_range(dir.path(), &[stamped("t__busy", 900, later)], 900, 900).unwrap();
+        let now = only(&load_manifest(dir.path()).unwrap(), "t__quiet");
+        assert!(
+            !now.provisional,
+            "the quiet table's tail reached the age limit"
+        );
+        assert_eq!((now.hash.as_str(), now.rows), (tail.hash.as_str(), 1));
+        assert_eq!(
+            std::fs::read(dir.path().join(SEGMENTS_DIR).join(&now.file)).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn a_tail_younger_than_the_age_limit_stays_provisional() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[stamped("t__sparse", 10, T0)], 10, 10).unwrap();
+        seal_range(dir.path(), &[stamped("t__quiet", 11, T0)], 11, 11).unwrap();
+        let young = T0 + SEAL_TABLE_AGE_SECS - 1;
+        seal_range(dir.path(), &[stamped("t__sparse", 900, young)], 900, 900).unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        assert!(
+            only(&m, "t__sparse").provisional,
+            "a folded tail one second short"
+        );
+        assert!(
+            only(&m, "t__quiet").provisional,
+            "an untouched tail one second short"
         );
     }
 
