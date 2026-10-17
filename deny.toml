@@ -61,9 +61,13 @@ ignore = [
   # zip 6.0.0 (transitive: dbsp and feldera-ir). Upstream yanked every release but 9.0.3 on 2026-10-16
   # (zip-rs/zip2#1075) for GHSA-vv5m-jxxh-4627, GHSA-4v9h-p7m9-rh26 and GHSA-4684-h2q9-2vcp, all in
   # extraction. dbsp only writes zips (`ZipWriter` in profile.rs, feldera-ir's lir.rs) and nothing here
-  # reads one. dbsp 0.320 requires zip ^6; 0.366 moves to ^9. More advisories are due this month:
-  # re-check them against this entry when they land, and drop it on the dbsp bump.
+  # reads one. dbsp 0.320 requires zip ^6; 0.366 moves to ^9. Drop these on the dbsp bump.
+  # The advisories landed 2026-10-17 as the three below, all in `extract()`; rechecked that day:
+  # dbsp 0.320 and feldera-ir 0.320 import only `ZipWriter`, and nothing in this tree imports zip.
   { crate = "zip@6.0.0", reason = "yanked for extraction flaws; dbsp only writes zips" },
+  "RUSTSEC-2026-0367", # zip: SUID/SGID bits kept on extraction
+  "RUSTSEC-2026-0368", # zip: extract() follows symlinks out of the destination
+  "RUSTSEC-2026-0369", # zip: extract() applies permissions through symlinks
 ]
 
 [licenses]
