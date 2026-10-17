@@ -4704,6 +4704,7 @@ dependencies = [
  "md-5 0.10.6",
  "num-bigint 0.4.8",
  "nuthatch-decode",
+ "nuthatch-seal",
  "object_store 0.12.5",
  "parquet",
  "postgres",
@@ -4741,6 +4742,19 @@ dependencies = [
  "anyhow",
  "hex",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "nuthatch-seal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "bytes",
+ "hex",
+ "parquet",
  "serde_json",
  "sha2 0.10.9",
 ]

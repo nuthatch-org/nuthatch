@@ -17,7 +17,7 @@ keywords = ["blockchain", "indexer", "ethereum", "self-hosted", "mcp"]
 categories = ["command-line-utilities", "database", "cryptography::cryptocurrencies"]
 # Keep the published crate lean: the scratch/docs aren't needed to build the host, and
 # fuzz/ is dev-only tooling (its own package, nightly-only, never in the data path per CLAUDE.md §4).
-exclude = ["/scratchpad", "/fuzz", "/decode", "/tools", "/count"]
+exclude = ["/scratchpad", "/fuzz", "/decode", "/seal", "/tools", "/count"]
 
 [[bin]]
 name = "nuthatch"
@@ -85,6 +85,7 @@ required-features = ["crash-points"]
 # BSD-2-Clause, already on deny.toml's allowlist, pure Rust - no effect on the static binary.
 Inflector = { version = "0.11.3", optional = true }
 nuthatch-decode = { path = "decode" }
+nuthatch-seal = { path = "seal" }
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 futures = "0.3"

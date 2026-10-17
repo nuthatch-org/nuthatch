@@ -26,14 +26,8 @@
 //! ever becomes worth the coupling to a parquet-rs internal; it is deliberately not pinned today.
 
 use anyhow::{Context, Result};
-use arrow::array::{Array, ArrayRef, StringArray, UInt64Array};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::metadata::SortingColumn;
-use parquet::file::properties::WriterProperties;
-use parquet::schema::types::ColumnPath;
+use arrow::array::{Array, StringArray, UInt64Array};
+use arrow::datatypes::DataType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -88,9 +82,8 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// this one.
 pub const ORIGINAL_WRITER_PROFILE: &str = "snappy";
 
-/// Writer settings this binary seals with now: zstd level 3, blooms on address/topic/hash columns,
-/// dictionary off on near-unique 32-byte hashes, rows sorted by `(block_number, log_index)`.
-pub const WRITER_PROFILE: &str = "zstd-bloom-v1";
+pub use nuthatch_seal::WRITER_PROFILE;
+use nuthatch_seal::{rows_to_batch, sort_rows_for_seal, write_parquet};
 
 fn default_writer_profile() -> String {
     ORIGINAL_WRITER_PROFILE.to_string()
@@ -576,171 +569,13 @@ fn remove_retired(files: Vec<PathBuf>) {
     }
 }
 
-/// A segment's rows back as the JSON objects `rows_to_batch` was given, so a provisional segment
-/// can be folded by re-sealing (#1150). The inverse of `rows_to_batch` exactly: a `UInt64` column
-/// becomes a number, a `Utf8` value a string, and a null is an absent key - which is what
-/// `rows_to_batch` maps an absent key *to*, so a fold round-trips to the bytes a single seal of the
-/// same rows produces. Nothing else needs this; `read_table_rows` is the typed reader.
+/// A segment's rows back as the JSON objects it was sealed from, for a fold (#1150). Nothing else
+/// needs this; `read_table_rows` is the typed reader.
 fn read_segment_rows(path: &Path) -> Result<Vec<Value>> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    let file =
-        std::fs::File::open(path).with_context(|| format!("opening segment {}", path.display()))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .context("reading segment metadata")?
-        .build()
-        .context("building segment reader")?;
-    let mut out = Vec::new();
-    for batch in reader {
-        let batch = batch.context("reading segment batch")?;
-        let schema = batch.schema();
-        for i in 0..batch.num_rows() {
-            let mut obj = serde_json::Map::new();
-            for (c, field) in schema.fields().iter().enumerate() {
-                let col = batch.column(c);
-                if col.is_null(i) {
-                    continue;
-                }
-                let v = match field.data_type() {
-                    DataType::UInt64 => {
-                        let a = col
-                            .as_any()
-                            .downcast_ref::<UInt64Array>()
-                            .context("UInt64 column of the wrong array type")?;
-                        Value::from(a.value(i))
-                    }
-                    DataType::Utf8 => {
-                        let a = col
-                            .as_any()
-                            .downcast_ref::<StringArray>()
-                            .context("Utf8 column of the wrong array type")?;
-                        Value::from(a.value(i))
-                    }
-                    other => anyhow::bail!(
-                        "segment {} has a {other} column, which this project never writes",
-                        path.display()
-                    ),
-                };
-                obj.insert(field.name().clone(), v);
-            }
-            out.push(Value::Object(obj));
-        }
-    }
-    Ok(out)
-}
-
-/// Build an Arrow batch from a table's JSON rows. `block_number`, `log_index`, `_seq` and
-/// `block_timestamp` are UInt64; every other column is Utf8 (canonical text: hex, decimal, or
-/// string). The query companions `*_dec` / `*_overflow` are not written here.
-fn rows_to_batch(rows: &[Value]) -> Result<RecordBatch> {
-    let mut columns: BTreeSet<String> = BTreeSet::new();
-    for r in rows {
-        if let Some(obj) = r.as_object() {
-            columns.extend(obj.keys().cloned());
-        }
-    }
-    let columns: Vec<String> = columns.into_iter().collect();
-
-    let mut fields = Vec::with_capacity(columns.len());
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
-    for col in &columns {
-        if col == "block_number" || col == "log_index" || col == "_seq" || col == "block_timestamp"
-        {
-            let vals: Vec<u64> = rows
-                .iter()
-                .map(|r| r.get(col).and_then(Value::as_u64).unwrap_or(0))
-                .collect();
-            fields.push(Field::new(col, DataType::UInt64, false));
-            arrays.push(Arc::new(UInt64Array::from(vals)));
-        } else {
-            let vals: Vec<Option<String>> = rows
-                .iter()
-                .map(|r| match r.get(col) {
-                    Some(Value::String(s)) => Some(s.clone()),
-                    None | Some(Value::Null) => None,
-                    Some(other) => Some(other.to_string()),
-                })
-                .collect();
-            fields.push(Field::new(col, DataType::Utf8, true));
-            arrays.push(Arc::new(StringArray::from(vals)));
-        }
-    }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .context("failed to build record batch")
-}
-
-/// Row order the catalogue promises: `(block_number, log_index)`. `tx_index` is not a column we
-/// write, so it is not in the key. Rows sharing those coordinates use their canonical JSON as a
-/// deterministic tie-breaker, so folding a provisional segment cannot make identical logical rows
-/// seal to different bytes merely by presenting them in another order. Applied before
-/// `rows_to_batch` so the footer sort metadata is true of the bytes, not just declared.
-fn sort_rows_for_seal(rows: &mut [Value]) {
-    rows.sort_by(|a, b| {
-        let key = |r: &Value| {
-            (
-                r.get("block_number").and_then(Value::as_u64).unwrap_or(0),
-                r.get("log_index").and_then(Value::as_u64).unwrap_or(0),
-            )
-        };
-        key(a)
-            .cmp(&key(b))
-            .then_with(|| a.to_string().cmp(&b.to_string()))
-    });
-}
-
-fn bloom_column(name: &str) -> bool {
-    matches!(
-        name,
-        "address"
-            | "from"
-            | "to"
-            | "owner"
-            | "spender"
-            | "topic0"
-            | "block_hash"
-            | "tx_hash"
-            | "hash"
-    ) || name.ends_with("_hash")
-        || name.ends_with("_address")
-}
-
-fn dictionary_off(name: &str) -> bool {
-    matches!(name, "block_hash" | "tx_hash" | "hash") || name.ends_with("_hash")
-}
-
-fn write_parquet(batch: &RecordBatch) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    let zstd = ZstdLevel::try_new(3).expect("zstd level 3 is valid");
-    let mut builder = WriterProperties::builder().set_compression(Compression::ZSTD(zstd));
-    let schema = batch.schema();
-    let mut sorting = Vec::new();
-    for name in ["block_number", "log_index"] {
-        if let Some((idx, _)) = schema.column_with_name(name) {
-            sorting.push(SortingColumn {
-                column_idx: idx as i32,
-                descending: false,
-                nulls_first: false,
-            });
-        }
-    }
-    if !sorting.is_empty() {
-        builder = builder.set_sorting_columns(Some(sorting));
-    }
-    for field in schema.fields() {
-        let path = ColumnPath::from(field.name().as_str());
-        if bloom_column(field.name()) {
-            builder = builder.set_column_bloom_filter_enabled(path.clone(), true);
-        }
-        if dictionary_off(field.name()) {
-            builder = builder.set_column_dictionary_enabled(path, false);
-        }
-    }
-    let props = builder.build();
-    let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
-        .context("failed to create parquet writer")?;
-    writer.write(batch).context("failed to write batch")?;
-    writer.close().context("failed to finalise parquet")?;
-    Ok(buf)
+    let bytes =
+        std::fs::read(path).with_context(|| format!("opening segment {}", path.display()))?;
+    nuthatch_seal::segment_rows(bytes.into())
+        .with_context(|| format!("reading segment {}", path.display()))
 }
 
 /// Encode JSON-object rows with the same deterministic Parquet writer used for sealed chain data.
@@ -1966,6 +1801,7 @@ pub(crate) fn footer_reads(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nuthatch_seal::{bloom_column, dictionary_off};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::basic::Compression;
     use std::fs::File;
@@ -3723,5 +3559,44 @@ mod tests {
             .rposition(|e| matches!(e, Durable::ManifestDir(p) if p == &manifest_dir))
             .unwrap();
         assert!(parent_at < manifest_at, "trace: {trace:?}");
+    }
+
+    /// RFC-0065 S2: the segment bytes sealing writes, pinned. Moving the writer into `nuthatch-seal`
+    /// must leave every hash here unchanged; a parquet or arrow bump that moves them is a re-seal.
+    #[test]
+    fn sealed_bytes_are_pinned() {
+        let rows = vec![
+            transfer(10, 1, "2"),
+            transfer(10, 0, "1"),
+            approval(10, 2),
+            r#"{"table":"usdc__transfer","from":"0xaaaa","to":"0xbbbb","value":"7","block_number":10,"tx_hash":"0xcc","log_index":1}"#.to_string(),
+            r#"{"table":"mixed","block_number":11,"log_index":0,"_seq":3,"block_timestamp":1767225611,"pool_address":"0x01","parent_hash":"0x02","amount":12,"flag":true}"#.to_string(),
+            r#"{"table":"mixed","block_number":11,"log_index":1,"_seq":4,"block_timestamp":1767225611,"pool_address":"0x03","note":null}"#.to_string(),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &rows, 10, 11).unwrap();
+        seal_range(dir.path(), &[transfer(12, 0, "9")], 12, 12).unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        let got: Vec<(&str, &str)> = ["mixed", "usdc__approval", "usdc__transfer"]
+            .into_iter()
+            .map(|t| (t, only(&m, t).hash.leak() as &str))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "mixed",
+                    "c2b562dc24a46706f9d66711586a92fe0baaa3a34b9d30cc4cfb68a86e4bf76d"
+                ),
+                (
+                    "usdc__approval",
+                    "f60fdcd1eca002cd2a665a4a222bedb7c657ec45662b7720101b5076cff17f2f"
+                ),
+                (
+                    "usdc__transfer",
+                    "057c0549505745d150c4426b9170825999b573f042c88912f130aac1bfccdc9f"
+                )
+            ]
+        );
     }
 }

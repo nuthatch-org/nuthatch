@@ -1,0 +1,17 @@
+[package]
+name = "nuthatch-seal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "The bytes nuthatch seals: rows to a content-addressed Parquet segment, with no filesystem."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow = "1"
+arrow = { version = "59", default-features = false }
+bytes = "1"
+hex = "0.4"
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
+serde_json = "1"
+sha2 = "0.10"
