@@ -34,10 +34,12 @@ is not used. Provisional segments are never published and the mirrored catalogue
 out, so every entry it names is an object under the prefix. When the nest has no provisional entries,
 `manifest.json` is byte-identical to its local catalogue.
 
-A provisional segment is a table's last few hundred rows, waiting to fold into its next segment. On a
-live nest that happens within a seal or two. On a table that has gone quiet, or a nest whose contract
-is finished, it never does, so the mirror stops short of those rows until the operator runs `nuthatch
-publish finalise` (see [operators](operators.md)). `sealed_through` does not tell you this: it is the
+A provisional segment is a table's last few hundred rows, waiting to fold into its next segment. It
+becomes final at 1,000 rows, or once its oldest row is three hours of chain time older than the
+newest row of a seal, whichever comes first, so on a nest that is still sealing no table's tail is
+withheld for much more than three hours. On a nest that has stopped sealing, or whose rows carry no
+`block_timestamp`, a tail can wait indefinitely, and the mirror stops short of those rows until the
+operator runs `nuthatch publish finalise` (see [operators](operators.md)). `sealed_through` does not tell you this: it is the
 highest block a published segment reaches, and a quiet table's withheld tail can sit below it.
 
 ## Globbing is allowed here, and only here
