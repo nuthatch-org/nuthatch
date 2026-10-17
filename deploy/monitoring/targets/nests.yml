@@ -1,10 +1,16 @@
 # One line per nest. The target is the box's tailnet address and the unit's local --listen port.
 # box=helsinki targets are scraped through the tailnet-only Caddy site on :9180 (see README);
-# box=thinkpad targets listen on the tailnet themselves. role=archive is a `serve`-only frozen
-# nest: it has no cursor, so the ingest and readiness rules skip it (docs/lodestar-lifecycle.md).
+# box=thinkpad targets listen on the tailnet themselves, except DeFi Pulse, which binds loopback only:
+# Prometheus runs on the ThinkPad with host networking, so 127.0.0.1 is that box. role=archive
+# is a `serve`-only frozen nest: it has no cursor, so the ingest and readiness rules skip it (docs/lodestar-lifecycle.md).
+# role=address-history is a rotki-mode nest (RFC-0063), which exports none of the cursor series.
 - {targets: ["100.82.188.91:8107"], labels: {unit: graph-allocations-nest-next, box: helsinki, role: cursor}}
 - {targets: ["100.82.188.91:8113"], labels: {unit: graph-gns-nest-next, box: helsinki, role: cursor}}
 - {targets: ["100.82.188.91:8104"], labels: {unit: nuthatch-dips, box: helsinki, role: cursor}}
 - {targets: ["100.82.188.91:8114"], labels: {unit: data-services-nest, box: helsinki, role: cursor}}
 - {targets: ["100.82.188.91:8103"], labels: {unit: graph-staking-legacy-readonly, box: helsinki, role: archive}}
 - {targets: ["100.83.44.63:8124"], labels: {unit: qos-reo-nest, box: thinkpad, role: cursor}}
+- {targets: ["100.83.44.63:8431"], labels: {unit: grt-supply-arbitrum-one, box: thinkpad, role: cursor}}
+- {targets: ["100.83.44.63:8432"], labels: {unit: grt-supply-mainnet, box: thinkpad, role: cursor}}
+- {targets: ["127.0.0.1:8460"], labels: {unit: defi-pulse, box: thinkpad, role: cursor}}
+- {targets: ["100.83.44.63:8433"], labels: {unit: rotki-demo, box: thinkpad, role: address-history}}
