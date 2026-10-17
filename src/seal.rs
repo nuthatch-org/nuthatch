@@ -76,94 +76,12 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 /// Catalogue version this binary writes. Absent in a file on disk is version 0 (RFC-0047 C2).
 pub const MANIFEST_VERSION: u32 = 1;
 
-/// Writer settings this binary sealed with before #1234: SNAPPY, crate-default dictionary and
-/// statistics, no blooms, no sort metadata. A segment whose field is missing deserialises as this,
-/// not as unknown (#1223 / #1234). Changing the settings is a new name, not a silent rewrite of
-/// this one.
-pub const ORIGINAL_WRITER_PROFILE: &str = "snappy";
-
+use nuthatch_seal::cut::{aged, block_timestamp};
+pub use nuthatch_seal::cut::{
+    Segment, ORIGINAL_WRITER_PROFILE, SEAL_TABLE_AGE_SECS, SEAL_TABLE_BYTES_FLOOR, SEAL_TABLE_FLOOR,
+};
 pub use nuthatch_seal::WRITER_PROFILE;
 use nuthatch_seal::{rows_to_batch, sort_rows_for_seal, write_parquet};
-
-fn default_writer_profile() -> String {
-    ORIGINAL_WRITER_PROFILE.to_string()
-}
-
-/// One sealed Parquet file. `hash` is the content address (sha256 of the file bytes).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Segment {
-    pub hash: String,
-    pub from_block: u64,
-    pub to_block: u64,
-    pub rows: usize,
-    pub file: String,
-    /// The discovered-child registry's content hash at seal time (RFC-0009): records exactly which
-    /// factory-discovered set produced this segment, so its child rows are reproducible. `None` for a
-    /// static (non-factory) nest. Absent in pre-RFC-0009 manifests (serde default).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registry_snapshot: Option<String>,
-    /// This table's rows since its last full segment, held under [`SEAL_TABLE_FLOOR`] (#1150). A
-    /// provisional segment is a real, content-addressed, queryable Parquet file like any other; the
-    /// one thing that distinguishes it is that the table's **next** seal folds it in rather than
-    /// sitting beside it, and the file it replaces is removed. At most one per table. Absent in
-    /// manifests written before this existed, which reads as `false` - every segment sealed then
-    /// was final.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub provisional: bool,
-    /// Which `write_parquet` settings produced these bytes. Missing deserialises as
-    /// [`ORIGINAL_WRITER_PROFILE`]: every segment sealed before this field existed was that profile.
-    #[serde(default = "default_writer_profile")]
-    pub writer_profile: String,
-    /// Hash of the parquet this seal was given, before a fold rewrote the file (#1631). Those rows
-    /// stay hot until the watermark, and the file hash no longer names them. Absent reads as none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_hash: Option<String>,
-}
-
-/// Rows a table needs before its segment at a cut is final rather than provisional (#1150).
-///
-/// The cut is global and data-determined (`indexer::take_sealable`): every `SEAL_DIRECT_BATCH` rows
-/// across all tables, at a block boundary the chain chose. That keeps segment identity independent
-/// of the operator's window, and it is kept. What it also did, on a nest with many tables, was write
-/// one file **per table per cut**, so a table seeing three events in twenty thousand got a three-row
-/// Parquet file every cut - measured on the Perpl backfill at 9.3%: 15,977 files, 4,702 under 8 KB,
-/// and a query pays about 0.15 ms per file it opens (docs/bench/segment-layout.md). Sealed segments
-/// are never compacted, so that only grew.
-///
-/// So a table whose pending rows at a cut are under this floor is sealed **provisionally** and folded
-/// into its own next cut, until it has this many. The rule is stated in the same terms as the cut -
-/// rows, counted from the data - so two operators still produce identical files; and it changes
-/// identity only for tables under the floor, since a table that clears it at every cut is sealed
-/// exactly as before. At 20,000 rows a cut that is every table with a share of 5% or more.
-///
-/// One thousand is a segment whose footer is no longer most of it (about 90 bytes a row on the
-/// nests measured, so ~90 KB), and it turns a 0.015% table's file count from one per cut into one
-/// per 333 cuts. A row rather than byte floor, because bytes depend on the writer version and rows
-/// do not.
-pub const SEAL_TABLE_FLOOR: usize = 1_000;
-
-/// Row JSON at which a table's segment is final however few rows it holds (RFC-0028 §4, amended
-/// 2026-09-13). A table of megabyte documents never reaches [`SEAL_TABLE_FLOOR`] at a cut, and every
-/// fold re-reads and rewrites the whole provisional file. Measured on row JSON, not Parquet bytes, for
-/// the reason the row floor gives.
-pub const SEAL_TABLE_BYTES_FLOOR: usize = 16 * 1024 * 1024;
-
-/// Block time after which a provisional tail is final however few rows it holds (#2084). Under the
-/// row floor alone a sparse table's tail waited for months, and the mirror withholds a provisional
-/// segment, so a seed or a browser tab read stale answers. Age is chain time, never the clock: the
-/// newest `block_timestamp` in the cut against the oldest in the tail, so two operators still seal
-/// identical files. A table whose rows carry no timestamp keeps the row floor alone.
-pub const SEAL_TABLE_AGE_SECS: u64 = 3 * 60 * 60;
-
-fn block_timestamp(row: &Value) -> Option<u64> {
-    row.get("block_timestamp").and_then(Value::as_u64)
-}
-
-/// The tail spans at least [`SEAL_TABLE_AGE_SECS`] of chain time up to the cut.
-fn aged(rows: &[Value], cut_time: Option<u64>) -> bool {
-    let oldest = rows.iter().filter_map(block_timestamp).min();
-    matches!((cut_time, oldest), (Some(c), Some(o)) if c.saturating_sub(o) >= SEAL_TABLE_AGE_SECS)
-}
 
 /// The floor `seal_range` applies for `dir`: the constant, unless a test has set otherwise.
 fn table_floor(dir: &Path) -> usize {
@@ -305,9 +223,7 @@ pub fn seal_range_with_snapshot(
                 (all, prev.from_block, bytes, hash, Some(prev))
             }
         };
-        let provisional = rows.len() < table_floor(dir)
-            && rows.iter().map(|v| v.to_string().len()).sum::<usize>() < SEAL_TABLE_BYTES_FLOOR
-            && !aged(&rows, cut_time);
+        let provisional = nuthatch_seal::cut::provisional(&rows, table_floor(dir), cut_time);
         let file = format!("{table}-{hash}.parquet");
 
         // Write once, into the shared store when this dataset belongs to a runtime (RFC-0033 §11a).

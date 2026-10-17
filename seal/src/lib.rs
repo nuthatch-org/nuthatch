@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+pub mod cut;
+
 /// Writer settings this crate seals with: zstd level 3, blooms on address/topic/hash columns,
 /// dictionary off on near-unique 32-byte hashes, rows sorted by `(block_number, log_index)`.
 pub const WRITER_PROFILE: &str = "zstd-bloom-v1";
