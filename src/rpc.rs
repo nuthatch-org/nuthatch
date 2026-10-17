@@ -2,6 +2,7 @@
 //! failover across the configured endpoints. No ExEx yet - that's the sovereignty upgrade later.
 
 // `Log` lives in nuthatch-decode so fuzz targets build without pulling in dbsp (nuthatch#581).
+use nuthatch_decode::rpc::parse_hex_u64;
 pub use nuthatch_decode::rpc::Log;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -2200,7 +2201,7 @@ impl RpcClient {
             .as_array()
             .ok_or_else(|| anyhow!("eth_getLogs did not return an array"))?;
         self.remember_log_timestamps(arr);
-        arr.iter().map(parse_log).collect()
+        arr.iter().map(Log::from_rpc).collect()
     }
 
     /// Nodes that carry `blockTimestamp` on each log (execution-apis, 2025) answer the header
@@ -2225,39 +2226,6 @@ impl RpcClient {
         }
         cache.extend(found);
     }
-}
-
-fn parse_log(v: &Value) -> Result<Log> {
-    let topics = v
-        .get("topics")
-        .and_then(Value::as_array)
-        .map(|t| {
-            t.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(Log {
-        address: field_str(v, "address")?,
-        topics,
-        data: field_str(v, "data").unwrap_or_default(),
-        block_number: parse_hex_u64(&field_str(v, "blockNumber")?)?,
-        block_hash: field_str(v, "blockHash").unwrap_or_default(),
-        tx_hash: field_str(v, "transactionHash")?,
-        log_index: parse_hex_u64(&field_str(v, "logIndex")?)?,
-    })
-}
-
-fn field_str(v: &Value, key: &str) -> Result<String> {
-    v.get(key)
-        .and_then(Value::as_str)
-        .map(String::from)
-        .ok_or_else(|| anyhow!("log missing field '{key}'"))
-}
-
-fn parse_hex_u64(s: &str) -> Result<u64> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    u64::from_str_radix(s, 16).with_context(|| format!("bad hex number '{s}'"))
 }
 
 /// Wall-clock millis since the epoch - used only for endpoint-health cooldowns (a coarse "try again
