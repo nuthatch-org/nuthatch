@@ -1400,8 +1400,10 @@ are view columns the SQL engine adds, not Parquet). Point another engine at the 
 s3://bucket/prefix>` copies every non-provisional segment and the catalogue, less its provisional
 entries, under `<target>/<data identity>/`, then writes `publish.json`; a second run uploads only
 what changed. A provisional segment is a table's tail of under 1,000 rows, held back because the
-table's next seal rewrites it. A table that has stopped receiving rows, and every table of an
-archived nest, keeps that tail forever, so the mirror never has those rows. When you know the chain
+table's next seal rewrites it. It is final once its oldest row is three hours of chain time older
+than the newest row of any seal of the nest (#2084), so a nest that is still sealing publishes every
+table within about three hours. An archived nest, which seals nothing more, keeps its tails, as does
+a nest whose rows carry no `block_timestamp`, so the mirror never has those rows. When you know the chain
 is done with the nest, stop it and run `nuthatch publish finalise --dir <nest>`, which lists the
 tails, then again with `--yes`, which marks them final; the next `publish sync` uploads them.
 Nothing is rewritten: the files and their hashes are unchanged. It refuses while anything holds the

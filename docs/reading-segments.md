@@ -102,7 +102,7 @@ Per segment, today:
 | `rows` | yes | row count in the file |
 | `file` | yes | `{table}-{hash}.parquet` |
 | `registry_snapshot` | no | factory-discovered child-set hash at seal time; absent on a static nest and on pre-RFC-0009 manifests |
-| `provisional` | no | `true` when this table had fewer than 1,000 rows, and under 16 MiB of row JSON, at the cut and the next seal will fold it; omitted when `false`, which is every segment sealed before this existed |
+| `provisional` | no | `true` when this table had fewer than 1,000 rows, under 16 MiB of row JSON, and under three hours of chain time between its oldest row and the cut's newest, and the next seal will fold it; omitted when `false`, which is every segment sealed before this existed |
 | `writer_profile` | no | the writer settings the file was produced with. Absent means `"snappy"`, **not** unknown: every segment sealed before the field existed was that profile |
 | `input_hash` | no | sha256 of the Parquet this seal was given, before a fold rewrote the file (#1631); equal to `hash` when nothing was folded. Absent on segments sealed before 4.1.1 |
 
