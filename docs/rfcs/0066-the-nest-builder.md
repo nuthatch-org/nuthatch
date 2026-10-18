@@ -166,6 +166,8 @@ Recorded 2026-10-18, against nuthatch 5.7.1 and burrmill-wasm at `c7ce789`.
 - **Full segments.** The same gate on groklet (`0x787873c9…8adc`, deployed at block 26,211,195), with
   GraphOps as the first RPC and Alchemy as the second: 13 of 13 segments hash to the node's, all of them
   full (4,199 transfers and 2,401 approvals among them), 6,604 logs in 13.7 s at 232 MiB peak RSS.
-- **Not yet shown.** The default second RPC
-  (flashbots) once answered "pruned history unavailable" for blocks 50,000 back, which would stop a
-  week-old backfill at its agreement check.
+- **Public RPC history.** Probed with USDC logs 5,000, 20,000 and 60,000 blocks back: publicnode answers
+  only the first without a personal token, and flashbots answers the older two with nothing. The page now
+  defaults to mevblocker and drpc, which answer all three (burrmill-wasm #6), and the groklet gate passes
+  on those two alone: 13 of 13, in 29.7 s. A contract older than about eight days needs a full-history
+  RPC in either box.
