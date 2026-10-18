@@ -53,7 +53,9 @@ contents in wasm, and the page keeps the nest directory as a map of path to byte
 
 1. **Address and chain.** The page reads the chain id from the RPC, resolves a proxy from its slots,
    and fetches the ABI from Sourcify (or from an Etherscan-class API with the visitor's key, or from a
-   pasted file). Each answer goes into the same parsers `init` uses.
+   pasted file). The deploy block comes from Sourcify's `deployment.blockNumber` where it has one:
+   `init`'s own search reads old state that public RPCs do not serve, and on 2026-10-18 it found
+   nothing through publicnode for a pair deployed the day before. Each answer goes into the same parsers `init` uses.
 2. **Scaffold.** `nuthatch-scaffold` (§4) turns (ABI, address, chain, deploy block, options) into the
    files `nuthatch init` writes: `nuthatch.toml`, `abis/`, `schema.json`, `views/`, `semantic.toml`,
    llms.txt and the skill. The page shows the tables and the starter view.
