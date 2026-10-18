@@ -9,6 +9,12 @@ use crate::chains;
 use crate::cli::{AddArgs, InitArgs};
 use crate::config::{Config, Contract, Extract, Nest};
 use crate::rpc::RpcClient;
+#[cfg(test)]
+use nuthatch_scaffold::resolve::slugify_alias;
+use nuthatch_scaffold::resolve::{
+    contract_name_from_abi, impl_from_slot, is_valid_alias, normalise_address, pick_alias,
+    IMPLEMENTATION_SELECTOR, PROXY_BEACON_SLOT, PROXY_IMPL_SLOTS,
+};
 
 pub async fn init(args: InitArgs) -> Result<()> {
     let count = crate::count::Pending::of(&args); // RFC-0054 hook
@@ -1122,27 +1128,6 @@ pub(crate) fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Well-known proxy implementation storage slots, tried in order - each holds the implementation
-/// address *directly*:
-/// - EIP-1967: keccak256("eip1967.proxy.implementation") − 1
-/// - EIP-1822 (UUPS "Proxiable"): keccak256("PROXIABLE")
-/// - legacy OpenZeppelin/zeppelinos: keccak256("org.zeppelinos.proxy.implementation") (e.g. USDC)
-const PROXY_IMPL_SLOTS: &[&str] = &[
-    "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
-    "0xc5f16f0fcc639fa48a6947836d9850f504798523bf8c9a3a87d5876cf622bcf7",
-    "0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3",
-];
-
-/// EIP-1967 beacon slot: keccak256("eip1967.proxy.beacon") − 1. A *beacon* proxy stores a beacon
-/// address here (not the implementation); the implementation comes from calling `implementation()` on
-/// that beacon - a common shape for factory-deployed proxies that share one upgradeable logic contract.
-const PROXY_BEACON_SLOT: &str =
-    "0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50";
-
-/// Selector for `implementation()` - `keccak256("implementation()")[..4]`. Both a beacon and an
-/// EIP-897 delegate proxy expose the implementation this way.
-const IMPLEMENTATION_SELECTOR: &str = "0x5c60da1b";
-
 /// Resolve the ABI to index events with. For a proxy (e.g. USDC), events emit from the proxy address
 /// but use the *implementation's* event definitions, so resolve the implementation's ABI. Falls back
 /// to the address's own ABI if it isn't a proxy or the implementation can't resolve. Init-time only -
@@ -1237,19 +1222,6 @@ async fn resolve_implementation(rpc: &RpcClient, address: &str) -> Option<String
         }
     }
     None
-}
-
-/// Extract a non-zero implementation address from a 32-byte storage word.
-fn impl_from_slot(slot: &str) -> Option<String> {
-    let h = slot.trim_start_matches("0x");
-    if h.len() < 40 {
-        return None;
-    }
-    let addr = &h[h.len() - 40..];
-    if addr.chars().all(|c| c == '0') {
-        return None;
-    }
-    Some(format!("0x{addr}"))
 }
 
 /// What a sample of the contract's real logs says about the ABI we resolved for it.
@@ -1562,87 +1534,6 @@ fn abi_event_topic0s(abi: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-fn is_valid_alias(a: &str) -> bool {
-    let mut chars = a.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-}
-
-/// `DelegationManager` → `delegation_manager`, `Vat` → `vat`, `L2GNS` → `l2gns`.
-/// None when the result is empty or would not pass [`is_valid_alias`].
-fn slugify_alias(name: &str) -> Option<String> {
-    let mut out = String::new();
-    let mut prev_lower = false;
-    for c in name.chars() {
-        if c.is_ascii_uppercase() {
-            if prev_lower {
-                out.push('_');
-            }
-            out.push(c.to_ascii_lowercase());
-            prev_lower = false;
-        } else if c.is_ascii_lowercase() || c.is_ascii_digit() {
-            out.push(c);
-            prev_lower = c.is_ascii_lowercase();
-        } else if !out.is_empty() && !out.ends_with('_') {
-            out.push('_');
-            prev_lower = false;
-        }
-    }
-    while out.ends_with('_') {
-        out.pop();
-    }
-    is_valid_alias(&out).then_some(out)
-}
-
-/// A name from Sourcify metadata or a wrapped ABI's `contractName`.
-fn contract_name_from_abi(abi: &serde_json::Value) -> Option<&str> {
-    abi.get("contractName").and_then(|v| v.as_str())
-}
-
-/// Next unused `cN`, then `cN+1`, skipping anything already taken.
-fn next_c_alias(used: &std::collections::HashSet<&str>, taken: &[String]) -> String {
-    let mut k = 0usize;
-    loop {
-        let cand = format!("c{k}");
-        if !used.contains(cand.as_str()) && !taken.contains(&cand) {
-            return cand;
-        }
-        k += 1;
-    }
-}
-
-/// Prefer an explicit alias, then a slugified contract name, then `cN`.
-fn pick_alias(
-    provided: Option<&str>,
-    contract_name: Option<&str>,
-    used: &std::collections::HashSet<&str>,
-    taken: &[String],
-) -> Result<String> {
-    if let Some(a) = provided {
-        if !is_valid_alias(a) {
-            bail!("alias '{a}' must match [a-z][a-z0-9_]*");
-        }
-        if used.contains(a) || taken.iter().any(|t| t == a) {
-            bail!("alias '{a}' is already used in this nest");
-        }
-        return Ok(a.to_string());
-    }
-    if let Some(slug) = contract_name.and_then(slugify_alias) {
-        if !used.contains(slug.as_str()) && !taken.contains(&slug) {
-            return Ok(slug);
-        }
-        let mut k = 2usize;
-        loop {
-            let cand = format!("{slug}_{k}");
-            if is_valid_alias(&cand) && !used.contains(cand.as_str()) && !taken.contains(&cand) {
-                return Ok(cand);
-            }
-            k += 1;
-        }
-    }
-    Ok(next_c_alias(used, taken))
-}
-
 /// The line `init` prints after scaffolding. A 0-table nest whose ABI was entirely anonymous
 /// must not look like USDC's success (#766).
 fn scaffold_summary(
@@ -1912,16 +1803,6 @@ fn dir_hint(dir: &str) -> String {
     } else {
         format!(" --dir {dir}")
     }
-}
-
-/// Minimal sanity check + lowercasing. Full checksum validation is a later concern.
-fn normalise_address(addr: &str) -> Result<String> {
-    let a = addr.trim();
-    let hex = a.strip_prefix("0x").unwrap_or(a);
-    if hex.len() != 40 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("'{addr}' is not a 20-byte hex address");
-    }
-    Ok(format!("0x{}", hex.to_ascii_lowercase()))
 }
 
 #[cfg(test)]
