@@ -4705,6 +4705,7 @@ dependencies = [
  "num-bigint 0.4.8",
  "nuthatch-decode",
  "nuthatch-identity",
+ "nuthatch-scaffold",
  "nuthatch-seal",
  "object_store 0.12.5",
  "parquet",
@@ -4756,6 +4757,20 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "toml",
+]
+
+[[package]]
+name = "nuthatch-scaffold"
+version = "0.1.0"
+dependencies = [
+ "alloy-json-abi",
+ "alloy-primitives",
+ "anyhow",
+ "hex",
+ "nuthatch-decode",
+ "serde",
+ "serde_json",
  "toml",
 ]
 

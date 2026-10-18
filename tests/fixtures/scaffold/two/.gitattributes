@@ -1,0 +1,2 @@
+*.sql linguist-detectable
+abis/** linguist-generated

@@ -1,0 +1,13 @@
+[nest]
+name = "pair"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://ethereum-rpc.publicnode.com"]
+schema_version = 1
+block_timestamps = true
+
+[[contracts]]
+alias = "uniswap_v2pair"
+address = "0x9d593420cc4936b8a8435cdfa0d6bbde9bdff9a4"
+start_block = 26212134
+abi = "abis/uniswap_v2pair.json"

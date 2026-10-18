@@ -1,0 +1,125 @@
+# semantic.toml - what this nest's data *means* (RFC-0016). Read by the MCP `schema`
+# tool, the admin UI, and the scaffolded skill. Edit descriptions freely; the
+# `[table.*.footguns]` are DERIVED from the ABI and regenerated - leave them be.
+
+schema_version = 1
+
+[nest]
+description = "The `pair` nest on mainnet. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.uniswap_v2pair__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `uniswap_v2pair` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.uniswap_v2pair__approval.columns]
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+spender = "The `spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.uniswap_v2pair__approval.footguns]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.uniswap_v2pair__burn]
+description = "`Burn(address,uint256,uint256,address)` events emitted by the `uniswap_v2pair` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Burn(address,uint256,uint256,address) event"
+
+[table.uniswap_v2pair__burn.columns]
+amount0 = "The `amount0` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount1 = "The `amount1` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.uniswap_v2pair__burn.footguns]
+reserved_words = ["to"]
+big_ints = [
+    "amount0",
+    "amount1",
+]
+overflows_dec = [
+    "amount0",
+    "amount1",
+]
+
+[table.uniswap_v2pair__mint]
+description = "`Mint(address,uint256,uint256)` events emitted by the `uniswap_v2pair` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Mint(address,uint256,uint256) event"
+
+[table.uniswap_v2pair__mint.columns]
+amount0 = "The `amount0` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount1 = "The `amount1` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.uniswap_v2pair__mint.footguns]
+big_ints = [
+    "amount0",
+    "amount1",
+]
+overflows_dec = [
+    "amount0",
+    "amount1",
+]
+
+[table.uniswap_v2pair__swap]
+description = "`Swap(address,uint256,uint256,uint256,uint256,address)` events emitted by the `uniswap_v2pair` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Swap(address,uint256,uint256,uint256,uint256,address) event"
+
+[table.uniswap_v2pair__swap.columns]
+amount0In = "The `amount0In` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount0Out = "The `amount0Out` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount1In = "The `amount1In` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount1Out = "The `amount1Out` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.uniswap_v2pair__swap.footguns]
+reserved_words = ["to"]
+big_ints = [
+    "amount0In",
+    "amount1In",
+    "amount0Out",
+    "amount1Out",
+]
+overflows_dec = [
+    "amount0In",
+    "amount1In",
+    "amount0Out",
+    "amount1Out",
+]
+
+[table.uniswap_v2pair__sync]
+description = "`Sync(uint112,uint112)` events emitted by the `uniswap_v2pair` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Sync(uint112,uint112) event"
+
+[table.uniswap_v2pair__sync.columns]
+reserve0 = "The `reserve0` uint112 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+reserve1 = "The `reserve1` uint112 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.uniswap_v2pair__sync.footguns]
+big_ints = [
+    "reserve0",
+    "reserve1",
+]
+
+[table.uniswap_v2pair__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `uniswap_v2pair` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.uniswap_v2pair__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.uniswap_v2pair__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[view]
+
+# Authored views (views/*.sql) are described here so the MCP/`/schema` can render them:
+# [view.your_view_name]
+# description = "What this derivation computes."

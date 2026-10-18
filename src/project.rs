@@ -97,12 +97,6 @@ async fn scaffold(args: InitArgs) -> Result<()> {
         println!("  · alias {alias}");
         aliases.push(alias);
         let alias = aliases.last().unwrap();
-        let abi_path = format!("abis/{alias}.json");
-        std::fs::write(
-            dir.join(&abi_path),
-            serde_json::to_string_pretty(&abi_json).context("failed to serialise ABI")?,
-        )
-        .with_context(|| format!("failed to write {abi_path}"))?;
 
         let start_block =
             resolve_contract_start(&rpc, address, tip, start_blocks[i], &mut undetected).await;
@@ -118,47 +112,31 @@ async fn scaffold(args: InitArgs) -> Result<()> {
             address,
         );
 
-        contracts.push(Contract {
+        contracts.push(nuthatch_scaffold::Contract {
             alias: alias.clone(),
             address: address.clone(),
             start_block,
-            abi: abi_path,
-            events: Vec::new(),
+            abi: abi_json,
         });
     }
 
-    let config = Config {
-        state_rpc_urls: Vec::new(),
-        read_only_role: false,
-        freshness: Default::default(),
-        ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
-        route: None,
-        ipfs_gateways: Vec::new(),
-        ipfs: Vec::new(),
-        nest: Nest {
-            name: nest_name(&dir),
-            chain: chain.name.clone(),
-            chain_id: chain.chain_id,
-            rpc_urls,
-            // Not `CURRENT_SCHEMA_VERSION`: a timestamped nest is a v1 file and stays readable by
-            // 0.8.x. See `config::required_schema_version`.
-            schema_version: crate::config::required_schema_version(!args.no_timestamps),
-            // Serialised unconditionally (no `skip_serializing_if`), so every scaffolded nest states
-            // its schema shape in the file. Someone reading `nuthatch.toml` to work out why a table
-            // has no `block_timestamp` finds the answer there rather than in our serde defaults.
-            block_timestamps: !args.no_timestamps,
-        },
+    let nest = nuthatch_scaffold::Nest {
+        name: nest_name(&dir),
+        chain: chain.name.clone(),
+        chain_id: chain.chain_id,
+        rpc_urls,
+        block_timestamps: !args.no_timestamps,
         contracts,
-        flags: crate::config::Flags::default(),
-        alerts: Vec::new(),
-        templates: Vec::new(),
-        factories: Vec::new(),
-        webhooks: Vec::new(),
-        extract: Extract::default(),
-        calls: Vec::new(),
-        address_history: None,
     };
-    config.save(&dir)?;
+    // The config and ABIs come from the scaffold as a tab gets them; the rest is written by
+    // `write_nest_artifacts`, which leaves an author's existing views and semantics alone.
+    for (path, bytes) in nuthatch_scaffold::files(&nest)? {
+        if path == crate::config::CONFIG_FILE || path.starts_with("abis/") {
+            std::fs::write(dir.join(&path), bytes)
+                .with_context(|| format!("failed to write {path}"))?;
+        }
+    }
+    let config = Config::load(&dir)?;
 
     // Build the registry from the vendored ABIs to generate the schema artifact + AI surface (one
     // source of truth: schema.json, llms.txt, the skill, and `/tables` all come from here).
@@ -961,10 +939,7 @@ fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result
     let hash = decode_identity(dir, config, &registry)?;
     std::fs::write(
         dir.join("schema.json"),
-        serde_json::to_string_pretty(&serde_json::json!({
-            "registry_hash": format!("0x{}", hex::encode(hash)),
-            "tables": &schema,
-        }))?,
+        nuthatch_scaffold::schema_json(hash, &schema)?,
     )
     .context("failed to write schema.json")?;
     scaffold_ai_surface(dir, chain_name, &config.contracts, &schema)?;
@@ -991,14 +966,11 @@ fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result
 /// derived from the nest's own first table, plus a README. Idempotent: if `views/` already exists (an
 /// `add` on a nest whose author already wrote views), it's left untouched. The starter is entirely
 /// comments, so it's a no-op for the query surface and validates clean until the author uncomments it.
-const GITATTRIBUTES: &str = "*.sql linguist-detectable\nabis/** linguist-generated\n";
-
 fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result<()> {
-    // GitHub counts SQL as data, so without this a nest repo shows no language. Hidden, so it stays
-    // outside the data identity.
     let attrs = dir.join(".gitattributes");
     if !attrs.exists() {
-        std::fs::write(&attrs, GITATTRIBUTES).context("failed to write .gitattributes")?;
+        std::fs::write(&attrs, nuthatch_scaffold::GITATTRIBUTES)
+            .context("failed to write .gitattributes")?;
     }
 
     let views = dir.join("views");
@@ -1007,49 +979,13 @@ fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result
     }
     std::fs::create_dir_all(&views)
         .with_context(|| format!("cannot create {}", views.display()))?;
-
+    std::fs::write(views.join("README.md"), nuthatch_scaffold::VIEWS_README)
+        .context("failed to write views/README.md")?;
     std::fs::write(
-        views.join("README.md"),
-        "# views/ - this nest's authored logic (RFC-0018 §1)\n\n\
-         Drop `*.sql` files here, each a `CREATE VIEW …` over your nest's tables (the live tip ∪ sealed\n\
-         history, one surface - recomputed per query, never materialised). Query a view by name with\n\
-         `nuthatch sql` or the MCP `sql` tool. Files load in sorted filename order (`10-…`, `20-…`), so\n\
-         a later view can build on an earlier one. Describe what a view *means* in `semantic.toml` under\n\
-         `[view.<name>]` so an agent sees it. A broken/drifted view fails `nuthatch check` loudly.
-         \
-         `views/` is the broad query-time surface. `entities/` plus `entities.toml` is separate: use it
-         only for a keyed relation in the bounded incremental SQL subset, maintained at indexing time
-         with explicit memory, reorg and restart semantics. `nuthatch check` refuses unsupported entity
-         SQL rather than silently turning an ordinary view into stored state.\n",
+        views.join("10-example.sql"),
+        nuthatch_scaffold::starter_view(schema),
     )
-    .context("failed to write views/README.md")?;
-
-    // The starter references this nest's real first table when there is one, so it's copy-paste-true.
-    let (table, alias) = schema
-        .first()
-        .map(|t| (t.table.as_str(), t.alias.as_str()))
-        .unwrap_or(("your__event", "your"));
-    let starter = format!(
-        "-- views/10-example.sql - an authored derivation this nest computes. Uncomment to enable.\n\
-         --\n\
-         -- Read-only SQL over your nest's tables (tip ∪ sealed history), recomputed per query. Query it\n\
-         -- by name via `nuthatch sql` or the MCP; describe it in semantic.toml `[view.<name>]`.\n\
-         --\n\
-         -- Footguns (see the builder skill's views.md):\n\
-         --   • reserved-word columns like \"from\"/\"to\" must be double-quoted\n\
-         --   • SUM(<col>_dec) is the values that fit; WHERE NOT <col>_overflow is that sum\n\
-         --     ids, nonces and hashes stay raw (`_dec` is NULL for a full-width uint256)\n\
-         --\n\
-         -- Example over this nest's `{table}` table:\n\
-         --\n\
-         -- CREATE VIEW {alias}_activity AS\n\
-         --   SELECT count(*) AS events,\n\
-         --          min(block_number) AS first_block,\n\
-         --          max(block_number) AS last_block\n\
-         --   FROM \"{table}\";\n"
-    );
-    std::fs::write(views.join("10-example.sql"), starter)
-        .context("failed to write views/10-example.sql")?;
+    .context("failed to write views/10-example.sql")?;
     Ok(())
 }
 
@@ -1934,74 +1870,22 @@ pub(crate) fn scaffold_ai_surface(
     contracts: &[Contract],
     schema: &[crate::registry::TableSchema],
 ) -> Result<()> {
-    let list: String = contracts
+    let contracts: Vec<_> = contracts
         .iter()
-        .map(|c| format!("- `{}` = {}\n", c.alias, c.address))
+        .map(|c| (c.alias.as_str(), c.address.as_str()))
         .collect();
-    let tables: String = schema
-        .iter()
-        .map(|t| {
-            let cols: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
-            format!("- `{}` - {} ({})\n", t.table, t.event, cols.join(", "))
-        })
-        .collect();
-    let llms = format!(
-        "# nuthatch nest on {chain}\n\
-         \n\
-         A self-hosted blockchain index. Query it locally; there is no third-party API.\n\
-         \n\
-         ## Contracts\n{list}\n\
-         ## Tables (one per contract event)\n{tables}\n\
-         ## Live HTTP API (run `nuthatch dev`)\n\
-         - `GET /`                    index status\n\
-         - `GET /tables`              every table with its columns\n\
-         - `GET /table/{{name}}?limit=N` recent rows of one table (hot + sealed)\n\
-         - `GET /entity/{{id}}`         one row by id (`{{block:012}}-{{logindex:06}}`)\n\
-         - `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{{alias}}__{{event}}`, and each\n\
-         \x20                            authored view (`views/*.sql`) answers by its own name\n\
-         - `GET /balances?limit=N`    top holder balances (when an ERC-20 Transfer table is present)\n\
-         - `GET /balance/{{address}}`   one address's derived balance\n\
-         - `GET /queries`             the mount's SQL mode and the queries its operator declared in\n\
-         \x20                            `mounts.toml` (none on an open nest); `GET /q/{{name}}` runs one\n\
-         - `GET /derived`             the nest's incremental entities (`entities.toml`); `GET /derived/{{entity}}` reads one\n\
-         \n\
-         ## MCP (for coding agents)\n\
-         Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, entity,\n\
-         balance, top_balances. Fully offline against the local instance; nothing phones home.\n"
-    );
-    std::fs::write(dir.join("llms.txt"), llms).context("failed to write llms.txt")?;
-
-    // A table this nest really has, so an agent copying the example gets an answer (#1662).
-    let example = schema
-        .first()
-        .map(|t| t.table.as_str())
-        .unwrap_or("<alias>__<event>");
+    std::fs::write(
+        dir.join("llms.txt"),
+        nuthatch_scaffold::llms_txt(chain, &contracts, schema),
+    )
+    .context("failed to write llms.txt")?;
     let skill_dir = dir.join(".claude/skills/nuthatch");
     std::fs::create_dir_all(&skill_dir).context("failed to create skill dir")?;
-    let skill = format!(
-        "---\n\
-         name: nuthatch\n\
-         description: Query this self-hosted nuthatch nest on {chain} - decoded events, balances, \
-         and read-only SQL. Use when asked about on-chain activity for these contracts.\n\
-         ---\n\
-         \n\
-         # Querying the nuthatch nest\n\
-         \n\
-         Contracts indexed on {chain}:\n{list}\n\
-         Data is local - never call an external API for it.\n\
-         \n\
-         ## Preferred: MCP\n\
-         If a `nuthatch` MCP server is configured, use its tools. Call `schema` first to learn the\n\
-         data model, then `sql` / `entity` / `balance` / `top_balances`.\n\
-         \n\
-         ## Fallback: HTTP (a `nuthatch dev` must be running)\n\
-         - Recent rows:  `curl localhost:8288/entities?limit=20`\n\
-         - Read-only SQL: `curl -G localhost:8288/sql --data-urlencode 'q=SELECT count(*) FROM {example}'`\n\
-         \n\
-         `sql` reads hot and sealed rows together, so it covers the live tip. Each answer's\n\
-         `provenance.sealed_through` is where finalized data ends.\n"
-    );
-    std::fs::write(skill_dir.join("SKILL.md"), skill).context("failed to write SKILL.md")?;
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        nuthatch_scaffold::skill_md(chain, &contracts, schema),
+    )
+    .context("failed to write SKILL.md")?;
     Ok(())
 }
 
@@ -2043,6 +1927,87 @@ fn normalise_address(addr: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn files_under(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        crate::blob::collect_files(root, None)
+            .unwrap()
+            .into_iter()
+            .map(|p| {
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                (rel, std::fs::read(&p).unwrap())
+            })
+            .collect()
+    }
+
+    /// RFC-0066 S0. The goldens are what `nuthatch init` wrote on 2026-10-18 before its file contents
+    /// moved to `nuthatch-scaffold`: one with block timestamps, one with two contracts (a proxy, and a
+    /// local ABI) without. A tab calls `files`; the node writes the config and ABIs from it and the
+    /// rest through `write_nest_artifacts`. Both must give the golden, byte for byte.
+    #[test]
+    fn the_scaffold_writes_what_init_wrote() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scaffold");
+        for name in ["pair", "two"] {
+            let golden = root.join(name);
+            let want = files_under(&golden);
+            let config = Config::load(&golden).unwrap();
+            let nest = nuthatch_scaffold::Nest {
+                name: config.nest.name.clone(),
+                chain: config.nest.chain.clone(),
+                chain_id: config.nest.chain_id,
+                rpc_urls: config.nest.rpc_urls.clone(),
+                block_timestamps: config.nest.block_timestamps,
+                contracts: config
+                    .contracts
+                    .iter()
+                    .map(|c| nuthatch_scaffold::Contract {
+                        alias: c.alias.clone(),
+                        address: c.address.clone(),
+                        start_block: c.start_block,
+                        abi: serde_json::from_slice(&want[&c.abi]).unwrap(),
+                    })
+                    .collect(),
+            };
+            let files = nuthatch_scaffold::files(&nest).unwrap();
+            assert_eq!(
+                files.keys().collect::<Vec<_>>(),
+                want.keys().collect::<Vec<_>>(),
+                "{name}"
+            );
+            for (path, bytes) in &want {
+                assert!(
+                    files[path] == *bytes,
+                    "{name}: the scaffold's {path} differs"
+                );
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+            for (path, bytes) in &files {
+                if path == crate::config::CONFIG_FILE || path.starts_with("abis/") {
+                    std::fs::write(dir.path().join(path), bytes).unwrap();
+                }
+            }
+            let config = Config::load(dir.path()).unwrap();
+            write_nest_artifacts(dir.path(), &config.nest.chain, &config).unwrap();
+            let got = files_under(dir.path());
+            assert_eq!(
+                got.keys().collect::<Vec<_>>(),
+                want.keys().collect::<Vec<_>>()
+            );
+            for (path, bytes) in &want {
+                assert!(got[path] == *bytes, "{name}: the node's {path} differs");
+            }
+
+            // The scaffold serialises its own config; the node's `Config` must agree with it.
+            let resaved = tempfile::tempdir().unwrap();
+            config.save(resaved.path()).unwrap();
+            assert_eq!(
+                std::fs::read(resaved.path().join(crate::config::CONFIG_FILE)).unwrap(),
+                want[crate::config::CONFIG_FILE],
+                "{name}: Config saves a different nuthatch.toml than the scaffold writes"
+            );
+        }
+    }
 
     /// #1662: the scaffolded skill's example names a table the nest has, and it does not steer an
     /// agent away from `/sql` for live data, which reads hot and sealed rows together.
@@ -2255,7 +2220,7 @@ mod tests {
         assert!(dir.path().join("views/README.md").exists());
         assert_eq!(
             std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap(),
-            GITATTRIBUTES
+            nuthatch_scaffold::GITATTRIBUTES
         );
         // References the nest's real table, and every line is a comment (a no-op that validates clean).
         assert!(starter.contains("usdc__transfer"));
@@ -2278,7 +2243,7 @@ mod tests {
         scaffold_views(old.path(), &schema).unwrap();
         assert_eq!(
             std::fs::read_to_string(old.path().join(".gitattributes")).unwrap(),
-            GITATTRIBUTES
+            nuthatch_scaffold::GITATTRIBUTES
         );
         std::fs::write(
             old.path().join(".gitattributes"),
