@@ -176,3 +176,19 @@ Recorded 2026-10-18, against nuthatch 5.7.1 and burrmill-wasm at `c7ce789`.
   defaults to mevblocker and drpc, which answer all three (burrmill-wasm #6), and the groklet gate passes
   on those two alone: 13 of 13, in 29.7 s. A contract older than about eight days needs a full-history
   RPC in either box.
+- **Base and Arbitrum One** (burrmill-wasm #9). The page carries each chain's seal span from the registry
+  (10,800 and 86,400 blocks). Gated against `nuthatch dev`: a four-day-old Base pair, 34 of 34 full
+  segments, 93,904 logs in 385 s at 361 MiB peak; GMX on Arbitrum from 100,000 blocks back, 2 of 2 full.
+  Base's keyless RPCs are thin: the one second that passed a browser's CORS preflight allows 50 blocks a
+  log query. nodies answers the preflight with no CORS header, so browsers cannot use it.
+- **Rows before their span seals** (burrmill-wasm #10). On Arbitrum nothing seals until 86,400 blocks
+  complete, and the page first answered 0 for 569 indexed logs. It now serves the agreed rows the
+  backfill has not sealed, and the head loop fetches only blocks past them.
+- **A memory budget** (burrmill-wasm #8). The heaviest Lodestar view peaks near 2 GiB, which kills a
+  phone tab, and watching memory from the page cannot see it: the engine computes for seconds without
+  yielding. The engine now holds a budget and refuses a statement over it: 600 MiB on phones, and elsewhere
+  2 GiB, nuthatch's budget per active-chain cursor, which a tab following a chain is (burrmill-wasm
+  #12). Refused at 600 MiB, the module stood at 836 MiB and the tab went on answering; under 2 GiB the
+  heaviest Lodestar view completes with the module at 1,956 MiB.
+- **Views are planned as they are typed**, against the declared tables with no data, so the engine's own
+  error shows before anything is indexed.
