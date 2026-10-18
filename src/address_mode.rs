@@ -3339,6 +3339,15 @@ async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Op
     } else {
         covered
     };
+    // Etherscan callers often ask through 99,999,999 for "everything": those blocks are not backfilling,
+    // they do not exist, and the answer should say which.
+    if chain > 0 && to > chain {
+        return Some(format!(
+            "covered through block {covered}; this range ends at block {to}, {} blocks above the chain head \
+             {chain}; ask through block {chain} at most",
+            to - chain
+        ));
+    }
     Some(()).map(|()| {
         format!(
             "covered through block {covered}; the {gap} blocks above it are being backfilled, more than can \
@@ -5959,6 +5968,27 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// Etherscan's "everything" idiom, an endblock of 99,999,999, is still refused whole, but the
+    /// refusal names the chain head rather than calling blocks that do not exist a backfill.
+    #[tokio::test]
+    async fn an_end_far_above_the_chain_head_names_the_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(100).unwrap();
+        let s = Arc::new(ModeState::new(history, 1, Duration::from_secs(300), true));
+        s.latest.store(100, Ordering::Relaxed);
+        s.backfill_rate.store(1, Ordering::Relaxed);
+        let path = format!(
+            "/api?module=account&action=txlist&address={ALICE}&startblock=50&endblock=99999999"
+        );
+        let (_, v) = call(router(s), "GET", &path, None).await;
+        let msg = v["result"].as_str().unwrap();
+        assert!(msg.contains("above the chain head 100"), "{v}");
+        assert!(msg.contains("ask through block 100 at most"), "{v}");
+        assert!(!msg.contains("being backfilled"), "{v}");
     }
 
     /// A measured rate under a block a minute is still measured: it is never read as no rate.
