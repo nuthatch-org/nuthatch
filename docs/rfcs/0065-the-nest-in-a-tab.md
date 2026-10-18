@@ -197,8 +197,9 @@ and by whoever sealed it, which is no change from today.
    merged upstream behind a feature or kept on a branch.
 3. ~~Whether S5 checks all receipts for every tail block by default, at about 0.9 MB a block, or only
    on request.~~ On request, 20 blocks at a time (Chief, 2026-10-18); §12 has the figures.
-4. Whether the page should accept any mirror URL, making it a client for every published nest
-   rather than a demo of one.
+4. ~~Whether the page should accept any mirror URL, making it a client for every published nest
+   rather than a demo of one.~~ No: a curated list of our nests, the picker `nests.json` already
+   feeds, with DeFi Pulse the one that follows the head (Chief, 2026-10-18).
 
 ## 12. Measured outcome, 2026-10-18
 
