@@ -1,7 +1,7 @@
 # RFC-0065: The nest in a tab - a published nest queried, then kept current, in a browser
 
 - Status: **Accepted 2026-10-17, through S6.** S0 to S5 shipped by 2026-10-18 (S5 in
-  burrmill-wasm#2); S6, added 2026-10-18, is not started. Measured outcome in §12. Chief, on the draft: "I like it. Save the plan as an RFC."
+  burrmill-wasm#2); S6, added 2026-10-18, has passed its first gate run (§12). Measured outcome in §12. Chief, on the draft: "I like it. Save the plan as an RFC."
 - Author: Pete (cargopete)
 - Date: 2026-10-16
 - Depends on: RFC-0052 (the mirrored nest: `manifest.json`, `schema.json`, content-addressed
@@ -239,3 +239,14 @@ hash, and every sealed log must name a block hash on that chain. The bloom does 
   with Helios, against 250 without it. Helios's own wasm memory is 2 to 3 MiB.
 - **Cost.** Public RPCs serve about 26 headers a second, so a seal span's headers take about 70 s.
   They are fetched only when a seal would follow, shared across both RPCs, and the tail shows first.
+
+**S6, the first gate run, 2026-10-18.** A UniswapV2Pair Sourcify lists as deployed at block 26,212,134
+(`0x9d59…f9a4`, about a day old), scaffolded by `nuthatch init` 5.7.1 and indexed natively to block
+26,218,847. The tab's sealer, from the deploy block, sealed the same range from publicnode: 154 logs into
+6 segments, and all 6 hash to the native ones. The 6,728 headers under Helios's block 26,218,861 hashed
+down to it. That run was in Node, not yet in a browser, and took 5 min 24 s, nearly all of it headers
+at public-RPC rates; the logs took seconds. A contract a week old would want about 50,000 headers, which
+is half an hour, so a backfill cannot check every header the way a tail does. It seals on two RPCs
+agreeing, as S4 did, and checks headers for the newest blocks only. `init` could not find the deploy
+block through publicnode, which does not serve the old state its search reads; Sourcify's
+`deployment.blockNumber` gave it.
