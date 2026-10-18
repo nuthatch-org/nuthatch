@@ -1,6 +1,7 @@
 # RFC-0065: The nest in a tab - a published nest queried, then kept current, in a browser
 
-- Status: **Draft - design only, 2026-10-16.** Chief: "I like it. Save the plan as an RFC."
+- Status: **Accepted 2026-10-17, through S5.** S0 to S4 shipped by 2026-10-18; S5 is built in
+  burrmill-wasm#2. Measured outcome in §12. Chief, on the draft: "I like it. Save the plan as an RFC."
 - Author: Pete (cargopete)
 - Date: 2026-10-16
 - Depends on: RFC-0052 (the mirrored nest: `manifest.json`, `schema.json`, content-addressed
@@ -119,7 +120,9 @@ log against its receipt. Two limits, both stated rather than worked around:
 - **Completeness is not verified.** Nothing in Helios uses the bloom, and EIP-7745 calls the mainnet
   bloom practically useless; an RPC that omits a log passes. A block's logs are complete only if the
   tab checks all of that block's receipts, about 0.9 MB a block, which is affordable for a tail of
-  hours and not for following the head all day.
+  hours and not for following the head all day. *(Measured 2026-10-18, §12: 1.17 MB a block on
+  DeFi Pulse, and 881 of a seal span's 1,800 blocks carry rows, so even inclusion for one span is
+  about 1 GB. Neither is affordable as a default.)*
 - **Header provenance reaches back about 27 hours** (EIP-2935's 8,191 hashes). Older blocks have no
   path in Helios, and EIP-4444 expiry is live.
 
@@ -184,7 +187,7 @@ and by whoever sealed it, which is no change from today.
 - Public RPC caps change without notice; drpc's error message already misreports its own limit. The
   page lets the visitor supply an RPC URL.
 - Tab lifetime. A discarded tab loses its tail; S4 makes the loss a refetch, not a gap.
-- Helios and Burrmill together in one wasm32 address space are unmeasured.
+- ~~Helios and Burrmill together in one wasm32 address space are unmeasured.~~ Measured, §12.
 - Safari: no Memory64, aggressive eviction. Supported, but the numbers are published per browser.
 
 ## 11. Open questions
@@ -192,7 +195,35 @@ and by whoever sealed it, which is no change from today.
 1. Which nest. Candidates are whatever is on the mirror and still sealing on 2026-10-16; S0 decides.
 2. Whether `burrmill-wasm` moves under nuthatch-org, and whether Burrmill's `pete/wasm` changes are
    merged upstream behind a feature or kept on a branch.
-3. Whether S5 checks all receipts for every tail block by default, at about 0.9 MB a block, or only
-   on request.
+3. ~~Whether S5 checks all receipts for every tail block by default, at about 0.9 MB a block, or only
+   on request.~~ On request, 20 blocks at a time (Chief, 2026-10-18); §12 has the figures.
 4. Whether the page should accept any mirror URL, making it a client for every published nest
    rather than a demo of one.
+
+## 12. Measured outcome, 2026-10-18
+
+**S4.** The tab's sealer, resumed from the mirror's seed at block 26,213,187, sealed 26,213,188 to
+26,214,987 from publicnode, and all 8 segments hash to the ones DeFi Pulse published on 5.7.1, with no
+native segment missed. Shipped to nuthatch-indexer.com/play in burrmill-wasm#1.
+
+**S5 does less with Helios than §6 planned, and checks more itself.** Helios's own verified
+`eth_getLogs` proves each block through `eth_getProof` against older state, which drpc serves,
+publicnode only for the last few blocks and flashbots not at all ("exceeds maximum proof window"). So the tab takes one thing from
+Helios, the finalized block hash, which the consensus endpoint can withhold but not forge. Every
+header from the last seal up to it is hashed in wasm (alloy-consensus) and must link to it by parent
+hash, and every sealed log must name a block hash on that chain. The bloom does not help: 1,337 of
+1,550 recent blocks match DeFi Pulse's filter.
+
+- **Logs are agreed, not proven, by default.** Both RPCs must still return the same logs before a
+  seal. Proving inclusion for one span would mean about 1 GB of receipts.
+- **Complete on request.** The page checks the 20 newest finalized tail blocks with rows: their
+  receipts must hash to the verified header, and the block's matching logs must equal the RPC's.
+  In Chrome, 20 of 20 came back complete from 14.3 MB of receipts in 1.7 s.
+- **Gates.** 12 scripted cases in `bench/verified-test.mjs`: an unverifiable finalized block, a
+  forged or missing header, a log off the chain, and a log altered, added or left out against real
+  receipts. Mutating either check turns a case red. Live, from the same seed: 5,260 headers hash
+  down to Helios's block 26,218,447, and the 8 segments still equal the mirror's.
+- **Memory.** One sample each in Chrome, by `measureUserAgentSpecificMemory`: 261 MiB for the tab
+  with Helios, against 250 without it. Helios's own wasm memory is 2 to 3 MiB.
+- **Cost.** Public RPCs serve about 26 headers a second, so a seal span's headers take about 70 s.
+  They are fetched only when a seal would follow, shared across both RPCs, and the tail shows first.
