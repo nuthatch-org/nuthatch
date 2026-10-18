@@ -163,7 +163,9 @@ Recorded 2026-10-18, against nuthatch 5.7.1 and burrmill-wasm at `c7ce789`.
   then seals the tab to the same block: for the pair deployed on 2026-10-17, 6 of 6 segments hash to the
   node's, 154 logs in 3.8 s at 133 MiB peak RSS. On the live page it indexed in 3.9 s and answered a
   count in 250 ms.
-- **Not yet shown.** Every table of that pair stayed under the 1,000-row floor, so all six segments are
-  tails; a contract busy enough to seal full segments is still to be gated. The default second RPC
+- **Full segments.** The same gate on groklet (`0x787873c9…8adc`, deployed at block 26,211,195), with
+  GraphOps as the first RPC and Alchemy as the second: 13 of 13 segments hash to the node's, all of them
+  full (4,199 transfers and 2,401 approvals among them), 6,604 logs in 13.7 s at 232 MiB peak RSS.
+- **Not yet shown.** The default second RPC
   (flashbots) once answered "pruned history unavailable" for blocks 50,000 back, which would stop a
   week-old backfill at its agreement check.
