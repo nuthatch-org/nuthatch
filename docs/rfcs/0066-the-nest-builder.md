@@ -1,6 +1,6 @@
 # RFC-0066: The nest builder - a nest defined, then indexed, in one browser tab
 
-- Status: **Accepted 2026-10-18, through S2.** S0 built (#2097, #2098). Chief: "a team defines a nest in some sort of 'nest builder' ui page
+- Status: **Accepted 2026-10-18, through S2.** S0 to S2 built (§12). Chief: "a team defines a nest in some sort of 'nest builder' ui page
   ... and then when they click 'index it' the nest starts indexing right there in the browser."
 - Author: Pete (cargopete)
 - Date: 2026-10-18
@@ -146,3 +146,24 @@ model writes reaches stored state (non-negotiable 4).
 
 1. Whether the builder lives at `/play` beside the published nests, or on its own page.
 2. Whether S3's token path is worth building before a team asks for it, given the zip.
+
+## 12. Measured outcome
+
+Recorded 2026-10-18, against nuthatch 5.7.1 and burrmill-wasm at `c7ce789`.
+
+- **S0** (#2097, #2098, #2100). `nuthatch init` on USDC, a UniswapV2 pair, CryptoPunks and a
+  two-contract nest with a local ABI and no timestamps wrote byte-identical files before and after the
+  move. The wasm module, run under Node, gives the pair the NID `nuthatch dev` reports for it.
+- **S1** (burrmill-wasm #4), live at nuthatch-indexer.com/play/build.html. `bench/builder-gate.mjs`
+  resolves live, zips, unzips and compares: USDC (a proxy), the pair (its deploy block from Sourcify)
+  and a two-contract nest each match `init` byte for byte, and `dev` reports the page's NID. In Chrome,
+  the zip the page downloaded with an edited view ran under `dev`, which reported the NID the page
+  showed, and the view answered.
+- **S2** (burrmill-wasm #5). `bench/index-gate.mjs` runs `dev` on a builder nest to the finalized head,
+  then seals the tab to the same block: for the pair deployed on 2026-10-17, 6 of 6 segments hash to the
+  node's, 154 logs in 3.8 s at 133 MiB peak RSS. On the live page it indexed in 3.9 s and answered a
+  count in 250 ms.
+- **Not yet shown.** Every table of that pair stayed under the 1,000-row floor, so all six segments are
+  tails; a contract busy enough to seal full segments is still to be gated. The default second RPC
+  (flashbots) once answered "pruned history unavailable" for blocks 50,000 back, which would stop a
+  week-old backfill at its agreement check.
