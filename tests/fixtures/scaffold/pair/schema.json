@@ -1,0 +1,431 @@
+{
+  "registry_hash": "0xa23277fb4dacf9cf974ac4e435e7cecd1862beee14650cbf14cac3dc30dbd95d",
+  "tables": [
+    {
+      "table": "uniswap_v2pair__approval",
+      "alias": "uniswap_v2pair",
+      "event": "Approval(address,address,uint256)",
+      "topic0": "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
+      "columns": [
+        {
+          "name": "block_number",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "block_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32",
+          "indexed": false
+        },
+        {
+          "name": "block_timestamp",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "tx_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32",
+          "indexed": false
+        },
+        {
+          "name": "log_index",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "address",
+          "sol_type": "implicit",
+          "storage": "address",
+          "indexed": false
+        },
+        {
+          "name": "_seq",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "owner",
+          "sol_type": "address",
+          "storage": "address",
+          "indexed": true
+        },
+        {
+          "name": "spender",
+          "sol_type": "address",
+          "storage": "address",
+          "indexed": true
+        },
+        {
+          "name": "value",
+          "sol_type": "uint256",
+          "storage": "word32",
+          "indexed": false
+        }
+      ]
+    },
+    {
+      "table": "uniswap_v2pair__burn",
+      "alias": "uniswap_v2pair",
+      "event": "Burn(address,uint256,uint256,address)",
+      "topic0": "0xdccd412f0b1252819cb1fd330b93224ca42612892bb3f4f789976e6d81936496",
+      "columns": [
+        {
+          "name": "block_number",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "block_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32",
+          "indexed": false
+        },
+        {
+          "name": "block_timestamp",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "tx_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32",
+          "indexed": false
+        },
+        {
+          "name": "log_index",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "address",
+          "sol_type": "implicit",
+          "storage": "address",
+          "indexed": false
+        },
+        {
+          "name": "_seq",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "sender",
+          "sol_type": "address",
+          "storage": "address",
+          "indexed": true
+        },
+        {
+          "name": "amount0",
+          "sol_type": "uint256",
+          "storage": "word32",
+          "indexed": false
+        },
+        {
+          "name": "amount1",
+          "sol_type": "uint256",
+          "storage": "word32",
+          "indexed": false
+        },
+        {
+          "name": "to",
+          "sol_type": "address",
+          "storage": "address",
+          "indexed": true
+        }
+      ]
+    },
+    {
+      "table": "uniswap_v2pair__mint",
+      "alias": "uniswap_v2pair",
+      "event": "Mint(address,uint256,uint256)",
+      "topic0": "0x4c209b5fc8ad50758f13e2e1088ba56a560dff690a1c6fef26394f4c03821c4f",
+      "columns": [
+        {
+          "name": "block_number",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "block_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32",
+          "indexed": false
+        },
+        {
+          "name": "block_timestamp",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "tx_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32",
+          "indexed": false
+        },
+        {
+          "name": "log_index",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "address",
+          "sol_type": "implicit",
+          "storage": "address",
+          "indexed": false
+        },
+        {
+          "name": "_seq",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "sender",
+          "sol_type": "address",
+          "storage": "address",
+          "indexed": true
+        },
+        {
+          "name": "amount0",
+          "sol_type": "uint256",
+          "storage": "word32",
+          "indexed": false
+        },
+        {
+          "name": "amount1",
+          "sol_type": "uint256",
+          "storage": "word32",
+          "indexed": false
+        }
+      ]
+    },
+    {
+      "table": "uniswap_v2pair__swap",
+      "alias": "uniswap_v2pair",
+      "event": "Swap(address,uint256,uint256,uint256,uint256,address)",
+      "topic0": "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
+      "columns": [
+        {
+          "name": "block_number",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "block_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32",
+          "indexed": false
+        },
+        {
+          "name": "block_timestamp",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "tx_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32",
+          "indexed": false
+        },
+        {
+          "name": "log_index",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "address",
+          "sol_type": "implicit",
+          "storage": "address",
+          "indexed": false
+        },
+        {
+          "name": "_seq",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "sender",
+          "sol_type": "address",
+          "storage": "address",
+          "indexed": true
+        },
+        {
+          "name": "amount0In",
+          "sol_type": "uint256",
+          "storage": "word32",
+          "indexed": false
+        },
+        {
+          "name": "amount1In",
+          "sol_type": "uint256",
+          "storage": "word32",
+          "indexed": false
+        },
+        {
+          "name": "amount0Out",
+          "sol_type": "uint256",
+          "storage": "word32",
+          "indexed": false
+        },
+        {
+          "name": "amount1Out",
+          "sol_type": "uint256",
+          "storage": "word32",
+          "indexed": false
+        },
+        {
+          "name": "to",
+          "sol_type": "address",
+          "storage": "address",
+          "indexed": true
+        }
+      ]
+    },
+    {
+      "table": "uniswap_v2pair__sync",
+      "alias": "uniswap_v2pair",
+      "event": "Sync(uint112,uint112)",
+      "topic0": "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1",
+      "columns": [
+        {
+          "name": "block_number",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "block_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32",
+          "indexed": false
+        },
+        {
+          "name": "block_timestamp",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "tx_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32",
+          "indexed": false
+        },
+        {
+          "name": "log_index",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "address",
+          "sol_type": "implicit",
+          "storage": "address",
+          "indexed": false
+        },
+        {
+          "name": "_seq",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "reserve0",
+          "sol_type": "uint112",
+          "storage": "word16",
+          "indexed": false
+        },
+        {
+          "name": "reserve1",
+          "sol_type": "uint112",
+          "storage": "word16",
+          "indexed": false
+        }
+      ]
+    },
+    {
+      "table": "uniswap_v2pair__transfer",
+      "alias": "uniswap_v2pair",
+      "event": "Transfer(address,address,uint256)",
+      "topic0": "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+      "columns": [
+        {
+          "name": "block_number",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "block_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32",
+          "indexed": false
+        },
+        {
+          "name": "block_timestamp",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "tx_hash",
+          "sol_type": "implicit",
+          "storage": "bytes32",
+          "indexed": false
+        },
+        {
+          "name": "log_index",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "address",
+          "sol_type": "implicit",
+          "storage": "address",
+          "indexed": false
+        },
+        {
+          "name": "_seq",
+          "sol_type": "implicit",
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "from",
+          "sol_type": "address",
+          "storage": "address",
+          "indexed": true
+        },
+        {
+          "name": "to",
+          "sol_type": "address",
+          "storage": "address",
+          "indexed": true
+        },
+        {
+          "name": "value",
+          "sol_type": "uint256",
+          "storage": "word32",
+          "indexed": false
+        }
+      ]
+    }
+  ]
+}

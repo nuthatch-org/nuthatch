@@ -1,0 +1,49 @@
+# nuthatch nest on mainnet
+
+A self-hosted blockchain index. Query it locally; there is no third-party API.
+
+## Contracts
+- `usdc` = 0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48
+- `pool` = 0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc
+
+## Tables (one per contract event)
+- `pool__approval` - Approval(address,address,uint256) (block_number, block_hash, tx_hash, log_index, address, _seq, owner, spender, value)
+- `pool__burn` - Burn(address,uint256,uint256,address) (block_number, block_hash, tx_hash, log_index, address, _seq, sender, amount0, amount1, to)
+- `pool__mint` - Mint(address,uint256,uint256) (block_number, block_hash, tx_hash, log_index, address, _seq, sender, amount0, amount1)
+- `pool__swap` - Swap(address,uint256,uint256,uint256,uint256,address) (block_number, block_hash, tx_hash, log_index, address, _seq, sender, amount0In, amount1In, amount0Out, amount1Out, to)
+- `pool__sync` - Sync(uint112,uint112) (block_number, block_hash, tx_hash, log_index, address, _seq, reserve0, reserve1)
+- `pool__transfer` - Transfer(address,address,uint256) (block_number, block_hash, tx_hash, log_index, address, _seq, from, to, value)
+- `usdc__approval` - Approval(address,address,uint256) (block_number, block_hash, tx_hash, log_index, address, _seq, owner, spender, value)
+- `usdc__authorization_canceled` - AuthorizationCanceled(address,bytes32) (block_number, block_hash, tx_hash, log_index, address, _seq, authorizer, nonce)
+- `usdc__authorization_used` - AuthorizationUsed(address,bytes32) (block_number, block_hash, tx_hash, log_index, address, _seq, authorizer, nonce)
+- `usdc__blacklisted` - Blacklisted(address) (block_number, block_hash, tx_hash, log_index, address, _seq, _account)
+- `usdc__blacklister_changed` - BlacklisterChanged(address) (block_number, block_hash, tx_hash, log_index, address, _seq, newBlacklister)
+- `usdc__burn` - Burn(address,uint256) (block_number, block_hash, tx_hash, log_index, address, _seq, burner, amount)
+- `usdc__master_minter_changed` - MasterMinterChanged(address) (block_number, block_hash, tx_hash, log_index, address, _seq, newMasterMinter)
+- `usdc__mint` - Mint(address,address,uint256) (block_number, block_hash, tx_hash, log_index, address, _seq, minter, to, amount)
+- `usdc__minter_configured` - MinterConfigured(address,uint256) (block_number, block_hash, tx_hash, log_index, address, _seq, minter, minterAllowedAmount)
+- `usdc__minter_removed` - MinterRemoved(address) (block_number, block_hash, tx_hash, log_index, address, _seq, oldMinter)
+- `usdc__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `usdc__pause` - Pause() (block_number, block_hash, tx_hash, log_index, address, _seq)
+- `usdc__pauser_changed` - PauserChanged(address) (block_number, block_hash, tx_hash, log_index, address, _seq, newAddress)
+- `usdc__rescuer_changed` - RescuerChanged(address) (block_number, block_hash, tx_hash, log_index, address, _seq, newRescuer)
+- `usdc__transfer` - Transfer(address,address,uint256) (block_number, block_hash, tx_hash, log_index, address, _seq, from, to, value)
+- `usdc__un_blacklisted` - UnBlacklisted(address) (block_number, block_hash, tx_hash, log_index, address, _seq, _account)
+- `usdc__unpause` - Unpause() (block_number, block_hash, tx_hash, log_index, address, _seq)
+
+## Live HTTP API (run `nuthatch dev`)
+- `GET /`                    index status
+- `GET /tables`              every table with its columns
+- `GET /table/{name}?limit=N` recent rows of one table (hot + sealed)
+- `GET /entity/{id}`         one row by id (`{block:012}-{logindex:06}`)
+- `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{alias}__{event}`, and each
+                             authored view (`views/*.sql`) answers by its own name
+- `GET /balances?limit=N`    top holder balances (when an ERC-20 Transfer table is present)
+- `GET /balance/{address}`   one address's derived balance
+- `GET /queries`             the mount's SQL mode and the queries its operator declared in
+                             `mounts.toml` (none on an open nest); `GET /q/{name}` runs one
+- `GET /derived`             the nest's incremental entities (`entities.toml`); `GET /derived/{entity}` reads one
+
+## MCP (for coding agents)
+Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, entity,
+balance, top_balances. Fully offline against the local instance; nothing phones home.

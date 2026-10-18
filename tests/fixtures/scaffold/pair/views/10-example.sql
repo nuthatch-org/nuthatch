@@ -1,0 +1,17 @@
+-- views/10-example.sql - an authored derivation this nest computes. Uncomment to enable.
+--
+-- Read-only SQL over your nest's tables (tip ∪ sealed history), recomputed per query. Query it
+-- by name via `nuthatch sql` or the MCP; describe it in semantic.toml `[view.<name>]`.
+--
+-- Footguns (see the builder skill's views.md):
+--   • reserved-word columns like "from"/"to" must be double-quoted
+--   • SUM(<col>_dec) is the values that fit; WHERE NOT <col>_overflow is that sum
+--     ids, nonces and hashes stay raw (`_dec` is NULL for a full-width uint256)
+--
+-- Example over this nest's `uniswap_v2pair__approval` table:
+--
+-- CREATE VIEW uniswap_v2pair_activity AS
+--   SELECT count(*) AS events,
+--          min(block_number) AS first_block,
+--          max(block_number) AS last_block
+--   FROM "uniswap_v2pair__approval";
