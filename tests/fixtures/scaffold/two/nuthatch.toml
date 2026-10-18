@@ -1,0 +1,19 @@
+[nest]
+name = "two"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://ethereum-rpc.publicnode.com"]
+schema_version = 2
+block_timestamps = false
+
+[[contracts]]
+alias = "usdc"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+start_block = 6082465
+abi = "abis/usdc.json"
+
+[[contracts]]
+alias = "pool"
+address = "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc"
+start_block = 10008355
+abi = "abis/pool.json"
