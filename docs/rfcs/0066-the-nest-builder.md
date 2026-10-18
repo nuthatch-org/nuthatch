@@ -95,6 +95,9 @@ the out-of-scope list in `CLAUDE.md` rules out running one. Three ways that stay
 
 The proposal is the first two. The web flow is not built.
 
+**Settled 2026-10-18, Chief: "we dont need a full connect iwth github".** The zip is how a nest leaves the
+tab; the team commits it themselves. S3 is not built unless someone asks for it.
+
 ## 6. AI
 
 A model can draft a view from a sentence, and that is useful here. Non-negotiable 3 allows a local
@@ -132,7 +135,8 @@ model writes reaches stored state (non-negotiable 4).
 - **S2, Index it.** RFC-0065 S6 driven from the page. Gate: for a contract deployed in the last
   week, every segment the tab seals equals the one `nuthatch dev` seals from the downloaded zip, with
   time, bytes and peak memory recorded.
-- **S3, to GitHub.** The token path of §5. Gate: the commit's tree is the zip's, file for file.
+- **S3, to GitHub.** The token path of §5. Gate: the commit's tree is the zip's, file for file. Not
+  built: the zip is enough (§5).
 - **S4, a drafted view.** BYO key or a local model; off by default.
 
 ## 10. Risks
@@ -145,7 +149,8 @@ model writes reaches stored state (non-negotiable 4).
 ## 11. Open questions
 
 1. Whether the builder lives at `/play` beside the published nests, or on its own page.
-2. Whether S3's token path is worth building before a team asks for it, given the zip.
+2. Whether S3's token path is worth building before a team asks for it, given the zip. **Answered:
+   no** (§5).
 
 ## 12. Measured outcome
 
