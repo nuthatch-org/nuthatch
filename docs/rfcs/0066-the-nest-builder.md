@@ -1,6 +1,6 @@
 # RFC-0066: The nest builder - a nest defined, then indexed, in one browser tab
 
-- Status: **Draft, 2026-10-18.** Chief: "a team defines a nest in some sort of 'nest builder' ui page
+- Status: **Accepted 2026-10-18, through S2.** S0 built (#2097, #2098). Chief: "a team defines a nest in some sort of 'nest builder' ui page
   ... and then when they click 'index it' the nest starts indexing right there in the browser."
 - Author: Pete (cargopete)
 - Date: 2026-10-18
