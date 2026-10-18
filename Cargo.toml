@@ -86,6 +86,7 @@ required-features = ["crash-points"]
 Inflector = { version = "0.11.3", optional = true }
 nuthatch-decode = { path = "decode" }
 nuthatch-seal = { path = "seal" }
+nuthatch-identity = { path = "identity" }
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 futures = "0.3"
