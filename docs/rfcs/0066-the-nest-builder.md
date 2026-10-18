@@ -186,7 +186,9 @@ Recorded 2026-10-18, against nuthatch 5.7.1 and burrmill-wasm at `c7ce789`.
   backfill has not sealed, and the head loop fetches only blocks past them.
 - **A memory budget** (burrmill-wasm #8). The heaviest Lodestar view peaks near 2 GiB, which kills a
   phone tab, and watching memory from the page cannot see it: the engine computes for seconds without
-  yielding. The engine now holds a budget, 600 MiB on phones and 3 GiB elsewhere, and refuses a statement
-  over it; refused at 600 MiB, the module stood at 836 MiB and the tab went on answering.
+  yielding. The engine now holds a budget and refuses a statement over it: 600 MiB on phones, and elsewhere
+  2 GiB, nuthatch's budget per active-chain cursor, which a tab following a chain is (burrmill-wasm
+  #12). Refused at 600 MiB, the module stood at 836 MiB and the tab went on answering; under 2 GiB the
+  heaviest Lodestar view completes with the module at 1,956 MiB.
 - **Views are planned as they are typed**, against the declared tables with no data, so the engine's own
   error shows before anything is indexed.
