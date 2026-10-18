@@ -1073,6 +1073,49 @@ abi = "abis/c.json"
         assert_eq!(build_manifest(src.path(), None).unwrap().nid(), clean_nid);
     }
 
+    /// RFC-0066 S0: the identities of fixed nests, pinned before the identity left this crate. A tab
+    /// computes these with the same code, so a moved byte here re-indexes every published nest.
+    #[test]
+    fn the_identity_of_fixed_nests_is_pinned() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        let config = std::fs::read_to_string(a.path().join(CONFIG_FILE)).unwrap();
+        std::fs::write(
+            a.path().join(CONFIG_FILE),
+            format!("{config}\n# kept\n[address_history]\naddresses = [\"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"]\n"),
+        )
+        .unwrap();
+        for (path, text) in [
+            ("views/10-a.sql", "CREATE VIEW a AS SELECT 1;\n"),
+            ("views-old.sql", "-- beside views/, not in it\n"),
+            ("labels/x.json", "{}"),
+            (".gitignore", "data/\n"),
+        ] {
+            let p = a.path().join(path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let got: Vec<_> = [
+            a.path().to_path_buf(),
+            root.join("docs/bench/nests/usdc-120"),
+            root.join("tests/fixtures/upgrade/config-4.0/nest"),
+        ]
+        .iter()
+        .map(|d| {
+            let m = build_manifest(d, None).unwrap_or_else(|e| panic!("{}: {e:#}", d.display()));
+            (m.nid(), m.data_identity())
+        })
+        .collect();
+        let want = [
+            ("a0be1608eff7220aaf762ca91a2b987b15c5ab8127f350d1ef67af150fcd1522", "1bc66ea1d7ce3e8eb21b2e9c1b9156d1688e77d9c1d7d9c7fc767c86add0d1f0"),
+            ("9dd6d3c6a305597bd84e87c8a4b406d8e1b867ff67a066e8537a5ee67ae1adde", "36850efe8751a23007fd87d7b8bd3f17feefb5f6f8dffac6ec2de1d739422139"),
+            ("9fac46172d71472f25f6f8f93d1dc27c995195cff238854a43854210704b33fc", "b52c44602be972b99191267aac8601223b4c4f76a94b044f9ef50759cf3e9274"),
+        ];
+        let want: Vec<_> = want.iter().map(|(n, d)| (n.to_string(), d.to_string())).collect();
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn manifest_is_deterministic_and_pins_the_registry_hash() {
         let a = tempfile::tempdir().unwrap();
