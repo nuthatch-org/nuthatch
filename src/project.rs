@@ -1974,7 +1974,10 @@ mod tests {
                 "{name}"
             );
             for (path, bytes) in &want {
-                assert!(files[path] == *bytes, "{name}: the scaffold's {path} differs");
+                assert!(
+                    files[path] == *bytes,
+                    "{name}: the scaffold's {path} differs"
+                );
             }
 
             let dir = tempfile::tempdir().unwrap();
@@ -1987,7 +1990,10 @@ mod tests {
             let config = Config::load(dir.path()).unwrap();
             write_nest_artifacts(dir.path(), &config.nest.chain, &config).unwrap();
             let got = files_under(dir.path());
-            assert_eq!(got.keys().collect::<Vec<_>>(), want.keys().collect::<Vec<_>>());
+            assert_eq!(
+                got.keys().collect::<Vec<_>>(),
+                want.keys().collect::<Vec<_>>()
+            );
             for (path, bytes) in &want {
                 assert!(got[path] == *bytes, "{name}: the node's {path} differs");
             }

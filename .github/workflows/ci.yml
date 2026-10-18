@@ -251,11 +251,20 @@ jobs:
           cargo fmt --check --manifest-path identity/Cargo.toml
           cargo clippy --locked --all-targets --manifest-path identity/Cargo.toml -- -D warnings
           cargo test --locked --manifest-path identity/Cargo.toml
+      # RFC-0066 S0. The files `init` writes, as contents, so a tab scaffolds the nest a node would;
+      # `project::tests::the_scaffold_writes_what_init_wrote` holds them to real `init` output.
+      - name: fmt · clippy · test (scaffold)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo fmt --check --manifest-path scaffold/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path scaffold/Cargo.toml -- -D warnings
+          cargo test --locked --manifest-path scaffold/Cargo.toml
       # RFC-0065: decode and seal must keep building for a tab. zstd-sys compiles C for the target,
       # which needs a clang with the WebAssembly backend; the runner's LLVM clang has one. Ubuntu's
       # clang also searches the host's /usr/include, which cannot build for wasm: unknown-unknown gets
       # an empty sysroot (zstd-sys brings its own shim headers), wasip2 the WASI one.
-      - name: wasm check (decode, seal, identity)
+      - name: wasm check (decode, seal, identity, scaffold)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
@@ -268,7 +277,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/no-sysroot"
           export CFLAGS_wasm32_unknown_unknown="--sysroot=$RUNNER_TEMP/no-sysroot"
           export CFLAGS_wasm32_wasip2="--sysroot=/usr/share/wasi-sysroot"
-          for crate in decode seal identity; do
+          for crate in decode seal identity scaffold; do
             for target in wasm32-unknown-unknown wasm32-wasip2; do
               cargo check --locked --manifest-path "$crate/Cargo.toml" --target "$target"
             done
