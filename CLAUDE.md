@@ -259,6 +259,17 @@ unconfigured.
 > **S6 accepted 2026-10-18**, Chief: "yes very good i want this": a young contract's backfill in the
 > tab, gated on segment hashes equal to native sealing, as the engine for RFC-0066's nest builder.
 >
+> **RFC-0066 is accepted through S2, and this line is the record RFC-0044 §8 asks for.** Chief
+> accepted [RFC-0066](docs/rfcs/0066-the-nest-builder.md) (the nest builder) on 2026-10-18 ("letsgooooo",
+> after S0 landed in #2097 and #2098). It is a static page beside the playground, not a binary change:
+> a visitor pastes a contract address, the tab scaffolds the nest with `init`'s own code compiled to
+> wasm (`nuthatch-scaffold`, `nuthatch-identity`), shows its NID, and indexes it on RFC-0065 S6's
+> backfill. S1 (the page and a zip out) and S2 (Index it) are authorised in order, each on its own
+> gate: the zip run with `nuthatch dev --dir` reports the NID the page showed, and every segment the
+> tab seals equals the one a node seals from that zip. Nothing of ours is hosted for it; S3 (GitHub)
+> and S4 (a drafted view) wait.
+
+>
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.
 > `docs/frozen-for-2027.md` stands unchanged, with its own rule: reopen one item at a time, naming
 > the new demand or evidence and an acceptance criterion that can fail. Chief separately deferred
