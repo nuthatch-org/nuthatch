@@ -50,6 +50,16 @@ reason = "Only gates the summary error line; the returned count and the quaranti
 # --- Equivalent. ---------------------------------------------------------------------------------
 
 [[survivor]]
+file = "src/seal.rs"
+mutation = "replace || with && in seal_range_with_snapshot"
+reason = """
+The aging pass skips a table when the cut has no time or the table was touched. With `&&` it also
+visits those, and changes nothing: with no cut time `aged` is false, and a touched table's only tail
+was written this cut by `provisional`, which already requires that it has not aged, so the same
+check cannot flip it. The mutant costs a file read and no state.
+"""
+
+[[survivor]]
 file = "src/chunker.rs"
 mutation = "replace > with >= in AdaptiveWindow::served_whole"
 reason = """
