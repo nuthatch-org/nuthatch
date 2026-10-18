@@ -1,7 +1,7 @@
 # RFC-0065: The nest in a tab - a published nest queried, then kept current, in a browser
 
-- Status: **Accepted 2026-10-17, through S5.** S0 to S4 shipped by 2026-10-18; S5 is built in
-  burrmill-wasm#2. Measured outcome in §12. Chief, on the draft: "I like it. Save the plan as an RFC."
+- Status: **Accepted 2026-10-17, through S6.** S0 to S5 shipped by 2026-10-18 (S5 in
+  burrmill-wasm#2); S6, added 2026-10-18, is not started. Measured outcome in §12. Chief, on the draft: "I like it. Save the plan as an RFC."
 - Author: Pete (cargopete)
 - Date: 2026-10-16
 - Depends on: RFC-0052 (the mirrored nest: `manifest.json`, `schema.json`, content-addressed
@@ -135,7 +135,8 @@ and by whoever sealed it, which is no change from today.
 - **Not the WASM transform layer.** Chief removed it on 2026-10-08 (#1999). This RFC runs
   nuthatch's own decoder and engine in a browser; it adds no handler layer, no components and no
   wasmtime, and nothing here touches the binary's derivation path.
-- Full history ingest in a tab. History comes from a mirror.
+- ~~Full history ingest in a tab. History comes from a mirror.~~ S6 backfills a young contract in the
+  tab (Chief, 2026-10-18), for RFC-0066's nest builder. A mature nest's history still comes from a mirror.
 - Cloudflare Workers or other edge runtimes. 128 MB per isolate rules out Burrmill; a decode-and-seal
   Worker would compile but the native binary does that job more cheaply.
 - Publishing what a tab seals. A tab-sealed segment is a local cache that happens to be
@@ -179,6 +180,12 @@ and by whoever sealed it, which is no change from today.
   cannot verify is not sealed below; a log altered in the RPC response is refused; for blocks marked complete, a log removed from the response is detected; peak memory with
   Helios and Burrmill together recorded. The page says which blocks are complete and which are only
   included.
+- **S6, a backfill in the tab.** A nest with no published history, indexed from its deploy block in the
+  tab: the live tail's fetch over a longer range, sealed by the same sealer. History older than
+  EIP-2935's 8,191 blocks is sealed on two RPCs agreeing, and the page says so. Gate: for a real
+  contract deployed in the last week, every segment the tab seals equals the one native `nuthatch
+  dev` seals for the same range, with the time and bytes it took recorded. A contract whose history
+  public RPCs will not serve is a finding, not a pass.
 
 ## 10. Risks
 
@@ -224,6 +231,10 @@ hash, and every sealed log must name a block hash on that chain. The bloom does 
   forged or missing header, a log off the chain, and a log altered, added or left out against real
   receipts. Mutating either check turns a case red. Live, from the same seed: 5,260 headers hash
   down to Helios's block 26,218,447, and the 8 segments still equal the mirror's.
+- **In a browser.** Chrome, resumed from the same seed against a local copy of the mirror frozen at
+  it, sealed 21 segments through block 26,218,587 below Helios's block 26,218,606. Pointed at the live
+  mirror once the nest had sealed that far, the tab found all 21 published with the same hashes.
+  Shipped in burrmill-wasm#2.
 - **Memory.** One sample each in Chrome, by `measureUserAgentSpecificMemory`: 261 MiB for the tab
   with Helios, against 250 without it. Helios's own wasm memory is 2 to 3 MiB.
 - **Cost.** Public RPCs serve about 26 headers a second, so a seal span's headers take about 70 s.
