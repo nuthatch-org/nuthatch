@@ -3,6 +3,7 @@
 //! Correctness-critical decoding lives elsewhere; this is just acquisition.
 
 use anyhow::{anyhow, bail, Context, Result};
+use nuthatch_scaffold::resolve::{parse_sourcify, sourcify_contract_name};
 use serde_json::Value;
 
 /// An ABI plus which resolver produced it, so a caller with a presentation layer (`init`/`add`'s
@@ -175,33 +176,6 @@ async fn sourcify(chain_id: u64, address: &str) -> Result<(Value, Option<String>
         .await
         .context("Sourcify response was not JSON")?;
     Ok((parse_sourcify(&body)?, sourcify_contract_name(&body)))
-}
-
-/// Sourcify v2's contract identifier - the verified contract's name, not an ABI field. Used as the
-/// default alias when `init`/`add` are not given `--alias` (#774).
-///
-/// Read from `compilation.name`, where the v2 schema keeps it today, and from the top-level `name`
-/// it used to be at (#1138) - the second because the field has moved once already and the alias is a
-/// hint, so the cheap thing is to accept either rather than break on the next move.
-fn sourcify_contract_name(body: &Value) -> Option<String> {
-    // The first *usable* value, not the first present one: an empty or non-string
-    // `compilation.name` must not shadow a legacy top-level name that is fine.
-    [body.pointer("/compilation/name"), body.get("name")]
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .find(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-/// The ABI out of a Sourcify v2 response body - split from the request so it is testable against
-/// fixtures rather than only against the live service (the network half has no interesting logic; this
-/// half decides whether we accept what we were handed).
-fn parse_sourcify(body: &Value) -> Result<Value> {
-    body.get("abi")
-        .filter(|a| a.is_array())
-        .cloned()
-        .ok_or_else(|| anyhow!("Sourcify had no ABI for this contract"))
 }
 
 /// Keyless Blockscout API roots we have independently verified. Do not guess a host for a chain:

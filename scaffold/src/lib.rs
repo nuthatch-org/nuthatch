@@ -10,6 +10,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use nuthatch_decode::registry::{ContractSpec, DecodeRegistry, TableSchema};
 use serde::Serialize;
 
+pub mod resolve;
 pub mod semantic;
 
 /// One contract as `init` resolved it.
