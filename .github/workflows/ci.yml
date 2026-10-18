@@ -242,11 +242,20 @@ jobs:
           cargo fmt --check --manifest-path seal/Cargo.toml
           cargo clippy --locked --all-targets --manifest-path seal/Cargo.toml -- -D warnings
           cargo test --locked --manifest-path seal/Cargo.toml
+      # RFC-0066 S0. The nest identity from its files' bytes, so a tab gets the NID a node gives the
+      # same nest; `blob::tests::the_identity_of_fixed_nests_is_pinned` in the root crate holds the hashes.
+      - name: fmt · clippy · test (identity)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo fmt --check --manifest-path identity/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path identity/Cargo.toml -- -D warnings
+          cargo test --locked --manifest-path identity/Cargo.toml
       # RFC-0065: decode and seal must keep building for a tab. zstd-sys compiles C for the target,
       # which needs a clang with the WebAssembly backend; the runner's LLVM clang has one. Ubuntu's
       # clang also searches the host's /usr/include, which cannot build for wasm: unknown-unknown gets
       # an empty sysroot (zstd-sys brings its own shim headers), wasip2 the WASI one.
-      - name: wasm check (decode, seal)
+      - name: wasm check (decode, seal, identity)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
@@ -259,7 +268,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/no-sysroot"
           export CFLAGS_wasm32_unknown_unknown="--sysroot=$RUNNER_TEMP/no-sysroot"
           export CFLAGS_wasm32_wasip2="--sysroot=/usr/share/wasi-sysroot"
-          for crate in decode seal; do
+          for crate in decode seal identity; do
             for target in wasm32-unknown-unknown wasm32-wasip2; do
               cargo check --locked --manifest-path "$crate/Cargo.toml" --target "$target"
             done
