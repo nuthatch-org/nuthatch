@@ -247,7 +247,7 @@ unconfigured.
 > gated to stay lightweight. Only address-free data such as timestamp to block is hosted. Seven slices,
 > each gated on Etherscan parity, MEV from the relays included.
 >
-> **RFC-0065 is accepted through S5, and this line is the record RFC-0044 §8 asks for.** Chief
+> **RFC-0065 is accepted through S6, and this line is the record RFC-0044 §8 asks for.** Chief
 > accepted [RFC-0065](docs/rfcs/0065-the-nest-in-a-tab.md) (the nest in a tab) on 2026-10-17. It
 > runs nuthatch's core somewhere new: decode, sealing and Burrmill compiled to WebAssembly in a
 > browser worker, following a chain from an RPC. S0 and S1 are done (#2083): defi-pulse-nest is the
@@ -256,6 +256,8 @@ unconfigured.
 > uses, so a tab and a node seal the same bytes. The tab seals nothing until two independent RPCs
 > agree on a finalized block hash, and every segment it seals must hash to the one on the mirror.
 > Until S5's light client verifies the head, the page says plainly that it trusts its RPCs.
+> **S6 accepted 2026-10-18**, Chief: "yes very good i want this": a young contract's backfill in the
+> tab, gated on segment hashes equal to native sealing, as the engine for RFC-0066's nest builder.
 >
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.
 > `docs/frozen-for-2027.md` stands unchanged, with its own rule: reopen one item at a time, naming
