@@ -872,7 +872,7 @@ pub struct DecodeRegistry {
 /// **Reserved regardless of the `block_timestamps` flag.** A timestamp-free nest does not carry that
 /// column today, but flipping the flag is supported (RFC-0029 §6b) and would otherwise turn a
 /// working nest into a colliding one at the worst possible moment.
-fn reserved_column_names() -> &'static [&'static str] {
+pub fn reserved_column_names() -> &'static [&'static str] {
     &[
         "block_number",
         "block_hash",
@@ -919,17 +919,28 @@ fn refuse_reserved_parameter_names(
         if !allowlist.is_empty() && !allowlist.iter().any(|a| a == &ev.name) {
             continue;
         }
-        for input in &ev.inputs {
-            if reserved_column_names().contains(&input.name.as_str()) {
+        // The resolved column names, after `_hash` and `arg{i}`, are what `to_json` writes (#2159).
+        let columns = EventDecoder::new(who, Address::ZERO, ev.clone()).columns;
+        let mut seen = HashSet::with_capacity(columns.len());
+        for c in &columns {
+            if !seen.insert(c.name.as_str()) {
                 bail!(
-                    "{what} '{who}' declares event '{}' with a parameter named '{}', which is a \
-                     column nuthatch adds to every row. Indexing it would silently replace the \
+                    "{what} '{who}' declares event '{}' with two parameters that both become column \
+                     '{}'. One would silently replace the other in every stored row.",
+                    ev.name,
+                    c.name,
+                );
+            }
+            if reserved_column_names().contains(&c.name.as_str()) {
+                bail!(
+                    "{what} '{who}' declares event '{}' with a parameter stored as column '{}', which \
+                     is a column nuthatch adds to every row. Indexing it would silently replace the \
                      chain's own value with the event's - the block number in the stored row would \
                      be the event's parameter, not the block it came from (#814). Reserved names: \
                      {}. There is no safe automatic rename: the column name is part of the query \
                      surface that views, `entities.toml` and any published schema already depend on.",
                     ev.name,
-                    input.name,
+                    c.name,
                     reserved_column_names().join(", "),
                 );
             }
@@ -1693,6 +1704,41 @@ mod stored_roundtrip {
                  several ABIs cannot tell which to open; got: {msg}"
             );
         }
+    }
+
+    /// #2159: the refusal checks the column name a parameter resolves to, not the ABI's raw name. An
+    /// indexed `string block` becomes `block_hash`, and an unnamed parameter becomes `arg{i}`.
+    #[test]
+    fn a_resolved_column_name_that_collides_is_refused() {
+        let build = |inputs: &str| {
+            let abi = format!(
+                r#"[{{"type":"event","name":"Odd","anonymous":false,"inputs":[{inputs}]}}]"#
+            );
+            match DecodeRegistry::build(vec![ContractSpec {
+                alias: "x".into(),
+                address: Address::from([0x11; 20]),
+                abi: serde_json::from_str(&abi).expect("parse ABI"),
+                events: Vec::new(),
+            }]) {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => String::new(),
+            }
+        };
+        let msg = build(r#"{"name":"block","type":"string","indexed":true}"#);
+        assert!(
+            msg.contains("block_hash") && msg.contains("Odd"),
+            "got: {msg}"
+        );
+        let msg = build(
+            r#"{"name":"","type":"uint256","indexed":false},
+               {"name":"arg0","type":"uint256","indexed":false}"#,
+        );
+        assert!(msg.contains("arg0") && msg.contains("Odd"), "got: {msg}");
+        let msg = build(
+            r#"{"name":"label","type":"string","indexed":true},
+               {"name":"label_hash","type":"bytes32","indexed":false}"#,
+        );
+        assert!(msg.contains("label_hash"), "got: {msg}");
     }
 
     /// #1437: a decoded table inside `offchain__` would be replaced by an offchain view of the same
