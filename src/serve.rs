@@ -998,7 +998,9 @@ async fn serve_until(
     grace: Duration,
 ) {
     let (stop, stopping) = tokio::sync::watch::channel(false);
-    let app = app.layer(axum::Extension(Stopping(stopping)));
+    let app = app
+        .layer(axum::Extension(Stopping(stopping)))
+        .layer(tower::util::MapRequestLayer::new(host_from_authority));
     // Not `axum::serve`: it gives hyper no timer, so the header-read timeout never fires (#1660).
     let mut http = hyper::server::conn::http1::Builder::new();
     http.timer(hyper_util::rt::TokioTimer::new())
@@ -1098,8 +1100,22 @@ fn admin_authorized(state: &AppState, q: &AdminQuery, headers: &axum::http::Head
     token_ok(state.admin_token.as_deref(), q.token.as_deref(), headers)
 }
 
+/// An HTTP/2 request names its target in `:authority` and an absolute-form one in its URI, and the
+/// target overrides `Host` (RFC 9112 §3.2.2), so the URI's authority is what [`token_ok`] must see.
+pub fn host_from_authority<B>(mut req: axum::http::Request<B>) -> axum::http::Request<B> {
+    if let Some(v) = req
+        .uri()
+        .authority()
+        .and_then(|a| axum::http::HeaderValue::from_str(a.as_str()).ok())
+    {
+        req.headers_mut().insert(axum::http::header::HOST, v);
+    }
+    req
+}
+
 /// A DNS-rebinding page reaches 127.0.0.1 same-origin under its own hostname, so the open surface
-/// answers only a loopback `Host` and, when present, a loopback `Origin` (#2136).
+/// answers only a loopback `Host` and, when present, a loopback `Origin` (#2136). A request with no
+/// `Host` is refused: every server path fills it from the URI authority when one was sent.
 fn addressed_to_loopback(headers: &axum::http::HeaderMap) -> bool {
     let loopback = |authority: &str| {
         let host = match authority.strip_prefix('[') {
@@ -1116,7 +1132,7 @@ fn addressed_to_loopback(headers: &axum::http::HeaderMap) -> bool {
             .get(name)
             .map(|v: &axum::http::HeaderValue| v.to_str().unwrap_or(""))
     };
-    header(axum::http::header::HOST).is_none_or(loopback)
+    header(axum::http::header::HOST).is_some_and(loopback)
         && header(axum::http::header::ORIGIN).is_none_or(|o| {
             o.split_once("://")
                 .is_some_and(|(_, authority)| loopback(authority))
@@ -9141,7 +9157,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
         let no_tok = || Query(AdminQuery { token: None });
-        let no_hdr = axum::http::HeaderMap::new;
+        let no_hdr = || {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(axum::http::header::HOST, "127.0.0.1:8288".parse().unwrap());
+            h
+        };
 
         // Localhost (admin_token None): open.
         let resp = admin_index(State(state.clone()), no_tok(), no_hdr())
@@ -9299,7 +9319,28 @@ mod tests {
                 "{host} is loopback"
             );
         }
-        assert!(token_ok(None, None, &hdr(&[])), "no Host is no browser");
+        assert!(
+            !token_ok(None, None, &hdr(&[])),
+            "no Host and no authority names no target, so it is refused"
+        );
+        let h2 = host_from_authority(
+            axum::http::Request::get("http://attacker.example:8288/_admin/")
+                .body(())
+                .unwrap(),
+        );
+        assert!(
+            !token_ok(None, None, h2.headers()),
+            "an HTTP/2 or absolute-form target must be checked like a Host"
+        );
+        let mut abs = axum::http::Request::get("http://attacker.example/")
+            .body(())
+            .unwrap();
+        abs.headers_mut()
+            .insert(HOST, axum::http::HeaderValue::from_static("127.0.0.1:8288"));
+        assert!(
+            !token_ok(None, None, host_from_authority(abs).headers()),
+            "the request target overrides a loopback Host"
+        );
         assert!(token_ok(
             None,
             None,
@@ -9520,7 +9561,11 @@ mod tests {
             admin_events(
                 State(state.clone()),
                 tok(None),
-                axum::http::HeaderMap::new(),
+                {
+                    let mut h = axum::http::HeaderMap::new();
+                    h.insert(axum::http::header::HOST, "127.0.0.1:8288".parse().unwrap());
+                    h
+                },
                 None
             )
             .await

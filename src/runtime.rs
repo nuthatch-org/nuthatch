@@ -7251,6 +7251,7 @@ mod tests {
             (dir.path().to_path_buf(), "joining".to_string()),
             Arc::new(move || {
                 let req = axum::http::Request::delete(&uri)
+                    .header(axum::http::header::HOST, "127.0.0.1")
                     .body(axum::body::Body::empty())
                     .unwrap();
                 let resp = tokio::task::block_in_place(|| {
@@ -7297,6 +7298,7 @@ mod tests {
         failed.reason = Some("refused".into());
         jobs.put(failed).unwrap();
         let req = axum::http::Request::delete(format!("/_admin/datasets/{nid}"))
+            .header(axum::http::header::HOST, "127.0.0.1")
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = lifecycle_routes(handles, jobs, true, None)
