@@ -77,8 +77,9 @@ WorkingDirectory=/var/lib/nuthatch/mynest        # the nest directory (holds nut
 ExecStart=/usr/local/bin/nuthatch dev --listen 127.0.0.1:8288 --seal-direct --concurrency 8
 Restart=on-failure
 RestartSec=5
-# Remote admin is OFF as written: the bind above is localhost, so the admin UI needs no token.
-# To enable it you must change the bind AND choose a token: generate one, never paste a literal:
+# Remote admin is OFF as written: the bind above is localhost and no token is set, so the admin UI
+# answers only requests addressed to loopback. To reach it through a reverse proxy, set a token; it is
+# then required on this bind too. Generate one, never paste a literal:
 #   Environment=NUTHATCH_ADMIN_TOKEN=<openssl rand -hex 32>
 # Keep it inside the footprint budget; the box needs headroom for analytical queries.
 MemoryMax=2G
@@ -674,7 +675,7 @@ SQL surfaces). Full key reference:
 
 | Variable | Purpose |
 |---|---|
-| `NUTHATCH_ADMIN_TOKEN` | required for the admin UI when bound off-localhost; presented as `?token=` or `Authorization: Bearer` |
+| `NUTHATCH_ADMIN_TOKEN` | when set, required for the admin surface on every bind, localhost included; needed to serve it at all off-localhost; presented as `?token=` or `Authorization: Bearer` |
 | `NUTHATCH_SQL_MEMO_BYTES` | ceiling on the analytical memo's remembered rows, in serialized bytes (default 64 MiB; `0` turns it off). See *The analytical memo* under capacity and sizing. |
 | `NUTHATCH_CALL_BODY_CONCURRENCY` | block-body batches (20 blocks each) fetched at once for `top_level_calls` (default 4, ceiling 10). Memory stays one 200-block chunk of bodies whatever the value. On `--seal-direct` it multiplies with `--concurrency`, since each window fetches its own bodies. |
 
@@ -1005,8 +1006,11 @@ with the reason rather than reporting on sealed data alone, which would bind aga
 schema than a following `/sql` would see. Anywhere you bound `/sql`, bound `/explain` with it: a
 guard on one and not the other leaves the cheaper-looking route as the expensive one.
 
-**Admin surface.** Off-localhost the admin UI requires `NUTHATCH_ADMIN_TOKEN` on every request; token
-comparison is constant-time. `--no-admin` removes the routes entirely rather than merely gating them.
+**Admin surface.** A set `NUTHATCH_ADMIN_TOKEN` is required on every request, on every bind, localhost
+included (#2132); off-localhost the routes are not served without one. Token comparison is
+constant-time. With no token, a localhost bind answers only requests whose `Host` (and `Origin`, if
+sent) is a loopback name or address, so a DNS-rebinding page cannot reach it (#2136). `--no-admin`
+removes the routes entirely rather than merely gating them.
 
 **`/metrics` and `/health` are unauthenticated by design.** Scope them to your internal network at the
 gateway if you do not want them public.
@@ -1102,13 +1106,16 @@ If you need it, generate the token. Never copy a literal out of documentation, i
 openssl rand -hex 32
 ```
 
-Set it as `NUTHATCH_ADMIN_TOKEN`, keep the published port on `127.0.0.1`, reach it through a reverse
-proxy with TLS, and treat the value as a credential: not in shell history, not in a committed compose
-file, and not in a world-readable unit file (`chmod 600`, or `EnvironmentFile=` pointing at a
-root-owned file).
+Set it as `NUTHATCH_ADMIN_TOKEN`, keep the published port (Docker) or the bind (systemd) on
+`127.0.0.1`, reach it through a reverse proxy with TLS, and treat the value as a credential: not in
+shell history, not in a committed compose file, and not in a world-readable unit file (`chmod 600`,
+or `EnvironmentFile=` pointing at a root-owned file).
 
 Two things worth knowing first:
 
+- **The token is required on a localhost bind too.** Behind a proxy every request arrives from
+  loopback, so the token is what gates it; a localhost bind with no token refuses any request whose
+  `Host` is not loopback, which includes everything your proxy forwards under a public name.
 - **Setting a token also removes a refusal.** `nuthatch` declines to serve the admin routes
   off-localhost *unless* a token is set. So setting one is not purely "adding auth", it also lifts
   the guard that was protecting you. Correct behaviour, but it means the token is the only thing
