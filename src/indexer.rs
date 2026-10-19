@@ -25318,7 +25318,7 @@ rpc_urls = ["https://rpc.example"]
                 balances: &balances,
                 exposure: &exposure_v,
                 velocity: &VelocityView::start(false).unwrap(),
-                velocity_window: None,
+                velocity_cfg: None,
             },
         )
         .unwrap();
