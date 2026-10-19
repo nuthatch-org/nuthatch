@@ -16,6 +16,8 @@
 //!                           `value_from_dynsol` (COR-11 guard, nuthatch#290); no uint narrower than
 //!                           256 appears in any other fixture so that branch was structurally
 //!                           unreachable before this fixture was added (nuthatch#612)
+//!   - `fuzz__narrow_int`    indexed and non-indexed `int64` - the signed `bits <= 64` branch, whose
+//!                           `as_i64()` panicked on any word outside `i64` (#2148)
 //!
 //! `topic0` is left fixed per fixture (the registry has already resolved it; it is not the part of
 //! a log an attacker or a byzantine RPC provider controls) - everything else is fuzzed.
@@ -106,6 +108,15 @@ fn build_registry() -> DecodeRegistry {
                 {"name": "id", "type": "uint64", "indexed": false},
             ],
         },
+        {
+            "type": "event",
+            "name": "NarrowInt",
+            "anonymous": false,
+            "inputs": [
+                {"name": "t", "type": "int64", "indexed": true},
+                {"name": "v", "type": "int64", "indexed": false},
+            ],
+        },
     ]);
     let abi: alloy_json_abi::JsonAbi = serde_json::from_value(events).unwrap();
     let spec = ContractSpec {
@@ -145,6 +156,7 @@ enum Fixture {
     HugeArray,
     Deep,
     Narrow,
+    NarrowInt,
 }
 
 impl Fixture {
@@ -156,6 +168,7 @@ impl Fixture {
             Self::HugeArray => "fuzz__huge_array",
             Self::Deep => "fuzz__deep",
             Self::Narrow => "fuzz__narrow",
+            Self::NarrowInt => "fuzz__narrow_int",
         }
     }
 }

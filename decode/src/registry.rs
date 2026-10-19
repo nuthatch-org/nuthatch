@@ -1307,7 +1307,12 @@ pub fn value_from_dynsol(dv: &DynSolValue, col: &Column) -> Value {
         }
         DynSolValue::Int(i, bits) => {
             if *bits <= 64 {
-                Value::I64(i.as_i64())
+                // Saturate as the uint arm does (#2148): every value that fits `i64` is unchanged.
+                Value::I64(i64::try_from(*i).unwrap_or(if i.is_negative() {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }))
             } else if *bits <= 128 {
                 Value::IWord16(i.to_be_bytes::<32>()[16..].try_into().unwrap())
             } else {
@@ -2942,6 +2947,36 @@ mod tests {
         assert_eq!(row.params[0].0, "v");
         // Saturated, not truncated/masked - the guard's documented behaviour.
         assert_eq!(row.params[0].1, Value::U64(u64::MAX));
+    }
+
+    /// The int arm of COR-11 (#2148): alloy detokenizes every `int<N>` as a full 256-bit word with no
+    /// sign-extension check, so an `int64` word that does not fit `i64` panicked `as_i64()`.
+    #[test]
+    fn an_out_of_range_sub64_int_saturates_instead_of_panicking() {
+        const ODD: &str = r#"[
+            {"type":"event","name":"Odd","anonymous":false,"inputs":[
+                {"name":"t","type":"int64","indexed":true},
+                {"name":"v","type":"int64","indexed":false}]}
+        ]"#;
+        let reg = DecodeRegistry::build(vec![spec("odd", USDC, ODD)]).unwrap();
+        let topic0 = format!("0x{}", hex::encode(reg.tables()[0].topic0));
+        let decode = |topic: String, data: String| {
+            let l = log(USDC, &[&topic0, &topic], &data, 1, 0);
+            reg.decode(&l)
+                .expect("an out-of-range int64 must not panic decoding")
+                .expect("topic0/address both match the fixture")
+                .params
+        };
+        let high = format!("0x01{}", "00".repeat(31));
+        let low = format!("0x80{}", "00".repeat(31));
+        let p = decode(high.clone(), low);
+        assert_eq!(p[0].1, Value::I64(i64::MAX));
+        assert_eq!(p[1].1, Value::I64(i64::MIN));
+        // A conformant negative still decodes to itself.
+        let minus_five = format!("0x{}fb", "ff".repeat(31));
+        let p = decode(minus_five.clone(), minus_five);
+        assert_eq!(p[0].1, Value::I64(-5));
+        assert_eq!(p[1].1, Value::I64(-5));
     }
 
     /// Prove the fuzz/fuzz_targets/decode_log.rs fixture ABI parses and that `decode` is actually
