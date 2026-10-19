@@ -6689,7 +6689,7 @@ impl NestIngest {
                 .get_meta(SEALED_THROUGH_KEY)?
                 .and_then(|s| s.parse::<u64>().ok());
             let resume_from = resume_from_watermark(sealed_watermark, origin);
-            if resume_from <= finalized_through {
+            let sealed_to = if resume_from <= finalized_through {
                 // Record where the backfill *began* once; a resume keeps the original origin.
                 if self.store.get_meta(START_BLOCK_KEY)?.is_none() {
                     self.store.set_meta(START_BLOCK_KEY, &origin.to_string())?;
@@ -6811,11 +6811,18 @@ impl NestIngest {
                 let _ = sealed;
                 prog.finish(finalized_through, false);
                 self.metrics.end_seal_direct();
-                publish_direct_seal(&self.metrics, self.store.as_ref(), finalized_through)?;
+                Some(finalized_through)
+            } else {
+                // A prior run sealed through finality and died before `last_block` (#2242).
+                sealed_watermark
+            };
+            if let Some(sealed_to) = sealed_to {
+                publish_direct_seal(&self.metrics, self.store.as_ref(), sealed_to)?;
                 // The first tip window's reorg walk needs a checkpoint at the watermark (#2175).
-                pin_checkpoint(self.store.as_ref(), source, finalized_through).await?;
+                pin_checkpoint(self.store.as_ref(), source, sealed_to).await?;
+                crate::crash::point("seal-direct:before-last-block");
                 self.store
-                    .set_meta(LAST_BLOCK_KEY, &finalized_through.to_string())?;
+                    .set_meta(LAST_BLOCK_KEY, &sealed_to.to_string())?;
                 if let Err(e) = rebuild_views(
                     &self.dir,
                     &self.store,
@@ -6837,7 +6844,7 @@ impl NestIngest {
                         &self.store,
                         &self.dir,
                         &self.webhooks,
-                        finalized_through,
+                        sealed_to,
                     ) {
                         tracing::warn!("webhook delivery after seal-direct failed: {e:#}");
                     }
