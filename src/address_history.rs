@@ -2090,7 +2090,20 @@ impl AddressHistory {
             for (table, tag) in [(TX_INTERNAL, TX_INTERNAL_TAG), (TX_CACHE, TX_CACHE_TAG)] {
                 let mut t = wtx.open_table(table)?;
                 let stale = match &reorged {
-                    Some(keys) => tagged(keys, tag),
+                    // An index key outlives a re-cache at a lower block, so the record decides.
+                    Some(keys) => {
+                        let mut stale = Vec::new();
+                        for k in tagged(keys, tag) {
+                            let above = match t.get(k.as_slice())? {
+                                Some(v) => cached_block(v.value())? > block,
+                                None => false,
+                            };
+                            if above {
+                                stale.push(k);
+                            }
+                        }
+                        stale
+                    }
                     None => {
                         let mut stale = Vec::new();
                         for e in t.iter()? {
@@ -3452,6 +3465,31 @@ mod tests {
                 .starts_with("NUTHATCH_UNSUPPORTED:"),
             "{none}"
         );
+    }
+
+    /// A transaction cached at 105 and re-cached at 90 keeps its 105 index key; a reorg back to 100
+    /// must read the record's block, not the key's, and keep the copy.
+    #[test]
+    fn a_reorg_keeps_a_cached_transaction_re_cached_under_the_fork() {
+        let (_d, h) = history();
+        h.finalize(80).unwrap();
+        for block in [105, 90] {
+            let g = h.generation().unwrap();
+            h.persist_pending(
+                &[(vec![1; 32], tx(block, 0).record)],
+                &[],
+                &[],
+                &[],
+                &[],
+                g,
+                None,
+                true,
+            )
+            .unwrap();
+        }
+        h.invalidate_above(100).unwrap();
+        let kept = h.cached_tx(&[1; 32]).unwrap().expect("cached at 90");
+        assert_eq!(kept["blockNumber"], "90");
     }
 
     /// #2117: a reorg reads what it takes back from a block-first index. A store written before the
