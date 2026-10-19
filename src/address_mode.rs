@@ -910,7 +910,7 @@ async fn hold_hash(
             bail!(why);
         }
         if missing {
-            bail!("block {block} could not be read from every main endpoint");
+            bail!("block {block} could not be read from the main endpoints");
         }
     }
     Ok(())
@@ -1379,6 +1379,12 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                     break;
                 }
             };
+            // A pace made again by a round under way when its account was unwatched goes now.
+            state
+                .backfill_paces
+                .lock()
+                .unwrap()
+                .retain(|a, _| round.binary_search(a).is_ok());
             let mut advanced = false;
             for address in round {
                 if Instant::now() >= budget {
@@ -1867,8 +1873,10 @@ async fn mev_passes<M: Rpc, T: Rpc>(
     };
     let _pass = state.begin_pass("mev");
     let now = unix_now();
-    let passes = async {
-        for a in watched {
+    let mut failed = false;
+    // One address's failing step is that address's: the others' produced blocks and the re-asks go on.
+    for a in watched {
+        let one = async {
             loop {
                 yield_cursor(state, d).await;
                 // Blocks covered in all, so a step that starts the coverage or joins two spans counts
@@ -1908,7 +1916,16 @@ async fn mev_passes<M: Rpc, T: Rpc>(
             {
                 tracing::info!("address history: {a} produced blocks covered through {t}");
             }
+            Ok::<_, anyhow::Error>(())
+        };
+        if let Err(e) = one.await {
+            failed = true;
+            tracing::warn!(
+                "address history: MEV pass for {a} not recorded, retrying next poll: {e:#}"
+            );
         }
+    }
+    let reasks = async {
         loop {
             yield_cursor(state, d).await;
             let more =
@@ -1919,9 +1936,12 @@ async fn mev_passes<M: Rpc, T: Rpc>(
         }
         Ok::<_, anyhow::Error>(())
     };
-    if let Err(e) = passes.await {
+    if let Err(e) = reasks.await {
+        failed = true;
+        tracing::warn!("address history: relay re-asks not recorded, retrying next poll: {e:#}");
+    }
+    if failed {
         state.window_failed();
-        tracing::warn!("address history: MEV pass not recorded, retrying next poll: {e:#}");
     }
     state.set_calls("main", d.main.calls());
 }
@@ -3479,7 +3499,7 @@ async fn wanted(s: &Arc<ModeState>, q: &HashMap<String, String>, answer: &Value)
                 }
                 _ => None,
             };
-            let watched = h.watched()?.contains(&who);
+            let watched = h.is_watched(&who)?;
             if watched && Need::of(action) != Need::Discovered {
                 // Here rather than in `cover`: a request beyond reach never gets that far, and its
                 // address must still join the background body scan.
@@ -3907,24 +3927,36 @@ async fn watch_many(s: Arc<ModeState>, addresses: Vec<String>) -> (StatusCode, J
 }
 
 async fn change(s: Arc<ModeState>, address: String, add: bool) -> (StatusCode, Json<Value>) {
-    if let Err(e) = crate::address_history::parse_address(&address) {
-        return failed(StatusCode::BAD_REQUEST, format!("address `{address}`: {e}"));
-    }
+    let key = match crate::address_history::parse_address(&address) {
+        Ok(a) => format!("0x{}", alloy_primitives::hex::encode(a)),
+        Err(e) => return failed(StatusCode::BAD_REQUEST, format!("address `{address}`: {e}")),
+    };
+    // Answered with counts, as a batch is: the whole set would be megabytes per call (#2117).
     let done = blocking(&s, move |h| {
+        let was = h.is_watched(&address)?;
         if add {
             h.watch(&address)?;
         } else {
             h.unwatch(&address)?;
         }
-        h.watched()
+        Ok((usize::from(was != add), h.watched_count()?))
     })
     .await;
-    match done.and_then(|w| watch_list(&s, w)) {
-        Ok(v) => {
-            if add {
-                s.wake.notify_one();
-            }
-            (StatusCode::OK, Json(v))
+    match done {
+        Ok((changed, watched)) if add => {
+            s.wake.notify_one();
+            (
+                StatusCode::OK,
+                Json(json!({ "added": changed, "watched": watched })),
+            )
+        }
+        Ok((changed, watched)) => {
+            // A kept pace would hold the account's old backoff and failure, in `/ready` too (#2124).
+            s.backfill_paces.lock().unwrap().remove(&key);
+            (
+                StatusCode::OK,
+                Json(json!({ "removed": changed, "watched": watched })),
+            )
         }
         Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
@@ -3998,7 +4030,7 @@ async fn ready(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
         .or_else(|| s.cursor_error.lock().expect("cursor_error lock").clone());
     let st = s.clone();
     match blocking(&s, move |h| {
-        Ok((h.head()?, h.watched()?.len(), served_through(&st, h)?))
+        Ok((h.head()?, h.watched_count()?, served_through(&st, h)?))
     })
     .await
     {
@@ -4066,7 +4098,7 @@ async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
             s.set_calls(endpoint, calls);
         }
     }
-    let (head, watched) = match blocking(&s, |h| Ok((h.head()?, h.watched()?.len()))).await {
+    let (head, watched) = match blocking(&s, |h| Ok((h.head()?, h.watched_count()?))).await {
         Ok((head, watched)) => (head.unwrap_or(0), watched),
         Err(e) => {
             return (
@@ -4166,18 +4198,24 @@ pub fn move_aside_pre_finality(
     if !path.exists() {
         return Ok(configured.to_vec());
     }
-    // The lock redb takes, held through the move, so a nest still running on this store is refused
-    // rather than left writing to the copy kept aside.
-    let held = std::fs::File::open(path)?;
-    held.try_lock().map_err(|_| {
+    let in_use = || {
         anyhow::anyhow!(
             "{} is open in another process; stop it first",
             path.display()
         )
-    })?;
-    let Some(accounts) = probe_copy(path)? else {
+    };
+    let Some(accounts) =
+        probe(path).map_err(|e| match e.downcast_ref::<redb::DatabaseError>() {
+            Some(redb::DatabaseError::DatabaseAlreadyOpen) => in_use(),
+            _ => e,
+        })?
+    else {
         return Ok(configured.to_vec());
     };
+    // The lock redb takes, held through the move, so a nest still running on this store is refused
+    // rather than left writing to the copy kept aside.
+    let held = std::fs::File::open(path)?;
+    held.try_lock().map_err(|_| in_use())?;
     // The replacement is built beside the old store, its accounts and removals committed, before
     // anything is moved: a crash at any step leaves the old store where it was, or linked at both
     // names.
@@ -4234,14 +4272,25 @@ fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
     p.into()
 }
 
-/// [`crate::address_history::pre_finality`] on a copy, so opening it, which redb may write to,
-/// never touches the store itself.
-fn probe_copy(path: &Path) -> Result<Option<crate::address_history::Accounts>> {
-    let probe = with_suffix(path, ".probe");
-    std::fs::copy(path, &probe)?;
-    let found = crate::address_history::pre_finality(&probe);
-    std::fs::remove_file(&probe)?;
-    found
+/// [`crate::address_history::pre_finality`] on the store itself, and only on a copy when redb would
+/// have to repair it, so a repair never touches the store. Copying every start cost a full copy of
+/// the store where the filesystem cannot clone (#2218).
+fn probe(path: &Path) -> Result<Option<crate::address_history::Accounts>> {
+    match crate::address_history::pre_finality(path, false) {
+        Err(e)
+            if matches!(
+                e.downcast_ref::<redb::DatabaseError>(),
+                Some(redb::DatabaseError::RepairAborted)
+            ) =>
+        {
+            let probe = with_suffix(path, ".probe");
+            std::fs::copy(path, &probe)?;
+            let found = crate::address_history::pre_finality(&probe, true);
+            std::fs::remove_file(&probe)?;
+            found
+        }
+        found => found,
+    }
 }
 
 /// `--poll-interval` wins over `poll_interval` in `[address_history]`, which wins over the default.
@@ -4792,7 +4841,7 @@ pub async fn start_nest(
     let state = Arc::new(state);
     tracing::info!(
         "address history: {} watched from block {}, polling every {}s",
-        state.history.watched()?.len(),
+        state.history.watched_count()?,
         state.start_block,
         poll_interval.as_secs()
     );
@@ -6129,6 +6178,58 @@ mod tests {
         assert!(beyond_reach(&s, &want(200_999)).await.is_some());
     }
 
+    /// #2123: the MEV pass stopped at the first address whose step failed, so every address after it
+    /// in watched order never had its produced blocks covered.
+    #[tokio::test]
+    async fn one_address_failing_its_mev_step_does_not_starve_the_next() {
+        use crate::address_history::{Action, Row};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let (alice, bob) = (ALICE.to_lowercase(), BOB.to_lowercase());
+        let history = AddressHistory::open(store, 1, &[alice.clone(), bob.clone()]).unwrap();
+        history.set_head(300_000).unwrap();
+        for a in [&alice, &bob] {
+            for action in crate::address_discovery::DISCOVERED
+                .into_iter()
+                .chain(crate::address_discovery::BLOCK_SCANNED)
+            {
+                // Alice was paid at block 5, whose header the RPC cannot serve.
+                let rows = if a == &alice && action == Action::TxList {
+                    let record = json!({"blockNumber": "5", "to": alice, "value": "1"});
+                    vec![Row {
+                        block: 5,
+                        tx_index: 0,
+                        position: 0,
+                        record: record.as_object().unwrap().clone(),
+                    }]
+                } else {
+                    Vec::new()
+                };
+                let g = history.generation().unwrap();
+                history.record(action, a, &rows, (0, 300_000), g).unwrap();
+            }
+        }
+        let relays: crate::address_mev::Relays = Arc::new(|_, _| Box::pin(async { Ok(vec![]) }));
+        let s = Arc::new(
+            ModeState::new(history.clone(), 1, Duration::from_secs(300), true).with_relays(relays),
+        );
+        let make = || Headers {
+            by_number: BTreeMap::new(),
+            finalized: Value::Null,
+        };
+        let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+        mev_passes(&d, &s, &[alice.clone(), bob.clone()], 199_999).await;
+        assert_eq!(
+            history.coverage(Action::ProducedBlocks, &alice).unwrap(),
+            vec![]
+        );
+        assert_eq!(
+            history.coverage(Action::ProducedBlocks, &bob).unwrap(),
+            vec![(0, 199_999)],
+            "bob's produced blocks waited behind alice's failure"
+        );
+    }
+
     /// Withdrawals come from block bodies alone (#2076): a request for them is admitted by the body
     /// scan's reach whatever discovery has covered, and a refusal names the bodies' coverage.
     #[tokio::test]
@@ -6831,7 +6932,7 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{r}");
-        assert_eq!(r["watched"].as_array().unwrap().len(), 2);
+        assert_eq!(r, json!({"added": 1, "watched": 2}));
         let q = format!("/api?module=account&action=txlist&address={BOB}&startblock=0&endblock=1");
         let (_, a) = call(router(s.clone()), "GET", &q, None).await;
         assert!(
@@ -6850,7 +6951,8 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(r["watched"], json!([ALICE.to_lowercase()]));
+        assert_eq!(r, json!({"removed": 1, "watched": 1}));
+        assert_eq!(s.history.watched().unwrap(), vec![ALICE.to_lowercase()]);
         let (st, _) = call(
             router(s.clone()),
             "POST",
@@ -6874,6 +6976,32 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN);
         assert_eq!(s.history.watched().unwrap().len(), 1);
+    }
+
+    /// #2124: an account unwatched while its windows failed stayed in `stalled_backfill`, and once
+    /// watched again waited out the old backoff before its first window.
+    #[tokio::test]
+    async fn unwatching_drops_the_accounts_backfill_pace() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        let alice = ALICE.to_lowercase();
+        let mut pace = Pace::new(64, 64, 50_000, Duration::from_secs(8));
+        for poll in 0..4 {
+            pace.failed(poll, "trace_filter failed".into());
+        }
+        assert!(!pace.due(4));
+        s.backfill_paces.lock().unwrap().insert(alice.clone(), pace);
+        assert_eq!(s.stalled_backfill().len(), 1);
+        let (st, r) = call(
+            router(s.clone()),
+            "POST",
+            "/api/unwatch",
+            Some(json!({"address": ALICE})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        assert_eq!(s.stalled_backfill(), Vec::<Value>::new());
+        assert!(!s.backfill_paces.lock().unwrap().contains_key(&alice));
     }
 
     /// Five minutes, written out: a test that compared against the constant would move with it.
@@ -8254,6 +8382,27 @@ mod tests {
         assert!(!files()
             .iter()
             .any(|f| f.ends_with(".new") || f.ends_with(".probe")));
+    }
+
+    /// #2218: every start copied the whole store to probe it, a full copy on ext4. A current store is
+    /// probed in place: a directory with no room for a copy, read-only here, still starts.
+    #[cfg(unix)]
+    #[test]
+    fn a_current_store_is_probed_without_a_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::config::DB_FILE);
+        {
+            let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+            h.finalize_at(70, [1; 32]).unwrap();
+        }
+        let set = |mode| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set(0o555);
+        let moved = move_aside_pre_finality(&path, 1, &[ALICE.into()]);
+        set(0o755);
+        assert_eq!(moved.unwrap(), [ALICE]);
     }
 
     /// An account removed through the API stays removed across the move, though configuration still

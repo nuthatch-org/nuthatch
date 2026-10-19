@@ -1434,34 +1434,67 @@ impl RpcClient {
             .ok_or_else(|| anyhow!("rpc response had no result"))
     }
 
-    /// One call asked of every endpoint in the pool, fallbacks included, in order. Any endpoint that
-    /// cannot answer fails the whole: the question is one whose answer must hold at all of them.
+    /// One call asked of every endpoint the pool would serve from, for a question whose answer must
+    /// hold at all of them. An endpoint that fails is cooled down and left out, as the pool leaves it
+    /// out of every other call; one in cooldown is asked only while nothing healthy has answered. Fails
+    /// only when no endpoint answers (#2113).
     pub(crate) async fn call_each(&self, method: &str, params: Value) -> Result<Vec<Value>> {
         let mut answers = Vec::with_capacity(self.urls.len());
-        for url in &self.urls {
-            answers.push(
-                self.call_one(url, method, &params, None)
-                    .await
-                    .with_context(|| format!("{method} at {}", redact_url(url)))?,
-            );
+        let mut failed = None;
+        self.visit_each(method, params, &mut |a| match a {
+            Ok(v) => answers.push(v),
+            Err(e) => failed = Some(e),
+        })
+        .await;
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(answers),
         }
-        Ok(answers)
     }
 
-    /// [`Self::call_each`], handing each endpoint's outcome to `seen` as it arrives, so one answer is
-    /// acted on before the next endpoint is awaited, and is not lost to its failure or a timeout.
+    /// [`Self::call_each`], handing each answer to `seen` as it arrives, so one answer is acted on
+    /// before the next endpoint is awaited, and is not lost to its failure or a timeout. When no
+    /// endpoint answers, `seen` gets the pool's failure instead.
     pub(crate) async fn visit_each(
         &self,
         method: &str,
         params: Value,
         seen: &mut (dyn FnMut(Result<Value>) + Send),
     ) {
-        for url in &self.urls {
-            seen(
-                self.call_one(url, method, &params, None)
-                    .await
-                    .with_context(|| format!("{method} at {}", redact_url(url))),
-            );
+        let mut failures = PoolFailures::default();
+        let (mut attempts, mut rate_limited, mut answered) = (0usize, 0usize, false);
+        let mut order = self.endpoint_order_by_health();
+        if order.is_empty() {
+            order = self.wait_out_rate_limits().await;
+        }
+        for &j in &order {
+            if answered && self.health[j].load(Ordering::Relaxed) > now_millis() {
+                continue;
+            }
+            let url = &self.urls[j];
+            attempts += 1;
+            let answer = match self.admit(j).await {
+                Ok(()) => self.call_one(url, method, &params, None).await,
+                Err(e) => Err(e),
+            };
+            match answer {
+                Ok(v) => {
+                    self.mark_healthy(j);
+                    answered = true;
+                    seen(Ok(v));
+                }
+                Err(e) => {
+                    if matches!(class_of(&e), Some(FailureClass::RateLimited { .. })) {
+                        rate_limited += 1;
+                    }
+                    self.record_failure(j, method, &e);
+                    failures.push(url, e.context(format!("{method} at {}", redact_url(url))));
+                }
+            }
+        }
+        if !answered {
+            failures.rested(self.resting(&order));
+            seen(Err(failures.verdict(attempts, rate_limited)));
         }
     }
 
@@ -3720,6 +3753,72 @@ mod tests {
         );
         hw.abort();
         hr.abort();
+    }
+
+    /// #2113: an unreachable fallback failed every question asked of each endpoint, so the
+    /// address-history cursor never advanced. It is cooled and left out, as every other call does.
+    #[tokio::test]
+    async fn one_unreachable_endpoint_does_not_fail_a_question_asked_of_each() {
+        let (good, h) = fake_rpc(1).await;
+        let c = RpcClient::with_fallbacks(vec![good], vec!["http://127.0.0.1:1/".into()]).unwrap();
+        let answers = c
+            .call_each("eth_chainId", serde_json::json!([]))
+            .await
+            .expect("the healthy primary answered");
+        assert_eq!(answers, vec![serde_json::json!("0x1")]);
+        let mut seen = Vec::new();
+        c.visit_each("eth_chainId", serde_json::json!([]), &mut |a| {
+            seen.push(a.is_ok())
+        })
+        .await;
+        assert_eq!(seen, vec![true], "only the answer is handed on");
+
+        // Two primaries asked in turn, so the dead one is asked first or after the answer, and
+        // fails the call in neither order.
+        for &dead_first in &[true, false] {
+            let (good, h) = fake_rpc(1).await;
+            let dead = "http://127.0.0.1:1/".to_string();
+            let urls = if dead_first {
+                vec![dead, good]
+            } else {
+                vec![good, dead]
+            };
+            let c = RpcClient::new(urls).unwrap();
+            let answers = c
+                .call_each("eth_chainId", serde_json::json!([]))
+                .await
+                .expect("one endpoint answered");
+            assert_eq!(answers, vec![serde_json::json!("0x1")], "{dead_first}");
+            h.abort();
+        }
+
+        let dead = RpcClient::new(vec!["http://127.0.0.1:1/".into()]).unwrap();
+        assert!(dead
+            .call_each("eth_chainId", serde_json::json!([]))
+            .await
+            .is_err());
+        h.abort();
+    }
+
+    /// #2113's comment: `call_each` spoke to every endpoint directly, so one unverified at startup
+    /// answered for another chain without the admission #2161 gives the pool.
+    #[tokio::test]
+    async fn a_question_asked_of_each_admits_an_unverified_endpoint_first() {
+        let (right, hr) = fake_rpc(1).await;
+        let (wrong, hw) = late_rpc(8453, 0x9999).await;
+        let c = RpcClient::new(vec![right, wrong]).unwrap();
+        c.verify_chain_ids(1).await.unwrap();
+        let answers = c
+            .call_each("eth_blockNumber", serde_json::json!([]))
+            .await
+            .unwrap();
+        assert_eq!(
+            answers,
+            vec![serde_json::json!(HEALTHY_TIP_HEX)],
+            "the chain-8453 endpoint answered"
+        );
+        hr.abort();
+        hw.abort();
     }
 
     /// #2225: `"error": null` beside a result is a success that spells the field out.
