@@ -267,7 +267,7 @@ unconfigured.
 > backfill. S1 (the page and a zip out) and S2 (Index it) are authorised in order, each on its own
 > gate: the zip run with `nuthatch dev --dir` reports the NID the page showed, and every segment the
 > tab seals equals the one a node seals from that zip. Nothing of ours is hosted for it; S3 (GitHub)
-> and S4 (a drafted view) wait.
+> waits, and S4 (a drafted view) will not be built: no users yet (Chief, 2026-10-18).
 
 >
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.

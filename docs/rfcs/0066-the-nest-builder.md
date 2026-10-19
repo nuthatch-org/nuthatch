@@ -137,7 +137,8 @@ model writes reaches stored state (non-negotiable 4).
   time, bytes and peak memory recorded.
 - **S3, to GitHub.** The token path of §5. Gate: the commit's tree is the zip's, file for file. Not
   built: the zip is enough (§5).
-- **S4, a drafted view.** BYO key or a local model; off by default.
+- **S4, a drafted view.** BYO key or a local model; off by default. Not built: Chief, 2026-10-18,
+  "we wont do nest builder s4 we dont even have users".
 
 ## 10. Risks
 
