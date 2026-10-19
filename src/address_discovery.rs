@@ -876,11 +876,24 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         let mut hashes = BTreeMap::new();
         let mut bodies: BTreeMap<u64, Vec<String>> = BTreeMap::new();
         let mut creations: Vec<(String, u64, [u8; 32])> = Vec::new();
+        let mut may_transfer = BTreeSet::new();
         for block in blocks {
             let block = block?;
             let number = hex_u64(block.get("number").unwrap_or(&Value::Null))?;
             let hash = word32(str_field(&block, "hash")?)?;
             hashes.insert(number, hash);
+            let bloom = block
+                .get("logsBloom")
+                .and_then(Value::as_str)
+                .and_then(|b| b.parse::<alloy_primitives::Bloom>().ok());
+            if bloom.is_none_or(|b| {
+                [TRANSFER, TRANSFER_SINGLE, TRANSFER_BATCH].iter().any(|t| {
+                    alloy_primitives::hex::decode(t)
+                        .is_ok_and(|t| b.contains_input(alloy_primitives::BloomInput::Raw(&t)))
+                })
+            }) {
+                may_transfer.insert(number);
+            }
             timestamps.insert(
                 number,
                 hex_u64(block.get("timestamp").unwrap_or(&Value::Null))?,
@@ -969,6 +982,26 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             parts.insert(b, self.transfer_logs_of(b, hashes[&b], &bodies[&b]).await?);
         }
         let logs: Vec<Value> = parts.into_values().flatten().collect();
+        // A provider can answer `[]` for blocks it has not indexed: a block whose bloom may hold a
+        // transfer and that no log names is read from its receipts, as #2118 probes empty traces.
+        for log in &logs {
+            may_transfer.remove(&hex_u64(log.get("blockNumber").unwrap_or(&Value::Null))?);
+        }
+        for b in may_transfer {
+            if bodies[&b].is_empty() {
+                continue;
+            }
+            if !self
+                .transfer_logs_of(b, hashes[&b], &bodies[&b])
+                .await?
+                .is_empty()
+            {
+                bail!(
+                    "eth_getLogs answered no transfers in block {b}, but its receipts hold some; not \
+                     recording [{from}, {to}] as swept"
+                );
+            }
+        }
         let mut found: BTreeMap<String, Found> = BTreeMap::new();
         for log in &logs {
             if log.get("removed").and_then(Value::as_bool) == Some(true) {
@@ -3872,7 +3905,7 @@ mod tests {
         let bh = format!("0x{:0>64}", "b1");
         script(move |m, p| match m {
             "eth_getBlockByNumber" => Ok(json!({"number": format!("0x{n:x}"), "hash": bh,
-                "timestamp": "0x64", "transactions": txs})),
+                "timestamp": "0x64", "transactions": txs, "logsBloom": format!("0x{}", "00".repeat(256))})),
             _ => rest(m, p),
         })
     }
@@ -3939,6 +3972,61 @@ mod tests {
                 "the transfer to A, not the approval: {rows:?}"
             );
             assert_eq!(rows[0].record["hash"], h2);
+        }
+    }
+
+    /// #2272: a provider that answers `[]` for blocks it has not indexed left the window covered with
+    /// its transfers missing. An empty answer is believed for a block only when its bloom rules out a
+    /// transfer or its receipts hold none.
+    #[tokio::test]
+    async fn an_empty_log_answer_over_transfers_refuses_the_window() {
+        use alloy_primitives::{Bloom, BloomInput};
+        const OUT: &str = "0x00000000000000000000000000000000000000ee";
+        let n = 17_000_000u64;
+        let bh = format!("0x{:0>64}", "b1");
+        let h1 = format!("0x{:0>64}", "1");
+        let transfer = json!({"address": "0x00000000000000000000000000000000000000c0",
+            "topics": [TRANSFER, padded(OUT), padded(A)], "data": format!("0x{:0>64}", "64"),
+            "blockNumber": format!("0x{n:x}"), "transactionHash": h1, "transactionIndex": "0x0",
+            "logIndex": "0x0", "blockHash": bh, "removed": false});
+        let mut may_transfer = Bloom::default();
+        may_transfer.accrue(BloomInput::Raw(
+            &alloy_primitives::hex::decode(TRANSFER).unwrap(),
+        ));
+        let bloom = |b: Bloom| alloy_primitives::hex::encode_prefixed(b.as_slice());
+        let set: std::collections::HashSet<String> = [A.to_string()].into();
+        // (the block's bloom, its receipts' logs, refused)
+        for (bloom, logs, refused) in [
+            (Some(bloom(may_transfer)), json!([transfer]), true),
+            (None, json!([transfer]), true),
+            (Some(bloom(may_transfer)), json!([]), false),
+            (Some(bloom(Bloom::default())), json!([transfer]), false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = history(dir.path());
+            let (bh, h1) = (bh.clone(), h1.clone());
+            let mut block = json!({"number": format!("0x{n:x}"), "hash": bh, "timestamp": "0x64",
+                "transactions": [sweep_tx(&h1, OUT, Some(OUT))]});
+            if let Some(b) = &bloom {
+                block["logsBloom"] = json!(b);
+            }
+            let main = script(move |m, _| match m {
+                "eth_getBlockByNumber" => Ok(block.clone()),
+                "eth_getLogs" => Ok(json!([])),
+                "eth_getBlockReceipts" => Ok(json!([
+                    {"transactionHash": h1, "blockHash": bh, "logs": logs.clone()}
+                ])),
+                other => bail!("unexpected {other}"),
+            });
+            let d = Discoverer::new(main, script(|m, _| bail!("no trace call expected: {m}")));
+            let pending = Pending::begin(&h).unwrap();
+            let swept = d.sweep(&h, &set, n, n, &pending, false).await;
+            if refused {
+                let err = format!("{:#}", swept.unwrap_err());
+                assert!(err.contains("not recording"), "{bloom:?}: {err}");
+            } else {
+                assert!(swept.unwrap().is_empty(), "{bloom:?}");
+            }
         }
     }
 
@@ -5265,7 +5353,7 @@ mod tests {
                             let txs = if b == n + 5 { vec![tx(b)] } else { vec![] };
                             json!({"number": format!("0x{b:x}"), "hash": format!("0x{b:064x}"),
                                    "parentHash": format!("0x{:064x}", b - 1),
-                                   "timestamp": "0x64", "transactions": txs})
+                                   "timestamp": "0x64", "transactions": txs, "logsBloom": format!("0x{}", "00".repeat(256))})
                         }
                         "eth_getLogs" => json!([]),
                         "eth_getTransactionByHash" => tx(n + 5),
