@@ -285,7 +285,7 @@ pub struct Template {
 pub struct Factory {
     /// The alias of the watched contract (or a template, for nested factories).
     pub watch: String,
-    /// The announcing event name, e.g. "PoolCreated".
+    /// The announcing event name, e.g. "PoolCreated", or its full signature when the ABI overloads it.
     pub event: String,
     /// The event parameter holding the child contract address, e.g. "pool".
     pub child_param: String,

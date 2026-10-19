@@ -9,7 +9,7 @@
 //! steps; here we build the state they read and prove its reorg + determinism properties.
 
 use crate::config::Config;
-use crate::registry::{snake_case, DecodedRow, Value};
+use crate::registry::{snake_case, DecodeRegistry, DecodedRow, Value};
 use anyhow::{bail, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -60,10 +60,26 @@ pub struct FactorySet {
 }
 
 impl FactorySet {
+    /// [`FactorySet::build`], with each rule's announcing table taken from the decoders `registry`
+    /// actually registered (#2158). An overloaded event's table carries a topic0 suffix, so the
+    /// name alone is refused as ambiguous and the rule must give the full signature.
+    pub fn resolved(config: &Config, registry: &DecodeRegistry) -> Result<Self> {
+        Self::build_with(config, |f| announcing_table(f, registry))
+    }
+
     /// Build + validate the factory rules from a nest config. Errors on a rule referencing an unknown
     /// `watch` alias/template or an unknown `template`, on a template naming an existing contract
     /// alias (ambiguous table namespace), or on nesting deeper than the depth-3 ceiling.
     pub fn build(config: &Config) -> Result<Self> {
+        Self::build_with(config, |f| {
+            Ok(format!("{}__{}", f.watch, snake_case(&f.event)))
+        })
+    }
+
+    fn build_with(
+        config: &Config,
+        table_of: impl Fn(&crate::config::Factory) -> Result<String>,
+    ) -> Result<Self> {
         let contract_aliases: HashSet<&str> =
             config.contracts.iter().map(|c| c.alias.as_str()).collect();
         let template_names: HashSet<String> =
@@ -101,7 +117,7 @@ impl FactorySet {
                     f.template
                 );
             }
-            let table = format!("{}__{}", f.watch, snake_case(&f.event));
+            let table = table_of(f)?;
             // A duplicate `(watch, event, child_param, template)` is a copy-paste error rather than a
             // second child, and silently indexing it twice would double every discovery.
             let entry = rules.entry(table).or_insert_with(Vec::new);
@@ -141,11 +157,8 @@ impl FactorySet {
             }
         }
         // Stamp each rule's watch depth and enforce the depth-3 ceiling on the produced child.
-        for (f, table) in config
-            .factories
-            .iter()
-            .map(|f| (f, format!("{}__{}", f.watch, snake_case(&f.event))))
-        {
+        for f in &config.factories {
+            let table = table_of(f)?;
             let src_depth = *watch_depth.get(&f.watch).unwrap_or(&0);
             if src_depth + 1 > 3 {
                 bail!(
@@ -279,6 +292,45 @@ impl FactorySet {
                 })
             })
             .collect()
+    }
+}
+
+/// The table `registry` decodes a factory rule's event into: by name, or by full signature when the
+/// name is overloaded.
+fn announcing_table(f: &crate::config::Factory, registry: &DecodeRegistry) -> Result<String> {
+    let by_signature = f.event.contains('(');
+    let want: String = f.event.chars().filter(|c| !c.is_whitespace()).collect();
+    let matches: Vec<_> = registry
+        .tables()
+        .into_iter()
+        .filter(|d| d.alias == f.watch)
+        .filter(|d| {
+            if by_signature {
+                d.signature == want
+            } else {
+                let name = d.signature.split('(').next().unwrap_or_default();
+                snake_case(name) == snake_case(&f.event)
+            }
+        })
+        .collect();
+    match matches.as_slice() {
+        [d] => Ok(d.table.clone()),
+        [] => bail!(
+            "factory watches '{}' event '{}', which '{}' does not decode: it is not in the ABI, \
+             or the `events` allowlist leaves it out. No child would ever be discovered.",
+            f.watch,
+            f.event,
+            f.watch
+        ),
+        many => bail!(
+            "factory watches '{}' event '{}', which is overloaded: write the full signature, one of {}",
+            f.watch,
+            f.event,
+            many.iter()
+                .map(|d| format!("\"{}\"", d.signature))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -513,6 +565,67 @@ template = "pool"
         }
     }
 
+    /// #2158: an overloaded event's table carries a topic0 suffix, so a rule keyed by the bare name
+    /// never matched a decoded row. The rule now resolves against the registry, and the bare name of
+    /// an overloaded or unknown event is refused rather than discovering nothing.
+    #[test]
+    fn a_rule_on_an_overloaded_event_resolves_to_its_registered_table() {
+        use crate::registry::{ContractSpec, TemplateSpec};
+        let abi = |json: &str| serde_json::from_str(json).unwrap();
+        let registry = DecodeRegistry::build_with_templates(
+            vec![ContractSpec {
+                alias: "factory".into(),
+                address: "0x1f98431c8ad98523631ae4a59f267346ea31f984"
+                    .parse()
+                    .unwrap(),
+                abi: abi(r#"[
+                    {"type":"event","name":"PoolCreated","anonymous":false,"inputs":[
+                        {"name":"pool","type":"address","indexed":false}]},
+                    {"type":"event","name":"PoolCreated","anonymous":false,"inputs":[
+                        {"name":"pool","type":"address","indexed":false},
+                        {"name":"fee","type":"uint256","indexed":false}]}
+                ]"#),
+                events: Vec::new(),
+            }],
+            vec![TemplateSpec {
+                name: "pool".into(),
+                abi: abi(r#"[{"type":"event","name":"Swap","anonymous":false,"inputs":[]}]"#),
+                events: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let table = registry
+            .tables()
+            .into_iter()
+            .find(|d| d.signature == "PoolCreated(address,uint256)")
+            .unwrap()
+            .table
+            .clone();
+        assert_ne!(table, "factory__pool_created");
+
+        let err = |toml: &str| match FactorySet::resolved(&cfg(toml), &registry) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => String::new(),
+        };
+        assert!(
+            err(UNIV3).contains("PoolCreated(address)"),
+            "{}",
+            err(UNIV3)
+        );
+        let unknown = UNIV3.replace(r#"event = "PoolCreated""#, r#"event = "Nope""#);
+        assert!(err(&unknown).contains("Nope"), "{}", err(&unknown));
+
+        let full = UNIV3.replace(
+            r#"event = "PoolCreated""#,
+            r#"event = "PoolCreated(address, uint256)""#,
+        );
+        let fs = FactorySet::resolved(&cfg(&full), &registry).unwrap();
+        let pool = "0xaaaabbbbccccddddeeeeffff0000111122223333";
+        let mut row = pool_created_row(100, 3, pool);
+        row.table = table.clone();
+        assert_eq!(fs.discover(&row).len(), 1);
+        assert_eq!(fs.factory_tables(), vec![table]);
+    }
     #[test]
     fn validates_references() {
         assert!(FactorySet::build(&cfg(UNIV3)).is_ok());

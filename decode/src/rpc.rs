@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
 /// A single log entry as returned by `eth_getLogs`.
@@ -30,10 +30,20 @@ impl Log {
             .and_then(Value::as_array)
             .map(|t| {
                 t.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect()
+                    .map(|x| {
+                        x.as_str()
+                            .map(String::from)
+                            .ok_or_else(|| anyhow!("log topic is not a string: {x}"))
+                    })
+                    .collect::<Result<Vec<_>>>()
             })
+            .transpose()?
             .unwrap_or_default();
+        let log_index = parse_hex_u64(&field_str(v, "logIndex")?)?;
+        // `DecodedRow::seq` packs log_index into 20 bits; a wider one would collide with another row.
+        if log_index >= 1 << 20 {
+            bail!("log index {log_index} does not fit the 20-bit _seq field");
+        }
         Ok(Log {
             address: field_str(v, "address")?,
             topics,
@@ -41,7 +51,7 @@ impl Log {
             block_number: parse_hex_u64(&field_str(v, "blockNumber")?)?,
             block_hash: field_str(v, "blockHash").unwrap_or_default(),
             tx_hash: field_str(v, "transactionHash")?,
-            log_index: parse_hex_u64(&field_str(v, "logIndex")?)?,
+            log_index,
         })
     }
 }
@@ -56,4 +66,45 @@ fn field_str(v: &Value, key: &str) -> Result<String> {
 pub fn parse_hex_u64(s: &str) -> Result<u64> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     u64::from_str_radix(s, 16).with_context(|| format!("bad hex number '{s}'"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rpc_log(topics: Value, log_index: &str) -> Value {
+        serde_json::json!({
+            "address": "0x11",
+            "topics": topics,
+            "data": "0x",
+            "blockNumber": "0x1",
+            "blockHash": "0xbh",
+            "transactionHash": "0xtx",
+            "logIndex": log_index,
+        })
+    }
+
+    /// #2228: a malformed topic used to vanish, shifting every later topic into the wrong parameter.
+    #[test]
+    fn a_non_string_topic_is_refused_not_dropped() {
+        let ok = Log::from_rpc(&rpc_log(serde_json::json!(["0xaa", "0xbb"]), "0x0")).unwrap();
+        assert_eq!(ok.topics, vec!["0xaa", "0xbb"]);
+        let err = Log::from_rpc(&rpc_log(serde_json::json!(["0xaa", null, "0xbb"]), "0x0"))
+            .expect_err("a null topic must be refused");
+        assert!(format!("{err:#}").contains("topic"), "{err:#}");
+    }
+
+    /// #2228: `_seq` keeps 20 bits of log_index, so a wider one would alias another row's key.
+    #[test]
+    fn a_log_index_wider_than_the_seq_field_is_refused() {
+        let topics = serde_json::json!([]);
+        assert_eq!(
+            Log::from_rpc(&rpc_log(topics.clone(), "0xfffff"))
+                .unwrap()
+                .log_index,
+            0xF_FFFF
+        );
+        let err = Log::from_rpc(&rpc_log(topics, "0x100000")).expect_err("must be refused");
+        assert!(format!("{err:#}").contains("20-bit"), "{err:#}");
+    }
 }

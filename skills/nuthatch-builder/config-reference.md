@@ -48,7 +48,7 @@ events = ["Swap"]             # optional event allowlist - WHAT is decoded from 
 
 [[factories]]                 # optional (RFC-0009)
 watch = "factory"             # ALIAS of the watched [[contracts]] (or a template, for nesting)
-event = "PoolCreated"         #   - NOT an address
+event = "PoolCreated"         #   - NOT an address; an overloaded event takes its full signature
 child_param = "pool"          # the event param holding the new child's address
 template = "pool"             # which [[templates]] the child uses
 start = 12369621             # optional: ignore discoveries before this block

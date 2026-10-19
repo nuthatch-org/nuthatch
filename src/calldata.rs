@@ -22,7 +22,7 @@
 //! - **No `indexed` distinction.** Function inputs are all in the body; there is no topics/data split
 //!   and therefore no hashed-dynamic-type problem. Call columns are never `Hash32`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::{Function, JsonAbi};
@@ -32,8 +32,8 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{Config, Extract};
 use crate::registry::{
-    implicit_columns, snake_case, value_from_dynsol, Column, ColumnSchema, DecodedRow, StorageKind,
-    TableKind, TableSchema, Value,
+    implicit_columns, reserved_column_names, snake_case, value_from_dynsol, Column, ColumnSchema,
+    DecodedRow, StorageKind, TableKind, TableSchema, Value,
 };
 
 /// Undecodable calls to contracts we index. One shared table rather than one per contract: the rows
@@ -171,16 +171,29 @@ impl CallRegistry {
             }
             register_functions(&mut by_selector, alias, *address, abi, &allow);
         }
-        if let Some(d) = by_selector
-            .values()
-            .flatten()
-            .find(|d| d.columns.iter().any(|c| c.name == TX_FROM_COLUMN))
-        {
-            return Err(anyhow!(
-                "`{}` has an argument named `{TX_FROM_COLUMN}`, which every call table already \
-                 carries as the transaction sender. Two columns of one name cannot both be stored.",
-                d.signature
-            ));
+        let mut decoders: Vec<&CallDecoder> = by_selector.values().flatten().collect();
+        decoders.sort_by(|a, b| a.table.cmp(&b.table));
+        for d in decoders {
+            let mut seen = HashSet::with_capacity(d.columns.len());
+            for c in &d.columns {
+                if c.name == TX_FROM_COLUMN || reserved_column_names().contains(&c.name.as_str()) {
+                    return Err(anyhow!(
+                        "`{}` has an argument stored as column `{}`, which every call table already \
+                         carries for the chain's own value. Two columns of one name cannot both be \
+                         stored (#814, #2159).",
+                        d.signature,
+                        c.name
+                    ));
+                }
+                if !seen.insert(c.name.as_str()) {
+                    return Err(anyhow!(
+                        "`{}` has two arguments that both become column `{}`. One would silently \
+                         replace the other in every stored row.",
+                        d.signature,
+                        c.name
+                    ));
+                }
+            }
         }
         let hash = registry_hash(&by_selector);
         Ok(CallRegistry {
@@ -559,6 +572,38 @@ mod tests {
             tx_from: addr(7),
             call_index: 3,
         }
+    }
+
+    /// #2159: an argument named after an implicit column would replace the chain's own value in the
+    /// stored row, exactly as an event parameter would (#814). Only `tx_from` used to be refused.
+    #[test]
+    fn an_argument_named_like_an_implicit_column_is_refused() {
+        let build = |inputs: &str| {
+            let abi: JsonAbi = serde_json::from_str(&format!(
+                r#"[{{"type":"function","name":"post","inputs":[{inputs}],
+                    "outputs":[],"stateMutability":"nonpayable"}}]"#
+            ))
+            .unwrap();
+            match CallRegistry::build(vec![("tok".into(), addr(1), abi)], &Extract::default()) {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => String::new(),
+            }
+        };
+        for name in [
+            "block_number",
+            "tx_hash",
+            "log_index",
+            "table",
+            TX_FROM_COLUMN,
+        ] {
+            let msg = build(&format!(r#"{{"name":"{name}","type":"uint256"}}"#));
+            assert!(
+                msg.contains(name) && msg.contains("post"),
+                "{name}: got {msg}"
+            );
+        }
+        let msg = build(r#"{"name":"","type":"uint256"},{"name":"arg0","type":"uint256"}"#);
+        assert!(msg.contains("arg0"), "got: {msg}");
     }
 
     /// The sender is on every call row, decoded or raw, and the schema says so. A DataEdge takes posts

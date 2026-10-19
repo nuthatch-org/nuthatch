@@ -1033,7 +1033,7 @@ fn init_from(source: &str, dir_arg: &str) -> Result<()> {
     let registry = crate::registry::from_nest(&target, &config)
         .context("nest ABIs failed to build a decode registry (is the nest self-contained?)")?;
     // Validate factory rules (RFC-0009): references must resolve and depth stays within the ceiling.
-    let factories = crate::factory::FactorySet::build(&config)
+    let factories = crate::factory::FactorySet::resolved(&config, &registry)
         .context("nest declares invalid factory/template rules")?;
 
     println!(

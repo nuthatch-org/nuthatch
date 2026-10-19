@@ -872,7 +872,7 @@ pub struct DecodeRegistry {
 /// **Reserved regardless of the `block_timestamps` flag.** A timestamp-free nest does not carry that
 /// column today, but flipping the flag is supported (RFC-0029 §6b) and would otherwise turn a
 /// working nest into a colliding one at the worst possible moment.
-fn reserved_column_names() -> &'static [&'static str] {
+pub fn reserved_column_names() -> &'static [&'static str] {
     &[
         "block_number",
         "block_hash",
@@ -919,17 +919,28 @@ fn refuse_reserved_parameter_names(
         if !allowlist.is_empty() && !allowlist.iter().any(|a| a == &ev.name) {
             continue;
         }
-        for input in &ev.inputs {
-            if reserved_column_names().contains(&input.name.as_str()) {
+        // The resolved column names, after `_hash` and `arg{i}`, are what `to_json` writes (#2159).
+        let columns = EventDecoder::new(who, Address::ZERO, ev.clone()).columns;
+        let mut seen = HashSet::with_capacity(columns.len());
+        for c in &columns {
+            if !seen.insert(c.name.as_str()) {
                 bail!(
-                    "{what} '{who}' declares event '{}' with a parameter named '{}', which is a \
-                     column nuthatch adds to every row. Indexing it would silently replace the \
+                    "{what} '{who}' declares event '{}' with two parameters that both become column \
+                     '{}'. One would silently replace the other in every stored row.",
+                    ev.name,
+                    c.name,
+                );
+            }
+            if reserved_column_names().contains(&c.name.as_str()) {
+                bail!(
+                    "{what} '{who}' declares event '{}' with a parameter stored as column '{}', which \
+                     is a column nuthatch adds to every row. Indexing it would silently replace the \
                      chain's own value with the event's - the block number in the stored row would \
                      be the event's parameter, not the block it came from (#814). Reserved names: \
                      {}. There is no safe automatic rename: the column name is part of the query \
                      surface that views, `entities.toml` and any published schema already depend on.",
                     ev.name,
-                    input.name,
+                    c.name,
                     reserved_column_names().join(", "),
                 );
             }
@@ -1307,7 +1318,12 @@ pub fn value_from_dynsol(dv: &DynSolValue, col: &Column) -> Value {
         }
         DynSolValue::Int(i, bits) => {
             if *bits <= 64 {
-                Value::I64(i.as_i64())
+                // Saturate as the uint arm does (#2148): every value that fits `i64` is unchanged.
+                Value::I64(i64::try_from(*i).unwrap_or(if i.is_negative() {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }))
             } else if *bits <= 128 {
                 Value::IWord16(i.to_be_bytes::<32>()[16..].try_into().unwrap())
             } else {
@@ -1688,6 +1704,41 @@ mod stored_roundtrip {
                  several ABIs cannot tell which to open; got: {msg}"
             );
         }
+    }
+
+    /// #2159: the refusal checks the column name a parameter resolves to, not the ABI's raw name. An
+    /// indexed `string block` becomes `block_hash`, and an unnamed parameter becomes `arg{i}`.
+    #[test]
+    fn a_resolved_column_name_that_collides_is_refused() {
+        let build = |inputs: &str| {
+            let abi = format!(
+                r#"[{{"type":"event","name":"Odd","anonymous":false,"inputs":[{inputs}]}}]"#
+            );
+            match DecodeRegistry::build(vec![ContractSpec {
+                alias: "x".into(),
+                address: Address::from([0x11; 20]),
+                abi: serde_json::from_str(&abi).expect("parse ABI"),
+                events: Vec::new(),
+            }]) {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => String::new(),
+            }
+        };
+        let msg = build(r#"{"name":"block","type":"string","indexed":true}"#);
+        assert!(
+            msg.contains("block_hash") && msg.contains("Odd"),
+            "got: {msg}"
+        );
+        let msg = build(
+            r#"{"name":"","type":"uint256","indexed":false},
+               {"name":"arg0","type":"uint256","indexed":false}"#,
+        );
+        assert!(msg.contains("arg0") && msg.contains("Odd"), "got: {msg}");
+        let msg = build(
+            r#"{"name":"label","type":"string","indexed":true},
+               {"name":"label_hash","type":"bytes32","indexed":false}"#,
+        );
+        assert!(msg.contains("label_hash"), "got: {msg}");
     }
 
     /// #1437: a decoded table inside `offchain__` would be replaced by an offchain view of the same
@@ -2942,6 +2993,36 @@ mod tests {
         assert_eq!(row.params[0].0, "v");
         // Saturated, not truncated/masked - the guard's documented behaviour.
         assert_eq!(row.params[0].1, Value::U64(u64::MAX));
+    }
+
+    /// The int arm of COR-11 (#2148): alloy detokenizes every `int<N>` as a full 256-bit word with no
+    /// sign-extension check, so an `int64` word that does not fit `i64` panicked `as_i64()`.
+    #[test]
+    fn an_out_of_range_sub64_int_saturates_instead_of_panicking() {
+        const ODD: &str = r#"[
+            {"type":"event","name":"Odd","anonymous":false,"inputs":[
+                {"name":"t","type":"int64","indexed":true},
+                {"name":"v","type":"int64","indexed":false}]}
+        ]"#;
+        let reg = DecodeRegistry::build(vec![spec("odd", USDC, ODD)]).unwrap();
+        let topic0 = format!("0x{}", hex::encode(reg.tables()[0].topic0));
+        let decode = |topic: String, data: String| {
+            let l = log(USDC, &[&topic0, &topic], &data, 1, 0);
+            reg.decode(&l)
+                .expect("an out-of-range int64 must not panic decoding")
+                .expect("topic0/address both match the fixture")
+                .params
+        };
+        let high = format!("0x01{}", "00".repeat(31));
+        let low = format!("0x80{}", "00".repeat(31));
+        let p = decode(high.clone(), low);
+        assert_eq!(p[0].1, Value::I64(i64::MAX));
+        assert_eq!(p[1].1, Value::I64(i64::MIN));
+        // A conformant negative still decodes to itself.
+        let minus_five = format!("0x{}fb", "ff".repeat(31));
+        let p = decode(minus_five.clone(), minus_five);
+        assert_eq!(p[0].1, Value::I64(-5));
+        assert_eq!(p[1].1, Value::I64(-5));
     }
 
     /// Prove the fuzz/fuzz_targets/decode_log.rs fixture ABI parses and that `decode` is actually

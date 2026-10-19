@@ -3141,7 +3141,7 @@ async fn build_nest(
     // runtime: every loop fetches `base ∪ children` and refetches for children found in the window,
     // flipping to topic0-only past FACTORY_FLIP_THRESHOLD children.
     let factory = {
-        let fs = FactorySet::build(config)?;
+        let fs = FactorySet::resolved(config, &registry)?;
         if fs.is_empty() {
             None
         } else {

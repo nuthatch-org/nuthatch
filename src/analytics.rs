@@ -2552,7 +2552,10 @@ fn define_children_views(session: &dyn Session, dir: &Path) {
     if config.factories.is_empty() {
         return;
     }
-    let Ok(fs) = crate::factory::FactorySet::build(&config) else {
+    let Ok(registry) = crate::registry::from_nest(dir, &config) else {
+        return;
+    };
+    let Ok(fs) = crate::factory::FactorySet::resolved(&config, &registry) else {
         return;
     };
     // A timestamp-free nest (RFC-0029 §6b) has no `block_timestamp` to project, so the provenance
@@ -4859,6 +4862,15 @@ template="pool"
 "#,
         )
         .unwrap();
+        // The view resolves each rule against the decode registry (#2158), so the ABIs must exist.
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join("abis/factory.json"),
+            r#"[{"type":"event","name":"PoolCreated","anonymous":false,"inputs":[
+                {"name":"pool","type":"address","indexed":false}]}]"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("abis/pool.json"), "[]").unwrap();
         // Seal two PoolCreated events (pool_a, pool_b) + a duplicate discovery of pool_a (later block,
         // must be de-duplicated to the earliest).
         let rows = vec![

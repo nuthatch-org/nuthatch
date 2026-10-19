@@ -364,7 +364,7 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
     // strawman" failure of RFC-0029 §4b in a second place, found running OBIB case 6 (which is
     // *entirely* child activity: 232 factory events against 35,039 expected records).
     let factory = {
-        let fs = FactorySet::build(&config)?;
+        let fs = FactorySet::resolved(&config, &registry)?;
         if fs.is_empty() {
             None
         } else {
