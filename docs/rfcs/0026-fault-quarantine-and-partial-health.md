@@ -78,7 +78,7 @@ Two corollaries that decide most of the detail below:
 
 | | **Retryable** (transient) | **Terminal** (needs an operator) |
 |---|---|---|
-| **Nest fault** | `process_window` store/RPC/webhook error; `prepare` backfill failure | `rollback_reorg` finality violation (`:1706`); `ensure_views_healthy` dead IVM circuit (`:1670-1678`) |
+| **Nest fault** | `process_window` store/RPC/webhook error; `prepare` backfill failure | `rollback_reorg` finality violation (`:1706`), or a rollback that fails after retracting views (#2165); `ensure_views_healthy` dead IVM circuit (`:1670-1678`) |
 | **Cursor fault** | *(none - tip/logs already retry in-loop)* | single-block-over-cap (`:603`); wrong-chain endpoint pool (see #150) |
 
 Three rulings fall out:
@@ -128,6 +128,12 @@ the siblings that ran ahead skip the re-fetched windows via the existing `if nex
 guard (`:580`). No nest re-processes a window it already committed; no nest skips one. The cost is a
 re-fetch of the intervening range for the whole cursor, which is why the backoff cap is minutes rather
 than seconds: re-admission is correct but not free.
+
+**But "unchanged" is safe only once the nest's own checkpoints are checked** (#2165). A nest out of
+the working set misses every reorg fanned out meanwhile, and the shared detection reads only the most
+caught-up sibling, which has already re-indexed past the fork. So a nest that joins the cursor, at
+startup, on mount or on re-admission, first runs `detect_reorg` against its own store and rolls back
+if it must, before it indexes forward. A check that cannot reach the source quarantines it again.
 
 **Attempt accounting is per unit and resets on success** - one committed window clears a nest's
 counter. A nest that fails every third window is degraded, not quarantined; that is a job for metrics

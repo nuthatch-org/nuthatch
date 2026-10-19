@@ -1584,6 +1584,9 @@ struct Supervisor {
     /// Whether a nest has a *valid* cursor. A nest whose `prepare` failed has `nexts[i] = 0`, which is
     /// not "start at genesis" but "unknown" - it must re-`prepare` before it may rejoin the working set.
     prepared: Vec<bool>,
+    /// Whether a nest's own checkpoints have been checked since it joined the cursor. A nest out of
+    /// the working set misses every reorg fanned out meanwhile, so it is checked before it indexes (#2165).
+    reorg_checked: Vec<bool>,
     /// The live health surface the API reads (RFC-0026 §5).
     health: Arc<crate::health::RuntimeHealth>,
     /// Fail-stop instead of quarantine (§6): exit on the first fault of any kind. Off by default;
@@ -1599,6 +1602,7 @@ impl Supervisor {
             states: (0..n).map(|_| NestState::Live).collect(),
             attempts: vec![0; n],
             prepared: vec![false; n],
+            reorg_checked: vec![false; n],
             health,
             fail_fast,
         }
@@ -1666,6 +1670,7 @@ impl Supervisor {
     /// (RFC-0026 §4): the nest rejoins with its cursor *unchanged* - i.e. behind - which pulls
     /// `global_next` back down to it, and the siblings that ran ahead skip the re-fetched windows via
     /// the loop's `nexts[i] > to` guard. No nest re-processes a committed window; no nest skips one.
+    /// It is checked against its own checkpoints before it indexes ([`check_joined_nests`]).
     fn readmit_due(&mut self, now: std::time::Instant) {
         for i in 0..self.states.len() {
             if let NestState::Quarantined {
@@ -1675,6 +1680,7 @@ impl Supervisor {
                 if now >= *t {
                     tracing::warn!("nest '{}' re-admitted to the shared cursor", self.names[i]);
                     self.states[i] = NestState::Live;
+                    self.reorg_checked[i] = false;
                     // Still not *indexing* until it commits a window, but it is no longer waiting on a
                     // backoff - so drop the stale `next_retry_unixtime` an operator would be watching.
                     self.health.mark_indexing(&self.names[i]);
@@ -1733,6 +1739,7 @@ impl Supervisor {
         self.states.push(NestState::Live);
         self.attempts.push(0);
         self.prepared.push(true);
+        self.reorg_checked.push(false);
         self.health.mark_indexing(name);
         self.names.len() - 1
     }
@@ -1980,7 +1987,47 @@ fn fan_out_rollback(
 ) -> Result<()> {
     for &i in live {
         match live_nest(nests, i).rollback_reorg(ancestor) {
-            Ok(()) => nexts[i] = nexts[i].min(ancestor + 1),
+            Ok(resume) => nexts[i] = nexts[i].min(resume),
+            Err(e) => sup.quarantine(i, &e)?,
+        }
+    }
+    Ok(())
+}
+
+/// Check each nest that has joined the cursor since its last check against its own checkpoints,
+/// and roll it back before it indexes forward. The shared detection reads only the most caught-up
+/// nest, which a sibling that was out of the working set may disagree with (#2165).
+async fn check_joined_nests(
+    source: &dyn Source,
+    nests: &mut [Option<NestIngest>],
+    nexts: &mut [u64],
+    sup: &mut Supervisor,
+) -> Result<()> {
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..nests.len() {
+        if !matches!(sup.states[i], NestState::Live) || sup.reorg_checked[i] {
+            continue;
+        }
+        let nest = live_nest(nests, i);
+        let found = match nexts[i] {
+            0 => Ok(None),
+            next => detect_reorg(source, &nest.store, next - 1).await,
+        };
+        let rolled = match found {
+            Ok(None) => Ok(()),
+            Ok(Some(ancestor)) => {
+                tracing::warn!(
+                    "nest '{}' rejoined behind a reorg to block {ancestor}: rolling it back",
+                    sup.names[i]
+                );
+                source.forget_cached_above(ancestor);
+                nest.rollback_reorg(ancestor)
+                    .map(|resume| nexts[i] = nexts[i].min(resume))
+            }
+            Err(e) => Err(e),
+        };
+        match rolled {
+            Ok(()) => sup.reorg_checked[i] = true,
             Err(e) => sup.quarantine(i, &e)?,
         }
     }
@@ -2334,6 +2381,7 @@ async fn runtime_index_loop(
                 }
             }
         }
+        check_joined_nests(source.as_ref(), &mut nests, &mut nexts, &mut sup).await?;
         let live = sup.live();
         if live.is_empty() {
             // Nothing left to advance. If every quarantine is terminal the cursor is dead and says so
@@ -6765,6 +6813,8 @@ impl NestIngest {
                 prog.finish(finalized_through, false);
                 self.metrics.end_seal_direct();
                 publish_direct_seal(&self.metrics, self.store.as_ref(), finalized_through)?;
+                // The first tip window's reorg walk needs a checkpoint at the watermark (#2175).
+                pin_checkpoint(self.store.as_ref(), source, finalized_through).await?;
                 self.store
                     .set_meta(LAST_BLOCK_KEY, &finalized_through.to_string())?;
                 if let Err(e) = rebuild_views(
@@ -6889,8 +6939,7 @@ impl NestIngest {
                 // timestamps and produce segments a re-execution against the canonical chain could not
                 // reproduce.
                 source.forget_cached_above(ancestor);
-                self.rollback_reorg(ancestor)?;
-                Ok(Some(ancestor + 1))
+                Ok(Some(self.rollback_reorg(ancestor)?))
             }
             Ok(None) => Ok(None),
             Err(e) => {
@@ -6992,7 +7041,17 @@ impl NestIngest {
         Ok(())
     }
 
-    fn rollback_reorg(&mut self, ancestor: u64) -> Result<()> {
+    fn rollback_reorg(&mut self, ancestor: u64) -> Result<u64> {
+        // Nothing below this nest's origin was indexed, so no rollback goes below it, and a fork
+        // deeper than every checkpoint resumes there rather than at block 1 (#2174).
+        let deepest = ancestor == 0;
+        let ancestor = ancestor.max(
+            self.store
+                .get_meta(START_BLOCK_KEY)?
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+                .saturating_sub(1),
+        );
         // Retract the rolled-back transfers from the IVM view *before* dropping them from the hot
         // store - a reorg is just the same facts re-fed with weight −1.
         let last_indexed = self
@@ -7002,7 +7061,7 @@ impl NestIngest {
             .unwrap_or(ancestor);
         // This nest hasn't reached past the fork: nothing to undo, and don't advance its cursor.
         if last_indexed <= ancestor {
-            return Ok(());
+            return Ok(ancestor + 1);
         }
         // A reorg below the sealed watermark is a finality violation this model can't repair: the
         // doomed blocks are already in immutable sealed segments (and pruned from hot), so the
@@ -7019,7 +7078,7 @@ impl NestIngest {
             // identically, so this nest is quarantined until an operator raises the finality depth.
             // `detect_reorg` answers 0 when no checkpoint it holds is canonical, which is not a fork
             // at genesis and must not read as one.
-            let fork = if ancestor == 0 {
+            let fork = if deepest {
                 "a fork deeper than every checkpoint this nest holds".to_string()
             } else {
                 format!("a reorg to block {ancestor}")
@@ -7030,6 +7089,14 @@ impl NestIngest {
             )));
         }
         let doomed = self.store.entities_in_range(ancestor + 1, last_indexed)?;
+        // From here the views are being retracted: a failure leaves them out of step with the store
+        // and a retry would retract them twice, so only a restart, which rebuilds them, recovers.
+        let torn = move |e: anyhow::Error| {
+            anyhow::Error::new(TerminalFault(format!(
+                "rolling back to block {ancestor} failed part-way, leaving the derived views out of \
+                 step with the hot store; restart to rebuild them: {e:#}"
+            )))
+        };
         // §5.2, for the authored entities: the same rows, at weight -1, *before* they are dropped
         // from the hot store. There is no rollback interface because there is nothing to roll back.
         //
@@ -7037,7 +7104,7 @@ impl NestIngest {
         // that is the whole point: DBSP cancels by key, so a retraction built by a different
         // converter than the insertion does not cancel it - it lands beside it and stays forever.
         // One conversion, both directions.
-        self.retract_entities(&doomed, ancestor)?;
+        self.retract_entities(&doomed, ancestor).map_err(torn)?;
         self.balances.apply(retraction_batch(&doomed));
         self.exposure.apply(exposure_retraction_batch(
             &doomed,
@@ -7063,7 +7130,8 @@ impl NestIngest {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(j) {
                     if let Some(kind) = v.get("kind").and_then(|k| k.as_str()) {
                         if self.router.watches(kind) {
-                            alerts::enqueue(&self.store, &self.router, "flag_retracted", kind, &v)?;
+                            alerts::enqueue(&self.store, &self.router, "flag_retracted", kind, &v)
+                                .map_err(torn)?;
                         }
                     }
                 }
@@ -7073,16 +7141,17 @@ impl NestIngest {
         // Roll the hot store back to the ancestor AND reset the `last_block` watermark in ONE txn: a
         // crash between a separate delete and watermark reset would leave `last_block` past the fork and
         // the rolled-back range permanently un-reindexed (a silent gap).
-        let removed =
-            self.store
-                .rollback_to_and_set_meta(ancestor, LAST_BLOCK_KEY, &ancestor.to_string())?;
+        let removed = self
+            .store
+            .rollback_to_and_set_meta(ancestor, LAST_BLOCK_KEY, &ancestor.to_string())
+            .map_err(torn)?;
 
         self.metrics.inc_reorgs();
         self.metrics.set_last_block(ancestor);
         tracing::warn!(
             "reorg detected: rolled back to block {ancestor} (removed {removed} entities)"
         );
-        Ok(())
+        Ok(ancestor + 1)
     }
 
     /// Undo the views this attempt just fed. The commit did not land, so a retry starts from here.
@@ -8203,14 +8272,25 @@ async fn maybe_seal(
     };
     let ceiling = finalized_through.min(last_indexed);
 
-    let mut from = match store.get_meta(SEALED_THROUGH_KEY)? {
-        Some(v) => v.parse::<u64>().context("corrupt sealed_through")? + 1,
+    let watermark = match store.get_meta(SEALED_THROUGH_KEY)? {
+        Some(v) => Some(v.parse::<u64>().context("corrupt sealed_through")?),
+        None => None,
+    };
+    let mut from = match watermark {
+        Some(w) => w + 1,
         None => store
             .get_meta(START_BLOCK_KEY)?
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0),
     };
     if ceiling < from {
+        // A watermark with no checkpoint, as a `--seal-direct` backfill can leave, sends a one-block
+        // reorg's walk below it until finality passes it, and that reads as a finality violation (#2175).
+        if let Some(w) = watermark {
+            if store.get_block_hash(w)?.is_none() {
+                pin_checkpoint(store, source, w).await?;
+            }
+        }
         return Ok(()); // nothing new has finalized
     }
 
@@ -12196,6 +12276,173 @@ template = "pool"
         );
         let known = format!("{:#}", nest.rollback_reorg(50).unwrap_err());
         assert!(known.contains("a reorg to block 50"), "{known}");
+    }
+
+    /// Canonical hashes everywhere, replaced at and above `fork_from`.
+    struct ForkSource {
+        tip: u64,
+        fork_from: std::sync::atomic::AtomicU64,
+    }
+
+    impl ForkSource {
+        fn new(tip: u64) -> Self {
+            Self {
+                tip,
+                fork_from: std::sync::atomic::AtomicU64::new(u64::MAX),
+            }
+        }
+        fn hash(&self, n: u64) -> String {
+            let chain = u64::from(n >= self.fork_from.load(std::sync::atomic::Ordering::SeqCst));
+            format!("0x{n:060x}{chain:04x}")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for ForkSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(self.tip)
+        }
+        async fn finalized(&self) -> Result<Option<u64>> {
+            Ok(self.tip.checked_sub(50))
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(self.hash(n)))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(vec![])
+        }
+    }
+
+    /// #2174: with no canonical checkpoint and nothing sealed, the nest re-indexes from its own
+    /// origin. It used to resume at block 1, far below a `--backfill` nest's range.
+    #[tokio::test]
+    async fn a_rollback_past_every_checkpoint_resumes_at_the_origin() {
+        let d = tempfile::tempdir().unwrap();
+        let nest = build_test_nest(d.path(), "0x0000000000000000000000000000000000000004").await;
+        nest.store.set_meta(START_BLOCK_KEY, "1000").unwrap();
+        seed_blocks(&nest, &[1000, 1010, 1020]);
+        let mut nests = vec![Some(nest)];
+        let mut nexts = vec![1021];
+        let mut sup = test_supervisor(1);
+
+        fan_out_rollback(&mut nests, &mut nexts, &mut sup, &[0], 0).unwrap();
+
+        assert_eq!(nexts[0], 1000, "re-index from the origin, not block 1");
+        let nest = nests[0].as_ref().unwrap();
+        assert_eq!(
+            nest.store.get_meta(LAST_BLOCK_KEY).unwrap().as_deref(),
+            Some("999")
+        );
+        assert!(nest
+            .store
+            .entities_in_range(0, u64::MAX)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// #2165: a nest quarantined while a reorg was fanned out comes back holding the orphaned rows,
+    /// and the shared detection reads a sibling. It is checked against its own checkpoints and rolled
+    /// back before it may index forward.
+    #[tokio::test]
+    async fn a_readmitted_nest_is_rolled_back_past_a_reorg_it_missed() {
+        let da = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let sibling =
+            build_test_nest(da.path(), "0x0000000000000000000000000000000000000005").await;
+        let missed = build_test_nest(db.path(), "0x0000000000000000000000000000000000000006").await;
+        let src = ForkSource::new(200);
+        seed_blocks(&sibling, &[100, 110]);
+        sibling.store.set_block_hash(110, &src.hash(110)).unwrap();
+        seed_blocks(&missed, &[100, 105, 110]);
+        missed.store.set_block_hash(100, &src.hash(100)).unwrap();
+        missed.store.set_block_hash(110, "0xorphaned").unwrap();
+
+        let mut sup = test_supervisor(2);
+        let mut nests = vec![Some(sibling), Some(missed)];
+        let mut nexts = vec![111, 111];
+        check_joined_nests(&src, &mut nests, &mut nexts, &mut sup)
+            .await
+            .unwrap();
+        assert_eq!(
+            nexts,
+            vec![111, 101],
+            "premise: joining at start is checked"
+        );
+
+        // Out of the working set while a reorg replaced 101..=110, then back in with its rows.
+        seed_blocks(nests[1].as_ref().unwrap(), &[105, 110]);
+        nests[1]
+            .as_ref()
+            .unwrap()
+            .store
+            .set_block_hash(110, "0xorphaned")
+            .unwrap();
+        nexts[1] = 111;
+        sup.quarantine(1, &anyhow::anyhow!("state rpc timed out"))
+            .unwrap();
+        sup.readmit_due(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        check_joined_nests(&src, &mut nests, &mut nexts, &mut sup)
+            .await
+            .unwrap();
+
+        assert_eq!(nexts[1], 101, "it resumes from the surviving checkpoint");
+        let store = &nests[1].as_ref().unwrap().store;
+        assert!(store.entities_in_range(101, u64::MAX).unwrap().is_empty());
+        assert_eq!(
+            store.get_meta(LAST_BLOCK_KEY).unwrap().as_deref(),
+            Some("100")
+        );
+        assert!(matches!(sup.states[1], NestState::Live));
+    }
+
+    /// #2175: a `--seal-direct` backfill leaves a checkpoint at its watermark, so a one-block reorg
+    /// of the first tip window is an ordinary rollback rather than a finality violation.
+    #[tokio::test]
+    async fn a_one_block_reorg_after_seal_direct_is_not_a_finality_violation() {
+        let d = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(d.path(), "0x0000000000000000000000000000000000000007").await;
+        let src = ForkSource::new(300);
+        let next = nest.prepare(&src, Some(200), true, 1, 100).await.unwrap();
+        let sealed = nest.store.sealed_through();
+        assert!(sealed > 0 && next == sealed + 1, "premise: seal-direct ran");
+
+        let to = next + 9;
+        nest.store
+            .commit_window(&[], Some((to, src.hash(to).as_str())), to)
+            .unwrap();
+        src.fork_from.store(to, std::sync::atomic::Ordering::SeqCst);
+        let ancestor = detect_reorg(&src, &nest.store, to).await.unwrap();
+        assert_eq!(ancestor, Some(sealed));
+        nest.rollback_reorg(sealed)
+            .expect("a fork above the watermark is not a finality violation");
+    }
+
+    /// #2175, for a store already in that state: the tip path pins a watermark that has no
+    /// checkpoint while finality has yet to pass it.
+    #[tokio::test]
+    async fn maybe_seal_pins_a_watermark_that_has_no_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let src = ForkSource::new(0);
+        let metrics = crate::metrics::NestMetrics::default();
+        store.set_meta(SEALED_THROUGH_KEY, "100").unwrap();
+        store
+            .commit_window(&[], Some((110, src.hash(110).as_str())), 110)
+            .unwrap();
+
+        maybe_seal(tmp.path(), &store, &src, 95, None, &metrics, SPAN_REAL)
+            .await
+            .unwrap();
+
+        src.fork_from
+            .store(110, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(detect_reorg(&src, &store, 110).await.unwrap(), Some(100));
     }
 
     /// A supervisor over `n` nests named a, b, c… with a throwaway health surface.
