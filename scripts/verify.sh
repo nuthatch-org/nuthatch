@@ -377,7 +377,7 @@ level5() {
     bash -c "[ \"\$(ctl $CONTROL_URL/nests/$nest/resolve | jget servable)\" = False ]"
   check 5.7b "pinning makes it servable" \
     bash -c "ctl -X PUT $CONTROL_URL/nests/$nest/pin -H 'content-type: application/json' \
-      -d '{\"version\":\"1.0.0\",\"bundle_hash\":\"0xverify\"}' >/dev/null && \
+      -d '{\"version\":\"1.0.0\",\"bundle_hash\":\"abababababababababababababababababababababababababababababababab\"}' >/dev/null && \
       [ \"\$(ctl $CONTROL_URL/nests/$nest/resolve | jget servable)\" = True ]"
 
   # 5.8: write-only secrets. The value must never come back, and must not reach disk.
