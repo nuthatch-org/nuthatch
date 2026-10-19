@@ -355,6 +355,23 @@ async fn ranged_in<R: Rpc>(
     params: impl Fn(u64, u64) -> Value,
     most: usize,
 ) -> Result<Vec<Value>> {
+    let parts = ranged_parts(rpc, window, from, to, method, params, most, None).await?;
+    Ok(parts.into_values().flatten().collect())
+}
+
+/// `ranged_in`'s spans keyed by their first block. With `overfull`, a single block refused for its
+/// size is listed there, for the caller to read another way, instead of failing the call.
+#[allow(clippy::too_many_arguments)]
+async fn ranged_parts<R: Rpc>(
+    rpc: &R,
+    window: &Window,
+    from: u64,
+    to: u64,
+    method: &str,
+    params: impl Fn(u64, u64) -> Value,
+    most: usize,
+    mut overfull: Option<&mut Vec<u64>>,
+) -> Result<BTreeMap<u64, Vec<Value>>> {
     let mut parts: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
     // Each range left to ask, with the largest span it may use: a refused span's retry is capped below
     // the size it was refused at.
@@ -418,6 +435,10 @@ async fn ranged_in<R: Rpc>(
                     }
                     again.push((s, e, next));
                 }
+                Judged::Overfull(err) => match overfull.as_deref_mut() {
+                    Some(blocks) => blocks.push(s),
+                    None => return Err(err),
+                },
             }
         }
         drop(probing);
@@ -426,13 +447,15 @@ async fn ranged_in<R: Rpc>(
             todo.push_front(range);
         }
     }
-    Ok(parts.into_values().flatten().collect())
+    Ok(parts)
 }
 
-/// One span's answer: its rows, or a refusal about its size that a smaller span may not meet.
+/// One span's answer: its rows, a refusal about its size that a smaller span may not meet, or a
+/// single block refused for its size, which no smaller span can meet.
 enum Judged {
     Rows(Vec<Value>),
     Smaller(String),
+    Overfull(anyhow::Error),
 }
 
 /// Judge one span's answer by the rules a sequential scan applies; an error is fatal to the call.
@@ -440,10 +463,10 @@ fn judge(method: &str, s: u64, e: u64, answer: Result<Value>) -> Result<Judged> 
     match answer {
         Ok(Value::Array(items)) if items.len() >= SUSPICIOUSLY_FULL => {
             if e == s {
-                bail!(
+                return Ok(Judged::Overfull(anyhow!(
                     "{method} at block {s} answered {} items, which may be a truncated page",
                     items.len()
-                );
+                )));
             }
             Ok(Judged::Smaller("too many results".into()))
         }
@@ -457,6 +480,9 @@ fn judge(method: &str, s: u64, e: u64, answer: Result<Value>) -> Result<Judged> 
                 Err(err).with_context(|| format!("{method} [{s}, {e}]"))
             }
         }
+        Err(err) if e == s && range_shaped(&format!("{err:#}")) => Ok(Judged::Overfull(
+            err.context(format!("{method} at block {s}")),
+        )),
         Err(err) => Err(err).with_context(|| format!("{method} at block {s}")),
     }
 }
@@ -848,6 +874,8 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         let mut refs: BTreeMap<String, Vec<TxRef>> = BTreeMap::new();
         let mut timestamps = BTreeMap::new();
         let mut hashes = BTreeMap::new();
+        let mut bodies: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        let mut creations: Vec<(String, u64, [u8; 32])> = Vec::new();
         for block in blocks {
             let block = block?;
             let number = hex_u64(block.get("number").unwrap_or(&Value::Null))?;
@@ -861,13 +889,18 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 .get("transactions")
                 .and_then(Value::as_array)
                 .ok_or_else(|| anyhow!("block {number} came without its transactions"))?;
+            let body = bodies.entry(number).or_default();
             for tx in txs {
                 let sender = str_field(tx, "from")?.to_ascii_lowercase();
+                body.push(str_field(tx, "hash")?.to_ascii_lowercase());
                 let receiver = tx
                     .get("to")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_ascii_lowercase();
+                if receiver.is_empty() {
+                    creations.push((str_field(tx, "hash")?.to_ascii_lowercase(), number, hash));
+                }
                 for (party, outgoing) in [(&sender, true), (&receiver, false)] {
                     if !set.contains(party) || (!outgoing && receiver == sender) {
                         continue;
@@ -882,7 +915,43 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 }
             }
         }
-        let logs = ranged(
+        // A creation names its contract only in its receipt; Etherscan lists it for that contract.
+        let created: Vec<Result<Option<(String, TxRef)>>> = futures::stream::iter(creations)
+            .map(|(tx, block, block_hash)| async move {
+                let receipt = self
+                    .main
+                    .call("eth_getTransactionReceipt", json!([tx]))
+                    .await
+                    .with_context(|| format!("receipt of creation {tx}"))?;
+                if word32(str_field(&receipt, "blockHash")?)? != block_hash {
+                    bail!("the receipt of creation {tx} is from another block than {block}'s");
+                }
+                // A failed creation made no contract, and trace_filter names none for it.
+                match receipt.get("status").and_then(Value::as_str) {
+                    Some("0x1") => {}
+                    Some("0x0") => return Ok(None),
+                    _ => bail!("the receipt of creation {tx} has no status"),
+                }
+                let contract = str_field(&receipt, "contractAddress")?.to_ascii_lowercase();
+                let r = TxRef {
+                    hash: tx,
+                    block,
+                    outgoing: false,
+                    failed: false,
+                    block_hash: Some(block_hash),
+                };
+                Ok(set.contains(&contract).then_some((contract, r)))
+            })
+            .buffered(SWEEP_CONCURRENCY)
+            .collect()
+            .await;
+        for c in created {
+            if let Some((contract, r)) = c? {
+                refs.entry(contract).or_default().push(r);
+            }
+        }
+        let mut overfull = Vec::new();
+        let mut parts = ranged_parts(
             &self.main,
             &self.log_window,
             from,
@@ -892,8 +961,14 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 json!([{ "fromBlock": format!("0x{s:x}"), "toBlock": format!("0x{e:x}"),
                      "topics": [[TRANSFER, TRANSFER_SINGLE, TRANSFER_BATCH]] }])
             },
+            RANGE_CONCURRENCY,
+            Some(&mut overfull),
         )
         .await?;
+        for b in overfull {
+            parts.insert(b, self.transfer_logs_of(b, hashes[&b], &bodies[&b]).await?);
+        }
+        let logs: Vec<Value> = parts.into_values().flatten().collect();
         let mut found: BTreeMap<String, Found> = BTreeMap::new();
         for log in &logs {
             if log.get("removed").and_then(Value::as_bool) == Some(true) {
@@ -925,7 +1000,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             }
         }
         if traced {
-            self.sweep_traces(set, &hashes, &timestamps, &mut found)
+            self.sweep_traces(set, &hashes, &bodies, &timestamps, &mut found)
                 .await?;
         }
         for (a, r) in refs {
@@ -941,6 +1016,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         &self,
         set: &std::collections::HashSet<String>,
         hashes: &BTreeMap<u64, [u8; 32]>,
+        bodies: &BTreeMap<u64, Vec<String>>,
         timestamps: &BTreeMap<u64, u64>,
         found: &mut BTreeMap<String, Found>,
     ) -> Result<()> {
@@ -975,6 +1051,16 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                     Some((h, fs)) if *h == hash => fs.push(f.clone()),
                     _ => by_tx.push((hash, vec![f.clone()])),
                 }
+            }
+            // Some providers answer `[]` for a block they never traced; every transaction has a
+            // root frame, so one without any was not read.
+            let traced: BTreeSet<&str> = by_tx.iter().map(|(h, _)| h.as_str()).collect();
+            if let Some(missing) = bodies[&b].iter().find(|tx| !traced.contains(tx.as_str())) {
+                bail!(
+                    "trace_block {b} has no frames for {missing}, one of its {} transactions; not \
+                     recording the block as traced",
+                    bodies[&b].len()
+                );
             }
             for (hash, frames) in by_tx {
                 for mut record in internal_records(&frames, timestamps[&b])? {
@@ -1023,6 +1109,51 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             }
         }
         Ok(())
+    }
+
+    /// Block `b`'s transfer logs from its receipts, for a block whose logs no `eth_getLogs` answer
+    /// carries whole. A receipt for each of `txs` in order, from block `hash`, is what makes it
+    /// whole, which a log answer cannot show.
+    async fn transfer_logs_of(&self, b: u64, hash: [u8; 32], txs: &[String]) -> Result<Vec<Value>> {
+        let receipts = self
+            .main
+            .call("eth_getBlockReceipts", json!([format!("0x{b:x}")]))
+            .await
+            .with_context(|| format!("receipts of block {b}, whose logs overfill eth_getLogs"))?;
+        let receipts = receipts
+            .as_array()
+            .ok_or_else(|| anyhow!("receipts of block {b} are not a list"))?;
+        if receipts.len() != txs.len() {
+            bail!(
+                "block {b} has {} transactions and {} receipts",
+                txs.len(),
+                receipts.len()
+            );
+        }
+        let mut logs = Vec::new();
+        for (r, tx) in receipts.iter().zip(txs) {
+            if !str_field(r, "transactionHash")?.eq_ignore_ascii_case(tx)
+                || word32(str_field(r, "blockHash")?)? != hash
+            {
+                bail!("block {b}'s receipts do not follow its transactions");
+            }
+            let all = r
+                .get("logs")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("a receipt of block {b} has no log list"))?;
+            logs.extend(
+                all.iter()
+                    .filter(|log| {
+                        log.pointer("/topics/0")
+                            .and_then(Value::as_str)
+                            .is_some_and(|t| {
+                                [TRANSFER, TRANSFER_SINGLE, TRANSFER_BATCH].contains(&t)
+                            })
+                    })
+                    .cloned(),
+            );
+        }
+        Ok(logs)
     }
 
     /// Every internal transaction of `hash`, as Etherscan's `txhash` form lists them: from the cache,
@@ -1527,48 +1658,67 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         // Every empty side is probed, a block with transactions at a time, so a refused probe
         // cannot be skipped on the retry.
         let mid = from + (to - from) / 2;
-        for probe in [mid, from, to] {
-            // The header with its hash list, not eth_getBlockTransactionCountByNumber, which
-            // GraphOps took 12.4 s to answer against 0.13 s for this (2026-10-15).
-            let block = self
-                .main
-                .call(
-                    "eth_getBlockByNumber",
-                    json!([format!("0x{probe:x}"), false]),
-                )
-                .await?;
-            let count = block
-                .get("transactions")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    anyhow!("block {probe} has no transaction list at the main endpoint")
-                })?
-                .len();
-            if count == 0 {
-                continue;
+        let mut probe = None;
+        for b in [mid, from, to] {
+            if self.transaction_count(b).await? > 0 {
+                probe = Some(b);
+                break;
             }
-            let traced = self
-                .trace
-                .call("trace_block", json!([format!("0x{probe:x}")]))
-                .await
-                .context("trace_block, checking an empty trace_filter window")?;
-            let Some(block_frames) = traced.as_array().filter(|t| !t.is_empty()) else {
-                bail!(
-                    "the trace source returned no traces for block {probe}, which holds \
-                     transactions; not recording [{from}, {to}] as covered"
-                );
-            };
-            for side in sides {
-                if block_frames.iter().any(|f| frame_side_is(f, side, a)) {
-                    bail!(
-                        "trace_filter {side} answered nothing for [{from}, {to}], but block \
-                         {probe} has a frame {side} {a}; not recording the window as covered"
-                    );
+        }
+        if probe.is_none() {
+            // A window with no transaction anywhere has no frame to miss; otherwise its first
+            // block holding one is probed instead.
+            let mut rest =
+                futures::stream::iter((from..=to).filter(|b| ![mid, from, to].contains(b)))
+                    .map(|b| async move {
+                        Ok::<_, anyhow::Error>((b, self.transaction_count(b).await?))
+                    })
+                    .buffered(SCAN_CONCURRENCY);
+            while let Some(next) = rest.next().await {
+                let (b, count) = next?;
+                if count > 0 {
+                    probe = Some(b);
+                    break;
                 }
             }
+        }
+        let Some(probe) = probe else {
             return Ok(());
+        };
+        let traced = self
+            .trace
+            .call("trace_block", json!([format!("0x{probe:x}")]))
+            .await
+            .context("trace_block, checking an empty trace_filter window")?;
+        let Some(block_frames) = traced.as_array().filter(|t| !t.is_empty()) else {
+            bail!(
+                "the trace source returned no traces for block {probe}, which holds \
+                 transactions; not recording [{from}, {to}] as covered"
+            );
+        };
+        for side in sides {
+            if block_frames.iter().any(|f| frame_side_is(f, side, a)) {
+                bail!(
+                    "trace_filter {side} answered nothing for [{from}, {to}], but block \
+                     {probe} has a frame {side} {a}; not recording the window as covered"
+                );
+            }
         }
         Ok(())
+    }
+
+    async fn transaction_count(&self, b: u64) -> Result<usize> {
+        // The header with its hash list, not eth_getBlockTransactionCountByNumber, which GraphOps
+        // took 12.4 s to answer against 0.13 s for this (2026-10-15).
+        let block = self
+            .main
+            .call("eth_getBlockByNumber", json!([format!("0x{b:x}"), false]))
+            .await?;
+        Ok(block
+            .get("transactions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("block {b} has no transaction list at the main endpoint"))?
+            .len())
     }
 
     /// For an EOA every sent transaction moves the nonce by one, so the outgoing root frames found
@@ -3221,6 +3371,50 @@ mod tests {
             .expect("the empty midpoint is skipped and block 1,000 has traces");
     }
 
+    /// Three empty probe blocks vouch for nothing: the window's one block with transactions is
+    /// probed instead, and only a window with none anywhere is believed unprobed (#2118).
+    #[tokio::test]
+    async fn empty_probe_blocks_do_not_vouch_for_the_window() {
+        for (busy, traced, believed) in [
+            (Some(1_040), false, false),
+            (Some(1_040), true, true),
+            (None, false, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = history(dir.path());
+            let (main, _) = chain(false);
+            let main = script(move |m, p| match m {
+                "eth_getBlockByNumber" => {
+                    let mut block = (main.answer)(m, p)?;
+                    block["transactions"] = if Some(hex_u64(&p[0])?) == busy {
+                        json!(["0x1"])
+                    } else {
+                        json!([])
+                    };
+                    Ok(block)
+                }
+                _ => (main.answer)(m, p),
+            });
+            let trace = script(move |m, p| match m {
+                "trace_filter" => Ok(json!([])),
+                "trace_block" if Some(hex_u64(&p[0])?) == busy && traced => Ok(json!([{"x": 1}])),
+                "trace_block" => Ok(json!([])),
+                other => bail!("unexpected {other}"),
+            });
+            let d = Discoverer::new(main, trace);
+            let got = d.discover_now(&h, A, 1_000, 1_099).await;
+            match believed {
+                true => {
+                    got.unwrap();
+                }
+                false => {
+                    let err = format!("{:#}", got.unwrap_err());
+                    assert!(err.contains("no traces for block 1040"), "{err}");
+                }
+            }
+        }
+    }
+
     /// One direction answering rows says nothing about the other's empty answer: an incoming
     /// transaction the toAddress filter dropped, while fromAddress found the outgoing one, must
     /// keep the window uncovered.
@@ -3666,6 +3860,233 @@ mod tests {
         assert_eq!(b.txlist.len(), 1);
         assert_eq!(b.txlist[0].record["hash"], hashes[1]);
         assert!(b.tokentx.is_empty());
+    }
+
+    /// One swept block at 17,000,000 holding `txs`, answering the rest of the main endpoint's
+    /// calls with `rest`.
+    fn swept_block(
+        txs: Vec<Value>,
+        rest: impl Fn(&str, &Value) -> Result<Value> + Send + Sync + 'static,
+    ) -> Script {
+        let n = 17_000_000u64;
+        let bh = format!("0x{:0>64}", "b1");
+        script(move |m, p| match m {
+            "eth_getBlockByNumber" => Ok(json!({"number": format!("0x{n:x}"), "hash": bh,
+                "timestamp": "0x64", "transactions": txs})),
+            _ => rest(m, p),
+        })
+    }
+
+    fn sweep_tx(hash: &str, from: &str, to: Option<&str>) -> Value {
+        json!({"blockNumber": format!("0x{:x}", 17_000_000u64), "blockHash": format!("0x{:0>64}", "b1"),
+               "hash": hash, "nonce": "0x0", "transactionIndex": "0x0", "from": from, "to": to,
+               "value": "0x1", "gas": "0x5208", "gasPrice": "0x1", "input": "0x"})
+    }
+
+    /// A block whose transfer logs no eth_getLogs answer carries whole is read from its receipts,
+    /// which must answer for every transaction, rather than wedge the sweep on it (#2111).
+    #[tokio::test]
+    async fn a_block_whose_logs_overfill_get_logs_is_read_from_its_receipts() {
+        const OUT: &str = "0x00000000000000000000000000000000000000ee";
+        let n = 17_000_000u64;
+        let bh = format!("0x{:0>64}", "b1");
+        let (h1, h2) = (format!("0x{:0>64}", "1"), format!("0x{:0>64}", "2"));
+        let log = |topic0: &str, to: &str, index: u64| {
+            json!({"address": "0x00000000000000000000000000000000000000c0",
+                   "topics": [topic0, padded(OUT), padded(to)],
+                   "data": format!("0x{:0>64}", "64"), "blockNumber": format!("0x{n:x}"),
+                   "transactionHash": h2, "transactionIndex": "0x1",
+                   "logIndex": format!("0x{index:x}"), "blockHash": bh, "removed": false})
+        };
+        let approval = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+        let receipts = json!([
+            {"transactionHash": h1, "blockHash": bh, "logs": []},
+            {"transactionHash": h2, "blockHash": bh,
+             "logs": [log(approval, A, 0), log(TRANSFER, A, 1), log(TRANSFER, OUT, 2)]},
+        ]);
+        let set: std::collections::HashSet<String> = [A.to_string()].into();
+        for whole in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = history(dir.path());
+            let answer = if whole {
+                receipts.clone()
+            } else {
+                json!([receipts[1]])
+            };
+            let main = swept_block(
+                vec![sweep_tx(&h1, OUT, Some(OUT)), sweep_tx(&h2, OUT, Some(OUT))],
+                move |m, _| match m {
+                    "eth_getLogs" => {
+                        bail!("response passed the 4194304-byte getLogs body cap; narrowing the range")
+                    }
+                    "eth_getBlockReceipts" => Ok(answer.clone()),
+                    other => bail!("unexpected {other}"),
+                },
+            );
+            let d = Discoverer::new(main, script(|m, _| bail!("no trace call expected: {m}")));
+            let pending = Pending::begin(&h).unwrap();
+            let swept = d.sweep(&h, &set, n, n, &pending, false).await;
+            if !whole {
+                let err = format!("{:#}", swept.unwrap_err());
+                assert!(err.contains("2 transactions and 1 receipts"), "{err}");
+                continue;
+            }
+            let found = swept.unwrap();
+            let rows = &found[A].tokentx;
+            assert_eq!(
+                rows.len(),
+                1,
+                "the transfer to A, not the approval: {rows:?}"
+            );
+            assert_eq!(rows[0].record["hash"], h2);
+        }
+    }
+
+    /// A span refused for its size is asked again smaller: only a single block refused falls back
+    /// to receipts, so every block of a range wider than the provider's cap keeps its transfers.
+    #[tokio::test]
+    async fn a_refused_span_in_a_sweep_is_narrowed_not_read_as_one_block() {
+        const OUT: &str = "0x00000000000000000000000000000000000000ee";
+        let n = 17_000_000u64;
+        let bh = |b: u64| format!("0x{b:064x}");
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let main = script(move |m, p| {
+            Ok(match m {
+                "eth_getBlockByNumber" => {
+                    let b = hex_u64(&p[0])?;
+                    json!({"number": format!("0x{b:x}"), "hash": bh(b), "timestamp": "0x64",
+                           "transactions": []})
+                }
+                "eth_getLogs" => {
+                    let s = hex_u64(&p[0]["fromBlock"])?;
+                    let e = hex_u64(&p[0]["toBlock"])?;
+                    if e - s + 1 > 2 {
+                        bail!("Log response size exceeded");
+                    }
+                    json!((s..=e)
+                        .map(
+                            |b| json!({"address": "0x00000000000000000000000000000000000000c0",
+                            "topics": [TRANSFER, padded(OUT), padded(A)],
+                            "data": format!("0x{:0>64}", "64"), "blockNumber": format!("0x{b:x}"),
+                            "transactionHash": bh(b + 1), "transactionIndex": "0x0",
+                            "logIndex": "0x0", "blockHash": bh(b), "removed": false})
+                        )
+                        .collect::<Vec<_>>())
+                }
+                other => bail!("unexpected {other}"),
+            })
+        });
+        let d = Discoverer::new(main, script(|m, _| bail!("no trace call expected: {m}")));
+        let set: std::collections::HashSet<String> = [A.to_string()].into();
+        let pending = Pending::begin(&h).unwrap();
+        let found = d.sweep(&h, &set, n, n + 4, &pending, false).await.unwrap();
+        let blocks: Vec<u64> = found[A].tokentx.iter().map(|r| r.block).collect();
+        assert_eq!(blocks, (n..=n + 4).collect::<Vec<_>>());
+    }
+
+    /// A trace that omits a transaction of the block was not read: the window is refused rather
+    /// than recorded traced without that transaction's internal transfers (#2112).
+    #[tokio::test]
+    async fn a_traced_sweep_refuses_a_block_traced_without_its_transactions() {
+        const OUT: &str = "0x00000000000000000000000000000000000000ee";
+        let n = 17_000_000u64;
+        let bh = format!("0x{:0>64}", "b1");
+        let (h1, h2) = (format!("0x{:0>64}", "1"), format!("0x{:0>64}", "2"));
+        let root = |tx: &str| {
+            json!({"type": "call", "traceAddress": [], "blockHash": bh, "transactionHash": tx,
+                   "transactionPosition": 0, "blockNumber": n,
+                   "action": {"from": OUT, "to": OUT, "value": "0x0", "callType": "call", "gas": "0x0"},
+                   "result": {"gasUsed": "0x0"}})
+        };
+        let set: std::collections::HashSet<String> = [A.to_string()].into();
+        for (frames, refused) in [
+            (json!([]), true),
+            (json!([root(&h1)]), true),
+            (json!([root(&h1), root(&h2)]), false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = history(dir.path());
+            let main = swept_block(
+                vec![sweep_tx(&h1, OUT, Some(OUT)), sweep_tx(&h2, OUT, Some(OUT))],
+                |m, _| match m {
+                    "eth_getLogs" => Ok(json!([])),
+                    other => bail!("unexpected {other}"),
+                },
+            );
+            let d = Discoverer::new(
+                main,
+                script(move |m, _| match m {
+                    "trace_block" => Ok(frames.clone()),
+                    other => bail!("unexpected {other}"),
+                }),
+            );
+            let pending = Pending::begin(&h).unwrap();
+            let swept = d.sweep(&h, &set, n, n, &pending, true).await;
+            match refused {
+                true => {
+                    let err = format!("{:#}", swept.unwrap_err());
+                    assert!(err.contains("has no frames for"), "{err}");
+                }
+                false => assert!(swept.unwrap().is_empty()),
+            }
+        }
+    }
+
+    /// A transaction that creates a watched contract is in that contract's txlist, as per-address
+    /// discovery and Etherscan list it; a failed creation made no contract and is not, whether or not its receipt names one (#2115).
+    #[tokio::test]
+    async fn a_sweep_lists_the_creation_of_a_watched_contract() {
+        const B: &str = "0x00000000000000000000000000000000000000b0";
+        const OUT: &str = "0x00000000000000000000000000000000000000ee";
+        let n = 17_000_000u64;
+        let bh = format!("0x{:0>64}", "b1");
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let [h1, h2, h3] = [1, 2, 3].map(|i| format!("0x{:0>64}", i));
+        let txs = vec![
+            sweep_tx(&h1, OUT, None),
+            sweep_tx(&h2, OUT, None),
+            sweep_tx(&h3, OUT, None),
+        ];
+        let by_hash = txs.clone();
+        let (made, failed, unnamed) = (h1.clone(), h2.clone(), h3.clone());
+        let main = swept_block(txs, move |m, p| {
+            Ok(match m {
+                "eth_getLogs" => json!([]),
+                "eth_getTransactionByHash" => {
+                    by_hash.iter().find(|t| t["hash"] == p[0]).cloned().unwrap()
+                }
+                "eth_getTransactionReceipt" => {
+                    let (status, contract) = if p[0] == made.as_str() {
+                        ("0x1", json!(A))
+                    } else if p[0] == failed.as_str() {
+                        ("0x0", json!(B))
+                    } else if p[0] == unnamed.as_str() {
+                        ("0x0", Value::Null)
+                    } else {
+                        bail!("unexpected receipt {p}")
+                    };
+                    json!({"status": status, "gasUsed": "0x5208", "cumulativeGasUsed": "0x5208",
+                           "effectiveGasPrice": "0x1", "contractAddress": contract,
+                           "blockHash": bh})
+                }
+                other => bail!("unexpected {other}"),
+            })
+        });
+        let d = Discoverer::new(main, script(|m, _| bail!("no trace call expected: {m}")));
+        let set: std::collections::HashSet<String> = [A, B].map(String::from).into();
+        let pending = Pending::begin(&h).unwrap();
+        let found = d.sweep(&h, &set, n, n, &pending, false).await.unwrap();
+        assert_eq!(
+            found.keys().collect::<Vec<_>>(),
+            [A],
+            "not B, whose creation failed"
+        );
+        let rows = &found[A].txlist;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].record["hash"], h1);
+        assert_eq!(rows[0].record["contractAddress"], A);
     }
 
     #[tokio::test]

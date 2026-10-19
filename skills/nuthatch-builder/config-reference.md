@@ -256,11 +256,12 @@ sweep follows the finalized head, or with
 deposits soon after they land.
 
 Every incoming row that moved value is a deposit in one feed across the whole set; a failed
-transaction, a frame inside a reverted call, a zero transfer and a `callcode` frame are served by the
-account actions as Etherscan serves them, but are not deposits. The feed is read with
-`GET /api?module=account&action=nuthatchDeposits&after=<seq>&offset=<n>`: entries in sequence order,
-each `{"seq", "event": "deposit", "address", "action", "blockNumber", "row"}`, and `sweptThrough`, the
-last block the feed is complete to. A reorg above finality adds `{"event": "retraction", "retracts":
+transaction, a frame inside a reverted call, a zero transfer, a send to oneself and a `callcode` frame
+are served by the account actions as Etherscan serves them, but are not deposits. The feed is read
+with `GET /api?module=account&action=nuthatchDeposits&after=<seq>&offset=<n>`: entries in sequence
+order, each `{"seq", "event": "deposit", "address", "action", "blockNumber", "row"}`, and
+`sweptThrough`, the last block the feed is complete to, or `null` on a page that stops short of the
+feed's end. A reorg above finality adds `{"event": "retraction", "retracts":
 <seq>, …}` for each deposit it took back, once, and the replacement arrives as a new deposit. With
 `webhook` set the feed is POSTed as `{"deposits": [...]}`, oldest first; a batch counts as delivered
 only after a 2xx, so a failed delivery is sent again, never skipped, and a consumer drops repeats by
