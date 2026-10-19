@@ -1438,6 +1438,41 @@ fn ds_nid_for(datasets: &[Dataset], route_key: &str, default_tenant: &str) -> Op
         .and_then(|d| d.nid.as_deref().map(Arc::from))
 }
 
+/// Overlay each booted mount's record (RFC-0034 §2). Applied **per mount, not per dataset**: that is
+/// the whole reason the allowlist is mount config rather than manifest. Two tenants sharing one
+/// dataset can expose different surfaces over it, and neither the NID nor the data is affected.
+fn overlay_boot_records(
+    states: &mut [(String, crate::serve::AppState)],
+    records: &[Mount],
+    datasets: &[Dataset],
+    default_tenant: &str,
+) -> Result<()> {
+    for (key, state) in states.iter_mut() {
+        let record = records
+            .iter()
+            .find(|m| mount_route(m, default_tenant) == *key);
+        let surface = served_surface(record, &state.dir, key)?;
+        if surface.access != crate::allowlist::SqlAccess::Open {
+            tracing::info!(
+                "mount {key}: sql = {:?}, {} declared quer{}",
+                surface.access,
+                surface.queries.len(),
+                if surface.queries.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            );
+        }
+        let nid = match record {
+            Some(_) => ds_nid_for(datasets, key, default_tenant),
+            None => state.nid.clone(),
+        };
+        overlay_mount_record(state, nid.as_deref(), record, surface);
+    }
+    Ok(())
+}
+
 /// Give every extra alias of a shared dataset its own route onto the *same* state (RFC-0032 §7).
 ///
 /// One dataset was indexed, under its canonical alias. Each further alias gets a **clone** of that
@@ -1760,17 +1795,12 @@ pub async fn dev(
     // store is opened, so a nest exposing more than its author sanctioned fails to start rather than
     // serving the excess until somebody notices.
     for ds in &datasets {
-        if let Some(ceiling) = crate::allowlist::Ceiling::load(&ds.dir)? {
-            for m in &ds.mounts {
-                if let Some(rec) = mounts
-                    .mounts
-                    .iter()
-                    .find(|r| r.tenant == m.tenant && r.alias == m.alias)
-                {
-                    rec.surface()
-                        .validate_within(&ceiling, &m.route_key(default_tenant))?;
-                }
-            }
+        for m in &ds.mounts {
+            let rec = mounts
+                .mounts
+                .iter()
+                .find(|r| r.tenant == m.tenant && r.alias == m.alias);
+            served_surface(rec, &ds.dir, &m.route_key(default_tenant))?;
         }
     }
 
@@ -2010,40 +2040,7 @@ pub async fn dev(
         default_tenant,
     );
 
-    // Overlay each mount's SQL surface (RFC-0034 §2). Applied **per mount, not per dataset**: that is
-    // the whole reason the allowlist is mount config rather than manifest. Two tenants sharing one
-    // dataset can expose different surfaces over it, and neither the NID nor the data is affected.
-    for (key, state) in all_states.iter_mut() {
-        let Some(m) = mounts.mounts.iter().find(|m| {
-            &MountRef {
-                tenant: m.tenant.clone(),
-                alias: m.alias.clone(),
-            }
-            .route_key(default_tenant)
-                == key
-        }) else {
-            continue;
-        };
-        let surface = m.surface();
-        if surface.access != crate::allowlist::SqlAccess::Open {
-            tracing::info!(
-                "mount {key}: sql = {:?}, {} declared quer{}",
-                surface.access,
-                surface.queries.len(),
-                if surface.queries.len() == 1 {
-                    "y"
-                } else {
-                    "ies"
-                }
-            );
-        }
-        state.surface = Arc::new(surface);
-        #[cfg(feature = "counter")]
-        {
-            state.counter = m.counter.clone().map(Arc::new);
-        }
-        state.nid = ds_nid_for(&datasets, key, default_tenant);
-    }
+    overlay_boot_records(&mut all_states, &mounts.mounts, &datasets, default_tenant)?;
     let all_states = all_states;
     let publishers = spawn_publishers(&dir, &mounts.mounts, default_tenant)?;
 
@@ -3554,21 +3551,37 @@ pub fn spawn_move_job(
     })
 }
 
-/// Stamp a live-mounted nest's dataset identity and mount record onto its serving state. Boot does
-/// the same after `build_nest`; without it a recorded `sql = "deny"` serves open until restart (#1536).
+/// The SQL surface a mount serves over `dataset`: its record's, or open with none, bounded by the
+/// author's ceiling (RFC-0034 §3). Refused when the record widens the ceiling.
+fn served_surface(
+    record: Option<&Mount>,
+    dataset: &Path,
+    route: &str,
+) -> Result<crate::allowlist::Surface> {
+    let surface = record.map(Mount::surface).unwrap_or_default();
+    match crate::allowlist::Ceiling::load(dataset)? {
+        Some(ceiling) => surface.within(&ceiling, route),
+        None => Ok(surface),
+    }
+}
+
+/// Stamp a mount's dataset identity, record and [`served_surface`] onto the state served under its
+/// name. Every path that installs a state under a name goes through here: boot, mount, resume and
+/// move (#1536, #2129).
 fn overlay_mount_record(
     state: &mut crate::serve::AppState,
     nid: Option<&str>,
     record: Option<&Mount>,
+    surface: crate::allowlist::Surface,
 ) {
     state.nid = nid.map(Arc::from);
-    if let Some(record) = record {
-        state.surface = Arc::new(record.surface());
-        #[cfg(feature = "counter")]
-        {
-            state.counter = record.counter.clone().map(Arc::new);
-        }
+    state.surface = Arc::new(surface);
+    #[cfg(feature = "counter")]
+    {
+        state.counter = record.and_then(|r| r.counter.clone()).map(Arc::new);
     }
+    #[cfg(not(feature = "counter"))]
+    let _ = record;
 }
 
 impl RuntimeHandles {
@@ -3865,16 +3878,10 @@ impl RuntimeHandles {
                     "nest '{name}' mounted onto the dataset '{cursor_key}' already indexes"
                 );
                 // The surface is the mount's own, never its co-tenant's (RFC-0034 §2).
-                let record = self
-                    .mount_ctx
-                    .mounts
-                    .iter()
-                    .find(|m| mount_route(m, &self.default_tenant) == name);
-                state.surface = Arc::new(record.map(Mount::surface).unwrap_or_default());
-                #[cfg(feature = "counter")]
-                {
-                    state.counter = record.and_then(|m| m.counter.clone()).map(Arc::new);
-                }
+                let record = self.surface_record(name);
+                let surface = served_surface(record.as_ref(), &dir, name)?;
+                let held = state.nid.clone();
+                overlay_mount_record(&mut state, held.as_deref(), record.as_ref(), surface);
                 (state, None, 0, cursor_key)
             }
             None => {
@@ -3894,6 +3901,8 @@ impl RuntimeHandles {
                     incoming_mb: incoming,
                     ..
                 } = self.admit(name, &config, &dir)?;
+                let record = self.surface_record(name);
+                let surface = served_surface(record.as_ref(), &dir, name)?;
 
                 // After the budget, so a refused mount never dials anything.
                 if let Some(d) = dormant {
@@ -3946,12 +3955,6 @@ impl RuntimeHandles {
                     &[name],
                 );
                 config.route = Some(name.to_string());
-                let record = self
-                    .mount_ctx
-                    .mounts
-                    .iter()
-                    .find(|m| mount_route(m, &self.default_tenant) == name)
-                    .cloned();
 
                 let (state, worker) = match lifecycle {
                     None => {
@@ -3977,7 +3980,7 @@ impl RuntimeHandles {
                         let (_, mut state) =
                             cursor.states.pop().expect("one nest in, one state out");
                         let worker = cursor.alert_workers.pop().map(|(_, w)| w);
-                        overlay_mount_record(&mut state, nid.as_deref(), record.as_ref());
+                        overlay_mount_record(&mut state, nid.as_deref(), record.as_ref(), surface);
                         self.lifecycle.insert(chain.clone(), cursor.lifecycle);
                         match &self.mount_ctx.cursors {
                             Some(feed) => {
@@ -4023,7 +4026,7 @@ impl RuntimeHandles {
                         // and the same one persisted into the mount record below. `dev()`'s startup path stamps this
                         // from the dataset scan (`ds_nid_for`); a live mount has no such scan to run, so it must stamp
                         // it here or serve `nid: null` until the next restart (#557).
-                        overlay_mount_record(&mut state, nid.as_deref(), record.as_ref());
+                        overlay_mount_record(&mut state, nid.as_deref(), record.as_ref(), surface);
 
                         // Phase 2: hand it to the cursor at a window boundary, and wait for it to be in the set.
                         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -4355,6 +4358,17 @@ impl RuntimeHandles {
         format!("{name}{STAGING_SUFFIX}")
     }
 
+    /// The record whose surface `name` serves. A move's staging name serves the moving name's, so
+    /// the incoming nest is never routed more open than the name it will take (#2129).
+    fn surface_record(&self, name: &str) -> Option<Mount> {
+        let owner = name.strip_suffix(STAGING_SUFFIX).unwrap_or(name);
+        self.mount_ctx
+            .mounts
+            .iter()
+            .find(|m| mount_route(m, &self.default_tenant) == owner)
+            .cloned()
+    }
+
     /// Undo a move's staging mount and return `cause`, the reason the move stopped. An unmount keeps a
     /// name's record for a remount and nothing remounts a staging name, so the record goes too, but
     /// only once the unmount has landed: one whose drain failed leaves the nest mounted.
@@ -4402,6 +4416,11 @@ impl RuntimeHandles {
             let cause = anyhow::anyhow!("a move keeps its chain: '{name}' is on {chain}");
             return Err(self.abandon_move(&staging, cause).await);
         }
+        let record = self.surface_record(name);
+        let surface = match served_surface(record.as_ref(), &self.states[new_idx].1.dir, name) {
+            Ok(surface) => surface,
+            Err(e) => return Err(self.abandon_move(&staging, e).await),
+        };
         let new_key = self.states[new_idx]
             .1
             .runtime_health
@@ -4467,6 +4486,7 @@ impl RuntimeHandles {
         } else {
             self.health.register_alias(name, &new_key, &chain);
         }
+        overlay_mount_record(&mut new_state, Some(nid.as_str()), record.as_ref(), surface);
         let old_idx = self
             .states
             .iter()
@@ -6588,6 +6608,47 @@ mod tests {
             runtime_health: None,
             address_history: None,
         }
+    }
+
+    /// #2129, #2135: boot serves each name its record's surface, bounded by its author's ceiling,
+    /// and an open record under a ceiling serves the ceiling.
+    #[test]
+    fn boot_serves_each_record_within_its_ceiling() {
+        use crate::allowlist::SqlAccess;
+        let (closed, bounded) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(
+            bounded.path().join(crate::allowlist::CEILING_FILE),
+            "[[queries]]\nname = \"total\"\nsql = \"SELECT 1\"\n",
+        )
+        .unwrap();
+        let record = |alias: &str, sql| Mount {
+            tenant: DEFAULT_TENANT.to_string(),
+            alias: alias.to_string(),
+            nid: "ab".repeat(32),
+            sql,
+            queries: Vec::new(),
+            publish: None,
+            #[cfg(feature = "counter")]
+            counter: None,
+        };
+        let mut states = vec![
+            (
+                "closed".to_string(),
+                nest_state(closed.path(), "arbitrum-one"),
+            ),
+            (
+                "bounded".to_string(),
+                nest_state(bounded.path(), "arbitrum-one"),
+            ),
+        ];
+        let records = [
+            record("closed", SqlAccess::Deny),
+            record("bounded", SqlAccess::Open),
+        ];
+        overlay_boot_records(&mut states, &records, &[], DEFAULT_TENANT).unwrap();
+        assert_eq!(states[0].1.surface.access, SqlAccess::Deny);
+        assert_eq!(states[1].1.surface.access, SqlAccess::Allowlist);
+        assert_eq!(states[1].1.surface.queries[0].name, "total");
     }
 
     /// #1647: every write of mounts.toml a suspend makes still holds the mount, so a crash at any
