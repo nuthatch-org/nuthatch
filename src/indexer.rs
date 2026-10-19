@@ -14083,8 +14083,8 @@ template = "pool"
         async fn tip(&self) -> Result<u64> {
             Ok(12)
         }
-        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-            Ok(None)
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("0xbh{n}")))
         }
         async fn logs(
             &self,
