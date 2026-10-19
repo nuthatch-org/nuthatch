@@ -343,3 +343,61 @@ async fn undeclaring_a_nest_removes_its_secrets() {
         "a nest's secrets must not outlive the nest - they are unreachable and inheritable"
     );
 }
+
+/// #2141: the control plane's own listener drops a client dribbling its request headers, as the
+/// data surface does (#1660). Driven through `run`, because the bound lives in how it serves.
+#[tokio::test]
+async fn the_control_listener_drops_a_client_dribbling_its_headers() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Some((_app, _cp)) = fixture(None) else {
+        return;
+    };
+    let url = std::env::var("NUTHATCH_TEST_PG").unwrap();
+    let addr = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let server = {
+        let addr = addr.clone();
+        tokio::spawn(async move { nuthatch::control_api::run(&addr, &url).await })
+    };
+    let started = std::time::Instant::now();
+    while reqwest::get(format!("http://{addr}/health")).await.is_err() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "never came up on {addr}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let (mut read, mut write) = tokio::net::TcpStream::connect(&addr)
+        .await
+        .unwrap()
+        .into_split();
+    write
+        .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
+    let dribble = tokio::spawn(async move {
+        while write.write_all(b"x").await.is_ok() {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    });
+    let bound = nuthatch::serve::HEADER_READ_TIMEOUT + std::time::Duration::from_secs(5);
+    let closed = tokio::time::timeout(bound, async {
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = read.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    dribble.abort();
+    server.abort();
+    assert!(
+        closed,
+        "a connection dribbling its headers was held past {bound:?}"
+    );
+}

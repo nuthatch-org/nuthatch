@@ -182,6 +182,17 @@ pub(crate) fn resolve_nest_dir(
         cache: cache_root,
         registry,
     } = nests;
+    // The control plane checks these on write; rows written before it did are refused here.
+    if let Err(e) = crate::runtime::check_mount_name(name, crate::runtime::DEFAULT_TENANT) {
+        return NestLocation::Unlocatable(format!("{e:#}"));
+    }
+    if let Some(hash) = source.and_then(|s| s.bundle_hash.as_deref()) {
+        if !crate::distribution::is_nid_shaped(hash) {
+            return NestLocation::Unlocatable(format!(
+                "pinned bundle hash '{hash}' is not 64 hex characters"
+            ));
+        }
+    }
     let per_nest = nest_root.join(name);
     if per_nest.join(crate::config::CONFIG_FILE).exists() {
         return NestLocation::Local(per_nest);
@@ -254,10 +265,17 @@ async fn start_nests_for(
     store: Arc<dyn HotStore>,
     nests: &NestPaths,
     chain: &str,
+    with_secrets: bool,
 ) -> Result<usize> {
     if running.by_chain.contains_key(chain) {
         return Ok(0); // already indexing this cursor
     }
+    // Before any nest dials: one started on its bundle's RPC would ignore the operator's secret.
+    let secrets = if with_secrets {
+        chain_secrets(cp, chain)?
+    } else {
+        HashMap::new()
+    };
     let desired: Vec<_> = cp
         .desired()?
         .into_iter()
@@ -333,7 +351,7 @@ async fn start_nests_for(
                 continue;
             }
         };
-        let cfg = match crate::config::Config::load(&dir) {
+        let mut cfg = match crate::config::Config::load(&dir) {
             Ok(c) => c,
             Err(e) => {
                 // Not fatal, and **loud**: a declared nest this worker cannot find is exactly the
@@ -351,6 +369,9 @@ async fn start_nests_for(
                 "nest on disk is for a different chain than the control plane declared - skipping"
             );
             continue;
+        }
+        if let Some(s) = secrets.get(&d.name) {
+            apply_secrets(&d.name, &mut cfg, s);
         }
         let source: Arc<dyn crate::source::Source> =
             Arc::new(crate::rpc::RpcClient::new(cfg.nest.rpc_urls.clone())?);
@@ -464,19 +485,18 @@ pub async fn run(
                 // nests it authorises.
                 for chain in &held {
                     if let Some((_, store)) = hosts.stores.iter().find(|(c, _)| c == chain) {
-                        if let Err(e) =
-                            start_nests_for(&cp, &mut running, store.clone(), &nests, chain).await
+                        if let Err(e) = start_nests_for(
+                            &cp,
+                            &mut running,
+                            store.clone(),
+                            &nests,
+                            chain,
+                            secrets_for_assigned,
+                        )
+                        .await
                         {
                             tracing::warn!(chain = %chain, "could not start nests: {e:#}");
                         }
-                    }
-                }
-                if secrets_for_assigned && !outcome.acquired.is_empty() {
-                    // Secrets are fetched *after* acquiring, scoped to what we actually hold - never
-                    // to what we were merely assigned. A worker that lost the race must not be handed
-                    // credentials for a cursor it does not own.
-                    if let Err(e) = load_secrets(&cp, &held) {
-                        tracing::warn!("could not load secrets for assigned nests: {e:#}");
                     }
                 }
             }
@@ -536,18 +556,34 @@ fn report(o: &TickOutcome, worker_id: &str) {
     }
 }
 
-fn load_secrets(
+/// The control-plane secrets of the nests declared on `chain`, keyed by nest name (RFC-0022 §5).
+/// Called only for a cursor this worker holds, so it never receives another worker's credentials.
+pub fn chain_secrets(
     cp: &ControlPlane,
-    held: &[String],
+    chain: &str,
 ) -> Result<HashMap<String, HashMap<String, String>>> {
-    let got = cp.secrets_for(held)?;
-    // Count only - never the keys, let alone the values. A log line is the easiest place for a
-    // credential to escape to.
-    tracing::info!(
-        nests = got.len(),
-        "runtime secrets injected for held cursors"
-    );
-    Ok(got)
+    let names: Vec<String> = cp
+        .desired()?
+        .into_iter()
+        .filter(|d| d.chain == chain)
+        .map(|d| d.name)
+        .collect();
+    cp.secrets_for(&names)
+}
+
+/// Apply a nest's secrets to the config it is about to run with. `rpc_url` is the one key a nest
+/// consumes; any other is named in a warning so a typo is not silently ignored.
+fn apply_secrets(nest: &str, cfg: &mut crate::config::Config, secrets: &HashMap<String, String>) {
+    for (key, value) in secrets {
+        match key.as_str() {
+            "rpc_url" => cfg.nest.rpc_urls = vec![value.clone()],
+            _ => {
+                tracing::warn!(nest = %nest, %key, "control-plane secret has no consumer - ignored")
+            }
+        }
+    }
+    // Key count only: a log line is the easiest place for a credential to escape to.
+    tracing::info!(nest = %nest, keys = secrets.len(), "runtime secrets applied");
 }
 
 async fn shutdown() {
@@ -582,6 +618,10 @@ mod tests {
         }
     }
 
+    fn hash(c: char) -> String {
+        c.to_string().repeat(64)
+    }
+
     fn touch_nest(dir: &std::path::Path) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join(crate::config::CONFIG_FILE), "[nest]\n").unwrap();
@@ -612,7 +652,7 @@ mod tests {
             resolve(
                 root.path(),
                 Some("/some/registry"),
-                Some(&source(Some("1.0.0"), Some("abc")))
+                Some(&source(Some("1.0.0"), Some(&hash('c'))))
             ),
             NestLocation::Local(root.path().join("nests/horizon"))
         );
@@ -639,12 +679,12 @@ mod tests {
             resolve(
                 root.path(),
                 Some("/some/registry"),
-                Some(&source(Some("1.2.3"), Some("deadbeef")))
+                Some(&source(Some("1.2.3"), Some(&hash('d'))))
             ),
             NestLocation::Pull {
                 reference: "horizon@1.2.3".into(),
-                pinned_hash: Some("deadbeef".into()),
-                target: root.path().join("cache/horizon/deadbeef"),
+                pinned_hash: Some(hash('d')),
+                target: root.path().join("cache/horizon").join(hash('d')),
                 replace: false,
             }
         );
@@ -657,7 +697,7 @@ mod tests {
     #[test]
     fn re_pinning_re_pulls_while_an_unchanged_pin_reuses_what_was_pulled() {
         let root = tempfile::tempdir().unwrap();
-        let old = source(Some("1.0.0"), Some("aaaa"));
+        let old = source(Some("1.0.0"), Some(&hash('a')));
         let NestLocation::Pull { target, .. } = resolve(root.path(), Some("/reg"), Some(&old))
         else {
             panic!("first sight of a pinned nest must pull");
@@ -672,11 +712,11 @@ mod tests {
         );
 
         // Re-pinned: a different bundle, so a different directory, so a fetch.
-        let new = source(Some("2.0.0"), Some("bbbb"));
+        let new = source(Some("2.0.0"), Some(&hash('b')));
         assert!(
             matches!(
                 resolve(root.path(), Some("/reg"), Some(&new)),
-                NestLocation::Pull { ref pinned_hash, .. } if pinned_hash.as_deref() == Some("bbbb")
+                NestLocation::Pull { ref pinned_hash, .. } if pinned_hash.as_deref() == Some(hash('b').as_str())
             ),
             "a re-pinned fleet must re-pull, not keep running the bundle it already has"
         );
@@ -734,6 +774,61 @@ mod tests {
             }
             other => panic!("both should be unlocatable, got {other:?}"),
         }
+    }
+
+    /// #2140: a declared name and a pinned hash become path segments on every worker, and the
+    /// unpinned branch removes its target. One that leaves the nest root or cache is refused.
+    #[test]
+    fn a_name_or_hash_that_leaves_the_cache_is_unlocatable() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = NestPaths {
+            root: root.path().join("nests"),
+            cache: root.path().join("cache"),
+            registry: Some("/reg".into()),
+        };
+        for name in ["../../srv/x", "/srv/x", ".."] {
+            let src = NestSource {
+                name: name.into(),
+                ..source(None, None)
+            };
+            let loc = resolve_nest_dir(&paths, name, Some(&src));
+            assert!(
+                matches!(loc, NestLocation::Unlocatable(_)),
+                "name {name:?} resolved to {loc:?}"
+            );
+        }
+        for h in ["../../srv/x", "/srv/x", "abc"] {
+            let loc = resolve(root.path(), Some("/reg"), Some(&source(Some("1"), Some(h))));
+            assert!(
+                matches!(loc, NestLocation::Unlocatable(_)),
+                "hash {h:?} resolved to {loc:?}"
+            );
+        }
+    }
+
+    /// #2138: an `rpc_url` secret replaces the bundle's RPC in the config the nest dials with.
+    #[test]
+    fn an_rpc_url_secret_replaces_the_bundles_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"horizon\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = [\"https://bundle.example\"]\n",
+        )
+        .unwrap();
+        let mut cfg = crate::config::Config::load(dir.path()).unwrap();
+        let secrets = HashMap::from([
+            (
+                "rpc_url".to_string(),
+                "https://private.example/k".to_string(),
+            ),
+            ("unused".to_string(), "x".to_string()),
+        ]);
+        apply_secrets("horizon", &mut cfg, &secrets);
+        assert_eq!(
+            cfg.nest.rpc_urls,
+            vec!["https://private.example/k".to_string()]
+        );
     }
 
     fn strings(v: &[&str]) -> Vec<String> {
