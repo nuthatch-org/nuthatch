@@ -1886,7 +1886,7 @@ pub async fn dev(
         groups.len(),
     );
 
-    let admin_token = indexer::admin_required_token(admin_enabled, &listen);
+    let admin_token = indexer::admin_required_token(admin_enabled);
     // The RSS budget is now **per active-chain cursor** (RFC-0021), not per whole runtime.
     let max_rss = meta.max_rss_mb.unwrap_or(DEFAULT_MAX_RSS_MB);
 
@@ -7251,6 +7251,7 @@ mod tests {
             (dir.path().to_path_buf(), "joining".to_string()),
             Arc::new(move || {
                 let req = axum::http::Request::delete(&uri)
+                    .header(axum::http::header::HOST, "127.0.0.1")
                     .body(axum::body::Body::empty())
                     .unwrap();
                 let resp = tokio::task::block_in_place(|| {
@@ -7297,6 +7298,7 @@ mod tests {
         failed.reason = Some("refused".into());
         jobs.put(failed).unwrap();
         let req = axum::http::Request::delete(format!("/_admin/datasets/{nid}"))
+            .header(axum::http::header::HOST, "127.0.0.1")
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = lifecycle_routes(handles, jobs, true, None)
@@ -7532,6 +7534,7 @@ mod tests {
             hook_key.clone(),
             Arc::new(move || {
                 let req = axum::http::Request::post("/_admin/nests?wait=true")
+                    .header("host", "127.0.0.1")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(r#"{"name":"usdc"}"#))
                     .unwrap();

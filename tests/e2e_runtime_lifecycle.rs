@@ -1280,7 +1280,11 @@ async fn call(
     body: Option<&str>,
 ) -> (axum::http::StatusCode, String) {
     use tower::ServiceExt;
-    let mut req = axum::http::Request::builder().method(method).uri(uri);
+    // A real client always names its target; the open surface refuses a request that does not (#2136).
+    let mut req = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(axum::http::header::HOST, "127.0.0.1");
     if let Some(t) = bearer {
         req = req.header(axum::http::header::AUTHORIZATION, format!("Bearer {t}"));
     }
@@ -2626,10 +2630,11 @@ async fn a_cross_site_page_cannot_suspend_a_mount_through_the_real_bind() {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            form.status(),
-            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "a cross-site form POST reached {route}"
+        // The foreign Origin is refused first since #2136; the content-type check stays behind it.
+        assert!(
+            matches!(form.status().as_u16(), 401 | 415),
+            "a cross-site form POST reached {route}: {}",
+            form.status()
         );
     }
     assert_eq!(

@@ -998,7 +998,9 @@ async fn serve_until(
     grace: Duration,
 ) {
     let (stop, stopping) = tokio::sync::watch::channel(false);
-    let app = app.layer(axum::Extension(Stopping(stopping)));
+    let app = app
+        .layer(axum::Extension(Stopping(stopping)))
+        .layer(tower::util::MapRequestLayer::new(host_from_authority));
     // Not `axum::serve`: it gives hyper no timer, so the header-read timeout never fires (#1660).
     let mut http = hyper::server::conn::http1::Builder::new();
     http.timer(hyper_util::rt::TokioTimer::new())
@@ -1056,8 +1058,8 @@ struct AdminQuery {
 
 /// Whether a request may reach the admin surface (SEC-5; header support is audit L7).
 ///
-/// On a localhost bind `admin_token` is `None` and the surface is open. Off-localhost a token is
-/// required per request, and may arrive either way:
+/// With no token configured (a localhost bind) the surface is open to requests addressed to loopback.
+/// A configured token is required per request on every bind, and may arrive either way:
 ///
 /// - **`?token=…`** - the original form, and it has to stay: the admin UI's own live updates use
 ///   `EventSource`, which cannot set request headers. It is already constant-time compared and
@@ -1072,14 +1074,14 @@ struct AdminQuery {
 ///
 /// Shared with the runtime's lifecycle routes (RFC-0027 §5) so mount/unmount are gated by exactly the
 /// same rule as the admin UI - one credential, one comparison, no second auth concept to get subtly
-/// wrong. `None` means a localhost bind, which is open by design.
+/// wrong. `None` means a localhost bind with no token, open to loopback-addressed requests only.
 pub fn token_ok(
     required: Option<&str>,
     token: Option<&str>,
     headers: &axum::http::HeaderMap,
 ) -> bool {
     let Some(required) = required else {
-        return true; // localhost bind: open
+        return addressed_to_loopback(headers);
     };
     if token.is_some_and(|t| ct_eq(t, required)) {
         return true;
@@ -1095,20 +1097,46 @@ pub fn token_ok(
 }
 
 fn admin_authorized(state: &AppState, q: &AdminQuery, headers: &axum::http::HeaderMap) -> bool {
-    let Some(required) = &state.admin_token else {
-        return true; // localhost bind: open
-    };
-    if q.token.as_deref().is_some_and(|t| ct_eq(t, required)) {
-        return true;
+    token_ok(state.admin_token.as_deref(), q.token.as_deref(), headers)
+}
+
+/// An HTTP/2 request names its target in `:authority` and an absolute-form one in its URI, and the
+/// target overrides `Host` (RFC 9112 §3.2.2), so the URI's authority is what [`token_ok`] must see.
+pub fn host_from_authority<B>(mut req: axum::http::Request<B>) -> axum::http::Request<B> {
+    if let Some(v) = req
+        .uri()
+        .authority()
+        .and_then(|a| axum::http::HeaderValue::from_str(a.as_str()).ok())
+    {
+        req.headers_mut().insert(axum::http::header::HOST, v);
     }
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            let (scheme, rest) = v.split_once(' ')?;
-            scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+    req
+}
+
+/// A DNS-rebinding page reaches 127.0.0.1 same-origin under its own hostname, so the open surface
+/// answers only a loopback `Host` and, when present, a loopback `Origin` (#2136). A request with no
+/// `Host` is refused: every server path fills it from the URI authority when one was sent.
+fn addressed_to_loopback(headers: &axum::http::HeaderMap) -> bool {
+    let loopback = |authority: &str| {
+        let host = match authority.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or(""),
+            None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+        };
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    };
+    let header = |name| {
+        headers
+            .get(name)
+            .map(|v: &axum::http::HeaderValue| v.to_str().unwrap_or(""))
+    };
+    header(axum::http::header::HOST).is_some_and(loopback)
+        && header(axum::http::header::ORIGIN).is_none_or(|o| {
+            o.split_once("://")
+                .is_some_and(|(_, authority)| loopback(authority))
         })
-        .is_some_and(|t| ct_eq(t, required))
 }
 
 async fn admin_index(
@@ -9133,7 +9161,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
         let no_tok = || Query(AdminQuery { token: None });
-        let no_hdr = axum::http::HeaderMap::new;
+        let no_hdr = || {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(axum::http::header::HOST, "127.0.0.1:8288".parse().unwrap());
+            h
+        };
 
         // Localhost (admin_token None): open.
         let resp = admin_index(State(state.clone()), no_tok(), no_hdr())
@@ -9265,6 +9297,99 @@ mod tests {
             storage(state, Some("s3cret"), None).await.status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// #2136: with no token the surface is open only to requests addressed to loopback. The lifecycle
+    /// routes and the control plane share `token_ok`, so this is their gate too.
+    #[test]
+    fn an_open_surface_checks_host_and_origin() {
+        let hdr = |pairs: &[(axum::http::HeaderName, &str)]| {
+            let mut h = axum::http::HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(k.clone(), axum::http::HeaderValue::from_str(v).unwrap());
+            }
+            h
+        };
+        use axum::http::header::{HOST, ORIGIN};
+        for host in [
+            "127.0.0.1:8288",
+            "localhost:8288",
+            "LOCALHOST",
+            "[::1]:8288",
+            "127.0.0.2",
+        ] {
+            assert!(
+                token_ok(None, None, &hdr(&[(HOST, host)])),
+                "{host} is loopback"
+            );
+        }
+        assert!(
+            !token_ok(None, None, &hdr(&[])),
+            "no Host and no authority names no target, so it is refused"
+        );
+        let h2 = host_from_authority(
+            axum::http::Request::get("http://attacker.example:8288/_admin/")
+                .body(())
+                .unwrap(),
+        );
+        assert!(
+            !token_ok(None, None, h2.headers()),
+            "an HTTP/2 or absolute-form target must be checked like a Host"
+        );
+        let mut abs = axum::http::Request::get("http://attacker.example/")
+            .body(())
+            .unwrap();
+        abs.headers_mut()
+            .insert(HOST, axum::http::HeaderValue::from_static("127.0.0.1:8288"));
+        assert!(
+            !token_ok(None, None, host_from_authority(abs).headers()),
+            "the request target overrides a loopback Host"
+        );
+        assert!(token_ok(
+            None,
+            None,
+            &hdr(&[(HOST, "127.0.0.1:8288"), (ORIGIN, "http://localhost:8288")])
+        ));
+        for host in [
+            "attacker.example:8288",
+            "localhost.attacker.example",
+            "10.0.0.1:8288",
+        ] {
+            assert!(
+                !token_ok(None, None, &hdr(&[(HOST, host)])),
+                "{host} must be refused"
+            );
+        }
+        for origin in ["http://attacker.example", "null"] {
+            assert!(
+                !token_ok(
+                    None,
+                    None,
+                    &hdr(&[(HOST, "127.0.0.1:8288"), (ORIGIN, origin)])
+                ),
+                "Origin {origin} must be refused"
+            );
+        }
+        assert!(
+            token_ok(
+                Some("s3cret"),
+                Some("s3cret"),
+                &hdr(&[(HOST, "nuthatch.example.com")])
+            ),
+            "a token-gated surface is reached through a proxy under any name"
+        );
+    }
+
+    /// #2219: a cell's `html` member is trusted only from the page's own formatters. A named tuple
+    /// decodes to a JSON object in `/table`, so a component called `html` arrives as one.
+    #[test]
+    fn admin_grid_trusts_html_only_from_a_formatter() {
+        assert!(
+            !ADMIN_HTML.contains("text && text.html ?"),
+            "the grid renders any cell's `html` member raw"
+        );
+        assert!(ADMIN_HTML
+            .contains("const trusted = c.fmt && v && typeof v === 'object' && 'html' in v;"));
     }
 
     #[tokio::test]
@@ -9440,7 +9565,11 @@ mod tests {
             admin_events(
                 State(state.clone()),
                 tok(None),
-                axum::http::HeaderMap::new(),
+                {
+                    let mut h = axum::http::HeaderMap::new();
+                    h.insert(axum::http::header::HOST, "127.0.0.1:8288".parse().unwrap());
+                    h
+                },
                 None
             )
             .await

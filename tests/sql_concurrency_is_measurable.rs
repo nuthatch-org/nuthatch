@@ -412,6 +412,7 @@ async fn the_admin_config_reports_the_live_value() {
     let resp = router
         .oneshot(
             axum::http::Request::get("/_admin/config")
+                .header("host", "127.0.0.1")
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )

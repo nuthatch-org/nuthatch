@@ -416,7 +416,9 @@ pub async fn run(listen: &str, db_url: &str) -> Result<()> {
     }
 
     let cp = Arc::new(ControlPlane::connect(db_url)?);
-    let app = routes(cp, token.clone());
+    let app = routes(cp, token.clone()).layer(tower::util::MapRequestLayer::new(
+        crate::serve::host_from_authority,
+    ));
     tracing::info!(
         listen = %listen,
         auth = %if token.is_some() { "token" } else { "open (localhost)" },

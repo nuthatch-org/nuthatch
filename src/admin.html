@@ -410,8 +410,10 @@ function gridInner(id){
   const head = '<tr>' + g.cols.map((c, i) => `<th class="${c.num ? 'num' : ''}" data-i="${i}">${esc(c.label ?? c.key)}${g.sort === i ? (g.dir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('') + '</tr>';
   const body = rows.map((r, ri) => `<tr${g.opts.click ? ` class="click" data-k="${esc(g.opts.click.key(r))}"` : ''}>` + g.cols.map(c => {
     const v = c.fmt ? c.fmt(cellRaw(c, r), r) : cellRaw(c, r);
-    const text = v === null || v === undefined ? '' : (typeof v === 'object' && !v.html ? JSON.stringify(v) : v);
-    return text && text.html ? `<td class="${c.num ? 'num' : ''}">${text.html}</td>` : `<td class="${c.num ? 'num' : ''}" title="${esc(text)}">${esc(text)}</td>`;
+    // Only the page's own formatters may emit markup: a named tuple in /table arrives as an object (#2219).
+    const trusted = c.fmt && v && typeof v === 'object' && 'html' in v;
+    const text = v === null || v === undefined ? '' : (typeof v === 'object' && !trusted ? JSON.stringify(v) : v);
+    return trusted ? `<td class="${c.num ? 'num' : ''}">${v.html}</td>` : `<td class="${c.num ? 'num' : ''}" title="${esc(text)}">${esc(text)}</td>`;
   }).join('') + '</tr>').join('');
   return `<thead>${head}</thead><tbody>${body}</tbody>`;
 }

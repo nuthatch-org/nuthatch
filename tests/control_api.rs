@@ -42,7 +42,10 @@ async fn call(
     uri: &str,
     body: Option<&str>,
 ) -> (StatusCode, serde_json::Value) {
-    let req = Request::builder().method(method).uri(uri);
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", "127.0.0.1");
     let req = match body {
         Some(b) => req
             .header("content-type", "application/json")
