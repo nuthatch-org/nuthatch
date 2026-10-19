@@ -500,6 +500,10 @@ pub async fn run_runtime(
     bind_and_serve(listen, live.service(), cors).await
 }
 
+/// The first path segments [`compose_runtime`] serves at the root. A mount named one of these would
+/// nest its own `/` onto the root's route, which `Router::nest` panics on (#2130).
+pub const RUNTIME_ROOT_ROUTES: [&str; 4] = ["health", "nests", "metrics", "ready"];
+
 /// Compose the runtime's routes for a given nest set: the root endpoints plus every nest nested under
 /// its `/<name>` prefix.
 ///
@@ -2328,7 +2332,7 @@ async fn admin_config(
             "seal_span": s.seal_span,
             "seal_table_floor": crate::seal::SEAL_TABLE_FLOOR,
             "sql": {
-                "max_concurrency": SQL_MAX_CONCURRENCY,
+                "max_concurrency": sql_max_concurrency(),
                 "max_queued": SQL_MAX_QUEUED,
                 "max_rows": SQL_MAX_ROWS,
                 "max_query_len": SQL_MAX_QUERY_LEN,
@@ -6597,6 +6601,30 @@ mod tests {
         let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{json}");
         assert_eq!(json["wedged"], json!(true));
+    }
+
+    /// #2130: every root route answers, and a mount of its name panics `Router::nest`, which is why
+    /// the runtime refuses exactly these names.
+    #[tokio::test]
+    async fn every_root_route_answers_and_collides_with_a_mount_of_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let roster = json!({"runtime": "t", "nests": []});
+        for segment in RUNTIME_ROOT_ROUTES {
+            let root = compose_runtime(roster.clone(), Vec::new(), health.clone());
+            let (code, _) = get(root, &format!("/{segment}")).await;
+            assert_ne!(code, StatusCode::NOT_FOUND, "/{segment}");
+            std::fs::create_dir_all(dir.path().join(segment)).unwrap();
+            let state = test_state(&dir.path().join(segment), 1);
+            let composed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                compose_runtime(
+                    roster.clone(),
+                    vec![(segment.to_string(), state)],
+                    health.clone(),
+                )
+            }));
+            assert!(composed.is_err(), "a mount named '{segment}' composed");
+        }
     }
 
     /// #1575, found on Base: a new finality-only nest whose start block is above the finality boundary

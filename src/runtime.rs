@@ -90,7 +90,8 @@ impl Nid {
         if nid.len() != 64 || !nid.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("nid '{nid}' is invalid (expected 64 hex characters)");
         }
-        Ok(Self(nid.to_string()))
+        // Lower case is what `nest_nid` prints; one dataset must not get a second directory (#2137).
+        Ok(Self(nid.to_ascii_lowercase()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -396,16 +397,35 @@ pub fn check_mount_name(name: &str, default_tenant: &str) -> Result<()> {
     Ok(())
 }
 
-/// Top-level routes of the runtime itself. A mount of any of these names collides; `_admin` is
-/// matched first and shadows the nest's own routes (#1673).
-const RESERVED_ROUTES: [&str; 3] = ["nests", "health", "_admin"];
+/// Whether a first path segment is the runtime's own: a root route, which a nested mount would
+/// overlap and panic `Router::nest` (#2130), or `_admin`, which shadows the nest's routes (#1673).
+fn reserved_route(segment: &str) -> bool {
+    segment == "_admin" || crate::serve::RUNTIME_ROOT_ROUTES.contains(&segment)
+}
 
 fn refuse_reserved_mount(tenant: Option<&str>, alias: &str) -> Result<()> {
-    if RESERVED_ROUTES.contains(&alias) {
+    if reserved_route(alias) {
         bail!("nest name '{alias}' is reserved (collides with a runtime route)");
     }
-    if let Some(tenant) = tenant.filter(|part| RESERVED_ROUTES.contains(part)) {
+    if let Some(tenant) = tenant.filter(|part| reserved_route(part)) {
         bail!("tenant '{tenant}' is reserved (collides with a runtime route)");
+    }
+    Ok(())
+}
+
+/// The routes one runtime serves, checked as a set, so what `Router::nest` would panic on is refused
+/// instead. A tenant is the first segment of its mounts' routes as an alias is of its own (#2130).
+fn refuse_route_collisions<'a>(routes: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let routes: std::collections::BTreeSet<&str> = routes.into_iter().collect();
+    for route in &routes {
+        let (tenant, alias) = split_route_key(route);
+        refuse_reserved_mount(tenant, alias)?;
+        if let Some(tenant) = tenant.filter(|t| routes.contains(t)) {
+            bail!(
+                "tenant '{tenant}' is also the name of a mount, so '{route}' would collide with that \
+                 mount's routes"
+            );
+        }
     }
     Ok(())
 }
@@ -518,13 +538,13 @@ fn refuse_over_entity_ceiling(
     if on_cursor <= MAX_ENTITIES_PER_CURSOR {
         return Ok(());
     }
-    bail!(
-        "mounts '{mounts}' cursor on {chain} declares {on_cursor} authored entities across {nests} \
-         nest(s), over the ceiling of {MAX_ENTITIES_PER_CURSOR} per cursor. Each entity is a circuit \
-         on its own thread; nests sharing a chain share the cursor and are counted together \
-         (RFC-0041 §7). Move some to another chain's runtime, or drop {} of them.",
-        on_cursor - MAX_ENTITIES_PER_CURSOR,
-    )
+    Err(MountRefusal::EntityCeiling {
+        mounts: mounts.to_string(),
+        chain: chain.to_string(),
+        on_cursor,
+        nests,
+    }
+    .into())
 }
 
 /// What a nest's declared entities cost the admission calculation: how many there are, and the sum
@@ -637,6 +657,13 @@ impl MountTable {
                 bail!("tenant '{}' mounts '{}' more than once", m.tenant, m.alias);
             }
         }
+        let default_tenant = mounts.tenant_default();
+        let routes: Vec<String> = mounts
+            .mount_refs()
+            .iter()
+            .map(|m| m.route_key(&default_tenant))
+            .collect();
+        refuse_route_collisions(routes.iter().map(String::as_str))?;
         Ok(mounts)
     }
 
@@ -651,8 +678,18 @@ impl MountTable {
         // both must work, so uniqueness is *within* a tenant and never global (RFC-0032 §4.1).
         let mut seen = std::collections::HashSet::new();
         for m in &self.mounts {
-            Nid::parse(&m.nid)
+            let nid = Nid::parse(&m.nid)
                 .with_context(|| format!("mount '{}' has an invalid nest identity", m.alias))?;
+            // Refused rather than lowered: the record names a directory, which on Linux is that spelling.
+            if nid.as_str() != m.nid {
+                bail!(
+                    "mount '{}' names nid {} in upper case; nids are lower case. Write it as {nid} \
+                     (and rename data/{} to match, if that directory exists)",
+                    m.alias,
+                    m.nid,
+                    m.nid
+                );
+            }
             // SEC-10, again: a tenant is a path segment now, so it gets the same charset as an alias.
             // It is opaque to nuthatch, which is not the same as being allowed to contain `../`.
             safe_segment(&m.tenant, "tenant")?;
@@ -2107,7 +2144,7 @@ pub async fn dev(
             h.health.suspend_nest(name);
         }
         if !h.suspended.is_empty() {
-            h.live.swap(h.compose());
+            h.live.swap(h.compose()?);
         }
     }
     let jobs = start_mount_jobs(&dir, &handles, admin_enabled).await?;
@@ -3092,6 +3129,15 @@ pub enum MountRefusal {
     InvalidName(String),
     /// The name is suspended on another NID. Resuming it is a mount of that NID (#1645).
     Suspended { name: String, nid: String },
+    /// The cursor would carry more authored entities than it admits (RFC-0041 §7).
+    EntityCeiling {
+        mounts: String,
+        chain: String,
+        on_cursor: usize,
+        nests: usize,
+    },
+    /// The runtime seals direct, which would serve the nest's authored entities empty (#1537).
+    SealDirectEntities { nest: String },
 }
 
 impl std::fmt::Display for MountRefusal {
@@ -3131,6 +3177,24 @@ impl std::fmt::Display for MountRefusal {
                 "this runtime does not hold nid {nid} and has no registry to fetch it from - start it \
                  with --registry"
             ),
+            MountRefusal::EntityCeiling {
+                mounts,
+                chain,
+                on_cursor,
+                nests,
+            } => write!(
+                f,
+                "mounts '{mounts}' cursor on {chain} declares {on_cursor} authored entities across {nests} \
+                 nest(s), over the ceiling of {MAX_ENTITIES_PER_CURSOR} per cursor. Each entity is a circuit \
+                 on its own thread; nests sharing a chain share the cursor and are counted together \
+                 (RFC-0041 §7). Move some to another chain's runtime, or drop {} of them.",
+                on_cursor - MAX_ENTITIES_PER_CURSOR,
+            ),
+            MountRefusal::SealDirectEntities { nest } => write!(
+                f,
+                "nest '{nest}' declares authored incremental entities, which this runtime's \
+                 --seal-direct would serve empty; restart it without --seal-direct to mount this nest"
+            ),
         }
     }
 }
@@ -3144,8 +3208,9 @@ impl MountRefusal {
             MountRefusal::AlreadyMounted(_)
             | MountRefusal::Suspended { .. }
             | MountRefusal::UndeclaredChain { .. }
-            | MountRefusal::CursorStopped { .. } => 409,
-            MountRefusal::OverBudget { .. } => 507,
+            | MountRefusal::CursorStopped { .. }
+            | MountRefusal::SealDirectEntities { .. } => 409,
+            MountRefusal::OverBudget { .. } | MountRefusal::EntityCeiling { .. } => 507,
             MountRefusal::NotHeld { .. } => 404,
             MountRefusal::InvalidName(_) => 400,
         }
@@ -3637,7 +3702,7 @@ impl RuntimeHandles {
         }
         // A mount of a suspended name is its resume; it stays suspended until the join has landed.
         if mounted.is_ok() && self.suspended.remove(name).is_some() {
-            self.live.swap(self.compose());
+            self.live.swap(self.compose()?);
             self.persist()?;
         }
         mounted
@@ -3682,6 +3747,12 @@ impl RuntimeHandles {
         // against *this cursor's* current membership, not the whole mounts - the ceiling is per cursor.
         let has_labels = !crate::labels::load(dir).is_empty();
         let (entity_count, entity_rows) = declared_entities(dir);
+        if self.mount_ctx.seal_direct && entity_count > 0 {
+            return Err(MountRefusal::SealDirectEntities {
+                nest: name.to_string(),
+            }
+            .into());
+        }
         let incoming_mb = estimate_nest_rss_mb(config, has_labels, entity_count, entity_rows);
         let existing: u64 = self
             .states
@@ -3781,9 +3852,17 @@ impl RuntimeHandles {
                 report.refusal = Some(format!("{e:#}"));
             }
         }
-        if let Some(source) = self.mount_ctx.sources.get(&config.nest.chain) {
-            report.tip = source.tip().await.ok();
-        }
+        // What the running cursor last saw: this holds the runtime's lock, so it dials nothing.
+        report.tip = self
+            .states
+            .iter()
+            .filter(|(_, s)| s.chain == config.nest.chain)
+            .filter_map(|(n, s)| {
+                let key = s.runtime_health.as_ref().map_or(n, |(k, _)| k);
+                crate::metrics::METRICS.nest_if_known(key).map(|m| m.tip())
+            })
+            .filter(|&tip| tip > 0)
+            .max();
         report.blocks_to_backfill = report
             .tip
             .zip(report.start_block)
@@ -3812,6 +3891,9 @@ impl RuntimeHandles {
             .into());
         }
         if let Err(e) = refuse_reserved_mount(tenant, alias) {
+            return Err(MountRefusal::InvalidName(format!("{e:#}")).into());
+        }
+        if let Err(e) = refuse_route_collisions(self.routes().chain([name])) {
             return Err(MountRefusal::InvalidName(format!("{e:#}")).into());
         }
         if let (Some(held), Some(asked)) = (self.suspended.get(name), nid) {
@@ -4137,13 +4219,15 @@ impl RuntimeHandles {
             &self.default_tenant,
             &self.estimates,
         ));
-        self.live.swap(self.compose());
+        self.live.swap(self.compose()?);
         self.persist()?;
         Ok(())
     }
 
     /// The routes to serve: every live mount, and a 503 for each suspended one not live again yet.
-    pub fn compose(&self) -> axum::Router {
+    pub fn compose(&self) -> Result<axum::Router> {
+        // `plan_mount` refuses a colliding name before it joins; this keeps a miss from panicking.
+        refuse_route_collisions(self.routes())?;
         let mut router = crate::serve::compose_runtime(
             self.roster.clone(),
             self.states.clone(),
@@ -4154,7 +4238,15 @@ impl RuntimeHandles {
                 router = router.nest(&format!("/{name}"), suspended_router(name));
             }
         }
-        router
+        Ok(router)
+    }
+
+    /// Every name [`Self::compose`] serves: the live mounts and the suspended ones.
+    fn routes(&self) -> impl Iterator<Item = &str> {
+        self.states
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .chain(self.suspended.keys().map(String::as_str))
     }
 
     /// Suspend a mount (#1548): drain it off its cursor as an unmount does, but keep its record and
@@ -4263,7 +4355,7 @@ impl RuntimeHandles {
             // A suspended mount is already off its cursor; unmounting it drops the record.
             if self.suspended.remove(name).is_some() {
                 self.health.retire_nest(name);
-                self.live.swap(self.compose());
+                self.live.swap(self.compose()?);
                 return self.persist();
             }
             tracing::debug!("nest '{name}' is not mounted; nothing to unmount");
@@ -4602,7 +4694,7 @@ impl RuntimeHandles {
             &self.default_tenant,
             &self.estimates,
         ));
-        self.live.swap(self.compose());
+        self.live.swap(self.compose()?);
         self.persist()
     }
 }
@@ -5875,6 +5967,28 @@ mod tests {
                 format!("alias = \"health\"\nnid = \"{good}\"\n"),
                 "reserved",
             ),
+            // Root routes too: nested there, the nest's `/` is the root's route and `nest` panics (#2130).
+            (
+                format!("alias = \"ready\"\nnid = \"{good}\"\n"),
+                "reserved",
+            ),
+            (
+                format!("tenant = \"metrics\"\nalias = \"a\"\nnid = \"{good}\"\n"),
+                "reserved",
+            ),
+            // `acme` and `acme/sql` would both serve `/acme/sql`.
+            (
+                format!(
+                    "alias = \"acme\"\nnid = \"{good}\"\n\n[[mounts]]\ntenant = \"acme\"\n\
+                     alias = \"sql\"\nnid = \"{good}\"\n"
+                ),
+                "is also the name of a mount",
+            ),
+            // The record names a directory; lowering it would point at another one (#2137).
+            (
+                format!("alias = \"a\"\nnid = \"{}\"\n", good.to_ascii_uppercase()),
+                "upper case",
+            ),
             // The primary key is (tenant, alias), so the *same* pair twice is the collision.
             (
                 format!(
@@ -5908,6 +6022,11 @@ mod tests {
     fn nid_parse_rejects_anything_that_is_not_64_hex_characters() {
         let good = "aa11".repeat(16);
         assert_eq!(Nid::parse(&good).unwrap().as_str(), good);
+        assert_eq!(
+            Nid::parse(&good.to_ascii_uppercase()).unwrap().as_str(),
+            good,
+            "one dataset, one spelling (#2137)"
+        );
 
         let bad = [
             "abc".to_string(), // the realistic typo: short, and not even all hex
@@ -6288,7 +6407,11 @@ mod tests {
         };
 
         let err = match handles.admit("new", &nest_config("ethereum"), &over) {
-            Err(e) => format!("{e:#}"),
+            Err(e) => {
+                let status = e.downcast_ref::<MountRefusal>().map(MountRefusal::status);
+                assert_eq!(status, Some(507), "a refusal, not a 500 (#2139)");
+                format!("{e:#}")
+            }
             Ok(_) => panic!("33 authored entities on one cursor is over the ceiling"),
         };
         assert!(err.contains("mounts 'prod'"), "{err}");

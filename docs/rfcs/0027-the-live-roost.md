@@ -172,6 +172,12 @@ Two consequences worth stating:
 > answered, which `202 Accepted` denies by definition. `source` is not dropped, only moved - see the
 > open question below.
 
+> **Amendment (#2144).** The table above and the #550 amendment are both superseded;
+> [docs/admin-api.md](../admin-api.md) is the contract. Unmount takes `?reclaim=true`, not `?purge=true`,
+> and an unknown `purge` key is ignored, so it unmounts and keeps the data. A mount answers `202` with a
+> job (#1544) and `200` only with `?wait=true`. `nuthatch roost mount` and `unmount` below were retired
+> with the roost in 2.0; the admin routes are the only lifecycle surface.
+
 Authentication is the existing admin token: `NUTHATCH_ADMIN_TOKEN`, presented as `?token=` or
 `Authorization: Bearer` (the header form lands with the audit-tail work). Off-localhost the token is
 **required**, as it already is for the admin UI. There is no new auth concept here and there must not be
