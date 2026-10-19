@@ -3174,7 +3174,7 @@ async fn build_nest(
                 balances: &balances,
                 exposure: &exposure,
                 velocity: &velocity,
-                velocity_window: velocity_cfg.map(|(_, w)| w),
+                velocity_cfg,
             },
         ) {
             tracing::error!(
@@ -6890,7 +6890,7 @@ impl NestIngest {
                         balances: &self.balances,
                         exposure: &self.exposure,
                         velocity: &self.velocity,
-                        velocity_window: self.velocity_cfg.map(|(_, w)| w),
+                        velocity_cfg: self.velocity_cfg,
                     },
                 ) {
                     tracing::warn!("view rebuild after seal-direct failed: {e:#}");
@@ -7804,6 +7804,9 @@ impl NestIngest {
         #[cfg(test)]
         before_commit();
         let alerted = !outbox.is_empty();
+        if let Some(gate) = &self.ipfs_gate {
+            gate.written_from(next);
+        }
         if let Err(e) = self
             .store
             .commit_window_blocking(std::mem::take(&mut to_store), outbox, checkpoint, to)
@@ -7908,6 +7911,10 @@ impl NestIngest {
             ) {
                 tracing::warn!("webhook delivery failed: {e:#}");
             }
+        }
+        if let Some((threshold, window)) = self.velocity_cfg {
+            self.velocity
+                .settle(self.store.sealed_through(), threshold, window);
         }
         // Whatever advanced the watermark, the fold writer hears of it here; an unchanged one costs an
         // atomic compare.
@@ -8451,12 +8458,17 @@ fn block_number_of(json: &str) -> Option<u64> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static HOLD_ROWS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The block a finalized range may seal through while documents it names are outstanding
 /// (RFC-0037 §3): one below the lowest block holding one, `finalized_through` when none is, and `None`
 /// when that block is block 0, where "one below" does not exist and nothing may seal.
 ///
-/// Read in chunks from the watermark up and stopped at the first outstanding document, which is
-/// normally near the watermark, so a long run of resolved documents above it is not reloaded per window.
+/// Read in chunks from the watermark, or from where the last read found every document settled if
+/// that is higher (#2231), and stopped at the first outstanding one.
 fn hold_for_documents(
     store: &dyn crate::store::HotStore,
     gate: &crate::ipfs_resolve::Gate,
@@ -8466,11 +8478,15 @@ fn hold_for_documents(
     let mut lo = match store.get_meta(SEALED_THROUGH_KEY)? {
         Some(v) => v.parse::<u64>().context("corrupt sealed_through")? + 1,
         None => 0,
-    };
+    }
+    .max(gate.clear_below());
     while lo <= finalized_through {
         let hi = lo.saturating_add(CHUNK - 1).min(finalized_through);
         let entities = store.entities_in_range(lo, hi)?;
+        #[cfg(test)]
+        HOLD_ROWS_READ.with(|n| n.set(n.get() + entities.len()));
         if let Some(pending) = gate.lowest_pending(store, &entities)? {
+            gate.cleared_below(pending);
             return Ok(pending.checked_sub(1));
         }
         if hi == u64::MAX {
@@ -8478,6 +8494,7 @@ fn hold_for_documents(
         }
         lo = hi + 1;
     }
+    gate.cleared_below(finalized_through.saturating_add(1));
     Ok(Some(finalized_through))
 }
 
@@ -8759,8 +8776,8 @@ struct DerivedViews<'a> {
     balances: &'a BalanceView,
     exposure: &'a ExposureView,
     velocity: &'a VelocityView,
-    /// `Some(window)` only when a velocity flag is configured (RFC-0008 C3).
-    velocity_window: Option<u64>,
+    /// `Some((threshold, window))` only when a velocity flag is configured (RFC-0008 C3).
+    velocity_cfg: Option<(i128, u64)>,
 }
 
 /// Rebuild every derived IVM view - balances, exposure and velocity - from stored facts, in a single
@@ -8796,7 +8813,7 @@ fn rebuild_views(
         balances,
         exposure,
         velocity,
-        velocity_window,
+        velocity_cfg,
     } = *into;
 
     // Each transfer table with its (from, to, value) column names - which vary by token (USDC:
@@ -8834,6 +8851,7 @@ fn rebuild_views(
     let mut cold_balances = 0usize;
     let mut cold_exposure = 0usize;
     let mut cold_velocity = 0usize;
+    let mut cold_buckets: std::collections::HashMap<String, (i128, i128)> = Default::default();
     for (table, from_col, to_col, val_col) in &transfer_tables {
         let catalogued = manifest
             .tables
@@ -8876,7 +8894,7 @@ fn rebuild_views(
                 exposure_batch.push(exposure::seed_item(key, amount, count));
             }
         }
-        if let Some(window) = velocity_window {
+        if let Some((_, window)) = velocity_cfg {
             let rows = crate::analytics::cold_velocity(
                 dir,
                 table,
@@ -8888,6 +8906,17 @@ fn rebuild_views(
             .with_context(|| format!("seeding velocity from the sealed {table}"))?;
             cold_velocity += rows.len();
             for (key, volume, count) in rows {
+                let bucket = cold_buckets.entry(key).or_insert((0, 0));
+                bucket.0 = bucket.0.saturating_add(volume);
+                bucket.1 = bucket.1.saturating_add(count);
+            }
+        }
+    }
+    // Summed across tables before the threshold is applied, since a bucket is a sender's window
+    // over every token. One that can never flag is not seeded (#2173).
+    if let Some((threshold, window)) = velocity_cfg {
+        for (key, (volume, count)) in cold_buckets {
+            if velocity::can_flag(&key, volume, threshold, window, sealed_through) {
                 velocity_batch.push(velocity::seed_item(key, volume, count));
             }
         }
@@ -8929,7 +8958,7 @@ fn rebuild_views(
                     exposure_batch.extend(d);
                 }
             }
-            if let Some(window) = velocity_window {
+            if let Some((_, window)) = velocity_cfg {
                 velocity_batch.extend(velocity::velocity_deltas(
                     &from,
                     row.block_number,
@@ -9086,51 +9115,100 @@ fn rebuild_children(
     let mut children = ChildRegistry::new();
     let manifest = crate::seal::load_manifest(dir)
         .context("reading the segment catalogue to rebuild the child registry")?;
-    // Every announcing table's rows, then one fold in block order across all of them, so the earliest
-    // discovery of a child two rules announce wins as it does live (#1637).
-    let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
+    // Each child's earliest announcement across every announcing table, cold and hot, so the
+    // earliest discovery of a child two rules announce wins as it does live (#1637). Only children
+    // are held, not the rows announcing them (#2160).
+    let mut earliest: std::collections::HashMap<String, crate::factory::ChildEntry> =
+        Default::default();
+    let mut fold = |table: &str, row: &serde_json::Value| {
+        for child in factory.discover_stored(table, row) {
+            let at = (child.discovered_block, child.discovered_log_index);
+            match earliest.entry(child.address.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if at < (e.get().discovered_block, e.get().discovered_log_index) {
+                        e.insert(child);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(child);
+                }
+            }
+        }
+    };
+    let sources = factory.view_sources();
     for table in factory.factory_tables() {
-        // Cold (sealed) rows via Burrmill - but only where the catalogue says a segment exists, so an
-        // unsealed table is skipped rather than queried-and-forgiven.
-        if manifest.tables.get(&table).is_some_and(|s| !s.is_empty()) {
-            rows.extend(
-                crate::analytics::query(dir, &format!("SELECT * FROM \"{table}\""))
-                    .with_context(|| format!("reading sealed factory rows for '{table}' (#373)"))?
-                    .into_iter()
-                    .map(|v| (table.clone(), v)),
+        // Cold (sealed) rows - but only where the catalogue says a segment exists, so an unsealed
+        // table is skipped rather than read-and-forgiven.
+        if let Some(segments) = manifest.tables.get(&table).filter(|s| !s.is_empty()) {
+            let mut columns = vec!["block_number", "log_index", "block_timestamp", "address"];
+            columns.extend(
+                sources
+                    .iter()
+                    .filter(|(_, t, _)| *t == table)
+                    .map(|(_, _, param)| param.as_str()),
             );
+            visit_sealed_columns(dir, segments, &columns, &mut |row| fold(&table, &row))
+                .with_context(|| format!("reading sealed factory rows for '{table}' (#373)"))?;
         }
         for raw in store
             .recent_by_table(&table, usize::MAX)
             .with_context(|| format!("reading hot factory rows for '{table}' (#373)"))?
         {
-            rows.push((
-                table.clone(),
-                serde_json::from_str::<serde_json::Value>(&raw).with_context(|| {
-                    format!("unparseable stored row in factory table '{table}' (#373)")
-                })?,
-            ));
+            let row = serde_json::from_str::<serde_json::Value>(&raw).with_context(|| {
+                format!("unparseable stored row in factory table '{table}' (#373)")
+            })?;
+            fold(&table, &row);
         }
     }
-    rows.sort_by(|(_, a), (_, b)| {
-        let key = |v: &serde_json::Value| {
-            (
-                v.get("block_number")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-                v.get("log_index")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            )
-        };
-        key(a).cmp(&key(b))
-    });
-    for (table, v) in &rows {
-        for child in factory.discover_stored(table, v) {
-            children.insert(child);
-        }
+    let mut found: Vec<_> = earliest.into_values().collect();
+    found.sort_by_key(|c| (c.discovered_block, c.discovered_log_index));
+    for child in found {
+        children.insert(child);
     }
     Ok(children)
+}
+
+/// Every row of `segments`, narrowed to whichever of `columns` they carry, as the JSON
+/// `FactorySet::discover_stored` reads. One record batch is held at a time.
+fn visit_sealed_columns(
+    dir: &std::path::Path,
+    segments: &[crate::seal::Segment],
+    columns: &[&str],
+    visit: &mut dyn FnMut(serde_json::Value),
+) -> Result<()> {
+    use arrow::array::{Array, StringArray, UInt64Array};
+    use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ProjectionMask};
+    for segment in segments {
+        let path = crate::seal::segment_path(dir, &segment.file, &segment.hash);
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("opening sealed segment {}", path.display()))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("reading sealed segment {}", path.display()))?;
+        let mask = ProjectionMask::columns(builder.parquet_schema(), columns.iter().copied());
+        for batch in builder.with_projection(mask).build()? {
+            let batch =
+                batch.with_context(|| format!("decoding sealed segment {}", path.display()))?;
+            for row in 0..batch.num_rows() {
+                let mut obj = serde_json::Map::new();
+                for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+                    if column.is_null(row) {
+                        continue;
+                    }
+                    let any = column.as_any();
+                    let value = if let Some(a) = any.downcast_ref::<UInt64Array>() {
+                        serde_json::Value::from(a.value(row))
+                    } else if let Some(a) = any.downcast_ref::<StringArray>() {
+                        serde_json::Value::from(a.value(row))
+                    } else {
+                        continue;
+                    };
+                    obj.insert(field.name().clone(), value);
+                }
+                visit(serde_json::Value::Object(obj));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn sleep_secs(s: u64) {
@@ -16383,6 +16461,74 @@ template = "pool"
             METRICS.nest("seal-direct-resolved-1421").ipfs_resolved(),
             stored,
             "one count per stored document"
+        );
+        drop(nest);
+        drop(state);
+        handle.abort();
+    }
+
+    /// #2231: a range found clear of outstanding documents is not read again on the next window, and
+    /// rows written below it, here by a reorg, are.
+    #[tokio::test]
+    async fn a_range_clear_of_documents_is_read_once_until_rows_land_in_it() {
+        let cid = crate::cid::cid_v0_for(b"given up on");
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::new(), 0).await;
+        let dir = qos_topic_nest("t");
+        let (mut nest, state, source) =
+            qos_nest_with(dir.path(), gateway, vec![(4, qos_post(&cid))]).await;
+        nest.seal_span = 1;
+        for b in [4, 5] {
+            nest.process_window(source.as_ref(), &[], b, b, 10_000)
+                .await
+                .unwrap()
+                .expect("the window must commit");
+        }
+        let gate = nest.ipfs_gate.clone().expect("a gate");
+        let give_up = |store: &dyn crate::store::HotStore| {
+            let plan = gate.plan_stored(&store.entities_in_range(4, 4).unwrap());
+            for p in &plan[&4].0 {
+                crate::ipfs_resolve::record_gave_up(
+                    store,
+                    &crate::ipfs_resolve::GaveUp {
+                        cid: p.cid.clone(),
+                        block: 4,
+                        slot: p.slot,
+                        declaration: None,
+                        error: None,
+                        at: None,
+                    },
+                )
+                .unwrap();
+            }
+        };
+        give_up(nest.store.as_ref());
+        assert_eq!(
+            hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
+            Some(9_000)
+        );
+        HOLD_ROWS_READ.with(|n| n.set(0));
+        assert_eq!(
+            hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
+            Some(9_000)
+        );
+        assert_eq!(
+            HOLD_ROWS_READ.with(|n| n.get()),
+            0,
+            "the cleared range was read again"
+        );
+
+        nest.rollback_reorg(3).unwrap();
+        let other = crate::cid::cid_v0_for(b"posted on the other fork");
+        let fork: Arc<dyn Source> = Arc::new(PostSource(vec![(4, qos_post(&other))]));
+        nest.process_window(fork.as_ref(), &[], 4, 4, 10_000)
+            .await
+            .unwrap()
+            .expect("the fork's window commits");
+        assert_eq!(
+            hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
+            Some(3),
+            "the fork's document at block 4 is outstanding"
         );
         drop(nest);
         drop(state);
@@ -25115,7 +25261,7 @@ rpc_urls = ["https://rpc.example"]
                 balances: &balances,
                 exposure: &exposure_v,
                 velocity: &velocity_v,
-                velocity_window: Some(WINDOW),
+                velocity_cfg: Some((0, WINDOW)),
             },
         )
         .unwrap();
@@ -25200,7 +25346,7 @@ rpc_urls = ["https://rpc.example"]
                 balances: &balances,
                 exposure: &exposure_v,
                 velocity: &VelocityView::start(false).unwrap(),
-                velocity_window: None,
+                velocity_cfg: None,
             },
         )
         .unwrap();
@@ -25259,7 +25405,7 @@ rpc_urls = ["https://rpc.example"]
                     balances: &BalanceView::start().unwrap(),
                     exposure: &ExposureView::start(false).unwrap(),
                     velocity: &VelocityView::start(false).unwrap(),
-                    velocity_window: None,
+                    velocity_cfg: None,
                 },
             )
         };
@@ -25274,6 +25420,53 @@ rpc_urls = ["https://rpc.example"]
         .unwrap();
         let err = rebuild().expect_err("an unreadable sealed table is a failed rebuild");
         assert!(format!("{err:#}").contains("usdc__transfer"), "{err:#}");
+    }
+
+    /// #2173: the restart seed leaves out a velocity bucket that can never flag - below the
+    /// threshold in a window wholly sealed - and keeps one whose window the hot tail still adds to.
+    #[test]
+    fn the_velocity_seed_leaves_out_buckets_that_cannot_flag() {
+        const ALICE: &str = "0x1111111111111111111111111111111111111111";
+        const BOB: &str = "0x2222222222222222222222222222222222222222";
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = [
+            transfer_row(10, 0, ALICE, Some(BOB), "5"),
+            transfer_row(20, 0, BOB, Some(ALICE), "500"),
+            transfer_row(150, 0, ALICE, Some(BOB), "5"),
+            transfer_row(210, 0, BOB, Some(ALICE), "5"),
+        ];
+        crate::seal::seal_range(dir.path(), &sealed, 10, 219).unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        store.set_meta("sealed_through", "219").unwrap();
+        store
+            .put_entity(
+                &Store::entity_key(230, 0),
+                &transfer_row(230, 0, BOB, Some(ALICE), "200"),
+            )
+            .unwrap();
+
+        let velocity = VelocityView::start(true).unwrap();
+        let none = BalanceView::start().unwrap();
+        rebuild_views(
+            dir.path(),
+            &store,
+            &erc20_registry(),
+            &DerivedViews {
+                labels: &labelset(&[]),
+                balances: &none,
+                exposure: &ExposureView::start(false).unwrap(),
+                velocity: &velocity,
+                velocity_cfg: Some((100, 100)),
+            },
+        )
+        .unwrap();
+        let flags: Vec<_> = velocity
+            .flags(100)
+            .into_iter()
+            .map(|f| (f.window_start, f.volume))
+            .collect();
+        assert_eq!(flags, vec![(0, 500), (200, 205)]);
+        assert_eq!(velocity.entries(), 2, "ALICE's sealed buckets cannot flag");
     }
 
     /// #294 itself: the restart rebuild must walk the hot store **once**.
@@ -25419,6 +25612,62 @@ template="pool"
         let fs = FactorySet::build(&config).unwrap();
         let table = fs.factory_tables().first().cloned().expect("one rule");
         (fs, table)
+    }
+
+    /// #2160: the sealed announcements are read for the columns discovery uses, and fold with the
+    /// hot ones so a child's earliest announcement wins, as it does live.
+    #[test]
+    fn rebuild_children_folds_sealed_and_hot_announcements() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fs, table) = one_rule_factory_set();
+        let (a, b, c) = (
+            "0x000000000000000000000000000000000000000a",
+            "0x000000000000000000000000000000000000000b",
+            "0x000000000000000000000000000000000000000c",
+        );
+        let row = |child: &str, block: u64, li: u64| {
+            serde_json::json!({
+                "table": table, "pool": child, "block_number": block, "log_index": li,
+                "block_timestamp": 1_700_000_000 + block, "tx_hash": "0xt",
+                "address": "0x1111111111111111111111111111111111111111", "salt": "f".repeat(512),
+            })
+            .to_string()
+        };
+        crate::seal::seal_range(dir.path(), &[row(a, 10, 1), row(b, 12, 0)], 10, 12).unwrap();
+        let store = crate::store::Store::open(&dir.path().join("t.redb")).unwrap();
+        store
+            .commit_window(
+                &[
+                    (Store::entity_key(20, 0), row(a, 20, 0)),
+                    (Store::entity_key(21, 0), row(c, 21, 0)),
+                ],
+                None,
+                21,
+            )
+            .unwrap();
+        let reg = DecodeRegistry::build(Vec::new()).unwrap();
+
+        let children = rebuild_children(dir.path(), &store, &reg, &fs).unwrap();
+        let got = |child: &str| {
+            let e = children.get(child).expect("discovered");
+            (
+                e.discovered_block,
+                e.discovered_log_index,
+                e.discovered_timestamp,
+            )
+        };
+        assert_eq!(
+            got(a),
+            (10, 1, 1_700_000_010),
+            "the sealed announcement is earlier"
+        );
+        assert_eq!(got(b), (12, 0, 1_700_000_012));
+        assert_eq!(got(c), (21, 0, 1_700_000_021));
+        assert_eq!(
+            children.get(a).unwrap().parent_address,
+            "0x1111111111111111111111111111111111111111"
+        );
+        assert_eq!(children.addresses().len(), 3);
     }
 
     /// #373: an unsealed factory table is a legitimate absence and must still rebuild cleanly.

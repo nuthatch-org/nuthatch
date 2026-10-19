@@ -81,6 +81,7 @@ pub fn drain_batched(dir: &Path, submit: &dyn Submit, batch: usize) -> Result<Dr
     let mut report = DrainReport::default();
     let batch = batch.max(1);
     let mut chunk = Vec::with_capacity(batch);
+    let mut recorded = recorded_outcomes(dir, &pending_keys(&pending_path, snapshot)?)?;
     if snapshot > 0 {
         let file = std::fs::File::open(&pending_path)
             .with_context(|| format!("read {}", pending_path.display()))?;
@@ -92,16 +93,30 @@ pub fn drain_batched(dir: &Path, submit: &dyn Submit, batch: usize) -> Result<Dr
             // prior run reached the durable journal but crashed before rewriting the pending queue,
             // finalise that result. Calling the operator command a second time would be a second
             // attempt to move the same money.
-            match recorded_outcome(dir, &row)? {
+            match recorded.get(&authorisation_key(&row)).cloned().flatten() {
                 Some(outcome) => journal(dir, &row, outcome, true, &mut report, &mut kept)?,
                 None => chunk.push(row),
             }
             if chunk.len() == batch {
-                submit_chunk(dir, submit, &mut chunk, &mut report, &mut kept)?;
+                submit_chunk(
+                    dir,
+                    submit,
+                    &mut chunk,
+                    &mut recorded,
+                    &mut report,
+                    &mut kept,
+                )?;
             }
         }
     }
-    submit_chunk(dir, submit, &mut chunk, &mut report, &mut kept)?;
+    submit_chunk(
+        dir,
+        submit,
+        &mut chunk,
+        &mut recorded,
+        &mut report,
+        &mut kept,
+    )?;
     // New payments may have arrived while the external command ran. Take them under the same
     // cross-process lock as the server's append.
     let _guard = crate::counter::lock_queue(dir)?;
@@ -113,6 +128,7 @@ fn submit_chunk(
     dir: &Path,
     submit: &dyn Submit,
     chunk: &mut Vec<serde_json::Value>,
+    recorded: &mut Recorded,
     report: &mut DrainReport,
     kept: &mut std::io::BufWriter<std::fs::File>,
 ) -> Result<()> {
@@ -124,6 +140,12 @@ fn submit_chunk(
         let outcome = outcomes
             .next()
             .unwrap_or_else(|| Outcome::Deferred("the submitter returned no outcome".into()));
+        // What this run journals counts too, as it did when every row reread the journal.
+        if !matches!(outcome, Outcome::Deferred(_)) {
+            recorded
+                .entry(authorisation_key(&row))
+                .or_insert_with(|| Some(outcome.clone()));
+        }
         journal(dir, &row, outcome, false, report, kept)?;
     }
     Ok(())
@@ -372,10 +394,45 @@ fn spent_row(row: &serde_json::Value, outcome: &str, detail: &str) -> serde_json
     })
 }
 
-fn recorded_outcome(dir: &Path, row: &serde_json::Value) -> Result<Option<Outcome>> {
+#[cfg(test)]
+thread_local! {
+    static JOURNAL_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The first outcome `spent.jsonl` records for each authorisation, keyed `(network, payer, nonce)`.
+type Recorded = std::collections::HashMap<[String; 3], Option<Outcome>>;
+
+/// Every authorisation in the first `snapshot` bytes of the queue. A line that will not parse is
+/// skipped here; the drain itself stops on it.
+fn pending_keys(path: &Path, snapshot: u64) -> Result<std::collections::HashSet<[String; 3]>> {
+    let mut keys = std::collections::HashSet::new();
+    if snapshot == 0 {
+        return Ok(keys);
+    }
+    let file = std::fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
+    for line in std::io::BufReader::new(std::io::Read::take(file, snapshot)).lines() {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        let row = serde_json::from_str::<serde_json::Value>(&line).ok();
+        keys.extend(row.as_ref().and_then(string_key));
+    }
+    Ok(keys)
+}
+
+/// One pass over the journal for the whole drain (#2178), keeping only what `pending` names, so it
+/// holds the queue's size rather than the journal's.
+fn recorded_outcomes(
+    dir: &Path,
+    pending: &std::collections::HashSet<[String; 3]>,
+) -> Result<Recorded> {
+    #[cfg(test)]
+    JOURNAL_SCANS.with(|s| s.set(s.get() + 1));
+    let mut out = Recorded::new();
+    if pending.is_empty() {
+        return Ok(out);
+    }
     let path = dir.join(SPENT);
     let file = match std::fs::File::open(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
         Ok(file) => file,
     };
@@ -386,31 +443,34 @@ fn recorded_outcome(dir: &Path, row: &serde_json::Value) -> Result<Option<Outcom
         }
         let recorded: serde_json::Value =
             serde_json::from_str(&line).with_context(|| format!("parse {}", path.display()))?;
-        if same_authorisation(&recorded, row) {
-            return Ok(
-                match recorded.get("outcome").and_then(serde_json::Value::as_str) {
-                    // Old spent rows were created before S3, so carry no external-result claim.
-                    None => None,
-                    Some("settled") => Some(Outcome::Settled),
-                    Some("failed") => Some(Outcome::Failed(
-                        recorded
-                            .get("detail")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("recorded failure")
-                            .to_owned(),
-                    )),
-                    Some(other) => bail!("unknown recorded settlement outcome {other:?}"),
-                },
-            );
+        let Some(key) = string_key(&recorded).filter(|k| pending.contains(k)) else {
+            continue;
+        };
+        if out.contains_key(&key) {
+            continue;
         }
+        let outcome = match recorded.get("outcome").and_then(serde_json::Value::as_str) {
+            // Old spent rows were created before S3, so carry no external-result claim.
+            None => None,
+            Some("settled") => Some(Outcome::Settled),
+            Some("failed") => Some(Outcome::Failed(
+                recorded
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("recorded failure")
+                    .to_owned(),
+            )),
+            Some(other) => bail!("unknown recorded settlement outcome {other:?}"),
+        };
+        out.insert(key, outcome);
     }
-    Ok(None)
+    Ok(out)
 }
 
-fn same_authorisation(left: &serde_json::Value, right: &serde_json::Value) -> bool {
-    ["network", "payer", "nonce"]
-        .into_iter()
-        .all(|key| left.get(key) == right.get(key))
+/// A pending row's three fields are validated strings, so a journal row without them matches none.
+fn string_key(row: &serde_json::Value) -> Option<[String; 3]> {
+    let field = |key: &str| row.get(key)?.as_str().map(str::to_owned);
+    Some([field("network")?, field("payer")?, field("nonce")?])
 }
 
 fn payer_row(row: &serde_json::Value, outcome: &str, detail: &str) -> serde_json::Value {
@@ -718,6 +778,33 @@ mod tests {
         .unwrap();
         assert_eq!(report.settled, 1);
         assert!(!dir.path().join(LOG).exists());
+    }
+
+    /// #2178: the journal was rescanned from the start for every pending row.
+    #[test]
+    fn a_drain_reads_the_spent_journal_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending: Vec<_> = (0..5).map(|n| row("0xaa", &format!("0x{n:02}"))).collect();
+        write_jsonl(&dir.path().join(LOG), &pending).unwrap();
+        for n in 10..20 {
+            let old = row("0xbb", &format!("0x{n:02}"));
+            append_jsonl(&dir.path().join(SPENT), &spent_row(&old, "settled", "")).unwrap();
+        }
+        append_jsonl(
+            &dir.path().join(SPENT),
+            &spent_row(&pending[3], "failed", "no"),
+        )
+        .unwrap();
+        JOURNAL_SCANS.with(|s| s.set(0));
+        let report = drain(
+            dir.path(),
+            &Scripted {
+                answers: std::sync::Mutex::new(vec![Outcome::Settled; 4].into()),
+            },
+        )
+        .unwrap();
+        assert_eq!((report.settled, report.failed), (4, 1));
+        assert_eq!(JOURNAL_SCANS.with(|s| s.get()), 1);
     }
 
     #[test]
