@@ -849,7 +849,15 @@ pub(crate) mod tests {
     impl Rpc for Fake {
         async fn call(&self, method: &str, params: Value) -> Result<Value> {
             *self.asked.lock().unwrap().entry(method.into()).or_default() += 1;
-            (self.answer)(method, &params)
+            // Answers simulate latency with a blocking sleep; on a worker thread that starves the
+            // tasks under test whenever the runner is busy (#2255).
+            if tokio::runtime::Handle::current().runtime_flavor()
+                == tokio::runtime::RuntimeFlavor::MultiThread
+            {
+                tokio::task::block_in_place(|| (self.answer)(method, &params))
+            } else {
+                (self.answer)(method, &params)
+            }
         }
     }
 
