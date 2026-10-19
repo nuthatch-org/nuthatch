@@ -2626,10 +2626,11 @@ async fn a_cross_site_page_cannot_suspend_a_mount_through_the_real_bind() {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            form.status(),
-            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "a cross-site form POST reached {route}"
+        // The foreign Origin is refused first since #2136; the content-type check stays behind it.
+        assert!(
+            matches!(form.status().as_u16(), 401 | 415),
+            "a cross-site form POST reached {route}: {}",
+            form.status()
         );
     }
     assert_eq!(
