@@ -7384,9 +7384,22 @@ impl NestIngest {
         }
         // Every row read before the checkpoint must be on the chain it names, and the window must
         // extend the stored chain. Hashes read after the checkpoint settle both (#2146).
-        let mut expected: Vec<(u64, String)> = rows
+        let exposed: Vec<_> = rows
             .iter()
-            .filter(|r| r.block_number > final_through && !r.block_hash.is_empty())
+            .filter(|r| r.block_number > final_through)
+            .collect();
+        // A row with no hash cannot be checked, so it cannot be committed where a reorg can reach.
+        if let Some(r) = exposed.iter().find(|r| r.block_hash.is_empty()) {
+            tracing::warn!(
+                "the source gave the log at ({}, {}) no block hash: refusing window {next}..={to}, \
+                 retrying",
+                r.block_number,
+                r.log_index
+            );
+            return refuse_window(source, read_from).await;
+        }
+        let mut expected: Vec<(u64, String)> = exposed
+            .iter()
             .map(|r| (r.block_number, r.block_hash.clone()))
             .collect();
         if let Some(parent) = next.checked_sub(1).filter(|&p| p > final_through) {
@@ -17710,6 +17723,30 @@ template = "pool"
         assert!(outcome.is_none(), "a fork row at block 10 was committed");
         assert!(nest.store.entities_in_range(10, 12).unwrap().is_empty());
         assert_eq!(nest.store.get_block_hash(12).unwrap(), None);
+    }
+
+    /// Jules on #2243: a row with no block hash was left out of the check and committed unchecked.
+    /// #1669 tolerated it only because the tail compares it as a string; above finality it is refused.
+    #[tokio::test]
+    async fn a_row_without_a_block_hash_is_refused_above_the_finality_depth() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        let source = MockSource { logs: Vec::new() };
+        let mut log = transfer_log(10, 0);
+        log.block_hash = String::new();
+        let outcome = nest
+            .process_window(&source, std::slice::from_ref(&log), 10, 12, 100)
+            .await
+            .unwrap();
+        assert!(outcome.is_none(), "an unhashed row committed unchecked");
+        assert!(nest.store.entities_in_range(10, 12).unwrap().is_empty());
+        // arbitrum-one's fallback depth is 1,800 blocks, so block 10 is final at tip 5,000.
+        let outcome = nest
+            .process_window(&source, &[log], 10, 12, 5_000)
+            .await
+            .unwrap();
+        assert!(outcome.is_some(), "a final row needs no hash check");
     }
 
     /// #2146: the reorg check runs before the logs are fetched. A window read after the chain moved
