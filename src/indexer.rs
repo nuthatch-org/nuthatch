@@ -8706,6 +8706,8 @@ async fn try_seal(
         let to_seal = store.entities_in_range(from, cut)?;
         match seal::seal_range_with_snapshot(dir, &to_seal, from, cut, registry_snapshot)? {
             Some(summary) => {
+                #[cfg(test)]
+                between_seal_and_prune();
                 // After the seal. It fsyncs the bytes and the manifest entry before returning, and
                 // this commit fsyncs the watermark (#1632).
                 let pruned =
@@ -9377,6 +9379,21 @@ thread_local! {
     static FAIL_AFTER_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static BEFORE_PRUNE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `probe` inside the next tip-path seal, after its segment is written and before its prune.
+#[cfg(test)]
+fn probe_before_the_next_prune(probe: impl FnOnce() + 'static) {
+    BEFORE_PRUNE.with(|p| *p.borrow_mut() = Some(Box::new(probe)));
+}
+
+#[cfg(test)]
+fn between_seal_and_prune() {
+    if let Some(probe) = BEFORE_PRUNE.with(|p| p.borrow_mut().take()) {
+        probe();
+    }
 }
 
 /// Run `probe` inside the next `process_window`, at the instant before its commit.
@@ -16689,6 +16706,83 @@ template = "pool"
             "a document given up on no longer holds its range"
         );
         drop(resolver);
+        drop(nest);
+        drop(state);
+        handle.abort();
+    }
+
+    /// #2263: the resolver writing a document while a seal is between its read and its prune. The
+    /// rows end up sealed or still hot, because the seal holds below every document it is waiting on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_document_resolved_during_a_seal_is_sealed_or_still_hot() {
+        let body = r#"{"bucket":1}"#.to_string();
+        let cid = crate::cid::cid_v0_for(body.as_bytes());
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::from([(cid.clone(), body)]), 0).await;
+        let dir = qos_topic_nest("t");
+        let (mut nest, state, source) =
+            qos_nest_with(dir.path(), gateway, vec![(4, qos_post(&cid))]).await;
+        nest.seal_span = 1;
+        let resolver = Arc::new(std::sync::Mutex::new(Some(
+            crate::ipfs_resolve::Resolver::new(
+                nest.store.clone(),
+                nest.ipfs_gate.clone().expect("a gate"),
+                nest.ipfs_gateways.clone(),
+                true,
+                Arc::new(crate::metrics::NestMetrics::default()),
+                fast_policy(3),
+            ),
+        )));
+        // Its own runtime on its own thread: the seal is blocked here until the resolver is done.
+        let resolve = {
+            let resolver = resolver.clone();
+            move || {
+                std::thread::spawn(move || {
+                    let Some(mut r) = resolver.lock().unwrap().take() else {
+                        return;
+                    };
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    assert_eq!(rt.block_on(resolve_all(&mut r)), 0);
+                })
+                .join()
+                .unwrap();
+            }
+        };
+        probe_before_the_next_prune(resolve.clone());
+        for b in 4..=6 {
+            nest.process_window(source.as_ref(), &[], b, b, 10_000)
+                .await
+                .unwrap()
+                .expect("the window must commit");
+        }
+        // No seal opened over the document's block, so it resolves here and the next seals take it.
+        resolve();
+        for b in 7..=9 {
+            nest.process_window(source.as_ref(), &[], b, b, 10_000)
+                .await
+                .unwrap()
+                .expect("the window must commit");
+        }
+
+        assert!(
+            nest.store.sealed_through() >= 4,
+            "premise: the document's block sealed"
+        );
+        let sealed = crate::seal::load_manifest(&nest.dir)
+            .unwrap()
+            .tables
+            .get("qos_payload")
+            .is_some_and(|segs| {
+                segs.iter()
+                    .any(|s| s.from_block <= 4 && 4 <= s.to_block && s.rows > 0)
+            });
+        assert!(
+            sealed || !stored_documents(nest.store.as_ref(), 4).is_empty(),
+            "a resolved document is in neither the sealed layer nor hot"
+        );
         drop(nest);
         drop(state);
         handle.abort();
