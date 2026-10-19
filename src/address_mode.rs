@@ -1332,17 +1332,10 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
     /// Requests waiting meanwhile are served between windows, so none waits behind a backlog.
     async fn catch_up(&self, state: &ModeState, safe: u64) {
         let to = state.end_block.map_or(safe, |e| e.min(safe));
-        let watched = match state.history.watched() {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::warn!("address history: reading the watched set: {e:#}");
-                return;
-            }
-        };
         // Produced blocks first, on what is already covered: they are cheap, and a long backfill of
         // other actions would otherwise hold them back for whole polls.
         if state.chain_id == 1 {
-            mev_passes(self, state, &watched, to).await;
+            mev_passes(self, state, to).await;
         }
         let min = if self.residual {
             crate::address_residual::RESIDUAL_MIN_SPAN
@@ -1504,16 +1497,24 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
         // Withdrawals and produced blocks come from bodies, and the definitions they are matched to
         // are Ethereum mainnet's, so only there is the block scan run. An account added during the
         // backfill joins these passes too.
-        let watched = state.history.watched().unwrap_or(watched);
         state.refresh_mirror().await;
         if state.chain_id == 1 {
             let skip = state.mirror_blocks().map(|(_, blocks)| blocks);
             if let Some((source, blocks)) = state.mirror_blocks() {
-                mirror_pass(self, state, &watched, to, &source, blocks).await;
+                // A sweeping nest reads bodies for the accounts that ask: mirrored coverage would make
+                // every account in its set body-scanned from then on.
+                let mirrored = match state.sweep {
+                    Some(_) => body_accounts(state, &state.history),
+                    None => state.history.watched(),
+                };
+                match mirrored {
+                    Ok(m) => mirror_pass(self, state, &m, to, &source, blocks).await,
+                    Err(e) => tracing::warn!("address history: reading the watched set: {e:#}"),
+                }
             }
             yield_cursor(state, self).await;
-            scan_bodies(self, state, &watched, to, skip).await;
-            mev_passes(self, state, &watched, to).await;
+            scan_bodies(self, state, to, skip).await;
+            mev_passes(self, state, to).await;
             validator_pass(self, state).await;
         } else if let Some((source, blocks)) = state.mirror_blocks() {
             // Elsewhere a partition is read for its verified headers alone: timestamp to block.
@@ -1823,12 +1824,12 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                 )
                 .await?;
             }
-            let watched = history.watched()?;
+            let produced = history.accounts_with(&[Action::ProducedBlocks], false)?;
             crate::address_mev::reask_range(
                 self,
                 relays,
                 history,
-                &watched,
+                &produced,
                 (from, to),
                 unix_now(),
                 Some(deadline),
@@ -1865,17 +1866,30 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
 async fn mev_passes<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     state: &ModeState,
-    watched: &[String],
     to: u64,
 ) {
     let Some(relays) = &state.relays else {
         return;
     };
+    use crate::address_history::Action;
+    // A step needs mined blocks covered, and a re-ask a produced block covered: only accounts with
+    // either have work here.
+    let watched = match state
+        .history
+        .accounts_with(&[Action::MinedBlocks, Action::ProducedBlocks], false)
+    {
+        Ok(w) => w,
+        Err(e) => {
+            state.window_failed();
+            tracing::warn!("address history: reading the accounts for the MEV pass: {e:#}");
+            return;
+        }
+    };
     let _pass = state.begin_pass("mev");
     let now = unix_now();
     let mut failed = false;
     // One address's failing step is that address's: the others' produced blocks and the re-asks go on.
-    for a in watched {
+    for a in &watched {
         let one = async {
             loop {
                 yield_cursor(state, d).await;
@@ -1928,8 +1942,11 @@ async fn mev_passes<M: Rpc, T: Rpc>(
     let reasks = async {
         loop {
             yield_cursor(state, d).await;
+            let produced = state
+                .history
+                .accounts_with(&[Action::ProducedBlocks], false)?;
             let more =
-                crate::address_mev::reask_pass(d, relays, &state.history, watched, now).await?;
+                crate::address_mev::reask_pass(d, relays, &state.history, &produced, now).await?;
             if !more {
                 break;
             }
@@ -2851,7 +2868,6 @@ async fn note_scanned<M: Rpc, T: Rpc>(
 async fn scan_bodies<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     state: &ModeState,
-    watched: &[String],
     to: u64,
     skip: Option<(u64, u64)>,
 ) {
@@ -2859,8 +2875,13 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
     // A hold from an earlier pass must not be committed: this pass may not reach the finalized block.
     state.clear_held();
     let mut keep = state.beacon.is_some() && state.validators.is_some();
-    let scanned = body_scanned(state, watched);
-    let watched = &scanned[..];
+    let watched = match body_accounts(state, &state.history) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("address history: reading the accounts for the body scan: {e:#}");
+            return;
+        }
+    };
     let _pass = state.begin_pass("bodies");
     let mut last: Option<u64> = None;
     let mut cursor = state.start_block;
@@ -2868,7 +2889,7 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
     loop {
         yield_cursor(state, d).await;
         let mut next = Vec::new();
-        for a in watched {
+        for a in &watched {
             match next_uncovered_for(&state.history, a, cursor, &BLOCK_SCANNED) {
                 Ok(n) => next.push((a.clone(), n)),
                 Err(e) => {
@@ -3965,13 +3986,12 @@ async fn change(s: Arc<ModeState>, address: String, add: bool) -> (StatusCode, J
 /// rotki asks for withdrawals and produced blocks only by a tracked validator's withdrawal address,
 /// so the body scan reads for the accounts asked, and a plain wallet pays no body a block. The
 /// proposer proof reads every scanned block, so with validators watched the scan stays whole.
-fn body_scanned(state: &ModeState, watched: &[String]) -> Vec<String> {
-    let whole = state.beacon.is_some() && state.validators.is_some();
-    watched
-        .iter()
-        .filter(|a| whole || state.history.bodies_wanted(a).unwrap_or(true))
-        .cloned()
-        .collect()
+fn body_accounts(state: &ModeState, h: &AddressHistory) -> Result<Vec<String>> {
+    use crate::address_history::Action;
+    if state.beacon.is_some() && state.validators.is_some() {
+        return h.watched();
+    }
+    h.accounts_with(&[Action::BeaconWithdrawals, Action::MinedBlocks], true)
 }
 
 /// Per action family this nest serves, the block up to which every account the family reads for is
@@ -3991,7 +4011,7 @@ fn served_through(s: &ModeState, h: &AddressHistory) -> Result<Value> {
         return Ok(Value::Object(out));
     }
     let watched = h.watched()?;
-    let scanned = body_scanned(s, &watched);
+    let scanned = body_accounts(s, h)?;
     let through = |accounts: &[String], set: &[Action]| -> Result<Value> {
         let mut next = u64::MAX;
         for a in accounts {
@@ -5261,7 +5281,7 @@ mod tests {
             },
         };
         let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
-        scan_bodies(&d, &state, &[ALICE.to_string()], anchor.number, None).await;
+        scan_bodies(&d, &state, anchor.number, None).await;
         let before = d
             .main
             .calls()
@@ -6137,7 +6157,7 @@ mod tests {
         };
         let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
         let started = Instant::now();
-        mev_passes(&d, &s, std::slice::from_ref(&alice), 199_999).await;
+        mev_passes(&d, &s, 199_999).await;
         let took = started.elapsed().as_millis().max(1) as u64;
         assert_eq!(
             history.coverage(Action::ProducedBlocks, &alice).unwrap(),
@@ -6218,7 +6238,7 @@ mod tests {
             finalized: Value::Null,
         };
         let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
-        mev_passes(&d, &s, &[alice.clone(), bob.clone()], 199_999).await;
+        mev_passes(&d, &s, 199_999).await;
         assert_eq!(
             history.coverage(Action::ProducedBlocks, &alice).unwrap(),
             vec![]
@@ -7055,6 +7075,84 @@ mod tests {
             let err = refuse_event_flags(&parse(flag)).unwrap_err();
             assert!(err.to_string().contains(flag[0]), "{flag:?}: {err}");
         }
+    }
+
+    /// #2275: a sweeping nest's mirror pass read partitions for its whole set, and the coverage left
+    /// every account body-scanned from then on. It reads for the accounts that asked for bodies.
+    #[tokio::test]
+    async fn a_sweeping_nest_mirrors_bodies_only_for_accounts_that_asked() {
+        use crate::address_discovery::Discoverer;
+        use crate::address_history::Action;
+        use crate::address_partitions::tests::{chain_rpc, Fake, MINER, PAID};
+        use crate::address_partitions::{build, Source, SPAN};
+        let mirror = tempfile::tempdir().unwrap();
+        let chain = chain_rpc(SPAN + 5);
+        build(
+            &chain,
+            mirror.path().to_str().unwrap(),
+            1,
+            (0, SPAN - 1),
+            4,
+            false,
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        let main = Fake::new(move |m, p| match m {
+            "eth_getBlockByNumber" if p[0] == "finalized" => {
+                Ok(json!({"number": format!("0x{:x}", SPAN + 5)}))
+            }
+            _ => (chain.answer)(m, p),
+        });
+        let trace = Fake::new(|m, _| bail!("unexpected {m}"));
+        let d = Discoverer::new(Counted::new(main), Counted::new(trace));
+        let (paid, miner) = (format!("{PAID:#x}"), format!("{MINER:#x}"));
+        let dir = tempfile::tempdir().unwrap();
+        let history = AddressHistory::open(
+            Store::open(&dir.path().join("t.redb")).unwrap(),
+            1,
+            &[paid.clone(), miner.clone()],
+        )
+        .unwrap();
+        history.ask_bodies(&paid).unwrap();
+        let g = history.generation().unwrap();
+        history
+            .record_sweep(
+                &BTreeMap::new(),
+                [&paid, &miner],
+                (5, SPAN + 5),
+                g,
+                None,
+                false,
+            )
+            .unwrap();
+        let source = Source::open(
+            mirror.path().to_str().unwrap(),
+            1,
+            dir.path().join("partitions"),
+            u64::MAX,
+        )
+        .unwrap();
+        let state = ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+            .with_range(5, Some(SPAN - 1), 0)
+            .with_mirror(Arc::new(source), (0, SPAN - 1))
+            .with_sweep(Some(crate::address_history::SweepConfig {
+                from_block: Some(5),
+                internal: false,
+                confirmations: None,
+                webhook: None,
+            }));
+        history.finalize(SPAN + 5).unwrap();
+        d.catch_up(&state, SPAN + 5).await;
+        assert_eq!(
+            history.coverage(Action::BeaconWithdrawals, &paid).unwrap(),
+            vec![(5, SPAN - 1)]
+        );
+        assert_eq!(
+            history.coverage(Action::MinedBlocks, &miner).unwrap(),
+            vec![],
+            "an account that never asked for bodies"
+        );
     }
 
     /// With a mirror, block history comes from verified partitions: no body is read over RPC in the
@@ -9567,5 +9665,58 @@ mod tests {
         let moved = timed(100, Some(51));
         assert!(search_by_time(&moved, at(50) + 5, false).await.is_err());
         assert!(search_by_time(&moved, at(50) + 5, true).await.is_err());
+    }
+
+    /// Times a sweeping nest's poll at `$NUTHATCH_AH_WATCHED` addresses (default 1,000,000, RFC-0064's
+    /// size), ten of them asked for bodies, with nothing to fetch, for #2275:
+    /// `cargo test --release --lib measure_a_sweeping_poll_at_scale -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn measure_a_sweeping_poll_at_scale() {
+        let n: usize =
+            std::env::var("NUTHATCH_AH_WATCHED").map_or(1_000_000, |v| v.parse().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[]).unwrap();
+        let addrs: Vec<String> = (1..=n).map(|i| format!("0x{i:040x}")).collect();
+        history.watch_many(&addrs).unwrap();
+        history.finalize(1_000).unwrap();
+        for a in addrs.iter().step_by(n / 10) {
+            history.ask_bodies(a).unwrap();
+        }
+        let g = history.generation().unwrap();
+        let none = BTreeMap::new();
+        history
+            .record_sweep(&none, std::iter::empty::<&str>(), (10, 60), g, None, false)
+            .unwrap();
+        let relays: crate::address_mev::Relays = Arc::new(|_, _| Box::pin(async { Ok(vec![]) }));
+        let sweep = crate::address_history::SweepConfig {
+            from_block: Some(10),
+            internal: false,
+            confirmations: None,
+            webhook: None,
+        };
+        let s = ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+            .with_relays(relays)
+            .with_range(100, None, 0)
+            .with_sweep(Some(sweep));
+        let make = || Headers {
+            by_number: BTreeMap::new(),
+            finalized: Value::Null,
+        };
+        let d = Discoverer::new(Counted::new(make()), Counted::new(make()));
+        let t = Instant::now();
+        d.catch_up(&s, 50).await;
+        println!("catch_up, sweeping, {n} watched: {:?}", t.elapsed());
+        assert_eq!(d.main.requests() + d.trace.requests(), 0);
+        let plain = ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
+            .with_relays(Arc::new(|_, _| Box::pin(async { Ok(vec![]) })))
+            .with_range(100, None, 0);
+        let t = Instant::now();
+        served_through(&plain, &history).unwrap();
+        println!(
+            "served_through, not sweeping, {n} watched: {:?}",
+            t.elapsed()
+        );
     }
 }

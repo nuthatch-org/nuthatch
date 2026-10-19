@@ -1289,6 +1289,37 @@ impl AddressHistory {
         Ok(rtx.open_table(WATCHED)?.get(a.as_slice())?.is_some())
     }
 
+    /// The watched accounts with coverage of their own for any of `actions`, and with `asked` those
+    /// asked for bodies: the few a per-account pass has work for, found without visiting every
+    /// watched address (#2275). A sweep's shared span is no account's own.
+    pub fn accounts_with(&self, actions: &[Action], asked: bool) -> Result<Vec<String>> {
+        let rtx = self.store.database().begin_read()?;
+        let mut found = std::collections::BTreeSet::new();
+        for e in rtx.open_table(COVERAGE)?.iter()? {
+            let (k, _) = e?;
+            let k = k.value();
+            if actions.iter().any(|a| a.code() == k[20]) {
+                found.insert(k[..20].to_vec());
+            }
+        }
+        if asked {
+            for e in rtx.open_table(BODIES_ASKED)?.iter()? {
+                found.insert(e?.0.value().to_vec());
+            }
+        }
+        let watched = rtx.open_table(WATCHED)?;
+        let mut accounts = Vec::new();
+        for a in found {
+            if watched.get(a.as_slice())?.is_some() {
+                accounts.push(address_hex(
+                    &a.try_into()
+                        .map_err(|_| anyhow!("account keys are 20 bytes"))?,
+                ));
+            }
+        }
+        Ok(accounts)
+    }
+
     /// Store a fetch's result: `rows`, replacing what `[from, to]` held, and the claim that the span
     /// is complete for (address, action), in one transaction. Refused if the address is not watched
     /// or the generation moved since the fetch began, because either way the claim no longer
@@ -3490,6 +3521,48 @@ mod tests {
         h.invalidate_above(100).unwrap();
         let kept = h.cached_tx(&[1; 32]).unwrap().expect("cached at 90");
         assert_eq!(kept["blockNumber"], "90");
+    }
+
+    /// #2275: the per-account passes find their accounts from coverage and the bodies asked for,
+    /// never from the sweep's shared span or an account no longer watched.
+    #[test]
+    fn accounts_with_finds_only_watched_accounts_with_their_own_coverage() {
+        let (_d, h) = history();
+        let (carol, dave) = (
+            "0x00000000000000000000000000000000000000c0",
+            "0x00000000000000000000000000000000000000d0",
+        );
+        h.watch_many(&[BOB.into(), carol.into(), dave.into()])
+            .unwrap();
+        let g = h.generation().unwrap();
+        h.record_sweep(
+            &std::collections::BTreeMap::new(),
+            [ALICE, BOB, carol, dave],
+            (1, 10),
+            g,
+            None,
+            false,
+        )
+        .unwrap();
+        let g = h.generation().unwrap();
+        h.record(Action::MinedBlocks, BOB, &[], (1, 10), g).unwrap();
+        h.ask_bodies(carol).unwrap();
+        h.record(Action::MinedBlocks, dave, &[], (1, 10), g)
+            .unwrap();
+        h.unwatch(dave).unwrap();
+        let bob = BOB.to_lowercase();
+        assert_eq!(
+            h.accounts_with(&[Action::MinedBlocks], false).unwrap(),
+            vec![bob.clone()]
+        );
+        assert_eq!(
+            h.accounts_with(&[Action::MinedBlocks], true).unwrap(),
+            vec![carol.to_string(), bob]
+        );
+        assert!(h
+            .accounts_with(&[Action::TxList], false)
+            .unwrap()
+            .is_empty());
     }
 
     /// #2117: a reorg reads what it takes back from a block-first index. A store written before the
