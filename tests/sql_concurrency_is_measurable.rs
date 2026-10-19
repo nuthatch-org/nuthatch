@@ -382,3 +382,45 @@ fn the_previous_value_survives_a_panic_inside_the_guard() {
 
     set_env(prev.as_deref());
 }
+
+/// #2143: the admin cockpit reports the permits the gate was built with, not the shipped default.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_admin_config_reports_the_live_value() {
+    use tower::ServiceExt;
+    let _guard = env_lock().lock().await;
+    let _restore = install_env(Some("8"));
+    let _mem = install_fitting_memory(8);
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    tape.insert_block(1, empty_block(1, 0, 1_700_000_000));
+    tape.advance_tip_to(1);
+    let cfg = scaffold_nest(dir.path(), "gate", USDC);
+    let rt = indexer::spawn_nest(
+        tape,
+        dir.path().to_path_buf(),
+        cfg,
+        None,
+        false,
+        1,
+        Some(2),
+        true,
+        None,
+    )
+    .await
+    .expect("spawn_nest");
+    let router = nuthatch::serve::router(nuthatch::serve::SharedNest::new(rt.state.clone()));
+    let resp = router
+        .oneshot(
+            axum::http::Request::get("/_admin/config")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    rt.ingest.abort();
+    assert_eq!(v["running"]["sql"]["max_concurrency"], 8, "{v}");
+}

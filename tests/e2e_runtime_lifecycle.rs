@@ -2696,6 +2696,17 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
         UndeclaredChain,
         CursorStopped,
         OverBudget,
+        EntityCeiling,
+        SealDirectEntities,
+    }
+    fn write_entities(dir: &std::path::Path, n: usize) {
+        let mut body = String::new();
+        for i in 0..n {
+            body.push_str(&format!(
+                "[[entities]]\nname = \"e{i}\"\nsql = \"entities/e{i}.sql\"\nkey = [\"id\"]\nmax_rows = 1\n\n"
+            ));
+        }
+        std::fs::write(dir.join("entities.toml"), body).unwrap();
     }
     for (label, case) in [
         ("admitted", Case::Admitted),
@@ -2704,6 +2715,8 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
         ("undeclared chain", Case::UndeclaredChain),
         ("cursor stopped", Case::CursorStopped),
         ("over budget", Case::OverBudget),
+        ("entity ceiling", Case::EntityCeiling),
+        ("seal-direct with entities", Case::SealDirectEntities),
     ] {
         let roost = tempfile::tempdir().unwrap();
         let nid = "7c".repeat(32);
@@ -2727,7 +2740,18 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
                 .health
                 .quarantine_cursor("arbitrum-one", "finality violation".to_string()),
             Case::OverBudget => handles.mount_ctx.max_rss_mb = 100,
+            Case::EntityCeiling => write_entities(&data_dir, 33),
+            Case::SealDirectEntities => {
+                write_entities(&data_dir, 1);
+                handles.mount_ctx.seal_direct = true;
+            }
         }
+        // #2139: these two answered 500, and their dry runs a null status.
+        let expected = match case {
+            Case::EntityCeiling => Some(507),
+            Case::SealDirectEntities => Some(409),
+            _ => None,
+        };
         let mounted_before = handles.states.len();
         let _ = intake.try_recv();
         let handles = Arc::new(tokio::sync::Mutex::new(handles));
@@ -2750,6 +2774,9 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
         .await;
         assert_eq!(status, axum::http::StatusCode::OK, "{label}: {dry}");
         let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
+        if let Some(code) = expected {
+            assert_eq!(dry["refusal_status"], code, "{label}: {dry}");
+        }
         assert_eq!(
             handles.lock().await.states.len(),
             mounted_before,
@@ -2781,7 +2808,10 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
                     "{label}: {dry} / {answer}"
                 );
                 assert!(dry["incoming_mb"].as_u64().is_some(), "{label}: {dry}");
-                assert_eq!(dry["tip"], 3, "{label}: {dry}");
+                assert!(
+                    dry["tip"].is_null(),
+                    "{label}: no cursor runs on the chain, and a dry run dials nothing: {dry}"
+                );
                 assert_eq!(dry["chain"], "arbitrum-one", "{label}: {dry}");
             }
         }
@@ -3512,4 +3542,152 @@ async fn a_configured_default_tenant_keeps_its_mounts_and_moves_one_alone() {
         vec![rec("acme", &new_nid), rec("globex", &old_nid)],
         "moving usdc leaves globex/usdc on its own nid"
     );
+}
+
+/// #2130: a mount whose routes would overlap another's is refused before it joins. `ready` and
+/// `metrics` are root routes, and a tenant named as a default-tenant alias serves under that alias's
+/// routes. Each used to panic `Router::nest` after the nest was on its cursor, and every later
+/// recomposition with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_whose_routes_would_collide_is_refused_before_it_joins() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "5e".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs.clone(), true, None);
+
+    for name in ["ready", "metrics", "ready/usdc"] {
+        let body = format!(r#"{{"name":"{name}","nid":"{nid}"}}"#);
+        for uri in ["/_admin/nests", "/_admin/nests?wait=true"] {
+            let (status, answer) = call(&routes, "POST", uri, None, Some(&body)).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{uri} '{name}': {answer}"
+            );
+        }
+        assert!(jobs.get(name).is_none(), "'{name}' was recorded as a job");
+    }
+
+    let collides = format!(r#"{{"name":"usdc/sql","nid":"{nid}"}}"#);
+    let (status, answer) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?wait=true",
+        None,
+        Some(&collides),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{answer}");
+    assert!(answer.contains("also the name of a mount"), "{answer}");
+    let (_, dry) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?dry_run=true",
+        None,
+        Some(&collides),
+    )
+    .await;
+    let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
+    assert_eq!(dry["refusal_status"], 400, "{dry}");
+    let (status, _) = call(&routes, "POST", "/_admin/nests", None, Some(&collides)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let job = wait_for_phase(&routes, "usdc/sql", "failed").await;
+    assert_eq!(job["phase"], "failed", "{job}");
+
+    // The other way round: a tenant first, then a default-tenant alias of its name.
+    let acme = format!(r#"{{"name":"acme/usdc","nid":"{nid}"}}"#);
+    let (status, answer) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?wait=true",
+        None,
+        Some(&acme),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{answer}");
+    let alias = format!(r#"{{"name":"acme","nid":"{nid}"}}"#);
+    let (status, answer) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?wait=true",
+        None,
+        Some(&alias),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{answer}");
+
+    let h = handles.lock().await;
+    let names: Vec<&str> = h.states.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["usdc", "acme/usdc"]);
+    assert_eq!(
+        self::status(&h.live, "/acme/usdc/health").await,
+        axum::http::StatusCode::OK
+    );
+}
+
+/// #2137: a NID is one dataset whatever case the caller spells it in. The upper-case form of a held
+/// NID shares the dataset; it used to be a second directory, indexed again from its start block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_nid_in_upper_case_names_the_same_dataset() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c3d4".repeat(16);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+
+    let body = format!(
+        r#"{{"name":"acme/usdc","nid":"{}"}}"#,
+        nid.to_ascii_uppercase()
+    );
+    let (status, answer) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?wait=true",
+        None,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{answer}");
+    let h = handles.lock().await;
+    let dirs: Vec<_> = h.states.iter().map(|(_, s)| s.dir.clone()).collect();
+    assert_eq!(dirs.len(), 2);
+    assert_eq!(dirs[0], dirs[1], "two directories for one dataset");
+    assert!(
+        h.mount_ctx.mounts.iter().all(|m| m.nid == nid),
+        "a record kept the caller's spelling: {:?}",
+        h.mount_ctx.mounts
+    );
+}
+
+/// #2139: a dry run reads the tip its chain's cursor last saw and dials nothing. It holds the
+/// runtime's lock, so a call to a slow RPC from here held up every other admin call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dry_run_reads_the_cursors_tip_and_dials_nothing() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "e1".repeat(32);
+    let (handles, tape) = one_live_mount_as(roost.path(), &nid, "tipwatch-2139").await;
+    let other = "e2".repeat(32);
+    let other_dir = runtime::MountTable::data_dir(roost.path(), &other);
+    std::fs::create_dir_all(&other_dir).unwrap();
+    scaffold_nest(&other_dir, "usdc", USDC);
+    tape.go_dark();
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+
+    let body = format!(r#"{{"name":"other-2139","nid":"{other}"}}"#);
+    let (status, dry) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?dry_run=true",
+        None,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{dry}");
+    let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
+    assert_eq!(dry["tip"], 3, "{dry}");
 }
