@@ -26,7 +26,7 @@ abi = "abis/uniswap_v3_pool.json"
 # The rule: when `factory`'s `PoolCreated` fires, index the child in the `pool` param under `pool`.
 [[factories]]
 watch = "factory"          # a contract alias, or another template (nested, up to depth 3)
-event = "PoolCreated"
+event = "PoolCreated"      # an overloaded event needs its full signature: "PoolCreated(address,uint24)"
 child_param = "pool"       # the event parameter holding the child contract address
 template = "pool"
 # start = 12369621         # optional: only honour discoveries at or after this block
