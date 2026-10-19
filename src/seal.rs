@@ -194,11 +194,23 @@ pub fn seal_range_with_snapshot(
         // incoming rows alone, before any fold. A fold's file hash is the folded bytes, so the
         // incoming hash is kept beside it (#1631).
         let input_hash = hash.clone();
-        if segments
+        // Only beside an intact copy: skipping beside a lost file, then pruning hot, would leave
+        // these rows in neither (#2261).
+        if let Some(s) = segments
             .iter()
-            .any(|s| s.hash == hash || s.input_hash.as_deref() == Some(hash.as_str()))
+            .find(|s| s.hash == hash || s.input_hash.as_deref() == Some(hash.as_str()))
         {
-            continue;
+            if segment_intact(dir, s) {
+                continue;
+            }
+            if s.hash == hash {
+                match shared_store(dir) {
+                    Some(store) => publish_durable(&store, &format!("{hash}.parquet"), &bytes)?,
+                    None => publish_durable(&seg_dir, &s.file, &bytes)?,
+                }
+                continue;
+            }
+            // A lost fold held these rows; they are sealed again as a segment of their own.
         }
         let new_rows = rows.len();
 
@@ -1354,21 +1366,42 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     Ok(quarantined)
 }
 
+/// The segment's file is present and hashes to its catalogue entry.
+fn segment_intact(dir: &Path, s: &Segment) -> bool {
+    std::fs::read(segment_path(dir, &s.file, &s.hash))
+        .is_ok_and(|bytes| hex::encode(Sha256::digest(&bytes)) == s.hash)
+}
+
 /// `(from, cut)` when a seal catalogued a fold through `cut` and stopped before its prune (#2169).
 /// The folded segment starts at or below `sealed_through` and ends past it, so the watermark admits
 /// it to no read, and the provisional rows it absorbed are no longer in hot either. Every table's
 /// rows through `cut` went into that one catalogue install, so the seal can be finished from here.
+///
+/// An error when a segment the finish would leave as the only copy of its rows is missing or does
+/// not hash to its entry: the prune would then lose the hot copy too.
 pub fn unpruned_fold(dir: &Path, sealed_through: u64) -> Result<Option<(u64, u64)>> {
     let manifest = load_manifest(dir)?;
-    let straddling = manifest
-        .tables
-        .values()
-        .flatten()
-        .filter(|s| s.from_block <= sealed_through && s.to_block > sealed_through);
-    Ok(straddling.fold(None, |acc, s| match acc {
-        None => Some((s.from_block, s.to_block)),
-        Some((from, cut)) => Some((from.min(s.from_block), cut.max(s.to_block))),
-    }))
+    let segments = || manifest.tables.values().flatten();
+    let Some((from, cut)) = segments()
+        .filter(|s| s.from_block <= sealed_through && s.to_block > sealed_through)
+        .fold(None, |acc, s| match acc {
+            None => Some((s.from_block, s.to_block)),
+            Some((from, cut)) => Some((from.min(s.from_block), cut.max(s.to_block))),
+        })
+    else {
+        return Ok(None);
+    };
+    for s in segments().filter(|s| s.to_block > sealed_through && s.to_block <= cut) {
+        if !segment_intact(dir, s) {
+            anyhow::bail!(
+                "segment {} (blocks {}..={}) is missing or does not hash to its catalogue entry",
+                s.file,
+                s.from_block,
+                s.to_block
+            );
+        }
+    }
+    Ok(Some((from, cut)))
 }
 
 /// What [`check_catalogue`] found. Diagnostic: it does not move files. Startup quarantine is
@@ -2935,6 +2968,35 @@ mod tests {
         );
         seal_range(dir.path(), &[transfer(12, 0, "2")], 12, 12).unwrap();
         assert_eq!(unpruned_fold(dir.path(), 11).unwrap(), Some((10, 12)));
+
+        let folded = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        std::fs::remove_file(dir.path().join(SEGMENTS_DIR).join(&folded.file)).unwrap();
+        assert!(
+            unpruned_fold(dir.path(), 11).is_err(),
+            "a fold whose file is gone must not be finished: the prune would drop the hot copy"
+        );
+    }
+
+    /// #2261: a re-seal of rows whose catalogued file is gone was skipped by hash, and the caller then
+    /// pruned the hot copy. The same bytes are put back under their name instead.
+    #[test]
+    fn a_re_seal_beside_a_missing_file_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let seg = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        let path = dir.path().join(SEGMENTS_DIR).join(&seg.file);
+        std::fs::remove_file(&path).unwrap();
+
+        seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        assert_eq!(
+            only(&load_manifest(dir.path()).unwrap(), "usdc__transfer").hash,
+            seg.hash
+        );
+        assert!(
+            segment_intact(dir.path(), &seg),
+            "the file was not restored"
+        );
     }
 
     /// #2230: two seals of identical bytes in one process each wrote `.{file}.{pid}.tmp`. The second

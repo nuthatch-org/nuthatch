@@ -270,7 +270,7 @@ const SPAN_CUT: u64 = 5 + 86_400 - 1;
 
 /// A tip-path seal that folds the provisional tail and, when `crash`, dies between installing the
 /// folded catalogue and pruning hot. Then a clean restart. Returns `/balances` and the row count.
-fn fold_then_restart(crash: bool) -> (serde_json::Value, u64) {
+fn fold_then_restart(crash: bool, lose_fold: bool) -> (serde_json::Value, u64) {
     let dir = tempfile::tempdir().unwrap();
     let (_rpc, rpc_port) = fixture_chain();
     let nest = dir.path().join("nest");
@@ -312,6 +312,10 @@ fn fold_then_restart(crash: bool) -> (serde_json::Value, u64) {
             vec![(0, SPAN_CUT)],
             "premise: the death followed a fold"
         );
+        if lose_fold {
+            let folded = &manifest.tables["c0__transfer"][0].file;
+            std::fs::remove_file(nest.join("segments").join(folded)).unwrap();
+        }
         drop(second);
     } else {
         let api = format!("http://127.0.0.1:{port}");
@@ -343,8 +347,8 @@ fn fold_then_restart(crash: bool) -> (serde_json::Value, u64) {
 /// rebuild seeded balances without them for the life of that process.
 #[test]
 fn a_death_between_a_folds_manifest_and_its_prune_loses_nothing_from_the_views() {
-    let (balances, count) = fold_then_restart(true);
-    let (reference, reference_count) = fold_then_restart(false);
+    let (balances, count) = fold_then_restart(true, false);
+    let (reference, reference_count) = fold_then_restart(false, false);
     assert_eq!(
         (count, reference_count),
         (TRANSFERS, TRANSFERS),
@@ -353,6 +357,23 @@ fn a_death_between_a_folds_manifest_and_its_prune_loses_nothing_from_the_views()
     assert_eq!(
         balances, reference,
         "balances after dying between the fold's manifest and its prune differ from an uncrashed run"
+    );
+}
+
+/// #2261 review: the same death, and the folded file is gone before the restart. Finishing the seal
+/// would prune the only other copy of blocks 5..=8, and re-sealing them was skipped by the folded
+/// segment's input hash. The tail's blocks 1..=4 are lost with the file; the hot ones must not be.
+#[test]
+fn a_lost_fold_is_not_finished_and_its_hot_rows_survive() {
+    let (balances, count) = fold_then_restart(true, true);
+    assert_eq!(
+        count,
+        TRANSFERS - 4,
+        "blocks 5..=8 were in hot when the fold's file went"
+    );
+    assert_eq!(
+        balances["items"][0]["balance"], "2600",
+        "the views lost the hot transfers: {balances}"
     );
 }
 

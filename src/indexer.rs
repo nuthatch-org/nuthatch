@@ -8688,8 +8688,18 @@ async fn maybe_seal(
 /// Finish a seal that installed a fold's catalogue and died before its prune (#2169): the prune and
 /// watermark it would have committed next. Until then the folded rows were in no read at all.
 fn finish_unpruned_fold(dir: &std::path::Path, store: &dyn crate::store::HotStore) -> Result<()> {
-    let Some((from, cut)) = seal::unpruned_fold(dir, store.sealed_through())? else {
-        return Ok(());
+    let watermark = store.sealed_through();
+    let (from, cut) = match seal::unpruned_fold(dir, watermark) {
+        Ok(Some(window)) => window,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::error!(
+                "a seal past block {watermark} stopped before its prune, and it cannot be finished: \
+                 {e:#}. Hot rows are kept and the watermark stays; restore the segment from a copy \
+                 and restart, or re-index the nest"
+            );
+            return Ok(());
+        }
     };
     let pruned = store.prune_and_set_meta(from, cut, SEALED_THROUGH_KEY, &cut.to_string())?;
     tracing::info!(
