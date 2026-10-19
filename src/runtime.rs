@@ -7039,6 +7039,10 @@ mod tests {
             "the store landed without its segments: a half-adopted dataset"
         );
         assert!(dataset.join(CONFIG_FILE).exists());
+        assert!(
+            dataset.join("segments").join("in-the-way").exists(),
+            "the unwind removed a directory this commit never moved"
+        );
     }
 
     /// #1768: a refused mount returns only once its store is closed. The alert worker it aborts may
