@@ -6845,7 +6845,7 @@ impl NestIngest {
                         &self.store,
                         &self.dir,
                         &self.webhooks,
-                        finalized_through,
+                        sealed_to,
                     ) {
                         tracing::warn!("webhook delivery after seal-direct failed: {e:#}");
                     }
