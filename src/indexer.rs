@@ -3169,7 +3169,7 @@ async fn build_nest(
                 balances: &balances,
                 exposure: &exposure,
                 velocity: &velocity,
-                velocity_window: velocity_cfg.map(|(_, w)| w),
+                velocity_cfg,
             },
         ) {
             tracing::error!(
@@ -6885,7 +6885,7 @@ impl NestIngest {
                         balances: &self.balances,
                         exposure: &self.exposure,
                         velocity: &self.velocity,
-                        velocity_window: self.velocity_cfg.map(|(_, w)| w),
+                        velocity_cfg: self.velocity_cfg,
                     },
                 ) {
                     tracing::warn!("view rebuild after seal-direct failed: {e:#}");
@@ -7904,6 +7904,10 @@ impl NestIngest {
                 tracing::warn!("webhook delivery failed: {e:#}");
             }
         }
+        if let Some((threshold, window)) = self.velocity_cfg {
+            self.velocity
+                .settle(self.store.sealed_through(), threshold, window);
+        }
         // Whatever advanced the watermark, the fold writer hears of it here; an unchanged one costs an
         // atomic compare.
         #[cfg(feature = "folds")]
@@ -8731,8 +8735,8 @@ struct DerivedViews<'a> {
     balances: &'a BalanceView,
     exposure: &'a ExposureView,
     velocity: &'a VelocityView,
-    /// `Some(window)` only when a velocity flag is configured (RFC-0008 C3).
-    velocity_window: Option<u64>,
+    /// `Some((threshold, window))` only when a velocity flag is configured (RFC-0008 C3).
+    velocity_cfg: Option<(i128, u64)>,
 }
 
 /// Rebuild every derived IVM view - balances, exposure and velocity - from stored facts, in a single
@@ -8768,7 +8772,7 @@ fn rebuild_views(
         balances,
         exposure,
         velocity,
-        velocity_window,
+        velocity_cfg,
     } = *into;
 
     // Each transfer table with its (from, to, value) column names - which vary by token (USDC:
@@ -8806,6 +8810,7 @@ fn rebuild_views(
     let mut cold_balances = 0usize;
     let mut cold_exposure = 0usize;
     let mut cold_velocity = 0usize;
+    let mut cold_buckets: std::collections::HashMap<String, (i128, i128)> = Default::default();
     for (table, from_col, to_col, val_col) in &transfer_tables {
         let catalogued = manifest
             .tables
@@ -8848,7 +8853,7 @@ fn rebuild_views(
                 exposure_batch.push(exposure::seed_item(key, amount, count));
             }
         }
-        if let Some(window) = velocity_window {
+        if let Some((_, window)) = velocity_cfg {
             let rows = crate::analytics::cold_velocity(
                 dir,
                 table,
@@ -8860,6 +8865,17 @@ fn rebuild_views(
             .with_context(|| format!("seeding velocity from the sealed {table}"))?;
             cold_velocity += rows.len();
             for (key, volume, count) in rows {
+                let bucket = cold_buckets.entry(key).or_insert((0, 0));
+                bucket.0 = bucket.0.saturating_add(volume);
+                bucket.1 = bucket.1.saturating_add(count);
+            }
+        }
+    }
+    // Summed across tables before the threshold is applied, since a bucket is a sender's window
+    // over every token. One that can never flag is not seeded (#2173).
+    if let Some((threshold, window)) = velocity_cfg {
+        for (key, (volume, count)) in cold_buckets {
+            if velocity::can_flag(&key, volume, threshold, window, sealed_through) {
                 velocity_batch.push(velocity::seed_item(key, volume, count));
             }
         }
@@ -8901,7 +8917,7 @@ fn rebuild_views(
                     exposure_batch.extend(d);
                 }
             }
-            if let Some(window) = velocity_window {
+            if let Some((_, window)) = velocity_cfg {
                 velocity_batch.extend(velocity::velocity_deltas(
                     &from,
                     row.block_number,
@@ -25087,7 +25103,7 @@ rpc_urls = ["https://rpc.example"]
                 balances: &balances,
                 exposure: &exposure_v,
                 velocity: &velocity_v,
-                velocity_window: Some(WINDOW),
+                velocity_cfg: Some((0, WINDOW)),
             },
         )
         .unwrap();
@@ -25231,7 +25247,7 @@ rpc_urls = ["https://rpc.example"]
                     balances: &BalanceView::start().unwrap(),
                     exposure: &ExposureView::start(false).unwrap(),
                     velocity: &VelocityView::start(false).unwrap(),
-                    velocity_window: None,
+                    velocity_cfg: None,
                 },
             )
         };
@@ -25246,6 +25262,53 @@ rpc_urls = ["https://rpc.example"]
         .unwrap();
         let err = rebuild().expect_err("an unreadable sealed table is a failed rebuild");
         assert!(format!("{err:#}").contains("usdc__transfer"), "{err:#}");
+    }
+
+    /// #2173: the restart seed leaves out a velocity bucket that can never flag - below the
+    /// threshold in a window wholly sealed - and keeps one whose window the hot tail still adds to.
+    #[test]
+    fn the_velocity_seed_leaves_out_buckets_that_cannot_flag() {
+        const ALICE: &str = "0x1111111111111111111111111111111111111111";
+        const BOB: &str = "0x2222222222222222222222222222222222222222";
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = [
+            transfer_row(10, 0, ALICE, Some(BOB), "5"),
+            transfer_row(20, 0, BOB, Some(ALICE), "500"),
+            transfer_row(150, 0, ALICE, Some(BOB), "5"),
+            transfer_row(210, 0, BOB, Some(ALICE), "5"),
+        ];
+        crate::seal::seal_range(dir.path(), &sealed, 10, 219).unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        store.set_meta("sealed_through", "219").unwrap();
+        store
+            .put_entity(
+                &Store::entity_key(230, 0),
+                &transfer_row(230, 0, BOB, Some(ALICE), "200"),
+            )
+            .unwrap();
+
+        let velocity = VelocityView::start(true).unwrap();
+        let none = BalanceView::start().unwrap();
+        rebuild_views(
+            dir.path(),
+            &store,
+            &erc20_registry(),
+            &DerivedViews {
+                labels: &labelset(&[]),
+                balances: &none,
+                exposure: &ExposureView::start(false).unwrap(),
+                velocity: &velocity,
+                velocity_cfg: Some((100, 100)),
+            },
+        )
+        .unwrap();
+        let flags: Vec<_> = velocity
+            .flags(100)
+            .into_iter()
+            .map(|f| (f.window_start, f.volume))
+            .collect();
+        assert_eq!(flags, vec![(0, 500), (200, 205)]);
+        assert_eq!(velocity.entries(), 2, "ALICE's sealed buckets cannot flag");
     }
 
     /// #294 itself: the restart rebuild must walk the hot store **once**.

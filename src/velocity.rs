@@ -98,9 +98,10 @@ struct VelocityCircuit {
     count_in: dbsp::ZSetHandle<KeyAmt>,
     volume_out: OutputHandle<OrdZSet<Tup2<String, i128>>>,
     count_out: OutputHandle<OrdZSet<Tup2<String, i128>>>,
-    volumes: HashMap<String, i128>,
-    counts: HashMap<String, i128>,
 }
+
+/// The published view: `(count, volume)` per encoded (address, window) key.
+type Buckets = HashMap<String, (i128, i128)>;
 
 impl VelocityCircuit {
     fn new() -> Result<Self> {
@@ -113,12 +114,11 @@ impl VelocityCircuit {
             count_in,
             volume_out,
             count_out,
-            volumes: HashMap::new(),
-            counts: HashMap::new(),
         })
     }
 
-    fn step(&mut self, batch: VelocityBatch) -> Result<()> {
+    /// Fold `batch`, returning only the buckets it changed (#2173).
+    fn step(&mut self, batch: VelocityBatch) -> Result<Delta> {
         let mut vol: Vec<Tup2<KeyAmt, i64>> = Vec::with_capacity(batch.len());
         let mut cnt: Vec<Tup2<KeyAmt, i64>> = Vec::with_capacity(batch.len());
         for it in batch {
@@ -127,34 +127,91 @@ impl VelocityCircuit {
         }
         self.volume_in.append(&mut vol);
         self.count_in.append(&mut cnt);
-        self.circuit
-            .transaction()
-            .map_err(|e| anyhow!("velocity transaction: {e}"))?;
-
-        fold_changes(&self.volume_out.consolidate(), &mut self.volumes, false);
-        let dropped = fold_changes(&self.count_out.consolidate(), &mut self.counts, true);
-        for k in dropped {
-            self.volumes.remove(&k);
+        // DBSP splits a large input across steps of its own and each writes the output afresh, so the
+        // output is drained after every step, as `EntityCircuit::step_to_commit` does.
+        let fault = |e| anyhow!("velocity transaction: {e}");
+        self.circuit.start_transaction().map_err(fault)?;
+        self.circuit.start_commit_transaction().map_err(fault)?;
+        let mut delta = Delta::default();
+        loop {
+            let complete = self.circuit.step().map_err(fault)?;
+            delta.counts.extend(changes(&self.count_out.consolidate()));
+            delta
+                .volumes
+                .extend(changes(&self.volume_out.consolidate()));
+            if complete {
+                return Ok(delta);
+            }
         }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn flags(&self, threshold: i128) -> Vec<VelocityFlag> {
-        rows_over(&self.counts, &self.volumes, threshold)
     }
 }
 
-/// Collect (address, window) entries whose volume ≥ `threshold`, descending by volume.
-fn rows_over(
-    counts: &HashMap<String, i128>,
-    volumes: &HashMap<String, i128>,
-    threshold: i128,
-) -> Vec<VelocityFlag> {
-    let mut out: Vec<VelocityFlag> = counts
+/// The buckets a batch changed: `Some(value)`, or `None` for a bucket that left the output.
+#[derive(Default)]
+struct Delta {
+    counts: HashMap<String, Option<i128>>,
+    volumes: HashMap<String, Option<i128>>,
+}
+
+impl Delta {
+    fn apply(self, into: &mut Buckets) {
+        // A bucket lives while it counts a transfer; its volume rides on it.
+        for (k, count) in self.counts {
+            match count {
+                Some(c) => into.entry(k).or_insert((0, 0)).0 = c,
+                None => {
+                    into.remove(&k);
+                }
+            }
+        }
+        for (k, volume) in self.volumes {
+            if let Some(bucket) = into.get_mut(&k) {
+                bucket.1 = volume.unwrap_or(0);
+            }
+        }
+    }
+}
+
+/// A circuit seeded with only the buckets `can` keeps, or `None` when it keeps them all.
+///
+/// Dropping a bucket by retracting it leaves DBSP's traces holding both signs: measured at a million
+/// buckets, that doubled the state to 1.4 GB and took a one-transfer step from 0.2 ms to 165 ms. A
+/// new circuit holds only what stays (#2173).
+fn compacted(
+    buckets: &Buckets,
+    can: impl Fn(&str, i128) -> bool,
+) -> Result<Option<VelocityCircuit>> {
+    let kept: VelocityBatch = buckets
         .iter()
-        .filter_map(|(k, &count)| {
-            let volume = volumes.get(k).copied().unwrap_or(0);
+        .filter(|(k, &(_, volume))| can(k, volume))
+        .map(|(k, &(count, volume))| seed_item(k.clone(), volume, count))
+        .collect();
+    if kept.len() == buckets.len() {
+        return Ok(None);
+    }
+    let mut fresh = VelocityCircuit::new()?;
+    fresh.step(kept)?;
+    Ok(Some(fresh))
+}
+
+/// The window start an encoded key carries, `None` for one that will not parse.
+fn bucket_window(key: &str) -> Option<u64> {
+    key.split_once(SEP)?.1.parse().ok()
+}
+
+/// Whether a bucket can ever be served as a flag once everything through `sealed` is sealed (#2173).
+/// One below `threshold` in a wholly sealed window cannot: sealed blocks never reorg, and later
+/// transfers land in later windows. `/flags` serves only buckets at or over the threshold.
+pub fn can_flag(key: &str, volume: i128, threshold: i128, window: u64, sealed: u64) -> bool {
+    let open = window_start(sealed.saturating_add(1), window);
+    sealed == 0 || volume >= threshold || bucket_window(key).is_none_or(|ws| ws >= open)
+}
+
+/// Collect (address, window) entries whose volume ≥ `threshold`, descending by volume.
+fn rows_over(buckets: &Buckets, threshold: i128) -> Vec<VelocityFlag> {
+    let mut out: Vec<VelocityFlag> = buckets
+        .iter()
+        .filter_map(|(k, &(count, volume))| {
             if volume < threshold {
                 return None;
             }
@@ -176,37 +233,19 @@ fn rows_over(
     out
 }
 
-fn fold_changes(
-    changes: &OrdZSet<Tup2<String, i128>>,
-    map: &mut HashMap<String, i128>,
-    drop_on_clear: bool,
-) -> Vec<String> {
-    let mut set: HashMap<String, i128> = HashMap::new();
-    let mut cleared: Vec<String> = Vec::new();
-    changes
+/// An output delta as `(key, Some(new value))`, or `(key, None)` for a key that left the output.
+fn changes(delta: &OrdZSet<Tup2<String, i128>>) -> HashMap<String, Option<i128>> {
+    let mut out: HashMap<String, Option<i128>> = HashMap::new();
+    delta
         .iter()
         .for_each(|(rec, (), weight): (Tup2<String, i128>, (), i64)| {
             if weight > 0 {
-                set.insert(rec.0.clone(), rec.1);
+                out.insert(rec.0, Some(rec.1));
             } else if weight < 0 {
-                cleared.push(rec.0);
+                out.entry(rec.0).or_insert(None);
             }
         });
-    for (k, v) in &set {
-        map.insert(k.clone(), *v);
-    }
-    let mut dropped = Vec::new();
-    for k in cleared {
-        if !set.contains_key(&k) {
-            if drop_on_clear {
-                map.remove(&k);
-                dropped.push(k);
-            } else {
-                map.insert(k, 0);
-            }
-        }
-    }
-    dropped
+    out
 }
 
 fn build_circuit(circuit: &mut RootCircuit) -> Result<CircuitHandles, anyhow::Error> {
@@ -232,6 +271,11 @@ fn build_circuit(circuit: &mut RootCircuit) -> Result<CircuitHandles, anyhow::Er
 enum Msg {
     Batch(VelocityBatch),
     Flush(SyncSender<()>),
+    Settle {
+        sealed_through: u64,
+        threshold: i128,
+        window: u64,
+    },
 }
 
 /// Cheap-to-clone handle to the live velocity view. Mirrors [`crate::exposure::ExposureView`].
@@ -268,25 +312,48 @@ impl VelocityView {
                         return;
                     }
                 };
+                // The first window not wholly sealed at the last sweep, so the buckets are walked
+                // once per window the watermark passes rather than once per seal.
+                let mut swept = 0u64;
                 while let Ok(msg) = rx.recv() {
-                    match msg {
-                        Msg::Batch(batch) => {
-                            if let Err(e) = circuit.step(batch) {
-                                tracing::error!("velocity step failed: {e:#}");
-                                health.store(false, Ordering::SeqCst);
-                                break;
+                    let batch = match msg {
+                        Msg::Batch(batch) => batch,
+                        Msg::Settle {
+                            sealed_through,
+                            threshold,
+                            window,
+                        } => {
+                            let open = window_start(sealed_through.saturating_add(1), window);
+                            if open <= swept {
+                                continue;
                             }
-                            let mut out = shared.write().unwrap();
-                            out.clear();
-                            for (k, &c) in &circuit.counts {
-                                out.insert(
-                                    k.clone(),
-                                    (c, circuit.volumes.get(k).copied().unwrap_or(0)),
-                                );
+                            swept = open;
+                            let can = |k: &str, v: i128| {
+                                can_flag(k, v, threshold, window, sealed_through)
+                            };
+                            match compacted(&shared.read().unwrap(), can) {
+                                Ok(None) => continue,
+                                Ok(Some(c)) => circuit = c,
+                                Err(e) => {
+                                    tracing::error!("velocity compaction failed: {e:#}");
+                                    health.store(false, Ordering::SeqCst);
+                                    break;
+                                }
                             }
+                            shared.write().unwrap().retain(|k, &mut (_, v)| can(k, v));
+                            continue;
                         }
                         Msg::Flush(ack) => {
                             let _ = ack.send(());
+                            continue;
+                        }
+                    };
+                    match circuit.step(batch) {
+                        Ok(delta) => delta.apply(&mut shared.write().unwrap()),
+                        Err(e) => {
+                            tracing::error!("velocity step failed: {e:#}");
+                            health.store(false, Ordering::SeqCst);
+                            break;
                         }
                     }
                 }
@@ -326,16 +393,22 @@ impl VelocityView {
         }
     }
 
+    /// Drop the buckets that can no longer flag at `threshold` now that `sealed_through` is sealed
+    /// (#2173). Only buckets at or over the threshold are ever served, so no answer changes.
+    pub fn settle(&self, sealed_through: u64, threshold: i128, window: u64) {
+        let _ = self.tx.send(Msg::Settle {
+            sealed_through,
+            threshold,
+            window,
+        });
+    }
+
     /// The current velocity flags at or above `threshold`, descending by volume.
     pub fn flags(&self, threshold: i128) -> Vec<VelocityFlag> {
-        let map = match self.rows.read() {
-            Ok(m) => m,
-            Err(_) => return Vec::new(),
-        };
-        let counts: HashMap<String, i128> = map.iter().map(|(k, &(c, _))| (k.clone(), c)).collect();
-        let volumes: HashMap<String, i128> =
-            map.iter().map(|(k, &(_, v))| (k.clone(), v)).collect();
-        rows_over(&counts, &volumes, threshold)
+        match self.rows.read() {
+            Ok(buckets) => rows_over(&buckets, threshold),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Number of (address, window) buckets tracked - a small gauge for `/` and `/metrics`.
@@ -353,7 +426,7 @@ mod tests {
     #[test]
     fn velocity_flags_maintained_with_retraction() {
         let w = 100u64;
-        let mut c = VelocityCircuit::new().unwrap();
+        let mut c = Fed::new();
         // alice sends 40 then 70 in the same window (blocks 10, 20 → window 0): volume 110.
         c.step(velocity_deltas("alice", 10, 40, 1, w)).unwrap();
         c.step(velocity_deltas("alice", 20, 70, 1, w)).unwrap();
@@ -396,7 +469,7 @@ mod tests {
     /// overflows i64 is tracked, not truncated (a threshold view on i64 would be a compliance bug).
     #[test]
     fn velocity_volume_exceeds_i64() {
-        let mut c = VelocityCircuit::new().unwrap();
+        let mut c = Fed::new();
         let big: i128 = 10_000_000_000_000_000_000; // > i64::MAX
         c.step(velocity_deltas("whale", 5, big, 1, 100)).unwrap();
         c.step(velocity_deltas("whale", 6, big, 1, 100)).unwrap();
@@ -409,11 +482,11 @@ mod tests {
     #[test]
     fn seeding_matches_replay() {
         let w = 100u64;
-        let mut replay = VelocityCircuit::new().unwrap();
+        let mut replay = Fed::new();
         for v in [10i128, 20, 70] {
             replay.step(velocity_deltas("a", 12, v, 1, w)).unwrap();
         }
-        let mut seed = VelocityCircuit::new().unwrap();
+        let mut seed = Fed::new();
         seed.step(vec![seed_item(key("a", window_start(12, w)), 100, 3)])
             .unwrap();
         assert_eq!(replay.flags(1), seed.flags(1));
@@ -426,5 +499,76 @@ mod tests {
         view.flush();
         assert_eq!(view.flags(1000)[0].volume, 4242);
         assert_eq!(view.entries(), 1);
+    }
+
+    /// #2173: a bucket below the threshold in a window the seal has passed can never be served, so
+    /// it is dropped from the circuit and the view; the flags served before and after are the same.
+    #[test]
+    fn a_sealed_window_keeps_only_the_buckets_that_flag() {
+        let view = VelocityView::start(true).unwrap();
+        for (who, block, value) in [
+            ("small", 10, 5),
+            ("big", 20, 500),
+            ("small", 150, 5),
+            ("big", 250, 5),
+        ] {
+            view.apply(velocity_deltas(who, block, value, 1, 100));
+        }
+        view.flush();
+        let before = view.flags(100);
+        assert_eq!(view.entries(), 4);
+
+        view.settle(199, 100, 100);
+        view.flush();
+        assert_eq!(view.flags(100), before);
+        assert_eq!(
+            view.entries(),
+            2,
+            "window 0's small bucket and window 100's go; window 0's flag and window 200 stay"
+        );
+
+        // A retraction in the open window still lands, so the dropped buckets left no residue.
+        view.retract(velocity_deltas("big", 250, 5, 1, 100));
+        view.apply(velocity_deltas("small", 260, 300, 1, 100));
+        view.flush();
+        assert_eq!(view.entries(), 2);
+        assert_eq!(view.flags(100).len(), 2);
+    }
+
+    /// DBSP splits a large input across steps of its own, each writing the output afresh; reading it
+    /// once per transaction kept only the last 10,000-row step, so a restart seed lost buckets.
+    #[test]
+    fn one_large_batch_keeps_every_bucket() {
+        let view = VelocityView::start(true).unwrap();
+        let batch: VelocityBatch = (0..25_000u64)
+            .flat_map(|i| velocity_deltas(&format!("0x{i:040x}"), 10, 1, 1, 100))
+            .collect();
+        view.apply(batch);
+        view.flush();
+        assert_eq!(view.entries(), 25_000);
+    }
+
+    /// The circuit and a view's published map, as the view thread holds them.
+    struct Fed {
+        c: VelocityCircuit,
+        rows: Buckets,
+    }
+
+    impl Fed {
+        fn new() -> Self {
+            Self {
+                c: VelocityCircuit::new().unwrap(),
+                rows: Buckets::new(),
+            }
+        }
+
+        fn step(&mut self, batch: VelocityBatch) -> Result<()> {
+            self.c.step(batch)?.apply(&mut self.rows);
+            Ok(())
+        }
+
+        fn flags(&self, threshold: i128) -> Vec<VelocityFlag> {
+            rows_over(&self.rows, threshold)
+        }
     }
 }
