@@ -320,6 +320,7 @@ out of scope - see RFC-0022 §6.
 runtime-dir/
   mounts.toml             # runtime state: chains + mount records (tenant, alias, nid) + budget
   mount-jobs.json         # the admin API's job table (3.13.0): every mount, move and resume job
+  runtime.lock            # held while a runtime runs; `prune --yes` refuses until it is let go
   segments/               # SHARED sealed Parquet, content-addressed - two nests that decode the
                           #   same contract hold ONE copy here, not two (RFC-0033 §11a)
   data/

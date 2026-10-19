@@ -66,6 +66,43 @@ pub const NESTS_DIR: &str = "nests";
 /// that. That separation is the whole point: it is what lets two mounts name one dataset.
 pub const DATA_DIR: &str = "data";
 
+/// Held shared by a running runtime and exclusively by `prune --yes`. A mount's data lands in
+/// `data/<nid>` before its store opens or any record names it, so only this tells prune it is not
+/// an orphan (#2249).
+pub const RUNTIME_LOCK: &str = "runtime.lock";
+
+/// Take [`RUNTIME_LOCK`] on `dir`, shared or exclusive, failing rather than waiting.
+pub fn lock_runtime_dir(dir: &Path, exclusive: bool) -> Result<std::fs::File> {
+    let path = dir.join(RUNTIME_LOCK);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let taken = if exclusive {
+        file.try_lock()
+    } else {
+        file.try_lock_shared()
+    };
+    match taken {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) if exclusive => bail!(
+            "a runtime is running on {}: a mount in progress can hold data nothing records yet. \
+             Stop the runtime, then prune again. Nothing was deleted.",
+            dir.display()
+        ),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "a prune is running on {}; start the runtime once it has finished",
+            dir.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("locking {}", path.display()))
+        }
+    }
+}
+
 /// A nest identity, validated: 64 hex characters, exactly what [`crate::blob::Manifest::nid`]
 /// produces and what a `mounts.toml` record has always been required to hold (the SEC-10 rule
 /// `validate_mounts` applies below).
@@ -1783,6 +1820,7 @@ pub async fn dev(
     // fifteenth minute of a backfill.
     let cors = crate::serve::cors_layer(&cors)?;
     let all_mounts = MountTable::load(&dir)?;
+    let _runtime_lock = lock_runtime_dir(&dir, false)?;
     let (mounts, suspended) = split_suspended(&all_mounts);
     let admin_enabled = indexer::admin_enabled(no_admin, &listen);
     // Empty is a valid start (#1545): nests arrive over the admin API. Without that API nothing
@@ -4140,7 +4178,9 @@ impl RuntimeHandles {
         if let Err(e) = refuse_reserved_mount(tenant, alias) {
             return Err(MountRefusal::InvalidName(format!("{e:#}")).into());
         }
-        if let Err(e) = refuse_route_collisions(self.routes().chain([name])) {
+        let joining: Vec<String> = self.joining.list().into_iter().map(|j| j.name).collect();
+        let routes = self.routes().chain(joining.iter().map(String::as_str));
+        if let Err(e) = refuse_route_collisions(routes.chain([name])) {
             return Err(MountRefusal::InvalidName(format!("{e:#}")).into());
         }
         if let (Some(held), Some(asked)) = (self.suspended.get(name), nid) {
@@ -8157,5 +8197,86 @@ mod tests {
         handles
             .plan_mount("usdc", None)
             .expect("the name is free again");
+    }
+
+    /// #2256: a mount whose route collides with one still catching up is refused at admission, not
+    /// found by `compose` once it has caught up itself.
+    #[tokio::test]
+    async fn a_mount_colliding_with_a_joining_one_is_refused() {
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = []\n",
+        )
+        .unwrap();
+        for (joining, second) in [("acme", "acme/usdc"), ("acme/usdc", "acme")] {
+            let handles = idle_handles(dir.path());
+            let _reserved = handles.joining.reserve(Joining {
+                name: joining.to_string(),
+                chain: "arbitrum-one".to_string(),
+                dir: MountTable::nest_dir(dir.path(), joining),
+                incoming_mb: 0,
+            });
+            let jobs = Arc::new(crate::mount_jobs::MountJobs::load(dir.path()));
+            let routes =
+                lifecycle_routes(Arc::new(tokio::sync::Mutex::new(handles)), jobs, true, None);
+            let req = axum::http::Request::post("/_admin/nests?wait=true")
+                .header("host", "127.0.0.1")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(format!(r#"{{"name":"{second}"}}"#)))
+                .unwrap();
+            let resp = routes.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "'{second}' was admitted beside '{joining}', still joining: {body}"
+            );
+            assert!(body.contains("is also the name of a mount"), "{body}");
+        }
+    }
+
+    /// #2249: a runtime holds its directory's lock for its life, so it cannot start under a prune,
+    /// and a prune cannot run under it.
+    #[tokio::test]
+    async fn a_runtime_will_not_start_under_a_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = []\n",
+        )
+        .unwrap();
+        let _pruning = lock_runtime_dir(dir.path(), true).unwrap();
+        let started = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dev(
+                dir.path().to_path_buf(),
+                "127.0.0.1:0".to_string(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                false,
+                1,
+                crate::ipfs_resolve::WINDOW_DEADLINE,
+                None,
+                false,
+                false,
+                Default::default(),
+                Vec::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("the runtime started under a prune");
+        let err = started.expect_err("the runtime started under a prune");
+        assert!(format!("{err:#}").contains("a prune is running"), "{err:#}");
     }
 }
