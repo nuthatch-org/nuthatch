@@ -116,7 +116,15 @@ async fn free_port() -> u16 {
 /// answers. Returns the base URL and the task, so the caller can abort it.
 async fn start_fe(dir: &std::path::Path, admin: bool) -> (String, tokio::task::JoinHandle<()>) {
     let port = free_port().await;
-    let listen = format!("[0:0:0:0:0:0:0:1]:{port}");
+    start_fe_on(dir, admin, format!("[0:0:0:0:0:0:0:1]:{port}")).await
+}
+
+/// [`start_fe`] on a bind of the caller's choosing.
+async fn start_fe_on(
+    dir: &std::path::Path,
+    admin: bool,
+    listen: String,
+) -> (String, tokio::task::JoinHandle<()>) {
     let args = ServeArgs {
         cors: Vec::new(),
         dir: dir.to_string_lossy().into_owned(),
@@ -202,6 +210,82 @@ async fn a_configured_token_gates_the_fe_admin_ui_rather_than_disabling_it() {
 
     assert_eq!(without.as_u16(), 401, "no credential must be refused");
     assert_eq!(with.as_u16(), 200, "the configured token must be accepted");
+}
+
+/// A free port on the real `127.0.0.1`, released before we hand it to the FE.
+async fn free_localhost_port() -> u16 {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    probe.local_addr().unwrap().port()
+}
+
+/// #2132: a token the operator set is required on a localhost bind too. Behind a reverse proxy every
+/// request arrives from loopback, so an ignored token left the lifecycle API open to the proxy's users.
+#[tokio::test]
+async fn a_configured_token_is_required_on_a_localhost_bind_too() {
+    let _env = ENV.lock().await;
+    let _token = EnvGuard::set("s3cret");
+
+    let dir = tempfile::tempdir().unwrap();
+    scaffold_fe_nest(dir.path());
+    let port = free_localhost_port().await;
+    let (base, task) = start_fe_on(dir.path(), true, format!("127.0.0.1:{port}")).await;
+
+    let client = reqwest::Client::new();
+    let without = client
+        .get(format!("{base}/_admin/"))
+        .send()
+        .await
+        .expect("admin request")
+        .status();
+    let with = client
+        .get(format!("{base}/_admin/"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .expect("admin request")
+        .status();
+    task.abort();
+
+    assert_eq!(
+        without.as_u16(),
+        401,
+        "a set NUTHATCH_ADMIN_TOKEN must not be ignored on 127.0.0.1"
+    );
+    assert_eq!(with.as_u16(), 200, "the configured token must be accepted");
+}
+
+/// #2136: the open (token-less) localhost surface answers only requests addressed to loopback. A
+/// DNS-rebinding page reaches 127.0.0.1 under its own hostname, and its `Host` header gives it away.
+#[tokio::test]
+async fn the_open_localhost_admin_surface_refuses_a_foreign_host() {
+    let _env = ENV.lock().await;
+    let _token = EnvGuard::unset();
+
+    let dir = tempfile::tempdir().unwrap();
+    scaffold_fe_nest(dir.path());
+    let port = free_localhost_port().await;
+    let (base, task) = start_fe_on(dir.path(), true, format!("127.0.0.1:{port}")).await;
+
+    let client = reqwest::Client::new();
+    let get = |host: String, origin: Option<&'static str>| {
+        let mut req = client
+            .get(format!("{base}/_admin/"))
+            .header(reqwest::header::HOST, host);
+        if let Some(o) = origin {
+            req = req.header(reqwest::header::ORIGIN, o);
+        }
+        async move { req.send().await.expect("admin request").status().as_u16() }
+    };
+    let local = get(format!("127.0.0.1:{port}"), None).await;
+    let named = get(format!("localhost:{port}"), None).await;
+    let rebound = get(format!("attacker.example:{port}"), None).await;
+    let cross_origin = get(format!("127.0.0.1:{port}"), Some("http://attacker.example")).await;
+    task.abort();
+
+    assert_eq!(local, 200, "a loopback Host must still be served");
+    assert_eq!(named, 200, "`localhost` is a loopback name");
+    assert_ne!(rebound, 200, "a rebound hostname must be refused");
+    assert_ne!(cross_origin, 200, "a foreign Origin must be refused");
 }
 
 /// #292, the second half: `--no-admin` promises *"no routes"* (`cli.rs`, `DevArgs::no_admin`), and the

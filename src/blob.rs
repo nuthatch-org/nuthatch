@@ -433,42 +433,59 @@ fn is_loopback_url(url: &str) -> bool {
 /// Whether a URL points at the link-local range - `169.254.0.0/16` or `fe80::/10`, which includes
 /// every cloud provider's instance-metadata endpoint (`169.254.169.254`, `fd00:ec2::254`).
 ///
-/// String-matched on the host rather than resolved: resolving would itself be a request, and a name
-/// that resolves to link-local is a DNS-rebinding problem this warning cannot solve anyway. This
-/// catches the literal form, which is what a bundle would carry.
+/// Parsed from the host rather than resolved: resolving would itself be a request, and a name that
+/// resolves to link-local is a DNS-rebinding problem this warning cannot solve anyway. The address
+/// is read in every spelling a URL parser accepts - decimal, hex, octal, IPv4-mapped (#2142).
 fn is_link_local_url(url: &str) -> bool {
-    let host = url
-        .split("://")
-        .nth(1)
-        .unwrap_or(url)
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split('@')
-        .next_back()
-        .unwrap_or("")
-        .trim_start_matches('[');
-    let host = host.split(']').next().unwrap_or(host);
-    let host = host.split(':').next().unwrap_or(host);
-    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
-        return v4.is_link_local();
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if let Some(v6) = host_port.strip_prefix('[') {
+        let v6 = v6.split([']', '%']).next().unwrap_or("");
+        return v6.parse::<std::net::Ipv6Addr>().is_ok_and(|v6| {
+            let seg = v6.segments();
+            // fe80::/10 link-local, plus the fd00:ec2::/32 metadata range AWS uses.
+            v6.to_ipv4().is_some_and(|v4| v4.is_link_local())
+                || (seg[0] & 0xffc0) == 0xfe80
+                || (seg[0] == 0xfd00 && seg[1] == 0x0ec2)
+        });
     }
-    if let Ok(v6) = url
-        .split("://")
-        .nth(1)
-        .and_then(|r| r.split('/').next())
-        .unwrap_or("")
-        .trim_start_matches('[')
-        .split(']')
-        .next()
-        .unwrap_or("")
-        .parse::<std::net::Ipv6Addr>()
-    {
-        // fe80::/10 link-local, plus the fd00:ec2::/32 metadata range AWS uses.
-        let seg = v6.segments();
-        return (seg[0] & 0xffc0) == 0xfe80 || (seg[0] == 0xfd00 && seg[1] == 0x0ec2);
+    let host = host_port.split(':').next().unwrap_or("");
+    url_ipv4(host).is_some_and(|v4| v4.is_link_local())
+}
+
+/// An IPv4 host as the WHATWG URL parser reads it: one to four dot-separated parts, each decimal,
+/// `0x` hex or leading-zero octal, the last filling the remaining bytes.
+fn url_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() > 4 {
+        return None;
     }
-    false
+    let mut nums = Vec::with_capacity(parts.len());
+    for p in &parts {
+        let n = if let Some(hex) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
+            if hex.is_empty() {
+                0
+            } else {
+                u64::from_str_radix(hex, 16).ok()?
+            }
+        } else if p.len() > 1 && p.starts_with('0') {
+            u64::from_str_radix(&p[1..], 8).ok()?
+        } else {
+            p.parse::<u64>().ok()?
+        };
+        nums.push(n);
+    }
+    let (last, init) = nums.split_last()?;
+    if init.iter().any(|&n| n > 255) || *last >= 1u64 << (8 * (5 - nums.len())) {
+        return None;
+    }
+    let addr = init
+        .iter()
+        .enumerate()
+        .fold(*last, |acc, (i, &n)| acc + (n << (8 * (3 - i))));
+    Some(std::net::Ipv4Addr::from(u32::try_from(addr).ok()?))
 }
 
 /// Warn about every non-loopback URL a just-installed nest declares (audit L6). Best-effort: a config
@@ -1498,6 +1515,37 @@ abi = "abis/c.json"
             assert!(
                 !is_link_local_url(ordinary),
                 "must not be flagged - a private LAN address is normal for a self-hosted fleet: {ordinary}"
+            );
+        }
+    }
+
+    /// #2142: every spelling a URL parser accepts for the metadata address is the metadata address.
+    #[test]
+    fn link_local_targets_are_recognised_in_every_spelling() {
+        for hostile in [
+            "http://2852039166/latest/meta-data",
+            "http://0xa9fea9fe/",
+            "http://0xA9.0xFE.0xA9.0xFE/",
+            "http://0251.0376.0251.0376/",
+            "http://169.254.43518/",
+            "http://169.16689662/",
+            "http://169.254.169.254./",
+            "http://[::ffff:169.254.169.254]/",
+            "http://[::ffff:a9fe:a9fe]:80/",
+            "http://u:p@[fe80::1%25en0]/x",
+        ] {
+            assert!(is_link_local_url(hostile), "must be flagged: {hostile}");
+        }
+        for ordinary in [
+            "http://2130706433/",
+            "http://[::ffff:10.0.0.1]/",
+            "http://1.2.3.4.5/",
+            "http://169.254.169.254.example.com/",
+            "http://4294967296/",
+        ] {
+            assert!(
+                !is_link_local_url(ordinary),
+                "must not be flagged: {ordinary}"
             );
         }
     }

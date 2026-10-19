@@ -1886,7 +1886,7 @@ pub async fn dev(
         groups.len(),
     );
 
-    let admin_token = indexer::admin_required_token(admin_enabled, &listen);
+    let admin_token = indexer::admin_required_token(admin_enabled);
     // The RSS budget is now **per active-chain cursor** (RFC-0021), not per whole runtime.
     let max_rss = meta.max_rss_mb.unwrap_or(DEFAULT_MAX_RSS_MB);
 

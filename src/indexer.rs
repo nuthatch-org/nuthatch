@@ -246,7 +246,7 @@ pub async fn upgrade(
         &[&old_config.nest.name, &new_config.nest.name],
     );
     let admin_enabled = admin_enabled(no_admin, &listen);
-    let admin_token = admin_required_token(admin_enabled, &listen);
+    let admin_token = admin_required_token(admin_enabled);
 
     // Both versions index concurrently. Keep `source` and `old_dir` so a post-quiesce stall
     // can restart the old writer against the still-open store.
@@ -764,7 +764,7 @@ pub async fn run(
     // (auth is the operator's gateway's job, but the local UI should never appear unguarded on a public
     // bind); `--no-admin` removes it entirely. Computed here since it depends on the process's `listen`.
     let admin_enabled = admin_enabled(no_admin, &listen);
-    let admin_token = admin_required_token(admin_enabled, &listen);
+    let admin_token = admin_required_token(admin_enabled);
     let publisher = publish
         .map(|settings| crate::publish::spawn(dir.clone(), config.nest.name.clone(), settings))
         .transpose()?;
@@ -829,15 +829,11 @@ pub fn admin_enabled(no_admin: bool, listen: &str) -> bool {
     enabled
 }
 
-/// The token an admin-UI request must present, given the bind (SEC-5). `None` on a localhost bind (the
-/// UI is open there); `Some(token)` off-localhost (the request must carry `?token=…`) - actually
-/// checking it per request, rather than the env var merely *enabling* the route.
-pub fn admin_required_token(admin_enabled: bool, listen: &str) -> Option<String> {
-    if admin_enabled && !serve::is_localhost(listen) {
-        admin_token_env()
-    } else {
-        None
-    }
+/// The token an admin-UI request must present (SEC-5): the configured one on every bind, localhost
+/// included, since behind a reverse proxy every request arrives from loopback (#2132). `None` only for
+/// a localhost bind with no token, which is open to loopback-addressed requests.
+pub fn admin_required_token(admin_enabled: bool) -> Option<String> {
+    admin_token_env().filter(|_| admin_enabled)
 }
 
 /// Build one nest's runtime: open its store, build its decode registry + IVM views, spawn its
@@ -3603,7 +3599,7 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
     // one role an operator actually puts on a network, was the one role with no credential (#292).
     // `--admin` is opt-in here and opt-out on `dev`, which is the only asymmetry that survives.
     let admin_enabled = admin_enabled(!args.admin, &args.listen);
-    let admin_token = admin_required_token(admin_enabled, &args.listen);
+    let admin_token = admin_required_token(admin_enabled);
     let (_ingest, state, alert_worker, _window) = build_nest(
         &source,
         dir.clone(),
