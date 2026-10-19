@@ -109,32 +109,45 @@ pub fn enqueue(
     kind: &str,
     annotation: &Value,
 ) -> Result<()> {
-    if router.is_empty() {
-        return Ok(());
+    let queued = payloads(router, event, kind, annotation);
+    for payload in &queued {
+        store.outbox_push(payload)?;
     }
-    let mut pushed = false;
-    for (url, format) in router.urls_for(kind) {
-        // The format rides in the payload rather than being looked up at delivery: the outbox is
-        // durable, so an entry may outlive an edit to `[[alerts]]`, and a queued alert should be
-        // delivered the way it was queued.
-        let payload = json!({
-            "event": event,
-            "kind": kind,
-            "url": url,
-            "format": format,
-            "annotation": annotation,
-        });
-        store.outbox_push(&payload.to_string())?;
-        pushed = true;
+    if !queued.is_empty() {
+        trim(store)?;
     }
-    if pushed {
-        let dropped = store.outbox_trim(OUTBOX_MAX)?;
-        if dropped > 0 {
-            tracing::warn!(
-                "alert outbox full ({OUTBOX_MAX}): dropped {dropped} oldest undelivered alert(s) - \
-                 a webhook is down or too slow"
-            );
-        }
+    Ok(())
+}
+
+/// The outbox entries [`enqueue`] would push, for a caller that writes them in its own transaction.
+pub fn payloads(router: &AlertRouter, event: &str, kind: &str, annotation: &Value) -> Vec<String> {
+    router
+        .urls_for(kind)
+        .into_iter()
+        .map(|(url, format)| {
+            // The format rides in the payload rather than being looked up at delivery: the outbox is
+            // durable, so an entry may outlive an edit to `[[alerts]]`, and a queued alert should be
+            // delivered the way it was queued.
+            json!({
+                "event": event,
+                "kind": kind,
+                "url": url,
+                "format": format,
+                "annotation": annotation,
+            })
+            .to_string()
+        })
+        .collect()
+}
+
+/// Bound the outbox at [`OUTBOX_MAX`], dropping the oldest undelivered entries.
+pub fn trim(store: &dyn HotStore) -> Result<()> {
+    let dropped = store.outbox_trim(OUTBOX_MAX)?;
+    if dropped > 0 {
+        tracing::warn!(
+            "alert outbox full ({OUTBOX_MAX}): dropped {dropped} oldest undelivered alert(s) - \
+             a webhook is down or too slow"
+        );
     }
     Ok(())
 }

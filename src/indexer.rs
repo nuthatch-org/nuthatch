@@ -1506,6 +1506,19 @@ fn is_terminal(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<TerminalFault>())
 }
 
+/// The chain moved under a window while it was being read: the tip loop reads the window again
+/// rather than ending the nest (#2154).
+#[derive(Debug)]
+struct WindowForked(String);
+
+impl std::fmt::Display for WindowForked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WindowForked {}
+
 /// Tags a [`NestIngest::prepare`] failure as "the chain wasn't reachable yet", not a real fault (#510).
 /// `prepare`'s cold-start tip lookups used to be a bare `?`: a fully dead RPC pool killed the whole
 /// solo `dev` process moments after `serve` had already logged "API live", and with the process gone
@@ -2083,7 +2096,11 @@ async fn fan_out_window(
                 // Re-admission alone must NOT reset this.
                 sup.mark_progress(i);
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if let Some(b) = live_nest(nests, i).rewound.take() {
+                    nexts[i] = b;
+                }
+            }
             Err(e) => sup.quarantine(i, &e)?,
         }
     }
@@ -2464,7 +2481,14 @@ async fn runtime_index_loop(
                     continue;
                 }
                 Ok(None) => {}
-                Err(e) => tracing::debug!("mounts reorg check skipped: {e:#}"),
+                // Unverified is not canonical; see `NestIngest::handle_reorg` (#2147).
+                Err(e) => {
+                    tracing::warn!(
+                        "mounts reorg check could not complete: {e:#}; not indexing until it does"
+                    );
+                    sleep_secs(2).await;
+                    continue;
+                }
             }
             reorg_gate.checked(tip, max_next);
         }
@@ -3423,6 +3447,7 @@ async fn build_nest(
         chain_id: config.nest.chain_id,
         calls: config.calls.clone(),
         state_rpc,
+        rewound: None,
     };
     // Stamps this nest's readiness clock (#510): `/ready`'s never-polled grace period is bounded from
     // here, not permanent - see `serve::poll_stalled`.
@@ -4806,16 +4831,16 @@ async fn resolve_calls_for_window_upto(
                         .filter(|row| row.block_number == block)
                         .any(|row| row.block_timestamp != timestamp)
                 {
-                    anyhow::bail!(
+                    anyhow::bail!(WindowForked(format!(
                         "source timestamp/header mismatch at block {block}; refusing pinned reads"
-                    );
+                    )));
                 }
             }
             for row in event_rows.iter().filter(|row| row.block_number == block) {
                 if !row.block_hash.eq_ignore_ascii_case(&hash) {
-                    anyhow::bail!(
+                    anyhow::bail!(WindowForked(format!(
                         "source log/header fork mismatch at block {block}; refusing pinned reads"
-                    );
+                    )));
                 }
             }
         }
@@ -4899,10 +4924,10 @@ async fn resolve_canonical_batch(
         // `None` is a chain momentarily shorter than `block`, which it will grow past.
         if let Ok(Some(now)) = source.block_hash(block).await {
             if !now.eq_ignore_ascii_case(hash) {
-                anyhow::bail!(
+                anyhow::bail!(WindowForked(format!(
                     "block {block} moved from {hash} to {now} under a canonical call; the window \
                      is re-read from its logs"
-                );
+                )));
             }
         }
         if rejects_block_hash_selector(&err) {
@@ -5128,14 +5153,16 @@ pub async fn backfill_direct(
         if registry.blocks() {
             let want: Vec<u64> = (next..=chunk_to).collect();
             let headers = source.block_headers(&want).await?;
-            let mut block_rows: Vec<_> = want
+            // A missing block row would seal as a block the chain never had (#2149).
+            let mut block_rows = want
                 .iter()
-                .filter_map(|b| {
+                .map(|b| {
                     headers
                         .get(b)
                         .and_then(|h| crate::registry::block_row(*b, h, registry.timestamps()))
+                        .with_context(|| format!("block {b} has no usable header"))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             // Same canonical ordering rule as above: segment bytes, and therefore the content
             // address, depend on row order.
             block_rows.sort_by_key(|r| r.block_number);
@@ -5937,14 +5964,16 @@ pub async fn backfill_direct_pipelined_with(
                 || source.block_headers(&want),
             )
             .await?;
-            let mut block_rows: Vec<_> = want
+            // A missing block row would seal as a block the chain never had (#2149).
+            let mut block_rows = want
                 .iter()
-                .filter_map(|b| {
+                .map(|b| {
                     headers
                         .get(b)
                         .and_then(|h| crate::registry::block_row(*b, h, registry.timestamps()))
+                        .with_context(|| format!("block {b} has no usable header"))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             block_rows.sort_by_key(|r| r.block_number);
             json.extend(
                 block_rows
@@ -6584,6 +6613,8 @@ pub struct NestIngest {
     freshness: crate::freshness::Freshness,
     /// `--ipfs-window-deadline` (#1399), what [`NestIngest::seal_direct_policy`] is built from.
     ipfs_window_deadline: std::time::Duration,
+    /// Where a refused window rolled this nest back to, for the loop to resume from (#2146).
+    rewound: Option<u64>,
 }
 
 impl NestIngest {
@@ -7064,9 +7095,9 @@ impl NestIngest {
     }
 
     /// Detect and handle a reorg against the last committed block. Returns `Ok(Some(next))` - the
-    /// block the caller should continue from - when a reorg was handled, `Ok(None)` when the chain
-    /// stayed canonical (or there is nothing to check yet), and propagates the finality-violation
-    /// `bail!` unchanged.
+    /// block the caller should continue from - when a reorg was handled or the check could not
+    /// complete, `Ok(None)` when the chain stayed canonical (or there is nothing to check yet), and
+    /// propagates the finality-violation `bail!` unchanged.
     async fn handle_reorg(&mut self, source: &dyn Source, next: u64) -> Result<Option<u64>> {
         // Reorg check: has the last block we committed against stayed canonical? If not, the
         // mutable hot store rolls back to the deepest surviving checkpoint (the only place a
@@ -7085,9 +7116,11 @@ impl NestIngest {
                 Ok(Some(self.rollback_reorg(ancestor)?))
             }
             Ok(None) => Ok(None),
+            // A window committed now would checkpoint over a fork nobody checked (#2147).
             Err(e) => {
-                tracing::debug!("reorg check skipped: {e:#}");
-                Ok(None)
+                tracing::warn!("reorg check could not complete: {e:#}; not indexing until it does");
+                sleep_secs(2).await;
+                Ok(Some(next))
             }
         }
     }
@@ -7267,15 +7300,14 @@ impl NestIngest {
             }
         }
         // Fire a `flag_retracted` alert for every rolled-back annotation a sink watches - a consumer
-        // that acted on a flag learns the chain took it back (RFC-0008 C5).
+        // that acted on a flag learns the chain took it back (RFC-0008 C5). Queued by the rollback's
+        // own transaction, so a rollback that fails retracts nothing (#2177).
+        let mut outbox = Vec::new();
         if !self.router.is_empty() {
             for j in &doomed {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(j) {
                     if let Some(kind) = v.get("kind").and_then(|k| k.as_str()) {
-                        if self.router.watches(kind) {
-                            alerts::enqueue(&self.store, &self.router, "flag_retracted", kind, &v)
-                                .map_err(torn)?;
-                        }
+                        outbox.extend(alerts::payloads(&self.router, "flag_retracted", kind, &v));
                     }
                 }
             }
@@ -7286,8 +7318,13 @@ impl NestIngest {
         // the rolled-back range permanently un-reindexed (a silent gap).
         let removed = self
             .store
-            .rollback_to_and_set_meta(ancestor, LAST_BLOCK_KEY, &ancestor.to_string())
+            .rollback_to_and_set_meta(ancestor, LAST_BLOCK_KEY, &ancestor.to_string(), &outbox)
             .map_err(torn)?;
+        if !outbox.is_empty() {
+            if let Err(e) = alerts::trim(self.store.as_ref()) {
+                tracing::warn!("could not bound the alert outbox: {e:#}");
+            }
+        }
 
         self.metrics.inc_reorgs();
         self.metrics.set_last_block(ancestor);
@@ -7312,9 +7349,9 @@ impl NestIngest {
 
     /// Decode, store, IVM-feed, checkpoint, seal and deliver webhooks for one fetched window
     /// `[next, to]` (with `tip` the current chain tip, used for the finality ceiling). Returns
-    /// `Ok(Some(stored))` - the row count, caller advances the cursor - or `Ok(None)` when block
-    /// timestamps were unavailable and the window must be retried WITHOUT advancing (the cursor stays
-    /// put so a freshly-finalized window never seals `block_timestamp = 0`, deadlock-review H4).
+    /// `Ok(Some(stored))` - the row count, caller advances the cursor - or `Ok(None)` when the window
+    /// was refused and must be retried WITHOUT advancing (the cursor stays put so a freshly-finalized
+    /// window never seals `block_timestamp = 0`, deadlock-review H4), or resumed from `rewound`.
     async fn process_window(
         &mut self,
         source: &dyn Source,
@@ -7358,7 +7395,7 @@ impl NestIngest {
         // A sealed block's rows were folded when they first arrived and are pruned from hot since, so
         // the lookup below would find nothing and fold them a second time.
         let sealed_through = self.store.sealed_through();
-        let mut stale_tail: Option<(u64, u64)> = None;
+        let mut stale_tail: Option<(u64, u64, Option<String>)> = None;
         rows.retain(|r| {
             if r.block_number >= fold_floor {
                 return true;
@@ -7374,28 +7411,44 @@ impl NestIngest {
             {
                 None => true,
                 Some(stored) => {
-                    let same_block = serde_json::from_str::<serde_json::Value>(&stored)
+                    let stored_hash = serde_json::from_str::<serde_json::Value>(&stored)
                         .ok()
                         .and_then(|v| {
                             v.get("block_hash")
                                 .and_then(|h| h.as_str())
                                 .map(str::to_string)
-                        })
-                        .is_some_and(|h| h == r.block_hash);
-                    if !same_block {
-                        stale_tail = Some((r.block_number, r.log_index));
+                        });
+                    if !stored_hash
+                        .as_deref()
+                        .is_some_and(|h| h.eq_ignore_ascii_case(&r.block_hash))
+                    {
+                        stale_tail.get_or_insert((r.block_number, r.log_index, stored_hash));
                     }
                     false
                 }
             }
         });
-        if let Some((b, i)) = stale_tail {
+        let read_from = logs.iter().map(|l| l.block_number).fold(next, u64::min);
+        if let Some((b, i, stored_hash)) = stale_tail {
+            // The reorg check passed, so the checkpoint above this row matches. A row the chain no
+            // longer has under it is one no later check would ever roll back (#2146).
+            if let Ok(Some(now)) = source.block_hash(b).await {
+                if !stored_hash.is_some_and(|h| h.eq_ignore_ascii_case(&now)) {
+                    let ancestor = b.saturating_sub(1);
+                    tracing::warn!(
+                        "stored row ({b}, {i}) is not on the chain the source has now, though the \
+                         checkpoint above it is - rolling back to block {ancestor}"
+                    );
+                    source.forget_cached_above(ancestor);
+                    self.rewound = Some(self.rollback_reorg(ancestor)?);
+                    return Ok(None);
+                }
+            }
             tracing::warn!(
                 "refetched tail row ({b}, {i}) is already stored under a different block hash: a \
                  reorg the handler has not yet rolled back - refusing this window, retrying"
             );
-            sleep_secs(2).await;
-            return Ok(None);
+            return refuse_window(source, read_from).await;
         }
         // RFC-0023 tier 3 samples blocks that may have emitted no log at all, and a stored row
         // with `block_timestamp = 0` seals that zero permanently once it finalizes (H4). Sampled
@@ -7418,16 +7471,14 @@ impl NestIngest {
                 tracing::warn!(
                     "block timestamps unavailable for {next}..={to}: {e:#} - retrying window"
                 );
-                sleep_secs(2).await;
-                return Ok(None);
+                return refuse_window(source, read_from).await;
             }
         };
         let l1_rows = match l1_block_rows(&self.registry, &rows, &block_data) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("{e:#} - retrying window {next}..={to}");
-                sleep_secs(2).await;
-                return Ok(None);
+                return refuse_window(source, read_from).await;
             }
         };
         let timestamps = block_data.timestamps;
@@ -7458,8 +7509,62 @@ impl NestIngest {
                 tracing::warn!(
                     "block {to} moved between the log fetch and the checkpoint: refusing this window, retrying"
                 );
-                sleep_secs(2).await;
-                return Ok(None);
+                return refuse_window(source, read_from).await;
+            }
+        }
+        // Below the fallback finality depth no reorg can reach a block, so only rows above it need
+        // checking, and only a window ending above it needs a checkpoint to be checked against later.
+        let final_through = seal_ceiling(self.finality, tip, None);
+        if let (Some(why), true) = (&checkpoint_missed, to > final_through) {
+            let n = self.metrics.inc_checkpoints_missed();
+            if n == 1 || n.is_multiple_of(REPEAT_WARN_EVERY) {
+                tracing::warn!(
+                    "blocks {next}..={to} refused: the source gave no hash for block {to} ({why}), \
+                     and a window is not committed without a reorg checkpoint. {n} window(s) so far \
+                     (nuthatch_nest_checkpoints_missed_total)."
+                );
+            }
+            return refuse_window(source, read_from).await;
+        }
+        // Every row read before the checkpoint must be on the chain it names, and the window must
+        // extend the stored chain. Hashes read after the checkpoint settle both (#2146).
+        let exposed: Vec<_> = rows
+            .iter()
+            .filter(|r| r.block_number > final_through)
+            .collect();
+        // A row with no hash cannot be checked, so it cannot be committed where a reorg can reach.
+        if let Some(r) = exposed.iter().find(|r| r.block_hash.is_empty()) {
+            tracing::warn!(
+                "the source gave the log at ({}, {}) no block hash: refusing window {next}..={to}, \
+                 retrying",
+                r.block_number,
+                r.log_index
+            );
+            return refuse_window(source, read_from).await;
+        }
+        let mut expected: Vec<(u64, String)> = exposed
+            .iter()
+            .map(|r| (r.block_number, r.block_hash.clone()))
+            .collect();
+        if let Some(parent) = next.checked_sub(1).filter(|&p| p > final_through) {
+            if let Some(h) = self.store.get_block_hash(parent)? {
+                expected.push((parent, h));
+            }
+        }
+        if !expected.is_empty() {
+            let mut blocks: Vec<u64> = expected.iter().map(|(b, _)| *b).collect();
+            blocks.sort_unstable();
+            blocks.dedup();
+            let moved = match source.block_hashes(&blocks).await {
+                Ok(now) => expected
+                    .iter()
+                    .find(|(b, h)| !now.get(b).is_some_and(|n| n.eq_ignore_ascii_case(h)))
+                    .map(|(b, _)| format!("block {b} is not on the chain the source has now")),
+                Err(e) => Some(format!("block hashes unavailable: {e:#}")),
+            };
+            if let Some(why) = moved {
+                tracing::warn!("{why}: refusing window {next}..={to}, retrying");
+                return refuse_window(source, read_from).await;
             }
         }
 
@@ -7470,6 +7575,8 @@ impl NestIngest {
         // PERF-2: accumulate every write and commit the whole window in ONE redb txn at the end,
         // instead of a `begin_write`/`commit` (fsync) per row. `(key, json)` for rows + annotations.
         let mut to_store: Vec<(String, String)> = Vec::with_capacity(rows.len());
+        // Alerts commit with the window, so a refused or failed window queues none (#2177).
+        let mut outbox: Vec<String> = Vec::new();
         for row in &mut rows {
             let key = Store::entity_key(row.block_number, row.log_index);
             // Feed the IVM balance + exposure views for transfer rows (extracted before storing).
@@ -7506,13 +7613,12 @@ impl NestIngest {
                             t,
                         ) {
                             to_store.push((fkey, ann.to_string()));
-                            alerts::enqueue(
-                                &self.store,
+                            outbox.extend(alerts::payloads(
                                 &self.router,
                                 "flag",
                                 "threshold_flag",
                                 &ann,
-                            )?;
+                            ));
                         }
                     }
                 } else if value.is_some() {
@@ -7545,28 +7651,31 @@ impl NestIngest {
         // a blocks table covers blocks that emitted no matching log at all (#447).
         if self.registry.blocks() {
             let want: Vec<u64> = (next..=to).collect();
-            match source.block_headers(&want).await {
-                Ok(headers) => {
-                    let mut block_rows: Vec<_> = want
-                        .iter()
-                        .filter_map(|b| {
-                            headers.get(b).and_then(|h| {
-                                crate::registry::block_row(*b, h, self.registry.timestamps())
-                            })
-                        })
-                        .collect();
-                    block_rows.sort_by_key(|r| r.block_number);
-                    for r in &block_rows {
-                        to_store.push((
-                            Store::entity_key(r.block_number, r.log_index),
-                            r.to_json().to_string(),
-                        ));
-                        stored += 1;
-                    }
-                }
+            // A block without its row would seal as a block the chain never had (#2149).
+            let headers = match source.block_headers(&want).await {
+                Ok(h) => h,
                 Err(e) => {
-                    tracing::warn!("block_headers unavailable for {next}..={to}: {e:#} - block rows skipped this window");
+                    tracing::warn!(
+                        "block_headers unavailable for {next}..={to}: {e:#} - retrying window"
+                    );
+                    return refuse_window(source, read_from).await;
                 }
+            };
+            for b in &want {
+                let Some(r) = headers
+                    .get(b)
+                    .and_then(|h| crate::registry::block_row(*b, h, self.registry.timestamps()))
+                else {
+                    tracing::warn!(
+                        "block {b} has no usable header - retrying window {next}..={to}"
+                    );
+                    return refuse_window(source, read_from).await;
+                };
+                to_store.push((
+                    Store::entity_key(r.block_number, r.log_index),
+                    r.to_json().to_string(),
+                ));
+                stored += 1;
             }
         }
 
@@ -7646,7 +7755,15 @@ impl NestIngest {
                 block_data.headers.as_ref(),
                 Some(TIP_RETRY_ATTEMPTS),
             )
-            .await?;
+            .await;
+            let call_rows = match call_rows {
+                Ok(r) => r,
+                Err(e) if e.chain().any(|c| c.is::<WindowForked>()) => {
+                    tracing::warn!("{e:#}: refusing window {next}..={to}, retrying");
+                    return refuse_window(source, read_from).await;
+                }
+                Err(e) => return Err(e),
+            };
             for row in call_rows {
                 to_store.push((
                     Store::entity_key(row.block_number, row.log_index),
@@ -7678,9 +7795,10 @@ impl NestIngest {
         }
         #[cfg(test)]
         before_commit();
+        let alerted = !outbox.is_empty();
         if let Err(e) = self
             .store
-            .commit_window_blocking(std::mem::take(&mut to_store), checkpoint, to)
+            .commit_window_blocking(std::mem::take(&mut to_store), outbox, checkpoint, to)
             .await
         {
             self.retract_folded_window(deltas, exp_deltas, vel_deltas);
@@ -7688,6 +7806,11 @@ impl NestIngest {
         }
         // Only now: a refused or failed window must not leave its children routing later logs (#2153).
         self.children.extend(found);
+        if alerted {
+            if let Err(e) = alerts::trim(self.store.as_ref()) {
+                tracing::warn!("could not bound the alert outbox: {e:#}");
+            }
+        }
         for (entity, batch) in self.entities.iter().zip(bound) {
             if let Some(batch) = batch {
                 entity.apply(batch, to);
@@ -7697,16 +7820,6 @@ impl NestIngest {
         // that the next window makes nobody's.
         if to >= tip {
             crate::maintained::changed(&self.dir);
-        }
-        if let Some(why) = checkpoint_missed {
-            let n = self.metrics.inc_checkpoints_missed();
-            if n == 1 || n.is_multiple_of(REPEAT_WARN_EVERY) {
-                tracing::warn!(
-                    "blocks {next}..={to} committed with no reorg checkpoint: the source gave no hash \
-                     for block {to} ({why}). {n} window(s) so far; a fork above the last checkpoint \
-                     goes unseen until one is stored (nuthatch_nest_checkpoints_missed_total)."
-                );
-            }
         }
         #[cfg(test)]
         take_after_commit_failure()?;
@@ -7796,6 +7909,14 @@ impl NestIngest {
         }
         Ok(Some(stored))
     }
+}
+
+/// Refuse a window for a retry. What it read may be from a chain that has moved since, and the
+/// timestamp cache is keyed by height, so it forgets from where the window began reading (#2152).
+async fn refuse_window(source: &dyn Source, read_from: u64) -> Result<Option<usize>> {
+    source.forget_cached_above(read_from.saturating_sub(1));
+    sleep_secs(2).await;
+    Ok(None)
 }
 
 /// Drive [`NestIngest::prepare`] to completion, retrying a [`ColdStartUnreachable`] failure forever
@@ -8010,15 +8131,13 @@ async fn index_loop(
                             sleep_for(nest.freshness.poll_interval).await;
                         }
                     }
-                    // Timestamps were unavailable; the cursor stayed put, retry the same window.
+                    // Refused: the cursor stays put, or resumes where the refusal rolled back to.
                     Ok(None) => {
-                        no_progress_tick(
-                            &mut no_progress,
-                            next,
-                            to,
-                            caught_up,
-                            "timestamps unavailable",
-                        )?;
+                        if let Some(b) = nest.rewound.take() {
+                            next = b;
+                            continue;
+                        }
+                        no_progress_tick(&mut no_progress, next, to, caught_up, "window refused")?;
                         continue;
                     }
                     // The window's own reads failed at the provider: a failed fetch, as below (#2151).
@@ -8124,6 +8243,7 @@ fn no_progress_tick(
 
 /// If the checkpoint at `last` is no longer canonical, return the deepest checkpoint that still
 /// is (the common ancestor to roll back to); otherwise None. Returns Some(0) if none survive.
+/// Errs when the source cannot answer: unverified is not canonical, and nothing may commit on it.
 async fn detect_reorg(
     source: &dyn Source,
     store: &dyn crate::store::HotStore,
@@ -8144,11 +8264,10 @@ async fn detect_reorg(
             None => return Ok(None), // genuinely no checkpoint yet (cold start)
         },
     };
-    let canonical = match source.block_hash(checkpoint).await? {
-        Some(h) => h,
-        None => return Ok(None), // source can't answer right now; try again next tick
+    let Some(canonical) = source.block_hash(checkpoint).await? else {
+        anyhow::bail!("the source has no hash for checkpoint {checkpoint}");
     };
-    if stored == canonical {
+    if stored.eq_ignore_ascii_case(&canonical) {
         return Ok(None);
     }
     for (block, hash) in store.checkpoints_desc()? {
@@ -8158,13 +8277,12 @@ async fn detect_reorg(
         // An unanswered checkpoint may be the ancestor or the seal pin, so walking past it can land
         // below the watermark, or at 0 if none answers (#1668). A lagging replica clears by the next poll.
         let Some(canon) = source.block_hash(block).await? else {
-            tracing::warn!(
+            anyhow::bail!(
                 "block {checkpoint} no longer matches its checkpoint, but the source has no hash for \
                  checkpoint {block}; not rolling back until it answers"
             );
-            return Ok(None);
         };
-        if canon == hash {
+        if canon.eq_ignore_ascii_case(&hash) {
             return Ok(Some(block));
         }
     }
@@ -11106,8 +11224,13 @@ mod tests {
         async fn tip(&self) -> Result<u64> {
             Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
         }
-        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-            Ok(None)
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(
+                self.logs
+                    .iter()
+                    .find(|l| l.block_number == n)
+                    .map_or_else(|| format!("0x{n:064x}"), |l| l.block_hash.clone()),
+            ))
         }
         async fn logs(
             &self,
@@ -13329,7 +13452,11 @@ template = "pool"
         *store.commit_hold.lock().unwrap() = Some((entered_tx, release_rx));
         let mut handle = tokio::spawn({
             let store = store.clone();
-            async move { store.commit_window_blocking(Vec::new(), None, 10).await }
+            async move {
+                store
+                    .commit_window_blocking(Vec::new(), Vec::new(), None, 10)
+                    .await
+            }
         });
         tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
             .await
@@ -13567,8 +13694,13 @@ template = "pool"
         async fn tip(&self) -> Result<u64> {
             Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
         }
-        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-            Ok(None)
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(
+                self.logs
+                    .iter()
+                    .find(|l| l.block_number == n)
+                    .map_or_else(|| format!("0x{n:064x}"), |l| l.block_hash.clone()),
+            ))
         }
         async fn logs(
             &self,
@@ -13611,8 +13743,13 @@ template = "pool"
         async fn tip(&self) -> Result<u64> {
             Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
         }
-        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-            Ok(None)
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(
+                self.logs
+                    .iter()
+                    .find(|l| l.block_number == n)
+                    .map_or_else(|| format!("0x{n:064x}"), |l| l.block_hash.clone()),
+            ))
         }
         async fn logs(
             &self,
@@ -14090,8 +14227,8 @@ template = "pool"
         async fn tip(&self) -> Result<u64> {
             Ok(12)
         }
-        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-            Ok(None)
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("0xbh{n}")))
         }
         async fn logs(
             &self,
@@ -14598,7 +14735,7 @@ template = "pool"
                 Ok(7)
             }
             async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-                Ok(None)
+                Ok(Some("0xbh".into()))
             }
             async fn logs(
                 &self,
@@ -14700,7 +14837,7 @@ template = "pool"
                 Ok(7)
             }
             async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-                Ok(None)
+                Ok(Some("0xbh".into()))
             }
             async fn logs(
                 &self,
@@ -14936,17 +15073,17 @@ template = "pool"
         let lagging = LaggingReplica {
             unanswered: &[100, 200],
         };
-        assert_eq!(
-            detect_reorg(&lagging, &store, 300).await.unwrap(),
-            None,
+        // Cannot-tell, not a fork at block 0, and not canonical either: an error, which the loops
+        // answer by committing nothing until the check completes (#2147).
+        assert!(
+            detect_reorg(&lagging, &store, 300).await.is_err(),
             "every older checkpoint answered None: that is cannot-tell, not a fork at block 0"
         );
         // The unanswered checkpoint may be the seal pin at the watermark; walking past it to 100
         // would read a lagging replica as a finality violation.
         let gap = LaggingReplica { unanswered: &[200] };
-        assert_eq!(
-            detect_reorg(&gap, &store, 300).await.unwrap(),
-            None,
+        assert!(
+            detect_reorg(&gap, &store, 300).await.is_err(),
             "the walk skipped an unanswered checkpoint and landed below it"
         );
     }
@@ -16824,8 +16961,9 @@ template = "pool"
         async fn tip(&self) -> Result<u64> {
             Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
         }
+        /// The hash `transfer_log` stamps on every block, so a window of them is on this chain.
         async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-            Ok(None)
+            Ok(Some("0xbh".into()))
         }
         async fn logs(
             &self,
@@ -16863,8 +17001,13 @@ template = "pool"
         async fn tip(&self) -> Result<u64> {
             Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
         }
-        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-            Ok(None)
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(
+                self.logs
+                    .iter()
+                    .find(|l| l.block_number == n)
+                    .map_or_else(|| format!("0x{n:064x}"), |l| l.block_hash.clone()),
+            ))
         }
         async fn logs(
             &self,
@@ -17705,6 +17848,376 @@ template = "pool"
         );
     }
 
+    /// #2146: only a row at `to` was compared with the checkpoint. A fork row lower in the window
+    /// committed under the hash the chain has now, and no later check would ever see it.
+    #[tokio::test]
+    async fn a_fork_row_below_the_window_end_refuses_the_window() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        let source = MovedTip {
+            canonical: "0xcanonical".into(),
+        };
+        let mut log = transfer_log(10, 0);
+        log.block_hash = "0xfork".into();
+        let outcome = nest
+            .process_window(&source, &[log], 10, 12, 100)
+            .await
+            .unwrap();
+        assert!(outcome.is_none(), "a fork row at block 10 was committed");
+        assert!(nest.store.entities_in_range(10, 12).unwrap().is_empty());
+        assert_eq!(nest.store.get_block_hash(12).unwrap(), None);
+    }
+
+    /// Jules on #2243: a row with no block hash was left out of the check and committed unchecked.
+    /// #1669 tolerated it only because the tail compares it as a string; above finality it is refused.
+    #[tokio::test]
+    async fn a_row_without_a_block_hash_is_refused_above_the_finality_depth() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        let source = MockSource { logs: Vec::new() };
+        let mut log = transfer_log(10, 0);
+        log.block_hash = String::new();
+        let outcome = nest
+            .process_window(&source, std::slice::from_ref(&log), 10, 12, 100)
+            .await
+            .unwrap();
+        assert!(outcome.is_none(), "an unhashed row committed unchecked");
+        assert!(nest.store.entities_in_range(10, 12).unwrap().is_empty());
+        // arbitrum-one's fallback depth is 1,800 blocks, so block 10 is final at tip 5,000.
+        let outcome = nest
+            .process_window(&source, &[log], 10, 12, 5_000)
+            .await
+            .unwrap();
+        assert!(outcome.is_some(), "a final row needs no hash check");
+    }
+
+    /// #2146: the reorg check runs before the logs are fetched. A window read after the chain moved
+    /// below it must not checkpoint the new chain over the stored one.
+    #[tokio::test]
+    async fn a_window_that_does_not_extend_the_stored_chain_is_refused() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        nest.store.set_block_hash(9, "0xold").unwrap();
+        nest.store.set_meta(LAST_BLOCK_KEY, "9").unwrap();
+        let source = MovedTip {
+            canonical: "0xcanonical".into(),
+        };
+        let outcome = nest
+            .process_window(&source, &[], 10, 10, 100)
+            .await
+            .unwrap();
+        assert!(
+            outcome.is_none(),
+            "a window over a replaced parent committed"
+        );
+        assert_eq!(nest.store.get_block_hash(10).unwrap(), None);
+    }
+
+    /// The chain under a refetched tail: `0xbh` up to block 10, `0xnew` above it.
+    struct ForkedAbove10;
+
+    #[async_trait::async_trait]
+    impl Source for ForkedAbove10 {
+        async fn tip(&self) -> Result<u64> {
+            Ok(100)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(if n > 10 { "0xnew" } else { "0xbh" }.into()))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(Vec::new())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+        }
+    }
+
+    /// #2146: a stored tail row the chain no longer has, under a checkpoint that still matches, was
+    /// refused and retried for ever. The chain settles which side is stale, and a stale store is
+    /// rolled back below it.
+    #[tokio::test]
+    async fn a_stored_tail_the_chain_no_longer_has_is_rolled_back() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        let first: Vec<_> = (10u64..=12).map(|b| transfer_log(b, 0)).collect();
+        nest.process_window(&MockSource { logs: Vec::new() }, &first, 10, 12, 100)
+            .await
+            .unwrap()
+            .expect("first window commits");
+        let mut tail: Vec<_> = (11u64..=12).map(|b| transfer_log(b, 0)).collect();
+        for l in &mut tail {
+            l.block_hash = "0xnew".into();
+        }
+        let outcome = nest
+            .process_window(&ForkedAbove10, &tail, 13, 13, 100)
+            .await
+            .unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(
+            nest.rewound,
+            Some(11),
+            "the loop is not told where to resume"
+        );
+        assert_eq!(nest.store.entities_in_range(10, 10).unwrap().len(), 1);
+        assert!(
+            nest.store.entities_in_range(11, 12).unwrap().is_empty(),
+            "the rows the chain replaced are still stored"
+        );
+    }
+
+    /// #2152: a refused window had already cached its blocks' timestamps by height, and the retry
+    /// read the replaced block's timestamp back for its replacement.
+    #[tokio::test]
+    async fn a_refused_window_forgets_the_timestamps_it_read() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        struct Moved(std::sync::Mutex<Vec<u64>>);
+        #[async_trait::async_trait]
+        impl Source for Moved {
+            async fn tip(&self) -> Result<u64> {
+                Ok(100)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(Some("0xnew".into()))
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(Vec::new())
+            }
+            async fn block_timestamps(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+            }
+            fn forget_cached_above(&self, block: u64) {
+                self.0.lock().unwrap().push(block);
+            }
+        }
+        let src = Moved(std::sync::Mutex::new(Vec::new()));
+        // Stamped from the old block 25, then refused at the checkpoint: the chain has `0xnew` there.
+        let outcome = nest
+            .process_window(&src, &[transfer_log(25, 0)], 25, 25, 100)
+            .await
+            .unwrap();
+        assert!(outcome.is_none(), "premise: the window is refused");
+        assert_eq!(
+            src.0.lock().unwrap().clone(),
+            vec![24],
+            "the refused window's cached timestamps were kept"
+        );
+    }
+
+    /// A blocks nest whose headers fail, or arrive without a hash for one block.
+    struct BrokenHeaders {
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for BrokenHeaders {
+        async fn tip(&self) -> Result<u64> {
+            Ok(100)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("0x{n:064x}")))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(Vec::new())
+        }
+        async fn block_headers(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+            if self.fail {
+                anyhow::bail!("block_headers: 3/3 header(s) missing after 8 rounds");
+            }
+            let mut out = LogCountingSource::new().block_headers(blocks).await?;
+            out.get_mut(&91)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove("hash");
+            Ok(out)
+        }
+    }
+
+    /// #2149: the tip path committed a blocks nest's window without its block rows when the headers
+    /// failed, and dropped a header it could not use. The range then sealed with a hole.
+    #[tokio::test]
+    async fn a_blocks_window_without_every_block_row_is_refused() {
+        for fail in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut nest =
+                build_test_nest(dir.path(), "0x1111111111111111111111111111111111111111").await;
+            nest.registry = Arc::new(DecodeRegistry::build(Vec::new()).unwrap().with_blocks(true));
+            let outcome = nest
+                .process_window(&BrokenHeaders { fail }, &[], 90, 92, 100)
+                .await
+                .unwrap();
+            assert!(
+                outcome.is_none(),
+                "fail={fail}: committed without its block rows"
+            );
+            assert!(nest.store.entities_in_range(90, 92).unwrap().is_empty());
+        }
+    }
+
+    /// Answers a checkpoint at 18 with nothing, as a lagging replica does, and everything else.
+    struct LaggingAt18;
+
+    #[async_trait::async_trait]
+    impl Source for LaggingAt18 {
+        async fn tip(&self) -> Result<u64> {
+            Ok(22)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok((n != 18).then(|| "0xbh".into()))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok((from..=to)
+                .filter(|&b| b == 21)
+                .map(|b| transfer_log(b, 0))
+                .collect())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+        }
+    }
+
+    /// #2147: a reorg check the source could not answer read as "canonical", and both loops went on
+    /// to commit a window above a checkpoint nobody had verified, which no later check revisits.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_reorg_check_commits_nothing() {
+        for runtime in [false, true] {
+            let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+            let d = tempfile::tempdir().unwrap();
+            let nest = build_test_nest(d.path(), addr).await;
+            nest.store.set_block_hash(18, "0xbh").unwrap();
+            nest.store.set_meta(LAST_BLOCK_KEY, "20").unwrap();
+            let store = nest.store.clone();
+            let src: Arc<dyn Source> = Arc::new(LaggingAt18);
+            let task = if runtime {
+                tokio::spawn(runtime_index_loop(
+                    src,
+                    vec![nest],
+                    Some(0),
+                    false,
+                    1,
+                    5,
+                    Arc::new(crate::health::RuntimeHealth::new()),
+                    false,
+                    None,
+                ))
+            } else {
+                tokio::spawn(index_loop(src, nest, Some(0), false, 1, 5))
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            task.abort();
+            let _ = task.await;
+            assert_eq!(
+                store.get_meta(LAST_BLOCK_KEY).unwrap().as_deref(),
+                Some("20"),
+                "runtime={runtime}: a window committed over an unverified checkpoint"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_reorg_holds_the_cursor_when_the_check_cannot_complete() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        nest.store.set_block_hash(18, "0xbh").unwrap();
+        assert_eq!(
+            nest.handle_reorg(&LaggingAt18, 21).await.unwrap(),
+            Some(21),
+            "an unanswered check must not read as canonical"
+        );
+    }
+
+    /// #2223: a provider may answer hashes in either case, and the same block is the same block.
+    #[tokio::test]
+    async fn a_checkpoint_in_the_other_case_is_not_a_reorg() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        store.set_block_hash(20, "0xABCDEF").unwrap();
+        let source = MovedTip {
+            canonical: "0xabcdef".into(),
+        };
+        assert_eq!(detect_reorg(&source, &store, 20).await.unwrap(), None);
+    }
+
+    /// #2177: a threshold alert was queued in its own write before the window committed, so a window
+    /// that failed queued it anyway, and its retry queued it again.
+    #[tokio::test]
+    async fn a_threshold_alert_is_queued_only_with_its_window() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        nest.threshold = Some(1);
+        nest.router = Arc::new(AlertRouter::new(vec![crate::config::Alert {
+            kinds: vec!["threshold_flag".into()],
+            url: "http://127.0.0.1:1/hook".into(),
+            format: crate::config::AlertFormat::Raw,
+        }]));
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                super::clear_fold_failure();
+            }
+        }
+        let _clear = Clear;
+        super::fail_the_next_fold();
+        let source = MockSource { logs: Vec::new() };
+        let logs = vec![transfer_log(10, 0)];
+        assert!(
+            nest.process_window(&source, &logs, 10, 10, 100)
+                .await
+                .is_err(),
+            "premise: the first attempt fails before its commit"
+        );
+        assert_eq!(
+            nest.store.outbox_len(),
+            0,
+            "a window that did not commit alerted"
+        );
+        nest.process_window(&source, &logs, 10, 10, 100)
+            .await
+            .unwrap()
+            .expect("the retry commits");
+        assert_eq!(nest.store.outbox_len(), 1, "one transfer, one alert");
+    }
+
     /// A provider that serves logs and timestamps and cannot answer `eth_getBlockByNumber` for a hash.
     struct NoBlockHash;
 
@@ -17732,11 +18245,11 @@ template = "pool"
         }
     }
 
-    /// #1666. Windows kept committing with no checkpoint, so reorg detection answered None for ever,
-    /// and nothing said so above debug. Ingestion carries on; the miss is counted where an alert can
-    /// read it.
+    /// #1666, #2147. A window committed with no checkpoint left the range below the next one unchecked
+    /// for good. Above the finality depth it is refused and counted; below it no reorg can reach, so it
+    /// commits.
     #[tokio::test]
-    async fn a_window_committed_without_a_checkpoint_is_counted() {
+    async fn a_window_without_a_checkpoint_is_refused_above_the_finality_depth() {
         let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
         let d = tempfile::tempdir().unwrap();
         let mut nest = build_test_nest(d.path(), addr).await;
@@ -17746,14 +18259,20 @@ template = "pool"
                 .process_window(&NoBlockHash, &[transfer_log(b, 0)], b, b, 100)
                 .await
                 .unwrap();
-            assert!(outcome.is_some(), "a missing checkpoint stopped ingestion");
+            assert!(outcome.is_none(), "block {b} committed with no checkpoint");
         }
-        assert_eq!(nest.store.get_block_hash(11).unwrap(), None);
+        assert!(nest.store.entities_in_range(10, 11).unwrap().is_empty());
         assert_eq!(
             nest.metrics.checkpoints_missed(),
             2,
-            "two windows committed with no reorg checkpoint and nothing counted them"
+            "two windows refused for want of a checkpoint and nothing counted them"
         );
+        // arbitrum-one's fallback depth is 1,800 blocks, so block 12 is final at tip 5,000.
+        let outcome = nest
+            .process_window(&NoBlockHash, &[transfer_log(12, 0)], 12, 12, 5_000)
+            .await
+            .unwrap();
+        assert!(outcome.is_some(), "a final window needs no checkpoint");
     }
 
     /// RFC-0004 §3: the pipelined (concurrent-fetch) backfill produces **byte-identical** segments to
@@ -17871,8 +18390,13 @@ template = "pool"
         async fn tip(&self) -> Result<u64> {
             Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
         }
-        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-            Ok(None)
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(
+                self.logs
+                    .iter()
+                    .find(|l| l.block_number == n)
+                    .map_or_else(|| format!("0x{n:064x}"), |l| l.block_hash.clone()),
+            ))
         }
         async fn logs(
             &self,
@@ -18890,8 +19414,13 @@ template="pool"
         async fn tip(&self) -> Result<u64> {
             Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
         }
-        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-            Ok(None)
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(
+                self.logs
+                    .iter()
+                    .find(|l| l.block_number == n)
+                    .map_or_else(|| format!("0x{n:064x}"), |l| l.block_hash.clone()),
+            ))
         }
         async fn logs(
             &self,
@@ -19232,8 +19761,8 @@ template="pool"
         async fn tip(&self) -> Result<u64> {
             Ok(100)
         }
-        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-            Ok(None)
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("0x{n:064x}")))
         }
         async fn logs(
             &self,
@@ -20142,7 +20671,7 @@ template="pool"
                 topics: vec![topic0.clone()],
                 data: abi_string(uri),
                 block_number: 9,
-                block_hash: format!("0x{:064x}", 9),
+                block_hash: "0xbh".into(),
                 tx_hash: format!("0xt{i}"),
                 log_index: i,
             })
@@ -20279,8 +20808,8 @@ template="pool"
             async fn tip(&self) -> Result<u64> {
                 Ok(100)
             }
-            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-                Ok(None)
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                Ok(Some(format!("0x{n:064x}")))
             }
             async fn logs(
                 &self,
@@ -20430,8 +20959,8 @@ template="pool"
             async fn tip(&self) -> Result<u64> {
                 Ok(100)
             }
-            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-                Ok(None)
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                Ok(Some(format!("0x{n:064x}")))
             }
             async fn logs(
                 &self,
@@ -20994,6 +21523,111 @@ template="pool"
         }
     }
 
+    /// #2154: a canonical call whose block moved under it ended `nuthatch dev` with an error, though
+    /// its own message said the window is re-read. The window is refused and read again.
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn a_block_that_moves_under_a_canonical_call_refuses_the_window() {
+        /// Names block 5 by its pinned hash twice - the checkpoint and the row check - then moves it.
+        struct MovesAfterTwo(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl Source for MovesAfterTwo {
+            async fn tip(&self) -> Result<u64> {
+                Ok(100)
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                let seen = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(format!(
+                    "0x{:064x}",
+                    if seen < 2 { n } else { n + 1_000 }
+                )))
+            }
+            async fn logs(
+                &self,
+                _f: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(Vec::new())
+            }
+            async fn block_headers(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                LogCountingSource::new().block_headers(blocks).await
+            }
+        }
+        let not_canonical =
+            serde_json::json!({"code": -32000, "message": "hash is not currently canonical"});
+        let url = stub_failing_state_rpc(not_canonical).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"c\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nschema_version = 3\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+             abi = \"abis/tok.json\"\n\n\
+             [[calls]]\nname = \"clock\"\n\
+             contract = \"0x1111111111111111111111111111111111111111\"\n\
+             on = \"tok__transfer\"\nsignature = \"blockNum()\"\ncanonical = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("abis/tok.json"),
+            r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        config.state_rpc_urls = vec![url];
+        let source: Arc<dyn Source> =
+            Arc::new(MovesAfterTwo(std::sync::atomic::AtomicUsize::new(0)));
+        let (mut nest, _state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .expect("a canonical calls nest must build");
+        if let Some(w) = worker {
+            w.abort();
+        }
+        let topic0 = format!(
+            "0x{}",
+            hex::encode(
+                nest.registry
+                    .tables()
+                    .iter()
+                    .find(|d| d.table == "tok__transfer")
+                    .expect("fixture must expose tok__transfer")
+                    .topic0
+            )
+        );
+        let log = crate::rpc::Log {
+            address: "0x1111111111111111111111111111111111111111".into(),
+            topics: vec![
+                topic0,
+                format!("0x{:064x}", 0xaa),
+                format!("0x{:064x}", 0xbb),
+            ],
+            data: format!("0x{:064x}", 1000),
+            block_number: 5,
+            block_hash: format!("0x{:064x}", 5),
+            tx_hash: "0xt".into(),
+            log_index: 0,
+        };
+        let outcome = nest
+            .process_window(source.as_ref(), &[log], 5, 5, 100)
+            .await
+            .expect("a fork under a canonical call is a re-read, not a fault");
+        assert!(outcome.is_none());
+        assert!(nest.store.entities_in_range(5, 5).unwrap().is_empty());
+    }
+
     /// **RFC-0038 §3, end to end: a declaration names an event's parameter.**
     ///
     /// This is the claim the whole parity argument rests on. A subgraph mapping reads
@@ -21062,7 +21696,7 @@ template="pool"
                 topics: vec![topic0.clone(), pad(0xaa), pad(0xb0 + i)],
                 data: format!("0x{:064x}", 1000 * i as u64),
                 block_number: 5,
-                block_hash: format!("0x{:064x}", 5),
+                block_hash: "0xbh".into(),
                 tx_hash: format!("0xt{i}"),
                 log_index: u64::from(i),
             })
@@ -21174,8 +21808,8 @@ template="pool"
             async fn tip(&self) -> Result<u64> {
                 Ok(100)
             }
-            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-                Ok(None)
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                Ok(Some(format!("0x{n:064x}")))
             }
             async fn logs(
                 &self,
@@ -22650,7 +23284,7 @@ template="pool"
             Ok(30)
         }
         async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-            Ok(None)
+            Ok(Some("0xbh".into()))
         }
         async fn logs(
             &self,
@@ -22864,8 +23498,13 @@ template="pool"
         async fn tip(&self) -> Result<u64> {
             Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
         }
-        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-            Ok(None)
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(
+                self.logs
+                    .iter()
+                    .find(|l| l.block_number == n)
+                    .map_or_else(|| format!("0x{n:064x}"), |l| l.block_hash.clone()),
+            ))
         }
         async fn logs(
             &self,
@@ -23373,6 +24012,7 @@ rpc_urls = ["https://rpc.example"]
                 (1, 0, 0),
                 "runtime={runtime}: an idle poll's bill, {idle:?}"
             );
+            // The second hash per window re-reads the parent checkpoint after the window's own (#2146).
             assert_eq!(
                 (
                     advancing.block_hash,
@@ -23381,7 +24021,7 @@ rpc_urls = ["https://rpc.example"]
                     advancing.finalized,
                     advancing.logs
                 ),
-                (m, m, 0, m, m),
+                (2 * m, m, 0, m, m),
                 "runtime={runtime}: per committed window, {advancing:?}"
             );
         }
@@ -23400,7 +24040,7 @@ rpc_urls = ["https://rpc.example"]
                     advancing.block_record,
                     advancing.block_timestamps
                 ),
-                (2 * m, m, 0),
+                (3 * m, m, 0),
                 "runtime={runtime}: per committed window, {advancing:?}"
             );
         }

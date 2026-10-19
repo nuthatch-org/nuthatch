@@ -118,7 +118,7 @@ pub struct NestMetrics {
     rows_decoded: AtomicU64,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
-    /// #1666: windows committed with no reorg checkpoint.
+    /// #1666, #2147: windows refused for want of a reorg checkpoint.
     checkpoints_missed: AtomicU64,
     /// RFC-0059 §5: sealed blocks whose rows the folds are not yet checkpointed through, and whether
     /// the writer has stopped. Only a folds build has a writer, so only it has the series.
@@ -1161,7 +1161,7 @@ impl Metrics {
         ));
         s.push_str(&counter(
             "nuthatch_checkpoints_missed_total",
-            "Windows committed with no reorg checkpoint because the source gave no hash for the boundary block, since start.",
+            "Windows refused because the source gave no hash for the boundary block, since start.",
             self.checkpoints_missed.load(Relaxed),
         ));
         s.push_str(&counter(
@@ -1549,7 +1549,7 @@ impl Metrics {
             );
             labelled(
                 "nuthatch_nest_checkpoints_missed_total",
-                "Windows committed with no reorg checkpoint because the source gave no hash for the boundary block, per nest. Reorg detection is blind while it climbs.",
+                "Windows refused because the source gave no hash for the boundary block, per nest. Indexing is held while it climbs.",
                 "counter",
                 &|m| m.checkpoints_missed.load(Relaxed),
             );

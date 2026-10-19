@@ -1241,11 +1241,12 @@ impl nuthatch::store::HotStore for HotScanFails {
     async fn commit_window_blocking(
         &self,
         entities: Vec<(String, String)>,
+        outbox: Vec<String>,
         checkpoint: Option<(u64, String)>,
         last_block: u64,
     ) -> anyhow::Result<()> {
         self.0
-            .commit_window_blocking(entities, checkpoint, last_block)
+            .commit_window_blocking(entities, outbox, checkpoint, last_block)
             .await
     }
     async fn settle_commits(&self) {
@@ -1259,8 +1260,10 @@ impl nuthatch::store::HotStore for HotScanFails {
         block: u64,
         meta_key: &str,
         meta_val: &str,
+        outbox: &[String],
     ) -> anyhow::Result<u64> {
-        self.0.rollback_to_and_set_meta(block, meta_key, meta_val)
+        self.0
+            .rollback_to_and_set_meta(block, meta_key, meta_val, outbox)
     }
     fn prune_range(&self, from: u64, to: u64) -> anyhow::Result<u64> {
         self.0.prune_range(from, to)

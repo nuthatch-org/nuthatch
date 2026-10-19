@@ -161,6 +161,74 @@ pub struct PgStore {
 }
 
 impl PgStore {
+    /// The trait's `commit_window`, with alert-outbox entries that land only if the window does.
+    fn commit_window_with(
+        &self,
+        entities: &[(String, String)],
+        outbox: &[String],
+        checkpoint: Option<(u64, &str)>,
+        last_block: u64,
+    ) -> Result<()> {
+        let schema = self.schema.clone();
+        let held = self.held_fence();
+        let entities = entities.to_vec();
+        let checkpoint = checkpoint.map(|(b, h)| (b, h.to_string()));
+        let outbox = outbox.to_vec();
+        self.conn.with(move |c| {
+            // One transaction, exactly as redb does it. This is the atomicity the trait's contract
+            // promises and `e2e_crash_safety` pins: rows, checkpoint and watermark land together, so
+            // a crash leaves the store at a clean window boundary and never mid-window.
+            let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
+            if !outbox.is_empty() {
+                outbox_push_in_tx(&mut tx, &schema, &outbox)?;
+            }
+            let ins = format!(
+                "INSERT INTO \"{schema}\".entities (key, value) VALUES ($1, $2) \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+            );
+            for (k, v) in &entities {
+                tx.execute(&ins, &[k, v])?;
+            }
+            if let Some((block, hash)) = &checkpoint {
+                let key = format!("{block:012}");
+                let existing: Option<String> = {
+                    let get = format!("SELECT value FROM \"{schema}\".blocks WHERE key = $1");
+                    tx.query_opt(&get, &[&key])?.map(|r| r.get::<_, String>(0))
+                };
+                let existing_ts = existing
+                    .as_deref()
+                    .and_then(|v| crate::store::decode_block_record(v).1);
+                let (h, packed_ts) = crate::store::decode_block_record(hash);
+                let packed = crate::store::encode_block_record(&h, packed_ts.or(existing_ts));
+                let sql = format!(
+                    "INSERT INTO \"{schema}\".blocks (key, value) VALUES ($1, $2) \
+                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+                );
+                tx.execute(&sql, &[&key, &packed])?;
+            }
+            let meta = format!(
+                "INSERT INTO \"{schema}\".meta (key, value) VALUES ('last_block', $1) \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+            );
+            tx.execute(&meta, &[&last_block.to_string()])?;
+            // As in redb (#1636, #1665): keep the newest checkpoint at or below the watermark and
+            // prune beneath it. Keys are zero-padded, so text order is block order.
+            if !cfg!(feature = "graph") {
+                let prune = format!(
+                    "DELETE FROM \"{schema}\".blocks WHERE key IN (\
+                     SELECT b.key FROM \"{schema}\".blocks b, \"{schema}\".meta m \
+                     WHERE m.key = 'sealed_through' AND b.key < (SELECT max(f.key) FROM \"{schema}\".blocks f \
+                     WHERE f.key <= lpad(m.value, 12, '0')) \
+                     ORDER BY b.key LIMIT 4096)"
+                );
+                tx.execute(&prune, &[])?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Connect and ensure this nest's schema exists.
     ///
     /// `nest` names a schema, so it is validated rather than escaped: an identifier cannot be a bound
@@ -674,72 +742,20 @@ impl HotStore for PgStore {
         checkpoint: Option<(u64, &str)>,
         last_block: u64,
     ) -> Result<()> {
-        let schema = self.schema.clone();
-        let held = self.held_fence();
-        let entities = entities.to_vec();
-        let checkpoint = checkpoint.map(|(b, h)| (b, h.to_string()));
-        self.conn.with(move |c| {
-            // One transaction, exactly as redb does it. This is the atomicity the trait's contract
-            // promises and `e2e_crash_safety` pins: rows, checkpoint and watermark land together, so
-            // a crash leaves the store at a clean window boundary and never mid-window.
-            let mut tx = c.transaction()?;
-            guard_fence_in_tx(&mut tx, &schema, held)?;
-            let ins = format!(
-                "INSERT INTO \"{schema}\".entities (key, value) VALUES ($1, $2) \
-                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
-            );
-            for (k, v) in &entities {
-                tx.execute(&ins, &[k, v])?;
-            }
-            if let Some((block, hash)) = &checkpoint {
-                let key = format!("{block:012}");
-                let existing: Option<String> = {
-                    let get = format!("SELECT value FROM \"{schema}\".blocks WHERE key = $1");
-                    tx.query_opt(&get, &[&key])?.map(|r| r.get::<_, String>(0))
-                };
-                let existing_ts = existing
-                    .as_deref()
-                    .and_then(|v| crate::store::decode_block_record(v).1);
-                let (h, packed_ts) = crate::store::decode_block_record(hash);
-                let packed = crate::store::encode_block_record(&h, packed_ts.or(existing_ts));
-                let sql = format!(
-                    "INSERT INTO \"{schema}\".blocks (key, value) VALUES ($1, $2) \
-                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
-                );
-                tx.execute(&sql, &[&key, &packed])?;
-            }
-            let meta = format!(
-                "INSERT INTO \"{schema}\".meta (key, value) VALUES ('last_block', $1) \
-                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
-            );
-            tx.execute(&meta, &[&last_block.to_string()])?;
-            // As in redb (#1636, #1665): keep the newest checkpoint at or below the watermark and
-            // prune beneath it. Keys are zero-padded, so text order is block order.
-            if !cfg!(feature = "graph") {
-                let prune = format!(
-                    "DELETE FROM \"{schema}\".blocks WHERE key IN (\
-                     SELECT b.key FROM \"{schema}\".blocks b, \"{schema}\".meta m \
-                     WHERE m.key = 'sealed_through' AND b.key < (SELECT max(f.key) FROM \"{schema}\".blocks f \
-                     WHERE f.key <= lpad(m.value, 12, '0')) \
-                     ORDER BY b.key LIMIT 4096)"
-                );
-                tx.execute(&prune, &[])?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
+        self.commit_window_with(entities, &[], checkpoint, last_block)
     }
 
     async fn commit_window_blocking(
         &self,
         entities: Vec<(String, String)>,
+        outbox: Vec<String>,
         checkpoint: Option<(u64, String)>,
         last_block: u64,
     ) -> Result<()> {
         // The work already happens on the connection thread, so there is nothing extra to offload -
         // the async signature exists so callers need not know which backend they hold.
         let cp = checkpoint.as_ref().map(|(b, h)| (*b, h.as_str()));
-        self.commit_window(&entities, cp, last_block)
+        self.commit_window_with(&entities, &outbox, cp, last_block)
     }
 
     /// The commit above runs inside the caller's poll, so it cannot outlive an abort.
@@ -757,13 +773,23 @@ impl HotStore for PgStore {
         })
     }
 
-    fn rollback_to_and_set_meta(&self, block: u64, meta_key: &str, meta_val: &str) -> Result<u64> {
+    fn rollback_to_and_set_meta(
+        &self,
+        block: u64,
+        meta_key: &str,
+        meta_val: &str,
+        outbox: &[String],
+    ) -> Result<u64> {
         let schema = self.schema.clone();
         let held = self.held_fence();
         let (mk, mv) = (meta_key.to_string(), meta_val.to_string());
+        let outbox = outbox.to_vec();
         self.conn.with(move |c| {
             let mut tx = c.transaction()?;
             guard_fence_in_tx(&mut tx, &schema, held)?;
+            if !outbox.is_empty() {
+                outbox_push_in_tx(&mut tx, &schema, &outbox)?;
+            }
             let removed = rollback_in_tx(&mut tx, &schema, block)?;
             set_meta_in_tx(&mut tx, &schema, &mk, &mv)?;
             tx.commit()?;
@@ -969,17 +995,7 @@ impl HotStore for PgStore {
         self.conn.with(move |c| {
             let mut tx = c.transaction()?;
             guard_fence_in_tx(&mut tx, &schema, held)?;
-            // Read-modify-write of the counter inside the transaction, with `FOR UPDATE` so two
-            // writers cannot both read the same seq. The trait says single-writer, but a lost outbox
-            // entry is silent and permanent, so this one is belt and braces.
-            let read = format!("SELECT value FROM \"{schema}\".meta WHERE key = $1 FOR UPDATE");
-            let seq: u64 = tx
-                .query_opt(&read, &[&OUTBOX_SEQ])?
-                .and_then(|r| r.get::<_, String>(0).parse().ok())
-                .unwrap_or(0);
-            set_meta_in_tx(&mut tx, &schema, OUTBOX_SEQ, &(seq + 1).to_string())?;
-            let push = format!("INSERT INTO \"{schema}\".outbox (key, value) VALUES ($1, $2)");
-            tx.execute(&push, &[&format!("{seq:020}"), &payload])?;
+            let seq = outbox_push_in_tx(&mut tx, &schema, &[payload])?;
             tx.commit()?;
             Ok(seq)
         })
@@ -1090,6 +1106,33 @@ fn guard_fence_in_tx(tx: &mut postgres::Transaction<'_>, schema: &str, held: u64
 
 /// Upsert one meta key inside an open transaction - shared by every mutation that must land the row
 /// change and the watermark together.
+/// Push `payloads` inside `tx`; returns the first one's sequence number.
+fn outbox_push_in_tx(
+    tx: &mut postgres::Transaction<'_>,
+    schema: &str,
+    payloads: &[String],
+) -> Result<u64> {
+    // Read-modify-write of the counter inside the transaction, with `FOR UPDATE` so two
+    // writers cannot both read the same seq. The trait says single-writer, but a lost outbox
+    // entry is silent and permanent, so this one is belt and braces.
+    let read = format!("SELECT value FROM \"{schema}\".meta WHERE key = $1 FOR UPDATE");
+    let first: u64 = tx
+        .query_opt(&read, &[&OUTBOX_SEQ])?
+        .and_then(|r| r.get::<_, String>(0).parse().ok())
+        .unwrap_or(0);
+    let push = format!("INSERT INTO \"{schema}\".outbox (key, value) VALUES ($1, $2)");
+    for (seq, payload) in (first..).zip(payloads) {
+        tx.execute(&push, &[&format!("{seq:020}"), payload])?;
+    }
+    set_meta_in_tx(
+        tx,
+        schema,
+        OUTBOX_SEQ,
+        &(first + payloads.len() as u64).to_string(),
+    )?;
+    Ok(first)
+}
+
 fn set_meta_in_tx(
     tx: &mut postgres::Transaction<'_>,
     schema: &str,

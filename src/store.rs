@@ -410,9 +410,11 @@ pub trait HotStore: Send + Sync {
         checkpoint: Option<(u64, &str)>,
         last_block: u64,
     ) -> Result<()>;
+    /// `outbox` entries are pushed in the same transaction, so an alert lands only with its window.
     async fn commit_window_blocking(
         &self,
         entities: Vec<(String, String)>,
+        outbox: Vec<String>,
         checkpoint: Option<(u64, String)>,
         last_block: u64,
     ) -> Result<()>;
@@ -420,7 +422,13 @@ pub trait HotStore: Send + Sync {
     /// whose caller was aborted.
     async fn settle_commits(&self);
     fn rollback_to(&self, block: u64) -> Result<u64>;
-    fn rollback_to_and_set_meta(&self, block: u64, meta_key: &str, meta_val: &str) -> Result<u64>;
+    fn rollback_to_and_set_meta(
+        &self,
+        block: u64,
+        meta_key: &str,
+        meta_val: &str,
+        outbox: &[String],
+    ) -> Result<u64>;
     fn prune_range(&self, from: u64, to: u64) -> Result<u64>;
     fn prune_and_set_meta(&self, from: u64, to: u64, meta_key: &str, meta_val: &str)
         -> Result<u64>;
@@ -812,19 +820,27 @@ impl Store {
     pub fn outbox_push(&self, payload: &str) -> Result<u64> {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
-        let seq;
-        {
-            let mut meta = wtx.open_table(META)?;
-            seq = meta
-                .get(OUTBOX_SEQ)?
-                .and_then(|v| v.value().parse::<u64>().ok())
-                .unwrap_or(0);
-            meta.insert(OUTBOX_SEQ, (seq + 1).to_string().as_str())?;
-            let mut ob = wtx.open_table(OUTBOX)?;
-            ob.insert(Self::outbox_key(seq).as_str(), payload)?;
-        }
+        let seq = Self::outbox_push_in(&wtx, &[payload.to_string()])?;
         self.commit(wtx)?;
         Ok(seq)
+    }
+
+    /// Push `payloads` inside `wtx`; returns the first one's sequence number.
+    fn outbox_push_in(wtx: &redb::WriteTransaction, payloads: &[String]) -> Result<u64> {
+        let mut meta = wtx.open_table(META)?;
+        let first = meta
+            .get(OUTBOX_SEQ)?
+            .and_then(|v| v.value().parse::<u64>().ok())
+            .unwrap_or(0);
+        meta.insert(
+            OUTBOX_SEQ,
+            (first + payloads.len() as u64).to_string().as_str(),
+        )?;
+        let mut ob = wtx.open_table(OUTBOX)?;
+        for (seq, payload) in (first..).zip(payloads) {
+            ob.insert(Self::outbox_key(seq).as_str(), payload.as_str())?;
+        }
+        Ok(first)
     }
 
     fn outbox_key(seq: u64) -> String {
@@ -982,8 +998,22 @@ impl Store {
         checkpoint: Option<(u64, &str)>,
         last_block: u64,
     ) -> Result<()> {
+        self.commit_window_with(entities, &[], checkpoint, last_block)
+    }
+
+    /// [`Store::commit_window`], with alert-outbox entries that land only if the window does.
+    fn commit_window_with(
+        &self,
+        entities: &[(String, String)],
+        outbox: &[String],
+        checkpoint: Option<(u64, &str)>,
+        last_block: u64,
+    ) -> Result<()> {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
+        if !outbox.is_empty() {
+            Self::outbox_push_in(&wtx, outbox)?;
+        }
         {
             let mut t = wtx.open_table(ENTITIES)?;
             for (k, v) in entities {
@@ -1057,6 +1087,7 @@ impl Store {
     pub async fn commit_window_blocking(
         &self,
         entities: Vec<(String, String)>,
+        outbox: Vec<String>,
         checkpoint: Option<(u64, String)>,
         last_block: u64,
     ) -> Result<()> {
@@ -1070,7 +1101,7 @@ impl Store {
                 let _ = release.recv();
             }
             let cp = checkpoint.as_ref().map(|(b, h)| (*b, h.as_str()));
-            store.commit_window(&entities, cp, last_block)
+            store.commit_window_with(&entities, &outbox, cp, last_block)
         })
         .await
         .context("the hot-store commit task panicked")?
@@ -1511,9 +1542,13 @@ impl Store {
         block: u64,
         meta_key: &str,
         meta_val: &str,
+        outbox: &[String],
     ) -> Result<u64> {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
+        if !outbox.is_empty() {
+            Self::outbox_push_in(&wtx, outbox)?;
+        }
         let mut removed = 0u64;
         {
             let mut entities = wtx.open_table(ENTITIES)?;
@@ -1838,8 +1873,14 @@ impl HotStore for Store {
     fn rollback_to(&self, block: u64) -> Result<u64> {
         Store::rollback_to(self, block)
     }
-    fn rollback_to_and_set_meta(&self, block: u64, meta_key: &str, meta_val: &str) -> Result<u64> {
-        Store::rollback_to_and_set_meta(self, block, meta_key, meta_val)
+    fn rollback_to_and_set_meta(
+        &self,
+        block: u64,
+        meta_key: &str,
+        meta_val: &str,
+        outbox: &[String],
+    ) -> Result<u64> {
+        Store::rollback_to_and_set_meta(self, block, meta_key, meta_val, outbox)
     }
     fn prune_range(&self, from: u64, to: u64) -> Result<u64> {
         Store::prune_range(self, from, to)
@@ -1974,10 +2015,11 @@ impl HotStore for Store {
     async fn commit_window_blocking(
         &self,
         entities: Vec<(String, String)>,
+        outbox: Vec<String>,
         checkpoint: Option<(u64, String)>,
         last_block: u64,
     ) -> Result<()> {
-        Store::commit_window_blocking(self, entities, checkpoint, last_block).await
+        Store::commit_window_blocking(self, entities, outbox, checkpoint, last_block).await
     }
     async fn settle_commits(&self) {
         drop(self.commit_gate.lock().await);
@@ -2116,8 +2158,14 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     fn rollback_to(&self, block: u64) -> Result<u64> {
         (**self).rollback_to(block)
     }
-    fn rollback_to_and_set_meta(&self, block: u64, meta_key: &str, meta_val: &str) -> Result<u64> {
-        (**self).rollback_to_and_set_meta(block, meta_key, meta_val)
+    fn rollback_to_and_set_meta(
+        &self,
+        block: u64,
+        meta_key: &str,
+        meta_val: &str,
+        outbox: &[String],
+    ) -> Result<u64> {
+        (**self).rollback_to_and_set_meta(block, meta_key, meta_val, outbox)
     }
     fn prune_range(&self, from: u64, to: u64) -> Result<u64> {
         (**self).prune_range(from, to)
@@ -2170,11 +2218,12 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     async fn commit_window_blocking(
         &self,
         entities: Vec<(String, String)>,
+        outbox: Vec<String>,
         checkpoint: Option<(u64, String)>,
         last_block: u64,
     ) -> Result<()> {
         (**self)
-            .commit_window_blocking(entities, checkpoint, last_block)
+            .commit_window_blocking(entities, outbox, checkpoint, last_block)
             .await
     }
     async fn settle_commits(&self) {
@@ -2224,7 +2273,7 @@ mod tests {
         );
         assert_eq!(store.checkpoint_number(&replacement).unwrap(), Some(1));
         store
-            .rollback_to_and_set_meta(3, "last_block", "3")
+            .rollback_to_and_set_meta(3, "last_block", "3", &[])
             .unwrap();
         assert_eq!(
             store.checkpoint_number(&format!("0x{:064x}", 4)).unwrap(),
@@ -2360,7 +2409,7 @@ mod tests {
         assert_eq!(store.rollback_to(9).unwrap(), 0);
         assert_eq!(
             store
-                .rollback_to_and_set_meta(9, "last_block", "9")
+                .rollback_to_and_set_meta(9, "last_block", "9", &[])
                 .unwrap(),
             0
         );
@@ -2713,7 +2762,7 @@ mod tests {
         }
         assert_eq!(
             store
-                .rollback_to_and_set_meta(3, "last_block", "3")
+                .rollback_to_and_set_meta(3, "last_block", "3", &[])
                 .unwrap(),
             2
         );
@@ -2768,7 +2817,7 @@ mod tests {
         // two txns (a crash between would strand `last_block` at 12 and permanently skip the re-org'd
         // range). One call does both.
         let removed = store
-            .rollback_to_and_set_meta(11, "last_block", "11")
+            .rollback_to_and_set_meta(11, "last_block", "11", &[])
             .unwrap();
         assert_eq!(removed, 4); // block 12's four entities dropped
         assert_eq!(store.count().unwrap(), 5); // blocks 10 + 11 survive
