@@ -306,6 +306,8 @@ would end up running the old bundle with nothing reporting an error.
 **Secrets never enter a bundle.** Private RPC URLs and API keys live in the control plane keyed by
 nest (`PUT /nests/<name>/secrets`), and a writer receives only the secrets of the nests it is
 assigned. The interface is **write-only**: you can list which keys exist, never read a value back.
+A secret named `rpc_url` replaces the nest's own `rpc_urls` when a writer starts its cursor; other keys
+are logged by name and ignored.
 Rotating a secret changes no bundle hash, so it does not invalidate segment reuse or force a
 re-index.
 
