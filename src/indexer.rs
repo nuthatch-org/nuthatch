@@ -25142,6 +25142,71 @@ rpc_urls = ["https://rpc.example"]
         );
     }
 
+    /// #2268: the restart seed reaches the views as one batch, and past DBSP's 10,000-row internal
+    /// step only the last step's changes used to survive it.
+    #[test]
+    fn rebuild_views_over_more_than_one_dbsp_step_matches_an_incremental_replay() {
+        const MIXER: &str = "0x3333333333333333333333333333333333333333";
+        const N: u64 = 12_000;
+        let holder = |i: u64| format!("0x{i:040x}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let rows: Vec<(String, String)> = (1..=N)
+            .map(|i| {
+                let row = transfer_row(i, 0, MIXER, Some(&holder(i)), &i.to_string());
+                (Store::entity_key(i, 0), row)
+            })
+            .collect();
+        store.commit_window(&rows, None, N).unwrap();
+        let labels = labelset(&[(MIXER, "mixer")]);
+
+        let balances = BalanceView::start().unwrap();
+        let exposure_v = ExposureView::start(true).unwrap();
+        rebuild_views(
+            dir.path(),
+            &store,
+            &erc20_registry(),
+            &DerivedViews {
+                labels: &labels,
+                balances: &balances,
+                exposure: &exposure_v,
+                velocity: &VelocityView::start(false).unwrap(),
+                velocity_window: None,
+            },
+        )
+        .unwrap();
+
+        // The reference arrives as the tip loop feeds it, in batches well under one DBSP step.
+        let want_balances = BalanceView::start().unwrap();
+        let want_exposure = ExposureView::start(true).unwrap();
+        for chunk in (1..=N).collect::<Vec<_>>().chunks(100) {
+            let mut b = Vec::new();
+            let mut e = Vec::new();
+            for &i in chunk {
+                let v = i as i128;
+                b.extend(views::transfer_deltas(MIXER, &holder(i), v, 1));
+                e.extend(exposure::exposure_deltas(MIXER, &holder(i), v, 1, &labels));
+            }
+            want_balances.apply(b);
+            want_exposure.apply(e);
+        }
+        want_balances.flush();
+        want_exposure.flush();
+
+        assert_eq!(want_balances.holders(), N as usize + 1, "premise");
+        assert_eq!(balances.holders(), want_balances.holders());
+        assert_eq!(balances.top(usize::MAX), want_balances.top(usize::MAX));
+        assert_eq!(want_exposure.entries(), N as usize, "premise");
+        assert_eq!(exposure_v.entries(), want_exposure.entries());
+        for i in (1..=N).step_by(997).chain([N]) {
+            assert_eq!(
+                exposure_v.exposure(&holder(i)),
+                want_exposure.exposure(&holder(i))
+            );
+        }
+    }
+
     /// #2171: a sealed transfer table the cold seed cannot read fails the rebuild, rather than
     /// rebuilding the views from the hot tail and calling that complete.
     #[test]

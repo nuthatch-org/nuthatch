@@ -91,33 +91,55 @@ impl BalanceCircuit {
         balances: &mut HashMap<String, i128>,
     ) -> Result<()> {
         self.input.append(&mut batch);
-        self.circuit
-            .transaction()
-            .map_err(|e| anyhow!("IVM transaction: {e}"))?;
+        let output = &self.output;
+        step_to_commit(&mut self.circuit, || fold_balances(output, balances))
+            .map_err(|e| anyhow!("IVM transaction: {e}"))
+    }
+}
 
-        // The aggregate emits a change stream: a key whose balance moves from old→new appears as
-        // (key,old,−1) and (key,new,+1); a key falling to zero appears only as (key,old,−1).
-        let changes = self.output.consolidate();
-        let mut set: HashMap<String, i128> = HashMap::new();
-        let mut cleared: Vec<String> = Vec::new();
-        changes
-            .iter()
-            .for_each(|(rec, (), weight): (Tup2<String, i128>, (), i64)| {
-                if weight > 0 {
-                    set.insert(rec.0.clone(), rec.1);
-                } else if weight < 0 {
-                    cleared.push(rec.0);
-                }
-            });
-        for (k, v) in set.iter() {
-            balances.insert(k.clone(), *v);
+/// Run one transaction to completion, calling `drain` after each of its steps. DBSP splits a large
+/// input into internal steps of 10,000 rows and each overwrites the output handles, so reading them
+/// once after `transaction()` keeps only the last step's changes (#2268).
+pub(crate) fn step_to_commit(
+    circuit: &mut dbsp::DBSPHandle,
+    mut drain: impl FnMut(),
+) -> Result<(), dbsp::Error> {
+    circuit.start_transaction()?;
+    circuit.start_commit_transaction()?;
+    loop {
+        let complete = circuit.step()?;
+        drain();
+        if complete {
+            return Ok(());
         }
-        for k in cleared {
-            if !set.contains_key(&k) {
-                balances.remove(&k); // balance returned to zero → drop the key
+    }
+}
+
+fn fold_balances(
+    output: &OutputHandle<OrdZSet<Tup2<String, i128>>>,
+    balances: &mut HashMap<String, i128>,
+) {
+    // The aggregate emits a change stream: a key whose balance moves from old→new appears as
+    // (key,old,−1) and (key,new,+1); a key falling to zero appears only as (key,old,−1).
+    let changes = output.consolidate();
+    let mut set: HashMap<String, i128> = HashMap::new();
+    let mut cleared: Vec<String> = Vec::new();
+    changes
+        .iter()
+        .for_each(|(rec, (), weight): (Tup2<String, i128>, (), i64)| {
+            if weight > 0 {
+                set.insert(rec.0.clone(), rec.1);
+            } else if weight < 0 {
+                cleared.push(rec.0);
             }
+        });
+    for (k, v) in set.iter() {
+        balances.insert(k.clone(), *v);
+    }
+    for k in cleared {
+        if !set.contains_key(&k) {
+            balances.remove(&k); // balance returned to zero → drop the key
         }
-        Ok(())
     }
 }
 
@@ -301,6 +323,22 @@ mod tests {
         );
         assert_eq!(transfer_value("0"), Some(0));
         assert_eq!(transfer_value("x"), None);
+    }
+
+    /// #2268: DBSP runs a large batch as several internal steps of 10,000 rows, so a batch the size
+    /// of a restart seed must keep every step's changes, not only the last's.
+    #[test]
+    fn one_batch_larger_than_a_dbsp_step_keeps_every_holder() {
+        let mut circuit = BalanceCircuit::new().unwrap();
+        let mut balances = HashMap::new();
+        let batch: WeightedBatch = (0..25_000)
+            .flat_map(|i| transfer_deltas("0xminter", &format!("0x{i:040x}"), 1, 1))
+            .collect();
+        circuit.step(batch, &mut balances).unwrap();
+
+        assert_eq!(balances.len(), 25_001, "25,000 holders and the minter");
+        assert_eq!(balances.get("0xminter"), Some(&-25_000));
+        assert!((0..25_000).all(|i| balances.get(&format!("0x{i:040x}")) == Some(&1)));
     }
 
     #[test]
