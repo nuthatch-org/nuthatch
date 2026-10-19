@@ -349,12 +349,18 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                     ),
                     self.minted(a, b)
                 )?;
-                Ok::<_, anyhow::Error>((b, r, block, trace, minted))
+                // A fee recipient is paid the block's priority fees outside any frame (#2116).
+                let tips = if field(&block, "miner").eq_ignore_ascii_case(a) {
+                    self.priority_fees(&block, b).await?
+                } else {
+                    0
+                };
+                Ok::<_, anyhow::Error>((b, r, block, trace, minted + tips))
             })
             .buffered(RESIDUAL_CONCURRENCY)
             .try_collect()
             .await?;
-        for (b, r, block, trace, minted) in traced {
+        for (b, r, block, trace, unframed) in traced {
             let txs = block
                 .get("transactions")
                 .and_then(Value::as_array)
@@ -370,7 +376,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 );
             }
             let block_hash = word32(field(&block, "hash"))?;
-            let mut credited = minted;
+            let mut credited = unframed;
             for (t, f) in txs.iter().zip(frames) {
                 let hash = field(t, "hash").to_ascii_lowercase();
                 if let Some(h) = f.get("txHash").and_then(Value::as_str) {
@@ -447,6 +453,44 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         Ok(sum)
     }
 
+    /// Block `b`'s priority fees, which its fee recipient is paid outside any call frame: each
+    /// transaction's gas used times what it paid over the base fee. Equal to the recipient's balance
+    /// rise to the wei on Gnosis (six blocks, 2026-10-20).
+    async fn priority_fees(&self, block: &Value, b: u64) -> Result<u128> {
+        let base = wei(block.get("baseFeePerGas"))?;
+        let receipts = self
+            .main
+            .call("eth_getBlockReceipts", json!([format!("0x{b:x}")]))
+            .await?;
+        let receipts = receipts
+            .as_array()
+            .ok_or_else(|| anyhow!("eth_getBlockReceipts {b} answered a non-list"))?;
+        let txs = block
+            .get("transactions")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        if receipts.len() != txs {
+            bail!(
+                "block {b} holds {txs} transactions and {} receipts",
+                receipts.len()
+            );
+        }
+        let mut sum = 0u128;
+        for r in receipts {
+            if !field(r, "blockHash").eq_ignore_ascii_case(field(block, "hash")) {
+                bail!("block {b}'s receipts are from another block");
+            }
+            let tip = wei(r.get("effectiveGasPrice"))?
+                .checked_sub(base)
+                .ok_or_else(|| anyhow!("a transaction in block {b} paid under the base fee"))?;
+            sum = wei(r.get("gasUsed"))?
+                .checked_mul(tip)
+                .and_then(|fee| sum.checked_add(fee))
+                .ok_or_else(|| anyhow!("block {b}'s priority fees overflow"))?;
+        }
+        Ok(sum)
+    }
+
     async fn balance_at(&self, a: &str, block: u64) -> Result<u128> {
         let v = self
             .main
@@ -482,6 +526,7 @@ mod tests {
     const A: &str = "0x00000000000000000000000000000000000000aa";
     const B: &str = "0x00000000000000000000000000000000000000bb";
     const C: &str = "0x00000000000000000000000000000000000000cc";
+    const BASE_FEE: u128 = 3;
 
     /// One transaction on the simulated chain. `inner` are value frames under the root, each
     /// `(to, value, reverted)`.
@@ -524,6 +569,8 @@ mod tests {
         mints: Vec<(u64, u128)>,
         /// Value taken from the account by code no transaction of its own sent: (block, value).
         drain: Option<(u64, u128)>,
+        /// Blocks the account proposed, paid each transaction's fee over [`BASE_FEE`] outside any frame.
+        proposed: Vec<u64>,
         asked: Mutex<Vec<String>>,
     }
 
@@ -537,6 +584,7 @@ mod tests {
                 understate_l1: 0,
                 mints: vec![],
                 drain: None,
+                proposed: vec![],
                 asked: Mutex::new(vec![]),
             }
         }
@@ -589,6 +637,12 @@ mod tests {
                     .filter(|t| t.block <= b)
                     .map(Self::debited)
                     .sum::<u128>()
+                + self
+                    .txs
+                    .iter()
+                    .filter(|t| t.block <= b && self.proposed.contains(&t.block))
+                    .map(|t| t.fee.0 * (t.fee.1 - BASE_FEE))
+                    .sum::<u128>()
         }
         fn nonce(&self, b: u64) -> u64 {
             (self
@@ -632,7 +686,8 @@ mod tests {
                         if let Some(m) = t.mint { j["mint"] = q(m); }
                         j
                     }).collect();
-                    json!({"number": format!("0x{b:x}"), "hash": format!("0x{:064x}", b), "transactions": txs})
+                    json!({"number": format!("0x{b:x}"), "hash": format!("0x{:064x}", b), "transactions": txs,
+                        "miner": if self.proposed.contains(&b) { A } else { C }, "baseFeePerGas": q(BASE_FEE)})
                 }
                 "eth_getTransactionReceipt" => {
                     let i = usize::from_str_radix(
@@ -644,6 +699,13 @@ mod tests {
                     let t = &self.txs[i];
                     json!({"status": if t.ok { "0x1" } else { "0x0" }, "gasUsed": q(t.fee.0),
                         "effectiveGasPrice": q(t.fee.1), "l1Fee": q(t.fee.2 - self.understate_l1)})
+                }
+                "eth_getBlockReceipts" => {
+                    let b = block_of(&params[0]);
+                    let receipts: Vec<Value> = self.txs.iter().filter(|t| t.block == b).map(|t| {
+                        json!({"blockHash": format!("0x{:064x}", b), "gasUsed": q(t.fee.0), "effectiveGasPrice": q(t.fee.1)})
+                    }).collect();
+                    json!(receipts)
                 }
                 "debug_traceBlockByNumber" => {
                     let b = block_of(&params[0]);
@@ -697,6 +759,23 @@ mod tests {
     /// Outgoing from the nonce, incoming from the residual, and only the blocks that credit the
     /// account traced: a failed send, a self-send, a refund inside its own swap, a reverted credit
     /// and a deposit from L1 all land where they belong.
+    /// #2116: a fee recipient is paid its blocks' priority fees with no frame and no log, so every
+    /// block it proposed failed the books and the window was retried for ever.
+    #[tokio::test]
+    async fn a_fee_recipients_priority_fees_balance_its_books() {
+        let mut sim = Sim::new(vec![tx(200, B, A, 40), tx(250, B, C, 5), tx(250, C, B, 6)]);
+        sim.proposed = vec![250];
+        let d = discoverer(sim);
+        let r = d
+            .residual_transactions(A, 0, 1_000)
+            .await
+            .expect("the proposed block's fees are credited");
+        assert_eq!(found(&r).0, vec![(Sim::hash(0), false, false)]);
+        let mut traced = d.main.traced();
+        traced.sort();
+        assert_eq!(traced, vec![200, 250]);
+    }
+
     #[tokio::test]
     async fn the_residual_finds_the_history_and_traces_only_crediting_blocks() {
         let mut failed = tx(300, A, B, 5);

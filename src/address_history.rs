@@ -363,6 +363,14 @@ const HEAD: &str = "head";
 /// The newest block served on demand above the finalized head.
 const TIP: &str = "tip";
 const GENERATION: &str = "generation";
+/// Every account row and cached transaction above the finalized head, keyed `block | tag | id` (an
+/// action's code and an address, or a cache's tag and a hash), so a reorg finds what it takes back
+/// as one range read instead of visiting every watched address (#2117). Pruned as finality passes.
+const REORGABLE: TableDefinition<&[u8], u8> = TableDefinition::new("ah_reorgable");
+/// Set once [`REORGABLE`] holds everything above the head, which a store written before it did not.
+const REORGABLE_COMPLETE: &str = "reorgable_complete";
+const TX_CACHE_TAG: u8 = 0xf0;
+const TX_INTERNAL_TAG: u8 = 0xf1;
 
 const KEY_LEN: usize = 20 + 8 * 3;
 
@@ -373,6 +381,60 @@ fn row_key(a: &Address, block: u64, tx_index: u64, position: u64) -> [u8; KEY_LE
     k[28..36].copy_from_slice(&tx_index.to_be_bytes());
     k[36..].copy_from_slice(&position.to_be_bytes());
     k
+}
+
+fn reorgable_key(block: u64, tag: u8, id: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(9 + id.len());
+    k.extend_from_slice(&block.to_be_bytes());
+    k.push(tag);
+    k.extend_from_slice(id);
+    k
+}
+
+/// The block a cached transaction or trace names; one without is taken back by any reorg.
+fn cached_block(record: &[u8]) -> Result<u64> {
+    Ok(decode_record(record)?
+        .get("blockNumber")
+        .and_then(Value::as_str)
+        .and_then(|b| b.parse::<u64>().ok())
+        .unwrap_or(u64::MAX))
+}
+
+/// Fill [`REORGABLE`] from a store written before it, once: one pass over the rows and caches.
+fn index_reorgable(wtx: &redb::WriteTransaction) -> Result<()> {
+    let head = {
+        let m = wtx.open_table(META)?;
+        if m.get(REORGABLE_COMPLETE)?.is_some() {
+            return Ok(());
+        }
+        let head = m.get(HEAD)?.map(|v| v.value());
+        head
+    };
+    let above = |b: u64| head.is_none_or(|h| b > h);
+    let mut index = wtx.open_table(REORGABLE)?;
+    for action in Action::ALL {
+        let t = wtx.open_table(action.table())?;
+        for e in t.iter()? {
+            let (k, _) = e?;
+            let k = k.value();
+            let block = u64::from_be_bytes(k[20..28].try_into().expect("row keys are 44 bytes"));
+            if above(block) {
+                index.insert(reorgable_key(block, action.code(), &k[..20]).as_slice(), 1)?;
+            }
+        }
+    }
+    for (table, tag) in [(TX_CACHE, TX_CACHE_TAG), (TX_INTERNAL, TX_INTERNAL_TAG)] {
+        let t = wtx.open_table(table)?;
+        for e in t.iter()? {
+            let (k, v) = e?;
+            let block = cached_block(v.value())?;
+            if above(block) {
+                index.insert(reorgable_key(block, tag, k.value()).as_slice(), 1)?;
+            }
+        }
+    }
+    wtx.open_table(META)?.insert(REORGABLE_COMPLETE, 1)?;
+    Ok(())
 }
 
 fn coverage_key(a: &Address, action: Action) -> [u8; 21] {
@@ -447,13 +509,18 @@ pub struct AddressHistory {
 }
 
 /// Whether the store at `path` holds history from before finalized hashes were recorded (a
-/// committed head and none of them), and if so the accounts it watched. Read without writing, so a
-/// store moved aside for it is moved intact.
-pub fn pre_finality(path: &std::path::Path) -> Result<Option<Accounts>> {
+/// committed head and none of them), and if so the accounts it watched. Unless `repair` is set, a
+/// store redb would have to repair is refused with [`redb::DatabaseError::RepairAborted`] rather
+/// than repaired, so a store moved aside for it is moved as it was.
+pub fn pre_finality(path: &std::path::Path, repair: bool) -> Result<Option<Accounts>> {
     if !path.exists() {
         return Ok(None);
     }
-    let db = redb::Database::open(path)?;
+    let mut builder = redb::Builder::new();
+    if !repair {
+        builder.set_repair_callback(redb::RepairSession::abort);
+    }
+    let db = builder.open(path)?;
     let rtx = db.begin_read()?;
     let head = match rtx.open_table(META) {
         Ok(t) => t.get(HEAD)?.map(|v| v.value()),
@@ -515,6 +582,16 @@ fn finalize_in(wtx: &redb::WriteTransaction, block: u64) -> Result<()> {
     if head.is_none_or(|h| block > h) {
         m.insert(HEAD, block)?;
     }
+    {
+        let mut index = wtx.open_table(REORGABLE)?;
+        let settled: Vec<Vec<u8>> = index
+            .range(..reorgable_key(block.saturating_add(1), 0, &[]).as_slice())?
+            .map(|e| e.map(|(k, _)| k.value().to_vec()))
+            .collect::<std::result::Result<_, _>>()?;
+        for k in settled {
+            index.remove(k.as_slice())?;
+        }
+    }
     let mut c = wtx.open_table(CANON)?;
     let done: Vec<u64> = c
         .range(..=block)?
@@ -560,7 +637,9 @@ impl AddressHistory {
         wtx.open_table(UNPROVABLE)?;
         wtx.open_table(DEPOSITS)?;
         wtx.open_table(LIVE_DEPOSITS)?;
+        wtx.open_table(REORGABLE)?;
         reset_produced_blocks(&wtx)?;
+        index_reorgable(&wtx)?;
         {
             let dropped = wtx.open_table(UNWATCHED)?;
             let mut w = wtx.open_table(WATCHED)?;
@@ -677,6 +756,10 @@ impl AddressHistory {
                     buf.clear();
                     encode_record(record, &mut buf)?;
                     t.insert(hash.as_slice(), buf.as_slice())?;
+                    if let Some(b) = block.filter(|b| head.is_none_or(|h| *b > h)) {
+                        wtx.open_table(REORGABLE)?
+                            .insert(reorgable_key(b, TX_CACHE_TAG, hash).as_slice(), 1)?;
+                    }
                 }
             }
             {
@@ -716,6 +799,10 @@ impl AddressHistory {
                     buf.clear();
                     encode_record(&wrapped, &mut buf)?;
                     t.insert(hash.as_slice(), buf.as_slice())?;
+                    if head.is_none_or(|h| *block > h) {
+                        wtx.open_table(REORGABLE)?
+                            .insert(reorgable_key(*block, TX_INTERNAL_TAG, hash).as_slice(), 1)?;
+                    }
                 }
             }
             {
@@ -1859,30 +1946,72 @@ impl AddressHistory {
     pub fn invalidate_above(&self, block: u64) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
         {
+            // What the index lists above the fork, for a reorg at or above the finalized head, the
+            // only kind the cursor takes back. Anything lower walks every holder and cache.
+            let reorged: Option<Vec<Vec<u8>>> = {
+                let (complete, head) = {
+                    let m = wtx.open_table(META)?;
+                    let complete = m.get(REORGABLE_COMPLETE)?.is_some();
+                    let head = m.get(HEAD)?.map(|v| v.value());
+                    (complete, head)
+                };
+                match block.checked_add(1) {
+                    Some(above) if complete && head.is_none_or(|h| block >= h) => Some(
+                        wtx.open_table(REORGABLE)?
+                            .range(reorgable_key(above, 0, &[]).as_slice()..)?
+                            .map(|e| e.map(|(k, _)| k.value().to_vec()))
+                            .collect::<std::result::Result<_, _>>()?,
+                    ),
+                    _ => None,
+                }
+            };
+            let tagged = |keys: &[Vec<u8>], tag: u8| -> Vec<Vec<u8>> {
+                keys.iter()
+                    .filter(|k| k[8] == tag)
+                    .map(|k| k[9..].to_vec())
+                    .collect()
+            };
             let mut c = wtx.open_table(COVERAGE)?;
             let entries: Vec<(Vec<u8>, Vec<u8>)> = c
                 .iter()?
                 .map(|e| e.map(|(k, v)| (k.value().to_vec(), v.value().to_vec())))
                 .collect::<std::result::Result<_, _>>()?;
-            // Rows can outlive their coverage (a fetch stored them, then a reorg cut the span), so
-            // the addresses to drain are every watched one and every covered one, not coverage alone.
-            let mut holders: std::collections::BTreeSet<Address> = wtx
-                .open_table(WATCHED)?
-                .iter()?
-                .map(|e| e.map(|(k, _)| k.value().try_into().expect("watched keys are 20 bytes")))
-                .collect::<std::result::Result<_, _>>()?;
-            holders.extend(entries.iter().map(|(k, _)| -> Address {
-                k[..20].try_into().expect("coverage keys are 21 bytes")
-            }));
             if let Some(above) = block.checked_add(1) {
-                for a in &holders {
-                    for action in Action::ALL {
-                        drain(
-                            &mut wtx.open_table(action.table())?,
-                            &row_key(a, above, 0, 0),
-                            &row_key(a, u64::MAX, u64::MAX, u64::MAX),
-                        )?;
+                let drained: Vec<(Action, Address)> = match &reorged {
+                    Some(keys) => keys
+                        .iter()
+                        .filter_map(|k| {
+                            let action = Action::ALL.into_iter().find(|a| a.code() == k[8])?;
+                            Some((action, k[9..].try_into().expect("row ids are 20 bytes")))
+                        })
+                        .collect(),
+                    None => {
+                        // Rows can outlive their coverage (a fetch stored them, then a reorg cut
+                        // the span), so every watched address and every covered one is drained.
+                        let mut holders: std::collections::BTreeSet<Address> = wtx
+                            .open_table(WATCHED)?
+                            .iter()?
+                            .map(|e| {
+                                e.map(|(k, _)| {
+                                    k.value().try_into().expect("watched keys are 20 bytes")
+                                })
+                            })
+                            .collect::<std::result::Result<_, _>>()?;
+                        holders.extend(entries.iter().map(|(k, _)| -> Address {
+                            k[..20].try_into().expect("coverage keys are 21 bytes")
+                        }));
+                        holders
+                            .into_iter()
+                            .flat_map(|a| Action::ALL.map(|action| (action, a)))
+                            .collect()
                     }
+                };
+                for (action, a) in drained {
+                    drain(
+                        &mut wtx.open_table(action.table())?,
+                        &row_key(&a, above, 0, 0),
+                        &row_key(&a, u64::MAX, u64::MAX, u64::MAX),
+                    )?;
                 }
             }
             for (key, spans) in entries {
@@ -1955,42 +2084,36 @@ impl AddressHistory {
                     relays.remove(b)?;
                 }
             }
-            {
-                // A trace of a block the reorg replaced describes a transaction that may no longer
-                // exist there; a txhash lookup must trace it again.
-                let mut traces = wtx.open_table(TX_INTERNAL)?;
-                let mut stale = Vec::new();
-                for e in traces.iter()? {
-                    let (k, v) = e?;
-                    let cached = decode_record(v.value())?
-                        .get("blockNumber")
-                        .and_then(Value::as_str)
-                        .and_then(|b| b.parse::<u64>().ok());
-                    if cached.is_none_or(|b| b > block) {
-                        stale.push(k.value().to_vec());
+            // A trace of a block the reorg replaced describes a transaction that may no longer exist
+            // there, so a txhash lookup must trace it again; and a transaction re-included elsewhere
+            // keeps its hash, so a cached copy would bring back its old block, index and receipt.
+            for (table, tag) in [(TX_INTERNAL, TX_INTERNAL_TAG), (TX_CACHE, TX_CACHE_TAG)] {
+                let mut t = wtx.open_table(table)?;
+                let stale = match &reorged {
+                    Some(keys) => tagged(keys, tag),
+                    None => {
+                        let mut stale = Vec::new();
+                        for e in t.iter()? {
+                            let (k, v) = e?;
+                            if cached_block(v.value())? > block {
+                                stale.push(k.value().to_vec());
+                            }
+                        }
+                        stale
                     }
-                }
+                };
                 for k in stale {
-                    traces.remove(k.as_slice())?;
+                    t.remove(k.as_slice())?;
                 }
             }
             {
-                // A transaction re-included elsewhere keeps its hash, so a cached copy would bring
-                // back its old block, index and receipt.
-                let mut txs = wtx.open_table(TX_CACHE)?;
-                let mut stale = Vec::new();
-                for e in txs.iter()? {
-                    let (k, v) = e?;
-                    let cached = decode_record(v.value())?
-                        .get("blockNumber")
-                        .and_then(Value::as_str)
-                        .and_then(|b| b.parse::<u64>().ok());
-                    if cached.is_none_or(|b| b > block) {
-                        stale.push(k.value().to_vec());
-                    }
-                }
-                for k in stale {
-                    txs.remove(k.as_slice())?;
+                let mut index = wtx.open_table(REORGABLE)?;
+                let above: Vec<Vec<u8>> = index
+                    .range(reorgable_key(block.saturating_add(1), 0, &[]).as_slice()..)?
+                    .map(|e| e.map(|(k, _)| k.value().to_vec()))
+                    .collect::<std::result::Result<_, _>>()?;
+                for k in above {
+                    index.remove(k.as_slice())?;
                 }
             }
             {
@@ -2220,6 +2343,8 @@ impl AddressHistory {
 
 fn put_rows(wtx: &redb::WriteTransaction, action: Action, a: &Address, rows: &[Row]) -> Result<()> {
     let mut t = wtx.open_table(action.table())?;
+    let head = wtx.open_table(META)?.get(HEAD)?.map(|v| v.value());
+    let mut index = wtx.open_table(REORGABLE)?;
     let mut buf = Vec::new();
     for r in rows {
         let claimed = r.record.get("blockNumber").and_then(Value::as_str);
@@ -2236,6 +2361,9 @@ fn put_rows(wtx: &redb::WriteTransaction, action: Action, a: &Address, rows: &[R
             row_key(a, r.block, r.tx_index, r.position).as_slice(),
             buf.as_slice(),
         )?;
+        if head.is_none_or(|h| r.block > h) {
+            index.insert(reorgable_key(r.block, action.code(), a).as_slice(), 1)?;
+        }
     }
     Ok(())
 }
@@ -3324,6 +3452,68 @@ mod tests {
                 .starts_with("NUTHATCH_UNSUPPORTED:"),
             "{none}"
         );
+    }
+
+    /// #2117: a reorg reads what it takes back from a block-first index. A store written before the
+    /// index is indexed once at open, so its rows and cached transactions above the head still go.
+    #[test]
+    fn a_store_from_before_the_reorg_index_is_indexed_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let bob = parse_address(BOB).unwrap();
+        {
+            let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+            h.finalize(100).unwrap();
+            h.insert(Action::TxList, ALICE, &[tx(90, 0), tx(105, 0)])
+                .unwrap();
+            // Rows of an address neither watched nor covered still go: a fetch can outlive both.
+            h.insert(Action::TokenTx, BOB, &[tx(106, 0)]).unwrap();
+            let g = h.generation().unwrap();
+            h.persist_pending(
+                &[
+                    (vec![1; 32], tx(105, 0).record),
+                    (vec![2; 32], tx(90, 0).record),
+                ],
+                &[],
+                &[],
+                &[],
+                &[],
+                g,
+                None,
+                true,
+            )
+            .unwrap();
+            let wtx = h.store.database().begin_write().unwrap();
+            wtx.open_table(REORGABLE)
+                .unwrap()
+                .retain(|_, _| false)
+                .unwrap();
+            wtx.open_table(META)
+                .unwrap()
+                .remove(REORGABLE_COMPLETE)
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        let h = AddressHistory::open(Store::open(&path).unwrap(), 1, &[ALICE.into()]).unwrap();
+        h.invalidate_above(100).unwrap();
+        let blocks = |action, a: &Address| -> Vec<u64> {
+            let rtx = h.store.database().begin_read().unwrap();
+            let t = rtx.open_table(Action::table(action)).unwrap();
+            t.range(
+                row_key(a, 0, 0, 0).as_slice()
+                    ..=row_key(a, u64::MAX, u64::MAX, u64::MAX).as_slice(),
+            )
+            .unwrap()
+            .map(|e| u64::from_be_bytes(e.unwrap().0.value()[20..28].try_into().unwrap()))
+            .collect()
+        };
+        assert_eq!(
+            blocks(Action::TxList, &parse_address(ALICE).unwrap()),
+            vec![90]
+        );
+        assert_eq!(blocks(Action::TokenTx, &bob), Vec::<u64>::new());
+        assert!(h.cached_tx(&[1; 32]).unwrap().is_none());
+        assert!(h.cached_tx(&[2; 32]).unwrap().is_some());
     }
 
     #[test]
@@ -4769,5 +4959,69 @@ mod tests {
             h.mark_covered(action, who, 0, 20_000_000).unwrap();
         }
         h.set_head(20_000_000).unwrap();
+    }
+
+    /// Times a reorg and the watched-set reads at `$NUTHATCH_AH_WATCHED` addresses (default
+    /// 1,000,000, RFC-0064's size), for #2117:
+    /// `cargo test --release --lib measure_a_reorg_at_scale -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn measure_a_reorg_at_scale() {
+        let n: usize =
+            std::env::var("NUTHATCH_AH_WATCHED").map_or(1_000_000, |v| v.parse().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let h =
+            AddressHistory::open(Store::open(&dir.path().join("t.redb")).unwrap(), 1, &[]).unwrap();
+        let addrs: Vec<String> = (1..=n).map(|i| format!("0x{i:040x}")).collect();
+        h.watch_many(&addrs).unwrap();
+        let head = 20_000_000;
+        h.finalize(head).unwrap();
+        for (i, a) in addrs.iter().take(1_000).enumerate() {
+            let rows: Vec<Row> = (0..20)
+                .map(|j| tx(head - 20_000 + j * 1_000, i as u64))
+                .collect();
+            h.insert(Action::TxList, a, &rows).unwrap();
+        }
+        for a in addrs.iter().take(100) {
+            h.insert(Action::TokenTx, a, &[tx(head + 5, 0)]).unwrap();
+        }
+        let g = h.generation().unwrap();
+        let txs: Vec<(Vec<u8>, Map<String, Value>)> = (0..200_000u64)
+            .map(|i| (i.to_be_bytes().repeat(4), tx(head - 200_000 + i, 0).record))
+            .chain((0..100u64).map(|i| {
+                (
+                    (u64::MAX - i).to_be_bytes().repeat(4),
+                    tx(head + 5, 0).record,
+                )
+            }))
+            .collect();
+        h.persist_pending(&txs, &[], &[], &[], &[], g, None, true)
+            .unwrap();
+        let t = std::time::Instant::now();
+        let w = h.watched().unwrap();
+        println!("watched(): {} addresses in {:?}", w.len(), t.elapsed());
+        let t = std::time::Instant::now();
+        assert!(h.is_watched(&addrs[n / 2]).unwrap());
+        println!("is_watched(): {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        assert_eq!(h.watched_count().unwrap(), n as u64);
+        println!("watched_count(): {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        h.invalidate_above(head + 2).unwrap();
+        println!("invalidate_above, {n} watched: {:?}", t.elapsed());
+        assert!(h
+            .cached_tx(&u64::MAX.to_be_bytes().repeat(4))
+            .unwrap()
+            .is_none());
+        assert!(h
+            .cached_tx(&0u64.to_be_bytes().repeat(4))
+            .unwrap()
+            .is_some());
+        let t = std::time::Instant::now();
+        let rows = h
+            .rows_in(Action::TokenTx, &addrs[0], (0, u64::MAX))
+            .unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+        println!("check: {:?}", t.elapsed());
     }
 }
