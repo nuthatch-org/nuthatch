@@ -13865,6 +13865,73 @@ template = "pool"
                 );
             }
         }
+
+        // A provider that refuses pass 2 wider than one block restarts the chunk with the children
+        // found so far already in pass 1's filter, so pass 1 fetches their earlier logs too.
+        struct NarrowChildPass(FilteringSource);
+        #[async_trait::async_trait]
+        impl Source for NarrowChildPass {
+            async fn tip(&self) -> Result<u64> {
+                self.0.tip().await
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                self.0.block_hash(n).await
+            }
+            async fn logs(
+                &self,
+                filter: &crate::source::LogFilter,
+                from: u64,
+                to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                let child_pass = !filter.addresses().is_empty()
+                    && !filter.addresses().iter().any(|a| {
+                        a.eq_ignore_ascii_case("0x0000000000000000000000000000000000000022")
+                    });
+                if child_pass && to > from {
+                    anyhow::bail!("Log response size exceeded for {from}..={to}");
+                }
+                self.0.logs(filter, from, to).await
+            }
+            async fn block_timestamps(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                self.0.block_timestamps(blocks).await
+            }
+        }
+        for window in [3u64, 12] {
+            let df = tempfile::tempdir().unwrap();
+            let fact = build_factory_test_nest(df.path()).await;
+            let source = NarrowChildPass(FilteringSource {
+                logs: factory_history_logs(&fact),
+            });
+            let out = tempfile::tempdir().unwrap();
+            backfill_direct_factory(
+                &source,
+                &fact.registry,
+                fact.factory.as_deref().unwrap(),
+                &mut ChildRegistry::new(),
+                out.path(),
+                &fact.topic0s,
+                &[],
+                None,
+                0,
+                1,
+                12,
+                window,
+                SPAN_OFF,
+                false,
+                |_| Ok(()),
+                |_, _, _| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                stored_row_keys(out.path(), None),
+                expected,
+                "seal-direct with pass 2 capped, window {window}"
+            );
+        }
     }
 
     /// An address-aware source whose logs can be swapped (a fork) and whose timestamp lookup can be
