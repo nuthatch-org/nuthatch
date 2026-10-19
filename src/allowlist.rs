@@ -547,6 +547,15 @@ mod tests {
         assert_eq!(narrow.clone().within(&c, "usdc").unwrap(), narrow);
     }
 
+    /// Only a missing `queries.toml` means no ceiling. One that exists and cannot be read is an
+    /// error, or the mount would serve free-form SQL past its author's ceiling.
+    #[test]
+    fn an_unreadable_ceiling_is_an_error_not_an_absent_one() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join(CEILING_FILE)).unwrap();
+        assert!(Ceiling::load(d.path()).is_err());
+    }
+
     /// No ceiling declared → phase 1's behaviour, unchanged. An author who has not opted in must not
     /// find their nest suddenly unmountable.
     #[test]
@@ -642,8 +651,11 @@ impl Ceiling {
     /// expose whatever its operator chooses (phase 1's behaviour, unchanged).
     pub fn load(nest_dir: &std::path::Path) -> Result<Option<Ceiling>> {
         let path = nest_dir.join(CEILING_FILE);
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            return Ok(None);
+        // Only a missing file means no ceiling; one that cannot be read must not open the mount.
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
         let ceiling: Ceiling =
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;

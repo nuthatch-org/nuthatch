@@ -500,6 +500,25 @@ async fn a_live_mount_wider_than_its_ceiling_is_refused() {
     );
 }
 
+/// #2135: a `queries.toml` that exists but cannot be read refuses the mount rather than opening it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_whose_ceiling_cannot_be_read_is_refused() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "ca".repeat(32);
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    std::fs::create_dir(runtime::MountTable::data_dir(roost.path(), &nid).join("queries.toml"))
+        .unwrap();
+    let err = handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect_err("a mount with an unreadable ceiling was accepted");
+    assert!(format!("{err:#}").contains("queries.toml"), "{err:#}");
+    assert!(
+        handles.states.is_empty(),
+        "a refused mount was left serving"
+    );
+}
+
 /// RFC-0027 §3: the three admission refusals, each decided **before** any work is done - no store
 /// opened, no block fetched, nothing left behind by a rejected mount.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
