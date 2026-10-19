@@ -297,6 +297,17 @@ impl BalanceView {
         }
     }
 
+    /// Take back `n` such transfers that a reorg rolled back (#2260).
+    pub fn retract_over_i128(&self, n: u64) {
+        if n > 0 {
+            let _ = self
+                .over_i128
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                    Some(c.saturating_sub(n))
+                });
+        }
+    }
+
     /// How many transfers these balances are missing because their value exceeds `i128`.
     ///
     /// Zero is the ordinary answer and means the balances are complete with respect to this cause.

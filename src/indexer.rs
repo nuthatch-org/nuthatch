@@ -7289,6 +7289,8 @@ impl NestIngest {
         // One conversion, both directions, and the views read the decoded rows as ingest does.
         self.retract_entities(&rows, ancestor).map_err(torn)?;
         self.balances.apply(retraction_batch(&rows));
+        self.balances
+            .retract_over_i128(rows.iter().filter(|r| oversized_transfer(r)).count() as u64);
         self.exposure
             .apply(exposure_retraction_batch(&rows, &self.labels));
         if let Some((_, w)) = self.velocity_cfg {
@@ -7575,6 +7577,7 @@ impl NestIngest {
         let mut deltas = Vec::new();
         let mut exp_deltas = Vec::new();
         let mut vel_deltas = Vec::new();
+        let mut oversized = 0u64;
         // PERF-2: accumulate every write and commit the whole window in ONE redb txn at the end,
         // instead of a `begin_write`/`commit` (fsync) per row. `(key, json)` for rows + annotations.
         let mut to_store: Vec<(String, String)> = Vec::with_capacity(rows.len());
@@ -7627,8 +7630,9 @@ impl NestIngest {
                 } else if value.is_some() {
                     // COR-8 (#814): a live transfer whose value exceeds 38 digits. Skipped here exactly
                     // as the cold fold skips it, so hot and sealed agree - but counted now, so the
-                    // balance says it is incomplete instead of looking complete.
-                    self.balances.note_over_i128(1);
+                    // balance says it is incomplete instead of looking complete. Noted once the
+                    // window commits, as a reorg retracts it from the stored row.
+                    oversized += 1;
                     tracing::warn!(
                         block = row.block_number,
                         log_index = row.log_index,
@@ -7815,6 +7819,7 @@ impl NestIngest {
             self.retract_folded_window(deltas, exp_deltas, vel_deltas);
             return Err(e);
         }
+        self.balances.note_over_i128(oversized);
         // Only now: a refused or failed window must not leave its children routing later logs (#2153).
         self.children.extend(found);
         if alerted {
@@ -8734,6 +8739,13 @@ fn view_transfer(row: &crate::registry::DecodedRow) -> Option<(String, String, i
     Some((from, to, value))
 }
 
+/// A transfer `view_transfer` passes over for its value alone, counted as `dropped_over_i128`.
+fn oversized_transfer(row: &crate::registry::DecodedRow) -> bool {
+    row.erc20_transfer_fields()
+        .and_then(|(_, _, value, _)| value)
+        .is_some_and(|v| crate::views::transfer_value(&v).is_none())
+}
+
 /// Build a weight −1 balance retraction batch from rolled-back rows (reorg).
 fn retraction_batch(rows: &[crate::registry::DecodedRow]) -> views::WeightedBatch {
     rows.iter()
@@ -8947,6 +8959,9 @@ fn rebuild_views(
         for v in rows.iter().rev() {
             let row = crate::registry::DecodedRow::from_stored(v, table_schema)?;
             let Some((from, to, val)) = view_transfer(&row) else {
+                if oversized_transfer(&row) {
+                    balances.note_over_i128(1);
+                }
                 continue;
             };
             balance_batch.extend(views::transfer_deltas(&from, &to, val, 1));
@@ -12843,6 +12858,31 @@ template = "pool"
                 "a {ty} `wad` must be retracted"
             );
         }
+    }
+
+    /// #2260: a reorg over a transfer too large for i128 takes it back out of `dropped_over_i128`.
+    #[tokio::test]
+    async fn a_reorg_retracts_an_oversized_transfer_from_the_dropped_count() {
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest_with(
+            d.path(),
+            "0x0000000000000000000000000000000000000008",
+            r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+            "",
+        )
+        .await;
+        let huge = format!(r#""1{}""#, "0".repeat(38));
+        nest.store
+            .put_entity(
+                &Store::entity_key(10, 0),
+                &tok_transfer(["from", "to", "value"], &huge),
+            )
+            .unwrap();
+        nest.store.set_meta(LAST_BLOCK_KEY, "10").unwrap();
+        nest.balances.note_over_i128(1);
+
+        nest.rollback_reorg(9).unwrap();
+        assert_eq!(nest.balances.dropped_over_i128(), 0);
     }
 
     /// #2164: a reorg over a threshold flag retracts the transfer from an entity and is not a fault.
@@ -25206,6 +25246,35 @@ rpc_urls = ["https://rpc.example"]
         )
         .unwrap();
         crate::labels::load(dir.path())
+    }
+
+    /// #2260: a restart counts the hot tail's oversized transfers, as the live loop did.
+    #[test]
+    fn a_rebuild_counts_an_oversized_transfer_in_the_hot_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let huge = format!("1{}", "0".repeat(38));
+        store
+            .put_entity(
+                &Store::entity_key(10, 0),
+                &transfer_row(10, 0, SENDER, Some(RECIPIENT), &huge),
+            )
+            .unwrap();
+        let balances = BalanceView::start().unwrap();
+        rebuild_views(
+            dir.path(),
+            &store,
+            &erc20_registry(),
+            &DerivedViews {
+                labels: &LabelSet::default(),
+                balances: &balances,
+                exposure: &ExposureView::start(true).unwrap(),
+                velocity: &VelocityView::start(true).unwrap(),
+                velocity_cfg: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(balances.dropped_over_i128(), 1);
     }
 
     /// The acceptance test for #294: collapsing three scans into one must leave the views **the same**,
