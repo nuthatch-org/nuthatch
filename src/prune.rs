@@ -62,6 +62,7 @@ pub fn collectable(dir: &Path) -> Result<Vec<Collectable>> {
         .with_context(|| format!("reading the mount table of {}", dir.display()))?;
     let mounted: std::collections::HashSet<&str> =
         mounts.mounts.iter().map(|m| m.nid.as_str()).collect();
+    let mounting = mounting(dir)?;
 
     let data = dir.join(DATA_DIR);
     let Ok(entries) = std::fs::read_dir(&data) else {
@@ -76,10 +77,10 @@ pub fn collectable(dir: &Path) -> Result<Vec<Collectable>> {
         let nid = e.file_name().to_string_lossy().to_string();
         // Only ever consider directories that *look* like datasets. A stray file or a directory an
         // operator dropped in here by hand is not ours to delete.
-        if nid.len() != 64 || !nid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !is_nid(&nid) {
             continue;
         }
-        if mounted.contains(nid.as_str()) {
+        if mounted.contains(nid.as_str()) || mounting.contains(&nid) {
             continue;
         }
         let path = e.path();
@@ -94,25 +95,68 @@ pub fn collectable(dir: &Path) -> Result<Vec<Collectable>> {
     Ok(out)
 }
 
+fn is_nid(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Every dataset directory under `data/`, mounted or not, and every adoption staging beside one,
+/// keyed by the NID each belongs to. An unmounted dataset is kept so a remount is free, so the
+/// segments its manifest names are as live as a mounted one's (#2128).
+fn dataset_dirs(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let data = dir.join(DATA_DIR);
+    let entries = match std::fs::read_dir(&data) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("listing {}", data.display())),
+    };
+    let mut out = Vec::new();
+    for e in entries {
+        let e = e.with_context(|| format!("listing {}", data.display()))?;
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        let nid = name.strip_suffix(".adopting").unwrap_or(&name);
+        if is_nid(nid) {
+            out.push((nid.to_string(), e.path()));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The datasets an unfinished mount job names. A job installs `data/<nid>` before the join records
+/// it, and a restart resumes the job, so these are not collectable either way (#2133).
+fn mounting(dir: &Path) -> Result<std::collections::HashSet<String>> {
+    let file = dir.join(crate::mount_jobs::JOBS_FILE);
+    let jobs: Vec<crate::mount_jobs::MountJob> = match std::fs::read(&file) {
+        Ok(raw) => serde_json::from_slice(&raw)
+            .with_context(|| format!("reading {}; nothing was collected", file.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
+    };
+    Ok(jobs
+        .into_iter()
+        .filter(|j| !j.phase.finished())
+        .filter_map(|j| j.nid)
+        .collect())
+}
+
 /// Every segment hash any surviving dataset still references (RFC-0033 §11a).
 ///
 /// **Derived from the manifests, never stored.** A stored count drifts, and here drift deletes bytes
 /// another dataset is reading - the one data-loss failure mode in the shared store, and the same
 /// reasoning as RFC-0032 §5's dataset refcount.
-fn referenced_segments(
-    dir: &Path,
-    surviving: &[String],
-) -> Result<std::collections::HashSet<String>> {
+fn referenced_segments(surviving: &[PathBuf]) -> Result<std::collections::HashSet<String>> {
     let mut out = std::collections::HashSet::new();
-    for nid in surviving {
+    for dataset in surviving {
         // Skipping a manifest that will not read made every segment it names an orphan.
-        let manifest =
-            crate::seal::load_manifest(&MountTable::data_dir(dir, nid)).with_context(|| {
-                format!(
-                    "reading the manifest of mounted dataset data/{}; nothing was collected",
-                    &nid[..nid.len().min(12)]
-                )
-            })?;
+        let manifest = crate::seal::load_manifest(dataset).with_context(|| {
+            format!(
+                "reading the manifest of {}; nothing was collected",
+                dataset.display()
+            )
+        })?;
         for segs in manifest.tables.values() {
             for s in segs {
                 out.insert(s.hash.clone());
@@ -138,8 +182,9 @@ fn store_is_held(dataset: &Path) -> bool {
 }
 
 /// Shared segments no surviving dataset references, with their sizes.
-fn orphan_segments(dir: &Path, surviving: &[String]) -> Result<Vec<(PathBuf, u64)>> {
-    let referenced = referenced_segments(dir, surviving)?;
+fn orphan_segments(dir: &Path) -> Result<Vec<(PathBuf, u64)>> {
+    let surviving: Vec<PathBuf> = dataset_dirs(dir)?.into_iter().map(|(_, p)| p).collect();
+    let referenced = referenced_segments(&surviving)?;
     let Ok(entries) = std::fs::read_dir(dir.join(crate::seal::SEGMENTS_DIR)) else {
         return Ok(Vec::new());
     };
@@ -215,10 +260,7 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
     }
     crate::crash::point("prune:after-datasets");
 
-    let surviving: Vec<String> = MountTable::load(dir)
-        .map(|r| r.mounts.iter().map(|m| m.nid.clone()).collect())
-        .unwrap_or_default();
-    let orphans = orphan_segments(dir, &surviving)?;
+    let orphans = orphan_segments(dir)?;
     let mut freed_segments = 0u64;
     for (path, size) in &orphans {
         if crate::seal::remove_segment_if_unheld(path)? {
@@ -240,11 +282,10 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
 /// A query in a running runtime can have planned against a shared segment a fold has since
 /// replaced, and its lease does not reach this process.
 fn refuse_while_a_store_is_open(dir: &Path) -> Result<()> {
-    if let Some(nid) = MountTable::load(dir)?
-        .mounts
-        .iter()
-        .map(|m| m.nid.clone())
-        .find(|nid| store_is_held(&MountTable::data_dir(dir, nid)))
+    // Every dataset, not only recorded ones: a live mount opens its store before it is recorded (#2133).
+    if let Some((nid, _)) = dataset_dirs(dir)?
+        .into_iter()
+        .find(|(nid, path)| *path == MountTable::data_dir(dir, nid) && store_is_held(path))
     {
         anyhow::bail!(
             "data/{} is open in a running runtime: removing shared segments now could delete one a \
@@ -258,12 +299,7 @@ fn refuse_while_a_store_is_open(dir: &Path) -> Result<()> {
 /// With no dataset left to remove, the segments no mounted dataset references: what a prune killed
 /// between removing its datasets and its orphan pass leaves behind, and what a fold replaces (#1717).
 fn collect_leftover_segments(dir: &Path, yes: bool) -> Result<()> {
-    let mounted: Vec<String> = MountTable::load(dir)?
-        .mounts
-        .iter()
-        .map(|m| m.nid.clone())
-        .collect();
-    let orphans = orphan_segments(dir, &mounted)?;
+    let orphans = orphan_segments(dir)?;
     if orphans.is_empty() {
         println!(
             "Nothing to prune in {} - every dataset is mounted.",
@@ -346,10 +382,12 @@ pub fn reclaim(dir: &Path, nid: &str) -> Result<Reclaim> {
         );
     }
 
-    let mut surviving: Vec<String> = mounts.mounts.iter().map(|m| m.nid.clone()).collect();
-    surviving.sort();
-    surviving.dedup();
-    let referenced = referenced_segments(dir, &surviving)?;
+    let surviving: Vec<PathBuf> = dataset_dirs(dir)?
+        .into_iter()
+        .filter(|(other, _)| other != nid)
+        .map(|(_, p)| p)
+        .collect();
+    let referenced = referenced_segments(&surviving)?;
     let own = crate::seal::load_manifest(&data)
         .with_context(|| format!("reading the manifest of data/{}", &nid[..nid.len().min(12)]))?;
     let segments = dir.join(crate::seal::SEGMENTS_DIR);
@@ -883,5 +921,120 @@ mod tests {
         )
         .unwrap();
         assert!(collectable(d.path()).unwrap().is_empty());
+    }
+
+    /// A manifest at `data/<name>/segments/manifest.json` naming `hashes` in table `t`.
+    fn manifest_naming(root: &Path, name: &str, hashes: &[&str]) {
+        let dir = root
+            .join(DATA_DIR)
+            .join(name)
+            .join(crate::seal::SEGMENTS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut m = crate::seal::Manifest::default();
+        m.tables.insert(
+            "t".to_string(),
+            hashes
+                .iter()
+                .map(|h| crate::seal::Segment {
+                    hash: h.to_string(),
+                    from_block: 1,
+                    to_block: 2,
+                    rows: 1,
+                    file: format!("t-{h}.parquet"),
+                    registry_snapshot: None,
+                    provisional: false,
+                    writer_profile: crate::seal::ORIGINAL_WRITER_PROFILE.to_string(),
+                    input_hash: None,
+                })
+                .collect(),
+        );
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string(&m).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// #2128: an unmounted dataset is kept so a remount is free, so a segment it shares with the one
+    /// reclaimed is not the reclaimed one's alone. Nor is one an adoption is staging.
+    #[test]
+    fn reclaim_keeps_a_segment_an_unmounted_dataset_or_an_adoption_still_names() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let (kept, adopting, drop_) = (nid("aa"), nid("cc"), nid("bb"));
+        let (shared, staged, lonely) = ("11".repeat(32), "33".repeat(32), "22".repeat(32));
+        fixture(root, &[], &[&kept, &drop_]);
+        let at = |h: &str| {
+            root.join(crate::seal::SEGMENTS_DIR)
+                .join(format!("{h}.parquet"))
+        };
+        std::fs::create_dir_all(root.join(crate::seal::SEGMENTS_DIR)).unwrap();
+        for h in [&shared, &staged, &lonely] {
+            std::fs::write(at(h), b"bytes").unwrap();
+        }
+        manifest_naming(root, &kept, &[&shared]);
+        manifest_naming(root, &format!("{adopting}.adopting"), &[&staged]);
+        manifest_naming(root, &drop_, &[&shared, &staged, &lonely]);
+
+        assert!(matches!(
+            reclaim(root, &drop_).unwrap(),
+            Reclaim::Reclaimed { .. }
+        ));
+        assert!(
+            at(&shared).exists(),
+            "reclaim deleted a segment the unmounted, kept dataset still names"
+        );
+        assert!(
+            at(&staged).exists(),
+            "reclaim deleted a segment an adoption is staging"
+        );
+        assert!(
+            !at(&lonely).exists(),
+            "the dataset's own segment stays behind"
+        );
+    }
+
+    /// #2133: a mount job that has installed `data/<nid>` but not yet recorded it names the dataset
+    /// in `mount-jobs.json`, and a restart resumes it, so prune keeps it. A failed job keeps nothing.
+    #[test]
+    fn prune_keeps_a_dataset_an_unfinished_mount_job_names() {
+        let d = tempfile::tempdir().unwrap();
+        let (joining, failed) = (nid("aa"), nid("bb"));
+        fixture(d.path(), &[], &[&joining, &failed]);
+        std::fs::write(
+            d.path().join(crate::mount_jobs::JOBS_FILE),
+            format!(
+                "[{{\"name\":\"j\",\"nid\":\"{joining}\",\"phase\":\"joining\",\"since_unixtime\":0}},\
+                 {{\"name\":\"f\",\"nid\":\"{failed}\",\"phase\":\"failed\",\"since_unixtime\":0}}]"
+            ),
+        )
+        .unwrap();
+
+        run(d.path(), true).unwrap();
+        assert!(
+            MountTable::data_dir(d.path(), &joining).is_dir(),
+            "prune deleted the dataset a mount job is about to record"
+        );
+        assert!(!MountTable::data_dir(d.path(), &failed).exists());
+
+        std::fs::write(d.path().join(crate::mount_jobs::JOBS_FILE), "not json").unwrap();
+        assert!(run(d.path(), true).is_err(), "unknown jobs must refuse");
+        assert!(MountTable::data_dir(d.path(), &joining).is_dir());
+    }
+
+    /// #2133: a store open in a runtime with every recorded mount suspended is one being mounted.
+    #[test]
+    fn prune_refuses_while_a_runtime_holds_an_unrecorded_store() {
+        let d = tempfile::tempdir().unwrap();
+        let mounting = nid("aa");
+        fixture(d.path(), &[], &[&mounting]);
+        let db = MountTable::data_dir(d.path(), &mounting).join(crate::config::DB_FILE);
+        std::fs::remove_file(&db).unwrap();
+        let held = crate::store::Store::open(&db).unwrap();
+
+        let err = run(d.path(), true).expect_err("a held store must refuse");
+        assert!(format!("{err:#}").contains("running runtime"), "{err:#}");
+        assert!(MountTable::data_dir(d.path(), &mounting).is_dir());
+        drop(held);
     }
 }

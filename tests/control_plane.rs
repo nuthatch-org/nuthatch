@@ -99,6 +99,13 @@ async fn a_nest_needs_a_name_and_a_chain() {
     let Some(cp) = cp("validation") else { return };
     assert!(cp.declare_nest(&nest("", "mainnet", 90)).is_err());
     assert!(cp.declare_nest(&nest("usdc", "", 90)).is_err());
+    // #2140: a name becomes a directory on every worker.
+    for name in ["../../srv/x", "/srv/x", ".."] {
+        assert!(
+            cp.declare_nest(&nest(name, "mainnet", 90)).is_err(),
+            "{name:?} was declared"
+        );
+    }
     assert!(cp.heartbeat("", 2048).is_err());
 }
 

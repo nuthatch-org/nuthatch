@@ -55,10 +55,13 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 changes on a restart, whatever else is mounted. A name is one or two parts, `alias` or `tenant/alias`,
 each of letters, digits, `_` and `-` and at most 64 characters; an alias may not end in `__moving`,
 which a move reserves, and the default tenant is never spelled out (`usdc`, not `default/usdc`, nor
-`acme/usdc` when `[runtime] default_tenant = "acme"`). Neither part may be `health`, `nests` or `_admin`,
-which are the runtime's own routes; boot refuses those too. Any other name is refused with `400`
-before anything is recorded. `/<name>/ready` answers for the nest itself, and `GET /nests` lists the
-roster.
+`acme/usdc` when `[runtime] default_tenant = "acme"`). Neither part may be `health`, `nests`, `metrics`,
+`ready` or `_admin`, which are the runtime's own routes; boot refuses those too. Any other name is
+refused with `400` before anything is recorded. Nor may a tenant share its name with a default-tenant
+alias, since `acme` and `acme/sql` would both serve `/acme/sql`: that depends on what is mounted, so it
+is refused when the mount is planned, before it joins, as a refusal below. A NID is read in either case
+and kept in lower case, the form `nuthatch nest nid` prints; `mounts.toml` must spell it so.
+`/<name>/ready` answers for the nest itself, and `GET /nests` lists the roster.
 
 ### Mounts are jobs
 
@@ -92,10 +95,10 @@ of a live mount is `200` there too. Use it from a script; a platform should poll
 
 | Status | Why |
 |---|---|
-| `400` | a malformed NID, or a name the runtime would not accept (see above) |
+| `400` | a malformed NID, a name the runtime would not accept, or a tenant that shares a mount's name (see above) |
 | `404` | the runtime does not hold the NID and was started without `--registry` |
-| `409` | the name is taken, the chain is not declared, or the chain's cursor has died (restart the runtime) |
-| `507` | the mount would breach the chain cursor's RAM ceiling; the reason carries projected and ceiling MB |
+| `409` | the name is taken, the chain is not declared, the chain's cursor has died (restart the runtime), the nest declares authored entities and the runtime runs `--seal-direct`, or another mount of that name or dataset is still catching up |
+| `507` | the mount would breach the chain cursor's RAM ceiling, the reason carrying projected and ceiling MB, or its authored entities would put the cursor over 32 |
 
 On the job route a refusal ends the job `failed` with the same reason. With `--registry`, a NID the
 registry does not hold is accepted like any mount and ends the job `failed`, its reason naming the NID;
@@ -127,8 +130,9 @@ that already indexes this dataset, in which case the mount costs nothing further
 
 A suspended mount leaves its cursor, releases its store and answers `503` with `"suspended": true` in
 place of its routes. Its data and record stay, and it stays suspended across a restart
-(`mounts.toml` lists it under `suspended`). Resume catches it up from where it stopped. Resuming a
-quarantined mount is its explicit release.
+(`mounts.toml` lists it under `suspended`). Resume catches it up from where it stopped. A quarantined
+mount is released by suspending it, then resuming it; resume answers `404` for a mount that is not
+suspended.
 
 ### Moving a name
 

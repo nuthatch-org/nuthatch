@@ -109,6 +109,7 @@ async fn two_nest_roost(
         ]),
         default_tenant: "default".to_string(),
         suspended: Default::default(),
+        joining: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.to_path_buf(),
             // Un-migrated: no mount records, so resolution stays on the pre-2.0 `nests/<name>` path.
@@ -306,6 +307,216 @@ async fn a_live_mount_applies_the_recorded_surface_and_shares_the_sql_gate() {
     assert!(
         Arc::ptr_eq(&gamma_state.1.sql_gate, &usdc.1.sql_gate),
         "a live mount must take the cursor's /sql gate"
+    );
+}
+
+fn surface_of(h: &runtime::RuntimeHandles, name: &str) -> nuthatch::allowlist::Surface {
+    let (_, s) = h
+        .states
+        .iter()
+        .find(|(n, _)| n == name)
+        .unwrap_or_else(|| panic!("'{name}' is not mounted"));
+    (*s.surface).clone()
+}
+
+fn allowlist_of(sql: &str) -> nuthatch::allowlist::Surface {
+    nuthatch::allowlist::Surface {
+        access: nuthatch::allowlist::SqlAccess::Allowlist,
+        queries: vec![nuthatch::allowlist::NamedQuery {
+            name: "total".to_string(),
+            sql: sql.to_string(),
+            params: Default::default(),
+        }],
+    }
+}
+
+fn record_surface(
+    h: &mut runtime::RuntimeHandles,
+    alias: &str,
+    surface: &nuthatch::allowlist::Surface,
+) {
+    let m = h
+        .mount_ctx
+        .mounts
+        .iter_mut()
+        .find(|m| m.alias == alias)
+        .expect("a record");
+    m.sql = surface.access;
+    m.queries = surface.queries.clone();
+}
+
+/// #2129: the first nest on a chain starts the cursor, and serves its record's surface from there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_that_starts_its_cursor_serves_the_recorded_surface() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c1".repeat(32);
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    let deny = nuthatch::allowlist::Surface {
+        access: nuthatch::allowlist::SqlAccess::Deny,
+        queries: Vec::new(),
+    };
+    record_surface(&mut handles, "usdc", &deny);
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("mount");
+    assert_eq!(surface_of(&handles, "usdc"), deny);
+}
+
+/// #2129: a second alias onto a dataset already served takes its own record, not its co-tenant's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_alias_serves_its_own_recorded_surface() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c2".repeat(32);
+    let (mut handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let narrow = allowlist_of("SELECT 1");
+    handles.mount_ctx.mounts.push(runtime::Mount {
+        tenant: "default".to_string(),
+        alias: "usdc2".to_string(),
+        nid: nid.clone(),
+        sql: narrow.access,
+        queries: narrow.queries.clone(),
+        publish: None,
+        #[cfg(feature = "counter")]
+        counter: None,
+    });
+    handles
+        .mount("usdc2", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("mount");
+    assert_eq!(surface_of(&handles, "usdc2"), narrow);
+    assert_eq!(surface_of(&handles, "usdc"), Default::default());
+}
+
+/// #2129: a move stages the new NID under another name, which has no record of its own. The name
+/// must come out of the move serving its own record, not the staging name's open default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_keeps_the_recorded_surface() {
+    let roost = tempfile::tempdir().unwrap();
+    let (old_nid, new_nid) = ("c3".repeat(32), "c4".repeat(32));
+    let (mut handles, _tape) = one_live_mount(roost.path(), &old_nid).await;
+    let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
+    std::fs::create_dir_all(&new_dir).unwrap();
+    scaffold_nest(&new_dir, "usdc", USDC);
+    let narrow = allowlist_of("SELECT 1");
+    record_surface(&mut handles, "usdc", &narrow);
+
+    handles
+        .move_name("usdc", runtime::Nid::parse(&new_nid).unwrap())
+        .await
+        .expect("move");
+    assert_eq!(surface_of(&handles, "usdc"), narrow);
+    assert_eq!(
+        status(&handles.live, "/usdc/sql?q=SELECT%202").await,
+        axum::http::StatusCode::FORBIDDEN,
+        "a moved allowlisted mount answered free-form SQL"
+    );
+}
+
+/// #2129: the name a move stages under is routed while the new NID catches up, so it serves the
+/// moving name's surface rather than the open default of a name with no record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_staged_move_serves_the_moving_names_surface() {
+    let roost = tempfile::tempdir().unwrap();
+    let (old_nid, new_nid) = ("c8".repeat(32), "c9".repeat(32));
+    let (mut handles, _tape) = one_live_mount(roost.path(), &old_nid).await;
+    let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
+    std::fs::create_dir_all(&new_dir).unwrap();
+    scaffold_nest(&new_dir, "usdc", USDC);
+    let narrow = allowlist_of("SELECT 1");
+    record_surface(&mut handles, "usdc", &narrow);
+
+    let staging = runtime::RuntimeHandles::staging_name("usdc");
+    handles
+        .mount(&staging, Some(runtime::Nid::parse(&new_nid).unwrap()))
+        .await
+        .expect("staging mount");
+    assert_eq!(surface_of(&handles, &staging), narrow);
+}
+
+/// #2129: a resume is a mount of the suspended name, and keeps the record it was suspended with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_keeps_the_recorded_surface() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c5".repeat(32);
+    let (mut handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let deny = nuthatch::allowlist::Surface {
+        access: nuthatch::allowlist::SqlAccess::Deny,
+        queries: Vec::new(),
+    };
+    record_surface(&mut handles, "usdc", &deny);
+    handles.suspend("usdc").await.expect("suspend");
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("resume");
+    assert_eq!(surface_of(&handles, "usdc"), deny);
+}
+
+/// #2135: a nest whose author declared a ceiling, mounted with no surface of its own, serves the
+/// ceiling: open is wider than any ceiling, and a mount may only narrow it (RFC-0034 §3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_mount_of_a_nest_with_a_ceiling_serves_the_ceiling() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c6".repeat(32);
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    std::fs::write(
+        runtime::MountTable::data_dir(roost.path(), &nid).join("queries.toml"),
+        "[[queries]]\nname = \"total\"\nsql = \"SELECT 1\"\n",
+    )
+    .unwrap();
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("mount");
+    assert_eq!(surface_of(&handles, "usdc"), allowlist_of("SELECT 1"));
+    assert_eq!(
+        status(&handles.live, "/usdc/sql?q=SELECT%202").await,
+        axum::http::StatusCode::FORBIDDEN,
+        "free-form SQL answered past the author's ceiling"
+    );
+}
+
+/// #2135: a live mount that would widen its author's ceiling is refused, as boot refuses it, and
+/// nothing is left mounted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_mount_wider_than_its_ceiling_is_refused() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c7".repeat(32);
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    std::fs::write(
+        runtime::MountTable::data_dir(roost.path(), &nid).join("queries.toml"),
+        "[[queries]]\nname = \"total\"\nsql = \"SELECT 1\"\n",
+    )
+    .unwrap();
+    record_surface(&mut handles, "usdc", &allowlist_of("SELECT 2"));
+    let err = handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect_err("a widening mount was accepted");
+    assert!(format!("{err:#}").contains("redefines"), "{err:#}");
+    assert!(
+        handles.states.is_empty(),
+        "a refused mount was left serving"
+    );
+}
+
+/// #2135: a `queries.toml` that exists but cannot be read refuses the mount rather than opening it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_whose_ceiling_cannot_be_read_is_refused() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "ca".repeat(32);
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    std::fs::create_dir(runtime::MountTable::data_dir(roost.path(), &nid).join("queries.toml"))
+        .unwrap();
+    let err = handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect_err("a mount with an unreadable ceiling was accepted");
+    assert!(format!("{err:#}").contains("queries.toml"), "{err:#}");
+    assert!(
+        handles.states.is_empty(),
+        "a refused mount was left serving"
     );
 }
 
@@ -513,6 +724,7 @@ async fn route_named_runtime(
         estimates: std::collections::HashMap::from([(route.to_string(), 90)]),
         default_tenant: "default".to_string(),
         suspended: Default::default(),
+        joining: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: nest_dir.to_path_buf(),
             mounts: Vec::new(),
@@ -722,6 +934,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
         estimates: std::collections::HashMap::from([("usdc".to_string(), 90)]),
         default_tenant: "default".to_string(),
         suspended: Default::default(),
+        joining: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             // Only `usdc` is on record - `gamma` below is exactly the "runtime has never seen this
@@ -900,6 +1113,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
         estimates: std::collections::HashMap::from([("usdc".to_string(), 90)]),
         default_tenant: "default".to_string(),
         suspended: Default::default(),
+        joining: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -1275,6 +1489,7 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
         estimates: std::collections::HashMap::from([("v1".to_string(), 90)]),
         default_tenant: "default".to_string(),
         suspended: Default::default(),
+        joining: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -1420,6 +1635,7 @@ async fn empty_runtime(
         estimates: Default::default(),
         default_tenant: "default".to_string(),
         suspended: Default::default(),
+        joining: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -2581,6 +2797,7 @@ async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it(
         estimates: std::collections::HashMap::from([("v1".to_string(), 90)]),
         default_tenant: "default".to_string(),
         suspended: Default::default(),
+        joining: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -2696,6 +2913,17 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
         UndeclaredChain,
         CursorStopped,
         OverBudget,
+        EntityCeiling,
+        SealDirectEntities,
+    }
+    fn write_entities(dir: &std::path::Path, n: usize) {
+        let mut body = String::new();
+        for i in 0..n {
+            body.push_str(&format!(
+                "[[entities]]\nname = \"e{i}\"\nsql = \"entities/e{i}.sql\"\nkey = [\"id\"]\nmax_rows = 1\n\n"
+            ));
+        }
+        std::fs::write(dir.join("entities.toml"), body).unwrap();
     }
     for (label, case) in [
         ("admitted", Case::Admitted),
@@ -2704,6 +2932,8 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
         ("undeclared chain", Case::UndeclaredChain),
         ("cursor stopped", Case::CursorStopped),
         ("over budget", Case::OverBudget),
+        ("entity ceiling", Case::EntityCeiling),
+        ("seal-direct with entities", Case::SealDirectEntities),
     ] {
         let roost = tempfile::tempdir().unwrap();
         let nid = "7c".repeat(32);
@@ -2727,7 +2957,18 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
                 .health
                 .quarantine_cursor("arbitrum-one", "finality violation".to_string()),
             Case::OverBudget => handles.mount_ctx.max_rss_mb = 100,
+            Case::EntityCeiling => write_entities(&data_dir, 33),
+            Case::SealDirectEntities => {
+                write_entities(&data_dir, 1);
+                handles.mount_ctx.seal_direct = true;
+            }
         }
+        // #2139: these two answered 500, and their dry runs a null status.
+        let expected = match case {
+            Case::EntityCeiling => Some(507),
+            Case::SealDirectEntities => Some(409),
+            _ => None,
+        };
         let mounted_before = handles.states.len();
         let _ = intake.try_recv();
         let handles = Arc::new(tokio::sync::Mutex::new(handles));
@@ -2750,6 +2991,9 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
         .await;
         assert_eq!(status, axum::http::StatusCode::OK, "{label}: {dry}");
         let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
+        if let Some(code) = expected {
+            assert_eq!(dry["refusal_status"], code, "{label}: {dry}");
+        }
         assert_eq!(
             handles.lock().await.states.len(),
             mounted_before,
@@ -2781,7 +3025,10 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
                     "{label}: {dry} / {answer}"
                 );
                 assert!(dry["incoming_mb"].as_u64().is_some(), "{label}: {dry}");
-                assert_eq!(dry["tip"], 3, "{label}: {dry}");
+                assert!(
+                    dry["tip"].is_null(),
+                    "{label}: no cursor runs on the chain, and a dry run dials nothing: {dry}"
+                );
                 assert_eq!(dry["chain"], "arbitrum-one", "{label}: {dry}");
             }
         }
@@ -3512,4 +3759,152 @@ async fn a_configured_default_tenant_keeps_its_mounts_and_moves_one_alone() {
         vec![rec("acme", &new_nid), rec("globex", &old_nid)],
         "moving usdc leaves globex/usdc on its own nid"
     );
+}
+
+/// #2130: a mount whose routes would overlap another's is refused before it joins. `ready` and
+/// `metrics` are root routes, and a tenant named as a default-tenant alias serves under that alias's
+/// routes. Each used to panic `Router::nest` after the nest was on its cursor, and every later
+/// recomposition with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_whose_routes_would_collide_is_refused_before_it_joins() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "5e".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs.clone(), true, None);
+
+    for name in ["ready", "metrics", "ready/usdc"] {
+        let body = format!(r#"{{"name":"{name}","nid":"{nid}"}}"#);
+        for uri in ["/_admin/nests", "/_admin/nests?wait=true"] {
+            let (status, answer) = call(&routes, "POST", uri, None, Some(&body)).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{uri} '{name}': {answer}"
+            );
+        }
+        assert!(jobs.get(name).is_none(), "'{name}' was recorded as a job");
+    }
+
+    let collides = format!(r#"{{"name":"usdc/sql","nid":"{nid}"}}"#);
+    let (status, answer) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?wait=true",
+        None,
+        Some(&collides),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{answer}");
+    assert!(answer.contains("also the name of a mount"), "{answer}");
+    let (_, dry) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?dry_run=true",
+        None,
+        Some(&collides),
+    )
+    .await;
+    let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
+    assert_eq!(dry["refusal_status"], 400, "{dry}");
+    let (status, _) = call(&routes, "POST", "/_admin/nests", None, Some(&collides)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let job = wait_for_phase(&routes, "usdc/sql", "failed").await;
+    assert_eq!(job["phase"], "failed", "{job}");
+
+    // The other way round: a tenant first, then a default-tenant alias of its name.
+    let acme = format!(r#"{{"name":"acme/usdc","nid":"{nid}"}}"#);
+    let (status, answer) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?wait=true",
+        None,
+        Some(&acme),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{answer}");
+    let alias = format!(r#"{{"name":"acme","nid":"{nid}"}}"#);
+    let (status, answer) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?wait=true",
+        None,
+        Some(&alias),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{answer}");
+
+    let h = handles.lock().await;
+    let names: Vec<&str> = h.states.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["usdc", "acme/usdc"]);
+    assert_eq!(
+        self::status(&h.live, "/acme/usdc/health").await,
+        axum::http::StatusCode::OK
+    );
+}
+
+/// #2137: a NID is one dataset whatever case the caller spells it in. The upper-case form of a held
+/// NID shares the dataset; it used to be a second directory, indexed again from its start block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_nid_in_upper_case_names_the_same_dataset() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c3d4".repeat(16);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+
+    let body = format!(
+        r#"{{"name":"acme/usdc","nid":"{}"}}"#,
+        nid.to_ascii_uppercase()
+    );
+    let (status, answer) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?wait=true",
+        None,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{answer}");
+    let h = handles.lock().await;
+    let dirs: Vec<_> = h.states.iter().map(|(_, s)| s.dir.clone()).collect();
+    assert_eq!(dirs.len(), 2);
+    assert_eq!(dirs[0], dirs[1], "two directories for one dataset");
+    assert!(
+        h.mount_ctx.mounts.iter().all(|m| m.nid == nid),
+        "a record kept the caller's spelling: {:?}",
+        h.mount_ctx.mounts
+    );
+}
+
+/// #2139: a dry run reads the tip its chain's cursor last saw and dials nothing. It holds the
+/// runtime's lock, so a call to a slow RPC from here held up every other admin call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dry_run_reads_the_cursors_tip_and_dials_nothing() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "e1".repeat(32);
+    let (handles, tape) = one_live_mount_as(roost.path(), &nid, "tipwatch-2139").await;
+    let other = "e2".repeat(32);
+    let other_dir = runtime::MountTable::data_dir(roost.path(), &other);
+    std::fs::create_dir_all(&other_dir).unwrap();
+    scaffold_nest(&other_dir, "usdc", USDC);
+    tape.go_dark();
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+
+    let body = format!(r#"{{"name":"other-2139","nid":"{other}"}}"#);
+    let (status, dry) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?dry_run=true",
+        None,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{dry}");
+    let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
+    assert_eq!(dry["tip"], 3, "{dry}");
 }

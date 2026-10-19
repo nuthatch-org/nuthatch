@@ -162,6 +162,8 @@ impl ControlPlane {
         if nest.name.is_empty() || nest.chain.is_empty() {
             return Err(anyhow!("a desired nest needs both a name and a chain"));
         }
+        // Every worker joins the name onto its nest root and cache, so it is held to the mount-name rules.
+        crate::runtime::check_mount_name(&nest.name, crate::runtime::DEFAULT_TENANT)?;
         let (name, chain, mb) = (
             nest.name.clone(),
             nest.chain.clone(),
@@ -316,6 +318,11 @@ impl ControlPlane {
     pub fn pin_version(&self, name: &str, version: &str, bundle_hash: &str) -> Result<bool> {
         if version.is_empty() || bundle_hash.is_empty() {
             return Err(anyhow!("pinning needs both a version and a bundle hash"));
+        }
+        if !crate::distribution::is_nid_shaped(bundle_hash) {
+            return Err(anyhow!(
+                "bundle hash '{bundle_hash}' is not 64 hex characters"
+            ));
         }
         let (name, version, hash) = (
             name.to_string(),

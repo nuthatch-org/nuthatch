@@ -306,6 +306,8 @@ would end up running the old bundle with nothing reporting an error.
 **Secrets never enter a bundle.** Private RPC URLs and API keys live in the control plane keyed by
 nest (`PUT /nests/<name>/secrets`), and a writer receives only the secrets of the nests it is
 assigned. The interface is **write-only**: you can list which keys exist, never read a value back.
+A secret named `rpc_url` replaces the nest's own `rpc_urls` when a writer starts its cursor; other keys
+are logged by name and ignored.
 Rotating a secret changes no bundle hash, so it does not invalidate segment reuse or force a
 re-index.
 
@@ -963,7 +965,10 @@ decision that matters here: `sql = "open"` is the default and it is the right de
 `nuthatch dev`, where exploration is the point - but on an endpoint strangers can reach, it means
 anyone may run arbitrary analytical SQL over your disk, bounded only by the guards below. If that is
 not what you want, set `sql = "allowlist"` on the mount and declare the queries it answers, or
-`sql = "deny"` to close SQL entirely while the typed routes keep serving. See
+`sql = "deny"` to close SQL entirely while the typed routes keep serving. A nest whose author
+ships a `queries.toml` caps every mount of it: a mount may name fewer of those queries or deny SQL,
+an allowlist wider than the author's is refused, and a mount left on `open` answers exactly the
+author's queries, never free-form SQL. See
 [Bounding what a mount will answer](https://nuthatch-indexer.com/docs/operate/security/#bounding-what-a-mount-will-answer).
 
 **Query guards** - node self-protection against a single runaway query or a burst, not per-caller

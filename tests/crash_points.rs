@@ -249,6 +249,95 @@ fn a_death_just_after_the_seal_direct_watermark_loses_and_doubles_nothing() {
     survives("seal-direct:after-watermark");
 }
 
+/// #2242: a seal-direct prepare that dies with history sealed through finality but `last_block`
+/// unwritten, retried before finality moves, resumes at the watermark. It used to take the cold-start
+/// branch, move the origin and hot-index blocks it had already sealed.
+#[test]
+fn a_seal_direct_retry_before_finality_moves_keeps_its_origin_and_indexes_nothing_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_rpc, rpc_port) = fixture_chain();
+    let nest = dir.path().join("nest");
+    init_nest(&nest, rpc_port);
+    let backfill = ["--backfill", "5"];
+    let origin = TIP - 5;
+
+    let point = "seal-direct:before-last-block";
+    let first_log = dir.path().join("first.log");
+    let mut first = Reaped(dev_with(
+        &nest,
+        free_port(),
+        Some(point),
+        &first_log,
+        &backfill,
+    ));
+    let status = poll(&format!("the nest to die at {point}"), 120, || {
+        first.0.try_wait().ok().flatten()
+    });
+    assert!(
+        !status.success() && read(&first_log).contains(&format!("crash point {point}: aborting")),
+        "the run was meant to abort at `{point}` (exit {status}). Its log:\n{}",
+        read(&first_log)
+    );
+    drop(first);
+
+    // The tip moves, so a recomputed `--backfill` origin differs; finality does not.
+    let tip = TIP + 3;
+    pin(rpc_port, "tip", tip);
+    let port = free_port();
+    let second_log = dir.path().join("second.log");
+    let mut second = Reaped(dev_with(&nest, port, None, &second_log, &backfill));
+    let api = format!("http://127.0.0.1:{port}");
+    poll("the restarted nest to reach the tip", 120, || {
+        let v: serde_json::Value = serde_json::from_str(&get(&format!("{api}/"))?).ok()?;
+        v["last_block"]
+            .as_str()?
+            .parse::<u64>()
+            .ok()
+            .filter(|&n| n >= tip)
+    });
+    let _ = Command::new("kill")
+        .args(["-TERM", &second.0.id().to_string()])
+        .status();
+    let _ = second.0.wait();
+
+    let redb = walk(&nest)
+        .into_iter()
+        .find(|p| p.extension().is_some_and(|e| e == "redb"))
+        .expect("the nest's hot store");
+    let store = nuthatch::store::Store::open_existing(&redb).unwrap();
+    assert_eq!(
+        store.get_meta("sealed_through").unwrap(),
+        Some(FINALIZED.to_string())
+    );
+    assert_eq!(
+        store.get_meta("start_block").unwrap(),
+        Some(origin.to_string()),
+        "the retry moved the nest's origin. Restart log:\n{}",
+        read(&second_log)
+    );
+    let hot_and_sealed = store.entities_in_range(0, FINALIZED).unwrap();
+    assert!(
+        hot_and_sealed.is_empty(),
+        "{} entities at or below sealed_through {FINALIZED} are also in the hot store. Restart \
+         log:\n{}",
+        hot_and_sealed.len(),
+        read(&second_log)
+    );
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// The control: a point name nothing carries must not abort. Without it a harness that killed the
 /// process on any `NUTHATCH_CRASH_AT` would pass every case above for the wrong reason.
 #[test]

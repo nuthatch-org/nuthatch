@@ -40,6 +40,10 @@ fn fixture(test: &str) -> Option<Arc<ControlPlane>> {
     Some(cp)
 }
 
+fn hash(c: char) -> String {
+    c.to_string().repeat(64)
+}
+
 fn declare(cp: &ControlPlane, name: &str, chain: &str) {
     cp.declare_nest(&DesiredNest {
         name: name.into(),
@@ -80,7 +84,7 @@ async fn every_node_resolves_an_endpoint_to_the_same_version() {
         return;
     };
     declare(&cp, "usdc", "mainnet");
-    assert!(cp.pin_version("usdc", "1.2.0", "0xaaaa").unwrap());
+    assert!(cp.pin_version("usdc", "1.2.0", &hash('a')).unwrap());
 
     // Four independent FE nodes: four separate connections to the control plane, as four processes
     // would be.
@@ -112,7 +116,7 @@ async fn a_compatible_update_moves_the_endpoint_for_the_whole_fleet_at_once() {
         return;
     };
     declare(&cp, "usdc", "mainnet");
-    cp.pin_version("usdc", "1.2.0", "0xaaaa").unwrap();
+    cp.pin_version("usdc", "1.2.0", &hash('a')).unwrap();
 
     let url = std::env::var("NUTHATCH_TEST_PG").unwrap();
     let node_b = ControlPlane::connect(&url).unwrap();
@@ -122,12 +126,12 @@ async fn a_compatible_update_moves_the_endpoint_for_the_whole_fleet_at_once() {
     );
 
     // The operator advances the endpoint.
-    cp.pin_version("usdc", "1.3.0", "0xbbbb").unwrap();
+    cp.pin_version("usdc", "1.3.0", &hash('b')).unwrap();
 
     // A *different* node sees the new version without being told, because there is one answer.
     let after = node_b.resolve("usdc").unwrap().unwrap();
     assert_eq!(after.version.as_deref(), Some("1.3.0"));
-    assert_eq!(after.bundle_hash.as_deref(), Some("0xbbbb"));
+    assert_eq!(after.bundle_hash.as_deref(), Some(hash('b').as_str()));
     assert_eq!(
         cp.desired().unwrap().len(),
         1,
@@ -143,12 +147,12 @@ async fn a_breaking_version_is_a_sibling_endpoint_and_both_resolve() {
         return;
     };
     declare(&cp, "usdc", "mainnet");
-    cp.pin_version("usdc", "1.3.0", "0xbbbb").unwrap();
+    cp.pin_version("usdc", "1.3.0", &hash('b')).unwrap();
 
     // The breaking version arrives as its own endpoint rather than displacing the old one - existing
     // consumers keep working, which is the entire point of the breaking path.
     declare(&cp, "usdc-v2", "mainnet");
-    cp.pin_version("usdc-v2", "2.0.0", "0xcccc").unwrap();
+    cp.pin_version("usdc-v2", "2.0.0", &hash('c')).unwrap();
 
     let url = std::env::var("NUTHATCH_TEST_PG").unwrap();
     let node = ControlPlane::connect(&url).unwrap();
@@ -175,7 +179,7 @@ async fn pinning_an_undeclared_endpoint_reports_the_miss() {
     let Some(cp) = fixture("pin-miss") else {
         return;
     };
-    assert!(!cp.pin_version("ghost", "1.0.0", "0xdead").unwrap());
+    assert!(!cp.pin_version("ghost", "1.0.0", &hash('d')).unwrap());
     assert!(cp.resolve("ghost").unwrap().is_none());
 }
 
@@ -185,8 +189,15 @@ async fn a_pin_needs_both_a_version_and_a_hash() {
         return;
     };
     declare(&cp, "usdc", "mainnet");
-    assert!(cp.pin_version("usdc", "", "0xaaaa").is_err());
+    assert!(cp.pin_version("usdc", "", &hash('a')).is_err());
     assert!(cp.pin_version("usdc", "1.0.0", "").is_err());
+    // #2140: a pinned hash becomes a directory on every worker.
+    for h in ["0xaaaa", "../../srv/x", "/srv/x"] {
+        assert!(
+            cp.pin_version("usdc", "1.0.0", h).is_err(),
+            "{h:?} was pinned"
+        );
+    }
     assert!(
         !cp.resolve("usdc").unwrap().unwrap().is_servable(),
         "a rejected pin must leave the endpoint unpinned, not half-pinned"

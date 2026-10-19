@@ -398,6 +398,10 @@ async fn a_live_mount_refuses_seal_direct_with_an_entity() {
         None,
         None,
         nuthatch::serve::new_sql_gate(),
+        indexer::CatchUp {
+            cursor_at: &|| None,
+            wanted: &|| true,
+        },
     )
     .await
     .err()
