@@ -232,7 +232,8 @@ class Chain:
                         "blockHash": "0x" + f"{b:064x}",
                         "transactionHash": "0x" + f"{idx:064x}",
                         "transactionIndex": hex(i),
-                        "logIndex": hex(idx),
+                        # Per block, as a node numbers them: nuthatch refuses one wider than 20 bits (#2228).
+                        "logIndex": hex(i * len(self.contracts) + ci),
                         "removed": False,
                     })
         return out

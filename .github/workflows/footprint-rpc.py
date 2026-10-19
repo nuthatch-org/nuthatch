@@ -67,7 +67,8 @@ def logs_for(from_block: int, to_block: int):
                 "blockHash": "0x" + f"{b:064x}",
                 "transactionHash": "0x" + f"{idx:064x}",
                 "transactionIndex": h(i),
-                "logIndex": h(idx),
+                # Per block, as a node numbers them: nuthatch refuses one wider than 20 bits (#2228).
+                "logIndex": h(i),
                 "removed": False,
             })
     return out
