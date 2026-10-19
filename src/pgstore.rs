@@ -501,9 +501,8 @@ impl HotStore for PgStore {
             let mut out: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
             for row in c.query(&sql, &[])? {
                 let raw: String = row.get(0);
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-                    continue;
-                };
+                let v = serde_json::from_str::<serde_json::Value>(&raw)
+                    .context("unparseable hot row in an analytical scan")?;
                 let Some(t) = v.get("table").and_then(|t| t.as_str()) else {
                     continue;
                 };
@@ -540,9 +539,8 @@ impl HotStore for PgStore {
                     }
                     .into());
                 }
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-                    continue;
-                };
+                let v = serde_json::from_str::<serde_json::Value>(&raw)
+                    .context("unparseable hot row in an analytical scan")?;
                 let Some(t) = v.get("table").and_then(|t| t.as_str()) else {
                     continue;
                 };

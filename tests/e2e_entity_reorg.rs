@@ -119,6 +119,48 @@ async fn a_checked_entity_file_starts_and_indexes() {
     rt.shutdown().await.expect("the nest stops");
 }
 
+/// #2166: an entity over `blocks` is fed each window's block rows as it indexes them, so the relation
+/// it serves while running is the one a restart seeds from the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entity_over_the_blocks_table_is_fed_as_it_indexes() {
+    const BY_MINER: &str = r#"[[entities]]
+name = "by_miner"
+query = "SELECT b.miner, COUNT(*) FROM blocks b GROUP BY b.miner"
+key = ["miner"]
+max_rows = 10000
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=CHAIN_LEN {
+        tape.insert_block(b, canonical_block(b));
+    }
+    tape.advance_tip_to(CHAIN_LEN);
+    scaffold_nest(dir.path(), "usdc", USDC);
+    let toml = dir.path().join("nuthatch.toml");
+    let body = std::fs::read_to_string(&toml).unwrap();
+    std::fs::write(&toml, format!("{body}\n[extract]\nblocks = true\n")).unwrap();
+    declare(dir.path(), BY_MINER);
+    let load = || nuthatch::config::Config::load(dir.path()).unwrap();
+    // The tape's headers name no miner, which a blocks row reads as the zero address.
+    let want = vec![(
+        format!("Row([Str({:?})])", format!("0x{}", "0".repeat(40))),
+        format!("Row([Int({CHAIN_LEN})])"),
+    )];
+
+    let live = spawn_loaded(dir.path(), tape.clone(), CHAIN_LEN, load()).await;
+    let fed = relation(&live);
+    live.shutdown().await.expect("the nest stops");
+    let restarted = spawn_loaded(dir.path(), tape, CHAIN_LEN, load()).await;
+    let seeded = relation(&restarted);
+    restarted.shutdown().await.expect("the nest stops");
+
+    assert_eq!(
+        seeded, want,
+        "premise: the seed reads the stored block rows"
+    );
+    assert_eq!(fed, want, "the live relation must hold every indexed block");
+}
+
 async fn spawn_with_entity(
     dir: &std::path::Path,
     tape: Arc<TapeSource>,
@@ -137,6 +179,16 @@ async fn spawn_declared(
 ) -> indexer::NestRuntime {
     let cfg = scaffold_nest(dir, "usdc", USDC);
     declare(dir, decl);
+    spawn_loaded(dir, tape, tip, cfg).await
+}
+
+/// Spawn a nest already written to `dir` and wait until its entities have folded through `tip`.
+async fn spawn_loaded(
+    dir: &std::path::Path,
+    tape: Arc<TapeSource>,
+    tip: u64,
+    cfg: nuthatch::config::Config,
+) -> indexer::NestRuntime {
     let rt = indexer::spawn_nest(
         tape,
         dir.to_path_buf(),

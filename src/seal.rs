@@ -521,7 +521,7 @@ pub fn read_table_rows(
     schema: &crate::registry::TableSchema,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
     let mut out = Vec::new();
-    read_table_rows_by_segment(dir, schema, &mut |mut rows| {
+    read_table_rows_by_segment(dir, schema, u64::MAX, &mut |mut rows| {
         out.append(&mut rows);
         Ok(())
     })?;
@@ -548,9 +548,13 @@ pub fn read_table_rows(
 /// Chunking is sound because a seed is `+1`-only: no retraction is fed, so the maintained relation
 /// grows monotonically and no chunk can trip `max_rows` earlier than the whole-history window
 /// would have. A seed that fits still fits.
+///
+/// Only segments ending at or below `sealed_through` are read, as `analytics::query_cold` bounds the
+/// views: a crash between the manifest and the prune leaves a newer segment whose rows hot still holds.
 pub fn read_table_rows_by_segment(
     dir: &Path,
     schema: &crate::registry::TableSchema,
+    sealed_through: u64,
     sink: &mut dyn FnMut(Vec<crate::registry::DecodedRow>) -> Result<()>,
 ) -> Result<()> {
     let manifest = load_manifest(dir)?;
@@ -558,7 +562,10 @@ pub fn read_table_rows_by_segment(
         return Ok(());
     };
     // Block order, and by content address within a block range so a re-seal cannot reorder rows.
-    let mut ordered: Vec<&Segment> = segments.iter().collect();
+    let mut ordered: Vec<&Segment> = segments
+        .iter()
+        .filter(|s| s.to_block <= sealed_through)
+        .collect();
     ordered.sort_by(|a, b| {
         (a.from_block, a.to_block, &a.hash).cmp(&(b.from_block, b.to_block, &b.hash))
     });
