@@ -3773,6 +3773,25 @@ mod tests {
         .await;
         assert_eq!(seen, vec![true], "only the answer is handed on");
 
+        // Two primaries asked in turn, so the dead one is asked first or after the answer, and
+        // fails the call in neither order.
+        for &dead_first in &[true, false] {
+            let (good, h) = fake_rpc(1).await;
+            let dead = "http://127.0.0.1:1/".to_string();
+            let urls = if dead_first {
+                vec![dead, good]
+            } else {
+                vec![good, dead]
+            };
+            let c = RpcClient::new(urls).unwrap();
+            let answers = c
+                .call_each("eth_chainId", serde_json::json!([]))
+                .await
+                .expect("one endpoint answered");
+            assert_eq!(answers, vec![serde_json::json!("0x1")], "{dead_first}");
+            h.abort();
+        }
+
         let dead = RpcClient::new(vec!["http://127.0.0.1:1/".into()]).unwrap();
         assert!(dead
             .call_each("eth_chainId", serde_json::json!([]))
