@@ -9074,51 +9074,100 @@ fn rebuild_children(
     let mut children = ChildRegistry::new();
     let manifest = crate::seal::load_manifest(dir)
         .context("reading the segment catalogue to rebuild the child registry")?;
-    // Every announcing table's rows, then one fold in block order across all of them, so the earliest
-    // discovery of a child two rules announce wins as it does live (#1637).
-    let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
+    // Each child's earliest announcement across every announcing table, cold and hot, so the
+    // earliest discovery of a child two rules announce wins as it does live (#1637). Only children
+    // are held, not the rows announcing them (#2160).
+    let mut earliest: std::collections::HashMap<String, crate::factory::ChildEntry> =
+        Default::default();
+    let mut fold = |table: &str, row: &serde_json::Value| {
+        for child in factory.discover_stored(table, row) {
+            let at = (child.discovered_block, child.discovered_log_index);
+            match earliest.entry(child.address.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if at < (e.get().discovered_block, e.get().discovered_log_index) {
+                        e.insert(child);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(child);
+                }
+            }
+        }
+    };
+    let sources = factory.view_sources();
     for table in factory.factory_tables() {
-        // Cold (sealed) rows via Burrmill - but only where the catalogue says a segment exists, so an
-        // unsealed table is skipped rather than queried-and-forgiven.
-        if manifest.tables.get(&table).is_some_and(|s| !s.is_empty()) {
-            rows.extend(
-                crate::analytics::query(dir, &format!("SELECT * FROM \"{table}\""))
-                    .with_context(|| format!("reading sealed factory rows for '{table}' (#373)"))?
-                    .into_iter()
-                    .map(|v| (table.clone(), v)),
+        // Cold (sealed) rows - but only where the catalogue says a segment exists, so an unsealed
+        // table is skipped rather than read-and-forgiven.
+        if let Some(segments) = manifest.tables.get(&table).filter(|s| !s.is_empty()) {
+            let mut columns = vec!["block_number", "log_index", "block_timestamp", "address"];
+            columns.extend(
+                sources
+                    .iter()
+                    .filter(|(_, t, _)| *t == table)
+                    .map(|(_, _, param)| param.as_str()),
             );
+            visit_sealed_columns(dir, segments, &columns, &mut |row| fold(&table, &row))
+                .with_context(|| format!("reading sealed factory rows for '{table}' (#373)"))?;
         }
         for raw in store
             .recent_by_table(&table, usize::MAX)
             .with_context(|| format!("reading hot factory rows for '{table}' (#373)"))?
         {
-            rows.push((
-                table.clone(),
-                serde_json::from_str::<serde_json::Value>(&raw).with_context(|| {
-                    format!("unparseable stored row in factory table '{table}' (#373)")
-                })?,
-            ));
+            let row = serde_json::from_str::<serde_json::Value>(&raw).with_context(|| {
+                format!("unparseable stored row in factory table '{table}' (#373)")
+            })?;
+            fold(&table, &row);
         }
     }
-    rows.sort_by(|(_, a), (_, b)| {
-        let key = |v: &serde_json::Value| {
-            (
-                v.get("block_number")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-                v.get("log_index")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            )
-        };
-        key(a).cmp(&key(b))
-    });
-    for (table, v) in &rows {
-        for child in factory.discover_stored(table, v) {
-            children.insert(child);
-        }
+    let mut found: Vec<_> = earliest.into_values().collect();
+    found.sort_by_key(|c| (c.discovered_block, c.discovered_log_index));
+    for child in found {
+        children.insert(child);
     }
     Ok(children)
+}
+
+/// Every row of `segments`, narrowed to whichever of `columns` they carry, as the JSON
+/// `FactorySet::discover_stored` reads. One record batch is held at a time.
+fn visit_sealed_columns(
+    dir: &std::path::Path,
+    segments: &[crate::seal::Segment],
+    columns: &[&str],
+    visit: &mut dyn FnMut(serde_json::Value),
+) -> Result<()> {
+    use arrow::array::{Array, StringArray, UInt64Array};
+    use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ProjectionMask};
+    for segment in segments {
+        let path = crate::seal::segment_path(dir, &segment.file, &segment.hash);
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("opening sealed segment {}", path.display()))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("reading sealed segment {}", path.display()))?;
+        let mask = ProjectionMask::columns(builder.parquet_schema(), columns.iter().copied());
+        for batch in builder.with_projection(mask).build()? {
+            let batch =
+                batch.with_context(|| format!("decoding sealed segment {}", path.display()))?;
+            for row in 0..batch.num_rows() {
+                let mut obj = serde_json::Map::new();
+                for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+                    if column.is_null(row) {
+                        continue;
+                    }
+                    let any = column.as_any();
+                    let value = if let Some(a) = any.downcast_ref::<UInt64Array>() {
+                        serde_json::Value::from(a.value(row))
+                    } else if let Some(a) = any.downcast_ref::<StringArray>() {
+                        serde_json::Value::from(a.value(row))
+                    } else {
+                        continue;
+                    };
+                    obj.insert(field.name().clone(), value);
+                }
+                visit(serde_json::Value::Object(obj));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn sleep_secs(s: u64) {
@@ -25454,6 +25503,62 @@ template="pool"
         let fs = FactorySet::build(&config).unwrap();
         let table = fs.factory_tables().first().cloned().expect("one rule");
         (fs, table)
+    }
+
+    /// #2160: the sealed announcements are read for the columns discovery uses, and fold with the
+    /// hot ones so a child's earliest announcement wins, as it does live.
+    #[test]
+    fn rebuild_children_folds_sealed_and_hot_announcements() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fs, table) = one_rule_factory_set();
+        let (a, b, c) = (
+            "0x000000000000000000000000000000000000000a",
+            "0x000000000000000000000000000000000000000b",
+            "0x000000000000000000000000000000000000000c",
+        );
+        let row = |child: &str, block: u64, li: u64| {
+            serde_json::json!({
+                "table": table, "pool": child, "block_number": block, "log_index": li,
+                "block_timestamp": 1_700_000_000 + block, "tx_hash": "0xt",
+                "address": "0x1111111111111111111111111111111111111111", "salt": "f".repeat(512),
+            })
+            .to_string()
+        };
+        crate::seal::seal_range(dir.path(), &[row(a, 10, 1), row(b, 12, 0)], 10, 12).unwrap();
+        let store = crate::store::Store::open(&dir.path().join("t.redb")).unwrap();
+        store
+            .commit_window(
+                &[
+                    (Store::entity_key(20, 0), row(a, 20, 0)),
+                    (Store::entity_key(21, 0), row(c, 21, 0)),
+                ],
+                None,
+                21,
+            )
+            .unwrap();
+        let reg = DecodeRegistry::build(Vec::new()).unwrap();
+
+        let children = rebuild_children(dir.path(), &store, &reg, &fs).unwrap();
+        let got = |child: &str| {
+            let e = children.get(child).expect("discovered");
+            (
+                e.discovered_block,
+                e.discovered_log_index,
+                e.discovered_timestamp,
+            )
+        };
+        assert_eq!(
+            got(a),
+            (10, 1, 1_700_000_010),
+            "the sealed announcement is earlier"
+        );
+        assert_eq!(got(b), (12, 0, 1_700_000_012));
+        assert_eq!(got(c), (21, 0, 1_700_000_021));
+        assert_eq!(
+            children.get(a).unwrap().parent_address,
+            "0x1111111111111111111111111111111111111111"
+        );
+        assert_eq!(children.addresses().len(), 3);
     }
 
     /// #373: an unsealed factory table is a legitimate absence and must still rebuild cleanly.
