@@ -157,7 +157,7 @@ fn every_mutating_path_is_fenced() {
     );
     is_fenced(a.rollback_to(0), "rollback_to");
     is_fenced(
-        a.rollback_to_and_set_meta(0, "k", "v"),
+        a.rollback_to_and_set_meta(0, "k", "v", &[]),
         "rollback_to_and_set_meta",
     );
     is_fenced(a.prune_range(0, 10), "prune_range");

@@ -7961,11 +7961,12 @@ mod tests {
         async fn commit_window_blocking(
             &self,
             entities: Vec<(String, String)>,
+            outbox: Vec<String>,
             checkpoint: Option<(u64, String)>,
             last_block: u64,
         ) -> Result<()> {
             crate::store::HotStore::commit_window_blocking(
-                &self.0, entities, checkpoint, last_block,
+                &self.0, entities, outbox, checkpoint, last_block,
             )
             .await
         }
@@ -7980,8 +7981,11 @@ mod tests {
             block: u64,
             meta_key: &str,
             meta_val: &str,
+            outbox: &[String],
         ) -> Result<u64> {
-            crate::store::HotStore::rollback_to_and_set_meta(&self.0, block, meta_key, meta_val)
+            crate::store::HotStore::rollback_to_and_set_meta(
+                &self.0, block, meta_key, meta_val, outbox,
+            )
         }
         fn prune_range(&self, from: u64, to: u64) -> Result<u64> {
             crate::store::HotStore::prune_range(&self.0, from, to)
