@@ -165,21 +165,20 @@ impl ExposureCircuit {
         }
         self.amount_in.append(&mut amt);
         self.count_in.append(&mut cnt);
-        self.circuit
-            .transaction()
-            .map_err(|e| anyhow!("exposure transaction: {e}"))?;
-
-        // Fold amount changes: a group moving old→new appears as (key,old,−1),(key,new,+1); a group
-        // returning to 0 appears only as (key,old,−1). Amount may legitimately be 0, so a cleared
-        // amount sets 0 rather than dropping - the count map decides existence.
-        fold_changes(&self.amount_out.consolidate(), &mut self.amounts, false);
-        // Fold count changes: same shape, but a cleared count *does* drop the key (no transfers left),
-        // and we drop it from amounts too so the two maps stay consistent.
-        let dropped = fold_changes(&self.count_out.consolidate(), &mut self.counts, true);
-        for k in dropped {
-            self.amounts.remove(&k);
-        }
-        Ok(())
+        let (amounts, counts) = (&mut self.amounts, &mut self.counts);
+        let (amount_out, count_out) = (&self.amount_out, &self.count_out);
+        crate::views::step_to_commit(&mut self.circuit, || {
+            // Fold amount changes: a group moving old→new appears as (key,old,−1),(key,new,+1); a
+            // group returning to 0 appears only as (key,old,−1). Amount may legitimately be 0, so a
+            // cleared amount sets 0 rather than dropping - the count map decides existence.
+            fold_changes(&amount_out.consolidate(), amounts, false);
+            // Fold count changes: same shape, but a cleared count *does* drop the key (no transfers
+            // left), and we drop it from amounts too so the two maps stay consistent.
+            for k in fold_changes(&count_out.consolidate(), counts, true) {
+                amounts.remove(&k);
+            }
+        })
+        .map_err(|e| anyhow!("exposure transaction: {e}"))
     }
 
     #[cfg(test)]
@@ -519,6 +518,23 @@ mod tests {
             .step(exposure_deltas("0xwhale", "0xsanctioned", big, 1, &labels))
             .unwrap();
         assert_eq!(circuit.rows_for("0xwhale")[0].amount, big);
+    }
+
+    /// #2268: a batch larger than DBSP's internal step of 10,000 rows keeps every step's changes.
+    #[test]
+    fn one_batch_larger_than_a_dbsp_step_keeps_every_key() {
+        let labels = labelset(&[("0xmixer", "mixer")]);
+        let mut circuit = ExposureCircuit::new().unwrap();
+        let batch: ExposureBatch = (0..25_000)
+            .flat_map(|i| exposure_deltas("0xmixer", &format!("0x{i:040x}"), 7, 1, &labels))
+            .collect();
+        circuit.step(batch).unwrap();
+
+        assert_eq!(circuit.counts.len(), 25_000);
+        assert!((0..25_000).all(|i| {
+            let k = key(&format!("0x{i:040x}"), "mixer", Direction::In);
+            circuit.counts.get(&k) == Some(&1) && circuit.amounts.get(&k) == Some(&7)
+        }));
     }
 
     /// Seeding a pre-summed cold aggregate reproduces the same state as replaying transfers - the
