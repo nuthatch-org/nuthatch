@@ -8665,10 +8665,12 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(120), d.catch_up(&s, 99_000))
             .await
             .unwrap();
-        // Alone, 128-block windows doubling to 50,000 cover 99,000 blocks in 11, two calls each.
+        // Alone, 128-block windows doubling to 50,000 cover 99,000 blocks in 11, two calls each. A
+        // shared pace (#2061) holds both at the 128-block floor, some 1,500 calls; 60 leaves room for
+        // a slow runner, which has taken 32 (#2255).
         let calls = chain.trace_fixed_us.lock().unwrap()[&BOB.to_ascii_lowercase()].1;
         assert!(
-            calls <= 30,
+            calls <= 60,
             "{calls} trace_filter calls for the quiet account"
         );
     }
