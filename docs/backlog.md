@@ -55,10 +55,10 @@ The 2026 capability-freeze items were closed into [frozen-for-2027.md](frozen-fo
 | `good first issue` | Small, self-contained, and does not need the whole architecture in your head first |
 
 **Sprint labels** (`brisk-bunting`, `temperate-tern`, and so on) mark membership of one sprint and
-remain afterwards as provenance. The open sprint is `dependable-dotterel` (2026-10-19): the chain we
-stored is the chain. It is the first of six that triage the 2026-10-19 cold audit (#2110); the rest
-are `earnest-eider`, `faithful-fieldfare`, `grounded-goldcrest`, `hardy-hawfinch` and
-`inquisitive-ibisbill`, in that order. A sprint label on a closed issue is historical; do not use it
+remain afterwards as provenance. The open sprint is `earnest-eider` (2026-10-19): one tenant cannot touch
+another. It is the second of six that triage the 2026-10-19 cold audit (#2110); `dependable-dotterel`
+closed the same day, and `faithful-fieldfare`, `grounded-goldcrest`, `hardy-hawfinch` and
+`inquisitive-ibisbill` follow, in that order. A sprint label on a closed issue is historical; do not use it
 to infer that work remains.
 
 The queries that matter:
