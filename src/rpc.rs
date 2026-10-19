@@ -8,7 +8,7 @@ pub use nuthatch_decode::rpc::Log;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// How many times a whole `block_timestamps` batch is retried before it's returned as an error rather
@@ -59,6 +59,11 @@ const TIMESTAMP_CACHE_MAX: usize = 262_144;
 /// ERC-20 transfers.
 pub const GETLOGS_BODY_CAP: usize = 32 << 20;
 
+/// A response's JSON-RPC `error`, where `"error": null` on a success is no error (#2225).
+fn error_of(resp: &Value) -> Option<&Value> {
+    resp.get("error").filter(|e| !e.is_null())
+}
+
 // `None` is a stored EVM fact, not a convenient bucket for provider failures.
 fn decode_call_batch(response: &Value, expected: usize) -> Result<Vec<Option<String>>> {
     let items = response
@@ -76,7 +81,7 @@ fn decode_call_batch(response: &Value, expected: usize) -> Result<Vec<Option<Str
             bail!("eth_call batch contains an unexpected or duplicate id {id}");
         }
         seen[id] = true;
-        if let Some(error) = item.get("error") {
+        if let Some(error) = error_of(item) {
             if item.get("result").is_some() {
                 bail!("eth_call batch item contains both result and error");
             }
@@ -96,6 +101,18 @@ fn decode_call_batch(response: &Value, expected: usize) -> Result<Vec<Option<Str
                     && (message == "execution reverted"
                         || message.starts_with("execution reverted:")
                         || message.starts_with("vm execution error: revert"));
+            // A revert in a shape not listed above is still the node's answer at a pinned block, so
+            // asking again cannot change it; it is refused by name rather than retried (#2226).
+            if !explicit_revert && message.contains("revert") {
+                return Err(ClassifiedError {
+                    class: FailureClass::Terminal,
+                    detail: format!(
+                        "eth_call batch item {id} reverted in a shape nuthatch does not recognise, \
+                         so it is neither stored nor asked again: {error}"
+                    ),
+                }
+                .into());
+            }
             if !explicit_revert {
                 return Err(ClassifiedError {
                     class: classify_rpc_error(error),
@@ -268,6 +285,9 @@ struct PoolFailures {
     /// A 429 is about our pacing at that endpoint, so another endpoint's answer outranks it (#1853):
     /// as the last error it hid a healthy endpoint's range cap, and the window never narrowed.
     limited: Option<anyhow::Error>,
+    /// One endpoint refusing our credentials is not the pool refusing them (#2155): the verdict only
+    /// when no endpoint failed for a reason that passes.
+    refused: Option<anyhow::Error>,
     pruned: Vec<String>,
     last_pruned: Option<anyhow::Error>,
 }
@@ -279,6 +299,8 @@ impl PoolFailures {
             self.last_pruned = Some(e);
         } else if matches!(class_of(&e), Some(FailureClass::RateLimited { .. })) {
             self.limited = Some(e);
+        } else if matches!(class_of(&e), Some(FailureClass::Terminal)) {
+            self.refused = Some(e);
         } else {
             self.other = Some(e);
         }
@@ -293,7 +315,10 @@ impl PoolFailures {
     fn verdict(self, attempts: usize, rate_limited: usize) -> anyhow::Error {
         let remedy = "supply an archive-capable RPC with `--rpc` or `rpc_urls`";
         let pruned = self.pruned.join(", ");
-        match (self.other.or(self.limited), self.last_pruned) {
+        match (
+            self.other.or(self.limited).or(self.refused),
+            self.last_pruned,
+        ) {
             (None, Some(e)) => anyhow::Error::new(ClassifiedError {
                 class: FailureClass::HistoryUnavailable,
                 detail: format!(
@@ -820,6 +845,11 @@ pub struct RpcClient {
     /// The most addresses one getLogs names, lowered when an endpoint refuses a list (#1941). One
     /// value for the pool: the strictest endpoint sets it, at the cost of extra requests elsewhere.
     log_address_cap: AtomicUsize,
+    /// Endpoints whose startup chain-id check got no answer; each is asked again before it serves
+    /// anything (#2161).
+    unverified: Vec<AtomicBool>,
+    /// The chain `verify_chain_ids` was asked to hold the pool to.
+    chain: AtomicU64,
 }
 
 impl RpcClient {
@@ -857,6 +887,8 @@ impl RpcClient {
             header_width,
             logs_body_cap: GETLOGS_BODY_CAP,
             log_address_cap: AtomicUsize::new(usize::MAX),
+            unverified: (0..n).map(|_| AtomicBool::new(false)).collect(),
+            chain: AtomicU64::new(0),
         })
     }
 
@@ -1018,6 +1050,31 @@ impl RpcClient {
         self.health[j].store(now_millis() + ENDPOINT_COOLDOWN_MS, Ordering::Relaxed);
     }
 
+    /// Ask an endpoint left unverified at startup which chain it is on, before it answers anything
+    /// else (#2161). The wrong chain is refused as terminal, so it is cooled and never used.
+    async fn admit(&self, j: usize) -> Result<()> {
+        if !self.unverified[j].load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let url = &self.urls[j];
+        let v = self.call_one(url, "eth_chainId", &json!([]), None).await?;
+        let got = parse_hex_u64(v.as_str().unwrap_or_default())
+            .with_context(|| format!("unparseable eth_chainId from {}", redact_url(url)))?;
+        let expected = self.chain.load(Ordering::Relaxed);
+        if got != expected {
+            return Err(anyhow::Error::new(ClassifiedError {
+                class: FailureClass::Terminal,
+                detail: format!(
+                    "RPC endpoint {} is on chain {got}, but this nest indexes chain {expected}, so \
+                     it serves nothing. Fix `rpc_urls`.",
+                    redact_url(url)
+                ),
+            }));
+        }
+        self.unverified[j].store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Cool an endpoint down for the *terminal* interval and say so at `warn!` (RFC-0028 §3).
     ///
     /// The log level is the point as much as the interval. Endpoint failures are logged at `debug!`,
@@ -1108,7 +1165,11 @@ impl RpcClient {
             crate::metrics::METRICS.inc_rpc_method(method);
             attempts += 1;
             let t0 = Instant::now();
-            match self.call_one(url, method, &params, body_cap).await {
+            let answer = match self.admit(j).await {
+                Ok(()) => self.call_one(url, method, &params, body_cap).await,
+                Err(e) => Err(e),
+            };
+            match answer {
                 Ok(v) => {
                     crate::metrics::METRICS.observe_rpc(
                         &crate::metrics::endpoint_label(url),
@@ -1173,7 +1234,11 @@ impl RpcClient {
             }
             attempts += 1;
             let t0 = Instant::now();
-            match self.post_one(url, body).await {
+            let answer = match self.admit(j).await {
+                Ok(()) => self.post_one(url, body).await,
+                Err(e) => Err(e),
+            };
+            match answer {
                 Ok(v) => {
                     crate::metrics::METRICS.observe_rpc(
                         &crate::metrics::endpoint_label(url),
@@ -1340,7 +1405,7 @@ impl RpcClient {
         // calls; otherwise the bad endpoint silently poisons the pool and the batch aborts with a
         // confusing non-error. (Per-item errors inside a normal array response stay the caller's to
         // handle.)
-        if let Some(err) = resp.get("error") {
+        if let Some(err) = error_of(&resp) {
             return Err(anyhow::Error::new(ClassifiedError {
                 class: classify_rpc_error(err),
                 detail: format!("rpc error (endpoint rejected the batch): {err}"),
@@ -1358,7 +1423,7 @@ impl RpcClient {
     ) -> Result<Value> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
         let resp: Value = self.send_classified(url, &body, body_cap).await?;
-        if let Some(err) = resp.get("error") {
+        if let Some(err) = error_of(&resp) {
             return Err(anyhow::Error::new(ClassifiedError {
                 class: classify_rpc_error(err),
                 detail: format!("rpc error: {err}"),
@@ -1440,6 +1505,7 @@ impl RpcClient {
         // promise, and one that only shows up when a public endpoint is having a bad day. Concurrent +
         // 2 s bounds the whole check at ~2 s no matter how many endpoints are configured or dead.
         const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        self.chain.store(expected, Ordering::Relaxed);
         let checks = self.urls.iter().enumerate().map(|(j, url)| async move {
             self.requests.fetch_add(1, Ordering::Relaxed);
             crate::metrics::METRICS.inc_rpc();
@@ -1468,12 +1534,12 @@ impl RpcClient {
                     }
                     self.mark_healthy(j);
                 }
-                // Unreachable or slow now ≠ wrong chain. Leave it in the pool; failover copes, and a
-                // wrong-chain endpoint that was merely late still gets caught the moment it answers a
-                // real call with a mismatching block hash. It is cooled, though: left healthy, the
-                // first real call waited out the client's 20 s timeout on it (#1885).
+                // Unreachable or slow now ≠ wrong chain. Leave it in the pool, cooled so the first real
+                // call does not wait out the client's 20 s timeout on it (#1885), and unverified, so
+                // `admit` asks its chain again before it answers anything else (#2161).
                 Ok(Err(e)) => {
                     self.mark_unhealthy(j);
+                    self.unverified[j].store(true, Ordering::Relaxed);
                     tracing::warn!(
                         "could not verify chain id of {} at startup ({e:#}) - leaving it in the pool",
                         redact_url(url)
@@ -1481,6 +1547,7 @@ impl RpcClient {
                 }
                 Err(_) => {
                     self.mark_unhealthy(j);
+                    self.unverified[j].store(true, Ordering::Relaxed);
                     tracing::warn!(
                         "chain id check for {} timed out after {}s - leaving it in the pool",
                         redact_url(url),
@@ -2038,7 +2105,7 @@ impl RpcClient {
             // error rather than a partial map - see COR-3 above.
             if let Some(result) = item.get("result").filter(|v| !v.is_null()) {
                 out.insert(block, result.clone());
-            } else if let Some(err) = item.get("error") {
+            } else if let Some(err) = error_of(item) {
                 // **A per-item error inside an HTTP 200 batch.** `post_one` only rejects a *top-level*
                 // error, so these are invisible to the failure classifier: the batch "succeeded", the
                 // items are silently dropped, and the caller's count check reports
@@ -2201,7 +2268,11 @@ impl RpcClient {
             .as_array()
             .ok_or_else(|| anyhow!("eth_getLogs did not return an array"))?;
         self.remember_log_timestamps(arr);
-        arr.iter().map(Log::from_rpc).collect()
+        // A log a reorg took back is not on the chain, whichever call a provider marks it on (#2222).
+        arr.iter()
+            .filter(|l| l.get("removed").and_then(Value::as_bool) != Some(true))
+            .map(Log::from_rpc)
+            .collect()
     }
 
     /// Nodes that carry `blockTimestamp` on each log (execution-apis, 2025) answer the header
@@ -3588,6 +3659,150 @@ mod tests {
         let msg = format!("{:#}", c.verify_chain_ids(1).await.unwrap_err());
         assert!(!msg.contains("SUPERSECRETKEY"), "leaked the API key: {msg}");
         h.abort();
+    }
+
+    /// An endpoint that errors on its first `eth_chainId` and then answers as chain `chain_id`, with
+    /// a tip of `tip`: one that was down for the startup check and came back.
+    async fn late_rpc(chain_id: u64, tip: u64) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let app = Router::new()
+            .route(
+                "/",
+                post(
+                    move |State(first): State<Arc<std::sync::atomic::AtomicBool>>,
+                          Json(req): Json<Value>| async move {
+                        let method = req["method"].as_str().unwrap_or_default().to_string();
+                        if method == "eth_chainId" && first.swap(false, Ordering::SeqCst) {
+                            return Json(
+                                json!({"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"warming up"}}),
+                            );
+                        }
+                        let result = match method.as_str() {
+                            "eth_chainId" => json!(format!("0x{chain_id:x}")),
+                            _ => json!(format!("0x{tip:x}")),
+                        };
+                        Json(json!({"jsonrpc":"2.0","id":1,"result":result}))
+                    },
+                ),
+            )
+            .with_state(first);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// #2161: an endpoint whose chain could not be checked at startup was used for data unverified.
+    /// It is asked its chain before it serves anything, and the wrong one serves nothing.
+    #[tokio::test]
+    async fn an_endpoint_unverified_at_startup_is_checked_before_it_serves() {
+        let (wrong, hw) = late_rpc(8453, 0x9999).await;
+        let c = RpcClient::new(vec![wrong]).unwrap();
+        c.verify_chain_ids(1).await.unwrap();
+        let err = c
+            .block_number()
+            .await
+            .expect_err("a chain-8453 endpoint answered for chain 1");
+        assert!(format!("{err:#}").contains("8453"), "{err:#}");
+        assert_eq!(super::class_of(&err), Some(super::FailureClass::Terminal));
+
+        let (right, hr) = late_rpc(1, 0x9999).await;
+        let c = RpcClient::new(vec![right]).unwrap();
+        c.verify_chain_ids(1).await.unwrap();
+        assert_eq!(
+            c.block_number().await.unwrap(),
+            0x9999,
+            "the right chain, late, is admitted"
+        );
+        hw.abort();
+        hr.abort();
+    }
+
+    /// #2225: `"error": null` beside a result is a success that spells the field out.
+    #[tokio::test]
+    async fn a_null_error_beside_a_result_is_a_success() {
+        let (url, h) =
+            canned_rpc(serde_json::json!({"jsonrpc":"2.0","id":1,"result":"0x10","error":null}))
+                .await;
+        let c = RpcClient::new(vec![url]).unwrap();
+        assert_eq!(c.block_number().await.unwrap(), 0x10);
+        h.abort();
+        assert_eq!(
+            super::decode_call_batch(
+                &serde_json::json!([{"id":0,"result":"0xab","error":null}]),
+                1
+            )
+            .unwrap(),
+            vec![Some("0xab".to_string())]
+        );
+    }
+
+    /// #2226: a revert in a shape not on the explicit list is the node's answer at a pinned block.
+    /// It must be refused by name, never classed transient and asked again for ever.
+    #[test]
+    fn an_unlisted_revert_shape_is_not_transient() {
+        for item in [
+            serde_json::json!({"code":-32603,"message":"execution reverted"}),
+            serde_json::json!({"code":-32000,"message":"Reverted 0x08c379a0"}),
+        ] {
+            let err = super::decode_call_batch(&serde_json::json!([{"id":0,"error":item}]), 1)
+                .unwrap_err();
+            assert_eq!(
+                super::class_of(&err),
+                Some(super::FailureClass::Terminal),
+                "{err:#}"
+            );
+            assert!(format!("{err:#}").contains("does not recognise"), "{err:#}");
+        }
+    }
+
+    /// #2222: a log a reorg took back is not stored, whichever call a provider marks it on.
+    #[tokio::test]
+    async fn a_removed_log_is_not_returned() {
+        let log = |li: u64, removed: bool| {
+            serde_json::json!({"address":"0xaa","topics":["0x01"],"data":"0x",
+                "blockNumber":"0xa","blockHash":"0xbh","transactionHash":"0xtx",
+                "logIndex":format!("0x{li:x}"),"removed":removed})
+        };
+        let (url, h) = canned_rpc(serde_json::json!({"jsonrpc":"2.0","id":1,
+            "result":[log(0, false), log(1, true), log(2, false)]}))
+        .await;
+        let c = RpcClient::new(vec![url]).unwrap();
+        let got = c.get_logs(&[], &["0x01".into()], 10, 10).await.unwrap();
+        h.abort();
+        assert_eq!(
+            got.iter().map(|l| l.log_index).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+    }
+
+    /// #2155: one endpoint refusing our key is not the pool refusing it. The verdict of a call that
+    /// another endpoint failed for a passing reason must not read as terminal, or a retry site that
+    /// stops on terminal gives up on a pool that will recover (#538).
+    #[tokio::test]
+    async fn one_endpoint_refusing_credentials_is_not_the_pools_verdict() {
+        let (down, hd, _) = broken_rpc().await;
+        let (refusing, hu) = unauthorized_rpc().await;
+        let c = RpcClient::new(vec![down, refusing]).unwrap();
+        for _ in 0..2 {
+            let err = c.block_number().await.unwrap_err();
+            assert_ne!(
+                super::class_of(&err),
+                Some(super::FailureClass::Terminal),
+                "{err:#}"
+            );
+        }
+        let (refusing, hu2) = unauthorized_rpc().await;
+        let only = RpcClient::new(vec![refusing]).unwrap();
+        let err = only.block_number().await.unwrap_err();
+        assert_eq!(super::class_of(&err), Some(super::FailureClass::Terminal));
+        hd.abort();
+        hu.abort();
+        hu2.abort();
     }
 
     use super::{redact_url, select_rpcs, RpcClient};
