@@ -14591,7 +14591,7 @@ template = "pool"
                 Ok(7)
             }
             async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-                Ok(None)
+                Ok(Some("0xbh".into()))
             }
             async fn logs(
                 &self,
@@ -14693,7 +14693,7 @@ template = "pool"
                 Ok(7)
             }
             async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
-                Ok(None)
+                Ok(Some("0xbh".into()))
             }
             async fn logs(
                 &self,
