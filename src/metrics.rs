@@ -162,6 +162,9 @@ pub struct NestMetrics {
     /// legitimately slow are the same observation - and `/ready` suppresses every other stall term
     /// while a pass is active, so it had nothing left to judge by.
     last_seal_progress: AtomicU64,
+    /// #2262: since when the tip path's seal has failed without a success between, and its latest
+    /// error. `None` while it succeeds.
+    seal_fault: Mutex<Option<(u64, String)>>,
     /// Hot-store file and sealed-segment directory, for #812 footprint gauges. `None` until the
     /// nest is built.
     storage: Mutex<Option<(PathBuf, PathBuf)>>,
@@ -498,6 +501,22 @@ impl NestMetrics {
     #[cfg(test)]
     pub fn set_last_seal_progress_for_test(&self, t: u64) {
         self.last_seal_progress.store(t, Relaxed);
+    }
+    /// The outcome of one tip-path seal attempt: its error, or `None` for one that did not fail.
+    /// A run of failures keeps the time of its first.
+    pub fn record_seal(&self, error: Option<String>) {
+        let mut fault = self.seal_fault.lock().unwrap();
+        *fault = error.map(|e| (fault.as_ref().map_or_else(now_unix, |(since, _)| *since), e));
+    }
+    /// `(since_unixtime, reason)` while the seal keeps failing.
+    pub fn seal_fault(&self) -> Option<(u64, String)> {
+        self.seal_fault.lock().unwrap().clone()
+    }
+    #[cfg(test)]
+    pub fn set_seal_fault_since_for_test(&self, t: u64) {
+        if let Some((since, _)) = self.seal_fault.lock().unwrap().as_mut() {
+            *since = t;
+        }
     }
     /// Handoff to tip-following: inactive, but the completed target stays (#807).
     pub fn end_seal_direct(&self) {
@@ -1466,6 +1485,21 @@ impl Metrics {
                 "Highest block sealed to the cold layer, per nest.",
                 "gauge",
                 &|m| m.sealed_through.load(Relaxed),
+            );
+            labelled(
+                "nuthatch_nest_last_seal_progress_unixtime",
+                "When the nest's sealed watermark last advanced, 0 if it never has.",
+                "gauge",
+                &|m| m.last_seal_progress.load(Relaxed),
+            );
+            labelled(
+                "nuthatch_nest_seal_fault_seconds",
+                "How long the nest's seal has failed on every attempt, 0 while it succeeds. /ready names the error.",
+                "gauge",
+                &|m| {
+                    m.seal_fault()
+                        .map_or(0, |(since, _)| now_unix().saturating_sub(since))
+                },
             );
             #[cfg(feature = "folds")]
             labelled(

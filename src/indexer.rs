@@ -8547,7 +8547,32 @@ async fn pin_checkpoint(
 ///
 /// Earlier write-ups called this `seal_finalized`. It sealed `from..=ceiling` with no row threshold,
 /// which is why 80% of a long-running nest's segments were under 20 KB (docs/bench/segment-layout.md).
+///
+/// The outcome goes to `metrics`, so `/ready` sees a seal that fails on every attempt (#2262).
 async fn maybe_seal(
+    dir: &std::path::Path,
+    store: &dyn crate::store::HotStore,
+    source: &dyn Source,
+    finalized_through: u64,
+    registry_snapshot: Option<&str>,
+    metrics: &crate::metrics::NestMetrics,
+    seal_span: u64,
+) -> Result<()> {
+    let sealed = try_seal(
+        dir,
+        store,
+        source,
+        finalized_through,
+        registry_snapshot,
+        metrics,
+        seal_span,
+    )
+    .await;
+    metrics.record_seal(sealed.as_ref().err().map(|e| format!("{e:#}")));
+    sealed
+}
+
+async fn try_seal(
     dir: &std::path::Path,
     store: &dyn crate::store::HotStore,
     source: &dyn Source,
@@ -12808,6 +12833,29 @@ template = "pool"
         src.fork_from
             .store(110, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(detect_reorg(&src, &store, 110).await.unwrap(), Some(100));
+    }
+
+    /// #2262: a failed seal reaches the metrics `/ready` reads, and the next one that succeeds clears it.
+    #[tokio::test]
+    async fn maybe_seal_records_its_failure_until_a_seal_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let metrics = crate::metrics::NestMetrics::default();
+        store.set_meta(LAST_BLOCK_KEY, "not a block").unwrap();
+
+        assert!(
+            maybe_seal(tmp.path(), &store, &HashOnly, 99, None, &metrics, SPAN_REAL)
+                .await
+                .is_err()
+        );
+        let (_, reason) = metrics.seal_fault().expect("the failure is recorded");
+        assert!(reason.contains("corrupt last_block"), "{reason}");
+
+        store.set_meta(LAST_BLOCK_KEY, "50").unwrap();
+        maybe_seal(tmp.path(), &store, &HashOnly, 99, None, &metrics, SPAN_REAL)
+            .await
+            .unwrap();
+        assert_eq!(metrics.seal_fault(), None);
     }
 
     const SENDER: &str = "0x1111111111111111111111111111111111111111";
