@@ -551,6 +551,14 @@ pub(crate) const ENTITY_RSS_BYTES_PER_ROW: u64 = 3_200;
 /// handled comfortably. The first entity footprint run was refused for precisely that reason.
 const ENTITY_CIRCUIT_RSS_MB: u64 = 8;
 
+/// What admission charges one entity, in bytes, which its sampled DBSP state is then held to (#2167).
+/// One that reads offchain is charged its `max_rows` twice, as [`declared_entities`] counts it.
+pub(crate) fn entity_allowance_bytes(max_rows: u64, reads_offchain: bool) -> u64 {
+    let rows = max_rows.saturating_mul(if reads_offchain { 2 } else { 1 });
+    (ENTITY_CIRCUIT_RSS_MB * 1024 * 1024)
+        .saturating_add(rows.saturating_mul(ENTITY_RSS_BYTES_PER_ROW))
+}
+
 /// The most authored entities one cursor will admit, across every nest on that chain.
 ///
 /// A count ceiling on top of the MB budget, because the two bound different things. An entity costs
@@ -634,6 +642,15 @@ pub fn estimate_nest_rss_mb(
         mb += NEST_VIEW_RSS_MB; // discovered-child registry (RFC-0009)
     }
     mb
+}
+
+/// The heap a nest's redb page cache can fill (#2176, RFC-0012's `redb_cache` term): its file, up to
+/// the cache ceiling, since redb caches only pages it has read. Measured when the nest is admitted,
+/// so a store that grows afterwards grows past it; the per-cursor RSS job is the guard for that.
+pub fn hot_store_cache_mb(dir: &Path) -> u64 {
+    let file = std::fs::metadata(dir.join(crate::config::DB_FILE)).map_or(0, |m| m.len());
+    file.min(crate::store::hot_store_cache_bytes() as u64)
+        .div_ceil(1024 * 1024)
 }
 
 impl MountTable {
@@ -1997,7 +2014,8 @@ pub async fn dev(
         for (name, path, config) in &group.nests {
             let has_labels = !crate::labels::load(path).is_empty();
             let (entity_count, entity_rows) = declared_entities(path);
-            let mb = estimate_nest_rss_mb(config, has_labels, entity_count, entity_rows);
+            let mb = estimate_nest_rss_mb(config, has_labels, entity_count, entity_rows)
+                + hot_store_cache_mb(path);
             estimates.insert(name.clone(), mb);
             cursor_mb += mb;
         }
@@ -4018,7 +4036,8 @@ impl RuntimeHandles {
             }
             .into());
         }
-        let incoming_mb = estimate_nest_rss_mb(config, has_labels, entity_count, entity_rows);
+        let incoming_mb = estimate_nest_rss_mb(config, has_labels, entity_count, entity_rows)
+            + hot_store_cache_mb(dir);
         let joining: Vec<Joining> = self
             .joining
             .list()
@@ -8278,5 +8297,38 @@ mod tests {
         .expect("the runtime started under a prune");
         let err = started.expect_err("the runtime started under a prune");
         assert!(format!("{err:#}").contains("a prune is running"), "{err:#}");
+    }
+
+    /// #2176: a nest's redb page cache is heap, up to the smaller of its file and the cache ceiling,
+    /// and admission must charge it to the cursor.
+    #[tokio::test]
+    async fn admission_charges_a_nests_hot_store_cache() {
+        let root = tempfile::tempdir().unwrap();
+        write_nest_dir(root.path(), "usdc", "ethereum", 1);
+        let dir = MountTable::nest_dir(root.path(), "usdc");
+        let config = Config::load(&dir).unwrap();
+        let mut handles = idle_handles(root.path());
+        let source: Arc<dyn Source> = Arc::new(QuietChain::at(1_000));
+        handles
+            .mount_ctx
+            .sources
+            .insert("ethereum".to_string(), source);
+        let (tx, _cursor) = admitting_cursor();
+        handles.lifecycle.insert("ethereum".to_string(), tx);
+        let bare = handles.admit("usdc", &config, &dir).unwrap().incoming_mb;
+
+        let store = std::fs::File::create(dir.join(crate::config::DB_FILE)).unwrap();
+        store.set_len(600 * 1024 * 1024).unwrap();
+        assert_eq!(
+            handles.admit("usdc", &config, &dir).unwrap().incoming_mb,
+            bare + 600
+        );
+        store.set_len(3 * 1024 * 1024 * 1024).unwrap();
+        let ceiling = crate::store::hot_store_cache_bytes() as u64 / (1024 * 1024);
+        assert_eq!(
+            handles.admit("usdc", &config, &dir).unwrap().incoming_mb,
+            bare + ceiling,
+            "the cache is a ceiling, not a copy of the file"
+        );
     }
 }

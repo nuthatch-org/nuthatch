@@ -76,6 +76,8 @@ whether or not the relation ever fills. A mount that would exceed the budget is 
 Measured at real scale on 3.0.0-alpha (`docs/bench/3.0.0-alpha-live.md`) the true cost was 940 to
 1,482 bytes per maintained row depending on how wide the key and aggregates are, so the charge is
 deliberately conservative. `nuthatch_entity_state_bytes` on `/metrics` is what a running circuit holds.
+A circuit whose sampled state outgrows its charge, such as a join whose output is far larger than
+its input, stops as one crossing `max_rows` does.
 
 ## What happens on a restart
 

@@ -102,6 +102,17 @@ fn sample_state(circuit: &mut EntityCircuit, into: &Mutex<Option<u64>>) -> Resul
     Ok((bytes, started.elapsed()))
 }
 
+/// Why a sampled state of `bytes` stops the entity, or `None` inside `allowance` (#2167). `max_rows`
+/// bounds input rows; a join's output, and the values a MIN or MAX keeps from it, can outgrow them.
+fn over_allowance(bytes: u64, allowance: u64) -> Option<String> {
+    (bytes > allowance).then(|| {
+        format!(
+            "the circuit holds {bytes} bytes of state, past the allowance of {allowance} bytes \
+             admission charged for this entity. Raise its max_rows, which admission charges for"
+        )
+    })
+}
+
 const REBUILD_ORDER: &str =
     "a rebuild message arrived with no rebuild in progress; the ingest path fed it out of order";
 
@@ -301,6 +312,10 @@ impl EntityView {
         let thread_label = label.clone();
         let state_bytes = Arc::new(Mutex::new(None::<u64>));
         let sampled = state_bytes.clone();
+        let allowance = crate::runtime::entity_allowance_bytes(
+            max_rows as u64,
+            !binding.offchain_tables().is_empty(),
+        );
 
         std::thread::Builder::new()
             .name(format!("nuthatch-entity-{name}"))
@@ -355,8 +370,15 @@ impl EntityView {
                 loop {
                     if let Some(every) = interval.filter(|_| changed && Instant::now() >= due) {
                         match sample_state(&mut circuit, &sampled) {
-                            Ok((_, took)) => {
-                                tracing::debug!("entity `{thread_label}` state sampled in {took:?}")
+                            Ok((bytes, took)) => {
+                                tracing::debug!(
+                                    "entity `{thread_label}` state sampled in {took:?}"
+                                );
+                                if let Some(why) = over_allowance(bytes, allowance) {
+                                    tracing::error!("entity `{thread_label}`: {why}");
+                                    *stopped.write().unwrap() = Some(why);
+                                    break;
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -475,13 +497,35 @@ impl EntityView {
                         // prior batch is folded - the ack unblocks the waiter.
                         Msg::Stop => break,
                         Msg::Flush(ack) => {
+                            // A seed is the whole history arriving at once, so its end is sampled
+                            // even when no sample is due.
+                            let why = interval.and(pending).and_then(|_| {
+                                let (bytes, _) = sample_state(&mut circuit, &sampled).ok()?;
+                                over_allowance(bytes, allowance)
+                            });
+                            if let Some(why) = why {
+                                tracing::error!("entity `{thread_label}`: {why}");
+                                *stopped.write().unwrap() = Some(why);
+                                let _ = ack.send(());
+                                break;
+                            }
                             if let Some(through) = pending.take() {
                                 stamp(through, &mut shared.write().unwrap());
                             }
                             let _ = ack.send(());
                         }
                         Msg::SampleState(ack) => {
-                            let _ = ack.send(sample_state(&mut circuit, &sampled));
+                            let sample = sample_state(&mut circuit, &sampled);
+                            let why = sample
+                                .as_ref()
+                                .ok()
+                                .and_then(|(bytes, _)| over_allowance(*bytes, allowance));
+                            let _ = ack.send(sample);
+                            if let Some(why) = why {
+                                tracing::error!("entity `{thread_label}`: {why}");
+                                *stopped.write().unwrap() = Some(why);
+                                break;
+                            }
                         }
                     }
                 }
@@ -1289,6 +1333,51 @@ mod tests {
         assert!(why.contains("max_rows exceeded"), "{why}");
         assert!(why.contains("both relations"), "{why}");
         assert_eq!(v.applied_through(), 0, "and the watermark did not move");
+    }
+
+    /// #2167: `max_rows` bounds input rows, but a join's output is not its input. Two hundred rows a
+    /// side, all on one join key, make forty thousand joined rows for a MAX to hold.
+    #[test]
+    fn state_past_the_admitted_allowance_faults_the_entity() {
+        let reg = registry();
+        let plan = Plan {
+            join: Some(Join {
+                right: src("usdc__approval", &["owner", "value"]),
+                right_filter: None,
+                on: (0, 0),
+            }),
+            key: vec![Expr::Column(1), Expr::Column(3)],
+            aggregates: vec![Agg::Max(Expr::Column(1))],
+            ..received()
+        };
+        let n = 200u64;
+        let v = EntityView::start(
+            "fanned",
+            &plan,
+            &["a".into(), "b".into(), "m".into()],
+            &reg,
+            2 * n as usize,
+            false,
+        )
+        .unwrap();
+        let logs: Vec<_> = (0..n)
+            .flat_map(|i| {
+                let value = format!("{:x}", i + 1);
+                [
+                    log(TRANSFER_TOPIC0, ALICE, BOB, &value, 100, 2 * i),
+                    log(APPROVAL_TOPIC0, BOB, ALICE, &value, 100, 2 * i + 1),
+                ]
+            })
+            .collect();
+        v.apply_window(&decode(&reg, &logs), 1, 100).unwrap();
+        v.flush();
+        let _ = v.sample_state();
+
+        let why = v
+            .fault()
+            .expect("state past what admission charged is a fault");
+        assert!(why.contains("allowance"), "{why}");
+        assert!(!why.contains("max_rows exceeded"), "400 rows fit: {why}");
     }
 
     #[test]
