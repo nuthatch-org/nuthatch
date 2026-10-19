@@ -6910,6 +6910,137 @@ mod tests {
         );
     }
 
+    /// #2221: a `?wait=true` mount of a name an async job is still mounting replaces that job's
+    /// claim. The job, fenced by its generation, stands down rather than mounting the name twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wait_mount_over_a_running_job_mounts_once() {
+        use crate::mount_jobs::{MountJob, MountPhase};
+        use tower::ServiceExt;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"ethereum\"\nchain_id = 1\nrpc_urls = []\n",
+        )
+        .unwrap();
+        write_nest_dir(root.path(), "usdc", "ethereum", 1);
+        let dir = MountTable::nest_dir(root.path(), "usdc");
+        crate::store::Store::open(&dir.join(crate::config::DB_FILE))
+            .unwrap()
+            .set_meta("last_block", "5")
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let admitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cursor = tokio::spawn({
+            let admitted = admitted.clone();
+            async move {
+                while let Some(cmd) = rx.recv().await {
+                    if let indexer::CursorCommand::Mount { nest, ack, .. } = cmd {
+                        admitted.lock().unwrap().push(nest);
+                        let _ = ack.expect("a live mount waits for its ack").send(());
+                    }
+                }
+            }
+        });
+        let mut idle = idle_handles(root.path());
+        let source: Arc<dyn Source> = Arc::new(crate::source::UnpolledSource);
+        idle.mount_ctx
+            .sources
+            .insert("ethereum".to_string(), source);
+        idle.lifecycle.insert("ethereum".to_string(), tx);
+        let handles = Arc::new(tokio::sync::Mutex::new(idle));
+        let jobs = Arc::new(crate::mount_jobs::MountJobs::load(root.path()));
+        let claimed = jobs
+            .claim(MountJob::new("usdc", None, MountPhase::Accepted))
+            .unwrap();
+
+        let routes = lifecycle_routes(handles.clone(), jobs.clone(), true, None);
+        let answer = Arc::new(std::sync::Mutex::new(None));
+        let answer_hook = answer.clone();
+        let hook_key = (root.path().to_path_buf(), "usdc".to_string());
+        super::before_mount_join().lock().unwrap().insert(
+            hook_key.clone(),
+            Arc::new(move || {
+                let req = axum::http::Request::post("/_admin/nests?wait=true")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"name":"usdc"}"#))
+                    .unwrap();
+                let resp = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(routes.clone().oneshot(req))
+                })
+                .unwrap();
+                *answer_hook.lock().unwrap() = Some(resp.status());
+            }),
+        );
+        struct Clear((std::path::PathBuf, String));
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                super::before_mount_join().lock().unwrap().remove(&self.0);
+            }
+        }
+        let _clear = Clear(hook_key);
+        spawn_mount_job(
+            handles.clone(),
+            jobs.clone(),
+            "usdc".into(),
+            None,
+            claimed.generation,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *answer.lock().unwrap(),
+            Some(axum::http::StatusCode::OK),
+            "premise: the waited mount landed while the job was between fetch and join"
+        );
+        assert_eq!(
+            super::mount_entries_in(root.path()),
+            1,
+            "the job mounted a name the waited mount already holds"
+        );
+        let mut h = handles.lock().await;
+        assert_eq!(h.states.iter().filter(|(n, _)| n == "usdc").count(), 1);
+        assert_eq!(jobs.get("usdc").unwrap().phase, MountPhase::Live);
+        for (_, w) in std::mem::take(&mut h.alert_workers) {
+            w.abort();
+        }
+        drop(h);
+        cursor.abort();
+        assert_eq!(
+            admitted.lock().unwrap().len(),
+            1,
+            "one nest reached the cursor"
+        );
+    }
+
+    /// #2233: a commit whose second rename fails takes the first back out, so the destination is
+    /// inputs-only and adoptable again rather than a store with no segments beside it.
+    #[test]
+    fn a_commit_that_fails_part_way_leaves_the_destination_inputs_only() {
+        let d = tempfile::tempdir().unwrap();
+        let (staging, dataset) = (d.path().join("staging"), d.path().join("dataset"));
+        std::fs::create_dir_all(staging.join("segments")).unwrap();
+        std::fs::write(staging.join(crate::config::DB_FILE), b"store").unwrap();
+        std::fs::write(staging.join("segments").join("manifest.json"), b"{}").unwrap();
+        // A non-empty directory in its place makes the second rename fail.
+        std::fs::create_dir_all(dataset.join("segments")).unwrap();
+        std::fs::write(dataset.join("segments").join("in-the-way"), b"").unwrap();
+        std::fs::write(dataset.join(CONFIG_FILE), b"inputs").unwrap();
+
+        let err = commit_derived_state(&staging, &dataset, crate::blob::DERIVED_STATE)
+            .expect_err("premise: the segments rename fails");
+        assert!(
+            format!("{err:#}").contains("committing segments"),
+            "{err:#}"
+        );
+        assert!(
+            !dataset.join(crate::config::DB_FILE).exists(),
+            "the store landed without its segments: a half-adopted dataset"
+        );
+        assert!(dataset.join(CONFIG_FILE).exists());
+    }
+
     /// #1768: a refused mount returns only once its store is closed. The alert worker it aborts may
     /// have a delivery on the blocking pool, holding a store clone, and a retry would hit the lock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
