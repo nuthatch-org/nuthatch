@@ -10,6 +10,7 @@
 //! tip-following never waits on a gateway.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -211,6 +212,9 @@ pub struct Gate {
     /// Storage kind of each column a declaration reads, by `(table, column)`. A `bytes` column is
     /// stored as hex, and JSON calldata only plans the same from a stored row once it is bytes again.
     kinds: HashMap<(String, String), String>,
+    /// The first block not known to be clear of outstanding documents: every block below it was
+    /// clear when last read (#2231). A window writing rows lowers it.
+    clear_below: AtomicU64,
 }
 
 #[derive(serde::Deserialize)]
@@ -241,7 +245,23 @@ impl Gate {
         Some(Arc::new(Gate {
             decls: decls.to_vec(),
             kinds,
+            clear_below: AtomicU64::new(0),
         }))
+    }
+
+    /// See the field. Blocks below this need not be read again for outstanding documents.
+    pub fn clear_below(&self) -> u64 {
+        self.clear_below.load(Ordering::Acquire)
+    }
+
+    /// Every block below `block` has been read and holds no outstanding document.
+    pub fn cleared_below(&self, block: u64) {
+        self.clear_below.fetch_max(block, Ordering::AcqRel);
+    }
+
+    /// Rows were written from `block` up, so what was read there no longer stands.
+    pub fn written_from(&self, block: u64) {
+        self.clear_below.fetch_min(block, Ordering::AcqRel);
     }
 
     pub fn decls(&self) -> &[IpfsDecl] {

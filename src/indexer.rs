@@ -7799,6 +7799,9 @@ impl NestIngest {
         #[cfg(test)]
         before_commit();
         let alerted = !outbox.is_empty();
+        if let Some(gate) = &self.ipfs_gate {
+            gate.written_from(next);
+        }
         if let Err(e) = self
             .store
             .commit_window_blocking(std::mem::take(&mut to_store), outbox, checkpoint, to)
@@ -8450,12 +8453,17 @@ fn block_number_of(json: &str) -> Option<u64> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static HOLD_ROWS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The block a finalized range may seal through while documents it names are outstanding
 /// (RFC-0037 §3): one below the lowest block holding one, `finalized_through` when none is, and `None`
 /// when that block is block 0, where "one below" does not exist and nothing may seal.
 ///
-/// Read in chunks from the watermark up and stopped at the first outstanding document, which is
-/// normally near the watermark, so a long run of resolved documents above it is not reloaded per window.
+/// Read in chunks from the watermark, or from where the last read found every document settled if
+/// that is higher (#2231), and stopped at the first outstanding one.
 fn hold_for_documents(
     store: &dyn crate::store::HotStore,
     gate: &crate::ipfs_resolve::Gate,
@@ -8465,11 +8473,15 @@ fn hold_for_documents(
     let mut lo = match store.get_meta(SEALED_THROUGH_KEY)? {
         Some(v) => v.parse::<u64>().context("corrupt sealed_through")? + 1,
         None => 0,
-    };
+    }
+    .max(gate.clear_below());
     while lo <= finalized_through {
         let hi = lo.saturating_add(CHUNK - 1).min(finalized_through);
         let entities = store.entities_in_range(lo, hi)?;
+        #[cfg(test)]
+        HOLD_ROWS_READ.with(|n| n.set(n.get() + entities.len()));
         if let Some(pending) = gate.lowest_pending(store, &entities)? {
+            gate.cleared_below(pending);
             return Ok(pending.checked_sub(1));
         }
         if hi == u64::MAX {
@@ -8477,6 +8489,7 @@ fn hold_for_documents(
         }
         lo = hi + 1;
     }
+    gate.cleared_below(finalized_through.saturating_add(1));
     Ok(Some(finalized_through))
 }
 
@@ -16420,6 +16433,74 @@ template = "pool"
             METRICS.nest("seal-direct-resolved-1421").ipfs_resolved(),
             stored,
             "one count per stored document"
+        );
+        drop(nest);
+        drop(state);
+        handle.abort();
+    }
+
+    /// #2231: a range found clear of outstanding documents is not read again on the next window, and
+    /// rows written below it, here by a reorg, are.
+    #[tokio::test]
+    async fn a_range_clear_of_documents_is_read_once_until_rows_land_in_it() {
+        let cid = crate::cid::cid_v0_for(b"given up on");
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::new(), 0).await;
+        let dir = qos_topic_nest("t");
+        let (mut nest, state, source) =
+            qos_nest_with(dir.path(), gateway, vec![(4, qos_post(&cid))]).await;
+        nest.seal_span = 1;
+        for b in [4, 5] {
+            nest.process_window(source.as_ref(), &[], b, b, 10_000)
+                .await
+                .unwrap()
+                .expect("the window must commit");
+        }
+        let gate = nest.ipfs_gate.clone().expect("a gate");
+        let give_up = |store: &dyn crate::store::HotStore| {
+            let plan = gate.plan_stored(&store.entities_in_range(4, 4).unwrap());
+            for p in &plan[&4].0 {
+                crate::ipfs_resolve::record_gave_up(
+                    store,
+                    &crate::ipfs_resolve::GaveUp {
+                        cid: p.cid.clone(),
+                        block: 4,
+                        slot: p.slot,
+                        declaration: None,
+                        error: None,
+                        at: None,
+                    },
+                )
+                .unwrap();
+            }
+        };
+        give_up(nest.store.as_ref());
+        assert_eq!(
+            hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
+            Some(9_000)
+        );
+        HOLD_ROWS_READ.with(|n| n.set(0));
+        assert_eq!(
+            hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
+            Some(9_000)
+        );
+        assert_eq!(
+            HOLD_ROWS_READ.with(|n| n.get()),
+            0,
+            "the cleared range was read again"
+        );
+
+        nest.rollback_reorg(3).unwrap();
+        let other = crate::cid::cid_v0_for(b"posted on the other fork");
+        let fork: Arc<dyn Source> = Arc::new(PostSource(vec![(4, qos_post(&other))]));
+        nest.process_window(fork.as_ref(), &[], 4, 4, 10_000)
+            .await
+            .unwrap()
+            .expect("the fork's window commits");
+        assert_eq!(
+            hold_for_documents(nest.store.as_ref(), &gate, 9_000).unwrap(),
+            Some(3),
+            "the fork's document at block 4 is outstanding"
         );
         drop(nest);
         drop(state);
