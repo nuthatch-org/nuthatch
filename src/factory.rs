@@ -359,6 +359,13 @@ impl ChildRegistry {
         true
     }
 
+    /// Register every child of `other` this registry does not already know.
+    pub fn extend(&mut self, other: ChildRegistry) {
+        for entry in other.children.into_values() {
+            self.insert(entry);
+        }
+    }
+
     /// Fill `discovered_timestamp` from a block-timestamp map when discovery ran before the stamp
     /// (#765: timestamps are fetched only for blocks that produced a kept row). Does not bump
     /// `version` - the set of children is unchanged.

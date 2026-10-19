@@ -72,6 +72,12 @@ events; pass 2 fetches the same chunk for newly discovered children only (usuall
 empty), merged by `(block, log_index)`. A child discovered in chunk N needs re-fetch
 only within chunk N.
 
+**Which logs a child gets (#2150, #2153, 2026-10-19).** Every regime applies one rule: a child's
+logs are decoded from its announcing block B on, including those earlier in B than the
+announcement, and none from before B. The tip re-scan above is that rule; the sequential backfill
+used to keep a child's logs anywhere in the fetched chunk, so what was sealed depended on chunk
+boundaries. Discovery is tentative until a window commits: a refused window registers nothing.
+
 **Backfill, pipelined (`backfill_direct_pipelined`, K windows in flight) - NEW.**
 The v1 design predates the pipeline and is insufficient under it: window N+1..N+K−1
 may already be *fetched* with a filter that predates a child discovered while

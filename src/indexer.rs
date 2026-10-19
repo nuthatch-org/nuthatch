@@ -1252,12 +1252,12 @@ fn narrowed_union_addresses<'a>(nests: impl Iterator<Item = &'a NestIngest>) -> 
 /// Refetch one over-cap block with an address filter instead of topic0-only, running the in-block
 /// child-discovery fixpoint so the result is what the wide fetch would have yielded (COR-5).
 ///
-/// Per round: fetch, decode the batch into every factory nest's child registry (discovery only - the
-/// rows are discarded, [`NestIngest::process_window`] does the authoritative decode), then refetch the
-/// same block for children discovered in this round but not yet fetched. Nested factories converge here
-/// exactly as they do in [`backfill_direct_factory`], and the loop terminates because every round adds
-/// strictly-new addresses to a set that only grows from decoded events (and `FactorySet::build` caps the
-/// chain at depth 3).
+/// Per round: fetch, decode what is in hand against every factory nest's child registry (discovery
+/// only - nothing is registered, [`NestIngest::process_window`] does the authoritative decode), then
+/// refetch the same block for children discovered in this round but not yet fetched. Nested factories
+/// converge here exactly as they do in [`backfill_direct_factory`], and the loop terminates because
+/// every round adds strictly-new addresses to a set that only grows from decoded events (and
+/// `FactorySet::build` caps the chain at depth 3).
 ///
 /// **Discovery is preserved, not traded away.** A child created in this block announces itself from its
 /// factory's address, which round 1 fetched, so round 2 picks up its own logs in the same block - the
@@ -1266,9 +1266,8 @@ fn narrowed_union_addresses<'a>(nests: impl Iterator<Item = &'a NestIngest>) -> 
 ///
 /// **Determinism** (non-negotiable 4) does not depend on how many rounds it took: the merged logs go
 /// through the same [`fan_out_window`] → `process_window` → [`decode_window`] path, and `decode_window`
-/// sorts by `(block, log_index)` before decoding. Discovery having run early only means a child is
-/// already in the registry when the authoritative decode reaches its creation event, and re-inserting a
-/// known child is a no-op (`ChildRegistry::insert` keeps the earliest discovery).
+/// sorts by `(block, log_index)` before decoding. The discovery rounds register nothing, so the
+/// authoritative decode starts from the same registry whichever way the logs were fetched.
 async fn refetch_address_filtered(
     source: &dyn Source,
     nests: &mut [Option<NestIngest>],
@@ -1280,7 +1279,7 @@ async fn refetch_address_filtered(
     fetch_discovering_union(source, nests, live, addresses, topics, block, block).await
 }
 
-/// [`fetch_discovering`] for a runtime cursor: discovery runs into every live factory nest.
+/// [`fetch_discovering`] for a runtime cursor: discovery runs against every live factory nest.
 async fn fetch_discovering_union(
     source: &dyn Source,
     nests: &mut [Option<NestIngest>],
@@ -1290,39 +1289,38 @@ async fn fetch_discovering_union(
     from: u64,
     to: u64,
 ) -> Result<Vec<crate::rpc::Log>> {
-    fetch_discovering(source, addresses, topics, from, to, |batch| {
+    fetch_discovering(source, addresses, topics, from, to, |logs| {
         let mut known = Vec::new();
         for &i in live {
-            let n = live_nest(nests, i);
-            let Some(fs) = n.factory.clone() else {
-                continue;
-            };
-            let registry = n.registry.clone();
-            known.extend(discover_children(&registry, &fs, &mut n.children, batch));
+            let n = live_ref(nests, i);
+            if let Some(fs) = n.factory.as_deref() {
+                known.extend(discover_children(&n.registry, fs, &n.children, logs));
+            }
         }
         known
     })
     .await
 }
 
-/// Decode `batch` for the children it announces, returning every child now known. The rows are
-/// discarded; the stamped decode happens later in `process_window`, as after the backfill's pass 1.
+/// Every child known once `logs` are decoded. Nothing is registered: `process_window` does that
+/// for the children a committed window announces.
 fn discover_children(
     registry: &DecodeRegistry,
     factory: &FactorySet,
-    children: &mut ChildRegistry,
-    batch: &[crate::rpc::Log],
+    children: &ChildRegistry,
+    logs: &[crate::rpc::Log],
 ) -> Vec<String> {
-    let _ = decode_window(
+    let (_, found) = decode_window(
         registry,
         Some(factory),
         children,
-        batch,
+        logs,
         &std::collections::HashMap::new(),
     );
     children
         .addresses()
         .into_iter()
+        .chain(found.addresses())
         .map(str::to_string)
         .collect()
 }
@@ -1330,9 +1328,9 @@ fn discover_children(
 /// `from..=to` address-filtered, then refetched for the children each round discovers until a round
 /// finds none: the backfill's pass 1 and pass 2 fixpoint, for the tip loops.
 ///
-/// `discover` decodes a batch into the child registries and returns every child they now hold. A
-/// child created in the range announces itself from its factory's address, which round 1 fetched, so
-/// its own logs in the same range arrive in round 2.
+/// `discover` decodes everything fetched so far and returns every child it knows of. A child
+/// created in the range announces itself from its factory's address, which round 1 fetched, so its
+/// own logs in the same range arrive in round 2.
 async fn fetch_discovering(
     source: &dyn Source,
     addresses: &[String],
@@ -1343,17 +1341,15 @@ async fn fetch_discovering(
 ) -> Result<Vec<crate::rpc::Log>> {
     use std::collections::HashSet;
     let mut fetched: HashSet<String> = addresses.iter().map(|a| a.to_ascii_lowercase()).collect();
-    let mut all: Vec<crate::rpc::Log> = Vec::new();
     let Some(filter) = LogFilter::new(addresses, topics) else {
         return Ok(Vec::new());
     };
-    let mut batch = source.logs(&filter, from, to).await?;
+    let mut all = source.logs(&filter, from, to).await?;
     loop {
-        let new: Vec<String> = discover(&batch)
+        let new: Vec<String> = discover(&all)
             .into_iter()
             .filter(|c| fetched.insert(c.to_ascii_lowercase()))
             .collect();
-        all.append(&mut batch);
         // An empty `new` would make the filter below address-less, so it returns first.
         if new.is_empty() {
             return Ok(all);
@@ -1361,7 +1357,7 @@ async fn fetch_discovering(
         let Some(child_filter) = LogFilter::new(&new, topics) else {
             return Ok(all);
         };
-        batch = source.logs(&child_filter, from, to).await?;
+        all.extend(source.logs(&child_filter, from, to).await?);
     }
 }
 
@@ -6204,6 +6200,7 @@ pub async fn backfill_direct_factory_with(
         }
 
         let mut all_logs;
+        let decoded;
         if use_topic0 {
             // Topic0-only: every matching log (contract + all children) is in hand in one fetch, so
             // there is no second pass; `decode_window` filters locally by registry membership.
@@ -6242,7 +6239,7 @@ pub async fn backfill_direct_factory_with(
                     }
                 }
             };
-            let _ = decode_window(registry, Some(factory), children, &all_logs, &empty_ts);
+            decoded = decode_window(registry, Some(factory), children, &all_logs, &empty_ts);
         } else {
             // Pass 1: current filter = base contracts + all children discovered so far.
             let mut fetched: HashSet<String> =
@@ -6280,13 +6277,13 @@ pub async fn backfill_direct_factory_with(
                 }
             };
             all_logs = logs1;
-            // Decode to discover children (rows discarded here; the authoritative decode is below once
-            // every child in this chunk is known and timestamps are in hand).
-            let _ = decode_window(registry, Some(factory), children, &all_logs, &empty_ts);
+            // Decoded again with every log in hand after each pass, the last decode authoritative.
+            let mut pass = decode_window(registry, Some(factory), children, &all_logs, &empty_ts);
 
             // Pass 2+ (fixpoint): re-fetch the chunk for children discovered here but not yet fetched.
             loop {
-                let new: Vec<String> = children
+                let new: Vec<String> = pass
+                    .1
                     .addresses()
                     .iter()
                     .filter(|c| !fetched.contains(&c.to_ascii_lowercase()))
@@ -6320,14 +6317,15 @@ pub async fn backfill_direct_factory_with(
                     // succeeded at a 19,936-block window and pass 2 died on it.
                     //
                     // Restarting the chunk is safe rather than merely convenient: `fetched` is
-                    // rebuilt per iteration, and a child already registered by pass 1's decode stays
-                    // registered. A child cannot emit before the block that created it, so carrying
-                    // it into a narrower window that ends before its creation costs nothing.
+                    // rebuilt per iteration, and the children found so far are carried into pass 1
+                    // so the narrower chunk converges. `decode_window` routes none of a child's logs
+                    // from before its announcing block, so carrying it early changes no row.
                     Err(e) if narrowing_can_help(&e, next, chunk_to) => {
                         if next >= chunk_to {
                             return Err(e).with_context(|| single_block_over_cap(next));
                         }
                         chunker.too_large();
+                        children.extend(std::mem::take(&mut pass.1));
                         continue 'chunk;
                     }
                     Err(e) => {
@@ -6335,13 +6333,15 @@ pub async fn backfill_direct_factory_with(
                             .with_context(|| format!("getLogs (children) {next}..={chunk_to}"));
                     }
                 };
-                let _ = decode_window(registry, Some(factory), children, &more, &empty_ts);
                 all_logs.extend(more);
+                pass = decode_window(registry, Some(factory), children, &all_logs, &empty_ts);
             }
+            decoded = pass;
         }
 
-        // Authoritative decode with the full child set, then headers only for kept rows (#765).
-        let mut rows = decode_window(registry, Some(factory), children, &all_logs, &empty_ts);
+        // Headers only for kept rows (#765).
+        let (mut rows, found) = decoded;
+        children.extend(found);
         let extra = if state_rpc.is_some() {
             calls
                 .iter()
@@ -6612,9 +6612,8 @@ impl NestIngest {
                 r => return r,
             }
         }
-        let (registry, children) = (&self.registry, &mut self.children);
-        fetch_discovering(source, &known, &self.topic0s, from, to, |batch| {
-            discover_children(registry, &fs, children, batch)
+        fetch_discovering(source, &known, &self.topic0s, from, to, |logs| {
+            discover_children(&self.registry, &fs, &self.children, logs)
         })
         .await
     }
@@ -7186,10 +7185,10 @@ impl NestIngest {
         // returns every matching event on the chain; stamping from the raw log list paid
         // eth_getBlockByNumber for foreign protocols we then discarded.
         let empty_ts = std::collections::HashMap::new();
-        let mut rows = decode_window(
+        let (mut rows, mut found) = decode_window(
             &self.registry,
             self.factory.as_deref(),
-            &mut self.children,
+            &self.children,
             logs,
             &empty_ts,
         );
@@ -7289,7 +7288,7 @@ impl NestIngest {
         };
         let timestamps = block_data.timestamps;
         apply_row_timestamps(&mut rows, &timestamps);
-        self.children.apply_timestamps(&timestamps);
+        found.apply_timestamps(&timestamps);
         // The logs and this hash are two calls. A tip that moved between them would commit the
         // fork's rows under the hash the chain has now, and the next reorg check would see them agree.
         // When no kept row stamped `to`, its hash and timestamp come from one header (#1494).
@@ -7543,6 +7542,8 @@ impl NestIngest {
             self.retract_folded_window(deltas, exp_deltas, vel_deltas);
             return Err(e);
         }
+        // Only now: a refused or failed window must not leave its children routing later logs (#2153).
+        self.children.extend(found);
         for (entity, batch) in self.entities.iter().zip(bound) {
             if let Some(batch) = batch {
                 entity.apply(batch, to);
@@ -8746,17 +8747,21 @@ fn rebuild_views(
 }
 
 /// Decode a window's logs in chain order (block, log_index), routing each to a contract decoder or -
-/// for a factory nest - a discovered child's template decoder, and discovering new children inline so
-/// same-window child activity decodes (RFC-0009). Timestamps may be empty here: #765 fetches headers
-/// only after local filtering, then `apply_row_timestamps` / `ChildRegistry::apply_timestamps` fill
-/// `block_timestamp` and `discovered_timestamp`. Pure aside from growing `children`.
+/// for a factory nest - a discovered child's template decoder. Timestamps may be empty here: #765
+/// fetches headers only after local filtering, then `apply_row_timestamps` /
+/// `ChildRegistry::apply_timestamps` fill `block_timestamp` and `discovered_timestamp`.
+///
+/// A child's logs are decoded from its announcing block on, including those earlier in that block
+/// (its constructor's), and never from an earlier block, so what is kept does not depend on window
+/// size or fetch path (#2150, RFC-0009 §3). `children` is only read: the children this window
+/// announces are returned for the caller to register once the window commits (#2153).
 fn decode_window(
     registry: &DecodeRegistry,
     factory: Option<&FactorySet>,
-    children: &mut ChildRegistry,
+    children: &ChildRegistry,
     logs: &[crate::rpc::Log],
     timestamps: &std::collections::HashMap<u64, u64>,
-) -> Vec<crate::registry::DecodedRow> {
+) -> (Vec<crate::registry::DecodedRow>, ChildRegistry) {
     let mut ordered: Vec<&crate::rpc::Log> = logs.iter().collect();
     ordered.sort_by(|a, b| {
         a.block_number
@@ -8764,45 +8769,73 @@ fn decode_window(
             .then_with(|| a.log_index.cmp(&b.log_index))
     });
 
+    let mut found = ChildRegistry::new();
     let mut rows = Vec::new();
-    for log in ordered {
-        let decoded = match registry.decode(log) {
-            Ok(Some(r)) => Some(r),
-            Ok(None) => {
-                // Not a contract event - route to a discovered child's template decoder, if any.
-                factory.and_then(|_| {
-                    let addr = log.address.to_ascii_lowercase();
-                    children
-                        .template_of(&addr)
-                        .map(str::to_string)
-                        .and_then(|tmpl| registry.decode_child(log, &tmpl).ok().flatten())
-                })
-            }
-            Err(e) => {
-                tracing::debug!("decode skipped: {e:#}");
-                None
-            }
-        };
-        if let Some(mut r) = decoded {
-            r.block_timestamp = timestamps.get(&r.block_number).copied().unwrap_or(0);
-            if let Some(fs) = factory {
-                // Every child this event announces, not just the first: one event may name several
-                // (issue #241).
-                for child in fs.discover(&r) {
-                    if children.insert(child.clone()) {
-                        tracing::info!(
-                            "factory discovered {} child {}… at block {}",
-                            child.template,
-                            &child.address[..12.min(child.address.len())],
-                            child.discovered_block
-                        );
+    for block in ordered.chunk_by(|a, b| a.block_number == b.block_number) {
+        // Children announced in this block route its logs; a pass that announces a child whose log
+        // it already passed over is run again.
+        let mut in_block = ChildRegistry::new();
+        let block_rows = loop {
+            let mut missed = std::collections::HashSet::new();
+            let mut grew = false;
+            let mut block_rows = Vec::new();
+            for &log in block {
+                let decoded = match registry.decode(log) {
+                    Ok(Some(r)) => Some(r),
+                    Ok(None) => factory.and_then(|_| {
+                        let addr = log.address.to_ascii_lowercase();
+                        let template = children
+                            .get(&addr)
+                            .filter(|c| c.discovered_block <= log.block_number)
+                            .or_else(|| found.get(&addr))
+                            .or_else(|| in_block.get(&addr))
+                            .map(|c| c.template.clone());
+                        if template.is_none() {
+                            missed.insert(addr);
+                        }
+                        template.and_then(|t| registry.decode_child(log, &t).ok().flatten())
+                    }),
+                    Err(e) => {
+                        tracing::debug!("decode skipped: {e:#}");
+                        None
                     }
+                };
+                if let Some(mut r) = decoded {
+                    r.block_timestamp = timestamps.get(&r.block_number).copied().unwrap_or(0);
+                    if let Some(fs) = factory {
+                        // Every child this event announces, not just the first (issue #241).
+                        for child in fs.discover(&r) {
+                            let known =
+                                children.contains(&child.address) || found.contains(&child.address);
+                            grew |= !known && missed.contains(&child.address);
+                            if !known {
+                                in_block.insert(child);
+                            }
+                        }
+                    }
+                    block_rows.push(r);
                 }
             }
-            rows.push(r);
+            if !grew {
+                break block_rows;
+            }
+        };
+        // Registered in the order the stored rows fold, as `rebuild_children` does after a restart.
+        if let Some(fs) = factory {
+            for child in block_rows.iter().flat_map(|r| fs.discover(r)) {
+                if !children.contains(&child.address) && found.insert(child.clone()) {
+                    tracing::info!(
+                        "factory discovered {} child {}… at block {}",
+                        child.template,
+                        &child.address[..12.min(child.address.len())],
+                        child.discovered_block
+                    );
+                }
+            }
         }
+        rows.extend(block_rows);
     }
-    rows
+    (rows, found)
 }
 
 /// Rebuild the discovered-child registry on a warm restart by folding the stored factory events
@@ -11740,9 +11773,8 @@ template = "pool"
             },
         ];
 
-        let mut children = ChildRegistry::new();
         let ts = std::collections::HashMap::from([(100u64, 1_700_000_000u64)]);
-        let rows = decode_window(&reg, Some(&fs), &mut children, &logs, &ts);
+        let (rows, children) = decode_window(&reg, Some(&fs), &ChildRegistry::new(), &logs, &ts);
 
         assert_eq!(
             rows.len(),
@@ -13665,6 +13697,264 @@ template = "pool"
             }),
             "one fetch serves the static co-tenant and the factory together: {calls:?}"
         );
+    }
+
+    /// A child announced at block 5 log 5 that also emits before its announcement: once in an earlier
+    /// block (block 3, never indexed) and once earlier in block 5 (its constructor, indexed). A second
+    /// child is announced at block 9 log 1 after pinging at log 0.
+    fn factory_history_logs(fact: &NestIngest) -> Vec<crate::rpc::Log> {
+        let (c, d) = (
+            "0x0000000000000000000000000000000000000033",
+            "0x0000000000000000000000000000000000000044",
+        );
+        let created = |child: &str, block, li| crate::rpc::Log {
+            address: "0x0000000000000000000000000000000000000022".into(),
+            topics: vec![
+                nest_topic0(fact, "fac__child_created"),
+                format!("0x{:0>64}", child.trim_start_matches("0x")),
+            ],
+            data: "0x".into(),
+            block_number: block,
+            block_hash: format!("0xbh{block}"),
+            tx_hash: "0xt".into(),
+            log_index: li,
+        };
+        let ping = |child: &str, block, li| crate::rpc::Log {
+            address: child.into(),
+            topics: vec![nest_topic0(fact, "child__ping")],
+            data: "0x".into(),
+            block_number: block,
+            block_hash: format!("0xbh{block}"),
+            tx_hash: "0xt".into(),
+            log_index: li,
+        };
+        vec![
+            ping(c, 3, 0),
+            ping(c, 5, 2),
+            created(c, 5, 5),
+            ping(c, 5, 7),
+            ping(c, 8, 0),
+            ping(d, 9, 0),
+            created(d, 9, 1),
+            ping(c, 11, 3),
+            ping(d, 12, 0),
+        ]
+    }
+
+    /// `(table, block, log_index, address)` of every row a nest directory holds, hot and sealed.
+    fn stored_row_keys(
+        dir: &std::path::Path,
+        store: Option<&dyn crate::store::HotStore>,
+    ) -> std::collections::BTreeSet<(String, u64, u64, String)> {
+        let num = |v: &serde_json::Value, k: &str| {
+            let f = &v[k];
+            f.as_u64()
+                .or_else(|| f.as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or_else(|| panic!("no {k} in {v}"))
+        };
+        let addr = |v: &serde_json::Value| v["address"].as_str().unwrap().to_ascii_lowercase();
+        let mut keys = std::collections::BTreeSet::new();
+        if let Some(store) = store {
+            for raw in store.entities_in_range(0, u64::MAX).unwrap() {
+                let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                keys.insert((
+                    v["table"].as_str().unwrap().to_string(),
+                    num(&v, "block_number"),
+                    num(&v, "log_index"),
+                    addr(&v),
+                ));
+            }
+        }
+        let manifest = crate::seal::load_manifest(dir).unwrap();
+        for (table, segs) in &manifest.tables {
+            if segs.is_empty() {
+                continue;
+            }
+            let sql = format!("SELECT block_number, log_index, address FROM \"{table}\"");
+            for v in crate::analytics::query(dir, &sql).unwrap() {
+                keys.insert((
+                    table.clone(),
+                    num(&v, "block_number"),
+                    num(&v, "log_index"),
+                    addr(&v),
+                ));
+            }
+        }
+        keys
+    }
+
+    /// #2150: what a factory nest stores for a chain does not depend on how the chain was fetched.
+    /// Seal-direct backfill and the tip loop, address-filtered and topic0-only, at several window
+    /// sizes, all store a child's logs from its announcing block on: its constructor's events before
+    /// the announcement in that block are kept, anything in an earlier block is not (RFC-0009 §3).
+    #[tokio::test]
+    async fn a_factory_childs_history_does_not_depend_on_how_it_was_fetched() {
+        let (fac, c, d) = (
+            "0x0000000000000000000000000000000000000022",
+            "0x0000000000000000000000000000000000000033",
+            "0x0000000000000000000000000000000000000044",
+        );
+        let key = |t: &str, b, li, a: &str| (t.to_string(), b, li, a.to_string());
+        let expected = std::collections::BTreeSet::from([
+            key("child__ping", 5, 2, c),
+            key("fac__child_created", 5, 5, fac),
+            key("child__ping", 5, 7, c),
+            key("child__ping", 8, 0, c),
+            key("child__ping", 9, 0, d),
+            key("fac__child_created", 9, 1, fac),
+            key("child__ping", 11, 3, c),
+            key("child__ping", 12, 0, d),
+        ]);
+        for template_extra in ["", "filter = \"topic0\"\n"] {
+            for window in [1u64, 2, 3, 5, 12] {
+                let how = format!("window {window}, template extra {template_extra:?}");
+
+                let df = tempfile::tempdir().unwrap();
+                let fact = build_factory_test_nest_with(df.path(), template_extra).await;
+                let source = FilteringSource {
+                    logs: factory_history_logs(&fact),
+                };
+                let out = tempfile::tempdir().unwrap();
+                let mut children = ChildRegistry::new();
+                let fs = fact.factory.as_deref().unwrap();
+                backfill_direct_factory(
+                    &source,
+                    &fact.registry,
+                    fs,
+                    &mut children,
+                    out.path(),
+                    &fact.topic0s,
+                    &[],
+                    None,
+                    0,
+                    1,
+                    12,
+                    window,
+                    SPAN_OFF,
+                    fs.force_topic0(),
+                    |_| Ok(()),
+                    |_, _, _| {},
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    stored_row_keys(out.path(), None),
+                    expected,
+                    "seal-direct, {how}"
+                );
+
+                let dt = tempfile::tempdir().unwrap();
+                let mut nest = build_factory_test_nest_with(dt.path(), template_extra).await;
+                let mut next = 1u64;
+                while next <= 12 {
+                    let to = (next + window - 1).min(12);
+                    let logs = nest
+                        .fetch_window(&source, overlap_from(next, 1), to)
+                        .await
+                        .unwrap();
+                    nest.process_window(&source, &logs, next, to, 12)
+                        .await
+                        .unwrap()
+                        .unwrap_or_else(|| panic!("window {next}..={to} refused, {how}"));
+                    next = to + 1;
+                }
+                assert_eq!(
+                    stored_row_keys(dt.path(), Some(nest.store.as_ref())),
+                    expected,
+                    "tip, {how}"
+                );
+            }
+        }
+    }
+
+    /// An address-aware source whose logs can be swapped (a fork) and whose timestamp lookup can be
+    /// made to fail, which refuses the window being processed.
+    struct ForkableSource {
+        logs: std::sync::Mutex<Vec<crate::rpc::Log>>,
+        timestamps_fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for ForkableSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(12)
+        }
+        async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn logs(
+            &self,
+            filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            let allow: std::collections::HashSet<String> = filter
+                .addresses()
+                .iter()
+                .map(|a| a.to_ascii_lowercase())
+                .collect();
+            Ok(self
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.block_number >= from && l.block_number <= to)
+                .filter(|l| allow.is_empty() || allow.contains(&l.address.to_ascii_lowercase()))
+                .cloned()
+                .collect())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            if self
+                .timestamps_fail
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                anyhow::bail!("timestamps unavailable");
+            }
+            Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+        }
+    }
+
+    /// #2153: a child announced in a window that is then refused is not registered. The chain the
+    /// retry sees has no announcement, so the child's later activity is not indexed either.
+    #[tokio::test]
+    async fn a_child_announced_in_a_refused_window_is_not_registered() {
+        let c = "0x0000000000000000000000000000000000000033";
+        for template_extra in ["", "filter = \"topic0\"\n"] {
+            let dt = tempfile::tempdir().unwrap();
+            let mut nest = build_factory_test_nest_with(dt.path(), template_extra).await;
+            let fork_a = factory_history_logs(&nest);
+            let source = ForkableSource {
+                logs: std::sync::Mutex::new(fork_a.clone()),
+                timestamps_fail: std::sync::atomic::AtomicBool::new(true),
+            };
+            let logs = nest.fetch_window(&source, 5, 5).await.unwrap();
+            let refused = nest.process_window(&source, &logs, 5, 5, 12).await.unwrap();
+            assert!(refused.is_none(), "the window must be refused");
+            assert!(
+                !nest.children.contains(c),
+                "a refused window's discovery must not reach the registry ({template_extra:?})"
+            );
+
+            // The retry sees a fork on which the factory never announced the child.
+            *source.logs.lock().unwrap() =
+                fork_a.into_iter().filter(|l| l.block_number != 5).collect();
+            source
+                .timestamps_fail
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            let logs = nest.fetch_window(&source, 5, 8).await.unwrap();
+            nest.process_window(&source, &logs, 5, 8, 12)
+                .await
+                .unwrap()
+                .expect("the retry commits");
+            let stored = stored_row_keys(dt.path(), Some(nest.store.as_ref()));
+            assert!(
+                stored.iter().all(|(_, _, _, a)| a != c),
+                "an unannounced child's activity was indexed ({template_extra:?}): {stored:?}"
+            );
+        }
     }
 
     /// The topic0 of a nest's table, from its own built registry (never a hand-copied hash).
@@ -18410,9 +18700,8 @@ template="pool"
         foreign.block_number = 99;
         foreign.log_index = 1;
         let logs = vec![kept[0].clone(), foreign];
-        let mut children = ChildRegistry::new();
         let empty = std::collections::HashMap::new();
-        let rows = decode_window(&reg, None, &mut children, &logs, &empty);
+        let (rows, _) = decode_window(&reg, None, &ChildRegistry::new(), &logs, &empty);
         assert_eq!(rows.len(), 1, "only the nest's own address decodes");
         assert_eq!(rows[0].block_number, 10);
         let stamp = blocks_needing_timestamps(&rows, std::iter::empty());
