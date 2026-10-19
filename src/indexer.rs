@@ -14024,6 +14024,57 @@ template = "pool"
         }
     }
 
+    /// #2153: a child is registered exactly when the window announcing it is in the store. A window
+    /// that fails after discovery but before its commit registers nothing; one that fails after the
+    /// commit has stored the announcement, so it registers the child, as a restart would.
+    #[tokio::test]
+    async fn a_child_is_registered_with_the_commit_of_its_window() {
+        let c = "0x0000000000000000000000000000000000000033";
+        let dt = tempfile::tempdir().unwrap();
+        let mut nest = build_factory_test_nest(dt.path()).await;
+        let source = FilteringSource {
+            logs: factory_history_logs(&nest),
+        };
+        let logs = nest.fetch_window(&source, 5, 5).await.unwrap();
+
+        fail_the_next_fold();
+        let failed = nest.process_window(&source, &logs, 5, 5, 12).await;
+        clear_fold_failure();
+        assert!(
+            failed.is_err(),
+            "the injected pre-commit failure fails the window"
+        );
+        assert!(
+            !nest.children.contains(c),
+            "a window that never committed must not register its children"
+        );
+
+        fail_the_next_commit();
+        let failed = nest.process_window(&source, &logs, 5, 5, 12).await;
+        clear_commit_failure();
+        assert!(
+            failed.is_err(),
+            "the injected post-commit failure fails the window"
+        );
+        assert!(
+            nest.store.get_meta("last_block").unwrap().as_deref() == Some("5"),
+            "the window committed"
+        );
+        let rebuilt = rebuild_children(
+            dt.path(),
+            nest.store.as_ref(),
+            &nest.registry,
+            nest.factory.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert!(rebuilt.contains(c), "the store holds the announcement");
+        assert_eq!(
+            nest.children.addresses(),
+            rebuilt.addresses(),
+            "the live registry is what a restart would rebuild from the store"
+        );
+    }
+
     /// The topic0 of a nest's table, from its own built registry (never a hand-copied hash).
     fn nest_topic0(nest: &NestIngest, table: &str) -> String {
         format!(
