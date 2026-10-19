@@ -38,15 +38,23 @@ template/alias collision, depth ≤ 3).
 
 ## How it works
 
-- **Tip:** a factory nest fetches logs **topic0-only** (no address filter), so a pool created *and*
-  traded in the same block is already in hand. Each window is decoded in chain order, routing every
-  log to a contract decoder or a discovered child's template decoder, and discovering new children
-  inline - no extra RPC round-trip.
+- **Which logs a child gets:** a child's events are indexed from the block whose factory event
+  announces it, including events earlier in that block (its constructor's, say), and never from an
+  earlier block. A registry-style factory announcing a contract that already existed indexes it from
+  the announcement on. The rule is the same on every path below, so what is stored for a chain does
+  not depend on window size or how the logs were fetched.
+- **Tip:** a factory nest asks `getLogs` for its contracts and discovered children by address, then
+  refetches the window for any child it discovers there, so a pool created *and* traded in the same
+  block is in hand. Past ~500 children (see "Scale") it fetches topic0-only instead. Each window is
+  decoded in chain order, routing every log to a contract decoder or a discovered child's template
+  decoder; a block in which a child emits before its announcement is decoded again so those logs
+  route too. A window's new children are registered only once the window commits, so a window
+  refused and retried leaves no child behind.
 - **Backfill (`--seal-direct`):** a sequential two-pass per chunk - pass 1 fetches the current
-  address filter (contracts + children so far) and updates the child registry from the factory
-  events; pass 2 re-fetches the chunk for only the newly discovered children (children-only, so their
-  *historical* activity is sealed even though it predates their discovery in the filter). Rows are
-  sorted by `(block, log_index)` and sealed to deterministic, content-addressed segments.
+  address filter (contracts + children so far) and decodes it to find the chunk's new children;
+  pass 2 re-fetches the chunk for only those children, until a pass finds none. The chunk is then
+  decoded once with every log in hand, by the same rule as the tip. Rows are sorted by
+  `(block, log_index)` and sealed to deterministic, content-addressed segments.
 - **Reorg:** a rolled-back factory event drops its children from the registry; the child's own rows
   roll back with their block. The discovered set is a pure fold over factory events ≤ B, so it
   reproduces exactly - a property test pins the convergence.
