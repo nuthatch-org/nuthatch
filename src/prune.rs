@@ -246,7 +246,7 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
         return Ok(());
     }
 
-    refuse_while_a_store_is_open(dir)?;
+    let _running = refuse_while_running(dir)?;
 
     // **Manifest first, bytes second** (RFC-0033 §11a). Removing the dataset - and with it the
     // manifest referencing its segments - before collecting orphans means an interrupted prune leaves
@@ -280,8 +280,9 @@ pub fn run(dir: &Path, yes: bool) -> Result<()> {
 }
 
 /// A query in a running runtime can have planned against a shared segment a fold has since
-/// replaced, and its lease does not reach this process.
-fn refuse_while_a_store_is_open(dir: &Path) -> Result<()> {
+/// replaced, and its lease does not reach this process. The returned lock keeps one from starting.
+fn refuse_while_running(dir: &Path) -> Result<std::fs::File> {
+    let lock = crate::runtime::lock_runtime_dir(dir, true)?;
     // Every dataset, not only recorded ones: a live mount opens its store before it is recorded (#2133).
     if let Some((nid, _)) = dataset_dirs(dir)?
         .into_iter()
@@ -293,23 +294,36 @@ fn refuse_while_a_store_is_open(dir: &Path) -> Result<()> {
             &nid[..nid.len().min(12)]
         );
     }
-    Ok(())
+    Ok(lock)
+}
+
+/// Why nothing is collectable, given that nothing is: a dataset an unfinished job names is not
+/// mounted yet (#2249).
+fn settled(dir: &Path) -> Result<String> {
+    let recorded = MountTable::load(dir)?;
+    let mid_mount = mounting(dir)?
+        .iter()
+        .filter(|nid| !recorded.mounts.iter().any(|m| m.nid == **nid))
+        .filter(|nid| MountTable::data_dir(dir, nid).is_dir())
+        .count();
+    Ok(match mid_mount {
+        0 => "every dataset is mounted".to_string(),
+        n => format!("every dataset is mounted or being mounted ({n} mid-mount)"),
+    })
 }
 
 /// With no dataset left to remove, the segments no mounted dataset references: what a prune killed
 /// between removing its datasets and its orphan pass leaves behind, and what a fold replaces (#1717).
 fn collect_leftover_segments(dir: &Path, yes: bool) -> Result<()> {
     let orphans = orphan_segments(dir)?;
+    let settled = settled(dir)?;
     if orphans.is_empty() {
-        println!(
-            "Nothing to prune in {} - every dataset is mounted.",
-            dir.display()
-        );
+        println!("Nothing to prune in {} - {settled}.", dir.display());
         return Ok(());
     }
     let bytes: u64 = orphans.iter().map(|(_, size)| size).sum();
     println!(
-        "Every dataset in {} is mounted, and {} shared segment(s) no dataset references hold {}.",
+        "In {}, {settled}, and {} shared segment(s) no dataset references hold {}.",
         dir.display(),
         orphans.len(),
         human(bytes)
@@ -321,7 +335,7 @@ fn collect_leftover_segments(dir: &Path, yes: bool) -> Result<()> {
         );
         return Ok(());
     }
-    refuse_while_a_store_is_open(dir)?;
+    let _running = refuse_while_running(dir)?;
     for (path, _) in &orphans {
         std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
     }
@@ -1036,5 +1050,48 @@ mod tests {
         assert!(format!("{err:#}").contains("running runtime"), "{err:#}");
         assert!(MountTable::data_dir(d.path(), &mounting).is_dir());
         drop(held);
+    }
+
+    /// #2249: a waited mount's fetch lands in `data/<nid>` with no store open and no job naming it.
+    /// A runtime holds its directory's lock meanwhile, and prune refuses on it.
+    #[test]
+    fn prune_refuses_while_a_runtime_holds_the_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let fetched = nid("aa");
+        fixture(d.path(), &[], &[&fetched]);
+        let db = MountTable::data_dir(d.path(), &fetched).join(crate::config::DB_FILE);
+        std::fs::remove_file(&db).unwrap();
+        let running = crate::runtime::lock_runtime_dir(d.path(), false).unwrap();
+
+        let err = run(d.path(), true).expect_err("a running runtime must refuse");
+        assert!(
+            format!("{err:#}").contains("a runtime is running"),
+            "{err:#}"
+        );
+        assert!(MountTable::data_dir(d.path(), &fetched).is_dir());
+
+        drop(running);
+        run(d.path(), true).unwrap();
+        assert!(!MountTable::data_dir(d.path(), &fetched).exists());
+    }
+
+    /// #2249: with nothing collectable because the one unrecorded dataset is mid-mount, prune says so
+    /// rather than calling every dataset mounted.
+    #[test]
+    fn a_dataset_mid_mount_is_not_reported_as_mounted() {
+        let d = tempfile::tempdir().unwrap();
+        let (mounted, joining) = (nid("aa"), nid("bb"));
+        fixture(d.path(), &[&mounted], &[&joining]);
+        assert_eq!(settled(d.path()).unwrap(), "every dataset is mounted");
+        std::fs::write(
+            d.path().join(crate::mount_jobs::JOBS_FILE),
+            format!("[{{\"name\":\"j\",\"nid\":\"{joining}\",\"phase\":\"joining\",\"since_unixtime\":0}}]"),
+        )
+        .unwrap();
+        assert!(collectable(d.path()).unwrap().is_empty());
+        assert_eq!(
+            settled(d.path()).unwrap(),
+            "every dataset is mounted or being mounted (1 mid-mount)"
+        );
     }
 }
