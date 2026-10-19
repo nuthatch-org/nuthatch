@@ -959,6 +959,7 @@ fn seed_entities(
         return Ok(());
     }
     let schema = registry.schema();
+    let sealed_through = store.sealed_through();
 
     // The hot tail, read once and shared. Every entity on this nest sees the same window at `+1`
     // during normal ingest, and a seed is a window like any other.
@@ -977,10 +978,15 @@ fn seed_entities(
                     entity.name()
                 )))
             };
-            crate::seal::read_table_rows_by_segment(dir, table_schema, &mut |rows| {
-                sealed += rows.len();
-                entity.seed_chunk(&rows, through)
-            })?;
+            crate::seal::read_table_rows_by_segment(
+                dir,
+                table_schema,
+                sealed_through,
+                &mut |rows| {
+                    sealed += rows.len();
+                    entity.seed_chunk(&rows, through)
+                },
+            )?;
         }
         entity.seed_chunk(&hot, through)?;
         if !entity.offchain_tables().is_empty() {
@@ -1000,26 +1006,22 @@ fn seed_entities(
 ///
 /// One conversion, and every caller uses it - the reorg path, the restart seed, and whatever needs it
 /// next. A second one written separately is how a retraction stops cancelling its insertion (#864).
+///
+/// A row of a table the registry does not decode (a threshold flag, a `[[calls]]` or `[[ipfs]]` row)
+/// is skipped: ingest never feeds one to an entity or a view, so nothing seeds or retracts it.
 fn decode_stored_rows(
     schema: &[crate::registry::TableSchema],
     stored: &[String],
 ) -> Result<Vec<crate::registry::DecodedRow>> {
     let mut rows = Vec::with_capacity(stored.len());
     for raw in stored {
-        let value: serde_json::Value = match serde_json::from_str(raw) {
-            Ok(v) => v,
-            // Annotations (sanction hits, threshold flags) share the rows' block keys and are not
-            // decoded rows. They were never fed to an entity, so they are not read back as one.
-            Err(_) => continue,
-        };
+        let value: serde_json::Value =
+            serde_json::from_str(raw).context("an unparseable row in the hot store")?;
         let Some(table) = value.get("table").and_then(serde_json::Value::as_str) else {
             continue;
         };
         let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
-            anyhow::bail!(TerminalFault(format!(
-                "the hot store holds a row of `{table}`, which this nest's registry does not \
-                 describe. Reading it against a guessed shape would produce rows that cancel nothing"
-            )));
+            continue;
         };
         rows.push(crate::registry::DecodedRow::from_stored(
             &value,
@@ -1900,7 +1902,15 @@ fn refresh_offchain(
             let rows = hot.as_deref().unwrap_or_default();
             // An entity that faults while rebuilding reports it as its own fault. Failing the window
             // would stall every table on the chain behind one entity.
-            if let Err(e) = rebuild_entity(dir, &schema, rows, &tables, entity, through) {
+            if let Err(e) = rebuild_entity(
+                dir,
+                store.sealed_through(),
+                &schema,
+                rows,
+                &tables,
+                entity,
+                through,
+            ) {
                 if entity.fault().is_none() {
                     return Err(e);
                 }
@@ -1922,6 +1932,7 @@ fn refresh_offchain(
 
 fn rebuild_entity(
     dir: &std::path::Path,
+    sealed_through: u64,
     schema: &[crate::registry::TableSchema],
     hot: &[crate::registry::DecodedRow],
     tables: &crate::entity_offchain::Tables,
@@ -1940,7 +1951,7 @@ fn rebuild_entity(
                 entity.name()
             )))
         };
-        crate::seal::read_table_rows_by_segment(dir, table_schema, &mut |rows| {
+        crate::seal::read_table_rows_by_segment(dir, table_schema, sealed_through, &mut |rows| {
             entity.rebuild_chain(&rows)
         })?;
     }
@@ -3161,7 +3172,10 @@ async fn build_nest(
                 velocity_window: velocity_cfg.map(|(_, w)| w),
             },
         ) {
-            tracing::warn!("view rebuild failed (will re-derive as it indexes): {e:#}");
+            tracing::error!(
+                "view rebuild failed; balances, exposure and velocity hold only what is indexed \
+                 from here until a restart rebuilds them: {e:#}"
+            );
         }
     }
 
@@ -7183,27 +7197,13 @@ impl NestIngest {
         Ok(())
     }
 
-    /// Stored JSON rows to decoded rows, against this nest's registry.
-    ///
-    /// One conversion, three callers - the reorg path, the restart seed, and whatever needs it next.
-    /// A second one written separately is how a retraction stops cancelling its insertion (#864).
-    fn decode_stored(&self, stored: &[String]) -> Result<Vec<crate::registry::DecodedRow>> {
-        decode_stored_rows(&self.registry.schema(), stored)
-    }
-
     /// Feed rolled-back rows to every authored entity at weight `-1`.
-    ///
-    /// A row belonging to a table no entity reads is skipped, not an error: a nest decodes many
-    /// tables and an entity reads one or two. A row this nest's registry has no schema for *is* an
-    /// error - it means the stored history and the live registry disagree about what was indexed,
-    /// and retracting it against a guessed shape would produce rows that cancel nothing.
-    fn retract_entities(&self, doomed: &[String], ancestor: u64) -> Result<()> {
-        if self.entities.is_empty() || doomed.is_empty() {
+    fn retract_entities(&self, rows: &[crate::registry::DecodedRow], ancestor: u64) -> Result<()> {
+        if self.entities.is_empty() || rows.is_empty() {
             return Ok(());
         }
-        let rows = self.decode_stored(doomed)?;
         for entity in self.entities.iter() {
-            entity.apply_window(&rows, -1, ancestor).with_context(|| {
+            entity.apply_window(rows, -1, ancestor).with_context(|| {
                 format!(
                     "retracting rolled-back rows from entity `{}`",
                     entity.name()
@@ -7261,6 +7261,12 @@ impl NestIngest {
             )));
         }
         let doomed = self.store.entities_in_range(ancestor + 1, last_indexed)?;
+        // A retry reads the same rows and fails the same way.
+        let rows = decode_stored_rows(&self.registry.schema(), &doomed).map_err(|e| {
+            anyhow::Error::new(TerminalFault(format!(
+                "the rows a reorg to block {ancestor} rolls back do not decode: {e:#}"
+            )))
+        })?;
         // From here the views are being retracted: a failure leaves them out of step with the store
         // and a retry would retract them twice, so only a restart, which rebuilds them, recovers.
         let torn = move |e: anyhow::Error| {
@@ -7275,17 +7281,13 @@ impl NestIngest {
         // These are reconstructed through `DecodedRow::from_stored` rather than parsed here, and
         // that is the whole point: DBSP cancels by key, so a retraction built by a different
         // converter than the insertion does not cancel it - it lands beside it and stays forever.
-        // One conversion, both directions.
-        self.retract_entities(&doomed, ancestor).map_err(torn)?;
-        self.balances.apply(retraction_batch(&doomed));
-        self.exposure.apply(exposure_retraction_batch(
-            &doomed,
-            &self.registry,
-            &self.labels,
-        ));
+        // One conversion, both directions, and the views read the decoded rows as ingest does.
+        self.retract_entities(&rows, ancestor).map_err(torn)?;
+        self.balances.apply(retraction_batch(&rows));
+        self.exposure
+            .apply(exposure_retraction_batch(&rows, &self.labels));
         if let Some((_, w)) = self.velocity_cfg {
-            self.velocity
-                .apply(velocity_retraction_batch(&doomed, &self.registry, w));
+            self.velocity.apply(velocity_retraction_batch(&rows, w));
         }
         // Drop children whose announcing factory event was rolled back (RFC-0009): the registry state
         // at B is a pure fold over factory events ≤ B.
@@ -7645,6 +7647,7 @@ impl NestIngest {
         // RFC-0036 §4.2: one row per block in the window for a blocks nest - same logic as the
         // backfill paths. Must enumerate from the window [next..=to], not from `logs`, because
         // a blocks table covers blocks that emitted no matching log at all (#447).
+        let mut block_rows = Vec::new();
         if self.registry.blocks() {
             let want: Vec<u64> = (next..=to).collect();
             // A block without its row would seal as a block the chain never had (#2149).
@@ -7672,6 +7675,7 @@ impl NestIngest {
                     r.to_json().to_string(),
                 ));
                 stored += 1;
+                block_rows.push(r);
             }
         }
 
@@ -7771,6 +7775,9 @@ impl NestIngest {
 
         // Bound before the commit and fed after it (#1906). An entity's watermark claims its blocks
         // are in the store, and `/sql` over the store is what a reader reconciles it against.
+        // Every registry row this window stores, since the seed and a reorg read all of them (#2166).
+        rows.extend(l1_rows);
+        rows.extend(block_rows);
         let mut bound = Vec::with_capacity(self.entities.len());
         for entity in self.entities.iter() {
             bound.push(
@@ -8673,113 +8680,45 @@ async fn maybe_seal(
     }
 }
 
-/// Build a weight −1 retraction batch from stored transfer JSON (used on reorg rollback).
-fn retraction_batch(entity_json: &[String]) -> views::WeightedBatch {
-    let mut batch = Vec::new();
-    for j in entity_json {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(j) else {
-            continue;
-        };
-        // Only transfer rows were fed to the balance view; retract only those.
-        let is_transfer = v
-            .get("table")
-            .and_then(|t| t.as_str())
-            .map(|t| t.ends_with("__transfer"))
-            .unwrap_or(false);
-        if !is_transfer {
-            continue;
-        }
-        let (Some(from), Some(to)) = (v["from"].as_str(), v["to"].as_str()) else {
-            continue;
-        };
-        if let Some(val) = v["value"].as_str().and_then(crate::views::transfer_value) {
-            batch.extend(views::transfer_deltas(from, to, val, -1));
-        }
-    }
-    batch
+/// A row's transfer as the derived views read it: (from, to, value), or `None` for any other row
+/// and for a value past i128 (#814). Ingest feeds the views through these two calls, so a reorg
+/// retracts and a restart replays through them too, whatever the token names its columns.
+fn view_transfer(row: &crate::registry::DecodedRow) -> Option<(String, String, i128)> {
+    let (from, to, value, _) = row.erc20_transfer_fields()?;
+    let value = value.as_deref().and_then(crate::views::transfer_value)?;
+    Some((from, to, value))
 }
 
-/// Build a weight −1 exposure retraction batch from rolled-back transfer rows (reorg). Reads each
-/// table's (from, to, value) column names from the registry - they vary by token (USDC from/to/value,
-/// WETH src/dst/wad) - then re-derives the same exposure deltas the live path fed, with weight −1, so
-/// a reorged flag/exposure retracts exactly like a balance.
+/// Build a weight −1 balance retraction batch from rolled-back rows (reorg).
+fn retraction_batch(rows: &[crate::registry::DecodedRow]) -> views::WeightedBatch {
+    rows.iter()
+        .filter_map(view_transfer)
+        .flat_map(|(from, to, v)| views::transfer_deltas(&from, &to, v, -1))
+        .collect()
+}
+
+/// Build a weight −1 exposure retraction batch from rolled-back rows (reorg), so a reorged
+/// flag/exposure retracts exactly like a balance.
 fn exposure_retraction_batch(
-    entity_json: &[String],
-    registry: &DecodeRegistry,
+    rows: &[crate::registry::DecodedRow],
     labels: &LabelSet,
 ) -> exposure::ExposureBatch {
-    // table → (from_col, to_col, value_col) for every transfer-shaped table.
-    let cols: std::collections::HashMap<String, (String, String, String)> = registry
-        .tables()
-        .iter()
-        .filter_map(|d| {
-            d.transfer_columns().map(|(f, t, v)| {
-                (
-                    d.table.clone(),
-                    (f.to_string(), t.to_string(), v.to_string()),
-                )
-            })
-        })
-        .collect();
-
-    let mut batch = Vec::new();
-    for j in entity_json {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(j) else {
-            continue;
-        };
-        let Some(table) = v.get("table").and_then(|t| t.as_str()) else {
-            continue;
-        };
-        let Some((from_col, to_col, val_col)) = cols.get(table) else {
-            continue; // not a transfer table
-        };
-        if let (Some(from), Some(to), Some(val)) = (
-            v[from_col].as_str(),
-            v[to_col].as_str(),
-            v[val_col].as_str().and_then(crate::views::transfer_value),
-        ) {
-            batch.extend(exposure::exposure_deltas(from, to, val, -1, labels));
-        }
-    }
-    batch
+    rows.iter()
+        .filter_map(view_transfer)
+        .flat_map(|(from, to, v)| exposure::exposure_deltas(&from, &to, v, -1, labels))
+        .collect()
 }
 
-/// Build a weight −1 velocity retraction batch from rolled-back transfer rows (reorg). Re-derives the
-/// sender's outbound-volume delta the live path fed, with weight −1, so a reorged velocity flag drops.
+/// Build a weight −1 velocity retraction batch from rolled-back rows (reorg), so a reorged velocity
+/// flag drops.
 fn velocity_retraction_batch(
-    entity_json: &[String],
-    registry: &DecodeRegistry,
+    rows: &[crate::registry::DecodedRow],
     window: u64,
 ) -> velocity::VelocityBatch {
-    let cols: std::collections::HashMap<String, (String, String)> = registry
-        .tables()
-        .iter()
-        .filter_map(|d| {
-            d.transfer_columns()
-                .map(|(f, _t, v)| (d.table.clone(), (f.to_string(), v.to_string())))
-        })
-        .collect();
-
-    let mut batch = Vec::new();
-    for j in entity_json {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(j) else {
-            continue;
-        };
-        let Some(table) = v.get("table").and_then(|t| t.as_str()) else {
-            continue;
-        };
-        let Some((from_col, val_col)) = cols.get(table) else {
-            continue;
-        };
-        if let (Some(from), Some(block), Some(val)) = (
-            v[from_col].as_str(),
-            v["block_number"].as_u64(),
-            v[val_col].as_str().and_then(crate::views::transfer_value),
-        ) {
-            batch.extend(velocity::velocity_deltas(from, block, val, -1, window));
-        }
-    }
-    batch
+    rows.iter()
+        .filter_map(|row| view_transfer(row).map(|t| (row.block_number, t)))
+        .flat_map(|(block, (from, _, v))| velocity::velocity_deltas(&from, block, v, -1, window))
+        .collect()
 }
 
 /// The derived IVM views a restart has to reconstruct, and the two things that decide whether each is
@@ -8860,119 +8799,117 @@ fn rebuild_views(
 
     // Cold seed. Three different aggregations over the same segments, so this stays three Burrmill
     // queries per table - they are pre-summed server-side and cheap, and it is the hot store, not
-    // the analytical engine, that #294 was about. A table with no sealed segment yet has no view; that just means it
-    // has nothing cold to seed, so an error here is a debug line, not a failure.
+    // the analytical engine, that #294 was about. A table the manifest catalogues nothing for at or
+    // below the watermark has nothing cold to seed; for one it does, a failed query is a failed
+    // rebuild, never a view served from the hot tail alone (#2171).
+    let manifest = crate::seal::load_manifest(dir)?;
     let mut cold_balances = 0usize;
     let mut cold_exposure = 0usize;
     let mut cold_velocity = 0usize;
     for (table, from_col, to_col, val_col) in &transfer_tables {
-        match crate::analytics::net_balances(dir, table, from_col, to_col, val_col, sealed_through)
-        {
-            Ok(nets) => {
-                cold_balances += nets.len();
-                for (addr, net) in nets {
-                    balance_batch.push(views::seed_delta(addr, net));
-                }
-            }
-            Err(e) => tracing::debug!("no cold seed for {table}: {e:#}"),
+        let catalogued = manifest
+            .tables
+            .get(table)
+            .is_some_and(|segments| segments.iter().any(|s| s.to_block <= sealed_through));
+        if !catalogued {
+            continue;
+        }
+        let nets =
+            crate::analytics::net_balances(dir, table, from_col, to_col, val_col, sealed_through)
+                .with_context(|| format!("seeding balances from the sealed {table}"))?;
+        cold_balances += nets.len();
+        for (addr, net) in nets {
+            balance_batch.push(views::seed_delta(addr, net));
         }
         // COR-8 (#814): the fold silently drops a transfer whose value exceeds 38 digits. The drop is
         // correct - both legs go, or the balance would gain value from nowhere - but it used to be
         // invisible, so a balance missing a transfer was served exactly like a complete one.
-        match crate::analytics::oversized_transfers(dir, table, val_col, sealed_through) {
-            Ok(0) => {}
-            Ok(n) => {
-                tracing::warn!(
-                    "{n} transfer(s) in {table} have a value of more than 38 digits and are \
-                     excluded from balances; /balances reports this as `dropped_over_i128` (#814)"
-                );
-                balances.note_over_i128(n);
-            }
-            // A table with no sealed segment has no view to count over; that is not a failure.
-            Err(e) => tracing::debug!("no oversized-transfer count for {table}: {e:#}"),
+        let n = crate::analytics::oversized_transfers(dir, table, val_col, sealed_through)
+            .with_context(|| format!("counting oversized transfers in the sealed {table}"))?;
+        if n > 0 {
+            tracing::warn!(
+                "{n} transfer(s) in {table} have a value of more than 38 digits and are \
+                 excluded from balances; /balances reports this as `dropped_over_i128` (#814)"
+            );
+            balances.note_over_i128(n);
         }
         if want_exposure {
-            match crate::analytics::cold_exposure(
+            let rows = crate::analytics::cold_exposure(
                 dir,
                 table,
                 from_col,
                 to_col,
                 val_col,
                 sealed_through,
-            ) {
-                Ok(rows) => {
-                    cold_exposure += rows.len();
-                    for (key, amount, count) in rows {
-                        exposure_batch.push(exposure::seed_item(key, amount, count));
-                    }
-                }
-                Err(e) => tracing::debug!("no cold exposure seed for {table}: {e:#}"),
+            )
+            .with_context(|| format!("seeding exposure from the sealed {table}"))?;
+            cold_exposure += rows.len();
+            for (key, amount, count) in rows {
+                exposure_batch.push(exposure::seed_item(key, amount, count));
             }
         }
         if let Some(window) = velocity_window {
-            match crate::analytics::cold_velocity(
+            let rows = crate::analytics::cold_velocity(
                 dir,
                 table,
                 from_col,
                 val_col,
                 window,
                 sealed_through,
-            ) {
-                Ok(rows) => {
-                    cold_velocity += rows.len();
-                    for (key, volume, count) in rows {
-                        velocity_batch.push(velocity::seed_item(key, volume, count));
-                    }
-                }
-                Err(e) => tracing::debug!("no cold velocity seed for {table}: {e:#}"),
+            )
+            .with_context(|| format!("seeding velocity from the sealed {table}"))?;
+            cold_velocity += rows.len();
+            for (key, volume, count) in rows {
+                velocity_batch.push(velocity::seed_item(key, volume, count));
             }
         }
     }
 
-    // Hot replay: the un-sealed tip, fed through the same delta paths the live loop uses. One scan,
-    // one parse, fanned out to all three views.
+    // Hot replay: the un-sealed tip, decoded and read through `view_transfer` exactly as the live
+    // loop reads it. One scan, one parse, fanned out to all three views.
     //
     // A read failure propagates rather than being swallowed into an empty tail. The old per-view
     // `unwrap_or_default()` would have applied the cold seed alone and logged nothing - a view short
     // of its entire hot tail, presented as a successful rebuild. The caller warns and carries on.
     let hot_rows = store.hot_rows_by_table()?;
+    let schema = registry.schema();
     let mut hot_balances = 0usize;
     let mut hot_exposure = 0usize;
     let mut hot_velocity = 0usize;
-    for (table, from_col, to_col, val_col) in &transfer_tables {
+    for (table, ..) in &transfer_tables {
         let Some(rows) = hot_rows.get(table) else {
             continue;
         };
+        let table_schema = schema
+            .iter()
+            .find(|t| &t.table == table)
+            .with_context(|| format!("the registry has no schema for {table}"))?;
         // Newest first, matching the order `recent_by_table` returned. The circuits fold weighted
         // deltas, so the summed result does not depend on it - but keeping the order identical means
         // "same views as the three-scan build" holds structurally rather than by argument.
         for v in rows.iter().rev() {
-            if let (Some(from), Some(to), Some(val)) = (
-                v[from_col].as_str(),
-                v[to_col].as_str(),
-                v[val_col].as_str().and_then(crate::views::transfer_value),
-            ) {
-                balance_batch.extend(views::transfer_deltas(from, to, val, 1));
-                hot_balances += 1;
-                if want_exposure {
-                    let d = exposure::exposure_deltas(from, to, val, 1, labels);
-                    if !d.is_empty() {
-                        hot_exposure += 1;
-                        exposure_batch.extend(d);
-                    }
+            let row = crate::registry::DecodedRow::from_stored(v, table_schema)?;
+            let Some((from, to, val)) = view_transfer(&row) else {
+                continue;
+            };
+            balance_batch.extend(views::transfer_deltas(&from, &to, val, 1));
+            hot_balances += 1;
+            if want_exposure {
+                let d = exposure::exposure_deltas(&from, &to, val, 1, labels);
+                if !d.is_empty() {
+                    hot_exposure += 1;
+                    exposure_batch.extend(d);
                 }
             }
-            // Velocity needs (from, block, value) and not `to`, so it is judged on its own terms: a
-            // row with an unreadable `to` still carries outbound volume.
             if let Some(window) = velocity_window {
-                if let (Some(from), Some(block), Some(val)) = (
-                    v[from_col].as_str(),
-                    v["block_number"].as_u64(),
-                    v[val_col].as_str().and_then(crate::views::transfer_value),
-                ) {
-                    velocity_batch.extend(velocity::velocity_deltas(from, block, val, 1, window));
-                    hot_velocity += 1;
-                }
+                velocity_batch.extend(velocity::velocity_deltas(
+                    &from,
+                    row.block_number,
+                    val,
+                    1,
+                    window,
+                ));
+                hot_velocity += 1;
             }
         }
     }
@@ -12380,20 +12317,32 @@ template = "pool"
     }
 
     async fn build_test_nest(dir: &std::path::Path, addr: &str) -> NestIngest {
+        build_test_nest_with(
+            dir,
+            addr,
+            r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+            "",
+        )
+        .await
+    }
+
+    /// [`build_test_nest`] with its own ABI and config appended after the contract.
+    async fn build_test_nest_with(
+        dir: &std::path::Path,
+        addr: &str,
+        abi: &str,
+        extra: &str,
+    ) -> NestIngest {
         std::fs::create_dir_all(dir.join("abis")).unwrap();
         std::fs::write(
             dir.join(crate::config::CONFIG_FILE),
             format!(
                 "[nest]\nname = \"n\"\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n\n\
-                 [[contracts]]\nalias = \"tok\"\naddress = \"{addr}\"\nabi = \"abis/tok.json\"\n"
+                 [[contracts]]\nalias = \"tok\"\naddress = \"{addr}\"\nabi = \"abis/tok.json\"\n\n{extra}"
             ),
         )
         .unwrap();
-        std::fs::write(
-            dir.join("abis/tok.json"),
-            r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("abis/tok.json"), abi).unwrap();
         let config = Config::load(dir).unwrap();
         let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
         let (nest, _state, worker, _w) = build_nest(
@@ -12738,6 +12687,93 @@ template = "pool"
         src.fork_from
             .store(110, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(detect_reorg(&src, &store, 110).await.unwrap(), Some(100));
+    }
+
+    const SENDER: &str = "0x1111111111111111111111111111111111111111";
+    const RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
+
+    /// One `tok__transfer` row as `DecodedRow::to_json` writes it, under the ABI's own column names.
+    fn tok_transfer(cols: [&str; 3], value: &str) -> String {
+        format!(
+            r#"{{"table":"tok__transfer","block_number":10,"block_hash":"0xbh","block_timestamp":1700000010,"tx_hash":"0xtx","log_index":0,"address":"0x0000000000000000000000000000000000000008","{}":"{SENDER}","{}":"{RECIPIENT}","{}":{value}}}"#,
+            cols[0], cols[1], cols[2]
+        )
+    }
+
+    /// #2170: a reorg takes a transfer back out of `/balances` whatever its token calls the columns
+    /// and whatever integer type its value has, because it reads the row as the live window did.
+    #[tokio::test]
+    async fn a_reorg_retracts_a_transfer_whatever_its_columns_are_called() {
+        for (ty, value) in [("uint256", r#""100""#), ("uint64", "100")] {
+            let d = tempfile::tempdir().unwrap();
+            let abi = format!(
+                r#"[{{"type":"event","name":"Transfer","inputs":[{{"name":"src","type":"address","indexed":true}},{{"name":"dst","type":"address","indexed":true}},{{"name":"wad","type":"{ty}","indexed":false}}],"anonymous":false}}]"#
+            );
+            let mut nest = build_test_nest_with(
+                d.path(),
+                "0x0000000000000000000000000000000000000008",
+                &abi,
+                "",
+            )
+            .await;
+            nest.store
+                .put_entity(
+                    &Store::entity_key(10, 0),
+                    &tok_transfer(["src", "dst", "wad"], value),
+                )
+                .unwrap();
+            nest.store.set_meta(LAST_BLOCK_KEY, "10").unwrap();
+            // What the live window fed for that row: it reads a transfer by position.
+            nest.balances
+                .apply(views::transfer_deltas(SENDER, RECIPIENT, 100, 1));
+            nest.balances.flush();
+            assert_eq!(nest.balances.balance(RECIPIENT), Some(100), "{ty}");
+
+            nest.rollback_reorg(9).unwrap();
+            nest.balances.flush();
+            assert_eq!(
+                nest.balances.balance(RECIPIENT).unwrap_or(0),
+                0,
+                "a {ty} `wad` must be retracted"
+            );
+        }
+    }
+
+    /// #2164: a reorg over a threshold flag retracts the transfer from an entity and is not a fault.
+    /// The flag shares the transfer's block keys and was never fed to the entity.
+    #[tokio::test]
+    async fn a_reorg_over_a_threshold_flag_retracts_the_entity_and_carries_on() {
+        let d = tempfile::tempdir().unwrap();
+        entity_fixture::write(
+            d.path(),
+            "[[entities]]\nname='received'\nkey=['to']\nmax_rows=100\n\
+             query='SELECT \"to\", sum(value) AS v FROM tok__transfer GROUP BY \"to\"'\n",
+        )
+        .unwrap();
+        let mut nest = build_test_nest_with(
+            d.path(),
+            "0x0000000000000000000000000000000000000008",
+            r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+            "[flags]\nthreshold = \"1\"\n",
+        )
+        .await;
+        let transfer = tok_transfer(["from", "to", "value"], r#""100""#);
+        let (flag_key, flag) =
+            crate::flags::threshold_annotation(SENDER, RECIPIENT, 100, 10, 0, "0xtx", 1).unwrap();
+        nest.store
+            .put_entity(&Store::entity_key(10, 0), &transfer)
+            .unwrap();
+        nest.store.put_entity(&flag_key, &flag.to_string()).unwrap();
+        nest.store.set_meta(LAST_BLOCK_KEY, "10").unwrap();
+        let fed = decode_stored_rows(&nest.registry.schema(), &[transfer]).unwrap();
+        nest.entities[0].apply_window(&fed, 1, 10).unwrap();
+        nest.entities[0].flush();
+        assert_eq!(nest.entities[0].relation().len(), 1, "premise: it was fed");
+
+        nest.rollback_reorg(9)
+            .expect("a flag beside a transfer is not a fault");
+        nest.entities[0].flush();
+        assert!(nest.entities[0].relation().is_empty());
     }
 
     /// A supervisor over `n` nests named a, b, c… with a throwaway health surface.
@@ -24477,11 +24513,8 @@ rpc_urls = ["https://rpc.example"]
     // --- restart rebuild: one pass over the hot store (issue #294) -------------------------------
 
     /// A transfer row shaped exactly as `DecodedRow::to_json` writes one: `value` is a decimal
-    /// *string* (uint256 does not fit a JSON number) and `block_number` is a number.
-    ///
-    /// `to` is optional and writes JSON `null` when absent, which is how an undecodable recipient
-    /// reaches the hot store. Such a row still carries outbound volume, so the rebuild must feed it
-    /// to velocity while withholding it from balances and exposure.
+    /// *string* (uint256 does not fit a JSON number) and `block_number` is a number. `None` writes a
+    /// JSON `null` recipient, which `to_json` never writes, so such a row is corruption.
     fn transfer_row(
         block: u64,
         log_index: u64,
@@ -24795,6 +24828,77 @@ rpc_urls = ["https://rpc.example"]
         );
     }
 
+    const TOTALS: &str = "[[entities]]\nname='totals'\nkey=['to']\nmax_rows=100\n\
+         query='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n";
+
+    /// The `totals` entity's sum for one recipient, after seeding it through `through`.
+    fn seeded_total(dir: &std::path::Path, store: &Store, to: &str, through: u64) -> Option<i128> {
+        use crate::entity_row::{Row, Scalar};
+        let registry = Arc::new(erc20_registry());
+        let mut views = start_entities(dir, &registry, true).unwrap();
+        seed_entities(dir, store, &registry, &mut views, through).unwrap();
+        let entity = view(&views, "totals");
+        assert!(entity.unavailable().is_none());
+        match entity.relation().get(&Row(vec![Scalar::Str(to.into())])) {
+            Some(Row(v)) => match v.as_slice() {
+                [Scalar::Int(n)] => Some(*n),
+                other => panic!("{other:?}"),
+            },
+            None => None,
+        }
+    }
+
+    /// #2164: the warm seed passes over hot rows of tables the registry does not decode, a threshold
+    /// flag and a `[[calls]]` row here, since ingest never fed them to an entity.
+    #[test]
+    fn a_warm_seed_passes_over_rows_no_entity_was_fed() {
+        const ALICE: &str = "0x1111111111111111111111111111111111111111";
+        const BOB: &str = "0x2222222222222222222222222222222222222222";
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        entity_fixture::write(dir.path(), TOTALS).unwrap();
+        let (flag_key, flag) =
+            crate::flags::threshold_annotation(ALICE, BOB, 100, 10, 0, "0xtx", 1).unwrap();
+        let stored = vec![
+            (
+                Store::entity_key(10, 0),
+                transfer_row(10, 0, ALICE, Some(BOB), "100"),
+            ),
+            (flag_key, flag.to_string()),
+            (
+                Store::entity_key(10, 1),
+                r#"{"table":"prices","block_number":10,"log_index":1,"price":"7"}"#.to_string(),
+            ),
+        ];
+        store.commit_window(&stored, Some((11, "aa")), 11).unwrap();
+        assert_eq!(seeded_total(dir.path(), &store, BOB, 11), Some(100));
+    }
+
+    /// #2168: a crash between the manifest and the prune leaves a catalogued segment whose rows hot
+    /// still holds under the old watermark. The seed counts them once, as the views do.
+    #[test]
+    fn a_seed_reads_a_segment_past_the_watermark_from_hot_alone() {
+        const ALICE: &str = "0x1111111111111111111111111111111111111111";
+        const BOB: &str = "0x2222222222222222222222222222222222222222";
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        entity_fixture::write(dir.path(), TOTALS).unwrap();
+        let rows = [
+            transfer_row(10, 0, ALICE, Some(BOB), "100"),
+            transfer_row(11, 0, ALICE, Some(BOB), "250"),
+        ];
+        let stored = vec![
+            (Store::entity_key(10, 0), rows[0].clone()),
+            (Store::entity_key(11, 0), rows[1].clone()),
+        ];
+        store.commit_window(&stored, Some((11, "aa")), 11).unwrap();
+        crate::seal::seal_range(dir.path(), &rows, 10, 11)
+            .unwrap()
+            .expect("premise: the cut is catalogued");
+        assert_eq!(store.sealed_through(), 0, "premise: the prune never ran");
+        assert_eq!(seeded_total(dir.path(), &store, BOB, 11), Some(350));
+    }
+
     /// An offchain table larger than one entity may hold faults that entity alone, before a row of
     /// it is read. The window succeeds and the chain-only entity beside it carries on.
     #[test]
@@ -24942,23 +25046,15 @@ rpc_urls = ["https://rpc.example"]
         const MIXER: &str = "0x3333333333333333333333333333333333333333";
         const ALICE: &str = "0x1111111111111111111111111111111111111111";
         const BOB: &str = "0x2222222222222222222222222222222222222222";
-        const CAROL: &str = "0x4444444444444444444444444444444444444444";
         const WINDOW: u64 = 100;
 
         // Two blocks in one velocity bucket and one far outside it, so bucketing is exercised; a
         // labelled counterparty on both sides, so exposure has "out" and "in" rows to build.
-        //
-        // CAROL's row has an unreadable `to` (JSON null) with `from` and `value` intact. It is the
-        // row that pins the shape of the hot-replay guard: balances and exposure need a counterparty
-        // and must skip it, velocity needs only (from, block, value) and must still count its
-        // outbound volume. Without such a row, folding velocity inside the `(from, to, val)` guard
-        // silently drops outbound volume with every assertion still green.
         let fixture = [
             (10u64, 0u64, ALICE, Some(MIXER), "100"),
             (11, 0, ALICE, Some(BOB), "250"),
             (11, 1, BOB, Some(MIXER), "7"),
             (210, 0, MIXER, Some(ALICE), "42"),
-            (12, 0, CAROL, None, "500"),
         ];
 
         let dir = tempfile::tempdir().unwrap();
@@ -25003,14 +25099,9 @@ rpc_urls = ["https://rpc.example"]
         let want_velocity = VelocityView::start(true).unwrap();
         for (b, _li, from, to, val) in fixture {
             let v: i128 = val.parse().unwrap();
-            // Balances and exposure are both two-sided, so a row with no readable `to` has nothing
-            // to move between and nothing to be exposed to - the live loop never feeds them one.
-            if let Some(to) = to {
-                want_balances.apply(views::transfer_deltas(from, to, v, 1));
-                want_exposure.apply(exposure::exposure_deltas(from, to, v, 1, &labels));
-            }
-            // Velocity is one-sided - "how much did `from` push out" - so it is fed unconditionally,
-            // `to` readable or not. This asymmetry is the thing under test.
+            let to = to.expect("every fixture row has a recipient");
+            want_balances.apply(views::transfer_deltas(from, to, v, 1));
+            want_exposure.apply(exposure::exposure_deltas(from, to, v, 1, &labels));
             want_velocity.apply(velocity::velocity_deltas(from, b, v, 1, WINDOW));
         }
         want_balances.flush();
@@ -25049,26 +25140,47 @@ rpc_urls = ["https://rpc.example"]
             velocity_v.entries() > 1,
             "fixture must land in more than one window bucket"
         );
+    }
 
-        // The unreadable-`to` row, asserted directly rather than only against the reference, so both
-        // sides of the guard's asymmetry are pinned even if the reference above drifts.
-        let carol = velocity_v
-            .flags(1)
-            .into_iter()
-            .find(|f| f.address == CAROL)
-            .expect("velocity must count outbound volume for a transfer with an unreadable `to`");
-        assert_eq!(
-            carol.volume, 500,
-            "velocity must count the whole outbound value of an unreadable-`to` transfer"
-        );
-        assert!(
-            !balances.top(usize::MAX).iter().any(|(a, _)| a == CAROL),
-            "balances must not move value for a transfer with no readable counterparty"
-        );
-        assert!(
-            exposure_v.exposure(CAROL).is_empty(),
-            "exposure must not build a row for a transfer with no readable counterparty"
-        );
+    /// #2171: a sealed transfer table the cold seed cannot read fails the rebuild, rather than
+    /// rebuilding the views from the hot tail and calling that complete.
+    #[test]
+    fn a_cold_seed_that_cannot_read_a_catalogued_segment_fails_the_rebuild() {
+        const ALICE: &str = "0x1111111111111111111111111111111111111111";
+        const BOB: &str = "0x2222222222222222222222222222222222222222";
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let rows = [transfer_row(10, 0, ALICE, Some(BOB), "100")];
+        crate::seal::seal_range(dir.path(), &rows, 10, 10)
+            .unwrap()
+            .unwrap();
+        store.set_meta(SEALED_THROUGH_KEY, "10").unwrap();
+        store.set_meta(LAST_BLOCK_KEY, "10").unwrap();
+        let rebuild = || {
+            rebuild_views(
+                dir.path(),
+                &store,
+                &erc20_registry(),
+                &DerivedViews {
+                    labels: &LabelSet::default(),
+                    balances: &BalanceView::start().unwrap(),
+                    exposure: &ExposureView::start(false).unwrap(),
+                    velocity: &VelocityView::start(false).unwrap(),
+                    velocity_window: None,
+                },
+            )
+        };
+        rebuild().expect("premise: a readable segment rebuilds");
+
+        let manifest = crate::seal::load_manifest(dir.path()).unwrap();
+        let segment = &manifest.tables["usdc__transfer"][0];
+        std::fs::write(
+            crate::seal::segment_path(dir.path(), &segment.file, &segment.hash),
+            b"not parquet",
+        )
+        .unwrap();
+        let err = rebuild().expect_err("an unreadable sealed table is a failed rebuild");
+        assert!(format!("{err:#}").contains("usdc__transfer"), "{err:#}");
     }
 
     /// #294 itself: the restart rebuild must walk the hot store **once**.

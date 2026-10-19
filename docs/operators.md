@@ -1860,6 +1860,11 @@ Stated plainly, because finding them yourself in production would be worse.
   token approaches this.
 - One malformed log fails its whole `getLogs` window and retries against another endpoint rather than
   being skipped. Deliberate: silently dropping an on-chain event would be a correctness bug.
+- That covers a log the endpoint mangled, not one the ABI cannot read. A well-formed log whose topic0
+  this nest decodes but whose data does not fit the ABI it holds *is* dropped, logged only at `debug`
+  as `decode skipped` and counted nowhere. A proxy upgrade or a wrong vendored ABI looks like this.
+  It is not accepted, it is open: [RFC-0049 §2](rfcs/0049-hardening-lessons-from-an-audited-pipeline.md).
+  Until it is fixed, a nest missing events it should have is worth a run at `RUST_LOG=nuthatch=debug`.
 - An endpoint that leaves a log out of the middle of a `getLogs` answer is not detected at ingest;
   the sealed-history audit above finds it after the fact, by sampling.
 - Segment identity may differ across nuthatch versions built on different arrow-rs releases.

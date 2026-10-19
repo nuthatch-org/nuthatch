@@ -1260,14 +1260,15 @@ impl Store {
                 }
                 .into());
             }
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(v.value()) {
-                if let Some(table) = json.get("table").and_then(|t| t.as_str()) {
-                    seen += 1;
-                    if seen > max_rows {
-                        return Err(HotScanTooLarge { cap: max_rows }.into());
-                    }
-                    out.rows.entry(table.to_string()).or_default().push(json);
+            // Corruption, as in `recent_by_table`: skipping it would shorten every answer silently.
+            let json = serde_json::from_str::<serde_json::Value>(v.value())
+                .context("unparseable hot row in an analytical scan")?;
+            if let Some(table) = json.get("table").and_then(|t| t.as_str()) {
+                seen += 1;
+                if seen > max_rows {
+                    return Err(HotScanTooLarge { cap: max_rows }.into());
                 }
+                out.rows.entry(table.to_string()).or_default().push(json);
             }
         }
         Ok(out)
@@ -2854,6 +2855,23 @@ mod tests {
             msg.contains("a__x"),
             "the error should name the table being scanned, got: {msg}"
         );
+    }
+
+    /// #2232: the analytical hot scan reads the same store and refuses the same corrupt row, rather
+    /// than answering `/sql` and rebuilding the views without it.
+    #[test]
+    fn the_hot_analytical_scan_errors_on_an_unparseable_row() {
+        let (store, _d) = temp_store();
+        store
+            .put_entity(&Store::entity_key(10, 0), r#"{"table":"a__x"}"#)
+            .unwrap();
+        store
+            .put_entity(&Store::entity_key(10, 1), "not json")
+            .unwrap();
+        let err = store
+            .hot_rows_by_table()
+            .expect_err("an unparseable stored row must fail the scan, not shrink it");
+        assert!(format!("{err:#}").contains("unparseable"), "{err:#}");
     }
 
     /// The ordinary case the corrupt-row guard must not break: a well-formed row belonging to a
