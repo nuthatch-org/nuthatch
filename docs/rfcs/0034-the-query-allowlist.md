@@ -81,6 +81,10 @@ is an authored input, so it is hashed with the bundle and it is part of the NID.
 A mount may then **narrow within the ceiling, never widen it**. An author ships a nest saying "these
 twelve queries are what this is for"; an operator exposes four of them.
 
+*(#2135.)* `open` is wider than any ceiling, so a mount on the default `open` serves the ceiling
+itself as its allowlist. The check runs wherever a mount takes its surface: at boot, and on a live
+mount, resume and move.
+
 Why this is worth having at all, given phase 1 works: it moves the surface from an operator decision to
 an author guarantee. A published nest becomes self-describing about what it answers, which is the
 property a registry needs and an operator cannot supply for someone else's nest.

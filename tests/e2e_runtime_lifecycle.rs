@@ -309,6 +309,216 @@ async fn a_live_mount_applies_the_recorded_surface_and_shares_the_sql_gate() {
     );
 }
 
+fn surface_of(h: &runtime::RuntimeHandles, name: &str) -> nuthatch::allowlist::Surface {
+    let (_, s) = h
+        .states
+        .iter()
+        .find(|(n, _)| n == name)
+        .unwrap_or_else(|| panic!("'{name}' is not mounted"));
+    (*s.surface).clone()
+}
+
+fn allowlist_of(sql: &str) -> nuthatch::allowlist::Surface {
+    nuthatch::allowlist::Surface {
+        access: nuthatch::allowlist::SqlAccess::Allowlist,
+        queries: vec![nuthatch::allowlist::NamedQuery {
+            name: "total".to_string(),
+            sql: sql.to_string(),
+            params: Default::default(),
+        }],
+    }
+}
+
+fn record_surface(
+    h: &mut runtime::RuntimeHandles,
+    alias: &str,
+    surface: &nuthatch::allowlist::Surface,
+) {
+    let m = h
+        .mount_ctx
+        .mounts
+        .iter_mut()
+        .find(|m| m.alias == alias)
+        .expect("a record");
+    m.sql = surface.access;
+    m.queries = surface.queries.clone();
+}
+
+/// #2129: the first nest on a chain starts the cursor, and serves its record's surface from there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_that_starts_its_cursor_serves_the_recorded_surface() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c1".repeat(32);
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    let deny = nuthatch::allowlist::Surface {
+        access: nuthatch::allowlist::SqlAccess::Deny,
+        queries: Vec::new(),
+    };
+    record_surface(&mut handles, "usdc", &deny);
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("mount");
+    assert_eq!(surface_of(&handles, "usdc"), deny);
+}
+
+/// #2129: a second alias onto a dataset already served takes its own record, not its co-tenant's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_alias_serves_its_own_recorded_surface() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c2".repeat(32);
+    let (mut handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let narrow = allowlist_of("SELECT 1");
+    handles.mount_ctx.mounts.push(runtime::Mount {
+        tenant: "default".to_string(),
+        alias: "usdc2".to_string(),
+        nid: nid.clone(),
+        sql: narrow.access,
+        queries: narrow.queries.clone(),
+        publish: None,
+        #[cfg(feature = "counter")]
+        counter: None,
+    });
+    handles
+        .mount("usdc2", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("mount");
+    assert_eq!(surface_of(&handles, "usdc2"), narrow);
+    assert_eq!(surface_of(&handles, "usdc"), Default::default());
+}
+
+/// #2129: a move stages the new NID under another name, which has no record of its own. The name
+/// must come out of the move serving its own record, not the staging name's open default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_keeps_the_recorded_surface() {
+    let roost = tempfile::tempdir().unwrap();
+    let (old_nid, new_nid) = ("c3".repeat(32), "c4".repeat(32));
+    let (mut handles, _tape) = one_live_mount(roost.path(), &old_nid).await;
+    let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
+    std::fs::create_dir_all(&new_dir).unwrap();
+    scaffold_nest(&new_dir, "usdc", USDC);
+    let narrow = allowlist_of("SELECT 1");
+    record_surface(&mut handles, "usdc", &narrow);
+
+    handles
+        .move_name("usdc", runtime::Nid::parse(&new_nid).unwrap())
+        .await
+        .expect("move");
+    assert_eq!(surface_of(&handles, "usdc"), narrow);
+    assert_eq!(
+        status(&handles.live, "/usdc/sql?q=SELECT%202").await,
+        axum::http::StatusCode::FORBIDDEN,
+        "a moved allowlisted mount answered free-form SQL"
+    );
+}
+
+/// #2129: the name a move stages under is routed while the new NID catches up, so it serves the
+/// moving name's surface rather than the open default of a name with no record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_staged_move_serves_the_moving_names_surface() {
+    let roost = tempfile::tempdir().unwrap();
+    let (old_nid, new_nid) = ("c8".repeat(32), "c9".repeat(32));
+    let (mut handles, _tape) = one_live_mount(roost.path(), &old_nid).await;
+    let new_dir = runtime::MountTable::data_dir(roost.path(), &new_nid);
+    std::fs::create_dir_all(&new_dir).unwrap();
+    scaffold_nest(&new_dir, "usdc", USDC);
+    let narrow = allowlist_of("SELECT 1");
+    record_surface(&mut handles, "usdc", &narrow);
+
+    let staging = runtime::RuntimeHandles::staging_name("usdc");
+    handles
+        .mount(&staging, Some(runtime::Nid::parse(&new_nid).unwrap()))
+        .await
+        .expect("staging mount");
+    assert_eq!(surface_of(&handles, &staging), narrow);
+}
+
+/// #2129: a resume is a mount of the suspended name, and keeps the record it was suspended with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_keeps_the_recorded_surface() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c5".repeat(32);
+    let (mut handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let deny = nuthatch::allowlist::Surface {
+        access: nuthatch::allowlist::SqlAccess::Deny,
+        queries: Vec::new(),
+    };
+    record_surface(&mut handles, "usdc", &deny);
+    handles.suspend("usdc").await.expect("suspend");
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("resume");
+    assert_eq!(surface_of(&handles, "usdc"), deny);
+}
+
+/// #2135: a nest whose author declared a ceiling, mounted with no surface of its own, serves the
+/// ceiling: open is wider than any ceiling, and a mount may only narrow it (RFC-0034 §3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_mount_of_a_nest_with_a_ceiling_serves_the_ceiling() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c6".repeat(32);
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    std::fs::write(
+        runtime::MountTable::data_dir(roost.path(), &nid).join("queries.toml"),
+        "[[queries]]\nname = \"total\"\nsql = \"SELECT 1\"\n",
+    )
+    .unwrap();
+    handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("mount");
+    assert_eq!(surface_of(&handles, "usdc"), allowlist_of("SELECT 1"));
+    assert_eq!(
+        status(&handles.live, "/usdc/sql?q=SELECT%202").await,
+        axum::http::StatusCode::FORBIDDEN,
+        "free-form SQL answered past the author's ceiling"
+    );
+}
+
+/// #2135: a live mount that would widen its author's ceiling is refused, as boot refuses it, and
+/// nothing is left mounted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_mount_wider_than_its_ceiling_is_refused() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c7".repeat(32);
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    std::fs::write(
+        runtime::MountTable::data_dir(roost.path(), &nid).join("queries.toml"),
+        "[[queries]]\nname = \"total\"\nsql = \"SELECT 1\"\n",
+    )
+    .unwrap();
+    record_surface(&mut handles, "usdc", &allowlist_of("SELECT 2"));
+    let err = handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect_err("a widening mount was accepted");
+    assert!(format!("{err:#}").contains("redefines"), "{err:#}");
+    assert!(
+        handles.states.is_empty(),
+        "a refused mount was left serving"
+    );
+}
+
+/// #2135: a `queries.toml` that exists but cannot be read refuses the mount rather than opening it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_whose_ceiling_cannot_be_read_is_refused() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "ca".repeat(32);
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    std::fs::create_dir(runtime::MountTable::data_dir(roost.path(), &nid).join("queries.toml"))
+        .unwrap();
+    let err = handles
+        .mount("usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect_err("a mount with an unreadable ceiling was accepted");
+    assert!(format!("{err:#}").contains("queries.toml"), "{err:#}");
+    assert!(
+        handles.states.is_empty(),
+        "a refused mount was left serving"
+    );
+}
+
 /// RFC-0027 §3: the three admission refusals, each decided **before** any work is done - no store
 /// opened, no block fetched, nothing left behind by a rejected mount.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
