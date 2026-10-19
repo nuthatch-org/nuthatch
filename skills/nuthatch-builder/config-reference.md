@@ -243,12 +243,15 @@ webhook = "https://processor.example/deposits"  # optional: POST the deposits fe
 ```
 
 A sweeping nest covers normal transactions and ERC-20, ERC-721 and ERC-1155 transfers for every watched
-account from the block it joined; nothing before that block is claimed, so a read below it answers
-`NUTHATCH_INCOMPLETE`. Accounts join at runtime in bulk, on a loopback bind only:
+account from the block it joined. It never reads back: a read below that block, or over blocks already
+swept without what it asks for, answers `NUTHATCH_INCOMPLETE` saying it is never covered, and only a
+read past the swept head says to ask again. There is no token allowlist: every transfer naming a
+watched account is served and is a deposit, so filter by the token contract. Accounts join at runtime in bulk, on a loopback bind only:
 `POST /api/watch` with `{"addresses": ["0x…", …]}` adds them in one transaction, all or none, and answers
 `{"added": n, "watched": total}`. With `internal = true` each block is traced once and internal
 transfers, such as value a smart wallet or contract sends from inside a call, are served too, but
-only over blocks swept with tracing on. The sweep follows the finalized head, or with
+only over blocks swept with tracing on; without it a `txlistinternal` range answers `NUTHATCH_UNSUPPORTED`. The
+sweep follows the finalized head, or with
 `confirmations` that many blocks under the chain head; set `poll_interval` near the block time to see
 deposits soon after they land.
 
@@ -331,10 +334,13 @@ a loopback bind; any other bind logs a warning at start. `addresses = []` is val
 serves timestamp lookups and accounts added later. A range the nest has not fetched answers
 `NUTHATCH_INCOMPLETE`, never an empty list. `/ready` answers 503 until the first finalized head is
 read, and still carries `chain_id`; `served_through` gives, per action family the nest serves, the block
-every watched account is covered through, `null` before any is: `transactions` (the five discovered
-actions), `bodies` (withdrawals and mined blocks, Ethereum) and `produced` (with `mev_relays`); a
-sweeping nest reports its swept span as `transactions`. A client that stops there is answered without
-waiting. It reports `stalled: true` while the last poll failed or no window advances, lists each address
+up to which every account the family reads for is answered without waiting, `null` before any is:
+`transactions` (the five discovered actions, every watched account), `bodies` (withdrawals and mined
+blocks, Ethereum) and `produced` (with `mev_relays`), both over the accounts asked for them (every account while validators are watched), since a plain
+wallet is not body-scanned until it asks. An account above its unprovable marker is refused for
+good rather than waited on, and so does not hold `transactions` back. A sweeping nest reports the end
+of its swept span as `transactions`: it never reads back, so below that nothing is still to come. A
+client that stops there is answered without waiting. It reports `stalled: true` while the last poll failed or no window advances, lists each address
 whose windows keep failing under `stalled_backfill` (failures, span, `retry_in_polls`, the last error),
 and 503 with
 the reason once a finalized block the nest committed changes hash (a reorg under finality, or an RPC
@@ -344,11 +350,16 @@ store across restarts; removing the address-history store is how a nest reads it
 The rows are Etherscan's account records with a narrower field set on two row types: token rows
 (`tokentx`, `tokennfttx`, `token1155tx`) omit `tokenName`, `tokenSymbol`, `tokenDecimal`, `gasUsed`
 and `functionName`, and internal rows carry an empty `input`. rotki's readers of those row types use
-none of them. `logs/getLogs` honours `page` and `offset` (at most 1,000), asks the RPC in spans that
+none of them. On OP-stack chains (Optimism, Base) a `txlist` row carries `L1FeesPaid`, the receipt's
+L1 data fee in wei, as Etherscan's does; a deposit from L1 has none. `txlistinternal` with `txhash`
+traces a transaction the nest has not traced yet, but off a loopback bind only one it holds for a
+watched account: like the proxy, the operator's trace RPC and disk are lent to anyone only on
+loopback. `logs/getLogs` honours `page` and `offset` (at most 1,000), asks the RPC in spans that
 start at 16 blocks and grow while they come back sparse, narrows any answer past 4 MiB, stops once
 it holds the page, and runs two
-requests at a time; a range that needs more than 64 calls, or a page that falls inside one block,
-answers `NUTHATCH_INCOMPLETE`.
+requests at a time; a range that needs more than 64 calls answers `NUTHATCH_INCOMPLETE`, and a first
+page whose logs all fall inside one block answers `NUTHATCH_UNSUPPORTED`, since paging from that block
+would return the same page forever.
 
 What leaves the machine: the RPC provider sees the watched addresses in its trace and log filters
 (history stays local; the provider's view does not); the mirror, if named, sees the IP and block

@@ -1694,7 +1694,7 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
             bail!("history ends at block {e}");
         }
         if state.sweep.is_some() {
-            bail!("this nest sweeps every block for its whole set and is not there yet; ask again shortly");
+            bail!("this nest sweeps every block for its whole set and covers nothing on demand");
         }
         if need != Need::Discovered && state.chain_id != 1 {
             bail!("withdrawals and produced blocks are served on Ethereum mainnet only");
@@ -2839,20 +2839,8 @@ async fn scan_bodies<M: Rpc, T: Rpc>(
     // A hold from an earlier pass must not be committed: this pass may not reach the finalized block.
     state.clear_held();
     let mut keep = state.beacon.is_some() && state.validators.is_some();
-    // rotki asks for withdrawals and produced blocks only by a tracked validator's withdrawal
-    // address, so a plain wallet would pay one body a block for nothing. The proposer proof reads
-    // every scanned block, so with validators watched the scan stays whole.
-    let asked: Vec<String>;
-    let watched = if keep {
-        watched
-    } else {
-        asked = watched
-            .iter()
-            .filter(|a| state.history.bodies_wanted(a).unwrap_or(true))
-            .cloned()
-            .collect();
-        &asked[..]
-    };
+    let scanned = body_scanned(state, watched);
+    let watched = &scanned[..];
     let _pass = state.begin_pass("bodies");
     let mut last: Option<u64> = None;
     let mut cursor = state.start_block;
@@ -3132,12 +3120,19 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>, deadline: Instan
         // the chain first, since a reorg since the last poll may have taken its block.
         let fresh = blocking(&s, move |h| {
             Ok(match h.tx_internals_block(&key)? {
-                None => true,
-                Some((b, named)) => named.is_none() || h.head()?.is_none_or(|f| b > f),
+                None => (true, h.cached_tx(&key)?.is_some()),
+                Some((b, named)) => (named.is_none() || h.head()?.is_none_or(|f| b > f), true),
             })
         })
         .await;
-        if matches!(fresh, Ok(true)) {
+        // Like the proxy, the operator's trace RPC and disk are lent to any hash only on a loopback
+        // bind; off it, only a transaction the store holds for a watched account is traced.
+        if matches!(fresh, Ok((true, false))) && !s.loopback {
+            return Json(crate::address_history::unsupported(&format!(
+                "{hash} is not a transaction of a watched account, and off a loopback bind only those are traced"
+            )));
+        }
+        if matches!(fresh, Ok((true, _))) {
             if let Err(e) = s
                 .ask(deadline, |deadline, reply| Request::Trace {
                     hash,
@@ -3181,13 +3176,26 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>, deadline: Instan
             "the history changed while it was being read; ask again",
         ));
     };
-    // A gap the cursor cannot cover within the deadline at its measured pace is refused at once,
-    // not after holding the request for the whole deadline: the backfill reaches it in the background.
-    if let Some(why) = beyond_reach(&s, &want).await {
-        return Json(crate::address_history::incomplete(&why));
-    }
-    match s
-        .ask(deadline, |deadline, reply| Request::Cover {
+    let asked = if let Some(cfg) = s.sweep.clone() {
+        use crate::address_history::Action;
+        let action = q.get("action").and_then(|a| Action::from_etherscan(a));
+        if action == Some(Action::TxListInternal) && !cfg.internal {
+            return Json(crate::address_history::unsupported(
+                "this nest's sweep does not trace, so it serves no internal transactions",
+            ));
+        }
+        // A sweep is never covered on demand: the cursor would only refuse it.
+        Err(blocking(&s, move |h| sweep_refusal(h, action, &want))
+            .await
+            .unwrap_or_else(|e| format!("{e:#}")))
+    } else {
+        // A gap the cursor cannot cover within the deadline at its measured pace is refused at
+        // once, not after holding the request for the whole deadline: the backfill reaches it in
+        // the background.
+        if let Some(why) = beyond_reach(&s, &want).await {
+            return Json(crate::address_history::incomplete(&why));
+        }
+        s.ask(deadline, |deadline, reply| Request::Cover {
             address: want.0,
             need: want.1,
             from: want.2,
@@ -3196,7 +3204,8 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>, deadline: Instan
             reply,
         })
         .await
-    {
+    };
+    match asked {
         Ok(()) => Json(respond(&s, &q).await),
         Err(e) => {
             // The cursor may have finished just as the ceiling passed: what is now covered is served,
@@ -3510,6 +3519,28 @@ async fn wanted(s: &Arc<ModeState>, q: &HashMap<String, String>, answer: &Value)
         )))
     };
     decided.await.unwrap_or(Want::Serve)
+}
+
+/// Why a sweeping nest refuses `want`: past the swept head it is still to come; below where the
+/// account joined, or behind the sweep and not read there for this action, it never will be.
+fn sweep_refusal(
+    h: &AddressHistory,
+    action: Option<crate::address_history::Action>,
+    (address, _, from, to): &(String, Need, u64, u64),
+) -> Result<String> {
+    let next = match action {
+        Some(a) => crate::address_discovery::next_uncovered_for(h, address, *from, &[a])?,
+        None => *from,
+    };
+    Ok(match (h.joined(address)?, h.swept()?) {
+        (Some(j), _) if next < j => format!(
+            "the sweep covers {address} from block {j}, where it joined, and never reads back below it"
+        ),
+        (_, Some((_, t))) if next <= t => format!(
+            "block {next} is behind the sweep and was not read there for this; the sweep never reads back, so it is never covered"
+        ),
+        _ => format!("the sweep has not reached block {to} yet; ask again shortly"),
+    })
 }
 
 /// `block/getblocknobytime`: from verified headers where they bracket the timestamp, else searched
@@ -3899,9 +3930,22 @@ async fn change(s: Arc<ModeState>, address: String, add: bool) -> (StatusCode, J
     }
 }
 
-/// Per action family this nest serves, the block every watched account is covered through, so a
-/// client can stop asking there (#2077); `null` before any is. A family the nest does not serve is
-/// absent. A sweep covers its whole set as one span.
+/// rotki asks for withdrawals and produced blocks only by a tracked validator's withdrawal address,
+/// so the body scan reads for the accounts asked, and a plain wallet pays no body a block. The
+/// proposer proof reads every scanned block, so with validators watched the scan stays whole.
+fn body_scanned(state: &ModeState, watched: &[String]) -> Vec<String> {
+    let whole = state.beacon.is_some() && state.validators.is_some();
+    watched
+        .iter()
+        .filter(|a| whole || state.history.bodies_wanted(a).unwrap_or(true))
+        .cloned()
+        .collect()
+}
+
+/// Per action family this nest serves, the block up to which every account the family reads for is
+/// answered without waiting, so a client can stop asking there (#2077); `null` before any is. A
+/// family the nest does not serve is absent. A sweep never reads back, so below its span's end
+/// nothing is still to come: what it did not read there is refused for good.
 fn served_through(s: &ModeState, h: &AddressHistory) -> Result<Value> {
     use crate::address_discovery::{next_uncovered_for, BLOCK_SCANNED, DISCOVERED};
     use crate::address_history::Action;
@@ -3915,10 +3959,16 @@ fn served_through(s: &ModeState, h: &AddressHistory) -> Result<Value> {
         return Ok(Value::Object(out));
     }
     let watched = h.watched()?;
-    let through = |set: &[Action]| -> Result<Value> {
+    let scanned = body_scanned(s, &watched);
+    let through = |accounts: &[String], set: &[Action]| -> Result<Value> {
         let mut next = u64::MAX;
-        for a in &watched {
-            next = next.min(next_uncovered_for(h, a, s.start_block, set)?);
+        for a in accounts {
+            let n = next_uncovered_for(h, a, s.start_block, set)?;
+            // Covered to its marker, an unprovable account is refused above it at once, for good.
+            if set == DISCOVERED && h.unprovable_from(a)?.is_some_and(|m| n >= m) {
+                continue;
+            }
+            next = next.min(n);
         }
         Ok(match next {
             u64::MAX => Value::Null,
@@ -3926,11 +3976,14 @@ fn served_through(s: &ModeState, h: &AddressHistory) -> Result<Value> {
             n => json!(n - 1),
         })
     };
-    out.insert("transactions".into(), through(&DISCOVERED)?);
+    out.insert("transactions".into(), through(&watched, &DISCOVERED)?);
     if s.chain_id == 1 {
-        out.insert("bodies".into(), through(&BLOCK_SCANNED)?);
+        out.insert("bodies".into(), through(&scanned, &BLOCK_SCANNED)?);
         if s.relays.is_some() {
-            out.insert("produced".into(), through(&[Action::ProducedBlocks])?);
+            out.insert(
+                "produced".into(),
+                through(&scanned, &[Action::ProducedBlocks])?,
+            );
         }
     }
     Ok(Value::Object(out))
@@ -6185,6 +6238,93 @@ mod tests {
         assert_eq!(r["head"], 500, "head is unchanged: {r}");
     }
 
+    /// `served_through` is a prefix every watched account is answered under without waiting: a plain
+    /// wallet the body scan never reads does not pin `bodies` at null, and an account covered up to
+    /// where it became unprovable, refused for good above it, does not pin `transactions` there.
+    #[tokio::test]
+    async fn served_through_is_not_pinned_by_accounts_the_family_never_waits_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        s.history.set_head(500).unwrap();
+        s.history.watch(BOB).unwrap();
+        let g = s.history.generation().unwrap();
+        for action in crate::address_discovery::DISCOVERED {
+            s.history.record(action, ALICE, &[], (0, 300), g).unwrap();
+            s.history.record(action, BOB, &[], (0, 200), g).unwrap();
+        }
+        for action in crate::address_discovery::BLOCK_SCANNED {
+            s.history.record(action, ALICE, &[], (0, 450), g).unwrap();
+        }
+        s.history.mark_unprovable(BOB, 201).unwrap();
+        let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert_eq!(
+            r["served_through"],
+            json!({"transactions": 300, "bodies": 450}),
+            "{r}"
+        );
+        // Short of its marker, the unprovable account still holds the family back.
+        s.history.mark_unprovable(ALICE, 400).unwrap();
+        s.history.mark_unprovable(BOB, 150).unwrap();
+        let (_, r) = call(router(s), "GET", "/ready", None).await;
+        assert_eq!(r["served_through"]["transactions"], 300, "{r}");
+    }
+
+    /// A sweep never reads back: a range below where an account joined it, or already swept without
+    /// what is asked, is refused as never covered, and only one past the sweep is to come. Without
+    /// tracing, internal transactions are not served at all (#2125).
+    #[tokio::test]
+    async fn a_sweep_refuses_what_it_will_never_read_as_never_covered() {
+        let sweeping = |dir: &Path, internal: bool| {
+            let store = Store::open(&dir.join("t.redb")).unwrap();
+            let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+            history.set_head(1_000).unwrap();
+            let g = history.generation().unwrap();
+            let none = BTreeMap::new();
+            history
+                .record_sweep(&none, [ALICE], (100, 200), g, None, false)
+                .unwrap();
+            history
+                .record_sweep(&none, [ALICE], (201, 300), g, None, internal)
+                .unwrap();
+            Arc::new(
+                ModeState::new(history, 1, Duration::from_secs(300), true).with_sweep(Some(
+                    crate::address_history::SweepConfig {
+                        from_block: None,
+                        internal,
+                        confirmations: None,
+                        webhook: None,
+                    },
+                )),
+            )
+        };
+        let ask = |action: &str, from: u64, to: u64| {
+            format!("/api?module=account&action={action}&address={ALICE}&startblock={from}&endblock={to}")
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let s = sweeping(dir.path(), true);
+        for (action, from, to, says) in [
+            ("txlist", 50, 150, "where it joined"),
+            ("txlistinternal", 150, 250, "never reads back"),
+            ("txlist", 250, 350, "ask again shortly"),
+        ] {
+            let (_, v) = call(router(s.clone()), "GET", &ask(action, from, to), None).await;
+            let why = v["result"].as_str().unwrap();
+            assert!(why.starts_with("NUTHATCH_INCOMPLETE:"), "{v}");
+            assert!(why.contains(says), "{action} {from}-{to}: {v}");
+            assert_eq!(why.contains("shortly"), says.contains("shortly"), "{v}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s = sweeping(dir.path(), false);
+        let (_, v) = call(router(s), "GET", &ask("txlistinternal", 250, 350), None).await;
+        assert!(
+            v["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_UNSUPPORTED:"),
+            "{v}"
+        );
+    }
+
     /// Admission is by the slowest layer a request needs: fast trace discovery does not admit a
     /// withdrawals request the slow body scan cannot finish in time.
     #[tokio::test]
@@ -6329,6 +6469,51 @@ mod tests {
             r.starts_with("NUTHATCH_INCOMPLETE:") && r.contains("finalized block 9"),
             "{v}"
         );
+    }
+
+    /// Off a loopback bind a `txhash` lookup traces only a transaction the store holds for a watched
+    /// account; any other is refused before the trace RPC is asked or anything is kept.
+    #[tokio::test]
+    async fn off_loopback_a_txhash_is_traced_only_for_a_watched_accounts_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), false)
+                .with_deadline(Duration::from_millis(200)),
+        );
+        let known = format!("0x{}", "ab".repeat(32));
+        let g = s.history.generation().unwrap();
+        s.history
+            .persist_pending(
+                &[(
+                    vec![0xab; 32],
+                    json!({"blockNumber": "100"}).as_object().unwrap().clone(),
+                )],
+                &[],
+                &[],
+                &[],
+                &[],
+                g,
+                None,
+                true,
+            )
+            .unwrap();
+        let ask = |hash: &str| format!("/api?module=account&action=txlistinternal&txhash={hash}");
+        let (_, v) = call(
+            router(s.clone()),
+            "GET",
+            &ask(&format!("0x{}", "cd".repeat(32))),
+            None,
+        )
+        .await;
+        let why = v["result"].as_str().unwrap();
+        assert!(
+            why.starts_with("NUTHATCH_UNSUPPORTED:") && why.contains("watched"),
+            "{v}"
+        );
+        let (_, v) = call(router(s), "GET", &ask(&known), None).await;
+        assert!(!v["result"].as_str().unwrap().contains("watched"), "{v}");
     }
 
     /// The nest's RPC is lent out through `proxy` only on a loopback bind.
