@@ -204,10 +204,18 @@ pub fn seal_range_with_snapshot(
                 continue;
             }
             if s.hash == hash {
-                match shared_store(dir) {
-                    Some(store) => publish_durable(&store, &format!("{hash}.parquet"), &bytes)?,
-                    None => publish_durable(&seg_dir, &s.file, &bytes)?,
-                }
+                // These are the bytes the address names, so they replace a corrupt file in place,
+                // shared or not (#2266). A replace that fails fails the seal, and hot is kept.
+                let target = match shared_store(dir) {
+                    Some(store) => {
+                        std::fs::create_dir_all(&store)
+                            .with_context(|| format!("creating {}", store.display()))?;
+                        store.join(format!("{hash}.parquet"))
+                    }
+                    None => seg_dir.join(&s.file),
+                };
+                replace_durable(&target, &bytes)
+                    .with_context(|| format!("restoring segment {}", s.file))?;
                 continue;
             }
             // A lost fold held these rows; they are sealed again as a segment of their own.
@@ -2997,6 +3005,60 @@ mod tests {
             segment_intact(dir.path(), &seg),
             "the file was not restored"
         );
+    }
+
+    /// #2266: a shared segment corrupt in place was left alone by the restore, which skips a name
+    /// that exists, and the caller then pruned hot. The re-seal's bytes are the ones the address
+    /// names, so they replace it before `seal_range` returns, which is before any prune.
+    #[test]
+    fn a_re_seal_replaces_a_corrupt_shared_segment_before_it_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        std::fs::create_dir_all(&dir).unwrap();
+        test_set_table_floor(&dir, 0);
+        seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let seg = only(&load_manifest(&dir).unwrap(), "usdc__transfer");
+        let shared = root
+            .path()
+            .join(SEGMENTS_DIR)
+            .join(format!("{}.parquet", seg.hash));
+        std::fs::write(&shared, b"rotted in place").unwrap();
+        assert!(
+            !segment_intact(&dir, &seg),
+            "premise: the shared copy is bad"
+        );
+
+        seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();
+        assert!(
+            segment_intact(&dir, &seg),
+            "the corrupt shared file kept its bytes"
+        );
+        assert_eq!(
+            load_manifest(&dir).unwrap().tables["usdc__transfer"].len(),
+            1
+        );
+    }
+
+    /// #2266: when the bad file cannot be replaced, the seal fails, so its caller keeps hot.
+    #[test]
+    fn a_re_seal_that_cannot_replace_a_corrupt_segment_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let seg = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        let seg_dir = dir.path().join(SEGMENTS_DIR);
+        std::fs::write(seg_dir.join(&seg.file), b"rotted in place").unwrap();
+        std::fs::set_permissions(&seg_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let sealed = seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10);
+        std::fs::set_permissions(&seg_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = format!(
+            "{:#}",
+            sealed.expect_err("a seal reported success beside a corrupt copy")
+        );
+        // The manifest lives in the same directory, so its write fails too; the restore must fail first.
+        assert!(err.contains("restoring segment"), "{err}");
     }
 
     /// #2230: two seals of identical bytes in one process each wrote `.{file}.{pid}.tmp`. The second
