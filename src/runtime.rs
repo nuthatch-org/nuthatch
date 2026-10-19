@@ -8112,4 +8112,47 @@ mod tests {
             let _ = w.await;
         }
     }
+
+    /// #2134: a mount catching up with no lock held keeps its place. A second mount of its name is
+    /// refused until it has joined or been dropped, and admission prices it against the cursor.
+    #[tokio::test]
+    async fn a_joining_mount_holds_its_name_and_its_budget() {
+        let root = tempfile::tempdir().unwrap();
+        write_nest_dir(root.path(), "usdc", "ethereum", 1);
+        let (tx, _cursor) = admitting_cursor();
+        let mut handles = idle_handles(root.path());
+        let source: Arc<dyn Source> = Arc::new(QuietChain::at(1_000));
+        handles
+            .mount_ctx
+            .sources
+            .insert("ethereum".to_string(), source);
+        handles.lifecycle.insert("ethereum".to_string(), tx);
+        let Begun::Join(pending) = handles.begin_mount("usdc", None).await.unwrap() else {
+            panic!("a nest beside a running cursor is reserved, not mounted");
+        };
+        let err = handles.plan_mount("usdc", None).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<MountRefusal>(),
+                Some(MountRefusal::Joining { .. })
+            ),
+            "{err:#}"
+        );
+        let reserved = handles.joining.list()[0].incoming_mb;
+        handles.mount_ctx.max_rss_mb = RUNTIME_BASE_RSS_MB + reserved;
+        write_nest_dir(root.path(), "dai", "ethereum", 1);
+        let err = handles.mount("dai", None).await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<MountRefusal>(),
+                Some(MountRefusal::OverBudget { .. })
+            ),
+            "the joining mount was not priced: {err:#}"
+        );
+        drop(pending);
+        assert!(handles.joining.list().is_empty());
+        handles
+            .plan_mount("usdc", None)
+            .expect("the name is free again");
+    }
 }
