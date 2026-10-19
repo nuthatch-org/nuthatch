@@ -2811,6 +2811,13 @@ impl ChainCursor {
     }
 }
 
+/// Where a live mount's private catch-up stops, and whether it is still wanted (RFC-0027 §4).
+pub struct CatchUp<'a> {
+    /// The furthest block the other nests on the cursor have committed; `None` when it has none.
+    pub cursor_at: &'a (dyn Fn() -> Option<u64> + Send + Sync),
+    pub wanted: &'a (dyn Fn() -> bool + Send + Sync),
+}
+
 /// Build a nest and bring it up to date **off to one side of a running cursor** - phase 1 of the
 /// two-phase mount (RFC-0027 §4).
 ///
@@ -2841,6 +2848,7 @@ pub async fn build_and_prepare_nest(
     // every existing caller.
     store_override: Option<Arc<dyn crate::store::HotStore>>,
     sql_gate: Arc<tokio::sync::Semaphore>,
+    join: CatchUp<'_>,
 ) -> Result<(
     NestIngest,
     serve::AppState,
@@ -2866,10 +2874,14 @@ pub async fn build_and_prepare_nest(
         drop(nest);
         return Err(release_refused(e, state, worker).await);
     }
-    match nest
+    let caught_up = match nest
         .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
         .await
     {
+        Ok(next) => nest.catch_up(source.as_ref(), next, window, &join).await,
+        Err(e) => Err(e),
+    };
+    match caught_up {
         Ok(next) => Ok((nest, state, worker, next)),
         Err(e) => {
             drop(nest);
@@ -6889,6 +6901,131 @@ impl NestIngest {
         }
         self.start_ipfs_resolver();
         Ok(next)
+    }
+
+    /// Phase 1 of a live mount (RFC-0027 §4): index this nest on its own, through the same window path
+    /// a solo `dev` runs, until `next` is within one window of the furthest co-tenant on its cursor.
+    /// A reorg meanwhile is caught when it joins (#2165).
+    async fn catch_up(
+        &mut self,
+        source: &dyn Source,
+        mut next: u64,
+        window: u64,
+        join: &CatchUp<'_>,
+    ) -> Result<u64> {
+        let range_floor = self.start_block.unwrap_or(0);
+        let mut chunker = tip_window(
+            self.ipfs_gate.is_some(),
+            self.registry.blocks(),
+            window,
+            self.window_ceiling,
+        );
+        let mut progress: Option<crate::progress::Backfill> = None;
+        let mut poll_failures = 0u32;
+        let mut no_progress = 0usize;
+        loop {
+            let Some(at) = (join.cursor_at)().filter(|&at| next.saturating_add(window) <= at)
+            else {
+                if let Some(p) = progress.take() {
+                    p.finish(next.saturating_sub(1), true);
+                }
+                return Ok(next);
+            };
+            if !(join.wanted)() {
+                anyhow::bail!("'{}' was unmounted while it caught up", self.name);
+            }
+            let tip = match source.tip().await {
+                Ok(t) => {
+                    poll_failures = 0;
+                    self.metrics.mark_poll_ok();
+                    t
+                }
+                Err(e) => {
+                    self.metrics.mark_poll_failed();
+                    poll_failures = escalate_stall(poll_failures, &e);
+                    sleep_secs(3).await;
+                    continue;
+                }
+            };
+            self.metrics.set_tip(tip);
+            let ceiling = cursor_ceiling(source, self.finality, self.freshness, tip).await;
+            if next > ceiling {
+                return Ok(next);
+            }
+            if self.ipfs_gate.is_some() && documents_backlogged(self.metrics.ipfs_pending()) {
+                sleep_secs(1).await;
+                continue;
+            }
+            progress.get_or_insert_with(|| crate::progress::Backfill::new("catching up", next, at));
+            let to = (next + chunker.window() - 1).min(ceiling);
+            self.metrics.set_fetch_window(chunker.window());
+            match self
+                .fetch_window(source, overlap_from(next, range_floor), to)
+                .await
+            {
+                Ok(logs) => {
+                    chunker.observed(logs.len() as u64);
+                    let n = logs.len() as u64;
+                    match self.process_window(source, &logs, next, to, tip).await {
+                        Ok(Some(_)) => {
+                            next = to + 1;
+                            no_progress = 0;
+                            if let Some(p) = progress.as_mut() {
+                                p.tick(to, n);
+                            }
+                        }
+                        Ok(None) => no_progress_tick(
+                            &mut no_progress,
+                            next,
+                            to,
+                            false,
+                            "timestamps unavailable",
+                        )?,
+                        Err(e) if e.downcast_ref::<ProviderGaveUp>().is_some() => {
+                            if retrying_cannot_help(&e) {
+                                return Err(e);
+                            }
+                            tracing::warn!("window {next}..={to} failed: {e:#}; retrying");
+                            no_progress_tick(
+                                &mut no_progress,
+                                next,
+                                to,
+                                false,
+                                &format!("reads failing: {e:#}"),
+                            )?;
+                            sleep_secs(3).await;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) if narrowing_can_help(&e, next, to) => {
+                    if next >= to {
+                        return Err(e).with_context(|| single_block_over_cap(next));
+                    }
+                    chunker.too_large();
+                    no_progress_tick(&mut no_progress, next, to, false, "narrowing")?;
+                }
+                Err(e) => {
+                    if matches!(
+                        crate::rpc::class_of(&e),
+                        Some(crate::rpc::FailureClass::HistoryUnavailable)
+                    ) {
+                        return Err(e).with_context(|| {
+                            format!("catch-up cannot fetch blocks {next}..={to}")
+                        });
+                    }
+                    tracing::warn!("get_logs {next}..={to} failed: {e:#}; retrying");
+                    no_progress_tick(
+                        &mut no_progress,
+                        next,
+                        to,
+                        false,
+                        &format!("fetch failing: {e:#}"),
+                    )?;
+                    sleep_secs(3).await;
+                }
+            }
+        }
     }
 
     /// Start resolving this nest's `[[ipfs]]` documents out of band, once.

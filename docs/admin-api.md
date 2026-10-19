@@ -97,7 +97,7 @@ of a live mount is `200` there too. Use it from a script; a platform should poll
 |---|---|
 | `400` | a malformed NID, a name the runtime would not accept, or a tenant that shares a mount's name (see above) |
 | `404` | the runtime does not hold the NID and was started without `--registry` |
-| `409` | the name is taken, the chain is not declared, the chain's cursor has died (restart the runtime), or the nest declares authored entities and the runtime runs `--seal-direct` |
+| `409` | the name is taken, the chain is not declared, the chain's cursor has died (restart the runtime), the nest declares authored entities and the runtime runs `--seal-direct`, or another mount of that name or dataset is still catching up |
 | `507` | the mount would breach the chain cursor's RAM ceiling, the reason carrying projected and ceiling MB, or its authored entities would put the cursor over 32 |
 
 On the job route a refusal ends the job `failed` with the same reason. With `--registry`, a NID the
