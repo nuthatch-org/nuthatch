@@ -2100,11 +2100,6 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         // The tip path's verdict, reported beside the backfill's so an operator can tell which term
         // took the nest unready without reading this source (#1199).
         "tip_seal_stalled": tip_seal_stalled,
-        // #2262: the tip seal's error while every attempt fails, null while it succeeds.
-        "seal_fault": seal_fault.map(|(since, reason)| json!({
-            "reason": reason,
-            "since_unixtime": since,
-        })),
         "seal_faulted": seal_faulted,
         // No longer gated on `seal_direct_active`: the tip path stamps this clock too now, and the
         // number was null on precisely the nests that needed it.
@@ -2126,8 +2121,12 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         }
         body
     };
-    // RFC-0062: absent unless the nest declares a maintained view.
     let mut body = body;
+    // #2262: the tip seal's error while every attempt fails, absent while it succeeds.
+    if let Some((since, reason)) = seal_fault {
+        body["seal_fault"] = json!({ "reason": reason, "since_unixtime": since });
+    }
+    // RFC-0062: absent unless the nest declares a maintained view.
     if crate::maintained::is_declared(&s.dir) {
         body["maintained"] = maintained_status(&s.dir);
     }
@@ -7382,7 +7381,7 @@ mod tests {
         handle.record_seal(None);
         let (code, json) = ready().await;
         assert_eq!(code, StatusCode::OK, "{json}");
-        assert_eq!(json["seal_fault"], Value::Null, "{json}");
+        assert!(json.get("seal_fault").is_none(), "{json}");
     }
 
     /// #1341: a sparse nest whose only seal is the span cut is not stalled for being quiet. Numbers

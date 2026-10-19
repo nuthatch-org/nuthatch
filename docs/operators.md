@@ -1294,7 +1294,7 @@ rather than as a caught-up seal.
 
 **A seal that fails says so at once.** `tip_seal_stalled` waits twelve hours and twice the seal span,
 because a seal holding rows is normal. A seal that errors is not, so from its first failed attempt
-`seal_fault` carries the latest `reason` and `since_unixtime`, when the failures began; it is `null`
+`seal_fault` carries the latest `reason` and `since_unixtime`, when the failures began; it is absent
 while sealing succeeds. Once it has lasted 15 minutes (or three poll intervals, if longer)
 `seal_faulted` turns true and the nest answers `503`, whatever `seal_lag_blocks` says (#2262). Hot
 keeps every unsealed row meanwhile, so reads stay complete; the log line at each attempt is the same
