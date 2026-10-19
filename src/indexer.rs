@@ -1440,6 +1440,54 @@ async fn recover_over_cap_block(
     Ok(())
 }
 
+/// A single block over the provider's cap on a union of static nests (#2162). Co-tenancy alone can
+/// cause it, so each nest is asked for the block by its own filter, and only a nest still over the
+/// cap is faulted.
+#[allow(clippy::too_many_arguments)]
+async fn recover_over_cap_static(
+    source: &dyn Source,
+    nests: &mut [Option<NestIngest>],
+    nexts: &mut [u64],
+    sup: &mut Supervisor,
+    live: &[usize],
+    block: u64,
+    tip: u64,
+) -> Result<()> {
+    let mut logs = Vec::new();
+    let mut served = Vec::new();
+    for &i in live {
+        let (name, filter) = {
+            let n = live_ref(nests, i);
+            (n.name.clone(), LogFilter::new(&n.addresses, &n.topic0s))
+        };
+        let Some(filter) = filter else {
+            served.push(i);
+            continue;
+        };
+        match source.logs(&filter, block, block).await {
+            Ok(own) => {
+                logs.extend(own);
+                served.push(i);
+            }
+            Err(e) if narrowing_can_help(&e, block, block) => {
+                let fault = anyhow::Error::new(TerminalFault(format!(
+                    "{}, even asked for this nest's own contracts alone: {e:#}",
+                    single_block_over_cap(block)
+                )));
+                sup.quarantine(i, &fault)?;
+            }
+            Err(e) => {
+                tracing::warn!("block {block}: asking for nest '{name}' alone failed: {e:#}");
+                sleep_secs(3).await;
+                return Ok(());
+            }
+        }
+    }
+    logs.sort_by_key(|l| (l.block_number, l.log_index));
+    logs.dedup_by_key(|l| (l.block_number, l.log_index));
+    fan_out_window(source, nests, nexts, sup, &served, &logs, block, tip).await
+}
+
 /// A fault that will re-fail identically on retry (RFC-0026 §3), so the unit it kills is quarantined
 /// **until restart** rather than backed off and re-admitted: a reorg below the sealed watermark bails
 /// again on the next attempt by construction, and a dead IVM circuit thread cannot be revived
@@ -2529,9 +2577,17 @@ async fn runtime_index_loop(
                     let factories =
                         topic0_only_culprits(live.iter().map(|&i| (i, live_ref(&nests, i))));
                     if factories.is_empty() {
-                        // No factory nest, so the union carried real addresses and narrowing the
-                        // filter is not available either. Unchanged behaviour: fail loudly.
-                        return Err(e).with_context(|| single_block_over_cap(global_next));
+                        recover_over_cap_static(
+                            source.as_ref(),
+                            &mut nests,
+                            &mut nexts,
+                            &mut sup,
+                            &live,
+                            global_next,
+                            tip,
+                        )
+                        .await?;
+                        continue;
                     }
                     recover_over_cap_block(
                         source.as_ref(),
@@ -4347,6 +4403,21 @@ async fn decode_top_level_calls(
     timestamps: bool,
     fanout: usize,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
+    decode_top_level_calls_upto(source, creg, addresses, from, to, timestamps, fanout, None).await
+}
+
+/// [`decode_top_level_calls`], each body batch retried at most `attempts` times when that is set.
+#[allow(clippy::too_many_arguments)]
+async fn decode_top_level_calls_upto(
+    source: &dyn Source,
+    creg: &crate::calldata::CallRegistry,
+    addresses: &[String],
+    from: u64,
+    to: u64,
+    timestamps: bool,
+    fanout: usize,
+    attempts: Option<usize>,
+) -> Result<Vec<crate::registry::DecodedRow>> {
     use futures::stream::StreamExt;
     let mut call_rows = Vec::new();
     let want: Vec<u64> = (from..=to).collect();
@@ -4357,7 +4428,7 @@ async fn decode_top_level_calls(
         // inside the stream is not provably `Send` to the spawned ingest task.
         let fetches: Vec<_> = chunk
             .chunks(TOP_LEVEL_BODY_BATCH)
-            .map(|batch| fetch_body_batch(source, batch))
+            .map(|batch| fetch_body_batch(source, batch, attempts))
             .collect();
         let batches: Vec<Result<std::collections::HashMap<u64, serde_json::Value>>> =
             futures::stream::iter(fetches)
@@ -4376,10 +4447,12 @@ async fn decode_top_level_calls(
 async fn fetch_body_batch(
     source: &dyn Source,
     batch: &[u64],
+    attempts: Option<usize>,
 ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
-    retry_transient(
+    retry_upto(
         &format!("block bodies for {} block(s)", batch.len()),
         BACKFILL_RETRY_BASE,
+        attempts,
         || async { source.block_bodies(batch).await },
     )
     .await
@@ -4547,6 +4620,37 @@ pub(crate) async fn resolve_calls_for_window(
     with_timestamps: bool,
     window_headers: Option<&std::collections::HashMap<u64, serde_json::Value>>,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
+    resolve_calls_for_window_upto(
+        source,
+        calls,
+        state_rpc,
+        chain_id,
+        event_rows,
+        from,
+        to,
+        timestamps,
+        with_timestamps,
+        window_headers,
+        None,
+    )
+    .await
+}
+
+/// [`resolve_calls_for_window`], each RPC retried at most `attempts` times when that is set.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_calls_for_window_upto(
+    source: &dyn Source,
+    calls: &[crate::calls::CallDecl],
+    state_rpc: &crate::rpc::RpcClient,
+    chain_id: u64,
+    event_rows: &[crate::registry::DecodedRow],
+    from: u64,
+    to: u64,
+    timestamps: &std::collections::HashMap<u64, u64>,
+    with_timestamps: bool,
+    window_headers: Option<&std::collections::HashMap<u64, serde_json::Value>>,
+    attempts: Option<usize>,
+) -> Result<Vec<crate::registry::DecodedRow>> {
     use std::collections::BTreeMap;
 
     let mut wanted: BTreeMap<u64, Vec<(usize, String, String)>> = BTreeMap::new();
@@ -4583,12 +4687,13 @@ pub(crate) async fn resolve_calls_for_window(
     let headers = if let Some(headers) = window_headers {
         headers
     } else {
-        fetched_headers = retry_transient(
+        fetched_headers = retry_upto(
             &format!(
                 "seal-direct block headers for {} block(s)",
                 wanted_blocks.len()
             ),
             BACKFILL_RETRY_BASE,
+            attempts,
             || async { source.block_headers(&wanted_blocks).await },
         )
         .await?;
@@ -4674,12 +4779,14 @@ pub(crate) async fn resolve_calls_for_window(
                     block,
                     &hash,
                     BACKFILL_RETRY_BASE,
+                    attempts,
                 )
                 .await?
             } else {
-                retry_transient(
+                retry_upto(
                     &format!("seal-direct pinned eth_call batch at block {block}"),
                     BACKFILL_RETRY_BASE,
+                    attempts,
                     || async {
                         crate::calls::resolve_pairs_at(state_rpc, chain_id, &pairs, block).await
                     },
@@ -4713,6 +4820,7 @@ pub(crate) async fn resolve_calls_for_window(
 /// A pin the chain has moved off never becomes canonical again, so that is a plain error and the
 /// window is re-read from its logs. A provider refusing the EIP-1898 selector will refuse it again,
 /// so that is terminal. Neither falls back to a block number.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_canonical_batch(
     source: &dyn Source,
     state_rpc: &crate::rpc::RpcClient,
@@ -4721,6 +4829,7 @@ async fn resolve_canonical_batch(
     block: u64,
     hash: &str,
     base: std::time::Duration,
+    attempts: Option<usize>,
 ) -> Result<Vec<crate::calls::CallResult>> {
     let label = format!("seal-direct canonical eth_call batch at block {block}");
     let mut attempt = 1usize;
@@ -4745,6 +4854,11 @@ async fn resolve_canonical_batch(
                 "the state RPC refuses EIP-1898 block-hash calls, which canonical calls require: \
                  {err:#}"
             )));
+        }
+        if retrying_cannot_help(&err) || attempts.is_some_and(|n| attempt >= n) {
+            return Err(err.context(ProviderGaveUp(format!(
+                "{label} gave up after {attempt} attempt(s)"
+            ))));
         }
         let backoff = backfill_backoff(base, attempt);
         log_backfill_retry(&label, attempt, &err, backoff);
@@ -5359,7 +5473,49 @@ fn log_backfill_retry(
 /// one host while the others throttle under concurrency). Without it a single such window could abort
 /// the whole seal-direct backfill; with it the window waits and retries, matching the tip loop's own
 /// resilience to the identical failure class. `base` is parameterised so tests can pass `Duration::ZERO`.
-async fn retry_transient<T, F, Fut>(label: &str, base: std::time::Duration, mut op: F) -> Result<T>
+async fn retry_transient<T, F, Fut>(label: &str, base: std::time::Duration, op: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    retry_upto(label, base, None, op).await
+}
+
+/// Attempts a tip-path retry makes, about a minute of backoff, before the failure becomes its nest's
+/// (#2151): a runtime cursor awaits its nests in turn, so one that never returns stops them all.
+const TIP_RETRY_ATTEMPTS: usize = 8;
+
+/// The one rule every RPC retry site obeys: a failure the whole pool gave for credentials or missing
+/// history, a single block over the provider's cap, or a [`TerminalFault`] is the same answer next
+/// time, so it is returned at once (#2151, #2155).
+fn retrying_cannot_help(e: &anyhow::Error) -> bool {
+    use crate::rpc::FailureClass;
+    is_terminal(e)
+        || narrowing_can_help(e, 0, 0)
+        || matches!(
+            crate::rpc::class_of(e),
+            Some(FailureClass::Terminal | FailureClass::HistoryUnavailable)
+        )
+}
+
+/// A provider failure a retry site stopped asking about, so a solo tip loop can treat it as a fetch
+/// that failed rather than a fault in its nest.
+#[derive(Debug)]
+struct ProviderGaveUp(String);
+
+impl std::fmt::Display for ProviderGaveUp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// [`retry_transient`], handing a transient failure back after `limit` attempts when there is one.
+async fn retry_upto<T, F, Fut>(
+    label: &str,
+    base: std::time::Duration,
+    limit: Option<usize>,
+    mut op: F,
+) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
@@ -5368,6 +5524,14 @@ where
     loop {
         match op().await {
             Ok(v) => return Ok(v),
+            Err(e) if retrying_cannot_help(&e) => {
+                return Err(e.context(ProviderGaveUp(format!("{label} cannot succeed as asked"))))
+            }
+            Err(e) if limit.is_some_and(|n| attempt >= n) => {
+                return Err(e.context(ProviderGaveUp(format!(
+                    "{label} still failing after {attempt} attempts"
+                ))))
+            }
             Err(e) => {
                 let backoff = backfill_backoff(base, attempt);
                 log_backfill_retry(label, attempt, &e, backoff);
@@ -5402,9 +5566,7 @@ async fn logs_with_retry(
             // pool-wide 429 at a single block is not one of those (#916): there is nothing for the
             // caller to shrink, so it belongs in the backoff arm below like any other throttle.
             // A refused filter is the caller's to change too (#1941); asking again is refused again.
-            Err(e) if narrowing_can_help(&e, from, to) || crate::rpc::filter_refused(&e) => {
-                return Err(e)
-            }
+            Err(e) if retrying_cannot_help(&e) || crate::rpc::filter_refused(&e) => return Err(e),
             Err(e) => {
                 let backoff = backfill_backoff(base, attempt);
                 log_backfill_retry(
@@ -7209,7 +7371,7 @@ impl NestIngest {
         let mut call_rows: Vec<crate::registry::DecodedRow> = Vec::new();
         if self.top_level_calls {
             if let Some(creg) = self.call_registry.clone() {
-                call_rows = decode_top_level_calls(
+                call_rows = decode_top_level_calls_upto(
                     source,
                     &creg,
                     &self.addresses,
@@ -7217,6 +7379,7 @@ impl NestIngest {
                     to,
                     self.registry.timestamps(),
                     call_body_concurrency(),
+                    Some(TIP_RETRY_ATTEMPTS),
                 )
                 .await?;
             }
@@ -7258,7 +7421,7 @@ impl NestIngest {
                 .state_rpc
                 .clone()
                 .context("tier-3 calls declared with no --state-rpc; refused at startup")?;
-            let call_rows = resolve_calls_for_window(
+            let call_rows = resolve_calls_for_window_upto(
                 source,
                 &self.calls,
                 rpc.as_ref(),
@@ -7269,6 +7432,7 @@ impl NestIngest {
                 &timestamps,
                 self.registry.timestamps(),
                 block_data.headers.as_ref(),
+                Some(TIP_RETRY_ATTEMPTS),
             )
             .await?;
             for row in call_rows {
@@ -7611,10 +7775,10 @@ async fn index_loop(
                 let n = logs.len() as u64;
                 match nest
                     .process_window(source.as_ref(), &logs, next, to, tip)
-                    .await?
+                    .await
                 {
                     // Window processed and committed - advance the cursor past it.
-                    Some(_stored) => {
+                    Ok(Some(_stored)) => {
                         next = to + 1;
                         no_progress = 0;
                         reorg_gate.checked(tip, next);
@@ -7633,7 +7797,7 @@ async fn index_loop(
                         }
                     }
                     // Timestamps were unavailable; the cursor stayed put, retry the same window.
-                    None => {
+                    Ok(None) => {
                         no_progress_tick(
                             &mut no_progress,
                             next,
@@ -7643,6 +7807,22 @@ async fn index_loop(
                         )?;
                         continue;
                     }
+                    // The window's own reads failed at the provider: a failed fetch, as below (#2151).
+                    Err(e) if e.downcast_ref::<ProviderGaveUp>().is_some() => {
+                        if !caught_up && retrying_cannot_help(&e) {
+                            return Err(e);
+                        }
+                        tracing::warn!("window {next}..={to} failed: {e:#}; retrying");
+                        no_progress_tick(
+                            &mut no_progress,
+                            next,
+                            to,
+                            caught_up,
+                            &format!("reads failing: {e:#}"),
+                        )?;
+                        sleep_secs(3).await;
+                    }
+                    Err(e) => return Err(e),
                 }
             }
             Err(e) if narrowing_can_help(&e, next, to) => {
@@ -10238,6 +10418,157 @@ mod tests {
             std::time::Duration::from_millis(31_750) + std::time::Duration::from_secs(150),
             "the loop must sleep the computed backoff, not spin"
         );
+    }
+
+    /// #2151: a runtime cursor awaits its nests in turn, so a tip read that never gives up stops every
+    /// co-tenant behind it. The failing nest is quarantined and the healthy one indexes the window.
+    #[tokio::test(start_paused = true)]
+    async fn a_nest_whose_reads_keep_failing_does_not_stall_its_co_tenant() {
+        struct NoBodies;
+        #[async_trait::async_trait]
+        impl Source for NoBodies {
+            async fn tip(&self) -> Result<u64> {
+                Ok(10_000)
+            }
+            async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+                Ok(Some(format!("0x{n:064x}")))
+            }
+            async fn logs(
+                &self,
+                _f: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(Vec::new())
+            }
+            async fn block_bodies(
+                &self,
+                _blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+                anyhow::bail!("all RPC endpoints failed")
+            }
+        }
+
+        let qos = qos_topic_nest("t");
+        let (failing, _state, _) =
+            qos_nest_with(qos.path(), "http://127.0.0.1:1".into(), Vec::new()).await;
+        let ds = tempfile::tempdir().unwrap();
+        let healthy =
+            build_test_nest(ds.path(), "0x0000000000000000000000000000000000000011").await;
+        let mut nests = vec![Some(failing), Some(healthy)];
+        let mut nexts = vec![4u64, 4];
+        let mut sup = test_supervisor(2);
+        let fanned = tokio::time::timeout(
+            std::time::Duration::from_secs(3_600),
+            fan_out_window(
+                &NoBodies,
+                &mut nests,
+                &mut nexts,
+                &mut sup,
+                &[0, 1],
+                &[],
+                4,
+                10_000,
+            ),
+        )
+        .await;
+        assert!(
+            fanned.is_ok(),
+            "an hour on and the failing nest is still retrying, so its co-tenant never had a turn"
+        );
+        fanned.unwrap().unwrap();
+        match &sup.states[0] {
+            NestState::Quarantined { reason, retry_at } => {
+                assert!(retry_at.is_some(), "an outage is re-admitted, not terminal");
+                assert!(reason.contains("all RPC endpoints failed"), "{reason}");
+            }
+            other => panic!("the failing nest must be quarantined, got {other:?}"),
+        }
+        assert_eq!(nexts, vec![4, 5], "the co-tenant indexed the window");
+    }
+
+    /// #2155: the pipelined seal-direct backfill retried a block over the provider's cap, and a pool
+    /// that keeps no blocks that old, for ever. Neither answer changes on asking again.
+    #[tokio::test(start_paused = true)]
+    async fn seal_direct_stops_on_a_failure_retrying_cannot_help() {
+        use crate::registry::{ContractSpec, DecodeRegistry};
+        type Refusal = fn() -> anyhow::Error;
+        struct Refuses(Refusal);
+        #[async_trait::async_trait]
+        impl Source for Refuses {
+            async fn tip(&self) -> Result<u64> {
+                Ok(100)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Err((self.0)())
+            }
+        }
+        const ERC20: &str = r#"[{"type":"event","name":"Transfer","inputs":[
+            {"name":"from","type":"address","indexed":true},
+            {"name":"to","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#;
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20).unwrap();
+        let reg = DecodeRegistry::build(vec![ContractSpec {
+            alias: "usdc".into(),
+            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                .parse()
+                .unwrap(),
+            abi,
+            events: Vec::new(),
+        }])
+        .unwrap();
+        let addresses = vec!["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".to_string()];
+        let cases: [(Refusal, &str); 2] = [
+            (
+                || anyhow::anyhow!("query returned more than 10000 results"),
+                "block 10 alone exceeds",
+            ),
+            (
+                || {
+                    anyhow::Error::new(crate::rpc::ClassifiedError {
+                        class: crate::rpc::FailureClass::HistoryUnavailable,
+                        detail: "no configured RPC endpoint keeps blocks this old".into(),
+                    })
+                },
+                "keeps blocks this old",
+            ),
+        ];
+        for (refusal, named) in cases {
+            let d = tempfile::tempdir().unwrap();
+            let run = tokio::time::timeout(
+                std::time::Duration::from_secs(3_600),
+                backfill_direct_pipelined(
+                    &Refuses(refusal),
+                    &reg,
+                    d.path(),
+                    &addresses,
+                    &[],
+                    &[],
+                    None,
+                    0,
+                    10,
+                    10,
+                    1,
+                    SPAN_OFF,
+                    1,
+                    |_| Ok(()),
+                    |_, _, _| {},
+                ),
+            )
+            .await;
+            let err = run
+                .expect("an hour on and the backfill is still asking the same question")
+                .expect_err("the backfill cannot succeed");
+            assert!(format!("{err:#}").contains(named), "{err:#}");
+        }
     }
 
     /// `logs_with_retry` must keep retrying a plain transient failure past the old 5-attempt ceiling
@@ -13455,6 +13786,159 @@ template = "pool"
         // block, and the cursor is still alive to retry it.
         assert!(matches!(sup.states[0], NestState::Live));
         assert_eq!(nexts, vec![7, 7], "an unfetched block advances nobody");
+    }
+
+    /// #2162: two static nests whose union is over the provider's cap at one block, though neither
+    /// nest's own filter is. That ended the cursor for both; each is now asked for the block alone.
+    #[tokio::test]
+    async fn a_block_over_the_cap_only_for_the_union_of_static_nests_is_indexed_for_each() {
+        struct UnionOverCap(Vec<crate::rpc::Log>);
+        #[async_trait::async_trait]
+        impl Source for UnionOverCap {
+            async fn tip(&self) -> Result<u64> {
+                Ok(7)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                filter: &crate::source::LogFilter,
+                from: u64,
+                to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                if filter.addresses().len() > 1 {
+                    anyhow::bail!("query returned more than 10000 results");
+                }
+                Ok(self
+                    .0
+                    .iter()
+                    .filter(|l| {
+                        (from..=to).contains(&l.block_number)
+                            && filter
+                                .addresses()
+                                .iter()
+                                .any(|a| a.eq_ignore_ascii_case(&l.address))
+                    })
+                    .cloned()
+                    .collect())
+            }
+            async fn block_timestamps(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+            }
+        }
+
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a_addr = "0x0000000000000000000000000000000000000011";
+        let b_addr = "0x0000000000000000000000000000000000000044";
+        let a = build_test_nest(da.path(), a_addr).await;
+        let b = build_test_nest(db.path(), b_addr).await;
+        let pad = |x: &str| format!("0x{:0>64}", x.trim_start_matches("0x"));
+        let transfer = |nest: &NestIngest, addr: &str, li: u64| crate::rpc::Log {
+            address: addr.into(),
+            topics: vec![
+                nest_topic0(nest, "tok__transfer"),
+                pad("0x00000000000000000000000000000000000000aa"),
+                pad("0x00000000000000000000000000000000000000bb"),
+            ],
+            data: format!("0x{:064x}", 42u64),
+            block_number: 7,
+            block_hash: "0xbh".into(),
+            tx_hash: format!("0xt{li}"),
+            log_index: li,
+        };
+        let source: Arc<dyn Source> = Arc::new(UnionOverCap(vec![
+            transfer(&a, a_addr, 0),
+            transfer(&b, b_addr, 1),
+        ]));
+        let (a_store, b_store) = (a.store.clone(), b.store.clone());
+        let task = tokio::spawn(runtime_index_loop(
+            source,
+            vec![a, b],
+            Some(0),
+            false,
+            1,
+            1,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            None,
+        ));
+
+        let indexed = |store: &Arc<dyn crate::store::HotStore>| {
+            store
+                .entities_in_range(7, 7)
+                .unwrap()
+                .iter()
+                .any(|r| r.contains("tok__transfer"))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline && !(indexed(&a_store) && indexed(&b_store)) {
+            if task.is_finished() {
+                let ended = task.await.unwrap().map_err(|e| format!("{e:#}"));
+                panic!("the cursor ended: {ended:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        task.abort();
+        assert!(
+            indexed(&a_store),
+            "the first nest indexes block 7 by its own filter"
+        );
+        assert!(indexed(&b_store), "and so does its co-tenant");
+    }
+
+    /// #2162, the other side: a nest whose own filter is still over the cap is the one faulted, and
+    /// its co-tenant indexes the block.
+    #[tokio::test]
+    async fn a_static_nest_over_the_cap_on_its_own_is_the_only_one_faulted() {
+        struct CapsOne;
+        #[async_trait::async_trait]
+        impl Source for CapsOne {
+            async fn tip(&self) -> Result<u64> {
+                Ok(7)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                if filter.addresses().iter().any(|a| a.ends_with("11")) {
+                    anyhow::bail!("query returned more than 10000 results");
+                }
+                Ok(Vec::new())
+            }
+            async fn block_timestamps(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+            }
+        }
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a = build_test_nest(da.path(), "0x0000000000000000000000000000000000000011").await;
+        let b = build_test_nest(db.path(), "0x0000000000000000000000000000000000000044").await;
+        let mut nests = vec![Some(a), Some(b)];
+        let mut nexts = vec![7u64, 7];
+        let mut sup = test_supervisor(2);
+        recover_over_cap_static(&CapsOne, &mut nests, &mut nexts, &mut sup, &[0, 1], 7, 7)
+            .await
+            .unwrap();
+        match &sup.states[0] {
+            NestState::Quarantined { reason, retry_at } => {
+                assert!(retry_at.is_none(), "asking again is refused again");
+                assert!(reason.contains("block 7 alone exceeds"), "{reason}");
+            }
+            other => panic!("the nest over the cap on its own is faulted, got {other:?}"),
+        }
+        assert!(matches!(sup.states[1], NestState::Live));
+        assert_eq!(nexts, vec![7, 8]);
     }
 
     /// Issue #147, the headline scenario, on the real fan-out path: a reorg drops below one nest's
