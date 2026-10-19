@@ -323,13 +323,13 @@ fn seal_snapshot(
     }
     let hash = hex::encode(Sha256::digest(&bytes));
     let out_dir = dir.join(DIR).join(SEGMENTS);
-    std::fs::create_dir_all(&out_dir)
-        .with_context(|| format!("cannot create {}", out_dir.display()))?;
     let file = format!("{table}-{hash}.parquet");
     let out = out_dir.join(&file);
-    if !out.exists() {
-        std::fs::write(&out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+    // A file here that is not these bytes was torn by an in-place write before #2179.
+    if out.exists() && std::fs::read(&out).ok().as_deref() != Some(&bytes[..]) {
+        std::fs::remove_file(&out).with_context(|| format!("removing torn {}", out.display()))?;
     }
+    crate::seal::publish_durable(&out_dir, &file, &bytes)?;
     let resolved = hash.clone();
     with_manifest(dir, |catalogue| {
         refuse_case_collision(catalogue, table)?;
@@ -539,11 +539,8 @@ fn validate_columns(columns: &[String]) -> Result<()> {
     Ok(())
 }
 fn save(dir: &Path, catalogue: &Catalogue) -> Result<()> {
-    let path = catalogue_path(dir);
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(catalogue)?)
-        .context("writing offchain provenance manifest")?;
-    std::fs::rename(tmp, path).context("installing offchain provenance manifest")
+    crate::seal::replace_durable(&catalogue_path(dir), &serde_json::to_vec_pretty(catalogue)?)
+        .context("installing offchain provenance manifest")
 }
 
 /// `outcome` is the served-bytes hash and resolved snapshot on success, or the error text. A failure
@@ -1218,5 +1215,49 @@ mod tests {
         let mut w = parquet::arrow::ArrowWriter::try_new(file, schema, None).unwrap();
         w.write(&batch).unwrap();
         w.close().unwrap();
+    }
+
+    /// #2179: a snapshot written in place and cut short by a crash kept its content-addressed name,
+    /// and every later pull of the same body saw the name and catalogued the torn file.
+    #[test]
+    fn a_torn_snapshot_under_its_content_address_is_replaced_by_the_next_pull() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("p.json");
+        std::fs::write(&input, PRICES).unwrap();
+        drop_file(dir.path(), &input, "prices").unwrap();
+        let snapshot = load(dir.path()).unwrap().tables["prices"][0].clone();
+        let path = segment_path(dir.path(), &snapshot);
+        let whole = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() / 2]).unwrap();
+
+        drop_file(dir.path(), &input, "prices").unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            whole,
+            "the torn file survived a pull of the same body"
+        );
+    }
+
+    /// #2179: the catalogue's bytes are fsynced before its rename and its directory entry after.
+    #[test]
+    fn the_catalogue_is_installed_durably() {
+        use crate::seal::Durable;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("p.json");
+        std::fs::write(&input, PRICES).unwrap();
+        let trace = crate::seal::capture_durable(|| {
+            drop_file(dir.path(), &input, "prices").unwrap();
+        });
+        let root = dir.path().join(DIR);
+        let synced = trace
+            .iter()
+            .position(|e| matches!(e, Durable::FileSync(p) if p.parent() == Some(root.as_path())));
+        let installed = trace
+            .iter()
+            .rposition(|e| matches!(e, Durable::ManifestDir(p) if p == &root));
+        assert!(
+            matches!((synced, installed), (Some(s), Some(i)) if s < i),
+            "trace: {trace:?}"
+        );
     }
 }

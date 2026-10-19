@@ -1,12 +1,15 @@
 //! Embedded hot store: redb. This is the tip layer for entity point-reads; Parquet sealing + Burrmill
 //! analytics live in `seal`/`analytics`.
 //!
-//! **Writers (audit F-C3 - this used to say "single writer", which was wrong).** Two tasks write here:
-//! the ingestion loop (entities, checkpoints, meta, and the outbox *enqueue*) and the alert-delivery
-//! worker (the outbox *drain*, via `outbox_remove`). They touch disjoint key ranges, and redb
-//! serialises write transactions internally regardless, so integrity holds - but "single writer" was a
-//! claim about the code that the code did not honour, and the next person to reason about concurrency
-//! here deserves the truth.
+//! **Writers (audit F-C3 - this used to say "single writer", which was wrong).** Three tasks write here:
+//! the ingestion loop (entities, checkpoints, meta, and the outbox *enqueue*), the alert-delivery
+//! worker (the outbox *drain*, via `outbox_remove`), and the IPFS resolver (documents and their typed
+//! rows into `ENTITIES`, via `put_entities_if_named`). The resolver shares the ingest loop's key range,
+//! so it writes only in a transaction that finds the row naming the document still there from the same
+//! block: a reorg rollback or a seal's prune that removed it makes the write a no-op (#2180). redb
+//! serialises write transactions, so each check and its write are atomic. "Single writer" was a claim
+//! about the code that the code did not honour, and the next person to reason about concurrency here
+//! deserves the truth.
 //!
 //! What *is* single is the **cursor**: exactly one ingestion task per chain advances the chain state
 //! (RFC-0012/0021). That is the invariant the architecture actually rests on. Readers (the API) are
@@ -288,10 +291,13 @@ impl std::error::Error for HotScanBudgetExceeded {}
 /// - [`commit_window`](HotStore::commit_window) is **atomic**. Rows, checkpoint and cursor advance
 ///   land together or not at all, so a crash mid-window leaves the previous window's state intact.
 ///   This is what `e2e_crash_safety` pins, and it is not negotiable for a backend claiming parity.
-/// - **Single writer.** Exactly one task mutates a given store. An implementation may assume it and
-///   must not silently repair concurrent writes - under RFC-0022 the assumption becomes a cursor
-///   lease, and a backend that quietly tolerated two writers would hide the very bug the lease
-///   exists to prevent.
+/// - **One cursor writer.** Exactly one ingestion task advances a given store's chain state. An
+///   implementation may assume it and must not silently repair concurrent cursor writes - under
+///   RFC-0022 the assumption becomes a cursor lease, and a backend that quietly tolerated two would
+///   hide the very bug the lease exists to prevent. Two other tasks write beside it (see the module
+///   doc): the outbox drain, and the IPFS resolver, whose
+///   [`put_entities_if_named`](HotStore::put_entities_if_named) must check its naming row and write
+///   in one transaction serialised against the cursor's.
 /// - **Keys order by block.** [`Store::entity_key`] is zero-padded so lexicographic order is block
 ///   order, and every range scan here depends on it.
 /// - **Reads see committed state only.** No dirty reads; `/sql` attaches read-only against this.
@@ -2237,6 +2243,112 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::Store;
+    use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    use std::sync::Arc;
+
+    /// An in-memory redb backend that fails one chosen read.
+    #[derive(Debug, Default)]
+    struct OneBadRead {
+        inner: Arc<redb::backends::InMemoryBackend>,
+        /// Reads left until the one that fails; 0 is disarmed.
+        countdown: Arc<AtomicU64>,
+    }
+
+    impl redb::StorageBackend for OneBadRead {
+        fn len(&self) -> std::io::Result<u64> {
+            self.inner.len()
+        }
+        fn read(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+            let left = self.countdown.load(SeqCst);
+            if left > 0 {
+                self.countdown.store(left - 1, SeqCst);
+                if left == 1 {
+                    return Err(std::io::Error::other("injected read fault"));
+                }
+            }
+            self.inner.read(offset, len)
+        }
+        fn set_len(&self, len: u64) -> std::io::Result<()> {
+            self.inner.set_len(len)
+        }
+        fn sync_data(&self, eventual: bool) -> std::io::Result<()> {
+            self.inner.sync_data(eventual)
+        }
+        fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+            self.inner.write(offset, data)
+        }
+    }
+
+    /// #2229 asked whether the range deletes, which collect their keys with `filter_map(ok)`, could
+    /// commit part of a range after a read error. They cannot: the only error a redb range yields is
+    /// I/O, and redb refuses every later call, the commit included, once one has happened. Every read
+    /// each delete makes is failed in turn here, and the store comes out all-or-nothing every time.
+    #[test]
+    fn a_read_error_inside_a_range_delete_commits_none_of_it() {
+        type Delete = fn(&Store) -> anyhow::Result<u64>;
+        let deletes: [(&str, Delete); 4] = [
+            ("prune_range", |s| s.prune_range(1, 24)),
+            ("prune_and_set_meta", |s| {
+                s.prune_and_set_meta(1, 24, "sealed_through", "24")
+            }),
+            ("rollback_to", |s| s.rollback_to(0)),
+            ("rollback_to_and_set_meta", |s| {
+                s.rollback_to_and_set_meta(0, "last_block", "0", &[])
+            }),
+        ];
+        for (name, delete) in deletes {
+            let mut failed = 0;
+            for nth in 1.. {
+                let memory = Arc::new(redb::backends::InMemoryBackend::new());
+                let backend = OneBadRead {
+                    inner: memory.clone(),
+                    countdown: Arc::default(),
+                };
+                let countdown = backend.countdown.clone();
+                let mut b = redb::Builder::new();
+                b.set_cache_size(0);
+                let store = Store::from_db(b.create_with_backend(backend).unwrap()).unwrap();
+                let pad = "x".repeat(600);
+                let rows: Vec<(String, String)> = (1..=24)
+                    .map(|n| {
+                        let row = format!(r#"{{"table":"t","block_number":{n},"pad":"{pad}"}}"#);
+                        (Store::entity_key(n, 0), row)
+                    })
+                    .collect();
+                store.commit_window(&rows, Some((24, "0xaa")), 24).unwrap();
+
+                countdown.store(nth, SeqCst);
+                let outcome = delete(&store);
+                let fired = countdown.swap(0, SeqCst) == 0;
+                // redb refuses every call after an I/O error, so what was committed is read on a reopen.
+                drop(store);
+                let reopened = OneBadRead {
+                    inner: memory,
+                    countdown: Arc::default(),
+                };
+                let store =
+                    Store::from_db(redb::Builder::new().create_with_backend(reopened).unwrap())
+                        .unwrap();
+                let left = store.entities_in_range(0, 24).unwrap().len();
+                match outcome {
+                    Ok(_) => assert_eq!(
+                        left, 0,
+                        "{name} lost read {nth}, reported success, and left {left} of 24 rows"
+                    ),
+                    Err(_) => {
+                        assert_eq!(left, 24, "{name} lost read {nth} and deleted a part");
+                        failed += 1;
+                    }
+                }
+                if !fired {
+                    break;
+                }
+            }
+            assert!(failed > 0, "premise: no injected fault reached {name}");
+        }
+    }
+
     #[cfg(feature = "graph")]
     #[test]
     fn checkpoint_hash_index_upgrades_old_history_and_tracks_reorgs() {
