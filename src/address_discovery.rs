@@ -480,7 +480,7 @@ fn judge(method: &str, s: u64, e: u64, answer: Result<Value>) -> Result<Judged> 
                 Err(err).with_context(|| format!("{method} [{s}, {e}]"))
             }
         }
-        Err(err) if range_shaped(&format!("{err:#}")) => Ok(Judged::Overfull(
+        Err(err) if e == s && range_shaped(&format!("{err:#}")) => Ok(Judged::Overfull(
             err.context(format!("{method} at block {s}")),
         )),
         Err(err) => Err(err).with_context(|| format!("{method} at block {s}")),
@@ -926,13 +926,13 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 if word32(str_field(&receipt, "blockHash")?)? != block_hash {
                     bail!("the receipt of creation {tx} is from another block than {block}'s");
                 }
-                let contract = str_field(&receipt, "contractAddress")?.to_ascii_lowercase();
                 // A failed creation made no contract, and trace_filter names none for it.
-                let made = match receipt.get("status").and_then(Value::as_str) {
-                    Some("0x1") => true,
-                    Some("0x0") => false,
+                match receipt.get("status").and_then(Value::as_str) {
+                    Some("0x1") => {}
+                    Some("0x0") => return Ok(None),
                     _ => bail!("the receipt of creation {tx} has no status"),
-                };
+                }
+                let contract = str_field(&receipt, "contractAddress")?.to_ascii_lowercase();
                 let r = TxRef {
                     hash: tx,
                     block,
@@ -940,7 +940,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                     failed: false,
                     block_hash: Some(block_hash),
                 };
-                Ok((made && set.contains(&contract)).then_some((contract, r)))
+                Ok(set.contains(&contract).then_some((contract, r)))
             })
             .buffered(SWEEP_CONCURRENCY)
             .collect()
@@ -3942,6 +3942,49 @@ mod tests {
         }
     }
 
+    /// A span refused for its size is asked again smaller: only a single block refused falls back
+    /// to receipts, so every block of a range wider than the provider's cap keeps its transfers.
+    #[tokio::test]
+    async fn a_refused_span_in_a_sweep_is_narrowed_not_read_as_one_block() {
+        const OUT: &str = "0x00000000000000000000000000000000000000ee";
+        let n = 17_000_000u64;
+        let bh = |b: u64| format!("0x{b:064x}");
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let main = script(move |m, p| {
+            Ok(match m {
+                "eth_getBlockByNumber" => {
+                    let b = hex_u64(&p[0])?;
+                    json!({"number": format!("0x{b:x}"), "hash": bh(b), "timestamp": "0x64",
+                           "transactions": []})
+                }
+                "eth_getLogs" => {
+                    let s = hex_u64(&p[0]["fromBlock"])?;
+                    let e = hex_u64(&p[0]["toBlock"])?;
+                    if e - s + 1 > 2 {
+                        bail!("Log response size exceeded");
+                    }
+                    json!((s..=e)
+                        .map(
+                            |b| json!({"address": "0x00000000000000000000000000000000000000c0",
+                            "topics": [TRANSFER, padded(OUT), padded(A)],
+                            "data": format!("0x{:0>64}", "64"), "blockNumber": format!("0x{b:x}"),
+                            "transactionHash": bh(b + 1), "transactionIndex": "0x0",
+                            "logIndex": "0x0", "blockHash": bh(b), "removed": false})
+                        )
+                        .collect::<Vec<_>>())
+                }
+                other => bail!("unexpected {other}"),
+            })
+        });
+        let d = Discoverer::new(main, script(|m, _| bail!("no trace call expected: {m}")));
+        let set: std::collections::HashSet<String> = [A.to_string()].into();
+        let pending = Pending::begin(&h).unwrap();
+        let found = d.sweep(&h, &set, n, n + 4, &pending, false).await.unwrap();
+        let blocks: Vec<u64> = found[A].tokentx.iter().map(|r| r.block).collect();
+        assert_eq!(blocks, (n..=n + 4).collect::<Vec<_>>());
+    }
+
     /// A trace that omits a transaction of the block was not read: the window is refused rather
     /// than recorded traced without that transaction's internal transfers (#2112).
     #[tokio::test]
@@ -3991,7 +4034,7 @@ mod tests {
     }
 
     /// A transaction that creates a watched contract is in that contract's txlist, as per-address
-    /// discovery and Etherscan list it; a failed creation made no contract and is not (#2115).
+    /// discovery and Etherscan list it; a failed creation made no contract and is not, whether or not its receipt names one (#2115).
     #[tokio::test]
     async fn a_sweep_lists_the_creation_of_a_watched_contract() {
         const B: &str = "0x00000000000000000000000000000000000000b0";
@@ -4000,10 +4043,14 @@ mod tests {
         let bh = format!("0x{:0>64}", "b1");
         let dir = tempfile::tempdir().unwrap();
         let h = history(dir.path());
-        let (h1, h2) = (format!("0x{:0>64}", "1"), format!("0x{:0>64}", "2"));
-        let txs = vec![sweep_tx(&h1, OUT, None), sweep_tx(&h2, OUT, None)];
+        let [h1, h2, h3] = [1, 2, 3].map(|i| format!("0x{:0>64}", i));
+        let txs = vec![
+            sweep_tx(&h1, OUT, None),
+            sweep_tx(&h2, OUT, None),
+            sweep_tx(&h3, OUT, None),
+        ];
         let by_hash = txs.clone();
-        let (made, failed) = (h1.clone(), h2.clone());
+        let (made, failed, unnamed) = (h1.clone(), h2.clone(), h3.clone());
         let main = swept_block(txs, move |m, p| {
             Ok(match m {
                 "eth_getLogs" => json!([]),
@@ -4012,9 +4059,11 @@ mod tests {
                 }
                 "eth_getTransactionReceipt" => {
                     let (status, contract) = if p[0] == made.as_str() {
-                        ("0x1", A)
+                        ("0x1", json!(A))
                     } else if p[0] == failed.as_str() {
-                        ("0x0", B)
+                        ("0x0", json!(B))
+                    } else if p[0] == unnamed.as_str() {
+                        ("0x0", Value::Null)
                     } else {
                         bail!("unexpected receipt {p}")
                     };
