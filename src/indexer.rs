@@ -3106,8 +3106,13 @@ async fn build_nest(
     // Startup integrity pass (0.5.x hardening): quarantine any sealed segment whose bytes no longer
     // hash to their content address (disk corruption / tampering) before the view rebuild below scans
     // them. A corrupt segment reduces a table's cold data, loudly - it never crash-loops the node.
-    if let Err(e) = seal::verify_and_quarantine(&dir) {
-        tracing::warn!("segment integrity check failed (continuing): {e:#}");
+    // The owner's alone: both rewrite the catalogue a sealing writer owns.
+    if owner {
+        if let Err(e) = seal::verify_and_quarantine(&dir) {
+            tracing::warn!("segment integrity check failed (continuing): {e:#}");
+        }
+        // Before the view rebuild below reads cold under the watermark (#2169).
+        finish_unpruned_fold(&dir, store.as_ref())?;
     }
 
     let balances = BalanceView::start()?;
@@ -8678,6 +8683,29 @@ async fn maybe_seal(
         // Sealing is synchronous; yielding between segments lets an aborted ingest stop here.
         tokio::task::yield_now().await;
     }
+}
+
+/// Finish a seal that installed a fold's catalogue and died before its prune (#2169): the prune and
+/// watermark it would have committed next. Until then the folded rows were in no read at all.
+fn finish_unpruned_fold(dir: &std::path::Path, store: &dyn crate::store::HotStore) -> Result<()> {
+    let watermark = store.sealed_through();
+    let (from, cut) = match seal::unpruned_fold(dir, watermark) {
+        Ok(Some(window)) => window,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::error!(
+                "a seal past block {watermark} stopped before its prune, and it cannot be finished: \
+                 {e:#}. Hot rows are kept and the watermark stays; restore the segment from a copy \
+                 and restart, or re-index the nest"
+            );
+            return Ok(());
+        }
+    };
+    let pruned = store.prune_and_set_meta(from, cut, SEALED_THROUGH_KEY, &cut.to_string())?;
+    tracing::info!(
+        "finished a seal through block {cut} that stopped before its prune: pruned {pruned} rows from hot"
+    );
+    Ok(())
 }
 
 /// A row's transfer as the derived views read it: (from, to, value), or `None` for any other row

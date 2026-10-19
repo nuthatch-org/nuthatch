@@ -249,6 +249,134 @@ fn a_death_just_after_the_seal_direct_watermark_loses_and_doubles_nothing() {
     survives("seal-direct:after-watermark");
 }
 
+fn sealed_through(api: &str) -> Option<u64> {
+    sql(api, "SELECT 1")?["provenance"]["sealed_through"].as_u64()
+}
+
+fn last_block(api: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(&get(&format!("{api}/"))?).ok()?;
+    v["last_block"].as_str()?.parse().ok()
+}
+
+fn stop(mut run: Reaped) {
+    let _ = Command::new("kill")
+        .args(["-TERM", &run.0.id().to_string()])
+        .status();
+    let _ = run.0.wait();
+}
+
+/// Arbitrum's seal span from the first tip-path row, block 5: the tip path's only cut here.
+const SPAN_CUT: u64 = 5 + 86_400 - 1;
+
+/// A tip-path seal that folds the provisional tail and, when `crash`, dies between installing the
+/// folded catalogue and pruning hot. Then a clean restart. Returns `/balances` and the row count.
+fn fold_then_restart(crash: bool, lose_fold: bool) -> (serde_json::Value, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let (_rpc, rpc_port) = fixture_chain();
+    let nest = dir.path().join("nest");
+    init_nest(&nest, rpc_port);
+
+    // Blocks 1..=4 seal-direct into one provisional segment; 5..=8 stay hot.
+    pin(rpc_port, "finalized", 4);
+    let port = free_port();
+    let first = Reaped(dev(&nest, port, None, &dir.path().join("first.log")));
+    let api = format!("http://127.0.0.1:{port}");
+    poll("blocks 1..=4 sealed and 5..=9 hot", 120, || {
+        (sealed_through(&api)? >= 4 && last_block(&api)? >= TIP).then_some(())
+    });
+    stop(first);
+
+    // Far enough on that the tip path cuts on span and folds the tail in.
+    pin(rpc_port, "tip", SPAN_CUT + 1_000);
+    pin(rpc_port, "finalized", SPAN_CUT + 500);
+    let port = free_port();
+    let second_log = dir.path().join("second.log");
+    let point = crash.then_some("seal:after-manifest");
+    let mut second = Reaped(dev(&nest, port, point, &second_log));
+    if crash {
+        let status = poll("the nest to die after the fold's manifest", 300, || {
+            second.0.try_wait().ok().flatten()
+        });
+        assert!(
+            !status.success() && read(&second_log).contains("crash point seal:after-manifest"),
+            "the run was meant to abort after the fold's manifest (exit {status}). Its log:\n{}",
+            read(&second_log)
+        );
+        let manifest = nuthatch::seal::load_manifest(&nest).unwrap();
+        let spans: Vec<(u64, u64)> = manifest.tables["c0__transfer"]
+            .iter()
+            .map(|s| (s.from_block, s.to_block))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![(0, SPAN_CUT)],
+            "premise: the death followed a fold"
+        );
+        if lose_fold {
+            let folded = &manifest.tables["c0__transfer"][0].file;
+            std::fs::remove_file(nest.join("segments").join(folded)).unwrap();
+        }
+        drop(second);
+    } else {
+        let api = format!("http://127.0.0.1:{port}");
+        poll("the fold to seal", 300, || {
+            sealed_through(&api).filter(|&n| n >= SPAN_CUT)
+        });
+        stop(second);
+    }
+
+    // The dead run had reached the tip; the restart seals only once a new window commits.
+    pin(rpc_port, "tip", SPAN_CUT + 1_010);
+    let port = free_port();
+    let third = Reaped(dev(&nest, port, None, &dir.path().join("third.log")));
+    let api = format!("http://127.0.0.1:{port}");
+    poll("the restart to seal through the fold", 300, || {
+        sealed_through(&api).filter(|&n| n >= SPAN_CUT)
+    });
+    let balances: serde_json::Value =
+        serde_json::from_str(&poll("/balances", 30, || get(&format!("{api}/balances")))).unwrap();
+    let count = poll("the count", 30, || {
+        sql(&api, "SELECT count(*) AS n FROM c0__transfer")?["rows"][0]["n"].as_u64()
+    });
+    stop(third);
+    (balances, count)
+}
+
+/// #2169: a fold catalogues the tail's rows in a segment ending past the watermark, and they had
+/// been pruned from hot. A death before the prune left them in no read, and the restart's view
+/// rebuild seeded balances without them for the life of that process.
+#[test]
+fn a_death_between_a_folds_manifest_and_its_prune_loses_nothing_from_the_views() {
+    let (balances, count) = fold_then_restart(true, false);
+    let (reference, reference_count) = fold_then_restart(false, false);
+    assert_eq!(
+        (count, reference_count),
+        (TRANSFERS, TRANSFERS),
+        "premise: every transfer readable"
+    );
+    assert_eq!(
+        balances, reference,
+        "balances after dying between the fold's manifest and its prune differ from an uncrashed run"
+    );
+}
+
+/// #2261 review: the same death, and the folded file is gone before the restart. Finishing the seal
+/// would prune the only other copy of blocks 5..=8, and re-sealing them was skipped by the folded
+/// segment's input hash. The tail's blocks 1..=4 are lost with the file; the hot ones must not be.
+#[test]
+fn a_lost_fold_is_not_finished_and_its_hot_rows_survive() {
+    let (balances, count) = fold_then_restart(true, true);
+    assert_eq!(
+        count,
+        TRANSFERS - 4,
+        "blocks 5..=8 were in hot when the fold's file went"
+    );
+    assert_eq!(
+        balances["items"][0]["balance"], "2600",
+        "the views lost the hot transfers: {balances}"
+    );
+}
+
 /// #2242: a seal-direct prepare that dies with history sealed through finality but `last_block`
 /// unwritten, retried before finality moves, resumes at the watermark. It used to take the cold-start
 /// branch, move the origin and hot-index blocks it had already sealed.

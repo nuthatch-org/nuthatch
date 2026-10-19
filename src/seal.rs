@@ -194,11 +194,31 @@ pub fn seal_range_with_snapshot(
         // incoming rows alone, before any fold. A fold's file hash is the folded bytes, so the
         // incoming hash is kept beside it (#1631).
         let input_hash = hash.clone();
-        if segments
+        // Only beside an intact copy: skipping beside a lost file, then pruning hot, would leave
+        // these rows in neither (#2261).
+        if let Some(s) = segments
             .iter()
-            .any(|s| s.hash == hash || s.input_hash.as_deref() == Some(hash.as_str()))
+            .find(|s| s.hash == hash || s.input_hash.as_deref() == Some(hash.as_str()))
         {
-            continue;
+            if segment_intact(dir, s) {
+                continue;
+            }
+            if s.hash == hash {
+                // These are the bytes the address names, so they replace a corrupt file in place,
+                // shared or not (#2266). A replace that fails fails the seal, and hot is kept.
+                let target = match shared_store(dir) {
+                    Some(store) => {
+                        std::fs::create_dir_all(&store)
+                            .with_context(|| format!("creating {}", store.display()))?;
+                        store.join(format!("{hash}.parquet"))
+                    }
+                    None => seg_dir.join(&s.file),
+                };
+                replace_durable(&target, &bytes)
+                    .with_context(|| format!("restoring segment {}", s.file))?;
+                continue;
+            }
+            // A lost fold held these rows; they are sealed again as a segment of their own.
         }
         let new_rows = rows.len();
 
@@ -1278,13 +1298,16 @@ fn segments_to_verify(dir: &Path, tables: &BTreeSet<String>) -> Vec<(String, Seg
 /// node. Sealed data is immutable and content-addressed, so a hash mismatch is unambiguous corruption.
 /// Returns the number of segments quarantined. Best-effort - never fatal (an IO error just logs).
 pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
-    let manifest = load_manifest(dir)?;
+    let mut manifest = load_manifest(dir)?;
     // Sibling of `segments/`, deliberately *outside* it - nothing globs or SQL-reads the quarantine.
     let quarantine = dir.join("quarantine");
     let mut quarantined = 0usize;
+    // A bad provisional tail stays catalogued, so its loss stays visible, but is never folded or aged
+    // again: both read its file, and the failed read stopped every later seal (#2172).
+    let mut lost_tails = 0usize;
 
-    for (table, segs) in &manifest.tables {
-        for s in segs {
+    for (table, segs) in &mut manifest.tables {
+        for s in segs.iter_mut() {
             let path = segment_path(dir, &s.file, &s.hash);
             // **Never quarantine a shared segment** (RFC-0033 §11a). Quarantine *moves* the file, and
             // in the shared store those bytes belong to every dataset referencing them - one nest's
@@ -1296,9 +1319,19 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
                 Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == s.hash => continue, // intact
                 Ok(_) => "hash mismatch (corrupt or tampered)",
                 // Already gone from disk - nothing to move; `define_views` skips it. Not counted.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if s.provisional {
+                        s.provisional = false;
+                        lost_tails += 1;
+                    }
+                    continue;
+                }
                 Err(_) => "unreadable",
             };
+            if s.provisional {
+                s.provisional = false;
+                lost_tails += 1;
+            }
             if is_shared {
                 tracing::error!(
                     "shared segment {} for table {table} is {reason} - left in place because other \
@@ -1313,9 +1346,12 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
                 Ok(()) => {
                     tracing::error!(
                         "quarantined segment {} for table {table} ({reason}) → {} - cold data for this \
-                         table is reduced; re-seal the range to restore it",
+                         table is reduced. Its rows left the hot store when it was sealed, so nuthatch \
+                         cannot re-seal them: restore a copy hashing to {} at {}, or re-index the nest",
                         s.file,
-                        dest.display()
+                        dest.display(),
+                        s.hash,
+                        path.display()
                     );
                     quarantined += 1;
                 }
@@ -1326,13 +1362,54 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
             }
         }
     }
+    if lost_tails > 0 {
+        save_manifest(dir, &manifest)?;
+    }
     if quarantined > 0 {
         tracing::error!(
             "startup integrity: quarantined {quarantined} corrupt segment(s) - data is reduced, node \
-             continues; investigate disk health and re-seal the affected ranges"
+             continues; investigate disk health, then restore the files or re-index the nest"
         );
     }
     Ok(quarantined)
+}
+
+/// The segment's file is present and hashes to its catalogue entry.
+fn segment_intact(dir: &Path, s: &Segment) -> bool {
+    std::fs::read(segment_path(dir, &s.file, &s.hash))
+        .is_ok_and(|bytes| hex::encode(Sha256::digest(&bytes)) == s.hash)
+}
+
+/// `(from, cut)` when a seal catalogued a fold through `cut` and stopped before its prune (#2169).
+/// The folded segment starts at or below `sealed_through` and ends past it, so the watermark admits
+/// it to no read, and the provisional rows it absorbed are no longer in hot either. Every table's
+/// rows through `cut` went into that one catalogue install, so the seal can be finished from here.
+///
+/// An error when a segment the finish would leave as the only copy of its rows is missing or does
+/// not hash to its entry: the prune would then lose the hot copy too.
+pub fn unpruned_fold(dir: &Path, sealed_through: u64) -> Result<Option<(u64, u64)>> {
+    let manifest = load_manifest(dir)?;
+    let segments = || manifest.tables.values().flatten();
+    let Some((from, cut)) = segments()
+        .filter(|s| s.from_block <= sealed_through && s.to_block > sealed_through)
+        .fold(None, |acc, s| match acc {
+            None => Some((s.from_block, s.to_block)),
+            Some((from, cut)) => Some((from.min(s.from_block), cut.max(s.to_block))),
+        })
+    else {
+        return Ok(None);
+    };
+    for s in segments().filter(|s| s.to_block > sealed_through && s.to_block <= cut) {
+        if !segment_intact(dir, s) {
+            anyhow::bail!(
+                "segment {} (blocks {}..={}) is missing or does not hash to its catalogue entry",
+                s.file,
+                s.from_block,
+                s.to_block
+            );
+        }
+    }
+    Ok(Some((from, cut)))
 }
 
 /// What [`check_catalogue`] found. Diagnostic: it does not move files. Startup quarantine is
@@ -1378,16 +1455,24 @@ pub fn check_catalogue(dir: &Path) -> Result<CatalogueCheck> {
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Durable {
+pub(crate) enum Durable {
     FileSync(PathBuf),
     ParentDir(PathBuf),
     SegmentDir(PathBuf),
     ManifestDir(PathBuf),
 }
 
+/// A temp name no other write in this process holds: two nests in one runtime can publish the same
+/// content address at once (#2230).
+fn temp_name(file_name: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(".{file_name}.{}.{n}.tmp", std::process::id())
+}
+
 /// Install `bytes` as `dir/file_name`. The bytes are fsynced before the name exists, and that
 /// directory entry is fsynced before this returns (#1632). A watermark is written only afterwards.
-fn publish_durable(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn publish_durable(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
     let created = !dir.exists();
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     if created {
@@ -1404,7 +1489,7 @@ fn publish_durable(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
         sync_segment_dir(dir)?;
         return Ok(());
     }
-    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let tmp = dir.join(temp_name(file_name));
     {
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
@@ -1416,10 +1501,34 @@ fn publish_durable(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
         #[cfg(test)]
         note_durable(Durable::FileSync(tmp.clone()));
     }
+    #[cfg(test)]
+    before_install();
     std::fs::rename(&tmp, &final_path)
         .with_context(|| format!("installing {}", final_path.display()))?;
     sync_segment_dir(dir)?;
     Ok(())
+}
+
+/// Replace `path` with `bytes`: written and fsynced under a temp name, renamed over it, and the
+/// directory entry fsynced, so a crash leaves the old file or the new one.
+pub(crate) fn replace_durable(path: &Path, bytes: &[u8]) -> Result<()> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        anyhow::bail!("{} has no parent directory", path.display());
+    };
+    let tmp = dir.join(temp_name(&name.to_string_lossy()));
+    {
+        let f =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        use std::io::Write;
+        (&f).write_all(bytes)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsyncing {}", tmp.display()))?;
+        #[cfg(test)]
+        note_durable(Durable::FileSync(tmp.clone()));
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))?;
+    sync_manifest_dir(dir)
 }
 
 fn sync_segment_dir(dir: &Path) -> Result<()> {
@@ -1463,7 +1572,7 @@ fn note_durable(event: Durable) {
 }
 
 #[cfg(test)]
-fn capture_durable(run: impl FnOnce()) -> Vec<Durable> {
+pub(crate) fn capture_durable(run: impl FnOnce()) -> Vec<Durable> {
     DURABLE_TRACE.with(|trace| *trace.borrow_mut() = Some(Vec::new()));
     run();
     DURABLE_TRACE.with(|trace| trace.borrow_mut().take().unwrap_or_default())
@@ -1498,6 +1607,32 @@ fn before_manifest() {
             run();
         }
     });
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_INSTALL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs once, between `publish_durable`'s temp write and its rename.
+#[cfg(test)]
+fn set_before_install(hook: impl FnOnce() + 'static) -> impl Drop {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            BEFORE_INSTALL.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    BEFORE_INSTALL.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    Clear
+}
+
+#[cfg(test)]
+fn before_install() {
+    if let Some(run) = BEFORE_INSTALL.with(|hook| hook.borrow_mut().take()) {
+        run();
+    }
 }
 
 /// Install a whole catalogue into a nest that has none of its own yet (`nuthatch seed`).
@@ -2788,6 +2923,163 @@ mod tests {
             std::fs::read(dir.path().join(SEGMENTS_DIR).join(&now.file)).unwrap(),
             bytes
         );
+    }
+
+    /// #2172: a provisional tail whose file the startup pass quarantined, or found gone, stops being a
+    /// tail. Before, the fold and the aging pass both read it with `?`, and no table sealed again.
+    #[test]
+    fn a_quarantined_or_missing_provisional_tail_stops_no_later_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[stamped("t__sparse", 10, T0)], 10, 10).unwrap();
+        seal_range(dir.path(), &[stamped("t__quiet", 11, T0)], 11, 11).unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        let (sparse, quiet) = (only(&m, "t__sparse"), only(&m, "t__quiet"));
+        assert!(
+            sparse.provisional && quiet.provisional,
+            "premise: two tails"
+        );
+        std::fs::write(dir.path().join(SEGMENTS_DIR).join(&sparse.file), b"rotted").unwrap();
+        std::fs::remove_file(dir.path().join(SEGMENTS_DIR).join(&quiet.file)).unwrap();
+
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 1);
+        // The cut folds `t__sparse` and ages `t__quiet`, the two reads that used to fail.
+        seal_range(dir.path(), &[stamped("t__sparse", 12, T0 + 12)], 12, 12)
+            .expect("a seal after the quarantine");
+
+        let m = load_manifest(dir.path()).unwrap();
+        let sparse_now = &m.tables["t__sparse"];
+        assert_eq!(
+            sparse_now
+                .iter()
+                .map(|s| (s.hash.as_str(), s.from_block, s.to_block, s.provisional))
+                .collect::<Vec<_>>(),
+            vec![
+                (sparse.hash.as_str(), 10, 10, false),
+                (sparse_now[1].hash.as_str(), 12, 12, true)
+            ],
+            "the lost tail stays catalogued, so its loss stays visible, and the cut starts afresh"
+        );
+        assert!(!only(&m, "t__quiet").provisional);
+    }
+
+    /// #2169: the state a crash between a fold's manifest and its prune leaves.
+    #[test]
+    fn an_unpruned_fold_is_found_and_an_ordinary_unpruned_seal_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        assert_eq!(unpruned_fold(dir.path(), 10).unwrap(), None);
+        seal_range(dir.path(), &[approval(11, 0)], 11, 11).unwrap();
+        assert_eq!(
+            unpruned_fold(dir.path(), 10).unwrap(),
+            None,
+            "a segment wholly past the watermark is served from hot until the prune"
+        );
+        seal_range(dir.path(), &[transfer(12, 0, "2")], 12, 12).unwrap();
+        assert_eq!(unpruned_fold(dir.path(), 11).unwrap(), Some((10, 12)));
+
+        let folded = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        std::fs::remove_file(dir.path().join(SEGMENTS_DIR).join(&folded.file)).unwrap();
+        assert!(
+            unpruned_fold(dir.path(), 11).is_err(),
+            "a fold whose file is gone must not be finished: the prune would drop the hot copy"
+        );
+    }
+
+    /// #2261: a re-seal of rows whose catalogued file is gone was skipped by hash, and the caller then
+    /// pruned the hot copy. The same bytes are put back under their name instead.
+    #[test]
+    fn a_re_seal_beside_a_missing_file_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let seg = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        let path = dir.path().join(SEGMENTS_DIR).join(&seg.file);
+        std::fs::remove_file(&path).unwrap();
+
+        seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        assert_eq!(
+            only(&load_manifest(dir.path()).unwrap(), "usdc__transfer").hash,
+            seg.hash
+        );
+        assert!(
+            segment_intact(dir.path(), &seg),
+            "the file was not restored"
+        );
+    }
+
+    /// #2266: a shared segment corrupt in place was left alone by the restore, which skips a name
+    /// that exists, and the caller then pruned hot. The re-seal's bytes are the ones the address
+    /// names, so they replace it before `seal_range` returns, which is before any prune.
+    #[test]
+    fn a_re_seal_replaces_a_corrupt_shared_segment_before_it_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        std::fs::create_dir_all(&dir).unwrap();
+        test_set_table_floor(&dir, 0);
+        seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let seg = only(&load_manifest(&dir).unwrap(), "usdc__transfer");
+        let shared = root
+            .path()
+            .join(SEGMENTS_DIR)
+            .join(format!("{}.parquet", seg.hash));
+        std::fs::write(&shared, b"rotted in place").unwrap();
+        assert!(
+            !segment_intact(&dir, &seg),
+            "premise: the shared copy is bad"
+        );
+
+        seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();
+        assert!(
+            segment_intact(&dir, &seg),
+            "the corrupt shared file kept its bytes"
+        );
+        assert_eq!(
+            load_manifest(&dir).unwrap().tables["usdc__transfer"].len(),
+            1
+        );
+    }
+
+    /// #2266: when the bad file cannot be replaced, the seal fails, so its caller keeps hot.
+    #[test]
+    fn a_re_seal_that_cannot_replace_a_corrupt_segment_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let seg = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        let seg_dir = dir.path().join(SEGMENTS_DIR);
+        std::fs::write(seg_dir.join(&seg.file), b"rotted in place").unwrap();
+        std::fs::set_permissions(&seg_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let sealed = seal_range(dir.path(), &[transfer(10, 0, "1")], 10, 10);
+        std::fs::set_permissions(&seg_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = format!(
+            "{:#}",
+            sealed.expect_err("a seal reported success beside a corrupt copy")
+        );
+        // The manifest lives in the same directory, so its write fails too; the restore must fail first.
+        assert!(err.contains("restoring segment"), "{err}");
+    }
+
+    /// #2230: two seals of identical bytes in one process each wrote `.{file}.{pid}.tmp`. The second
+    /// truncated the first's, and whichever renamed last found its temp file gone.
+    #[test]
+    fn two_publishes_of_one_file_in_one_process_both_install_it() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("segments");
+        let inner = store.clone();
+        let _hook = set_before_install(move || {
+            publish_durable(&inner, "s.parquet", b"same").unwrap();
+        });
+        publish_durable(&store, "s.parquet", b"same").expect("the first publish");
+        assert_eq!(std::fs::read(store.join("s.parquet")).unwrap(), b"same");
+        let left: Vec<_> = std::fs::read_dir(&store)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n != "s.parquet")
+            .collect();
+        assert!(left.is_empty(), "temp files left behind: {left:?}");
     }
 
     #[test]
