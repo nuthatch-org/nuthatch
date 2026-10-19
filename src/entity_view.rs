@@ -520,10 +520,14 @@ impl EntityView {
                                 .as_ref()
                                 .ok()
                                 .and_then(|(bytes, _)| over_allowance(*bytes, allowance));
-                            let _ = ack.send(sample);
-                            if let Some(why) = why {
+                            // The fault is published before the ack, so a caller that sees this
+                            // sample also sees the entity stopped.
+                            if let Some(why) = &why {
                                 tracing::error!("entity `{thread_label}`: {why}");
-                                *stopped.write().unwrap() = Some(why);
+                                *stopped.write().unwrap() = Some(why.clone());
+                            }
+                            let _ = ack.send(sample);
+                            if why.is_some() {
                                 break;
                             }
                         }
