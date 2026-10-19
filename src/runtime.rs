@@ -7534,6 +7534,7 @@ mod tests {
             hook_key.clone(),
             Arc::new(move || {
                 let req = axum::http::Request::post("/_admin/nests?wait=true")
+                    .header("host", "127.0.0.1")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(r#"{"name":"usdc"}"#))
                     .unwrap();
