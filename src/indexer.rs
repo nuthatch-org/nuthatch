@@ -7289,6 +7289,8 @@ impl NestIngest {
         // One conversion, both directions, and the views read the decoded rows as ingest does.
         self.retract_entities(&rows, ancestor).map_err(torn)?;
         self.balances.apply(retraction_batch(&rows));
+        self.balances
+            .retract_over_i128(rows.iter().filter(|r| oversized_transfer(r)).count() as u64);
         self.exposure
             .apply(exposure_retraction_batch(&rows, &self.labels));
         if let Some((_, w)) = self.velocity_cfg {
@@ -7575,6 +7577,7 @@ impl NestIngest {
         let mut deltas = Vec::new();
         let mut exp_deltas = Vec::new();
         let mut vel_deltas = Vec::new();
+        let mut oversized = 0u64;
         // PERF-2: accumulate every write and commit the whole window in ONE redb txn at the end,
         // instead of a `begin_write`/`commit` (fsync) per row. `(key, json)` for rows + annotations.
         let mut to_store: Vec<(String, String)> = Vec::with_capacity(rows.len());
@@ -7627,8 +7630,9 @@ impl NestIngest {
                 } else if value.is_some() {
                     // COR-8 (#814): a live transfer whose value exceeds 38 digits. Skipped here exactly
                     // as the cold fold skips it, so hot and sealed agree - but counted now, so the
-                    // balance says it is incomplete instead of looking complete.
-                    self.balances.note_over_i128(1);
+                    // balance says it is incomplete instead of looking complete. Noted once the
+                    // window commits, as a reorg retracts it from the stored row.
+                    oversized += 1;
                     tracing::warn!(
                         block = row.block_number,
                         log_index = row.log_index,
@@ -7815,6 +7819,7 @@ impl NestIngest {
             self.retract_folded_window(deltas, exp_deltas, vel_deltas);
             return Err(e);
         }
+        self.balances.note_over_i128(oversized);
         // Only now: a refused or failed window must not leave its children routing later logs (#2153).
         self.children.extend(found);
         if alerted {
@@ -8542,7 +8547,32 @@ async fn pin_checkpoint(
 ///
 /// Earlier write-ups called this `seal_finalized`. It sealed `from..=ceiling` with no row threshold,
 /// which is why 80% of a long-running nest's segments were under 20 KB (docs/bench/segment-layout.md).
+///
+/// The outcome goes to `metrics`, so `/ready` sees a seal that fails on every attempt (#2262).
 async fn maybe_seal(
+    dir: &std::path::Path,
+    store: &dyn crate::store::HotStore,
+    source: &dyn Source,
+    finalized_through: u64,
+    registry_snapshot: Option<&str>,
+    metrics: &crate::metrics::NestMetrics,
+    seal_span: u64,
+) -> Result<()> {
+    let sealed = try_seal(
+        dir,
+        store,
+        source,
+        finalized_through,
+        registry_snapshot,
+        metrics,
+        seal_span,
+    )
+    .await;
+    metrics.record_seal(sealed.as_ref().err().map(|e| format!("{e:#}")));
+    sealed
+}
+
+async fn try_seal(
     dir: &std::path::Path,
     store: &dyn crate::store::HotStore,
     source: &dyn Source,
@@ -8676,6 +8706,8 @@ async fn maybe_seal(
         let to_seal = store.entities_in_range(from, cut)?;
         match seal::seal_range_with_snapshot(dir, &to_seal, from, cut, registry_snapshot)? {
             Some(summary) => {
+                #[cfg(test)]
+                between_seal_and_prune();
                 // After the seal. It fsyncs the bytes and the manifest entry before returning, and
                 // this commit fsyncs the watermark (#1632).
                 let pruned =
@@ -8732,6 +8764,13 @@ fn view_transfer(row: &crate::registry::DecodedRow) -> Option<(String, String, i
     let (from, to, value, _) = row.erc20_transfer_fields()?;
     let value = value.as_deref().and_then(crate::views::transfer_value)?;
     Some((from, to, value))
+}
+
+/// A transfer `view_transfer` passes over for its value alone, counted as `dropped_over_i128`.
+fn oversized_transfer(row: &crate::registry::DecodedRow) -> bool {
+    row.erc20_transfer_fields()
+        .and_then(|(_, _, value, _)| value)
+        .is_some_and(|v| crate::views::transfer_value(&v).is_none())
 }
 
 /// Build a weight −1 balance retraction batch from rolled-back rows (reorg).
@@ -8947,6 +8986,9 @@ fn rebuild_views(
         for v in rows.iter().rev() {
             let row = crate::registry::DecodedRow::from_stored(v, table_schema)?;
             let Some((from, to, val)) = view_transfer(&row) else {
+                if oversized_transfer(&row) {
+                    balances.note_over_i128(1);
+                }
                 continue;
             };
             balance_batch.extend(views::transfer_deltas(&from, &to, val, 1));
@@ -9337,6 +9379,21 @@ thread_local! {
     static FAIL_AFTER_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static BEFORE_PRUNE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `probe` inside the next tip-path seal, after its segment is written and before its prune.
+#[cfg(test)]
+fn probe_before_the_next_prune(probe: impl FnOnce() + 'static) {
+    BEFORE_PRUNE.with(|p| *p.borrow_mut() = Some(Box::new(probe)));
+}
+
+#[cfg(test)]
+fn between_seal_and_prune() {
+    if let Some(probe) = BEFORE_PRUNE.with(|p| p.borrow_mut().take()) {
+        probe();
+    }
 }
 
 /// Run `probe` inside the next `process_window`, at the instant before its commit.
@@ -12795,6 +12852,29 @@ template = "pool"
         assert_eq!(detect_reorg(&src, &store, 110).await.unwrap(), Some(100));
     }
 
+    /// #2262: a failed seal reaches the metrics `/ready` reads, and the next one that succeeds clears it.
+    #[tokio::test]
+    async fn maybe_seal_records_its_failure_until_a_seal_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        let metrics = crate::metrics::NestMetrics::default();
+        store.set_meta(LAST_BLOCK_KEY, "not a block").unwrap();
+
+        assert!(
+            maybe_seal(tmp.path(), &store, &HashOnly, 99, None, &metrics, SPAN_REAL)
+                .await
+                .is_err()
+        );
+        let (_, reason) = metrics.seal_fault().expect("the failure is recorded");
+        assert!(reason.contains("corrupt last_block"), "{reason}");
+
+        store.set_meta(LAST_BLOCK_KEY, "50").unwrap();
+        maybe_seal(tmp.path(), &store, &HashOnly, 99, None, &metrics, SPAN_REAL)
+            .await
+            .unwrap();
+        assert_eq!(metrics.seal_fault(), None);
+    }
+
     const SENDER: &str = "0x1111111111111111111111111111111111111111";
     const RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
 
@@ -12843,6 +12923,31 @@ template = "pool"
                 "a {ty} `wad` must be retracted"
             );
         }
+    }
+
+    /// #2260: a reorg over a transfer too large for i128 takes it back out of `dropped_over_i128`.
+    #[tokio::test]
+    async fn a_reorg_retracts_an_oversized_transfer_from_the_dropped_count() {
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest_with(
+            d.path(),
+            "0x0000000000000000000000000000000000000008",
+            r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+            "",
+        )
+        .await;
+        let huge = format!(r#""1{}""#, "0".repeat(38));
+        nest.store
+            .put_entity(
+                &Store::entity_key(10, 0),
+                &tok_transfer(["from", "to", "value"], &huge),
+            )
+            .unwrap();
+        nest.store.set_meta(LAST_BLOCK_KEY, "10").unwrap();
+        nest.balances.note_over_i128(1);
+
+        nest.rollback_reorg(9).unwrap();
+        assert_eq!(nest.balances.dropped_over_i128(), 0);
     }
 
     /// #2164: a reorg over a threshold flag retracts the transfer from an entity and is not a fault.
@@ -16601,6 +16706,83 @@ template = "pool"
             "a document given up on no longer holds its range"
         );
         drop(resolver);
+        drop(nest);
+        drop(state);
+        handle.abort();
+    }
+
+    /// #2263: the resolver writing a document while a seal is between its read and its prune. The
+    /// rows end up sealed or still hot, because the seal holds below every document it is waiting on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_document_resolved_during_a_seal_is_sealed_or_still_hot() {
+        let body = r#"{"bucket":1}"#.to_string();
+        let cid = crate::cid::cid_v0_for(body.as_bytes());
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::from([(cid.clone(), body)]), 0).await;
+        let dir = qos_topic_nest("t");
+        let (mut nest, state, source) =
+            qos_nest_with(dir.path(), gateway, vec![(4, qos_post(&cid))]).await;
+        nest.seal_span = 1;
+        let resolver = Arc::new(std::sync::Mutex::new(Some(
+            crate::ipfs_resolve::Resolver::new(
+                nest.store.clone(),
+                nest.ipfs_gate.clone().expect("a gate"),
+                nest.ipfs_gateways.clone(),
+                true,
+                Arc::new(crate::metrics::NestMetrics::default()),
+                fast_policy(3),
+            ),
+        )));
+        // Its own runtime on its own thread: the seal is blocked here until the resolver is done.
+        let resolve = {
+            let resolver = resolver.clone();
+            move || {
+                std::thread::spawn(move || {
+                    let Some(mut r) = resolver.lock().unwrap().take() else {
+                        return;
+                    };
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    assert_eq!(rt.block_on(resolve_all(&mut r)), 0);
+                })
+                .join()
+                .unwrap();
+            }
+        };
+        probe_before_the_next_prune(resolve.clone());
+        for b in 4..=6 {
+            nest.process_window(source.as_ref(), &[], b, b, 10_000)
+                .await
+                .unwrap()
+                .expect("the window must commit");
+        }
+        // No seal opened over the document's block, so it resolves here and the next seals take it.
+        resolve();
+        for b in 7..=9 {
+            nest.process_window(source.as_ref(), &[], b, b, 10_000)
+                .await
+                .unwrap()
+                .expect("the window must commit");
+        }
+
+        assert!(
+            nest.store.sealed_through() >= 4,
+            "premise: the document's block sealed"
+        );
+        let sealed = crate::seal::load_manifest(&nest.dir)
+            .unwrap()
+            .tables
+            .get("qos_payload")
+            .is_some_and(|segs| {
+                segs.iter()
+                    .any(|s| s.from_block <= 4 && 4 <= s.to_block && s.rows > 0)
+            });
+        assert!(
+            sealed || !stored_documents(nest.store.as_ref(), 4).is_empty(),
+            "a resolved document is in neither the sealed layer nor hot"
+        );
         drop(nest);
         drop(state);
         handle.abort();
@@ -25206,6 +25388,35 @@ rpc_urls = ["https://rpc.example"]
         )
         .unwrap();
         crate::labels::load(dir.path())
+    }
+
+    /// #2260: a restart counts the hot tail's oversized transfers, as the live loop did.
+    #[test]
+    fn a_rebuild_counts_an_oversized_transfer_in_the_hot_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let huge = format!("1{}", "0".repeat(38));
+        store
+            .put_entity(
+                &Store::entity_key(10, 0),
+                &transfer_row(10, 0, SENDER, Some(RECIPIENT), &huge),
+            )
+            .unwrap();
+        let balances = BalanceView::start().unwrap();
+        rebuild_views(
+            dir.path(),
+            &store,
+            &erc20_registry(),
+            &DerivedViews {
+                labels: &LabelSet::default(),
+                balances: &balances,
+                exposure: &ExposureView::start(true).unwrap(),
+                velocity: &VelocityView::start(true).unwrap(),
+                velocity_cfg: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(balances.dropped_over_i128(), 1);
     }
 
     /// The acceptance test for #294: collapsing three scans into one must leave the views **the same**,

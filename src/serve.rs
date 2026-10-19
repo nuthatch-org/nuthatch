@@ -1695,6 +1695,8 @@ pub(crate) struct NestReadiness {
     pub initial_failure: bool,
     pub seal_stalled: bool,
     pub tip_seal_stalled: bool,
+    pub seal_faulted: bool,
+    pub seal_fault: Option<(u64, String)>,
     pub entities_stalled: bool,
     pub cursor_stalled: bool,
     pub tip: u64,
@@ -1740,6 +1742,9 @@ impl NestReadiness {
         }
         if self.tip_seal_stalled {
             out.push("tip_seal_stalled");
+        }
+        if self.seal_faulted {
+            out.push("seal_faulted");
         }
         if self.entities_stalled {
             out.push("entities_stalled");
@@ -1908,7 +1913,14 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
                 )
                 || wedged)
     };
-    let stalled = seal_stalled || tip_seal_stalled || entities_stalled || cursor_stalled;
+    // #2262: a seal that errors is not holding by design, so neither the span guard nor the twelve
+    // hours above apply to it.
+    let seal_fault = nest.as_ref().and_then(|m| m.seal_fault());
+    let seal_faulted = seal_fault.as_ref().is_some_and(|(since, _)| {
+        now.saturating_sub(*since) > s.freshness.stall_threshold_secs(READINESS_SEAL_STALL_SECS)
+    });
+    let stalled =
+        seal_stalled || tip_seal_stalled || seal_faulted || entities_stalled || cursor_stalled;
     #[cfg(feature = "folds")]
     let stalled = stalled || folds_stalled;
     NestReadiness {
@@ -1917,6 +1929,8 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
         initial_failure,
         seal_stalled,
         tip_seal_stalled,
+        seal_faulted,
+        seal_fault,
         entities_stalled,
         cursor_stalled,
         tip,
@@ -1978,6 +1992,8 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         initial_failure,
         seal_stalled,
         tip_seal_stalled,
+        seal_faulted,
+        seal_fault,
         entities_stalled,
         cursor_stalled: _,
         tip,
@@ -2084,6 +2100,7 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         // The tip path's verdict, reported beside the backfill's so an operator can tell which term
         // took the nest unready without reading this source (#1199).
         "tip_seal_stalled": tip_seal_stalled,
+        "seal_faulted": seal_faulted,
         // No longer gated on `seal_direct_active`: the tip path stamps this clock too now, and the
         // number was null on precisely the nests that needed it.
         "seconds_since_seal_progress": (last_seal_progress != 0)
@@ -2104,8 +2121,12 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         }
         body
     };
-    // RFC-0062: absent unless the nest declares a maintained view.
     let mut body = body;
+    // #2262: the tip seal's error while every attempt fails, absent while it succeeds.
+    if let Some((since, reason)) = seal_fault {
+        body["seal_fault"] = json!({ "reason": reason, "since_unixtime": since });
+    }
+    // RFC-0062: absent unless the nest declares a maintained view.
     if crate::maintained::is_declared(&s.dir) {
         body["maintained"] = maintained_status(&s.dir);
     }
@@ -7304,6 +7325,63 @@ mod tests {
             "the backfill term must stay false: no pass was ever running, and conflating the two \
              is what hid this"
         );
+    }
+
+    /// #2262: a seal that fails on every attempt says why at once, and takes the nest unready once
+    /// it has failed for longer than a quarter of an hour, however small the seal lag is.
+    #[tokio::test]
+    async fn a_seal_that_keeps_failing_says_why_and_reports_unready() {
+        use crate::metrics::METRICS;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "failing-tip-seal";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let now = crate::metrics::now_unix();
+        let handle = METRICS.nest(name);
+        handle.set_tip(1_000_100);
+        handle.set_last_block(1_000_100);
+        handle.set_sealed_through(1_000_000);
+        handle.mark_poll_ok();
+        handle.set_last_progress_for_test(now);
+        let ready = || {
+            let router = router.clone();
+            async move {
+                let (code, body) = get(router, &format!("/{name}/ready")).await;
+                (code, serde_json::from_slice::<Value>(&body).unwrap())
+            }
+        };
+
+        handle.record_seal(Some("reading segment t-1.parquet: not found".into()));
+        let (code, json) = ready().await;
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "one failure is not yet a stall: {json}"
+        );
+        assert_eq!(json["seal_faulted"], json!(false), "{json}");
+        assert_eq!(
+            json["seal_fault"]["reason"],
+            json!("reading segment t-1.parquet: not found"),
+            "{json}"
+        );
+
+        handle.set_seal_fault_since_for_test(now.saturating_sub(1_000));
+        let (code, json) = ready().await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_eq!(json["seal_faulted"], json!(true), "{json}");
+        assert_eq!(json["tip_seal_stalled"], json!(false), "{json}");
+        assert!(METRICS.render().contains(&format!(
+            "nuthatch_nest_seal_fault_seconds{{nest=\"{name}\"}} 10"
+        )));
+
+        handle.record_seal(None);
+        let (code, json) = ready().await;
+        assert_eq!(code, StatusCode::OK, "{json}");
+        assert!(json.get("seal_fault").is_none(), "{json}");
     }
 
     /// #1341: a sparse nest whose only seal is the span cut is not stalled for being quiet. Numbers

@@ -282,6 +282,9 @@ fn shutdown(rt: indexer::NestRuntime) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_maintained_view_is_its_definition_at_every_head_through_reorgs() {
+    // A remembered answer counts neither a hit nor a fallback, so with the memo on `check_head`
+    // settled before any copy was built (#2265). This target runs this one test alone.
+    std::env::set_var(nuthatch::sqlmemo::ENV_MAX_BYTES, "0");
     let tape = Arc::new(TapeSource::new());
     let mut head_block = 8;
     for b in 1..=head_block {
@@ -302,7 +305,8 @@ async fn a_maintained_view_is_its_definition_at_every_head_through_reorgs() {
     check_head(&m, &p, "before any reorg", &mut seen).await;
 
     // A seal moves the views' inputs from hot to sealed: the copy is rebuilt with no request asking.
-    let built = stats(&m).await;
+    // Copies by file, not the build counter: a build is counted only after its copy is served.
+    let before_seal = copy_files(&m.state.dir);
     tape.advance_finalized_to(2);
     head_block += 1;
     tape.insert_block(head_block, empty_block(head_block, 0, ts(head_block)));
@@ -314,9 +318,15 @@ async fn a_maintained_view_is_its_definition_at_every_head_through_reorgs() {
             && m.state.store.sealed_through() == p.state.store.sealed_through()
     })
     .await;
+    let views: Vec<String> = stats(&m).await.into_keys().collect();
     eventually("a build of each view after the seal", || async {
-        let now = stats(&m).await;
-        built.iter().all(|(v, (.., b))| now[v].2 > *b)
+        let now = copy_files(&m.state.dir);
+        views.iter().all(|view| {
+            now.keys().any(|path| {
+                !before_seal.contains_key(path)
+                    && path.parent().is_some_and(|d| d.ends_with(view.as_str()))
+            })
+        })
     })
     .await;
     let before_asking = stats(&m).await;

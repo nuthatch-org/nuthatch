@@ -909,7 +909,7 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 |---|---|
 | `GET /` | summary: nest identity, heights, table count |
 | `GET /health` | liveness. `200 "ok"` while the process serves |
-| `GET /ready` | readiness. Per-nest: `503` if quarantined, the source stops answering, the cursor stops advancing (`wedged`), or the seal stops advancing (`tip_seal_stalled`, 3.6.1) |
+| `GET /ready` | readiness. Per-nest: `503` if quarantined, the source stops answering, the cursor stops advancing (`wedged`), or the seal stops advancing (`tip_seal_stalled`, 3.6.1) or fails on every attempt for 15 minutes (`seal_faulted`) |
 | `GET /metrics` | Prometheus text exposition |
 | `GET /tables`, `GET /table/{name}` | schema and recent rows, merged hot and cold; `"degraded": true` and the table in `degraded_tables`, as on `/sql`, when the sealed rows could not be read |
 | `GET /schema` | the full data model |
@@ -1165,7 +1165,9 @@ unlabelled `nuthatch_sealed_segments_bytes`, which counts each store once),
 `nuthatch_nest_analytics_engines` (the global pool series for the engines opened over this nest's
 dataset; two mounts of one dataset show the same engines),
 `nuthatch_nest_tip_height`, `nuthatch_nest_last_block`, `nuthatch_nest_tip_lag_blocks`,
-`nuthatch_nest_sealed_through`, `nuthatch_nest_rows_decoded_total`,
+`nuthatch_nest_sealed_through`, `nuthatch_nest_last_seal_progress_unixtime` (when that watermark last
+moved), `nuthatch_nest_seal_fault_seconds` (how long every seal attempt has failed, 0 while one
+succeeds; `/ready` names the error), `nuthatch_nest_rows_decoded_total`,
 `nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`, `nuthatch_nest_checkpoints_missed_total`,
 `nuthatch_nest_ipfs_unreadable_total` (rows an `[[ipfs]]` declaration read that named no usable CID),
 `nuthatch_nest_ipfs_pending` (documents named and neither stored nor given up on; sealing holds below
@@ -1289,6 +1291,14 @@ stopped sealing at tip answered `ready: true` with `lag_blocks: 0` indefinitely 
 blocks behind on a live nest (#1199). `seal_lag_blocks` is `null` for a `serve`-only role, and `null`
 before anything has sealed at all, so read `sealed_through: 0` beside it as "nothing sealed yet"
 rather than as a caught-up seal.
+
+**A seal that fails says so at once.** `tip_seal_stalled` waits twelve hours and twice the seal span,
+because a seal holding rows is normal. A seal that errors is not, so from its first failed attempt
+`seal_fault` carries the latest `reason` and `since_unixtime`, when the failures began; it is absent
+while sealing succeeds. Once it has lasted 15 minutes (or three poll intervals, if longer)
+`seal_faulted` turns true and the nest answers `503`, whatever `seal_lag_blocks` says (#2262). Hot
+keeps every unsealed row meanwhile, so reads stay complete; the log line at each attempt is the same
+error.
 
 **A seal-direct pass reports the concurrency it runs at.** `seal_direct_concurrency` is
 `{"requested", "effective", "capped_by"}`, and `null` for a nest not started with `--seal-direct`. With a
