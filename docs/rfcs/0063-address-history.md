@@ -30,7 +30,7 @@ never return `[]`.
 
 | Action | What rotki reads |
 |---|---|
-| `account/txlist` | `hash, blockNumber, timeStamp, from, to, value, input, gas, gasPrice, gasUsed, nonce`, optional type, authorisations, L1 fee. Saved as full records. |
+| `account/txlist` | `hash, blockNumber, timeStamp, from, to, value, input, gas, gasPrice, gasUsed, nonce`, optional type, authorisations, and on OP-stack chains the L1 fee as `L1FeesPaid`, a decimal (a missing one is an unknown fee, not zero). Saved as full records. |
 | `account/txlistinternal` | parent `hash, blockNumber, timeStamp, from, to, value, traceId, gas, gasUsed, callType`; delegatecalls skipped; also queried by `txhash`. `traceId` is parsed as an integer. |
 | `account/tokentx` | `hash, timeStamp, blockNumber` only. Hashes are hydrated over RPC. |
 | `block/getblocknobytime` | `timestamp, closest=before|after`, a decimal block number. |
@@ -98,8 +98,10 @@ different outcomes.
 
 `GET /api` on the nest, Etherscan-shaped: `chainid, module, action`, and for account lists
 `address, startblock, endblock, sort, page, offset`, inclusive bounds, ascending by default, 1,000
-rows a page. `txlistinternal` also takes `txhash`. Actions: the six in §2, plus `account/balance`,
-the `proxy` RPC passthroughs rotki uses (`eth_blockNumber`, `eth_getBlockByNumber`,
+rows a page. `txlistinternal` also takes `txhash`; off a loopback bind only a transaction the nest
+holds for a watched account is traced for it. Actions: the six in §2, plus `account/balance`
+(**not built**: it answers `NUTHATCH_UNSUPPORTED`), the `proxy` RPC passthroughs rotki uses
+(`eth_blockNumber`, `eth_getBlockByNumber`,
 `eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getCode`, `eth_call`) and
 `logs/getLogs`. `contract/getabi`, `contract/getcontractcreation` and `block/getblockreward` answer
 unsupported until built.

@@ -2045,6 +2045,9 @@ pub fn txlist_record(
         },
     );
     put("gasUsed", dec(receipt, "gasUsed")?);
+    if let Some(fee) = receipt.get("l1Fee").and_then(Value::as_str) {
+        put("L1FeesPaid", decimal(fee)?);
+    }
     let failed = match status {
         Some(s) => decimal(s)? == "0",
         None => trace_failed,
@@ -2940,6 +2943,26 @@ mod tests {
         assert_eq!(r["isError"], "1");
         assert_eq!(r["txreceipt_status"], "");
         assert_eq!(txlist_record(&tx, &old, 1, false).unwrap()["isError"], "0");
+    }
+
+    /// rotki reads an OP-stack fee's L1 part from Etherscan's `L1FeesPaid`, a decimal, and takes a
+    /// missing one as unknown, not zero; a receipt without `l1Fee` (L1, or an OP deposit) has none.
+    #[test]
+    fn an_op_stack_txlist_record_carries_its_l1_fee() {
+        let tx = json!({
+            "blockNumber": "0x1", "blockHash": "0xab", "hash": "0xcd", "nonce": "0x0",
+            "transactionIndex": "0x0", "from": "0x01", "to": "0x02", "value": "0x0",
+            "gas": "0x5208", "gasPrice": "0x1", "input": "0x",
+        });
+        let mut receipt = json!({
+            "status": "0x1", "gasUsed": "0x5208", "cumulativeGasUsed": "0x5208",
+            "effectiveGasPrice": "0x1", "l1Fee": "0x2d79883d2000",
+        });
+        let r = txlist_record(&tx, &receipt, 1, false).unwrap();
+        assert_eq!(r["L1FeesPaid"], "50000000000000");
+        receipt.as_object_mut().unwrap().remove("l1Fee");
+        let r = txlist_record(&tx, &receipt, 1, false).unwrap();
+        assert!(!r.contains_key("L1FeesPaid"), "{r:?}");
     }
 
     type Answer = dyn Fn(&str, &Value) -> Result<Value> + Send + Sync;

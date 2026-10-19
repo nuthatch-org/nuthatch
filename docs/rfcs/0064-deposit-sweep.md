@@ -33,8 +33,8 @@ line. Each row is a commitment with a gate in §9, not a claim.
 | A failed `eth_getLogs`, receipt or trace is a warning, and the deposit is silently missed | Any failure fails the block, which is retried; nothing is recorded past it |
 | Native value only top-level with empty calldata, unless per-transaction tracing is switched on; Safe MultiSend, 4337 and other smart accounts missed | One trace per block (`trace_block`), every frame that credits a watched address, any wallet kind |
 | ERC-20 only; ERC-721 reported as ERC-20 with amount 0; no ERC-1155 | ERC-20, ERC-721 with token id, ERC-1155 single and batch |
-| Any contract's `Transfer` credited, no allowlist | Rows carry the token contract; an optional allowlist, and unlisted tokens marked, never dropped silently |
-| New addresses polled from Postgres every 1 s, off by default, with a startup gap; no history for them | Appended through the API, live at the next block, recorded `joined_at`; optional history for that address through RFC-0063 discovery |
+| Any contract's `Transfer` credited, no allowlist | Rows carry the token contract. **Not built:** the optional allowlist and the marking of unlisted tokens; every `Transfer` naming a watched address is a deposit, and the consumer filters by contract |
+| New addresses polled from Postgres every 1 s, off by default, with a startup gap; no history for them | Appended through the API, live at the next block, recorded `joined_at`. **Not built:** history before `joined_at`; a sweeping nest runs no RFC-0063 discovery, so a range below it is refused as never covered |
 | No reorg tests, no explorer parity | Reorg property tests over the sweep and Etherscan parity on pinned addresses, both release gates |
 | Redis, NATS JetStream, a KV store and Postgres beside it | One binary |
 
@@ -64,8 +64,8 @@ size.
 
 **Backfill is the expensive direction**: about 3 calls a block, so a million blocks is roughly 35
 hours at 8 in parallel. The default is therefore to sweep from the head at first start. History for
-an individual address, when wanted, comes from RFC-0063's per-address discovery, which already
-exists and is the cheaper path for a few addresses.
+an individual address before it joined was to come from RFC-0063's per-address discovery; that is
+**not built**, since a sweeping nest runs no discovery.
 
 Matched rows go into RFC-0063's existing tables, so `txlist`, `txlistinternal`, `tokentx`,
 `tokennfttx` and `token1155tx` answer for any swept address exactly as they do now, and
@@ -76,12 +76,15 @@ Matched rows go into RFC-0063's existing tables, so `txlist`, `txlistinternal`, 
 Addresses are appended at runtime through `/api/watch`, extended to take a list (thousands per call)
 and unchanged in being loopback-only. An address joins the sweep at the next block the sweep reads,
 and the store records that block as its **joined_at**. Its sweep coverage is `[joined_at, swept
-head]`; nothing before `joined_at` is claimed, so a query below it answers incomplete, never empty.
+head]`; nothing before `joined_at` is claimed, so a query below it answers incomplete, never empty, and says
+it is never covered: the sweep does not read back. A range past the swept head is the one refusal
+that says to ask again.
 
 **Coverage is held once for the sweep, not per address.** Per-address coverage rows, rewritten every
 poll for 100,000 addresses, would turn a cheap pass into a large write. The sweep keeps one span and
-each address keeps its `joined_at`; an address's coverage is the union of its own RFC-0063 coverage
-and the sweep span from `joined_at`.
+each address keeps its `joined_at`; an address's coverage is the sweep span from `joined_at`. (The
+union with its own RFC-0063 coverage was the plan; a sweeping nest runs no discovery, so there is
+none.)
 
 ## 5. One feed for the whole set
 

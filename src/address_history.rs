@@ -1498,6 +1498,16 @@ impl AddressHistory {
         self.swept_span(SWEPT)
     }
 
+    /// The block `address` joined the sweep at, once the sweep has read a window with it watched.
+    pub fn joined(&self, address: &str) -> Result<Option<u64>> {
+        let a = parse_address(address)?;
+        let rtx = self.store.database().begin_read()?;
+        Ok(rtx
+            .open_table(JOINED)?
+            .get(a.as_slice())?
+            .map(|v| v.value()))
+    }
+
     /// The span the sweep has traced for internal transfers, when it traces them.
     pub fn swept_internal(&self) -> Result<Option<(u64, u64)>> {
         self.swept_span(SWEPT_INTERNAL)
@@ -2800,7 +2810,7 @@ pub fn respond(
 /// `getblocknobytime` prove an answer from one neighbour. Arbitrum's and BNB Chain's blocks can share a
 /// second, so they are refused rather than answered from a guess.
 pub fn strictly_increasing_timestamps(chain_id: u64) -> bool {
-    matches!(chain_id, 1 | 10 | 100 | 8453)
+    matches!(chain_id, 1 | 10 | 100 | 137 | 8453)
 }
 
 /// `account/nuthatchDeposits`: the deposits feed after sequence number `after`, at most `offset`
@@ -3773,6 +3783,15 @@ mod tests {
                 .starts_with("NUTHATCH_UNSUPPORTED:"),
             "{a}"
         );
+    }
+
+    /// Bor rejects a header whose time is not at least its period past its parent's, and Polygon's
+    /// period has never been below one second, so its timestamps strictly increase.
+    #[test]
+    fn polygon_timestamps_strictly_increase() {
+        assert!(strictly_increasing_timestamps(137));
+        assert!(!strictly_increasing_timestamps(42161));
+        assert!(!strictly_increasing_timestamps(56));
     }
 
     /// Page 1 without an end reads to the end of what is covered, which moves as coverage grows, so a
