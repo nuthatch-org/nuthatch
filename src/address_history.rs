@@ -1493,6 +1493,28 @@ impl AddressHistory {
             .collect()
     }
 
+    /// [`Self::deposits_after`] and, in the same read, the last block the page is complete to: the
+    /// sweep's end when the page reaches the feed's end, else none, since an entry past the page
+    /// can name an earlier block than the page's last (a reorg's replacement).
+    pub fn deposits_page(&self, after: u64, limit: usize) -> Result<(Vec<Value>, Option<u64>)> {
+        let rtx = self.store.database().begin_read()?;
+        let mut entries = rtx
+            .open_table(DEPOSITS)?
+            .range(after.saturating_add(1)..)?
+            .take(limit.saturating_add(1))
+            .map(|e| Ok(serde_json::from_slice(e?.1.value())?))
+            .collect::<Result<Vec<Value>>>()?;
+        if entries.len() > limit {
+            entries.truncate(limit);
+            return Ok((entries, None));
+        }
+        let through = match rtx.open_table(SWEEP)?.get(SWEPT)? {
+            Some(v) => decode_spans(v.value())?.last().map(|(_, t)| *t),
+            None => None,
+        };
+        Ok((entries, through))
+    }
+
     /// The span the sweep has read, from the first block it read to the last.
     pub fn swept(&self) -> Result<Option<(u64, u64)>> {
         self.swept_span(SWEPT)
@@ -1591,11 +1613,14 @@ impl AddressHistory {
                     }
                     put_rows(&wtx, action, &a, rows)?;
                     for r in rows {
-                        let incoming = r
-                            .record
-                            .get("to")
-                            .and_then(Value::as_str)
-                            .is_some_and(|t| t.eq_ignore_ascii_case(address));
+                        let field = |k: &str| r.record.get(k).and_then(Value::as_str);
+                        // A creation's receiver is its contract; a send to oneself brings nothing.
+                        let receiver = match field("to") {
+                            Some("") | None => field("contractAddress"),
+                            to => to,
+                        };
+                        let incoming = receiver.is_some_and(|t| t.eq_ignore_ascii_case(address))
+                            && !field("from").is_some_and(|f| f.eq_ignore_ascii_case(address));
                         if !incoming || !arrived(action, r, &f.callcode) {
                             continue;
                         }
@@ -2833,15 +2858,12 @@ fn deposits_feed(
         (Ok(_), Ok(l)) => return error(format!("offset {l} is outside 1 to {MAX_OFFSET}")),
         (Err(e), _) | (_, Err(e)) => return error(e),
     };
-    match (
-        history.deposits_after(after, limit as usize),
-        history.swept(),
-    ) {
-        (Ok(entries), Ok(swept)) => serde_json::json!({
+    match history.deposits_page(after, limit as usize) {
+        Ok((entries, through)) => serde_json::json!({
             "status": "1", "message": "OK", "result": entries,
-            "sweptThrough": swept.map(|(_, t)| t),
+            "sweptThrough": through,
         }),
-        (Err(e), _) | (_, Err(e)) => error(format!("{e:#}")),
+        Err(e) => error(format!("{e:#}")),
     }
 }
 
@@ -4482,6 +4504,89 @@ mod tests {
         assert_eq!(answer["status"], "1", "{answer}");
         assert_eq!(answer["result"].as_array().unwrap().len(), 2);
         assert_eq!(answer["result"][0]["seq"], 3);
+    }
+
+    /// A deposit is value that arrived: a watched address sending to itself is not one, and a
+    /// creation carrying value into a watched contract is (#2121, #2115).
+    #[test]
+    fn a_send_to_oneself_is_no_deposit_and_a_creation_is_one() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        let alice = ALICE.to_ascii_lowercase();
+        let row = |i: u64, fields: &[(&str, &str)]| {
+            let mut r = tx(105, i);
+            for (k, v) in fields {
+                r.record.insert((*k).into(), Value::String((*v).into()));
+            }
+            r
+        };
+        let mut found = std::collections::BTreeMap::new();
+        found.insert(
+            alice.clone(),
+            crate::address_discovery::Found {
+                txlist: vec![
+                    row(0, &[("from", &alice), ("to", &alice), ("value", "1")]),
+                    row(
+                        1,
+                        &[
+                            ("from", BOB),
+                            ("to", ""),
+                            ("contractAddress", &alice),
+                            ("value", "1"),
+                        ],
+                    ),
+                ],
+                tokentx: vec![row(2, &[("from", &alice), ("to", &alice), ("value", "1")])],
+                ..Default::default()
+            },
+        );
+        h.record_sweep(&found, &[ALICE.to_string()], (100, 110), g, None, false)
+            .unwrap();
+        let feed = h.deposits_after(0, 100).unwrap();
+        let rows: Vec<&Value> = feed.iter().map(|e| &e["row"]["hash"]).collect();
+        assert_eq!(rows, [&found[&alice].txlist[1].record["hash"]], "{feed:?}");
+    }
+
+    /// `sweptThrough` is read with the page and claims nothing for a page that stops short of the
+    /// feed's end, where a later entry can name an earlier block (#2122).
+    #[test]
+    fn swept_through_is_claimed_only_by_a_page_that_reaches_the_feed_end() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        let mut found = std::collections::BTreeMap::new();
+        found.insert(
+            ALICE.to_ascii_lowercase(),
+            crate::address_discovery::Found {
+                txlist: [0, 1, 2]
+                    .map(|i| {
+                        let mut r = tx(105, i);
+                        r.record.insert("to".into(), Value::String(ALICE.into()));
+                        r
+                    })
+                    .into(),
+                ..Default::default()
+            },
+        );
+        h.record_sweep(&found, &[ALICE.to_string()], (100, 110), g, None, false)
+            .unwrap();
+        let page = |after: &str, offset: &str| {
+            respond(
+                Some(&h),
+                &params(&[
+                    ("module", "account"),
+                    ("action", "nuthatchDeposits"),
+                    ("after", after),
+                    ("offset", offset),
+                ]),
+            )
+        };
+        let short = page("0", "2");
+        assert_eq!(short["result"].as_array().unwrap().len(), 2, "{short}");
+        assert_eq!(short["sweptThrough"], Value::Null, "{short}");
+        for (after, offset) in [("0", "3"), ("2", "2")] {
+            let end = page(after, offset);
+            assert_eq!(end["sweptThrough"], 110, "{end}");
+        }
     }
 
     /// RFC-0064 S2: internal transactions are claimed only over windows the sweep traced, so turning
