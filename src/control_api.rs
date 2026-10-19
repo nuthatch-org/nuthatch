@@ -423,6 +423,5 @@ pub async fn run(listen: &str, db_url: &str) -> Result<()> {
         "control-plane API listening (RFC-0022 §3)"
     );
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+    crate::serve::serve_bound(listener, app, None).await
 }

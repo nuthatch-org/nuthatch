@@ -172,3 +172,42 @@ abi = "abis/usdc.json"
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
+
+/// #2138: secrets are keyed by nest, and a worker holding a cursor must ask for them by the names of
+/// the nests declared on its chain. Asking by chain name matched nothing.
+#[tokio::test]
+async fn a_held_cursor_receives_its_declared_nests_secrets() {
+    let Some(cp) = cp("chain-secrets") else {
+        return;
+    };
+    for n in ["horizon", "gamma"] {
+        cp.undeclare_nest(n).unwrap();
+    }
+    for (name, chain) in [("horizon", "arbitrum-one"), ("gamma", "mainnet")] {
+        cp.declare_nest(&nuthatch::scheduler::DesiredNest {
+            name: name.into(),
+            chain: chain.into(),
+            estimated_rss_mb: 64,
+        })
+        .unwrap();
+    }
+    cp.set_secret("horizon", "rpc_url", SECRET).unwrap();
+    cp.set_secret("gamma", "rpc_url", "gamma-only-value")
+        .unwrap();
+
+    let got = nuthatch::worker::chain_secrets(&cp, "arbitrum-one").unwrap();
+    for n in ["horizon", "gamma"] {
+        cp.undeclare_nest(n).unwrap();
+    }
+    assert_eq!(
+        got.get("horizon")
+            .and_then(|s| s.get("rpc_url"))
+            .map(String::as_str),
+        Some(SECRET),
+        "the nest on the held chain must receive its secret"
+    );
+    assert!(
+        !got.contains_key("gamma"),
+        "a nest on another chain's cursor must not"
+    );
+}

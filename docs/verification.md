@@ -564,7 +564,7 @@ change no cursor's ownership and no ingestion progress. *Proves* the plane split
 **5.7 Versions resolve identically fleet-wide**
 
 ```sh
-curl -XPUT localhost:8290/nests/usdc/pin -H 'Content-Type: application/json' -d '{"version":"1.0.0","bundle_hash":"0x…"}'
+curl -XPUT localhost:8290/nests/usdc/pin -H 'Content-Type: application/json' -d '{"version":"1.0.0","bundle_hash":"<64 hex>"}'
 # then, against each FE node:
 curl -s localhost:8290/nests/usdc/resolve
 ```
