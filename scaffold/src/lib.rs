@@ -174,8 +174,8 @@ pub fn schema_json(registry_hash: [u8; 32], schema: &[TableSchema]) -> Result<St
 }
 
 /// GitHub counts SQL as data, so without this a nest repo shows no language. Hidden, so it stays
-/// outside the data identity.
-pub const GITATTRIBUTES: &str = "*.sql linguist-detectable\nabis/** linguist-generated\n";
+/// outside the data identity. `-text` keeps a CRLF checkout from moving a clone's NID (#2199).
+pub const GITATTRIBUTES: &str = "* -text\n*.sql linguist-detectable\nabis/** linguist-generated\n";
 
 pub const VIEWS_README: &str =
         "# views/ - this nest's authored logic (RFC-0018 §1)\n\n\

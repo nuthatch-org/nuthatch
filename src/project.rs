@@ -2076,6 +2076,36 @@ mod tests {
         );
     }
 
+    /// A clone under `core.autocrlf=true` reports the publisher's NID (#2199).
+    #[test]
+    fn a_crlf_checkout_keeps_a_scaffolded_nests_nid() {
+        let git = |dir: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "core.autocrlf=true"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scaffold/pair");
+        for (path, bytes) in files_under(&fixture) {
+            std::fs::create_dir_all(src.join(&path).parent().unwrap()).unwrap();
+            std::fs::write(src.join(&path), bytes).unwrap();
+        }
+        std::fs::write(src.join(".gitattributes"), nuthatch_scaffold::GITATTRIBUTES).unwrap();
+        git(&src, &["init", "-q"]);
+        git(&src, &["add", "."]);
+        git(&src, &["commit", "-qm", "nest"]);
+        git(tmp.path(), &["clone", "-q", "src", "dst"]);
+        let nid = |dir: &Path| crate::blob::build_manifest(dir, None).unwrap().nid();
+        assert_eq!(nid(&tmp.path().join("dst")), nid(&src));
+    }
+
     #[test]
     fn scaffold_views_creates_a_commented_starter_and_never_clobbers() {
         use crate::registry::{ColumnSchema, TableSchema};
