@@ -2355,13 +2355,21 @@ fn now_millis() -> u64 {
 /// prefix a slice would keep (#1589).
 pub(crate) fn redact_url(url: &str) -> String {
     match reqwest::Url::parse(url) {
-        Ok(u) => match (u.host_str(), u.port()) {
-            (Some(host), Some(port)) => format!("{}://{host}:{port}", u.scheme()),
-            (Some(host), None) => format!("{}://{host}", u.scheme()),
-            (None, _) => format!("{}:<no host>", u.scheme()),
+        Ok(u) => match url_host(&u) {
+            Some(host) => format!("{}://{host}", u.scheme()),
+            None => format!("{}:<no host>", u.scheme()),
         },
         Err(_) => "<unparseable url>".to_string(),
     }
+}
+
+/// `host[:port]` of a parsed URL and nothing else, for labels that must not carry a scheme.
+pub(crate) fn url_host(u: &reqwest::Url) -> Option<String> {
+    let host = u.host_str()?;
+    Some(match u.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
 }
 
 #[cfg(test)]

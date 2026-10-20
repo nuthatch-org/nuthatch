@@ -423,29 +423,31 @@ pub async fn fetch_ipfs_proven_within(
     let mut answered = false;
     let mut over_cap = None;
     for url in &urls {
+        // The failures are stored and served by `/ipfs/gave-up`, and a gateway may carry a key.
+        let shown = crate::rpc::redact_url(url);
         let body = match client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => match read_capped(resp).await {
                 // A CID can name an empty (or whitespace-only) file. Let the proof below decide;
                 // rejecting it here makes the resolver retry immutable bytes for half an hour.
                 Ok(body) if !body.trim().is_empty() || expect.is_some() => body,
                 Ok(_) => {
-                    failures.push(format!("{url}: empty body"));
+                    failures.push(format!("{shown}: empty body"));
                     continue;
                 }
                 Err(e) => {
                     if e.is::<crate::cid::OverCap>() {
                         over_cap = Some(e.to_string());
                     }
-                    failures.push(format!("{url}: {e}"));
+                    failures.push(format!("{shown}: {e}"));
                     continue;
                 }
             },
             Ok(resp) => {
-                failures.push(format!("{url}: HTTP {}", resp.status()));
+                failures.push(format!("{shown}: HTTP {}", resp.status()));
                 continue;
             }
             Err(e) => {
-                failures.push(format!("{url}: {e}"));
+                failures.push(format!("{shown}: {}", e.without_url()));
                 continue;
             }
         };
@@ -468,10 +470,10 @@ pub async fn fetch_ipfs_proven_within(
                 })
             }
             Err(e) if e.is::<crate::cid::Unprovable>() => {
-                failures.push(format!("{url}: {e}"));
+                failures.push(format!("{shown}: {e}"));
                 unproven.get_or_insert((body, e.to_string()));
             }
-            Err(e) => failures.push(format!("{url}: {e}")),
+            Err(e) => failures.push(format!("{shown}: {e}")),
         }
     }
 
@@ -489,7 +491,7 @@ pub async fn fetch_ipfs_proven_within(
                     if e.is::<crate::cid::OverCap>() {
                         over_cap = Some(e.to_string());
                     }
-                    failures.push(format!("{url}: {e:#}"));
+                    failures.push(format!("{}: {e:#}", crate::rpc::redact_url(&url)));
                 }
             }
         }
@@ -529,7 +531,8 @@ async fn fetch_car(client: &reqwest::Client, url: &str, cid: &crate::cid::Cid) -
         .get(url)
         .header(reqwest::header::ACCEPT, "application/vnd.ipld.car")
         .send()
-        .await?;
+        .await
+        .map_err(|e| e.without_url())?;
     if !resp.status().is_success() {
         bail!("HTTP {}", resp.status());
     }
@@ -581,7 +584,9 @@ async fn read_capped_bytes(resp: reqwest::Response, cap: usize) -> Result<Vec<u8
     let mut out: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("reading response body")?;
+        let chunk = chunk
+            .map_err(|e| e.without_url())
+            .context("reading response body")?;
         if out.len() + chunk.len() > cap {
             return Err(crate::cid::OverCap(format!(
                 "response exceeds {} MiB - refusing to buffer it",
@@ -1338,6 +1343,29 @@ mod tests {
         assert_eq!(got.body.as_bytes(), file);
         empty_handle.abort();
         good_handle.abort();
+    }
+
+    /// The failure text is stored and served by `/ipfs/gave-up`, so a keyed gateway must not reach
+    /// it, whether the key is userinfo or in the path, and whether the gateway answered or not (#2207).
+    #[tokio::test]
+    async fn a_gateway_failure_names_the_host_and_never_its_key() {
+        let cid = crate::cid::cid_v0_for(b"[1,2,3]");
+        let (answering, handle) = trustless_gateway(Vec::new(), None).await;
+        let keyed = answering.replacen("http://", "http://PROJECT:SECRET1@", 1);
+        let refused = "http://PROJECT:SECRET2@127.0.0.1:1/SECRET3/ipfs/".to_string();
+        let err = fetch_ipfs_proven(&cid, &[keyed, refused], Origin::Manifest)
+            .await
+            .err()
+            .expect("an empty answer proves nothing and the other gateway is closed");
+        handle.abort();
+        let text = format!("{err:#}");
+        for secret in ["SECRET1", "SECRET2", "SECRET3"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+        assert!(
+            text.contains("http://127.0.0.1:1"),
+            "the host still names the gateway: {text}"
+        );
     }
 
     #[tokio::test]

@@ -750,9 +750,9 @@ pub enum PackWhat {
 
 #[derive(Args)]
 pub struct PackKeygenArgs {
-    /// Where to write the keypair JSON.
-    #[arg(long, default_value = "nuthatch-key.json")]
-    pub out: String,
+    /// Where to write the keypair JSON. Defaults to ~/.nuthatch/nuthatch-key.json, outside any nest.
+    #[arg(long)]
+    pub out: Option<String>,
 }
 
 #[derive(Args)]

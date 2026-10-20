@@ -532,26 +532,28 @@ async fn post(
     if !op.variables.is_null() {
         body["variables"] = op.variables.clone();
     }
+    // A gateway URL carries its API key in the path.
+    let shown = crate::rpc::redact_url(url);
     let resp = client
         .post(url)
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("{url}: {e}"))?;
+        .map_err(|e| format!("{shown}: {}", e.without_url()))?;
     let status = resp.status();
     let value: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("{url}: response was not JSON ({e})"))?;
+        .map_err(|e| format!("{shown}: response was not JSON ({})", e.without_url()))?;
     if !status.is_success() {
-        return Err(format!("{url}: HTTP {status}"));
+        return Err(format!("{shown}: HTTP {status}"));
     }
     // A GraphQL endpoint can return 200 with an `errors` array and a partial `data`. Comparing the
     // partial answer would be comparing a failure to a success, so it is reported as an error.
     if let Some(errors) = value.get("errors").and_then(|e| e.as_array()) {
         if !errors.is_empty() {
             return Err(format!(
-                "{url}: {}",
+                "{shown}: {}",
                 serde_json::Value::Array(errors.clone())
             ));
         }

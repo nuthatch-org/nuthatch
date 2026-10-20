@@ -75,7 +75,7 @@ pub fn keygen(out: &Path) -> Result<()> {
         secret: hex::encode(sk.to_bytes()),
         public: hex::encode(sk.verifying_key().to_bytes()),
     };
-    std::fs::write(out, serde_json::to_string_pretty(&kf)?)
+    write_secret(out, serde_json::to_string_pretty(&kf)?.as_bytes())
         .with_context(|| format!("cannot write key file {}", out.display()))?;
     println!(
         "✓ wrote keypair to {} (public {})",
@@ -84,6 +84,30 @@ pub fn keygen(out: &Path) -> Result<()> {
     );
     println!("  keep the secret safe; distribute the public key so auditors can verify your packs");
     Ok(())
+}
+
+/// Owner-only on unix, including over an existing file whose mode was wider.
+fn write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(path)?;
+    #[cfg(unix)]
+    f.set_permissions(
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )?;
+    f.write_all(bytes)
+}
+
+/// `~/.nuthatch/nuthatch-key.json`: the working directory is usually a nest, and anything in a nest
+/// travels with `git push` and `nest bundle`.
+fn default_key_path(home: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    let home = home.ok_or_else(|| anyhow!("no home directory is set; pass --out <file>"))?;
+    Ok(PathBuf::from(home)
+        .join(".nuthatch")
+        .join("nuthatch-key.json"))
 }
 
 fn load_signing_key(path: &Path) -> Result<SigningKey> {
@@ -275,7 +299,22 @@ fn check_signature(body: &Body, sig: &Signature, trusted: &VerifyingKey) -> Resu
 /// CLI entry: build/verify/keygen dispatch.
 pub fn run(args: crate::cli::PackArgs, created: &str) -> Result<()> {
     match args.what {
-        crate::cli::PackWhat::Keygen(a) => keygen(&PathBuf::from(&a.out)),
+        crate::cli::PackWhat::Keygen(a) => {
+            let out = match a.out {
+                Some(out) => PathBuf::from(out),
+                None => {
+                    let out = default_key_path(
+                        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+                    )?;
+                    if let Some(parent) = out.parent() {
+                        std::fs::create_dir_all(parent)
+                            .with_context(|| format!("cannot create {}", parent.display()))?;
+                    }
+                    out
+                }
+            };
+            keygen(&out)
+        }
         crate::cli::PackWhat::Build(a) => build(
             &PathBuf::from(&a.dir),
             a.key.as_deref().map(Path::new),
@@ -353,6 +392,34 @@ mod tests {
             !check_signature(&tampered, &signature, &vk).unwrap(),
             "tampered body fails"
         );
+    }
+
+    /// The secret is created owner-only, also over a file that was already readable (#2197).
+    #[cfg(unix)]
+    #[test]
+    fn keygen_writes_the_secret_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.json");
+        keygen(&fresh).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&fresh), 0o600);
+        let old = dir.path().join("old.json");
+        std::fs::write(&old, "{}").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+        keygen(&old).unwrap();
+        assert_eq!(mode(&old), 0o600);
+    }
+
+    /// The default lives in the home directory, never in the nest the command was run from.
+    #[test]
+    fn the_default_key_path_is_outside_the_working_directory() {
+        let home = std::path::PathBuf::from("/home/op");
+        assert_eq!(
+            default_key_path(Some(home.clone().into_os_string())).unwrap(),
+            home.join(".nuthatch").join("nuthatch-key.json")
+        );
+        assert!(default_key_path(None).is_err());
     }
 
     fn nest() -> tempfile::TempDir {

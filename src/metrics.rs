@@ -1788,16 +1788,13 @@ fn jemalloc_stats() -> Option<JemallocStats> {
     })
 }
 
-/// Host[:port] of an RPC URL, never a scheme or path. An API key in a metric label is a
-/// credential leak; `://` in a label is the test that would have caught it (#812).
+/// Host[:port] of an RPC URL, never a scheme, userinfo, path or query. An API key in a metric label
+/// is a credential leak; `://` in a label is the test that would have caught it (#812, #2206).
 pub fn endpoint_label(url: &str) -> String {
-    let rest = url.split("://").nth(1).unwrap_or(url);
-    let hostport = rest.split('/').next().unwrap_or(rest);
-    let hostport = match hostport.rfind('@') {
-        Some(at) => &hostport[at + 1..],
-        None => hostport,
-    };
-    hostport.trim().to_string()
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| crate::rpc::url_host(&u))
+        .unwrap_or_else(|| "unparseable".to_string())
 }
 
 /// Bytes of the segment files a dataset's manifest names, each file counted once.
@@ -2234,6 +2231,13 @@ mod tests {
         assert!(!label.contains("://"), "a scheme in the label is the leak");
         assert!(!label.contains('/'), "a path in the label is the leak");
         assert!(!label.contains("SECRETKEY123"));
+        // A key after a path-less host, in the query or the fragment, is the same leak (#2206).
+        assert_eq!(
+            endpoint_label("https://rpc.example:8545?apikey=SECRET"),
+            "rpc.example:8545"
+        );
+        assert_eq!(endpoint_label("https://rpc.example#SECRET"), "rpc.example");
+        assert!(!endpoint_label("https://rpc.example?k=\"SECRET\"").contains('"'));
     }
 
     #[test]

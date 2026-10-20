@@ -225,9 +225,7 @@ fn events_declared_of(config: &crate::config::Config) -> Vec<String> {
 }
 
 fn provider_of(url: &str) -> Option<String> {
-    let rest = url.split("://").nth(1)?;
-    let host = rest.split('/').next()?;
-    (!host.is_empty()).then(|| host.to_string())
+    crate::rpc::url_host(&reqwest::Url::parse(url).ok()?)
 }
 
 /// A replayed report names the host the tape was recorded against, not the nest's configured
@@ -1556,6 +1554,15 @@ mod tests {
             .unwrap()
             .contains("SECRETKEY123"));
         assert_eq!(provider_of("not-a-url"), None);
+        // Basic-auth userinfo and a path-less query key are credentials too (#2206).
+        assert_eq!(
+            provider_of("https://user:pass@nd-1.p2pify.com/"),
+            Some("nd-1.p2pify.com".into())
+        );
+        assert_eq!(
+            provider_of("https://host.example?apikey=K"),
+            Some("host.example".into())
+        );
     }
 
     #[test]
