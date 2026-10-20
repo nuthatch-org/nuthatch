@@ -284,6 +284,44 @@ pub fn reuse_segments(old_dir: &Path, new_dir: &Path) -> Result<ReuseOutcome> {
         ));
     }
 
+    // Read the *old* version's watermark and indexed layout before anything is copied. Opened and
+    // dropped here, before the indexer opens it (redb is single-writer).
+    //
+    // Non-creating (#413, #469): a probe must not be able to answer itself. A directory can reach
+    // here with sealed segments but no store yet - the manifest check above only proves segments
+    // exist, not that a cursor ever opened this store - and a creating open would read
+    // `sealed_through = 0` back from the empty file it had just written, set the new store's
+    // watermark to 0, and litter the old directory with a store nobody indexed.
+    let (old_sealed, old_layout) = {
+        let s = crate::store::Store::open_existing(&old_dir.join(crate::config::DB_FILE))
+            .with_context(|| {
+                format!(
+                    "reusing segments from {} needs its sealed watermark, but there is no store \
+                     there to read it from",
+                    old_dir.display()
+                )
+            })?;
+        (
+            s.sealed_through(),
+            s.get_meta(crate::store::INDEXED_LAYOUT_KEY)?,
+        )
+    };
+    // The registry hash cannot see a swap of indexed positions (#2157). A store from before the
+    // layout was recorded has none, and is taken at its registry hash as before.
+    if let Some(found) = old_layout {
+        let found = serde_json::from_str(&found)
+            .with_context(|| format!("unreadable indexed layout in {}", old_dir.display()))?;
+        let config = crate::config::Config::load(new_dir)?;
+        let want = crate::indexer::indexed_layout(&crate::registry::from_nest(new_dir, &config)?);
+        let changes = crate::indexer::indexed_layout_changes(&found, &want);
+        if !changes.is_empty() {
+            return Ok(ReuseOutcome::NotReusable(format!(
+                "indexed parameters changed - history must be re-indexed:\n{}",
+                changes.join("\n")
+            )));
+        }
+    }
+
     // Copy every sealed file (the manifest + each content-addressed .parquet) into the new nest.
     let new_seg = new_dir.join(crate::seal::SEGMENTS_DIR);
     std::fs::create_dir_all(&new_seg).with_context(|| format!("creating {}", new_seg.display()))?;
@@ -300,25 +338,6 @@ pub fn reuse_segments(old_dir: &Path, new_dir: &Path) -> Result<ReuseOutcome> {
         }
     }
 
-    // Set the new store's sealed watermark so its indexer resumes past the reused range. Opened and
-    // dropped here, before the indexer opens it (redb is single-writer).
-    //
-    // Non-creating (#413, #469): this reads the *old* version's watermark, and a probe must not be
-    // able to answer itself. A directory can reach here with sealed segments but no store yet - the
-    // manifest check above only proves segments exist, not that a cursor ever opened this store - and
-    // a creating open would read `sealed_through = 0` back from the empty file it had just written,
-    // set the new store's watermark to 0, and litter the old directory with a store nobody indexed.
-    let old_sealed = {
-        let s = crate::store::Store::open_existing(&old_dir.join(crate::config::DB_FILE))
-            .with_context(|| {
-                format!(
-                    "reusing segments from {} needs its sealed watermark, but there is no store \
-                     there to read it from",
-                    old_dir.display()
-                )
-            })?;
-        s.sealed_through()
-    };
     {
         let s = crate::store::Store::open(&new_dir.join(crate::config::DB_FILE))?;
         s.set_meta("sealed_through", &old_sealed.to_string())?;
@@ -468,6 +487,74 @@ mod tests {
             !old_db.exists(),
             "a refused read must not leave a nuthatch.redb behind in the source directory - that \
              litters it and, per issue #408/#415, can make it look unadoptable ever after"
+        );
+    }
+
+    /// #2157: swapping which parameter is indexed keeps the registry hash, so the old segments hold
+    /// the values in other columns than the new version decodes them into.
+    #[test]
+    fn reuse_declines_when_the_indexed_positions_swap() {
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        for dir in [old.path(), new.path()] {
+            std::fs::write(
+                dir.join("schema.json"),
+                r#"{"registry_hash":"0xAAA","tables":[]}"#,
+            )
+            .unwrap();
+        }
+        let old_seg = old.path().join(crate::seal::SEGMENTS_DIR);
+        std::fs::create_dir_all(&old_seg).unwrap();
+        std::fs::write(old_seg.join(crate::seal::MANIFEST_FILE), "{}").unwrap();
+        {
+            let s = crate::store::Store::open(&old.path().join(crate::config::DB_FILE)).unwrap();
+            s.set_meta("sealed_through", "93").unwrap();
+            s.set_meta(crate::store::INDEXED_LAYOUT_KEY, r#"{"e__e":[0]}"#)
+                .unwrap();
+        }
+        let abi = |indexed: usize| {
+            let p = |i: usize, n: &str| {
+                format!(
+                    r#"{{"name":"{n}","type":"uint256","indexed":{}}}"#,
+                    i == indexed
+                )
+            };
+            format!(
+                r#"[{{"type":"event","name":"E","anonymous":false,"inputs":[{},{}]}}]"#,
+                p(0, "a"),
+                p(1, "b")
+            )
+        };
+        std::fs::create_dir_all(new.path().join("abis")).unwrap();
+        std::fs::write(
+            new.path().join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"swap\"\nchain = \"gnosis\"\nchain_id = 100\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"e\"\naddress = \"0x00000000000000000000000000000000000000aa\"\n\
+             abi = \"abis/e.json\"\n",
+        )
+        .unwrap();
+
+        std::fs::write(new.path().join("abis/e.json"), abi(1)).unwrap();
+        match reuse_segments(old.path(), new.path()).unwrap() {
+            ReuseOutcome::NotReusable(why) => assert!(
+                why.contains("e__e: indexed parameter positions [0] stored, [1] configured"),
+                "{why}"
+            ),
+            other => panic!("expected NotReusable, got {other:?}"),
+        }
+        assert!(
+            !new.path().join(crate::seal::SEGMENTS_DIR).exists(),
+            "a declined reuse must not copy segments"
+        );
+
+        std::fs::write(new.path().join("abis/e.json"), abi(0)).unwrap();
+        assert_eq!(
+            reuse_segments(old.path(), new.path()).unwrap(),
+            ReuseOutcome::Reused {
+                sealed_through: 93,
+                segments: 0
+            },
+            "the same layout still reuses"
         );
     }
 
