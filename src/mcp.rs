@@ -720,7 +720,11 @@ mod tests {
         let climbed = call_tool(&call("../_admin/events"), &client, &base).await;
         assert!(!matches!(&climbed, Ok(b) if b == "admin"), "{climbed:?}");
         for refused in ["..", "."] {
-            assert!(call_tool(&call(refused), &client, &base).await.is_err());
+            let err = call_tool(&call(refused), &client, &base).await.unwrap_err();
+            assert!(
+                err.to_string().contains("not a valid path segment"),
+                "{err}"
+            );
         }
         assert_eq!(
             call_tool(&call("a/b?c"), &client, &base).await.unwrap(),
