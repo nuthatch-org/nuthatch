@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use nuthatch_fixture_rpc::footprint::Footprint;
+use nuthatch_fixture_rpc::footprint::{self, Footprint};
 use nuthatch_fixture_rpc::multinest::{self, Multinest};
 use nuthatch_fixture_rpc::scripted::Scripted;
 use nuthatch_fixture_rpc::{serve, Fixture};
@@ -39,6 +39,13 @@ enum Chain {
         /// Advance the tip one block per fixture_advance call, recording when each was first seen
         #[arg(long)]
         moving: bool,
+        #[arg(long, default_value_t = footprint::TIP)]
+        tip: u64,
+        #[arg(long, default_value_t = footprint::LOGS_PER_BLOCK)]
+        logs_per_block: u64,
+        /// Transaction hashes in each header; the default serves headers without the field
+        #[arg(long, default_value_t = 0)]
+        txs_per_block: u64,
     },
     /// Many contracts emitting every event of an ABI, the tip moving once the backfill drains
     Multinest {
@@ -80,7 +87,18 @@ fn main() {
             );
             run(&bind, port, fx, Some(banner));
         }
-        Chain::Footprint { port, moving } => run("127.0.0.1", port, Footprint::new(moving), None),
+        Chain::Footprint {
+            port,
+            moving,
+            tip,
+            logs_per_block,
+            txs_per_block,
+        } => run(
+            "127.0.0.1",
+            port,
+            Footprint::dense(moving, tip, logs_per_block, txs_per_block),
+            None,
+        ),
         Chain::Multinest {
             port,
             abi,
