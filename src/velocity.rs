@@ -17,6 +17,7 @@
 use anyhow::{anyhow, Context, Result};
 use dbsp::utils::Tup2;
 use dbsp::{IndexedZSetReader, OrdZSet, OutputHandle, RootCircuit, Runtime};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
@@ -207,30 +208,31 @@ pub fn can_flag(key: &str, volume: i128, threshold: i128, window: u64, sealed: u
     sealed == 0 || volume >= threshold || bucket_window(key).is_none_or(|ws| ws >= open)
 }
 
-/// Collect (address, window) entries whose volume ≥ `threshold`, descending by volume.
-fn rows_over(buckets: &Buckets, threshold: i128) -> Vec<VelocityFlag> {
-    let mut out: Vec<VelocityFlag> = buckets
-        .iter()
-        .filter_map(|(k, &(count, volume))| {
-            if volume < threshold {
-                return None;
-            }
-            let (addr, ws) = k.split_once(SEP)?;
-            Some(VelocityFlag {
-                address: addr.to_string(),
-                window_start: ws.parse().ok()?,
+/// Collect (address, window) entries whose volume ≥ `threshold`, descending by volume, at most `limit`.
+fn rows_over(buckets: &Buckets, threshold: i128, limit: usize) -> Vec<VelocityFlag> {
+    let over = buckets.iter().filter_map(|(k, &(count, volume))| {
+        if volume < threshold {
+            return None;
+        }
+        let (addr, ws) = k.split_once(SEP)?;
+        Some((
+            volume,
+            Reverse(addr),
+            Reverse(ws.parse::<u64>().ok()?),
+            count,
+        ))
+    });
+    crate::views::top_k(over, limit)
+        .into_iter()
+        .map(
+            |(volume, Reverse(address), Reverse(window_start), count)| VelocityFlag {
+                address: address.to_string(),
+                window_start,
                 count,
                 volume,
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| {
-        b.volume
-            .cmp(&a.volume)
-            .then_with(|| a.address.cmp(&b.address))
-            .then_with(|| a.window_start.cmp(&b.window_start))
-    });
-    out
+            },
+        )
+        .collect()
 }
 
 /// An output delta as `(key, Some(new value))`, or `(key, None)` for a key that left the output.
@@ -405,8 +407,13 @@ impl VelocityView {
 
     /// The current velocity flags at or above `threshold`, descending by volume.
     pub fn flags(&self, threshold: i128) -> Vec<VelocityFlag> {
+        self.top_flags(threshold, usize::MAX)
+    }
+
+    /// The first `limit` of [`Self::flags`], without ordering the rest (#2210).
+    pub fn top_flags(&self, threshold: i128, limit: usize) -> Vec<VelocityFlag> {
         match self.rows.read() {
-            Ok(buckets) => rows_over(&buckets, threshold),
+            Ok(buckets) => rows_over(&buckets, threshold, limit),
             Err(_) => Vec::new(),
         }
     }
@@ -548,6 +555,27 @@ mod tests {
         assert_eq!(view.entries(), 25_000);
     }
 
+    /// #2210: `/flags?kind=velocity&limit=n` is the first `n` of the full ordering, ties included.
+    #[test]
+    fn top_flags_are_the_head_of_the_full_ordering() {
+        let mut c = Fed::new();
+        for (i, addr) in ["d", "b", "a", "c", "e"].iter().enumerate() {
+            c.step(velocity_deltas(addr, 10, 50, 1, 100)).unwrap();
+            c.step(velocity_deltas(addr, 150, 10 * (i as i128 + 1), 1, 100))
+                .unwrap();
+        }
+        let all = c.flags(i128::MIN);
+        assert_eq!(all.len(), 10);
+        for limit in [0, 1, 3, 7, 10, 11] {
+            assert_eq!(
+                rows_over(&c.rows, i128::MIN, limit),
+                all[..limit.min(all.len())],
+                "limit {limit}"
+            );
+        }
+        assert_eq!(rows_over(&c.rows, 20, 2), all[..2]);
+    }
+
     /// The circuit and a view's published map, as the view thread holds them.
     struct Fed {
         c: VelocityCircuit,
@@ -568,7 +596,7 @@ mod tests {
         }
 
         fn flags(&self, threshold: i128) -> Vec<VelocityFlag> {
-            rows_over(&self.rows, threshold)
+            rows_over(&self.rows, threshold, usize::MAX)
         }
     }
 }

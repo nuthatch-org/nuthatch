@@ -7162,6 +7162,8 @@ mod tests {
             tables: Arc::new(vec![]),
             sql_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             sql_queued: Default::default(),
+            memo_gate: Default::default(),
+            sql_response_bytes: Default::default(),
             sql_max_hot_rows: crate::serve::SQL_MAX_HOT_ROWS,
             sql_max_hot_bytes: crate::serve::SQL_MAX_HOT_BYTES,
             sql_max_named_scan_bytes: crate::serve::SQL_MAX_NAMED_SCAN_BYTES,

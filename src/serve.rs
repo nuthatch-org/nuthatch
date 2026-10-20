@@ -91,6 +91,45 @@ pub fn new_sql_gate() -> Arc<Semaphore> {
     Arc::new(Semaphore::new(sql_max_concurrency()))
 }
 
+/// Memo keys one nest builds at once. Each reads the segment manifest and hashes the authored
+/// files, and a hit re-stats every segment, so a flood of distinct statements queues here, off the
+/// executor, rather than on every worker (#2213).
+const MEMO_KEY_PERMITS: usize = 4;
+
+#[derive(Clone)]
+pub struct MemoGate(Arc<Semaphore>);
+
+impl Default for MemoGate {
+    fn default() -> Self {
+        Self(Arc::new(Semaphore::new(MEMO_KEY_PERMITS)))
+    }
+}
+
+/// `/sql` and `/q` response bodies the process holds at once, in KiB. A remembered answer costs no
+/// engine time to replay, so without this a few hundred slow readers of one 16 MiB answer hold
+/// gigabytes nothing else counts (#2212). Four of the largest result `engine` will build.
+const SQL_MAX_INFLIGHT_RESPONSE_KIB: usize = 4 * crate::engine::SQL_MAX_RESULT_BYTES / 1024;
+
+/// The budget for [`SQL_MAX_INFLIGHT_RESPONSE_KIB`]. Every default shares the process's one.
+#[derive(Clone)]
+pub struct ResponseBytes(Arc<Semaphore>);
+
+impl Default for ResponseBytes {
+    fn default() -> Self {
+        static PROCESS: std::sync::LazyLock<Arc<Semaphore>> =
+            std::sync::LazyLock::new(|| Arc::new(Semaphore::new(SQL_MAX_INFLIGHT_RESPONSE_KIB)));
+        Self(Arc::clone(&PROCESS))
+    }
+}
+
+impl ResponseBytes {
+    /// Room for a body of `len` bytes, held until the body is sent or dropped; `None` when full.
+    fn reserve(&self, len: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let kib = len.div_ceil(1024).clamp(1, SQL_MAX_INFLIGHT_RESPONSE_KIB) as u32;
+        Arc::clone(&self.0).try_acquire_many_owned(kib).ok()
+    }
+}
+
 pub fn sql_max_concurrency() -> usize {
     match std::env::var("NUTHATCH_SQL_MAX_CONCURRENCY") {
         Err(_) => SQL_MAX_CONCURRENCY,
@@ -266,6 +305,10 @@ pub struct AppState {
     /// Per-nest and not shared across a cursor, unlike the gate itself: the gate bounds what runs
     /// in Burrmill, this bounds the memory held by requests that are not running at all (#1319).
     pub sql_queued: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bounds how many `/sql` memo keys this nest builds at once (#2213).
+    pub memo_gate: MemoGate,
+    /// `/sql` response bytes in flight, process-wide in production (#2212).
+    pub sql_response_bytes: ResponseBytes,
     /// The most unsealed rows `/sql` and `/explain` will materialise for one query before refusing
     /// with a `503` (`HotScanTooLarge`) - the live value [`SQL_MAX_HOT_ROWS`] documents. A field
     /// rather than the handlers reading the const directly, so a test can lower the ceiling instead
@@ -3487,6 +3530,99 @@ async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
     )
 }
 
+/// Rows a whole-store read may touch inline, on the executor and without a permit (#2209, #2210).
+/// About the work of serialising the largest answer these routes give, so a read this small costs
+/// what its response does; one that needs more waits for the SQL gate like `/sql`.
+const INLINE_SCAN_ROWS: usize = 4096;
+
+/// `/sql`'s admission: a free permit, or a wait bounded in time and in how many wait, else `503`.
+async fn admit(
+    s: &AppState,
+) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, axum::response::Response> {
+    admit_to(&s.sql_gate, &s.sql_queued).await
+}
+
+/// [`admit`] to any gate, parking in the nest's one queue.
+async fn admit_to(
+    gate: &Arc<Semaphore>,
+    queued: &Arc<std::sync::atomic::AtomicUsize>,
+) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, axum::response::Response> {
+    let busy = || {
+        crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
+        )
+            .into_response()
+    };
+    if let Ok(permit) = Arc::clone(gate).try_acquire_owned() {
+        return Ok(permit);
+    }
+    let Some(_slot) = QueueSlot::take(queued) else {
+        return Err(busy());
+    };
+    match tokio::time::timeout(SQL_ADMISSION_WAIT, Arc::clone(gate).acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        _ => Err(busy()),
+    }
+}
+
+/// `work` off the executor under an admitted permit.
+async fn admitted<T: Send + 'static>(
+    s: &AppState,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, axum::response::Response> {
+    let permit = admit(s).await?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| error(format!("{e}")))
+}
+
+/// `work` inline when it reads at most [`INLINE_SCAN_ROWS`], else [`admitted`].
+async fn sized<T: Send + 'static>(
+    s: &AppState,
+    rows: usize,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, axum::response::Response> {
+    if rows <= INLINE_SCAN_ROWS {
+        Ok(work())
+    } else {
+        admitted(s, work).await
+    }
+}
+
+/// A hot-store read given a row budget, `None` when the budget ran out first. Tried inline at
+/// [`INLINE_SCAN_ROWS`], then admitted, off the executor, at the hot row ceiling `/sql` holds the
+/// tip to. The permit comes back for a caller with cold work to do under it.
+async fn bounded_hot_read<T: Send + 'static>(
+    s: &AppState,
+    read: impl Fn(usize) -> Result<Option<T>> + Send + 'static,
+) -> std::result::Result<(T, Option<tokio::sync::OwnedSemaphorePermit>), axum::response::Response> {
+    match read(INLINE_SCAN_ROWS) {
+        Ok(Some(rows)) => return Ok((rows, None)),
+        Ok(None) => {}
+        Err(e) => return Err(error(format!("{e:#}"))),
+    }
+    let permit = admit(s).await?;
+    let cap = s.sql_max_hot_rows;
+    match tokio::task::spawn_blocking(move || read(cap)).await {
+        Ok(Ok(Some(rows))) => Ok((rows, Some(permit))),
+        Ok(Ok(None)) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": crate::store::HotScanTooLarge { cap }.to_string(),
+                "sealed_through": s.store.sealed_through(),
+            })),
+        )
+            .into_response()),
+        Ok(Err(e)) => Err(error(format!("{e:#}"))),
+        Err(e) => Err(error(format!("{e}"))),
+    }
+}
+
 /// Recent rows of one table, merged across the hot store and the sealed cold segments.
 async fn table(
     State(s): State<AppState>,
@@ -3499,24 +3635,25 @@ async fn table(
     let limit = q.limit.unwrap_or(100).min(1000);
 
     // Hot rows (tip), newest first.
-    let hot = if q.from_block.is_none() && q.to_block.is_none() {
-        s.store.recent_by_table(&name, limit).and_then(|rows| {
-            rows.iter()
-                .map(|r| serde_json::from_str::<Value>(r).context("unparseable hot row"))
-                .collect()
-        })
-    } else {
-        hot_rows_in_window(
-            &*s.store,
-            &name,
-            limit,
-            q.from_block.unwrap_or(0),
-            q.to_block.unwrap_or(u64::MAX),
-        )
-    };
-    let mut items = match hot {
-        Ok(items) => items,
-        Err(e) => return error(format!("{e:#}")),
+    let store = s.store.clone();
+    let table = name.clone();
+    let window = (q.from_block.is_some() || q.to_block.is_some())
+        .then(|| (q.from_block.unwrap_or(0), q.to_block.unwrap_or(u64::MAX)));
+    let hot = bounded_hot_read(&s, move |max_scanned| match window {
+        None => store
+            .recent_by_table_within(&table, limit, max_scanned)?
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| serde_json::from_str::<Value>(r).context("unparseable hot row"))
+                    .collect()
+            })
+            .transpose(),
+        Some((from, to)) => hot_rows_in_window(&*store, &table, limit, from, to, max_scanned),
+    })
+    .await;
+    let (mut items, held) = match hot {
+        Ok(hot) => hot,
+        Err(refused) => return refused,
     };
 
     // Fill from cold (sealed segments) if the hot store didn't satisfy the limit. This runs under
@@ -3525,7 +3662,11 @@ async fn table(
     // hot-only answer is never read as the merged table (#1659).
     let mut degraded_tables = std::collections::BTreeSet::new();
     if items.len() < limit {
-        let cold = match Arc::clone(&s.sql_gate).try_acquire_owned() {
+        let permit = match held {
+            Some(permit) => Ok(permit),
+            None => Arc::clone(&s.sql_gate).try_acquire_owned(),
+        };
+        let cold = match permit {
             Err(_) => Err("the SQL gate is saturated".to_string()),
             Ok(permit) => {
                 let need = limit - items.len();
@@ -3593,35 +3734,48 @@ async fn table(
 
 /// The newest `limit` hot rows of `table` with a block in `[from, to]`, newest first. The window is
 /// applied before the limit, or a window below the newest `limit` hot rows would find none (#1659).
+/// `None` when the window holds more than `max_scanned` rows.
 fn hot_rows_in_window(
     store: &dyn crate::store::HotStore,
     table: &str,
     limit: usize,
     from: u64,
     to: u64,
-) -> Result<Vec<Value>> {
+    max_scanned: usize,
+) -> Result<Option<Vec<Value>>> {
     let mut newest = std::collections::VecDeque::with_capacity(limit.min(1024));
-    let mut unparseable = None;
+    let mut scanned = 0usize;
+    let mut outcome = Ok(true);
     store.scan_entities_in_range(from, to, &mut |_, raw| {
-        match serde_json::from_str::<Value>(raw) {
-            Ok(v) if v.get("table").and_then(Value::as_str) == Some(table) => {
-                newest.push_back(v);
+        if scanned == max_scanned {
+            outcome = Ok(false);
+            return false;
+        }
+        scanned += 1;
+        match crate::store::row_table_is(raw, table) {
+            Ok(true) => {
+                newest.push_back(raw.to_string());
                 if newest.len() > limit {
                     newest.pop_front();
                 }
             }
-            Ok(_) => {}
+            Ok(false) => {}
             Err(e) => {
-                unparseable = Some(e);
+                outcome = Err(e);
                 return false;
             }
         }
         true
     })?;
-    if let Some(e) = unparseable {
-        return Err(e).context("unparseable hot row");
+    if !outcome.context("unparseable hot row")? {
+        return Ok(None);
     }
-    Ok(newest.into_iter().rev().collect())
+    newest
+        .iter()
+        .rev()
+        .map(|r| serde_json::from_str(r).context("unparseable hot row"))
+        .collect::<Result<_>>()
+        .map(Some)
 }
 
 #[derive(Deserialize)]
@@ -4134,6 +4288,175 @@ fn json_len(value: &serde_json::Value) -> u64 {
     count.0
 }
 
+/// The relations `sql` reads, last name part lowercased, less the CTEs it defines; any
+/// `information_schema` relation adds `information_schema`. A statement that will not parse falls
+/// back to every identifier in it, which can only copy more.
+fn relations_read(sql: &str) -> std::collections::HashSet<String> {
+    use sqlparser::ast::{Query, Visit, Visitor};
+    use std::ops::ControlFlow;
+    struct Ctes(std::collections::HashSet<String>);
+    impl Visitor for Ctes {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            for cte in q.with.iter().flat_map(|w| &w.cte_tables) {
+                self.0.insert(cte.alias.name.value.to_ascii_lowercase());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let Ok(statements) =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, sql)
+    else {
+        return sql_identifiers(sql);
+    };
+    let mut read = std::collections::HashSet::new();
+    let mut ctes = Ctes(Default::default());
+    for statement in &statements {
+        let _ = sqlparser::ast::visit_relations(statement, |name| {
+            if name
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("information_schema")
+            {
+                read.insert("information_schema".to_string());
+            }
+            if let Some(last) = name.0.last() {
+                read.insert(last.to_string().trim_matches('"').to_ascii_lowercase());
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        let _ = statement.visit(&mut ctes);
+    }
+    read.retain(|r| !ctes.0.contains(r));
+    read
+}
+
+/// The identifiers in `sql`, lowercased: bare words and double-quoted names, skipping string
+/// literals and comments, so `'holders'` or `shareholders` does not name `holders`.
+fn sql_identifiers(sql: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut chars = sql.chars().peekable();
+    let mut word = String::new();
+    while let Some(c) = chars.next() {
+        if c.is_alphanumeric() || c == '_' {
+            word.push(c.to_ascii_lowercase());
+            continue;
+        }
+        if !word.is_empty() {
+            out.insert(std::mem::take(&mut word));
+        }
+        match (c, chars.peek()) {
+            ('\'', _) => {
+                while let Some(c) = chars.next() {
+                    if c == '\'' && chars.next_if_eq(&'\'').is_none() {
+                        break;
+                    }
+                }
+            }
+            ('"', _) => {
+                let mut quoted = String::new();
+                while let Some(c) = chars.next() {
+                    if c == '"' && chars.next_if_eq(&'"').is_none() {
+                        break;
+                    }
+                    quoted.push(c.to_ascii_lowercase());
+                }
+                out.insert(quoted);
+            }
+            ('-', Some('-')) => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut prev = ' ';
+                for c in chars.by_ref() {
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !word.is_empty() {
+        out.insert(word);
+    }
+    out
+}
+
+/// Copy into `hot` each maintained relation `sql` can reach, charged on top of the tip's rows and
+/// source bytes against the ceilings a declared query's copy is held to (#2211). A relation
+/// read neither by the statement nor by an authored view it reads is not copied, so `SELECT 1`
+/// copies nothing; a catalogue listing reaches them all.
+fn copy_reachable_entities(
+    entities: &[crate::entity_view::EntityView],
+    dir: &std::path::Path,
+    sql: &str,
+    hot: &mut std::collections::HashMap<String, Vec<Value>>,
+    (mut rows, mut bytes): (u64, u64),
+    (max_rows, max_bytes): (usize, u64),
+) -> Result<crate::entity_view::Watermarks> {
+    // The relations the statement reads and those of the authored views it reads, transitively.
+    let mut reach = relations_read(sql);
+    let mut views: Vec<(String, String)> = crate::analytics::nest_view_bodies(dir)
+        .into_iter()
+        .map(|(name, body)| (name.to_ascii_lowercase(), body))
+        .collect();
+    loop {
+        let (named, rest): (Vec<_>, Vec<_>) = views
+            .into_iter()
+            .partition(|(name, _)| reach.contains(name));
+        if named.is_empty() {
+            break;
+        }
+        for (_, body) in named {
+            reach.extend(relations_read(&body));
+        }
+        views = rest;
+    }
+    let reaches = |name: &str| {
+        reach.contains("information_schema") || reach.contains(&name.to_ascii_lowercase())
+    };
+    let mut watermarks = crate::entity_view::Watermarks::new();
+    for entity in entities {
+        if entity.unavailable().is_some() || entity.fault().is_some() {
+            continue;
+        }
+        if !reaches(entity.name()) {
+            // For the memo's fence only: no answer names a relation it could not reach.
+            watermarks.insert(entity.name().to_string(), entity.fence_watermark());
+            continue;
+        }
+        // Refuse on the count before serialising a relation too large to copy.
+        if rows.saturating_add(entity.len() as u64) > max_rows as u64 {
+            return Err(crate::store::HotScanTooLarge { cap: max_rows }.into());
+        }
+        let (copy, applied) = entity.rows_as_json_with_watermark();
+        rows += copy.len() as u64;
+        if rows > max_rows as u64 {
+            return Err(crate::store::HotScanTooLarge { cap: max_rows }.into());
+        }
+        bytes = copy
+            .iter()
+            .fold(bytes, |sum, row| sum.saturating_add(json_len(row)));
+        if bytes > max_bytes {
+            return Err(crate::store::HotScanBudgetExceeded {
+                source_bytes: bytes,
+                budget: max_bytes,
+            }
+            .into());
+        }
+        watermarks.insert(entity.name().to_string(), applied);
+        hot.insert(entity.name().to_string(), copy);
+    }
+    Ok(watermarks)
+}
+
 /// Read-only analytical SQL over the sealed segments; one view per `{alias}__{event}` table.
 ///
 /// Self-protecting, so a public `/sql` isn't a DoS vector: bounded concurrency (503 when the
@@ -4212,27 +4535,25 @@ fn memo_identity(
     Some((key, generation, sealed, watermarks))
 }
 
-async fn run_sql_query_at(
-    s: AppState,
-    sql_text: String,
-    requested_max_rows: Option<usize>,
-    historical_block: Option<u64>,
-    operation_timeout: Option<Duration>,
-) -> axum::response::Response {
+/// The remembered answer to `sql`, or the identity a computed answer is remembered under (#1186).
+/// Reads the manifest, hashes the authored files and, on a hit, stats every segment, so it is
+/// called off the executor (#2213).
+#[allow(clippy::type_complexity)]
+fn remembered(
+    s: &AppState,
+    sql: &str,
+    max_rows: usize,
+) -> std::result::Result<
+    axum::response::Response,
+    Option<(
+        crate::sqlmemo::Key,
+        u64,
+        String,
+        crate::entity_view::Watermarks,
+    )>,
+> {
     use crate::metrics::METRICS;
-    let q = SqlQuery {
-        q: sql_text,
-        max_rows: requested_max_rows,
-    };
-    // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
-    // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
-    let max_rows = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
-    // The deterministic memo (#1186): the identity of this answer is the statement plus every input
-    // it reads - the served segments, the hot rows' generation, entity watermarks, authored files. A
-    // remembered answer for that identity is the answer, and it is returned before the permit gate,
-    // because a hit costs no Burrmill and the gate exists to bound Burrmill. `None` where the store
-    // cannot report a rows generation; that backend simply computes every time.
-    let memo = memo_identity(&s, &q.q, max_rows, historical_block);
+    let memo = memo_identity(s, sql, max_rows, None);
     if let Some((key, generation, sealed, before)) = &memo {
         if let Some(hit) = crate::sqlmemo::get(key) {
             // Re-read the fence after the lookup, as the computing path does after its query: a
@@ -4269,8 +4590,8 @@ async fn run_sql_query_at(
                     == hit.segments
             {
                 METRICS.inc_sql();
-                return sql_response(
-                    &s,
+                return Ok(sql_response(
+                    s,
                     &hit.out,
                     SqlRows::Serialized {
                         json: &hit.rows,
@@ -4279,10 +4600,61 @@ async fn run_sql_query_at(
                     &hit.watermarks,
                     (as_of, sealed_through),
                     true,
-                );
+                ));
             }
         }
     }
+    Err(memo)
+}
+
+async fn run_sql_query_at(
+    s: AppState,
+    sql_text: String,
+    requested_max_rows: Option<usize>,
+    historical_block: Option<u64>,
+    operation_timeout: Option<Duration>,
+) -> axum::response::Response {
+    use crate::metrics::METRICS;
+    let q = SqlQuery {
+        q: sql_text,
+        max_rows: requested_max_rows,
+    };
+    // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
+    // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
+    let max_rows = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
+    // The deterministic memo (#1186): the identity of this answer is the statement plus every input
+    // it reads - the served segments, the hot rows' generation, entity watermarks, authored files. A
+    // remembered answer for that identity is the answer, and it is returned before the permit gate,
+    // because a hit costs no Burrmill and the gate exists to bound Burrmill. `None` where the store
+    // cannot report a rows generation; that backend simply computes every time.
+    // Building the key reads the manifest and hashes the authored files, so it runs off the
+    // executor, a few at a time per nest, before this request may queue for a permit (#2213).
+    let memo = if historical_block.is_none()
+        && s.store.rows_generation().is_some()
+        && crate::sqlmemo::is_deterministic(&q.q)
+    {
+        // A GraphQL operation already holds its SQL permit for every root.
+        let slot = match operation_timeout {
+            Some(_) => None,
+            None => match admit_to(&s.memo_gate.0, &s.sql_queued).await {
+                Ok(slot) => Some(slot),
+                Err(busy) => return busy,
+            },
+        };
+        let (st, sql) = (s.clone(), q.q.clone());
+        match tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            remembered(&st, &sql, max_rows)
+        })
+        .await
+        {
+            Ok(Ok(hit)) => return hit,
+            Ok(Err(memo)) => memo,
+            Err(e) => return error(format!("{e}")),
+        }
+    } else {
+        None
+    };
     // A GraphQL operation acquires once and passes the time it has left. Taking another permit
     // here would start that root's 30s from now (#1658). `/sql` still admits itself.
     let (permit, sql_timeout) = if let Some(timeout) = operation_timeout {
@@ -4353,6 +4725,7 @@ async fn run_sql_query_at(
     let store = s.store.clone();
     let sql_max_hot_rows = s.sql_max_hot_rows;
     let sql_max_hot_bytes = s.sql_max_hot_bytes;
+    let sql_max_named_scan_bytes = s.sql_max_named_scan_bytes;
     // The live, registry-derived schema - every table the config declares, whether or not it has
     // populated yet. Threaded into `define_views` so a declared-but-never-fired event still gets an
     // empty typed view instead of the whole nest view failing to bind on a missing table (#663).
@@ -4364,11 +4737,14 @@ async fn run_sql_query_at(
                               // rows alongside the sealed segments (RFC-0013). A scan failure degrades to cold-only.
                               // A scan failure degrades to cold-only, *except* an over-budget tip: that must surface, or a
                               // query would quietly answer from sealed data alone and report a different number.
-        let (hot, tip_unavailable) = match store
+        let (hot, tip_unavailable, spent) = match store
             .hot_rows_by_table_bounded_with_bytes(sql_max_hot_rows, sql_max_hot_bytes)
-            .map(|snapshot| snapshot.rows)
         {
-            Ok(hot) => (hot, false),
+            Ok(snapshot) => (
+                snapshot.rows,
+                false,
+                (snapshot.source_rows, snapshot.source_bytes),
+            ),
             Err(e)
                 if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
                     || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
@@ -4380,11 +4756,11 @@ async fn run_sql_query_at(
             // as serious, and the fallback below must not be the only trace of it.
             Err(e) => {
                 tracing::error!("hot-tip scan failed - serving cold-only for this query: {e:#}");
-                (Default::default(), true)
+                (Default::default(), true, (0, 0))
             }
         };
         // §5.4: the maintained relation is exposed under its declared name, alongside the decoded
-        // tables. **This copies every entity row into the connection, per request** - #822 criterion
+        // tables. **This copies every reachable entity row into the connection, per request** - #822 criterion
         // 7's separate term, and it is what this seam is: `hot` is the map `analytics::run` defines
         // its views from.
         //
@@ -4405,18 +4781,18 @@ async fn run_sql_query_at(
         // that watermark into the provenance below. Re-reading `applied_through()` after the query
         // ran is a race - measured at 1 in 12 on a 0.25s-block chain - and it reports an answer as
         // more current than the rows it is made of.
-        let mut watermarks: crate::entity_view::Watermarks = Default::default();
-        for entity in declared_entities.iter() {
-            if historical_block.is_some() {
-                continue;
-            }
-            if entity.unavailable().is_some() || entity.fault().is_some() {
-                continue;
-            }
-            let (rows, applied) = entity.rows_as_json_with_watermark();
-            watermarks.insert(entity.name().to_string(), applied);
-            hot.insert(entity.name().to_string(), rows);
-        }
+        let watermarks = if historical_block.is_some() {
+            Default::default()
+        } else {
+            copy_reachable_entities(
+                &declared_entities,
+                &dir,
+                &sql,
+                &mut hot,
+                spent,
+                (sql_max_hot_rows, sql_max_named_scan_bytes),
+            )?
+        };
         let sealed_through = store.sealed_through();
         let guard = analytics::QueryGuard {
             timeout: sql_timeout,
@@ -4579,6 +4955,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
     let store = s.store.clone();
     let sql_max_hot_rows = s.sql_max_hot_rows;
     let sql_max_hot_bytes = s.sql_max_hot_bytes;
+    let sql_max_named_scan_bytes = s.sql_max_named_scan_bytes;
     let tables = s.tables.clone();
     let declared_entities = s.entities.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -4589,11 +4966,14 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
         // the process past the budget `/sql` refuses to cross (#293). As there, an over-budget tip
         // surfaces rather than degrading to cold-only: answering "valid" off sealed data alone
         // would bind against a narrower schema than the one a subsequent `/sql` would see.
-        let (hot, tip_unavailable) = match store
+        let (hot, tip_unavailable, spent) = match store
             .hot_rows_by_table_bounded_with_bytes(sql_max_hot_rows, sql_max_hot_bytes)
-            .map(|snapshot| snapshot.rows)
         {
-            Ok(hot) => (hot, false),
+            Ok(snapshot) => (
+                snapshot.rows,
+                false,
+                (snapshot.source_rows, snapshot.source_bytes),
+            ),
             Err(e)
                 if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
                     || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
@@ -4605,7 +4985,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
             // least as serious, and the fallback below must not be the only trace of it - #528.
             Err(e) => {
                 tracing::error!("hot-tip scan failed - serving cold-only for this query: {e:#}");
-                (Default::default(), true)
+                (Default::default(), true, (0, 0))
             }
         };
         // **The same relations `/sql` would see.** Without this, `/explain` answers a question about a
@@ -4620,12 +5000,14 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
         // it was told a good query was invalid, or told it was valid for the wrong reason, depending
         // on which of the pool it landed on.
         let mut hot = hot;
-        for entity in declared_entities.iter() {
-            if entity.unavailable().is_some() || entity.fault().is_some() {
-                continue;
-            }
-            hot.insert(entity.name().to_string(), entity.rows_as_json());
-        }
+        copy_reachable_entities(
+            &declared_entities,
+            &dir,
+            &query,
+            &mut hot,
+            spent,
+            (sql_max_hot_rows, sql_max_named_scan_bytes),
+        )?;
         let sealed_through = store.sealed_through();
         let mut out = analytics::plan_hot_cold(
             &dir,
@@ -4705,11 +5087,14 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
 /// Top balances from the IVM view, descending. Balances are in i64 token base units.
 async fn balances(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(100).min(1000);
+    let view = s.balances.clone();
+    let top = match sized(&s, s.balances.holders(), move || view.top(limit)).await {
+        Ok(top) => top,
+        Err(refused) => return refused,
+    };
     // Balances are i128 base units, serialised as decimal strings - JSON numbers can't carry i128
     // losslessly, and a client parsing a huge balance as an f64 would silently corrupt it.
-    let items: Vec<Value> = s
-        .balances
-        .top(limit)
+    let items: Vec<Value> = top
         .into_iter()
         .map(|(address, balance)| json!({ "address": address, "balance": balance.to_string() }))
         .collect();
@@ -4724,6 +5109,7 @@ async fn balances(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> 
         "items": items,
         "dropped_over_i128": s.balances.dropped_over_i128(),
     }))
+    .into_response()
 }
 
 /// The nest's authored incremental entities, and how current each one is (RFC-0041 §5.4, #822).
@@ -4901,21 +5287,73 @@ fn sql_response(
             provenance.insert("offchain".into(), read);
         }
     }
-    match rows {
-        SqlRows::Values(_) => Json(response).into_response(),
-        SqlRows::Serialized { json, .. } => match serde_json::to_vec(&WithRows(&response, json)) {
-            Ok(body) => (
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                body,
-            )
-                .into_response(),
-            Err(e) => (
+    // Room for the body is taken before a remembered one is copied, and after a computed one,
+    // already bounded by the permit that computed it, is serialized (#2212).
+    let full = || {
+        crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "server busy: too many SQL response bytes in flight" })),
+        )
+            .into_response()
+    };
+    let early = match rows {
+        SqlRows::Serialized { json, .. } => {
+            let len = json
+                .get()
+                .len()
+                .saturating_add(json_len(&response) as usize);
+            match s.sql_response_bytes.reserve(len) {
+                Some(permit) => Some(permit),
+                None => return full(),
+            }
+        }
+        SqlRows::Values(_) => None,
+    };
+    let body = match rows {
+        SqlRows::Values(_) => serde_json::to_vec(&response),
+        SqlRows::Serialized { json, .. } => serde_json::to_vec(&WithRows(&response, json)),
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(e) => {
+            return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("serializing a remembered answer: {e}") })),
+                Json(json!({ "error": format!("serializing an answer: {e}") })),
             )
-                .into_response(),
-        },
+                .into_response()
+        }
+    };
+    match early.or_else(|| s.sql_response_bytes.reserve(body.len())) {
+        Some(permit) => held_body(body, permit),
+        None => full(),
     }
+}
+
+/// `body` as a JSON response that holds `permit` until its last chunk has been taken to be sent.
+fn held_body(body: Vec<u8>, permit: tokio::sync::OwnedSemaphorePermit) -> axum::response::Response {
+    use futures::StreamExt;
+    const CHUNK: usize = 64 * 1024;
+    let len = body.len();
+    let body = axum::body::Bytes::from(body);
+    let chunks = (0..len)
+        .step_by(CHUNK)
+        .map(move |at| Ok::<_, std::convert::Infallible>(body.slice(at..(at + CHUNK).min(len))));
+    let stream = stream::iter(chunks).map(move |chunk| {
+        let _held = &permit;
+        chunk
+    });
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            ),
+            (axum::http::header::CONTENT_LENGTH, len.to_string()),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 /// The rows of a `/sql` answer: computed, or remembered already serialized (#2072).
@@ -5179,15 +5617,19 @@ struct FlagsQuery {
 /// `threshold_flag` annotations (hot store; the full sealed history is at `/sql SELECT * FROM
 /// threshold_flag`). Omit `kind` for both. Amounts are i128 base units, serialised as decimal strings.
 async fn flags(State(s): State<AppState>, Query(q): Query<FlagsQuery>) -> impl IntoResponse {
+    type Refused = axum::response::Response;
     let limit = q.limit.unwrap_or(100).min(1000);
     let kind = q.kind.as_deref();
 
-    let velocity = |s: &AppState| -> Vec<Value> {
+    async fn velocity(s: &AppState, limit: usize) -> std::result::Result<Vec<Value>, Refused> {
         let threshold = s.velocity_threshold.unwrap_or(i128::MIN);
-        s.velocity
-            .flags(threshold)
+        let view = s.velocity.clone();
+        let flags = sized(s, s.velocity.entries(), move || {
+            view.top_flags(threshold, limit)
+        })
+        .await?;
+        Ok(flags
             .into_iter()
-            .take(limit)
             .map(|f| {
                 json!({
                     "address": f.address,
@@ -5196,52 +5638,54 @@ async fn flags(State(s): State<AppState>, Query(q): Query<FlagsQuery>) -> impl I
                     "volume": f.volume.to_string(),
                 })
             })
-            .collect()
-    };
+            .collect())
+    }
     // Recent threshold_flag annotations from the hot store (newest first). Sealed history via /sql.
-    let threshold = match kind {
-        Some("threshold") | None => {
-            let read = s
-                .store
-                .recent_by_table("threshold_flag", limit)
-                .and_then(|rows| {
+    // An unparseable row is corruption and answers 500, not a shorter list.
+    async fn threshold(s: &AppState, limit: usize) -> std::result::Result<Vec<Value>, Refused> {
+        let store = s.store.clone();
+        let (rows, _) = bounded_hot_read(s, move |max_scanned| {
+            store
+                .recent_by_table_within("threshold_flag", limit, max_scanned)?
+                .map(|rows| {
                     rows.iter()
                         .map(|r| serde_json::from_str::<Value>(r).context("unparseable hot row"))
                         .collect::<Result<Vec<Value>>>()
-                });
-            match read {
-                Ok(rows) => rows,
-                Err(e) => return error(format!("{e:#}")),
-            }
-        }
-        _ => Vec::new(),
-    };
-
-    match kind {
-        Some("velocity") => Json(json!({
-            "kind": "velocity",
-            "threshold": s.velocity_threshold.map(|t| t.to_string()),
-            "flags": velocity(&s),
-        }))
-        .into_response(),
-        Some("threshold") => Json(json!({
-            "kind": "threshold",
-            "threshold": s.threshold.map(|t| t.to_string()),
-            "flags": threshold,
-            "note": "recent hot flags; full sealed history: /sql?q=SELECT * FROM threshold_flag",
-        }))
-        .into_response(),
-        Some(other) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("unknown flag kind '{other}' (want: threshold, velocity)") })),
-        )
-            .into_response(),
-        None => Json(json!({
-            "threshold": { "configured": s.threshold.map(|t| t.to_string()), "flags": threshold },
-            "velocity": { "configured": s.velocity_threshold.map(|t| t.to_string()), "flags": velocity(&s) },
-        }))
-        .into_response(),
+                })
+                .transpose()
+        })
+        .await?;
+        Ok(rows)
     }
+
+    let answer = async {
+        Ok::<_, Refused>(match kind {
+            Some("velocity") => Json(json!({
+                "kind": "velocity",
+                "threshold": s.velocity_threshold.map(|t| t.to_string()),
+                "flags": velocity(&s, limit).await?,
+            }))
+            .into_response(),
+            Some("threshold") => Json(json!({
+                "kind": "threshold",
+                "threshold": s.threshold.map(|t| t.to_string()),
+                "flags": threshold(&s, limit).await?,
+                "note": "recent hot flags; full sealed history: /sql?q=SELECT * FROM threshold_flag",
+            }))
+            .into_response(),
+            Some(other) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("unknown flag kind '{other}' (want: threshold, velocity)") })),
+            )
+                .into_response(),
+            None => Json(json!({
+                "threshold": { "configured": s.threshold.map(|t| t.to_string()), "flags": threshold(&s, limit).await? },
+                "velocity": { "configured": s.velocity_threshold.map(|t| t.to_string()), "flags": velocity(&s, limit).await? },
+            }))
+            .into_response(),
+        })
+    };
+    answer.await.unwrap_or_else(|refused| refused)
 }
 
 /// Parse an entity id `{block:012}-{log_index:06}` back into its components.
@@ -6124,6 +6568,8 @@ mod tests {
             seal_span: crate::chains::DEFAULT_SEAL_SPAN,
             freshness: Default::default(),
             sql_queued: Default::default(),
+            memo_gate: Default::default(),
+            sql_response_bytes: Default::default(),
             sql_max_hot_rows: SQL_MAX_HOT_ROWS,
             sql_max_hot_bytes: SQL_MAX_HOT_BYTES,
             sql_max_named_scan_bytes: SQL_MAX_NAMED_SCAN_BYTES,
@@ -8379,6 +8825,116 @@ mod tests {
         assert_eq!(body["degraded"], false, "{body}");
     }
 
+    /// A hot store past [`INLINE_SCAN_ROWS`]: one `rare` row under `rows` newer rows of `t`.
+    fn deep_hot_fixture(dir: &std::path::Path, rows: u64) -> AppState {
+        let mut state = table_fixture(dir, 1..=1, 2..=2);
+        let mut tables = (*state.tables).clone();
+        let mut rare = tables[0].clone();
+        rare.table = "rare".into();
+        rare.alias = "rare".into();
+        tables.push(rare);
+        state.tables = Arc::new(tables);
+        let row = |table: &str, b: u64| {
+            json!({"table": table, "block_number": b, "log_index": 0}).to_string()
+        };
+        let mut batch = vec![(Store::entity_key(10, 0), row("rare", 10))];
+        batch.extend((11..11 + rows).map(|b| (Store::entity_key(b, 0), row("t", b))));
+        state.store.commit_window(&batch, None, 10 + rows).unwrap();
+        state
+    }
+
+    /// #2209: a read that has to walk the hot store waits for the SQL gate like `/sql`, rather than
+    /// parsing the whole tip on the executor; a read the newest rows answer still needs no permit.
+    #[tokio::test]
+    async fn a_hot_read_past_the_inline_budget_waits_for_the_sql_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = deep_hot_fixture(tmp.path(), INLINE_SCAN_ROWS as u64 + 10);
+        let held = Arc::clone(&state.sql_gate).try_acquire_owned().unwrap();
+        for uri in [
+            "/table/rare?limit=10",
+            "/table/rare?limit=10&from_block=0",
+            "/flags",
+            "/flags?kind=threshold",
+        ] {
+            let (status, body) = get_json(state.clone(), uri).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+        }
+        let (status, body) = get_json(state.clone(), "/table/t?limit=10").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 10, "{body}");
+        let (status, body) = get_json(state.clone(), "/flags?kind=velocity").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        drop(held);
+
+        let (status, body) = get_json(state, "/table/rare?limit=10").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 1, "{body}");
+        assert_eq!(body["degraded"], false, "{body}");
+    }
+
+    /// #2210: `/balances` and velocity flags walk their whole view whatever the limit, so past the
+    /// inline budget they wait for the SQL gate; a small view answers without one.
+    #[tokio::test]
+    async fn a_whole_view_read_past_the_inline_budget_waits_for_the_sql_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 1);
+        let holders = INLINE_SCAN_ROWS + 1;
+        state.balances.apply(
+            (0..holders)
+                .flat_map(|i| crate::views::transfer_deltas("0xm", &format!("0x{i:040x}"), 1, 1))
+                .collect(),
+        );
+        state.balances.flush();
+        state.velocity.apply(
+            (0..holders)
+                .flat_map(|i| {
+                    crate::velocity::velocity_deltas(&format!("0x{i:040x}"), 1, 1, 1, 100)
+                })
+                .collect(),
+        );
+        state.velocity.flush();
+
+        let held = Arc::clone(&state.sql_gate).try_acquire_owned().unwrap();
+        for uri in ["/balances?limit=1", "/flags?kind=velocity&limit=1"] {
+            let (status, body) = get_json(state.clone(), uri).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+        }
+        drop(held);
+        let (status, body) = get_json(state.clone(), "/balances?limit=1").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["items"][0]["address"],
+            format!("0x{:040x}", 0),
+            "{body}"
+        );
+        let (status, body) = get_json(state, "/flags?kind=velocity&limit=1").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["flags"].as_array().unwrap().len(), 1, "{body}");
+    }
+
+    /// #2209: an admitted hot read is held to the hot row ceiling `/sql` holds the tip to.
+    #[tokio::test]
+    async fn a_hot_read_past_the_row_ceiling_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = deep_hot_fixture(tmp.path(), INLINE_SCAN_ROWS as u64 + 10);
+        state.sql_max_hot_rows = INLINE_SCAN_ROWS + 5;
+        for uri in ["/table/rare?limit=10", "/table/rare?from_block=0", "/flags"] {
+            let (status, body) = get_json(state.clone(), uri).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unsealed tip holds more than"),
+                "{uri}: {body}"
+            );
+        }
+        state.sql_max_hot_rows = INLINE_SCAN_ROWS + 12;
+        let (status, body) = get_json(state, "/table/rare?from_block=0").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 1, "{body}");
+    }
+
     /// #1659: a block window is applied to the hot rows before the limit, so a window older than
     /// the newest `limit` hot rows still finds the rows inside it.
     #[tokio::test]
@@ -8444,6 +9000,63 @@ mod tests {
         drop(held);
         assert_eq!(queued.load(Ordering::Relaxed), 0);
         assert!(QueueSlot::take(&queued).is_some());
+    }
+
+    /// #2212: a `/sql` body holds its bytes until it has been taken to be sent, and past the budget
+    /// the next answer is refused rather than buffered, a remembered one included.
+    #[tokio::test]
+    async fn sql_response_bytes_in_flight_are_bounded() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.sql_response_bytes = ResponseBytes(Arc::new(Semaphore::new(1)));
+        let app = router(SharedNest::new(state));
+        let get = |q: &str| {
+            let req = axum::http::Request::builder()
+                .uri(format!("/sql?q={q}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            app.clone().oneshot(req)
+        };
+
+        let unread = get("SELECT%202212%20AS%20n").await.unwrap();
+        assert_eq!(unread.status(), StatusCode::OK);
+        for q in ["SELECT%202212%20AS%20n", "SELECT%201%20AS%20m"] {
+            let refused = get(q).await.unwrap();
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE, "{q}");
+        }
+        let body = axum::body::to_bytes(unread.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["rows"][0]["n"],
+            2212
+        );
+
+        let again = get("SELECT%202212%20AS%20n").await.unwrap();
+        assert_eq!(again.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(again.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["cached"],
+            true
+        );
+    }
+
+    /// #2213: a memo key is built under the nest's memo gate, so a flood of deterministic statements
+    /// waits there; a statement the memo never keeps does not build one.
+    #[tokio::test]
+    async fn memo_keys_are_built_under_their_own_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        let _held = Arc::clone(&state.memo_gate.0)
+            .try_acquire_many_owned(MEMO_KEY_PERMITS as u32)
+            .unwrap();
+        let (status, body) = get_json(state.clone(), "/sql?q=SELECT%202213%20AS%20n").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let (status, body) = get_json(state, "/sql?q=SELECT%20random()%20AS%20r").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     /// A request refused because the queue is full is refused *immediately* - it must not also sit
@@ -8888,12 +9501,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn maintained_relation_rows_spend_the_named_scan_budget() {
+    /// A maintained relation `name` holding two rows.
+    fn two_row_entity(name: &str) -> crate::entity_view::EntityView {
         use crate::entity_expr::Expr;
         use crate::entity_plan::{Agg, Plan, Source};
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
         let abi: alloy_json_abi::JsonAbi = serde_json::from_str(
             r#"[{"type":"event","name":"Transfer","inputs":[
                 {"name":"from","type":"address","indexed":true},
@@ -8922,7 +9533,7 @@ mod tests {
         };
         let columns = vec!["to".to_string(), "sum_value".to_string()];
         let entity =
-            crate::entity_view::EntityView::start("e", &plan, &columns, &reg, 1_000, false)
+            crate::entity_view::EntityView::start(name, &plan, &columns, &reg, 1_000, false)
                 .unwrap();
         let row = |to: &str, v: i128| {
             crate::entity_row::Row(vec![
@@ -8938,6 +9549,14 @@ mod tests {
             10,
         );
         entity.flush();
+        entity
+    }
+
+    #[tokio::test]
+    async fn maintained_relation_rows_spend_the_named_scan_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        let entity = two_row_entity("e");
         let (rows, _) = entity.rows_as_json_with_watermark();
         assert_eq!(rows.len(), 2);
         let bytes: u64 = rows.iter().map(json_len).sum();
@@ -8962,6 +9581,76 @@ mod tests {
         let app = router(SharedNest::new(state));
         let (status, _, body) = call_named(&app, named_request(&[])).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    }
+
+    #[test]
+    fn sql_identifiers_skip_literals_and_comments() {
+        let ids = sql_identifiers(
+            "SELECT \"Holders\", h.x FROM whales h -- shareholders\n WHERE s = 'it''s holders' /* x */",
+        );
+        let mut ids: Vec<_> = ids.into_iter().collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            ["from", "h", "holders", "s", "select", "whales", "where", "x"]
+        );
+    }
+
+    /// #2211: `/sql` and `/explain` copy a maintained relation only for a statement that can reach
+    /// it, directly or through an authored view, and charge the copy to the ceilings `/q` does.
+    #[tokio::test]
+    async fn sql_copies_only_reachable_relations_and_charges_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.entities = Arc::new(vec![two_row_entity("holders")]);
+        std::fs::create_dir_all(tmp.path().join("views")).unwrap();
+        std::fs::write(
+            tmp.path().join("views/whales.sql"),
+            "CREATE VIEW whales AS SELECT * FROM holders;",
+        )
+        .unwrap();
+        let get = |state: &AppState, uri: &str| {
+            let (state, uri) = (state.clone(), uri.to_string());
+            async move { get_json(state, &uri).await }
+        };
+
+        let (status, body) = get(&state, "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20whales").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["rows"][0]["n"], 2, "{body}");
+
+        state.sql_max_hot_rows = 1;
+        for uri in [
+            "/sql?q=SELECT%20count(*)%20AS%20m%20FROM%20holders",
+            "/sql?q=SELECT%20count(*)%20AS%20m%20FROM%20whales",
+            "/explain?q=SELECT%20*%20FROM%20holders",
+        ] {
+            let (status, body) = get(&state, uri).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+        }
+        // A literal, a longer identifier or a comment that spells the name does not reach it.
+        for uri in [
+            "/sql?q=SELECT%201%20AS%20one",
+            "/explain?q=SELECT%201",
+            "/sql?q=SELECT%20'holders'%20AS%20s",
+            "/sql?q=SELECT%201%20AS%20shareholders",
+            "/sql?q=SELECT%201%20AS%20n%20--%20holders",
+            "/sql?q=SELECT%201%20AS%20n%20/*%20holders%20*/",
+            "/sql?q=SELECT%201%20AS%20holders",
+            "/sql?q=WITH%20other%20AS%20(SELECT%201%20AS%20holders)%20SELECT%20holders%20FROM%20other",
+            "/sql?q=WITH%20holders%20AS%20(SELECT%201%20AS%20n)%20SELECT%20n%20FROM%20holders",
+        ] {
+            let (status, body) = get(&state, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        }
+        // A column named for it, from a table that does not exist, is a bind error and not a copy.
+        let (status, body) = get(&state, "/sql?q=SELECT%20holders%20FROM%20other").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        state.sql_max_hot_rows = SQL_MAX_HOT_ROWS;
+        state.sql_max_named_scan_bytes = 1;
+        let (status, body) = get(&state, "/sql?q=SELECT%20*%20FROM%20holders").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body["hot_source_bytes"].as_u64().unwrap() > 1, "{body}");
     }
 
     #[cfg(feature = "counter")]

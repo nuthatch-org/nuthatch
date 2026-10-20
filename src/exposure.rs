@@ -276,12 +276,46 @@ enum Msg {
     Flush(SyncSender<()>),
 }
 
+/// The published view, keyed by address so `/exposure/{address}` is one lookup, not a walk of every
+/// labeled counterparty under the lock the circuit thread publishes through (#2214).
+#[derive(Default)]
+struct Published {
+    by_address: HashMap<String, Vec<ExposureRow>>,
+    entries: usize,
+}
+
+impl Published {
+    fn insert(&mut self, key: &str, count: i128, amount: i128) {
+        let mut parts = key.splitn(3, SEP);
+        let (Some(address), Some(label), Some(direction)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return;
+        };
+        let direction = match direction {
+            "out" => "out",
+            "in" => "in",
+            _ => return,
+        };
+        self.by_address
+            .entry(address.to_string())
+            .or_default()
+            .push(ExposureRow {
+                label: label.to_string(),
+                direction,
+                count,
+                amount,
+            });
+        self.entries += 1;
+    }
+}
+
 /// Cheap-to-clone handle to the live exposure view. Mirrors [`crate::views::BalanceView`].
 #[derive(Clone)]
 pub struct ExposureView {
     tx: Sender<Msg>,
-    /// Snapshot of the maintained view: address-prefixed key → (count, amount). Read by the API.
-    rows: Arc<RwLock<HashMap<String, (i128, i128)>>>,
+    /// Snapshot of the maintained view. Read by the API.
+    rows: Arc<RwLock<Published>>,
     /// Flips false if the circuit thread dies on an error, so the ingest loop can fail loudly rather
     /// than serve frozen (and, for compliance, silently wrong) exposure. A disabled view stays healthy.
     healthy: Arc<AtomicBool>,
@@ -293,7 +327,7 @@ impl ExposureView {
     /// receiver) and `snapshot` stays empty, so an unused view costs nothing (L10).
     pub fn start(enabled: bool) -> Result<Self> {
         let (tx, rx) = channel::<Msg>();
-        let rows = Arc::new(RwLock::new(HashMap::new()));
+        let rows = Arc::new(RwLock::new(Published::default()));
         let healthy = Arc::new(AtomicBool::new(true));
         if !enabled {
             drop(rx);
@@ -323,14 +357,12 @@ impl ExposureView {
                             // Publish the whole (count, amount) map after each step. The view is small
                             // (labeled-set counterparties only), so a full swap is cheap and keeps the
                             // read path lock-free of the circuit internals.
-                            let mut out = shared.write().unwrap();
-                            out.clear();
+                            let mut next = Published::default();
                             for (k, &c) in &circuit.counts {
-                                out.insert(
-                                    k.clone(),
-                                    (c, circuit.amounts.get(k).copied().unwrap_or(0)),
-                                );
+                                next.insert(k, c, circuit.amounts.get(k).copied().unwrap_or(0));
                             }
+                            let old = std::mem::replace(&mut *shared.write().unwrap(), next);
+                            drop(old);
                         }
                         Msg::Flush(ack) => {
                             let _ = ack.send(());
@@ -376,31 +408,12 @@ impl ExposureView {
 
     /// The exposure rows for `address`, descending by amount.
     pub fn exposure(&self, address: &str) -> Vec<ExposureRow> {
-        let map = match self.rows.read() {
-            Ok(m) => m,
+        let mut rows = match self.rows.read() {
+            Ok(m) => m.by_address.get(address).cloned().unwrap_or_default(),
             Err(_) => return Vec::new(),
         };
-        let prefix = format!("{address}{SEP}");
-        let mut rows: Vec<ExposureRow> = map
-            .iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .filter_map(|(k, &(count, amount))| {
-                let mut parts = k.splitn(3, SEP);
-                let _addr = parts.next()?;
-                let label = parts.next()?.to_string();
-                let direction = match parts.next()? {
-                    "out" => "out",
-                    "in" => "in",
-                    _ => return None,
-                };
-                Some(ExposureRow {
-                    label,
-                    direction,
-                    count,
-                    amount,
-                })
-            })
-            .collect();
+        #[cfg(test)]
+        EXPOSURE_ROWS_READ.with(|n| n.set(n.get() + rows.len()));
         rows.sort_by(|a, b| {
             b.amount
                 .cmp(&a.amount)
@@ -413,8 +426,13 @@ impl ExposureView {
     /// Number of distinct (address, label, direction) exposure entries maintained - a small gauge for
     /// `/` and `/metrics`.
     pub fn entries(&self) -> usize {
-        self.rows.read().map(|m| m.len()).unwrap_or(0)
+        self.rows.read().map(|m| m.entries).unwrap_or(0)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXPOSURE_ROWS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -574,5 +592,30 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].amount, 42);
         assert_eq!(view.entries(), 1);
+    }
+
+    /// #2214: one address's exposure reads that address's rows, not every labeled counterparty's.
+    #[test]
+    fn an_address_read_touches_only_that_address() {
+        let labels = labelset(&[("0xmixer", "mixer")]);
+        let view = ExposureView::start(true).unwrap();
+        let mut batch: ExposureBatch = (0..5_000)
+            .flat_map(|i| exposure_deltas("0xmixer", &format!("0x{i:040x}"), 7, 1, &labels))
+            .collect();
+        batch.extend(exposure_deltas("0xalice", "0xmixer", 42, 1, &labels));
+        batch.extend(exposure_deltas("0xmixer", "0xalice", 9, 1, &labels));
+        view.apply(batch);
+        view.flush();
+        assert_eq!(view.entries(), 5_002);
+
+        EXPOSURE_ROWS_READ.with(|n| n.set(0));
+        let rows = view.exposure("0xalice");
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.direction, r.amount))
+                .collect::<Vec<_>>(),
+            vec![("out", 42), ("in", 9)]
+        );
+        assert_eq!(EXPOSURE_ROWS_READ.with(|n| n.get()), 2);
     }
 }
