@@ -434,13 +434,14 @@ pub async fn install_by_nid(registry: &str, nid: &str, target: &Path) -> Result<
 
 /// The `AWS_*` variables, lower-cased, as `object_store::parse_url_opts` options. Lower case because
 /// it matches keys only in lower case; `AWS_*` only because it also takes bare aliases such as
-/// `endpoint` and `bucket`, which an unrelated shell variable would otherwise set (#2198).
+/// `endpoint` and `bucket`, which an unrelated shell variable would otherwise set (#2198). The
+/// prefix is checked before lower-casing, so `aws_endpoint` in any other case is not config either.
 #[cfg(feature = "object-store")]
 pub(crate) fn object_store_options(
     vars: impl Iterator<Item = (String, String)>,
 ) -> impl Iterator<Item = (String, String)> {
-    vars.map(|(k, v)| (k.to_ascii_lowercase(), v))
-        .filter(|(k, _)| k.starts_with("aws_"))
+    vars.filter(|(k, _)| k.starts_with("AWS_"))
+        .map(|(k, v)| (k.to_ascii_lowercase(), v))
 }
 
 /// The S3-compatible registry backend (RFC-0019 slice 2), behind the `object-store` feature so the
@@ -1076,6 +1077,8 @@ abi = "abis/c.json"
             ("PATH", "/bin"),
             ("AWS_ENDPOINT", "http://minio:9000"),
             ("AWS_ACCESS_KEY_ID", "id"),
+            ("aws_endpoint", "http://lower"),
+            ("Aws_Endpoint", "http://mixed"),
         ]
         .map(|(k, v)| (k.to_string(), v.to_string()));
         let opts: Vec<(String, String)> = object_store_options(env.into_iter()).collect();
