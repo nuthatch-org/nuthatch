@@ -51,7 +51,7 @@ today - each with a reason. A survivor **not** in that file fails the job, namin
 file. The gate is therefore about *new* decorative tests, not a demand to fix everything at once.
 
 Removing an entry is the good direction and needs no ceremony. Adding one needs a reason a reader can
-disagree with. `scripts/mutants-check.py` also prints baseline entries that no longer survive, so a
+disagree with. `scripts/mutants-check.sh` also prints baseline entries that no longer survive, so a
 stale exemption gets noticed - #769's allow-list check caught exactly that shape the day after it was
 built, on the author of the sprint.
 

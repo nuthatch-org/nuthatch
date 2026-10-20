@@ -64,10 +64,12 @@ the nest has reached regardless of the pin. A first run had the nest at 25,945,6
 in those 2,134 blocks. `Pool` and `Swap` carry block predicates and were unaffected. The harness now
 refuses an unequal pin rather than leaving the invariant to the procedure.
 
-Reproduce with `scripts/port-diff-uniswap-v4.py --block 25945634 --window 500` against a nest under
-`serve` frozen at that block. **No credential is needed**:
-`https://api.thegraph.com/subgraphs/id/<CID>` answers keyless. It reports an
-auth failure, and a pruned-block refusal, as HTTP **200** with the error in the body, so a client
+The table came from `scripts/port-diff-uniswap-v4.py --block 25945634 --window 500` against a nest
+under `serve` frozen at that block. The script was removed on 2026-10-20 (#2294) and lives in git
+history at `14187c7a`: the reference has since pruned past the pin (on 2026-10-20 it held data from
+block 26,230,124 only), so the table can no longer be reproduced as it was. Querying the reference
+needs **no credential**: `https://api.thegraph.com/subgraphs/id/<CID>` answers keyless. It reports
+an auth failure, and a pruned-block refusal, as HTTP **200** with the error in the body, so a client
 gating on status reads either as an empty result.
 
 ## What did not reproduce
