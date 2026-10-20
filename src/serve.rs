@@ -3487,6 +3487,91 @@ async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
     )
 }
 
+/// Rows a whole-store read may touch inline, on the executor and without a permit (#2209, #2210).
+/// About the work of serialising the largest answer these routes give, so a read this small costs
+/// what its response does; one that needs more waits for the SQL gate like `/sql`.
+const INLINE_SCAN_ROWS: usize = 4096;
+
+/// `/sql`'s admission: a free permit, or a wait bounded in time and in how many wait, else `503`.
+async fn admit(
+    s: &AppState,
+) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, axum::response::Response> {
+    let busy = || {
+        crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
+        )
+            .into_response()
+    };
+    if let Ok(permit) = Arc::clone(&s.sql_gate).try_acquire_owned() {
+        return Ok(permit);
+    }
+    let Some(_slot) = QueueSlot::take(&s.sql_queued) else {
+        return Err(busy());
+    };
+    match tokio::time::timeout(SQL_ADMISSION_WAIT, Arc::clone(&s.sql_gate).acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        _ => Err(busy()),
+    }
+}
+
+/// `work` off the executor under an admitted permit.
+async fn admitted<T: Send + 'static>(
+    s: &AppState,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, axum::response::Response> {
+    let permit = admit(s).await?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| error(format!("{e}")))
+}
+
+/// `work` inline when it reads at most [`INLINE_SCAN_ROWS`], else [`admitted`].
+async fn sized<T: Send + 'static>(
+    s: &AppState,
+    rows: usize,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, axum::response::Response> {
+    if rows <= INLINE_SCAN_ROWS {
+        Ok(work())
+    } else {
+        admitted(s, work).await
+    }
+}
+
+/// A hot-store read given a row budget, `None` when the budget ran out first. Tried inline at
+/// [`INLINE_SCAN_ROWS`], then admitted, off the executor, at the hot row ceiling `/sql` holds the
+/// tip to. The permit comes back for a caller with cold work to do under it.
+async fn bounded_hot_read<T: Send + 'static>(
+    s: &AppState,
+    read: impl Fn(usize) -> Result<Option<T>> + Send + 'static,
+) -> std::result::Result<(T, Option<tokio::sync::OwnedSemaphorePermit>), axum::response::Response> {
+    match read(INLINE_SCAN_ROWS) {
+        Ok(Some(rows)) => return Ok((rows, None)),
+        Ok(None) => {}
+        Err(e) => return Err(error(format!("{e:#}"))),
+    }
+    let permit = admit(s).await?;
+    let cap = s.sql_max_hot_rows;
+    match tokio::task::spawn_blocking(move || read(cap)).await {
+        Ok(Ok(Some(rows))) => Ok((rows, Some(permit))),
+        Ok(Ok(None)) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": crate::store::HotScanTooLarge { cap }.to_string(),
+                "sealed_through": s.store.sealed_through(),
+            })),
+        )
+            .into_response()),
+        Ok(Err(e)) => Err(error(format!("{e:#}"))),
+        Err(e) => Err(error(format!("{e}"))),
+    }
+}
+
 /// Recent rows of one table, merged across the hot store and the sealed cold segments.
 async fn table(
     State(s): State<AppState>,
@@ -3499,24 +3584,25 @@ async fn table(
     let limit = q.limit.unwrap_or(100).min(1000);
 
     // Hot rows (tip), newest first.
-    let hot = if q.from_block.is_none() && q.to_block.is_none() {
-        s.store.recent_by_table(&name, limit).and_then(|rows| {
-            rows.iter()
-                .map(|r| serde_json::from_str::<Value>(r).context("unparseable hot row"))
-                .collect()
-        })
-    } else {
-        hot_rows_in_window(
-            &*s.store,
-            &name,
-            limit,
-            q.from_block.unwrap_or(0),
-            q.to_block.unwrap_or(u64::MAX),
-        )
-    };
-    let mut items = match hot {
-        Ok(items) => items,
-        Err(e) => return error(format!("{e:#}")),
+    let store = s.store.clone();
+    let table = name.clone();
+    let window = (q.from_block.is_some() || q.to_block.is_some())
+        .then(|| (q.from_block.unwrap_or(0), q.to_block.unwrap_or(u64::MAX)));
+    let hot = bounded_hot_read(&s, move |max_scanned| match window {
+        None => store
+            .recent_by_table_within(&table, limit, max_scanned)?
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| serde_json::from_str::<Value>(r).context("unparseable hot row"))
+                    .collect()
+            })
+            .transpose(),
+        Some((from, to)) => hot_rows_in_window(&*store, &table, limit, from, to, max_scanned),
+    })
+    .await;
+    let (mut items, held) = match hot {
+        Ok(hot) => hot,
+        Err(refused) => return refused,
     };
 
     // Fill from cold (sealed segments) if the hot store didn't satisfy the limit. This runs under
@@ -3525,7 +3611,11 @@ async fn table(
     // hot-only answer is never read as the merged table (#1659).
     let mut degraded_tables = std::collections::BTreeSet::new();
     if items.len() < limit {
-        let cold = match Arc::clone(&s.sql_gate).try_acquire_owned() {
+        let permit = match held {
+            Some(permit) => Ok(permit),
+            None => Arc::clone(&s.sql_gate).try_acquire_owned(),
+        };
+        let cold = match permit {
             Err(_) => Err("the SQL gate is saturated".to_string()),
             Ok(permit) => {
                 let need = limit - items.len();
@@ -3593,35 +3683,48 @@ async fn table(
 
 /// The newest `limit` hot rows of `table` with a block in `[from, to]`, newest first. The window is
 /// applied before the limit, or a window below the newest `limit` hot rows would find none (#1659).
+/// `None` when the window holds more than `max_scanned` rows.
 fn hot_rows_in_window(
     store: &dyn crate::store::HotStore,
     table: &str,
     limit: usize,
     from: u64,
     to: u64,
-) -> Result<Vec<Value>> {
+    max_scanned: usize,
+) -> Result<Option<Vec<Value>>> {
     let mut newest = std::collections::VecDeque::with_capacity(limit.min(1024));
-    let mut unparseable = None;
+    let mut scanned = 0usize;
+    let mut outcome = Ok(true);
     store.scan_entities_in_range(from, to, &mut |_, raw| {
-        match serde_json::from_str::<Value>(raw) {
-            Ok(v) if v.get("table").and_then(Value::as_str) == Some(table) => {
-                newest.push_back(v);
+        if scanned == max_scanned {
+            outcome = Ok(false);
+            return false;
+        }
+        scanned += 1;
+        match crate::store::row_table_is(raw, table) {
+            Ok(true) => {
+                newest.push_back(raw.to_string());
                 if newest.len() > limit {
                     newest.pop_front();
                 }
             }
-            Ok(_) => {}
+            Ok(false) => {}
             Err(e) => {
-                unparseable = Some(e);
+                outcome = Err(e);
                 return false;
             }
         }
         true
     })?;
-    if let Some(e) = unparseable {
-        return Err(e).context("unparseable hot row");
+    if !outcome.context("unparseable hot row")? {
+        return Ok(None);
     }
-    Ok(newest.into_iter().rev().collect())
+    newest
+        .iter()
+        .rev()
+        .map(|r| serde_json::from_str(r).context("unparseable hot row"))
+        .collect::<Result<_>>()
+        .map(Some)
 }
 
 #[derive(Deserialize)]
@@ -4705,11 +4808,14 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
 /// Top balances from the IVM view, descending. Balances are in i64 token base units.
 async fn balances(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(100).min(1000);
+    let view = s.balances.clone();
+    let top = match sized(&s, s.balances.holders(), move || view.top(limit)).await {
+        Ok(top) => top,
+        Err(refused) => return refused,
+    };
     // Balances are i128 base units, serialised as decimal strings - JSON numbers can't carry i128
     // losslessly, and a client parsing a huge balance as an f64 would silently corrupt it.
-    let items: Vec<Value> = s
-        .balances
-        .top(limit)
+    let items: Vec<Value> = top
         .into_iter()
         .map(|(address, balance)| json!({ "address": address, "balance": balance.to_string() }))
         .collect();
@@ -4724,6 +4830,7 @@ async fn balances(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> 
         "items": items,
         "dropped_over_i128": s.balances.dropped_over_i128(),
     }))
+    .into_response()
 }
 
 /// The nest's authored incremental entities, and how current each one is (RFC-0041 §5.4, #822).
@@ -5179,15 +5286,19 @@ struct FlagsQuery {
 /// `threshold_flag` annotations (hot store; the full sealed history is at `/sql SELECT * FROM
 /// threshold_flag`). Omit `kind` for both. Amounts are i128 base units, serialised as decimal strings.
 async fn flags(State(s): State<AppState>, Query(q): Query<FlagsQuery>) -> impl IntoResponse {
+    type Refused = axum::response::Response;
     let limit = q.limit.unwrap_or(100).min(1000);
     let kind = q.kind.as_deref();
 
-    let velocity = |s: &AppState| -> Vec<Value> {
+    async fn velocity(s: &AppState, limit: usize) -> std::result::Result<Vec<Value>, Refused> {
         let threshold = s.velocity_threshold.unwrap_or(i128::MIN);
-        s.velocity
-            .flags(threshold)
+        let view = s.velocity.clone();
+        let flags = sized(s, s.velocity.entries(), move || {
+            view.top_flags(threshold, limit)
+        })
+        .await?;
+        Ok(flags
             .into_iter()
-            .take(limit)
             .map(|f| {
                 json!({
                     "address": f.address,
@@ -5196,52 +5307,54 @@ async fn flags(State(s): State<AppState>, Query(q): Query<FlagsQuery>) -> impl I
                     "volume": f.volume.to_string(),
                 })
             })
-            .collect()
-    };
+            .collect())
+    }
     // Recent threshold_flag annotations from the hot store (newest first). Sealed history via /sql.
-    let threshold = match kind {
-        Some("threshold") | None => {
-            let read = s
-                .store
-                .recent_by_table("threshold_flag", limit)
-                .and_then(|rows| {
+    // An unparseable row is corruption and answers 500, not a shorter list.
+    async fn threshold(s: &AppState, limit: usize) -> std::result::Result<Vec<Value>, Refused> {
+        let store = s.store.clone();
+        let (rows, _) = bounded_hot_read(s, move |max_scanned| {
+            store
+                .recent_by_table_within("threshold_flag", limit, max_scanned)?
+                .map(|rows| {
                     rows.iter()
                         .map(|r| serde_json::from_str::<Value>(r).context("unparseable hot row"))
                         .collect::<Result<Vec<Value>>>()
-                });
-            match read {
-                Ok(rows) => rows,
-                Err(e) => return error(format!("{e:#}")),
-            }
-        }
-        _ => Vec::new(),
-    };
-
-    match kind {
-        Some("velocity") => Json(json!({
-            "kind": "velocity",
-            "threshold": s.velocity_threshold.map(|t| t.to_string()),
-            "flags": velocity(&s),
-        }))
-        .into_response(),
-        Some("threshold") => Json(json!({
-            "kind": "threshold",
-            "threshold": s.threshold.map(|t| t.to_string()),
-            "flags": threshold,
-            "note": "recent hot flags; full sealed history: /sql?q=SELECT * FROM threshold_flag",
-        }))
-        .into_response(),
-        Some(other) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("unknown flag kind '{other}' (want: threshold, velocity)") })),
-        )
-            .into_response(),
-        None => Json(json!({
-            "threshold": { "configured": s.threshold.map(|t| t.to_string()), "flags": threshold },
-            "velocity": { "configured": s.velocity_threshold.map(|t| t.to_string()), "flags": velocity(&s) },
-        }))
-        .into_response(),
+                })
+                .transpose()
+        })
+        .await?;
+        Ok(rows)
     }
+
+    let answer = async {
+        Ok::<_, Refused>(match kind {
+            Some("velocity") => Json(json!({
+                "kind": "velocity",
+                "threshold": s.velocity_threshold.map(|t| t.to_string()),
+                "flags": velocity(&s, limit).await?,
+            }))
+            .into_response(),
+            Some("threshold") => Json(json!({
+                "kind": "threshold",
+                "threshold": s.threshold.map(|t| t.to_string()),
+                "flags": threshold(&s, limit).await?,
+                "note": "recent hot flags; full sealed history: /sql?q=SELECT * FROM threshold_flag",
+            }))
+            .into_response(),
+            Some(other) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("unknown flag kind '{other}' (want: threshold, velocity)") })),
+            )
+                .into_response(),
+            None => Json(json!({
+                "threshold": { "configured": s.threshold.map(|t| t.to_string()), "flags": threshold(&s, limit).await? },
+                "velocity": { "configured": s.velocity_threshold.map(|t| t.to_string()), "flags": velocity(&s, limit).await? },
+            }))
+            .into_response(),
+        })
+    };
+    answer.await.unwrap_or_else(|refused| refused)
 }
 
 /// Parse an entity id `{block:012}-{log_index:06}` back into its components.
@@ -8377,6 +8490,116 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["count"], 2, "{body}");
         assert_eq!(body["degraded"], false, "{body}");
+    }
+
+    /// A hot store past [`INLINE_SCAN_ROWS`]: one `rare` row under `rows` newer rows of `t`.
+    fn deep_hot_fixture(dir: &std::path::Path, rows: u64) -> AppState {
+        let mut state = table_fixture(dir, 1..=1, 2..=2);
+        let mut tables = (*state.tables).clone();
+        let mut rare = tables[0].clone();
+        rare.table = "rare".into();
+        rare.alias = "rare".into();
+        tables.push(rare);
+        state.tables = Arc::new(tables);
+        let row = |table: &str, b: u64| {
+            json!({"table": table, "block_number": b, "log_index": 0}).to_string()
+        };
+        let mut batch = vec![(Store::entity_key(10, 0), row("rare", 10))];
+        batch.extend((11..11 + rows).map(|b| (Store::entity_key(b, 0), row("t", b))));
+        state.store.commit_window(&batch, None, 10 + rows).unwrap();
+        state
+    }
+
+    /// #2209: a read that has to walk the hot store waits for the SQL gate like `/sql`, rather than
+    /// parsing the whole tip on the executor; a read the newest rows answer still needs no permit.
+    #[tokio::test]
+    async fn a_hot_read_past_the_inline_budget_waits_for_the_sql_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = deep_hot_fixture(tmp.path(), INLINE_SCAN_ROWS as u64 + 10);
+        let held = Arc::clone(&state.sql_gate).try_acquire_owned().unwrap();
+        for uri in [
+            "/table/rare?limit=10",
+            "/table/rare?limit=10&from_block=0",
+            "/flags",
+            "/flags?kind=threshold",
+        ] {
+            let (status, body) = get_json(state.clone(), uri).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+        }
+        let (status, body) = get_json(state.clone(), "/table/t?limit=10").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 10, "{body}");
+        let (status, body) = get_json(state.clone(), "/flags?kind=velocity").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        drop(held);
+
+        let (status, body) = get_json(state, "/table/rare?limit=10").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 1, "{body}");
+        assert_eq!(body["degraded"], false, "{body}");
+    }
+
+    /// #2210: `/balances` and velocity flags walk their whole view whatever the limit, so past the
+    /// inline budget they wait for the SQL gate; a small view answers without one.
+    #[tokio::test]
+    async fn a_whole_view_read_past_the_inline_budget_waits_for_the_sql_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 1);
+        let holders = INLINE_SCAN_ROWS + 1;
+        state.balances.apply(
+            (0..holders)
+                .flat_map(|i| crate::views::transfer_deltas("0xm", &format!("0x{i:040x}"), 1, 1))
+                .collect(),
+        );
+        state.balances.flush();
+        state.velocity.apply(
+            (0..holders)
+                .flat_map(|i| {
+                    crate::velocity::velocity_deltas(&format!("0x{i:040x}"), 1, 1, 1, 100)
+                })
+                .collect(),
+        );
+        state.velocity.flush();
+
+        let held = Arc::clone(&state.sql_gate).try_acquire_owned().unwrap();
+        for uri in ["/balances?limit=1", "/flags?kind=velocity&limit=1"] {
+            let (status, body) = get_json(state.clone(), uri).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+        }
+        drop(held);
+        let (status, body) = get_json(state.clone(), "/balances?limit=1").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["items"][0]["address"],
+            format!("0x{:040x}", 0),
+            "{body}"
+        );
+        let (status, body) = get_json(state, "/flags?kind=velocity&limit=1").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["flags"].as_array().unwrap().len(), 1, "{body}");
+    }
+
+    /// #2209: an admitted hot read is held to the hot row ceiling `/sql` holds the tip to.
+    #[tokio::test]
+    async fn a_hot_read_past_the_row_ceiling_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = deep_hot_fixture(tmp.path(), INLINE_SCAN_ROWS as u64 + 10);
+        state.sql_max_hot_rows = INLINE_SCAN_ROWS + 5;
+        for uri in ["/table/rare?limit=10", "/table/rare?from_block=0", "/flags"] {
+            let (status, body) = get_json(state.clone(), uri).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unsealed tip holds more than"),
+                "{uri}: {body}"
+            );
+        }
+        state.sql_max_hot_rows = INLINE_SCAN_ROWS + 12;
+        let (status, body) = get_json(state, "/table/rare?from_block=0").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 1, "{body}");
     }
 
     /// #1659: a block window is applied to the hot rows before the limit, so a window older than

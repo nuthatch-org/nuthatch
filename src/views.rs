@@ -25,7 +25,8 @@
 use anyhow::{anyhow, Context, Result};
 use dbsp::utils::Tup2;
 use dbsp::{IndexedZSetReader, OrdZSet, OutputHandle, RootCircuit, Runtime};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
 use std::sync::{Arc, RwLock};
@@ -95,6 +96,27 @@ impl BalanceCircuit {
         step_to_commit(&mut self.circuit, || fold_balances(output, balances))
             .map_err(|e| anyhow!("IVM transaction: {e}"))
     }
+}
+
+/// The `k` greatest of `items`, greatest first, in one pass that keeps only `k` of them (#2210).
+pub(crate) fn top_k<T: Ord>(items: impl Iterator<Item = T>, k: usize) -> Vec<T> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut heap = BinaryHeap::with_capacity(k.min(1024) + 1);
+    for item in items {
+        if heap.len() < k {
+            heap.push(Reverse(item));
+        } else if let Some(mut least) = heap.peek_mut() {
+            if item > least.0 {
+                *least = Reverse(item);
+            }
+        }
+    }
+    heap.into_sorted_vec()
+        .into_iter()
+        .map(|Reverse(item)| item)
+        .collect()
 }
 
 /// Run one transaction to completion, calling `drain` after each of its steps. DBSP splits a large
@@ -274,16 +296,16 @@ impl BalanceView {
         self.balances.read().ok()?.get(address).copied()
     }
 
-    /// Top `n` addresses by balance, descending.
+    /// Top `n` addresses by balance, descending, ties by address.
     pub fn top(&self, n: usize) -> Vec<(String, i128)> {
         let map = match self.balances.read() {
             Ok(m) => m,
             Err(_) => return Vec::new(),
         };
-        let mut v: Vec<(String, i128)> = map.iter().map(|(k, val)| (k.clone(), *val)).collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        v.truncate(n);
-        v
+        top_k(map.iter().map(|(k, v)| (*v, Reverse(k.as_str()))), n)
+            .into_iter()
+            .map(|(v, Reverse(k))| (k.to_string(), v))
+            .collect()
     }
 
     pub fn holders(&self) -> usize {
@@ -453,5 +475,61 @@ mod tests {
         view.flush();
         assert_eq!(view.balance("b"), Some(42));
         assert_eq!(view.balance("a"), Some(-42));
+    }
+
+    /// #2210: `/balances?limit=1` sorted every holder to keep one. A top-`k` compares each item about
+    /// once; a sort of 100,000 makes about 1.6 million comparisons.
+    #[test]
+    fn top_k_does_not_order_what_it_drops() {
+        use std::cell::Cell;
+        use std::cmp::Ordering as Cmp;
+        thread_local!(static COMPARED: Cell<usize> = const { Cell::new(0) });
+        #[derive(PartialEq, Eq, Debug)]
+        struct Counted(u64);
+        impl Ord for Counted {
+            fn cmp(&self, other: &Self) -> Cmp {
+                COMPARED.with(|c| c.set(c.get() + 1));
+                self.0.cmp(&other.0)
+            }
+        }
+        impl PartialOrd for Counted {
+            fn partial_cmp(&self, other: &Self) -> Option<Cmp> {
+                Some(self.cmp(other))
+            }
+        }
+        let n = 100_000u64;
+        let values = (0..n).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 1_000_003);
+        let mut want: Vec<u64> = values.clone().collect();
+        want.sort_unstable_by(|a, b| b.cmp(a));
+        want.truncate(10);
+
+        let top = top_k(values.map(Counted), 10);
+        assert_eq!(top.into_iter().map(|c| c.0).collect::<Vec<_>>(), want);
+        let compared = COMPARED.with(Cell::get);
+        assert!(
+            compared < 2 * n as usize,
+            "{compared} comparisons for {n} items"
+        );
+    }
+
+    #[test]
+    fn top_breaks_ties_by_address_and_takes_at_most_n() {
+        let view = BalanceView::start().unwrap();
+        view.balances.write().unwrap().extend([
+            ("0xc".to_string(), 5),
+            ("0xa".to_string(), 5),
+            ("0xb".to_string(), 9),
+            ("0xd".to_string(), -1),
+        ]);
+        assert_eq!(
+            view.top(3),
+            vec![
+                ("0xb".to_string(), 9),
+                ("0xa".to_string(), 5),
+                ("0xc".to_string(), 5)
+            ]
+        );
+        assert!(view.top(0).is_empty());
+        assert_eq!(view.top(10).len(), 4);
     }
 }

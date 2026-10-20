@@ -249,6 +249,17 @@ impl std::fmt::Display for HotScanTooLarge {
 
 impl std::error::Error for HotScanTooLarge {}
 
+/// Whether hot row `json` belongs to `table`, reading its `table` field and skipping the rest
+/// unbuilt. An error is a row that is not JSON.
+pub fn row_table_is(json: &str, table: &str) -> serde_json::Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct Tagged {
+        table: Option<serde_json::Value>,
+    }
+    let tagged: Tagged = serde_json::from_str(json)?;
+    Ok(tagged.table.as_ref().and_then(|t| t.as_str()) == Some(table))
+}
+
 /// One consistent hot-store read for an analytical query. `source_bytes` is the length of the
 /// serialized redb values that will be parsed into Burrmill, not a JSON re-encoding or a resident-RAM
 /// estimate (RFC-0048 S2).
@@ -354,6 +365,16 @@ pub trait HotStore: Send + Sync {
     fn count(&self) -> Result<u64>;
     fn recent(&self, limit: usize) -> Result<Vec<String>>;
     fn recent_by_table(&self, table: &str, limit: usize) -> Result<Vec<String>>;
+    /// [`HotStore::recent_by_table`] reading at most `max_scanned` rows, `None` past that (#2209). A
+    /// backend that filters on its own side has nothing to bound here.
+    fn recent_by_table_within(
+        &self,
+        table: &str,
+        limit: usize,
+        _max_scanned: usize,
+    ) -> Result<Option<Vec<String>>> {
+        self.recent_by_table(table, limit).map(Some)
+    }
     fn hot_rows_by_table(&self) -> Result<HashMap<String, Vec<serde_json::Value>>>;
     fn hot_rows_by_table_bounded(
         &self,
@@ -1183,29 +1204,40 @@ impl Store {
     /// used to. That silence is what made #373's parse-failure arm in `rebuild_children` unreachable
     /// through this store - the corrupt row never survived to be rejected.
     pub fn recent_by_table(&self, table: &str, limit: usize) -> Result<Vec<String>> {
+        Ok(self
+            .recent_by_table_within(table, limit, usize::MAX)?
+            .unwrap_or_default())
+    }
+
+    /// [`Self::recent_by_table`], reading at most `max_scanned` rows: `None` when that many were read
+    /// before `limit` matched or the store ran out (#2209).
+    pub fn recent_by_table_within(
+        &self,
+        table: &str,
+        limit: usize,
+        max_scanned: usize,
+    ) -> Result<Option<Vec<String>>> {
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(ENTITIES)?;
         // Cap the pre-allocation: `limit` may be usize::MAX (rebuild wants "all rows"); the Vec
         // still grows as needed, we just don't reserve an absurd capacity up front.
         let mut out = Vec::with_capacity(limit.min(1024));
-        for row in t.iter()?.rev() {
+        for (scanned, row) in t.iter()?.rev().enumerate() {
+            if out.len() >= limit {
+                break;
+            }
+            if scanned >= max_scanned {
+                return Ok(None);
+            }
             let (_k, v) = row?;
             let s = v.value();
-            let parsed: serde_json::Value = serde_json::from_str(s).with_context(|| {
+            if row_table_is(s, table).with_context(|| {
                 format!("unparseable hot row while scanning for table '{table}'")
-            })?;
-            let matches = parsed
-                .get("table")
-                .and_then(|t| t.as_str())
-                .is_some_and(|t| t == table);
-            if matches {
+            })? {
                 out.push(s.to_string());
-                if out.len() >= limit {
-                    break;
-                }
             }
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// The sealed watermark: the highest block whose rows have been sealed to Parquet and pruned from
@@ -1807,6 +1839,14 @@ impl HotStore for Store {
     fn recent(&self, limit: usize) -> Result<Vec<String>> {
         Store::recent(self, limit)
     }
+    fn recent_by_table_within(
+        &self,
+        table: &str,
+        limit: usize,
+        max_scanned: usize,
+    ) -> Result<Option<Vec<String>>> {
+        Store::recent_by_table_within(self, table, limit, max_scanned)
+    }
     fn recent_by_table(&self, table: &str, limit: usize) -> Result<Vec<String>> {
         Store::recent_by_table(self, table, limit)
     }
@@ -2091,6 +2131,14 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     }
     fn recent(&self, limit: usize) -> Result<Vec<String>> {
         (**self).recent(limit)
+    }
+    fn recent_by_table_within(
+        &self,
+        table: &str,
+        limit: usize,
+        max_scanned: usize,
+    ) -> Result<Option<Vec<String>>> {
+        (**self).recent_by_table_within(table, limit, max_scanned)
     }
     fn recent_by_table(&self, table: &str, limit: usize) -> Result<Vec<String>> {
         (**self).recent_by_table(table, limit)
