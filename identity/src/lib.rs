@@ -180,13 +180,20 @@ pub fn without_address_history(bytes: Vec<u8>) -> Result<Vec<u8>> {
     for line in text.split_inclusive('\n') {
         let t = line.trim_start();
         if let Some(name) = table_header(t) {
+            let was_skipping = skipping;
+            // `[address_history.sweep]` and `.mirror` are sub-tables of it, so they go too.
+            skipping = name
+                .split('.')
+                .next()
+                .map(|k| k.trim().trim_matches(['"', '\'']))
+                == Some(TABLE);
             if skipping {
+                held.clear();
+                continue;
+            }
+            if was_skipping {
                 out.push_str(&held);
                 held.clear();
-            }
-            skipping = name == TABLE;
-            if skipping {
-                continue;
             }
         }
         if !skipping {
@@ -334,5 +341,17 @@ mod tests {
         };
         assert_eq!(hash(&with), hash(&format!("{plain}\n")));
         assert_ne!(hash(&with), hash(plain));
+    }
+
+    /// The documented `[address_history.sweep]` and `.mirror` sub-tables are part of the table (#2188).
+    #[test]
+    fn the_address_history_sub_tables_are_cut_with_it() {
+        let plain = "[nest]\nname = \"n\"\n";
+        let with = format!(
+            "{plain}\n[address_history]\naddresses = []\n\n[address_history.sweep]\n\
+             from_block = 1\n\n[ address_history . mirror ]\nurl = \"m\"\n\n[sink]\nx = 1\n"
+        );
+        let cut = String::from_utf8(without_address_history(with.into_bytes()).unwrap()).unwrap();
+        assert_eq!(cut, format!("{plain}\n\n[sink]\nx = 1\n"));
     }
 }

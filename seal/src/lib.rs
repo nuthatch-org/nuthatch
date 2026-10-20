@@ -214,4 +214,18 @@ mod tests {
         let bytes = seal_rows(&mut rows).unwrap();
         assert_eq!(segment_rows(bytes.into()).unwrap(), rows);
     }
+
+    /// A named tuple seals in the ABI's key order in every build, this crate's alone included (#2224).
+    #[test]
+    fn an_object_value_seals_in_its_own_key_order() {
+        let mut rows: Vec<Value> = vec![serde_json::from_str(
+            r#"{"block_number":1,"log_index":0,"order":{"z":"1","a":"2"}}"#,
+        )
+        .unwrap()];
+        let bytes = seal_rows(&mut rows).unwrap();
+        assert_eq!(
+            segment_rows(bytes.into()).unwrap()[0]["order"],
+            r#"{"z":"1","a":"2"}"#
+        );
+    }
 }

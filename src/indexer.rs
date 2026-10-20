@@ -4777,7 +4777,8 @@ async fn resolve_calls_for_window_upto(
         }
     }
 
-    let capacity = crate::registry::BLOCK_ROW_LOG_INDEX - crate::registry::CALL_ROW_LOG_INDEX_BASE;
+    let capacity =
+        crate::registry::IPFS_ROW_LOG_INDEX_BASE - crate::registry::CALL_ROW_LOG_INDEX_BASE;
     // Canonical windows retain their timestamp headers, avoiding a second fetch.
     // Other callers still fetch the wanted headers in one batch (#720).
     let wanted_blocks: Vec<u64> = wanted.keys().copied().collect();
@@ -4801,7 +4802,7 @@ async fn resolve_calls_for_window_upto(
     for (block, mut items) in wanted {
         let mut seen = std::collections::HashSet::new();
         items.retain(|(i, c, d)| seen.insert((*i, c.clone(), d.clone())));
-        if items.len() as u64 >= capacity {
+        if items.len() as u64 > capacity {
             anyhow::bail!(
                 "block {block} wants {} distinct pinned reads, and only {capacity} fit in the \
                  reserved row-index band.\n\n\
@@ -21649,6 +21650,60 @@ template="pool"
         );
         assert!(state.maximum.load(Ordering::SeqCst) <= PINNED_CALL_BATCH_CONCURRENCY);
         server.abort();
+    }
+
+    /// The pinned-read band ends where the IPFS band starts, so a 125,001st read in one block would
+    /// take an IPFS row's key (#2163).
+    #[tokio::test]
+    async fn pinned_reads_past_their_band_are_refused() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, handle) = stub_state_rpc(seen.clone()).await;
+        let rpc = crate::rpc::RpcClient::new(vec![url]).unwrap();
+        let decl: crate::calls::CallDecl = toml::from_str(
+            "name='supply'\ncontract_column='pool'\non='factory__pool_created'\nsignature='totalSupply()'",
+        )
+        .unwrap();
+        let band =
+            crate::registry::IPFS_ROW_LOG_INDEX_BASE - crate::registry::CALL_ROW_LOG_INDEX_BASE;
+        let rows = (0..=band)
+            .map(|i| {
+                let mut pool = [0u8; 20];
+                pool[12..].copy_from_slice(&i.to_be_bytes());
+                crate::registry::DecodedRow {
+                    table: "factory__pool_created".into(),
+                    params: vec![("pool".into(), crate::registry::Value::Address(pool))],
+                    block_number: 5,
+                    block_hash: format!("0x{:064x}", 5),
+                    block_timestamp: 0,
+                    timestamps: false,
+                    log_index: i,
+                    tx_hash: String::new(),
+                    address: "0x1111111111111111111111111111111111111111".into(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let Err(err) = resolve_calls_for_window(
+            &MockSource { logs: Vec::new() },
+            &[decl],
+            &rpc,
+            42161,
+            &rows,
+            5,
+            5,
+            &std::collections::HashMap::new(),
+            false,
+            None,
+        )
+        .await
+        else {
+            panic!("125,001 pinned reads in one block were accepted");
+        };
+        assert!(err.to_string().contains("only 125000 fit"), "{err:#}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing is read once refused"
+        );
+        handle.abort();
     }
 
     #[tokio::test]

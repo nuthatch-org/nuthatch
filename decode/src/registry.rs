@@ -2340,6 +2340,30 @@ mod tests {
         assert_eq!(obj["z"], json!("2"));
     }
 
+    /// The stored object keeps the ABI's component order in every build, this crate's alone
+    /// included, so a node and a tab store the same string (#2224).
+    #[test]
+    fn a_named_tuple_keeps_its_abi_key_order() {
+        let abi = made_abi(
+            "tuple",
+            false,
+            r#"[{"name":"z","type":"uint256"},{"name":"a","type":"uint256"}]"#,
+        );
+        let reg = DecodeRegistry::build(vec![spec("t", USDC, &abi)]).unwrap();
+        let topic0 = format!("0x{}", hex::encode(reg.tables()[0].topic0));
+        let data = format!("0x{}01{}02", "00".repeat(31), "00".repeat(31));
+        let row = reg
+            .decode(&log(USDC, &[&topic0], &data, 1, 0))
+            .unwrap()
+            .expect("topic0 and address match");
+        assert_eq!(row.params[0].1, Value::Json(r#"{"z":"1","a":"2"}"#.into()));
+        assert_eq!(
+            row.to_json()["order"].to_string(),
+            r#"{"z":"1","a":"2"}"#,
+            "the hot-store spelling the sealer re-serialises"
+        );
+    }
+
     /// Duplicate component names cannot be object keys; the value stays a positional array.
     #[test]
     fn a_tuple_with_duplicate_names_decodes_as_an_array() {
