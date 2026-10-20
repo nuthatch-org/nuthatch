@@ -46,8 +46,8 @@ want=$(grep -v '^#' "$root/.github/required-checks.txt" | grep -v '^$' | sed 's/
 # flipping the up-to-date-branch requirement while doing it is the class of surprise it exists to
 # avoid.
 current_json=$(GH_TOKEN="$token" gh api "repos/${repo}/branches/${branch}/protection/required_status_checks")
-have=$(printf '%s' "$current_json" | python3 -c 'import json,sys; print("\n".join(sorted(json.load(sys.stdin)["contexts"])))')
-strict=$(printf '%s' "$current_json" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["strict"]))')
+have=$(printf '%s' "$current_json" | jq -r '.contexts | sort | .[]')
+strict=$(printf '%s' "$current_json" | jq -c .strict)
 
 if [ "$want" = "$have" ]; then
   echo "no change: ${branch} already enforces the $(echo "$want" | wc -l | tr -d ' ') committed contexts"
@@ -66,8 +66,7 @@ if [ "$apply" -eq 0 ]; then
   exit 0
 fi
 
-body=$(printf '%s' "$want" | python3 -c \
-  "import json,sys; print(json.dumps({'strict': json.loads('''$strict'''), 'contexts': [l.strip() for l in sys.stdin if l.strip()]}))")
+body=$(printf '%s\n' "$want" | jq -Rn --argjson strict "$strict" '{strict: $strict, contexts: [inputs | gsub("^\\s+|\\s+$"; "") | select(length > 0)]}')
 GH_TOKEN="$token" gh api --method PATCH \
   "repos/${repo}/branches/${branch}/protection/required_status_checks" \
   --input - <<<"$body" >/dev/null
