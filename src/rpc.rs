@@ -1800,15 +1800,14 @@ impl RpcClient {
             .chunks(self.header_width)
             .map(|c| self.fetch_timestamp_batch(c, false, true))
             .collect();
-        let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
-            .buffered(TIMESTAMP_FANOUT)
-            .collect()
-            .await;
+        let mut results = futures::stream::iter(futures).buffered(TIMESTAMP_FANOUT);
         // The batch returns whole headers (RFC-0036 reuses this path for the `blocks` table); this
         // caller wants one field. Projecting here rather than widening the cache keeps the cache a
         // `block -> u64` map: holding headers for `TIMESTAMP_CACHE_MAX` blocks instead would be a
-        // footprint regression on the hot path, against a 2 GB per-cursor budget.
-        for r in results {
+        // footprint regression on the hot path, against a 2 GB per-cursor budget. Each batch is
+        // projected as it lands: collected first, a dense window held every header, transaction
+        // hashes and all, at once (#2227).
+        while let Some(r) = results.next().await {
             for (b, header) in r? {
                 if let Some(ts) = header
                     .get("timestamp")
@@ -2115,7 +2114,7 @@ impl RpcClient {
                 }
             }
         }
-        let resp = match resp {
+        let mut resp = match resp {
             Some(r) => r,
             None => {
                 return Err(last_err
@@ -2125,7 +2124,7 @@ impl RpcClient {
         };
         let mut out = HashMap::new();
         let mut first_item_error: Option<FailureClass> = None;
-        for item in resp.as_array().into_iter().flatten() {
+        for item in resp.as_array_mut().into_iter().flatten() {
             let Some(idx) = item.get("id").and_then(Value::as_u64) else {
                 continue;
             };
@@ -2136,8 +2135,9 @@ impl RpcClient {
             // needs, and RFC-0036's `blocks` table keeps the rest. A `null` result (archive-vs-full
             // load-balancer split) is skipped, and the caller's total-count check turns that into an
             // error rather than a partial map - see COR-3 above.
-            if let Some(result) = item.get("result").filter(|v| !v.is_null()) {
-                out.insert(block, result.clone());
+            let result = item.get_mut("result").map(Value::take);
+            if let Some(result) = result.filter(|v| !v.is_null()) {
+                out.insert(block, result);
             } else if let Some(err) = error_of(item) {
                 // **A per-item error inside an HTTP 200 batch.** `post_one` only rejects a *top-level*
                 // error, so these are invisible to the failure classifier: the batch "succeeded", the
