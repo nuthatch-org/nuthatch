@@ -52,7 +52,7 @@ VERSION="${VERSION:-}"                # release to install; empty = latest
 # a 4 GB box OOMs unless you cap parallelism. Not a trap worth walking into for a few euros.
 
 need() { command -v "$1" >/dev/null || { echo "need $1"; exit 1; }; }
-need curl; need python3; need ssh
+need curl; need jq; need ssh
 
 : "${HCLOUD_TOKEN:?set HCLOUD_TOKEN to a Hetzner Cloud API token}"
 
@@ -85,27 +85,17 @@ hc() { # hc METHOD PATH [json]
   case "$code" in
     2*) printf '%s' "$out" ;;
     *)  echo "hetzner API $m $p -> HTTP $code" >&2
-        echo "$out" | python3 -c 'import sys,json
-try:
-    e = json.load(sys.stdin).get("error", {})
-    print(f"  {e.get(\"code\",\"?\")}: {e.get(\"message\",\"?\")}", file=sys.stderr)
-    for d in (e.get("details") or {}).get("fields", []):
-        print(f"  field {d.get(\"name\")}: {d.get(\"messages\")}", file=sys.stderr)
-except Exception:
-    print("  " + sys.stdin.read()[:300], file=sys.stderr)' 2>/dev/null || echo "  $out" >&2
+        jq -r '.error | "  \(.code // "?"): \(.message // "?")",
+          ((.details // {}).fields // [] | .[] | "  field \(.name): \(.messages)")' \
+          <<<"$out" >&2 2>/dev/null || echo "  $out" >&2
         return 1 ;;
   esac
 }
-jq_() { python3 -c 'import sys,json;d=json.load(sys.stdin)
-for k in sys.argv[1].split("."):
-    d = d[int(k)] if k.isdigit() else d.get(k) if isinstance(d,dict) else d
-print(d if d is not None else "")' "$1"; }
+jq_() { jq -er --arg p "$1" 'getpath($p | split(".") | map(tonumber? // .)) // ""'; }
 
 price_of() { # rough hourly, from the API so it is never a stale number in a comment
-  hc GET "/server_types?name=$1" | python3 -c 'import sys,json
-d=json.load(sys.stdin)["server_types"][0]
-p=[x for x in d["prices"]][0]
-print(f'"'"'{float(p["price_hourly"]["gross"]):.4f}'"'"')'
+  hc GET "/server_types?name=$1" | jq -er '.server_types[0].prices[0].price_hourly.gross // empty' \
+    | awk '{ printf "%.4f\n", $1 }'
 }
 
 cloud_init() { # cloud_init <role>
@@ -141,7 +131,7 @@ YAML
 create_server() { # create_server <name> <type> <role> [network-id]
   local name="$1" type="$2" role="$3" net="${4:-}"
   local LOCATION="${LOCATION}"
-  local ci; ci=$(cloud_init "$role" | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read()))')
+  local ci; ci=$(cloud_init "$role" | jq -Rs .)
   local netpart=""; [ -n "$net" ] && netpart=",\"networks\":[$net]"
   hc POST /servers "{
     \"name\":\"$name\",\"server_type\":\"$type\",\"image\":\"$IMAGE\",\"location\":\"$LOCATION\",
@@ -153,17 +143,13 @@ create_server() { # create_server <name> <type> <role> [network-id]
 # Private (10.44.x.x) address of a box, by role. The public IP is how *we* reach it; the private one
 # is how the boxes reach each other, and it is what a writer must be given for the store.
 private_ip() { # private_ip <role> [index]
-  hc GET "/servers?label_selector=$LABEL" | python3 -c 'import sys,json
-role, idx = sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 0
-hits = [s for s in json.load(sys.stdin)["servers"] if s["labels"].get("role") == role]
-hits.sort(key=lambda s: s["name"])
-nets = hits[idx]["private_net"] if idx < len(hits) else []
-print(nets[0]["ip"] if nets else "")' "$1" "${2:-0}"
+  hc GET "/servers?label_selector=$LABEL" | jq -r --arg role "$1" --argjson idx "${2:-0}" \
+    '[.servers[] | select(.labels.role == $role)] | sort_by(.name) | .[$idx].private_net // []
+     | if length > 0 then .[0].ip else "" end'
 }
 
-ips_by_role() { hc GET "/servers?label_selector=$LABEL" | python3 -c 'import sys,json
-for s in json.load(sys.stdin)["servers"]:
-    print(s["labels"].get("role","?"), s["public_net"]["ipv4"]["ip"], s["name"])'; }
+ips_by_role() { hc GET "/servers?label_selector=$LABEL" \
+  | jq -r '.servers[] | "\(.labels.role // "?") \(.public_net.ipv4.ip) \(.name)"'; }
 
 wait_ready() { # wait_ready <ip>
   echo "  waiting for cloud-init on $1 (installs docker + the release; a few minutes)"
@@ -181,14 +167,15 @@ cmd_up() {
   local hourly
   case "$shape" in
     single) hourly=$(price_of "$TYPE_SINGLE") ;;
-    multi)  hourly=$(python3 -c "print(f'{2*$(price_of "$TYPE_WRITER")+$(price_of "$TYPE_SMALL"):.4f}')") ;;
+    multi)  hourly=$(awk -v w="$(price_of "$TYPE_WRITER")" -v s="$(price_of "$TYPE_SMALL")" \
+              'BEGIN { if (w == "" || s == "") exit 1; printf "%.4f", 2 * w + s }') ;;
     *) echo "shape must be 'single' or 'multi'"; exit 1 ;;
   esac
   cat <<TXT
 
   shape:    $shape
   location: $LOCATION
-  cost:     ~€$hourly/hour  (~€$(python3 -c "print(f'{float($hourly)*24:.2f}')")/day)
+  cost:     ~€$hourly/hour  (~€$(awk -v h="$hourly" 'BEGIN { printf "%.2f", h * 24 }')/day)
 
   Hetzner bills hourly, so this is only cheap if you destroy it:
       ./scripts/fleet-lab.sh down
@@ -218,9 +205,8 @@ TXT
     # its boxes leaves the network behind (it is free, and `down` only runs if someone runs it), and a
     # hard failure there sends the operator hunting for a resource that costs nothing and is safe to
     # share. Idempotent `up` beats a tidy-first rule nobody remembers.
-    local net; net=$(hc GET "/networks?label_selector=$LABEL" 2>/dev/null | python3 -c 'import sys,json
-n=json.load(sys.stdin).get("networks") or []
-print(n[0]["id"] if n else "")' 2>/dev/null || true)
+    local net; net=$(hc GET "/networks?label_selector=$LABEL" 2>/dev/null \
+      | jq -r '(.networks // [])[0].id // ""' 2>/dev/null || true)
     if [ -n "$net" ]; then
       echo "  reusing network $net"
     else
@@ -359,9 +345,7 @@ cmd_verify_distributed() {
     # The control plane binds to the **private** address (CONTROL_BIND), so `localhost` refuses -
     # which made this read 0 forever while the registry was in fact populated.
     local n; n=$(lab_ssh "root@$cp" "curl -fsS -m3 http://$cp_priv:8290/workers -H 'authorization: Bearer dev-token-change-me' 2>/dev/null" \
-      | python3 -c 'import sys,json
-try: print(len(json.load(sys.stdin).get("workers", [])))
-except Exception: print(0)' 2>/dev/null || echo 0)
+      | jq -e '(.workers // []) | length' 2>/dev/null || echo 0)
     echo "   registered: $n"
     [ "${n:-0}" -ge 1 ] && break
     sleep 5
@@ -629,14 +613,12 @@ cmd_down() {
   echo "destroying everything labelled $LABEL:"
   ips_by_role | sed 's/^/  /' || true
   read -r -p "  destroy? [y/N] " ok; [ "$ok" = y ] || { echo "  kept"; exit 0; }
-  hc GET "/servers?label_selector=$LABEL" | python3 -c 'import sys,json
-print("\n".join(str(s["id"]) for s in json.load(sys.stdin)["servers"]))' | while read -r id; do
+  hc GET "/servers?label_selector=$LABEL" | jq -r '.servers[].id' | while read -r id; do
     [ -n "$id" ] && { hc DELETE "/servers/$id" >/dev/null && echo "  server $id gone"; }
   done
   # Networks refuse deletion while attached, so they go last.
   sleep 5
-  hc GET "/networks?label_selector=$LABEL" | python3 -c 'import sys,json
-print("\n".join(str(n["id"]) for n in json.load(sys.stdin)["networks"]))' | while read -r id; do
+  hc GET "/networks?label_selector=$LABEL" | jq -r '.networks[].id' | while read -r id; do
     [ -n "$id" ] && { hc DELETE "/networks/$id" >/dev/null && echo "  network $id gone"; }
   done
   echo "done - billing stops now."

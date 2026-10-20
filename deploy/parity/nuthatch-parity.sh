@@ -72,7 +72,7 @@ for m in $modes; do
 done
 case "$retain" in '' | *[!0-9]*) fail "PARITY_RETAIN_DAYS must be a whole number of days" ;; esac
 case "$head_attempts" in '' | *[!0-9]* | 0) fail "PARITY_HEAD_ATTEMPTS must be a positive integer" ;; esac
-command -v python3 >/dev/null || fail "python3 is not on PATH; lodestar-parity.sh needs it"
+command -v jq >/dev/null || fail "jq is not on PATH; lodestar-parity.sh needs it"
 command -v curl >/dev/null || fail "curl is not on PATH"
 [ -x "$script" ] || fail "no executable parity script at $script"
 [ -f "$env_file" ] || fail "no env file at $env_file (GRAPH_API_KEY=..., mode 0600)"

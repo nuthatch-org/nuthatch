@@ -6,9 +6,29 @@
 //! the epoch value fields alone, or on the escrow collections the tests at the end add (#1114, #1983).
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use serde_json::{json, Value};
+
+/// The comparison binary `scripts/lodestar-parity.sh` runs, built once from `tools/lodestar-parity`.
+pub(crate) fn compare_bin() -> PathBuf {
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("lodestar-parity");
+        let built = Command::new(env!("CARGO"))
+            .args(["build", "--locked", "--quiet", "--manifest-path"])
+            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/lodestar-parity/Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&target)
+            .status()
+            .expect("run cargo");
+        assert!(built.success(), "building tools/lodestar-parity failed");
+        target.join("debug/lodestar-parity-compare")
+    })
+    .clone()
+}
 
 fn decode(s: &str) -> String {
     let b = s.as_bytes();
@@ -273,6 +293,7 @@ impl Fixture {
             .env("NEST_URL", &srv)
             .env("GRAPH_GATEWAY", &srv)
             .env("GRAPH_API_KEY", "k")
+            .env("PARITY_COMPARE", compare_bin())
             .env_remove("PINNED_BLOCK")
             .env_remove("PARITY_MODE")
             .env_remove("EPOCH_PARITY_FROM")

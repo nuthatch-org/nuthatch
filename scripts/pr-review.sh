@@ -516,7 +516,7 @@ for v in body_file commits_file base_file base_commits_file own_files_file \
   fi
 done
 
-# Empty is a fact, not a file: python's `diff.strip()` check, ported directly.
+# Empty is a fact, not a file: a diff of whitespace alone is empty.
 if ! grep -q '[^[:space:]]' -- "$diff_file"; then
   echo "pr-review: the diff is empty - nothing to review" >&2
   exit 1

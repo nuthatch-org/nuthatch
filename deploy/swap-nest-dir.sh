@@ -75,12 +75,13 @@ PROD=$PROD_UNIT STAGED=$STAGED_UNIT P=$PROD_DIR L=$STAGED_DIR PP=$PROD_PORT LP=$
 OLD=$P.$OLD_SUFFIX-$stamp
 say() { echo "[$(date -u +%H:%M:%S)] $*"; }
 die() { say "STOP: $*"; exit 1; }
-js() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {}, {"d": d}))' "$1"; }
+js() { jq -er "$1"; }
+command -v jq >/dev/null || die "jq is not on this box"
 get() { curl -fsS -m "${2:-30}" "http://127.0.0.1:$1"; }
 sql() { curl -sS -m 600 -G "http://127.0.0.1:$1/sql" --data-urlencode "q=$2"; }
-nid() { get "$1/nest" | js 'd["nid"]'; }
-last() { get "$1/ready" | js 'd["last_block"]'; }
-views_ok() { [ "$(get "$1/ready" | js 'len(d["views_failed"])')" = 0 ]; }
+nid() { get "$1/nest" | js .nid; }
+last() { get "$1/ready" | js .last_block; }
+views_ok() { [ "$(get "$1/ready" | js '.views_failed | arrays | length')" = 0 ]; }
 wait_ready() {  # wait_ready PORT SECONDS
   local t=0
   until get "$1/ready" 5 >/dev/null 2>&1; do
@@ -88,13 +89,13 @@ wait_ready() {  # wait_ready PORT SECONDS
     sleep 5; t=$((t + 5))
   done
 }
-invariant() { sql "$1" "$INVARIANT" | js 'd["rows"][0][d["columns"][0]]'; }
+invariant() { sql "$1" "$INVARIANT" | js '.columns[0] as $c | .rows[0][$c]'; }
 smoke() {  # smoke PORT: every statement in $work/smoke.sql answers without an error
   local n=0 s out
   while IFS= read -r s; do
     case "$s" in ''|--*) continue ;; esac
     out=$(sql "$1" "$s") || return 1
-    printf '%s' "$out" | js '"error" not in d or not d["error"]' | grep -qx True || { say "smoke refused: ${s:0:120}"; return 1; }
+    printf '%s' "$out" | jq -e '.error | . == null or . == false or . == ""' >/dev/null || { say "smoke refused: ${s:0:120}"; return 1; }
     n=$((n + 1))
   done < "$work/smoke.sql"
   say "smoke: $n statements answered"

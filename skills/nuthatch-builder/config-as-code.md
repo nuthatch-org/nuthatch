@@ -13,7 +13,7 @@
 > how the front-end behaved while it existed; none of it runs today.
 
 Historically, RFC-0018 §2 added an **optional** second front-end: a `nest.star` file that *computes*
-the config in [Starlark](https://github.com/facebook/starlark-rust) (a small, hermetic Python dialect)
+the config in [Starlark](https://github.com/facebook/starlark-rust) (a small, hermetic configuration language)
 and evaluates to the **exact same `Config`** the TOML would - sugar, never a new capability. A `.star`
 and its equivalent `.toml` produce a byte-identical config.
 
@@ -45,7 +45,7 @@ All arguments are **keyword-only** - `contract(alias="usdc", ...)`, never `contr
 
 ## The canonical win: a loop instead of copy-paste
 
-```python
+```starlark
 # nest.star - index a basket of ERC-20s that all share one ABI
 STABLES = {
     "usdc": "0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48",
@@ -84,7 +84,7 @@ The contract is **library-defines, entry-instantiates**:
   itself**. It is a library, not an entry.
 - An **entry** `nest.star` `load()`s that function and calls it once, with its chain's parameters.
 
-```python
+```starlark
 # uniswap-v3/lib.star - the reusable unit. Defines; never self-instantiates.
 def uniswap_v3(name, chain, factory, rpc):
     return nest(
@@ -96,7 +96,7 @@ def uniswap_v3(name, chain, factory, rpc):
     )
 ```
 
-```python
+```starlark
 # uniswap-v3-arbitrum/nest.star - one instance; its siblings differ only in the three arguments.
 load("//uniswap-v3:lib.star", "uniswap_v3")
 uniswap_v3(

@@ -1,0 +1,18 @@
+[package]
+name = "lodestar-parity"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "The comparison half of scripts/lodestar-parity.sh: the Lodestar nest against the Graph Network subgraph"
+publish = false
+
+# Its own crate, outside the binary: it runs on the box beside scripts/lodestar-parity.sh.
+[[bin]]
+name = "lodestar-parity-compare"
+path = "src/main.rs"
+
+[dependencies]
+# Epoch totals are wei and exceed u64; the comparison is on their exact digits.
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+ureq = "2"

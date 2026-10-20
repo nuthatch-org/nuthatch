@@ -447,7 +447,7 @@ rg -o --no-filename "from '[^']*(db|database|postgres|pg)[^']*'" src/app/api --g
 ```sh
 # Already served by a nest (11), and the crons (19).
 rg -l 'nuthatchSql|nuthatchEnabled|hasNuthatch' src --glob '*.ts' --glob '*.tsx' | grep -v __tests__
-python3 -c "import json;print(len(json.load(open('vercel.json'))['crons']))"
+jq '.crons | length' vercel.json
 
 # api/subgraph's production guard, and its size.
 grep -n "NODE_ENV === 'production'" src/app/api/subgraph/route.ts && wc -l src/app/api/subgraph/route.ts
@@ -457,24 +457,29 @@ grep -n "NODE_ENV === 'production'" src/app/api/subgraph/route.ts && wc -l src/a
 is checkable against the document rather than the repo. Run from the nuthatch repo:
 
 ```sh
-python3 - <<'EOF'
-s=open('docs/lodestar-migration-inventory.md').read()
-i=s.index('## 3. Group C'); j=s.index('**Twenty-nine surfaces')
-rows=[l for l in s[i:j].split('\n') if l.startswith('| ') and l.split('|')[1].strip().isdigit()]
-b={'covered':0,'needs a view':0,'mixed':0,'unclassified':0}
-multi=[r for r in rows if ',' in r.strip('|').split('|')[1]]
-for r in rows:
-    c=[x.strip() for x in r.strip('|').split('|')]; nest,onchain=c[4],c[3]
-    if '.sql`' in nest: b['covered']+=1
-    elif nest=='**no view**' and onchain=='**mixed**': b['mixed']+=1
-    elif nest=='**no view**': b['needs a view']+=1
-    elif nest=='partial': b['mixed']+=1
-    else: b['unclassified']+=1
-print(b, 'sum', sum(b.values()), 'rows', len(rows))
-# One row is one surface: a row naming two files makes the total unverifiable.
-assert not multi, f'row names more than one surface: {multi}'
-assert sum(b.values()) == len(rows) == 29 and b['unclassified'] == 0
-EOF
+awk -F'|' '
+  /## 3\. Group C/ { s = 1 }
+  /\*\*Twenty-nine surfaces/ { s = 0 }
+  !s || !/^\| / { next }
+  { k = $2; gsub(/^[ \t]+|[ \t]+$/, "", k) }
+  k !~ /^[0-9]+$/ { next }
+  {
+    rows++; nest = $6; onchain = $5
+    gsub(/^[ \t]+|[ \t]+$/, "", nest); gsub(/^[ \t]+|[ \t]+$/, "", onchain)
+    if ($3 ~ /,/) multi = multi "\n" $0
+    if (index(nest, ".sql`")) covered++
+    else if (nest == "**no view**" && onchain == "**mixed**") mixed++
+    else if (nest == "**no view**") noview++
+    else if (nest == "partial") mixed++
+    else unclassified++
+  }
+  END {
+    printf "covered %d, needs a view %d, mixed %d, unclassified %d, sum %d, rows %d\n",
+      covered, noview, mixed, unclassified, covered + noview + mixed + unclassified, rows
+    # One row is one surface: a row naming two files makes the total unverifiable.
+    if (multi != "") { print "row names more than one surface:" multi; exit 1 }
+    if (covered + noview + mixed != rows || rows != 29 || unclassified) exit 1
+  }' docs/lodestar-migration-inventory.md
 ```
 
 ### And the prose against the table
@@ -484,32 +489,34 @@ wrong: **seven review rounds found seven stale figures, every one of them a sent
 updated when the table moved.** So the check that matters asserts the prose:
 
 ```sh
-python3 - <<'EOF'
-s = open('docs/lodestar-migration-inventory.md').read()
-i = s.index('## 3. Group C'); j = s.index('**Twenty-nine surfaces')
-rows = [l for l in s[i:j].split('\n') if l.startswith('| ') and l.split('|')[1].strip().isdigit()]
-cov = noview = mixed = 0
-for r in rows:
-    c = [x.strip() for x in r.strip('|').split('|')]; nest, onchain = c[4], c[3]
-    if '.sql`' in nest: cov += 1
-    elif nest == '**no view**' and onchain == '**mixed**': mixed += 1
-    elif nest == '**no view**': noview += 1
-    elif nest == 'partial': mixed += 1
-n = len(rows)
-assert (n, cov, noview, mixed) == (29, 12, 12, 5), (n, cov, noview, mixed)
-assert [int(r.split('|')[1]) for r in rows] == list(range(1, n + 1)), 'row numbers are not 1..n'
-assert not [r for r in rows if ',' in r.strip('|').split('|')[1]], 'a row names two surfaces'
+f=docs/lodestar-migration-inventory.md
+read -r n cov noview mixed ok < <(awk -F'|' '
+  /## 3\. Group C/ { s = 1 }
+  /\*\*Twenty-nine surfaces/ { s = 0 }
+  !s || !/^\| / { next }
+  { k = $2; gsub(/^[ \t]+|[ \t]+$/, "", k) }
+  k !~ /^[0-9]+$/ { next }
+  {
+    n++; nest = $6; onchain = $5
+    gsub(/^[ \t]+|[ \t]+$/, "", nest); gsub(/^[ \t]+|[ \t]+$/, "", onchain)
+    if (k + 0 != n || $3 ~ /,/) bad = 1
+    if (index(nest, ".sql`")) cov++
+    else if (nest == "**no view**" && onchain == "**mixed**") mixed++
+    else if (nest == "**no view**") noview++
+    else if (nest == "partial") mixed++
+  }
+  END { print n + 0, cov + 0, noview + 0, mixed + 0, bad ? "no" : "yes" }' "$f")
+[ "$n $cov $noview $mixed" = "29 12 12 5" ] || { echo "table is $n rows, $cov / $noview / $mixed"; exit 1; }
+[ "$ok" = yes ] || { echo "row numbers are not 1..n, or a row names two surfaces"; exit 1; }
 
 # Every sentence that quotes one of those numbers, by the number it must quote.
-must = [
-    f'group C, {n} surfaces', f'0 of {n} migrated', f'7 rows of a {n}-row group',
-    f"group C's {n}", f'**{cov}** with a view file', f'**{noview}** needing a view written',
-    f'**{mixed}** mixed', f'{cov} having cleared the', f'{cov} / {noview} / {mixed} over {n} rows',
-]
-missing = [m for m in must if m not in s]
-assert not missing, f'prose disagrees with the table: {missing}'
-print(f'{n} rows = {cov} covered + {noview} no view + {mixed} mixed; prose agrees')
-EOF
+missing=0
+for m in "group C, $n surfaces" "0 of $n migrated" "7 rows of a $n-row group" \
+  "group C's $n" "**$cov** with a view file" "**$noview** needing a view written" \
+  "**$mixed** mixed" "$cov having cleared the" "$cov / $noview / $mixed over $n rows"; do
+  grep -qF -- "$m" "$f" || { echo "prose disagrees with the table: $m"; missing=1; }
+done
+[ "$missing" = 0 ] && echo "$n rows = $cov covered + $noview no view + $mixed mixed; prose agrees"
 ```
 
 Run it before quoting any figure from this file elsewhere. A number here that no longer matches the
