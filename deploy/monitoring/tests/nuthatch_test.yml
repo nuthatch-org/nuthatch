@@ -82,23 +82,23 @@ tests:
       - series: 'nuthatch_last_poll_unixtime{job="nuthatch", instance="100.82.188.91:8104", unit="nuthatch-dips", box="helsinki", role="cursor"}'
         values: '0+15x20'
     alert_rule_test:
-      - eval_time: 9m
+      - eval_time: 34m
         alertname: IngestStalled
         exp_alerts: []
-      - eval_time: 16m
+      - eval_time: 36m
         alertname: IngestStalled
         exp_alerts:
           - exp_labels: {severity: page, job: nuthatch, instance: "100.82.188.91:8104", unit: nuthatch-dips, box: helsinki, role: cursor}
             exp_annotations:
-              summary: "nuthatch-dips: no successful poll for 11m 0s"
+              summary: "nuthatch-dips: no successful poll for 31m 0s"
 
-  # A healthy 5-minute poller must never fire it.
+  # A healthy 15-minute poller must never fire it.
   - interval: 1m
     input_series:
       - series: 'nuthatch_last_poll_unixtime{job="nuthatch", instance="100.82.188.91:8107", unit="graph-allocations-nest-next", box="helsinki", role="cursor"}'
-        values: '0 0 0 0 0 300 300 300 300 300 600 600 600 600 600 900 900 900 900 900 1200'
+        values: '0x14 900x14 1800x14 2700'
     alert_rule_test:
-      - eval_time: 19m
+      - eval_time: 44m
         alertname: IngestStalled
         exp_alerts: []
 

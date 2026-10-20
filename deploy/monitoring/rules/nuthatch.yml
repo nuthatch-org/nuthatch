@@ -31,11 +31,12 @@ groups:
         annotations:
           summary: "{{ $labels.unit }}: {{ $labels.nest }} has not reached tip in 30 minutes and is falling further behind ({{ $value }} blocks more over 15m)"
 
-      # The documented threshold is 300 s; the units here poll every 5 minutes, so the age of the
-      # last poll reaches 300 s on every healthy cycle. max_over_time keeps the last value for an
-      # hour after the process has gone, so a stopped unit still fires this.
+      # Two missed polls at the slowest interval in use: the Helsinki units poll every 15 minutes
+      # (zz-poll-15m.conf), so the age of the last poll reaches 900 s on every healthy cycle.
+      # max_over_time keeps the last value for an hour after the process has gone, so a stopped unit
+      # still fires this.
       - alert: IngestStalled
-        expr: time() - max_over_time(nuthatch_last_poll_unixtime{role="cursor"}[1h]) > 600
+        expr: time() - max_over_time(nuthatch_last_poll_unixtime{role="cursor"}[1h]) > 1800
         labels: {severity: page}
         annotations:
           summary: "{{ $labels.unit }}: no successful poll for {{ $value | humanizeDuration }}"
