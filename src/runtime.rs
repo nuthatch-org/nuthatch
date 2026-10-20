@@ -1826,6 +1826,8 @@ pub async fn dev(
     seal_direct: bool,
     concurrency: usize,
     ipfs_window_deadline: std::time::Duration,
+    ipfs_gateways: Vec<String>,
+    state_rpc: Vec<String>,
     window_override: Option<u64>,
     no_admin: bool,
     fail_fast: bool,
@@ -1840,6 +1842,16 @@ pub async fn dev(
     let _runtime_lock = lock_runtime_dir(&dir, false)?;
     let (mounts, suspended) = split_suspended(&all_mounts);
     let admin_enabled = indexer::admin_enabled(no_admin, &listen);
+    // Declared chains, not mounted ones: a nest hot-mounted onto a dormant chain is stamped too.
+    let declared = all_mounts.chains.len();
+    if !state_rpc.is_empty() && declared > 1 {
+        bail!(
+            "--state-rpc is ambiguous for a multichain runtime ({} chains declared): an archive \
+             endpoint answers for one chain, and a `[[calls]]` nest on another would read the wrong \
+             chain's state",
+            declared
+        );
+    }
     // Empty is a valid start (#1545): nests arrive over the admin API. Without that API nothing
     // ever could.
     if mounts.mount_refs().is_empty() && !admin_enabled {
@@ -1879,7 +1891,13 @@ pub async fn dev(
     // The dial is the operator's, not the nest's (RFC-0040), so it is stamped onto every mounted
     // config here rather than read from any of them - `Config::freshness` is `#[serde(skip)]`.
     for (_, _, config) in &mut mounted {
-        stamp_operator_settings(config, freshness, ipfs_window_deadline);
+        stamp_operator_settings(
+            config,
+            freshness,
+            ipfs_window_deadline,
+            &ipfs_gateways,
+            &state_rpc,
+        );
     }
     let groups = group_by_chain(&endpoints, mounted)?;
 
@@ -2180,6 +2198,8 @@ pub async fn dev(
             seal_direct,
             concurrency,
             ipfs_window_deadline,
+            ipfs_gateways,
+            state_rpc,
             window_override,
             admin_enabled,
             admin_token: admin_token.clone(),
@@ -3070,14 +3090,18 @@ pub struct RuntimeHandles {
 }
 
 /// The operator's run-time settings, stamped onto every mounted config at boot and at a hot mount alike.
-/// Neither is identity: each is `#[serde(skip)]` on `Config`.
+/// None is identity: each is `#[serde(skip)]` on `Config`.
 pub fn stamp_operator_settings(
     config: &mut Config,
     freshness: crate::freshness::Freshness,
     ipfs_window_deadline: std::time::Duration,
+    ipfs_gateways: &[String],
+    state_rpc: &[String],
 ) {
     config.freshness = freshness;
     config.ipfs_window_deadline = ipfs_window_deadline;
+    config.ipfs_gateways = ipfs_gateways.to_vec();
+    config.state_rpc_urls = state_rpc.to_vec();
 }
 
 /// The context a running mounts needs in order to build and admit a nest (RFC-0027 §3).
@@ -3103,6 +3127,9 @@ pub struct MountContext {
     pub concurrency: usize,
     /// `--ipfs-window-deadline`, stamped onto a hot-mounted nest's config like `freshness` (#1399).
     pub ipfs_window_deadline: std::time::Duration,
+    /// `--ipfs` and `--state-rpc`, stamped the same way.
+    pub ipfs_gateways: Vec<String>,
+    pub state_rpc: Vec<String>,
     pub window_override: Option<u64>,
     pub admin_enabled: bool,
     pub admin_token: Option<String>,
@@ -4289,7 +4316,13 @@ impl RuntimeHandles {
                     .get(&config.nest.chain)
                     .copied()
                     .unwrap_or(self.mount_ctx.freshness);
-                stamp_operator_settings(&mut config, dial, self.mount_ctx.ipfs_window_deadline);
+                stamp_operator_settings(
+                    &mut config,
+                    dial,
+                    self.mount_ctx.ipfs_window_deadline,
+                    &self.mount_ctx.ipfs_gateways,
+                    &self.mount_ctx.state_rpc,
+                );
                 let Admission {
                     chain,
                     dormant,
@@ -4319,7 +4352,13 @@ impl RuntimeHandles {
                         .insert(chain.clone(), d.endpoint.rpc_urls.len());
                     self.mount_ctx.chain_freshness.insert(chain.clone(), dial);
                     self.mount_ctx.dormant.remove(&chain);
-                    stamp_operator_settings(&mut config, dial, self.mount_ctx.ipfs_window_deadline);
+                    stamp_operator_settings(
+                        &mut config,
+                        dial,
+                        self.mount_ctx.ipfs_window_deadline,
+                        &self.mount_ctx.ipfs_gateways,
+                        &self.mount_ctx.state_rpc,
+                    );
                 }
                 let Some(source) = self.mount_ctx.sources.get(&chain).cloned() else {
                     return Err(MountRefusal::UndeclaredChain {
@@ -5322,8 +5361,8 @@ mod tests {
         std::fs::write(nest.join("abi.json"), "[]").unwrap();
     }
 
-    /// #1399: boot and a hot mount both stamp `--ipfs-window-deadline` through this, beside the
-    /// freshness dial, onto a config that loaded with the default.
+    /// #1399, #2183: boot and a hot mount both stamp `--ipfs-window-deadline`, `--ipfs` and
+    /// `--state-rpc` through this, beside the freshness dial, onto a config that loaded with the default.
     #[test]
     fn operator_settings_reach_a_mounted_config() {
         let d = tempfile::tempdir().unwrap();
@@ -5339,9 +5378,20 @@ mod tests {
             finality_only: true,
             poll_interval_explicit: true,
         };
-        stamp_operator_settings(&mut config, freshness, std::time::Duration::ZERO);
+        let gateway = vec!["http://127.0.0.1:8080/ipfs/".to_string()];
+        let archive = vec!["http://archive.invalid".to_string()];
+        stamp_operator_settings(
+            &mut config,
+            freshness,
+            std::time::Duration::ZERO,
+            &gateway,
+            &archive,
+        );
         assert_eq!(config.ipfs_window_deadline, std::time::Duration::ZERO);
         assert_eq!(config.freshness.poll_interval, minute);
+        // #2183: `--ipfs` and `--state-rpc` reach a mounted nest as they reach a solo one.
+        assert_eq!(config.ipfs_gateways, gateway);
+        assert_eq!(config.state_rpc_urls, archive);
     }
 
     fn mounted(roost_dir: &Path, name: &str) -> (String, PathBuf, Config) {
@@ -6156,6 +6206,8 @@ mod tests {
                 seal_direct: false,
                 concurrency: 1,
                 ipfs_window_deadline: std::time::Duration::from_secs(1),
+                ipfs_gateways: Vec::new(),
+                state_rpc: Vec::new(),
                 window_override: None,
                 admin_enabled: true,
                 admin_token: None,
@@ -6837,6 +6889,8 @@ mod tests {
                 seal_direct: false,
                 concurrency: 1,
                 ipfs_window_deadline: std::time::Duration::from_secs(1),
+                ipfs_gateways: Vec::new(),
+                state_rpc: Vec::new(),
                 window_override: None,
                 admin_enabled: true,
                 admin_token: None,
@@ -7399,6 +7453,8 @@ mod tests {
                 seal_direct: false,
                 concurrency: 1,
                 ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
+                ipfs_gateways: Vec::new(),
+                state_rpc: Vec::new(),
                 window_override: None,
                 admin_enabled: true,
                 admin_token: None,
@@ -8287,6 +8343,8 @@ mod tests {
                 false,
                 1,
                 crate::ipfs_resolve::WINDOW_DEADLINE,
+                Vec::new(),
+                Vec::new(),
                 None,
                 false,
                 false,
@@ -8299,6 +8357,48 @@ mod tests {
         .expect("the runtime started under a prune");
         let err = started.expect_err("the runtime started under a prune");
         assert!(format!("{err:#}").contains("a prune is running"), "{err:#}");
+    }
+
+    /// #2183: one `--state-rpc` answers for one chain, so a runtime declaring two refuses it rather
+    /// than stamp it onto a `[[calls]]` nest of the other.
+    #[tokio::test]
+    async fn a_multichain_runtime_refuses_state_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\n\n\
+             [[chains]]\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[chains]]\nchain = \"base\"\nchain_id = 8453\nrpc_urls = []\n",
+        )
+        .unwrap();
+        let started = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dev(
+                dir.path().to_path_buf(),
+                "127.0.0.1:0".to_string(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                false,
+                1,
+                crate::ipfs_resolve::WINDOW_DEADLINE,
+                Vec::new(),
+                vec!["http://archive.invalid".to_string()],
+                None,
+                true,
+                false,
+                Default::default(),
+                Vec::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("the runtime started");
+        let err = started.expect_err("the runtime accepted --state-rpc across two chains");
+        assert!(
+            format!("{err:#}").contains("--state-rpc is ambiguous for a multichain runtime"),
+            "{err:#}"
+        );
     }
 
     /// #2176: a nest's redb page cache is heap, up to the smaller of its file and the cache ceiling,
