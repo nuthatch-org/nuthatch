@@ -38,6 +38,11 @@ async fn retry_pause(pause: Duration) {
 /// a node. Splitting into bounded sub-batches keeps each request within common limits.
 const MAX_TIMESTAMP_BATCH: usize = 200;
 
+/// The most of one multi-item `eth_getBlockByNumber` or `eth_call` batch body read before the batch is
+/// narrowed (#2227). Every transaction hash rides in a header, so without it a dense chain at
+/// `--concurrency 8` held over 2 GB of headers in flight.
+const BATCH_BODY_CAP: usize = 8 << 20;
+
 /// Return type of the self-recursive [`RpcClient::fetch_timestamp_batch`]. Boxed because an `async fn`
 /// cannot recurse into itself without a heap indirection.
 type TimestampBatchFuture<'a> =
@@ -243,6 +248,29 @@ impl std::fmt::Display for ClassifiedError {
 
 impl std::error::Error for ClassifiedError {}
 
+/// A response refused past our own body cap. Narrowable, but says nothing about the endpoint: every
+/// endpoint sends the same bytes, so it is neither cooled down nor failed over from (#2227).
+#[derive(Debug)]
+pub(crate) struct BodyCapped {
+    cap: usize,
+}
+
+impl std::fmt::Display for BodyCapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "response passed the {}-byte body cap; narrowing the range",
+            self.cap
+        )
+    }
+}
+
+impl std::error::Error for BodyCapped {}
+
+fn body_capped(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<BodyCapped>())
+}
+
 /// Re-classify an all-endpoints failure as [`FailureClass::Narrowable`] when **every** attempt was a
 /// rate limit (RFC-0028 §3d).
 ///
@@ -362,9 +390,15 @@ pub(crate) fn filter_refused(err: &anyhow::Error) -> bool {
 /// would silently lose the classification the moment anyone added context, which is exactly the sort of
 /// bug that shows up as "it works in the unit test".
 pub(crate) fn class_of(err: &anyhow::Error) -> Option<FailureClass> {
-    err.chain()
-        .find_map(|e| e.downcast_ref::<ClassifiedError>())
-        .map(|c| c.class.clone())
+    err.chain().find_map(|e| {
+        if e.is::<BodyCapped>() {
+            return Some(FailureClass::Narrowable {
+                suggested: None,
+                escalated_from_rate_limit: false,
+            });
+        }
+        e.downcast_ref::<ClassifiedError>().map(|c| c.class.clone())
+    })
 }
 
 /// Classify an HTTP-level failure. Auth is terminal; a payload-too-large is about the request; the
@@ -839,9 +873,11 @@ pub struct RpcClient {
     timestamps: std::sync::Mutex<HashMap<u64, u64>>,
     /// Headers per batch: [`MAX_TIMESTAMP_BATCH`], or less where a known endpoint in the pool takes
     /// less ([`crate::chains::header_batch_cap`], #1570).
-    header_width: usize,
+    header_width: AtomicUsize,
     /// [`GETLOGS_BODY_CAP`], or a smaller one a test sets.
     logs_body_cap: usize,
+    /// [`BATCH_BODY_CAP`], or a smaller one a test sets.
+    batch_body_cap: usize,
     /// The most addresses one getLogs names, lowered when an endpoint refuses a list (#1941). One
     /// value for the pool: the strictest endpoint sets it, at the cost of extra requests elsewhere.
     log_address_cap: AtomicUsize,
@@ -884,8 +920,9 @@ impl RpcClient {
             heads,
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
-            header_width,
+            header_width: AtomicUsize::new(header_width),
             logs_body_cap: GETLOGS_BODY_CAP,
+            batch_body_cap: BATCH_BODY_CAP,
             log_address_cap: AtomicUsize::new(usize::MAX),
             unverified: (0..n).map(|_| AtomicBool::new(false)).collect(),
             chain: AtomicU64::new(0),
@@ -895,6 +932,12 @@ impl RpcClient {
     #[cfg(test)]
     pub(crate) fn with_logs_body_cap(mut self, cap: usize) -> Self {
         self.logs_body_cap = cap;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_batch_body_cap(mut self, cap: usize) -> Self {
+        self.batch_body_cap = cap;
         self
     }
 
@@ -1187,6 +1230,9 @@ impl RpcClient {
                         true,
                         attempts > 1,
                     );
+                    if body_capped(&e) {
+                        return Err(e);
+                    }
                     if matches!(class_of(&e), Some(FailureClass::RateLimited { .. })) {
                         rate_limited += 1;
                     }
@@ -1202,6 +1248,15 @@ impl RpcClient {
     /// POST a raw JSON-RPC body (single object or a batch array) with the same health-ordered failover
     /// as `call`, returning the parsed response. Used for batch requests `call` can't express.
     async fn post_with_failover(&self, body: &Value) -> Result<Value> {
+        self.post_with_failover_capped(body, None).await
+    }
+
+    /// [`Self::post_with_failover`], refusing a response body past `body_cap` bytes as too large.
+    async fn post_with_failover_capped(
+        &self,
+        body: &Value,
+        body_cap: Option<usize>,
+    ) -> Result<Value> {
         let mut failures = PoolFailures::default();
         let mut attempts = 0usize;
         let mut rate_limited = 0usize;
@@ -1235,7 +1290,7 @@ impl RpcClient {
             attempts += 1;
             let t0 = Instant::now();
             let answer = match self.admit(j).await {
-                Ok(()) => self.post_one(url, body).await,
+                Ok(()) => self.post_one(url, body, body_cap).await,
                 Err(e) => Err(e),
             };
             match answer {
@@ -1256,6 +1311,9 @@ impl RpcClient {
                         true,
                         attempts > 1,
                     );
+                    if body_capped(&e) {
+                        return Err(e);
+                    }
                     if matches!(class_of(&e), Some(FailureClass::RateLimited { .. })) {
                         rate_limited += 1;
                     }
@@ -1371,17 +1429,16 @@ impl RpcClient {
             return resp.json::<Value>().await.map_err(read_failed);
         };
         let mut resp = resp;
-        let mut body = Vec::new();
+        let declared = resp.content_length().unwrap_or(0) as usize;
+        if declared > cap {
+            return Err(anyhow::Error::new(BodyCapped { cap }));
+        }
+        // Grown by doubling, a body near the cap left the allocator holding several times it.
+        let mut body = Vec::with_capacity(declared);
         while let Some(chunk) = resp.chunk().await.map_err(read_failed)? {
             body.extend_from_slice(&chunk);
             if body.len() > cap {
-                return Err(classified(
-                    FailureClass::Narrowable {
-                        suggested: None,
-                        escalated_from_rate_limit: false,
-                    },
-                    format!("response passed the {cap}-byte getLogs body cap; narrowing the range"),
-                ));
+                return Err(anyhow::Error::new(BodyCapped { cap }));
             }
         }
         serde_json::from_slice(&body)
@@ -1396,8 +1453,8 @@ impl RpcClient {
         self.send_classified(&url, body, None).await
     }
 
-    async fn post_one(&self, url: &str, body: &Value) -> Result<Value> {
-        let resp: Value = self.send_classified(url, body, None).await?;
+    async fn post_one(&self, url: &str, body: &Value, body_cap: Option<usize>) -> Result<Value> {
+        let resp: Value = self.send_classified(url, body, body_cap).await?;
         // A whole-batch rejection - e.g. a keyless endpoint answering HTTP 200 with
         // `{"error":{"message":"authenticate with an API key"}}` instead of the expected array - comes
         // back as a single object with a top-level `error`. Treat it as an endpoint failure so
@@ -1712,7 +1769,10 @@ impl RpcClient {
                         "params": [{ "to": to, "data": data }, selector] })
             })
             .collect();
-        let resp = self.post_with_failover(&Value::Array(batch)).await?;
+        let cap = (calls.len() > 1).then_some(self.batch_body_cap);
+        let resp = self
+            .post_with_failover_capped(&Value::Array(batch), cap)
+            .await?;
         decode_call_batch(&resp, calls.len())
     }
 
@@ -1797,7 +1857,7 @@ impl RpcClient {
         // Futures built eagerly rather than mapped inside the stream: the borrow of each chunk has to
         // outlive the stream, and a closure producing them cannot express that.
         let futures: Vec<_> = blocks
-            .chunks(self.header_width)
+            .chunks(self.header_width.load(Ordering::Relaxed))
             .map(|c| self.fetch_timestamp_batch(c, false, true))
             .collect();
         let mut results = futures::stream::iter(futures).buffered(TIMESTAMP_FANOUT);
@@ -1902,7 +1962,7 @@ impl RpcClient {
         for round in 0..ROUNDS {
             use futures::stream::StreamExt;
             let futures: Vec<_> = missing
-                .chunks(self.header_width)
+                .chunks(self.header_width.load(Ordering::Relaxed))
                 .map(|c| self.fetch_timestamp_batch(c, full, true))
                 .collect();
             let results: Vec<Result<HashMap<u64, Value>>> = futures::stream::iter(futures)
@@ -2026,6 +2086,9 @@ impl RpcClient {
                 // and recursing further would spin on a dead endpoint (the failure RFC-0028 avoided).
                 Err(e) if blocks.len() > 1 && batch_is_narrowable(&e) => {
                     let mid = blocks.len() / 2;
+                    if body_capped(&e) && !full {
+                        self.header_width.fetch_min(mid, Ordering::Relaxed);
+                    }
                     let class = class_label(class_of(&e).as_ref());
                     // The classifier's decision at *this* level, named. #656 asks which class drove
                     // the descent, and that is answerable only if each level says so on its way past.
@@ -2094,11 +2157,13 @@ impl RpcClient {
         let mut resp = None;
         let mut last_err = None;
         for attempt in 0..TIMESTAMP_ATTEMPTS {
-            match self.post_with_failover(&body).await {
+            let cap = (blocks.len() > 1).then_some(self.batch_body_cap);
+            match self.post_with_failover_capped(&body, cap).await {
                 Ok(r) => {
                     resp = Some(r);
                     break;
                 }
+                Err(e) if body_capped(&e) => return Err(e),
                 Err(e) => {
                     tracing::debug!("block_timestamps attempt {} failed: {e:#}", attempt + 1);
                     // Same as `block_headers` (#361): prefer the provider's own number to our guess.
@@ -2449,6 +2514,89 @@ mod tests {
         (format!("http://{addr}/"), handle)
     }
 
+    /// A node answering headers with `txs` transaction hashes each, recording each batch's width.
+    async fn dense_header_rpc(
+        txs: usize,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+        let widths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = widths.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    let items = req.as_array().cloned().unwrap_or_default();
+                    seen.lock().unwrap().push(items.len());
+                    let out: Vec<Value> = items
+                        .iter()
+                        .map(|it| {
+                            let n =
+                                super::parse_hex_u64(it["params"][0].as_str().unwrap()).unwrap();
+                            let hashes: Vec<String> = (0..txs)
+                                .map(|i| format!("0x{:064x}", (n << 32) + i as u64))
+                                .collect();
+                            json!({"jsonrpc": "2.0", "id": it["id"], "result": {
+                                "number": format!("0x{n:x}"),
+                                "timestamp": format!("0x{:x}", n * 12),
+                                "transactions": hashes,
+                            }})
+                        })
+                        .collect();
+                    Json(Value::Array(out))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), widths, handle)
+    }
+
+    /// #2227: a header batch past the body cap is narrowed rather than held whole, the width that
+    /// fit is kept for the next window, and the endpoint is not cooled down for it.
+    #[tokio::test]
+    async fn a_header_batch_past_the_body_cap_narrows_and_remembers() {
+        // About 6.9 KB a header, so nine fit under 64 KiB.
+        let (a, widths, server) = dense_header_rpc(100).await;
+        let (b, other, spare) = dense_header_rpc(100).await;
+        let c = super::RpcClient::new(vec![a, b])
+            .unwrap()
+            .with_batch_body_cap(64 << 10);
+        let first: Vec<u64> = (1..=200).collect();
+        let got = c.block_timestamps(&first).await.unwrap();
+        assert!(first.iter().all(|b| got[b] == b * 12));
+        let learned = c.header_width.load(Ordering::Relaxed);
+        assert!((2..=9).contains(&learned), "learned width {learned}");
+        let mut sent = widths.lock().unwrap().clone();
+        sent.extend(other.lock().unwrap().iter());
+        // Asked once: neither retried at its width nor failed over to the other endpoint.
+        assert_eq!(sent.iter().filter(|&&w| w == 200).count(), 1, "{sent:?}");
+
+        widths.lock().unwrap().clear();
+        other.lock().unwrap().clear();
+        let next: Vec<u64> = (1_000..1_200).collect();
+        let got = c.block_timestamps(&next).await.unwrap();
+        server.abort();
+        spare.abort();
+        assert!(next.iter().all(|b| got[b] == b * 12));
+        let mut sent = widths.lock().unwrap().clone();
+        sent.extend(other.lock().unwrap().iter());
+        assert!(sent.iter().all(|&w| w <= learned), "{sent:?}");
+        assert_eq!(
+            sent.len(),
+            200usize.div_ceil(learned),
+            "a refused batch: {sent:?}"
+        );
+    }
+
     /// Address history's getLogs is capped the same way, at its own smaller cap, with an error its
     /// span narrowing reads as a range refusal, and one block past it is refused too.
     #[tokio::test]
@@ -2485,6 +2633,7 @@ mod tests {
             crate::chunker::is_result_too_large(&err),
             "a body past the cap must read as a cap: {err:#}"
         );
+        assert!(capped.health[0].load(Ordering::Relaxed) <= super::now_millis());
         let one = capped.get_logs(&[], &t0, 1, 1).await.unwrap();
         assert_eq!(one.len(), 2_000, "a single block is read whole");
         let roomy = super::RpcClient::new(vec![url])
@@ -3094,15 +3243,25 @@ mod tests {
     fn a_pool_with_arb1_sends_header_batches_it_takes() {
         let arb1 = "https://arb1.arbitrum.io/rpc".to_string();
         let keyed = "https://arb-mainnet.g.alchemy.com/v2/k".to_string();
-        assert_eq!(RpcClient::new(vec![arb1.clone()]).unwrap().header_width, 10);
         assert_eq!(
-            RpcClient::with_fallbacks(vec![keyed.clone()], vec![arb1])
+            RpcClient::new(vec![arb1.clone()])
                 .unwrap()
-                .header_width,
+                .header_width
+                .into_inner(),
             10
         );
         assert_eq!(
-            RpcClient::new(vec![keyed]).unwrap().header_width,
+            RpcClient::with_fallbacks(vec![keyed.clone()], vec![arb1])
+                .unwrap()
+                .header_width
+                .into_inner(),
+            10
+        );
+        assert_eq!(
+            RpcClient::new(vec![keyed])
+                .unwrap()
+                .header_width
+                .into_inner(),
             super::MAX_TIMESTAMP_BATCH
         );
     }
@@ -3158,7 +3317,7 @@ mod tests {
 
         let (url, seen) = serve(false).await;
         let mut c = RpcClient::new(vec![url]).unwrap();
-        c.header_width = 10;
+        c.header_width = std::sync::atomic::AtomicUsize::new(10);
         let blocks: Vec<u64> = (1_000..1_300).collect();
         let got = c
             .block_timestamps(&blocks)
@@ -3180,7 +3339,7 @@ mod tests {
 
         let (url, seen) = serve(true).await;
         let mut c = RpcClient::new(vec![url]).unwrap();
-        c.header_width = 10;
+        c.header_width = std::sync::atomic::AtomicUsize::new(10);
         // Recorded rather than slept: the endpoint rests a full cooldown after each 429 (#1853).
         super::RETRY_PAUSES
             .scope(std::cell::RefCell::new(Vec::new()), async {
