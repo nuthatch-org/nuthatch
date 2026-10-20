@@ -949,10 +949,42 @@ impl EntityView {
     ///
     /// Serving a row and then reading `applied_through()` separately is the race this fixes; doing it
     /// inside the accessor would only move the race, so both come off the same guard.
-    pub fn get_with_watermark(&self, key: &Row) -> (Option<Row>, Applied) {
-        match self.state.read() {
-            Ok(s) => (s.relation.get(key).cloned(), s.applied()),
-            Err(_) => (None, Applied::default()),
+    ///
+    /// `readings` holds, per key part, each scalar that part could be: a caller with text in hand
+    /// cannot know a part's type, and the first combination the relation holds is the key (#2205).
+    pub fn get_with_watermark(
+        &self,
+        readings: &[Vec<crate::entity_row::Scalar>],
+    ) -> (Option<Row>, Applied) {
+        let Ok(s) = self.state.read() else {
+            return (None, Applied::default());
+        };
+        let width = s.relation.keys().next().map_or(0, |k| k.0.len());
+        if width == 0 || width != readings.len() || readings.iter().any(Vec::is_empty) {
+            return (None, s.applied());
+        }
+        let mut at = vec![0usize; width];
+        loop {
+            let key = Row(at
+                .iter()
+                .zip(readings)
+                .map(|(&i, r)| r[i].clone())
+                .collect());
+            if let Some(row) = s.relation.get(&key) {
+                return (Some(row.clone()), s.applied());
+            }
+            let mut i = 0;
+            loop {
+                if i == width {
+                    return (None, s.applied());
+                }
+                at[i] += 1;
+                if at[i] < readings[i].len() {
+                    break;
+                }
+                at[i] = 0;
+                i += 1;
+            }
         }
     }
 
