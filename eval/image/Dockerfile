@@ -1,9 +1,9 @@
 # The subject's environment for RFC-0017's authoring eval (#1058).
 #
-# The runner (`eval/run-authoring.py --docker-image`) builds the whole `docker run` itself and puts
-# this on a Docker `--internal` network, so **isolation is not this image's job**: the repository is
-# simply not mounted and there is no route off the network. What the image owes is the opposite -
-# being *usable* enough that a failure is the agent's and not the environment's:
+# The runner (`run-authoring --docker-image`, in eval/runner) builds the whole `docker run` itself
+# and puts this on a Docker `--internal` network, so **isolation is not this image's job**: the
+# repository is simply not mounted and there is no route off the network. What the image owes is
+# the opposite - being *usable* enough that a failure is the agent's and not the environment's:
 #
 #   * `claude`      - the subject. The runner's preflight refuses an image without it, because
 #                     otherwise every run records criteria false and reads as a failing agent.

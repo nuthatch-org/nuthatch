@@ -9,8 +9,6 @@ mod abi_floors_documented;
 mod actions_are_pinned;
 #[path = "authoring_eval_board.rs"]
 mod authoring_eval_board;
-#[path = "authoring_runner_self_test.rs"]
-mod authoring_runner_self_test;
 #[path = "bench_citations.rs"]
 mod bench_citations;
 #[path = "bench_commits.rs"]
@@ -98,8 +96,6 @@ mod engine_batch_boundary;
 mod entity_provenance_is_atomic;
 #[path = "eval_harness.rs"]
 mod eval_harness;
-#[path = "eval_runner_self_test.rs"]
-mod eval_runner_self_test;
 #[cfg(feature = "folds")]
 #[path = "fold_cli_stdout.rs"]
 mod fold_cli_stdout;

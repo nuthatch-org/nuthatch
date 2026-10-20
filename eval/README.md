@@ -71,9 +71,14 @@ either direction loses the same information, and this file has done both.
 HTTP error or a response of an unexpected shape used to leave the row set empty and score the
 question *failed* - so a scorer that could not reach the nest published a schema-valid 0/15 with
 nothing to say why. A scorer that cannot obtain a verdict has not discovered the agent is wrong; it
-has discovered it cannot tell, and those must not share a result. `python3 eval/run-tier-b.py
---self-test` proves it without a key, a nest or a model, and `cargo test --test
-eval_runner_self_test` runs that inside CI's required check.
+has discovered it cannot tell, and those must not share a result. The runner's `--self-test` proves it
+without a key, a nest or a model, and `cargo test --manifest-path eval/runner/Cargo.toml` runs that
+inside CI's required check. A keyed run:
+
+```sh
+cargo run --release --manifest-path eval/runner/Cargo.toml --bin run-tier-b -- \
+  --url http://127.0.0.1:8288 --nuthatch target/release/nuthatch --runs 3
+```
 
 **Every failing result records its query (#1051).** `final_query`, plus `final_rows` on a failure.
 Without them a zero cannot say whether the agent invented a table name, tripped the
@@ -115,7 +120,7 @@ Two things the board caught while being built, both by mutating it rather than b
   test read the chain's `finalized` pin instead, so editing the criterion changed nothing. A
   criterion the scorer does not consult is not a criterion.
 - **The runner's numeric-tolerance check proved nothing.** `"3600"` against `3600` passes even with
-  numeric comparison removed entirely, because `json.dumps(3600)` is `"3600"`. It takes a float to
+  numeric comparison removed entirely, because `3600` serialises as `"3600"`. It takes a float to
   discriminate.
 
 ### Isolation: enforced by construction, or labelled as asserted
@@ -190,9 +195,9 @@ authoring.
 ### Running it
 
 ```sh
-python3 eval/run-authoring.py --self-test                       # no key, no model, no network
-python3 eval/run-authoring.py --nuthatch target/release/nuthatch --runs 3 \
-  --sandbox docker run --rm -v "$WORKDIR:/w" -w /w <image>
+cargo run --manifest-path eval/runner/Cargo.toml --bin run-authoring -- --self-test   # no key, no model, no network
+cargo run --release --manifest-path eval/runner/Cargo.toml --bin run-authoring -- \
+  --nuthatch target/release/nuthatch --runs 3 --docker-image nuthatch-eval-subject
 ```
 
 **No baseline is published yet.** The board, the runner and both self-tests are in place and CI-gated;
