@@ -9447,7 +9447,7 @@ mod tests {
         let segments = tmp.path().join(crate::seal::SEGMENTS_DIR);
         std::fs::create_dir_all(&segments).unwrap();
         std::fs::write(segments.join("a.parquet"), [0u8; 7]).unwrap();
-        let seg = |file: &str, from: u64, to: u64, rows: usize| json!({ "hash": file, "from_block": from, "to_block": to, "rows": rows, "file": file });
+        let seg = |file: &str, from: u64, to: u64, rows: usize| json!({ "hash": file.trim_end_matches(".parquet"), "from_block": from, "to_block": to, "rows": rows, "file": file });
         std::fs::write(
             segments.join(crate::seal::MANIFEST_FILE),
             json!({ "tables": { "t__e": [seg("a.parquet", 5, 9, 3), seg("gone.parquet", 10, 12, 4)] } })
@@ -9508,7 +9508,7 @@ mod tests {
                      "missing_files": 1, "from_block": 5, "to_block": 12 }])
         );
         let detail = v["detail"]["segments"].as_array().unwrap();
-        assert_eq!(detail[0]["hash"], "gone.parquet", "newest first");
+        assert_eq!(detail[0]["hash"], "gone", "newest first");
         assert_eq!(detail[0]["bytes"], Value::Null);
         assert_eq!(detail[1]["bytes"], 7);
 

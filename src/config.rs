@@ -603,6 +603,14 @@ impl Config {
         cfg.check_schema_version()?;
         cfg.extract
             .l1_blocks_check(&cfg.nest.chain, cfg.nest.chain_id)?;
+        // An alias or template name becomes part of a table name, and a table name a segment file
+        // name, so a cloned nest's config must not reach outside `segments/` (#2184).
+        for c in &cfg.contracts {
+            crate::runtime::safe_segment(&c.alias, "contract alias")?;
+        }
+        for t in &cfg.templates {
+            crate::runtime::safe_segment(&t.name, "template name")?;
+        }
         // Declarations are validated at load, not at the first round trip: a typo'd address would
         // otherwise surface thousands of blocks into a backfill as a wall of identical failures.
         for c in &cfg.calls {
@@ -1318,6 +1326,38 @@ rpc_urls = ["https://rpc.example"]
             !prod.contains("load` ends with `refuse_unwired_calls"),
             "`load` docs still name a function it does not call"
         );
+    }
+
+    /// #2184: an alias or template name becomes a segment file name, so it is one path segment.
+    #[test]
+    fn an_alias_or_template_name_that_is_not_one_path_segment_is_refused() {
+        for (alias, template) in [("../x", "t"), ("a/b", "t"), ("c", "../t"), ("c", "")] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                format!(
+                    r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+
+[[contracts]]
+alias = "{alias}"
+address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+abi = "abis/c.json"
+
+[[templates]]
+name = "{template}"
+abi = "abis/t.json"
+"#
+                ),
+            )
+            .unwrap();
+            let err = format!("{:#}", Config::load(dir.path()).unwrap_err());
+            assert!(err.contains("is invalid"), "{alias} {template}: {err}");
+        }
     }
 
     /// A webhook declaring `finality = "tip"` is refused rather than accepted and silently never

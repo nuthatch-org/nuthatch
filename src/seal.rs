@@ -717,13 +717,28 @@ pub(crate) fn test_rows_materialised(dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// A catalogue is read from the nest's own tree, which a cloned repository supplies, and its names
+/// become paths: each table, hash and file must be one segment under the runtime's rule (#2184).
+fn checked(m: Manifest) -> Result<Manifest> {
+    for (table, segs) in &m.tables {
+        crate::runtime::safe_segment(table, "catalogued table")?;
+        for s in segs {
+            crate::runtime::safe_segment(&s.hash, "catalogued segment hash")?;
+            let stem = s.file.strip_suffix(".parquet").unwrap_or("");
+            crate::runtime::safe_segment(stem, "catalogued segment file")
+                .with_context(|| format!("{table}: segment file {:?}", s.file))?;
+        }
+    }
+    Ok(m)
+}
+
 /// Load the segment catalogue (empty if none yet).
 /// The catalogue, with the sha256 of the exact bytes it was parsed from (RFC-0048 §3). `None` when
 /// nothing has sealed.
 pub fn load_manifest_with_hash(dir: &Path) -> Result<(Manifest, Option<String>)> {
     match std::fs::read(manifest_path(dir)) {
         Ok(raw) => Ok((
-            serde_json::from_slice(&raw).context("corrupt segments manifest")?,
+            checked(serde_json::from_slice(&raw).context("corrupt segments manifest")?)?,
             Some(hex::encode(Sha256::digest(&raw))),
         )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Manifest::default(), None)),
@@ -743,7 +758,7 @@ pub fn catalogue_hash(dir: &Path) -> Result<Option<String>> {
 pub fn load_manifest(dir: &Path) -> Result<Manifest> {
     let path = manifest_path(dir);
     match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).context("corrupt segments manifest"),
+        Ok(raw) => checked(serde_json::from_str(&raw).context("corrupt segments manifest")?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::default()),
         Err(e) => Err(e).context("failed to read manifest"),
     }
@@ -1934,6 +1949,34 @@ mod tests {
             values.value(0),
             "9",
             "unpadded decimal text; as UTF-8, \"9\" > \"10\""
+        );
+    }
+
+    /// #2184: a catalogue a cloned nest ships cannot name a file outside its own `segments/`.
+    #[test]
+    fn a_catalogue_naming_a_path_outside_segments_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(SEGMENTS_DIR)).unwrap();
+        let entry = |table: &str, hash: &str, file: &str| {
+            format!(
+                r#"{{"tables":{{"{table}":[{{"hash":"{hash}","from_block":1,"to_block":1,"rows":1,"file":"{file}","provisional":true}}]}}}}"#
+            )
+        };
+        for (table, hash, file) in [
+            ("t", "aa", "../../victim/segments/t-aa.parquet"),
+            ("t", "aa", "/etc/t-aa.parquet"),
+            ("t", "aa", "..parquet"),
+            ("t", "../aa", "t-aa.parquet"),
+            ("../t", "aa", "t-aa.parquet"),
+        ] {
+            std::fs::write(manifest_path(dir.path()), entry(table, hash, file)).unwrap();
+            assert!(load_manifest(dir.path()).is_err(), "{table} {hash} {file}");
+            assert!(load_manifest_with_hash(dir.path()).is_err(), "{file}");
+        }
+        std::fs::write(manifest_path(dir.path()), entry("t", "aa", "t-aa.parquet")).unwrap();
+        assert_eq!(
+            load_manifest(dir.path()).unwrap().tables["t"][0].file,
+            "t-aa.parquet"
         );
     }
 

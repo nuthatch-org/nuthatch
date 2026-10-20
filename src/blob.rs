@@ -160,15 +160,18 @@ pub fn bundle(dir: &Path, out: Option<&Path>, as_dir: bool, allow_secrets: bool)
     }
     let manifest = build_manifest(dir, None)?;
     let hash = manifest.blob_hash();
-    let default_out = |ext: &str| {
+    let default_out = |ext: &str| -> Result<PathBuf> {
+        crate::runtime::safe_segment(&manifest.nest_name, "the nest name")
+            .context("pass --out to choose where to write the bundle")?;
         let parent = dir.parent().unwrap_or_else(|| Path::new("."));
-        parent.join(format!("{}-{}.{ext}", manifest.nest_name, &hash[..12]))
+        Ok(parent.join(format!("{}-{}.{ext}", manifest.nest_name, &hash[..12])))
     };
 
     if as_dir {
-        let out_dir = out
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| default_out("nest"));
+        let out_dir = match out {
+            Some(o) => o.to_path_buf(),
+            None => default_out("nest")?,
+        };
         // If the chosen output dir is *inside* the nest, rebuild the manifest excluding it (so the
         // bundle doesn't try to pack itself). Rare, but a foot-gun worth closing.
         let (manifest, hash) = if out_dir.starts_with(dir) {
@@ -187,9 +190,10 @@ pub fn bundle(dir: &Path, out: Option<&Path>, as_dir: bool, allow_secrets: bool)
         return Ok(());
     }
 
-    let out_file = out
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| default_out("bundle"));
+    let out_file = match out {
+        Some(o) => o.to_path_buf(),
+        None => default_out("bundle")?,
+    };
     write_bundle(dir, &manifest, &out_file)?;
     println!("bundled nest '{}'", manifest.nest_name);
     println!("  bundle:   {}", out_file.display());
@@ -292,6 +296,24 @@ pub(crate) fn checked_join(base: &Path, rel: &str) -> Result<PathBuf> {
     Ok(base.join(rel_path))
 }
 
+/// A bundle is a nest's config, ABIs and views; this is far above any real one.
+const MAX_FETCHED_BUNDLE: u64 = 1 << 30;
+
+async fn fetch_bundle(url: &str, dest: &Path, cap: u64) -> Result<()> {
+    use std::io::Write;
+    let resp = reqwest::get(url)
+        .await
+        .with_context(|| format!("fetching bundle from {url}"))?
+        .error_for_status()
+        .with_context(|| format!("fetching bundle from {url}"))?;
+    let mut file = std::fs::File::create(dest).context("writing fetched bundle")?;
+    crate::publish::read_capped(resp, "the fetched bundle", cap, |c| {
+        file.write_all(c).context("writing fetched bundle")
+    })
+    .await?;
+    Ok(())
+}
+
 /// `nuthatch nest load <bundle> [--dir <target>] [--expect <hash>]`: load a bundle into a runnable
 /// nest. `bundle` may be a `.bundle` file, an `http(s)://` URL to one, or an already-unpacked bundle
 /// directory. A URL or file is resolved to a local bundle dir (fetch + untar), then verified and
@@ -299,17 +321,9 @@ pub(crate) fn checked_join(base: &Path, rel: &str) -> Result<PathBuf> {
 /// URL - a local `.bundle` or dir loads fully offline.
 pub async fn load(bundle: &str, target: Option<&Path>, expect: Option<&str>) -> Result<()> {
     if bundle.starts_with("http://") || bundle.starts_with("https://") {
-        let bytes = reqwest::get(bundle)
-            .await
-            .with_context(|| format!("fetching bundle from {bundle}"))?
-            .error_for_status()
-            .with_context(|| format!("fetching bundle from {bundle}"))?
-            .bytes()
-            .await
-            .context("reading fetched bundle bytes")?;
         let tmp = tempfile::tempdir().context("temp dir for fetched bundle")?;
         let bundle_file = tmp.path().join("fetched.bundle");
-        std::fs::write(&bundle_file, &bytes).context("writing fetched bundle")?;
+        fetch_bundle(bundle, &bundle_file, MAX_FETCHED_BUNDLE).await?;
         let blob_dir = tmp.path().join("unpacked");
         extract_bundle(&bundle_file, &blob_dir)?;
         return install_verified(&blob_dir, target, expect);
@@ -604,7 +618,11 @@ pub fn install_verified(
 
     let target = match target {
         Some(t) => t.to_path_buf(),
-        None => PathBuf::from(&manifest.nest_name),
+        None => {
+            crate::runtime::safe_segment(&manifest.nest_name, "the bundle's nest name")
+                .context("pass --dir to choose where to install it")?;
+            PathBuf::from(&manifest.nest_name)
+        }
     };
     if target.exists() && std::fs::read_dir(&target)?.next().is_some() {
         bail!("target {} exists and is not empty", target.display());
@@ -739,6 +757,60 @@ mod tests {
                 "path {evil_path:?} should be refused, got: {err}"
             );
         }
+    }
+
+    /// #2185: without `--dir` the install root comes from the bundle, so it must be one plain name.
+    #[test]
+    fn a_bundle_cannot_choose_where_it_is_installed() {
+        let blob = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let landing = elsewhere.path().join("autostart");
+        std::fs::write(blob.path().join("x.desktop"), b"x").unwrap();
+        let manifest = Manifest {
+            blob_format_version: BLOB_FORMAT_VERSION,
+            nest_name: landing.to_str().unwrap().into(),
+            schema_version: 1,
+            generator_version: "x".into(),
+            registry_hash: "00".into(),
+            files: vec![FileEntry {
+                path: "x.desktop".into(),
+                sha256: hex::encode(Sha256::digest(b"x")),
+            }],
+        };
+        std::fs::write(
+            blob.path().join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        let err = format!(
+            "{:#}",
+            install_verified(blob.path(), None, None).unwrap_err()
+        );
+        assert!(err.contains("--dir"), "{err}");
+        assert!(
+            !landing.exists(),
+            "the bundle wrote to {}",
+            landing.display()
+        );
+    }
+
+    /// #2202: a bundle URL is streamed to disk and refused past its cap, never buffered whole.
+    #[tokio::test]
+    async fn a_fetched_bundle_past_its_cap_is_refused() {
+        let app = axum::Router::new().route(
+            "/huge.bundle",
+            axum::routing::get(|| async { vec![0u8; 4096] }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/huge.bundle", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let err = fetch_bundle(&url, &dir.path().join("b"), 1024)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("larger than 1024 bytes"), "{err}");
+        server.abort();
     }
 
     /// A minimal nest dir (config + one ABI) for exercising bundle/load.

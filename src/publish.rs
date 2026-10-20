@@ -65,6 +65,44 @@ pub(crate) trait Mirror: Send + Sync {
     fn content_etags(&self) -> bool {
         false
     }
+    /// Write `key` to `dest`, refusing more than `cap` bytes, and return the sha256 of what was written.
+    async fn get_file(&self, key: &str, dest: &Path, cap: u64) -> Result<Option<String>> {
+        let Some(bytes) = self.get(key).await? else {
+            return Ok(None);
+        };
+        if bytes.len() as u64 > cap {
+            bail!("{key} is larger than {cap} bytes");
+        }
+        std::fs::write(dest, &bytes).with_context(|| format!("writing {}", dest.display()))?;
+        Ok(Some(sha256_hex(&bytes)))
+    }
+}
+
+/// The most an HTTP mirror may send for a document read into memory (a catalogue, a seed snapshot).
+const MAX_HTTP_DOCUMENT: u64 = 256 << 20;
+
+/// Read a response a chunk at a time into `sink`, refusing more than `cap` bytes: a mirror or bundle
+/// URL is not trusted to end (#2202).
+pub(crate) async fn read_capped(
+    mut resp: reqwest::Response,
+    what: &str,
+    cap: u64,
+    mut sink: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<u64> {
+    let mut n = 0u64;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| e.without_url())
+        .with_context(|| format!("reading {what}"))?
+    {
+        n += chunk.len() as u64;
+        if n > cap {
+            bail!("{what} is larger than {cap} bytes");
+        }
+        sink(&chunk)?;
+    }
+    Ok(n)
 }
 
 struct FsMirror {
@@ -190,12 +228,30 @@ impl Mirror for HttpMirror {
         let Some(resp) = self.request(reqwest::Method::GET, key).await? else {
             return Ok(None);
         };
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| e.without_url())
-            .with_context(|| format!("reading {key}"))?;
-        Ok(Some(bytes.to_vec()))
+        let mut bytes = Vec::new();
+        read_capped(resp, key, MAX_HTTP_DOCUMENT, |c| {
+            bytes.extend_from_slice(c);
+            Ok(())
+        })
+        .await?;
+        Ok(Some(bytes))
+    }
+
+    async fn get_file(&self, key: &str, dest: &Path, cap: u64) -> Result<Option<String>> {
+        use std::io::Write;
+        let Some(resp) = self.request(reqwest::Method::GET, key).await? else {
+            return Ok(None);
+        };
+        let mut file =
+            std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+        let mut hasher = Sha256::new();
+        read_capped(resp, key, cap, |c| {
+            hasher.update(c);
+            file.write_all(c)
+                .with_context(|| format!("writing {}", dest.display()))
+        })
+        .await?;
+        Ok(Some(hex::encode(hasher.finalize())))
     }
 
     async fn put(&self, key: &str, _bytes: &[u8]) -> Result<()> {
@@ -2779,5 +2835,31 @@ abi = "abis/usdc.json"
             (caught_up.pending_segments, caught_up.pending_bytes),
             (0, 0)
         );
+    }
+
+    /// #2202: an HTTP mirror's object is streamed to disk and refused past its cap, never buffered whole.
+    #[tokio::test]
+    async fn an_http_mirror_object_past_its_cap_is_refused() {
+        let app = axum::Router::new().route(
+            "/d/seg.parquet",
+            axum::routing::get(|| async { vec![7u8; 4096] }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mirror = HttpMirror::new(&base).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("seg.parquet.tmp");
+
+        let err = mirror
+            .get_file("d/seg.parquet", &dest, 1024)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("larger than 1024 bytes"), "{err}");
+        let got = mirror.get_file("d/seg.parquet", &dest, 4096).await.unwrap();
+        assert_eq!(got, Some(sha256_hex(&[7u8; 4096])));
+        assert_eq!(std::fs::read(&dest).unwrap(), vec![7u8; 4096]);
+        server.abort();
     }
 }

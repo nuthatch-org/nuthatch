@@ -377,7 +377,7 @@ pub struct RuntimeMeta {
 /// Tenants and aliases are both. A tenant being **opaque** to nuthatch (RFC-0032 §6) means we never
 /// interpret it, not that it may contain `..` or a separator - opacity is about meaning, not about
 /// what a path resolver will do with it.
-fn safe_segment(value: &str, what: &str) -> Result<()> {
+pub(crate) fn safe_segment(value: &str, what: &str) -> Result<()> {
     if value.is_empty()
         || !value
             .bytes()
