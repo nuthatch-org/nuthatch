@@ -1,6 +1,6 @@
 [package]
 name = "nuthatch"
-version = "5.7.2"
+version = "5.8.0"
 edition = "2021"
 autotests = false
 # **Measured, not asserted.** `cargo +1.85.0 check` fails outright - `cranelift-assembler-x64` needs
