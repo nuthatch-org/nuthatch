@@ -142,7 +142,7 @@ fi
 
 live=$(curl -fsS -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" \
   "https://api.github.com/repos/${GITHUB_REPOSITORY:-nuthatch-org/nuthatch}/branches/main/protection" \
-  | python3 -c "import json,sys; print('\n'.join(sorted(json.load(sys.stdin)['required_status_checks']['contexts'])))")
+  | jq -r '.required_status_checks.contexts[]' | sort)
 
 if [ -z "$live" ]; then
   echo "FAIL: the protection API returned no contexts. Either protection is off on main, or the" >&2

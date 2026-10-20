@@ -280,3 +280,50 @@ fn a_sort_that_fails_after_partial_output_is_not_treated_as_a_short_list() {
         "and it must never blame the contents:\n{text}"
     );
 }
+
+/// #2287: the live path parses the protection answer with `jq`. A `python3` that refuses to run
+/// stands earlier on `PATH`, so a script that still reached for it fails here.
+#[test]
+fn the_live_comparison_parses_with_jq_not_python() {
+    let root = root_with(REQUIRED);
+    let bin = root.path().join("stub-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let stubs = [
+        (
+            "curl",
+            "#!/bin/sh\necho '{\"required_status_checks\":{\"contexts\":[\"Jules approval\",\"fmt · clippy · test\",\"build release\"]}}'\n",
+        ),
+        ("python3", "#!/bin/sh\necho 'python3 called' >&2\nexit 127\n"),
+    ];
+    for (name, body) in stubs {
+        let p = bin.join(name);
+        std::fs::write(&p, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .arg(root.path().join("scripts/check-required-contexts.sh"))
+        .env("PATH", path)
+        .env("GH_TOKEN", "stub")
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .expect("bash must be on PATH");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("required checks match live protection on main (3 contexts)"),
+        "{text}"
+    );
+}
