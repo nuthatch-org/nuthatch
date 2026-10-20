@@ -40,29 +40,16 @@ REPORT="${REPORT:-}"
 TIMEOUT_S="${TIMEOUT_S:-1800}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ABI="$(mktemp)"
-python3 - "$EVENTS" "$ABI" <<'PY'
-import json, sys
-n, path = int(sys.argv[1]), sys.argv[2]
-events = []
-for i in range(n):
-    events.append({
-        "anonymous": False,
-        "inputs": [
-            {"indexed": True, "internalType": "address", "name": "a", "type": "address"},
-            {"indexed": True, "internalType": "address", "name": "b", "type": "address"},
-            {"indexed": False, "internalType": "uint256", "name": "v", "type": "uint256"},
-        ],
-        "name": f"Event{i:02d}",
-        "type": "event",
-    })
-open(path, "w").write(json.dumps(events))
-PY
-TABLES="$(python3 - "$ABI" <<'PY'
-import json, sys
-abi = json.load(open(sys.argv[1]))
-print(" ".join(f"wide__event{i:02d}" for i, e in enumerate(abi) if e.get("type") == "event"))
-PY
-)"
+# Byte for byte the JSON this always wrote, spaced separators included: it is copied into the nest.
+{
+  printf '['
+  for ((i = 0; i < EVENTS; i++)); do
+    [ "$i" -eq 0 ] || printf ', '
+    printf '{"anonymous": false, "inputs": [{"indexed": true, "internalType": "address", "name": "a", "type": "address"}, {"indexed": true, "internalType": "address", "name": "b", "type": "address"}, {"indexed": false, "internalType": "uint256", "name": "v", "type": "uint256"}], "name": "Event%02d", "type": "event"}' "$i"
+  done
+  printf ']'
+} > "$ABI"
+TABLES="$(jq -r '[to_entries[] | select(.value.type == "event") | "wide__event\(.key | if . < 10 then "0\(.)" else "\(.)" end)"] | join(" ")' "$ABI")"
 # The ABI file is in /tmp; delete it with the rest of the workdir, not here.
 
 # Absolute, because the runtime directory is a tmpdir and a relative BIN would resolve against it.

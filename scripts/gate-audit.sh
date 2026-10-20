@@ -80,6 +80,20 @@ target_exists() {  # target_exists <name>
   [ -f "tests/$1.rs" ]
 }
 
+# mutate_all <file> <needle> <replacement>: replaces every literal occurrence and prints how many, or
+# fails having written nothing. Bytewise, which is also what keeps bash 3.2 fast on a large file.
+mutate_all() {
+  local LC_ALL=C s t n r=$3
+  IFS= read -r -d '' s < "$1" || true
+  t=${s//"$2"/}
+  n=$(( (${#s} - ${#t}) / ${#2} ))
+  [ "$n" -gt 0 ] || return 1
+  # $r unquoted: bash 3.2 keeps a quoted replacement's quotes, and 5.2 reads an unquoted & as the match.
+  shopt -u patsub_replacement 2>/dev/null || true
+  printf '%s' "${s//"$2"/$r}" > "$1"
+  echo "$n"
+}
+
 # Prints one of: pass | assert-fail | build-fail | no-tests
 #
 # ORDER MATTERS, and the first draft of this function got it wrong in a way worth recording. It
@@ -156,15 +170,7 @@ for c in "${CASES[@]}"; do
   # It happened: `shipped 2026-08-28` occurs twice in CLAUDE.md, and `ivm_claims` was reported as a
   # survivor on 2026-08-30 for exactly that reason. The count is printed so a needle matching far
   # more than intended is visible rather than silent.
-  hits=$(python3 - "$file" "$needle" "$repl" <<'PYMUT'
-import pathlib, sys
-p = pathlib.Path(sys.argv[1]); s = p.read_text()
-n = s.count(sys.argv[2])
-assert n > 0, "NOT APPLIED"
-p.write_text(s.replace(sys.argv[2], sys.argv[3]))
-print(n)
-PYMUT
-  )
+  hits=$(mutate_all "$file" "$needle" "$repl")
   if [ $? -ne 0 ]; then
     printf "  %-28s SKIP   (mutation did not apply)\n" "$name"; SKIPPED=$((SKIPPED+1))
     cp "/tmp/gate-audit.bak.$$" "$file"; continue

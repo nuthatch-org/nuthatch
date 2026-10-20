@@ -82,11 +82,8 @@ note() { printf '  \033[2m%s\033[0m\n' "$1"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 api()  { curl -fsS -m 15 "$@"; }
 ctl()  { curl -fsS -m 15 -H "authorization: Bearer $CONTROL_TOKEN" "$@"; }
-# JSON field extraction without a jq dependency - python3 is present everywhere we run.
-jget() { python3 -c 'import sys,json;d=json.load(sys.stdin)
-for k in sys.argv[1].split("."):
-    d = d[int(k)] if k.isdigit() else d[k]
-print(d)' "$1"; }
+# `jget a.0.b` prints one field, and fails rather than printing null for a missing one.
+jget() { jq -r --arg p "$1" 'getpath($p | split(".") | map(tonumber? // .)) | if . == null then error("no \($p)") else . end'; }
 
 hr() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
@@ -174,7 +171,7 @@ level1() {
   if ! api "$NUTHATCH_URL/tables" >/dev/null 2>&1; then
     local prefix
     prefix=$(api "$NUTHATCH_URL/nests" 2>/dev/null \
-      | python3 -c 'import sys,json;print(json.load(sys.stdin)["nests"][0]["base_path"])' 2>/dev/null)
+      | jget nests.0.base_path 2>/dev/null)
     if [ -n "$prefix" ]; then
       base="$NUTHATCH_URL$prefix"
       note "a runtime hosting many nests - Level 1 runs against $prefix"
@@ -188,13 +185,13 @@ level1() {
   # configured behaviour and not a defect. Detect that rather than scoring it as a failure.
   local free_form
   free_form=$(api "$base/queries" 2>/dev/null \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("free_form"))' 2>/dev/null)
+    | jq -r .free_form 2>/dev/null)
 
   # The step that separates "it ran" from "it is correct" is comparing against an independent source,
   # which this script cannot do for you. It asserts the weaker machine-checkable claim and says so.
   local table
-  table=$(api "$base/tables" | python3 -c 'import sys,json;print(json.load(sys.stdin)["tables"][0]["table"])' 2>/dev/null)
-  if [ "$free_form" = "False" ]; then
+  table=$(api "$base/tables" | jget tables.0.table 2>/dev/null)
+  if [ "$free_form" = false ]; then
     skip 1.3c "a decoded table is queryable" "this mount answers only its declared queries (sql != open)"
     skip 1.4 "responses carry provenance" "no free-form /sql on this mount"
     return
@@ -374,11 +371,11 @@ level5() {
 
   # 5.7: one pinned answer per endpoint, fleet-wide.
   check 5.7a "an unpinned endpoint is not servable" \
-    bash -c "[ \"\$(ctl $CONTROL_URL/nests/$nest/resolve | jget servable)\" = False ]"
+    bash -c "[ \"\$(ctl $CONTROL_URL/nests/$nest/resolve | jget servable)\" = false ]"
   check 5.7b "pinning makes it servable" \
     bash -c "ctl -X PUT $CONTROL_URL/nests/$nest/pin -H 'content-type: application/json' \
       -d '{\"version\":\"1.0.0\",\"bundle_hash\":\"abababababababababababababababababababababababababababababababab\"}' >/dev/null && \
-      [ \"\$(ctl $CONTROL_URL/nests/$nest/resolve | jget servable)\" = True ]"
+      [ \"\$(ctl $CONTROL_URL/nests/$nest/resolve | jget servable)\" = true ]"
 
   # 5.8: write-only secrets. The value must never come back, and must not reach disk.
   local canary="NH-VERIFY-CANARY-$$"

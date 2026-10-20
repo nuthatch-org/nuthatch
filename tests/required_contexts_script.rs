@@ -281,10 +281,9 @@ fn a_sort_that_fails_after_partial_output_is_not_treated_as_a_short_list() {
     );
 }
 
-/// #2287: the live path parses the protection answer with `jq`. A `python3` that refuses to run
-/// stands earlier on `PATH`, so a script that still reached for it fails here.
+/// #2287: the live path parses the protection answer with `jq`, here from a stubbed `curl`.
 #[test]
-fn the_live_comparison_parses_with_jq_not_python() {
+fn the_live_comparison_parses_with_jq() {
     let root = root_with(REQUIRED);
     let bin = root.path().join("stub-bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -293,7 +292,6 @@ fn the_live_comparison_parses_with_jq_not_python() {
             "curl",
             "#!/bin/sh\necho '{\"required_status_checks\":{\"contexts\":[\"Jules approval\",\"fmt · clippy · test\",\"build release\"]}}'\n",
         ),
-        ("python3", "#!/bin/sh\necho 'python3 called' >&2\nexit 127\n"),
     ];
     for (name, body) in stubs {
         let p = bin.join(name);

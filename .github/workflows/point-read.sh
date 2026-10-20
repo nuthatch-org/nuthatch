@@ -288,7 +288,7 @@ if [ -n "$BASELINE" ] && [ -f "$OUT" ]; then
     echo "      derived from; a missing one is not a pass."
     exit 1
   fi
-  hw_of() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("hardware") or "")' "$1"; }
+  hw_of() { jq -r '.hardware // ""' "$1"; }
   base_hw="$(hw_of "$BASELINE")"
   this_hw="$(hw_of "$OUT")"
   if [ "$base_hw" != "$this_hw" ]; then
@@ -310,7 +310,7 @@ if [ -n "$BASELINE" ] && [ -f "$OUT" ]; then
   # 12,800-row hot store leaves the runner spec untouched, so the committed baseline would go on
   # describing a scenario nobody measures any more while still passing its own provenance check. The
   # label is generated from the scenario parameters, so it drifts exactly when the scenario does.
-  label_of() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("label") or "")' "$1"; }
+  label_of() { jq -r '.label // ""' "$1"; }
   base_label="$(label_of "$BASELINE")"
   this_label="$(label_of "$OUT")"
   if [ "$base_label" != "$this_label" ]; then

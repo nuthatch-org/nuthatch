@@ -25,11 +25,6 @@ nuthatch.toml
 # local smoke-test nest (scripts/try-nuthatch.sh)
 nuthatch-trial/
 
-# Python bytecode. `git add eval/` swept one of these into 11f898cc - `git add <dir>` sweeps
-# exactly as `git add -A` does, and a compiled artifact in the tree is noise at best and a stale
-# import at worst.
-__pycache__/
-*.pyc
 
 # Scratch from builds, test runs and background jobs, at the repo ROOT only.
 #

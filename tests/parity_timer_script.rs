@@ -438,6 +438,7 @@ fn parity(mode: Option<&str>, gateway_body: &str, extra: &[(&str, &str)]) -> (i3
         .env("NEST_URL", "http://127.0.0.1:9")
         .env("GRAPH_API_KEY", "k")
         .env("GRAPH_GATEWAY", format!("file://{}", gw.display()))
+        .env("PARITY_COMPARE", crate::parity_epoch_shift::compare_bin())
         .env_remove("PINNED_BLOCK")
         .env_remove("PARITY_MODE");
     if let Some(m) = mode {

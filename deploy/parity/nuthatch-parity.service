@@ -1,7 +1,10 @@
 # Daily Lodestar parity on Helsinki (#1713, #1718): scripts/lodestar-parity.sh at sealed_through,
 # then at the nest's head, through deploy/parity/nuthatch-parity.sh.
-# Install, as root on the box, with this repo's files copied to /tmp:
+# Install, as root on the box, with this repo's files copied to /tmp (deploy/parity/install-from-mac.sh
+# does all of this):
 #   install -D -m 755 /tmp/lodestar-parity.sh /usr/local/lib/nuthatch-parity/lodestar-parity.sh
+#   cargo build --release --manifest-path tools/lodestar-parity/Cargo.toml, and install its
+#   lodestar-parity-compare beside lodestar-parity.sh
 #   install -m 755 /tmp/nuthatch-parity.sh /usr/local/bin/nuthatch-parity
 #   install -m 644 /tmp/nuthatch-parity.service /tmp/nuthatch-parity.timer /etc/systemd/system/
 #   install -m 600 /etc/nuthatch/deadman_discord_webhook_url /etc/nuthatch/parity_discord_webhook_url

@@ -174,6 +174,12 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+      # tests/parity_*.rs run scripts/lodestar-parity.sh, which runs this; the shards have no cargo.
+      - name: build the parity comparison into the test archive
+        run: |
+          t=${CARGO_TARGET_DIR:-target}
+          cargo build --locked --manifest-path tools/lodestar-parity/Cargo.toml --target-dir "$t/lodestar-parity"
+          mkdir -p "$t/parity-bin" && cp "$t/lodestar-parity/debug/lodestar-parity-compare" "$t/parity-bin/"
       - uses: ./.github/actions/install-nextest
       # Built here, run by the `test-default` shards. Outside `target/`, so rust-cache never saves it.
       - name: build the test archive
@@ -241,6 +247,13 @@ jobs:
           cargo fmt --check --manifest-path tools/fixture-rpc/Cargo.toml
           cargo clippy --locked --all-targets --manifest-path tools/fixture-rpc/Cargo.toml -- -D warnings
           cargo test --locked --manifest-path tools/fixture-rpc/Cargo.toml
+      # The comparison scripts/lodestar-parity.sh runs; tests/parity_*.rs drive it through the script.
+      - name: fmt · clippy (lodestar-parity)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo fmt --check --manifest-path tools/lodestar-parity/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path tools/lodestar-parity/Cargo.toml -- -D warnings
       # RFC-0065 S2. The bytes sealing writes, in their own crate so a browser tab can seal to the
       # same address; `seal::tests::sealed_bytes_are_pinned` in the root crate holds the hashes.
       - name: fmt · clippy · test (seal)
@@ -365,6 +378,12 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: regenerate the skill reference without it
         run: cargo run --locked -- skill-refs
+      # tests/parity_*.rs run scripts/lodestar-parity.sh, which runs this; the shards have no cargo.
+      - name: build the parity comparison into the test archive
+        run: |
+          t=${CARGO_TARGET_DIR:-target}
+          cargo build --locked --manifest-path tools/lodestar-parity/Cargo.toml --target-dir "$t/lodestar-parity"
+          mkdir -p "$t/parity-bin" && cp "$t/lodestar-parity/debug/lodestar-parity-compare" "$t/parity-bin/"
       - uses: ./.github/actions/install-nextest
       - name: build the test archive
         run: cargo nextest archive --locked --archive-file "$RUNNER_TEMP/nextest-no-count.tar.zst"
@@ -450,6 +469,12 @@ jobs:
         run: cargo clippy --locked --features counter --all-targets -- -D warnings
       - name: clippy (crash-points)
         run: cargo clippy --locked --features crash-points --all-targets -- -D warnings
+      # tests/parity_*.rs run scripts/lodestar-parity.sh, which runs this; the shards have no cargo.
+      - name: build the parity comparison into the test archive
+        run: |
+          t=${CARGO_TARGET_DIR:-target}
+          cargo build --locked --manifest-path tools/lodestar-parity/Cargo.toml --target-dir "$t/lodestar-parity"
+          mkdir -p "$t/parity-bin" && cp "$t/lodestar-parity/debug/lodestar-parity-compare" "$t/parity-bin/"
       - uses: ./.github/actions/install-nextest
       - name: build the test archive
         run: cargo nextest archive --locked --features graph,counter,crash-points --archive-file "$RUNNER_TEMP/nextest-features.tar.zst"
@@ -834,7 +859,7 @@ jobs:
           # is `noworkers` rather than the budget one it was asserting.
           for i in $(seq 1 30); do
             n=$(curl -fsS -m 3 -H "authorization: Bearer $NUTHATCH_CONTROL_TOKEN" \
-              localhost:8290/workers | python3 -c 'import sys,json;print(json.load(sys.stdin)["count"])' 2>/dev/null || echo 0)
+              localhost:8290/workers | jq -er '.count // empty' 2>/dev/null || echo 0)
             [ "${n:-0}" -ge 1 ] && { echo "workers registered: $n"; break; }
             sleep 2
           done

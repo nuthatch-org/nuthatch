@@ -49,8 +49,8 @@ It cannot see the regressions a floor would be there to catch:
 
 A floor tight enough to see a 4x decode cost would sit inside the runner's own batch spread. A
 floor loose enough to survive that spread passes the decode mutation, and losing the pipeline
-reads as an improvement. The fixture is single-threaded Python sharing four cores with the binary,
-so the figure is mostly the fixture and the fetch, not nuthatch. The point-read gate states the
+reads as an improvement. When this was measured the fixture was a single-threaded script sharing
+four cores with the binary, so the figure is mostly the fixture and the fetch, not nuthatch. The point-read gate states the
 rule (ci.yml): a ceiling that passes the known break is decoration. A throughput gate needs a
 scenario where nuthatch's own work dominates the wall clock. Until there is one, the floor is a
 design target measured by hand with `bench backfill`, not a gate.

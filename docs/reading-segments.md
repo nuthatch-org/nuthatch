@@ -267,27 +267,22 @@ column as text.
 A small resolver matching `segment_path` and the block-order sort, for a dataset directory
 `dataset`:
 
-```python
-import json
-from pathlib import Path
-
-def segment_files(dataset: Path, table: str) -> list[Path]:
-    manifest = json.loads((dataset / "segments" / "manifest.json").read_text())
-    segs = sorted(
-        manifest["tables"][table],
-        key=lambda s: (s["from_block"], s["to_block"], s["hash"]),
-    )
-    parent = dataset.parent
-    shared = parent.parent / "segments" if parent.name == "data" else None
-    out = []
-    for s in segs:
-        if shared is not None:
-            p = shared / f"{s['hash']}.parquet"
-            if p.exists():
-                out.append(p)
-                continue
-        out.append(dataset / "segments" / s["file"])
-    return [p for p in out if p.exists()]
+```sh
+# segment_files <dataset> <table>: one existing file per line, in block order.
+segment_files() {
+  local dataset=$1 parent shared=""
+  parent=$(dirname "$dataset")
+  [ "$(basename "$parent")" = data ] && shared=$(dirname "$parent")/segments
+  jq -r --arg t "$2" '.tables[$t] | sort_by(.from_block, .to_block, .hash)[] | "\(.hash)\t\(.file)"' \
+    "$dataset/segments/manifest.json" |
+    while IFS=$'\t' read -r hash file; do
+      if [ -n "$shared" ] && [ -e "$shared/$hash.parquet" ]; then
+        echo "$shared/$hash.parquet"
+      elif [ -e "$dataset/segments/$file" ]; then
+        echo "$dataset/segments/$file"
+      fi
+    done
+}
 ```
 
 That is the migration path. Reading `src/seal.rs` to reconstruct it is not.
