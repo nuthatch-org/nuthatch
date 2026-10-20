@@ -11,6 +11,9 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
+/// Above the node's own SQL timeout and permit wait; the stdio loop is sequential, so one endless
+/// response would otherwise wedge the session (#2217).
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The MCP server is meant to be launched by an MCP *client* (Claude Code, Cursor, …) as a stdio
 /// subprocess. When a human runs `nuthatch mcp` in a terminal, stdin is a TTY and no client is
@@ -113,7 +116,7 @@ pub async fn serve(base: String) -> Result<()> {
     if guide_if_interactive(&base) {
         return Ok(());
     }
-    let client = reqwest::Client::new();
+    let client = http_client()?;
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
     while let Some(line) = next_message(&mut stdin, MAX_MESSAGE_BYTES).await? {
@@ -376,7 +379,11 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
                 .as_str()
                 .ok_or_else(|| anyhow!("`name` is required"))?;
             let n = args["limit"].as_u64().unwrap_or(50);
-            get(client, &format!("{base}/table/{name}?limit={n}")).await
+            get(
+                client,
+                &format!("{base}/table/{}?limit={n}", segment(name)?),
+            )
+            .await
         }
         "sql" => {
             let q = args["query"]
@@ -403,13 +410,13 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
             let id = args["id"]
                 .as_str()
                 .ok_or_else(|| anyhow!("`id` is required"))?;
-            get(client, &format!("{base}/entity/{id}")).await
+            get(client, &format!("{base}/entity/{}", segment(id)?)).await
         }
         "balance" => {
             let a = args["address"]
                 .as_str()
                 .ok_or_else(|| anyhow!("`address` is required"))?;
-            get(client, &format!("{base}/balance/{a}")).await
+            get(client, &format!("{base}/balance/{}", segment(a)?)).await
         }
         "top_balances" => {
             let n = args["limit"].as_u64().unwrap_or(20);
@@ -417,6 +424,9 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
         }
         "flags" => {
             let kind = args["kind"].as_str().unwrap_or("threshold");
+            if !matches!(kind, "threshold" | "velocity") {
+                bail!("unknown flag kind `{kind}` (want: threshold, velocity)");
+            }
             let n = args["limit"].as_u64().unwrap_or(50);
             get(client, &format!("{base}/flags?kind={kind}&limit={n}")).await
         }
@@ -424,7 +434,7 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
             let a = args["address"]
                 .as_str()
                 .ok_or_else(|| anyhow!("`address` is required"))?;
-            get(client, &format!("{base}/exposure/{a}")).await
+            get(client, &format!("{base}/exposure/{}", segment(a)?)).await
         }
         other => bail!("unknown tool `{other}`"),
     }
@@ -565,6 +575,28 @@ fn cell(v: &Value) -> String {
     }
 }
 
+fn http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()?)
+}
+
+/// One URL path segment from a tool argument. Encoding alone is not enough: the URL parser resolves
+/// `..` (and `%2e%2e`) against the base, which would reach another route or mount.
+fn segment(s: &str) -> Result<String> {
+    if s.is_empty() || s == "." || s == ".." {
+        bail!("`{s}` is not a valid path segment");
+    }
+    Ok(s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect())
+}
+
 async fn get(client: &reqwest::Client, url: &str) -> Result<String> {
     fetch(client.get(url), url).await
 }
@@ -666,6 +698,59 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("larger than 1024 bytes"), "{err}");
+        server.abort();
+    }
+
+    /// #2217: a tool argument is one path segment; it cannot climb to another route.
+    #[tokio::test]
+    async fn a_tool_argument_cannot_leave_its_route() {
+        use axum::{extract::Path, routing::get, Router};
+        let app = Router::new()
+            .route(
+                "/table/{name}",
+                get(|Path(n): Path<String>| async move { format!("table:{n}") }),
+            )
+            .route("/_admin/events", get(|| async { "admin" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let call = |name: &str| json!({ "name": "table", "arguments": { "name": name } });
+
+        let climbed = call_tool(&call("../_admin/events"), &client, &base).await;
+        assert!(!matches!(&climbed, Ok(b) if b == "admin"), "{climbed:?}");
+        for refused in ["..", "."] {
+            assert!(call_tool(&call(refused), &client, &base).await.is_err());
+        }
+        assert_eq!(
+            call_tool(&call("a/b?c"), &client, &base).await.unwrap(),
+            "table:a/b?c"
+        );
+        let flags = json!({ "name": "flags", "arguments": { "kind": "x&limit=1" } });
+        assert!(call_tool(&flags, &client, &base).await.is_err());
+        server.abort();
+    }
+
+    /// #2217: an endless response ends in an error rather than wedging the sequential stdio loop.
+    #[tokio::test(start_paused = true)]
+    async fn an_endless_response_times_out() {
+        use axum::{body::Body, routing::get, Router};
+        let app = Router::new().route(
+            "/table/{name}",
+            get(|| async {
+                Body::from_stream(futures::stream::pending::<Result<Vec<u8>, std::io::Error>>())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let call = json!({ "name": "table", "arguments": { "name": "t" } });
+        let answered = tokio::time::timeout(
+            REQUEST_TIMEOUT * 5,
+            call_tool(&call, &http_client().unwrap(), &base),
+        )
+        .await;
+        assert!(matches!(answered, Ok(Err(_))), "{answered:?}");
         server.abort();
     }
 
