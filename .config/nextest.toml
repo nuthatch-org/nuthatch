@@ -28,13 +28,6 @@ filter = "binary(e2e_warm_restart)"
 threads-required = "num-test-threads"
 priority = 100
 
-# Paces two accounts against simulated per-call latency under a 120 s bound. It takes 12-20 s on a
-# loaded laptop but overran 120 s four times on 2026-10-19 beside the parallel harness (#2255).
-[[profile.default.overrides]]
-filter = "test(=address_mode::tests::each_account_keeps_its_own_pace)"
-threads-required = "num-test-threads"
-priority = 100
-
 [profile.ci]
 
 [profile.ci.junit]

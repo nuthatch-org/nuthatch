@@ -829,7 +829,12 @@ pub(crate) mod tests {
     pub(crate) struct Fake {
         pub(crate) answer: Answer,
         pub(crate) asked: Mutex<BTreeMap<String, u64>>,
+        /// How long a call takes, slept on tokio's clock: a test on paused time simulates it rather
+        /// than waiting it out, so the pacer sees the same durations on any runner (#2255).
+        latency: Option<Latency>,
     }
+
+    type Latency = Box<dyn Fn(&str, &Value) -> std::time::Duration + Send + Sync>;
 
     impl Fake {
         pub(crate) fn new(
@@ -838,7 +843,16 @@ pub(crate) mod tests {
             Fake {
                 answer: Box::new(f),
                 asked: Mutex::new(BTreeMap::new()),
+                latency: None,
             }
+        }
+
+        pub(crate) fn with_latency(
+            mut self,
+            f: impl Fn(&str, &Value) -> std::time::Duration + Send + Sync + 'static,
+        ) -> Fake {
+            self.latency = Some(Box::new(f));
+            self
         }
 
         pub(crate) fn count(&self, method: &str) -> u64 {
@@ -849,15 +863,10 @@ pub(crate) mod tests {
     impl Rpc for Fake {
         async fn call(&self, method: &str, params: Value) -> Result<Value> {
             *self.asked.lock().unwrap().entry(method.into()).or_default() += 1;
-            // Answers simulate latency with a blocking sleep; on a worker thread that starves the
-            // tasks under test whenever the runner is busy (#2255).
-            if tokio::runtime::Handle::current().runtime_flavor()
-                == tokio::runtime::RuntimeFlavor::MultiThread
-            {
-                tokio::task::block_in_place(|| (self.answer)(method, &params))
-            } else {
-                (self.answer)(method, &params)
+            if let Some(latency) = &self.latency {
+                tokio::time::sleep(latency(method, &params)).await;
             }
+            (self.answer)(method, &params)
         }
     }
 
