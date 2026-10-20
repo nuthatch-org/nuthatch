@@ -91,6 +91,50 @@ pub fn new_sql_gate() -> Arc<Semaphore> {
     Arc::new(Semaphore::new(sql_max_concurrency()))
 }
 
+/// Memo keys one nest builds at once. Each reads the segment manifest and hashes the authored
+/// files, and a hit re-stats every segment, so a flood of distinct statements queues here, off the
+/// executor, rather than on every worker (#2213).
+const MEMO_KEY_PERMITS: usize = 4;
+
+#[derive(Clone)]
+pub struct MemoGate(Arc<Semaphore>);
+
+impl Default for MemoGate {
+    fn default() -> Self {
+        Self(Arc::new(Semaphore::new(MEMO_KEY_PERMITS)))
+    }
+}
+
+/// `/sql` and `/q` response bodies the process holds at once, in KiB. A remembered answer costs no
+/// engine time to replay, so without this a few hundred slow readers of one 16 MiB answer hold
+/// gigabytes nothing else counts (#2212). Four of the largest result `engine` will build.
+const SQL_MAX_INFLIGHT_RESPONSE_KIB: usize = 4 * crate::engine::SQL_MAX_RESULT_BYTES / 1024;
+
+/// The budget for [`SQL_MAX_INFLIGHT_RESPONSE_KIB`]. Every default shares the process's one.
+#[derive(Clone)]
+pub struct ResponseBytes(Arc<Semaphore>);
+
+impl Default for ResponseBytes {
+    fn default() -> Self {
+        static PROCESS: std::sync::LazyLock<Arc<Semaphore>> =
+            std::sync::LazyLock::new(|| Arc::new(Semaphore::new(SQL_MAX_INFLIGHT_RESPONSE_KIB)));
+        Self(Arc::clone(&PROCESS))
+    }
+}
+
+impl ResponseBytes {
+    /// Room for a body of `len` bytes, held until the body is sent or dropped; `None` when full.
+    fn reserve(&self, len: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let kib = len.div_ceil(1024).clamp(1, SQL_MAX_INFLIGHT_RESPONSE_KIB) as u32;
+        Arc::clone(&self.0).try_acquire_many_owned(kib).ok()
+    }
+
+    #[cfg(test)]
+    fn kib(kib: usize) -> Self {
+        Self(Arc::new(Semaphore::new(kib)))
+    }
+}
+
 pub fn sql_max_concurrency() -> usize {
     match std::env::var("NUTHATCH_SQL_MAX_CONCURRENCY") {
         Err(_) => SQL_MAX_CONCURRENCY,
@@ -266,6 +310,10 @@ pub struct AppState {
     /// Per-nest and not shared across a cursor, unlike the gate itself: the gate bounds what runs
     /// in Burrmill, this bounds the memory held by requests that are not running at all (#1319).
     pub sql_queued: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bounds how many `/sql` memo keys this nest builds at once (#2213).
+    pub memo_gate: MemoGate,
+    /// `/sql` response bytes in flight, process-wide in production (#2212).
+    pub sql_response_bytes: ResponseBytes,
     /// The most unsealed rows `/sql` and `/explain` will materialise for one query before refusing
     /// with a `503` (`HotScanTooLarge`) - the live value [`SQL_MAX_HOT_ROWS`] documents. A field
     /// rather than the handlers reading the const directly, so a test can lower the ceiling instead
@@ -3496,6 +3544,14 @@ const INLINE_SCAN_ROWS: usize = 4096;
 async fn admit(
     s: &AppState,
 ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, axum::response::Response> {
+    admit_to(&s.sql_gate, &s.sql_queued).await
+}
+
+/// [`admit`] to any gate, parking in the nest's one queue.
+async fn admit_to(
+    gate: &Arc<Semaphore>,
+    queued: &Arc<std::sync::atomic::AtomicUsize>,
+) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, axum::response::Response> {
     let busy = || {
         crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
         (
@@ -3504,13 +3560,13 @@ async fn admit(
         )
             .into_response()
     };
-    if let Ok(permit) = Arc::clone(&s.sql_gate).try_acquire_owned() {
+    if let Ok(permit) = Arc::clone(gate).try_acquire_owned() {
         return Ok(permit);
     }
-    let Some(_slot) = QueueSlot::take(&s.sql_queued) else {
+    let Some(_slot) = QueueSlot::take(queued) else {
         return Err(busy());
     };
-    match tokio::time::timeout(SQL_ADMISSION_WAIT, Arc::clone(&s.sql_gate).acquire_owned()).await {
+    match tokio::time::timeout(SQL_ADMISSION_WAIT, Arc::clone(gate).acquire_owned()).await {
         Ok(Ok(permit)) => Ok(permit),
         _ => Err(busy()),
     }
@@ -4384,27 +4440,25 @@ fn memo_identity(
     Some((key, generation, sealed, watermarks))
 }
 
-async fn run_sql_query_at(
-    s: AppState,
-    sql_text: String,
-    requested_max_rows: Option<usize>,
-    historical_block: Option<u64>,
-    operation_timeout: Option<Duration>,
-) -> axum::response::Response {
+/// The remembered answer to `sql`, or the identity a computed answer is remembered under (#1186).
+/// Reads the manifest, hashes the authored files and, on a hit, stats every segment, so it is
+/// called off the executor (#2213).
+#[allow(clippy::type_complexity)]
+fn remembered(
+    s: &AppState,
+    sql: &str,
+    max_rows: usize,
+) -> std::result::Result<
+    axum::response::Response,
+    Option<(
+        crate::sqlmemo::Key,
+        u64,
+        String,
+        crate::entity_view::Watermarks,
+    )>,
+> {
     use crate::metrics::METRICS;
-    let q = SqlQuery {
-        q: sql_text,
-        max_rows: requested_max_rows,
-    };
-    // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
-    // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
-    let max_rows = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
-    // The deterministic memo (#1186): the identity of this answer is the statement plus every input
-    // it reads - the served segments, the hot rows' generation, entity watermarks, authored files. A
-    // remembered answer for that identity is the answer, and it is returned before the permit gate,
-    // because a hit costs no Burrmill and the gate exists to bound Burrmill. `None` where the store
-    // cannot report a rows generation; that backend simply computes every time.
-    let memo = memo_identity(&s, &q.q, max_rows, historical_block);
+    let memo = memo_identity(s, sql, max_rows, None);
     if let Some((key, generation, sealed, before)) = &memo {
         if let Some(hit) = crate::sqlmemo::get(key) {
             // Re-read the fence after the lookup, as the computing path does after its query: a
@@ -4441,8 +4495,8 @@ async fn run_sql_query_at(
                     == hit.segments
             {
                 METRICS.inc_sql();
-                return sql_response(
-                    &s,
+                return Ok(sql_response(
+                    s,
                     &hit.out,
                     SqlRows::Serialized {
                         json: &hit.rows,
@@ -4451,10 +4505,57 @@ async fn run_sql_query_at(
                     &hit.watermarks,
                     (as_of, sealed_through),
                     true,
-                );
+                ));
             }
         }
     }
+    Err(memo)
+}
+
+async fn run_sql_query_at(
+    s: AppState,
+    sql_text: String,
+    requested_max_rows: Option<usize>,
+    historical_block: Option<u64>,
+    operation_timeout: Option<Duration>,
+) -> axum::response::Response {
+    use crate::metrics::METRICS;
+    let q = SqlQuery {
+        q: sql_text,
+        max_rows: requested_max_rows,
+    };
+    // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
+    // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
+    let max_rows = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
+    // The deterministic memo (#1186): the identity of this answer is the statement plus every input
+    // it reads - the served segments, the hot rows' generation, entity watermarks, authored files. A
+    // remembered answer for that identity is the answer, and it is returned before the permit gate,
+    // because a hit costs no Burrmill and the gate exists to bound Burrmill. `None` where the store
+    // cannot report a rows generation; that backend simply computes every time.
+    // Building the key reads the manifest and hashes the authored files, so it runs off the
+    // executor, a few at a time per nest, before this request may queue for a permit (#2213).
+    let memo = if historical_block.is_none()
+        && s.store.rows_generation().is_some()
+        && crate::sqlmemo::is_deterministic(&q.q)
+    {
+        let slot = match admit_to(&s.memo_gate.0, &s.sql_queued).await {
+            Ok(slot) => slot,
+            Err(busy) => return busy,
+        };
+        let (st, sql) = (s.clone(), q.q.clone());
+        match tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            remembered(&st, &sql, max_rows)
+        })
+        .await
+        {
+            Ok(Ok(hit)) => return hit,
+            Ok(Err(memo)) => memo,
+            Err(e) => return error(format!("{e}")),
+        }
+    } else {
+        None
+    };
     // A GraphQL operation acquires once and passes the time it has left. Taking another permit
     // here would start that root's 30s from now (#1658). `/sql` still admits itself.
     let (permit, sql_timeout) = if let Some(timeout) = operation_timeout {
@@ -5087,21 +5188,73 @@ fn sql_response(
             provenance.insert("offchain".into(), read);
         }
     }
-    match rows {
-        SqlRows::Values(_) => Json(response).into_response(),
-        SqlRows::Serialized { json, .. } => match serde_json::to_vec(&WithRows(&response, json)) {
-            Ok(body) => (
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                body,
-            )
-                .into_response(),
-            Err(e) => (
+    // Room for the body is taken before a remembered one is copied, and after a computed one,
+    // already bounded by the permit that computed it, is serialized (#2212).
+    let full = || {
+        crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "server busy: too many SQL response bytes in flight" })),
+        )
+            .into_response()
+    };
+    let early = match rows {
+        SqlRows::Serialized { json, .. } => {
+            let len = json
+                .get()
+                .len()
+                .saturating_add(json_len(&response) as usize);
+            match s.sql_response_bytes.reserve(len) {
+                Some(permit) => Some(permit),
+                None => return full(),
+            }
+        }
+        SqlRows::Values(_) => None,
+    };
+    let body = match rows {
+        SqlRows::Values(_) => serde_json::to_vec(&response),
+        SqlRows::Serialized { json, .. } => serde_json::to_vec(&WithRows(&response, json)),
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(e) => {
+            return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("serializing a remembered answer: {e}") })),
+                Json(json!({ "error": format!("serializing an answer: {e}") })),
             )
-                .into_response(),
-        },
+                .into_response()
+        }
+    };
+    match early.or_else(|| s.sql_response_bytes.reserve(body.len())) {
+        Some(permit) => held_body(body, permit),
+        None => full(),
     }
+}
+
+/// `body` as a JSON response that holds `permit` until its last chunk has been taken to be sent.
+fn held_body(body: Vec<u8>, permit: tokio::sync::OwnedSemaphorePermit) -> axum::response::Response {
+    use futures::StreamExt;
+    const CHUNK: usize = 64 * 1024;
+    let len = body.len();
+    let body = axum::body::Bytes::from(body);
+    let chunks = (0..len)
+        .step_by(CHUNK)
+        .map(move |at| Ok::<_, std::convert::Infallible>(body.slice(at..(at + CHUNK).min(len))));
+    let stream = stream::iter(chunks).map(move |chunk| {
+        let _held = &permit;
+        chunk
+    });
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            ),
+            (axum::http::header::CONTENT_LENGTH, len.to_string()),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 /// The rows of a `/sql` answer: computed, or remembered already serialized (#2072).
@@ -6316,6 +6469,8 @@ mod tests {
             seal_span: crate::chains::DEFAULT_SEAL_SPAN,
             freshness: Default::default(),
             sql_queued: Default::default(),
+            memo_gate: Default::default(),
+            sql_response_bytes: Default::default(),
             sql_max_hot_rows: SQL_MAX_HOT_ROWS,
             sql_max_hot_bytes: SQL_MAX_HOT_BYTES,
             sql_max_named_scan_bytes: SQL_MAX_NAMED_SCAN_BYTES,
@@ -8746,6 +8901,63 @@ mod tests {
         drop(held);
         assert_eq!(queued.load(Ordering::Relaxed), 0);
         assert!(QueueSlot::take(&queued).is_some());
+    }
+
+    /// #2212: a `/sql` body holds its bytes until it has been taken to be sent, and past the budget
+    /// the next answer is refused rather than buffered, a remembered one included.
+    #[tokio::test]
+    async fn sql_response_bytes_in_flight_are_bounded() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.sql_response_bytes = ResponseBytes::kib(1);
+        let app = router(SharedNest::new(state));
+        let get = |q: &str| {
+            let req = axum::http::Request::builder()
+                .uri(format!("/sql?q={q}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            app.clone().oneshot(req)
+        };
+
+        let unread = get("SELECT%202212%20AS%20n").await.unwrap();
+        assert_eq!(unread.status(), StatusCode::OK);
+        for q in ["SELECT%202212%20AS%20n", "SELECT%201%20AS%20m"] {
+            let refused = get(q).await.unwrap();
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE, "{q}");
+        }
+        let body = axum::body::to_bytes(unread.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["rows"][0]["n"],
+            2212
+        );
+
+        let again = get("SELECT%202212%20AS%20n").await.unwrap();
+        assert_eq!(again.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(again.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["cached"],
+            true
+        );
+    }
+
+    /// #2213: a memo key is built under the nest's memo gate, so a flood of deterministic statements
+    /// waits there; a statement the memo never keeps does not build one.
+    #[tokio::test]
+    async fn memo_keys_are_built_under_their_own_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        let _held = Arc::clone(&state.memo_gate.0)
+            .try_acquire_many_owned(MEMO_KEY_PERMITS as u32)
+            .unwrap();
+        let (status, body) = get_json(state.clone(), "/sql?q=SELECT%202213%20AS%20n").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let (status, body) = get_json(state, "/sql?q=SELECT%20random()%20AS%20r").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     /// A request refused because the queue is full is refused *immediately* - it must not also sit
