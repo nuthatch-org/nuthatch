@@ -1596,14 +1596,14 @@ impl RpcClient {
     /// otherwise fail naming every endpoint (#2310). For a one-shot command: `dev` waits forever
     /// instead, because it is serving `/ready` meanwhile (#510).
     pub async fn await_an_answer(&self, deadline: Duration) -> Result<()> {
-        let start = Instant::now();
+        let until = tokio::time::Instant::now() + deadline;
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []});
         let mut warned = false;
         loop {
             let probes = self
                 .urls
                 .iter()
-                .map(|url| self.http.post(url).json(&body).send());
+                .map(|url| tokio::time::timeout_at(until, self.http.post(url).json(&body).send()));
             let mut failures = Vec::with_capacity(self.urls.len());
             for (url, outcome) in self
                 .urls
@@ -1611,27 +1611,29 @@ impl RpcClient {
                 .zip(futures::future::join_all(probes).await)
             {
                 match outcome {
-                    Ok(_) => return Ok(()),
-                    Err(e) => failures.push(format!(
+                    Ok(Ok(_)) => return Ok(()),
+                    Ok(Err(e)) => failures.push(format!(
                         "{} ({:#})",
                         redact_url(url),
                         anyhow::Error::new(e.without_url())
                     )),
+                    Err(_) => failures.push(format!(
+                        "{} (no answer within {deadline:?})",
+                        redact_url(url)
+                    )),
                 }
             }
-            let left = deadline.saturating_sub(start.elapsed());
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
             if left.is_zero() {
                 bail!(
-                    "no RPC endpoint answered in {}s: {}",
-                    deadline.as_secs(),
+                    "no RPC endpoint answered in {deadline:?}: {}",
                     failures.join(", ")
                 );
             }
             if !warned {
                 tracing::warn!(
-                    "no RPC endpoint answers yet ({}); giving up after {}s",
-                    failures.join(", "),
-                    deadline.as_secs()
+                    "no RPC endpoint answers yet ({}); giving up after {deadline:?}",
+                    failures.join(", ")
                 );
                 warned = true;
             }
@@ -2731,7 +2733,8 @@ mod tests {
         );
     }
 
-    /// Accepting TCP and never answering is no answer either.
+    /// Accepting TCP and never answering is no answer either, and the deadline holds against a request
+    /// timeout far longer than it.
     #[tokio::test]
     async fn a_pool_that_accepts_and_never_answers_is_named_after_the_deadline() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2742,11 +2745,8 @@ mod tests {
                 open.push(s);
             }
         });
-        let client = super::RpcClient::with_timeout(
-            vec![format!("http://127.0.0.1:{port}")],
-            std::time::Duration::from_millis(200),
-        )
-        .unwrap();
+        let client = super::RpcClient::new(vec![format!("http://127.0.0.1:{port}")]).unwrap();
+        let started = std::time::Instant::now();
         let text = format!(
             "{:#}",
             client
@@ -2755,7 +2755,12 @@ mod tests {
                 .unwrap_err()
         );
         assert!(
-            text.contains(&format!("http://127.0.0.1:{port} (")),
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the 300ms deadline ran {:?}",
+            started.elapsed()
+        );
+        assert!(
+            text.contains(&format!("http://127.0.0.1:{port} (no answer within 300ms)")),
             "{text}"
         );
     }
@@ -2768,7 +2773,7 @@ mod tests {
             super::RpcClient::new(vec![format!("http://127.0.0.1:{}", closed_port()), live])
                 .unwrap();
         client
-            .await_an_answer(std::time::Duration::ZERO)
+            .await_an_answer(std::time::Duration::from_secs(5))
             .await
             .unwrap();
     }
