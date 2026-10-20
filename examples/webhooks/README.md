@@ -17,8 +17,10 @@ the depth gauge applies to both.
 Start the receiver:
 
 ```sh
-python3 examples/webhooks/receiver.py --secret hunter2
+cargo run --example webhooks -- --secret hunter2
 ```
+
+From a clone of this repository. The first run builds the crate, which takes a few minutes.
 
 Point a nest at it, in `nuthatch.toml`:
 
@@ -65,8 +67,8 @@ that payload again. Key on something stable from the row rather than counting de
 
 **Verify the signature against the raw body.** nuthatch signs the exact bytes it sends. Parsing
 the JSON and re-encoding it to check the HMAC produces different bytes and fails for reasons
-that look like a nuthatch bug and are not. See `verify()` in `receiver.py` — twelve lines, and
-the only part of that file worth copying.
+that look like a nuthatch bug and are not. See `verify()` in [`main.rs`](main.rs): about fifteen lines,
+and the only part of that file worth copying.
 
 **`[[alerts]]` deliveries are never signed - there is no `secret` field for them.** Signing is a
 `[[webhooks]]`-only feature; `Alert` (the `[[alerts]]` config struct) has just `kinds` and `url`.

@@ -298,7 +298,7 @@ case.
   and sat here marked ⛔ regardless, which is how a checklist stops being trusted.)*
 - [ ] ✅ Alerting hooks (`alerts.rs`, `webhooks.rs`) documented end-to-end with a runnable example.  **[#302]**
   *`examples/webhooks/README.md` (110 lines, landed `dfed0f8` / #328): both `[[webhooks]]` and
-  `[[alerts]]` through one outbox, runnable `receiver.py --secret hunter2`, `nuthatch.toml` block,
+  `[[alerts]]` through one outbox, runnable receiver (Rust since #2294), `nuthatch.toml` block,
   and five "surprises" (at-least-once, `since`, finality, depth gauge, alert signing). Two README
   false claims corrected in #302: the table said `[[webhooks]]` is "triggered by rows sealing (or
   hitting the tip)" - tip delivery does not exist yet, and `nuthatch.toml` load now refuses
