@@ -3101,6 +3101,7 @@ async fn build_nest(
         config.extract.top_level_calls,
         owner,
     )?;
+    guard_indexed_layout(store.as_ref(), &registry, owner)?;
     guard_coverage(store.as_ref(), config, owner)?;
 
     // Startup integrity pass (0.5.x hardening): quarantine any sealed segment whose bytes no longer
@@ -4032,6 +4033,74 @@ fn guard_registry_identity(
     }
 }
 
+/// The positions of each event table's indexed parameters. Two layouts that swap which parameter is
+/// indexed share a topic0 and a registry hash, and decode each other's logs into the wrong columns.
+pub(crate) fn indexed_layout(
+    registry: &crate::registry::DecodeRegistry,
+) -> std::collections::BTreeMap<String, Vec<usize>> {
+    registry
+        .tables()
+        .into_iter()
+        .map(|d| {
+            let positions = d.columns.iter().enumerate();
+            let positions = positions.filter(|(_, c)| c.indexed).map(|(i, _)| i);
+            (d.table.clone(), positions.collect())
+        })
+        .collect()
+}
+
+/// One line per table whose indexed positions differ between `found` (recorded) and `want`.
+pub(crate) fn indexed_layout_changes(
+    found: &std::collections::BTreeMap<String, Vec<usize>>,
+    want: &std::collections::BTreeMap<String, Vec<usize>>,
+) -> Vec<String> {
+    found
+        .iter()
+        .filter_map(|(table, was)| {
+            let now = want.get(table)?;
+            (was != now).then(|| {
+                format!("  {table}: indexed parameter positions {was:?} stored, {now:?} configured")
+            })
+        })
+        .collect()
+}
+
+/// Refuse to serve rows decoded under a different indexed layout (#2157). A store written before
+/// this was recorded has none; it adopts the current layout, like [`guard_coverage`].
+fn guard_indexed_layout(
+    store: &dyn crate::store::HotStore,
+    registry: &crate::registry::DecodeRegistry,
+    owner: bool,
+) -> Result<()> {
+    let want = indexed_layout(registry);
+    match store.get_meta(crate::store::INDEXED_LAYOUT_KEY)? {
+        Some(found) => {
+            let found = serde_json::from_str(&found).with_context(|| {
+                format!(
+                    "unreadable {} in the store",
+                    crate::store::INDEXED_LAYOUT_KEY
+                )
+            })?;
+            let changes = indexed_layout_changes(&found, &want);
+            anyhow::ensure!(
+                changes.is_empty(),
+                "this nest's stored data was decoded with different parameters indexed:\n\n{}\n\n\
+                 The topic0 and the registry hash are the same either way, so the stored rows put \
+                 these values in other columns than this ABI decodes them into. Re-index from \
+                 scratch (remove `nuthatch.redb` and `segments/`), or restore the previous ABI to \
+                 keep serving this data.",
+                changes.join("\n")
+            );
+            Ok(())
+        }
+        None if !owner => Ok(()),
+        None => store.set_meta(
+            crate::store::INDEXED_LAYOUT_KEY,
+            &serde_json::to_string(&want)?,
+        ),
+    }
+}
+
 /// Bumped whenever [`coverage`] records more, so a store recorded under an earlier version is
 /// re-recorded rather than refused.
 const COVERAGE_VERSION: u64 = 1;
@@ -4183,6 +4252,7 @@ pub(crate) fn stamp_fresh_store(
         config.extract.top_level_calls,
         true,
     )?;
+    guard_indexed_layout(store, &registry, true)?;
     guard_coverage(store, config, true)
 }
 
@@ -17281,6 +17351,93 @@ template = "pool"
         .unwrap();
         std::fs::write(dir.path().join("abis/data-edge.json"), QOS_EDGE_ABI).unwrap();
         dir
+    }
+
+    /// `E(uint256 a, uint256 b)` with parameter `indexed` indexed: the same topic0 and registry hash
+    /// whichever it is (#2157).
+    fn write_swap_nest(dir: &std::path::Path, indexed: usize) {
+        std::fs::create_dir_all(dir.join("abis")).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            format!(
+                "[nest]\nname = \"swap\"\nchain = \"gnosis\"\nchain_id = 100\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"e\"\naddress = \"{ADDRESS}\"\nabi = \"abis/e.json\"\n"
+            ),
+        )
+        .unwrap();
+        let param = |i: usize, name: &str| {
+            format!(
+                r#"{{"name":"{name}","type":"uint256","indexed":{}}}"#,
+                i == indexed
+            )
+        };
+        std::fs::write(
+            dir.join("abis/e.json"),
+            format!(
+                r#"[{{"type":"event","name":"E","anonymous":false,"inputs":[{},{}]}}]"#,
+                param(0, "a"),
+                param(1, "b")
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_indexed_position_swap_is_refused_at_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = || {
+            let c = Config::load(dir.path()).unwrap();
+            let r = crate::registry::from_nest(dir.path(), &c).unwrap();
+            let id = crate::project::decode_identity(dir.path(), &c, &r).unwrap();
+            (hex::encode(id), hex::encode(r.hash()))
+        };
+        write_swap_nest(dir.path(), 0);
+        let before = identity();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        stamp_fresh_store(&store, dir.path(), &Config::load(dir.path()).unwrap()).unwrap();
+        store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
+
+        write_swap_nest(dir.path(), 1);
+        assert_eq!(
+            identity(),
+            before,
+            "premise: the swap keeps the registry hash"
+        );
+        let config = Config::load(dir.path()).unwrap();
+        let err = stamp_fresh_store(&store, dir.path(), &config)
+            .expect_err("rows decoded with `a` indexed must not be served as `b` indexed")
+            .to_string();
+        assert!(
+            err.contains("e__e: indexed parameter positions [0] stored, [1] configured"),
+            "{err}"
+        );
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        guard_indexed_layout(&store, &registry, false).expect_err("and a reader refuses it too");
+    }
+
+    #[test]
+    fn a_store_from_before_the_indexed_layout_opens_and_gains_one() {
+        use crate::store::INDEXED_LAYOUT_KEY;
+        let dir = tempfile::tempdir().unwrap();
+        write_swap_nest(dir.path(), 1);
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let identity =
+            hex::encode(crate::project::decode_identity(dir.path(), &config, &registry).unwrap());
+        // What a build before #2157 recorded.
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        guard_timestamp_policy(&store, config.nest.block_timestamps, true).unwrap();
+        let events = hex::encode(registry.hash());
+        guard_registry_identity(&store, &identity, &events, false, true).unwrap();
+        guard_coverage(&store, &config, true).unwrap();
+        store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
+        assert_eq!(store.get_meta(INDEXED_LAYOUT_KEY).unwrap(), None, "premise");
+
+        stamp_fresh_store(&store, dir.path(), &config).expect("a legacy store must still open");
+        assert_eq!(
+            store.get_meta(INDEXED_LAYOUT_KEY).unwrap().as_deref(),
+            Some(r#"{"e__e":[1]}"#)
+        );
     }
 
     /// The guard and provenance hashed the event registry alone, so a calldata-only nest claimed the

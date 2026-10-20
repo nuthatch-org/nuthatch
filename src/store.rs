@@ -626,6 +626,9 @@ pub const IDENTITY_FORMULA: &str = "2";
 /// What the store's data covers beyond its decode, as JSON: chain, contracts and their start blocks,
 /// factories, extraction (#1420).
 pub const COVERAGE_KEY: &str = "indexed_coverage";
+/// Which parameter positions of each event table were indexed when the data was written (#2157).
+/// The registry hash cannot see a swap of indexed positions at the same arity.
+pub const INDEXED_LAYOUT_KEY: &str = "indexed_layout";
 
 /// The formula this store recorded its registry hash under, read without creating anything.
 pub fn recorded_identity_formula(path: &Path) -> Result<Option<String>> {
