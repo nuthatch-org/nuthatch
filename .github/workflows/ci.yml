@@ -174,6 +174,12 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+      # tests/parity_*.rs run scripts/lodestar-parity.sh, which runs this; the shards have no cargo.
+      - name: build the parity comparison into the test archive
+        run: |
+          t=${CARGO_TARGET_DIR:-target}
+          cargo build --locked --manifest-path tools/lodestar-parity/Cargo.toml --target-dir "$t/lodestar-parity"
+          mkdir -p "$t/parity-bin" && cp "$t/lodestar-parity/debug/lodestar-parity-compare" "$t/parity-bin/"
       - uses: ./.github/actions/install-nextest
       # Built here, run by the `test-default` shards. Outside `target/`, so rust-cache never saves it.
       - name: build the test archive
@@ -372,6 +378,12 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: regenerate the skill reference without it
         run: cargo run --locked -- skill-refs
+      # tests/parity_*.rs run scripts/lodestar-parity.sh, which runs this; the shards have no cargo.
+      - name: build the parity comparison into the test archive
+        run: |
+          t=${CARGO_TARGET_DIR:-target}
+          cargo build --locked --manifest-path tools/lodestar-parity/Cargo.toml --target-dir "$t/lodestar-parity"
+          mkdir -p "$t/parity-bin" && cp "$t/lodestar-parity/debug/lodestar-parity-compare" "$t/parity-bin/"
       - uses: ./.github/actions/install-nextest
       - name: build the test archive
         run: cargo nextest archive --locked --archive-file "$RUNNER_TEMP/nextest-no-count.tar.zst"
@@ -457,6 +469,12 @@ jobs:
         run: cargo clippy --locked --features counter --all-targets -- -D warnings
       - name: clippy (crash-points)
         run: cargo clippy --locked --features crash-points --all-targets -- -D warnings
+      # tests/parity_*.rs run scripts/lodestar-parity.sh, which runs this; the shards have no cargo.
+      - name: build the parity comparison into the test archive
+        run: |
+          t=${CARGO_TARGET_DIR:-target}
+          cargo build --locked --manifest-path tools/lodestar-parity/Cargo.toml --target-dir "$t/lodestar-parity"
+          mkdir -p "$t/parity-bin" && cp "$t/lodestar-parity/debug/lodestar-parity-compare" "$t/parity-bin/"
       - uses: ./.github/actions/install-nextest
       - name: build the test archive
         run: cargo nextest archive --locked --features graph,counter,crash-points --archive-file "$RUNNER_TEMP/nextest-features.tar.zst"
