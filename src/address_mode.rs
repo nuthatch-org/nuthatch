@@ -1359,12 +1359,12 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
         }
         // Discovery yields after a poll interval: bodies and produced blocks need no traces, and a
         // long trace backlog would otherwise hold them back for its whole length (#2078).
-        let budget = Instant::now() + state.poll_interval;
+        let budget = tokio::time::Instant::now() + state.poll_interval;
         let poll = state.polls.load(Ordering::Relaxed);
         let (mut advanced_any, mut failed_any) = (false, false);
         // A sweeping nest covers its set block by block; discovering each address too would cost
         // per address what the sweep exists to avoid.
-        while state.sweep.is_none() && Instant::now() < budget {
+        while state.sweep.is_none() && tokio::time::Instant::now() < budget {
             let round = match state.history.watched() {
                 Ok(w) => w,
                 Err(e) => {
@@ -1380,7 +1380,7 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                 .retain(|a, _| round.binary_search(a).is_ok());
             let mut advanced = false;
             for address in round {
-                if Instant::now() >= budget {
+                if tokio::time::Instant::now() >= budget {
                     break;
                 }
                 if stopped.contains(&address) {
@@ -1438,7 +1438,8 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                     .saturating_add(span - 1)
                     .min(to)
                     .min(limit.map_or(u64::MAX, |l| l - 1));
-                let started = Instant::now();
+                // Tokio's clock, std's outside a paused test: there it simulates what a pace measures.
+                let started = tokio::time::Instant::now();
                 let done = discover_window(self, state, &address, (next, end), None).await;
                 let took = started.elapsed();
                 if let Some(p) = state.backfill_paces.lock().unwrap().get_mut(&address) {
@@ -7676,21 +7677,15 @@ mod tests {
                     }
                     let s = crate::address_discovery::hex_u64(&f["fromBlock"])?;
                     let e = crate::address_discovery::hex_u64(&f["toBlock"])?.min(c.latest());
-                    let per = c.trace_us_per_block.load(Ordering::Relaxed);
-                    let fixed = ["fromAddress", "toAddress"]
+                    if let Some(a) = ["fromAddress", "toAddress"]
                         .iter()
                         .find_map(|k| f[*k][0].as_str())
-                        .and_then(|a| {
-                            let mut m = c.trace_fixed_us.lock().unwrap();
-                            m.get_mut(&a.to_ascii_lowercase()).map(|(us, n)| {
-                                *n += 1;
-                                *us
-                            })
-                        })
-                        .unwrap_or(0);
-                    std::thread::sleep(Duration::from_micros(
-                        fixed + per * (e + 1).saturating_sub(s),
-                    ));
+                    {
+                        let mut m = c.trace_fixed_us.lock().unwrap();
+                        if let Some((_, n)) = m.get_mut(&a.to_ascii_lowercase()) {
+                            *n += 1;
+                        }
+                    }
                     let frames: Vec<Value> = if f.get("toAddress").is_some() {
                         (s..=e)
                             .filter(|b| c.row_at(*b))
@@ -7730,6 +7725,25 @@ mod tests {
                 }
                 "trace_block" => Ok(json!([{"x": 1}])),
                 other => bail!("unexpected {other}"),
+            });
+            let c = self.clone();
+            let trace = trace.with_latency(move |m, p| {
+                let f = &p[0];
+                let named = ["fromAddress", "toAddress"]
+                    .iter()
+                    .find_map(|k| f[*k][0].as_str())
+                    .map(str::to_ascii_lowercase);
+                let fails = |a: &String| c.trace_fails.lock().unwrap().contains_key(a);
+                if m != "trace_filter" || named.as_ref().is_some_and(fails) {
+                    return Duration::ZERO;
+                }
+                let block = |k: &str| crate::address_discovery::hex_u64(&f[k]).unwrap_or(0);
+                let (s, e) = (block("fromBlock"), block("toBlock").min(c.latest()));
+                let fixed = named
+                    .and_then(|a| c.trace_fixed_us.lock().unwrap().get(&a).map(|(us, _)| *us))
+                    .unwrap_or(0);
+                let per = c.trace_us_per_block.load(Ordering::Relaxed);
+                Duration::from_micros(fixed + per * (e + 1).saturating_sub(s))
             });
             (main, trace)
         }
@@ -8729,7 +8743,7 @@ mod tests {
     }
 
     /// Accounts take turns: a second account gets coverage while the first still has a backlog.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(start_paused = true)]
     async fn accounts_take_turns_in_the_backfill() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
@@ -8755,7 +8769,7 @@ mod tests {
         };
         // BOB sorts first. When ALICE gets her first window, BOB must still have a backlog: one
         // account's whole backlog first would have taken BOB to 29,000.
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         while covered(ALICE).is_none() && started.elapsed() < Duration::from_secs(20) {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -8888,8 +8902,9 @@ mod tests {
     }
 
     /// A quiet account backfilled beside a slow one grows its windows as it would alone: one pace
-    /// judged on both settled at the floor for both (#2061).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// judged on both settled at the floor for both (#2061). On paused time the pacer measures the
+    /// simulated latencies alone, whatever the runner's speed (#2255).
+    #[tokio::test(start_paused = true)]
     async fn each_account_keeps_its_own_pace() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
@@ -8909,17 +8924,11 @@ mod tests {
         }
         let d = Arc::new(chain.node());
         d.reconcile(&s, chain.latest()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(120), d.catch_up(&s, 99_000))
-            .await
-            .unwrap();
+        d.catch_up(&s, 99_000).await;
         // Alone, 128-block windows doubling to 50,000 cover 99,000 blocks in 11, two calls each. A
-        // shared pace (#2061) holds both at the 128-block floor, some 1,500 calls; 60 leaves room for
-        // a slow runner, which has taken 32 (#2255).
+        // shared pace (#2061) holds both at the 128-block floor, hundreds of calls.
         let calls = chain.trace_fixed_us.lock().unwrap()[&BOB.to_ascii_lowercase()].1;
-        assert!(
-            calls <= 60,
-            "{calls} trace_filter calls for the quiet account"
-        );
+        assert_eq!(calls, 22, "trace_filter calls for the quiet account");
     }
 
     /// A request for history above what is covered is served inside a long backfill: the cursor's
