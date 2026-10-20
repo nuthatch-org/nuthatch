@@ -7,12 +7,22 @@
 · Website: [www.nuthatch-indexer.com](https://www.nuthatch-indexer.com)
 
 ```sh
-curl -fsSL https://nuthatch-indexer.com/install.sh | sh                  # macOS Apple Silicon, Linux x86_64 and aarch64
-export PATH="$HOME/.local/bin:$PATH"                                    # the installer's directory; a fresh macOS shell lacks it
-nuthatch init 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 --alias weth   # WETH; the chain is detected
-nuthatch dev --backfill 300                                             # the last 300 blocks, then keeps up
-nuthatch sql "SELECT count(*) FROM weth__transfer"                      # in a second terminal
+curl -fsSL https://nuthatch-indexer.com/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+nuthatch init 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 --alias weth
+nuthatch dev --backfill 300
 ```
+
+Then, in a second terminal:
+
+```sh
+nuthatch sql "SELECT count(*) FROM weth__transfer"
+```
+
+The installer covers macOS Apple Silicon and Linux x86_64 and aarch64, and the `export` adds its
+directory, which a fresh macOS shell lacks. `init` indexes WETH and detects its chain. The block
+carries no `#` comments because zsh, the macOS default, does not treat a pasted `#` as one: it
+passes the rest of the line on as arguments.
 
 The Linux binary needs glibc 2.35 or newer to run from 4.1.0, which is also what it is built on;
 4.0.x ran on 2.34. No Intel Mac binary is published: there, and on other platforms, build from

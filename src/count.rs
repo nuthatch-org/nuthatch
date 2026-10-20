@@ -244,14 +244,18 @@ pub struct Pending {
 impl Pending {
     pub fn of(args: &InitArgs) -> Self {
         Pending {
-            dir: PathBuf::from(&args.dir),
+            dir: crate::project::target_dir(args),
             source: Source::of(args),
         }
     }
 
     pub async fn ask(self) {
         let Some(path) = config_path() else { return };
-        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        // Input already waiting is the next line of a paste, not an answer to a question not yet
+        // printed (#2235): leave it to the shell and ask at a later init.
+        let interactive = std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+            && !typed_ahead(&std::io::stdin());
         let decision = decide(
             Answer::load(&path).as_ref(),
             interactive,
@@ -269,6 +273,23 @@ impl Pending {
             }
         }
     }
+}
+
+/// Whether `input` has bytes ready to read right now.
+#[cfg(unix)]
+fn typed_ahead(input: &impl std::os::fd::AsRawFd) -> bool {
+    let mut fd = libc::pollfd {
+        fd: input.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut fd, 1, 0) };
+    ready > 0 && fd.revents & libc::POLLIN != 0
+}
+
+#[cfg(not(unix))]
+fn typed_ahead<T>(_: &T) -> bool {
+    false
 }
 
 /// Read back from what `init` wrote, so every arm of `init` is counted without each passing it on.
@@ -367,6 +388,53 @@ mod tests {
     }
 
     const SOURCES: [Source; 3] = [Source::Addresses, Source::From, Source::Subgraph];
+
+    // #2235: a pasted next line is already waiting when the question would be asked.
+    #[cfg(unix)]
+    #[test]
+    fn input_waiting_before_the_question_is_seen() {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read, mut write) = unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        };
+        assert!(!typed_ahead(&read));
+        write.write_all(b"nuthatch dev --backfill 300\n").unwrap();
+        assert!(typed_ahead(&read));
+    }
+
+    fn init_args(argv: &[&str]) -> InitArgs {
+        use clap::Parser;
+        match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+            crate::cli::Command::Init(a) => a,
+            _ => unreachable!(),
+        }
+    }
+
+    // #2189: `--from` with the default `--dir` writes the nest under the source's name, so the chain is
+    // read from there, not from whatever `./nuthatch.toml` happens to be.
+    #[test]
+    fn the_chain_is_read_from_the_directory_init_wrote() {
+        let from = init_args(&[
+            "nuthatch",
+            "init",
+            "--from",
+            "https://github.com/o/mynest.git",
+        ]);
+        assert_eq!(Pending::of(&from).dir, PathBuf::from("mynest"));
+        let given = init_args(&["nuthatch", "init", "--from", "./a", "--dir", "b"]);
+        assert_eq!(Pending::of(&given).dir, PathBuf::from("b"));
+        let addresses = init_args(&[
+            "nuthatch",
+            "init",
+            "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        ]);
+        assert_eq!(Pending::of(&addresses).dir, PathBuf::from("."));
+    }
 
     // A3: the field set is the RFC's, exactly. Adding one fails here until the RFC is amended.
     #[test]

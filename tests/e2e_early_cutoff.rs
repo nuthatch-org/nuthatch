@@ -437,6 +437,8 @@ async fn bring_up_live(
             seal_direct: false,
             concurrency: 1,
             ipfs_window_deadline: nuthatch::ipfs_resolve::WINDOW_DEADLINE,
+            ipfs_gateways: Vec::new(),
+            state_rpc: Vec::new(),
             window_override: Some(2),
             admin_enabled: false,
             admin_token: None,

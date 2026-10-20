@@ -24,10 +24,11 @@ pub async fn init(args: InitArgs) -> Result<()> {
 }
 
 async fn scaffold(args: InitArgs) -> Result<()> {
+    refuse_inapplicable(&args)?;
     // Three ways to start a nest: clone/copy a published one (`--from`), port a subgraph
     // (`--from-subgraph`), or resolve from addresses.
     if let Some(source) = args.from.clone() {
-        return init_from(&source, &args.dir);
+        return init_from(&source, &target_dir(&args));
     }
     if let Some(source) = args.from_subgraph.clone() {
         return init_from_subgraph(&source, &args).await;
@@ -35,6 +36,7 @@ async fn scaffold(args: InitArgs) -> Result<()> {
     if args.addresses.is_empty() {
         bail!("provide one or more contract addresses, --from <git-url|dir>, or --from-subgraph <cid>");
     }
+    refuse_existing_nest(Path::new(&args.dir))?;
     // Chain identity: honour an explicit `--chain`, otherwise detect it. The first-run friction we
     // most want to delete is making the user know (and correctly spell) which chain their contract
     // is on - so when they don't say, we go and find out.
@@ -428,6 +430,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
     use crate::subgraph_import as sg;
     use std::collections::BTreeMap;
 
+    refuse_existing_nest(Path::new(&args.dir))?;
     let gateways: Vec<String> = if args.ipfs.is_empty() {
         sg::DEFAULT_IPFS_GATEWAYS
             .iter()
@@ -995,17 +998,77 @@ fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result
     Ok(())
 }
 
+/// Where `init` writes the nest: `--dir`, except that `--from` with the default names it after its
+/// source.
+pub(crate) fn target_dir(args: &InitArgs) -> PathBuf {
+    match &args.from {
+        Some(source) if args.dir == "." => PathBuf::from(source_basename(source)),
+        _ => PathBuf::from(&args.dir),
+    }
+}
+
+/// `init` writes `nuthatch.toml` and `abis/` from scratch, so over an existing nest it would replace
+/// the authored config and orphan the data indexed under it.
+fn refuse_existing_nest(dir: &Path) -> Result<()> {
+    if dir.join(crate::config::CONFIG_FILE).exists() {
+        bail!(
+            "'{}' already holds a nest ({}), and init would overwrite it. To index another \
+             contract in it run `nuthatch add <address> --dir {}`; to start a new nest pass \
+             `--dir <new-dir>`.",
+            dir.display(),
+            crate::config::CONFIG_FILE,
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a flag the chosen way of starting a nest would parse and then never read.
+fn refuse_inapplicable(args: &InitArgs) -> Result<()> {
+    let (mode, ignored): (&str, Vec<(&str, bool, &str)>) = if args.from.is_some() {
+        (
+            "--from",
+            vec![
+                ("--chain", args.chain.is_some(), "a published nest names its own chain in nuthatch.toml"),
+                ("--rpc", !args.rpc.is_empty(), "a published nest carries its own rpc_urls; pass --rpc to `nuthatch dev` to use yours"),
+                ("--start-block", !args.start_block.is_empty(), "a published nest's start blocks are in its nuthatch.toml"),
+                ("--no-timestamps", args.no_timestamps, "a published nest's block_timestamps is in its nuthatch.toml"),
+                ("--explorer", args.explorer.is_some(), "a published nest vendors its ABIs, so nothing is resolved"),
+                ("--ipfs", !args.ipfs.is_empty(), "a published nest vendors its ABIs, so nothing is resolved"),
+                ("--alias", !args.alias.is_empty(), "a published nest names its own contracts"),
+                ("--abi", !args.abi.is_empty(), "a published nest vendors its ABIs, so nothing is resolved"),
+            ],
+        )
+    } else if args.from_subgraph.is_some() {
+        (
+            "--from-subgraph",
+            vec![
+                (
+                    "--start-block",
+                    !args.start_block.is_empty(),
+                    "each data source's startBlock is carried across from the manifest",
+                ),
+                (
+                    "--explorer",
+                    args.explorer.is_some(),
+                    "ABIs come from the CIDs the manifest pins, not an explorer",
+                ),
+            ],
+        )
+    } else {
+        return Ok(());
+    };
+    if let Some((flag, _, why)) = ignored.into_iter().find(|(_, given, _)| *given) {
+        bail!("{flag} does not apply to {mode}: {why}");
+    }
+    Ok(())
+}
+
 /// Initialise a nest from a published one - a git URL or a local directory - instead of resolving
 /// from addresses. The nest is self-contained (ABIs vendored, `nuthatch.toml` committed), so this
 /// clones/copies it and validates it: the toml parses at a supported schema version and the decode
 /// registry builds from the vendored ABIs. Publishing a nest is `git push`; consuming it is this.
-fn init_from(source: &str, dir_arg: &str) -> Result<()> {
-    // Default the target dir to the nest's own name (repo/dir basename) unless one was given.
-    let target = if dir_arg == "." {
-        PathBuf::from(source_basename(source))
-    } else {
-        PathBuf::from(dir_arg)
-    };
+fn init_from(source: &str, target: &Path) -> Result<()> {
     if target.exists() && target.read_dir().map(|mut d| d.next().is_some())? {
         bail!(
             "target '{}' already exists and is not empty",
@@ -1015,7 +1078,7 @@ fn init_from(source: &str, dir_arg: &str) -> Result<()> {
 
     if is_git_source(source) {
         println!("→ cloning nest from {source} …");
-        clone_repo(source, &target)?;
+        clone_repo(source, target)?;
         // Drop the clone's history: a consumed nest is a plain working copy, not a live checkout.
         let _ = std::fs::remove_dir_all(target.join(".git"));
     } else {
@@ -1024,13 +1087,13 @@ fn init_from(source: &str, dir_arg: &str) -> Result<()> {
             bail!("--from '{source}' is neither a git URL nor an existing local directory");
         }
         println!("→ copying nest from {} …", src.display());
-        copy_dir(&src, &target)?;
+        copy_dir_except(&src, target, &crate::blob::is_excluded)?;
     }
 
     // Validate: it must be a real nest - toml at a supported schema version, ABIs present + decodable.
-    let config = Config::load(&target)
+    let config = Config::load(target)
         .with_context(|| format!("'{}' is not a valid nuthatch nest", target.display()))?;
-    let registry = crate::registry::from_nest(&target, &config)
+    let registry = crate::registry::from_nest(target, &config)
         .context("nest ABIs failed to build a decode registry (is the nest self-contained?)")?;
     // Validate factory rules (RFC-0009): references must resolve and depth stays within the ceiling.
     let factories = crate::factory::FactorySet::resolved(&config, &registry)
@@ -1109,17 +1172,22 @@ fn clone_repo(url: &str, target: &Path) -> Result<()> {
 
 /// Recursively copy a local nest directory (skipping any `.git`).
 pub(crate) fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    copy_dir_except(src, dst, &|name| name == ".git")
+}
+
+/// [`copy_dir`], skipping every entry, at any depth, whose name `skip` matches.
+fn copy_dir_except(src: &Path, dst: &Path, skip: &dyn Fn(&std::ffi::OsStr) -> bool) -> Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("cannot create {}", dst.display()))?;
     for entry in std::fs::read_dir(src).with_context(|| format!("cannot read {}", src.display()))? {
         let entry = entry?;
         let name = entry.file_name();
-        if name == ".git" {
+        if skip(&name) {
             continue;
         }
         let from = entry.path();
         let to = dst.join(&name);
         if entry.file_type()?.is_dir() {
-            copy_dir(&from, &to)?;
+            copy_dir_except(&from, &to, skip)?;
         } else {
             std::fs::copy(&from, &to)
                 .with_context(|| format!("failed to copy {}", from.display()))?;
@@ -1665,10 +1733,7 @@ async fn detect_chain(addresses: &[String]) -> Result<&'static chains::Chain> {
     }
 
     match found.as_slice() {
-        [] => bail!(
-            "couldn't find bytecode for {probe} on any known chain (mainnet, arbitrum-one, base).\n\
-             Pass --chain explicitly, or --rpc <url> for a custom endpoint."
-        ),
+        [] => Err(found_nowhere(&probe, &probed)),
         [only] => {
             println!("  ✓ found on {}", only.name);
             Ok(only)
@@ -1683,6 +1748,15 @@ async fn detect_chain(addresses: &[String]) -> Result<&'static chains::Chain> {
             Ok(first)
         }
     }
+}
+
+fn found_nowhere(probe: &str, probed: &[(&'static chains::Chain, Option<bool>)]) -> anyhow::Error {
+    let names: Vec<&str> = probed.iter().map(|(c, _)| c.name).collect();
+    anyhow::anyhow!(
+        "couldn't find bytecode for {probe} on any known chain ({}).\n\
+         Pass --chain explicitly, or --rpc <url> for a custom endpoint.",
+        names.join(", ")
+    )
 }
 
 /// Per request while probing. A public endpoint that never answers (tenderly from a Docker network,
@@ -2230,6 +2304,151 @@ mod tests {
         assert!(is_git_source("./local-bare-repo.git"));
         assert!(!is_git_source("./horizon-nest"));
         assert!(!is_git_source("/abs/path/to/nest"));
+    }
+
+    fn parsed_init(argv: &[&str]) -> InitArgs {
+        use clap::Parser;
+        let mut full = vec!["nuthatch", "init"];
+        full.extend_from_slice(argv);
+        match crate::cli::Cli::try_parse_from(full).unwrap().command {
+            crate::cli::Command::Init(a) => a,
+            _ => unreachable!(),
+        }
+    }
+
+    // #2187: a second `init` into a nest is refused before anything is resolved or written.
+    #[tokio::test]
+    async fn init_refuses_to_overwrite_an_existing_nest() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().to_str().unwrap();
+        std::fs::write(d.path().join("nuthatch.toml"), "# authored\n").unwrap();
+        for argv in [
+            vec![
+                "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+                "--chain",
+                "mainnet",
+                "--rpc",
+                "http://127.0.0.1:1",
+                "--dir",
+                dir,
+            ],
+            vec![
+                "--from-subgraph",
+                "QmVPhLKqbpPuQSLVbA8cbVaB4zhgsLWbWS2jgZZdHrBgfn",
+                "--ipfs",
+                "http://127.0.0.1:1/ipfs/",
+                "--dir",
+                dir,
+            ],
+        ] {
+            let err = scaffold(parsed_init(&argv)).await.unwrap_err().to_string();
+            assert!(err.contains("already holds a nest"), "{err}");
+            assert!(err.contains("nuthatch add"), "{err}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("nuthatch.toml")).unwrap(),
+            "# authored\n"
+        );
+    }
+
+    // #2190: a flag the mode never reads is refused by name, with the reason.
+    #[tokio::test]
+    async fn init_refuses_flags_its_mode_would_ignore() {
+        let from = ["--from", "./nest"];
+        let subgraph = [
+            "--from-subgraph",
+            "QmVPhLKqbpPuQSLVbA8cbVaB4zhgsLWbWS2jgZZdHrBgfn",
+        ];
+        let cases: &[(&[&str], &[&str], &str)] = &[
+            (
+                &from,
+                &["--chain", "base"],
+                "--chain does not apply to --from",
+            ),
+            (
+                &from,
+                &["--rpc", "https://mine"],
+                "--rpc does not apply to --from",
+            ),
+            (
+                &from,
+                &["--start-block", "5"],
+                "--start-block does not apply to --from",
+            ),
+            (
+                &from,
+                &["--no-timestamps"],
+                "--no-timestamps does not apply to --from",
+            ),
+            (
+                &from,
+                &["--explorer", "https://x"],
+                "--explorer does not apply to --from",
+            ),
+            (
+                &from,
+                &["--ipfs", "https://x/ipfs/"],
+                "--ipfs does not apply to --from",
+            ),
+            (&from, &["--alias", "a"], "--alias does not apply to --from"),
+            (
+                &from,
+                &["--abi", "a.json"],
+                "--abi does not apply to --from",
+            ),
+            (
+                &subgraph,
+                &["--start-block", "5"],
+                "--start-block does not apply to --from-subgraph",
+            ),
+            (
+                &subgraph,
+                &["--explorer", "https://x"],
+                "--explorer does not apply to --from-subgraph",
+            ),
+        ];
+        for (mode, flag, want) in cases {
+            let argv: Vec<&str> = mode.iter().chain(flag.iter()).copied().collect();
+            let err = scaffold(parsed_init(&argv)).await.unwrap_err().to_string();
+            assert!(err.starts_with(want), "{argv:?}: {err}");
+        }
+    }
+
+    // #2191: `--from <dir>` copies the nest's inputs, never its hot store or sealed segments, and the
+    // copy is the same nest.
+    #[test]
+    fn init_from_a_local_dir_copies_inputs_not_data() {
+        let src = tempfile::tempdir().unwrap();
+        copy_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scaffold/two"),
+            src.path(),
+        )
+        .unwrap();
+        let nid = crate::blob::build_manifest(src.path(), None).unwrap().nid();
+        std::fs::write(src.path().join(crate::config::DB_FILE), b"hot store").unwrap();
+        std::fs::create_dir_all(src.path().join("segments/0")).unwrap();
+        std::fs::write(src.path().join("segments/0/a.parquet"), b"sealed").unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("copy");
+        init_from(src.path().to_str().unwrap(), &target).unwrap();
+        assert!(!target.join(crate::config::DB_FILE).exists());
+        assert!(!target.join("segments").exists());
+        assert!(target.join("nuthatch.toml").exists());
+        assert_eq!(
+            crate::blob::build_manifest(&target, None).unwrap().nid(),
+            nid
+        );
+    }
+
+    // #2193: the failure names every chain that was probed.
+    #[test]
+    fn found_nowhere_names_every_probed_chain() {
+        let probed: Vec<_> = chains::all().iter().map(|c| (*c, Some(false))).collect();
+        let msg = found_nowhere("0xabc", &probed).to_string();
+        for c in chains::all() {
+            assert!(msg.contains(c.name), "{} missing from: {msg}", c.name);
+        }
     }
 
     #[test]
