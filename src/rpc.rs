@@ -271,6 +271,21 @@ fn body_capped(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<BodyCapped>())
 }
 
+/// Appends `chunk` unless it would take `body` past `cap`, growing it by doubling no further than
+/// the cap, so neither the bytes nor the allocation ever exceed it.
+fn append_capped(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> Result<(), BodyCapped> {
+    let need = body.len() + chunk.len();
+    if need > cap {
+        return Err(BodyCapped { cap });
+    }
+    if need > body.capacity() {
+        let grown = need.max(body.capacity() * 2).min(cap);
+        body.reserve_exact(grown - body.len());
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
 /// Re-classify an all-endpoints failure as [`FailureClass::Narrowable`] when **every** attempt was a
 /// rate limit (RFC-0028 §3d).
 ///
@@ -1436,10 +1451,7 @@ impl RpcClient {
         // Grown by doubling, a body near the cap left the allocator holding several times it.
         let mut body = Vec::with_capacity(declared);
         while let Some(chunk) = resp.chunk().await.map_err(read_failed)? {
-            body.extend_from_slice(&chunk);
-            if body.len() > cap {
-                return Err(anyhow::Error::new(BodyCapped { cap }));
-            }
+            append_capped(&mut body, &chunk, cap)?;
         }
         serde_json::from_slice(&body)
             .map_err(|e| classified(FailureClass::Transient, format!("malformed response: {e}")))
@@ -2595,6 +2607,52 @@ mod tests {
             200usize.div_ceil(learned),
             "a refused batch: {sent:?}"
         );
+    }
+
+    /// A chunk past the remaining allowance is refused before it is copied, and the buffer never
+    /// holds an allocation past the cap, however the chunks fall.
+    #[test]
+    fn a_capped_body_never_allocates_past_the_cap() {
+        let cap = 1_000;
+        let mut body = Vec::new();
+        assert!(super::append_capped(&mut body, &[0; 1_001], cap).is_err());
+        assert!(body.capacity() <= cap, "{}", body.capacity());
+        for _ in 0..9 {
+            super::append_capped(&mut body, &[0; 111], cap).unwrap();
+            assert!(body.capacity() <= cap, "{}", body.capacity());
+        }
+        assert!(super::append_capped(&mut body, &[0; 2], cap).is_err());
+        assert_eq!(body.len(), 999);
+        assert!(body.capacity() <= cap, "{}", body.capacity());
+    }
+
+    /// The same over HTTP: a chunked response with no `Content-Length`, one chunk past the cap.
+    #[tokio::test]
+    async fn one_chunk_past_the_cap_without_a_length_is_refused() {
+        use axum::{body::Body, routing::post, Router};
+        let app = Router::new().route(
+            "/",
+            post(|| async {
+                let filler = "0".repeat(200 << 10);
+                let one = format!(r#"[{{"jsonrpc":"2.0","id":0,"result":"{filler}"}}]"#);
+                Body::from_stream(futures::stream::iter([Ok::<_, std::io::Error>(one)]))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let c = super::RpcClient::new(vec![format!("http://{addr}/")])
+            .unwrap()
+            .with_batch_body_cap(64 << 10);
+        let batch = serde_json::json!([{"jsonrpc": "2.0", "id": 0, "method": "eth_call"}]);
+        let err = c
+            .post_with_failover_capped(&batch, Some(c.batch_body_cap))
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(super::body_capped(&err), "{err:#}");
     }
 
     /// Address history's getLogs is capped the same way, at its own smaller cap, with an error its
