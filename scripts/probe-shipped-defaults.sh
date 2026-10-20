@@ -64,7 +64,7 @@ done
 for u in https://arb1.arbitrum.io/rpc https://arb-pokt.nodies.app; do
   probe arbitrum-one 0xaf88d065e77c8cC2239327C5EDb3A432268e5831 "$u"
 done
-for u in https://mainnet.base.org https://base-pokt.nodies.app; do
+for u in https://base.gateway.tenderly.co https://base-pokt.nodies.app; do
   probe base 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 "$u"
 done
 # Polygon: probe each shipped endpoint for getLogs failure (same gate as above).

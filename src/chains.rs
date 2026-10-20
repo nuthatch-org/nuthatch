@@ -167,10 +167,13 @@ const BASE: Chain = Chain {
     name: "base",
     chain_id: 8453,
     rpc_urls: &[
-        // Keyless Base mainnet endpoints. Both re-measured 2026-08-06 against the RFC-0030 §4 bar:
-        // archive OK, getLogs 5/5, batch-of-5 OK, `finalized` OK. The official RPC first.
-        "https://mainnet.base.org",
+        // Keyless Base mainnet endpoints. `base-pokt.nodies.app` re-measured 2026-08-06 against the
+        // RFC-0030 §4 bar: archive OK, getLogs 5/5, batch-of-5 OK, `finalized` OK. Tenderly added
+        // 2026-10-20: archive OK, getLogs window 160, `finalized` OK.
+        "https://base.gateway.tenderly.co",
         "https://base-pokt.nodies.app",
+        // Removed 2026-10-20 (#2246): `mainnet.base.org` answers every eth_getLogs, even ten empty
+        // blocks, with 429 `request limit reached` since at least 2026-10-12.
         // Removed 2026-08-06 (issue #267): `base.drpc.org` rejects a 5-request batch with `Batch of
         // more than 3 requests are not allowed`, and `getLogs` was 4/5 with the same free-plan
         // timeout its sibling endpoints return. Flaky *and* over the bar's batch floor.
@@ -183,7 +186,7 @@ const BASE: Chain = Chain {
         fallback_depth: 900,
     },
     // ~2 s blocks and busy - a moderate window that the adaptive chunker (RFC-0004 §2) tunes further.
-    // Measured 2026-08-07, address-filtered: `mainnet.base.org` ~80, `base-pokt.nodies.app` ~40.
+    // Measured address-filtered: `base-pokt.nodies.app` ~40 (2026-08-07), Tenderly ~160 (2026-10-20).
     // Same reasoning as Arbitrum: the optimistic default is recovered by adaptive splitting, at the
     // cost of early retries.
     log_window: 1000,

@@ -102,11 +102,13 @@ fi
 # The `reviewed-by signature` gate was retired: a PR is admitted by CI and Jules, not by a line of
 # text a party could type about itself. Asserted in the negative because re-adding the context
 # without re-adding the workflow blocks every PR on a check that can never report.
-if echo "$expected" | grep -qx 'reviewed-by signature'; then
+if grep -qx 'reviewed-by signature' <<< "$expected"; then
   echo "required-checks.txt names the retired 'reviewed-by signature' context, whose workflow no longer exists" >&2
   exit 1
 fi
-if ! echo "$expected" | grep -qx 'Jules approval'; then
+# A here-string, not `echo | grep -q`: grep -q exits at its match, the echo's next write takes
+# SIGPIPE, and pipefail turns a found context into a missing one (#2280).
+if ! grep -qx 'Jules approval' <<< "$expected"; then
   echo "required-checks.txt is missing 'Jules approval'" >&2
   exit 1
 fi

@@ -119,6 +119,21 @@ fn an_unknown_flag_is_refused_rather_than_ignored() {
     assert!(out.contains("usage"), "{out}");
 }
 
+/// #2280 - `grep -q` stops reading at its match, so a context it found reached the caller as
+/// missing whenever the writer feeding it took SIGPIPE under `pipefail`. On a short list that is a
+/// race; a list past the pipe buffer, with the match sorted first, makes it certain.
+#[test]
+fn a_context_found_early_in_a_long_list_is_not_reported_missing() {
+    let mut list = String::from("Jules approval\n");
+    for i in 0..6000 {
+        list.push_str(&format!("context number {i}\n"));
+    }
+    let root = root_with(&list);
+    let (code, out) = run(root.path(), &["--offline"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("is missing"), "{out}");
+}
+
 /// The committed script and the committed list are the ones CI runs, so assert against them rather
 /// than only against fixtures - a fixture-only suite cannot see the real file drifting.
 #[test]
