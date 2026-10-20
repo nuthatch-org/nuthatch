@@ -20,7 +20,7 @@ use crate::{hex, hex_u64, int, quoted, truthy, Fault, Fixture};
 
 const CHAIN_ID: u64 = 1;
 pub const TIP: u64 = 20_000;
-const LOGS_PER_BLOCK: u64 = 4;
+pub const LOGS_PER_BLOCK: u64 = 4;
 // `Transfer(address,address,uint256)`
 const TOPIC0: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const CONTRACT: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
@@ -28,6 +28,8 @@ const FINALITY: u64 = 64;
 
 pub struct Footprint {
     moving: bool,
+    logs_per_block: u64,
+    txs_per_block: u64,
     state: Mutex<State>,
 }
 
@@ -39,10 +41,18 @@ struct State {
 
 impl Footprint {
     pub fn new(moving: bool) -> Self {
+        Self::dense(moving, TIP, LOGS_PER_BLOCK, 0)
+    }
+
+    /// The same chain at another tip and density. `txs_per_block` puts that many hashes in each
+    /// header, as a node answers `eth_getBlockByNumber(n, false)`; zero leaves the field out.
+    pub fn dense(moving: bool, tip: u64, logs_per_block: u64, txs_per_block: u64) -> Self {
         Self {
             moving,
+            logs_per_block,
+            txs_per_block,
             state: Mutex::new(State {
-                tip: TIP,
+                tip,
                 appeared: HashMap::new(),
                 seen: HashMap::new(),
             }),
@@ -60,11 +70,11 @@ fn word(n: u128) -> String {
     format!("0x{n:064x}")
 }
 
-fn logs_for(from: u64, to: u64, tip: u64) -> Vec<Value> {
+fn logs_for(from: u64, to: u64, tip: u64, per_block: u64) -> Vec<Value> {
     let mut out = Vec::new();
     for b in from.max(1)..=to.min(tip) {
-        for i in 0..LOGS_PER_BLOCK {
-            let idx = u128::from(b * LOGS_PER_BLOCK + i);
+        for i in 0..per_block {
+            let idx = u128::from(b * per_block + i);
             out.push(json!({
                 "address": CONTRACT,
                 "topics": [TOPIC0, word(idx % 512), word((idx * 7 + 3) % 512)],
@@ -115,13 +125,24 @@ impl Fixture for Footprint {
                         return Ok(Value::Null);
                     }
                 }
-                Ok(json!({
+                let mut header = json!({
                     "number": hex(n),
                     "hash": format!("0x{n:064x}"),
                     "parentHash": format!("0x{:064x}", n.saturating_sub(1)),
                     // Deterministic, and monotonic so finality maths behaves.
                     "timestamp": hex(1_600_000_000 + n * 12),
-                }))
+                });
+                if self.txs_per_block > 0 {
+                    if p.get(1).is_some_and(truthy) {
+                        return Err(Fault::Rpc(-32601, "footprint mock: hashes only".into()));
+                    }
+                    let base = u128::from(n) << 32;
+                    let txs: Vec<Value> = (0..u128::from(self.txs_per_block))
+                        .map(|i| json!(word(base + i)))
+                        .collect();
+                    header["transactions"] = Value::Array(txs);
+                }
+                Ok(header)
             }
             Some("eth_getLogs") => {
                 let filter = p.get(0).filter(|f| f.is_object()).ok_or(Fault::Malformed)?;
@@ -131,7 +152,7 @@ impl Fixture for Footprint {
                     Some(v) => hex_u64(v).ok_or(Fault::Malformed),
                 };
                 let (from, to) = (bound("fromBlock", 0)?, bound("toBlock", s.tip)?);
-                Ok(Value::Array(logs_for(from, to, s.tip)))
+                Ok(Value::Array(logs_for(from, to, s.tip, self.logs_per_block)))
             }
             Some("fixture_advance") if self.moving => {
                 s.tip += 1;
