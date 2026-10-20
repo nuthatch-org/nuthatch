@@ -2,7 +2,7 @@
 #
 # Tip lag: how long after a block appears at the chain's tip its rows answer through /sql (#1884).
 #
-# footprint-rpc.py serves its chain with `--moving`, so the tip advances one block, four Transfers,
+# `fixture-rpc footprint --moving` serves its chain, so the tip advances one block, four Transfers,
 # each time this script asks. Each sample waits a random 0-999 ms, advances the tip, then polls /sql
 # every 10 ms until the new block's four rows are there. Two figures per sample:
 #
@@ -39,7 +39,8 @@ if [ -z "${EPOCHREALTIME:-}" ]; then
 fi
 now_ms() { local t="${EPOCHREALTIME/[.,]/}"; echo "${t:0:13}"; }
 
-python3 "$HERE/footprint-rpc.py" "$RPC_PORT" --moving &
+RPC_BIN="$(bash "$HERE/../../scripts/fixture-rpc.sh")"
+"$RPC_BIN" footprint "$RPC_PORT" --moving &
 RPC_PID=$!
 DEV_PID=
 trap 'kill "$RPC_PID" ${DEV_PID:+"$DEV_PID"} 2>/dev/null || true' EXIT
@@ -126,7 +127,7 @@ jq -s --arg label "tip lag: footprint fixture, moving tip, 4 Transfers a block, 
   def stats(k): (map(.[k]) | sort) as $s | ($s | length) as $n |
     {p50: $s[(($n - 1) / 2 | floor)], p99: $s[((($n * 99 + 99) / 100 | floor) - 1)],
      min: $s[0], max: $s[$n - 1]};
-  {label: $label, version: $version, commit: $commit, provider: "footprint-rpc.py --moving, local",
+  {label: $label, version: $version, commit: $commit, provider: "fixture-rpc footprint --moving, local",
    hardware: $hardware, poll_interval_ms: 1000,
    samples: length, lag_ms: stats("lag_ms"), after_seen_ms: stats("after_seen_ms"), raw: .}
 ' "$WORK/samples.jsonl" > "$OUT"

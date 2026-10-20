@@ -4,12 +4,14 @@
 runner refuses to start, which is why RFC-0017's authoring eval has a proven board, a runner, two
 isolation modes and **no baseline**.
 
-**Two images are required**, and the runner refuses by name if either is missing. The proxy is what
-lets the subject reach its model without reaching anything else — see below.
+**Three images are required**, and the runner refuses by name if any is missing. The proxy is what
+lets the subject reach its model without reaching anything else (see below). The fixture is the
+chain the subject indexes, run inside the same internal network.
 
 ```sh
 docker build -t nuthatch-eval-subject eval/image
 docker build -t nuthatch-eval-proxy   eval/image/proxy
+docker build -t nuthatch-eval-fixture tools/fixture-rpc
 # If buildx complains about ~/.docker/buildx/activity, DOCKER_BUILDKIT=0 builds it with the legacy
 # builder. That is a local docker-state problem, not a Dockerfile one.
 python3 eval/run-authoring.py --docker-image nuthatch-eval-subject --runs 3 \

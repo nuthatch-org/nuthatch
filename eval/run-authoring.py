@@ -15,7 +15,7 @@ The board is proven before anyone plays on it: `tests/authoring_eval_board.rs` w
 scenario with a scripted reference solution and must be green in CI first. A 0/3 against an
 unproven board is a number about nothing.
 
-Fully offline: `scripts/fixture_rpc.py` serves the chain over loopback and the ABI is a local file.
+Fully offline: `tools/fixture-rpc` serves the chain over loopback and the ABI is a local file.
 
     python3 eval/run-authoring.py --nuthatch target/release/nuthatch --runs 3
     python3 eval/run-authoring.py --self-test          # no key, no model, no network
@@ -166,10 +166,16 @@ def wait_for(what: str, seconds: float, probe, strict: bool = False):
     return None
 
 
+def fixture_rpc_bin() -> str:
+    return subprocess.run(
+        ["bash", str(ROOT / "scripts/fixture-rpc.sh")], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
 def start_fixture_chain(scenario) -> tuple[subprocess.Popen, str, int]:
     port = free_port()
     proc = subprocess.Popen(
-        [sys.executable, str(ROOT / "scripts/fixture_rpc.py"),
+        [fixture_rpc_bin(), "scripted",
          "--port", str(port), "--contract", scenario["contract"]],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
@@ -212,13 +218,15 @@ class DockerIsolation:
     (`--tip`/`--finalized`) rather than through `/control/*`: the runner cannot post to it either.
     """
 
-    def __init__(self, image: str, scenario, run_id: str, proxy_image: str = "nuthatch-eval-proxy"):
+    def __init__(self, image: str, scenario, run_id: str, proxy_image: str = "nuthatch-eval-proxy",
+                 fixture_image: str = "nuthatch-eval-fixture"):
         self.image, self.scenario, self.run_id = image, scenario, run_id
         self.network = f"nuthatch-eval-{run_id}"
         self.egress = f"nuthatch-egress-{run_id}"
         self.fixture = f"nuthatch-fixture-{run_id}"
         self.proxy = f"nuthatch-proxy-{run_id}"
         self.proxy_image = proxy_image
+        self.fixture_image = fixture_image
         self.rpc_port = 8945
         self.rpc = f"http://{self.fixture}:{self.rpc_port}/"
         # `claude` must reach its own model service and nothing else. Review of #1058 found the
@@ -232,10 +240,10 @@ class DockerIsolation:
         # so on a host that has only built the subject image `docker run` fails deep inside setup
         # with a registry error - and review of #1058 pointed out the documented baseline command
         # did not run as written. A missing prerequisite should be a sentence, not a stack trace.
-        for image, where in ((self.image, "eval/image"), (self.proxy_image, "eval/image/proxy")):
+        for image, where in ((self.image, "eval/image"), (self.proxy_image, "eval/image/proxy"),
+                             (self.fixture_image, "tools/fixture-rpc")):
             if _run(["docker", "image", "inspect", image])[0] != 0:
                 die(f"the image '{image}' is not built. Run:  docker build -t {image} {where}")
-        script = ROOT / "scripts" / "fixture_rpc.py"
         _sh(["docker", "network", "create", "--internal", self.network])
         # A second, ordinary network for the proxy's outward half only. The subject is never on it.
         _sh(["docker", "network", "create", self.egress])
@@ -265,8 +273,7 @@ class DockerIsolation:
             )
         _sh([
             "docker", "run", "-d", "--rm", "--name", self.fixture, "--network", self.network,
-            "-v", f"{script}:{script}:ro", self.image,
-            "python3", str(script),
+            self.fixture_image, "scripted",
             "--port", str(self.rpc_port), "--bind", "0.0.0.0",
             "--contract", self.scenario["contract"],
             # Pinned here: the control endpoints are unreachable from the host on this network.

@@ -1,0 +1,24 @@
+[package]
+name = "nuthatch-fixture-rpc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Deterministic JSON-RPC chains for nuthatch's tests and CI gates"
+publish = false
+
+# Its own crate, outside the binary: the root crate takes it as a dev-dependency only, so a default
+# build is what it would be had this never been written.
+[[bin]]
+name = "fixture-rpc"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tiny-keccak = { version = "2", features = ["keccak"] }
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync"] }

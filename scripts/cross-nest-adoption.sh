@@ -7,7 +7,7 @@
 # Nest A and nest B declare the same contract, ABI and start block (so their `data_identity()`
 # matches) but are authored separately - different alias, different `semantic.toml` description,
 # different `views/` - so their NIDs differ. A indexes and seals against a real JSON-RPC endpoint
-# (scripts/fixture_rpc.py); B is then migrated in against an endpoint that has been switched to serve
+# (tools/fixture-rpc); B is then migrated in against an endpoint that has been switched to serve
 # the exact same block headers with **zero logs** - a provider that could not have served the range B
 # ends up holding. If B's row counts match A's, the only route was adoption.
 #
@@ -49,11 +49,16 @@ trap cleanup EXIT
 
 api()  { curl -fsS -m 15 "$@"; }
 ctl()  { curl -fsS -m 15 "http://127.0.0.1:$RPC_PORT$1"; }
-jget() { python3 -c 'import sys,json
-d=json.load(sys.stdin)
-for k in sys.argv[1].split("."):
-    d = d[int(k)] if k.isdigit() else d[k]
-print(d)' "$1"; }
+jget() { jq -er "$1 // empty"; }
+# The nid of the [[mounts]] record with alias $1, as `migrate` writes them: one `key = "value"` a line.
+mount_nid() {
+  awk -v want="$1" '
+    /^\[/ { inm = ($0 == "[[mounts]]"); alias = ""; nid = ""; next }
+    inm && /^alias = / { alias = $3; gsub(/"/, "", alias) }
+    inm && /^nid = / { nid = $3; gsub(/"/, "", nid) }
+    inm && alias == want && nid != "" { print nid; exit }
+  ' "$ROOT/mounts.toml"
+}
 
 echo "nuthatch: $($NUTHATCH --version 2>/dev/null || echo 'not found')"
 echo "scratch:  $ROOT"
@@ -91,7 +96,8 @@ nests = ["alpha-usdc-mirror"]
 EOF
 
 # --- Start the fixture RPC, full history mode ------------------------------------------------------
-python3 "$SCRIPT_DIR/fixture_rpc.py" --port "$RPC_PORT" --contract "$CONTRACT" \
+RPC_BIN="$(bash "$SCRIPT_DIR/fixture-rpc.sh")"
+"$RPC_BIN" scripted --port "$RPC_PORT" --contract "$CONTRACT" \
   > "$ROOT/fixture-rpc.log" 2>&1 &
 RPC_PID=$!
 for _ in $(seq 1 50); do ctl "/control/state" >/dev/null 2>&1 && break; sleep 0.2; done
@@ -107,7 +113,7 @@ curl -fsS -m 5 -XPOST "http://127.0.0.1:$RPC_PORT/control/finalized" -d '{"numbe
 echo
 echo "-- migrate A alone --"
 $NUTHATCH migrate --dir "$ROOT"
-ALPHA_NID=$(python3 -c "import tomllib; t=tomllib.load(open('$ROOT/mounts.toml','rb')); print(t['mounts'][0]['nid'])")
+ALPHA_NID=$(mount_nid alpha-usdc-mirror)
 [ ${#ALPHA_NID} -eq 64 ] && pass "A resolved to a 64-char nest identity ($ALPHA_NID)" \
   || fail "A did not resolve to an identity"
 
@@ -120,7 +126,7 @@ $NUTHATCH dev --dir "$ROOT" --listen "127.0.0.1:$PORT" --seal-direct \
 DEV_PID=$!
 landed=0
 for _ in $(seq 1 100); do
-  v=$(api "http://127.0.0.1:$PORT/alpha-usdc-mirror/tables" 2>/dev/null | jget count 2>/dev/null || true)
+  v=$(api "http://127.0.0.1:$PORT/alpha-usdc-mirror/tables" 2>/dev/null | jget .count 2>/dev/null || true)
   [ "${v:-0}" -ge 1 ] 2>/dev/null && { landed=1; break; }
   sleep 0.3
 done
@@ -129,14 +135,14 @@ done
 # Wait for seal-direct to land: sealed_through must reach the finalized block (8).
 sealed=0
 for _ in $(seq 1 200); do
-  st=$(api --get "http://127.0.0.1:$PORT/alpha-usdc-mirror/sql" --data-urlencode 'q=select 1' 2>/dev/null | jget provenance.sealed_through 2>/dev/null || echo 0)
+  st=$(api --get "http://127.0.0.1:$PORT/alpha-usdc-mirror/sql" --data-urlencode 'q=select 1' 2>/dev/null | jget .provenance.sealed_through 2>/dev/null || echo 0)
   [ "${st:-0}" -ge 8 ] 2>/dev/null && { sealed=1; break; }
   sleep 0.5
 done
 [ "$sealed" -eq 1 ] && pass "A sealed through block 8 (finality crossed, segments written)" \
   || fail "A never sealed through block 8"
 
-BEFORE=$(api --get "http://127.0.0.1:$PORT/alpha-usdc-mirror/sql" --data-urlencode 'q=select count(*) c from "t__transfer"' 2>/dev/null | jget rows.0.c 2>/dev/null || echo 0)
+BEFORE=$(api --get "http://127.0.0.1:$PORT/alpha-usdc-mirror/sql" --data-urlencode 'q=select count(*) c from "t__transfer"' 2>/dev/null | jget ".rows[0].c" 2>/dev/null || echo 0)
 echo "  A holds $BEFORE transfer row(s) before B ever exists"
 
 kill "$DEV_PID" 2>/dev/null || true
@@ -164,14 +170,8 @@ curl -fsS -m 5 -XPOST "http://127.0.0.1:$RPC_PORT/control/reset_calls" >/dev/nul
 
 # Append B to the pending-nests list in the [runtime] section. migrate cleared this field after
 # processing A; we re-add only B so the second run sees exactly one pending nest.
-python3 - "$ROOT/mounts.toml" <<'PYEOF'
-import sys, pathlib
-p = pathlib.Path(sys.argv[1])
-text = p.read_text()
-# Insert the nests key immediately after the [runtime] header line.
-text = text.replace('[runtime]\n', '[runtime]\nnests = ["beta-payments-monitor"]\n', 1)
-p.write_text(text)
-PYEOF
+awk '{ print } $0 == "[runtime]" && !done { print "nests = [\"beta-payments-monitor\"]"; done = 1 }' \
+  "$ROOT/mounts.toml" > "$ROOT/mounts.toml.new" && mv "$ROOT/mounts.toml.new" "$ROOT/mounts.toml"
 
 echo
 echo "-- migrate B in, against a source that already holds the data --"
@@ -183,13 +183,7 @@ else
   fail "the plan did not choose ADOPT for beta-payments-monitor"
 fi
 
-BETA_NID=$(python3 -c "
-import tomllib
-t = tomllib.load(open('$ROOT/mounts.toml','rb'))
-for m in t['mounts']:
-    if m['alias'] == 'beta-payments-monitor':
-        print(m['nid'])
-")
+BETA_NID=$(mount_nid beta-payments-monitor)
 [ -n "$BETA_NID" ] && [ "$BETA_NID" != "$ALPHA_NID" ] && \
   pass "A and B hold DISTINCT identities ($ALPHA_NID != $BETA_NID)" || \
   fail "A and B ended up with the same identity (that would be two mounts of one nest, not this)"
@@ -211,13 +205,13 @@ $NUTHATCH dev --dir "$ROOT" --listen "127.0.0.1:$PORT" \
 DEV_PID=$!
 landed=0
 for _ in $(seq 1 100); do
-  n=$(api "http://127.0.0.1:$PORT/nests" 2>/dev/null | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["nests"]))' 2>/dev/null || echo 0)
+  n=$(api "http://127.0.0.1:$PORT/nests" 2>/dev/null | jq '.nests | length' 2>/dev/null || echo 0)
   [ "${n:-0}" -ge 2 ] 2>/dev/null && { landed=1; break; }
   sleep 0.3
 done
 [ "$landed" -eq 1 ] && pass "both alpha and beta are serving" || fail "both nests never came up together"
 
-AFTER=$(api --get "http://127.0.0.1:$PORT/beta-payments-monitor/sql" --data-urlencode 'q=select count(*) c from "t__transfer"' 2>/dev/null | jget rows.0.c 2>/dev/null || echo 0)
+AFTER=$(api --get "http://127.0.0.1:$PORT/beta-payments-monitor/sql" --data-urlencode 'q=select count(*) c from "t__transfer"' 2>/dev/null | jget ".rows[0].c" 2>/dev/null || echo 0)
 echo "  B holds $AFTER transfer row(s), from an endpoint serving zero logs for the whole range"
 
 if [ "$AFTER" = "$BEFORE" ] && [ "${AFTER:-0}" -gt 0 ]; then
@@ -228,9 +222,7 @@ fi
 
 sleep 2 # let any post-mount catch-up poll land before reading the call log
 CALLS=$(ctl "/control/calls")
-HISTORIC=$(echo "$CALLS" | python3 -c 'import sys,json
-calls = json.load(sys.stdin)["calls"]
-print(sum(1 for c in calls if c["from"] <= 8))')
+HISTORIC=$(echo "$CALLS" | jq '[.calls[] | select(.from <= 8)] | length')
 if [ "$HISTORIC" -eq 0 ]; then
   pass "zero eth_getLogs calls touched blocks 1..=8 after B was mounted (the falsifiable claim)"
 else

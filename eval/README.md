@@ -96,7 +96,7 @@ succeeds, `dev` reaches the pinned tip, one canned question answers correctly - 
 (exit codes + result comparison)"*. **Mechanically** is load-bearing: nothing scores prose, effort,
 or how well the agent explained itself. Three facts about the filesystem and one result set.
 
-Fully offline and deterministic. `scripts/fixture_rpc.py` serves the chain over loopback and the ABI
+Fully offline and deterministic. `tools/fixture-rpc` serves the chain over loopback and the ABI
 is handed over as a local file, so there is no Sourcify, no Etherscan and no network - a score that
 moved because a third party was slow would be a number about the internet.
 

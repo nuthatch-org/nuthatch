@@ -29,7 +29,7 @@
 #     nest, against `footprint.sh`'s one.
 #   - **Dense.** NESTS nests on ONE cursor - the density the budget is stated in terms of.
 #   - **High event rate.** Every contract emits LOGS_PER_BLOCK logs every block.
-#   - **At tip.** The mock's tip *moves* (see multinest-rpc.py), so once the backfill drains the
+#   - **At tip.** The mock's tip *moves* (see tools/fixture-rpc), so once the backfill drains the
 #     cursor spends the rest of the run on the live path - near-tip window, finality, sealing. A
 #     fixed tip only ever measures a backfill, and the budget is about sustained operation.
 #
@@ -164,7 +164,7 @@ write_runtime() {
     local nest="$dir/nests/n$i"
     mkdir -p "$nest/abis"
     cp "$ABI" "$nest/abis/pool_manager.json"
-    # Contract i is address 0x…{i}, matching multinest-rpc.py's derivation, so each nest indexes its
+    # Contract i is address 0x…{i}, matching the fixture chain's derivation, so each nest indexes its
     # own contract and no two nests share a dataset.
     cat > "$nest/nuthatch.toml" <<TOML
 [nest]
@@ -232,7 +232,8 @@ echo "scenario: $NESTS nests on one cursor, 10-event ABI, ${LOGS_PER_BLOCK} logs
 echo "          blocks $FIRST_BLOCK..$FINAL_TIP (backfill $BACKFILL_BLOCKS, then tip-follow to $FINAL_TIP)"
 echo "          expecting $EXPECT_ROWS rows/nest, floor $MIN_ROWS_PER_NEST; ceiling $MAX_RSS_MB MB"
 
-python3 "$HERE/multinest-rpc.py" --port "$RPC_PORT" --abi "$ABI" \
+RPC_BIN="$(bash "$HERE/../../scripts/fixture-rpc.sh")"
+"$RPC_BIN" multinest --port "$RPC_PORT" --abi "$ABI" \
   --contracts "$NESTS" --logs-per-block "$LOGS_PER_BLOCK" \
   --initial-tip "$INITIAL_TIP" --final-tip "$FINAL_TIP" --tip-step "$TIP_STEP" &
 RPC_PID=$!

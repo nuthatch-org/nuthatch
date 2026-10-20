@@ -3,10 +3,10 @@
 # Backfill events/sec on a fixed, locally served chain: tracked on every PR, not gated (#1723).
 #
 # `nuthatch bench backfill --seal-direct --concurrency 4` over blocks 1 to 20,000 of the chain
-# footprint-rpc.py serves: one contract, four Transfers a block, 80,000 rows. It is RFC-0052 S2's
-# scenario (scripts/publish-throughput-gate.sh) without the mirror, so there is no third party and no
-# secret. BATCHES batches of RUNS runs; the bench reports each batch's median, and the figure reported
-# is the median of those.
+# `fixture-rpc footprint` serves: one contract, four Transfers a block, 80,000 rows. It is
+# RFC-0052 S2's scenario (scripts/publish-throughput-gate.sh) without the mirror, so there is no
+# third party and no secret. BATCHES batches of RUNS runs; the bench reports each batch's median,
+# and the figure reported is the median of those.
 #
 # Why there is no floor: the runner's batches agree to 4.2%, but the scenario cannot see the
 # regressions a floor would exist for. A 4x decode cost moved it about 1%, and on the 4-core runner
@@ -31,7 +31,8 @@ EXPECT=$(( TO_BLOCK * 4 ))
 LABEL="backfill throughput: blocks 1-$TO_BLOCK, 4 Transfers a block, seal-direct, concurrency $CONCURRENCY, locally-served chain"
 WORK="$(mktemp -d)"
 
-python3 "$HERE/footprint-rpc.py" "$RPC_PORT" &
+RPC_BIN="$(bash "$HERE/../../scripts/fixture-rpc.sh")"
+"$RPC_BIN" footprint "$RPC_PORT" &
 RPC_PID=$!
 trap 'kill "$RPC_PID" 2>/dev/null || true' EXIT
 for _ in $(seq 1 40); do

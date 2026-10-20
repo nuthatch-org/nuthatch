@@ -16,13 +16,13 @@
 # scores prose, effort, or whether the agent explained itself well. Three facts about the filesystem
 # and one result set, or it did not work.
 #
-# Fully offline and deterministic: `scripts/fixture_rpc.py` serves the chain over real HTTP, and the
+# Fully offline and deterministic: `tools/fixture-rpc` serves the chain over real HTTP, and the
 # ABI is handed over as a local file, so no Sourcify, no Etherscan, and no network at all. A score
 # that moved because a third party was slow would be a number about the internet.
 
 schema_version = 1
 
-# The fixture chain, from scripts/fixture_rpc.py. Blocks 1..=8 each carry one ERC-20 Transfer on
+# The fixture chain, from tools/fixture-rpc. Blocks 1..=8 each carry one ERC-20 Transfer on
 # `contract`; tip is pinned at 9 (no logs there) and finality at 8, so the whole history seals in one
 # pass and tip-following then idles somewhere stable rather than racing the scorer.
 contract = "0x000000000000000000000000000000000000c0de"

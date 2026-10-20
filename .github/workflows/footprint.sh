@@ -16,9 +16,9 @@
 #   2. The number was not comparable between runs. Peak RSS depended on how many blocks a
 #      rate-limited endpoint happened to serve, so "did this change cost us memory?" was unanswerable.
 #
-# Both are fixed by serving the chain ourselves (footprint-rpc.py) and checking in the nest instead of
-# calling `init`, which removes the ABI-resolution round trip too. Every run indexes exactly the same
-# logs, so a change in peak RSS is a change in nuthatch.
+# Both are fixed by serving the chain ourselves (`fixture-rpc footprint`) and checking in the nest
+# instead of calling `init`, which removes the ABI-resolution round trip too. Every run indexes
+# exactly the same logs, so a change in peak RSS is a change in nuthatch.
 #
 # Env: BIN (default target/release/nuthatch), MAX_RSS_MB (default 256), PORT (default 8288),
 #      RPC_PORT (default 8545).
@@ -30,7 +30,8 @@ PORT="${PORT:-8288}"
 RPC_PORT="${RPC_PORT:-8545}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-python3 "$HERE/footprint-rpc.py" "$RPC_PORT" &
+RPC_BIN="$(bash "$HERE/../../scripts/fixture-rpc.sh")"
+"$RPC_BIN" footprint "$RPC_PORT" &
 RPC_PID=$!
 trap 'kill "$RPC_PID" 2>/dev/null || true' EXIT
 for _ in $(seq 1 40); do
