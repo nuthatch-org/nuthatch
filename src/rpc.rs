@@ -1592,6 +1592,53 @@ impl RpcClient {
         Ok(())
     }
 
+    /// Wait up to `deadline` for any endpoint to answer an HTTP request at all, whatever it says, and
+    /// otherwise fail naming every endpoint (#2310). For a one-shot command: `dev` waits forever
+    /// instead, because it is serving `/ready` meanwhile (#510).
+    pub async fn await_an_answer(&self, deadline: Duration) -> Result<()> {
+        let start = Instant::now();
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []});
+        let mut warned = false;
+        loop {
+            let probes = self
+                .urls
+                .iter()
+                .map(|url| self.http.post(url).json(&body).send());
+            let mut failures = Vec::with_capacity(self.urls.len());
+            for (url, outcome) in self
+                .urls
+                .iter()
+                .zip(futures::future::join_all(probes).await)
+            {
+                match outcome {
+                    Ok(_) => return Ok(()),
+                    Err(e) => failures.push(format!(
+                        "{} ({:#})",
+                        redact_url(url),
+                        anyhow::Error::new(e.without_url())
+                    )),
+                }
+            }
+            let left = deadline.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                bail!(
+                    "no RPC endpoint answered in {}s: {}",
+                    deadline.as_secs(),
+                    failures.join(", ")
+                );
+            }
+            if !warned {
+                tracing::warn!(
+                    "no RPC endpoint answers yet ({}); giving up after {}s",
+                    failures.join(", "),
+                    deadline.as_secs()
+                );
+                warned = true;
+            }
+            retry_pause(left.min(Duration::from_secs(2))).await;
+        }
+    }
+
     /// A storage slot's value at `address` (latest block) - used to read the EIP-1967 proxy slot.
     pub async fn get_storage_at(&self, address: &str, slot: &str) -> Result<String> {
         let result = self
@@ -2650,6 +2697,80 @@ mod tests {
             .unwrap_err();
         let text = format!("{error:#}");
         assert!(text.contains("timed out"), "{text}");
+    }
+
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    /// #2310: a pool that refuses every connection is named, redacted, once the deadline passes.
+    #[tokio::test]
+    async fn a_pool_that_refuses_every_connection_is_named_after_the_deadline() {
+        let (a, b) = (closed_port(), closed_port());
+        let client = super::RpcClient::new(vec![
+            format!("http://127.0.0.1:{a}/v3/secret"),
+            format!("http://user:pw@127.0.0.1:{b}"),
+        ])
+        .unwrap();
+        let started = std::time::Instant::now();
+        let text = format!(
+            "{:#}",
+            client
+                .await_an_answer(std::time::Duration::from_millis(300))
+                .await
+                .unwrap_err()
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        assert!(
+            text.contains(&format!("http://127.0.0.1:{a} ("))
+                && text.contains(&format!("http://127.0.0.1:{b} ("))
+                && !text.contains("secret")
+                && !text.contains("pw"),
+            "{text}"
+        );
+    }
+
+    /// Accepting TCP and never answering is no answer either.
+    #[tokio::test]
+    async fn a_pool_that_accepts_and_never_answers_is_named_after_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                open.push(s);
+            }
+        });
+        let client = super::RpcClient::with_timeout(
+            vec![format!("http://127.0.0.1:{port}")],
+            std::time::Duration::from_millis(200),
+        )
+        .unwrap();
+        let text = format!(
+            "{:#}",
+            client
+                .await_an_answer(std::time::Duration::from_millis(300))
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            text.contains(&format!("http://127.0.0.1:{port} (")),
+            "{text}"
+        );
+    }
+
+    /// Any HTTP answer counts, an error status included: what it says is the caller's next question.
+    #[tokio::test]
+    async fn one_endpoint_answering_is_enough() {
+        let (live, _h, _) = broken_rpc().await;
+        let client =
+            super::RpcClient::new(vec![format!("http://127.0.0.1:{}", closed_port()), live])
+                .unwrap();
+        client
+            .await_an_answer(std::time::Duration::ZERO)
+            .await
+            .unwrap();
     }
 
     /// A provider key in the URL must not travel with a transport error into logs or stored text.

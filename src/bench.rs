@@ -317,7 +317,17 @@ fn resolve_keep(keep: &Option<String>) -> Result<Option<PathBuf>> {
     Ok(Some(p))
 }
 
+/// How long `bench backfill` waits for its pool to answer before naming it and stopping (#2310).
+const POOL_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
+    backfill_with(args, POOL_ANSWER_DEADLINE).await
+}
+
+async fn backfill_with(
+    args: BackfillBenchArgs,
+    answer_deadline: std::time::Duration,
+) -> Result<()> {
     if args.to < args.from {
         bail!("--to ({}) is before --from ({})", args.to, args.from);
     }
@@ -474,6 +484,13 @@ pub async fn backfill(args: BackfillBenchArgs) -> Result<()> {
         (None, Some(p)) => TapeMode::Replay(p),
         (None, None) => TapeMode::Live,
     };
+    // `dev` reaches its pool for the tip before it backfills; this bench never asked, so a dead pool
+    // went straight into the seal-direct retry, which waits out an outage for as long as it lasts.
+    if !matches!(tape_mode, TapeMode::Replay(_)) {
+        RpcClient::new(rpc_urls.clone())?
+            .await_an_answer(answer_deadline)
+            .await?;
+    }
 
     let mut runs = Vec::with_capacity(args.runs);
     for run in 1..=args.runs {
@@ -2059,6 +2076,46 @@ abi = "abis/c.json"
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle)
+    }
+
+    /// #2310: the seal-direct arm retries a refused connection for as long as it lasts, so a bench
+    /// against a closed port sat for 18 minutes saying nothing.
+    #[tokio::test]
+    async fn a_bench_against_a_closed_port_stops_and_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        nest_config(dir.path());
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let args = BackfillBenchArgs {
+            dir: dir.path().to_string_lossy().into_owned(),
+            from: 100,
+            to: 200,
+            runs: 1,
+            rpc: Some(format!("http://127.0.0.1:{port}/v3/secret")),
+            state_rpc: Vec::new(),
+            out: None,
+            label: None,
+            seal_direct: true,
+            window_adaptive: false,
+            concurrency: 4,
+            keep: None,
+            record: None,
+            replay: None,
+            publish_target: None,
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            backfill_with(args, std::time::Duration::from_millis(300)),
+        )
+        .await
+        .expect("bench backfill must give up on a pool that never answers");
+        let err = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            err.contains(&format!("http://127.0.0.1:{port}")) && !err.contains("secret"),
+            "the error must name the endpoint, redacted: {err}"
+        );
     }
 
     /// **#784: the harness must not fabricate a stored column.** A provider error on the timestamp
