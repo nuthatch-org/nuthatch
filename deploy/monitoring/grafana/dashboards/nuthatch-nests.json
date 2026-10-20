@@ -81,7 +81,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Age of last successful poll",
-      "description": "IngestStalled fires past 600 s.",
+      "description": "IngestStalled fires past 1800 s.",
       "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [

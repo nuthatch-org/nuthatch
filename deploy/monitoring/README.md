@@ -98,8 +98,8 @@ Four things differ from the page they come from, deliberately:
   `nuthatch_cursor_live` or `nuthatch_nest_quarantine_total`.** Those are a multi-nest runtime's
   series. `NestQuarantined` and `QuarantineFlapping` therefore cannot fire here until a runtime is
   scraped, and `CursorDead` also reads `up`, because for a single nest the process is the cursor.
-- **`IngestStalled` is 600 s, not 300 s.** These units poll every 5 minutes, so the age of the last
-  poll reaches 300 s on every healthy cycle.
+- **`IngestStalled` is 1800 s, not 300 s.** These units poll every 15 minutes (`zz-poll-15m.conf`), so
+  the age of the last poll reaches 900 s on every healthy cycle; 1800 s is two missed polls.
 - **`MemoryNearBudget` is 75% of 2 GiB**, the per-cursor budget, whatever `NUTHATCH_MAX_RSS` a unit
   was given.
 - **`SealedHistoryDisagrees` and `AuditNotRunning` need a unit started with `--audit-rpc`** (#1786),
@@ -121,6 +121,6 @@ amtool check-config alertmanager/alertmanager.yml
 
 ## Proving it
 
-Issue #1714 closes on a recorded page: stop one Helsinki unit for 10 minutes. `TargetDown` and
-`CursorDead` fire after 2 minutes and `IngestStalled` within 10; starting the unit resolves them.
+Issue #1714 closes on a recorded page: stop one Helsinki unit for 40 minutes. `TargetDown` and
+`CursorDead` fire after 2 minutes and `IngestStalled` within 35; starting the unit resolves them.
 Paste the Discord messages onto the issue.
