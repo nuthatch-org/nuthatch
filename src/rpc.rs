@@ -1429,7 +1429,12 @@ impl RpcClient {
             return resp.json::<Value>().await.map_err(read_failed);
         };
         let mut resp = resp;
-        let mut body = Vec::new();
+        let declared = resp.content_length().unwrap_or(0) as usize;
+        if declared > cap {
+            return Err(anyhow::Error::new(BodyCapped { cap }));
+        }
+        // Grown by doubling, a body near the cap left the allocator holding several times it.
+        let mut body = Vec::with_capacity(declared);
         while let Some(chunk) = resp.chunk().await.map_err(read_failed)? {
             body.extend_from_slice(&chunk);
             if body.len() > cap {
