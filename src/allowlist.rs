@@ -51,7 +51,7 @@ pub enum SqlAccess {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParamType {
-    /// A signed 64-bit integer, rendered as decimal digits.
+    /// A signed 64-bit integer, rendered as decimal digits, parenthesised when negative.
     Int,
     /// A 20-byte hex address, rendered as a quoted lowercase literal.
     Address,
@@ -67,7 +67,12 @@ impl ParamType {
                 let n: i64 = raw
                     .parse()
                     .map_err(|_| anyhow::anyhow!("expected an integer, got {raw:?}"))?;
-                Ok(n.to_string())
+                // Bare, `100-{n}` with n = -1 would render `100--1` and comment out the rest of the line.
+                Ok(if n < 0 {
+                    format!("({n})")
+                } else {
+                    n.to_string()
+                })
             }
             ParamType::Address => {
                 let hex = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"));
@@ -310,6 +315,26 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT * FROM t WHERE addr = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' LIMIT 25"
+        );
+    }
+
+    #[test]
+    fn a_negative_int_cannot_form_a_comment() {
+        let query = q(
+            "x",
+            "SELECT * FROM t WHERE amount > 100-{n} AND owner = {who}",
+            &[("n", ParamType::Int), ("who", ParamType::Address)],
+        );
+        let sql = query
+            .render(&args(&[
+                ("n", "-1"),
+                ("who", "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            ]))
+            .unwrap();
+        assert!(!sql.contains("--"), "{sql}");
+        assert_eq!(
+            sql,
+            "SELECT * FROM t WHERE amount > 100-(-1) AND owner = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
         );
     }
 
