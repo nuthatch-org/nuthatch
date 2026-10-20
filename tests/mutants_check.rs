@@ -1,6 +1,6 @@
 //! #841 - the mutation gate's verdict step must fail when it has no verdict to give.
 //!
-//! `scripts/mutants-check.py` used to read an absent `mutants.out/missed.txt` as an empty survivor
+//! `scripts/mutants-check` used to read an absent `mutants.out/missed.txt` as an empty survivor
 //! list and print "No new survivors" on its way to exit 0. Every nightly mutation run between
 //! 2026-08-23 and 2026-08-25 was cancelled at the job timeout and left exactly that state behind, so
 //! the step that exists to report survivors reported success three times having read nothing.
@@ -18,15 +18,15 @@ fn root() -> &'static Path {
 
 /// Run the checker inside `dir`, returning (exit-ok, combined output).
 fn check(dir: &Path, file: Option<&str>) -> (bool, String) {
-    let mut c = Command::new("python3");
-    c.arg(root().join("scripts/mutants-check.py"))
+    let mut c = Command::new("bash");
+    c.arg(root().join("scripts/mutants-check.sh"))
         .current_dir(dir);
     if let Some(f) = file {
         c.arg("--file").arg(f);
     }
     let out = c
         .output()
-        .expect("python3 must be on PATH to run the mutation checker");
+        .expect("bash and jq must be on PATH to run the mutation checker");
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
     (out.status.success(), s)

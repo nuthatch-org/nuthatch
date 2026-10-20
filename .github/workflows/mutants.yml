@@ -20,7 +20,7 @@
 #
 # It was one job over all three files with `timeout-minutes: 300`. It ran three times and was
 # cancelled at exactly 300 minutes three times, having produced a complete set of outcomes and then
-# died before the step that reports them. Nobody found out, because `mutants-check.py` read the
+# died before the step that reports them. Nobody found out, because the checker script read the
 # absent `missed.txt` as "no survivors" and exited 0. Both halves are fixed: the checker now fails on
 # a truncated run, and the sweep is split so it fits.
 #
@@ -140,7 +140,7 @@ jobs:
       - name: new survivors fail this job
         if: always()
         shell: bash
-        run: python3 scripts/mutants-check.py --file ${{ matrix.file }} | tee -a "$GITHUB_STEP_SUMMARY"
+        run: bash scripts/mutants-check.sh --file ${{ matrix.file }} | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: keep the output
         if: always()

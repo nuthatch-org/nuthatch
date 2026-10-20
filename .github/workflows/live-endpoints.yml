@@ -115,7 +115,7 @@ jobs:
           # The extractor exits non-zero on a `Chain` block it cannot read, and writes whatever it had
           # got to before that. Judge the exit status, not the file: a partial list looks exactly like
           # a complete one, and the chain that fell out of it is the one nobody would probe.
-          if ! python3 .github/workflows/shipped-endpoints.py > /tmp/shipped.tsv; then
+          if ! bash .github/workflows/shipped-endpoints.sh > /tmp/shipped.tsv; then
             echo "::error::could not extract the shipped endpoints from src/chains.rs - see the message above; this job cannot judge anything until it can read the registry"
             exit 1
           fi
