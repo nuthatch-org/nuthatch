@@ -128,11 +128,6 @@ impl ResponseBytes {
         let kib = len.div_ceil(1024).clamp(1, SQL_MAX_INFLIGHT_RESPONSE_KIB) as u32;
         Arc::clone(&self.0).try_acquire_many_owned(kib).ok()
     }
-
-    #[cfg(test)]
-    fn kib(kib: usize) -> Self {
-        Self(Arc::new(Semaphore::new(kib)))
-    }
 }
 
 pub fn sql_max_concurrency() -> usize {
@@ -4293,6 +4288,64 @@ fn json_len(value: &serde_json::Value) -> u64 {
     count.0
 }
 
+/// The identifiers in `sql`, lowercased: bare words and double-quoted names, skipping string
+/// literals and comments, so `'holders'` or `shareholders` does not name `holders`.
+fn sql_identifiers(sql: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut chars = sql.chars().peekable();
+    let mut word = String::new();
+    while let Some(c) = chars.next() {
+        if c.is_alphanumeric() || c == '_' {
+            word.push(c.to_ascii_lowercase());
+            continue;
+        }
+        if !word.is_empty() {
+            out.insert(std::mem::take(&mut word));
+        }
+        match (c, chars.peek()) {
+            ('\'', _) => {
+                while let Some(c) = chars.next() {
+                    if c == '\'' && chars.next_if_eq(&'\'').is_none() {
+                        break;
+                    }
+                }
+            }
+            ('"', _) => {
+                let mut quoted = String::new();
+                while let Some(c) = chars.next() {
+                    if c == '"' && chars.next_if_eq(&'"').is_none() {
+                        break;
+                    }
+                    quoted.push(c.to_ascii_lowercase());
+                }
+                out.insert(quoted);
+            }
+            ('-', Some('-')) => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut prev = ' ';
+                for c in chars.by_ref() {
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !word.is_empty() {
+        out.insert(word);
+    }
+    out
+}
+
 /// Copy into `hot` each maintained relation `sql` can reach, charged on top of the tip's rows and
 /// source bytes against the ceilings a declared query's copy is held to (#2211). A relation
 /// named neither in the statement nor in an authored view it names cannot be read by it, so
@@ -4305,11 +4358,11 @@ fn copy_reachable_entities(
     (mut rows, mut bytes): (u64, u64),
     (max_rows, max_bytes): (usize, u64),
 ) -> Result<crate::entity_view::Watermarks> {
-    // The statement's text and the bodies of the authored views it names, through views they name.
-    let mut reach = sql.to_ascii_lowercase();
+    // The statement's identifiers and those of the authored views it names, through views they name.
+    let mut reach = sql_identifiers(sql);
     let mut views: Vec<(String, String)> = crate::analytics::nest_view_bodies(dir)
         .into_iter()
-        .map(|(name, body)| (name.to_ascii_lowercase(), body.to_ascii_lowercase()))
+        .map(|(name, body)| (name.to_ascii_lowercase(), body))
         .collect();
     loop {
         let (named, rest): (Vec<_>, Vec<_>) = views
@@ -4319,8 +4372,7 @@ fn copy_reachable_entities(
             break;
         }
         for (_, body) in named {
-            reach.push('\n');
-            reach.push_str(&body);
+            reach.extend(sql_identifiers(&body));
         }
         views = rest;
     }
@@ -8914,7 +8966,7 @@ mod tests {
         use tower::ServiceExt;
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
-        state.sql_response_bytes = ResponseBytes::kib(1);
+        state.sql_response_bytes = ResponseBytes(Arc::new(Semaphore::new(1)));
         let app = router(SharedNest::new(state));
         let get = |q: &str| {
             let req = axum::http::Request::builder()
@@ -9488,6 +9540,19 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     }
 
+    #[test]
+    fn sql_identifiers_skip_literals_and_comments() {
+        let ids = sql_identifiers(
+            "SELECT \"Holders\", h.x FROM whales h -- shareholders\n WHERE s = 'it''s holders' /* x */",
+        );
+        let mut ids: Vec<_> = ids.into_iter().collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            ["from", "h", "holders", "s", "select", "whales", "where", "x"]
+        );
+    }
+
     /// #2211: `/sql` and `/explain` copy a maintained relation only for a statement that can reach
     /// it, directly or through an authored view, and charge the copy to the ceilings `/q` does.
     #[tokio::test]
@@ -9519,7 +9584,15 @@ mod tests {
             let (status, body) = get(&state, uri).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
         }
-        for uri in ["/sql?q=SELECT%201%20AS%20one", "/explain?q=SELECT%201"] {
+        // A literal, a longer identifier or a comment that spells the name does not reach it.
+        for uri in [
+            "/sql?q=SELECT%201%20AS%20one",
+            "/explain?q=SELECT%201",
+            "/sql?q=SELECT%20'holders'%20AS%20s",
+            "/sql?q=SELECT%201%20AS%20shareholders",
+            "/sql?q=SELECT%201%20AS%20n%20--%20holders",
+            "/sql?q=SELECT%201%20AS%20n%20/*%20holders%20*/",
+        ] {
             let (status, body) = get(&state, uri).await;
             assert_eq!(status, StatusCode::OK, "{uri}: {body}");
         }

@@ -306,6 +306,7 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "the proposer catalogue manifest a publisher writes, not nest config",
     ),
     ("src/tape.rs", "RFC-0039 tape bytes, not nest config"),
+    ("src/store.rs", "the table tag of a hot row, not nest config"),
     (
         "src/mount_jobs.rs",
         "mount-jobs.json: live-mount progress the runtime writes and resumes (#1544), never operator input",
