@@ -65,6 +65,10 @@ const VOLATILE: &[&str] = &[
 /// never remembered. Conservative on purpose: a false `false` costs a hit, a false `true` would
 /// cost the guarantee.
 pub fn is_deterministic(sql: &str) -> bool {
+    !idents(sql).iter().any(|i| VOLATILE.contains(&i.as_str()))
+}
+
+fn idents(sql: &str) -> Vec<String> {
     let lower = sql.to_ascii_lowercase();
     let mut ident = String::new();
     let mut idents = Vec::new();
@@ -75,7 +79,44 @@ pub fn is_deterministic(sql: &str) -> bool {
             idents.push(std::mem::take(&mut ident));
         }
     }
-    !idents.iter().any(|i| VOLATILE.contains(&i.as_str()))
+    idents
+}
+
+/// [`is_deterministic`] over everything `sql` can reach in the nest at `dir`: the authored views it
+/// names, through the views those name, and the generated `offchain__<t>__status` views, whose age
+/// is taken in Rust when they are defined (#2203). Reach is by identifier, so a column that shares a
+/// view's name costs a hit and nothing else.
+pub fn is_deterministic_in(dir: &Path, sql: &str) -> bool {
+    let mut views = HashMap::new();
+    for file in crate::analytics::nest_view_files(dir) {
+        for stmt in crate::analytics::split_sql_statements(&file.sql) {
+            match crate::analytics::view_name(&stmt) {
+                Some(name) => {
+                    views.insert(name, stmt);
+                }
+                // Not attributable to a name, so not to a reach either.
+                None if !is_deterministic(&stmt) => return false,
+                None => {}
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = vec![sql];
+    while let Some(text) = pending.pop() {
+        for id in idents(text) {
+            if VOLATILE.contains(&id.as_str())
+                || (id.starts_with("offchain__") && id.ends_with("__status"))
+            {
+                return false;
+            }
+            if let Some(body) = views.get(&id) {
+                if seen.insert(id) {
+                    pending.push(body.as_str());
+                }
+            }
+        }
+    }
+    true
 }
 
 /// The identity of an answer: a hash over every input it depends on.

@@ -3625,14 +3625,13 @@ struct EntitiesQuery {
 
 async fn entities(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(100).min(1000);
-    match s.store.recent(limit) {
-        Ok(rows) => {
-            let items: Vec<Value> = rows
-                .iter()
-                .filter_map(|r| serde_json::from_str::<Value>(r).ok())
-                .collect();
-            Json(json!({ "count": items.len(), "items": items })).into_response()
-        }
+    let items = s.store.recent(limit).and_then(|rows| {
+        rows.iter()
+            .map(|r| serde_json::from_str::<Value>(r).context("unparseable hot row"))
+            .collect::<Result<Vec<Value>>>()
+    });
+    match items {
+        Ok(items) => Json(json!({ "count": items.len(), "items": items })).into_response(),
         Err(e) => error(format!("{e:#}")),
     }
 }
@@ -4185,7 +4184,7 @@ fn memo_identity(
         .store
         .rows_generation()
         .filter(|_| historical_block.is_none())
-        .filter(|_| crate::sqlmemo::is_deterministic(sql))?;
+        .filter(|_| crate::sqlmemo::is_deterministic_in(&s.dir, sql))?;
     let sealed = crate::sqlmemo::sealed_segments(&s.dir, s.store.sealed_through())?;
     let watermarks: crate::entity_view::Watermarks = s
         .entities
@@ -5041,12 +5040,9 @@ async fn derived_key(
     // The key is a single column here. A composite key arrives as its parts joined by the unit
     // separator, the same character the built-in views use, so a key containing a comma or a slash
     // cannot be mistaken for a delimiter.
-    let wanted = crate::entity_row::Row(
-        key.split('\u{1f}')
-            .map(|p| crate::entity_row::Scalar::Str(p.to_string()))
-            .collect(),
-    );
-    let (found, applied) = entity.get_with_watermark(&wanted);
+    let readings: Vec<Vec<crate::entity_row::Scalar>> =
+        key.split('\u{1f}').map(key_part_readings).collect();
+    let (found, applied) = entity.get_with_watermark(&readings);
     match found {
         Some(row) => Json(json!({
             "key": key,
@@ -5065,6 +5061,24 @@ async fn derived_key(
         )
             .into_response(),
     }
+}
+
+/// What one path segment can be as a key part: the integer or bool it spells, the text itself, and a
+/// `0x` text lowercased, as addresses and hashes are stored (#2205). At most two per part.
+fn key_part_readings(part: &str) -> Vec<crate::entity_row::Scalar> {
+    use crate::entity_row::Scalar;
+    let mut out = Vec::with_capacity(2);
+    if let Ok(n) = part.parse::<i128>() {
+        out.push(Scalar::Int(n));
+    } else if let Ok(b) = part.parse::<bool>() {
+        out.push(Scalar::Bool(b));
+    }
+    out.push(Scalar::Str(part.to_string()));
+    let lower = part.to_ascii_lowercase();
+    if lower.starts_with("0x") && lower != part {
+        out.push(Scalar::Str(lower));
+    }
+    out
 }
 
 /// The whole maintained relation, bounded.
@@ -5179,13 +5193,22 @@ async fn flags(State(s): State<AppState>, Query(q): Query<FlagsQuery>) -> impl I
             .collect()
     };
     // Recent threshold_flag annotations from the hot store (newest first). Sealed history via /sql.
-    let threshold = |s: &AppState| -> Vec<Value> {
-        s.store
-            .recent_by_table("threshold_flag", limit)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|r| serde_json::from_str::<Value>(r).ok())
-            .collect()
+    let threshold = match kind {
+        Some("threshold") | None => {
+            let read = s
+                .store
+                .recent_by_table("threshold_flag", limit)
+                .and_then(|rows| {
+                    rows.iter()
+                        .map(|r| serde_json::from_str::<Value>(r).context("unparseable hot row"))
+                        .collect::<Result<Vec<Value>>>()
+                });
+            match read {
+                Ok(rows) => rows,
+                Err(e) => return error(format!("{e:#}")),
+            }
+        }
+        _ => Vec::new(),
     };
 
     match kind {
@@ -5198,7 +5221,7 @@ async fn flags(State(s): State<AppState>, Query(q): Query<FlagsQuery>) -> impl I
         Some("threshold") => Json(json!({
             "kind": "threshold",
             "threshold": s.threshold.map(|t| t.to_string()),
-            "flags": threshold(&s),
+            "flags": threshold,
             "note": "recent hot flags; full sealed history: /sql?q=SELECT * FROM threshold_flag",
         }))
         .into_response(),
@@ -5208,7 +5231,7 @@ async fn flags(State(s): State<AppState>, Query(q): Query<FlagsQuery>) -> impl I
         )
             .into_response(),
         None => Json(json!({
-            "threshold": { "configured": s.threshold.map(|t| t.to_string()), "flags": threshold(&s) },
+            "threshold": { "configured": s.threshold.map(|t| t.to_string()), "flags": threshold },
             "velocity": { "configured": s.velocity_threshold.map(|t| t.to_string()), "flags": velocity(&s) },
         }))
         .into_response(),
@@ -5688,6 +5711,129 @@ mod tests {
                 .is_some_and(|r| r.contains("max_rows")),
             "the refusal must name the cause: {body}"
         );
+    }
+
+    /// #2205: a path segment is text, and an entity key is typed. `42` finds an integer key part and
+    /// an address in any case finds the lowercase one it is stored as.
+    #[tokio::test]
+    async fn a_derived_key_reads_integer_and_mixed_case_address_parts() {
+        use crate::entity_expr::Expr;
+        use crate::entity_plan::{Agg, Plan, Source};
+        use crate::entity_row::{Row, Scalar};
+
+        let dir = tempfile::tempdir().unwrap();
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(
+            r#"[{"type":"event","name":"Transfer","inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let reg = crate::registry::DecodeRegistry::build(vec![crate::registry::ContractSpec {
+            alias: "usdc".into(),
+            address: alloy_primitives::Address::from([0x11; 20]),
+            abi,
+            events: Vec::new(),
+        }])
+        .unwrap();
+        let plan = Plan {
+            left: Source {
+                table: "usdc__transfer".into(),
+                columns: vec!["to".into(), "value".into()],
+            },
+            left_filter: None,
+            join: None,
+            key: vec![Expr::Column(1), Expr::Column(0)],
+            aggregates: vec![Agg::Count],
+        };
+        let columns = vec!["value".to_string(), "to".to_string(), "n".to_string()];
+        let entity =
+            crate::entity_view::EntityView::start("e", &plan, &columns, &reg, 100, false).unwrap();
+        let to = "0xabcdef0000000000000000000000000000000001";
+        entity.apply(
+            crate::entity_view::Batch {
+                left: vec![(Row(vec![Scalar::Str(to.into()), Scalar::Int(42)]), 1)],
+                right: Vec::new(),
+            },
+            1,
+        );
+        entity.flush();
+        let state = AppState {
+            entities: Arc::new(vec![entity]),
+            #[cfg(feature = "folds")]
+            folds: None,
+            ..test_state(dir.path(), 1)
+        };
+        let get = |key: String| {
+            let state = state.clone();
+            async move {
+                let resp = derived_key(State(state), Path(("e".to_string(), key)))
+                    .await
+                    .into_response();
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, serde_json::from_slice::<Value>(&body).unwrap())
+            }
+        };
+
+        let (st, body) = get(format!("42\u{1f}{to}")).await;
+        assert_eq!(st, StatusCode::OK, "an integer key part: {body}");
+        assert_eq!(body["row"][0], "1", "{body}");
+        let (st, body) = get("42\u{1f}0xABCDEF0000000000000000000000000000000001".into()).await;
+        assert_eq!(st, StatusCode::OK, "an address in checksum case: {body}");
+        let (st, _) = get(format!("43\u{1f}{to}")).await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "a key the relation does not hold"
+        );
+        let (st, _) = get("42".into()).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "a key short of a part");
+    }
+
+    /// #2215: a hot row that will not parse is corruption, and a listing over it says so rather than
+    /// answering a short page.
+    #[tokio::test]
+    async fn hot_listings_fail_on_an_unparseable_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 1);
+        state
+            .store
+            .put_entity(
+                &crate::store::Store::entity_key(1, 0),
+                r#"{"table":"threshold_flag","block_number":1}"#,
+            )
+            .unwrap();
+        state
+            .store
+            .put_entity(&crate::store::Store::entity_key(2, 0), "{not json")
+            .unwrap();
+        let resp = entities(State(state.clone()), Query(EntitiesQuery { limit: None }))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "/entities"
+        );
+        for kind in [Some("threshold".to_string()), None] {
+            let resp = flags(
+                State(state.clone()),
+                Query(FlagsQuery {
+                    kind: kind.clone(),
+                    limit: None,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(
+                resp.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "/flags kind={kind:?}"
+            );
+        }
     }
 
     /// #1437: readiness and `/derived` provenance name the offchain snapshots an entity's rows were
@@ -9973,6 +10119,37 @@ mod tests {
         assert_eq!(third["cached"], false);
         let (_, fourth) = sql_json(&state, "SELECT current_timestamp AS t").await;
         assert_eq!(fourth["cached"], false);
+    }
+
+    /// #2203: the clock read inside a view the statement names, through another view, or baked into
+    /// a generated offchain status view, is as volatile as one in the statement's own text.
+    #[tokio::test]
+    async fn a_statement_reaching_the_clock_through_a_view_is_never_remembered() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("views")).unwrap();
+        std::fs::write(
+            tmp.path().join("views/10-clock.sql"),
+            "CREATE VIEW clock AS SELECT now() AS t;\nCREATE VIEW via_clock AS SELECT t FROM clock;\n",
+        )
+        .unwrap();
+        let state = test_state(tmp.path(), 2);
+        for q in ["SELECT t FROM clock", "SELECT t FROM via_clock"] {
+            let (st, first) = sql_json(&state, q).await;
+            assert_eq!(st, StatusCode::OK, "{first}");
+            let (_, second) = sql_json(&state, q).await;
+            assert_eq!(second["cached"], false, "{q} reads now(): {second}");
+        }
+        assert!(
+            memo_identity(
+                &state,
+                "SELECT stale FROM offchain__prices__status",
+                10,
+                None
+            )
+            .is_none(),
+            "a status view's age is taken when it is defined"
+        );
+        assert!(memo_identity(&state, "SELECT 1 AS n", 10, None).is_some());
     }
 
     /// **Jules on #1189, and the answer is the ordering.** The concern was that a statement reading

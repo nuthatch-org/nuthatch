@@ -101,6 +101,13 @@ pub fn hot_store_cache_bytes() -> usize {
     }
 }
 
+/// Where a new handle's rows generation starts. The memo is process-wide and outlives a handle, so a
+/// reopen - a resume - must not reuse the generations an earlier handle named other rows by (#2204).
+fn rows_epoch() -> u64 {
+    static OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 32
+}
+
 /// A redb builder carrying the configured cache size. Every open site in this file goes through it,
 /// so none of them can quietly keep redb's default.
 fn builder() -> Builder {
@@ -727,7 +734,7 @@ impl Store {
             released,
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            rows: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rows: Arc::new(std::sync::atomic::AtomicU64::new(rows_epoch())),
             commit_gate: Arc::default(),
             #[cfg(test)]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -808,7 +815,7 @@ impl Store {
             released,
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            rows: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rows: Arc::new(std::sync::atomic::AtomicU64::new(rows_epoch())),
             commit_gate: Arc::default(),
             #[cfg(test)]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2501,6 +2508,26 @@ mod tests {
         assert_eq!(store.write_generation(), Some(g1 + 2));
     }
 
+    /// #2204: the memo outlives a handle, so a reopen of the same store - a resume - must not
+    /// reuse a generation the previous handle already named a different row set by.
+    #[test]
+    fn a_reopened_store_never_repeats_a_rows_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let mut seen = std::collections::BTreeSet::new();
+        for b in 1..=3u64 {
+            let store = Store::open(&path).unwrap();
+            assert!(seen.insert(store.rows_generation().unwrap()), "{seen:?}");
+            store
+                .put_entity(
+                    &Store::entity_key(b, 0),
+                    &format!(r#"{{"table":"t","block_number":{b}}}"#),
+                )
+                .unwrap();
+            assert!(seen.insert(store.rows_generation().unwrap()), "{seen:?}");
+        }
+    }
+
     /// #1951: the commits a cursor makes on every poll - `last_block`, checkpoints, a prune or
     /// rollback that finds nothing - leave the rows generation alone, and every commit that adds or
     /// removes a hot row moves it by two.
@@ -2510,6 +2537,7 @@ mod tests {
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
         let rows = |s: &Store| s.rows_generation().expect("at rest");
         let g0 = rows(&store);
+        let w0 = store.write_generation().unwrap();
         store.commit_window(&[], Some((5, "0xaa")), 5).unwrap();
         store.set_meta("sealed_through", "4").unwrap();
         assert_eq!(
@@ -2528,7 +2556,7 @@ mod tests {
         );
         assert_eq!(rows(&store), g0, "no commit above touched a hot row");
         assert!(
-            store.write_generation().unwrap() > g0,
+            store.write_generation().unwrap() > w0,
             "though each one committed"
         );
 
