@@ -63,6 +63,14 @@ gate while everything else still reports success. That is shape 1 reappearing in
 detect shape 1. So a skipped case is a failure, and the fix is to repair the case rather than delete
 it.
 
+## A case that runs no tests fails
+
+When most test files became modules of `tests/it.rs`, every `cargo test --test <name>` stopped naming
+a target and the mutating run proved nothing (#2304). Each case now runs `--test <name>` when
+`Cargo.toml` declares that target and `--test it <name>::` when it is a module of `tests/it.rs`, and
+`--check` fails a case whose target is neither. A filter that matches nothing still exits 0, so the
+run counts the tests that ran, and a case where none did is a failure.
+
 ## Not covered
 
 The `e2e_*` behaviour tests. They are not doc-or-config gates and cargo-mutants already mutates the

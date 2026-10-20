@@ -28,7 +28,7 @@ for a in "$@"; do
     *) FILTER="$a" ;;
   esac
 done
-PASS=0; SURVIVED=0; SKIPPED=0
+PASS=0; SURVIVED=0; SKIPPED=0; NOTRAN=0
 declare -a SURVIVORS=()
 
 # name | test-target | file to mutate | needle | replacement
@@ -76,21 +76,46 @@ CASES=(
 BASELINE_OK=""     # targets proven green unmutated, space-delimited
 BASELINE_BAD=""
 
-target_exists() {  # target_exists <name>
-  [ -f "tests/$1.rs" ]
+# cargo_target_args <name>: the `cargo test` arguments that run exactly this gate. Most gates are
+# modules of tests/it.rs (#2304), where `--test <name>` names no target at all; a few stay explicit.
+cargo_target_args() {
+  if grep -qx "name = \"$1\"" Cargo.toml; then
+    printf '%s\n' --test "$1"
+  elif grep -qx "mod $1;" tests/it.rs; then
+    printf '%s\n' --test it "$1::"
+  else
+    return 1
+  fi
+}
+
+run_target() {  # run_target <name>; the caller has already resolved it
+  local args
+  args=$(cargo_target_args "$1")
+  # shellcheck disable=SC2086
+  cargo test --quiet $args 2>&1
 }
 
 # mutate_all <file> <needle> <replacement>: replaces every literal occurrence and prints how many, or
-# fails having written nothing. Bytewise, which is also what keeps bash 3.2 fast on a large file.
+# fails having written nothing. Not `${s//x/y}`: bash 3.2 runs it in quadratic time and never finished
+# on the 6.5 MB clean tape (#2304). Needles are single-line; ENVIRON keeps awk from reading escapes.
 mutate_all() {
-  local LC_ALL=C s t n r=$3
-  IFS= read -r -d '' s < "$1" || true
-  t=${s//"$2"/}
-  n=$(( (${#s} - ${#t}) / ${#2} ))
-  [ "$n" -gt 0 ] || return 1
-  # $r unquoted: bash 3.2 keeps a quoted replacement's quotes, and 5.2 reads an unquoted & as the match.
-  shopt -u patsub_replacement 2>/dev/null || true
-  printf '%s' "${s//"$2"/$r}" > "$1"
+  local tmp cnt n nl=0
+  [ -n "$(tail -c1 "$1")" ] || nl=1
+  tmp=$(mktemp) && cnt=$(mktemp) || return 1
+  GA_NEEDLE=$2 GA_REPL=$3 LC_ALL=C awk -v nl="$nl" -v cnt="$cnt" '
+    BEGIN { n = ENVIRON["GA_NEEDLE"]; r = ENVIRON["GA_REPL"]; L = length(n); c = 0 }
+    {
+      s = $0; out = ""
+      while ((i = index(s, n)) > 0) { out = out substr(s, 1, i - 1) r; s = substr(s, i + L); c++ }
+      if (NR > 1) printf "\n"
+      printf "%s", out s
+    }
+    END { if (nl && NR > 0) printf "\n"; print c > cnt }
+  ' "$1" > "$tmp" || { rm -f "$tmp" "$cnt"; return 1; }
+  n=$(cat "$cnt"); rm -f "$cnt"
+  if [ "${n:-0}" -gt 0 ]; then cat "$tmp" > "$1"; fi
+  rm -f "$tmp"
+  [ "${n:-0}" -gt 0 ] || return 1
   echo "$n"
 }
 
@@ -102,9 +127,15 @@ mutate_all() {
 # `build-fail` and skipped, which would have made the whole audit unreportable while looking
 # deliberate. The harness must be able to tell "the test ran and failed" from "the test never ran",
 # and the only reliable evidence that it RAN is a `test result:` line.
+#
+# A `test result:` line alone is not enough either: a filter that matches nothing prints
+# `0 passed; 0 failed; N filtered out` and exits 0, which read as a green baseline (#2304).
 classify_run() {   # classify_run <cargo test output> <exit code>
-  local out="$1" rc="$2"
+  local out="$1" rc="$2" ran
   if printf '%s' "$out" | grep -qE '^test result:'; then
+    ran=$(printf '%s' "$out" | sed -nE 's/^test result: [^.]*\. ([0-9]+) passed; ([0-9]+) failed.*/\1 \2/p' \
+      | awk '{ n += $1 + $2 } END { print n + 0 }')
+    if [ "$ran" -eq 0 ]; then printf 'no-tests'; return; fi
     if [ "$rc" -eq 0 ]; then printf 'pass'; else printf 'assert-fail'; fi
     return
   fi
@@ -115,6 +146,16 @@ classify_run() {   # classify_run <cargo test output> <exit code>
   printf 'no-tests'
 }
 
+# A mutated file must go back even if the run is interrupted mid-case.
+BAK=$(mktemp "${TMPDIR:-/tmp}/gate-audit.bak.XXXXXX") || exit 1
+MUTATED=""
+restore() {
+  if [ -n "$MUTATED" ]; then cp "$BAK" "$MUTATED" && MUTATED=""; fi
+}
+trap 'restore; rm -f "$BAK"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # Every distinct target, run once, unmutated. A case whose target is already red cannot report
 # anything: its mutation would be "caught" by a failure that was there before the mutation.
 if [ "$CHECK_ONLY" = 0 ]; then
@@ -123,11 +164,11 @@ if [ "$CHECK_ONLY" = 0 ]; then
     IFS='|' read -r _n t _rest <<< "$c"
     case " $seen " in *" $t "*) continue ;; esac
     seen="$seen $t"
-    if ! target_exists "$t"; then
-      echo "  BASELINE  $t: no tests/$t.rs - the case names a target that does not exist"
+    if ! cargo_target_args "$t" >/dev/null; then
+      echo "  BASELINE  $t: neither a [[test]] target nor a module of tests/it.rs"
       BASELINE_BAD="$BASELINE_BAD $t"; continue
     fi
-    bout=$(cargo test --quiet --test "$t" 2>&1); brc=$?
+    bout=$(run_target "$t"); brc=$?
     bkind=$(classify_run "$bout" "$brc")
     if [ "$bkind" = pass ]; then
       BASELINE_OK="$BASELINE_OK $t"
@@ -149,6 +190,10 @@ for c in "${CASES[@]}"; do
     printf "  %-28s SKIP   (needle %q absent from %s - the audit case has drifted)\n" "$name" "$needle" "$file"
     SKIPPED=$((SKIPPED+1)); continue
   fi
+  if ! cargo_target_args "$target" >/dev/null; then
+    printf "  %-28s SKIP   (%s is neither a [[test]] target nor a module of tests/it.rs)\n" "$name" "$target"
+    SKIPPED=$((SKIPPED+1)); continue
+  fi
   # --check runs on every push, inside `cargo test`, along 31 other integration binaries that read
   # this same working tree. Writing a mutation into the tree - even for the microseconds it takes to
   # restore it - is a window in which one of them reads the mutated file and fails. Measured
@@ -161,7 +206,12 @@ for c in "${CASES[@]}"; do
     fi
     printf "  %-28s target present in %s\n" "$name" "$file"; PASS=$((PASS+1)); continue
   fi
-  cp "$file" "/tmp/gate-audit.bak.$$"
+  case " $BASELINE_OK " in
+    *" $target "*) ;;
+    *) printf "  %-28s SKIP   (%s was not green unmutated - see BASELINE above)\n" "$name" "$target"
+       SKIPPED=$((SKIPPED+1)); continue ;;
+  esac
+  cp "$file" "$BAK"; MUTATED="$file"
   # #974: replace EVERY occurrence, not the first.
   #
   # The guarded property is "this file still asserts X". Replacing one of several instances leaves
@@ -173,21 +223,20 @@ for c in "${CASES[@]}"; do
   hits=$(mutate_all "$file" "$needle" "$repl")
   if [ $? -ne 0 ]; then
     printf "  %-28s SKIP   (mutation did not apply)\n" "$name"; SKIPPED=$((SKIPPED+1))
-    cp "/tmp/gate-audit.bak.$$" "$file"; continue
+    restore; continue
   fi
   if [ "${hits:-0}" -gt 1 ]; then
     printf "  %-28s note   (needle occurs %s times; all replaced)\n" "$name" "$hits"
   fi
-  out=$(cargo test --quiet --test "$target" 2>&1)
+  out=$(run_target "$target")
   rc=$?
-  cp "/tmp/gate-audit.bak.$$" "$file"; rm -f "/tmp/gate-audit.bak.$$"
+  restore
   kind=$(classify_run "$out" "$rc")
-  case " $BASELINE_OK " in
-    *" $target "*) ;;
-    *) printf "  %-28s SKIP   (%s was not green unmutated - see BASELINE above)\n" "$name" "$target"
-       SKIPPED=$((SKIPPED+1)); continue ;;
-  esac
-  if [ "$kind" = build-fail ] || [ "$kind" = no-tests ]; then
+  if [ "$kind" = no-tests ]; then
+    printf "  %-28s FAILED (no tests ran under mutation)\n" "$name"
+    NOTRAN=$((NOTRAN+1)); continue
+  fi
+  if [ "$kind" = build-fail ]; then
     # #974: this used to read as "caught". It is the audit failing, not the gate working.
     printf "  %-28s SKIP   (mutation produced %s, not an assertion failure)\n" "$name" "$kind"
     SKIPPED=$((SKIPPED+1)); continue
@@ -201,7 +250,7 @@ for c in "${CASES[@]}"; do
 done
 
 echo
-echo "caught: $PASS   survived: $SURVIVED   skipped: $SKIPPED"
+echo "caught: $PASS   survived: $SURVIVED   skipped: $SKIPPED   no tests ran: $NOTRAN"
 if [ ${#SURVIVORS[@]} -gt 0 ]; then
   echo
   echo "SURVIVORS - these gates did not notice their own subject changing:"
@@ -216,4 +265,4 @@ if [ -n "$BASELINE_BAD" ]; then
   echo "UNREPORTABLE - these targets were not green unmutated, so nothing measured against them counts:"
   printf '  %s\n' $BASELINE_BAD
 fi
-[ "$SURVIVED" -eq 0 ] && [ "$SKIPPED" -eq 0 ] && [ -z "$BASELINE_BAD" ]
+[ "$SURVIVED" -eq 0 ] && [ "$SKIPPED" -eq 0 ] && [ "$NOTRAN" -eq 0 ] && [ -z "$BASELINE_BAD" ]
