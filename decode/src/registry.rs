@@ -495,6 +495,25 @@ impl EventDecoder {
     }
 }
 
+/// Where [`count_header_transactions`] leaves a header's transaction count.
+const HEADER_TX_COUNT: &str = "transactionCount";
+
+/// Replace a hashes-only header's `transactions` with their count, which is all [`block_row`] reads.
+/// A dense block carries thousands of hashes, and a window holds a header for every block (#2309).
+pub fn count_header_transactions(header: &mut Json) {
+    let Some(obj) = header.as_object_mut() else {
+        return;
+    };
+    if let Some(n) = obj
+        .get("transactions")
+        .and_then(Json::as_array)
+        .map(Vec::len)
+    {
+        obj.remove("transactions");
+        obj.insert(HEADER_TX_COUNT.to_string(), json!(n));
+    }
+}
+
 /// Build the `blocks` row for one header (RFC-0036 §4.2). `None` when the header is missing the
 /// fields that identify it, which the caller turns into a refused window rather than a gap.
 ///
@@ -534,6 +553,7 @@ pub fn block_row(number: u64, header: &Json, timestamps: bool) -> Option<Decoded
         .get("transactions")
         .and_then(Json::as_array)
         .map(|a| a.len() as u64)
+        .or_else(|| header.get(HEADER_TX_COUNT).and_then(Json::as_u64))
         // `[block, false]` returns transaction *hashes*; an endpoint that omits the array entirely
         // yields 0 rather than a wrong count, and the column says `transaction_count` not `has_txs`.
         .unwrap_or(0);
@@ -2077,6 +2097,26 @@ mod tests {
                 .find(|(k, _)| k == "l1_block_number")
                 .map(|(_, v)| v.clone()),
             Some(Value::U64(0)),
+        );
+    }
+
+    /// Counting a header's transactions at fetch must not change the row it seals (#2309).
+    #[test]
+    fn a_counted_header_builds_the_same_block_row() {
+        let full = serde_json::json!({
+            "hash": "0xaa",
+            "timestamp": "0x64",
+            "transactions": ["0x01", "0x02", "0x03"],
+        });
+        let mut counted = full.clone();
+        count_header_transactions(&mut counted);
+        assert!(counted.get("transactions").is_none());
+        let row = |h: &Json| block_row(1, h, true).unwrap().to_json().to_string();
+        assert_eq!(row(&counted), row(&full));
+        assert!(
+            row(&full).contains("\"transaction_count\":3"),
+            "{}",
+            row(&full)
         );
     }
 
