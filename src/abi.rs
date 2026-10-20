@@ -111,7 +111,9 @@ async fn built_in(chain_id: u64, address: &str, sourcify_miss: String) -> Result
 async fn blockscout_v2(root: &str, address: &str) -> Result<(Value, Option<String>)> {
     let base = root.trim_end_matches('/');
     let url = format!("{base}/api/v2/smart-contracts/{address}");
-    let resp = reqwest::get(&url)
+    let resp = http()
+        .get(&url)
+        .send()
         .await
         .with_context(|| format!("could not reach the explorer at {base}"))?;
     // A 404 is an answer about the *contract*, not about the root, and conflating the two sends the
@@ -165,7 +167,9 @@ async fn sourcify(chain_id: u64, address: &str) -> Result<(Value, Option<String>
     let url = format!(
         "https://sourcify.dev/server/v2/contract/{chain_id}/{address}?fields=abi,compilation"
     );
-    let resp = reqwest::get(&url)
+    let resp = http()
+        .get(&url)
+        .send()
         .await
         .context("Sourcify request failed")?;
     if !resp.status().is_success() {
@@ -195,7 +199,9 @@ async fn blockscout(chain_id: u64, address: &str) -> Result<Value> {
         anyhow!("no keyless Blockscout ABI endpoint is configured for chain {chain_id}")
     })?;
     let url = format!("{base}?module=contract&action=getabi&address={address}");
-    let body: Value = reqwest::get(&url)
+    let body: Value = http()
+        .get(&url)
+        .send()
         .await
         .context("Blockscout request failed")?
         .json()
@@ -224,16 +230,36 @@ fn missing_etherscan_key(chain_id: u64) -> String {
 async fn etherscan(chain_id: u64, address: &str) -> Result<Value> {
     let key = std::env::var("ETHERSCAN_API_KEY")
         .map_err(|_| anyhow!("{}", missing_etherscan_key(chain_id)))?;
+    etherscan_at("https://api.etherscan.io/v2/api", chain_id, address, &key).await
+}
+
+async fn etherscan_at(base: &str, chain_id: u64, address: &str, key: &str) -> Result<Value> {
     let url = format!(
-        "https://api.etherscan.io/v2/api?chainid={chain_id}&module=contract&action=getabi&address={address}&apikey={key}"
+        "{base}?chainid={chain_id}&module=contract&action=getabi&address={address}&apikey={key}"
     );
-    let body: Value = reqwest::get(&url)
+    // `without_url`: the key is in the query string, and reqwest's error text carries the URL.
+    let body: Value = http()
+        .get(&url)
+        .send()
         .await
+        .map_err(|e| e.without_url())
         .context("Etherscan request failed")?
         .json()
         .await
+        .map_err(|e| e.without_url())
         .context("Etherscan response was not JSON")?;
     parse_etherscan(&body)
+}
+
+/// One client for every resolver, so a stalled explorer cannot hold `init` indefinitely.
+fn http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("a reqwest client with only a timeout set builds")
+    })
 }
 
 /// The ABI out of an Etherscan v2 response body - split from the request so it is testable against
@@ -612,5 +638,32 @@ mod tests {
             "mainnet already tried Blockscout: {mainnet}"
         );
         assert!(!mainnet.contains("has no keyless Blockscout"), "{mainnet}");
+    }
+
+    /// The key rides in Etherscan's query string, and reqwest's error text carries the URL (#2156).
+    #[tokio::test]
+    async fn a_failed_etherscan_request_does_not_print_the_key() {
+        let refused = etherscan_at("http://127.0.0.1:1/v2/api", 1, "0xabc", "SECRETKEY123")
+            .await
+            .unwrap_err();
+        assert!(
+            !format!("{refused:#}").contains("SECRETKEY123"),
+            "{refused:#}"
+        );
+
+        let app = axum::Router::new().route("/v2/api", axum::routing::get(|| async { "not json" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let h = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let garbled = etherscan_at(&format!("http://{addr}/v2/api"), 1, "0xabc", "SECRETKEY123")
+            .await
+            .unwrap_err();
+        h.abort();
+        assert!(
+            !format!("{garbled:#}").contains("SECRETKEY123"),
+            "{garbled:#}"
+        );
     }
 }

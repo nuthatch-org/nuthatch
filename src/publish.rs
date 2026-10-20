@@ -295,7 +295,7 @@ impl ObjMirror {
         }
         let url = url::Url::parse(locator)
             .with_context(|| format!("parsing publish target {locator:?}"))?;
-        let opts = std::env::vars().map(|(k, v)| (k.to_ascii_lowercase(), v));
+        let opts = crate::distribution::object_store_options(std::env::vars());
         let (store, path) = object_store::parse_url_opts(&url, opts)
             .with_context(|| format!("opening publish target {locator:?}"))?;
         Ok(Self {

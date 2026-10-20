@@ -148,11 +148,10 @@ pub fn bundle(dir: &Path, out: Option<&Path>, as_dir: bool, allow_secrets: bool)
             .join("\n");
         if !allow_secrets {
             bail!(
-                "{} would publish {} credential(s) with it, because the bundle carries it verbatim:\n\
+                "the bundle would publish {} credential(s), because it carries the nest's files verbatim:\n\
                  {list}\n\
                  Remove them before bundling (an RPC endpoint can be passed at run time with --rpc), \
                  or pass --allow-secrets if publishing them is intended.",
-                crate::config::CONFIG_FILE,
                 found.len()
             );
         }
@@ -301,11 +300,13 @@ const MAX_FETCHED_BUNDLE: u64 = 1 << 30;
 
 async fn fetch_bundle(url: &str, dest: &Path, cap: u64) -> Result<()> {
     use std::io::Write;
+    // A bundle URL may be presigned; its signature must not reach the error text.
+    let shown = crate::rpc::redact_url(url);
     let resp = reqwest::get(url)
         .await
-        .with_context(|| format!("fetching bundle from {url}"))?
-        .error_for_status()
-        .with_context(|| format!("fetching bundle from {url}"))?;
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| e.without_url())
+        .with_context(|| format!("fetching bundle from {shown}"))?;
     let mut file = std::fs::File::create(dest).context("writing fetched bundle")?;
     crate::publish::read_capped(resp, "the fetched bundle", cap, |c| {
         file.write_all(c).context("writing fetched bundle")
@@ -382,7 +383,27 @@ fn bundled_credentials(dir: &Path) -> Vec<String> {
     {
         found.push(format!("alert sink: {} (a key in the URL)", shown(&a.url)));
     }
+    found.extend(signing_keys(dir));
     found
+}
+
+/// Files shaped like `pack keygen`'s output: a JSON object holding a `secret` (#2197).
+fn signing_keys(dir: &Path) -> Vec<String> {
+    let files = collect_files(dir, None).unwrap_or_default();
+    files
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .filter(|p| {
+            std::fs::read(p)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .is_some_and(|v| v.get("secret").is_some())
+        })
+        .map(|p| {
+            let rel = p.strip_prefix(dir).unwrap_or(p);
+            format!("{}: a signing key's secret", rel.display())
+        })
+        .collect()
 }
 
 /// Whether a URL looks like it embeds a credential: userinfo, a key-named query parameter, or a path
@@ -909,6 +930,20 @@ abi = "abis/c.json"
 
         std::fs::write(src.path().join(CONFIG_FILE), config).unwrap();
         assert_eq!(build_manifest(src.path(), None).unwrap().nid(), clean_nid);
+    }
+
+    /// A signing key written into the nest would travel with the bundle verbatim (#2197).
+    #[test]
+    fn bundle_refuses_a_pack_signing_key_in_the_nest() {
+        let src = tempfile::tempdir().unwrap();
+        write_nest(src.path());
+        crate::pack::keygen(&src.path().join("nuthatch-key.json")).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let err = bundle(src.path(), Some(&out.path().join("a.bundle")), false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nuthatch-key.json"), "{err}");
+        assert!(!out.path().join("a.bundle").exists());
     }
 
     /// RFC-0066 S0: the identities of fixed nests, pinned before the identity left this crate. A tab

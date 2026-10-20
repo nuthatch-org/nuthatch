@@ -432,6 +432,18 @@ pub async fn install_by_nid(registry: &str, nid: &str, target: &Path) -> Result<
     Ok(())
 }
 
+/// The `AWS_*` variables, lower-cased, as `object_store::parse_url_opts` options. Lower case because
+/// it matches keys only in lower case; `AWS_*` only because it also takes bare aliases such as
+/// `endpoint` and `bucket`, which an unrelated shell variable would otherwise set (#2198). The
+/// prefix is checked before lower-casing, so `aws_endpoint` in any other case is not config either.
+#[cfg(feature = "object-store")]
+pub(crate) fn object_store_options(
+    vars: impl Iterator<Item = (String, String)>,
+) -> impl Iterator<Item = (String, String)> {
+    vars.filter(|(k, _)| k.starts_with("AWS_"))
+        .map(|(k, v)| (k.to_ascii_lowercase(), v))
+}
+
 /// The S3-compatible registry backend (RFC-0019 slice 2), behind the `object-store` feature so the
 /// default embedded binary never pulls the S3 dep tree. Same [`BundleStore`] contract as [`FsStore`];
 /// same key layout (`<prefix>/blobs/<hash>.bundle`, `<prefix>/index/<name>/<version>`).
@@ -469,8 +481,8 @@ mod object_store_impl {
             //
             // Found by the RFC-0019 live verification against Hetzner Object Storage; the backend was
             // effectively unusable as documented, including by our own error text ("check your AWS_*
-            // env"). Lower-casing the keys is the whole fix.
-            let opts = std::env::vars().map(|(k, v)| (k.to_ascii_lowercase(), v));
+            // env").
+            let opts = crate::distribution::object_store_options(std::env::vars());
             let (store, path) = object_store::parse_url_opts(&url, opts)
                 .with_context(|| format!("opening object-store registry {locator:?}"))?;
             Ok(ObjStore {
@@ -1044,6 +1056,39 @@ abi = "abis/c.json"
 
         // Unrelated environment (PATH, HOME, …) must stay ignored rather than becoming config.
         assert!(AmazonS3ConfigKey::from_str(&lower("PATH")).is_err());
+    }
+
+    /// The S3 builder takes bare aliases (`endpoint`, `token`, `bucket`, `region`), so an unrelated
+    /// `ENDPOINT` in the shell would redirect every upload. Only `AWS_*` reaches it (#2198).
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn only_aws_variables_configure_the_object_store() {
+        use object_store::aws::AmazonS3ConfigKey;
+        use std::str::FromStr;
+        assert!(
+            AmazonS3ConfigKey::from_str("endpoint").is_ok(),
+            "the alias this guards"
+        );
+        let env = [
+            ("ENDPOINT", "http://other"),
+            ("TOKEN", "t"),
+            ("BUCKET", "elsewhere"),
+            ("REGION", "r"),
+            ("PATH", "/bin"),
+            ("AWS_ENDPOINT", "http://minio:9000"),
+            ("AWS_ACCESS_KEY_ID", "id"),
+            ("aws_endpoint", "http://lower"),
+            ("Aws_Endpoint", "http://mixed"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()));
+        let opts: Vec<(String, String)> = object_store_options(env.into_iter()).collect();
+        assert_eq!(
+            opts,
+            [
+                ("aws_endpoint".to_string(), "http://minio:9000".to_string()),
+                ("aws_access_key_id".to_string(), "id".to_string()),
+            ]
+        );
     }
 
     #[cfg(not(feature = "object-store"))]

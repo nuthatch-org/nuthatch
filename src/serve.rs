@@ -2213,6 +2213,12 @@ fn publish_summary(s: &AppState) -> Value {
     let Some(target) = m.publish_target() else {
         return Value::Null;
     };
+    // `/` is unauthenticated: a mirror URL may be presigned or keyed, a path is the host's layout.
+    let target = if target.contains("://") {
+        crate::rpc::redact_url(&target)
+    } else {
+        "a local directory".to_string()
+    };
     json!({
         "target": target,
         "sealed_through": m.publish_sealed_through(),
@@ -9757,11 +9763,22 @@ mod tests {
         m.publish_succeeded(Some(12));
 
         let row = &summary_value(&state)["publish"];
-        assert_eq!(row["target"], "s3://bucket/mirror");
+        // `/` is unauthenticated: a target is shown as scheme and host, never its path or key (#2208).
+        assert_eq!(row["target"], "s3://bucket");
         assert_eq!(row["sealed_through"], 12);
         assert!(row["lag_blocks"].is_u64(), "{row}");
         assert!(row["last_success_unixtime"].as_u64().unwrap() > 0, "{row}");
         assert_eq!(row["dead_letter"], false);
+        m.set_publish_enabled("https://user:SECRET@mirror.example/nest?sig=SECRET");
+        assert_eq!(
+            summary_value(&state)["publish"]["target"],
+            "https://mirror.example"
+        );
+        m.set_publish_enabled("/srv/SECRET/mirror");
+        assert_eq!(
+            summary_value(&state)["publish"]["target"],
+            "a local directory"
+        );
     }
 
     #[tokio::test]

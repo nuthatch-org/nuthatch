@@ -338,7 +338,7 @@ Assemble `compliance-pack.toml` from the nest's config + artifact hashes (option
 
 Generate an ed25519 signing keypair into a local JSON file
 
-- `--out <OUT>` - Where to write the keypair JSON
+- `--out <OUT>` - Where to write the keypair JSON. Defaults to ~/.nuthatch/nuthatch-key.json, outside any nest
 
 ## `nuthatch pack verify`
 

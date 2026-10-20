@@ -157,16 +157,22 @@ fn snapshot_bytes(addresses: &[String]) -> (String, Vec<u8>) {
 }
 
 async fn download(url: &str) -> Result<String> {
-    tracing::info!("fetching list from {url} (host-side, out-of-band)…");
+    let shown = crate::rpc::redact_url(url);
+    tracing::info!("fetching list from {shown} (host-side, out-of-band)…");
     let resp = reqwest::Client::new()
         .get(url)
         .header("user-agent", "nuthatch")
         .send()
         .await
-        .with_context(|| format!("request to {url} failed"))?
+        .map_err(|e| e.without_url())
+        .with_context(|| format!("request to {shown} failed"))?
         .error_for_status()
-        .with_context(|| format!("list source {url} returned an error status"))?;
-    resp.text().await.context("reading list response body")
+        .map_err(|e| e.without_url())
+        .with_context(|| format!("list source {shown} returned an error status"))?;
+    resp.text()
+        .await
+        .map_err(|e| e.without_url())
+        .context("reading list response body")
 }
 
 fn record_fetch(dir: &Path, list: &str, hash: &str, count: usize, source: &str) -> Result<()> {
