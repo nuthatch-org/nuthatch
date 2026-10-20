@@ -2560,8 +2560,9 @@ mod tests {
     #[tokio::test]
     async fn a_header_batch_past_the_body_cap_narrows_and_remembers() {
         // About 6.9 KB a header, so nine fit under 64 KiB.
-        let (url, widths, server) = dense_header_rpc(100).await;
-        let c = super::RpcClient::new(vec![url])
+        let (a, widths, server) = dense_header_rpc(100).await;
+        let (b, other, spare) = dense_header_rpc(100).await;
+        let c = super::RpcClient::new(vec![a, b])
             .unwrap()
             .with_batch_body_cap(64 << 10);
         let first: Vec<u64> = (1..=200).collect();
@@ -2569,17 +2570,20 @@ mod tests {
         assert!(first.iter().all(|b| got[b] == b * 12));
         let learned = c.header_width.load(Ordering::Relaxed);
         assert!((2..=9).contains(&learned), "learned width {learned}");
-        assert!(
-            c.health[0].load(Ordering::Relaxed) <= super::now_millis(),
-            "cooled down"
-        );
+        let mut sent = widths.lock().unwrap().clone();
+        sent.extend(other.lock().unwrap().iter());
+        // Asked once: neither retried at its width nor failed over to the other endpoint.
+        assert_eq!(sent.iter().filter(|&&w| w == 200).count(), 1, "{sent:?}");
 
         widths.lock().unwrap().clear();
+        other.lock().unwrap().clear();
         let next: Vec<u64> = (1_000..1_200).collect();
         let got = c.block_timestamps(&next).await.unwrap();
         server.abort();
+        spare.abort();
         assert!(next.iter().all(|b| got[b] == b * 12));
-        let sent = widths.lock().unwrap().clone();
+        let mut sent = widths.lock().unwrap().clone();
+        sent.extend(other.lock().unwrap().iter());
         assert!(sent.iter().all(|&w| w <= learned), "{sent:?}");
         assert_eq!(
             sent.len(),
