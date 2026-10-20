@@ -4237,6 +4237,75 @@ fn json_len(value: &serde_json::Value) -> u64 {
     count.0
 }
 
+/// Copy into `hot` each maintained relation `sql` can reach, charged on top of the tip's rows and
+/// source bytes against the ceilings a declared query's copy is held to (#2211). A relation
+/// named neither in the statement nor in an authored view it names cannot be read by it, so
+/// `SELECT 1` copies nothing; a catalogue listing reaches them all.
+fn copy_reachable_entities(
+    entities: &[crate::entity_view::EntityView],
+    dir: &std::path::Path,
+    sql: &str,
+    hot: &mut std::collections::HashMap<String, Vec<Value>>,
+    (mut rows, mut bytes): (u64, u64),
+    (max_rows, max_bytes): (usize, u64),
+) -> Result<crate::entity_view::Watermarks> {
+    // The statement's text and the bodies of the authored views it names, through views they name.
+    let mut reach = sql.to_ascii_lowercase();
+    let mut views: Vec<(String, String)> = crate::analytics::nest_view_bodies(dir)
+        .into_iter()
+        .map(|(name, body)| (name.to_ascii_lowercase(), body.to_ascii_lowercase()))
+        .collect();
+    loop {
+        let (named, rest): (Vec<_>, Vec<_>) = views
+            .into_iter()
+            .partition(|(name, _)| reach.contains(name));
+        if named.is_empty() {
+            break;
+        }
+        for (_, body) in named {
+            reach.push('\n');
+            reach.push_str(&body);
+        }
+        views = rest;
+    }
+    let reaches = |name: &str| {
+        reach.contains("information_schema") || reach.contains(&name.to_ascii_lowercase())
+    };
+    let mut watermarks = crate::entity_view::Watermarks::new();
+    for entity in entities {
+        if entity.unavailable().is_some() || entity.fault().is_some() {
+            continue;
+        }
+        if !reaches(entity.name()) {
+            // For the memo's fence only: no answer names a relation it could not reach.
+            watermarks.insert(entity.name().to_string(), entity.fence_watermark());
+            continue;
+        }
+        // Refuse on the count before serialising a relation too large to copy.
+        if rows.saturating_add(entity.len() as u64) > max_rows as u64 {
+            return Err(crate::store::HotScanTooLarge { cap: max_rows }.into());
+        }
+        let (copy, applied) = entity.rows_as_json_with_watermark();
+        rows += copy.len() as u64;
+        if rows > max_rows as u64 {
+            return Err(crate::store::HotScanTooLarge { cap: max_rows }.into());
+        }
+        bytes = copy
+            .iter()
+            .fold(bytes, |sum, row| sum.saturating_add(json_len(row)));
+        if bytes > max_bytes {
+            return Err(crate::store::HotScanBudgetExceeded {
+                source_bytes: bytes,
+                budget: max_bytes,
+            }
+            .into());
+        }
+        watermarks.insert(entity.name().to_string(), applied);
+        hot.insert(entity.name().to_string(), copy);
+    }
+    Ok(watermarks)
+}
+
 /// Read-only analytical SQL over the sealed segments; one view per `{alias}__{event}` table.
 ///
 /// Self-protecting, so a public `/sql` isn't a DoS vector: bounded concurrency (503 when the
@@ -4456,6 +4525,7 @@ async fn run_sql_query_at(
     let store = s.store.clone();
     let sql_max_hot_rows = s.sql_max_hot_rows;
     let sql_max_hot_bytes = s.sql_max_hot_bytes;
+    let sql_max_named_scan_bytes = s.sql_max_named_scan_bytes;
     // The live, registry-derived schema - every table the config declares, whether or not it has
     // populated yet. Threaded into `define_views` so a declared-but-never-fired event still gets an
     // empty typed view instead of the whole nest view failing to bind on a missing table (#663).
@@ -4467,11 +4537,14 @@ async fn run_sql_query_at(
                               // rows alongside the sealed segments (RFC-0013). A scan failure degrades to cold-only.
                               // A scan failure degrades to cold-only, *except* an over-budget tip: that must surface, or a
                               // query would quietly answer from sealed data alone and report a different number.
-        let (hot, tip_unavailable) = match store
+        let (hot, tip_unavailable, spent) = match store
             .hot_rows_by_table_bounded_with_bytes(sql_max_hot_rows, sql_max_hot_bytes)
-            .map(|snapshot| snapshot.rows)
         {
-            Ok(hot) => (hot, false),
+            Ok(snapshot) => (
+                snapshot.rows,
+                false,
+                (snapshot.source_rows, snapshot.source_bytes),
+            ),
             Err(e)
                 if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
                     || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
@@ -4483,11 +4556,11 @@ async fn run_sql_query_at(
             // as serious, and the fallback below must not be the only trace of it.
             Err(e) => {
                 tracing::error!("hot-tip scan failed - serving cold-only for this query: {e:#}");
-                (Default::default(), true)
+                (Default::default(), true, (0, 0))
             }
         };
         // §5.4: the maintained relation is exposed under its declared name, alongside the decoded
-        // tables. **This copies every entity row into the connection, per request** - #822 criterion
+        // tables. **This copies every reachable entity row into the connection, per request** - #822 criterion
         // 7's separate term, and it is what this seam is: `hot` is the map `analytics::run` defines
         // its views from.
         //
@@ -4508,18 +4581,18 @@ async fn run_sql_query_at(
         // that watermark into the provenance below. Re-reading `applied_through()` after the query
         // ran is a race - measured at 1 in 12 on a 0.25s-block chain - and it reports an answer as
         // more current than the rows it is made of.
-        let mut watermarks: crate::entity_view::Watermarks = Default::default();
-        for entity in declared_entities.iter() {
-            if historical_block.is_some() {
-                continue;
-            }
-            if entity.unavailable().is_some() || entity.fault().is_some() {
-                continue;
-            }
-            let (rows, applied) = entity.rows_as_json_with_watermark();
-            watermarks.insert(entity.name().to_string(), applied);
-            hot.insert(entity.name().to_string(), rows);
-        }
+        let watermarks = if historical_block.is_some() {
+            Default::default()
+        } else {
+            copy_reachable_entities(
+                &declared_entities,
+                &dir,
+                &sql,
+                &mut hot,
+                spent,
+                (sql_max_hot_rows, sql_max_named_scan_bytes),
+            )?
+        };
         let sealed_through = store.sealed_through();
         let guard = analytics::QueryGuard {
             timeout: sql_timeout,
@@ -4682,6 +4755,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
     let store = s.store.clone();
     let sql_max_hot_rows = s.sql_max_hot_rows;
     let sql_max_hot_bytes = s.sql_max_hot_bytes;
+    let sql_max_named_scan_bytes = s.sql_max_named_scan_bytes;
     let tables = s.tables.clone();
     let declared_entities = s.entities.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -4692,11 +4766,14 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
         // the process past the budget `/sql` refuses to cross (#293). As there, an over-budget tip
         // surfaces rather than degrading to cold-only: answering "valid" off sealed data alone
         // would bind against a narrower schema than the one a subsequent `/sql` would see.
-        let (hot, tip_unavailable) = match store
+        let (hot, tip_unavailable, spent) = match store
             .hot_rows_by_table_bounded_with_bytes(sql_max_hot_rows, sql_max_hot_bytes)
-            .map(|snapshot| snapshot.rows)
         {
-            Ok(hot) => (hot, false),
+            Ok(snapshot) => (
+                snapshot.rows,
+                false,
+                (snapshot.source_rows, snapshot.source_bytes),
+            ),
             Err(e)
                 if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
                     || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
@@ -4708,7 +4785,7 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
             // least as serious, and the fallback below must not be the only trace of it - #528.
             Err(e) => {
                 tracing::error!("hot-tip scan failed - serving cold-only for this query: {e:#}");
-                (Default::default(), true)
+                (Default::default(), true, (0, 0))
             }
         };
         // **The same relations `/sql` would see.** Without this, `/explain` answers a question about a
@@ -4723,12 +4800,14 @@ async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl I
         // it was told a good query was invalid, or told it was valid for the wrong reason, depending
         // on which of the pool it landed on.
         let mut hot = hot;
-        for entity in declared_entities.iter() {
-            if entity.unavailable().is_some() || entity.fault().is_some() {
-                continue;
-            }
-            hot.insert(entity.name().to_string(), entity.rows_as_json());
-        }
+        copy_reachable_entities(
+            &declared_entities,
+            &dir,
+            &query,
+            &mut hot,
+            spent,
+            (sql_max_hot_rows, sql_max_named_scan_bytes),
+        )?;
         let sealed_through = store.sealed_through();
         let mut out = analytics::plan_hot_cold(
             &dir,
@@ -9111,12 +9190,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn maintained_relation_rows_spend_the_named_scan_budget() {
+    /// A maintained relation `name` holding two rows.
+    fn two_row_entity(name: &str) -> crate::entity_view::EntityView {
         use crate::entity_expr::Expr;
         use crate::entity_plan::{Agg, Plan, Source};
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
         let abi: alloy_json_abi::JsonAbi = serde_json::from_str(
             r#"[{"type":"event","name":"Transfer","inputs":[
                 {"name":"from","type":"address","indexed":true},
@@ -9145,7 +9222,7 @@ mod tests {
         };
         let columns = vec!["to".to_string(), "sum_value".to_string()];
         let entity =
-            crate::entity_view::EntityView::start("e", &plan, &columns, &reg, 1_000, false)
+            crate::entity_view::EntityView::start(name, &plan, &columns, &reg, 1_000, false)
                 .unwrap();
         let row = |to: &str, v: i128| {
             crate::entity_row::Row(vec![
@@ -9161,6 +9238,14 @@ mod tests {
             10,
         );
         entity.flush();
+        entity
+    }
+
+    #[tokio::test]
+    async fn maintained_relation_rows_spend_the_named_scan_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        let entity = two_row_entity("e");
         let (rows, _) = entity.rows_as_json_with_watermark();
         assert_eq!(rows.len(), 2);
         let bytes: u64 = rows.iter().map(json_len).sum();
@@ -9185,6 +9270,49 @@ mod tests {
         let app = router(SharedNest::new(state));
         let (status, _, body) = call_named(&app, named_request(&[])).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    }
+
+    /// #2211: `/sql` and `/explain` copy a maintained relation only for a statement that can reach
+    /// it, directly or through an authored view, and charge the copy to the ceilings `/q` does.
+    #[tokio::test]
+    async fn sql_copies_only_reachable_relations_and_charges_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.entities = Arc::new(vec![two_row_entity("holders")]);
+        std::fs::create_dir_all(tmp.path().join("views")).unwrap();
+        std::fs::write(
+            tmp.path().join("views/whales.sql"),
+            "CREATE VIEW whales AS SELECT * FROM holders;",
+        )
+        .unwrap();
+        let get = |state: &AppState, uri: &str| {
+            let (state, uri) = (state.clone(), uri.to_string());
+            async move { get_json(state, &uri).await }
+        };
+
+        let (status, body) = get(&state, "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20whales").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["rows"][0]["n"], 2, "{body}");
+
+        state.sql_max_hot_rows = 1;
+        for uri in [
+            "/sql?q=SELECT%20count(*)%20AS%20m%20FROM%20holders",
+            "/sql?q=SELECT%20count(*)%20AS%20m%20FROM%20whales",
+            "/explain?q=SELECT%20*%20FROM%20holders",
+        ] {
+            let (status, body) = get(&state, uri).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+        }
+        for uri in ["/sql?q=SELECT%201%20AS%20one", "/explain?q=SELECT%201"] {
+            let (status, body) = get(&state, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        }
+
+        state.sql_max_hot_rows = SQL_MAX_HOT_ROWS;
+        state.sql_max_named_scan_bytes = 1;
+        let (status, body) = get(&state, "/sql?q=SELECT%20*%20FROM%20holders").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body["hot_source_bytes"].as_u64().unwrap() > 1, "{body}");
     }
 
     #[cfg(feature = "counter")]
