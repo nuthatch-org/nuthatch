@@ -260,6 +260,15 @@ jobs:
           cargo fmt --check --manifest-path scaffold/Cargo.toml
           cargo clippy --locked --all-targets --manifest-path scaffold/Cargo.toml -- -D warnings
           cargo test --locked --manifest-path scaffold/Cargo.toml
+      # The RFC-0016/RFC-0017 eval runners, outside the binary. Their tests run both self-tests,
+      # which need no key, model or network (#1050, #1051).
+      - name: fmt · clippy · test (eval runner)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo fmt --check --manifest-path eval/runner/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path eval/runner/Cargo.toml -- -D warnings
+          cargo test --locked --manifest-path eval/runner/Cargo.toml
       # RFC-0065: decode and seal must keep building for a tab. zstd-sys compiles C for the target,
       # which needs a clang with the WebAssembly backend; the runner's LLVM clang has one. Ubuntu's
       # clang also searches the host's /usr/include, which cannot build for wasm: unknown-unknown gets
