@@ -4288,6 +4288,49 @@ fn json_len(value: &serde_json::Value) -> u64 {
     count.0
 }
 
+/// The relations `sql` reads, last name part lowercased, less the CTEs it defines; any
+/// `information_schema` relation adds `information_schema`. A statement that will not parse falls
+/// back to every identifier in it, which can only copy more.
+fn relations_read(sql: &str) -> std::collections::HashSet<String> {
+    use sqlparser::ast::{Query, Visit, Visitor};
+    use std::ops::ControlFlow;
+    struct Ctes(std::collections::HashSet<String>);
+    impl Visitor for Ctes {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            for cte in q.with.iter().flat_map(|w| &w.cte_tables) {
+                self.0.insert(cte.alias.name.value.to_ascii_lowercase());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let Ok(statements) =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, sql)
+    else {
+        return sql_identifiers(sql);
+    };
+    let mut read = std::collections::HashSet::new();
+    let mut ctes = Ctes(Default::default());
+    for statement in &statements {
+        let _ = sqlparser::ast::visit_relations(statement, |name| {
+            if name
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("information_schema")
+            {
+                read.insert("information_schema".to_string());
+            }
+            if let Some(last) = name.0.last() {
+                read.insert(last.to_string().trim_matches('"').to_ascii_lowercase());
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        let _ = statement.visit(&mut ctes);
+    }
+    read.retain(|r| !ctes.0.contains(r));
+    read
+}
+
 /// The identifiers in `sql`, lowercased: bare words and double-quoted names, skipping string
 /// literals and comments, so `'holders'` or `shareholders` does not name `holders`.
 fn sql_identifiers(sql: &str) -> std::collections::HashSet<String> {
@@ -4348,8 +4391,8 @@ fn sql_identifiers(sql: &str) -> std::collections::HashSet<String> {
 
 /// Copy into `hot` each maintained relation `sql` can reach, charged on top of the tip's rows and
 /// source bytes against the ceilings a declared query's copy is held to (#2211). A relation
-/// named neither in the statement nor in an authored view it names cannot be read by it, so
-/// `SELECT 1` copies nothing; a catalogue listing reaches them all.
+/// read neither by the statement nor by an authored view it reads is not copied, so `SELECT 1`
+/// copies nothing; a catalogue listing reaches them all.
 fn copy_reachable_entities(
     entities: &[crate::entity_view::EntityView],
     dir: &std::path::Path,
@@ -4358,8 +4401,8 @@ fn copy_reachable_entities(
     (mut rows, mut bytes): (u64, u64),
     (max_rows, max_bytes): (usize, u64),
 ) -> Result<crate::entity_view::Watermarks> {
-    // The statement's identifiers and those of the authored views it names, through views they name.
-    let mut reach = sql_identifiers(sql);
+    // The relations the statement reads and those of the authored views it reads, transitively.
+    let mut reach = relations_read(sql);
     let mut views: Vec<(String, String)> = crate::analytics::nest_view_bodies(dir)
         .into_iter()
         .map(|(name, body)| (name.to_ascii_lowercase(), body))
@@ -4372,7 +4415,7 @@ fn copy_reachable_entities(
             break;
         }
         for (_, body) in named {
-            reach.extend(sql_identifiers(&body));
+            reach.extend(relations_read(&body));
         }
         views = rest;
     }
@@ -9592,10 +9635,16 @@ mod tests {
             "/sql?q=SELECT%201%20AS%20shareholders",
             "/sql?q=SELECT%201%20AS%20n%20--%20holders",
             "/sql?q=SELECT%201%20AS%20n%20/*%20holders%20*/",
+            "/sql?q=SELECT%201%20AS%20holders",
+            "/sql?q=WITH%20other%20AS%20(SELECT%201%20AS%20holders)%20SELECT%20holders%20FROM%20other",
+            "/sql?q=WITH%20holders%20AS%20(SELECT%201%20AS%20n)%20SELECT%20n%20FROM%20holders",
         ] {
             let (status, body) = get(&state, uri).await;
             assert_eq!(status, StatusCode::OK, "{uri}: {body}");
         }
+        // A column named for it, from a table that does not exist, is a bind error and not a copy.
+        let (status, body) = get(&state, "/sql?q=SELECT%20holders%20FROM%20other").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
         state.sql_max_hot_rows = SQL_MAX_HOT_ROWS;
         state.sql_max_named_scan_bytes = 1;
