@@ -7,7 +7,7 @@
 # was a print statement rather than a gate and every perf change to the storage path could regress it
 # in silence.
 #
-# The chain is served locally by `multinest-rpc.py` and the nest is written here rather than fetched,
+# The chain is served locally by `fixture-rpc multinest` and the nest is written here rather than fetched,
 # so there is **no secret and no third party** (issue #260). A fork PR can satisfy this check, and
 # every run reads exactly the same rows - so a change in p99 is a change in nuthatch and not in
 # somebody's rate limiter.
@@ -95,7 +95,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # nobody runs.
 #
 # So the fixture is now the `per-cursor RAM budget` job's chain, served by the same
-# `multinest-rpc.py` off the same real Uniswap V4 `PoolManager` ABI: ten event types, ten tables, and
+# `fixture-rpc multinest` off the same real Uniswap V4 `PoolManager` ABI: ten event types, ten tables, and
 # **200 logs per block**. That is the rate the RSS scenario puts on one cursor (20 nests x 10
 # logs/block/contract), carried here by a single high-rate contract so that it lands in one nest's
 # store - which is the store a point-read seeks in, since each nest gets its own redb. The hot store
@@ -141,7 +141,8 @@ HOT_EXPECT=$(( FINALITY_DEPTH * LOGS_PER_BLOCK ))
 # The tip is **fixed**, unlike the RSS scenario's. That gate is about sustained operation at tip, so
 # its tip has to move; this one measures an offline store after `dev` has been stopped, so a moving
 # tip would buy nothing and cost the exact hot-row count that `--min-reads` is derived from.
-python3 "$HERE/multinest-rpc.py" --port "$RPC_PORT" --abi "$ABI" \
+RPC_BIN="$(bash "$HERE/../../scripts/fixture-rpc.sh")"
+"$RPC_BIN" multinest --port "$RPC_PORT" --abi "$ABI" \
   --contracts 1 --logs-per-block "$LOGS_PER_BLOCK" \
   --initial-tip "$TIP" --final-tip "$TIP" --tip-step 0 &
 RPC_PID=$!
@@ -156,7 +157,7 @@ done
 DIR="$(mktemp -d)"
 mkdir -p "$DIR/abis"
 cp "$ABI" "$DIR/abis/pool_manager.json"
-# Contract 1 is address 0x…01, matching multinest-rpc.py's derivation.
+# Contract 1 is address 0x…01, matching the fixture chain's derivation.
 cat > "$DIR/nuthatch.toml" <<TOML
 [nest]
 name = "point-read"

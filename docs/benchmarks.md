@@ -32,7 +32,7 @@ Nothing here optimises anything. It exists so the seal-direct / adaptive-chunker
 
 CLAUDE.md sets a backfill floor of 10K events/s, aiming for 30K. **No CI check fails on events/sec.**
 The `backfill throughput · tip lag` job runs `.github/workflows/backfill-throughput.sh` on every PR: three
-batches of 15 over the chain `footprint-rpc.py` serves (blocks 1 to 20,000, 80,000 rows, seal-direct,
+batches of 15 over the chain `fixture-rpc footprint` serves (blocks 1 to 20,000, 80,000 rows, seal-direct,
 concurrency 4). It reports the median to the step summary and an artifact, and fails only if a run
 did not decode all 80,000 events. #1723 measured the figure before choosing that shape.
 
@@ -57,7 +57,7 @@ design target measured by hand with `bench backfill`, not a gate.
 
 ## Tip lag is gated on its after-seen median
 
-The `backfill throughput · tip lag` job also runs `.github/workflows/tip-lag.sh` on every PR. `footprint-rpc.py --moving` serves
+The `backfill throughput · tip lag` job also runs `.github/workflows/tip-lag.sh` on every PR. `fixture-rpc footprint --moving` serves
 the footprint chain with a tip the script advances one block at a time, and `dev --poll-interval 1s`
 follows it. For 100 blocks the script records two figures: **lag**, from the block appearing to its
 four rows answering through `/sql`, and **after seen**, from nuthatch's first `eth_blockNumber`
@@ -386,7 +386,7 @@ floor is greenest exactly when it has measured nothing. The `footprint` check le
 and asserts its row count before it compares a peak.
 
 CI runs this as the **`point-read latency`** job (`.github/workflows/point-read.sh`), on the dense
-fixture the `per-cursor RAM budget` job uses (#424): `multinest-rpc.py` serves the chain, one contract
+fixture the `per-cursor RAM budget` job uses (#424): `fixture-rpc multinest` serves the chain, one contract
 with the 10-event Uniswap V4 ABI at 200 logs a block, the nest is written inline, and every run
 indexes exactly 200,200 rows across ten tables. No secret and no third party, so a fork's pull
 request can satisfy it, and a change in p99 is a change in nuthatch rather than in somebody's rate
@@ -568,7 +568,7 @@ at ~22 nests on a model an order of magnitude out. It has since been fitted to t
 
 ### The fixture
 
-`multinest-rpc.py` serves the chain locally, the nests are written inline, and topic0s are derived by
+`fixture-rpc multinest` serves the chain locally, the nests are written inline, and topic0s are derived by
 hashing the signatures in the same ABI file the harness writes. No secret, no third party, and a fork
 PR can satisfy the check - the lesson of issue #260, which this inherits rather than relearns.
 

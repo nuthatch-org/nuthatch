@@ -11,7 +11,7 @@
 //! without a single eval file being touched. Then the next keyed run scores zero, and the number
 //! looks like a model that got worse.
 //!
-//! Deliberately a **normal test**: it needs no key, no model and no network - `scripts/fixture_rpc.py`
+//! Deliberately a **normal test**: it needs no key, no model and no network - `tools/fixture-rpc`
 //! serves the chain over loopback and the ABI is a local file - so there is no reason for it to sit
 //! behind `--ignored` where nothing would run it.
 
@@ -19,6 +19,8 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use nuthatch_fixture_rpc::scripted::Scripted;
 
 const ERC20_TRANSFER_ABI: &str = r#"[{"anonymous":false,"inputs":[
   {"indexed":true,"name":"from","type":"address"},
@@ -82,7 +84,7 @@ fn scenario() -> toml::Value {
 /// Pin the fixture chain to the scenario's declared tip and finality, and **prove it took**.
 ///
 /// Extracted so both board tests use one implementation. `serve_cannot_index...` had none at all:
-/// it ran against `fixture_rpc.py`'s built-in defaults rather than the scenario, which is a
+/// it ran against the fixture chain.s built-in defaults rather than the scenario, which is a
 /// different chain from the one `start_fixture_chain` gives the keyed runner. A board that is not
 /// the scenario proves nothing about it.
 ///
@@ -125,20 +127,10 @@ fn the_authoring_scenario_is_achievable_and_its_criteria_are_exact() {
     std::fs::write(&abi, ERC20_TRANSFER_ABI).expect("write abi");
 
     // --- the fixture chain, over real HTTP so the real binary can be pointed at it ---------------
-    let rpc_port = free_port();
+    let rpc =
+        nuthatch_fixture_rpc::spawn(Scripted::new(&contract), "127.0.0.1:0").expect("fixture RPC");
+    let rpc_port = rpc.port();
     let rpc_url = format!("http://127.0.0.1:{rpc_port}/");
-    let _rpc = Reaped(
-        Command::new("python3")
-            .arg(root().join("scripts/fixture_rpc.py"))
-            .args(["--port", &rpc_port.to_string(), "--contract", &contract])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn fixture_rpc.py"),
-    );
-    poll("the fixture RPC to come up", 30, || {
-        get(&format!("http://127.0.0.1:{rpc_port}/control/state"))
-    });
     pin_chain(rpc_port, tip, finalized);
 
     // --- criterion 1: `init` succeeds, entirely offline -------------------------------------------
@@ -357,19 +349,9 @@ fn serve_cannot_index_so_the_scorer_cannot_do_the_agents_work() {
     let abi = dir.path().join("erc20.json");
     std::fs::write(&abi, ERC20_TRANSFER_ABI).expect("write abi");
 
-    let rpc_port = free_port();
-    let _rpc = Reaped(
-        Command::new("python3")
-            .arg(root().join("scripts/fixture_rpc.py"))
-            .args(["--port", &rpc_port.to_string(), "--contract", &contract])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn fixture_rpc.py"),
-    );
-    poll("the fixture RPC to come up", 30, || {
-        get(&format!("http://127.0.0.1:{rpc_port}/control/state"))
-    });
+    let rpc =
+        nuthatch_fixture_rpc::spawn(Scripted::new(&contract), "127.0.0.1:0").expect("fixture RPC");
+    let rpc_port = rpc.port();
     pin_chain(
         rpc_port,
         s["tip"].as_integer().unwrap(),

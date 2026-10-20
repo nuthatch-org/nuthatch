@@ -210,12 +210,26 @@ impl Drop for Reaped {
     }
 }
 
+/// The fixture-rpc binary: scripts/fixture-rpc.sh builds it unless FIXTURE_RPC names one.
+fn fixture_rpc_bin() -> Result<String, Error> {
+    let out = Command::new("bash")
+        .arg(root().join("scripts/fixture-rpc.sh"))
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| Error::Other(format!("build the fixture chain: {e}")))?;
+    if !out.status.success() {
+        return Err(die(
+            "could not build tools/fixture-rpc; nothing can be scored",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// The fixture chain on host loopback, pinned through `/control/*`.
 fn start_fixture_chain(scenario: &Value) -> Result<(Reaped, String, u16), Error> {
     let port = free_port();
-    let chain = Command::new("python3")
-        .arg(root().join("scripts/fixture_rpc.py"))
-        .args(["--port", &port.to_string(), "--contract"])
+    let chain = Command::new(fixture_rpc_bin()?)
+        .args(["scripted", "--port", &port.to_string(), "--contract"])
         .arg(scenario["contract"].as_str().unwrap_or_default())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -292,6 +306,7 @@ pub struct DockerIsolation {
     fixture: String,
     proxy: String,
     proxy_image: String,
+    fixture_image: String,
     pub rpc_port: u16,
     pub rpc: String,
     proxy_url: String,
@@ -310,12 +325,14 @@ impl DockerIsolation {
             fixture,
             proxy,
             proxy_image: "nuthatch-eval-proxy".into(),
+            fixture_image: "nuthatch-eval-fixture".into(),
             rpc_port: 8945,
         };
         // A missing prerequisite should be a sentence, not a registry error deep inside setup.
         for (image, place) in [
             (&iso.image, "eval/image"),
             (&iso.proxy_image, "eval/image/proxy"),
+            (&iso.fixture_image, "tools/fixture-rpc"),
         ] {
             let argv = ["docker", "image", "inspect", image].map(String::from);
             if run_argv(&argv, Duration::from_secs(180)).0 != 0 {
@@ -324,8 +341,6 @@ impl DockerIsolation {
                 )));
             }
         }
-        let script = root().join("scripts/fixture_rpc.py");
-        let script = script.to_string_lossy();
         sh(
             &["docker", "network", "create", "--internal", &iso.network],
             true,
@@ -384,7 +399,6 @@ impl DockerIsolation {
         }
         let tip = scenario["tip"].to_string();
         let finalized = scenario["finalized"].to_string();
-        let mount = format!("{script}:{script}:ro");
         sh(
             &[
                 "docker",
@@ -395,11 +409,8 @@ impl DockerIsolation {
                 &iso.fixture,
                 "--network",
                 &iso.network,
-                "-v",
-                &mount,
-                &iso.image,
-                "python3",
-                &script,
+                &iso.fixture_image,
+                "scripted",
                 "--port",
                 &iso.rpc_port.to_string(),
                 "--bind",
@@ -485,14 +496,10 @@ impl DockerIsolation {
         }
 
         let mut reached = false;
-        for tool in ["curl", "wget", "python3"] {
+        for tool in ["curl", "wget"] {
             let fetch = match tool {
                 "curl" => format!("curl -fsS -m 5 {}control/state", self.rpc),
-                "wget" => format!("wget -qO- -T 5 {}control/state", self.rpc),
-                _ => format!(
-                    "python3 -c \"import urllib.request as u;print(u.urlopen('{}control/state',timeout=5).read().decode())\"",
-                    self.rpc
-                ),
+                _ => format!("wget -qO- -T 5 {}control/state", self.rpc),
             };
             let (code, out) = self.in_box(
                 workdir,
@@ -508,9 +515,9 @@ impl DockerIsolation {
         }
         if !reached {
             return Err(die(format!(
-                "the image cannot reach the fixture at {}. Either it has none of curl, wget or \
-                 python3 - in which case reachability cannot be established and is not assumed - \
-                 or the fixture container did not come up.",
+                "the image cannot reach the fixture at {}. Either it has neither curl nor wget - \
+                 in which case reachability cannot be established and is not assumed - or the \
+                 fixture container did not come up.",
                 self.rpc
             )));
         }
@@ -657,12 +664,11 @@ pub fn verify_sandbox(template: &str, rpc_port: u16) -> Result<(), Error> {
     for probe in [
         format!("curl -fsS -m 5 http://127.0.0.1:{rpc_port}/control/state"),
         format!("wget -qO- -T 5 http://127.0.0.1:{rpc_port}/control/state"),
-        format!(
-            "python3 -c \"import urllib.request as u;print(u.urlopen('http://127.0.0.1:{rpc_port}/control/state',timeout=5).read().decode())\""
-        ),
     ] {
         let tool = probe.split_whitespace().next().unwrap_or_default();
-        let (code, body) = run(&format!("command -v {tool} >/dev/null 2>&1 || exit 97; {probe}"));
+        let (code, body) = run(&format!(
+            "command -v {tool} >/dev/null 2>&1 || exit 97; {probe}"
+        ));
         if code == 97 {
             continue;
         }
@@ -675,7 +681,7 @@ pub fn verify_sandbox(template: &str, rpc_port: u16) -> Result<(), Error> {
     }
     if !reached {
         let why = match &state {
-            None => "None of curl, wget or python3 exists inside it, so reachability cannot be\n\
+            None => "Neither curl nor wget exists inside it, so reachability cannot be\n\
                      established - and it is not assumed. The subject must make HTTP requests from\n\
                      in there, so the image needs one of them."
                 .to_string(),

@@ -7,7 +7,7 @@
 # so every table is hit every block, at tip after a backfill. More decoders, more tables, more
 # keyspaces - a different pressure on the hot store than more rows through the same ten tables.
 #
-# Hermetic: multinest-rpc.py serves the chain, the nest is written inline, topic0s come from the
+# Hermetic: `fixture-rpc multinest` serves the chain, the nest is written inline, topic0s come from the
 # generated ABI. No secret, a fork can satisfy it.
 #
 # Absence-test guard: FINAL_TIP reached, row floor, **every one of the 31 tables non-empty**.
@@ -63,7 +63,7 @@ abi = json.load(open(sys.argv[1]))
 print(" ".join(f"wide__event{i:02d}" for i, e in enumerate(abi) if e.get("type") == "event"))
 PY
 )"
-# The ABI file is in /tmp; delete it with the rest of the workdir, not here - rpc.py reads it live.
+# The ABI file is in /tmp; delete it with the rest of the workdir, not here.
 
 # Absolute, because the runtime directory is a tmpdir and a relative BIN would resolve against it.
 # Checked rather than assumed: a missing binary otherwise surfaces as "dev exited early", which reads
@@ -171,7 +171,8 @@ echo "scenario: $NESTS nest, ${EVENTS}-event ABI (breadth), ${LOGS_PER_BLOCK} lo
 echo "          blocks $FIRST_BLOCK..$FINAL_TIP (backfill $BACKFILL_BLOCKS, then tip-follow to $FINAL_TIP)"
 echo "          expecting $EXPECT_ROWS rows/nest, floor $MIN_ROWS_PER_NEST; ceiling $MAX_RSS_MB MB"
 
-python3 "$HERE/multinest-rpc.py" --port "$RPC_PORT" --abi "$ABI" \
+RPC_BIN="$(bash "$HERE/../../scripts/fixture-rpc.sh")"
+"$RPC_BIN" multinest --port "$RPC_PORT" --abi "$ABI" \
   --contracts "$NESTS" --logs-per-block "$LOGS_PER_BLOCK" \
   --initial-tip "$INITIAL_TIP" --final-tip "$FINAL_TIP" --tip-step "$TIP_STEP" &
 RPC_PID=$!

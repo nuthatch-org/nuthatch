@@ -22,7 +22,7 @@ FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3e
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl git jq python3 xz-utils \
+      ca-certificates curl git jq xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
 # **Apt packages are not version-pinned, and that is a stated limitation rather than an oversight.**
@@ -37,7 +37,7 @@ RUN apt-get update \
 # above) and `claude` (pinned below); curl's patch version cannot move an authoring result.
 RUN { echo "base: node:22-bookworm-slim (digest-pinned in this Dockerfile)"; \
       echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
-      dpkg-query -W -f='${binary:Package}=${Version}\n' ca-certificates curl git jq python3 xz-utils; \
+      dpkg-query -W -f='${binary:Package}=${Version}\n' ca-certificates curl git jq xz-utils; \
     } > /etc/nuthatch-eval-image.manifest
 
 # Pinned rather than `@latest`: a score is a number about a *pairing*, and an eval whose subject

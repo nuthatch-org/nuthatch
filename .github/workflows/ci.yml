@@ -233,6 +233,14 @@ jobs:
           cargo fmt --check --manifest-path count/receiver/Cargo.toml
           cargo clippy --locked --all-targets --manifest-path count/receiver/Cargo.toml -- -D warnings
           cargo test --locked --manifest-path count/receiver/Cargo.toml
+      # The fixture chains the tests and measurement jobs run against, in their own crate.
+      - name: fmt · clippy · test (fixture-rpc)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo fmt --check --manifest-path tools/fixture-rpc/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path tools/fixture-rpc/Cargo.toml -- -D warnings
+          cargo test --locked --manifest-path tools/fixture-rpc/Cargo.toml
       # RFC-0065 S2. The bytes sealing writes, in their own crate so a browser tab can seal to the
       # same address; `seal::tests::sealed_bytes_are_pinned` in the root crate holds the hashes.
       - name: fmt · clippy · test (seal)
@@ -915,11 +923,19 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
       - name: build
         run: cargo build --release --locked
+      # The chains the measurement jobs serve themselves (tools/fixture-rpc), shipped beside the
+      # binary so no job needs a toolchain. Its own crate: `nuthatch` is not rebuilt.
+      - name: build the fixture chains
+        run: |
+          cargo build --release --locked --target-dir target \
+            --manifest-path tools/fixture-rpc/Cargo.toml
       - name: upload binary
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nuthatch-release
-          path: target/release/nuthatch
+          path: |
+            target/release/nuthatch
+            target/release/fixture-rpc
           retention-days: 1
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
@@ -951,14 +967,15 @@ jobs:
         # was also incomparable between runs, since it depended on how many blocks a rate-limited
         # endpoint served.
         #
-        # The script now serves the chain itself (footprint-rpc.py) and writes the nest inline rather
-        # than calling `init`, so there is no RPC and no ABI lookup. Every run indexes exactly 8004
-        # rows: a change in peak RSS is a change in nuthatch, and a fork behaves identically.
+        # The script now serves the chain itself (`fixture-rpc footprint`) and writes the nest inline
+        # rather than calling `init`, so there is no RPC and no ABI lookup. Every run indexes exactly
+        # 8004 rows: a change in peak RSS is a change in nuthatch, and a fork behaves identically.
         env:
           BIN: bin/nuthatch
+          FIXTURE_RPC: bin/fixture-rpc
           MAX_RSS_MB: "256"
         run: |
-          chmod +x bin/nuthatch
+          chmod +x bin/nuthatch bin/fixture-rpc
           bash .github/workflows/footprint.sh
 
   point-read:
@@ -978,10 +995,11 @@ jobs:
         # fail the build; `nuthatch bench query` measured it and nothing compared the number to
         # anything, so a scan where there was a seek could land unnoticed.
         #
-        # Same hermetic shape as `footprint` above - the chain is served by multinest-rpc.py and the
-        # nest is written inline - so there is no secret, no third party, and a fork PR can satisfy
-        # it. Every run indexes 200,200 rows across ten tables (real 10-event Uniswap V4 PoolManager
-        # ABI, 200 logs/block), of which 12,800 stay hot once everything past finality has sealed.
+        # Same hermetic shape as `footprint` above - the chain is served by `fixture-rpc multinest`
+        # and the nest is written inline - so there is no secret, no third party, and a fork PR can
+        # satisfy it. Every run indexes 200,200 rows across ten tables (real 10-event Uniswap V4
+        # PoolManager ABI, 200 logs/block), of which 12,800 stay hot once everything past finality
+        # has sealed.
         # That is the same fixture the `per-cursor RAM budget` job runs (#424).
         #
         # **The ceiling comes from a measured mutation, not from a guess.** Replacing the B-tree seek
@@ -1027,11 +1045,12 @@ jobs:
         # correct, because the 8µs ceiling above was measured on the old spec.
         env:
           BIN: bin/nuthatch
+          FIXTURE_RPC: bin/fixture-rpc
           MAX_P50_US: "8"
           BASELINE: docs/bench/point-read.json
           OUT: point-read-report.json
         run: |
-          chmod +x bin/nuthatch
+          chmod +x bin/nuthatch bin/fixture-rpc
           bash .github/workflows/point-read.sh
       - name: upload report
         # Always: a run that failed the gate is the report you most want to read.
@@ -1062,11 +1081,12 @@ jobs:
         # for. docs/benchmarks.md has the figures. It fails only if the run did not do the work.
         env:
           BIN: bin/nuthatch
+          FIXTURE_RPC: bin/fixture-rpc
           OUT: backfill-throughput-report.json
           # Never the merge ref the checkout is at on a pull_request (#1918).
           COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          chmod +x bin/nuthatch
+          chmod +x bin/nuthatch bin/fixture-rpc
           bash .github/workflows/backfill-throughput.sh
       - name: upload report
         if: always()
@@ -1082,12 +1102,13 @@ jobs:
         if: always()
         env:
           BIN: bin/nuthatch
+          FIXTURE_RPC: bin/fixture-rpc
           OUT: tip-lag-report.json
           MAX_SEEN_P50_MS: "30"
         # Unchanged code read 41 and 43 ms on a busy runner (f598d238, 0eaa5754) against 14-27 ms over
         # thirty runs, so a failure is measured once more on a fresh server; the 20 ms sleep fails both.
         run: |
-          chmod +x bin/nuthatch
+          chmod +x bin/nuthatch bin/fixture-rpc
           bash .github/workflows/tip-lag.sh || {
             echo "::warning::tip lag over its ceiling; measuring once more on a fresh server"
             PORT=8291 RPC_PORT=8549 bash .github/workflows/tip-lag.sh
@@ -1162,9 +1183,9 @@ jobs:
         #                      be a regression gate: the scenario measures ~145 MB, so a change
         #                      could cost ten times the memory and still pass 2048.
         #
-        # No secret and no third party - multinest-rpc.py serves the chain, the nests are written
-        # inline, and topic0s are derived from the same ABI file the harness writes. A fork PR can
-        # satisfy it, which was the whole lesson of #260.
+        # No secret and no third party - `fixture-rpc multinest` serves the chain, the nests are
+        # written inline, and topic0s are derived from the same ABI file the harness writes. A fork PR
+        # can satisfy it, which was the whole lesson of #260.
         #
         # The scenario itself - nests, event rate, block span, tip - is **not** set here. It is the
         # harness's own defaults, so that the bare command in docs/benchmarks.md, the re-baseline
@@ -1174,6 +1195,7 @@ jobs:
         # policy, and where to write the artifact.
         env:
           BIN: bin/nuthatch
+          FIXTURE_RPC: bin/fixture-rpc
           MAX_RSS_MB: "2048"
           # 602, from a seven-run band on this runner (#1156; rss-band.yml run 33956127005,
           # 2026-09-05, ubuntu-latest, 4 cpus, 16 GB). The previous 466 came from a SINGLE run at
@@ -1193,7 +1215,7 @@ jobs:
           REGRESSION_MB: "602"
           REPORT: multinest-footprint.json
         run: |
-          chmod +x bin/nuthatch
+          chmod +x bin/nuthatch bin/fixture-rpc
           bash .github/workflows/multinest-footprint.sh
       - name: upload the report
         # The measurement is a CI artifact, per CLAUDE.md. It is also what re-baselining reads: the
@@ -1224,10 +1246,11 @@ jobs:
         # budget, a different pressure on the hot store. Floor: every table non-empty.
         env:
           BIN: bin/nuthatch
+          FIXTURE_RPC: bin/fixture-rpc
           MAX_RSS_MB: "2048"
           REPORT: wideabi-footprint.json
         run: |
-          chmod +x bin/nuthatch
+          chmod +x bin/nuthatch bin/fixture-rpc
           bash .github/workflows/wideabi-footprint.sh
       - name: upload the report
         if: always()

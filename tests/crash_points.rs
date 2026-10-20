@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use nuthatch_fixture_rpc::scripted::Scripted;
+use nuthatch_fixture_rpc::Running;
+
 const ERC20_TRANSFER_ABI: &str = r#"[{"anonymous":false,"inputs":[
   {"indexed":true,"name":"from","type":"address"},
   {"indexed":true,"name":"to","type":"address"},
@@ -33,10 +36,6 @@ impl Drop for Reaped {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 fn free_port() -> u16 {
@@ -95,20 +94,10 @@ fn pin(rpc_port: u16, path: &str, n: u64) {
 
 /// A fixture chain and an `init`ed nest pointed at it.
 /// The fixture chain over HTTP, pinned to the tip and finality the cases expect.
-fn fixture_chain() -> (Reaped, u16) {
-    let rpc_port = free_port();
-    let rpc = Reaped(
-        Command::new("python3")
-            .arg(root().join("scripts/fixture_rpc.py"))
-            .args(["--port", &rpc_port.to_string(), "--contract", CONTRACT])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn fixture_rpc.py"),
-    );
-    poll("the fixture RPC", 30, || {
-        get(&format!("http://127.0.0.1:{rpc_port}/control/state"))
-    });
+fn fixture_chain() -> (Running, u16) {
+    let rpc =
+        nuthatch_fixture_rpc::spawn(Scripted::new(CONTRACT), "127.0.0.1:0").expect("fixture RPC");
+    let rpc_port = rpc.port();
     pin(rpc_port, "tip", TIP);
     pin(rpc_port, "finalized", FINALIZED);
     (rpc, rpc_port)
@@ -136,7 +125,7 @@ fn init_nest(nest: &Path, rpc_port: u16) {
 }
 
 /// A fixture chain and an `init`ed nest pointed at it.
-fn chain_and_nest(dir: &Path) -> (Reaped, PathBuf) {
+fn chain_and_nest(dir: &Path) -> (Running, PathBuf) {
     let (rpc, rpc_port) = fixture_chain();
     let nest = dir.join("nest");
     init_nest(&nest, rpc_port);

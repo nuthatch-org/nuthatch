@@ -4704,6 +4704,7 @@ dependencies = [
  "md-5 0.10.6",
  "num-bigint 0.4.8",
  "nuthatch-decode",
+ "nuthatch-fixture-rpc",
  "nuthatch-identity",
  "nuthatch-scaffold",
  "nuthatch-seal",
@@ -4746,6 +4747,20 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "nuthatch-fixture-rpc"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "sha2 0.10.9",
+ "tiny-keccak",
+ "tokio",
 ]
 
 [[package]]

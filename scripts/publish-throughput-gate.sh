@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # RFC-0052 S2's throughput gate: `bench backfill` with and without a mirror publishing to an S3 server (versitygw, #1492) behind
-# a Toxiproxy bandwidth limit, on the deterministic chain footprint-rpc.py serves. Four batches,
-# alternated so drift on the box lands on both arms. Results: docs/bench/publish-throttled.md.
+# a Toxiproxy bandwidth limit, on the deterministic chain `fixture-rpc footprint` serves. Four
+# batches, alternated so drift on the box lands on both arms. Results:
+# docs/bench/publish-throttled.md.
 #
-# Needs versitygw, toxiproxy-server, toxiproxy-cli, python3, jq, and a curl with --aws-sigv4.
+# Needs versitygw, toxiproxy-server, toxiproxy-cli, jq, and a curl with --aws-sigv4.
 # Env: BIN (target/release/nuthatch), VERSITYGW (versitygw), RUNS (15), RATE_KB (1024), OUT (a temp dir)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,7 +22,8 @@ pids=()
 cleanup() { for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
-python3 "$ROOT/.github/workflows/footprint-rpc.py" "$RPC_PORT" > "$OUT/rpc.log" 2>&1 & pids+=($!)
+RPC_BIN="$(bash "$ROOT/scripts/fixture-rpc.sh")"
+"$RPC_BIN" footprint "$RPC_PORT" > "$OUT/rpc.log" 2>&1 & pids+=($!)
 ROOT_ACCESS_KEY=$KEY ROOT_SECRET_KEY=$SECRET "$VERSITYGW" --port "127.0.0.1:$MINIO_PORT" \
   --health /health posix "$WORK/s3-data" > "$OUT/s3.log" 2>&1 & pids+=($!)
 toxiproxy-server -host 127.0.0.1 -port "$TOXI_PORT" > "$OUT/toxiproxy.log" 2>&1 & pids+=($!)

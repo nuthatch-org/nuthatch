@@ -11,6 +11,8 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use nuthatch_fixture_rpc::scripted::Scripted;
+
 const ERC20_TRANSFER_ABI: &str = r#"[{"anonymous":false,"inputs":[
   {"indexed":true,"name":"from","type":"address"},
   {"indexed":true,"name":"to","type":"address"},
@@ -67,37 +69,17 @@ fn poll<T>(what: &str, secs: u64, mut f: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-fn pin(rpc_port: u16, path: &str, n: u64) {
-    let ok = Command::new("curl")
-        .args(["-fsS", "-m", "5", "-XPOST"])
-        .arg(format!("http://127.0.0.1:{rpc_port}/control/{path}"))
-        .args(["-d", &format!("{{\"number\": {n}}}")])
-        .status()
-        .expect("curl")
-        .success();
-    assert!(ok, "could not pin {path} to {n}");
-}
-
 /// A sealed fixture nest, built once per test binary, and the name of its one table.
 fn template() -> &'static (tempfile::TempDir, String) {
     static T: OnceLock<(tempfile::TempDir, String)> = OnceLock::new();
     T.get_or_init(|| {
         let dir = tempfile::tempdir().unwrap();
-        let rpc_port = free_port();
-        let _rpc = Reaped(
-            Command::new("python3")
-                .arg(root().join("scripts/fixture_rpc.py"))
-                .args(["--port", &rpc_port.to_string(), "--contract", CONTRACT])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn fixture_rpc.py"),
-        );
-        poll("the fixture RPC", 30, || {
-            get(&format!("http://127.0.0.1:{rpc_port}/control/state"))
-        });
-        pin(rpc_port, "tip", TIP);
-        pin(rpc_port, "finalized", FINALIZED);
+        let rpc = nuthatch_fixture_rpc::spawn(
+            Scripted::new(CONTRACT).pinned(Some(TIP), Some(FINALIZED)),
+            "127.0.0.1:0",
+        )
+        .expect("fixture RPC");
+        let rpc_port = rpc.port();
 
         let nest = dir.path().join("nest");
         let abi = dir.path().join("erc20.abi.json");

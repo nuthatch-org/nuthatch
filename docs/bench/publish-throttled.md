@@ -11,7 +11,7 @@ and the script now runs versitygw; a rerun measures against that.
 ## The scenario
 
 `nuthatch bench backfill --seal-direct --concurrency 4` over blocks 1 to 20,000 of the chain
-`.github/workflows/footprint-rpc.py` serves: one contract, four `Transfer` logs a block, 80,000 rows,
+`fixture-rpc footprint` (tools/fixture-rpc) serves: one contract, four `Transfer` logs a block, 80,000 rows,
 sealed on the production row cut (`SEAL_DIRECT_BATCH`, 20,000) into four segments during the run.
 No network and no third party, so every run indexes exactly the same logs.
 
