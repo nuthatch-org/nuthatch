@@ -363,14 +363,10 @@ impl PgStore {
     }
 }
 
-/// Strip any password before a connection string reaches a log or an error message.
+/// A connection string reaches logs and errors as scheme and host only: libpq also takes the
+/// password from the query (`?password=`), so cutting userinfo alone is not enough (#2284).
 fn redact(url: &str) -> String {
-    match (url.find("://"), url.rfind('@')) {
-        (Some(scheme), Some(at)) if at > scheme => {
-            format!("{}://***@{}", &url[..scheme], &url[at + 1..])
-        }
-        _ => url.to_string(),
-    }
+    crate::rpc::redact_url(url)
 }
 
 #[async_trait::async_trait]
@@ -1195,12 +1191,15 @@ mod tests {
     fn passwords_are_redacted_from_connection_strings() {
         assert_eq!(
             redact("postgres://nuthatch:hunter2@db.internal:5432/nuthatch"),
-            "postgres://***@db.internal:5432/nuthatch"
+            "postgres://db.internal:5432"
         );
         assert_eq!(
             redact("postgres://localhost:5432/nuthatch"),
-            "postgres://localhost:5432/nuthatch"
+            "postgres://localhost:5432"
         );
+        let shown =
+            redact("postgres://nuthatch@db.internal/nuthatch?password=hunter2&sslmode=require");
+        assert!(!shown.contains("hunter2"), "{shown}");
     }
 
     /// A schema name is concatenated into DDL, so the validation is the injection guard.

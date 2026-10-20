@@ -464,10 +464,5 @@ impl ControlPlane {
 }
 
 fn redact(url: &str) -> String {
-    match (url.find("://"), url.rfind('@')) {
-        (Some(scheme), Some(at)) if at > scheme => {
-            format!("{}://***@{}", &url[..scheme], &url[at + 1..])
-        }
-        _ => url.to_string(),
-    }
+    crate::rpc::redact_url(url)
 }
