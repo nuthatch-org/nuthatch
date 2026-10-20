@@ -342,9 +342,10 @@ Generate an ed25519 signing keypair into a local JSON file
 
 ## `nuthatch pack verify`
 
-Verify a pack: signature, artifact hashes, and grant conformance
+Verify a pack: its signature against the signer's public key you were given, and, when the nest's config sits beside it, that it still describes that nest. An unsigned pack fails
 
 - `--dir <DIR>` - Nest directory (must contain a `compliance-pack.toml`)
+- `--pubkey <PUBKEY>` - The signer's public key: 64 hex characters, or a file holding them. The key inside the pack is never trusted; anyone who edits a pack can re-sign it with a key of their own
 
 ## `nuthatch partitions`
 

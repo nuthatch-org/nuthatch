@@ -11,7 +11,7 @@ throughout are i128 base units, returned as decimal strings. Flags are authorita
 | **Labels** | Content-addressed sets of tagged addresses (the annotation substrate). | `nuthatch labels import <file>` / `labels list` |
 | **Flags** | `threshold` (single transfer ≥ N) and `velocity` (windowed volume) flags. Configured in `nuthatch.toml` `[flags]`. | query the `flags` MCP tool / `/flags` |
 | **Exposure** | An address's direct counterparty exposure to the labeled set. | the `exposure` MCP tool / `/exposure/{addr}` |
-| **Pack** | Build/sign/verify a manifest of the registry hash, flag thresholds and alert sinks (ed25519). | `nuthatch pack keygen` → `pack build --key …` → `pack verify` |
+| **Pack** | Build/sign/verify a manifest of the registry hash, flag thresholds and alert sinks (ed25519). | `nuthatch pack keygen` → `pack build --key …` → `pack verify --pubkey …` |
 | **Audit** | `report` summarises the threshold flags in a block range. | `nuthatch audit report --from … --to … --json` |
 
 Live sanctions screening and the WASM screening component were removed on 2026-10-08. A
