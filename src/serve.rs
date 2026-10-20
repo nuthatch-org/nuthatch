@@ -4538,9 +4538,13 @@ async fn run_sql_query_at(
         && s.store.rows_generation().is_some()
         && crate::sqlmemo::is_deterministic(&q.q)
     {
-        let slot = match admit_to(&s.memo_gate.0, &s.sql_queued).await {
-            Ok(slot) => slot,
-            Err(busy) => return busy,
+        // A GraphQL operation already holds its SQL permit for every root.
+        let slot = match operation_timeout {
+            Some(_) => None,
+            None => match admit_to(&s.memo_gate.0, &s.sql_queued).await {
+                Ok(slot) => Some(slot),
+                Err(busy) => return busy,
+            },
         };
         let (st, sql) = (s.clone(), q.q.clone());
         match tokio::task::spawn_blocking(move || {
