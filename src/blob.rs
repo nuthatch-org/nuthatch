@@ -30,6 +30,11 @@ const EXCLUDE: &[&str] = &[DB_FILE, "segments", ".git", ".DS_Store"];
 #[cfg(feature = "folds")]
 const EXCLUDE: &[&str] = &[DB_FILE, "segments", "checkpoints", ".git", ".DS_Store"];
 
+/// Whether a file or directory of this name is left out of a nest's inputs, at any depth.
+pub(crate) fn is_excluded(name: &std::ffi::OsStr) -> bool {
+    EXCLUDE.iter().any(|x| name == std::ffi::OsStr::new(x))
+}
+
 /// The **derived state** a dataset accumulates by indexing: the hot store and the sealed segments.
 ///
 /// Named separately from [`EXCLUDE`] because it is read in the other direction. `EXCLUDE` answers

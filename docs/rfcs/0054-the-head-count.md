@@ -239,6 +239,9 @@ is never held hostage to a prompt. It is asked only when all of the following ho
 5. `init` was not invoked with a flag that means "do not talk to me". As of 3.6.1 `InitArgs`
    carries no `--quiet` or `--yes` (verified 2026-09-11 against `src/cli.rs`); if one is added
    later it must gate this.
+6. nothing is already waiting on stdin. A line typed or pasted ahead is the next command, not an
+   answer to a question not yet printed, so it is left to the shell and the question waits for a
+   later `init` (#2235).
 
 The prompt, in full, printed once:
 

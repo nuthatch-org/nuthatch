@@ -1157,8 +1157,9 @@ pub struct InitArgs {
     /// The ABIs a manifest pins are strictly better than Sourcify for proxy-heavy codebases:
     /// Sourcify returns the proxy ABI, which declares none of the events the contract emits.
     ///
-    /// Gateway responses are trusted, not verified: nothing recomputes the hash over the bytes
-    /// that come back, so a CID names what to ask for rather than proving what arrived.
+    /// Bytes fetched by CID are checked against that CID, the file first and then block by block;
+    /// bytes that contradict it are refused, and bytes no gateway can prove are accepted with an
+    /// UNVERIFIED warning. A manifest given by URL names a location, not a content, and is trusted.
     ///
     /// Which template a factory creates lives in the mapping WASM, not the manifest, so factory
     /// rules are inferred only where a parameter unambiguously names a template. Everything else is
