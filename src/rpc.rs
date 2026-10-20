@@ -2201,7 +2201,10 @@ impl RpcClient {
             // load-balancer split) is skipped, and the caller's total-count check turns that into an
             // error rather than a partial map - see COR-3 above.
             let result = item.get_mut("result").map(Value::take);
-            if let Some(result) = result.filter(|v| !v.is_null()) {
+            if let Some(mut result) = result.filter(|v| !v.is_null()) {
+                if !full {
+                    crate::registry::count_header_transactions(&mut result);
+                }
                 out.insert(block, result);
             } else if let Some(err) = error_of(item) {
                 // **A per-item error inside an HTTP 200 batch.** `post_one` only rejects a *top-level*
@@ -3351,6 +3354,46 @@ mod tests {
             sent.iter().all(|&n| n == 4),
             "a throttle was narrowed: {sent:?}"
         );
+    }
+
+    /// A header leaves the batch holding its transaction count, not the hashes (#2309), and a block
+    /// body keeps its transactions.
+    #[tokio::test]
+    async fn a_fetched_header_keeps_its_transaction_count_not_the_hashes() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        let app = Router::new().route(
+            "/",
+            post(|Json(req): Json<Value>| async move {
+                let answer = |item: &Value| {
+                    json!({"jsonrpc":"2.0","id":item["id"],"result":{
+                        "number":item["params"][0],"hash":format!("0x{:064x}", 7),"timestamp":"0x64",
+                        "transactions":["0x01","0x02","0x03"]}})
+                };
+                Json(match &req {
+                    Value::Array(items) => Value::Array(items.iter().map(answer).collect()),
+                    item => answer(item),
+                })
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
+
+        let headers = c.block_headers(&[5, 6]).await.unwrap();
+        for h in headers.values() {
+            assert!(h.get("transactions").is_none(), "hashes held: {h}");
+            let row = crate::registry::block_row(5, h, true).unwrap();
+            let count = row.params.iter().find(|(k, _)| k == "transaction_count");
+            assert_eq!(
+                count.map(|(_, v)| v.clone()),
+                Some(crate::registry::Value::U64(3))
+            );
+        }
+        let bodies = c.block_bodies(&[5]).await.unwrap();
+        assert_eq!(bodies[&5]["transactions"].as_array().map(Vec::len), Some(3));
     }
 
     #[tokio::test]
