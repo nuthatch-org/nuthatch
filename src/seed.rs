@@ -24,6 +24,8 @@ use crate::store::Store;
 /// store holding it is half-seeded: `dev` refuses it and `seed` finishes it.
 pub const SEED_PENDING_KEY: &str = "seed_pending";
 const PARALLELISM: usize = 8;
+/// Far above any segment a seal writes; it bounds what a hostile mirror can put on disk (#2202).
+const MAX_SEGMENT_BYTES: u64 = 4 << 30;
 /// Reads of the catalogue and the snapshot that may disagree before giving up: a publisher writes
 /// the first, then the second, and a pass is short.
 const SNAPSHOT_ATTEMPTS: usize = 5;
@@ -312,13 +314,20 @@ async fn download(
                 return Ok(0);
             }
         }
-        let bytes = mirror
-            .get(&format!("{dataset}/{}", w.key))
-            .await?
-            .with_context(|| {
-                format!("the mirror's catalogue names {} but it is not there", w.key)
-            })?;
-        if publish::sha256_hex(&bytes) != w.segment.hash {
+        let tmp = dest.with_extension("parquet.tmp");
+        let got = mirror
+            .get_file(&format!("{dataset}/{}", w.key), &tmp, MAX_SEGMENT_BYTES)
+            .await;
+        let got = match got {
+            Ok(Some(h)) => h,
+            Ok(None) => bail!("the mirror's catalogue names {} but it is not there", w.key),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+        if got != w.segment.hash {
+            let _ = std::fs::remove_file(&tmp);
             if w.segment.provisional {
                 bail!(
                     "{} is not the tail the seed snapshot names. The publisher rewrites tails as \
@@ -328,10 +337,11 @@ async fn download(
             }
             bail!("{} does not hash to its content address", w.key);
         }
-        let tmp = dest.with_extension("parquet.tmp");
-        std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        let len = std::fs::metadata(&tmp)
+            .with_context(|| format!("reading {}", tmp.display()))?
+            .len();
         std::fs::rename(&tmp, &dest).with_context(|| format!("installing {}", dest.display()))?;
-        Ok(bytes.len() as u64)
+        Ok(len)
     }))
     .buffer_unordered(PARALLELISM)
     .collect()
