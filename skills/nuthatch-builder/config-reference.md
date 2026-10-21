@@ -355,7 +355,10 @@ none of them. On OP-stack chains (Optimism, Base) a `txlist` row carries `L1Fees
 L1 data fee in wei, as Etherscan's does; a deposit from L1 has none. `txlistinternal` with `txhash`
 traces a transaction the nest has not traced yet, but off a loopback bind only one it holds for a
 watched account: like the proxy, the operator's trace RPC and disk are lent to anyone only on
-loopback. `logs/getLogs` honours `page` and `offset` (at most 1,000), asks the RPC in spans that
+loopback. The token actions take `contractaddress` with an `address`; a token alone answers
+`NUTHATCH_UNSUPPORTED`. On loopback, `account/balance` and `account/balancemulti` (at most 20
+addresses, `tag` latest or a block) are read from the RPC, as are `proxy/eth_estimateGas`,
+`eth_gasPrice` and `eth_getTransactionCount`; `eth_sendRawTransaction` is refused. `logs/getLogs` honours `page` and `offset` (at most 1,000), asks the RPC in spans that
 start at 16 blocks and grow while they come back sparse, narrows any answer past 4 MiB, stops once
 it holds the page, and runs two
 requests at a time; a range that needs more than 64 calls answers `NUTHATCH_INCOMPLETE`, and a first
