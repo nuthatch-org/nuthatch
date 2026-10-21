@@ -203,6 +203,7 @@ async fn main() -> Result<()> {
              is the embedded one and carries no database driver (CLAUDE.md non-negotiable 1)."
         ),
         cli::Command::Sql(args) => run_sql(args).await,
+        cli::Command::Diff(args) => run_diff(args).await,
         cli::Command::Offchain(args) => match args.what {
             cli::OffchainWhat::Drop(args) => offchain::drop_file(
                 std::path::Path::new(&args.dir),
@@ -421,6 +422,159 @@ fn run_labels(args: cli::LabelsArgs) -> Result<()> {
     }
 }
 
+/// `nuthatch diff --flow` (RFC-0071). Reads through the same backend as `nuthatch sql`, so a nest
+/// `dev` holds is read over HTTP and a stopped one from its store.
+async fn run_diff(args: cli::DiffArgs) -> Result<()> {
+    use nuthatch::diff;
+    if !args.flow {
+        anyhow::bail!(
+            "only the flow is built so far: add --flow. The range story is a later slice (RFC-0071 \
+             §15)."
+        );
+    }
+    let tx = match &args.tx {
+        Some(t) => {
+            let t = t.to_ascii_lowercase();
+            let hex = t.strip_prefix("0x").unwrap_or("");
+            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                anyhow::bail!("--tx {t} is not a transaction hash (0x and 64 hex digits)");
+            }
+            Some(t)
+        }
+        None => None,
+    };
+    let dir = std::path::PathBuf::from(&args.dir);
+    let local_config = config::Config::load(&dir).ok();
+    let (from, to) = match (args.block, args.from, args.to, &tx) {
+        (Some(b), ..) => (b, b),
+        (None, Some(f), Some(t), _) => (f, t),
+        (None, _, _, Some(hash)) => {
+            let configured = local_config
+                .as_ref()
+                .map(|c| c.nest.rpc_urls.clone())
+                .unwrap_or_default();
+            let urls = nuthatch::rpc::select_rpcs(&args.rpc, configured);
+            if urls.is_empty() {
+                anyhow::bail!(
+                    "--tx needs its block: pass --block N, or --rpc for one receipt lookup"
+                );
+            }
+            let rpc = nuthatch::rpc::RpcClient::new(urls)?;
+            let block = rpc.transaction_block(hash).await.with_context(|| {
+                "looking up the transaction's block; pass --block N to skip the lookup".to_string()
+            })?;
+            let Some(b) = block else {
+                anyhow::bail!("no receipt for {hash} at the RPC: it is not mined on this chain");
+            };
+            (b, b)
+        }
+        _ => anyhow::bail!("name what to draw: --tx, --block, or --from with --to"),
+    };
+    let req = diff::Request { from, to, tx };
+
+    let backend = SqlBackend::open(&args.dir, &args.url).await?;
+    let mut ctx = diff::NestContext {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        ..Default::default()
+    };
+    let tables: Vec<nuthatch::registry::TableSchema> = match &backend {
+        SqlBackend::Local { dir, store } => {
+            ctx.start_block = store
+                .get_meta("start_block")?
+                .and_then(|s| s.parse().ok())
+                .or_else(|| {
+                    local_config
+                        .as_ref()
+                        .and_then(|c| c.contracts.iter().filter_map(|c| c.start_block).min())
+                });
+            ctx.indexed_head = store.indexed_head()?;
+            ctx.sealed_through = store.sealed_through();
+            ctx.data_identity = blob::build_manifest(dir, None)
+                .ok()
+                .map(|m| m.data_identity());
+            match &local_config {
+                Some(cfg) => {
+                    let reg = nuthatch::registry::from_nest(dir, cfg)?;
+                    indexer::full_schema(&reg, cfg)
+                }
+                None => {
+                    let raw =
+                        std::fs::read_to_string(dir.join("schema.json")).with_context(|| {
+                            format!(
+                                "{} has neither nuthatch.toml nor schema.json",
+                                dir.display()
+                            )
+                        })?;
+                    let v: serde_json::Value = serde_json::from_str(&raw)?;
+                    serde_json::from_value(v["tables"].clone()).context("reading schema.json")?
+                }
+            }
+        }
+        SqlBackend::Http { .. } => {
+            let ready = backend.get_json("/ready").await?;
+            let summary = backend.get_json("/").await?;
+            let nest = backend.get_json("/nest").await?;
+            ctx.indexed_head = ready["last_block"].as_u64();
+            ctx.sealed_through = ready["sealed_through"].as_u64().unwrap_or(0);
+            ctx.start_block = summary["start_block"].as_str().and_then(|s| s.parse().ok());
+            ctx.data_identity = nest["data_identity"].as_str().map(str::to_string);
+            ctx.name = nest["name"].as_str().unwrap_or_default().to_string();
+            ctx.chain = nest["chain"].as_str().unwrap_or_default().to_string();
+            ctx.chain_id = nest["chain_id"].as_u64();
+            for c in nest["contracts"].as_array().into_iter().flatten() {
+                if let (Some(a), Some(alias)) = (c["address"].as_str(), c["alias"].as_str()) {
+                    ctx.aliases
+                        .insert(a.to_ascii_lowercase(), alias.to_string());
+                }
+            }
+            let t = backend.get_json("/tables").await?;
+            serde_json::from_value(t["tables"].clone()).context("reading /tables")?
+        }
+    };
+    if let Some(cfg) = &local_config {
+        ctx.name = cfg.nest.name.clone();
+        ctx.chain = cfg.nest.chain.clone();
+        ctx.chain_id = Some(cfg.nest.chain_id);
+        for c in &cfg.contracts {
+            ctx.aliases
+                .insert(c.address.to_ascii_lowercase(), c.alias.clone());
+        }
+    }
+    ctx.metadata = nuthatch::metadata::load(&dir);
+    ctx.metadata_sha256 = std::fs::read(dir.join(nuthatch::metadata::METADATA_FILE))
+        .ok()
+        .map(|b| {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&b))
+        });
+    if let Ok(entries) = std::fs::read_dir(dir.join(labels::LABELS_DIR)) {
+        ctx.label_snapshots = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .filter_map(|p| p.file_stem()?.to_str().map(str::to_string))
+            .collect();
+        ctx.label_snapshots.sort();
+    }
+    for (address, l) in labels::load(&dir).iter() {
+        let mut l = l.to_vec();
+        l.sort();
+        ctx.labels.insert(address.clone(), l);
+    }
+
+    diff::check_coverage(&req, &ctx)?;
+    let classified = diff::classify(&tables, ctx.chain_id);
+    let flow = diff::read(&backend, &classified, &req, diff::ROW_CAP).await?;
+    let doc = diff::document(&flow, &ctx, &req);
+    print!("{}", diff::render(&doc, args.format, args.top));
+    Ok(())
+}
+
+impl nuthatch::diff::Source for SqlBackend {
+    async fn query(&self, sql: &str) -> Result<analytics::QueryOutput> {
+        SqlBackend::query(self, sql).await
+    }
+}
+
 /// `nuthatch sql [query]` - read-only SQL over the nest's data (live tip ∪ sealed history). With a
 /// query, one-shot to a table (`--json` to pipe). Without, an interactive REPL. The terminal-native
 /// front door to querying, so a user never needs curl to poke at their own data (RFC-0015).
@@ -626,6 +780,28 @@ impl SqlBackend {
                 })
             }
         }
+    }
+
+    /// A JSON route of the running instance, under the mount prefix. Local backends have none.
+    async fn get_json(&self, path: &str) -> Result<serde_json::Value> {
+        let SqlBackend::Http {
+            url,
+            prefix,
+            client,
+            ..
+        } = self
+        else {
+            anyhow::bail!("{path} is a route of a running instance, and this nest is local");
+        };
+        let resp = client
+            .get(format!("{url}{prefix}{path}"))
+            .send()
+            .await
+            .with_context(|| format!("asking {url}{prefix}{path} - is `nuthatch dev` running?"))?;
+        if !resp.status().is_success() {
+            anyhow::bail!("{url}{prefix}{path} answered {}", resp.status());
+        }
+        resp.json().await.context("reading the API response")
     }
 
     fn describe(&self) -> String {

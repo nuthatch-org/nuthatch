@@ -155,6 +155,21 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--no-admin` - Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that front their own dashboard (RFC-0010 Part A). Off-localhost the UI requires `NUTHATCH_ADMIN_TOKEN` to be set AND each request to present it as `?token=…` (or it self-disables with a log line)
 - `--registry <REGISTRY>` - A runtime (`--dir` holding a `mounts.toml`): the registry a live mount fetches a NID from when this runtime does not hold it (RFC-0019, #1543). A filesystem path, or `s3://bucket/prefix`
 
+## `nuthatch diff`
+
+Draw the token flow of a transaction, a block or a block range: who sent what to whom, exactly (RFC-0071). Read-only, from the rows the nest already holds
+
+- `--flow` - Draw the token flow: one edge per (from, to, token) with the exact amount, and each address's net flow. The only mode built so far (RFC-0071 §15); the range story comes later
+- `--tx <TX>` - One transaction. Its block is found with one `eth_getTransactionReceipt` unless --block names it
+- `--block <BLOCK>` - One block, or the block that holds --tx
+- `--from <FROM>` - First block of an inclusive range
+- `--to <TO>` - Last block of an inclusive range
+- `--format <FORMAT>` - `text`, `json` (the document every other format is drawn from), `dot` or `mermaid`
+- `--top <TOP>` - Edges per token, and addresses per token in the net flow, that text, DOT and Mermaid show. JSON always carries every one
+- `--dir <DIR>` - Nest directory. Read directly when it holds a store no `nuthatch dev` has open; its `metadata.json` and labels are read either way
+- `--url <URL>` - The running instance's API, used when --dir holds no store or `nuthatch dev` has it open
+- `--rpc <RPC>` - RPC for the --tx receipt lookup. Defaults to the nest's `rpc_urls`
+
 ## `nuthatch doctor`
 
 Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width, max JSON-RPC batch size, and archive depth - and print the largest safe `--window`. Each of those limits otherwise surfaces mid-backfill as a retry loop that looks like slowness

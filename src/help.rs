@@ -19,7 +19,9 @@ pub const GROUPS: &[(&str, &[&str])] = &[
     ("CORE", &["init", "add", "dev", "sql", "mcp"]),
     (
         "OPERATING",
-        &["serve", "doctor", "check", "schema", "bench", "settle"],
+        &[
+            "serve", "doctor", "check", "diff", "schema", "bench", "settle",
+        ],
     ),
     ("SCALED", &["worker", "control"]),
     ("COMPLIANCE", &["labels", "lists", "pack", "audit"]),

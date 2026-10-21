@@ -1,0 +1,18 @@
+[
+  {"type":"event","name":"Transfer","anonymous":false,"inputs":[
+    {"name":"from","type":"address","indexed":true},
+    {"name":"to","type":"address","indexed":true},
+    {"name":"value","type":"uint256","indexed":false}]},
+  {"type":"event","name":"Approval","anonymous":false,"inputs":[
+    {"name":"owner","type":"address","indexed":true},
+    {"name":"spender","type":"address","indexed":true},
+    {"name":"value","type":"uint256","indexed":false}]},
+  {"type":"event","name":"TransferShares","anonymous":false,"inputs":[
+    {"name":"from","type":"address","indexed":true},
+    {"name":"to","type":"address","indexed":true},
+    {"name":"sharesValue","type":"uint256","indexed":false}]},
+  {"type":"event","name":"Submitted","anonymous":false,"inputs":[
+    {"name":"sender","type":"address","indexed":true},
+    {"name":"amount","type":"uint256","indexed":false},
+    {"name":"referral","type":"address","indexed":false}]}
+]

@@ -1,0 +1,92 @@
+{
+  "0x0275b156cd77c5ed82d44bcc5f9e93eecff20138": {
+    "decimals": 18,
+    "symbol": "eWBTC",
+    "name": "Euler Pool: Wrapped BTC"
+  },
+  "0x1b808f49add4b8c6b5117d9681cf7312fcf0dc1d": {
+    "decimals": 18,
+    "symbol": "eWETH",
+    "name": "Euler Pool: Wrapped Ether"
+  },
+  "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599": {
+    "decimals": 8,
+    "symbol": "WBTC",
+    "name": "Wrapped BTC"
+  },
+  "0x36c4a49f624342225ba45fcfc2e1a4bcbcdce557": {
+    "decimals": 8,
+    "symbol": "dWBTC",
+    "name": "Euler Debt: Wrapped BTC"
+  },
+  "0x436548baab5ec4d79f669d1b9506d67e98927af7": {
+    "decimals": 18,
+    "symbol": "dwstETH",
+    "name": "Euler Debt: Wrapped liquid staked Ether 2.0"
+  },
+  "0x570a7e6e75c8043bd75b574d47988aa305873818": {
+    "decimals": 18,
+    "symbol": "estETH",
+    "name": "Euler Pool: Liquid staked Ether 2.0"
+  },
+  "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686": {
+    "decimals": 18,
+    "symbol": "dDAI",
+    "name": "Euler Debt: Dai Stablecoin"
+  },
+  "0x62e28f054efc24b26a794f5c1249b6349454352c": {
+    "decimals": 18,
+    "symbol": "dWETH",
+    "name": "Euler Debt: Wrapped Ether"
+  },
+  "0x6b175474e89094c44da98b954eedeac495271d0f": {
+    "decimals": 18,
+    "symbol": "DAI",
+    "name": "Dai Stablecoin"
+  },
+  "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0": {
+    "decimals": 18,
+    "symbol": "wstETH",
+    "name": "Wrapped liquid staked Ether 2.0"
+  },
+  "0x84721a3db22eb852233aeae74f9bc8477f8bcc42": {
+    "decimals": 6,
+    "symbol": "dUSDC",
+    "name": "Euler Debt: USD Coin"
+  },
+  "0x8f222fc08bd508571fce098cab5bb4095346a561": {
+    "decimals": 18,
+    "symbol": "dstETH",
+    "name": "Euler Debt: Liquid staked Ether 2.0"
+  },
+  "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": {
+    "decimals": 6,
+    "symbol": "USDC",
+    "name": "USD Coin"
+  },
+  "0xae7ab96520de3a18e5e111b5eaab095312d7fe84": {
+    "decimals": 18,
+    "symbol": "stETH",
+    "name": "Liquid staked Ether 2.0"
+  },
+  "0xbd1bd5c956684f7eb79da40f582cbe1373a1d593": {
+    "decimals": 18,
+    "symbol": "ewstETH",
+    "name": "Euler Pool: Wrapped liquid staked Ether 2.0"
+  },
+  "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": {
+    "decimals": 18,
+    "symbol": "WETH",
+    "name": "Wrapped Ether"
+  },
+  "0xe025e3ca2be02316033184551d4d3aa22024d9dc": {
+    "decimals": 18,
+    "symbol": "eDAI",
+    "name": "Euler Pool: Dai Stablecoin"
+  },
+  "0xeb91861f8a4e1c12333f42dce8fb0ecdc28da716": {
+    "decimals": 18,
+    "symbol": "eUSDC",
+    "name": "Euler Pool: USD Coin"
+  }
+}

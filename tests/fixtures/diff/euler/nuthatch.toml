@@ -1,0 +1,117 @@
+# RFC-0071 S0(a)'s Euler nest (tools/rfc-0071-s0/euler-nest) with the segments `bench backfill
+# --seal-direct` sealed over blocks 16,817,996 to 16,818,085 and the metadata.json `metadata fetch`
+# wrote. tests/diff_flow.rs draws its flows and compares them with golden/.
+[nest]
+name = "euler-exploit"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://ethereum-rpc.publicnode.com"]
+schema_version = 2
+
+[[contracts]]
+alias = "dai"
+address = "0x6b175474e89094c44da98b954eedeac495271d0f"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "usdc"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "wbtc"
+address = "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "weth"
+address = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+start_block = 16817996
+abi = "abis/weth.json"
+
+[[contracts]]
+alias = "steth"
+address = "0xae7ab96520de3a18e5e111b5eaab095312d7fe84"
+start_block = 16817996
+abi = "abis/steth.json"
+
+[[contracts]]
+alias = "wsteth"
+address = "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "edai"
+address = "0xe025e3ca2be02316033184551d4d3aa22024d9dc"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "ddai"
+address = "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "eweth"
+address = "0x1b808f49add4b8c6b5117d9681cf7312fcf0dc1d"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "dweth"
+address = "0x62e28f054efc24b26a794f5c1249b6349454352c"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "ewbtc"
+address = "0x0275b156cd77c5ed82d44bcc5f9e93eecff20138"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "dwbtc"
+address = "0x36c4a49f624342225ba45fcfc2e1a4bcbcdce557"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "ewsteth"
+address = "0xbd1bd5c956684f7eb79da40f582cbe1373a1d593"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "dwsteth"
+address = "0x436548baab5ec4d79f669d1b9506d67e98927af7"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "eusdc"
+address = "0xeb91861f8a4e1c12333f42dce8fb0ecdc28da716"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "dusdc"
+address = "0x84721a3db22eb852233aeae74f9bc8477f8bcc42"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "esteth"
+address = "0x570a7e6e75c8043bd75b574d47988aa305873818"
+start_block = 16817996
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "dsteth"
+address = "0x8f222fc08bd508571fce098cab5bb4095346a561"
+start_block = 16817996
+abi = "abis/erc20.json"
