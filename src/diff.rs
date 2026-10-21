@@ -61,6 +61,9 @@ pub struct FlowTable {
     /// The recipient column, for a `Transfer` only.
     pub second: Option<String>,
     pub amount: String,
+    /// The only emitters whose rows are flow; empty for any. A row from another emitter is counted
+    /// under other events: a factory alias spans many contracts.
+    pub emitters: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -92,12 +95,33 @@ fn shape(t: &TableSchema, want: &[(&str, bool)]) -> Option<Vec<String>> {
     .then(|| p.iter().map(|c| c.name.clone()).collect())
 }
 
-pub fn classify(tables: &[TableSchema]) -> Classified {
+/// WETH9-style wrappers by chain id: contracts whose wrap and unwrap emit `Deposit` and `Withdrawal`
+/// and no `Transfer`, each checked on chain (RFC-0071 §16). The signature alone proves nothing: a
+/// Curve gauge emits the same `Deposit` beside its own `Transfer` from the zero address.
+pub const WETH9_WRAPPERS: &[(u64, &str)] = &[
+    (1, "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"),
+    (10, "0x4200000000000000000000000000000000000006"),
+    (56, "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"),
+    (100, "0xe91d153e0b41518a2ce8dd3d7944fa863463a97d"),
+    (137, "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270"),
+    (143, "0x3bd359c1119da7da1d913d1c4d2b7c461115433a"),
+    (8453, "0x4200000000000000000000000000000000000006"),
+];
+
+pub fn wrappers(chain_id: Option<u64>) -> Vec<String> {
+    WETH9_WRAPPERS
+        .iter()
+        .filter(|(id, _)| Some(*id) == chain_id)
+        .map(|(_, a)| a.to_string())
+        .collect()
+}
+
+pub fn classify(tables: &[TableSchema], chain_id: Option<u64>) -> Classified {
     let transfer = topic("Transfer(address,address,uint256)");
     let deposit = topic("Deposit(address,uint256)");
     let withdrawal = topic("Withdrawal(address,uint256)");
+    let wrappers = wrappers(chain_id);
     let mut flow = Vec::new();
-    let mut maybe_weth = Vec::new();
     let mut other = Vec::new();
     for t in tables {
         let topic0 = t.topic0.to_ascii_lowercase();
@@ -114,13 +138,14 @@ pub fn classify(tables: &[TableSchema]) -> Classified {
                     first: c[0].clone(),
                     second: Some(c[1].clone()),
                     amount: c[2].clone(),
+                    emitters: Vec::new(),
                 });
                 continue;
             }
         }
-        if event && (topic0 == deposit || topic0 == withdrawal) {
+        if event && !wrappers.is_empty() && (topic0 == deposit || topic0 == withdrawal) {
             if let Some(c) = shape(t, &[("address", true), ("uint256", false)]) {
-                maybe_weth.push(FlowTable {
+                flow.push(FlowTable {
                     table: t.table.clone(),
                     alias: t.alias.clone(),
                     reads: if topic0 == deposit {
@@ -131,21 +156,12 @@ pub fn classify(tables: &[TableSchema]) -> Classified {
                     first: c[0].clone(),
                     second: None,
                     amount: c[1].clone(),
+                    emitters: wrappers.clone(),
                 });
                 continue;
             }
         }
         other.push(t.table.clone());
-    }
-    // `Deposit(address indexed, uint256)` is a common signature (staking pools, vaults). It reads as
-    // WETH9's mint only where the same contract also emits an ERC-20 `Transfer` the nest indexes.
-    let tokens: BTreeSet<String> = flow.iter().map(|f| f.alias.clone()).collect();
-    for w in maybe_weth {
-        if tokens.contains(&w.alias) {
-            flow.push(w);
-        } else {
-            other.push(w.table);
-        }
     }
     flow.sort_by(|a, b| a.table.cmp(&b.table));
     other.sort();
@@ -366,14 +382,19 @@ pub async fn read<S: Source>(
             for row in &out.rows {
                 let m = movement(f, row)?;
                 after = Some((m.block, m.log_index));
-                flow.add(m);
+                if f.emitters.is_empty() || f.emitters.contains(&m.token) {
+                    flow.add(m);
+                } else {
+                    *flow.other.entry(f.table.clone()).or_insert(0) += 1;
+                }
             }
             if n < PAGE {
                 break;
             }
         }
         let want = counts[&f.table];
-        let got = flow.table_rows.get(&f.table).copied().unwrap_or(0);
+        let got = flow.table_rows.get(&f.table).copied().unwrap_or(0)
+            + flow.other.get(&f.table).copied().unwrap_or(0);
         if got != want {
             bail!(
                 "{}: counted {want} rows in range but read {got}; the nest moved under the read, run \
@@ -1328,7 +1349,7 @@ mod tests {
 
     #[test]
     fn weth9_binds_by_position_and_reads_deposit_and_withdrawal() {
-        let c = classify(&weth9());
+        let c = classify(&weth9(), Some(1));
         assert!(c.other.is_empty(), "{:?}", c.other);
         let by: BTreeMap<&str, &FlowTable> = c.flow.iter().map(|f| (f.table.as_str(), f)).collect();
         let t = by["weth__transfer"];
@@ -1366,7 +1387,7 @@ mod tests {
                 col("value", "uint256", false),
             ],
         );
-        let c = classify(&[t]);
+        let c = classify(&[t], Some(1));
         assert_eq!(c.flow[0].first, "to");
         assert_eq!(c.flow[0].second.as_deref(), Some("from"));
     }
@@ -1383,7 +1404,7 @@ mod tests {
                 col("tokenId", "uint256", true),
             ],
         );
-        // A staking pool's `Deposit(address indexed, uint256)` is not a mint of anything it emits.
+        // Arbitrum lists no wrapper (its WETH wraps with `Transfer`), so no `Deposit` is flow there.
         let pool = table(
             "pool__deposit",
             "pool",
@@ -1393,7 +1414,7 @@ mod tests {
                 col("amount", "uint256", false),
             ],
         );
-        let c = classify(&[nft, pool]);
+        let c = classify(&[nft, pool], Some(42161));
         assert!(c.flow.is_empty(), "{:?}", c.flow);
         assert_eq!(c.other, vec!["nft__transfer", "pool__deposit"]);
     }
@@ -1459,6 +1480,7 @@ mod tests {
                 first: String::new(),
                 second: second.map(|_| String::new()),
                 amount: String::new(),
+                emitters: Vec::new(),
             };
             let v = serde_json::json!({
                 "block_number": 1, "log_index": log, "block_hash": "0xh",
@@ -1548,7 +1570,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_range_over_the_cap_is_refused_before_a_row_is_read() {
-        let c = classify(&weth9());
+        let c = classify(&weth9(), Some(1));
         let req = Request {
             from: 100,
             to: 199,
@@ -1574,6 +1596,64 @@ mod tests {
             "{msg}"
         );
         assert!(read(&Counted(0), &c, &req, 1_000).await.is_ok());
+    }
+
+    /// Serves two `Deposit` rows from one table: one emitted by WETH, one by a vault that shares the
+    /// alias, as factory children do. Every other table is empty.
+    struct SharedAlias;
+
+    const VAULT: &str = "0x00000000000000000000000000000000000000cc";
+
+    impl Source for SharedAlias {
+        async fn query(&self, sql: &str) -> Result<QueryOutput> {
+            let ours = sql.contains("\"weth__deposit\"");
+            let row = |emitter: &str, log: u64| {
+                serde_json::json!({
+                    "block_number": 1, "log_index": log, "block_hash": "0xh",
+                    "address": emitter, "p0": A, "p1": null, "p2": "7",
+                })
+            };
+            let rows = match (sql.starts_with("SELECT count(*)"), ours) {
+                (true, true) => vec![serde_json::json!({ "n": 2 })],
+                (true, false) => vec![serde_json::json!({ "n": 0 })],
+                (false, true) => vec![row(WETH, 0), row(VAULT, 1)],
+                (false, false) => Vec::new(),
+            };
+            Ok(QueryOutput {
+                rows,
+                columns: Vec::new(),
+                truncated: false,
+                degraded_tables: Default::default(),
+                tip_unavailable: false,
+                referenced_tables: None,
+                offchain: None,
+                scan_bound: None,
+            })
+        }
+    }
+
+    /// WETH9 is a property of a contract, not of a signature or an alias: the vault's `Deposit` is
+    /// counted, not drawn, while WETH's in the same table is a transfer from the zero address.
+    #[tokio::test]
+    async fn only_a_listed_wrapper_s_deposit_is_flow() {
+        let c = classify(&weth9(), Some(1));
+        let flow = read(&SharedAlias, &c, &one_block(), 1_000).await.unwrap();
+        let doc = document(&flow, &ctx(), &one_block());
+        assert_eq!(doc.edges.len(), 1, "{:?}", doc.edges);
+        let e = &doc.edges[0];
+        assert_eq!(
+            (e.token.as_str(), e.from.as_str(), e.to.as_str()),
+            (WETH, ZERO_ADDRESS, A)
+        );
+        assert!(doc.net.iter().all(|n| n.token == WETH));
+        let deposit: Vec<(Option<Reads>, u64)> = doc
+            .tables
+            .iter()
+            .filter(|t| t.table == "weth__deposit")
+            .map(|t| (t.reads, t.rows))
+            .collect();
+        assert_eq!(deposit, vec![(Some(Reads::Weth9Deposit), 1), (None, 1)]);
+        assert_eq!(doc.rows_total, 2);
     }
 
     #[test]

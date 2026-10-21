@@ -562,7 +562,7 @@ async fn run_diff(args: cli::DiffArgs) -> Result<()> {
     }
 
     diff::check_coverage(&req, &ctx)?;
-    let classified = diff::classify(&tables);
+    let classified = diff::classify(&tables, ctx.chain_id);
     let flow = diff::read(&backend, &classified, &req, diff::ROW_CAP).await?;
     let doc = diff::document(&flow, &ctx, &req);
     print!("{}", diff::render(&doc, args.format, args.top));
