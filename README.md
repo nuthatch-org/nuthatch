@@ -610,9 +610,8 @@ A major version is a promise about **stability**, not a claim of completeness.
   Scaled mode is built and verified across real machines, but younger: until 0.9.3 its writer pool
   did not index at all. If one process per box is enough, that is still the shape to reach for.
 
-**What is deliberately not here:** a hosted service, a token, telemetry on by default, non-EVM chains before EVM is
-airtight, or any deployment story beyond binary + compose. Those are not backlog items; they are out
-of scope.
+**What is deliberately not here:** a billed or metered hosted service, a token, telemetry on by default,
+or any deployment story beyond binary + compose. Those are not backlog items; they are out of scope.
 
 ## Security
 
@@ -637,10 +636,12 @@ the findings we closed as *not ours to fix* and why, is in
   [RFC-0015](docs/rfcs/0015-the-delightful-core.md). Deferred/leftover work is in
   [`docs/backlog.md`](docs/backlog.md); what each release changed is in [`docs/releases/`](docs/releases/).
 - **Governance:** a self-funded public good, maintained by one person; everything is open source. No
-  hosted service, no token, no phone-home. See [`GOVERNANCE.md`](GOVERNANCE.md) and the standing
-  design brief [`CLAUDE.md`](CLAUDE.md).
-- **Out of scope:** a hosted/metered service, non-EVM chains before EVM is airtight, or any deployment
-  story beyond binary + compose.
+  token, no phone-home. See [`GOVERNANCE.md`](GOVERNANCE.md) and the standing design brief
+  [`CLAUDE.md`](CLAUDE.md).
+- **Community:** the [Nuthatch Discord](https://discord.gg/p9Xc45txWa). Ask there if you would like a
+  nest run for you, on the stock binary and with no billing, or need a chain nuthatch does not support
+  yet: non-EVM chains are added on request.
+- **Out of scope:** a metered or billed service, or any deployment story beyond binary + compose.
 
 ## License
 
