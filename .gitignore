@@ -21,6 +21,8 @@ nuthatch.toml
 # …and the frozen upgrade fixtures, store included: they are what the 4.x promise is tested against.
 !tests/fixtures/upgrade/**/nuthatch.toml
 !tests/fixtures/upgrade/**/*.redb
+# …and the diff goldens' nest: keyless, a public RPC only.
+!tests/fixtures/diff/**/nuthatch.toml
 
 # local smoke-test nest (scripts/try-nuthatch.sh)
 nuthatch-trial/
