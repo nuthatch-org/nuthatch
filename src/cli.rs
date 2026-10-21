@@ -61,9 +61,9 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Run a nest's invariant/parity checks (`checks/*.sql`) against recorded expected results.
     Check(CheckArgs),
-    /// What happened in a block range, a block or a transaction, told in fixed sentences: control
-    /// plane, movements, new holders, approvals, flags (RFC-0071). `--flow` draws the token flow.
-    /// Read-only, from the rows the nest already holds.
+    /// What happened in a block range, a block or a transaction, in fixed sentences: ownership,
+    /// pauses, upgrades and roles, movements, new holders, approvals (RFC-0071). `--flow` draws the
+    /// token flow. Read-only, from the rows the nest already holds.
     Diff(DiffArgs),
     /// Regenerate the derived artifacts (`schema.json`, `llms.txt`, `semantic.toml` footguns) from
     /// `nuthatch.toml` - run after hand-editing the config (e.g. adding a factory `[[template]]`), so

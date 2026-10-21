@@ -881,7 +881,7 @@ mod tests {
         let tools = resp["result"]["tools"].as_array().unwrap();
         // The base is unreachable here, so `fetch_shape` fails its probe and falls back to advertising
         // everything (RFC-0025) - the safe default, identical to the pre-RFC-0025 unconditional surface.
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
         assert!(tools.iter().any(|t| t["name"] == "sql"));
         assert!(tools.iter().any(|t| t["name"] == "explain"));
         assert!(tools.iter().any(|t| t["name"] == "tables"));
@@ -900,14 +900,15 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // Bare nest (e.g. a Uniswap-V3 pool: Swap events, no transfers, no compliance): the 7 generic
+        // Bare nest (e.g. a Uniswap-V3 pool: Swap events, no transfers, no compliance): the 8 generic
         // tools only, and the compliance-shaped `investigate-address` prompt is withheld.
         let bare = Shape {
             transfers: false,
             compliance: false,
         };
         let t = names(&tool_specs(&bare));
-        assert_eq!(t.len(), 7);
+        assert_eq!(t.len(), 8);
+        assert!(t.contains(&"diff".to_string()), "diff is on every nest");
         for hidden in ["balance", "top_balances", "flags", "exposure"] {
             assert!(
                 !t.contains(&hidden.to_string()),
@@ -923,16 +924,16 @@ mod tests {
             compliance: false,
         };
         let t = names(&tool_specs(&token));
-        assert_eq!(t.len(), 9);
+        assert_eq!(t.len(), 10);
         assert!(t.contains(&"balance".to_string()) && t.contains(&"top_balances".to_string()));
         assert!(!t.contains(&"flags".to_string()));
 
-        // Compliance-configured token nest: the full 11, and `investigate-address` returns.
+        // Compliance-configured token nest: the full 12, and `investigate-address` returns.
         let full = Shape {
             transfers: true,
             compliance: true,
         };
-        assert_eq!(names(&tool_specs(&full)).len(), 11);
+        assert_eq!(names(&tool_specs(&full)).len(), 12);
         assert!(names(&prompt_specs(&full)).contains(&"investigate-address".to_string()));
     }
 

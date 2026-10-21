@@ -1,7 +1,9 @@
 # RFC-0071: The diff - what happened between block X and block Y, as a story
 
 - Status: **Accepted (2026-10-21, Chief).** One of five "fun" RFCs Chief asked for on
-  2026-10-21 (0068 to 0072), planned in parallel and to be built one after another.
+  2026-10-21 (0068 to 0072), planned in parallel and to be built one after another. Steps 1 to 3 of
+  §15 are built (§16 to §18): the flow, story lines and the grouped fallback, and the range story with
+  `GET /diff` and the MCP `diff` tool. Step 4, the address-history source, remains.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: RFC-0016 (the semantic layer, `semantic.toml`), RFC-0008 (labels and flags), RFC-0061
@@ -702,3 +704,101 @@ at "not used" and the integration test at the stderr warning; dropping story war
   is that, keyed by table: weather's fact kinds can be `Piece` lists built in code, rendered by
   `story::tell` from a row of named values, and get the same exact-numbers rule. Ranking is not
   shared: a story table is ordered by rows, and weather's per-fact score is its own.
+
+## 18. The range story, built 2026-10-22
+
+§15 step 3 is built in `src/range_story.rs`. `nuthatch diff` without `--flow` now tells the range
+story; `--flow` is unchanged and its eleven goldens are byte for byte what §16 committed. The story
+takes `--tx` (with `--block`, or one receipt lookup), `--block`, `--from`/`--to` and `--since-last`,
+and renders as text, Markdown or JSON. `GET /diff` serves the same document and the MCP `diff` tool
+returns the route's body as sent.
+
+**One pipeline.** `diff::produce` is the only path from a request to a document: the CLI calls it over
+a local store, `GET /diff` over the running instance's rows, and the CLI with `--url` asks the route
+for the story rather than rebuilding it from `/sql`. That last change closes §17's untested case: a
+story line is now read from the instance's own `semantic.toml`. `--flow --url` still reads through
+`/sql`, as §16 built it.
+
+**Sections, in §4's order.** The control plane: every `OwnershipTransferred`, `Paused`, `Unpaused`,
+`Upgraded`, `AdminChanged`, `BeaconUpgraded`, `RoleGranted`, `RoleRevoked` and `RoleAdminChanged` in
+chain order, each with its transaction, never cut by `--top`. Movements per token: the `--top`
+largest transfers and net flows, tokens ordered by rows, then address. ERC-721 and ERC-1155 transfers
+are counted and told by their first `--top` rows in chain order, since a token id is not an amount.
+New holders and first rows. ERC-20 approvals per token, unlimited ones first, then ERC-721 and
+`ApprovalForAll`. Threshold flags and every labelled address seen. Then every other table through
+`story::read`. Every catalogue entry is matched by topic0 and parameter shape, and every sentence's
+amounts go through `diff::amount_in` and its addresses through `NestContext::address_text`.
+
+### Gate
+
+| Gate | Result |
+|---|---|
+| CLI, route and MCP tool give one document | Pass. `the_cli_the_route_and_the_mcp_tool_give_the_same_document` runs `nuthatch serve` on one copy of the control-plane fixture and the CLI on another, and compares the CLI's `--format json`, `GET /diff` and `tools/call diff` through `nuthatch mcp` as strings, for a range, a transaction and a `flow=true` block. The CLI pointed at the instance prints the same JSON and the same text |
+| Goldens: Euler and a control-plane fixture | Pass on macOS (aarch64), in the ordinary `it` suite. Euler: the DAI transaction in text, Markdown and JSON, and blocks 16,818,024 to 16,818,085. Control plane (`tests/fixtures/diff/control/`): mainnet blocks 26,241,000 to 26,243,100, recorded by a `--seal-direct` backfill, 33 segments, 516 KB. It holds a `Paused` and an `Unpaused`, two proxies' `AdminChanged`, two `RoleAdminChanged` and a deployment transaction with `Upgraded`, `OwnershipTransferred`, `RoleGranted` and `RoleRevoked`: 30 control-plane events, beside LINK (1,877 transfers and 128 approvals, 23 unlimited, over the later range) and the ENS registrar. Goldens: that later range in text, Markdown and JSON, the whole range, and the deployment transaction. `git status --ignored` shows no ignored file in the new fixture |
+| `--flow` and its 11 goldens unchanged | Pass. No flow golden was regenerated, and `tests/diff_flow.rs` passes against the committed files |
+| RSS on a Lodestar copy, widest range under the cap | Pass. The GRT nest Lodestar reads (Arbitrum, ThinkPad copy), blocks 234,915,449 to 376,570,031, 1,999,995 transfers: text in 20.4 s at 572 MiB peak, new holders counted (28,760 against 4.7M earlier rows). The allocations nest's whole history, 6,000,998 rows, in 5.1 s at 105 MiB. 6,695,707 rows refused in 0.41 s |
+| The route does not stall indexing | Pass. `nuthatch dev` following mainnet LINK and USDC at a 2 s poll: 90 s idle, tip lag mean 0.14 blocks, max 1; 90 s with 8 clients looping on `/diff` over the last 200 blocks, mean 0.41, max 2, and the cursor advanced 7 blocks in both. 784 diffs answered (mean 0.45 s), 1,307 refused at once with `503 busy`: a diff holds one of the cursor's two analytical permits for its whole run, and its queries run on blocking threads, never the ingest task. 337 MiB resident after the load |
+| Reorgs above the sealed boundary | Pass. `a_reorg_above_the_sealed_boundary_tells_the_canonical_story` (proptest, 12 cases): 12 hot blocks over the sealed fixture, a reorg of depth 1 to 12 onto one of three forks, and the story of a range crossing the boundary equals the one told from a store that only held the new chain, with `final: false`. `--final-only` refuses that range and names the unsealed span |
+
+**Mutation checks**, each applied to the committed tree, shown in the diff, restored from HEAD and
+checked clean. Reading control-plane tables with `--top` as their limit: `the_control_plane_is_never_capped`
+red (19 of 22 events at `--top 1`); the goldens stay green, since no table there holds more than ten.
+The new-holders budget doubled: the omission unit test red. Naming 2^256-2 as unlimited: the unit test
+red, the integration test green (no such approval in the fixture); dropping the naming: three goldens
+red. The `--since-last` cursor written into the nest directory: red at the state-directory listing,
+and written to both places, red at "the nest directory changed". The route naming the NID as the data
+identity: red at "the route and the CLI differ". The MCP tool re-serialising compactly: red at "the
+MCP tool and the CLI differ"; re-serialising pretty is an equivalent mutant (key order is kept) and
+stays green. Calling every range final: the reorg property and the `--final-only` test red.
+
+### What the gate found
+
+The first RSS run failed the whole diff. New holders asked, in one query, which of the 1,999,995
+range rows' recipients appear in the 4.7M rows before it, and Burrmill's hash join ran out of its 448
+MB pool. It now reads history as distinct (token, holder) pairs and intersects them with the touched
+set in Rust, and an engine memory refusal omits the section with that reason instead of failing the
+diff, which `new_holders_the_engine_cannot_hold_are_omitted_not_fatal` holds.
+
+The rewrite also corrected a count. The join had looked for a holder's history only in the table it
+received from in range, so a WETH holder who wrapped by `Deposit` before the range and received by
+`Transfer` inside it was called new. Over Euler's blocks 16,818,024 to 16,818,085 that was two of
+363; the golden now says 361.
+
+### Decisions the earlier sections did not settle
+
+- **`--top` defaults to 10 for the story** (§4's K) and stays 25 for `--flow`.
+- **The row cap counts every row read whole**: transfers, control-plane rows and ERC-20 approvals, at
+  2,000,000. NFT tables and every other table are counted, never read whole.
+- **New holders are relative to the nest.** "No transfer in of the token before block X, in this
+  nest's rows since its start block", at block level even for `--tx`. A range that starts at the
+  nest's first block is not counted, and says why. Its own budget is 20,000,000 history rows; above
+  it, or when the engine cannot hold the history, the section is omitted with the count.
+- **First rows** are per table: a table whose first row in this nest is in range.
+- **Unlimited approvals** are listed first in chain order, up to `--top`, with the rest counted; an
+  approval of zero reads "set the allowance to zero".
+- **Roles** are named only when their hash is one of a fixed list (`DEFAULT_ADMIN_ROLE`, `MINTER_ROLE`,
+  `PAUSER_ROLE` and six more); any other is printed as its hash.
+- **Threshold flags** are read only where `[flags] threshold` is set, and print base units: a flag
+  carries no token.
+- **`--since-last`** starts at the nest's first block when no cursor exists, ends at `sealed_through`,
+  prints nothing and keeps the cursor when nothing new is sealed, and writes the cursor only after
+  the diff has printed.
+- **`GET /diff` makes no RPC call**, so `tx` needs `block`. It holds one analytical permit and one hot
+  snapshot for the whole diff, so its queries see one state, under `/sql`'s 30 s budget and hot-row
+  ceilings. A mount whose `sql` mode is not `open` refuses it, because a diff reads every table.
+- **The MCP `diff` tool is advertised on every nest**, unlike `balance`: every nest has rows to tell.
+- **The control-plane fixture carries `schema.json`, `llms.txt`, `semantic.toml` and `views/`**,
+  because `serve` writes them when absent and two of them are in the data identity; a real nest has
+  them from `init`.
+
+### Not verified
+
+- Linux byte-identity rests on CI running `tests/diff_range.rs`.
+- ERC-1155 sentences have no fixture; the templates are covered only by reading the code.
+- The route's RSS was read after the load, not as a peak.
+- Nobody from GraphOps or an operator has read a range story.
+
+### What remains
+
+§15 step 4, the address-history source (old S5): `txlist`, `txlistinternal` and `tokentx` rows for
+watched addresses into the story and the flow, gated on Etherscan's `txlistinternal` for one range.

@@ -247,9 +247,10 @@ pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
          - `GET /queries`             the mount's SQL mode and the queries its operator declared in\n\
          \x20                            `mounts.toml` (none on an open nest); `GET /q/{{name}}` runs one\n\
          - `GET /derived`             the nest's incremental entities (`entities.toml`); `GET /derived/{{entity}}` reads one\n\
+         - `GET /diff?from=X&to=Y`    what happened in a range (`block=N`, or `tx=0x..&block=N`), as JSON, `format=text` or `markdown`\n\
          \n\
          ## MCP (for coding agents)\n\
-         Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, entity,\n\
+         Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, entity, diff,\n\
          balance, top_balances. Fully offline against the local instance; nothing phones home.\n"
     )
 }

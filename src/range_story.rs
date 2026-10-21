@@ -115,7 +115,10 @@ const A: (&str, bool) = ("address", true);
 const U: (&str, bool) = ("address", false);
 
 /// §4's fixed catalogue, beside the flow's `Transfer` and WETH9 shapes in [`diff::classify`].
-const CATALOGUE: &[(&str, &[(&str, bool)], Kind)] = &[
+/// Each parameter's Solidity type and whether it is indexed, in declared order.
+type Shape = &'static [(&'static str, bool)];
+
+const CATALOGUE: &[(&str, Shape, Kind)] = &[
     (
         "OwnershipTransferred(address,address)",
         &[A, A],
@@ -656,6 +659,9 @@ fn earliest(a: &mut Option<(u64, u64, String)>, b: (u64, u64, &str), first: bool
     }
 }
 
+/// One ERC-20 approval: block, log index, owner, spender, amount.
+type Approved = (u64, u64, String, String, U256);
+
 /// Count everything the story reads in full, refuse above the cap, then read each section.
 pub async fn read<S: Source>(
     src: &S,
@@ -752,7 +758,7 @@ pub async fn read<S: Source>(
     control.sort_by(|a, b| (a.block, a.log_index, &a.table).cmp(&(b.block, b.log_index, &b.table)));
 
     // ERC-20 approvals: every row read, per token; unlimited ones first.
-    let mut by_token: BTreeMap<String, Vec<(u64, u64, String, String, U256)>> = BTreeMap::new();
+    let mut by_token: BTreeMap<String, Vec<Approved>> = BTreeMap::new();
     let mut approval_alias: BTreeMap<String, String> = BTreeMap::new();
     for c in cat.iter().filter(|c| c.kind == Kind::Approval) {
         let want = rows_in(&c.table);
@@ -1144,41 +1150,20 @@ async fn new_holders<S: Source>(
         ));
         return Ok(out);
     }
-    let mut before: BTreeSet<(String, String)> = BTreeSet::new();
-    for (f, col, emitters) in &receiving {
-        let h = format!("lower(CAST({} AS VARCHAR))", quote(col));
-        let mut after: Option<(String, String)> = None;
-        loop {
-            let keyset = after
-                .as_ref()
-                .map(|(t, a)| format!(" WHERE t > '{t}' OR (t = '{t}' AND h > '{a}')"))
-                .unwrap_or_default();
-            let sql = format!(
-                "SELECT t, h FROM (SELECT DISTINCT lower(address) AS t, {h} AS h FROM {tbl} \
-                 WHERE block_number < {from}{emitters} AND {h} IN (SELECT {h} FROM {tbl} WHERE \
-                 {range}{emitters})){keyset} ORDER BY t, h LIMIT {PAGE}",
-                tbl = quote(&f.table),
-                from = req.from,
-                range = diff::filter(req),
-            );
-            let q = src
-                .query(&sql)
-                .await
-                .with_context(|| format!("reading {}", f.table))?;
-            diff::complete(&q, &f.table)?;
-            let n = q.rows.len() as u64;
-            for r in &q.rows {
-                let (Some(t), Some(a)) = (diff::text(r.get("t")), diff::text(r.get("h"))) else {
-                    continue;
-                };
-                after = Some((t.clone(), a.clone()));
-                before.insert((t, a));
-            }
-            if n < PAGE {
-                break;
-            }
+    let before = match seen_before(src, &receiving, req, &touched).await {
+        Ok(b) => b,
+        Err(e) if crate::sql_errors::is_out_of_memory(&format!("{e:#}")) => {
+            out.status = Status::Omitted;
+            out.reason = Some(format!(
+                "telling a new holder from an old one means reading the {} transfer rows before \
+                 block {}, and the query engine could not do it within its memory limit",
+                group(out.history_rows),
+                group(req.from)
+            ));
+            return Ok(out);
         }
-    }
+        Err(e) => return Err(e),
+    };
     let mut per: BTreeMap<&str, Vec<(&str, U512)>> = BTreeMap::new();
     for (&(t, a), v) in &touched {
         if !before.contains(&(t.to_string(), a.to_string())) {
@@ -1216,6 +1201,52 @@ async fn new_holders<S: Source>(
     });
     out.tokens = tokens;
     Ok(out)
+}
+
+/// The touched (token, holder) pairs that received the token before the range. History is read as
+/// distinct pairs, so the engine holds one entry per holder rather than joining two row sets.
+async fn seen_before<S: Source>(
+    src: &S,
+    receiving: &[(&diff::FlowTable, String, String)],
+    req: &Request,
+    touched: &BTreeMap<(&str, &str), U512>,
+) -> Result<BTreeSet<(String, String)>> {
+    let mut before = BTreeSet::new();
+    for (f, col, emitters) in receiving {
+        let h = format!("lower(CAST({} AS VARCHAR))", quote(col));
+        let mut after: Option<(String, String)> = None;
+        loop {
+            let keyset = after
+                .as_ref()
+                .map(|(t, a)| format!(" WHERE t > '{t}' OR (t = '{t}' AND h > '{a}')"))
+                .unwrap_or_default();
+            let sql = format!(
+                "SELECT t, h FROM (SELECT DISTINCT lower(address) AS t, {h} AS h FROM {tbl} \
+                 WHERE block_number < {from}{emitters}){keyset} ORDER BY t, h LIMIT {PAGE}",
+                tbl = quote(&f.table),
+                from = req.from,
+            );
+            let q = src
+                .query(&sql)
+                .await
+                .with_context(|| format!("reading {}", f.table))?;
+            diff::complete(&q, &f.table)?;
+            let n = q.rows.len() as u64;
+            for r in &q.rows {
+                let (Some(t), Some(a)) = (diff::text(r.get("t")), diff::text(r.get("h"))) else {
+                    continue;
+                };
+                if touched.contains_key(&(t.as_str(), a.as_str())) {
+                    before.insert((t.clone(), a.clone()));
+                }
+                after = Some((t, a));
+            }
+            if n < PAGE {
+                break;
+            }
+        }
+    }
+    Ok(before)
 }
 
 /// Tables whose first row in this nest is in the range.
@@ -1377,7 +1408,6 @@ fn token_heading(
 }
 
 fn blocks(doc: &Document) -> Vec<Block> {
-    let top = doc.top;
     let mut out = Vec::new();
 
     let mut lines = Vec::new();
@@ -1658,7 +1688,6 @@ fn blocks(doc: &Document) -> Vec<Block> {
         title: "Flags and labels".into(),
         lines,
     });
-    let _ = top;
     out
 }
 
@@ -1937,6 +1966,44 @@ mod tests {
         );
         assert_eq!(under.tokens[0].count, 1);
         assert_eq!(under.tokens[0].largest[0].address, SPENDER);
+    }
+
+    /// Counts a small history, then refuses the history read as the engine does over its pool.
+    struct Exhausted;
+
+    impl Source for Exhausted {
+        async fn query(&self, sql: &str) -> Result<crate::analytics::QueryOutput> {
+            if sql.contains("DISTINCT") {
+                anyhow::bail!("substrate error: Out of Memory Error: Additional allocation failed");
+            }
+            History(5).query(sql).await
+        }
+    }
+
+    /// Within its row budget the history read can still exceed the engine's memory: the section is
+    /// omitted and says so, and the rest of the diff stands.
+    #[tokio::test]
+    async fn new_holders_the_engine_cannot_hold_are_omitted_not_fatal() {
+        let (classified, flow) = one_receipt();
+        let mut ctx = ctx();
+        ctx.start_block = Some(100);
+        let req = Request {
+            from: 150,
+            to: 150,
+            tx: None,
+        };
+        let out = new_holders(&Exhausted, &classified, &flow, &req, &ctx, 10)
+            .await
+            .unwrap();
+        assert_eq!(out.status, Status::Omitted);
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap()
+                .ends_with("could not do it within its memory limit"),
+            "{:?}",
+            out.reason
+        );
     }
 
     /// 2^256-1 is the one amount named rather than printed, and one less than it is printed exactly.

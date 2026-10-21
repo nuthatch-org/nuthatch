@@ -513,7 +513,7 @@ fn the_cli_the_route_and_the_mcp_tool_give_the_same_document() {
         assert_eq!(tool, cli, "{path}: the MCP tool and the CLI differ");
     }
     // The CLI pointed at the instance prints the route's document, and its text is the local text.
-    let over = cli_over_http(served.port, &[&LATER[..], &["--format", "json"]].concat());
+    let over = cli_over_http(served.port, &[LATER, &["--format", "json"]].concat());
     let (_, cli, _) = diff(local.path(), &[LATER, &["--format", "json"]].concat());
     assert_eq!(over, cli);
     let over = cli_over_http(served.port, LATER);
@@ -633,11 +633,11 @@ fn block_rows(b: u64, fork: u64) -> Vec<(String, String)> {
             "table": "link__approval", "block_number": b, "block_hash": hash,
             "tx_hash": format!("0x{:060x}{:04x}", b, 10), "log_index": 10, "_seq": 10,
             "address": LINK, "owner": addr(b), "spender": addr(b + 1),
-            "value": if (b + fork) % 2 == 0 { alloy_primitives::U256::MAX.to_string() } else { "5".into() },
+            "value": if (b + fork).is_multiple_of(2) { alloy_primitives::U256::MAX.to_string() } else { "5".into() },
         })
         .to_string(),
     ));
-    if (b + fork) % 4 == 0 {
+    if (b + fork).is_multiple_of(4) {
         rows.push((
             format!("{b:012}-{:06}", 11),
             serde_json::json!({

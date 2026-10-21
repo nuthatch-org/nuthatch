@@ -309,7 +309,7 @@ Largest movements, per token (amounts of two tokens are never compared)
       0xc2a463278387e649eeaa5ae5076e283260b0b1be  +980.324128545592885258 eDAI
 
 New holders: no transfer in of the token before block 16,818,024, in this nest's rows since block 16,817,996
-  WETH: 363
+  WETH: 361
     0x036cec1a199234fc02f72d29e596a09440825f1c received 61,448.430227250683598741 WETH
     0x030ba81f1c18d280636f32af80b9aad02cf0854e received 34,377.025514154658653096 WETH
     0xd3b7cea28feb5e537fca4e657e3f60129456eaf3 received 28,994.303891868396965958 WETH
@@ -320,7 +320,7 @@ New holders: no transfer in of the token before block 16,818,024, in this nest's
     0xd8de6af55f618a7bc69835d55ddc6582220c36c0 received 10,072.757392057596279933 WETH
     0x00000000032962b51589768828ad878876299e14 received 9,775.315873406766200282 WETH
     0x9dd864d39fbfdf7648402746263e451cd4f36af0 received 8,846.101712577416528045 WETH
-    353 more not listed
+    351 more not listed
   USDC: 347
     0x036cec1a199234fc02f72d29e596a09440825f1c received 454,413,863.41846 USDC
     0xd444a7ac5d1c5eb8ebc9dab83834a412e9b7be76 received 244,413,863.41846 USDC

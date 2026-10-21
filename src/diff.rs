@@ -393,8 +393,8 @@ impl Ask {
 }
 
 pub enum Produced {
-    Flow(Document),
-    Story(crate::range_story::Document),
+    Flow(Box<Document>),
+    Story(Box<crate::range_story::Document>),
 }
 
 impl Produced {
@@ -448,11 +448,11 @@ pub async fn produce<S: Source>(src: &S, inputs: Inputs<'_>, ask: &Ask) -> Resul
                 warnings: inputs.warnings,
             };
             let events = crate::story::read(src, plan, req, ask.top, ctx).await?;
-            Ok(Produced::Flow(document(&flow, events, ctx, req)))
+            Ok(Produced::Flow(Box::new(document(&flow, events, ctx, req))))
         }
-        Mode::Story => Ok(Produced::Story(
+        Mode::Story => Ok(Produced::Story(Box::new(
             crate::range_story::read(src, &classified, inputs, ask).await?,
-        )),
+        ))),
     }
 }
 

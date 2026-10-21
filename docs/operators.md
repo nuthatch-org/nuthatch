@@ -915,6 +915,7 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /schema` | the full data model |
 | `GET /sql?q=…` | read-only analytical SQL over hot and sealed data; the answer carries `cached`, `degraded`, `tip_unavailable` and a `provenance` block (`as_of`, `sealed_through`, `nid`, `registry_hash`) |
 | `GET /explain` | binds caller-supplied SQL without running it (`valid`, `note`); guarded like `/sql` |
+| `GET /diff` | what happened in a range (`from`, `to`), a `block`, or a `tx` with its `block`: the document `nuthatch diff --format json` prints, or `format=text`/`markdown`; `flow=true` for the token flow. One `/sql` permit per diff, `/sql`'s hot-row ceilings and its 30 s budget; refused on a mount whose `sql` mode is not `open` (RFC-0071) |
 | `GET /queries`, `GET /q/{name}` | the mount's `sql` mode (`open`, `allowlist`, `deny`) and its declared queries (RFC-0034), and one of them by name |
 | `GET /derived`, `GET /derived/{entity}`, `GET /derived/{entity}/{key}` | authored incremental entities (RFC-0041): the list with its head, one relation, one row |
 | `GET /ipfs/gave-up?limit=100` | the `[[ipfs]]` documents the nest stopped trying to fetch, in block order |
