@@ -610,9 +610,8 @@ A major version is a promise about **stability**, not a claim of completeness.
   Scaled mode is built and verified across real machines, but younger: until 0.9.3 its writer pool
   did not index at all. If one process per box is enough, that is still the shape to reach for.
 
-**What is deliberately not here:** a hosted service, a token, telemetry on by default, non-EVM chains before EVM is
-airtight, or any deployment story beyond binary + compose. Those are not backlog items; they are out
-of scope.
+**What is deliberately not here:** a billed or metered hosted service, a token, telemetry on by default,
+or any deployment story beyond binary + compose. Those are not backlog items; they are out of scope.
 
 ## Security
 
