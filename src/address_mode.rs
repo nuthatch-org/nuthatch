@@ -3278,6 +3278,8 @@ fn before_history(s: &ModeState, q: &HashMap<String, String>) -> Option<String> 
         return None;
     }
     Action::from_etherscan(q.get("action")?)?;
+    // A request naming no address has no history to start; `respond` says what is wrong with it.
+    q.get("address").filter(|a| !a.is_empty())?;
     let start = match q.get("startblock").filter(|v| !v.is_empty()) {
         None => 0,
         Some(v) => v.parse::<u64>().ok()?,
@@ -4191,7 +4193,7 @@ pub fn counter<M: Rpc, T: Rpc>(discovery: Arc<Discoverer<Counted<M>, Counted<T>>
     })
 }
 
-/// Forwards a `proxy` or `logs` call to the nest's main RPC, once `verified` says it is on the
+/// Forwards a `proxy`, `logs` or balance call to the nest's main RPC, once `verified` says it is on the
 /// nest's chain. Counted with the rest of the nest's calls.
 pub fn forward<M: Rpc, T: Rpc>(
     discovery: Arc<Discoverer<Counted<M>, Counted<T>>>,
@@ -5788,6 +5790,78 @@ mod tests {
         assert!(text.contains("chain_id=\"1\"") && text.contains("chain_id=\"100\""));
     }
 
+    /// On a directory of chains, a balance, a gas price and a nonce are read from the RPC of the chain
+    /// `chainid` names, never another's.
+    #[tokio::test]
+    async fn balance_and_gas_calls_reach_the_named_chains_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        // Each chain's RPC answers its own chain id to everything.
+        let state = |id: u64| {
+            let store = Store::open(&dir.path().join(format!("{id}.redb"))).unwrap();
+            let history = AddressHistory::open(store, id, &[ALICE.into()]).unwrap();
+            let forward: crate::address_proxy::Forward = Arc::new(move |_m: String, _p: Value| {
+                Box::pin(async move { Ok(json!(format!("0x{id:x}"))) })
+            });
+            Arc::new(
+                ModeState::new(history, id, Duration::from_secs(300), true).with_forward(forward),
+            )
+        };
+        let chains: Chains = Arc::new([(1, state(1)), (100, state(100))].into());
+        for id in [1u64, 100] {
+            let ask = async |q: &str| {
+                call(
+                    chains_router(chains.clone()),
+                    "GET",
+                    &format!("/api?chainid={id}&{q}"),
+                    None,
+                )
+                .await
+            };
+            let (_, v) = ask(&format!(
+                "module=account&action=balance&address={ALICE}&tag=0x10"
+            ))
+            .await;
+            assert_eq!(v["result"], id.to_string(), "chain {id}: {v}");
+            let (_, v) = ask(&format!(
+                "module=account&action=balancemulti&address={ALICE}"
+            ))
+            .await;
+            assert_eq!(v["result"][0]["balance"], id.to_string(), "chain {id}: {v}");
+            for action in [
+                "eth_gasPrice",
+                "eth_getTransactionCount&address=0xaa&tag=pending",
+            ] {
+                let (_, v) = ask(&format!("module=proxy&action={action}")).await;
+                assert_eq!(v["result"], format!("0x{id:x}"), "chain {id} {action}: {v}");
+            }
+        }
+    }
+
+    /// A token named with no address is refused for what it is, not answered with where history
+    /// starts: asking again from there would only be refused again.
+    #[tokio::test]
+    async fn a_token_without_an_address_is_unsupported_not_before_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(25_700_000, None, 64),
+        );
+        let (_, v) = call(
+            router(s),
+            "GET",
+            "/api?module=account&action=tokentx&contractaddress=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            None,
+        )
+        .await;
+        let r = v["result"].as_str().unwrap_or_default();
+        assert!(
+            r.starts_with("NUTHATCH_UNSUPPORTED:") && r.contains("contractaddress"),
+            "{v}"
+        );
+    }
+
     /// rotki asks from block 0, or names no start: every account action must answer in the wording
     /// rotki reads to ask again from the configured start.
     #[tokio::test]
@@ -7265,6 +7339,7 @@ mod tests {
                         page: 1,
                         offset: 10_000,
                         generation: None,
+                        contract: None,
                     },
                 )
                 .unwrap()
