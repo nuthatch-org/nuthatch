@@ -172,7 +172,9 @@ l1_blocks = true              # Arbitrum-family chains only (arbitrum-one, robin
 ### `[address_history]` - an account's history for rotki (RFC-0063)
 
 A nest with this table and no `[[contracts]]` watches accounts instead of contracts, and serves their
-history Etherscan-shaped at `GET /api`, so rotki can use it as an indexer. It runs on its own light
+history Etherscan-shaped at `GET /api`, so rotki can use it as an indexer. `/api` also takes the same
+parameters as a form `POST` (up to 1 MiB), merged with the query string; a key the two give different
+values is refused. `chainId` is read as `chainid`, and the two naming different chains are refused. It runs on its own light
 path: no SQL engine, no sealing, one cursor polling the chain head.
 
 ```toml

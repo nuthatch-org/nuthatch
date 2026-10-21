@@ -96,7 +96,9 @@ different outcomes.
 
 ## 5. The HTTP surface
 
-`GET /api` on the nest, Etherscan-shaped: `chainid, module, action`, and for account lists
+`GET /api` on the nest, or the same parameters as a form `POST` (up to 1 MiB, merged with the query
+string, a key the two disagree on refused), as BitBoxApp sends a call too long for a GET. `chainId` is
+read as `chainid`; the two naming different chains are refused. Etherscan-shaped: `chainid, module, action`, and for account lists
 `address, startblock, endblock, sort, page, offset`, inclusive bounds, ascending by default, 1,000
 rows a page. `txlistinternal` also takes `txhash`; off a loopback bind only a transaction the nest
 holds for a watched account is traced for it. The token actions take `contractaddress` with an
