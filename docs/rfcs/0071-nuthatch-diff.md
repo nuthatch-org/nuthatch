@@ -479,3 +479,24 @@ well under one cent. Coverage read local copies and one running nest and made no
 - S1 binds template parameters by position and type, never by column name.
 - Whether `init` should index control-plane events by default is a question for Chief before S1:
   without it, the first section of every diff measured here is empty.
+
+## 15. Chief's decision on S0, 2026-10-21
+
+Chief agreed to continue in a new order, which supersedes §11's from S1 on:
+
+1. **The flow first.** The forensic `--flow` for a transaction, block or range, in text, DOT and
+   Mermaid, with §14's corrections: WETH9's `Deposit` and `Withdrawal` read as mint and burn,
+   parameters bound by position and type, transfers to and from the zero address said as such, and
+   net flow described as transfers seen, never as a balance. **Gate:** S0's Euler nest re-run gives
+   every leg in §14 to the unit, and no longer shows the 19,639.62 WETH the attacker had unwrapped;
+   byte-identical goldens on macOS and Linux; RSS on a Lodestar copy inside the budget.
+2. **Author templates and a better fallback, together.** `story` lines in `semantic.toml` (outside
+   the data identity), and a fallback that groups each event by its parameters rather than printing
+   "Signature x N". **Gate:** Lodestar with templates written for it reaches half its rows; every row
+   is still counted somewhere.
+3. **The range story** (old S1) and the other inputs and surfaces (old S2) on top of both.
+4. **The address-history source** (old S5), unchanged.
+
+`init` does not add control-plane events to new nests by default: it would change every new nest's
+data identity for a section few read. RFC-0072's S1 waits for step 2, since weather reuses these
+templates.
