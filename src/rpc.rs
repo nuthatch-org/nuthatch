@@ -2337,6 +2337,18 @@ impl RpcClient {
         Ok(result.get("hash").and_then(Value::as_str).map(String::from))
     }
 
+    /// The block a transaction was mined in, from its receipt, or None if the node has no receipt.
+    pub async fn transaction_block(&self, hash: &str) -> Result<Option<u64>> {
+        let result = self
+            .call("eth_getTransactionReceipt", json!([hash]))
+            .await?;
+        result
+            .get("blockNumber")
+            .and_then(Value::as_str)
+            .map(parse_hex_u64)
+            .transpose()
+    }
+
     /// [`Self::block_hash`] and the same header's timestamp, from one `eth_getBlockByNumber`.
     pub async fn block_record(&self, number: u64) -> Result<Option<(String, Option<u64>)>> {
         let result = self

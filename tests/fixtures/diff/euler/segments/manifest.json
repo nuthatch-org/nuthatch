@@ -1,0 +1,339 @@
+{
+  "manifest_version": 1,
+  "tables": {
+    "dai__approval": [
+      {
+        "hash": "c742dac089aeed4529c868e64cd99e3a560058849e97ef497d37907387626a83",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 56,
+        "file": "dai__approval-c742dac089aeed4529c868e64cd99e3a560058849e97ef497d37907387626a83.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "c742dac089aeed4529c868e64cd99e3a560058849e97ef497d37907387626a83"
+      }
+    ],
+    "dai__transfer": [
+      {
+        "hash": "86a2967269f7e191ef11bb1935919fa1f5f08bcd489a771c899ccedd266440a2",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 274,
+        "file": "dai__transfer-86a2967269f7e191ef11bb1935919fa1f5f08bcd489a771c899ccedd266440a2.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "86a2967269f7e191ef11bb1935919fa1f5f08bcd489a771c899ccedd266440a2"
+      }
+    ],
+    "ddai__transfer": [
+      {
+        "hash": "aa19f7597216a5fa3b8838b7b5294f00208e5f8a61f03398f613f1803f11700c",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 6,
+        "file": "ddai__transfer-aa19f7597216a5fa3b8838b7b5294f00208e5f8a61f03398f613f1803f11700c.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "aa19f7597216a5fa3b8838b7b5294f00208e5f8a61f03398f613f1803f11700c"
+      }
+    ],
+    "dsteth__transfer": [
+      {
+        "hash": "13a32e212c4200315760f3bbf7378092e22499241c406d3111e9be50763593df",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 6,
+        "file": "dsteth__transfer-13a32e212c4200315760f3bbf7378092e22499241c406d3111e9be50763593df.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "13a32e212c4200315760f3bbf7378092e22499241c406d3111e9be50763593df"
+      }
+    ],
+    "dusdc__transfer": [
+      {
+        "hash": "f174a6ee841291fe049b3a9cc8e0a83ff8ff6ceb42ceffae55537fb3ec171d5d",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 6,
+        "file": "dusdc__transfer-f174a6ee841291fe049b3a9cc8e0a83ff8ff6ceb42ceffae55537fb3ec171d5d.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "f174a6ee841291fe049b3a9cc8e0a83ff8ff6ceb42ceffae55537fb3ec171d5d"
+      }
+    ],
+    "dwbtc__transfer": [
+      {
+        "hash": "0155ce121587c67b2133961bceaf1b7f7b00395506f23d7fabce2eaba678aa72",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 6,
+        "file": "dwbtc__transfer-0155ce121587c67b2133961bceaf1b7f7b00395506f23d7fabce2eaba678aa72.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "0155ce121587c67b2133961bceaf1b7f7b00395506f23d7fabce2eaba678aa72"
+      }
+    ],
+    "dweth__transfer": [
+      {
+        "hash": "9ef5f469e7e384e229d5363b6ab9dfef956e8f191161c4d73f6ca506c19c8a3a",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 8,
+        "file": "dweth__transfer-9ef5f469e7e384e229d5363b6ab9dfef956e8f191161c4d73f6ca506c19c8a3a.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "9ef5f469e7e384e229d5363b6ab9dfef956e8f191161c4d73f6ca506c19c8a3a"
+      }
+    ],
+    "dwsteth__transfer": [
+      {
+        "hash": "d4ad3f22a0c47eb33293f513cba18cb0f8da1fa86be021fac69e22082035db80",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 12,
+        "file": "dwsteth__transfer-d4ad3f22a0c47eb33293f513cba18cb0f8da1fa86be021fac69e22082035db80.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "d4ad3f22a0c47eb33293f513cba18cb0f8da1fa86be021fac69e22082035db80"
+      }
+    ],
+    "edai__transfer": [
+      {
+        "hash": "5cf0eacfcdd716bfcda1de9b1ed9981576295bf1d7b93141051c4e0b41c24a4a",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 7,
+        "file": "edai__transfer-5cf0eacfcdd716bfcda1de9b1ed9981576295bf1d7b93141051c4e0b41c24a4a.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "5cf0eacfcdd716bfcda1de9b1ed9981576295bf1d7b93141051c4e0b41c24a4a"
+      }
+    ],
+    "esteth__transfer": [
+      {
+        "hash": "edbb3ad5157a7193fb1f3ce913492b152db19bcf5d3d8774242cd40aa44974c8",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 6,
+        "file": "esteth__transfer-edbb3ad5157a7193fb1f3ce913492b152db19bcf5d3d8774242cd40aa44974c8.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "edbb3ad5157a7193fb1f3ce913492b152db19bcf5d3d8774242cd40aa44974c8"
+      }
+    ],
+    "eusdc__transfer": [
+      {
+        "hash": "da8eb27af4bb51737e69f1c85c03fe83eaa01cc56a22a1a08556720c369ec11c",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 6,
+        "file": "eusdc__transfer-da8eb27af4bb51737e69f1c85c03fe83eaa01cc56a22a1a08556720c369ec11c.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "da8eb27af4bb51737e69f1c85c03fe83eaa01cc56a22a1a08556720c369ec11c"
+      }
+    ],
+    "ewbtc__transfer": [
+      {
+        "hash": "d18f526966a1202c83c72028f278e0e51f02cd024a53a7005e8a564b83907af6",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 6,
+        "file": "ewbtc__transfer-d18f526966a1202c83c72028f278e0e51f02cd024a53a7005e8a564b83907af6.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "d18f526966a1202c83c72028f278e0e51f02cd024a53a7005e8a564b83907af6"
+      }
+    ],
+    "eweth__transfer": [
+      {
+        "hash": "f5649e65954077f47f50bcf474885d456c9814810832818d0c4789ceed0888a9",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 8,
+        "file": "eweth__transfer-f5649e65954077f47f50bcf474885d456c9814810832818d0c4789ceed0888a9.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "f5649e65954077f47f50bcf474885d456c9814810832818d0c4789ceed0888a9"
+      }
+    ],
+    "ewsteth__transfer": [
+      {
+        "hash": "120be10d3f16043d038b4b596e3f2d718f9941073d8e6e8374398558021872c9",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 12,
+        "file": "ewsteth__transfer-120be10d3f16043d038b4b596e3f2d718f9941073d8e6e8374398558021872c9.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "120be10d3f16043d038b4b596e3f2d718f9941073d8e6e8374398558021872c9"
+      }
+    ],
+    "steth__approval": [
+      {
+        "hash": "c43345a21baa0710aca696987550809147a5fb2e4207e12fa49e0fbe17c81403",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 101,
+        "file": "steth__approval-c43345a21baa0710aca696987550809147a5fb2e4207e12fa49e0fbe17c81403.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "c43345a21baa0710aca696987550809147a5fb2e4207e12fa49e0fbe17c81403"
+      }
+    ],
+    "steth__submitted": [
+      {
+        "hash": "fdf29a40c8eac723c12d16a224f74f807b8f6b2c804ffdea9328af024259ee88",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 8,
+        "file": "steth__submitted-fdf29a40c8eac723c12d16a224f74f807b8f6b2c804ffdea9328af024259ee88.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "fdf29a40c8eac723c12d16a224f74f807b8f6b2c804ffdea9328af024259ee88"
+      }
+    ],
+    "steth__transfer": [
+      {
+        "hash": "c00f88e4524de9328dd67ce490fb156f511d20b59ce61cb0947b050bd105a44d",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 144,
+        "file": "steth__transfer-c00f88e4524de9328dd67ce490fb156f511d20b59ce61cb0947b050bd105a44d.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "c00f88e4524de9328dd67ce490fb156f511d20b59ce61cb0947b050bd105a44d"
+      }
+    ],
+    "steth__transfer_shares": [
+      {
+        "hash": "9a22cbdc9da3700cd7388113b088c1deeae7d01f8fe60383eb9cefda02a068f3",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 144,
+        "file": "steth__transfer_shares-9a22cbdc9da3700cd7388113b088c1deeae7d01f8fe60383eb9cefda02a068f3.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "9a22cbdc9da3700cd7388113b088c1deeae7d01f8fe60383eb9cefda02a068f3"
+      }
+    ],
+    "usdc__approval": [
+      {
+        "hash": "a34ed610c6d2752f04aa7ae5fce903c6f7379b910e25742f9a62c272e3e2c389",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 183,
+        "file": "usdc__approval-a34ed610c6d2752f04aa7ae5fce903c6f7379b910e25742f9a62c272e3e2c389.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "a34ed610c6d2752f04aa7ae5fce903c6f7379b910e25742f9a62c272e3e2c389"
+      }
+    ],
+    "usdc__transfer": [
+      {
+        "hash": "7dabccf06391fd243ffbb49bb0b2e5fe16bbc3bbe509c08ee5f8ce8186064b28",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 1400,
+        "file": "usdc__transfer-7dabccf06391fd243ffbb49bb0b2e5fe16bbc3bbe509c08ee5f8ce8186064b28.parquet",
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "7dabccf06391fd243ffbb49bb0b2e5fe16bbc3bbe509c08ee5f8ce8186064b28"
+      }
+    ],
+    "wbtc__approval": [
+      {
+        "hash": "60cff38882a461d40aba91ff4badc706ecfafc03d488b7a3e9b3731e957eeab5",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 32,
+        "file": "wbtc__approval-60cff38882a461d40aba91ff4badc706ecfafc03d488b7a3e9b3731e957eeab5.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "60cff38882a461d40aba91ff4badc706ecfafc03d488b7a3e9b3731e957eeab5"
+      }
+    ],
+    "wbtc__transfer": [
+      {
+        "hash": "b64172ae8d7d6efbefef3c61d6d1331d4ef16337ddb4e34cd67054dc3e62865f",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 190,
+        "file": "wbtc__transfer-b64172ae8d7d6efbefef3c61d6d1331d4ef16337ddb4e34cd67054dc3e62865f.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "b64172ae8d7d6efbefef3c61d6d1331d4ef16337ddb4e34cd67054dc3e62865f"
+      }
+    ],
+    "weth__approval": [
+      {
+        "hash": "463a1db79fe3a6f8b815a8c2f56838eefadd02662d95526ecb2e527b9bcfa959",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 99,
+        "file": "weth__approval-463a1db79fe3a6f8b815a8c2f56838eefadd02662d95526ecb2e527b9bcfa959.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "463a1db79fe3a6f8b815a8c2f56838eefadd02662d95526ecb2e527b9bcfa959"
+      }
+    ],
+    "weth__deposit": [
+      {
+        "hash": "f1d4f19c10e4ca611d810a8ede917a9c52caa3632b4192900f96c164cafd4cfa",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 538,
+        "file": "weth__deposit-f1d4f19c10e4ca611d810a8ede917a9c52caa3632b4192900f96c164cafd4cfa.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "f1d4f19c10e4ca611d810a8ede917a9c52caa3632b4192900f96c164cafd4cfa"
+      }
+    ],
+    "weth__transfer": [
+      {
+        "hash": "16575f4068d8c579e594a74aa24045ee3eb87f0c933be228a07c78ae324a1b68",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 2574,
+        "file": "weth__transfer-16575f4068d8c579e594a74aa24045ee3eb87f0c933be228a07c78ae324a1b68.parquet",
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "16575f4068d8c579e594a74aa24045ee3eb87f0c933be228a07c78ae324a1b68"
+      }
+    ],
+    "weth__withdrawal": [
+      {
+        "hash": "65c9699d579f51e2e4787e86479ef1f896b07aa8b4fadd9f1ce271df7dd7a86e",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 688,
+        "file": "weth__withdrawal-65c9699d579f51e2e4787e86479ef1f896b07aa8b4fadd9f1ce271df7dd7a86e.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "65c9699d579f51e2e4787e86479ef1f896b07aa8b4fadd9f1ce271df7dd7a86e"
+      }
+    ],
+    "wsteth__approval": [
+      {
+        "hash": "797af932c33c6c86b4c8c3c08d4d5be9dc2d59c19794087ba7672a9bdde85b0c",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 111,
+        "file": "wsteth__approval-797af932c33c6c86b4c8c3c08d4d5be9dc2d59c19794087ba7672a9bdde85b0c.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "797af932c33c6c86b4c8c3c08d4d5be9dc2d59c19794087ba7672a9bdde85b0c"
+      }
+    ],
+    "wsteth__transfer": [
+      {
+        "hash": "6e64a59855f896a31c1856630e2f5db0f46a586b53cf51a7e2b0a026ee1a6d83",
+        "from_block": 16817996,
+        "to_block": 16818085,
+        "rows": 279,
+        "file": "wsteth__transfer-6e64a59855f896a31c1856630e2f5db0f46a586b53cf51a7e2b0a026ee1a6d83.parquet",
+        "provisional": true,
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "6e64a59855f896a31c1856630e2f5db0f46a586b53cf51a7e2b0a026ee1a6d83"
+      }
+    ]
+  }
+}

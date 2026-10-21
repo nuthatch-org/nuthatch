@@ -59,6 +59,10 @@ impl LabelSet {
         self.by_address.is_empty()
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Vec<String>)> {
+        self.by_address.iter()
+    }
+
     fn insert(&mut self, address: String, label: String) {
         let labels = self.by_address.entry(address).or_default();
         if !labels.contains(&label) {

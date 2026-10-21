@@ -61,6 +61,9 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Run a nest's invariant/parity checks (`checks/*.sql`) against recorded expected results.
     Check(CheckArgs),
+    /// Draw the token flow of a transaction, a block or a block range: who sent what to whom, exactly
+    /// (RFC-0071). Read-only, from the rows the nest already holds.
+    Diff(DiffArgs),
     /// Regenerate the derived artifacts (`schema.json`, `llms.txt`, `semantic.toml` footguns) from
     /// `nuthatch.toml` - run after hand-editing the config (e.g. adding a factory `[[template]]`), so
     /// the schema and the derived `*_dec` columns match the tables the config now produces.
@@ -1125,6 +1128,54 @@ pub struct SqlArgs {
     /// Emit newline-delimited JSON instead of a table (for piping to jq etc.).
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Args)]
+#[command(group(clap::ArgGroup::new("what").required(true).multiple(true).args(["tx", "block", "from"])))]
+pub struct DiffArgs {
+    /// Draw the token flow: one edge per (from, to, token) with the exact amount, and each address's
+    /// net flow. The only mode built so far (RFC-0071 §15); the range story comes later.
+    #[arg(long)]
+    pub flow: bool,
+
+    /// One transaction. Its block is found with one `eth_getTransactionReceipt` unless --block
+    /// names it.
+    #[arg(long, value_name = "HASH")]
+    pub tx: Option<String>,
+
+    /// One block, or the block that holds --tx.
+    #[arg(long, conflicts_with_all = ["from", "to"])]
+    pub block: Option<u64>,
+
+    /// First block of an inclusive range.
+    #[arg(long, requires = "to", conflicts_with = "tx")]
+    pub from: Option<u64>,
+
+    /// Last block of an inclusive range.
+    #[arg(long, requires = "from")]
+    pub to: Option<u64>,
+
+    /// `text`, `json` (the document every other format is drawn from), `dot` or `mermaid`.
+    #[arg(long, value_enum, default_value_t = crate::diff::Format::Text)]
+    pub format: crate::diff::Format,
+
+    /// Edges per token, and addresses per token in the net flow, that text, DOT and Mermaid show.
+    /// JSON always carries every one.
+    #[arg(long, default_value_t = crate::diff::DEFAULT_TOP)]
+    pub top: usize,
+
+    /// Nest directory. Read directly when it holds a store no `nuthatch dev` has open; its
+    /// `metadata.json` and labels are read either way.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+
+    /// The running instance's API, used when --dir holds no store or `nuthatch dev` has it open.
+    #[arg(long, default_value = "http://127.0.0.1:8288")]
+    pub url: String,
+
+    /// RPC for the --tx receipt lookup. Defaults to the nest's `rpc_urls`.
+    #[arg(long, value_name = "URL")]
+    pub rpc: Vec<String>,
 }
 
 #[derive(Args)]

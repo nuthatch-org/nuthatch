@@ -1,0 +1,674 @@
+{
+  "kind": "flow",
+  "nest": {
+    "name": "euler-exploit",
+    "chain": "mainnet",
+    "chain_id": 1,
+    "data_identity": "7d7681b43831b5ef2cd1b7ed04773f83ade3324b7b71412cbb20765e14c29e28"
+  },
+  "request": {
+    "from": 16817996,
+    "to": 16817996,
+    "tx": "0xc310a0affe2169d1f6feec1c63dbc7f7c62a887fa48795d327d4d2da2d6b111d"
+  },
+  "coverage": {
+    "start_block": 16817996,
+    "indexed_head": 16818085,
+    "sealed_through": 16818085,
+    "final": true
+  },
+  "tables": [
+    {
+      "table": "dai__approval",
+      "rows": 2
+    },
+    {
+      "table": "dai__transfer",
+      "reads": "transfer",
+      "rows": 7
+    },
+    {
+      "table": "ddai__approval",
+      "rows": 0
+    },
+    {
+      "table": "ddai__transfer",
+      "reads": "transfer",
+      "rows": 6
+    },
+    {
+      "table": "dsteth__approval",
+      "rows": 0
+    },
+    {
+      "table": "dsteth__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "dusdc__approval",
+      "rows": 0
+    },
+    {
+      "table": "dusdc__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "dwbtc__approval",
+      "rows": 0
+    },
+    {
+      "table": "dwbtc__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "dweth__approval",
+      "rows": 0
+    },
+    {
+      "table": "dweth__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "dwsteth__approval",
+      "rows": 0
+    },
+    {
+      "table": "dwsteth__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "edai__approval",
+      "rows": 0
+    },
+    {
+      "table": "edai__transfer",
+      "reads": "transfer",
+      "rows": 6
+    },
+    {
+      "table": "esteth__approval",
+      "rows": 0
+    },
+    {
+      "table": "esteth__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "eusdc__approval",
+      "rows": 0
+    },
+    {
+      "table": "eusdc__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "ewbtc__approval",
+      "rows": 0
+    },
+    {
+      "table": "ewbtc__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "eweth__approval",
+      "rows": 0
+    },
+    {
+      "table": "eweth__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "ewsteth__approval",
+      "rows": 0
+    },
+    {
+      "table": "ewsteth__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "steth__approval",
+      "rows": 0
+    },
+    {
+      "table": "steth__submitted",
+      "rows": 0
+    },
+    {
+      "table": "steth__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "steth__transfer_shares",
+      "rows": 0
+    },
+    {
+      "table": "usdc__approval",
+      "rows": 0
+    },
+    {
+      "table": "usdc__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "wbtc__approval",
+      "rows": 0
+    },
+    {
+      "table": "wbtc__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "weth__approval",
+      "rows": 0
+    },
+    {
+      "table": "weth__deposit",
+      "reads": "weth9_deposit",
+      "rows": 0
+    },
+    {
+      "table": "weth__transfer",
+      "reads": "transfer",
+      "rows": 0
+    },
+    {
+      "table": "weth__withdrawal",
+      "reads": "weth9_withdrawal",
+      "rows": 0
+    },
+    {
+      "table": "wsteth__approval",
+      "rows": 0
+    },
+    {
+      "table": "wsteth__transfer",
+      "reads": "transfer",
+      "rows": 0
+    }
+  ],
+  "rows_total": 21,
+  "tokens": [
+    {
+      "address": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "alias": "dai",
+      "symbol": "DAI",
+      "decimals": 18,
+      "rows": 7
+    },
+    {
+      "address": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "alias": "ddai",
+      "symbol": "dDAI",
+      "decimals": 18,
+      "rows": 6
+    },
+    {
+      "address": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "alias": "edai",
+      "symbol": "eDAI",
+      "decimals": 18,
+      "rows": 6
+    }
+  ],
+  "nodes": [
+    {
+      "address": "0x0000000000000000000000000000000000000000"
+    },
+    {
+      "address": "0x028171bca77440897b824ca71d1c56cac55b68a3"
+    },
+    {
+      "address": "0x27182842e098f60e3d576794a5bffb0777e025d3"
+    },
+    {
+      "address": "0x583c21631c48d442b5c0e605d624f54a0b366c72"
+    },
+    {
+      "address": "0xa0b3ee897f233f385e5d61086c32685257d4f12b"
+    },
+    {
+      "address": "0xebc29199c817dc47ba12e3f86102564d640cbf99"
+    }
+  ],
+  "edges": [
+    {
+      "n": 1,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0x028171bca77440897b824ca71d1c56cac55b68a3",
+      "to": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+      "amount": "30000000000000000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16817996,
+      "first_log_index": 0
+    },
+    {
+      "n": 2,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+      "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "amount": "30000000000000000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16817996,
+      "first_log_index": 2
+    },
+    {
+      "n": 3,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "to": "0x27182842e098f60e3d576794a5bffb0777e025d3",
+      "amount": "30000000000000000000000000",
+      "transfers": 2,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16817996,
+      "first_log_index": 5
+    },
+    {
+      "n": 4,
+      "token": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "from": "0x0000000000000000000000000000000000000000",
+      "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "amount": "410930612374274603970808266",
+      "transfers": 3,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16817996,
+      "first_log_index": 7
+    },
+    {
+      "n": 5,
+      "token": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "from": "0x0000000000000000000000000000000000000000",
+      "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "amount": "400000000000000000000000000",
+      "transfers": 2,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16817996,
+      "first_log_index": 14
+    },
+    {
+      "n": 6,
+      "token": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "to": "0x0000000000000000000000000000000000000000",
+      "amount": "264234370990601202559999999",
+      "transfers": 2,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16817996,
+      "first_log_index": 19
+    },
+    {
+      "n": 7,
+      "token": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "to": "0x0000000000000000000000000000000000000000",
+      "amount": "100000000000000000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16817996,
+      "first_log_index": 29
+    },
+    {
+      "n": 8,
+      "token": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "from": "0x0000000000000000000000000000000000000000",
+      "to": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "amount": "259319058410413226611199998",
+      "transfers": 2,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16817996,
+      "first_log_index": 36
+    },
+    {
+      "n": 9,
+      "token": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "to": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "amount": "310930612374274603970808264",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16817996,
+      "first_log_index": 42
+    },
+    {
+      "n": 10,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0x27182842e098f60e3d576794a5bffb0777e025d3",
+      "to": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "amount": "38904507348306697267428294",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16817996,
+      "first_log_index": 46
+    },
+    {
+      "n": 11,
+      "token": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "from": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "to": "0x0000000000000000000000000000000000000000",
+      "amount": "38064411973236041314928395",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16817996,
+      "first_log_index": 48
+    },
+    {
+      "n": 12,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "to": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+      "amount": "38904507348306697267428294",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16817996,
+      "first_log_index": 50
+    },
+    {
+      "n": 13,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+      "to": "0x028171bca77440897b824ca71d1c56cac55b68a3",
+      "amount": "30027000000000000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16817996,
+      "first_log_index": 54
+    }
+  ],
+  "net": [
+    {
+      "token": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "address": "0x0000000000000000000000000000000000000000",
+      "sent": "659319058410413226611199998",
+      "received": "264234370990601202559999999",
+      "net": "-395084687419812024051199999"
+    },
+    {
+      "token": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "address": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "sent": "264234370990601202559999999",
+      "received": "400000000000000000000000000",
+      "net": "135765629009398797440000001"
+    },
+    {
+      "token": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "address": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "sent": "0",
+      "received": "259319058410413226611199998",
+      "net": "259319058410413226611199998"
+    },
+    {
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "address": "0x028171bca77440897b824ca71d1c56cac55b68a3",
+      "sent": "30000000000000000000000000",
+      "received": "30027000000000000000000000",
+      "net": "27000000000000000000000"
+    },
+    {
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "address": "0x27182842e098f60e3d576794a5bffb0777e025d3",
+      "sent": "38904507348306697267428294",
+      "received": "30000000000000000000000000",
+      "net": "-8904507348306697267428294"
+    },
+    {
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "address": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "sent": "30000000000000000000000000",
+      "received": "30000000000000000000000000",
+      "net": "0"
+    },
+    {
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "address": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "sent": "38904507348306697267428294",
+      "received": "38904507348306697267428294",
+      "net": "0"
+    },
+    {
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "address": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+      "sent": "60027000000000000000000000",
+      "received": "68904507348306697267428294",
+      "net": "8877507348306697267428294"
+    },
+    {
+      "token": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "address": "0x0000000000000000000000000000000000000000",
+      "sent": "410930612374274603970808266",
+      "received": "138064411973236041314928395",
+      "net": "-272866200401038562655879871"
+    },
+    {
+      "token": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "address": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "sent": "410930612374274603970808264",
+      "received": "410930612374274603970808266",
+      "net": "2"
+    },
+    {
+      "token": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "address": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "sent": "38064411973236041314928395",
+      "received": "310930612374274603970808264",
+      "net": "272866200401038562655879869"
+    }
+  ],
+  "transfers": [
+    {
+      "block": 16817996,
+      "log_index": 0,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0x028171bca77440897b824ca71d1c56cac55b68a3",
+      "to": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+      "amount": "30000000000000000000000000",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 2,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+      "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "amount": "30000000000000000000000000",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 5,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "to": "0x27182842e098f60e3d576794a5bffb0777e025d3",
+      "amount": "20000000000000000000000000",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 7,
+      "token": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "from": "0x0000000000000000000000000000000000000000",
+      "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "amount": "19568124398774981141467060",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 11,
+      "token": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "from": "0x0000000000000000000000000000000000000000",
+      "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "amount": "195681243987749811414670603",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 14,
+      "token": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "from": "0x0000000000000000000000000000000000000000",
+      "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "amount": "200000000000000000000000000",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 17,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "to": "0x27182842e098f60e3d576794a5bffb0777e025d3",
+      "amount": "10000000000000000000000000",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 19,
+      "token": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "to": "0x0000000000000000000000000000000000000000",
+      "amount": "10000000000000000000000000",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 23,
+      "token": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "from": "0x0000000000000000000000000000000000000000",
+      "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "amount": "195681243987749811414670603",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 25,
+      "token": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "from": "0x0000000000000000000000000000000000000000",
+      "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "amount": "200000000000000000000000000",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 29,
+      "token": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "to": "0x0000000000000000000000000000000000000000",
+      "amount": "100000000000000000000000000",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 34,
+      "token": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "to": "0x0000000000000000000000000000000000000000",
+      "amount": "254234370990601202559999999",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 36,
+      "token": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "from": "0x0000000000000000000000000000000000000000",
+      "to": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "amount": "254234370990601202559999999",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 38,
+      "token": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "from": "0x0000000000000000000000000000000000000000",
+      "to": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "amount": "5084687419812024051199999",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 42,
+      "token": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+      "to": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "amount": "310930612374274603970808264",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 46,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0x27182842e098f60e3d576794a5bffb0777e025d3",
+      "to": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "amount": "38904507348306697267428294",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 48,
+      "token": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "from": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "to": "0x0000000000000000000000000000000000000000",
+      "amount": "38064411973236041314928395",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 50,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+      "to": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+      "amount": "38904507348306697267428294",
+      "reads": "transfer"
+    },
+    {
+      "block": 16817996,
+      "log_index": 54,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+      "to": "0x028171bca77440897b824ca71d1c56cac55b68a3",
+      "amount": "30027000000000000000000000",
+      "reads": "transfer"
+    }
+  ],
+  "not_seen": "Not seen by this nest: native ETH, internal calls, tokens it does not index, and any balance change made without one of these events (a rebase, for one). Net flow is the sum of the transfers seen, not a balance.",
+  "provenance": {
+    "version": "{version}",
+    "data_identity": "7d7681b43831b5ef2cd1b7ed04773f83ade3324b7b71412cbb20765e14c29e28",
+    "first_row": {
+      "block": 16817996,
+      "log_index": 0,
+      "block_hash": "0xde714b65354d54e684a95d80a1da7f668e8b2ee6ae8b5779f69ab9e04468b859"
+    },
+    "last_row": {
+      "block": 16817996,
+      "log_index": 54,
+      "block_hash": "0xde714b65354d54e684a95d80a1da7f668e8b2ee6ae8b5779f69ab9e04468b859"
+    },
+    "sealed_through": 16818085,
+    "metadata_sha256": "784e641498908da5d8a649b38f122c815ecaa29e687edfe7b88cc9acab2f34cb",
+    "label_snapshots": []
+  }
+}

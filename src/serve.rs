@@ -2214,6 +2214,7 @@ fn summary_value(s: &AppState) -> Value {
         "chain": s.chain,
         "address": s.address,
         "entities": count,
+        "start_block": s.store.get_meta("start_block").ok().flatten(),
         "last_block": last_block,
         "sealed_through": s.store.get_meta("sealed_through").ok().flatten(),
         "holders": s.balances.holders(),

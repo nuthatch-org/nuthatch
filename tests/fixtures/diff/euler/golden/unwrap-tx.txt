@@ -1,0 +1,24 @@
+Flow of transaction 0x68eb306c558d45e777c8d588e611db5323a6a5021a9f551bc0be915ef5e24691 in block 16,818,032 on mainnet (chain 1).
+Nest euler-exploit, data identity 7d7681b43831b5ef2cd1b7ed04773f83ade3324b7b71412cbb20765e14c29e28. 1 row in range: 1 read as flow, 0 of other events.
+All final: sealed through 16,818,085.
+
+Tokens
+  WETH 0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2 (18 decimals), 1 row
+
+Transfers, in log order
+  log 76: 0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x0000000000000000000000000000000000000000 (zero address): 8,080.498391868396965958 WETH (WETH9 Withdrawal)
+
+Edges, in order of first transfer
+  1. 0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x0000000000000000000000000000000000000000 (zero address): 8,080.498391868396965958 WETH (1 WETH9 Withdrawal, first at block 16,818,032 log 76)
+
+Net flow of the transfers seen, per token (not a balance)
+  WETH
+    0x0000000000000000000000000000000000000000 (zero address)  +8,080.498391868396965958 WETH
+    0x036cec1a199234fc02f72d29e596a09440825f1c  -8,080.498391868396965958 WETH
+
+Other events in range: none.
+Not seen by this nest: native ETH, internal calls, tokens it does not index, and any balance change made without one of these events (a rebase, for one). Net flow is the sum of the transfers seen, not a balance.
+
+nuthatch {version}; data identity 7d7681b43831b5ef2cd1b7ed04773f83ade3324b7b71412cbb20765e14c29e28; sealed through 16,818,085.
+First row read: block 16,818,032 log 76 (0xff3b454923fcc61ca211b9589701555c81b192df4237715d595b1e7384f74039). Last: block 16,818,032 log 76 (0xff3b454923fcc61ca211b9589701555c81b192df4237715d595b1e7384f74039).
+metadata.json: sha256 784e641498908da5d8a649b38f122c815ecaa29e687edfe7b88cc9acab2f34cb. Label snapshots: none.

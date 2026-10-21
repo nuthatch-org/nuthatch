@@ -31,6 +31,8 @@ mod core_stays_pristine;
 mod cors_reaches_the_bind;
 #[path = "deploy_nest_script.rs"]
 mod deploy_nest_script;
+#[path = "diff_flow.rs"]
+mod diff_flow;
 #[path = "doc_command_check.rs"]
 mod doc_command_check;
 #[path = "e2e_bare_help.rs"]

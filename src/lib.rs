@@ -44,6 +44,8 @@ pub mod count; // RFC-0054 hook
 #[cfg(feature = "counter")]
 pub mod counter;
 pub mod crash;
+/// `nuthatch diff --flow` (RFC-0071): the token flow of a transaction, block or range.
+pub mod diff;
 pub mod distribution;
 pub mod doctor;
 pub(crate) mod engine;
