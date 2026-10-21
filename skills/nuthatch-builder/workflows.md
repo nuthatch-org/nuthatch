@@ -93,6 +93,23 @@ Each nest is isolated (own store, own reorg blast radius) but shares its cursor'
 per-cursor RAM budget (`max_rss_mb`, default 2048) refuses a mount projected to blow it; `GET /nests`
 reports the projection per runtime and per mount.
 
+## Trace where the tokens went (RFC-0071)
+
+```sh
+nuthatch metadata fetch                                       # once: decimals and symbols
+nuthatch diff --flow --tx 0xHASH --block 16817996             # one transaction, every transfer in log order
+nuthatch diff --flow --from 16818024 --to 16818057 --format dot > flow.dot
+```
+
+The flow reads ERC-20 `Transfer` rows, and WETH9 `Deposit`/`Withdrawal` as transfers from and to the
+zero address, matched by event signature and parameter position, never by name. Amounts are exact,
+scaled by `metadata.json` (base units, marked "decimals unknown", without it). Net flow is the sum of
+the transfers seen, not a balance: native ETH, internal calls and tokens the nest does not index are
+invisible, and every output says so. `--format json` carries every edge; text, `dot` and `mermaid`
+show the `--top` largest per token. A range with more than 2,000,000 transfer rows, or one outside
+what the nest has indexed, is refused rather than drawn in part. Without `--block`, `--tx` makes one
+`eth_getTransactionReceipt` call to find its block.
+
 ## Wire an AI client to a running nest
 
 ```sh

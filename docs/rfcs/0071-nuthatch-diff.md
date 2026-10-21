@@ -500,3 +500,67 @@ Chief agreed to continue in a new order, which supersedes §11's from S1 on:
 `init` does not add control-plane events to new nests by default: it would change every new nest's
 data identity for a section few read. RFC-0072's S1 waits for step 2, since weather reuses these
 templates.
+
+## 16. The flow, built 2026-10-22
+
+§15 step 1 is built as `nuthatch diff --flow` in the default binary (`src/diff.rs`): a transaction
+(`--tx`, with `--block` or one `eth_getTransactionReceipt`), a block, or an inclusive range, read
+through the same local-or-`--url` backend as `nuthatch sql`, rendered as text, JSON, DOT or Mermaid.
+Every format is drawn from the JSON document. `--flow` is required, so the range story can become the
+default later without changing what an existing command prints.
+
+**What reads as flow.** An ERC-20 `Transfer` (topic0, two indexed addresses, an unindexed `uint256`),
+and WETH9's `Deposit` and `Withdrawal` as transfers from and to the zero address. Parameters are bound
+by position, type and indexedness; a column's name is only used to quote it. Every other table,
+ERC-721 and ERC-1155 transfers included, is counted in range under "other events", so the per-table
+counts sum to the range total. Text says "(zero address)" and never "minted" or "burned". Net flow is
+headed "of the transfers seen, per token (not a balance)", and every output ends with the §7 line,
+extended to name balance changes no event records.
+
+### Gate
+
+| Gate | Result |
+|---|---|
+| S0's Euler nest, every §14 leg to the unit | Pass. The DAI transaction's 19 transfers in log order carry each figure of §14's first table exactly, profit 8,877,507.348306697267428294 DAI included; the five other markets' figures (8,080.498391868396965958 WETH, 846.43597139 WBTC, 66,271.498175683316786271 wstETH and 73,821.459345383044466413 stETH, 34,224,863.41846 USDC, 3,878.698857548022052968 stETH) each appear as the legs §14 names |
+| No longer shows the 19,639.62 WETH unwrapped | Pass. Over blocks 16,818,024 to 16,818,057 the attack contract `0x036c…5f1c` received and sent 61,448.430227250683598741 WETH: net 0. The two WETH9 withdrawals are one edge to the zero address, 19,639.624727250683598741 WETH |
+| Byte-identical goldens | Pass on macOS (aarch64). Eleven goldens in `tests/fixtures/diff/euler/golden/` (seven transactions in text, the DAI one also in JSON, DOT and Mermaid, and the WETH range), asserted by `tests/diff_flow.rs` in the ordinary `it` suite, so CI runs them on Linux. The fixture is S0's nest with the 29 segments a `--seal-direct` backfill sealed (612 KB) and a store holding only the three watermarks `dev` would; the version string is the one substitution. The same range read from a hot (unsealed) copy gives the same lines |
+| RSS inside 2 GB, widest range under the cap | Pass. On the GRT supply nest Lodestar reads (Arbitrum, 6,695,742 transfers, a ThinkPad copy), blocks 234,915,449 to 376,570,031 hold 1,999,995 transfer rows: text peaked at 399 MiB in 11.7 s, JSON (119,056 edges, 67 MB) at 463 MiB. Lodestar's allocations nest (release-gate copy, frozen 2026-10-12) has no transfer table; its whole history, 6,003,316 rows, is counted as other events in 1.6 s at 95 MiB |
+| Over the cap: refused | Pass. 2,000,172 rows refused in 0.29 s, naming the count, the 2,000,000 cap and a narrower span. Nothing is printed to stdout |
+| Outside coverage: refused | Pass. A range below `start_block` or above the indexed head is refused with the covered interval |
+
+**Mutation checks**, each applied to `src/diff.rs`, shown in the diff before the run, restored after:
+reading WETH9's `Deposit`/`Withdrawal` as other events turns the attacker's WETH net to
+19639624727250683598741 and four goldens red; binding the sender by the name `from` fails the
+positional test (the goldens stay green, since every Euler token but WETH names it `from`, and WETH
+falls back to position); "(burned)" for "(zero address)" fails the wording test and two golden tests;
+a cap check of `cap * 2` fails the cap test; trimming fractions to six places fails the scaling test
+and three golden tests.
+
+### Decisions the earlier sections did not settle
+
+- **A transaction lists every transfer.** §8's edges sum legs, so the DAI transaction's three eDAI
+  mints are one edge. For `--tx` only, the text and JSON also list each transfer in log order, which
+  is where §14's legs are read. Blocks and ranges get edges only.
+- **`Deposit(address indexed, uint256)` is WETH9 only where the same contract's ERC-20 `Transfer` is
+  indexed.** The signature is common (staking pools, vaults), and elsewhere it is not a mint of the
+  emitting contract.
+- **The row cap counts transfer rows only**, at the proposed 2,000,000: the measurement above leaves
+  it with room. Other tables are counted, not read, and are not capped.
+- **`--top` defaults to 25** per token for edges and net flow in text, DOT and Mermaid; JSON keeps all.
+- **A partial read is refused.** A degraded table or an unreadable hot tip stops the flow rather than
+  drawing it with a gap.
+- `GET /` gains `start_block`, so `--url` can refuse a range below it.
+
+### Not verified
+
+- Linux byte-identity rests on CI running `tests/diff_flow.rs`; it was not run on a Linux box by hand.
+- `--url` was checked once against `nuthatch serve` on a copy of the Euler nest (same flow as the
+  local read); it has no automated test.
+- The receipt lookup for `--tx` without `--block` is tested only for its failure message.
+- Labels on nodes are read from the nest's `labels/` snapshots; no nest measured here has any.
+
+### For the next slice
+
+Step 2's grouped fallback should reuse this document's per-table counts, which already account for
+every row. The flow's "other events" line on Lodestar is 73 tables long; it is the first thing the
+grouped fallback should replace.

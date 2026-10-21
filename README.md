@@ -245,6 +245,10 @@ curl 'localhost:8288/sql?q=SELECT%20count(*)%20FROM%20usdc__transfer'
   `{col}_dec` DECIMAL view. `SUM(value_dec)` is those values: a full-width word is NULL and is not a
   term. `WHERE NOT {col}_overflow` writes the same sum out. Ids, nonces and hashes stay on the raw
   column.
+- **Where did the tokens go.** `nuthatch diff --flow --tx 0x… --block N` (or `--from`/`--to`) draws
+  the token flow as text, JSON, DOT or Mermaid: exact amounts, each address's net flow of the
+  transfers seen, every transfer of a single transaction, and a closing line on what the nest cannot
+  see (RFC-0071).
 - **AI-native.** A Model Context Protocol server is compiled in (`nuthatch mcp`) - point Claude (or any
   MCP client) at your indexer and ask your contract's data in plain English, fully offline.
 
