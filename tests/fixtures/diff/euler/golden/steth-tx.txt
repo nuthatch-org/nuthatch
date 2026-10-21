@@ -61,9 +61,16 @@ Net flow of the transfers seen, per token (not a balance)
     0x12df82a443c77eae9d5bb0f5c8d0ec706ecb338c  +179,789.545540861089304025 dstETH
     0xa4c0afeca6273b012382970c1ed8690c2929988d  +95,370.739665822461466642 dstETH
 
-Other events in range, not part of the flow: steth__approval 7, steth__transfer_shares 8.
+Other events in range, not part of the flow: 15 rows in 2 tables, 0 of them told by a story line.
+  steth__transfer_shares, TransferShares(address,address,uint256): 8 rows in block 16,818,085, from 1 contract
+    from: 5 distinct; most rows 0x036cec1a199234fc02f72d29e596a09440825f1c (3 rows), 0xa4c0afeca6273b012382970c1ed8690c2929988d (2 rows), 0x12df82a443c77eae9d5bb0f5c8d0ec706ecb338c (1 row)
+    to: 6 distinct; most rows 0x036cec1a199234fc02f72d29e596a09440825f1c (2 rows), 0x27182842e098f60e3d576794a5bffb0777e025d3 (2 rows), 0x12df82a443c77eae9d5bb0f5c8d0ec706ecb338c (1 row)
+  steth__approval, Approval(address,address,uint256): 7 rows in block 16,818,085, from 1 contract
+    owner: 2 distinct; most rows 0x036cec1a199234fc02f72d29e596a09440825f1c (4 rows), 0xa4c0afeca6273b012382970c1ed8690c2929988d (3 rows)
+    spender: 3 distinct; most rows 0x27182842e098f60e3d576794a5bffb0777e025d3 (3 rows), 0x7d2768de32b0b80b7a3454c06bdac94a69ddc7a9 (2 rows), 0xdc24316b9ae028f1497c275eb9192a3ea0f67022 (2 rows)
 Not seen by this nest: native ETH, internal calls, tokens it does not index, and any balance change made without one of these events (a rebase, for one). Net flow is the sum of the transfers seen, not a balance.
 
 nuthatch {version}; data identity 7d7681b43831b5ef2cd1b7ed04773f83ade3324b7b71412cbb20765e14c29e28; sealed through 16,818,085.
 First row read: block 16,818,085 log 24 (0x6475b8addeb3606d3560605ced3f36b7525f453e863882ff8a58fed9128f253a). Last: block 16,818,085 log 89 (0x6475b8addeb3606d3560605ced3f36b7525f453e863882ff8a58fed9128f253a).
 metadata.json: sha256 784e641498908da5d8a649b38f122c815ecaa29e687edfe7b88cc9acab2f34cb. Label snapshots: none.
+semantic.toml: absent.

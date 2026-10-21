@@ -127,6 +127,7 @@ pub(crate) mod spill;
 pub mod sql_errors;
 pub mod sqlmemo;
 pub mod store;
+pub mod story;
 pub mod subgraph_import;
 pub mod tape;
 pub mod velocity;

@@ -561,10 +561,31 @@ async fn run_diff(args: cli::DiffArgs) -> Result<()> {
         ctx.labels.insert(address.clone(), l);
     }
 
+    let semantic_raw = std::fs::read(dir.join("semantic.toml")).ok();
+    ctx.semantic_sha256 = semantic_raw.as_ref().map(|b| {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(b))
+    });
+    let (stories, warnings) = match nuthatch::semantic::load(&dir)? {
+        Some(sem) => nuthatch::story::compile(&tables, &sem),
+        None => Default::default(),
+    };
+    for w in &warnings {
+        eprintln!("semantic.toml: {w}");
+    }
+
     diff::check_coverage(&req, &ctx)?;
     let classified = diff::classify(&tables, ctx.chain_id);
     let flow = diff::read(&backend, &classified, &req, diff::ROW_CAP).await?;
-    let doc = diff::document(&flow, &ctx, &req);
+    let plan = nuthatch::story::Plan {
+        schema: &tables,
+        classified: &classified,
+        other: flow.other_counts(),
+        stories: &stories,
+        warnings,
+    };
+    let events = nuthatch::story::read(&backend, plan, &req, args.top, &ctx).await?;
+    let doc = diff::document(&flow, events, &ctx, &req);
     print!("{}", diff::render(&doc, args.format, args.top));
     Ok(())
 }

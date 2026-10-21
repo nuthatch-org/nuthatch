@@ -462,6 +462,38 @@ description = "The 100 addresses receiving the most USDC, by total value."
 `[view.*]` is rendered into `/schema` and the MCP exactly like a table, so an agent sees the
 derivation by name and what it means rather than rediscovering it from SQL.
 
+### `story` - one sentence per row, for `nuthatch diff` (RFC-0071 §17)
+
+An optional line per table, never generated. `nuthatch diff` tells that table's rows with it
+instead of grouping them:
+
+```toml
+[table.staking__horizon_stake_deposited]
+story = "{serviceProvider} staked {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.usdc__approval]
+story = "{owner} approved {spender} to spend {value:amount}"
+```
+
+| Placeholder | Prints |
+|---|---|
+| `{col}` | the column's value as stored; an address gets its nest alias and labels |
+| `{col:amount}` | an integer column as an amount of the contract that emitted the row |
+| `{col:amount@0xADDR}` | an amount of the token at that address |
+| `{col:amount@other}` | an amount of the token whose address is in column `other` of the same row |
+| `{{` `}}` | a literal brace |
+
+`col` is any column of the table by name, implicit ones (`address`, `tx_hash`, `block_number`)
+included. An amount is exact: the point is moved by the token's `decimals` from `metadata.json` and
+only trailing zeros of the fraction are trimmed; with no cached decimals it is printed in base units
+with "(decimals unknown)", never guessed. Run `nuthatch metadata fetch` to cache them for the nest's
+contracts.
+
+A story naming a column the table lacks, `:amount` on a non-integer, or `@other` on a non-address
+column is not used: `dev` warns with the table's name, `diff` warns on stderr and in its output, and
+the rows are grouped instead. `semantic.toml` is outside the data identity, so adding or editing a
+story moves the NID and never re-indexes. Each sentence reads one row; nothing sums across rows.
+
 ## `mounts.toml` - many nests, one runtime (RFC-0012; multichain RFC-0021; renamed in 2.0)
 
 **The roost is retired.** There is one command - `nuthatch dev --dir <dir>` - and what it runs is a
