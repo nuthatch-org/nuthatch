@@ -268,6 +268,20 @@ unconfigured.
 > gate: the zip run with `nuthatch dev --dir` reports the NID the page showed, and every segment the
 > tab seals equals the one a node seals from that zip. Nothing of ours is hosted for it; S3 (GitHub)
 > waits, and S4 (a drafted view) will not be built: no users yet (Chief, 2026-10-18).
+>
+> **RFC-0068 to RFC-0072 are accepted, and this line is the record RFC-0044 §8 asks for.** Chief asked
+> for "something fun" on 2026-10-21 and accepted all five the same day, each on its own RFC's
+> recommendations, to be built one after another in this order:
+> [0071](docs/rfcs/0071-nuthatch-diff.md) (the diff, default binary, read-only, templated sentences,
+> no model), [0070](docs/rfcs/0070-time-lapse.md) (time-lapse, the tab first, the binary producer
+> behind an off-by-default `timelapse` feature), [0072](docs/rfcs/0072-chain-weather.md) (chain
+> weather, default binary, opt-in per nest by `weather.toml`, model prose off until `[prose]` is
+> written and fenced so no model text reaches stored or served facts),
+> [0068](docs/rfcs/0068-nest-postcards.md) (postcards, its S0 mail test first; the CLI behind an
+> off-by-default `postcard` feature; whether burrmill-wasm goes public is open before S2), and
+> [0069](docs/rfcs/0069-the-engine-room.md) (the engine room, a watch subcommand behind a `watch`
+> feature on by default, which lifts his 2026-10-03 preference for the cockpit over a TUI for this
+> one). Each slice keeps its own gate; an S0 that fails stops its RFC.
 
 >
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.

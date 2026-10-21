@@ -1,6 +1,6 @@
 # RFC-0072: Chain weather - a daily report a nest writes about itself
 
-- Status: **Proposed (2026-10-21), awaiting Chief.**
+- Status: **Accepted (2026-10-21, Chief).**
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: RFC-0071 (nuthatch diff), for its row-to-sentence templates and its ranking, and on

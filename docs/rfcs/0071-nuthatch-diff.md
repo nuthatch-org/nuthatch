@@ -1,6 +1,6 @@
 # RFC-0071: The diff - what happened between block X and block Y, as a story
 
-- Status: **Proposed 2026-10-21, awaiting Chief.** One of five "fun" RFCs Chief asked for on
+- Status: **Accepted (2026-10-21, Chief).** One of five "fun" RFCs Chief asked for on
   2026-10-21 (0068 to 0072), planned in parallel and to be built one after another.
 - Author: Pete (cargopete)
 - Date: 2026-10-21

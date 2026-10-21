@@ -1,6 +1,6 @@
 # RFC-0069: The engine room - a running nest watched from a terminal
 
-- Status: **Proposed (2026-10-21), awaiting Chief.**
+- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: the endpoints a nest already serves (`/ready`, `/metrics`, `/`, `/nests`, the admin

@@ -1,6 +1,6 @@
 # RFC-0070: Time-lapse - a contract's sealed history replayed at speed
 
-- Status: **Proposed (2026-10-21), awaiting Chief.**
+- Status: **Accepted (2026-10-21, Chief).**
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: RFC-0047 (the sealed directory as a contract), RFC-0061 (256-bit values stay decimal

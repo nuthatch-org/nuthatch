@@ -1,6 +1,6 @@
 # RFC-0068: Nest postcards - a nest's sealed history and its SQL engine in one HTML file
 
-- Status: **Proposed (2026-10-21), awaiting Chief.** Nothing is accepted and nothing is built.
+- Status: **Accepted (2026-10-21, Chief).** Nothing is built yet.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: RFC-0065 (the nest in a tab: Burrmill compiled to wasm, hash-checked segments),
