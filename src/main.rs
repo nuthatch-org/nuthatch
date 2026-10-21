@@ -422,16 +422,17 @@ fn run_labels(args: cli::LabelsArgs) -> Result<()> {
     }
 }
 
-/// `nuthatch diff --flow` (RFC-0071). Reads through the same backend as `nuthatch sql`, so a nest
-/// `dev` holds is read over HTTP and a stopped one from its store.
+/// `nuthatch diff` (RFC-0071): the range story, or with `--flow` the token flow. A local store is read
+/// through the same pipeline `GET /diff` runs; a running instance's story is asked of that route, so
+/// both answer with one document.
 async fn run_diff(args: cli::DiffArgs) -> Result<()> {
     use nuthatch::diff;
-    if !args.flow {
-        anyhow::bail!(
-            "only the flow is built so far: add --flow. The range story is a later slice (RFC-0071 \
-             §15)."
-        );
-    }
+    let mode = if args.flow {
+        diff::Mode::Flow
+    } else {
+        diff::Mode::Story
+    };
+    let top = diff::Ask::top_or_default(mode, args.top);
     let tx = match &args.tx {
         Some(t) => {
             let t = t.to_ascii_lowercase();
@@ -445,10 +446,11 @@ async fn run_diff(args: cli::DiffArgs) -> Result<()> {
     };
     let dir = std::path::PathBuf::from(&args.dir);
     let local_config = config::Config::load(&dir).ok();
-    let (from, to) = match (args.block, args.from, args.to, &tx) {
-        (Some(b), ..) => (b, b),
-        (None, Some(f), Some(t), _) => (f, t),
-        (None, _, _, Some(hash)) => {
+    let explicit = match (args.since_last, args.block, args.from, args.to, &tx) {
+        (true, ..) => None,
+        (_, Some(b), ..) => Some((b, b)),
+        (_, None, Some(f), Some(t), _) => Some((f, t)),
+        (_, None, _, _, Some(hash)) => {
             let configured = local_config
                 .as_ref()
                 .map(|c| c.nest.rpc_urls.clone())
@@ -466,33 +468,70 @@ async fn run_diff(args: cli::DiffArgs) -> Result<()> {
             let Some(b) = block else {
                 anyhow::bail!("no receipt for {hash} at the RPC: it is not mined on this chain");
             };
-            (b, b)
+            Some((b, b))
         }
-        _ => anyhow::bail!("name what to draw: --tx, --block, or --from with --to"),
+        _ => anyhow::bail!("name what to diff: --tx, --block, --from with --to, or --since-last"),
     };
-    let req = diff::Request { from, to, tx };
 
     let backend = SqlBackend::open(&args.dir, &args.url).await?;
-    let mut ctx = diff::NestContext {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        ..Default::default()
-    };
-    let tables: Vec<nuthatch::registry::TableSchema> = match &backend {
+    // The running instance tells the story itself; only the flow is still drawn here from /sql.
+    if let (SqlBackend::Http { .. }, diff::Mode::Story) = (&backend, mode) {
+        let (from, to, cursor) = match explicit {
+            Some((f, t)) => (f, t, None),
+            None => {
+                let ready = backend.get_json("/ready").await?;
+                let nest = backend.get_json("/nest").await?;
+                let summary = backend.get_json("/").await?;
+                let sealed = ready["sealed_through"].as_u64().unwrap_or(0);
+                let start = summary["start_block"].as_str().and_then(|s| s.parse().ok());
+                let id = nest["data_identity"].as_str().map(str::to_string);
+                match next_since_last(id.as_deref(), start, sealed)? {
+                    Some(x) => x,
+                    None => return Ok(()),
+                }
+            }
+        };
+        let format = match args.format {
+            diff::Format::Text => "text",
+            diff::Format::Markdown => "markdown",
+            diff::Format::Json => "json",
+            diff::Format::Dot | diff::Format::Mermaid => anyhow::bail!(
+                "--format dot and mermaid draw the flow: add --flow, or use text, markdown or json"
+            ),
+        };
+        let mut q: Vec<(&str, String)> = vec![
+            ("from", from.to_string()),
+            ("to", to.to_string()),
+            ("top", top.to_string()),
+            ("format", format.to_string()),
+        ];
+        if let Some(t) = &tx {
+            q.push(("tx", t.clone()));
+        }
+        if args.final_only {
+            q.push(("final_only", "true".into()));
+        }
+        print!("{}", backend.get_text("/diff", &q).await?);
+        if let Some((path, block)) = cursor {
+            diff::write_cursor(&path, block)?;
+        }
+        return Ok(());
+    }
+
+    let tables: Vec<nuthatch::registry::TableSchema>;
+    let ctx = match &backend {
         SqlBackend::Local { dir, store } => {
-            ctx.start_block = store
-                .get_meta("start_block")?
-                .and_then(|s| s.parse().ok())
-                .or_else(|| {
-                    local_config
-                        .as_ref()
-                        .and_then(|c| c.contracts.iter().filter_map(|c| c.start_block).min())
-                });
-            ctx.indexed_head = store.indexed_head()?;
-            ctx.sealed_through = store.sealed_through();
-            ctx.data_identity = blob::build_manifest(dir, None)
+            let data_identity = blob::build_manifest(dir, None)
                 .ok()
                 .map(|m| m.data_identity());
-            match &local_config {
+            let facts = match &local_config {
+                Some(cfg) => diff::Facts::from_config(cfg, data_identity),
+                None => diff::Facts {
+                    data_identity,
+                    ..Default::default()
+                },
+            };
+            tables = match &local_config {
                 Some(cfg) => {
                     let reg = nuthatch::registry::from_nest(dir, cfg)?;
                     indexer::full_schema(&reg, cfg)
@@ -508,9 +547,14 @@ async fn run_diff(args: cli::DiffArgs) -> Result<()> {
                     let v: serde_json::Value = serde_json::from_str(&raw)?;
                     serde_json::from_value(v["tables"].clone()).context("reading schema.json")?
                 }
-            }
+            };
+            diff::NestContext::gather(dir, store, facts)?
         }
         SqlBackend::Http { .. } => {
+            let mut ctx = diff::NestContext {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                ..Default::default()
+            };
             let ready = backend.get_json("/ready").await?;
             let summary = backend.get_json("/").await?;
             let nest = backend.get_json("/nest").await?;
@@ -527,67 +571,88 @@ async fn run_diff(args: cli::DiffArgs) -> Result<()> {
                         .insert(a.to_ascii_lowercase(), alias.to_string());
                 }
             }
+            if let Some(cfg) = &local_config {
+                ctx.name = cfg.nest.name.clone();
+                ctx.chain = cfg.nest.chain.clone();
+                ctx.chain_id = Some(cfg.nest.chain_id);
+                for c in &cfg.contracts {
+                    ctx.aliases
+                        .insert(c.address.to_ascii_lowercase(), c.alias.clone());
+                }
+            }
+            ctx.add_files(&dir);
             let t = backend.get_json("/tables").await?;
-            serde_json::from_value(t["tables"].clone()).context("reading /tables")?
+            tables = serde_json::from_value(t["tables"].clone()).context("reading /tables")?;
+            ctx
         }
     };
-    if let Some(cfg) = &local_config {
-        ctx.name = cfg.nest.name.clone();
-        ctx.chain = cfg.nest.chain.clone();
-        ctx.chain_id = Some(cfg.nest.chain_id);
-        for c in &cfg.contracts {
-            ctx.aliases
-                .insert(c.address.to_ascii_lowercase(), c.alias.clone());
-        }
-    }
-    ctx.metadata = nuthatch::metadata::load(&dir);
-    ctx.metadata_sha256 = std::fs::read(dir.join(nuthatch::metadata::METADATA_FILE))
-        .ok()
-        .map(|b| {
-            use sha2::Digest;
-            hex::encode(sha2::Sha256::digest(&b))
-        });
-    if let Ok(entries) = std::fs::read_dir(dir.join(labels::LABELS_DIR)) {
-        ctx.label_snapshots = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .filter_map(|p| p.file_stem()?.to_str().map(str::to_string))
-            .collect();
-        ctx.label_snapshots.sort();
-    }
-    for (address, l) in labels::load(&dir).iter() {
-        let mut l = l.to_vec();
-        l.sort();
-        ctx.labels.insert(address.clone(), l);
-    }
-
-    let semantic_raw = std::fs::read(dir.join("semantic.toml")).ok();
-    ctx.semantic_sha256 = semantic_raw.as_ref().map(|b| {
-        use sha2::Digest;
-        hex::encode(sha2::Sha256::digest(b))
-    });
-    let (stories, warnings) = match nuthatch::semantic::load(&dir)? {
-        Some(sem) => nuthatch::story::compile(&tables, &sem),
-        None => Default::default(),
+    let (from, to, cursor) = match explicit {
+        Some((f, t)) => (f, t, None),
+        None => match next_since_last(
+            ctx.data_identity.as_deref(),
+            ctx.start_block,
+            ctx.sealed_through,
+        )? {
+            Some(x) => x,
+            None => return Ok(()),
+        },
     };
+    let (stories, warnings) = diff::stories(&dir, &tables)?;
     for w in &warnings {
         eprintln!("semantic.toml: {w}");
     }
-
-    diff::check_coverage(&req, &ctx)?;
-    let classified = diff::classify(&tables, ctx.chain_id);
-    let flow = diff::read(&backend, &classified, &req, diff::ROW_CAP).await?;
-    let plan = nuthatch::story::Plan {
-        schema: &tables,
-        classified: &classified,
-        other: flow.other_counts(),
+    let ask = diff::Ask {
+        req: diff::Request { from, to, tx },
+        mode,
+        top,
+        final_only: args.final_only,
+    };
+    let inputs = diff::Inputs {
+        tables: &tables,
+        ctx: &ctx,
         stories: &stories,
         warnings,
     };
-    let events = nuthatch::story::read(&backend, plan, &req, args.top, &ctx).await?;
-    let doc = diff::document(&flow, events, &ctx, &req);
-    print!("{}", diff::render(&doc, args.format, args.top));
+    let produced = diff::produce(&backend, inputs, &ask).await?;
+    print!("{}", produced.render(args.format, top)?);
+    if let Some((path, block)) = cursor {
+        diff::write_cursor(&path, block)?;
+    }
     Ok(())
+}
+
+/// The `--since-last` range and where its cursor goes once the diff is printed, or `None`, said on
+/// stderr, when nothing new is sealed.
+#[allow(clippy::type_complexity)]
+fn next_since_last(
+    data_identity: Option<&str>,
+    start: Option<u64>,
+    sealed_through: u64,
+) -> Result<Option<(u64, u64, Option<(std::path::PathBuf, u64)>)>> {
+    let Some(id) = data_identity else {
+        anyhow::bail!(
+            "--since-last keys its cursor by the nest's data identity, and none could be computed \
+             for this nest"
+        );
+    };
+    let Some(path) = nuthatch::diff::cursor_path(id) else {
+        anyhow::bail!("--since-last needs $XDG_STATE_HOME or $HOME to keep its cursor in");
+    };
+    let cursor = nuthatch::diff::read_cursor(&path)?;
+    match nuthatch::diff::since_last(cursor, start, sealed_through) {
+        Some((from, to)) => Ok(Some((from, to, Some((path, to))))),
+        None => {
+            eprintln!(
+                "Nothing sealed since the last diff: it ended at block {}, and the nest is sealed \
+                 through {}.",
+                cursor
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                sealed_through
+            );
+            Ok(None)
+        }
+    }
 }
 
 impl nuthatch::diff::Source for SqlBackend {
@@ -823,6 +888,35 @@ impl SqlBackend {
             anyhow::bail!("{url}{prefix}{path} answered {}", resp.status());
         }
         resp.json().await.context("reading the API response")
+    }
+
+    /// A route's body as sent, so a document the instance rendered is printed byte for byte.
+    async fn get_text(&self, path: &str, query: &[(&str, String)]) -> Result<String> {
+        let SqlBackend::Http {
+            url,
+            prefix,
+            client,
+            ..
+        } = self
+        else {
+            anyhow::bail!("{path} is a route of a running instance, and this nest is local");
+        };
+        let resp = client
+            .get(format!("{url}{prefix}{path}"))
+            .query(query)
+            .send()
+            .await
+            .with_context(|| format!("asking {url}{prefix}{path} - is `nuthatch dev` running?"))?;
+        let status = resp.status();
+        let body = resp.text().await.context("reading the API response")?;
+        if !status.is_success() {
+            let why = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["error"].as_str().map(str::to_string))
+                .unwrap_or(body);
+            anyhow::bail!("{why}");
+        }
+        Ok(body)
     }
 
     fn describe(&self) -> String {

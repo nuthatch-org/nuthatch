@@ -73,11 +73,11 @@ pub struct Classified {
     pub other: Vec<String>,
 }
 
-fn topic(signature: &str) -> String {
+pub(crate) fn topic(signature: &str) -> String {
     format!("0x{}", hex::encode(keccak256(signature.as_bytes())))
 }
 
-fn params(t: &TableSchema) -> Vec<&ColumnSchema> {
+pub(crate) fn params(t: &TableSchema) -> Vec<&ColumnSchema> {
     t.columns
         .iter()
         .filter(|c| c.sol_type != "implicit")
@@ -86,7 +86,7 @@ fn params(t: &TableSchema) -> Vec<&ColumnSchema> {
 
 /// Positional and typed: a parameter is matched by where it sits, its Solidity type and whether it
 /// is indexed. WETH9 names its `Transfer` parameters `src`, `dst` and `wad`.
-fn shape(t: &TableSchema, want: &[(&str, bool)]) -> Option<Vec<String>> {
+pub(crate) fn shape(t: &TableSchema, want: &[(&str, bool)]) -> Option<Vec<String>> {
     let p = params(t);
     (p.len() == want.len()
         && p.iter()
@@ -196,6 +196,264 @@ pub struct NestContext {
     pub aliases: BTreeMap<String, String>,
     pub semantic_sha256: Option<String>,
     pub version: String,
+    /// The configured single-transfer threshold in base units, when threshold flags are on.
+    pub threshold: Option<i128>,
+}
+
+/// What a nest's config says about it: from `nuthatch.toml` for a local read, from the startup facts
+/// a running instance holds for `GET /diff`. Both come from the same config, so both surfaces build
+/// the same [`NestContext`].
+#[derive(Debug, Clone, Default)]
+pub struct Facts {
+    pub name: String,
+    pub chain: String,
+    pub chain_id: Option<u64>,
+    pub data_identity: Option<String>,
+    pub aliases: BTreeMap<String, String>,
+    /// The config's earliest `start_block`, for a store that has not recorded one.
+    pub start_block: Option<u64>,
+    pub threshold: Option<i128>,
+}
+
+impl Facts {
+    pub fn from_config(cfg: &crate::config::Config, data_identity: Option<String>) -> Self {
+        Facts {
+            name: cfg.nest.name.clone(),
+            chain: cfg.nest.chain.clone(),
+            chain_id: Some(cfg.nest.chain_id),
+            data_identity,
+            aliases: cfg
+                .contracts
+                .iter()
+                .map(|c| (c.address.to_ascii_lowercase(), c.alias.clone()))
+                .collect(),
+            start_block: cfg.contracts.iter().filter_map(|c| c.start_block).min(),
+            threshold: cfg.flags.threshold_amount(),
+        }
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+impl NestContext {
+    /// The context of the nest at `dir` whose store is `store`: its watermarks, and the
+    /// `metadata.json`, label snapshots and `semantic.toml` beside it.
+    pub fn gather(
+        dir: &std::path::Path,
+        store: &dyn crate::store::HotStore,
+        facts: Facts,
+    ) -> Result<Self> {
+        let mut ctx = NestContext {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            name: facts.name,
+            chain: facts.chain,
+            chain_id: facts.chain_id,
+            data_identity: facts.data_identity,
+            aliases: facts.aliases,
+            threshold: facts.threshold,
+            ..Default::default()
+        };
+        ctx.start_block = store
+            .get_meta("start_block")?
+            .and_then(|s| s.parse().ok())
+            .or(facts.start_block);
+        ctx.indexed_head = store.indexed_head()?;
+        ctx.sealed_through = store.sealed_through();
+        ctx.add_files(dir);
+        Ok(ctx)
+    }
+
+    /// The authored files a diff reads beside the rows, and their hashes for the provenance footer.
+    pub fn add_files(&mut self, dir: &std::path::Path) {
+        self.metadata = crate::metadata::load(dir);
+        self.metadata_sha256 = std::fs::read(dir.join(crate::metadata::METADATA_FILE))
+            .ok()
+            .map(|b| sha256_hex(&b));
+        if let Ok(entries) = std::fs::read_dir(dir.join(crate::labels::LABELS_DIR)) {
+            self.label_snapshots = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .filter_map(|p| p.file_stem()?.to_str().map(str::to_string))
+                .collect();
+            self.label_snapshots.sort();
+        }
+        for (address, l) in crate::labels::load(dir).iter() {
+            let mut l = l.to_vec();
+            l.sort();
+            self.labels.insert(address.clone(), l);
+        }
+        self.semantic_sha256 = std::fs::read(dir.join("semantic.toml"))
+            .ok()
+            .map(|b| sha256_hex(&b));
+    }
+}
+
+/// The story lines `semantic.toml` holds for these tables, and a warning for each one not used.
+pub fn stories(
+    dir: &std::path::Path,
+    tables: &[TableSchema],
+) -> Result<(BTreeMap<String, crate::story::Story>, Vec<String>)> {
+    Ok(match crate::semantic::load(dir)? {
+        Some(sem) => crate::story::compile(tables, &sem),
+        None => Default::default(),
+    })
+}
+
+/// Where `--since-last` keeps its cursor: `$XDG_STATE_HOME/nuthatch/diff/<data identity>`, else
+/// `$HOME/.local/state/…`. Never the nest directory: every file there counts towards the NID (§3).
+pub fn cursor_path_from(
+    xdg_state: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    data_identity: &str,
+) -> Option<std::path::PathBuf> {
+    let base = xdg_state
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            home.map(std::path::PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map(|h| h.join(".local").join("state"))
+        })?;
+    Some(base.join("nuthatch").join("diff").join(data_identity))
+}
+
+pub fn cursor_path(data_identity: &str) -> Option<std::path::PathBuf> {
+    cursor_path_from(
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+        data_identity,
+    )
+}
+
+/// The last block the previous `--since-last` diff covered, if there was one.
+pub fn read_cursor(path: &std::path::Path) -> Result<Option<u64>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => s
+            .trim()
+            .parse()
+            .map(Some)
+            .with_context(|| format!("{} does not hold a block number", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+pub fn write_cursor(path: &std::path::Path, block: u64) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, format!("{block}\n"))
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+}
+
+/// The next `--since-last` range: from the block after the cursor (or the nest's first block) to
+/// the sealed boundary, so a reorg above it is never skipped. `None` when nothing new is sealed.
+pub fn since_last(
+    cursor: Option<u64>,
+    start: Option<u64>,
+    sealed_through: u64,
+) -> Option<(u64, u64)> {
+    let from = match cursor {
+        Some(c) => c + 1,
+        None => start.unwrap_or(0),
+    };
+    (from <= sealed_through).then_some((from, sealed_through))
+}
+
+/// Which document a diff is: the flow (§8), or the range story (§4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Flow,
+    Story,
+}
+
+/// One diff request, as every surface takes it.
+#[derive(Debug, Clone)]
+pub struct Ask {
+    pub req: Request,
+    pub mode: Mode,
+    pub top: usize,
+    pub final_only: bool,
+}
+
+impl Ask {
+    /// `--top` when given, else the mode's own default.
+    pub fn top_or_default(mode: Mode, top: Option<usize>) -> usize {
+        top.unwrap_or(match mode {
+            Mode::Flow => DEFAULT_TOP,
+            Mode::Story => crate::range_story::DEFAULT_TOP,
+        })
+    }
+}
+
+pub enum Produced {
+    Flow(Document),
+    Story(crate::range_story::Document),
+}
+
+impl Produced {
+    pub fn render(&self, format: Format, top: usize) -> Result<String> {
+        match (self, format) {
+            (Produced::Flow(_), Format::Markdown) => bail!(
+                "--format markdown is the range story's; the flow is drawn as text, json, dot or \
+                 mermaid"
+            ),
+            (Produced::Flow(d), f) => Ok(render(d, f, top)),
+            (Produced::Story(_), Format::Dot | Format::Mermaid) => bail!(
+                "--format dot and mermaid draw the flow: add --flow, or use text, markdown or json"
+            ),
+            (Produced::Story(d), f) => Ok(crate::range_story::render(d, f)),
+        }
+    }
+}
+
+/// Everything a diff reads besides the rows.
+pub struct Inputs<'a> {
+    pub tables: &'a [TableSchema],
+    pub ctx: &'a NestContext,
+    pub stories: &'a BTreeMap<String, crate::story::Story>,
+    pub warnings: Vec<String>,
+}
+
+/// The one diff pipeline the CLI, `GET /diff` and the MCP tool share, so one request gives one
+/// document on every surface.
+pub async fn produce<S: Source>(src: &S, inputs: Inputs<'_>, ask: &Ask) -> Result<Produced> {
+    let (req, ctx) = (&ask.req, inputs.ctx);
+    check_coverage(req, ctx)?;
+    if ask.final_only && req.to > ctx.sealed_through {
+        bail!(
+            "--final-only: blocks {} to {} are not final (sealed through {}), so no diff is given. \
+             Drop --final-only for a provisional one, or end the range at {}.",
+            group(req.from.max(ctx.sealed_through + 1)),
+            group(req.to),
+            group(ctx.sealed_through),
+            group(ctx.sealed_through)
+        );
+    }
+    let classified = classify(inputs.tables, ctx.chain_id);
+    match ask.mode {
+        Mode::Flow => {
+            let flow = read(src, &classified, req, ROW_CAP).await?;
+            let plan = crate::story::Plan {
+                schema: inputs.tables,
+                classified: &classified,
+                other: flow.other_counts(),
+                stories: inputs.stories,
+                warnings: inputs.warnings,
+            };
+            let events = crate::story::read(src, plan, req, ask.top, ctx).await?;
+            Ok(Produced::Flow(document(&flow, events, ctx, req)))
+        }
+        Mode::Story => Ok(Produced::Story(
+            crate::range_story::read(src, &classified, inputs, ask).await?,
+        )),
+    }
 }
 
 impl NestContext {
@@ -268,7 +526,7 @@ pub fn check_coverage(req: &Request, ctx: &NestContext) -> Result<()> {
     Ok(())
 }
 
-fn quote(ident: &str) -> String {
+pub(crate) fn quote(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
@@ -283,7 +541,7 @@ pub(crate) fn filter(req: &Request) -> String {
     w
 }
 
-fn text(v: Option<&Value>) -> Option<String> {
+pub(crate) fn text(v: Option<&Value>) -> Option<String> {
     match v? {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
@@ -291,7 +549,7 @@ fn text(v: Option<&Value>) -> Option<String> {
     }
 }
 
-fn number(v: Option<&Value>) -> Option<u64> {
+pub(crate) fn number(v: Option<&Value>) -> Option<u64> {
     match v? {
         Value::Number(n) => n.as_u64(),
         Value::String(s) => s.parse().ok(),
@@ -299,7 +557,7 @@ fn number(v: Option<&Value>) -> Option<u64> {
     }
 }
 
-async fn count<S: Source>(src: &S, table: &str, req: &Request) -> Result<u64> {
+pub(crate) async fn count<S: Source>(src: &S, table: &str, req: &Request) -> Result<u64> {
     let out = src
         .query(&format!(
             "SELECT count(*) AS n FROM {} WHERE {}",
@@ -375,6 +633,22 @@ pub async fn read<S: Source>(
     req: &Request,
     cap: u64,
 ) -> Result<Flow> {
+    let flow = if req.tx.is_some() {
+        Flow::keeping_movements()
+    } else {
+        Flow::default()
+    };
+    read_into(src, classified, req, cap, flow).await
+}
+
+/// [`read`] into a fold the caller chose.
+pub async fn read_into<S: Source>(
+    src: &S,
+    classified: &Classified,
+    req: &Request,
+    cap: u64,
+    mut flow: Flow,
+) -> Result<Flow> {
     let mut counts = BTreeMap::new();
     let mut total = 0u64;
     for f in &classified.flow {
@@ -395,11 +669,6 @@ pub async fn read<S: Source>(
             group(narrower)
         );
     }
-    let mut flow = if req.tx.is_some() {
-        Flow::keeping_movements()
-    } else {
-        Flow::default()
-    };
     for f in &classified.flow {
         let second = f.second.as_deref().map(quote).unwrap_or("NULL".into());
         let mut after: Option<(u64, u64)> = None;
@@ -469,17 +738,26 @@ struct EdgeAcc {
 #[derive(Debug, Default)]
 pub struct Flow {
     edges: HashMap<(String, String, String), EdgeAcc>,
-    sent: HashMap<(String, String), U512>,
-    received: HashMap<(String, String), U512>,
-    token_rows: BTreeMap<String, u64>,
-    token_alias: BTreeMap<String, String>,
+    pub(crate) sent: HashMap<(String, String), U512>,
+    pub(crate) received: HashMap<(String, String), U512>,
+    pub(crate) token_rows: BTreeMap<String, u64>,
+    pub(crate) token_alias: BTreeMap<String, String>,
     table_rows: BTreeMap<String, u64>,
     table_reads: BTreeMap<String, Reads>,
     other: BTreeMap<String, u64>,
-    first: Option<(u64, u64, String)>,
-    last: Option<(u64, u64, String)>,
+    pub(crate) first: Option<(u64, u64, String)>,
+    pub(crate) last: Option<(u64, u64, String)>,
     /// Every movement, kept only for one transaction, where each leg matters and the count is small.
     movements: Option<Vec<Movement>>,
+    /// The largest movements per token, at most `.0` each once [`Flow::largest`] has trimmed them.
+    largest: Option<(usize, HashMap<String, Vec<Movement>>)>,
+}
+
+/// Largest amount first, then chain order.
+fn by_size(a: &Movement, b: &Movement) -> std::cmp::Ordering {
+    b.amount
+        .cmp(&a.amount)
+        .then((a.block, a.log_index).cmp(&(b.block, b.log_index)))
 }
 
 impl Flow {
@@ -491,9 +769,39 @@ impl Flow {
         }
     }
 
+    /// A fold that also keeps each token's `k` largest movements, for the range story.
+    pub fn keeping_largest(k: usize) -> Self {
+        Flow {
+            largest: Some((k, HashMap::new())),
+            ..Default::default()
+        }
+    }
+
+    /// Each token's largest movements, largest first, ties in chain order.
+    pub fn largest(&self, token: &str) -> Vec<&Movement> {
+        let Some((k, by)) = &self.largest else {
+            return Vec::new();
+        };
+        let mut ms: Vec<&Movement> = by
+            .get(token)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+        ms.sort_by(|a, b| by_size(a, b));
+        ms.truncate(*k);
+        ms
+    }
+
     pub fn add(&mut self, m: Movement) {
         if let Some(ms) = &mut self.movements {
             ms.push(m.clone());
+        }
+        if let Some((k, by)) = &mut self.largest {
+            let v = by.entry(m.token.clone()).or_default();
+            v.push(m.clone());
+            if v.len() >= 2 * *k + 16 {
+                v.sort_by(by_size);
+                v.truncate(*k);
+            }
         }
         *self.table_rows.entry(m.table.clone()).or_insert(0) += 1;
         self.table_reads.insert(m.table.clone(), m.reads);
@@ -528,6 +836,11 @@ impl Flow {
             .entry((m.token.clone(), m.from))
             .or_insert(U512::ZERO) += amount;
         *self.received.entry((m.token, m.to)).or_insert(U512::ZERO) += amount;
+    }
+
+    /// The rows read as flow, per table.
+    pub fn table_rows(&self) -> &BTreeMap<String, u64> {
+        &self.table_rows
     }
 
     /// Each table, or the part of a split table, that the flow counted but did not read.
@@ -838,6 +1151,7 @@ pub fn document(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Format {
     Text,
+    Markdown,
     Json,
     Dot,
     Mermaid,
@@ -845,7 +1159,7 @@ pub enum Format {
 
 pub fn render(doc: &Document, format: Format, top: usize) -> String {
     match format {
-        Format::Text => text_out(doc, top),
+        Format::Text | Format::Markdown => text_out(doc, top),
         Format::Json => {
             let mut s = serde_json::to_string_pretty(doc).expect("the document serialises");
             s.push('\n');
@@ -973,28 +1287,43 @@ fn drawn(doc: &Document, top: usize) -> (Vec<&EdgeOut>, Vec<(String, usize)>) {
     (shown, left)
 }
 
-fn rows(n: u64) -> String {
+pub(crate) fn rows(n: u64) -> String {
     format!("{} {}", group(n), if n == 1 { "row" } else { "rows" })
 }
 
 fn heading(doc: &Document) -> String {
-    let r = &doc.request;
-    let what = match (&r.tx, r.from == r.to) {
+    format!(
+        "Flow of {} on {}",
+        what_text(&doc.request),
+        chain_text(&doc.nest)
+    )
+}
+
+pub(crate) fn what_text(r: &Request) -> String {
+    match (&r.tx, r.from == r.to) {
         (Some(tx), _) => format!("transaction {tx} in block {}", group(r.from)),
         (None, true) => format!("block {}", group(r.from)),
         (None, false) => format!("blocks {} to {}", group(r.from), group(r.to)),
-    };
-    let chain = match doc.nest.chain_id {
-        Some(id) => format!("{} (chain {id})", doc.nest.chain),
-        None => doc.nest.chain.clone(),
-    };
-    format!("Flow of {what} on {chain}")
+    }
+}
+
+pub(crate) fn chain_text(n: &NestOut) -> String {
+    match n.chain_id {
+        Some(id) => format!("{} (chain {id})", n.chain),
+        None => n.chain.clone(),
+    }
 }
 
 fn finality(doc: &Document) -> String {
-    let r = &doc.request;
-    let sealed = doc.coverage.sealed_through;
-    if doc.coverage.is_final {
+    finality_line(
+        &doc.request,
+        doc.coverage.sealed_through,
+        doc.coverage.is_final,
+    )
+}
+
+pub(crate) fn finality_line(r: &Request, sealed: u64, is_final: bool) -> String {
+    if is_final {
         format!("All final: sealed through {}.", group(sealed))
     } else {
         let from = r.from.max(sealed + 1);
@@ -1010,8 +1339,7 @@ fn finality(doc: &Document) -> String {
     }
 }
 
-fn provenance_lines(doc: &Document) -> Vec<String> {
-    let p = &doc.provenance;
+pub(crate) fn provenance_lines(p: &ProvenanceOut) -> Vec<String> {
     let at = |r: &Option<RowAt>| match r {
         Some(r) => format!(
             "block {} log {} ({})",
@@ -1196,7 +1524,7 @@ fn text_out(doc: &Document, top: usize) -> String {
     o.push_str(&crate::story::text(&doc.events, top));
     let _ = writeln!(o, "{}", doc.not_seen);
     o.push('\n');
-    for l in provenance_lines(doc) {
+    for l in provenance_lines(&doc.provenance) {
         let _ = writeln!(o, "{l}");
     }
     o
@@ -1249,7 +1577,7 @@ fn dot(doc: &Document, top: usize) -> String {
     let mut o = String::new();
     let _ = writeln!(o, "// {}.", heading(doc));
     let _ = writeln!(o, "// {}", finality(doc));
-    for l in provenance_lines(doc) {
+    for l in provenance_lines(&doc.provenance) {
         let _ = writeln!(o, "// {l}");
     }
     let _ = writeln!(o, "digraph flow {{");
@@ -1294,7 +1622,7 @@ fn mermaid(doc: &Document, top: usize) -> String {
     let mut o = String::new();
     let _ = writeln!(o, "%% {}.", heading(doc));
     let _ = writeln!(o, "%% {}", finality(doc));
-    for l in provenance_lines(doc) {
+    for l in provenance_lines(&doc.provenance) {
         let _ = writeln!(o, "%% {l}");
     }
     let _ = writeln!(o, "flowchart LR");

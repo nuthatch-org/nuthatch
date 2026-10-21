@@ -1,0 +1,119 @@
+# nuthatch nest on mainnet
+
+A self-hosted blockchain index. Query it locally; there is no third-party API.
+
+## Contracts
+- `link` = 0x514910771af9ca656af840dff83e8264ecf986ca
+- `ens` = 0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85
+- `pausable` = 0xebcb31a8465d6130c744c41060e7dcbfa17d1d8a
+- `proxy_a` = 0x9bdabf038eeaea56abc17a3b4b9c39e447cba57f
+- `proxy_b` = 0x0ed0c116a099b4e626499dc83a6e6799bdad1000
+- `roles` = 0xdd2a05fc735c4bc72f9da845c1a5109147d89136
+- `vlsquill` = 0x60e71dd36fa5bf92bcd9320e85cf0040ffe437bc
+- `deploy_b` = 0x3d5297b22b54d37df8da84e8951f711512a884fc
+- `deploy_c` = 0x8997c2469deedade760f84e9328baa2adede426c
+- `proxy_admin` = 0xfe05b05a60f34ae974cf6876809fa18f43dba4d1
+
+## Tables (one per contract event)
+- `deploy_b__admin_changed` - AdminChanged(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousAdmin, newAdmin)
+- `deploy_b__beacon_upgraded` - BeaconUpgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, beacon)
+- `deploy_b__initialized` - Initialized(uint64) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `deploy_b__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `deploy_b__paused` - Paused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `deploy_b__role_admin_changed` - RoleAdminChanged(bytes32,bytes32,bytes32) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, previousAdminRole, newAdminRole)
+- `deploy_b__role_granted` - RoleGranted(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `deploy_b__role_revoked` - RoleRevoked(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `deploy_b__unpaused` - Unpaused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `deploy_b__upgraded` - Upgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, implementation)
+- `deploy_c__admin_changed` - AdminChanged(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousAdmin, newAdmin)
+- `deploy_c__beacon_upgraded` - BeaconUpgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, beacon)
+- `deploy_c__initialized` - Initialized(uint64) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `deploy_c__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `deploy_c__paused` - Paused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `deploy_c__role_admin_changed` - RoleAdminChanged(bytes32,bytes32,bytes32) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, previousAdminRole, newAdminRole)
+- `deploy_c__role_granted` - RoleGranted(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `deploy_c__role_revoked` - RoleRevoked(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `deploy_c__unpaused` - Unpaused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `deploy_c__upgraded` - Upgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, implementation)
+- `ens__approval` - Approval(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, approved, tokenId)
+- `ens__approval_for_all` - ApprovalForAll(address,address,bool) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, operator, approved)
+- `ens__transfer` - Transfer(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, to, tokenId)
+- `link__approval` - Approval(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, spender, value)
+- `link__transfer` - Transfer(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, to, value)
+- `pausable__admin_changed` - AdminChanged(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousAdmin, newAdmin)
+- `pausable__beacon_upgraded` - BeaconUpgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, beacon)
+- `pausable__initialized` - Initialized(uint64) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `pausable__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `pausable__paused` - Paused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `pausable__role_admin_changed` - RoleAdminChanged(bytes32,bytes32,bytes32) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, previousAdminRole, newAdminRole)
+- `pausable__role_granted` - RoleGranted(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `pausable__role_revoked` - RoleRevoked(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `pausable__unpaused` - Unpaused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `pausable__upgraded` - Upgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, implementation)
+- `proxy_a__admin_changed` - AdminChanged(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousAdmin, newAdmin)
+- `proxy_a__beacon_upgraded` - BeaconUpgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, beacon)
+- `proxy_a__initialized` - Initialized(uint64) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `proxy_a__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `proxy_a__paused` - Paused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `proxy_a__role_admin_changed` - RoleAdminChanged(bytes32,bytes32,bytes32) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, previousAdminRole, newAdminRole)
+- `proxy_a__role_granted` - RoleGranted(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `proxy_a__role_revoked` - RoleRevoked(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `proxy_a__unpaused` - Unpaused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `proxy_a__upgraded` - Upgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, implementation)
+- `proxy_admin__admin_changed` - AdminChanged(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousAdmin, newAdmin)
+- `proxy_admin__beacon_upgraded` - BeaconUpgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, beacon)
+- `proxy_admin__initialized` - Initialized(uint64) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `proxy_admin__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `proxy_admin__paused` - Paused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `proxy_admin__role_admin_changed` - RoleAdminChanged(bytes32,bytes32,bytes32) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, previousAdminRole, newAdminRole)
+- `proxy_admin__role_granted` - RoleGranted(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `proxy_admin__role_revoked` - RoleRevoked(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `proxy_admin__unpaused` - Unpaused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `proxy_admin__upgraded` - Upgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, implementation)
+- `proxy_b__admin_changed` - AdminChanged(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousAdmin, newAdmin)
+- `proxy_b__beacon_upgraded` - BeaconUpgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, beacon)
+- `proxy_b__initialized` - Initialized(uint64) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `proxy_b__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `proxy_b__paused` - Paused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `proxy_b__role_admin_changed` - RoleAdminChanged(bytes32,bytes32,bytes32) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, previousAdminRole, newAdminRole)
+- `proxy_b__role_granted` - RoleGranted(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `proxy_b__role_revoked` - RoleRevoked(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `proxy_b__unpaused` - Unpaused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `proxy_b__upgraded` - Upgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, implementation)
+- `roles__admin_changed` - AdminChanged(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousAdmin, newAdmin)
+- `roles__beacon_upgraded` - BeaconUpgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, beacon)
+- `roles__initialized` - Initialized(uint64) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `roles__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `roles__paused` - Paused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `roles__role_admin_changed` - RoleAdminChanged(bytes32,bytes32,bytes32) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, previousAdminRole, newAdminRole)
+- `roles__role_granted` - RoleGranted(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `roles__role_revoked` - RoleRevoked(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `roles__unpaused` - Unpaused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `roles__upgraded` - Upgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, implementation)
+- `vlsquill__admin_changed` - AdminChanged(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousAdmin, newAdmin)
+- `vlsquill__beacon_upgraded` - BeaconUpgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, beacon)
+- `vlsquill__initialized` - Initialized(uint64) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `vlsquill__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `vlsquill__paused` - Paused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `vlsquill__role_admin_changed` - RoleAdminChanged(bytes32,bytes32,bytes32) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, previousAdminRole, newAdminRole)
+- `vlsquill__role_granted` - RoleGranted(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `vlsquill__role_revoked` - RoleRevoked(bytes32,address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, role, account, sender)
+- `vlsquill__unpaused` - Unpaused(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, account)
+- `vlsquill__upgraded` - Upgraded(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, implementation)
+
+## Live HTTP API (run `nuthatch dev`)
+- `GET /`                    index status
+- `GET /tables`              every table with its columns
+- `GET /table/{name}?limit=N` recent rows of one table (hot + sealed)
+- `GET /entity/{id}`         one row by id (`{block:012}-{logindex:06}`)
+- `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{alias}__{event}`, and each
+                             authored view (`views/*.sql`) answers by its own name
+- `GET /balances?limit=N`    top holder balances (when an ERC-20 Transfer table is present)
+- `GET /balance/{address}`   one address's derived balance
+- `GET /queries`             the mount's SQL mode and the queries its operator declared in
+                             `mounts.toml` (none on an open nest); `GET /q/{name}` runs one
+- `GET /derived`             the nest's incremental entities (`entities.toml`); `GET /derived/{entity}` reads one
+
+## MCP (for coding agents)
+Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, entity,
+balance, top_balances. Fully offline against the local instance; nothing phones home.

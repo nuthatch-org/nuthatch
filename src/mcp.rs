@@ -323,7 +323,7 @@ fn render_prompt(name: &str, args: &Value) -> Option<Value> {
 /// The tool surface. Not a thin single-endpoint wrapper - schema discovery, SQL, point-reads, and
 /// the IVM views, each with an LLM-friendly description.
 fn tool_specs(shape: &Shape) -> Value {
-    // The seven generic tools - meaningful on every nest, so always advertised.
+    // The generic tools - meaningful on every nest, so always advertised.
     let mut tools = vec![
         json!({ "name": "status", "description": "Index status: contract, chain, transfers indexed, holders, last & sealed block.",
           "inputSchema": { "type": "object", "properties": {} } }),
@@ -339,6 +339,15 @@ fn tool_specs(shape: &Shape) -> Value {
           "inputSchema": { "type": "object", "properties": { "query": { "type": "string", "description": "A SELECT or WITH query to validate." } }, "required": ["query"] } }),
         json!({ "name": "entity", "description": "Look up one transfer by its id, formatted `{block:012}-{logindex:06}`.",
           "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] } }),
+        json!({ "name": "diff", "description": "What happened in a block range, a block or one transaction, as a JSON document of fixed sentences with exact amounts: every control-plane event (ownership, pause, upgrade, roles), the largest movements and net flows per token, new holders, approvals with unlimited ones named, labels, and every other table counted or told. `flow: true` gives the token flow instead. Give `from` and `to`, or `block`, or `tx` with its `block`. Nothing in it is inferred; `not_seen` says what the nest cannot see.",
+          "inputSchema": { "type": "object", "properties": {
+            "from": { "type": "integer", "description": "First block of an inclusive range." },
+            "to": { "type": "integer", "description": "Last block of an inclusive range." },
+            "block": { "type": "integer", "description": "One block, or the block holding `tx`." },
+            "tx": { "type": "string", "description": "One transaction hash; needs `block`." },
+            "flow": { "type": "boolean", "description": "The token flow instead of the story.", "default": false },
+            "top": { "type": "integer", "description": "Items per list (story default 10)." },
+            "final_only": { "type": "boolean", "description": "Refuse a range above the sealed boundary.", "default": false } } } }),
     ];
     // ERC-20-shaped tools (RFC-0025): advertised only where a transfer-shaped decoder exists - the same
     // gate the balance view uses - so they never return an empty `{"count":0}` that an agent misreads
@@ -405,6 +414,26 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
                 .as_str()
                 .ok_or_else(|| anyhow!("`query` is required"))?;
             get_query(client, &format!("{base}/explain"), &[("q", q)]).await
+        }
+        // The route's JSON document, returned as it was sent: the same bytes `nuthatch diff
+        // --format json` prints for the same request.
+        "diff" => {
+            let mut q: Vec<(&str, String)> = vec![("format", "json".into())];
+            for k in ["from", "to", "block", "top"] {
+                if let Some(n) = args[k].as_u64() {
+                    q.push((k, n.to_string()));
+                }
+            }
+            if let Some(t) = args["tx"].as_str() {
+                q.push(("tx", t.to_string()));
+            }
+            for k in ["flow", "final_only"] {
+                if args[k].as_bool() == Some(true) {
+                    q.push((k, "true".into()));
+                }
+            }
+            let q: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            get_query(client, &format!("{base}/diff"), &q).await
         }
         "entity" => {
             let id = args["id"]

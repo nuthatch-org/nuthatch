@@ -1,0 +1,399 @@
+{
+  "kind": "story",
+  "nest": {
+    "name": "euler-exploit",
+    "chain": "mainnet",
+    "chain_id": 1,
+    "data_identity": "7d7681b43831b5ef2cd1b7ed04773f83ade3324b7b71412cbb20765e14c29e28"
+  },
+  "request": {
+    "from": 16817996,
+    "to": 16817996,
+    "tx": "0xc310a0affe2169d1f6feec1c63dbc7f7c62a887fa48795d327d4d2da2d6b111d"
+  },
+  "coverage": {
+    "start_block": 16817996,
+    "indexed_head": 16818085,
+    "sealed_through": 16818085,
+    "final": true
+  },
+  "tables": [
+    {
+      "table": "dai__approval",
+      "section": "approvals",
+      "rows": 2
+    },
+    {
+      "table": "dai__transfer",
+      "section": "movements",
+      "rows": 7
+    },
+    {
+      "table": "ddai__transfer",
+      "section": "movements",
+      "rows": 6
+    },
+    {
+      "table": "edai__transfer",
+      "section": "movements",
+      "rows": 6
+    }
+  ],
+  "rows_total": 21,
+  "top": 10,
+  "control": [],
+  "movements": [
+    {
+      "address": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "alias": "dai",
+      "symbol": "DAI",
+      "decimals": 18,
+      "rows": 7,
+      "addresses": 5,
+      "largest": [
+        {
+          "block": 16817996,
+          "log_index": 46,
+          "from": "0x27182842e098f60e3d576794a5bffb0777e025d3",
+          "to": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+          "amount": "38904507348306697267428294",
+          "reads": "transfer",
+          "text": "0x27182842e098f60e3d576794a5bffb0777e025d3 -> 0xa0b3ee897f233f385e5d61086c32685257d4f12b: 38,904,507.348306697267428294 DAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 50,
+          "from": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+          "to": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+          "amount": "38904507348306697267428294",
+          "reads": "transfer",
+          "text": "0xa0b3ee897f233f385e5d61086c32685257d4f12b -> 0xebc29199c817dc47ba12e3f86102564d640cbf99: 38,904,507.348306697267428294 DAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 54,
+          "from": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+          "to": "0x028171bca77440897b824ca71d1c56cac55b68a3",
+          "amount": "30027000000000000000000000",
+          "reads": "transfer",
+          "text": "0xebc29199c817dc47ba12e3f86102564d640cbf99 -> 0x028171bca77440897b824ca71d1c56cac55b68a3: 30,027,000 DAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 0,
+          "from": "0x028171bca77440897b824ca71d1c56cac55b68a3",
+          "to": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+          "amount": "30000000000000000000000000",
+          "reads": "transfer",
+          "text": "0x028171bca77440897b824ca71d1c56cac55b68a3 -> 0xebc29199c817dc47ba12e3f86102564d640cbf99: 30,000,000 DAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 2,
+          "from": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+          "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "amount": "30000000000000000000000000",
+          "reads": "transfer",
+          "text": "0xebc29199c817dc47ba12e3f86102564d640cbf99 -> 0x583c21631c48d442b5c0e605d624f54a0b366c72: 30,000,000 DAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 5,
+          "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "to": "0x27182842e098f60e3d576794a5bffb0777e025d3",
+          "amount": "20000000000000000000000000",
+          "reads": "transfer",
+          "text": "0x583c21631c48d442b5c0e605d624f54a0b366c72 -> 0x27182842e098f60e3d576794a5bffb0777e025d3: 20,000,000 DAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 17,
+          "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "to": "0x27182842e098f60e3d576794a5bffb0777e025d3",
+          "amount": "10000000000000000000000000",
+          "reads": "transfer",
+          "text": "0x583c21631c48d442b5c0e605d624f54a0b366c72 -> 0x27182842e098f60e3d576794a5bffb0777e025d3: 10,000,000 DAI"
+        }
+      ],
+      "net": [
+        {
+          "address": "0x27182842e098f60e3d576794a5bffb0777e025d3",
+          "sent": "38904507348306697267428294",
+          "received": "30000000000000000000000000",
+          "net": "-8904507348306697267428294",
+          "text": "0x27182842e098f60e3d576794a5bffb0777e025d3  -8,904,507.348306697267428294 DAI"
+        },
+        {
+          "address": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+          "sent": "60027000000000000000000000",
+          "received": "68904507348306697267428294",
+          "net": "8877507348306697267428294",
+          "text": "0xebc29199c817dc47ba12e3f86102564d640cbf99  +8,877,507.348306697267428294 DAI"
+        },
+        {
+          "address": "0x028171bca77440897b824ca71d1c56cac55b68a3",
+          "sent": "30000000000000000000000000",
+          "received": "30027000000000000000000000",
+          "net": "27000000000000000000000",
+          "text": "0x028171bca77440897b824ca71d1c56cac55b68a3  +27,000 DAI"
+        }
+      ],
+      "net_not_listed": 0,
+      "netted_to_zero": 2
+    },
+    {
+      "address": "0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686",
+      "alias": "ddai",
+      "symbol": "dDAI",
+      "decimals": 18,
+      "rows": 6,
+      "addresses": 3,
+      "largest": [
+        {
+          "block": 16817996,
+          "log_index": 34,
+          "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "to": "0x0000000000000000000000000000000000000000",
+          "amount": "254234370990601202559999999",
+          "reads": "transfer",
+          "text": "0x583c21631c48d442b5c0e605d624f54a0b366c72 -> 0x0000000000000000000000000000000000000000 (zero address): 254,234,370.990601202559999999 dDAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 36,
+          "from": "0x0000000000000000000000000000000000000000",
+          "to": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+          "amount": "254234370990601202559999999",
+          "reads": "transfer",
+          "text": "0x0000000000000000000000000000000000000000 (zero address) -> 0xa0b3ee897f233f385e5d61086c32685257d4f12b: 254,234,370.990601202559999999 dDAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 14,
+          "from": "0x0000000000000000000000000000000000000000",
+          "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "amount": "200000000000000000000000000",
+          "reads": "transfer",
+          "text": "0x0000000000000000000000000000000000000000 (zero address) -> 0x583c21631c48d442b5c0e605d624f54a0b366c72: 200,000,000 dDAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 25,
+          "from": "0x0000000000000000000000000000000000000000",
+          "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "amount": "200000000000000000000000000",
+          "reads": "transfer",
+          "text": "0x0000000000000000000000000000000000000000 (zero address) -> 0x583c21631c48d442b5c0e605d624f54a0b366c72: 200,000,000 dDAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 19,
+          "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "to": "0x0000000000000000000000000000000000000000",
+          "amount": "10000000000000000000000000",
+          "reads": "transfer",
+          "text": "0x583c21631c48d442b5c0e605d624f54a0b366c72 -> 0x0000000000000000000000000000000000000000 (zero address): 10,000,000 dDAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 38,
+          "from": "0x0000000000000000000000000000000000000000",
+          "to": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+          "amount": "5084687419812024051199999",
+          "reads": "transfer",
+          "text": "0x0000000000000000000000000000000000000000 (zero address) -> 0xa0b3ee897f233f385e5d61086c32685257d4f12b: 5,084,687.419812024051199999 dDAI"
+        }
+      ],
+      "net": [
+        {
+          "address": "0x0000000000000000000000000000000000000000",
+          "sent": "659319058410413226611199998",
+          "received": "264234370990601202559999999",
+          "net": "-395084687419812024051199999",
+          "text": "0x0000000000000000000000000000000000000000 (zero address)  -395,084,687.419812024051199999 dDAI"
+        },
+        {
+          "address": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+          "sent": "0",
+          "received": "259319058410413226611199998",
+          "net": "259319058410413226611199998",
+          "text": "0xa0b3ee897f233f385e5d61086c32685257d4f12b  +259,319,058.410413226611199998 dDAI"
+        },
+        {
+          "address": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "sent": "264234370990601202559999999",
+          "received": "400000000000000000000000000",
+          "net": "135765629009398797440000001",
+          "text": "0x583c21631c48d442b5c0e605d624f54a0b366c72  +135,765,629.009398797440000001 dDAI"
+        }
+      ],
+      "net_not_listed": 0,
+      "netted_to_zero": 0
+    },
+    {
+      "address": "0xe025e3ca2be02316033184551d4d3aa22024d9dc",
+      "alias": "edai",
+      "symbol": "eDAI",
+      "decimals": 18,
+      "rows": 6,
+      "addresses": 3,
+      "largest": [
+        {
+          "block": 16817996,
+          "log_index": 42,
+          "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "to": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+          "amount": "310930612374274603970808264",
+          "reads": "transfer",
+          "text": "0x583c21631c48d442b5c0e605d624f54a0b366c72 -> 0xa0b3ee897f233f385e5d61086c32685257d4f12b: 310,930,612.374274603970808264 eDAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 11,
+          "from": "0x0000000000000000000000000000000000000000",
+          "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "amount": "195681243987749811414670603",
+          "reads": "transfer",
+          "text": "0x0000000000000000000000000000000000000000 (zero address) -> 0x583c21631c48d442b5c0e605d624f54a0b366c72: 195,681,243.987749811414670603 eDAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 23,
+          "from": "0x0000000000000000000000000000000000000000",
+          "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "amount": "195681243987749811414670603",
+          "reads": "transfer",
+          "text": "0x0000000000000000000000000000000000000000 (zero address) -> 0x583c21631c48d442b5c0e605d624f54a0b366c72: 195,681,243.987749811414670603 eDAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 29,
+          "from": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "to": "0x0000000000000000000000000000000000000000",
+          "amount": "100000000000000000000000000",
+          "reads": "transfer",
+          "text": "0x583c21631c48d442b5c0e605d624f54a0b366c72 -> 0x0000000000000000000000000000000000000000 (zero address): 100,000,000 eDAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 48,
+          "from": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+          "to": "0x0000000000000000000000000000000000000000",
+          "amount": "38064411973236041314928395",
+          "reads": "transfer",
+          "text": "0xa0b3ee897f233f385e5d61086c32685257d4f12b -> 0x0000000000000000000000000000000000000000 (zero address): 38,064,411.973236041314928395 eDAI"
+        },
+        {
+          "block": 16817996,
+          "log_index": 7,
+          "from": "0x0000000000000000000000000000000000000000",
+          "to": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "amount": "19568124398774981141467060",
+          "reads": "transfer",
+          "text": "0x0000000000000000000000000000000000000000 (zero address) -> 0x583c21631c48d442b5c0e605d624f54a0b366c72: 19,568,124.39877498114146706 eDAI"
+        }
+      ],
+      "net": [
+        {
+          "address": "0x0000000000000000000000000000000000000000",
+          "sent": "410930612374274603970808266",
+          "received": "138064411973236041314928395",
+          "net": "-272866200401038562655879871",
+          "text": "0x0000000000000000000000000000000000000000 (zero address)  -272,866,200.401038562655879871 eDAI"
+        },
+        {
+          "address": "0xa0b3ee897f233f385e5d61086c32685257d4f12b",
+          "sent": "38064411973236041314928395",
+          "received": "310930612374274603970808264",
+          "net": "272866200401038562655879869",
+          "text": "0xa0b3ee897f233f385e5d61086c32685257d4f12b  +272,866,200.401038562655879869 eDAI"
+        },
+        {
+          "address": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "sent": "410930612374274603970808264",
+          "received": "410930612374274603970808266",
+          "net": "2",
+          "text": "0x583c21631c48d442b5c0e605d624f54a0b366c72  +0.000000000000000002 eDAI"
+        }
+      ],
+      "net_not_listed": 0,
+      "netted_to_zero": 0
+    }
+  ],
+  "nft_movements": [],
+  "new_holders": {
+    "status": "not_applicable",
+    "reason": "the range begins at this nest's first indexed block, 16,817,996, so the nest holds no earlier transfer to tell a new holder from an old one",
+    "before_block": 16817996,
+    "since": 16817996,
+    "history_rows": 0,
+    "budget": 20000000,
+    "tokens": []
+  },
+  "first_tables": {
+    "status": "not_applicable",
+    "reason": "the range begins at this nest's first indexed block, 16,817,996",
+    "tables": []
+  },
+  "approvals": [
+    {
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "alias": "dai",
+      "symbol": "DAI",
+      "decimals": 18,
+      "rows": 2,
+      "unlimited": 2,
+      "listed": [
+        {
+          "block": 16817996,
+          "log_index": 1,
+          "owner": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+          "spender": "0x7d2768de32b0b80b7a3454c06bdac94a69ddc7a9",
+          "amount": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+          "unlimited": true,
+          "text": "0xebc29199c817dc47ba12e3f86102564d640cbf99 approved 0x7d2768de32b0b80b7a3454c06bdac94a69ddc7a9 to spend any amount of DAI (unlimited: 2^256-1)"
+        },
+        {
+          "block": 16817996,
+          "log_index": 3,
+          "owner": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+          "spender": "0x27182842e098f60e3d576794a5bffb0777e025d3",
+          "amount": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+          "unlimited": true,
+          "text": "0x583c21631c48d442b5c0e605d624f54a0b366c72 approved 0x27182842e098f60e3d576794a5bffb0777e025d3 to spend any amount of DAI (unlimited: 2^256-1)"
+        }
+      ]
+    }
+  ],
+  "nft_approvals": [],
+  "threshold_flags": {
+    "configured": false,
+    "count": 0,
+    "listed": []
+  },
+  "labels": [],
+  "events": {
+    "tables": [],
+    "rows_told": 0,
+    "story_warnings": []
+  },
+  "not_seen": "Not seen by this nest: native ETH, internal calls, tokens it does not index, and any balance change made without one of these events (a rebase, for one). Net flow is the sum of the transfers seen, not a balance.",
+  "provenance": {
+    "version": "{version}",
+    "data_identity": "7d7681b43831b5ef2cd1b7ed04773f83ade3324b7b71412cbb20765e14c29e28",
+    "first_row": {
+      "block": 16817996,
+      "log_index": 0,
+      "block_hash": "0xde714b65354d54e684a95d80a1da7f668e8b2ee6ae8b5779f69ab9e04468b859"
+    },
+    "last_row": {
+      "block": 16817996,
+      "log_index": 54,
+      "block_hash": "0xde714b65354d54e684a95d80a1da7f668e8b2ee6ae8b5779f69ab9e04468b859"
+    },
+    "sealed_through": 16818085,
+    "metadata_sha256": "784e641498908da5d8a649b38f122c815ecaa29e687edfe7b88cc9acab2f34cb",
+    "label_snapshots": [],
+    "semantic_sha256": null
+  }
+}
