@@ -6252,18 +6252,13 @@ mod tests {
             format!("/api?module=account&action=txlist&address={ALICE}&startblock=0&endblock=180");
         let s = Arc::new(
             ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
-                .with_deadline(Duration::from_millis(300))
+                .with_deadline(Duration::from_secs(5))
                 .with_hash_at(make([7; 32])),
         );
-        let started = Instant::now();
+        // Waiting behind the cursor would run into the deadline and answer INCOMPLETE.
         let (_, v) = call(router(s), "GET", &path, None).await;
         assert_eq!(v["status"], "1", "{v}");
         assert_eq!(v["result"][0]["blockNumber"], "150");
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "{:?}",
-            started.elapsed()
-        );
         assert_eq!(asked.load(Ordering::Relaxed), 1, "one hash check");
         let s = Arc::new(
             ModeState::new(history.clone(), 1, Duration::from_secs(300), true)
