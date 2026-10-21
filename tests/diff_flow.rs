@@ -164,10 +164,6 @@ fn the_dai_transaction_matches_in_every_format() {
 fn the_unwrapped_weth_is_not_left_with_the_attacker() {
     let nest = nest();
     let range = ["--flow", "--from", "16818024", "--to", "16818057"];
-    let (ok, out, err) = diff(nest.path(), &range);
-    assert!(ok, "{err}");
-    assert_golden("weth-range.txt", &out);
-
     let (ok, out, err) = diff(nest.path(), &[&range[..], &["--format", "json"]].concat());
     assert!(ok, "{err}");
     let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -195,6 +191,10 @@ fn the_unwrapped_weth_is_not_left_with_the_attacker() {
         .sum();
     assert_eq!(rows, doc["rows_total"].as_u64().unwrap());
     assert_eq!(rows, 2256, "every row in range is counted in some table");
+
+    let (ok, out, err) = diff(nest.path(), &range);
+    assert!(ok, "{err}");
+    assert_golden("weth-range.txt", &out);
 }
 
 const ZERO: &str = "0x0000000000000000000000000000000000000000";
