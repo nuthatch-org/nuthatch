@@ -510,7 +510,8 @@ Every format is drawn from the JSON document. `--flow` is required, so the range
 default later without changing what an existing command prints.
 
 **What reads as flow.** An ERC-20 `Transfer` (topic0, two indexed addresses, an unindexed `uint256`),
-and WETH9's `Deposit` and `Withdrawal` as transfers from and to the zero address. Parameters are bound
+and `Deposit` and `Withdrawal` emitted by the chain's listed WETH9-style wrapper, as transfers from and
+to the zero address (decision 3 below). Parameters are bound
 by position, type and indexedness; a column's name is only used to quote it. Every other table,
 ERC-721 and ERC-1155 transfers included, is counted in range under "other events", so the per-table
 counts sum to the range total. Text says "(zero address)" and never "minted" or "burned". Net flow is
@@ -529,8 +530,10 @@ extended to name balance changes no event records.
 | Outside coverage: refused | Pass. A range below `start_block` or above the indexed head is refused with the covered interval |
 
 **Mutation checks**, each applied to `src/diff.rs`, shown in the diff before the run, restored after:
-reading WETH9's `Deposit`/`Withdrawal` as other events turns the attacker's WETH net to
-19639624727250683598741 and four goldens red; binding the sender by the name `from` fails the
+reading WETH9's `Deposit`/`Withdrawal` as other events (mainnet WETH dropped from the wrapper list)
+turns the attacker's WETH net to 19639624727250683598741 and two golden tests red; reading every
+emitter's rows in a `Deposit` table as flow fails the shared-alias test (a vault's deposit drawn as
+an edge); dropping the "this chain lists a wrapper" condition fails the Arbitrum test; binding the sender by the name `from` fails the
 positional test (the goldens stay green, since every Euler token but WETH names it `from`, and WETH
 falls back to position); "(burned)" for "(zero address)" fails the wording test and two golden tests;
 a cap check of `cap * 2` fails the cap test; trimming fractions to six places fails the scaling test
@@ -541,9 +544,31 @@ and three golden tests.
 - **A transaction lists every transfer.** §8's edges sum legs, so the DAI transaction's three eDAI
   mints are one edge. For `--tx` only, the text and JSON also list each transfer in log order, which
   is where §14's legs are read. Blocks and ranges get edges only.
-- **`Deposit(address indexed, uint256)` is WETH9 only where the same contract's ERC-20 `Transfer` is
-  indexed.** The signature is common (staking pools, vaults), and elsewhere it is not a mint of the
-  emitting contract.
+- **WETH9 is a property of a contract, not of a signature.** A `Deposit(address indexed, uint256)`
+  or `Withdrawal` row is flow only when the address that emitted it, the row's own `address` column,
+  is the listed wrapper for the nest's chain. Every other row of the same table, a factory child or a
+  vault sharing the alias, is counted under other events, so a table can appear on both sides with
+  counts that still sum to the total. Neither the alias nor "same contract also emits `Transfer`" is
+  enough: on Optimism two Curve gauges (crvUSDT-gauge `0x393f…2668`, crvUSDC-gauge `0xf9cb…beef`)
+  emit this exact `Deposit` beside a `Transfer` from the zero address in the same transaction, which
+  would count each deposit twice. The list, each checked on chain on 2026-10-22 by `symbol()` and
+  recent logs (`Deposit` present, and no `Transfer` from the zero address at the contract in the
+  sampled deposit's transaction or, for WBNB, in the 20-block window):
+
+  | Chain | Wrapper | `symbol()` | Evidence |
+  |---|---|---|---|
+  | mainnet (1) | `0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2` | WETH | 452 `Deposit` in 40 blocks; tx `0xc3270265…1902` has none |
+  | optimism (10) | `0x4200000000000000000000000000000000000006` | WETH | 7 in 40 blocks; tx `0x63f985bc…b766` has none |
+  | base (8453) | `0x4200000000000000000000000000000000000006` | WETH | 314 in 40 blocks; tx `0xdeda5343…b557` has none |
+  | bsc (56) | `0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c` | WBNB | 52 in 20 blocks, 0 `Transfer` from zero |
+  | polygon (137) | `0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270` | WPOL | 5 in 40 blocks; tx `0x792d70f0…64e9` has none |
+  | gnosis (100) | `0xe91d153e0b41518a2ce8dd3d7944fa863463a97d` | WXDAI | 1 in 40 blocks; tx `0x21c4fd3c…d7ac` has none |
+  | monad (143) | `0x3bd359c1119da7da1d913d1c4d2b7c461115433a` | WMON | 2 in 40 blocks; tx `0xdc55fb13…a401` has none |
+
+  Not listed: Arbitrum One's WETH (`0x82af…bab1`) emitted no `Deposit` in 2,000 blocks and 99
+  `Transfer`s from the zero address, so it wraps by `Transfer` and is already flow. Robinhood Chain
+  had no `Deposit` from any contract in 40 blocks and no wrapper could be checked. A later slice may
+  let an author declare further wrappers in `semantic.toml`; nothing for that is built.
 - **The row cap counts transfer rows only**, at the proposed 2,000,000: the measurement above leaves
   it with room. Other tables are counted, not read, and are not capped.
 - **`--top` defaults to 25** per token for edges and net flow in text, DOT and Mermaid; JSON keeps all.

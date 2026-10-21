@@ -101,8 +101,9 @@ nuthatch diff --flow --tx 0xHASH --block 16817996             # one transaction,
 nuthatch diff --flow --from 16818024 --to 16818057 --format dot > flow.dot
 ```
 
-The flow reads ERC-20 `Transfer` rows, and WETH9 `Deposit`/`Withdrawal` as transfers from and to the
-zero address, matched by event signature and parameter position, never by name. Amounts are exact,
+The flow reads ERC-20 `Transfer` rows, matched by event signature and parameter position, never by
+name, and `Deposit`/`Withdrawal` as transfers from and to the zero address only when emitted by the
+chain's WETH9-style wrapper (WETH, WBNB, WPOL, WXDAI, WMON). Amounts are exact,
 scaled by `metadata.json` (base units, marked "decimals unknown", without it). Net flow is the sum of
 the transfers seen, not a balance: native ETH, internal calls and tokens the nest does not index are
 invisible, and every output says so. `--format json` carries every edge; text, `dot` and `mermaid`
