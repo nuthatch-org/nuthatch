@@ -454,7 +454,7 @@ pub async fn read<S: Source>(
                 let row: BTreeMap<String, Option<String>> = cols
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| (c.to_string(), cell(r.get(&format!("c{i}")))))
+                    .map(|(i, c)| (c.to_string(), cell(r.get(format!("c{i}")))))
                     .collect();
                 out.sentences.push(SentenceOut {
                     block: number(r.get("block_number")).unwrap_or(0),

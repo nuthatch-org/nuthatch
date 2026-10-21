@@ -1134,7 +1134,8 @@ pub struct SqlArgs {
 #[command(group(clap::ArgGroup::new("what").required(true).multiple(true).args(["tx", "block", "from"])))]
 pub struct DiffArgs {
     /// Draw the token flow: one edge per (from, to, token) with the exact amount, and each address's
-    /// net flow. The only mode built so far (RFC-0071 §15); the range story comes later.
+    /// net flow. Every other table follows, told by its `story` line in semantic.toml or grouped by
+    /// its indexed parameters. The only mode built so far (RFC-0071 §15); the range story comes later.
     #[arg(long)]
     pub flow: bool,
 
@@ -1159,8 +1160,8 @@ pub struct DiffArgs {
     #[arg(long, value_enum, default_value_t = crate::diff::Format::Text)]
     pub format: crate::diff::Format,
 
-    /// Edges per token, and addresses per token in the net flow, that text, DOT and Mermaid show.
-    /// JSON always carries every one.
+    /// Edges per token, and addresses per token in the net flow, that text, DOT and Mermaid show;
+    /// JSON carries every one. Also the sentences told per story table, in every format.
     #[arg(long, default_value_t = crate::diff::DEFAULT_TOP)]
     pub top: usize,
 

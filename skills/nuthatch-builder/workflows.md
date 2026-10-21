@@ -111,6 +111,12 @@ show the `--top` largest per token. A range with more than 2,000,000 transfer ro
 what the nest has indexed, is refused rather than drawn in part. Without `--block`, `--tx` makes one
 `eth_getTransactionReceipt` call to find its block.
 
+Every other table in range is listed below the flow, most rows first, and the per-table counts sum
+to the range's total. A table with a `story` line in `semantic.toml` is told one sentence per row
+(the first `--top` in chain order); one without is grouped: its rows, block span, emitting contracts,
+and for each indexed parameter the distinct count and the three values on the most rows. Writing a
+story line is the way to turn that list into sentences; see config-reference.md.
+
 ## Wire an AI client to a running nest
 
 ```sh
