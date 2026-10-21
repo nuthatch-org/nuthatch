@@ -42,7 +42,7 @@ without users. Every slice after S1 is gated on evidence of demand, not on the p
 
 1. A Solana nest is declared by its scope: program IDs, optional extra accounts, a start slot.
 2. Sealed history is finalized-only and provably complete: every slot in a segment's range is a
-   block or a confirmed skip.
+   block or a slot proved skipped on finalized evidence (§5).
 3. Decoding is deterministic from an IDL in effect at that slot; raw rows are always kept, so a
    better IDL re-decodes without re-fetching.
 4. A default build is byte-for-byte unaffected (§9).
@@ -68,6 +68,13 @@ as separate cursors, each inside its own 2 GB budget.
 
 **Time axis.** Slot, not block height. Skipped slots are stored explicitly (`blocks.skipped`), so a
 segment can prove it is complete. `block_height` and `block_time` are attributes.
+
+**What proves a skip.** A slot is recorded as skipped only on finalized evidence: it is at or below
+the finalized slot, `getBlocks` at `finalized` does not list it, and the parent links agree, meaning
+the next produced block's `parentSlot` is the previous produced slot, jumping over it. A block an RPC
+cannot return (not available, missing from long-term storage) is *unavailable*, not skipped, and a
+segment holding an unavailable slot does not seal until it is fetched. S0 records which RPC errors
+mean which, on each provider used.
 
 **Finality.** Rows enter the hot store (redb) at confirmed or finalized, and only finalized slots are
 sealed. Alpenglow replaced TowerBFT on mainnet on 2026-10-21; Anza states finality fell to about
@@ -146,7 +153,7 @@ tree gains nothing; `cargo tree` with and without the feature is checked in CI.
 - **S0, the spike, which can stop the programme.** Behind the feature: one well-known Anchor program
   backfilled over RPC for a bounded slot range (about one epoch), raw tables sealed into epoch-aligned
   segments, queried through Burrmill. Gates: every slot in range accounted for as a block or a
-  confirmed skip; the program's transactions over the range match an independent count (a second
+  skip proved on finalized evidence (§5), with an unavailable block refusing the seal; the program's transactions over the range match an independent count (a second
   RPC, or solarchive.org's daily Parquet); RSS inside 2 GB; the finalized lag after Alpenglow and
   the RPC calls and wall time recorded. A default build's `cargo tree` and help are unchanged.
 - **S1, the tip.** Yellowstone at finalized, reconnect from a slot, gaps filled over RPC, a reorg of
