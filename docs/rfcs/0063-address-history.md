@@ -96,15 +96,22 @@ different outcomes.
 
 ## 5. The HTTP surface
 
-`GET /api` on the nest, Etherscan-shaped: `chainid, module, action`, and for account lists
+`GET /api` on the nest, or the same parameters as a form `POST` (up to 1 MiB, merged with the query
+string, a key the two disagree on refused), as BitBoxApp sends a call too long for a GET. `chainId` is
+read as `chainid`; the two naming different chains are refused. Etherscan-shaped: `chainid, module, action`, and for account lists
 `address, startblock, endblock, sort, page, offset`, inclusive bounds, ascending by default, 1,000
 rows a page. `txlistinternal` also takes `txhash`; off a loopback bind only a transaction the nest
-holds for a watched account is traced for it. Actions: the six in §2, plus `account/balance`
-(**not built**: it answers `NUTHATCH_UNSUPPORTED`), the `proxy` RPC passthroughs rotki uses
-(`eth_blockNumber`, `eth_getBlockByNumber`,
-`eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getCode`, `eth_call`) and
-`logs/getLogs`. `contract/getabi`, `contract/getcontractcreation` and `block/getblockreward` answer
-unsupported until built.
+holds for a watched account is traced for it. The token actions take `contractaddress` with an
+`address` and list that token's transfers only; `contractaddress` alone is every holder's, which a
+nest of watched addresses cannot list, so it answers `NUTHATCH_UNSUPPORTED`. Actions: the six in §2,
+plus `account/balance` and `account/balancemulti` (at most 20 addresses) at a `tag` of `latest` or a
+block in hex or decimal, read from the nest's RPC by `eth_getBalance` and stored nowhere, the `proxy`
+RPC passthroughs rotki and BitBoxApp use (`eth_blockNumber`, `eth_getBlockByNumber`,
+`eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getCode`, `eth_call`,
+`eth_estimateGas`, `eth_gasPrice`, `eth_getTransactionCount`) and `logs/getLogs`. Like the proxy,
+balances are answered only on a loopback bind. `proxy/eth_sendRawTransaction` is refused: a history
+service never broadcasts. `contract/getabi`, `contract/getcontractcreation` and
+`block/getblockreward` answer unsupported until built.
 
 Success is `{"status":"1","message":"OK","result":...}`; a covered empty list is `[]`. Anything the
 nest cannot answer completely is `{"status":"0","message":"NOTOK","result":"NUTHATCH_UNSUPPORTED: ..."}`

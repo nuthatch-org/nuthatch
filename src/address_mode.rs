@@ -3048,7 +3048,12 @@ fn supervise(
 
 pub fn router(state: Arc<ModeState>) -> Router {
     Router::new()
-        .route("/api", get(api))
+        .route(
+            "/api",
+            get(api)
+                .post(api_form)
+                .layer(axum::extract::DefaultBodyLimit::max(API_BODY)),
+        )
         // A batch of addresses is about 45 bytes each: 16 MB takes some 350,000 in one call.
         .route(
             "/api/watch",
@@ -3076,10 +3081,66 @@ fn failed(status: StatusCode, e: impl std::fmt::Display) -> (StatusCode, Json<Va
     (status, Json(json!({ "error": e.to_string() })))
 }
 
+/// The most an `/api` form POST may carry: a client posts when its GET would be too long, so an
+/// `eth_call` with long data, never a batch.
+const API_BODY: usize = 1024 * 1024;
+
+/// One `/api` request's parameters, whether sent as a query string or a form POST (BitBoxApp posts
+/// a call too long for a GET), with `chainId` read as `chainid`. A key the two disagree on is refused
+/// by name rather than one silently winning.
+fn api_params(
+    mut q: HashMap<String, String>,
+    form: HashMap<String, String>,
+) -> std::result::Result<HashMap<String, String>, Value> {
+    for (k, v) in form {
+        match q.get(&k) {
+            Some(was) if *was != v => {
+                return Err(crate::address_history::unsupported(&format!(
+                    "{k} is `{was}` in the query string and `{v}` in the body"
+                )))
+            }
+            _ => {
+                q.insert(k, v);
+            }
+        }
+    }
+    if let Some(id) = q.remove("chainId") {
+        match q.get("chainid") {
+            Some(c) if *c != id => {
+                return Err(crate::address_history::unsupported(&format!(
+                    "chainid {c} and chainId {id} name different chains"
+                )))
+            }
+            _ => {
+                q.insert("chainid".into(), id);
+            }
+        }
+    }
+    Ok(q)
+}
+
 async fn api(
     State(s): State<Arc<ModeState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<Value> {
+    match api_params(q, HashMap::new()) {
+        Ok(q) => serve_api(s, q).await,
+        Err(refused) => Json(refused),
+    }
+}
+
+async fn api_form(
+    State(s): State<Arc<ModeState>>,
+    Query(q): Query<HashMap<String, String>>,
+    axum::Form(form): axum::Form<HashMap<String, String>>,
+) -> Json<Value> {
+    match api_params(q, form) {
+        Ok(q) => serve_api(s, q).await,
+        Err(refused) => Json(refused),
+    }
+}
+
+async fn serve_api(s: Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
     let conflict = |s: &ModeState| s.conflicted();
     if let Some(why) = conflict(&s) {
         return Json(crate::address_history::incomplete(&why));
@@ -3278,6 +3339,8 @@ fn before_history(s: &ModeState, q: &HashMap<String, String>) -> Option<String> 
         return None;
     }
     Action::from_etherscan(q.get("action")?)?;
+    // A request naming no address has no history to start; `respond` says what is wrong with it.
+    q.get("address").filter(|a| !a.is_empty())?;
     let start = match q.get("startblock").filter(|v| !v.is_empty()) {
         None => 0,
         Some(v) => v.parse::<u64>().ok()?,
@@ -4191,7 +4254,7 @@ pub fn counter<M: Rpc, T: Rpc>(discovery: Arc<Discoverer<Counted<M>, Counted<T>>
     })
 }
 
-/// Forwards a `proxy` or `logs` call to the nest's main RPC, once `verified` says it is on the
+/// Forwards a `proxy`, `logs` or balance call to the nest's main RPC, once `verified` says it is on the
 /// nest's chain. Counted with the rest of the nest's calls.
 pub fn forward<M: Rpc, T: Rpc>(
     discovery: Arc<Discoverer<Counted<M>, Counted<T>>>,
@@ -4495,7 +4558,12 @@ type Chains = Arc<BTreeMap<u64, Arc<ModeState>>>;
 /// `chainid` names, or of every chain where the answer spans them.
 pub fn chains_router(chains: Chains) -> Router {
     Router::new()
-        .route("/api", get(chains_api))
+        .route(
+            "/api",
+            get(chains_api)
+                .post(chains_api_form)
+                .layer(axum::extract::DefaultBodyLimit::max(API_BODY)),
+        )
         .route(
             "/api/watch",
             get(chains_watched)
@@ -4517,6 +4585,24 @@ async fn chains_api(
     State(c): State<Chains>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<Value> {
+    match api_params(q, HashMap::new()) {
+        Ok(q) => chains_serve(c, q).await,
+        Err(refused) => Json(refused),
+    }
+}
+
+async fn chains_api_form(
+    State(c): State<Chains>,
+    Query(q): Query<HashMap<String, String>>,
+    axum::Form(form): axum::Form<HashMap<String, String>>,
+) -> Json<Value> {
+    match api_params(q, form) {
+        Ok(q) => chains_serve(c, q).await,
+        Err(refused) => Json(refused),
+    }
+}
+
+async fn chains_serve(c: Chains, q: HashMap<String, String>) -> Json<Value> {
     let asked = match q.get("chainid") {
         None if c.len() == 1 => c.values().next().cloned(),
         None => {
@@ -4528,7 +4614,7 @@ async fn chains_api(
         Some(id) => id.parse::<u64>().ok().and_then(|id| c.get(&id).cloned()),
     };
     match asked {
-        Some(s) => api(State(s), Query(q)).await,
+        Some(s) => serve_api(s, q).await,
         // Worded with `chainid`, which rotki reads as "not this indexer for that chain".
         None => Json(crate::address_history::unsupported(&format!(
             "chainid {} is not served here; this endpoint serves chains {}",
@@ -5786,6 +5872,217 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("chain_id=\"1\"") && text.contains("chain_id=\"100\""));
+    }
+
+    /// On a directory of chains, a balance, a gas price and a nonce are read from the RPC of the chain
+    /// `chainid` names, never another's.
+    #[tokio::test]
+    async fn balance_and_gas_calls_reach_the_named_chains_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        // Each chain's RPC answers its own chain id to everything.
+        let state = |id: u64| {
+            let store = Store::open(&dir.path().join(format!("{id}.redb"))).unwrap();
+            let history = AddressHistory::open(store, id, &[ALICE.into()]).unwrap();
+            let forward: crate::address_proxy::Forward = Arc::new(move |_m: String, _p: Value| {
+                Box::pin(async move { Ok(json!(format!("0x{id:x}"))) })
+            });
+            Arc::new(
+                ModeState::new(history, id, Duration::from_secs(300), true).with_forward(forward),
+            )
+        };
+        let chains: Chains = Arc::new([(1, state(1)), (100, state(100))].into());
+        for id in [1u64, 100] {
+            let ask = async |q: &str| {
+                call(
+                    chains_router(chains.clone()),
+                    "GET",
+                    &format!("/api?chainid={id}&{q}"),
+                    None,
+                )
+                .await
+            };
+            let (_, v) = ask(&format!(
+                "module=account&action=balance&address={ALICE}&tag=0x10"
+            ))
+            .await;
+            assert_eq!(v["result"], id.to_string(), "chain {id}: {v}");
+            let (_, v) = ask(&format!(
+                "module=account&action=balancemulti&address={ALICE}"
+            ))
+            .await;
+            assert_eq!(v["result"][0]["balance"], id.to_string(), "chain {id}: {v}");
+            for action in [
+                "eth_gasPrice",
+                "eth_getTransactionCount&address=0xaa&tag=pending",
+            ] {
+                let (_, v) = ask(&format!("module=proxy&action={action}")).await;
+                assert_eq!(v["result"], format!("0x{id:x}"), "chain {id} {action}: {v}");
+            }
+        }
+    }
+
+    type Recorded = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
+    /// A loopback nest on `id` whose RPC answers its chain id to everything, recording each call.
+    fn recording_state(dir: &Path, id: u64) -> (Arc<ModeState>, Recorded) {
+        let store = Store::open(&dir.join(format!("{id}.redb"))).unwrap();
+        let history = AddressHistory::open(store, id, &[ALICE.into()]).unwrap();
+        let calls: Recorded = Arc::default();
+        let seen = calls.clone();
+        let forward: crate::address_proxy::Forward = Arc::new(move |m: String, p: Value| {
+            seen.lock().unwrap().push((m, p));
+            Box::pin(async move { Ok(json!(format!("0x{id:x}"))) })
+        });
+        let s = ModeState::new(history, id, Duration::from_secs(300), true).with_forward(forward);
+        (Arc::new(s), calls)
+    }
+
+    async fn post_form(app: Router, path: &str, body: &str) -> (StatusCode, Value) {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// BitBoxApp names the chain `chainId` on every call. A nest must read it, or a Sepolia request
+    /// to a mainnet nest is answered with mainnet's data.
+    #[tokio::test]
+    async fn a_chain_named_chainid_in_bitboxs_spelling_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let (solo, calls) = recording_state(dir.path(), 1);
+        let ask = async |q: String| call(router(solo.clone()), "GET", &q, None).await.1;
+        let balance = format!("module=account&action=balance&address={ALICE}");
+        let txlist = format!("module=account&action=txlist&address={ALICE}");
+        for q in [&balance, &txlist] {
+            let v = ask(format!("/api?chainId=11155111&{q}")).await;
+            let r = v["result"].as_str().unwrap_or_default();
+            assert!(
+                r.starts_with("NUTHATCH_UNSUPPORTED:") && r.contains("11155111"),
+                "{q}: {v}"
+            );
+        }
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no RPC call for another chain"
+        );
+        let v = ask(format!("/api?chainid=1&chainId=11155111&{balance}")).await;
+        let r = v["result"].as_str().unwrap_or_default();
+        assert!(
+            r.starts_with("NUTHATCH_UNSUPPORTED:") && r.contains("chainId 11155111"),
+            "{v}"
+        );
+        let v = ask(format!("/api?chainId=1&{balance}")).await;
+        assert_eq!(v["result"], "1", "{v}");
+
+        let other = tempfile::tempdir().unwrap();
+        let chains: Chains = Arc::new(
+            [1, 100]
+                .into_iter()
+                .map(|id| (id, recording_state(other.path(), id).0))
+                .collect(),
+        );
+        for (id, answers) in [(1, "1"), (100, "100")] {
+            let (_, v) = call(
+                chains_router(chains.clone()),
+                "GET",
+                &format!("/api?chainId={id}&{balance}"),
+                None,
+            )
+            .await;
+            assert_eq!(v["result"], answers, "chainId={id}: {v}");
+        }
+    }
+
+    /// BitBoxApp posts a call as a form when its GET would be too long, and always posts a
+    /// broadcast. A post is answered exactly as the GET would be; a broadcast is still refused.
+    #[tokio::test]
+    async fn a_form_post_is_answered_as_the_get_would_be() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = format!("0x{}", "ab".repeat(8_000));
+        let call_q = format!("module=proxy&action=eth_call&from={ALICE}&to={ALICE}&data={data}");
+        let (solo, solo_calls) = recording_state(dir.path(), 1);
+        let (chain, chain_calls) = recording_state(dir.path(), 100);
+        let chains: Chains = Arc::new([(100, chain)].into());
+        for (app, calls, prefix) in [
+            (
+                Box::new(move || router(solo.clone())) as Box<dyn Fn() -> Router>,
+                solo_calls,
+                "",
+            ),
+            (
+                Box::new(move || chains_router(chains.clone())),
+                chain_calls,
+                "chainId=100&",
+            ),
+        ] {
+            let (_, got) = call(app(), "GET", &format!("/api?{prefix}{call_q}"), None).await;
+            let (code, posted) = post_form(app(), "/api", &format!("{prefix}{call_q}")).await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(posted, got, "{prefix}");
+            assert_eq!(posted["jsonrpc"], "2.0", "{posted}");
+            let seen = calls.lock().unwrap().clone();
+            assert_eq!(seen.len(), 2, "{prefix}");
+            assert_eq!(seen[0], seen[1], "{prefix}");
+            assert_eq!(seen[1].1[0]["data"], data.as_str());
+
+            let raw = format!("{prefix}module=proxy&action=eth_sendRawTransaction&hex=0x02f8");
+            let (_, v) = post_form(app(), "/api", &raw).await;
+            let r = v["result"].as_str().unwrap_or_default();
+            assert!(r.starts_with("NUTHATCH_UNSUPPORTED:"), "{prefix}: {v}");
+            // The query string and body naming different actions is refused, not resolved.
+            let (_, v) = post_form(
+                app(),
+                "/api?action=eth_gasPrice",
+                &format!("{prefix}{call_q}"),
+            )
+            .await;
+            let r = v["result"].as_str().unwrap_or_default();
+            assert!(
+                r.starts_with("NUTHATCH_UNSUPPORTED:") && r.contains("action"),
+                "{prefix}: {v}"
+            );
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                2,
+                "{prefix}: nothing more reached the RPC"
+            );
+        }
+    }
+
+    /// A token named with no address is refused for what it is, not answered with where history
+    /// starts: asking again from there would only be refused again.
+    #[tokio::test]
+    async fn a_token_without_an_address_is_unsupported_not_before_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_range(25_700_000, None, 64),
+        );
+        let (_, v) = call(
+            router(s),
+            "GET",
+            "/api?module=account&action=tokentx&contractaddress=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            None,
+        )
+        .await;
+        let r = v["result"].as_str().unwrap_or_default();
+        assert!(
+            r.starts_with("NUTHATCH_UNSUPPORTED:") && r.contains("contractaddress"),
+            "{v}"
+        );
     }
 
     /// rotki asks from block 0, or names no start: every account action must answer in the wording
@@ -7265,6 +7562,7 @@ mod tests {
                         page: 1,
                         offset: 10_000,
                         generation: None,
+                        contract: None,
                     },
                 )
                 .unwrap()

@@ -497,7 +497,7 @@ pub(crate) fn hex_u64(v: &Value) -> Result<u64> {
 }
 
 /// A hex quantity or 32-byte word as the decimal string Etherscan prints.
-fn decimal(hex: &str) -> Result<String> {
+pub(crate) fn decimal(hex: &str) -> Result<String> {
     let digits = hex.trim_start_matches("0x");
     if digits.is_empty() {
         return Ok("0".into());
@@ -4283,6 +4283,7 @@ mod tests {
             page: 1,
             offset: 10,
             generation: None,
+            contract: None,
         };
         let crate::address_history::Answer::Rows(rows) = h.page(Action::TxList, &req).unwrap()
         else {
@@ -5409,6 +5410,7 @@ mod tests {
                 page: 1,
                 offset: 10,
                 generation: None,
+                contract: None,
             };
             let crate::address_history::Answer::Rows(rows) = h.page(Action::TxList, &req).unwrap()
             else {
@@ -5551,6 +5553,7 @@ mod tests {
             page: 1,
             offset: 10,
             generation: None,
+            contract: None,
         };
         let crate::address_history::Answer::Rows(rows) = h.page(Action::MinedBlocks, &req).unwrap()
         else {

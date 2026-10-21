@@ -28,14 +28,22 @@ const MAX_LOG_CALLS: usize = 64;
 /// Receipts and headers a getLogs page fetches at once.
 const AT_ONCE: usize = 16;
 
-/// The answer to a `proxy` or `logs` request, or `None` for any other module.
+/// The most addresses one `balancemulti` takes, as Etherscan caps it.
+const MAX_BALANCES: usize = 20;
+
+/// The answer to a `proxy`, `logs` or account balance request, or `None` for anything else.
 pub async fn answer(
     q: &HashMap<String, String>,
     chain_id: u64,
     forward: &Forward,
 ) -> Option<Value> {
     let module = q.get("module").map(String::as_str)?;
-    if module != "proxy" && module != "logs" {
+    let balance = module == "account"
+        && matches!(
+            q.get("action").map(String::as_str),
+            Some("balance" | "balancemulti")
+        );
+    if module != "proxy" && module != "logs" && !balance {
         return None;
     }
     if let Some(c) = q.get("chainid") {
@@ -46,7 +54,9 @@ pub async fn answer(
         }
     }
     let action = q.get("action").map(String::as_str).unwrap_or("");
-    let result = if module == "proxy" {
+    let result = if balance {
+        balances(q, action == "balancemulti", forward).await
+    } else if module == "proxy" {
         proxy(q, action, forward).await
     } else if action == "getLogs" {
         // A failed range is one the nest could not answer, never an error in the caller's request,
@@ -62,6 +72,7 @@ pub async fn answer(
     Some(match result {
         Ok(Answer::Rpc(result)) => json!({ "jsonrpc": "2.0", "id": 1, "result": result }),
         Ok(Answer::Logs(rows)) => json!({ "status": "1", "message": "OK", "result": rows }),
+        Ok(Answer::Account(result)) => json!({ "status": "1", "message": "OK", "result": result }),
         Ok(Answer::Unsupported(why)) => crate::address_history::unsupported(&why),
         Ok(Answer::Incomplete(why)) => crate::address_history::incomplete(&why),
         Err(e) => json!({ "status": "0", "message": "NOTOK", "result": format!("Error! {e:#}") }),
@@ -71,8 +82,68 @@ pub async fn answer(
 enum Answer {
     Rpc(Value),
     Logs(Vec<Value>),
+    Account(Value),
     Unsupported(String),
     Incomplete(String),
+}
+
+/// `account/balance` and `account/balancemulti` at `tag`, from `eth_getBalance`, in decimal wei.
+async fn balances(q: &HashMap<String, String>, multi: bool, forward: &Forward) -> Result<Answer> {
+    use futures::{StreamExt, TryStreamExt};
+    let tag = match q.get("tag").map(String::as_str).filter(|t| !t.is_empty()) {
+        None => "latest".to_string(),
+        Some(t @ ("latest" | "earliest" | "pending" | "safe" | "finalized")) => t.to_string(),
+        Some(t) => {
+            let n = match t.strip_prefix("0x") {
+                Some(hex) => u64::from_str_radix(hex, 16),
+                None => t.parse::<u64>(),
+            };
+            format!("0x{:x}", n.map_err(|_| anyhow!("Invalid tag `{t}`"))?)
+        }
+    };
+    let asked: Vec<String> = q
+        .get("address")
+        .map_or("", String::as_str)
+        .split(',')
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
+        .collect();
+    if asked.is_empty() {
+        bail!("Missing address");
+    }
+    if !multi && asked.len() > 1 {
+        bail!("Invalid address format");
+    }
+    if asked.len() > MAX_BALANCES {
+        bail!("Maximum of {MAX_BALANCES} addresses per call");
+    }
+    for a in &asked {
+        crate::address_history::parse_address(a).map_err(|_| anyhow!("Invalid address format"))?;
+    }
+    let found: Vec<String> = futures::stream::iter(asked.clone())
+        .map(|a: String| {
+            let tag = tag.clone();
+            async move {
+                let wei = forward("eth_getBalance".into(), json!([a, tag])).await?;
+                let wei = wei
+                    .as_str()
+                    .ok_or_else(|| anyhow!("eth_getBalance answered {wei}"))?;
+                crate::address_discovery::decimal(wei)
+            }
+        })
+        .buffered(AT_ONCE)
+        .try_collect()
+        .await?;
+    Ok(Answer::Account(if multi {
+        asked
+            .iter()
+            .zip(found)
+            .map(|(a, balance)| json!({ "account": a, "balance": balance }))
+            .collect()
+    } else {
+        json!(found[0])
+    }))
 }
 
 async fn proxy(q: &HashMap<String, String>, action: &str, forward: &Forward) -> Result<Answer> {
@@ -82,12 +153,28 @@ async fn proxy(q: &HashMap<String, String>, action: &str, forward: &Forward) -> 
             .ok_or_else(|| anyhow!("Missing {k}"))
     };
     let tag = || q.get("tag").map_or("latest", String::as_str);
+    // The call object as Etherscan's `eth_call` and `eth_estimateGas` take it: a wallet estimating a
+    // token transfer needs its `from`, or the estimate is the zero address's.
+    let call = || -> Result<Value> {
+        let mut c = Map::new();
+        c.insert("to".into(), json!(get("to")?));
+        for k in ["from", "data", "value", "gas", "gasPrice"] {
+            if let Some(v) = q.get(k).filter(|v| !v.is_empty()) {
+                c.insert(k.into(), json!(v));
+            }
+        }
+        Ok(Value::Object(c))
+    };
     let params = match action {
-        "eth_blockNumber" => json!([]),
+        "eth_blockNumber" | "eth_gasPrice" => json!([]),
         "eth_getBlockByNumber" => json!([get("tag")?, get("boolean")? == "true"]),
         "eth_getTransactionByHash" | "eth_getTransactionReceipt" => json!([get("txhash")?]),
-        "eth_getCode" => json!([get("address")?, tag()]),
-        "eth_call" => json!([{ "to": get("to")?, "data": get("data")? }, tag()]),
+        "eth_getCode" | "eth_getTransactionCount" => json!([get("address")?, tag()]),
+        "eth_call" => {
+            get("data")?;
+            json!([call()?, tag()])
+        }
+        "eth_estimateGas" => json!([call()?]),
         other => {
             return Ok(Answer::Unsupported(format!(
                 "proxy/{other} is not served by this nest"
@@ -460,6 +547,176 @@ mod tests {
         )
         .await
         .is_none());
+    }
+
+    /// BitBoxApp's wallet calls, as `etherscan.go` sends them: a gas price, a nonce at `pending` or a
+    /// block, and an estimate whose `from` and `value` reach the RPC, since a token transfer estimated
+    /// from the zero address reverts.
+    #[tokio::test]
+    async fn a_wallets_gas_and_nonce_calls_reach_the_rpc() {
+        let (forward, calls) = fake(|m, _| json!(format!("answer to {m}")));
+        for (pairs, method, params) in [
+            (vec![("action", "eth_gasPrice")], "eth_gasPrice", json!([])),
+            (
+                vec![
+                    ("action", "eth_getTransactionCount"),
+                    ("address", "0xaa"),
+                    ("tag", "pending"),
+                ],
+                "eth_getTransactionCount",
+                json!(["0xaa", "pending"]),
+            ),
+            (
+                vec![
+                    ("action", "eth_estimateGas"),
+                    ("from", "0xf0"),
+                    ("to", "0xcc"),
+                    ("data", "0xa9059cbb"),
+                    ("value", "0x0"),
+                    ("gasPrice", "0x3b9aca00"),
+                ],
+                "eth_estimateGas",
+                json!([{"from": "0xf0", "to": "0xcc", "data": "0xa9059cbb", "value": "0x0",
+                    "gasPrice": "0x3b9aca00"}]),
+            ),
+            (
+                vec![
+                    ("action", "eth_call"),
+                    ("from", "0xf0"),
+                    ("to", "0xcc"),
+                    ("data", "0x01"),
+                ],
+                "eth_call",
+                json!([{"from": "0xf0", "to": "0xcc", "data": "0x01"}, "latest"]),
+            ),
+        ] {
+            let mut p = q(&pairs);
+            p.insert("module".into(), "proxy".into());
+            let got = answer(&p, 1, &forward).await.unwrap();
+            assert_eq!(
+                got["result"],
+                format!("answer to {method}"),
+                "{method}: {got}"
+            );
+            assert_eq!(
+                calls.lock().unwrap().last().unwrap(),
+                &(method.to_string(), params)
+            );
+        }
+    }
+
+    /// `account/balance` and `balancemulti` at a block, as BitBoxApp asks (`tag` in hex), answered
+    /// from `eth_getBalance` in Etherscan's decimal wei, one call per address and in the order asked.
+    #[tokio::test]
+    async fn balances_are_read_from_the_rpc_at_the_tag() {
+        let (forward, calls) = fake(|_, p| {
+            let a = p[0].as_str().unwrap();
+            json!(if a.ends_with('1') {
+                "0xde0b6b3a7640000"
+            } else {
+                "0x0"
+            })
+        });
+        let a1 = "0x0000000000000000000000000000000000000001";
+        let a2 = "0x0000000000000000000000000000000000000002";
+        let ask = async |pairs: &[(&str, &str)]| answer(&q(pairs), 1, &forward).await;
+
+        let one = ask(&[
+            ("module", "account"),
+            ("action", "balance"),
+            ("address", a1),
+            ("tag", "0x10"),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            one,
+            json!({"status": "1", "message": "OK", "result": "1000000000000000000"})
+        );
+        assert_eq!(
+            calls.lock().unwrap().last().unwrap(),
+            &("eth_getBalance".to_string(), json!([a1, "0x10"]))
+        );
+        for (tag, sent) in [
+            (None, "latest"),
+            (Some("16"), "0x10"),
+            (Some("latest"), "latest"),
+        ] {
+            let mut p = vec![
+                ("module", "account"),
+                ("action", "balance"),
+                ("address", a2),
+            ];
+            p.extend(tag.map(|t| ("tag", t)));
+            let got = ask(&p).await.unwrap();
+            assert_eq!(got["result"], "0", "{got}");
+            assert_eq!(calls.lock().unwrap().last().unwrap().1, json!([a2, sent]));
+        }
+
+        let multi = ask(&[
+            ("module", "account"),
+            ("action", "balancemulti"),
+            ("address", &format!("{a2},{a1}")),
+            ("tag", "latest"),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            multi,
+            json!({"status": "1", "message": "OK", "result": [
+                {"account": a2, "balance": "0"},
+                {"account": a1, "balance": "1000000000000000000"},
+            ]})
+        );
+
+        let before = calls.lock().unwrap().len();
+        let twenty_one = vec![a1; 21].join(",");
+        for (action, address, tag) in [
+            ("balancemulti", twenty_one.as_str(), "latest"),
+            ("balance", "0xnope", "latest"),
+            ("balance", a1, "soon"),
+        ] {
+            let got = ask(&[
+                ("module", "account"),
+                ("action", action),
+                ("address", address),
+                ("tag", tag),
+            ])
+            .await
+            .unwrap();
+            assert_eq!(got["status"], "0", "{got}");
+            assert!(
+                got["result"].as_str().unwrap().starts_with("Error! "),
+                "{got}"
+            );
+        }
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            before,
+            "a refused request asks nothing"
+        );
+        let twenty = vec![a1; 20].join(",");
+        let got = ask(&[
+            ("module", "account"),
+            ("action", "balancemulti"),
+            ("address", &twenty),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(got["result"].as_array().unwrap().len(), 20, "{got}");
+
+        let other_chain = ask(&[
+            ("module", "account"),
+            ("action", "balance"),
+            ("address", a1),
+            ("chainid", "10"),
+        ])
+        .await
+        .unwrap();
+        assert!(other_chain["result"]
+            .as_str()
+            .unwrap()
+            .contains("chainid 10"));
     }
 
     /// Etherscan's log carries the block's timestamp and its transaction's gas price and gas used;

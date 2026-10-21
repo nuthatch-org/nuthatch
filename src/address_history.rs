@@ -253,6 +253,14 @@ impl Action {
         }
     }
 
+    /// Whether Etherscan narrows the action to one token by `contractaddress`.
+    pub fn by_token(self) -> bool {
+        matches!(
+            self,
+            Action::TokenTx | Action::TokenNftTx | Action::Token1155Tx
+        )
+    }
+
     /// Stored in coverage keys, so these numbers are on disk and must never be reassigned.
     fn code(self) -> u8 {
         match self {
@@ -493,6 +501,8 @@ pub struct PageRequest {
     /// The generation page 1 was cut from. Pages after the first carry it, so a reorg or unwatch
     /// between pages reads incomplete instead of silently shifting rows across a page boundary.
     pub generation: Option<u64>,
+    /// A token action's `contractaddress`: only that token's transfers, paged after filtering.
+    pub contract: Option<Address>,
 }
 
 #[cfg(test)]
@@ -2356,13 +2366,31 @@ impl AddressHistory {
         let read = read.inspect(|_| ROWS_READ.with(|n| n.set(n.get() + 1)));
         #[cfg(test)]
         ROWS_READ.with(|n| n.set(0));
-        let rows = read
-            .skip(skip)
+        let decode = |e: std::result::Result<_, redb::StorageError>| {
+            let (_, v): (_, redb::AccessGuard<&[u8]>) = e?;
+            decode_record(v.value())
+        };
+        let rows: Box<dyn Iterator<Item = Result<Map<String, Value>>>> = match req.contract {
+            // Unfiltered, the skipped rows are never decoded.
+            None => Box::new(read.skip(skip).map(decode)),
+            Some(c) => {
+                let c = address_hex(&c);
+                Box::new(
+                    read.map(decode)
+                        .filter(move |r| {
+                            r.as_ref().map_or(true, |r| {
+                                r.get("contractAddress")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|a| a.eq_ignore_ascii_case(&c))
+                            })
+                        })
+                        .skip(skip),
+                )
+            }
+        };
+        let rows = rows
             .take(take)
-            .map(|e| {
-                let (_, v) = e?;
-                decode_record(v.value()).map(Value::Object)
-            })
+            .map(|r| r.map(Value::Object))
             .collect::<Result<Vec<_>>>()?;
         answer(Answer::Rows(rows))
     }
@@ -2982,6 +3010,14 @@ pub fn respond(
     if let Some(hash) = get("txhash") {
         return by_txhash(history, act, hash, params);
     }
+    let given = |k: &str| get(k).is_some_and(|v| !v.is_empty());
+    if act.by_token() && given("contractaddress") && !given("address") {
+        return unsupported(&format!(
+            "{} by contractaddress alone lists every holder of the token; this nest holds its watched \
+             addresses' transfers only, so name an address",
+            act.etherscan()
+        ));
+    }
     if act == Action::MinedBlocks && get("blocktype").is_some_and(|t| t != "blocks") {
         return unsupported("getminedblocks is served for blocktype=blocks only");
     }
@@ -3169,6 +3205,12 @@ fn parse_request(params: &std::collections::HashMap<String, String>) -> Result<P
         Some("desc") => Sort::Desc,
         Some(s) => bail!("invalid sort `{s}`"),
     };
+    let contract = get("contractaddress")
+        .filter(|_| {
+            Action::from_etherscan(get("action").unwrap_or("")).is_some_and(Action::by_token)
+        })
+        .map(|c| parse_address(c).map_err(|_| anyhow!("Invalid contractaddress format")))
+        .transpose()?;
     let page = num("page")?.unwrap_or(1);
     let offset = num("offset")?.unwrap_or(DEFAULT_OFFSET);
     if page == 0 || offset == 0 {
@@ -3185,6 +3227,7 @@ fn parse_request(params: &std::collections::HashMap<String, String>) -> Result<P
         page,
         offset,
         generation: num("generation")?,
+        contract,
     })
 }
 
@@ -3249,6 +3292,7 @@ mod tests {
             page,
             offset,
             generation: None,
+            contract: None,
         }
     }
 
@@ -3346,6 +3390,67 @@ mod tests {
         desc.reverse();
         assert_eq!(asc.len(), 5);
         assert_eq!(asc, desc);
+    }
+
+    /// BitBoxApp asks `tokentx` per token with `contractaddress`: only that token's transfers, paged
+    /// after filtering, whatever case the address is written in. A token alone, with no address, is
+    /// every holder's transfers, which a nest of watched addresses cannot list whole.
+    #[test]
+    fn tokentx_by_contractaddress_lists_that_tokens_transfers_only() {
+        let (_d, h) = history();
+        let usdc = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let dai = "0x6b175474e89094c44da98b954eedeac495271d0f";
+        let rows: Vec<Row> = (101..=106)
+            .map(|b| {
+                let mut r = tx(b, 0);
+                let token = if b % 2 == 1 { usdc } else { dai };
+                r.record.insert("contractAddress".into(), token.into());
+                r
+            })
+            .collect();
+        h.insert(Action::TokenTx, ALICE, &rows).unwrap();
+        h.mark_covered(Action::TokenTx, ALICE, 100, 200).unwrap();
+        let ask = |extra: &[(&str, &str)]| {
+            let mut p = params(&[
+                ("module", "account"),
+                ("action", "tokentx"),
+                ("startblock", "100"),
+                ("endblock", "200"),
+                ("sort", "desc"),
+                ("offset", "2"),
+            ]);
+            p.extend(params(extra));
+            respond(Some(&h), &p)
+        };
+        let blocks = |v: &Value| -> Vec<String> {
+            v["result"]
+                .as_array()
+                .unwrap_or_else(|| panic!("not a list: {v}"))
+                .iter()
+                .map(|r| r["blockNumber"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let checksummed = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        let first = ask(&[("address", ALICE), ("contractaddress", checksummed)]);
+        assert_eq!(blocks(&first), ["105", "103"], "{first}");
+        let second = ask(&[("address", ALICE), ("contractaddress", usdc), ("page", "2")]);
+        assert_eq!(blocks(&second), ["101"], "{second}");
+        let all = ask(&[("address", ALICE), ("offset", "10")]);
+        assert_eq!(blocks(&all).len(), 6, "no filter, every token");
+
+        let alone = ask(&[("contractaddress", usdc)]);
+        assert!(
+            alone["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_UNSUPPORTED:"),
+            "{alone}"
+        );
+        let bad = ask(&[("address", ALICE), ("contractaddress", "0xnope")]);
+        assert_eq!(
+            bad["result"], "Error! Invalid contractaddress format",
+            "{bad}"
+        );
     }
 
     #[test]
@@ -4714,6 +4819,7 @@ mod tests {
                     page: 1,
                     offset: 100,
                     generation: None,
+                    contract: None,
                 },
             )
             .unwrap()
