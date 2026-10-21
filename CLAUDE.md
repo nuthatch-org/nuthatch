@@ -277,8 +277,9 @@ unconfigured.
 > behind an off-by-default `timelapse` feature), [0072](docs/rfcs/0072-chain-weather.md) (chain
 > weather, default binary, opt-in per nest by `weather.toml`, model prose off until `[prose]` is
 > written and fenced so no model text reaches stored or served facts),
-> [0068](docs/rfcs/0068-nest-postcards.md) (postcards, its S0 mail test first; the CLI behind an
-> off-by-default `postcard` feature; whether burrmill-wasm goes public is open before S2), and
+> [0068](docs/rfcs/0068-nest-postcards.md) (postcards, reshaped by Chief the same day into a link: a `/play` URL
+> whose fragment pins a published nest's segments by hash, read from any static host; no binary
+> change), and
 > [0069](docs/rfcs/0069-the-engine-room.md) (the engine room, a watch subcommand behind a `watch`
 > feature on by default, which lifts his 2026-10-03 preference for the cockpit over a TUI for this
 > one). Each slice keeps its own gate; an S0 that fails stops its RFC.
