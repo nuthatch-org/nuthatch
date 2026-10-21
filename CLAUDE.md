@@ -268,6 +268,14 @@ unconfigured.
 > gate: the zip run with `nuthatch dev --dir` reports the NID the page showed, and every segment the
 > tab seals equals the one a node seals from that zip. Nothing of ours is hosted for it; S3 (GitHub)
 > waits, and S4 (a drafted view) will not be built: no users yet (Chief, 2026-10-18).
+>
+> **RFC-0067 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
+> [RFC-0067](docs/rfcs/0067-solana-program-history.md) (Solana program history) on 2026-10-21, the
+> first non-EVM chain and his call under that day's out-of-scope amendment, with no named user yet.
+> All of it stays behind the `solana` cargo feature, off by default, under RFC-0046 §1's deletion
+> test. A nest is a program, never the chain; only finalized slots are sealed, and decoding is from an
+> IDL only: the removed WASM layer is not rebuilt for it. S0 and S1 are authorised; S2 onwards waits on
+> the two-week demand test in §10, which Chief runs.
 
 >
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.
@@ -348,8 +356,8 @@ Do not start slice N+1 while slice N has failing tests or an unmet budget.
   service is explicitly deferred).
 - Non-EVM chains before EVM is airtight. **Amended 2026-10-21 by Chief:** "Non evm chains could be
   supported upon user request." A request is a named user asking for a named chain; the site says
-  so. None is built today, and building one is new ingestion and decode, so each request is a
-  decision for Chief, not a standing authorisation.
+  so. Building one is new ingestion and decode, so each request is a decision for Chief, not a
+  standing authorisation. Solana is the first, decided 2026-10-21 (RFC-0067, behind `solana`).
 - TEE attestation, zk proofs (verifiability = deterministic re-execution of the core
   + content-addressed segments; nothing heavier).
 - Kubernetes manifests, Helm charts, or any deployment story beyond binary + compose.
