@@ -153,8 +153,8 @@ tree gains nothing; `cargo tree` with and without the feature is checked in CI.
 - **S0, the spike, which can stop the programme.** Behind the feature: one well-known Anchor program
   backfilled over RPC for a bounded slot range (about one epoch), raw tables sealed into epoch-aligned
   segments, queried through Burrmill. Gates: every slot in range accounted for as a block or a
-  skip proved on finalized evidence (§5), with an unavailable block refusing the seal; the program's transactions over the range match an independent count (a second
-  RPC, or solarchive.org's daily Parquet); RSS inside 2 GB; the finalized lag after Alpenglow and
+  skip proved on finalized evidence (§5), with an unavailable block refusing the seal; the
+  program's transactions over the range match an independent count (a second RPC, or solarchive.org's daily Parquet); RSS inside 2 GB; the finalized lag after Alpenglow and
   the RPC calls and wall time recorded. A default build's `cargo tree` and help are unchanged.
 - **S1, the tip.** Yellowstone at finalized, reconnect from a slot, gaps filled over RPC, a reorg of
   confirmed slots retracted from hot, the same property tests as EVM's reorg suite.
