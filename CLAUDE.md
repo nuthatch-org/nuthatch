@@ -276,7 +276,7 @@ unconfigured.
 > no model), [0070](docs/rfcs/0070-time-lapse.md) (time-lapse, the tab first, the binary producer
 > behind an off-by-default `timelapse` feature), [0072](docs/rfcs/0072-chain-weather.md) (chain
 > weather, default binary, opt-in per nest by `weather.toml`, model prose off until `[prose]` is
-> written and fenced so no model text reaches stored or served facts),
+> written, and model text is never stored or served by the nest, only sent at delivery),
 > [0068](docs/rfcs/0068-nest-postcards.md) (postcards, reshaped by Chief the same day into a link: a `/play` URL
 > whose fragment pins a published nest's segments by hash, read from any static host; no binary
 > change), and

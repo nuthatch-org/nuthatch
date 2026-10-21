@@ -125,15 +125,19 @@ Each run writes one JSON document, the facts, and one Markdown rendering of them
 ```json
 {
   "nest": "<nid>", "data_identity": "<hash>", "day": "2026-10-20",
-  "blocks": [21034112, 21041287], "sealed_through": 21041301,
+  "blocks": [21034112, 21041287],
   "binary": "4.x.y", "weather_version": 1, "provisional": false,
   "facts": [
     { "id": "busiest_hour", "rank": 1, "values": { "hour": 14, "events": 1832, "share": "0.21" },
       "query": "SELECT ...", "query_sha256": "..." }
-  ],
-  "prose": { "source": "template", "text": "..." }
+  ]
 }
 ```
+
+Two things a run knows are deliberately not in it. The sealed watermark at the time of computing moves
+on without day D's rows changing, and nothing about prose belongs to the facts. Both go in a separate,
+non-canonical `<day>.provenance.json` (watermark, wall-clock time of the run, which prose source the
+stored Markdown used). `--verify` compares the facts document only.
 
 Every number in the Markdown carries a reference to the fact it came from. Numbers are rendered once,
 in the facts, as decimal strings with their unit, and the Markdown reuses those exact strings; nothing
@@ -174,13 +178,14 @@ The fence around it:
    the reason logged once.
 4. **One attempt.** One request per report, no retries, the timeout above. Offline, refused or slow,
    the result is the template, and the report is otherwise identical.
-5. **Marked where it appears.** The facts document records `"source": "model"` with the provider and
-   model name. The Markdown puts the model's paragraph under a heading that says it was written by
-   that model from the facts below, and the facts follow it in full. A webhook body carries the same
-   line.
-6. **Outside the data path.** The model's text is never read by a query, a view, an entity, the MCP
-   `sql` tool or the next day's report. It is stored in its own file (§5.6) beside the facts, which
-   are byte-identical with or without it.
+5. **Never stored, never served by the nest.** Non-negotiable 4 keeps LLM output out of the runtime
+   data path, so the model's text is not written under `data/`, not part of the facts, and not
+   returned by `/weather`, the MCP tool or any other route; those always carry the template
+   rendering. Model prose exists only in transit: written at delivery time into a webhook body, or
+   printed by the CLI when the operator asks for it, and then gone.
+6. **Marked where it appears.** In a webhook body or the CLI output, the model's paragraph sits under a
+   heading naming the provider and model and saying it was written from the facts that follow, and
+   the facts follow it in full.
 
 A BYO remote key sends the facts, including the addresses in them, to that provider. That is the
 operator's choice, made by writing the section, and the docs say so in those words.
@@ -206,13 +211,13 @@ the runtime was down across several boundaries, the missed days are computed in 
 
 ### 5.6 Storage, retention, timestamp-free nests
 
-Reports live at `data/<nid>/weather/<day>.json` and `<day>.md`, and the model's paragraph, when there
-is one, at `<day>.model.md`. Retention deletes files older than `retain_days`. A report is a few
-kilobytes, so 90 days is well under a megabyte.
+Reports live at `data/<nid>/weather/<day>.json` (the facts), `<day>.md` (the template rendering) and
+`<day>.provenance.json` (§5.3). No model text is stored (§5.4). Retention deletes files older than
+`retain_days`. A report is a few kilobytes, so 90 days is well under a megabyte.
 
 Under a data directory keyed by NID, two mounts of one nest share the reports, which is right: the
-facts are a function of the data. If two tenants configure different models, the model file is the one
-thing they would contend for; §11 asks whether model prose is stored at all.
+facts are a function of the data. Two tenants configuring different models contend for nothing, since
+model prose is produced per delivery.
 
 A nest with `block_timestamps = false` has no UTC day. `weather.toml` on such a nest is refused at load,
 by name, rather than approximated by block buckets that would read as days and are not.
@@ -318,9 +323,8 @@ off by default, so the default binary contains no model client at all. §11 asks
 
 1. Default binary with per-nest opt-in (recommended), or the model client behind an off-by-default
    `weather-prose` feature?
-2. Store the model's paragraph at all, or store facts and template only and generate model prose at
-   delivery time? Storing is simpler to read; not storing keeps model text out of the data directory
-   entirely.
+2. Settled in review: model prose is not stored or served by the nest, only produced at delivery
+   (§5.4), because non-negotiable 4 forbids it in the runtime data path.
 3. If S0's history scans are too slow, are "first seen in 90 days" and "highest in 90 days" acceptable,
    or should those two signals be dropped?
 4. Is `slack` worth adding as an `AlertFormat` now, since alerts would get it too?
