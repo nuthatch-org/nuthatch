@@ -107,6 +107,7 @@ pub fn drift(schema: &[TableSchema], sem: &Semantic) -> Vec<String> {
         ));
     }
 
+    warnings.extend(crate::story::compile(schema, sem).1);
     warnings
 }
 

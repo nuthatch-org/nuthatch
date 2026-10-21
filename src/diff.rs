@@ -194,7 +194,52 @@ pub struct NestContext {
     pub labels: BTreeMap<String, Vec<String>>,
     /// Indexed contract addresses (lowercase) to their nest alias.
     pub aliases: BTreeMap<String, String>,
+    pub semantic_sha256: Option<String>,
     pub version: String,
+}
+
+impl NestContext {
+    /// An address with its nest alias and labels, as every format prints one.
+    pub fn address_text(&self, address: &str) -> String {
+        address_with(
+            address,
+            self.aliases.get(address).map(String::as_str),
+            self.labels.get(address).map(Vec::as_slice).unwrap_or(&[]),
+        )
+    }
+
+    /// Base units of the token at `token`, scaled by its `metadata.json` decimals when known.
+    pub fn amount_text(&self, token: &str, base: &str) -> String {
+        let meta = self.metadata.get(token);
+        let name = meta
+            .and_then(|m| m.symbol.clone())
+            .or_else(|| self.aliases.get(token).cloned())
+            .unwrap_or_else(|| token.to_string());
+        amount_in(base, meta.and_then(|m| m.decimals), &name)
+    }
+}
+
+/// The one exact-numbers rule (RFC-0071 §4): move the point by known decimals, or say base units.
+pub fn amount_in(base: &str, decimals: Option<u8>, name: &str) -> String {
+    match decimals {
+        Some(d) => format!("{} {name}", scale(base, d)),
+        None => format!("{} base units of {name} (decimals unknown)", group(base)),
+    }
+}
+
+pub fn address_with(address: &str, alias: Option<&str>, labels: &[String]) -> String {
+    if address == ZERO_ADDRESS {
+        return format!("{address} (zero address)");
+    }
+    let mut tags: Vec<String> = alias.map(str::to_string).into_iter().collect();
+    for l in labels {
+        tags.push(format!("label {l}"));
+    }
+    if tags.is_empty() {
+        address.to_string()
+    } else {
+        format!("{address} [{}]", tags.join("; "))
+    }
 }
 
 /// Refuse a range the nest does not cover, with the interval it does, rather than answer it empty.
@@ -227,7 +272,7 @@ fn quote(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
-fn filter(req: &Request) -> String {
+pub(crate) fn filter(req: &Request) -> String {
     let mut w = format!(
         "block_number >= {} AND block_number <= {}",
         req.from, req.to
@@ -269,7 +314,7 @@ async fn count<S: Source>(src: &S, table: &str, req: &Request) -> Result<u64> {
 }
 
 /// A flow drawn from a partial read would be a wrong number, so an incomplete answer is refused.
-fn complete(out: &QueryOutput, table: &str) -> Result<()> {
+pub(crate) fn complete(out: &QueryOutput, table: &str) -> Result<()> {
     if out.tip_unavailable || !out.degraded_tables.is_empty() {
         bail!(
             "the nest could not serve complete data for {table} (the hot tip or a sealed segment \
@@ -485,6 +530,11 @@ impl Flow {
         *self.received.entry((m.token, m.to)).or_insert(U512::ZERO) += amount;
     }
 
+    /// Each table, or the part of a split table, that the flow counted but did not read.
+    pub fn other_counts(&self) -> &BTreeMap<String, u64> {
+        &self.other
+    }
+
     /// Record a table's in-range count for a table the flow does not read.
     pub fn add_other(&mut self, table: &str, rows: u64) {
         self.other.insert(table.to_string(), rows);
@@ -516,6 +566,8 @@ pub struct Document {
     /// Each movement in log order, for a single transaction only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transfers: Option<Vec<TransferOut>>,
+    /// The tables outside the flow, told by their story lines or grouped.
+    pub events: crate::story::Events,
     pub not_seen: &'static str,
     pub provenance: ProvenanceOut,
 }
@@ -609,6 +661,7 @@ pub struct ProvenanceOut {
     pub sealed_through: u64,
     pub metadata_sha256: Option<String>,
     pub label_snapshots: Vec<String>,
+    pub semantic_sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -626,7 +679,12 @@ fn signed(received: U512, sent: U512) -> String {
     }
 }
 
-pub fn document(flow: &Flow, ctx: &NestContext, req: &Request) -> Document {
+pub fn document(
+    flow: &Flow,
+    events: crate::story::Events,
+    ctx: &NestContext,
+    req: &Request,
+) -> Document {
     let mut tables: Vec<TableOut> = flow
         .table_rows
         .iter()
@@ -759,6 +817,7 @@ pub fn document(flow: &Flow, ctx: &NestContext, req: &Request) -> Document {
                 })
                 .collect()
         }),
+        events,
         not_seen: NOT_SEEN,
         provenance: ProvenanceOut {
             version: ctx.version.clone(),
@@ -768,6 +827,7 @@ pub fn document(flow: &Flow, ctx: &NestContext, req: &Request) -> Document {
             sealed_through: ctx.sealed_through,
             metadata_sha256: ctx.metadata_sha256.clone(),
             label_snapshots: ctx.label_snapshots.clone(),
+            semantic_sha256: ctx.semantic_sha256.clone(),
         },
     }
 }
@@ -851,34 +911,16 @@ impl<'a> Names<'a> {
     }
 
     fn amount(&self, token: &str, base: &str) -> String {
-        let t = self.tokens[token];
-        match t.decimals {
-            Some(d) => format!("{} {}", scale(base, d), self.token(token)),
-            None => format!(
-                "{} base units of {} (decimals unknown)",
-                group(base),
-                self.token(token)
-            ),
-        }
+        amount_in(base, self.tokens[token].decimals, &self.token(token))
     }
 
     fn node(&self, address: &str) -> String {
-        if address == ZERO_ADDRESS {
-            return format!("{address} (zero address)");
-        }
         let n = self.nodes.get(address);
-        let mut tags: Vec<String> = Vec::new();
-        if let Some(a) = n.and_then(|n| n.alias.as_ref()) {
-            tags.push(a.clone());
-        }
-        for l in n.map(|n| n.labels.as_slice()).unwrap_or(&[]) {
-            tags.push(format!("label {l}"));
-        }
-        if tags.is_empty() {
-            address.to_string()
-        } else {
-            format!("{address} [{}]", tags.join("; "))
-        }
+        address_with(
+            address,
+            n.and_then(|n| n.alias.as_deref()),
+            n.map(|n| n.labels.as_slice()).unwrap_or(&[]),
+        )
     }
 }
 
@@ -1006,6 +1048,13 @@ fn provenance_lines(doc: &Document) -> Vec<String> {
             } else {
                 p.label_snapshots.join(", ")
             }
+        ),
+        format!(
+            "semantic.toml: {}.",
+            p.semantic_sha256
+                .as_deref()
+                .map(|h| format!("sha256 {h}"))
+                .unwrap_or_else(|| "absent".into()),
         ),
     ]
 }
@@ -1144,21 +1193,7 @@ fn text_out(doc: &Document, top: usize) -> String {
         }
     }
     o.push('\n');
-    let other: Vec<String> = doc
-        .tables
-        .iter()
-        .filter(|t| t.reads.is_none() && t.rows > 0)
-        .map(|t| format!("{} {}", t.table, group(t.rows)))
-        .collect();
-    if other.is_empty() {
-        let _ = writeln!(o, "Other events in range: none.");
-    } else {
-        let _ = writeln!(
-            o,
-            "Other events in range, not part of the flow: {}.",
-            other.join(", ")
-        );
-    }
+    o.push_str(&crate::story::text(&doc.events, top));
     let _ = writeln!(o, "{}", doc.not_seen);
     o.push('\n');
     for l in provenance_lines(doc) {
@@ -1493,7 +1528,7 @@ mod tests {
         flow.add(row(0, Reads::Weth9Deposit, A, None));
         flow.add(row(1, Reads::Transfer, A, Some(B)));
         flow.add(row(2, Reads::Weth9Withdrawal, B, None));
-        let doc = document(&flow, &ctx(), &one_block());
+        let doc = document(&flow, Default::default(), &ctx(), &one_block());
         let net: BTreeMap<&str, &str> = doc
             .net
             .iter()
@@ -1516,7 +1551,7 @@ mod tests {
         let mut flow = Flow::default();
         flow.add(m(0, Reads::Transfer, ZERO_ADDRESS, A, 7));
         flow.add(m(1, Reads::Transfer, A, ZERO_ADDRESS, 3));
-        let doc = document(&flow, &ctx(), &one_block());
+        let doc = document(&flow, Default::default(), &ctx(), &one_block());
         for format in [Format::Text, Format::Dot, Format::Mermaid] {
             let out = render(&doc, format, DEFAULT_TOP).to_lowercase();
             assert!(out.contains("zero address"), "{format:?}: {out}");
@@ -1638,7 +1673,7 @@ mod tests {
     async fn only_a_listed_wrapper_s_deposit_is_flow() {
         let c = classify(&weth9(), Some(1));
         let flow = read(&SharedAlias, &c, &one_block(), 1_000).await.unwrap();
-        let doc = document(&flow, &ctx(), &one_block());
+        let doc = document(&flow, Default::default(), &ctx(), &one_block());
         assert_eq!(doc.edges.len(), 1, "{:?}", doc.edges);
         let e = &doc.edges[0];
         assert_eq!(

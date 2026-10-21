@@ -58,9 +58,13 @@ Net flow of the transfers seen, per token (not a balance)
     0xa0b3ee897f233f385e5d61086c32685257d4f12b  +272,866,200.401038562655879869 eDAI
     0x583c21631c48d442b5c0e605d624f54a0b366c72  +0.000000000000000002 eDAI
 
-Other events in range, not part of the flow: dai__approval 2.
+Other events in range, not part of the flow: 2 rows in 1 table, 0 of them told by a story line.
+  dai__approval, Approval(address,address,uint256): 2 rows in block 16,817,996, from 1 contract
+    owner: 2 distinct, one row each
+    spender: 2 distinct, one row each
 Not seen by this nest: native ETH, internal calls, tokens it does not index, and any balance change made without one of these events (a rebase, for one). Net flow is the sum of the transfers seen, not a balance.
 
 nuthatch {version}; data identity 7d7681b43831b5ef2cd1b7ed04773f83ade3324b7b71412cbb20765e14c29e28; sealed through 16,818,085.
 First row read: block 16,817,996 log 0 (0xde714b65354d54e684a95d80a1da7f668e8b2ee6ae8b5779f69ab9e04468b859). Last: block 16,817,996 log 54 (0xde714b65354d54e684a95d80a1da7f668e8b2ee6ae8b5779f69ab9e04468b859).
 metadata.json: sha256 784e641498908da5d8a649b38f122c815ecaa29e687edfe7b88cc9acab2f34cb. Label snapshots: none.
+semantic.toml: absent.

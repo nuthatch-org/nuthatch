@@ -314,9 +314,33 @@ Net flow of the transfers seen, per token (not a balance)
     0x0000000000000000000000000000000000000000 (zero address)  -980.324128545592885258 eDAI
     0xc2a463278387e649eeaa5ae5076e283260b0b1be  +980.324128545592885258 eDAI
 
-Other events in range, not part of the flow: dai__approval 30, steth__approval 8, steth__submitted 3, steth__transfer_shares 15, usdc__approval 50, wbtc__approval 18, weth__approval 33, wsteth__approval 3.
+Other events in range, not part of the flow: 160 rows in 8 tables, 0 of them told by a story line.
+  usdc__approval, Approval(address,address,uint256): 50 rows in blocks 16,818,024 to 16,818,057, from 1 contract
+    owner: 36 distinct; most rows 0x7122db0ebe4eb9b434a9f2ffe6760bc03bfbd0e0 (9 rows), 0x7cea8a6da079dc7501d4eb2bbc937e70a2764cef (3 rows), 0x555b6ee8fab3dfdbcca9121721c435fd4c7a1fd1 (2 rows)
+    spender: 24 distinct; most rows 0x1111111254eeb25477b68fb85ed929f73a960582 (8 rows), 0x000000000022d473030f116ddee9f6b43ac78ba3 (5 rows), 0xbebc44782c7db0a1a60cb6fe97d0b483032ff1c7 (5 rows)
+  weth__approval, Approval(address,address,uint256): 33 rows in blocks 16,818,024 to 16,818,057, from 1 contract
+    src: 19 distinct; most rows 0xa88800cd213da5ae406ce248380802bd53b47647 (9 rows), 0x7122db0ebe4eb9b434a9f2ffe6760bc03bfbd0e0 (4 rows), 0x0b3f6d4a5d6835137ccb2c1248f5a7d882c0dbda (2 rows)
+    guy: 14 distinct; most rows 0x1111111254eeb25477b68fb85ed929f73a960582 (13 rows), 0x000000000022d473030f116ddee9f6b43ac78ba3 (2 rows), 0x4a585e0f7c18e2c414221d6402652d5e0990e5f8 (2 rows)
+  dai__approval, Approval(address,address,uint256): 30 rows in blocks 16,818,024 to 16,818,053, from 1 contract
+    owner: 21 distinct; most rows 0x7122db0ebe4eb9b434a9f2ffe6760bc03bfbd0e0 (7 rows), 0x135896de8421be2ec868e0b811006171d9df802a (2 rows), 0xa88800cd213da5ae406ce248380802bd53b47647 (2 rows)
+    spender: 18 distinct; most rows 0x1111111254eeb25477b68fb85ed929f73a960582 (7 rows), 0x340d693ed55d7ba167d184ea76ea2fd092a35bdc (3 rows), 0xbebc44782c7db0a1a60cb6fe97d0b483032ff1c7 (3 rows)
+  wbtc__approval, Approval(address,address,uint256): 18 rows in blocks 16,818,034 to 16,818,057, from 1 contract
+    owner: 10 distinct; most rows 0x80aca0c645fedabaa20fd2bf0daf57885a309fe6 (4 rows), 0x135896de8421be2ec868e0b811006171d9df802a (2 rows), 0x86ecd42504fead01409901f41cda45a0f8c54e71 (2 rows)
+    spender: 8 distinct; most rows 0x7d2768de32b0b80b7a3454c06bdac94a69ddc7a9 (6 rows), 0xd51a44d3fae010294c616388b506acda1bfaae46 (3 rows), 0x1111111254eeb25477b68fb85ed929f73a960582 (2 rows)
+  steth__transfer_shares, TransferShares(address,address,uint256): 15 rows in blocks 16,818,024 to 16,818,056, from 1 contract
+    from: 12 distinct; most rows 0x0000000000000000000000000000000000000000 (zero address) (3 rows), 0x7122db0ebe4eb9b434a9f2ffe6760bc03bfbd0e0 (2 rows), 0x07068b6dd18602afc8110233d1966b0e73586670 (1 row)
+    to: 14 distinct; most rows 0x7122db0ebe4eb9b434a9f2ffe6760bc03bfbd0e0 (2 rows), 0x1111111254eeb25477b68fb85ed929f73a960582 (1 row), 0x1982b2f5814301d4e9a8b0201555376e62f82428 (1 row)
+  steth__approval, Approval(address,address,uint256): 8 rows in blocks 16,818,024 to 16,818,056, from 1 contract
+    owner: 5 distinct; most rows 0x07068b6dd18602afc8110233d1966b0e73586670 (2 rows), 0x7122db0ebe4eb9b434a9f2ffe6760bc03bfbd0e0 (2 rows), 0xa88800cd213da5ae406ce248380802bd53b47647 (2 rows)
+    spender: 5 distinct; most rows 0x1111111254eeb25477b68fb85ed929f73a960582 (2 rows), 0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0 [wsteth] (2 rows), 0x99a58482bd75cbab83b27ec03ca68ff489b5788f (2 rows)
+  steth__submitted, Submitted(address,uint256,address): 3 rows in blocks 16,818,032 to 16,818,043, from 1 contract
+    sender: 3 distinct, one row each
+  wsteth__approval, Approval(address,address,uint256): 3 rows in block 16,818,045, from 1 contract
+    owner: 1 distinct; most rows 0x000000000dfde7deaf24138722987c9a6991e2d4 (3 rows)
+    spender: 1 distinct; most rows 0xc1e7dfe73e1598e3910ef4c7845b68a9ab6f4c83 (3 rows)
 Not seen by this nest: native ETH, internal calls, tokens it does not index, and any balance change made without one of these events (a rebase, for one). Net flow is the sum of the transfers seen, not a balance.
 
 nuthatch {version}; data identity 7d7681b43831b5ef2cd1b7ed04773f83ade3324b7b71412cbb20765e14c29e28; sealed through 16,818,085.
 First row read: block 16,818,024 log 2 (0x083aa605e65ec11990ce3b18e8ccdd0c3ff354ea35e10a49046c0dcafc4f40e0). Last: block 16,818,057 log 434 (0xb2fafc0c134263f8c7d9f3a831a7d024fb34ea72ecbf2ac140e1e31f51926882).
 metadata.json: sha256 784e641498908da5d8a649b38f122c815ecaa29e687edfe7b88cc9acab2f34cb. Label snapshots: none.
+semantic.toml: absent.

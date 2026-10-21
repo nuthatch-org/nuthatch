@@ -59,6 +59,10 @@ pub struct TableSemantic {
     /// stay correct even when the author edits everything else.
     #[serde(default, skip_serializing_if = "Footguns::is_empty")]
     pub footguns: Footguns,
+    /// One sentence per row for `nuthatch diff` (RFC-0071 §17), e.g.
+    /// `"{indexer} staked {tokens:amount@0x…} with {verifier}"`. Authored, never generated.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub story: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +272,7 @@ pub fn generate(schema: &[TableSchema], nest_name: &str, chain: &str) -> Semanti
                 grain,
                 columns,
                 footguns,
+                story: String::new(),
             },
         );
     }

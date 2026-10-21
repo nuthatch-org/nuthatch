@@ -653,6 +653,53 @@
       "reads": "transfer"
     }
   ],
+  "events": {
+    "tables": [
+      {
+        "table": "dai__approval",
+        "event": "Approval(address,address,uint256)",
+        "rows": 2,
+        "first_block": 16817996,
+        "last_block": 16817996,
+        "emitters": 1,
+        "told_by": "grouped",
+        "groups": [
+          {
+            "parameter": "owner",
+            "sol_type": "address",
+            "distinct": 2,
+            "top": [
+              {
+                "value": "0x583c21631c48d442b5c0e605d624f54a0b366c72",
+                "rows": 1
+              },
+              {
+                "value": "0xebc29199c817dc47ba12e3f86102564d640cbf99",
+                "rows": 1
+              }
+            ]
+          },
+          {
+            "parameter": "spender",
+            "sol_type": "address",
+            "distinct": 2,
+            "top": [
+              {
+                "value": "0x27182842e098f60e3d576794a5bffb0777e025d3",
+                "rows": 1
+              },
+              {
+                "value": "0x7d2768de32b0b80b7a3454c06bdac94a69ddc7a9",
+                "rows": 1
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "rows_told": 0,
+    "story_warnings": []
+  },
   "not_seen": "Not seen by this nest: native ETH, internal calls, tokens it does not index, and any balance change made without one of these events (a rebase, for one). Net flow is the sum of the transfers seen, not a balance.",
   "provenance": {
     "version": "{version}",
@@ -669,6 +716,7 @@
     },
     "sealed_through": 16818085,
     "metadata_sha256": "784e641498908da5d8a649b38f122c815ecaa29e687edfe7b88cc9acab2f34cb",
-    "label_snapshots": []
+    "label_snapshots": [],
+    "semantic_sha256": null
   }
 }

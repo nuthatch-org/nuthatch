@@ -45,7 +45,7 @@ const TXS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-fn fixture() -> PathBuf {
+pub(crate) fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff/euler")
 }
 
@@ -64,7 +64,7 @@ fn copy_dir(from: &Path, to: &Path) {
 
 /// The fixture as `dev` would leave it after sealing these blocks: segments on disk and a store whose
 /// watermarks say so. The store is written here because a seal-direct backfill keeps none.
-fn nest() -> tempfile::TempDir {
+pub(crate) fn nest() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     for f in ["nuthatch.toml", "metadata.json"] {
         std::fs::copy(fixture().join(f), tmp.path().join(f)).unwrap();
@@ -86,7 +86,7 @@ fn nest() -> tempfile::TempDir {
     tmp
 }
 
-fn diff(dir: &Path, args: &[&str]) -> (bool, String, String) {
+pub(crate) fn diff(dir: &Path, args: &[&str]) -> (bool, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
         .arg("diff")
         .arg("--dir")
@@ -112,7 +112,7 @@ fn unversioned(s: &str) -> String {
         )
 }
 
-fn assert_golden(name: &str, got: &str) {
+pub(crate) fn assert_golden(name: &str, got: &str) {
     let path = fixture().join("golden").join(name);
     if std::env::var_os("NUTHATCH_BLESS_DIFF").is_some() {
         std::fs::write(&path, unversioned(got)).unwrap();

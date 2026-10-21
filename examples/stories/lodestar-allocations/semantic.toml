@@ -1,0 +1,237 @@
+# Story lines for Lodestar's allocations nest (graph-allocations-nest, Arbitrum One), written for
+# RFC-0071 §17's gate. Merge the `story` keys into the nest's own semantic.toml, or use this file as it
+# stands: `nuthatch diff` reads only the story lines, and semantic.toml is outside the data identity,
+# so either way the nest is not re-indexed.
+#
+# Every GRT amount names the token by address, so `metadata.json` supplies its decimals when
+# `nuthatch metadata fetch` has cached them, and the diff prints base units with "(decimals unknown)"
+# when it has not. The six call tables and l1_blocks have no story and are grouped.
+schema_version = 1
+
+[table.curation__burned]
+story = "{curator} burned {signal} signal on {subgraphDeploymentID} for {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.curation__collected]
+story = "curators of {subgraphDeploymentID} collected {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.curation__signalled]
+story = "{curator} signalled {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} on {subgraphDeploymentID} for {signal} signal, tax {curationTax:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.disputes__dispute_accepted]
+story = "dispute {disputeId} against {indexer} accepted; {fisherman} rewarded {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.disputes__dispute_cancelled]
+story = "dispute {disputeId} against {indexer} cancelled by {fisherman}; {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} returned"
+
+[table.disputes__dispute_drawn]
+story = "dispute {disputeId} against {indexer} drawn; {fisherman} returned {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.disputes__dispute_linked]
+story = "dispute {disputeId1} linked to {disputeId2}"
+
+[table.disputes__dispute_rejected]
+story = "dispute {disputeId} against {indexer} rejected; {fisherman} lost {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.disputes__indexing_dispute_created]
+story = "{fisherman} opened indexing dispute {disputeId} against {indexer} over allocation {allocationId}, deposit {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.disputes__legacy_dispute_created]
+story = "{fisherman} opened legacy dispute {disputeId} against {indexer} over allocation {allocationId}, slashing {tokensSlash:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.disputes__query_dispute_created]
+story = "{fisherman} opened query dispute {disputeId} against {indexer} on {subgraphDeploymentId}, deposit {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.epochs__epoch_length_update]
+story = "epoch length set to {epochLength} blocks from epoch {epoch}"
+
+[table.epochs__epoch_run]
+story = "{caller} ran epoch {epoch}"
+
+[table.escrow__cancel_thaw]
+story = "{payer} cancelled thawing {tokensThawing:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of escrow for {receiver} via {collector}"
+
+[table.escrow__deposit]
+story = "{payer} deposited {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} in escrow for {receiver} via {collector}"
+
+[table.escrow__escrow_collected]
+story = "{collector} collected {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} from {payer}'s escrow for {receiver}, paid to {receiverDestination}"
+
+[table.escrow__thaw]
+story = "{payer} began thawing {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of escrow for {receiver} via {collector}, until {thawEndTimestamp}"
+
+[table.escrow__withdraw]
+story = "{payer} withdrew {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of escrow for {receiver} via {collector}"
+
+[table.gns__g_r_t_withdrawn]
+story = "{curator} withdrew {withdrawnGRT:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} from subgraph {subgraphID}, burning {nSignalBurnt} name signal"
+
+[table.gns__signal_burned]
+story = "{curator} burned {nSignalBurnt} name signal on subgraph {subgraphID} for {tokensReceived:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.gns__signal_minted]
+story = "{curator} minted {nSignalCreated} name signal on subgraph {subgraphID} for {tokensDeposited:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.gns__subgraph_deprecated]
+story = "subgraph {subgraphID} deprecated, {withdrawableGRT:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} withdrawable"
+
+[table.gns__subgraph_published]
+story = "subgraph {subgraphID} published deployment {subgraphDeploymentID}"
+
+[table.graph_token__bridge_burned]
+story = "bridge burned {amount:amount} from {account}"
+
+[table.graph_token__bridge_minted]
+story = "bridge minted {amount:amount} to {account}"
+
+[table.rewards__horizon_rewards_assigned]
+story = "{indexer} was assigned {amount:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of rewards for allocation {allocationID}"
+
+[table.rewards__parameter_updated]
+story = "rewards parameter {param} updated"
+
+[table.rewards__rewards_assigned]
+story = "{indexer} was assigned {amount:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of rewards for allocation {allocationID} in epoch {epoch}"
+
+[table.rewards__rewards_denied_07b6]
+story = "rewards denied to {indexer} for allocation {allocationID} in epoch {epoch}"
+
+[table.rewards__rewards_denied_9b13]
+story = "rewards denied to {indexer} for allocation {allocationID}"
+
+[table.rewards__rewards_denylist_updated]
+story = "{subgraphDeploymentID} denied rewards since block {sinceBlock} (0 lifts the denial)"
+
+[table.service_registry__service_registered]
+story = "{indexer} registered url {url} at {geohash}"
+
+[table.service_registry__service_unregistered]
+story = "{indexer} unregistered"
+
+[table.staking__delegated_tokens_withdrawn]
+story = "{delegator} withdrew {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of delegation from {serviceProvider} for {verifier}"
+
+[table.staking__delegation_fee_cut_set]
+story = "{serviceProvider} set fee cut {feeCut} for payment type {paymentType} with {verifier}"
+
+[table.staking__delegation_slashed]
+story = "delegation to {serviceProvider} for {verifier} slashed {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.staking__horizon_stake_deposited]
+story = "{serviceProvider} staked {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.staking__horizon_stake_locked]
+story = "{serviceProvider} locked {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of stake until {until}"
+
+[table.staking__horizon_stake_withdrawn]
+story = "{serviceProvider} withdrew {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of stake"
+
+[table.staking__operator_set]
+story = "{serviceProvider} set {operator} as operator for {verifier}: {allowed}"
+
+[table.staking__provision_created]
+story = "{serviceProvider} provisioned {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} to {verifier}, max verifier cut {maxVerifierCut}, thawing period {thawingPeriod} s"
+
+[table.staking__provision_increased]
+story = "{serviceProvider} added {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} to its provision for {verifier}"
+
+[table.staking__provision_slashed]
+story = "{serviceProvider}'s provision for {verifier} slashed {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.staking__provision_thawed]
+story = "{serviceProvider} began thawing {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of its provision for {verifier}"
+
+[table.staking__stake_delegated_withdrawn]
+story = "{delegator} withdrew {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of legacy delegation from {indexer}"
+
+[table.staking__thaw_request_created]
+story = "thaw request {thawRequestId} for {owner}: {shares} shares of {serviceProvider} with {verifier}, until {thawingUntil}"
+
+[table.staking__thaw_request_fulfilled]
+story = "thaw request {thawRequestId} fulfilled: {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} for {shares} shares, valid {valid}"
+
+[table.staking__thaw_requests_fulfilled]
+story = "{thawRequestsFulfilled} thaw requests of {owner} fulfilled for {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} from {serviceProvider} with {verifier}"
+
+[table.staking__tokens_delegated]
+story = "{delegator} delegated {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} to {serviceProvider} for {verifier}, {shares} shares"
+
+[table.staking__tokens_deprovisioned]
+story = "{serviceProvider} removed {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} from its provision for {verifier}"
+
+[table.staking__tokens_to_delegation_pool_added]
+story = "{tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} added to the delegation pool of {serviceProvider} for {verifier}"
+
+[table.staking__tokens_undelegated]
+story = "{delegator} undelegated {shares} shares ({tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}) from {serviceProvider} for {verifier}"
+
+[table.staking_legacy__allocation_closed_7203]
+story = "{indexer} closed legacy allocation {allocationID} of {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} on {subgraphDeploymentID} in epoch {epoch}"
+
+[table.staking_legacy__allocation_closed_f672]
+story = "{indexer} closed legacy allocation {allocationID} of {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} on {subgraphDeploymentID} in epoch {epoch}"
+
+[table.staking_legacy__allocation_collected]
+story = "allocation {allocationID} of {indexer} collected {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of query fees from {from}"
+
+[table.staking_legacy__allocation_created]
+story = "{indexer} opened legacy allocation {allocationID} of {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} on {subgraphDeploymentID} in epoch {epoch}"
+
+[table.staking_legacy__delegation_parameters_updated]
+story = "{indexer} set indexing reward cut {indexingRewardCut} and query fee cut {queryFeeCut}"
+
+[table.staking_legacy__rebate_claimed]
+story = "{indexer} claimed a rebate of {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} for allocation {allocationID}"
+
+[table.staking_legacy__rebate_collected]
+story = "{indexer} collected a rebate of {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} for allocation {allocationID}"
+
+[table.staking_legacy__set_operator]
+story = "{indexer} set {operator} as operator: {allowed}"
+
+[table.staking_legacy__set_rewards_destination]
+story = "{indexer} sends rewards to {destination}"
+
+[table.staking_legacy__stake_delegated]
+story = "{delegator} delegated {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} to {indexer}, {shares} shares"
+
+[table.staking_legacy__stake_delegated_locked]
+story = "{delegator} undelegated {shares} shares ({tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}) from {indexer}, locked until {until}"
+
+[table.staking_legacy__stake_deposited]
+story = "{indexer} staked {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} (legacy)"
+
+[table.staking_legacy__stake_locked]
+story = "{indexer} locked {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of stake until {until} (legacy)"
+
+[table.staking_legacy__stake_slashed]
+story = "{indexer} slashed {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}, {reward:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} to {beneficiary}"
+
+[table.staking_legacy__stake_withdrawn]
+story = "{indexer} withdrew {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of stake (legacy)"
+
+[table.subgraph_service__allocation_closed]
+story = "{indexer} closed allocation {allocationId} of {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} on {subgraphDeploymentId}, forced {forceClosed}"
+
+[table.subgraph_service__allocation_created]
+story = "{indexer} opened allocation {allocationId} of {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} on {subgraphDeploymentId} in epoch {currentEpoch}"
+
+[table.subgraph_service__allocation_resized]
+story = "{indexer} resized allocation {allocationId} on {subgraphDeploymentId} from {oldTokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} to {newTokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7}"
+
+[table.subgraph_service__indexing_rewards_collected]
+story = "{indexer} collected {tokensRewards:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of indexing rewards on allocation {allocationId}, {tokensDelegationRewards:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} to delegators, epoch {currentEpoch}"
+
+[table.subgraph_service__legacy_allocation_migrated]
+story = "{indexer}'s legacy allocation {allocationId} on {subgraphDeploymentId} migrated"
+
+[table.subgraph_service__query_fees_collected]
+story = "{serviceProvider} collected {tokensCollected:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} of query fees from {payer} on allocation {allocationId}, {tokensCurators:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} to curators"
+
+[table.subgraph_service__service_provider_registered]
+story = "{serviceProvider} registered with the subgraph service"
+
+[table.tally__payment_collected]
+story = "{dataService} collected {tokens:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} from {payer} for {receiver}, collection {collectionId}"
+
+[table.tally__r_a_v_collected]
+story = "{dataService} redeemed a receipt aggregate of {valueAggregate:amount@0x9623063377ad1b27544c965ccd7342f7ea7e88c7} from {payer} for {serviceProvider}, collection {collectionId}"

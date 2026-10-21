@@ -1,0 +1,15 @@
+# Story lines for the Euler fixture, copied in as semantic.toml by tests/diff_story.rs. The other
+# tables are left without one, so a diff shows told and grouped tables side by side.
+schema_version = 1
+
+[table.dai__approval]
+story = "{owner} approved {spender} to spend {value:amount}"
+
+[table.usdc__approval]
+story = "{owner} approved {spender} to spend {value:amount}"
+
+[table.steth__transfer_shares]
+story = "{from} moved {sharesValue} stETH shares to {to}"
+
+[table.steth__submitted]
+story = "{sender} submitted {amount} wei to Lido, referral {referral}"

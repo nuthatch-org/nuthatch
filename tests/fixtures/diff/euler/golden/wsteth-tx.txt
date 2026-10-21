@@ -102,9 +102,19 @@ Net flow of the transfers seen, per token (not a balance)
     0xdc24316b9ae028f1497c275eb9192a3ea0f67022  +73,821.459345383044466412 stETH
     0x036cec1a199234fc02f72d29e596a09440825f1c  +0.000000000000000001 stETH
 
-Other events in range, not part of the flow: steth__approval 2, steth__transfer_shares 2, wsteth__approval 6.
+Other events in range, not part of the flow: 10 rows in 3 tables, 0 of them told by a story line.
+  wsteth__approval, Approval(address,address,uint256): 6 rows in block 16,818,062, from 1 contract
+    owner: 2 distinct; most rows 0x1e4446016f3fddfe2ecc046cf91a8010a30e9a9b (3 rows), 0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a (3 rows)
+    spender: 1 distinct; most rows 0x27182842e098f60e3d576794a5bffb0777e025d3 (6 rows)
+  steth__approval, Approval(address,address,uint256): 2 rows in block 16,818,062, from 1 contract
+    owner: 1 distinct; most rows 0x036cec1a199234fc02f72d29e596a09440825f1c (2 rows)
+    spender: 1 distinct; most rows 0xdc24316b9ae028f1497c275eb9192a3ea0f67022 (2 rows)
+  steth__transfer_shares, TransferShares(address,address,uint256): 2 rows in block 16,818,062, from 1 contract
+    from: 2 distinct, one row each
+    to: 2 distinct, one row each
 Not seen by this nest: native ETH, internal calls, tokens it does not index, and any balance change made without one of these events (a rebase, for one). Net flow is the sum of the transfers seen, not a balance.
 
 nuthatch {version}; data identity 7d7681b43831b5ef2cd1b7ed04773f83ade3324b7b71412cbb20765e14c29e28; sealed through 16,818,085.
 First row read: block 16,818,062 log 12 (0x1bb40003432c0695aacbeb97a66cc57c3b0abfa99d4940758d6d6f5d829bcfdc). Last: block 16,818,062 log 124 (0x1bb40003432c0695aacbeb97a66cc57c3b0abfa99d4940758d6d6f5d829bcfdc).
 metadata.json: sha256 784e641498908da5d8a649b38f122c815ecaa29e687edfe7b88cc9acab2f34cb. Label snapshots: none.
+semantic.toml: absent.
