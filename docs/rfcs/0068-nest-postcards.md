@@ -1,323 +1,237 @@
-# RFC-0068: Nest postcards - a nest's sealed history and its SQL engine in one HTML file
+# RFC-0068: Nest postcards - a link that opens a published nest, pinned and checked, in a tab
 
-- Status: **Accepted (2026-10-21, Chief).** Nothing is built yet.
+- Status: **Accepted (2026-10-21, Chief).** Chief reshaped it the same day from a self-contained
+  `.html` file to a link ("lets make postcards just a url or something not email"); this is that
+  shape. Nothing is built yet.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
-- Depends on: RFC-0065 (the nest in a tab: Burrmill compiled to wasm, hash-checked segments),
-  RFC-0052 (the mirrored nest: `manifest.json` as the catalogue, `publish.json`, content-addressed
-  segments), RFC-0047 (the sealed directory as a contract).
+- Depends on: RFC-0065 (the nest in a tab: `/play`, Burrmill in wasm, hash-checked segments),
+  RFC-0052 (the mirrored nest: `manifest.json` as the catalogue, append-only, content-addressed
+  segments under `<data_identity>/`), RFC-0047 (the sealed directory as a contract).
 - Blocks: nothing.
-- Nature: a file format and two producers of it. One producer is a button on the `/play` page, a
-  separate artefact; the other is a CLI subcommand, proposed behind an off-by-default cargo feature
-  (§9). The RFC-0044 §8 record each needs is in §10.
+- Nature: a change to the `/play` page in `burrmill-wasm`, a separate artefact. **No change to the
+  binary**: `nuthatch publish sync` already writes everything a postcard reads (§6).
 
 ## 1. What it is for
 
-A postcard is one self-contained `.html` file. It holds a nest's sealed Parquet segments, the
-catalogue that names them, the nest's authored views, and Burrmill compiled to wasm. Whoever receives
-it opens it in a browser and runs SQL over the nest, offline, with nothing installed and nothing
-hosted by anyone. "Every Uniswap v4 hook deployment, as of block N", sent as an attachment.
+A postcard is a URL. It opens nuthatch-indexer.com/play on one published nest, pinned to the segments
+that nest had sealed when the link was made, with a query or view ready to run. The tab fetches the
+catalogue and segments from wherever the nest is published, checks every byte against the hashes the
+link carries, and answers in the browser. "Every Uniswap v4 hook deployment, as of block N", pasted
+into a chat.
 
-The point is the product's own claim, "be your own indexer", carried one step further: the recipient
-does not need an indexer, a server, a mirror, or us. The sender needed only their own nest.
+The point is "be your own indexer" carried to the reader: the sender runs a nest and puts its sealed
+directory on any static host they control; the recipient needs a browser. No server runs a query, and
+the query itself never reaches one, because it travels in the URL fragment (§4).
 
-The engine is the expensive part of the file, not the data, and that decides most of this RFC (§3).
+## 2. What `/play` does today, read 2026-10-21 at `burrmill-wasm` `a42752f`
 
-## 2. What exists, read 2026-10-21
+- **The worker already opens an arbitrary base.** `open({ base, views, decoder })` in
+  `web/play/worker.js` fetches `${base}/manifest.json`, `schema.json` and `_seed/seed.json`, and reads
+  each segment from `${base}/<table>/<hash>.parquet`, checking its SHA-256 against the address and
+  caching it in OPFS by hash. Nothing in it is specific to our mirror.
+- **The page only offers our nests.** `play.js` reads `nests.json` (base
+  `https://nestsss.nestsss-worker.workers.dev`, a curated list) and chooses by `?nest=<name>`. That is
+  RFC-0065 §11's answer 4 (Chief, 2026-10-18: a curated list, not any mirror URL). A postcard to a
+  sender's own host reopens that answer for links only; §11 asks Chief to confirm it.
+- **A share link exists, in the wrong place.** Every run writes `?nest=<name>&q=<sql>` into the
+  address with `history.replaceState`. That is the query string, so the SQL goes to the host serving
+  `/play` on every reload.
+- **The catalogue is not pinned.** The manifest is fetched with `cache: "no-cache"` and used whole.
+  A nest that seals more between sending and opening answers over more rows than the sender saw, and
+  a host that drops or adds an entry goes unnoticed. `schema.json` is not checked at all.
+- **Views come from `nests.json`**, copied from each nest's repository at a commit. The mirror does not
+  publish `views/` (RFC-0052 publishes the catalogue, segments, `schema.json`, `publish.json` and
+  `_seed/`), so a nest on someone else's host arrives with no views.
+- **The tab follows the head by default**: it loads the seed's provisional tails and fetches a live
+  tail from an RPC. A snapshot link wants neither.
 
-- **The engine in a tab.** `burrmill-wasm` (private, `nuthatch-org`) answers a mirrored nest's
-  authored views in a browser worker, row-identical to native Burrmill (RFC-0065 §1). It fetches
-  each segment over HTTP and checks it against the SHA-256 its key names. It holds a memory budget:
-  600 MiB on phones, 2 GiB elsewhere (RFC-0066 §12).
-- **The catalogue and its hash.** A published nest's `manifest.json` lists every sealed segment per
-  table with `hash`, `from_block`, `to_block`, `rows` and `writer_profile`. `publish.json` carries
-  `catalogue_sha256` (the SHA-256 of that catalogue, `src/publish.rs:737`), `data_identity`, `nid`,
-  `chain_id` and `sealed_through`. Both are what a postcard needs to say what it is.
-- **The trust sentence already written.** `src/seed.rs` says of the mirror: the hashes prove each
-  file is the one the catalogue names, and prove nothing about who wrote the catalogue or whether it
-  is true to the chain. A postcard inherits that sentence unchanged (§6).
-- **Nothing produces a single file today.** `pack` builds the compliance manifest (RFC-0008 C6),
-  `publish` mirrors a directory to object storage, `seed` reads one back. None of them bundles an
-  engine.
+So the reader exists. What is missing is a pinned catalogue, a fragment, views that travel with the
+link, a mode with no tail, and a way to name a host that is not ours.
 
-## 3. Size, measured 2026-10-21
+## 3. Pinning a snapshot of a catalogue that keeps growing
 
-All figures from files on the MacBook, with `wc -c`, `gzip -9`, `brotli -q 11` and `xz -9`. Nothing
-was built for this RFC.
+The obvious pin, `catalogue_sha256` from `publish.json`, does not work: the mirror rewrites
+`manifest.json` every time the nest seals, so the hash a sender copies stops matching within minutes.
 
-**The engine.** The module live on `/play` (`.play-deploy/pkg/burrmill_wasm_bg.wasm`, built
-2026-10-21, `opt-level = "s"`, `wasm-opt -Os`) carries Burrmill, Parquet, decode, seal, scaffold,
-identity and alloy-consensus:
+What does hold is RFC-0052 §3.2: the published catalogue is append-only and an entry is never removed.
+So a link pins **a cut**: for each table, the highest `to_block` the sender's catalogue held. The tab
+takes the host's current catalogue, keeps the entries at or below each table's cut, and hashes them.
 
-| Form | Bytes | As base64 in HTML |
+**Measured on DeFi Pulse, 2026-10-21.** The catalogue copied on 2026-10-17 held 1,181 entries; the
+mirror's today holds 1,288. All 1,181 are in today's, and cutting today's at the old catalogue's
+highest `to_block` (26,209,583) gives exactly those 1,181, no more, no fewer. Two findings from the same
+check: the local `publish.json` beside that copy said `sealed_through` 26,207,783, below entries the
+catalogue listed (the two may have been copied at different moments), so the cut comes from the
+catalogue's own `to_block`s, never from `publish.json`; and segment boundaries differ between tables,
+so one global block number could admit a lagging table's later segment. Hence one cut per table.
+
+**The digest** the link carries is SHA-256 over `schema.json`'s bytes followed by the cut's entries as
+sorted `table hash` lines. It binds the schema, every table, every segment and the absence of any
+other. A host can withhold; it cannot substitute or add without the tab refusing.
+
+## 4. The link
+
+```
+https://nuthatch-indexer.com/play/#v=1&m=<base>&d=<data_identity>&c=<cuts>&h=<digest>&q=<query>
+```
+
+- `m`, the base URL of the published directory; omitted for our mirror.
+- `d`, the data identity, which is the directory name `publish sync` writes under. It names the nest;
+  it is not checked, since the tab cannot recompute it from published files. `h` is the check.
+- `c`, the per-table cuts in sorted table order; `h`, the digest of §3, base64url.
+- `q`, the query, raw-deflated and base64url'd; optionally `w`, the views it needs, the same way.
+
+**Everything after `#` stays in the browser.** Browsers do not send a fragment in a request, so neither
+our host nor the sender's sees the query, the views or the pin. The sender's host sees the opener's IP
+and a `Referer` of `https://nuthatch-indexer.com/` when segments are fetched, as for any link.
+
+**Length, measured with Node's `deflateRawSync` at level 9:**
+
+| Query | Raw | Percent-encoded | Deflate + base64url |
+|---|---|---|---|
+| a one-line `SELECT` (58 chars) | 58 | 86 | 75 |
+| DeFi Pulse `10-eth-usd.sql` | 531 | 721 | 380 |
+| DeFi Pulse `30-aave.sql` | 4,939 | 6,621 | 2,742 |
+| all four DeFi Pulse views | 8,898 | 12,150 | 4,299 |
+
+With the fixed fields (about 300 characters for ten tables, an estimate), a link with a short query is
+under 400 characters and one carrying all four DeFi Pulse views about 4,600. Browsers accept URLs far
+longer than that (Chromium documents 2 MB; not measured here). The binding limit is where links are
+pasted: Discord's documented message limit is 2,000 characters, X shortens every link. **Fallback for a
+long query:** above 1,500 characters the page offers a short link whose `q` is `sha256:<hex>` and a
+`.sql` file for the sender to put at `<base>/queries/<hex>.sql`. The tab fetches it and refuses it
+unless it hashes to the link's value. That works only on a host the sender controls, and the page says
+so.
+
+## 5. Hosts, and what they need
+
+A host must serve the published directory as plain files over HTTPS with
+`Access-Control-Allow-Origin` on GET responses. The tab sends no custom headers, so a CORS-simple GET
+needs no preflight. Checked with `curl -D -` and an `Origin` header, 2026-10-21:
+
+| Host | Allow-Origin | Notes |
 |---|---|---|
-| raw | 35,303,889 | 47.1 MB |
-| gzip -9 | 9,028,436 | 12.0 MB |
-| brotli -q 11 | 5,656,750 | 7.5 MB |
-| xz -9 | 5,446,688 | 7.3 MB |
+| our Worker (`nestsss.nestsss-worker.workers.dev`) | `*` | preflight also answered: GET, HEAD, `range`; manifests `max-age=60` |
+| our bucket's `r2.dev` URL | none | a browser cannot read it; a sender's own R2 bucket needs a CORS rule |
+| GitHub Pages (`rust-lang.github.io`) | `*` | `max-age=600` |
+| `raw.githubusercontent.com` | `*` | |
+| jsDelivr | `*` | |
+| `ipfs.io`, `dweb.link` | `*` | both answered **429** from this machine: rate-limited |
 
-The module of 2026-10-17 was 54,134,307 bytes raw and 7,076,774 at brotli, so this number moves.
-A postcard needs Burrmill, Parquet and SHA-256 only. A reader-only build without decode, seal,
-scaffold, identity and alloy is smaller by an amount nobody has measured; `twiggy` cannot attribute
-the stripped module (60,521 items, none named). **Estimate:** 4 to 5 MB at brotli. S1 measures it.
+So GitHub Pages works as it stands, and is free. Two traps there: Pages runs Jekyll unless the site has
+a `.nojekyll` file, and Jekyll drops paths starting with `_`, so `_seed/` would vanish (a postcard does
+not read it, but a seeding node would); and GitHub documents a 1 GB site and 100 MB file limit
+(unverified here), which DeFi Pulse's 128 MB fits and Lodestar's 512 MB fits too. IPFS gateways serve
+CORS but rate-limit, so an IPFS-only postcard is supported and not recommended.
 
-A single file cannot use HTTP's `Content-Encoding`, so the page decompresses the engine itself.
-`DecompressionStream('gzip')` is in Chrome, Firefox (113) and Safari (16.4), and costs no code.
-Brotli costs a JavaScript decoder in the file (google/brotli's, MIT; size **estimated** under 200 KB,
-unmeasured) and saves 4.5 MB of base64. S0 measures both and picks one.
+**A host that lags is not a host that lies.** A cached manifest older than the link's cut (Pages caches
+ten minutes) holds fewer entries than the cut; the tab says the host has not caught up and offers a
+retry, rather than calling the digest wrong.
 
-**The data.** Segments are already zstd inside Parquet, so the cost is base64's 4/3. Local copies of
-four mirrored nests (`burrmill-wasm/data/`):
+## 6. How a sender makes one
 
-| Nest | Segments | Rows | Parquet bytes | As base64 | gzip -6 saves |
-|---|---|---|---|---|---|
-| dips (Graph DIPs contracts) | 24 | 38 | 108,824 | 0.15 MB | - |
-| graph-gns | 16 | 73,176 | 18,622,636 | 24.8 MB | 23% |
-| defi-pulse | 1,181 | 1,532,888 | 128,179,943 | 170.9 MB | 4% |
-| allocations (Lodestar) | 4,745 | 5,990,740 | 511,783,531 | 682.4 MB | - |
+1. **Publish.** For our curated nests this is done. For the sender's own,
+   `nuthatch publish sync --dir . --target ./site` writes the directory to a folder (the filesystem
+   target exists today, `src/publish.rs:588`), which they push to GitHub Pages with a `.nojekyll`; or
+   `--target s3://bucket` to their own R2 or S3 bucket with a GET CORS rule.
+2. **Open it in `/play`.** A field takes a published base URL; the tab reads `publish.json` and the
+   catalogue and opens it, unpinned, as it opens our nests today.
+3. **Copy the postcard.** A button computes the cut and digest from the catalogue the tab has open,
+   folds in the current query and any views it uses, and copies the link.
 
-That is about 84 bytes a row on DeFi Pulse and 254 on graph-gns, with a floor of a few KB a segment:
-20 of dips' 24 segments are under 6 KB. DeFi Pulse's catalogue is 498,191 bytes, 114,880 at gzip.
+**No new binary capability.** Step 1 is `publish sync` as shipped; steps 2 and 3 are the page. RFC-0046
+§1's deletion test is trivially passed: delete postcards and a self-hoster's binary is byte-identical.
+The RFC-0044 §8 record therefore covers the page only. A later convenience, `publish sync` printing
+the link when told the host's public URL, would be a new flag and need its own line; it is not proposed.
 
-**Whole postcards**, at the brotli engine (7.5 MB) plus the page (estimated 0.2 MB):
+**The nest builder** (RFC-0066) seals in the tab, into OPFS, and publishes nothing, so it cannot make a
+postcard until its zip has been run by a node and published. Not in v1.
 
-- dips: about 7.9 MB. At the gzip engine, about 12.4 MB.
-- graph-gns: about 32.5 MB, or about 27 MB with the data compressed again.
-- defi-pulse: about 179 MB.
+## 7. What the tab checks, and what that proves
 
-**The ceiling.** An attachment travels as MIME base64, another 4/3. Gmail's published limit is 25 MB
-a message and Outlook.com's 20 MB (provider documentation, not checked here), and many company
-gateways sit at 10 MB. **Proposed default ceiling: 15 MB of file**, about 20 MB on the wire. At the
-brotli engine that leaves about 7 MB of base64, or about 5 MB of Parquet: some 60,000 rows shaped
-like DeFi Pulse, or 20,000 like graph-gns. At the gzip engine it leaves about 2 MB of Parquet. Small,
-narrow nests fit; a busy nest's whole history does not, and should not pretend to.
+On opening a postcard, before any query, the tab:
 
-**Above the ceiling the producer refuses**, and prints each table's size and segment count so the
-sender can narrow the selection (§4). It does not sample, because a sampled table answers `count(*)`
-and `sum` wrongly without saying so. It does not write a link, because a link needs something hosted;
-the mirror and `/play` already serve that case. A sender who means to move the file by USB or a file
-share raises the ceiling explicitly, up to a hard limit S0 sets from what a browser will open (§11).
+1. fetches `schema.json` and `manifest.json` from the base, cuts the catalogue (§3), and compares the
+   digest with `h`; a mismatch stops it and says which side has more entries, when it can tell;
+2. fetches each segment a statement reaches and checks it against its address, as today; a segment that
+   fails is named and its table answers nothing rather than answering short;
+3. runs with no seed tails and no live tail, and shows: chain, data identity, per-table cut, and "these
+   rows are what the nest had sealed through block N; nothing later is included."
 
-## 4. What a postcard holds
+**What that proves.** The rows the tab answered from are exactly the set of segments the link names,
+whatever host served them. The host is untrusted: it can refuse or lag, and the tab says so; it cannot
+change an answer without the tab refusing. Because segment addresses are the ones every node and our
+mirror use, the same link opened against a different host holding the same nest gives the same answer.
 
-One HTML document, no external references of any kind:
+**What it does not prove.** Who made the link: anyone can compute a digest over any catalogue, and a
+link edited in transit names a different set, so a postcard is as trustworthy as the channel it came
+through. That the data is true to the chain, which is the nest's and its sealer's business, as
+`src/seed.rs` says of the mirror. Signing stays out, per Chief on 2026-10-05.
 
-1. **The page**: HTML, CSS and the JavaScript glue, inline.
-2. **The engine**: the wasm module, compressed and base64'd, in a non-executing
-   `<script type="application/octet-stream">` element, with its SHA-256.
-3. **The catalogue**: the nest's full `manifest.json`, `publish.json` where the nest is published,
-   and `schema.json`, verbatim.
-4. **The views**: `views/*.sql`, verbatim.
-5. **The segments**: each chosen segment in its own non-executing element, keyed by its content
-   address, base64 of the exact bytes the nest sealed, compressed again only where that saves 5% or
-   more (graph-gns above, not DeFi Pulse).
+## 8. What a recipient can do
 
-**Selection is by whole table and whole segment, never by row.** A sender picks tables and,
-optionally, a block range, which is widened to segment boundaries. Every embedded segment is
-therefore byte-identical to one the nest sealed and the mirror holds, under the same name. The full
-catalogue always travels, so its hash still equals the published `catalogue_sha256`, and the page
-can show which catalogue entries are present and which were left out. Omission is visible, not
-silent. A row filter would need new Parquet, which is a new file no node ever sealed, and the
-integrity story of §6 would end there. The nest is the filter: a narrow nest makes a small postcard.
+What `/play` does now, within the cut: run SQL, run the link's views, chart, export CSV. Plus one
+button, **Follow to the head**, which drops the pin and turns the tab into ordinary `/play` for that
+nest, live tail and all, with the page saying the answers are no longer the postcard's.
 
-Only sealed segments travel. Rows in the hot store, and a published nest's provisional tails
-(RFC-0052 `_seed/`), are left out: they can still change.
+## 9. Against the non-negotiables
 
-**The file is deterministic.** The same engine, catalogue, views, selection and page version give the
-same bytes, with no timestamp of the producer's own. The producer prints the file's SHA-256, so a
-sender can state it beside the attachment, and the two producers of §5 can be gated on writing the
-same file (§9, S3).
+- **Single static binary; ≤2 GB.** The binary is untouched. The tab keeps its 2 GiB engine budget and
+  600 MiB on phones (RFC-0066 §12).
+- **No phone-home.** Nothing new. The tab talks to the host the link names, and to an RPC only after
+  Follow to the head.
+- **Determinism.** A read surface over sealed, content-addressed bytes; nothing feeds stored state. The
+  pin makes the answer reproducible from the link alone.
+- **Out of scope list.** We host nothing new: links to our nests use the mirror we already run, and any
+  other link uses the sender's host.
 
-## 5. Who makes one
+## 10. Slices and their gates
 
-- **The page.** A "Postcard" control on `/play`, over a curated nest it already reads, and in the
-  nest builder over a nest the tab has sealed (RFC-0066). The page holds the engine and fetches the
-  chosen segments from the mirror, checking each hash as it does today. It shows the size before
-  building, refuses above the ceiling, and hands the file to the visitor as a download. Nothing about
-  it touches the binary.
-- **The CLI.** A `postcard` subcommand over a local nest directory's sealed segments, for an operator
-  whose nest is not on the mirror. Proposed shape, not yet a command: nuthatch postcard --dir DIR
-  --tables T1,T2 --out FILE. It needs the engine bytes at build time (§9).
+- **S0, the cut and the hosts, which can stop the programme.** (a) Snapshot every nest's published
+  catalogue daily for seven days; for each day pair, cutting the later catalogue at the earlier one's
+  per-table `to_block`s gives exactly the earlier entry set. DeFi Pulse passed one such pair (§3). Any
+  nest whose published catalogue drops, rewrites or back-fills an entry under a cut stops the design: a
+  link would then need a frozen copy, which is hosting. (b) A nest published with `publish sync` to a
+  folder, pushed to GitHub Pages with `.nojekyll`, and to an R2 bucket with a CORS rule, opened by a
+  hand-written link in Chrome, Firefox and Safari: every authored view row-identical to native Burrmill
+  (multisets of the nuthatch encoding, as RFC-0065 measures). Stop if neither host serves the tab.
+- **S1, the reader.** Fragment parsing, the cut and digest of §3, `schema.json` pinned, tails off,
+  `q` and `w` from the fragment, and the existing share link moved from the query string into it. Gates,
+  each by a scripted host: an altered segment is refused and named; an entry added under a cut, an entry
+  dropped and an altered `schema.json` each fail the digest; a host behind the cut reads as behind; the
+  browser's network log over a full session contains no request whose URL holds the query. Mutating
+  each check turns its case red.
+- **S2, the writer.** The base-URL field and Copy postcard. Gates: a link copied in one browser profile
+  and opened in a fresh one gives the same answer digest; the long-query fallback round-trips and
+  refuses a `.sql` file edited by one byte; link lengths for every curated nest's views recorded.
 
-## 6. Integrity: what the page checks and what that proves
+## 11. Non-goals
 
-On open, before any query, the page:
+- A self-contained file. Dropped by Chief on 2026-10-21; see §12.
+- A shortener, a link registry, or any server of ours that sees a postcard.
+- Rows that can still change: no hot store, no provisional tails, unless the recipient follows the head.
+- Signing, and the nest builder as a producer (§6).
+- Entities, maintained views and folds: authored SQL views only, as RFC-0065 §7.
 
-1. hashes the decompressed engine and compares it with the hash in the file;
-2. hashes the embedded catalogue and shows it beside `catalogue_sha256`, the data identity, the NID
-   and the chain;
-3. hashes every embedded segment and compares it with the content address the catalogue names for
-   it. A segment that fails is not registered, and the page names it and its table. A table with a
-   failed segment answers nothing rather than answering short.
+## 12. Alternatives
 
-**What that proves.** The file is internally consistent and was not damaged in transit, and every
-segment in it is byte-for-byte the segment that some nest sealed under that address. Because the
-addresses are the mirror's, a recipient who compares the catalogue hash shown on the page with the
-nest's `publish.json` on the mirror, or with a node running the same nest, learns that the postcard
-holds exactly what that nest published. That comparison is out of band, by eye or by a second tool:
-the page makes no network call to do it (§8).
+- **The self-contained `.html` file**, this RFC's first draft: engine and segments base64'd into one
+  file. Measured, it was the engine that sank it: 5.66 MB at brotli (7.5 MB as base64) for today's
+  `/play` module, so dips' 38 rows made a 7.9 MB file and DeFi Pulse 179 MB, against mail limits of
+  20 to 25 MB, and gateways score such files as HTML smuggling.
+- **Pinning `catalogue_sha256`.** Breaks on the nest's next seal (§3).
+- **A frozen copy per postcard** on the sender's host, so the whole catalogue can be pinned. Works, and
+  multiplies storage per link; the cut gets the same guarantee from the append-only rule for free.
+- **Publishing `views/` with the directory.** Tidier for views, but it changes what `publish sync`
+  writes and makes a binary change of a page feature; the link carries the views instead.
 
-**What it does not prove.** Who made the file: the hashes and the data sit in the same file, so a
-forger who edits one segment can edit the catalogue and its hash to match, and the page will pass.
-That the data is true to the chain, which is the nest's job and its sealer's, as for every mirror
-(`src/seed.rs`). That the engine is the one we released, unless the recipient compares its hash with
-a published one. Signing would answer the first; Chief said "no signing for now" on 2026-10-05 for the
-mirror, and this RFC does not reopen it (§12).
+## 13. Open questions for Chief
 
-The page says this in two sentences at the top, not in a help panel.
-
-## 7. What a recipient can do
-
-Kept small on purpose:
-
-- **Run SQL** over the embedded tables in a text box, with the engine's own errors.
-- **Run the nest's authored views**, one button each, in their file order.
-- **Three canned queries**, generated from the catalogue: per table, the row count, the first and
-  last block, and the ten newest rows.
-- **Export the current result as CSV**, through a download the page builds in memory.
-- **Read the schema**: tables, columns and types from `schema.json`.
-
-Not in v1: charts, entities, maintained views, folds, joins across two postcards, saving queries
-back into the file. The engine's memory budget from RFC-0066 applies unchanged.
-
-## 8. Freshness and the network
-
-**A postcard is a snapshot.** Its header says: sealed through block N on chain C, published at T where
-the nest was published, and that no row after block N is in the file. On a chain with a long seal
-span, `sealed_through` trails the head by up to that span (86,400 blocks on Arbitrum One, RFC-0066
-§12), and the header says that too.
-
-**No live tail in v1.** RFC-0065's tail would make a postcard current, but only by calling an RPC,
-and the promise that makes a postcard safe to open from email is that it calls nothing. A recipient
-who wants the head is pointed, in plain text and not as a fetch, at `/play` or at running the nest.
-Reopening this is §12, question 4.
-
-**No network, enforced.** The page carries a Content-Security-Policy meta tag:
-`default-src 'none'; script-src 'sha256-…'; style-src 'unsafe-inline'; worker-src blob:;
-img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'`, with `'wasm-unsafe-eval'`
-added to `script-src` so the module can instantiate, and the inline scripts admitted by their hashes,
-which the producer computes. `connect-src 'none'` is the guarantee: no fetch, XHR, WebSocket or beacon
-leaves the page. Decompression and decoding work on in-memory bytes and need none of them. The page
-counts `securitypolicyviolation` events and shows the count; S0 gates on it being zero.
-
-## 9. Default binary or feature
-
-The page producer is not a binary question: it is a static page in `burrmill-wasm`.
-
-For the CLI producer, **RFC-0046 §1's deletion test does not decide it**, and saying otherwise would be
-dishonest. Delete the subcommand and a self-hoster loses nothing they had before, and nothing else in
-the binary would depend on it. Any optional, purely additive command passes that test wherever it
-lives. What decides it is what the command costs everyone who never uses it:
-
-- **Binary size.** The 5.8.2 macOS release tarball is 37,877,867 bytes. Embedding today's engine adds
-  5.66 MB at brotli (about 15%) or 9.03 MB at gzip (about 24%), on every `curl | sh`, for a feature
-  most operators will not run. A reader-only engine shrinks that; it does not remove it.
-- **The release pipeline.** The engine is a wasm32 build from a private repository, needing Homebrew
-  LLVM's clang for zstd-sys. Putting it in every release build ties the binary's release to that
-  toolchain and to a repository the public cannot rebuild from.
-
-**Recommendation: off by default, behind a `postcard` cargo feature**, as `folds` and `graph` are, with
-a separate release asset if a user asks for one. A default build's CLI help, `init` output, on-disk
-layout and behaviour are what they would be had this RFC not been written, and S3 gates on exactly
-that. Promotion to the default binary is a later decision for Chief, on a user's request and a
-measured size.
-
-## 10. Against the non-negotiables
-
-- **Single static binary.** Unchanged by default. The feature build stays one binary; the engine is
-  bytes inside it.
-- **≤2 GB.** Not the CI budget, but the recipient's tab runs under the same 2 GiB engine budget, and
-  S0 records peak memory for every view.
-- **No phone-home.** The postcard calls nothing (§8). The producers call only what they call today:
-  the page the mirror, the CLI nothing.
-- **Determinism.** A postcard is a read surface over sealed bytes; nothing in it feeds stored state.
-  The file itself is deterministic (§4).
-- **MIT OR Apache-2.0.** The engine and every crate in it are already under it. The brotli decoder,
-  if chosen, is MIT. `burrmill-wasm` being private is a distribution question, not a licence one
-  (§12, question 2).
-- **RFC-0044 §8.** S0 and S1 change nothing in this tree. S2 is a new surface in a separate artefact
-  and, like RFC-0065 S3 and RFC-0066 S1, needs Chief's line in `CLAUDE.md` before it starts. S3 adds
-  a feature to the binary and needs its own line, naming the feature as off by default.
-
-## 11. Slices and their gates
-
-- **S0, a postcard by hand, which can stop the programme.** No producer: a script assembles two files
-  from today's engine, dips whole and a DeFi Pulse selection near the ceiling, once with a gzip
-  engine and once with brotli. Gates: opened from `file://` with the CSP of §8, in Chrome, Firefox and
-  Safari on the MacBook, every authored view answers row-identical to native Burrmill (multisets of
-  the nuthatch encoding, as RFC-0065 measures), with zero CSP violations and zero network requests in
-  the browser's own log. Recorded: file size, time to first answer, peak memory, per browser, and the
-  largest file each browser opens. Each file is also mailed to Gmail, Outlook.com and one other
-  provider, downloaded at the far end, and hashed. **Stop** if Chrome cannot run the engine from
-  `file://`, or if two of the three providers strip or quarantine the attachment: then a postcard
-  is not a postcard, and whether it is still worth building as "a file you share" is Chief's call.
-- **S1, a reader-only engine.** A second build target in `burrmill-wasm` with Burrmill, Parquet and
-  SHA-256 only. Gates: every S0 view still identical; the size recorded; two clean builds of the same
-  commit give the same bytes, since a postcard prints the engine's hash and a recipient can only check
-  a hash that can be reproduced. If the build is not reproducible, that is a finding to fix before S3.
-- **S2, the page producer.** The `/play` control of §5. Gates: for a pinned nest and selection, every
-  embedded segment's hash equals the mirror catalogue's entry, and the catalogue's hash equals
-  `publish.json`'s; a test that flips one byte of one embedded segment sees the page refuse that
-  segment, name it, and answer nothing from its table; a selection over the ceiling is refused with
-  the per-table sizes. Mutating either check turns its test red.
-- **S3, the CLI producer, behind `postcard`.** Gates: for the same nest, selection and engine, the CLI
-  writes the same bytes the page does; a default build's `--help`, `init` output and release binary
-  are unchanged from the commit before, which is the deletion test written as a gate; the feature
-  build's size delta is recorded.
-
-Not slices: a live tail, signing, a shared-postcard gallery.
-
-## 12. Non-goals
-
-- **Hosting.** Nothing in this RFC is served by us; the file is the whole delivery.
-- **Rows that can change.** No hot store, no provisional tails, no unsealed rows.
-- **Row-level selection or sampling** (§3, §4).
-- **A live tail** in v1 (§8).
-- **Entities, maintained views, folds.** Authored SQL views only, as in RFC-0065 §7.
-- **Writing back.** A postcard never becomes a nest; the zip from RFC-0066 is how a nest travels.
-- **The WASM transform layer.** Removed on 2026-10-08 (#1999). This runs the engine, not handlers.
-
-## 13. Risks
-
-- **It looks like HTML smuggling.** A large base64 blob that inline JavaScript decodes is how a common
-  phishing technique delivers payloads, and mail gateways score HTML attachments on it. Some
-  recipients will never see a postcard. S0 measures this before anything else is built.
-- **`file://` is each browser's own.** Workers from `blob:` URLs, `wasm-unsafe-eval` under a meta CSP
-  and OPFS behave differently on an opaque origin, and change between releases. OPFS is not assumed:
-  a postcard decompresses on every open. If a worker is refused, the engine runs on the main thread
-  and the page says it may pause.
-- **Phones.** Mail apps preview HTML attachments without running script. A phone recipient must save
-  the file and open it in a browser, under the 600 MiB budget.
-- **The engine dominates the size**, so the whole design leans on S1. If a reader-only engine stays
-  near 5.7 MB at brotli, the useful data budget stays near 5 MB of Parquet.
-- **A frozen engine.** A postcard answers with the engine it was made with, forever. That is what
-  makes it reproducible, and it also keeps that engine's bugs. The page shows the engine's version.
-- **A snapshot read as current.** Mitigated by the header of §8, not removed.
-
-## 14. Alternatives
-
-- **The engine fetched at open time from a CDN.** A tiny file, but a network call on open, a third
-  party in the trust path, and a postcard that stops working when the URL does. Rejected.
-- **A zip of Parquet plus a link to `/play`.** Smaller, but needs our page to stay up and a browser
-  that grants it file access. It is the mirror case with extra steps.
-- **DuckDB-Wasm instead of Burrmill.** 35.6 to 41.3 MB raw for its three builds, slower on nuthatch's
-  views (RFC-0065 §1), and not the engine a node answers with.
-- **The CLI fetches the engine from the release page** when run, keeping the default binary small.
-  It is a network call the operator asked for, which non-negotiable 3 allows, but the command then fails offline.
-  Worth having as a fallback if S3 is never promoted.
-
-## 15. Open questions for Chief
-
-1. **The ceiling.** 15 MB by default, refused above it with the sizes shown, raisable to a hard limit
-   S0 sets. Is refusing the right behaviour, or should the producer offer to drop whole tables until
-   it fits?
-2. **`burrmill-wasm` stays private?** Every postcard carries its build. A recipient can check the
-   engine's hash only against something published, and can rebuild it only from a public source.
-   RFC-0065 §11 asked the same question for a different reason.
-3. **Which producer first.** The page (S2) needs no binary change and reaches visitors; the CLI (S3)
-   reaches operators whose nests are not on the mirror. The order above is page first.
-4. **A live tail later?** It would need `connect-src` opened to one RPC, behind a button the recipient
-   presses, and the page would stop being a file that calls nothing. Lean: never in a postcard; that
-   is what `/play` is.
-5. **Signing.** Out, per 2026-10-05. A postcard leaves every channel we control, and its hashes
-   cannot say who made it (§6), which is a stronger case for signing than the mirror's. Still out?
+1. **Any host, or our mirror only?** RFC-0065 §11 settled `/play` on a curated list. A postcard to a
+   sender's own GitHub Pages means `/play` opens a base URL named in a link. The design assumes yes,
+   for links and the base-URL field, with the picker staying curated.
+2. **IPFS.** Supported by construction, rate-limited in practice (429 from both gateways tried). List it
+   in the docs, or leave it unmentioned until someone asks?
+3. **Follow to the head** on a postcard: in, as proposed, or should a postcard only ever show its
+   snapshot?
