@@ -340,9 +340,16 @@ Do not start slice N+1 while slice N has failing tests or an unmet budget.
   nuthatch feature on its own merits, or it is not built. That includes a direct offer to a named
   Graph user whose subgraph is hurt by the Studio sunset or a chain's deprecation; the 2026-10-08
   stopgap hold still rules out promotion and any approach through the Foundation.
+  **Amended 2026-10-21 by Chief: the hosting offer is public.** "It is a public offer on the site."
+  nuthatch-indexer.com/subgraphs says so, and people reach out on the Nuthatch Discord server. The
+  other terms of the 2026-10-09 amendment still bind: the stock binary, no billing, no accounts,
+  nothing in this tree built for it.
 - Token, staking, decentralized network features (a possible future Graph Horizon data
   service is explicitly deferred).
-- Non-EVM chains before EVM is airtight.
+- Non-EVM chains before EVM is airtight. **Amended 2026-10-21 by Chief:** "Non evm chains could be
+  supported upon user request." A request is a named user asking for a named chain; the site says
+  so. None is built today, and building one is new ingestion and decode, so each request is a
+  decision for Chief, not a standing authorisation.
 - TEE attestation, zk proofs (verifiability = deterministic re-execution of the core
   + content-addressed segments; nothing heavier).
 - Kubernetes manifests, Helm charts, or any deployment story beyond binary + compose.
