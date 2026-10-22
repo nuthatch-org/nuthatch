@@ -1,6 +1,6 @@
 # RFC-0069: The engine room - a running nest watched from a terminal
 
-- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI. S0 measured 2026-10-22 (§15): the feature adds 0.30 MiB on macOS and 0.34 MiB on Linux, `cargo deny` stays green, and one watcher leaves tip lag and RSS inside their unwatched spread; it waits on Chief watching the clip.
+- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI. S0 measured 2026-10-22 (§15): the feature adds 0.30 MiB on macOS and 0.34 MiB on Linux, `cargo deny` stays green, and one watcher leaves tip lag and RSS inside their unwatched spread. Chief watched the clip on 2026-10-22 and said build it.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: the endpoints a nest already serves (`/ready`, `/metrics`, `/`, `/nests`, the admin
