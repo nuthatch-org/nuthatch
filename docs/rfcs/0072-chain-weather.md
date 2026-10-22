@@ -1,6 +1,9 @@
 # RFC-0072: Chain weather - a daily report a nest writes about itself
 
-- Status: **Accepted (2026-10-21, Chief).**
+- Status: **Accepted (2026-10-21, Chief).** S0 measured 2026-10-22 (§13): the answers are
+  byte-identical across passes and machines and a day's set runs in under 10 s, but the full-history
+  newcomer scan breaks the 256 MB rise on the GRT nest, so the 90-day fallback is taken. Waiting on
+  Chief reading the 28 reports.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: RFC-0071 (nuthatch diff), for its row-to-sentence templates and its ranking, and on
@@ -343,3 +346,92 @@ off by default, so the default binary contains no model client at all. §11 asks
 - **Shipping it as a skill or external script over `/sql`.** Possible today, and S0 is exactly that.
   It loses the MCP tool, the delivery and the `--verify` guarantee, which are what make it a nest's own
   report rather than someone's cron job.
+
+## 13. S0, measured 2026-10-22
+
+The harness is `tools/rfc-0072-s0/`, bash and jq against `nuthatch serve` 5.8.2 on copies of two nests.
+`day.sh` writes one UTC day's §5.2 signals as plain `/sql` and keeps every answer; `facts.sh` merges
+them into a facts document; `render.jq` is the throwaway template; `pass.sh` runs 14 days on a fresh
+`serve` per day, so no answer is `/sql`'s memo and each day's RSS rise is its own; `compare.sh` checks
+two passes byte for byte. `lodestar.config.json` and `grt.config.json` are each nest's tables and
+address parameters as `nest-config.sh` read them, with Lodestar's allocation ids added by hand (5
+below). No model is involved.
+
+- **Lodestar's allocations nest** (`graph-allocations-nest`, the release-gate copy frozen
+  2026-10-12): 2026-09-28 to 2026-10-11. 76 event tables are declared and 66 have rows. It has no
+  Transfer table, so `biggest_mover` and `largest_transfer` do not apply.
+- **The GRT supply nest** (`grt-supply-nest`, Arbitrum GRT `Transfer`, `BridgeMinted`,
+  `BridgeBurned`): 2026-09-23 to 2026-10-06. It was built with `block_timestamps = false`, which §5.6
+  says weather refuses. S0 ran it anyway, with its day and hour boundaries read once from Arbitrum
+  (`grt-bounds.sh`, 428 first blocks by bisection), to have an ERC-20 at all; no other ERC-20 nest
+  with timestamps and 90 days of history was to hand. Its records are 90-day only, since the full
+  history has no clock to bucket it by, and its quiet-spell times are placed between hour boundaries.
+
+| Gate | Result |
+|---|---|
+| Each query gives the same bytes twice | **Pass.** Every response body and every facts document identical on two MacBook passes: 728 files for Lodestar (350 statements over 14 days), 336 for GRT (154). The ThinkPad pass gives the same 1,064 files byte for byte |
+| A day's set under 10 s on the ThinkPad | **Pass.** Lodestar 6.0 to 6.5 s with full-history signals (7.6 to 8.1 s with the 90-day variants run beside them), GRT 2.7 to 2.9 s (4.0 to 4.3 s) |
+| RSS rise under 256 MB on the ThinkPad | **Fails on GRT with full history, passes on the 90-day fallback.** Lodestar 211 to 223 MiB. GRT 244 to 259 MiB, over 256 MiB on 4 of 14 days. With the full-history statements left out, 87 to 107 MiB (three GRT days, two Lodestar days, replayed by `stmt-rss.sh`) |
+| Chief reads the reports, half told him something | **Open.** `rfc0072-chain-weather-s0.html`, 28 reports, 44 KB, no network requests |
+
+| A day's set | Lodestar, MacBook | Lodestar, ThinkPad | GRT, MacBook | GRT, ThinkPad |
+|---|---|---|---|---|
+| Statements | 25 | 25 | 11 | 11 |
+| Time, full-history signals | 4.2 to 5.6 s | 6.0 to 6.5 s | 2.4 to 4.0 s | 2.7 to 2.9 s |
+| Time, 90-day signals only | | 4.3 to 4.6 s | | 2.4 to 2.5 s |
+| RSS rise, full history | 169 to 226 MiB | 211 to 223 MiB | 202 to 256 MiB | 244 to 259 MiB |
+| RSS rise, 90-day only | | 103 to 104 MiB | | 87 to 107 MiB |
+
+The heaviest single statements: GRT's full-history newcomers, 1.55 s and a 153 MiB rise on its own
+against 0.58 s and 68 MiB over 90 days; Lodestar's full-history distinct-address record, 1.23 s and
+114 MiB against 0.48 s and 17 MiB.
+
+What this changes:
+
+1. **A signal over every event table is not one `/sql` statement.** Burrmill refuses more than 64
+   `UNION`s in a statement, and `/sql` refuses a statement over 16 KiB. Lodestar has 66 tables with
+   rows. S0 runs each event-row signal as one statement per chunk of 40 tables whose answers merge
+   exactly (counts per table and day, min and max per day, distinct timestamps for gaps), puts a
+   table's address parameters in one branch with `unnest`, and checks "seen before" against literal
+   lists of 150 addresses. §5.3's `query`, one string a reader pastes into `/sql`, becomes a list of
+   statements and a merge rule. S1 should keep that shape, with the merge in Rust, rather than run its
+   own queries past `/sql`'s admission, so a reader can still re-run every statement.
+2. **The obvious "new address" query runs out of memory.** A join of the day's addresses against 13
+   million history rows failed in GRT's 512 MB analytics budget (`HashJoinInput`, can spill: false).
+   A `GROUP BY address HAVING MIN(block_number) >= D's first block` gives the same set in 1.55 s.
+3. **§11 Q3: take the 90-day fallback**, "first seen in 90 days" and "highest in 90 days", which is
+   what the RFC recommended. Full history passes the time gate and fails the RSS one on GRT, and it
+   is also the less useful signal: no full-history record fired on any of the 28 days, because
+   Lodestar's highs are 28,131 events on 2024-12-06 and 10,306 active addresses on 2024-04-02, the
+   L2 migration. Over 90 days, records fired three times (Lodestar 2026-10-09, GRT 2026-09-26 and
+   2026-09-29). Newcomers over full history and over 90 days differ (Lodestar 0 to 4 against 0 to 12
+   a day), and the report can say both only while full history is affordable.
+4. **`quiet_spell` fired on all 28 days.** Four times the day's median gap is a few minutes on
+   Lodestar and a few hundred blocks on GRT. One was checked against the chain: Lodestar's 3 h 58 min
+   silence on 2026-10-10 (blocks 513,413,421 to 513,464,164) holds 234 logs from the nest's contracts
+   by `eth_getLogs` on Arbitrum, all GRT `Transfer` and `Approval`, which this nest does not index,
+   and none with one of its topics. It was the chain, not a hole in the nest. S1 should compare the
+   day's longest gap with the previous days' longest gaps, not with its own median. Not measured.
+5. **`new_counterparties` needs a definition for a nest without transfers.** S0 used every indexed
+   address parameter, by name, and left out allocation ids, which are new on nearly every row and drown
+   the rest (1,036 of 1,103 role and address pairs on the first try at 2026-10-11). That list was
+   written by hand for S0; S1 needs an author hint in `semantic.toml` for a parameter that is an
+   identifier, not a counterparty. With it, Lodestar named one to four new delegators, curators, payers or receivers on 13 of 14 days.
+6. **`unusual` fired on 12 of 14 Lodestar days and never on GRT.** Lodestar's tables swing well past
+   3x and a third of their 7-day medians most days; GRT is one large table and two with medians under
+   20. Whether that is signal or noise is Chief's reading.
+7. **Addresses need names.** GRT's report for 2026-09-23 names its largest net mover, in 2,149
+   transfers, only as `0x00669a4c...ef03`, which Lodestar's nest calls `staking`. Neither nest has labels. S1
+   should name addresses through `NestContext::address_text` as the diff does, and an ERC-20 nest will
+   still not know its counterparties' names.
+8. **Timestamp-free nests stay refused (§5.6).** S0 shows the alternative costs a day-boundary table
+   read from the chain (25 first blocks a day for the hour), approximate times and no full-history
+   records. Nothing in S1 should depend on it.
+
+§11, as S0 took them: Q1 default binary with per-nest opt-in, the recommendation; Q2 settled; Q3 the
+90-day fallback, above; Q4 `slack` added with S2, as recommended; Q5 S1 waits for RFC-0071's
+templates, which have since landed (§17 of 0071); Q6 UTC days only.
+
+Not verified: ranking (S0 orders facts by a fixed list); the reorg property of S1; any report on a
+live nest, or one sealed under the chain-time age rule; `weather.toml`, routes and delivery, none of
+which S0 builds; and the GRT nest's quiet-spell times, which are interpolated.
