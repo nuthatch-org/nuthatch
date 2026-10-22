@@ -339,9 +339,17 @@ markup around the same script.
 
 **What the build settled that the sections above left open.**
 
-- **The link.** `#v=1&m=<base>&d=<data identity>&c=<table>:<block>,…&h=<digest>&w=<views>&q=<query>`,
-  `c` in table order and naming only tables with entries. `m` is omitted for our mirror. `q` and `w`
-  are raw-deflated base64url, or `sha256:<hex>` for the short form below.
+- **The link.** `#v=1&m=<base>&d=<data identity>&c=<cuts>&h=<digest>&w=<views>&q=<query>`. `m` is
+  omitted for our mirror. `c`, `q` and `w` are raw-deflated base64url; `q` and `w` may instead be
+  `sha256:<hex>` for the short form below.
+- **`c` is deflated** (Chief, 2026-10-22, after the first length table below): it unpacks to
+  `<table>:<block>,…` in table order, naming only tables with entries. Allocations' 75 cuts are 2,914
+  characters plain and 1,159 packed. Deflate carries no checksum, so the packing is not what protects
+  the pin: a `c` that does not unpack, or unpacks to anything but `table:block` pairs, is refused as a
+  damaged cut list before any fetch, and one that unpacks to some other well-formed cut still meets the
+  digest, which it cannot pass unless it admits exactly the pinned entries. A nest with no entries
+  carries `c=AwA`, the empty list; the plain form had no way to say that, and refused such a postcard
+  as cut short.
 - **The digest's lines are `table hash from_block to_block rows`**, not `table hash`. A host that kept
   the hashes and rewrote the other fields would otherwise pass; binding them costs nothing.
 - **Three refusals, said apart.** *Behind*: a table's highest `to_block` on the host is below the cut,
@@ -376,6 +384,7 @@ a mutation that drops something from the digest cannot hide behind a link that n
 | an entry added under a cut; a middle entry dropped; one byte of `schema.json` changed | each fails the digest |
 | the top entry of one table missing | reads as behind |
 | the last two segments re-cut across the cut | reads as moved |
+| `c` with its last 12 characters cut off; `c` unpacking to a cut list ending in a bare table name | each refused as a damaged cut list, by name |
 | one 503 on a segment | retried, answered |
 | two 503s, then a second query | first refused as not arrived, second answered |
 | a session: postcard, a second query, reload, Follow to the head | no request line or header in Chrome's NetLog, and no request at either server, carries the query |
@@ -383,7 +392,11 @@ a mutation that drops something from the digest cannot hide behind a link that n
 Mutating each check turned its case red: the address check (the swap answered 16,499 rows, the flip
 17,159 rows with a wrong digest), the retry, the dropped failure, the digest comparison, `schema.json`
 in the digest, the no-cut rule, the cut filter, the behind check, the moved check, the pinned path,
-and writing the query to the query string (5 request lines carried it). Each was applied to the
+writing the query to the query string (5 request lines carried it), an unpack failure read as an
+empty cut list (the truncated `c` then read as a digest mismatch), and a parse that skips what is not
+`table:block` (the damaged `c` then opened and answered, since the pairs left still admitted the
+pinned set). 13 mutations, the last run on `83aef5f` after rebasing onto `burrmill-wasm` main with
+the time-lapse player in it. Each was applied to the
 committed tree, shown in `git diff`, restored from HEAD and the tree checked clean. One gate was too
 weak on first run: with the retry removed, the one-503 case stayed green because the next query
 refetched. It now queries nothing on open, and the mutation turned it red.
@@ -397,8 +410,9 @@ postcard, then opens it itself; a fresh profile B opens the same link.
 | our mirror, `#nest=graph-gns-nest` | 17,593 `9bd10f70…` | same | same |
 | GitHub Pages, `postcard-s0-pages` | 17,159 `2ce4449e…`, native | same | same, from its own segment cache |
 
-The fallback: a query with 40 random literals made a 3,911-character link, whose short form was 518
-characters with 2 files; with the files in place B answered as A did (30,282 rows `9af478ca…`), and
+With `c` packed the three links were 1,662, 1,684 and 1,680 characters, and all twelve answers above
+were taken again on them. The fallback: a query with 40 random literals made a 3,833-character link,
+whose short form was 440 characters with 2 files; with the files in place B answered as A did (30,282 rows `9af478ca…`), and
 with one byte of the query's file changed B refused it by URL. Mutated, the `.sql` hash check, the
 copied cut (moved one block down, which reads as moved) and the view closure (a dependency dropped)
 each turned red.
@@ -408,19 +422,21 @@ catalogue on 2026-10-22, at `https://nuthatch-indexer.com/play/`:
 
 | Nest | Tables cut | Views | Link without query | Shortest | Median | Longest | Over 2,000 |
 |---|---|---|---|---|---|---|---|
-| graph-gns-nest | 7 | 7 | 409 | 713 | 1,089 | 2,014 | 1 |
-| graph-allocations-nest | 75 | 23 | 3,068 | 3,359 | 5,566 | 20,731 | 23 |
-| dips-nest | 22 | 2 | 1,271 | 1,650 | 1,906 | 1,906 | 0 |
-| data-services-nest | 0 | 1 | 151 | 384 | 384 | 384 | 0 |
-| defi-pulse-nest | 10 | 9 | 443 | 798 | 1,071 | 3,014 | 3 |
-| betswirl-bnb-nest | 33 | 20 | 1,163 | 1,751 | 5,791 | 7,916 | 19 |
-| qos-reo-nest | 5 | 23 | 319 | 713 | 2,274 | 4,197 | 15 |
-| grt-supply-arbitrum-one | 3 | 2 | 259 | 658 | 778 | 778 | 0 |
-| grt-supply-mainnet | 1 | 2 | 184 | 486 | 488 | 488 | 0 |
+| graph-gns-nest | 7 | 7 | 322 | 626 | 1,002 | 1,927 | 0 |
+| graph-allocations-nest | 75 | 23 | 1,313 | 1,604 | 3,811 | 18,976 | 17 |
+| dips-nest | 22 | 2 | 496 | 875 | 1,131 | 1,131 | 0 |
+| data-services-nest | 0 | 1 | 157 | 390 | 390 | 390 | 0 |
+| defi-pulse-nest | 10 | 9 | 353 | 708 | 981 | 2,924 | 3 |
+| betswirl-bnb-nest | 33 | 20 | 546 | 1,134 | 5,174 | 7,299 | 18 |
+| qos-reo-nest | 5 | 23 | 280 | 674 | 2,235 | 4,158 | 15 |
+| grt-supply-arbitrum-one | 3 | 2 | 256 | 655 | 775 | 775 | 0 |
+| grt-supply-mainnet | 1 | 2 | 197 | 499 | 501 | 501 | 0 |
 
-61 of 89 are over Discord's 2,000. §4's estimate of about 300 characters of fixed fields held for
-small nests and not for wide ones: allocations' 75 cuts alone are 2,914 characters, which deflate to
-1,159. Deflating `c` is not built, and since these are mirror nests the short form does not apply.
+53 of 89 are over Discord's 2,000, down from 61 with `c` plain. The fixed part fell most where there
+are many tables: allocations from 3,068 to 1,313, dips from 1,271 to 496, betswirl from 1,163 to 546.
+It rose by 6 and 13 characters for data-services and grt-supply-mainnet, where an empty list or a
+single cut packs longer than it reads plain. What is left over the limit is the views: betswirl's and qos-reo's long views, and
+allocations' whole dependency chains. These are mirror nests, so the short form does not apply.
 
 **Not verified.** Firefox, which is not installed. Safari ran the three copied links only, not the
 tamper cases or the fallback. The clipboard write under a real click: headless read the link from the
