@@ -1,0 +1,40 @@
+ DEFI-PULSE  LIVE  · mainnet · nuthatch 5.9.0 · freshness tip · nid 7933ef4a1b5d
+┌ THE TIP ─────────────────────────────────────────────────┐┌ BOILER ──────────────────────────────────────────────────┐
+│ TIP       26,249,904                                     ││ RSS       ▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+│ INDEXED   26,249,904                                     ││           181.0 MiB of 2.0 GiB · process · 1 cursor      │
+│ LAG       0 blocks                                       ││ CPU       3.8% of a core                                 │
+│ POLL      every 12 s · last 4 s ago · next in 8 s        ││ POOL      reserved 0 B · peak 11.8 KiB                   │
+│ ARRIVALS  ▃ ▃ ▃ ▃                                        ││ HOT STORE 2.5 MiB                                        │
+│           one mark a poll; the taller, the more blocks   ││                                                          │
+└──────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘
+┌ THE PRESS ───────────────────────────────────────────────┐┌ FEED LINES ──────────────────────────────────────────────┐
+│ SEALED    through 26,249,579                             ││ ENDPOINT                     REQ  FAIL RETRY        MEAN │
+│ SEAL LAG  325 blocks                                     ││ eth.drpc.org                  16     1     0       59 ms │
+│ OUTPUT    0 rows · 369.3 KiB on disk                     ││ ethereum-rpc.publicnode.…     21     0     1       64 ms │
+│ DIRECT    no seal-direct pass                            ││                                                          │
+│ STAMPS    none seen yet                                  ││                                                          │
+│           one mark an advance of sealed_through          ││                                                          │
+└──────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘
+┌ REORG ───────────────────────────────────────────────────┐┌ DISPATCH ────────────────────────────────────────────────┐
+│ REORGS    0 since the process started                    ││ REQUESTS  2.7/s · p50 0.9 ms · 160 in the last minute    │
+│ LAST      none                                           ││   0s /tables                               200    0.9 ms │
+│                                                          ││   0s /sql                                  200    2.9 ms │
+│                                                          ││   1s /tables                               200    0.8 ms │
+│                                                          ││   1s /sql                                  200    2.9 ms │
+│                                                          ││   1s /tables                               200    0.7 ms │
+│                                                          ││   1s /sql                                  200     35 ms │
+│                                                          ││   2s /table/{name} no_such_table           404    0.1 ms │
+│                                                          ││   2s /tables                               200    0.9 ms │
+│                                                          ││   2s /sql                                  200    2.7 ms │
+│                                                          ││   3s /tables                               200    0.8 ms │
+│                                                          ││   3s /sql                                  200    2.7 ms │
+│                                                          ││   3s /tables                               200    0.7 ms │
+│                                                          ││   3s /sql                                  200     31 ms │
+│                                                          ││   4s /tables                               200    0.6 ms │
+│                                                          ││   4s /sql                                  200     35 ms │
+│                                                          ││   4s /table/{name} no_such_table           404    0.1 ms │
+│                                                          ││   4s /tables                               200    0.6 ms │
+│                                                          ││   4s /sql                                  200     33 ms │
+│                                                          ││   5s /entities                             200    0.4 ms │
+└──────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘
+ replaying a fixture

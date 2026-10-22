@@ -374,3 +374,32 @@ fn the_poll_countdown_runs_between_reads() {
     );
     assert!(drawn.contains(&want), "want {want:?} in\n{drawn}");
 }
+
+/// DISPATCH and REORG drawn from a nest that served queries while it was watched (RFC-0069 S3).
+#[test]
+fn dispatch_draws_what_the_nest_served() {
+    let (app, now) = replayed("dispatch.jsonl");
+    for (w, h) in [(120, 40), (80, 24), (60, 20)] {
+        let drawn = text(&buffer(&app, now, ColorMode::True, w, h));
+        snapshot(&format!("dispatch-{w}x{h}"), &drawn);
+    }
+    let drawn = text(&buffer(&app, now, ColorMode::None, 120, 40));
+    assert!(drawn.contains("/sql"), "{drawn}");
+    assert!(drawn.contains("p50"), "{drawn}");
+}
+
+/// The live nest's ring, read while it answered SQL, carried no SQL: the recording is the evidence.
+#[test]
+fn the_recorded_ring_holds_no_query_text() {
+    let reads = load_recording(&fixture("dispatch.jsonl")).unwrap();
+    let feeds: Vec<&Read> = reads
+        .iter()
+        .filter(|r| r.route == "/_admin/requests" && r.status == 200)
+        .collect();
+    assert!(feeds.iter().any(|r| r.body.contains("\"/sql\"")));
+    for r in feeds {
+        for needle in ["SELECT", "select", "q=", "usdc__"] {
+            assert!(!r.body.contains(needle), "{needle} in {}", r.body);
+        }
+    }
+}

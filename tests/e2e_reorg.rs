@@ -51,7 +51,21 @@ async fn spawn_indexed(
     indexer::NestRuntime,
     std::sync::Arc<dyn nuthatch::store::HotStore>,
 ) {
-    let cfg = scaffold_nest(dir, "usdc", USDC);
+    spawn_indexed_as(dir, "usdc", tape, tip, within).await
+}
+
+/// [`spawn_indexed`] under a nest name of the caller's, whose per-nest series no other test shares.
+async fn spawn_indexed_as(
+    dir: &std::path::Path,
+    name: &str,
+    tape: Arc<TapeSource>,
+    tip: u64,
+    within: std::time::Duration,
+) -> (
+    indexer::NestRuntime,
+    std::sync::Arc<dyn nuthatch::store::HotStore>,
+) {
+    let cfg = scaffold_nest(dir, name, USDC);
     let rt = indexer::spawn_nest(
         tape,
         dir.to_path_buf(),
@@ -97,6 +111,19 @@ const CHAIN_LEN: u64 = 24;
 /// hot state converges byte-for-byte to a clean nest indexed directly over the post-reorg chain.
 async fn converge_after_reorg(fork: u64) {
     assert!((1..CHAIN_LEN).contains(&fork));
+    // A name of its own, so the per-nest reorg gauges it reads are this case's and no other test's.
+    static CASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = format!(
+        "usdc_reorg_{}",
+        CASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let gauge = |series: &str| -> Option<u64> {
+        let prefix = format!("{series}{{nest=\"{name}\"}} ");
+        nuthatch::metrics::METRICS
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()).map(|v| v.parse().unwrap()))
+    };
 
     // Reorged nest: index the canonical chain 1..=CHAIN_LEN, then reorg above `fork`.
     let reorged_dir = tempfile::tempdir().unwrap();
@@ -105,8 +132,27 @@ async fn converge_after_reorg(fork: u64) {
         tape.insert_block(b, canonical_block(b));
     }
     tape.advance_tip_to(CHAIN_LEN);
-    let (rt, store) =
-        spawn_indexed(reorged_dir.path(), tape.clone(), CHAIN_LEN, POLL_TIMEOUT).await;
+    let (rt, store) = spawn_indexed_as(
+        reorged_dir.path(),
+        &name,
+        tape.clone(),
+        CHAIN_LEN,
+        POLL_TIMEOUT,
+    )
+    .await;
+    // RFC-0069 G2: no reorg yet, so no depth and no time, rather than a zero that reads as one.
+    assert_eq!(gauge("nuthatch_nest_last_reorg_depth_blocks"), None);
+    assert_eq!(gauge("nuthatch_nest_last_reorg_unixtime"), None);
+    // The rollback lands on the deepest checkpoint still canonical, the newest at or below the fork,
+    // so it can undo more blocks than the chain replaced; the gauge counts what was rolled back.
+    let ancestor = store
+        .checkpoints_desc()
+        .unwrap()
+        .into_iter()
+        .map(|(b, _)| b)
+        .find(|b| *b <= fork)
+        .unwrap_or(0);
+    let reorged_at = nuthatch::metrics::now_unix();
 
     // Rewrite blocks (fork, CHAIN_LEN] with the replacement chain.
     let replacement: Vec<BlockFixture> = ((fork + 1)..=CHAIN_LEN).map(replacement_block).collect();
@@ -126,6 +172,16 @@ async fn converge_after_reorg(fork: u64) {
     })
     .await;
     assert!(converged, "fork={fork}: reorg did not reconverge in time");
+    assert_eq!(
+        gauge("nuthatch_nest_last_reorg_depth_blocks"),
+        Some(CHAIN_LEN - ancestor),
+        "fork={fork}: the depth is the blocks rolled back, to checkpoint {ancestor}"
+    );
+    let at = gauge("nuthatch_nest_last_reorg_unixtime").expect("a reorg time");
+    assert!(
+        (reorged_at..=nuthatch::metrics::now_unix()).contains(&at),
+        "fork={fork}: reorg time {at}"
+    );
     let reorged_rows = store.entities_in_range(1, CHAIN_LEN).unwrap();
     shutdown(rt);
 
@@ -140,7 +196,7 @@ async fn converge_after_reorg(fork: u64) {
     }
     clean_tape.advance_tip_to(CHAIN_LEN);
     let (clean_rt, clean_store) =
-        spawn_indexed(clean_dir.path(), clean_tape, CHAIN_LEN, POLL_TIMEOUT).await;
+        spawn_indexed_as(clean_dir.path(), &name, clean_tape, CHAIN_LEN, POLL_TIMEOUT).await;
     let clean_rows = clean_store.entities_in_range(1, CHAIN_LEN).unwrap();
     shutdown(clean_rt);
 

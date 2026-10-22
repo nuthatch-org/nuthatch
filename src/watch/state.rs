@@ -123,6 +123,59 @@ pub struct Mount {
     pub chain: Option<String>,
 }
 
+/// One request a nest served, as `/_admin/requests` lists it.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Served {
+    pub seq: u64,
+    pub unix_ms: u64,
+    pub route: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub status: u16,
+    pub ms: f64,
+}
+
+/// What `/_admin/requests` has said: its last status, and the requests seen so far.
+#[derive(Debug, Default, Clone)]
+pub struct Dispatch {
+    pub status: Option<u16>,
+    pub served: VecDeque<Served>,
+    pub last_seq: u64,
+}
+
+impl Dispatch {
+    fn take(&mut self, status: u16, body: &str) {
+        self.status = Some(status);
+        if status != 200 {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(body) else {
+            return;
+        };
+        let last = v.get("last_seq").and_then(Value::as_u64).unwrap_or(0);
+        // A nest that restarted counts from 1 again.
+        if last < self.last_seq {
+            self.served.clear();
+            self.last_seq = 0;
+        }
+        let fresh: Vec<Served> = v
+            .get("requests")
+            .and_then(|r| serde_json::from_value(r.clone()).ok())
+            .unwrap_or_default();
+        for s in fresh.into_iter().filter(|s| s.seq > self.last_seq) {
+            push_capped_served(&mut self.served, s);
+        }
+        self.last_seq = self.last_seq.max(last);
+    }
+}
+
+fn push_capped_served(ring: &mut VecDeque<Served>, s: Served) {
+    if ring.len() == STRIP {
+        ring.pop_front();
+    }
+    ring.push_back(s);
+}
+
 /// The last interval in which an endpoint was asked anything: its mean latency and when.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Latency {
@@ -145,6 +198,8 @@ pub struct App {
     pub latency: BTreeMap<String, Latency>,
     /// Which of a runtime's mounts the screen shows.
     pub selected: usize,
+    /// `/_admin/requests`, keyed as `tracks` is.
+    pub dispatch: BTreeMap<String, Dispatch>,
 }
 
 /// The nest one engine room is drawn for: a solo nest, or one mount of a runtime.
@@ -154,6 +209,7 @@ pub struct NestView<'a> {
     pub chain: Option<String>,
     pub ready: &'a RouteState,
     pub track: Option<&'a Track>,
+    pub dispatch: Option<&'a Dispatch>,
 }
 
 impl App {
@@ -182,7 +238,23 @@ impl App {
                     self.remember_latency(t);
                 }
             }
+            "/_admin/requests" => self
+                .dispatch
+                .entry(String::new())
+                .or_default()
+                .take(read.status, &read.body),
             route => {
+                if let Some(name) = route
+                    .strip_prefix('/')
+                    .and_then(|r| r.strip_suffix("/_admin/requests"))
+                    .filter(|n| !n.is_empty() && !n.contains('/'))
+                {
+                    self.dispatch
+                        .entry(name.to_string())
+                        .or_default()
+                        .take(read.status, &read.body);
+                    return;
+                }
                 if let Some(name) = route
                     .strip_prefix('/')
                     .and_then(|r| r.strip_suffix("/ready"))
@@ -286,6 +358,7 @@ impl App {
                     chain: m.chain.clone(),
                     ready: self.nest_ready.get(&m.name).unwrap_or(&EMPTY_ROUTE),
                     track: self.tracks.get(&m.name),
+                    dispatch: self.dispatch.get(&m.name),
                 }
             }
             None => NestView {
@@ -293,6 +366,7 @@ impl App {
                 chain: self.root.str("chain"),
                 ready: &self.ready,
                 track: self.tracks.get(""),
+                dispatch: self.dispatch.get(""),
             },
         }
     }

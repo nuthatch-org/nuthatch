@@ -60,12 +60,11 @@ impl Screen<'_> {
 
     fn draw_full(&self, frame: &mut Frame, area: Rect) {
         let view = self.app.view();
-        let [plate, top, middle, bottom, _, foot] = Layout::vertical([
+        let [plate, top, middle, bottom, foot] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(8),
             Constraint::Length(8),
-            Constraint::Length(3),
-            Constraint::Min(0),
+            Constraint::Min(4),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -74,6 +73,7 @@ impl Screen<'_> {
         };
         let [tip, boiler] = halves(top);
         let [press, feed] = halves(middle);
+        let [reorg, dispatch] = halves(bottom);
         let fit = |r: Rect| {
             let width = r.width.saturating_sub(2);
             Fit {
@@ -89,7 +89,13 @@ impl Screen<'_> {
         self.panel(frame, press, "THE PRESS", self.the_press(&view, fit(press)));
         self.panel(frame, boiler, "BOILER", self.boiler(fit(boiler)));
         self.panel(frame, feed, "FEED LINES", self.feed_lines(fit(feed)));
-        self.panel(frame, bottom, "REORG", self.reorg(&view));
+        self.panel(frame, reorg, "REORG", self.reorg(&view, fit(reorg)));
+        self.panel(
+            frame,
+            dispatch,
+            "DISPATCH",
+            self.dispatch(&view, fit(dispatch), dispatch.height.saturating_sub(2)),
+        );
         frame.render_widget(Paragraph::new(self.footer()), foot);
     }
 
@@ -107,7 +113,8 @@ impl Screen<'_> {
         lines.extend(self.the_press(&view, fit));
         lines.extend(self.boiler(fit));
         lines.extend(self.feed_lines(fit));
-        lines.extend(self.reorg(&view));
+        lines.extend(self.reorg(&view, fit));
+        lines.extend(self.dispatch(&view, fit, 0));
         let [body, foot] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
         frame.render_widget(Paragraph::new(lines), body);
@@ -550,16 +557,117 @@ impl Screen<'_> {
         lines
     }
 
-    fn reorg(&self, view: &NestView) -> Vec<Line<'static>> {
+    fn reorg(&self, view: &NestView, fit: Fit) -> Vec<Line<'static>> {
         let t = &self.theme;
         let count = self.app.nest_metric(view, series::NEST_REORGS);
-        vec![self.row(
-            "REORGS",
-            vec![count.map_or_else(
-                || t.no_signal(),
-                |c| t.value(format!("{} since the process started", thousands(c as u64))),
-            )],
-        )]
+        let depth = self.app.nest_metric(view, series::NEST_LAST_REORG_DEPTH);
+        let at = self.app.nest_metric(view, series::NEST_LAST_REORG_AT);
+        let since = if fit.roomy {
+            " since the process started"
+        } else {
+            " since start"
+        };
+        let last = match (depth, at, count) {
+            (Some(d), Some(at), _) => vec![
+                t.value(format!("{} blocks", thousands(d as u64))),
+                t.dim(" rolled back, "),
+                t.value(short_age((self.now_ms / 1000).saturating_sub(at as u64))),
+                t.dim(" ago"),
+            ],
+            // The gauges are absent until a reorg, so with none counted that absence is the answer.
+            (None, None, Some(0.0)) => vec![t.dim("none")],
+            _ => vec![t.no_signal()],
+        };
+        vec![
+            self.row(
+                "REORGS",
+                vec![count.map_or_else(
+                    || t.no_signal(),
+                    |c| t.value(format!("{}{since}", thousands(c as u64))),
+                )],
+            ),
+            self.row("LAST", last),
+        ]
+    }
+
+    /// The requests the nest served, newest first, under the rate and median of the last minute.
+    fn dispatch(&self, view: &NestView, fit: Fit, rows: u16) -> Vec<Line<'static>> {
+        let t = &self.theme;
+        let Some(d) = view.dispatch.filter(|d| d.status.is_some_and(|s| s != 0)) else {
+            return vec![self.row("REQUESTS", vec![t.no_signal()])];
+        };
+        match d.status {
+            Some(200) => {}
+            Some(401) => {
+                let mut v = vec![Span::styled("NO TOKEN", t.alarm(Ink::Ember))];
+                if fit.roomy {
+                    v.push(t.dim(" set NUTHATCH_ADMIN_TOKEN to read it"));
+                }
+                return vec![self.row("REQUESTS", v)];
+            }
+            Some(status) => {
+                let mut v = vec![Span::styled("NOT SERVED", t.alarm(Ink::Ember))];
+                if fit.roomy {
+                    v.push(t.dim(format!(" /_admin/requests answered {status}")));
+                }
+                return vec![self.row("REQUESTS", v)];
+            }
+            None => unreachable!("filtered above"),
+        }
+        const WINDOW_MS: u64 = 60_000;
+        let mut recent: Vec<f64> = d
+            .served
+            .iter()
+            .filter(|s| s.unix_ms + WINDOW_MS >= self.now_ms)
+            .map(|s| s.ms)
+            .collect();
+        recent.sort_by(f64::total_cmp);
+        let summary = if recent.is_empty() {
+            vec![t.dim("none in the last minute")]
+        } else {
+            vec![
+                t.value(format!(
+                    "{:.1}/s",
+                    recent.len() as f64 * 1000.0 / WINDOW_MS as f64
+                )),
+                t.dim(" · p50 "),
+                t.value(format!("{} ms", millis(recent[recent.len() / 2]))),
+            ]
+        };
+        let mut summary = summary;
+        if fit.roomy && !recent.is_empty() {
+            summary.push(t.dim(format!(" · {} in the last minute", recent.len())));
+        }
+        let mut lines = vec![self.row("REQUESTS", summary)];
+        let route_w = (fit.width as usize)
+            .saturating_sub(5 + 4 + 9 + 3)
+            .clamp(8, 40);
+        for s in d.served.iter().rev().take(rows.saturating_sub(1) as usize) {
+            let age = short_age(self.now_ms.saturating_sub(s.unix_ms) / 1000);
+            let what = match &s.name {
+                Some(n) => format!("{} {n}", s.route),
+                None => s.route.clone(),
+            };
+            lines.push(Line::from(vec![
+                t.dim(format!(" {age:>4} ")),
+                Span::styled(
+                    format!("{:<route_w$}", clip(&what, route_w)),
+                    t.fg(Ink::Body),
+                ),
+                Span::styled(
+                    format!(" {:>3}", s.status),
+                    if s.status >= 500 {
+                        t.alarm(Ink::Rust)
+                    } else if s.status >= 400 {
+                        t.alarm(Ink::Ember)
+                    } else {
+                        t.fg(Ink::Copper)
+                    },
+                ),
+                t.value(format!(" {:>6} ms", millis(s.ms))),
+            ]));
+        }
+        lines
     }
 
     fn footer(&self) -> Line<'static> {
@@ -631,6 +739,15 @@ pub fn thousands(v: u64) -> String {
         out.push(c);
     }
     out
+}
+
+/// Milliseconds to the precision a reader can use: a tenth below ten, whole above.
+fn millis(ms: f64) -> String {
+    if ms < 10.0 {
+        format!("{ms:.1}")
+    } else {
+        format!("{ms:.0}")
+    }
 }
 
 /// A count in at most six characters.

@@ -7404,7 +7404,7 @@ impl NestIngest {
             }
         }
 
-        self.metrics.inc_reorgs();
+        self.metrics.record_reorg(last_indexed - ancestor);
         self.metrics.set_last_block(ancestor);
         tracing::warn!(
             "reorg detected: rolled back to block {ancestor} (removed {removed} entities)"

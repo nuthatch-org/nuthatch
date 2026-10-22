@@ -118,6 +118,9 @@ pub struct NestMetrics {
     rows_decoded: AtomicU64,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
+    /// RFC-0069 G2: how many blocks the last reorg rolled back, and when; 0 until one has.
+    last_reorg_depth: AtomicU64,
+    last_reorg_unixtime: AtomicU64,
     /// #1666, #2147: windows refused for want of a reorg checkpoint.
     checkpoints_missed: AtomicU64,
     /// RFC-0059 §5: sealed blocks whose rows the folds are not yet checkpointed through, and whether
@@ -363,6 +366,17 @@ impl NestMetrics {
     pub fn inc_reorgs(&self) {
         self.reorgs.fetch_add(1, Relaxed);
         METRICS.inc_reorgs();
+    }
+    /// A reorg that rolled `depth` blocks back. Counted, and kept as the last one.
+    pub fn record_reorg(&self, depth: u64) {
+        self.inc_reorgs();
+        self.last_reorg_depth.store(depth, Relaxed);
+        self.last_reorg_unixtime.store(now_unix(), Relaxed);
+    }
+    /// The last reorg's depth in blocks and its unix time, `None` before the first.
+    pub fn last_reorg(&self) -> Option<(u64, u64)> {
+        let at = self.last_reorg_unixtime.load(Relaxed);
+        (at != 0).then(|| (self.last_reorg_depth.load(Relaxed), at))
     }
     /// The count including this one, so the caller can rate-limit its warning.
     pub fn inc_checkpoints_missed(&self) -> u64 {
@@ -1618,6 +1632,32 @@ impl Metrics {
                 "gauge",
                 &|m| m.fetch_window.load(Relaxed),
             );
+            // RFC-0069 G2. Absent until a nest has reorged: a depth of 0 would read as a reorg that
+            // rolled nothing back.
+            let reorged: Vec<_> = per
+                .iter()
+                .filter_map(|(nest, m)| m.last_reorg().map(|r| (nest, r)))
+                .collect();
+            if !reorged.is_empty() {
+                for (name, help, pick) in [
+                    (
+                        "nuthatch_nest_last_reorg_depth_blocks",
+                        "Blocks the nest's last reorg rolled back. Absent until it has reorged.",
+                        (|(depth, _)| depth) as fn((u64, u64)) -> u64,
+                    ),
+                    (
+                        "nuthatch_nest_last_reorg_unixtime",
+                        "When the nest's last reorg was rolled back. Absent until it has reorged.",
+                        |(_, at)| at,
+                    ),
+                ] {
+                    s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+                    for (nest, r) in &reorged {
+                        let v = pick(*r);
+                        s.push_str(&format!("{name}{{nest=\"{nest}\"}} {v}\n"));
+                    }
+                }
+            }
             // RFC-0052 S2. Only publishing nests carry these, so an unmirrored nest does not grow a
             // column of zeros that reads like a mirror that is caught up.
             let publishing: Vec<_> = per
@@ -1980,6 +2020,40 @@ mod tests {
         assert!(out.contains("nuthatch_nest_checkpoints_missed_total{nest=\"graph-network\"} 1"));
         // A per-nest update also feeds the process-global aggregate (backward-compatible).
         assert_eq!(horizon.last_block.load(Relaxed), 500);
+    }
+
+    /// RFC-0069 G2: the last reorg's depth and time are absent until a nest reorgs, then labelled
+    /// to that nest alone.
+    #[test]
+    fn reorg_gauges_are_absent_until_a_reorg() {
+        let m = Metrics::new();
+        let calm = m.nest("calm");
+        let shaken = m.nest("shaken");
+        let out = m.render();
+        assert!(
+            !out.contains("nuthatch_nest_last_reorg_depth_blocks"),
+            "{out}"
+        );
+        assert!(!out.contains("nuthatch_nest_last_reorg_unixtime"), "{out}");
+        assert_eq!(shaken.last_reorg(), None);
+
+        let before = now_unix();
+        shaken.record_reorg(3);
+        shaken.record_reorg(7);
+        let out = m.render();
+        assert!(out.contains("nuthatch_nest_last_reorg_depth_blocks{nest=\"shaken\"} 7\n"));
+        let (depth, at) = shaken.last_reorg().unwrap();
+        assert_eq!(depth, 7);
+        assert!(at >= before && at <= now_unix());
+        assert!(out.contains(&format!(
+            "nuthatch_nest_last_reorg_unixtime{{nest=\"shaken\"}} {at}\n"
+        )));
+        assert!(
+            !out.contains("last_reorg_depth_blocks{nest=\"calm\"}"),
+            "{out}"
+        );
+        assert!(out.contains("nuthatch_nest_reorgs_total{nest=\"shaken\"} 2\n"));
+        assert_eq!(calm.last_reorg(), None);
     }
 
     #[test]

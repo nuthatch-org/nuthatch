@@ -13,6 +13,8 @@ pub const NEST_HOT_BYTES: &str = "nuthatch_nest_hot_store_bytes";
 pub const NEST_POOL_RESERVED: &str = "nuthatch_nest_analytics_pool_reserved_bytes";
 pub const NEST_POOL_PEAK: &str = "nuthatch_nest_analytics_pool_peak_bytes";
 pub const NEST_REORGS: &str = "nuthatch_nest_reorgs_total";
+pub const NEST_LAST_REORG_DEPTH: &str = "nuthatch_nest_last_reorg_depth_blocks";
+pub const NEST_LAST_REORG_AT: &str = "nuthatch_nest_last_reorg_unixtime";
 
 pub const RPC_REQUESTS: &str = "nuthatch_rpc_endpoint_requests_total";
 pub const RPC_FAILURES: &str = "nuthatch_rpc_endpoint_failures_total";
@@ -32,6 +34,8 @@ pub const ALL: &[&str] = &[
     NEST_POOL_RESERVED,
     NEST_POOL_PEAK,
     NEST_REORGS,
+    NEST_LAST_REORG_DEPTH,
+    NEST_LAST_REORG_AT,
     RPC_REQUESTS,
     RPC_FAILURES,
     RPC_RETRIES,
@@ -45,12 +49,12 @@ mod tests {
 
     use super::*;
 
-    /// Every name the watcher reads is one a fresh registry emits once a nest exists and an RPC call
-    /// has been made: the state a running nest is in by the time anyone watches it.
+    /// Every name the watcher reads is one a fresh registry emits once a nest exists, an RPC call has
+    /// been made and a reorg rolled back: the reorg gauges are absent until one has.
     #[test]
     fn every_series_the_client_reads_is_emitted() {
         let m = crate::metrics::Metrics::fresh_for_test();
-        m.nest("watched");
+        m.nest("watched").record_reorg(2);
         m.observe_rpc("rpc.example", Duration::from_millis(40), false, false);
         let rendered = crate::watch::prom::Metrics::parse(&m.render());
         let names: Vec<&str> = rendered.names().collect();
