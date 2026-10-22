@@ -1,0 +1,18 @@
+[package]
+name = "rfc-0070-s0"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "RFC-0070 S0: the time-lapse fold over a nest's final sealed segments, checked against Burrmill"
+publish = false
+
+# Its own crate, outside the binary and the workspace: S0 is a measurement, not a shipped surface.
+[dependencies]
+burrmill = { git = "https://github.com/nuthatch-org/burrmill", rev = "0777d7620a862ae55cbce09938199f32324b3112", default-features = false, features = ["datafusion"] }
+alloy-primitives = { version = "1.6", default-features = false, features = ["std"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"

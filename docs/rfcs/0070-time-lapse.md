@@ -1,6 +1,8 @@
 # RFC-0070: Time-lapse - a contract's sealed history replayed at speed
 
-- Status: **Accepted (2026-10-21, Chief).**
+- Status: **Accepted (2026-10-21, Chief).** S0 measured 2026-10-22 (§13): the fold matches Burrmill's
+  `GROUP BY` at every sampled frame and hashes the same on both boxes; it waits on Chief watching the
+  first rendering.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: RFC-0047 (the sealed directory as a contract), RFC-0061 (256-bit values stay decimal
@@ -146,6 +148,8 @@ copy re-sealed under a newer writer profile holds the same rows under different 
 choices (fps, colours, easing between frames) live in the player and never enter the hash.
 
 ## 5. Cost
+
+S0 measured these on real segments; where §13 differs, §13 stands.
 
 Measured 2026-10-21 on this MacBook (Apple Silicon), on a local copy of
 `graph-allocations-nest-next`: 4,811,656 rows in 1,970 segments, 647 MB on disk, which is about
@@ -311,3 +315,87 @@ without it. A feature costs nothing to promote later; a default subcommand is aw
    aggregate back into a row-local map?
 6. Is a browser-recorded WebM an acceptable stand-in for GIF?
 7. Should recordings sit beside a nest on the public mirror, as static files like its segments?
+
+## 13. S0, measured 2026-10-22
+
+The harness is `tools/rfc-0070-s0/`, its own crate outside the workspace and the binary. It reads
+`segments/manifest.json` and `schema.json`, takes the final segments of the tables the spec's query
+names, binds each chunk's segments in Burrmill (`register_facts`, the windowed binding the main crate
+uses), runs the row-local query ordered by `(block_number, log_index, key)`, and folds the rows into a
+signed 256-bit sum per key with an ordered index over the live keys. Chunks are cut on frame closes
+and bounded by catalogue row counts (200,000 by default). It then binds every final segment once and
+asks Burrmill, at 20 evenly spaced frames, for `SELECT key, SUM(...) ... WHERE block_number <= N
+GROUP BY key HAVING SUM(...) <> 0` ordered by value then key, and for the count and total of the same
+grouping, and compares them as text with the frame. It builds the `sum` fold only; `last` is S1's.
+
+Three specs, in `tools/rfc-0070-s0/specs/`, on copies of two nests:
+
+- **The demo**: indexers by net GRT delegated (`StakeDelegated` tokens in, `StakeDelegatedLocked`
+  tokens out) on `graph-allocations-nest-next` as sealed on Helsinki on 2026-10-12, blocks
+  60,586,400 to 385,547,599, 1,200 frames of 270,801 blocks, 499,514 rows.
+- **Delegators**: the same quantity keyed by delegator, for state size.
+- **GRT holders**: `grt-supply-nest`, every Arbitrum GRT `Transfer` as a credit to `to` and a debit
+  from `from`, the zero address left out, blocks 42,449,227 to 512,623,626, 11,937,686 rows. This is
+  the nearest thing to §5's USDC case that exists, and the largest replay by rows; the allocations
+  nest (510 MB, 4,801 segments) is the largest by size.
+
+| Gate | Result |
+|---|---|
+| 20 frames byte-identical to Burrmill's `GROUP BY` | **Pass**, all three specs: 60 of 60 frames, top 10, live count and total identical as text |
+| Same `frames_sha256` twice on the MacBook | **Pass**: demo `fce5af90...a4174`, delegators `43bbe523...5f101`, holders `26235ec1...ba906b`, each in two runs |
+| Same `frames_sha256` on the ThinkPad | **Pass**: the same three hashes, built and run on x86_64 Linux from the segments copied across |
+| Chunking does not change the frames | **Pass**: the demo cut into 3 chunks and into 1,200, the holders into 35 and into 427, give the same hash |
+| Peak RSS and time on the largest nest | Recorded below; nothing near the 1 GiB stop |
+| Chief watches the first rendering | **Open**: a self-contained `.html` of the demo, about 1 MB, waits for him |
+
+| Replay (MacBook, fold only) | Rows | Live keys at peak | Time | Peak RSS |
+|---|---|---|---|---|
+| Demo, 136 indexers | 499,514 | 136 | 0.32 to 0.40 s | 134 MB |
+| Delegators | 499,514 | 307,788 | 0.49 s | 244 MB |
+| GRT holders | 11,937,686 | 119,270 | 7.5 to 7.6 s | 268 MB |
+| GRT holders, 20,000-row chunks | 11,937,686 | 119,270 | 8.5 s | 180 MB |
+
+With the 20-frame check in the same process the holders replay peaked at 732 MB and took 20.6 s, the
+check being 20 full `GROUP BY`s over 2,944 segments. The ThinkPad took 0.61 s, 0.90 s and 13.6 s for
+the three. The holders replay split as 2.5 s encoding rows to JSON, 4.0 s folding them, and the rest
+Burrmill reading and sorting.
+
+What this replaces in §5, and what it adds:
+
+1. **Throughput is lower than §5 estimated.** End to end the holders replay ran at 1.57 million rows a
+   second, against §5's 3 to 5 million. A third of the time is the JSON detour the harness takes
+   because Burrmill's Arrow is not ours to name; S1 should fold Arrow batches directly. At the
+   measured rate a year of USDC at 100 to 200 million rows (two per transfer) is 64 to 127 s, not
+   10 to 35 s. USDC itself is still not measured: no USDC nest was built.
+2. **The per-key state is larger than §5's interned estimate.** 307,652 more live keys cost 110 MB of
+   RSS, about 360 bytes a key with 42-character text keys, an `Rc` shared by the map and the index,
+   and a 256-bit value. At that size the 1 GiB cap is about 3 million live keys, which is USDC's
+   range. S1 should intern 20-byte keys when the key is an address, as §5 assumed.
+3. **A key leaves the state only when its quantity is conserved.** GRT holders reach zero exactly and
+   leave: 119,270 live at the peak. Net delegation per delegator almost never does, because
+   undelegated tokens include rewards and exclude the tax, so 307,788 delegator keys stayed live. §4.1's
+   bound by live keys holds for balances, not for every sum.
+4. **Never reading a provisional segment can cut a sparse table's end off by months.** The legacy
+   staking tables stopped at block 408,818,200, and their last 725 and 271 rows sit in provisional
+   segments in this copy, sealed by 5.0.1 before the chain-time age rule of #2084. The demo therefore
+   ends at block 385,547,920 (3 October 2025) rather than at the Horizon switchover. A copy re-sealed
+   under the age rule would finalise them; until then a replay stops at the last final segment, and
+   the refusal names the block.
+5. **A frame's timestamp is the newest folded event's, not its closing block's.** A nest does not hold
+   every block's timestamp, and `grt-supply-nest` holds none (`block_timestamps = false`), so its
+   frames carry `null`. §4.1's "that block's timestamp" needs a source the design does not yet have;
+   S1 should name the field for what it is and accept an optional `block_timestamp` column in the
+   query, as the harness does.
+6. **NID and data identity are not in S0's manifest.** Computing them needs the nest walk the main
+   crate does; S0 records the `registry_hash` from `schema.json`, the spec's hash and every segment
+   read. S3 has the walk.
+7. **A recording is the size §5 said**: 994 KB of `frames.jsonl` for the demo, and the exported page
+   with the player is 1.07 MB.
+
+Not verified in S0: the `last` fold; the row-local validator (S1); a read lease, since the harness
+reads copies nothing else writes; the in-tab replay; and USDC.
+
+§12, as S0 took them, with Chief's answer to the first: the tab is the first renderer and the binary
+is unchanged (1, Chief). The producer stays off by default (2, §9's leaning). The demo is the
+delegation table (3). Specs stay outside the nest (4, §4.2's leaning). An RFC-0041 entity is not
+accepted by name (5, §4.2's leaning). Questions 6 and 7 were not exercised.
