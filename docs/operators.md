@@ -924,7 +924,7 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /exposure/{address}`, `GET /flags` | compliance surfaces (RFC-0008) |
 | `GET /nest` | nest identity and registry hash |
 | `GET /shape` | capability probe: what this nest can answer (drives adaptive MCP) |
-| `GET /_admin/`, `/_admin/events`, `/_admin/config`, `/_admin/storage` | admin UI (eight tabs since 4.2.1), its event stream, the authored files and limits as JSON with every URL cut to scheme and host and every secret withheld, and the sealed catalogue per table (`?table=` for one table's segments). Token-gated off-localhost; removable with `--no-admin` |
+| `GET /_admin/`, `/_admin/events`, `/_admin/config`, `/_admin/storage`, `/_admin/requests` | admin UI (eight tabs since 4.2.1), its event stream, the authored files and limits as JSON with every URL cut to scheme and host and every secret withheld, the sealed catalogue per table (`?table=` for one table's segments), and the last 256 requests served (`?since=<seq>` for those after one): route template, the declared query or entity name when the nest knows it, status, milliseconds and bytes, never SQL text, a query string, a path value or a client address, and not the monitoring reads (`/`, `/health`, `/ready`, `/metrics`, `/_admin*`). Token-gated off-localhost; removable with `--no-admin` |
 
 **Runtime root routes:** `GET /nests` (roster with live per-nest health), `GET /ready` (runtime-wide),
 `GET /health`, and `GET /metrics` (the whole runtime's exposition, served before anything is mounted;
@@ -1169,7 +1169,9 @@ dataset; two mounts of one dataset show the same engines),
 `nuthatch_nest_sealed_through`, `nuthatch_nest_last_seal_progress_unixtime` (when that watermark last
 moved), `nuthatch_nest_seal_fault_seconds` (how long every seal attempt has failed, 0 while one
 succeeds; `/ready` names the error), `nuthatch_nest_rows_decoded_total`,
-`nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`, `nuthatch_nest_checkpoints_missed_total`,
+`nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`, `nuthatch_nest_last_reorg_depth_blocks` and
+`nuthatch_nest_last_reorg_unixtime` (the blocks the last reorg rolled back, to the deepest checkpoint
+still canonical, and when; absent until the nest has reorged), `nuthatch_nest_checkpoints_missed_total`,
 `nuthatch_nest_ipfs_unreadable_total` (rows an `[[ipfs]]` declaration read that named no usable CID),
 `nuthatch_nest_ipfs_pending` (documents named and neither stored nor given up on; sealing holds below
 the lowest), `nuthatch_nest_ipfs_resolved_total`, `nuthatch_nest_ipfs_given_up_total`,
@@ -1340,7 +1342,10 @@ per-nest `/<name>/ready`; page on the root.**
 `/nests`) and nothing else (RFC-0069). On a terminal it draws the engine room: THE TIP (tip, indexed,
 lag in blocks, the age of the last poll and the countdown to the next), THE PRESS (the seal and its
 lag), BOILER (process RSS against 2 GiB per cursor), FEED LINES (each RPC endpoint, with `FAILOVER`
-when a retry landed on it) and REORG. A mark appears only when a counter moved between two reads, and
+when a retry landed on it), REORG (the count, and the last one's depth and age) and DISPATCH (the
+requests the nest served, from `/_admin/requests`, with their rate and median over the last minute).
+DISPATCH sends `NUTHATCH_ADMIN_TOKEN` from the watcher's own environment as a bearer header when the
+nest wants one, and says `NO TOKEN` when it is refused. A mark appears only when a counter moved between two reads, and
 a field the nest did not serve reads `NO SIGNAL`, never 0. `NO_COLOR` removes every colour; below 80
 columns the panels stack. Pointed at a runtime's root, `n` and `N` step through its mounts.
 
