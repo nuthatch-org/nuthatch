@@ -65,8 +65,8 @@ fn nest_line(
         "nest={} chain={} tip={} lag={} sealed={} {process}",
         quoted(name),
         quoted(chain),
-        n(ready.u64("tip")),
-        n(ready.u64("lag_blocks")),
+        n(ready.tip()),
+        n(ready.lag()),
         n(sealed),
     )
 }
