@@ -661,6 +661,25 @@ mod tests {
         assert_eq!(h.tables().iter().map(|t| t.rows).sum::<u64>(), 3);
     }
 
+    /// Two internal transfers of one transaction between two watched addresses are two rows, told
+    /// apart by trace index, each filed under both addresses and each read once.
+    #[test]
+    fn internal_rows_of_one_transaction_are_told_apart_by_trace_index() {
+        let r = rows(vec![
+            internal(A, 1, A, B, 3),
+            internal(A, 4, B, A, 1),
+            internal(B, 1, A, B, 3),
+            internal(B, 4, B, A, 1),
+        ]);
+        let mut flow = Flow::default();
+        let h = fold(&r, &REQ, &ctx(), &mut flow, 10).unwrap();
+        assert_eq!((h.actions[1].rows, h.actions[1].shared), (2, 2));
+        assert_eq!(sent(&flow, NATIVE, A), "3");
+        assert_eq!(sent(&flow, NATIVE, B), "1");
+        let traces: Vec<Option<u64>> = h.native.iter().map(|n| n.trace_index).collect();
+        assert_eq!(traces, [Some(1), Some(4)]);
+    }
+
     /// The chain's own currency is a token of its own: never summed with an ERC-20 of the same
     /// amount, and named by the chain's symbol with the 18 decimals of wei.
     #[test]
