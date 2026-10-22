@@ -142,8 +142,24 @@ fn client() -> Result<reqwest::Client> {
 }
 
 pub async fn get(client: &reqwest::Client, base: &str, route: &str) -> Read {
+    fetch(client, base, route, "", None).await
+}
+
+/// A read of `route` with `query` appended, recorded under `route` alone, and with the admin token
+/// as a bearer header when one is given: never in the URL, where a proxy's log would keep it.
+async fn fetch(
+    client: &reqwest::Client,
+    base: &str,
+    route: &str,
+    query: &str,
+    token: Option<&str>,
+) -> Read {
     let t_ms = unix_ms();
-    let (status, body) = match client.get(format!("{base}{route}")).send().await {
+    let mut request = client.get(format!("{base}{route}{query}"));
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let (status, body) = match request.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
             (status, response.text().await.unwrap_or_default())
@@ -224,14 +240,17 @@ async fn run_lines(
     Ok(())
 }
 
-/// The screen's reads: `/ready` (or each mount's) and `/` every `every` seconds, `/metrics` every
-/// two of those unless --interval set one period for all, and `/nests` every thirty.
+/// The screen's reads: `/ready` (or each mount's), `/` and `/_admin/requests` every `every` seconds,
+/// `/metrics` every two of those unless --interval set one period for all, and `/nests` every thirty.
 async fn poll_screen(
     client: reqwest::Client,
     base: String,
     interval: Option<u64>,
+    token: Option<String>,
     tx: mpsc::UnboundedSender<Read>,
 ) {
+    // Where each `/_admin/requests` read left off, so the next asks only for what is new.
+    let mut since: std::collections::BTreeMap<String, u64> = Default::default();
     let every = interval.unwrap_or(1);
     let metrics_every = if interval.is_some() { 1 } else { 2 };
     let nests_every = (30 / every).max(1);
@@ -266,8 +285,33 @@ async fn poll_screen(
         if n.is_multiple_of(metrics_every) {
             routes.push("/metrics".into());
         }
-        let reads = futures::future::join_all(routes.iter().map(|r| get(&client, &base, r))).await;
-        for read in reads {
+        let feeds: Vec<String> = match &mounts {
+            Some(m) if !m.is_empty() => m.iter().map(|m| format!("/{m}/_admin/requests")).collect(),
+            _ => vec!["/_admin/requests".to_string()],
+        };
+        let queries: Vec<String> = feeds
+            .iter()
+            .map(|f| format!("?since={}", since.get(f).copied().unwrap_or(0)))
+            .collect();
+        let (reads, fed) = tokio::join!(
+            futures::future::join_all(routes.iter().map(|r| get(&client, &base, r))),
+            futures::future::join_all(feeds.iter().zip(&queries).map(|(f, q)| fetch(
+                &client,
+                &base,
+                f,
+                q,
+                token.as_deref()
+            ))),
+        );
+        for read in &fed {
+            if let Some(last) = serde_json::from_str::<serde_json::Value>(&read.body)
+                .ok()
+                .and_then(|v| v.get("last_seq").and_then(serde_json::Value::as_u64))
+            {
+                since.insert(read.route.clone(), last);
+            }
+        }
+        for read in reads.into_iter().chain(fed) {
             if tx.send(read).is_err() {
                 return;
             }
@@ -284,7 +328,16 @@ async fn run_live_screen(
     exit_after: Option<u64>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Read>();
-    tokio::spawn(poll_screen(client()?, base.to_string(), interval, tx));
+    let token = std::env::var("NUTHATCH_ADMIN_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    tokio::spawn(poll_screen(
+        client()?,
+        base.to_string(),
+        interval,
+        token,
+        tx,
+    ));
     let every = interval.unwrap_or(1);
     let footer = format!(
         "reading {described} · /ready every {every} s, /metrics every {} s · n N mount · q quits",

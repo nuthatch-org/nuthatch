@@ -1,0 +1,24 @@
+ DEFI-PULSE  LIVE  · mainnet · nuthatch 5.9.0 · freshness tip · nid 7933ef4a1b5d
+┌ THE TIP ─────────────────────────────┐┌ BOILER ──────────────────────────────┐
+│ TIP       26,249,933                 ││ RSS       ▓▓░░░░░░░░░░░░░░░░░░░░░░░░ │
+│ INDEXED   26,249,933                 ││           183.8 MiB of 2.0 GiB       │
+│ LAG       0 blocks                   ││ CPU       1.5% of a core             │
+│ POLL      12 s: 14 s ago, next due   ││ POOL      reserved 0 B · peak 11.8 Ki│
+│ ARRIVALS  ▃ ▃ ·                      ││ HOT STORE 4.5 MiB                    │
+│                                      ││                                      │
+└──────────────────────────────────────┘└──────────────────────────────────────┘
+┌ THE PRESS ───────────────────────────┐┌ FEED LINES ──────────────────────────┐
+│ SEALED    through 26,249,579         ││ ENDPOINT       REQ  FAIL        MEAN │
+│ SEAL LAG  354 blocks                 ││ eth.drpc.o…     18     2  2049 ms 6s │
+│ OUTPUT    0 rows · 369.3 KiB         ││ ethereum-r…     15     1    61 ms 6s │
+│ DIRECT    no seal-direct pass        ││                                      │
+│ STAMPS    none seen yet              ││                                      │
+│                                      ││                                      │
+└──────────────────────────────────────┘└──────────────────────────────────────┘
+┌ REORG ───────────────────────────────┐┌ DISPATCH ────────────────────────────┐
+│ REORGS    0 since start              ││ REQUESTS  2.7/s · p50 0.9 ms         │
+│ LAST      none                       ││   0s /table/{name}     404    0.1 ms │
+│                                      ││   0s /tables           200    0.9 ms │
+│                                      ││   0s /sql              200    2.7 ms │
+└──────────────────────────────────────┘└──────────────────────────────────────┘
+ replaying a fixture

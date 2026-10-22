@@ -112,6 +112,7 @@ pub mod recipes;
 #[cfg(feature = "postgres-store")]
 pub mod reconcile;
 pub mod registry;
+pub mod requests;
 pub mod rpc;
 pub mod runtime;
 /// Cursor placement for scaled mode (RFC-0022 §2) - pure decision logic, no I/O.

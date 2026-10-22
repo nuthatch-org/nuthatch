@@ -14,7 +14,7 @@
  eth.drpc.org                   198    18     2 1056 ms 18s
  ethereum-rpc.publicnode.com    417     2    18    57 ms 6s
  REORGS    0 since the process started
-
-
+ LAST      none
+ REQUESTS  NO SIGNAL
 
  replaying a fixture

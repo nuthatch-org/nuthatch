@@ -6153,7 +6153,10 @@ pub async fn backfill_direct_pipelined_with(
             to,
             seal_span,
             |rows, seal_to| {
-                seal::seal_range(dir, &rows, batch_from, seal_to)?;
+                count_sealed(
+                    extras.metrics,
+                    seal::seal_range(dir, &rows, batch_from, seal_to)?,
+                );
                 batch_from = seal_to + 1;
                 on_seal(seal_to)?;
                 Ok(())
@@ -6181,10 +6184,20 @@ pub async fn backfill_direct_pipelined_with(
         };
     }
     if !buf.is_empty() {
-        seal::seal_range(dir, &drain_sealable(&mut buf), batch_from, to)?;
+        count_sealed(
+            extras.metrics,
+            seal::seal_range(dir, &drain_sealable(&mut buf), batch_from, to)?,
+        );
         on_seal(to)?;
     }
     Ok(total)
+}
+
+/// Count a seal-direct segment's rows into `nuthatch_rows_sealed_total`, as the tip path does (#2339).
+fn count_sealed(metrics: Option<&crate::metrics::NestMetrics>, sealed: Option<seal::SealSummary>) {
+    if let (Some(m), Some(s)) = (metrics, sealed) {
+        m.add_rows_sealed(s.rows as u64);
+    }
 }
 
 /// How often a seal-direct pass says it is still waiting for its first window.
@@ -6559,26 +6572,28 @@ pub async fn backfill_direct_factory_with(
             seal_span,
             |rows, seal_to| {
                 // Stamp the discovered-child set that produced these rows (RFC-0009 step 4).
-                seal::seal_range_with_snapshot(
+                let sealed = seal::seal_range_with_snapshot(
                     dir,
                     &rows,
                     batch_from,
                     seal_to,
                     Some(&children.hash()),
                 )?;
+                count_sealed(extras.metrics, sealed);
                 batch_from = seal_to + 1;
                 on_seal(seal_to)?;
                 Ok(())
             },
         )?;
         if next > to && !buf.is_empty() {
-            seal::seal_range_with_snapshot(
+            let sealed = seal::seal_range_with_snapshot(
                 dir,
                 &drain_sealable(&mut buf),
                 batch_from,
                 to,
                 Some(&children.hash()),
             )?;
+            count_sealed(extras.metrics, sealed);
             batch_from = next;
             on_seal(to)?;
         }
@@ -7404,7 +7419,7 @@ impl NestIngest {
             }
         }
 
-        self.metrics.inc_reorgs();
+        self.metrics.record_reorg(last_indexed - ancestor);
         self.metrics.set_last_block(ancestor);
         tracing::warn!(
             "reorg detected: rolled back to block {ancestor} (removed {removed} entities)"
@@ -15991,6 +16006,65 @@ template = "pool"
             1,
             "the document it names must be sealed beside it"
         );
+        handle.abort();
+    }
+
+    /// #2339: a seal-direct pass counts the rows it seals into `nuthatch_rows_sealed_total`, as the
+    /// tip path does. It counted none, so a nest backfilled that way reported 0 rows sealed beside
+    /// megabytes of segments.
+    #[tokio::test]
+    async fn seal_direct_counts_the_rows_it_seals() {
+        let body = r#"{"bucket":1}"#.to_string();
+        let cid = crate::cid::cid_v0_for(body.as_bytes());
+        let (gateway, _requests, handle) =
+            content_gateway(std::collections::HashMap::from([(cid.clone(), body)]), 0).await;
+        let dir = qos_topic_nest("t");
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let mut tables = full_schema(&registry, &config);
+        tables.extend(creg.schema(&config.extract));
+        let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
+        let gateways = vec![gateway];
+        let source = PostSource(vec![(4, qos_post(&cid)), (700, qos_post(&cid))]);
+        let metrics = crate::metrics::NestMetrics::default();
+        backfill_direct_pipelined_with(
+            &source,
+            &registry,
+            dir.path(),
+            &[],
+            &[],
+            &[],
+            None,
+            100,
+            0,
+            1_000,
+            1_000,
+            SPAN_REAL,
+            1,
+            DirectExtras {
+                call_registry: Some(&creg),
+                ipfs: Some(&gate),
+                gateways: &gateways,
+                metrics: Some(&metrics),
+                ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
+                store: None,
+                window_ceiling: None,
+            },
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        let catalogued: usize = crate::seal::load_manifest(dir.path())
+            .unwrap()
+            .tables
+            .values()
+            .flatten()
+            .map(|s| s.rows)
+            .sum();
+        assert!(catalogued >= 4, "the pass sealed {catalogued} rows");
+        assert_eq!(metrics.rows_sealed(), catalogued as u64);
         handle.abort();
     }
 

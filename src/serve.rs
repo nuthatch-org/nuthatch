@@ -436,6 +436,7 @@ pub fn router(backing: SharedNest) -> Router {
             .route("/_admin/events", get(admin_events))
             .route("/_admin/config", get(admin_config))
             .route("/_admin/storage", get(admin_storage))
+            .route("/_admin/requests", get(admin_requests))
     };
     admin(graph_facade(
         Router::new()
@@ -465,8 +466,13 @@ pub fn router(backing: SharedNest) -> Router {
             .route("/shape", get(shape))
             .route("/api", get(etherscan_api)),
     ))
-    // Count every served request for `/metrics` (the operator's billing signal).
-    .layer(axum::middleware::from_fn(count_request))
+    // Count every served request for `/metrics` (the operator's billing signal), and keep the last
+    // few for `/_admin/requests` (RFC-0069 G1). The ring belongs to the route set, so a hot swap of
+    // the backing keeps it.
+    .layer(axum::middleware::from_fn({
+        let ring = std::sync::Arc::new(crate::requests::RequestRing::default());
+        move |req, next| count_request(ring.clone(), req, next)
+    }))
     .with_state(backing)
 }
 
@@ -1270,13 +1276,71 @@ async fn shutdown_signal() {
     crate::analytics::interrupt_for_shutdown();
 }
 
-/// Middleware: bump the request counter, then pass through.
+/// Middleware: bump the request counter, then pass through, keeping the request's shape in `ring`.
 async fn count_request(
-    req: axum::extract::Request,
+    ring: std::sync::Arc<crate::requests::RequestRing>,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     crate::metrics::METRICS.inc_http();
-    next.run(req).await
+    // An unmatched path is not a route, and its text is whatever the caller typed.
+    let shape = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| {
+            let local = req.uri().path();
+            let route = crate::requests::local_template(m.as_str(), local);
+            (
+                std::sync::Arc::<str>::from(route),
+                crate::requests::captured_name(route, local),
+            )
+        })
+        .filter(|(route, _)| !crate::requests::is_monitoring(route));
+    req.extensions_mut().insert(ring.clone());
+    let Some((route, name)) = shape else {
+        return next.run(req).await;
+    };
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    let bytes = axum::body::HttpBody::size_hint(resp.body()).exact();
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let status = resp.status().as_u16();
+    // A name the nest does not know is whatever the caller typed.
+    let name = name.filter(|_| status != 404);
+    ring.push(unix_ms, route, name, status, ms, bytes);
+    resp
+}
+
+#[derive(serde::Deserialize, Default)]
+struct AdminRequestsQuery {
+    token: Option<String>,
+    since: Option<u64>,
+}
+
+/// `GET /_admin/requests?since=<seq>` (RFC-0069 G1): the requests this nest served after `since`,
+/// oldest first. Gated exactly as [`admin_events`]: even the timings of other callers are the
+/// operator's data.
+async fn admin_requests(
+    State(s): State<AppState>,
+    Query(q): Query<AdminRequestsQuery>,
+    headers: axum::http::HeaderMap,
+    ring: Option<axum::Extension<std::sync::Arc<crate::requests::RequestRing>>>,
+) -> impl IntoResponse {
+    if !s.admin_enabled {
+        return (StatusCode::NOT_FOUND, "admin UI disabled").into_response();
+    }
+    let auth = AdminQuery { token: q.token };
+    if !admin_authorized(&s, &auth, &headers) {
+        return (StatusCode::UNAUTHORIZED, "admin token required").into_response();
+    }
+    let (requests, last) = ring
+        .map(|r| r.since(q.since.unwrap_or(0)))
+        .unwrap_or_default();
+    Json(json!({ "last_seq": last, "capacity": crate::requests::CAPACITY, "requests": requests }))
+        .into_response()
 }
 
 /// `GET /metrics` - Prometheus text exposition (RFC-0005 §6).
@@ -10793,6 +10857,170 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+    }
+
+    /// RFC-0069 G1: `/_admin/requests` is gated exactly as the event stream above is - open on a
+    /// loopback bind with no token, 404 with admin off, 401 without the token and 200 with it in
+    /// either form.
+    #[tokio::test]
+    async fn admin_requests_gated_like_the_admin_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        let q = |t: Option<&str>| {
+            Query(AdminRequestsQuery {
+                token: t.map(str::to_string),
+                since: None,
+            })
+        };
+        let status = |state: AppState, query, headers| async move {
+            admin_requests(State(state), query, headers, None)
+                .await
+                .into_response()
+                .status()
+        };
+        let loopback = || {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(axum::http::header::HOST, "127.0.0.1:8288".parse().unwrap());
+            h
+        };
+        assert_eq!(
+            status(state.clone(), q(None), loopback()).await,
+            StatusCode::OK
+        );
+        state.admin_enabled = false;
+        assert_eq!(
+            status(state.clone(), q(None), axum::http::HeaderMap::new()).await,
+            StatusCode::NOT_FOUND
+        );
+        state.admin_enabled = true;
+        state.admin_token = Some("s3cret".into());
+        assert_eq!(
+            status(state.clone(), q(None), axum::http::HeaderMap::new()).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(
+                state.clone(),
+                q(Some("s3cret")),
+                axum::http::HeaderMap::new()
+            )
+            .await,
+            StatusCode::OK
+        );
+        let mut hdr = axum::http::HeaderMap::new();
+        hdr.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer s3cret"),
+        );
+        assert_eq!(status(state, q(None), hdr).await, StatusCode::OK);
+    }
+
+    /// RFC-0069 G1: the ring keeps a request's route, declared name, status and timing, and nothing a
+    /// caller sent: no SQL text, no query string, no path value that is data. Driven through the
+    /// real router, mounted under a runtime prefix, so the template the ring sees is the nested one.
+    #[tokio::test]
+    async fn the_request_ring_holds_no_query_text() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        assert!(state.admin_enabled && state.admin_token.is_none());
+        let app = Router::new().nest("/pulse", router(SharedNest::new(state)));
+        let get = |uri: &str| {
+            axum::http::Request::builder()
+                .uri(uri)
+                .header(axum::http::header::HOST, "127.0.0.1:8288")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        for uri in [
+            "/pulse/sql?q=SELECT%20%27SECRETSQL%27",
+            "/pulse/q/SECRETQUERY?limit=5&who=SECRETARG",
+            "/pulse/balance/0xSECRETADDRESS",
+            "/pulse/derived/SECRETENTITY/SECRETKEY",
+            "/pulse/ready",
+            "/pulse/metrics",
+            "/pulse",
+            "/pulse/no-such-route-SECRETPATH",
+        ] {
+            let resp = app.clone().oneshot(get(uri)).await.unwrap();
+            let _ = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+        }
+        let resp = app
+            .clone()
+            .oneshot(get("/pulse/_admin/requests"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("SECRET"),
+            "the ring kept a caller's input: {text}"
+        );
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let seen: Vec<(String, Option<String>)> = v["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["route"].as_str().unwrap().to_string(),
+                    r["name"].as_str().map(str::to_string),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("/sql".to_string(), None),
+                // This nest declares no query and no entity, so both answer 404 and the names, being
+                // whatever the caller typed, are not kept.
+                ("/q/{name}".to_string(), None),
+                ("/balance/{address}".to_string(), None),
+                ("/derived/{entity}/{key}".to_string(), None),
+            ],
+            "{text}"
+        );
+        for r in v["requests"].as_array().unwrap() {
+            assert!(
+                r["status"].as_u64().is_some() && r["ms"].as_f64().is_some(),
+                "{r}"
+            );
+        }
+        // From where the last read left off there is nothing new: the monitor's own read is not kept.
+        let last = v["last_seq"].as_u64().unwrap();
+        let resp = app
+            .oneshot(get(&format!("/pulse/_admin/requests?since={last}")))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["requests"].as_array().unwrap().len(), 0, "{v}");
+        assert_eq!(v["last_seq"].as_u64(), Some(last));
+    }
+
+    /// With the admin surface off the route is not there at all, as the other admin routes are not.
+    #[tokio::test]
+    async fn admin_requests_is_not_routed_with_admin_off() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.admin_enabled = false;
+        let resp = router(SharedNest::new(state))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/_admin/requests")
+                    .header(axum::http::header::HOST, "127.0.0.1:8288")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// Serve `app` on an ephemeral port behind [`serve_until`]; the sender is the shutdown signal.

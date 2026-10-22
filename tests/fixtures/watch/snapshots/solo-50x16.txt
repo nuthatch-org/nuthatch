@@ -10,7 +10,7 @@
  CPU       0.3% of a core
  HOT STORE 1.5 MiB
  RPC       2/2 up · 615 req
- REORGS    0 since the process started
-
-
+ REORGS    0 since start
+ LAST      none
+ REQUESTS  NO SIGNAL
  replaying a fixture

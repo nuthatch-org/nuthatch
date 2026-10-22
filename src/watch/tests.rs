@@ -374,3 +374,83 @@ fn the_poll_countdown_runs_between_reads() {
     );
     assert!(drawn.contains(&want), "want {want:?} in\n{drawn}");
 }
+
+/// DISPATCH and REORG drawn from a nest that served queries while it was watched (RFC-0069 S3).
+#[test]
+fn dispatch_draws_what_the_nest_served() {
+    let (app, now) = replayed("dispatch.jsonl");
+    for (w, h) in [(120, 40), (80, 24), (60, 20)] {
+        let drawn = text(&buffer(&app, now, ColorMode::True, w, h));
+        snapshot(&format!("dispatch-{w}x{h}"), &drawn);
+    }
+    let drawn = text(&buffer(&app, now, ColorMode::None, 120, 40));
+    assert!(drawn.contains("/sql"), "{drawn}");
+    assert!(drawn.contains("p50"), "{drawn}");
+}
+
+/// The live nest's ring, read while it answered SQL, carried no SQL: the recording is the evidence.
+#[test]
+fn the_recorded_ring_holds_no_query_text() {
+    let reads = load_recording(&fixture("dispatch.jsonl")).unwrap();
+    let feeds: Vec<&Read> = reads
+        .iter()
+        .filter(|r| r.route == "/_admin/requests" && r.status == 200)
+        .collect();
+    assert!(feeds.iter().any(|r| r.body.contains("\"/sql\"")));
+    for r in feeds {
+        for needle in ["SELECT", "select", "q=", "usdc__"] {
+            assert!(!r.body.contains(needle), "{needle} in {}", r.body);
+        }
+    }
+}
+
+/// What `/_admin/requests` answers decides what DISPATCH says: refused for want of a token, not
+/// there at all, or nothing heard yet. None of them reads as an idle nest.
+#[test]
+fn dispatch_names_why_it_has_no_feed() {
+    let (base, now) = replayed("solo.jsonl");
+    drop(base);
+    for (status, want) in [
+        (401, "NO TOKEN"),
+        (404, "NOT SERVED"),
+        (0, "REQUESTS  NO SIGNAL"),
+    ] {
+        let (mut app, _) = replayed("solo.jsonl");
+        app.apply(&read(
+            now - 100,
+            "/_admin/requests",
+            status,
+            "admin token required",
+        ));
+        let drawn = text(&buffer(&app, now, ColorMode::None, 120, 40));
+        assert!(drawn.contains(want), "{status}: want {want:?} in\n{drawn}");
+        assert!(!drawn.contains("none in the last minute"), "{status}");
+    }
+}
+
+/// After a reorg the panel gives its depth and age from the two gauges, and before one it says
+/// none, because the gauges are absent until a nest has reorged.
+#[test]
+fn reorg_reads_depth_and_age_from_the_gauges() {
+    let (mut app, now) = replayed("solo.jsonl");
+    let drawn = text(&buffer(&app, now, ColorMode::None, 120, 40));
+    assert!(drawn.contains(" LAST      none"), "{drawn}");
+    let name = app.solo_name().unwrap();
+    let at = now / 1000 - 125;
+    let body = format!(
+        "nuthatch_nest_last_block{{nest=\"{name}\"}} 1\n\
+         nuthatch_nest_reorgs_total{{nest=\"{name}\"}} 3\n\
+         nuthatch_nest_last_reorg_depth_blocks{{nest=\"{name}\"}} 4\n\
+         nuthatch_nest_last_reorg_unixtime{{nest=\"{name}\"}} {at}\n"
+    );
+    app.apply(&read(now - 50, "/metrics", 200, &body));
+    let drawn = text(&buffer(&app, now, ColorMode::None, 120, 40));
+    assert!(
+        drawn.contains(" REORGS    3 since the process started"),
+        "{drawn}"
+    );
+    assert!(
+        drawn.contains(" LAST      4 blocks rolled back, 2m ago"),
+        "{drawn}"
+    );
+}
