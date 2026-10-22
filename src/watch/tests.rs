@@ -354,3 +354,23 @@ fn a_nest_that_stops_answering_is_stale() {
     let s = screen(&app, now, ColorMode::None);
     assert_eq!(s.state(&app.view()).0, "STALE");
 }
+
+/// Between two reads of `/ready` the poll's age keeps counting and the countdown keeps falling, from
+/// the instant the body was read, not from when it was drawn.
+#[test]
+fn the_poll_countdown_runs_between_reads() {
+    let (app, now) = replayed("solo.jsonl");
+    let ready = app.ready.value().unwrap();
+    let since = ready["seconds_since_poll"].as_u64().unwrap();
+    let every = ready["freshness"]["poll_interval_secs"].as_u64().unwrap();
+    let read_at = app.ready.read_at().unwrap();
+    let later = read_at + 3_000;
+    assert!(later > now);
+    let drawn = text(&buffer(&app, later, ColorMode::None, 120, 40));
+    let want = format!(
+        "every {every} s · last {} s ago · next in {} s",
+        since + 3,
+        every - since - 3
+    );
+    assert!(drawn.contains(&want), "want {want:?} in\n{drawn}");
+}
