@@ -124,8 +124,18 @@ scaled by `metadata.json` (base units, marked "decimals unknown", without it). N
 the transfers seen, not a balance: native ETH, internal calls and tokens the nest does not index are
 invisible, and every output says so. `--format json` carries every edge; text, `dot` and `mermaid`
 show the `--top` largest per token. A range with more than 2,000,000 transfer rows, or one outside
-what the nest has indexed, is refused rather than drawn in part. Without `--block`, `--tx` makes one
-`eth_getTransactionReceipt` call to find its block.
+what the nest has indexed, is refused rather than drawn in part, and so is one whose read passes
+500,000 distinct (token, from, to) edges: memory follows edges, not rows. Without `--block`, `--tx`
+makes one `eth_getTransactionReceipt` call to find its block.
+
+On an address-history nest (RFC-0063) the same commands read the watched addresses' `txlist`,
+`txlistinternal` and `tokentx` rows instead of event tables. A transaction's value and an internal
+transfer are movements of the chain's own currency (ETH, BNB, xDAI, POL, MON), never summed with an
+ERC-20; a row two watched addresses share is told once; a reverted row is listed and moves nothing.
+The story adds the native rows in chain order, the first `--top` of them, and `/api` serves every
+row. It sees everything around a watched address and nothing between two it does not watch, and says
+so. A range any watched address has not been read over is refused with what is covered, rows above
+the finalized head are provisional, and `nuthatch dev` serves the same document at `GET /diff`.
 
 Every other table in range is listed below the flow, most rows first, and the per-table counts sum
 to the range's total. A table with a `story` line in `semantic.toml` is told one sentence per row

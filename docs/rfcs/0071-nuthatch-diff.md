@@ -1,9 +1,9 @@
 # RFC-0071: The diff - what happened between block X and block Y, as a story
 
 - Status: **Accepted (2026-10-21, Chief).** One of five "fun" RFCs Chief asked for on
-  2026-10-21 (0068 to 0072), planned in parallel and to be built one after another. Steps 1 to 3 of
-  §15 are built (§16 to §18): the flow, story lines and the grouped fallback, and the range story with
-  `GET /diff` and the MCP `diff` tool. Step 4, the address-history source, remains.
+  2026-10-21 (0068 to 0072), planned in parallel and to be built one after another. All four steps
+  of §15 are built (§16 to §19): the flow, story lines and the grouped fallback, the range story with
+  `GET /diff` and the MCP `diff` tool, and the address-history source.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: RFC-0016 (the semantic layer, `semantic.toml`), RFC-0008 (labels and flags), RFC-0061
@@ -802,3 +802,128 @@ received from in range, so a WETH holder who wrapped by `Deposit` before the ran
 
 §15 step 4, the address-history source (old S5): `txlist`, `txlistinternal` and `tokentx` rows for
 watched addresses into the story and the flow, gated on Etherscan's `txlistinternal` for one range.
+Built in §19.
+
+## 19. The address-history source, built 2026-10-22
+
+§15 step 4 is built in `src/diff_history.rs`. On an address-history nest (RFC-0063) `nuthatch diff`
+reads the `txlist`, `txlistinternal` and `tokentx` rows the nest keeps for its watched addresses and
+tells them through the same pipeline as an event nest: the range story, `--flow`, `--tx`, `--block`,
+`--from`/`--to` and `--since-last`, as text, Markdown, JSON, DOT or Mermaid. The value a transaction
+or an internal call moved is a movement of the chain's own currency.
+
+**A second source, not a second path.** `diff::Inputs` gains `history`, read beside the SQL source
+and never through it. `AddressHistory::diff_snapshot` opens one redb read transaction, counts the
+rows in range by key and reads coverage, finality and the conflict mark in it, and the rows are
+streamed from that same transaction as the fold asks for them, so a cursor writing meanwhile cannot
+split a diff and two million rows are never held at once. An address-history nest has no SQL tables:
+the SQL side is `diff::NoTables`, which nothing asks. `nuthatch diff` on its directory, `GET /diff`
+on the nest's own router under `nuthatch dev`, and the MCP `diff` tool through that route give one
+document; `--url` asks the route for the flow too, since the nest has no `/sql`, and a CLI with no
+local config tells the two kinds apart by `/ready`'s `mode`.
+
+**What reads as a movement.** A `txlist` row's value and a `txlistinternal` row's value, when the
+row is not marked failed and the value is not zero; a creation's recipient is the contract it made.
+Every `tokentx` row, as an ERC-20 `Transfer` of the token that emitted it, exactly as an event row is
+read. The chain's own currency is the token `native`, named by the chain (ETH, BNB, xDAI, POL, MON)
+with the 18 decimals of wei, and is never summed or compared with an ERC-20: it has its own edges,
+net flows and largest movements, like any token.
+
+**What it says.** The story gains a section, "Native ETH of N watched addresses, in chain order":
+per action its rows, how many moved value, carried none or were marked failed, and how many were
+filed under a second watched address and read once; then the first `--top` transaction values and
+internal transfers in chain order, reverted ones included and said as "reverted: moved nothing",
+with `native_rows` counting all of them in JSON. Control plane and approvals say "Not read: an
+address-history nest indexes no contract's events"; new holders and first rows are not counted, with
+the reason. The `not_seen` line is the source's own: everything around a watched address,
+nothing between two addresses it does not watch, and what it never holds (gas fees, withdrawals,
+block rewards; NFT transfers, which `/api` serves). On the chains RFC-0063 §13 proves by the balance
+residual it adds the one row that method does not list, an incoming transaction moving no value.
+
+### Gate
+
+| Gate | Result |
+|---|---|
+| ETH and internal-transfer lines equal Etherscan's for one range, every row and every wei | Pass. The Euler exploiter's EOA `0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4` and attack contract `0x036cec1a199234fc02f72d29e596a09440825f1c`, mainnet blocks 16,817,996 to 16,837,739: the attack contract's ETH legs, its payouts, and the small transfers people sent the exploiter afterwards. Per address, the diff's internal rows equal Etherscan's `txlistinternal` (14 and 1 rows) and its transaction-value rows equal Etherscan's `txlist` rows with a value (0 and 3), compared as multisets of (block, transaction, from, to or created contract, wei, type, failed); 17 native rows in all, the 8,080.498391868396965958 ETH `ethToDeployer()` transfer filed under both addresses and told once. The `txlist`, `txlistinternal` and `tokentx` row counts equal Etherscan's lists merged across the two addresses (17, 14, 37), and every token's net flow per address equals Etherscan's `tokentx` to the base unit. `the_native_rows_are_etherscans_row_for_row_and_wei_for_wei` |
+| Fixture recorded, tracked, small | `tests/fixtures/diff/history/`, 312 KB: `history.json` (71 KB), the rows, coverage and finalized hashes a `nuthatch dev` backfill against Alchemy wrote (5.8.2, 318 address windows in 10.5 minutes, one run), which the tests record into a fresh store through `AddressHistory::record`, the cursor's own write; Etherscan's six answers for the same addresses and range, pinned beside it; `nuthatch.toml` (a keyless public RPC) and `metadata.json`. The recorded store was 3.6 MB of mostly caches and is not committed. `git status --ignored` shows nothing ignored |
+| Goldens byte-identical across two runs | Pass on macOS (aarch64): eight goldens (the story in text, Markdown and JSON; the flow in text, JSON and DOT; the payout transaction as a story and a flow), each asserted twice in one test, in the ordinary `it` suite, so CI's Linux shards assert them |
+| CLI, route and MCP tool give one document | Pass. `the_cli_the_route_and_the_mcp_tool_give_the_same_history_document` runs `nuthatch dev` on one copy with an RPC that answers nothing and the CLI on another, and compares the CLI's JSON, `GET /diff` and `tools/call diff` as strings for a range, a transaction and a flow; the CLI over `--url` prints the local text, for the story and the flow |
+| Reorg property | Pass. `a_reorg_above_the_finalized_head_tells_the_canonical_story` (proptest, 12 cases): rows over 101 to 111 with the finalized head at 105, a reorg of depth 1 to 6 onto one of three forks through `invalidate_above` and a re-record, and the story equals the one told from a store that only held the new chain; it changed, it is labelled `"final": false`, and `--final-only` refuses it naming the finalized head |
+| RSS well inside 2 GB on the largest nest built cheaply | Pass after two fixes and a new cap, below. A synthetic nest of 1,989,996 rows (just under the row cap) for two addresses: with counterparties from a pool of 10,000, the story peaked at 241 MiB in 4.1 s and the flow's JSON at 347 MiB. With 30,000, 480,000 distinct edges: 725 MiB and 784 MiB. With every row its own counterparty the diff is refused at the edge cap at 785 MiB peak |
+| Existing goldens unchanged | Pass. No flow, story or range golden was regenerated; every new JSON field is omitted when empty |
+
+### What the gate found
+
+The first RSS run peaked at 3.7 GB, three causes. The CLI read the address-history store through the
+event store's 1 GiB page cache; it now reopens it with address history's own 32 MiB, which took
+about 800 MB off. The rows were decoded into memory before the fold; they are now streamed from the
+read transaction, and a row is kept for de-duplication only when two of its parties are watched,
+since only then can it be filed twice. What remained, 2.9 GB, was the fold itself: one entry per
+distinct (token, from, to) edge and per (token, address) sum, keyed by owned strings, about 1 KB per
+edge in the story and 1.6 KB in the flow's JSON, measured at 320,000 to 1,346,664 edges. §6 said a
+diff's memory is bounded by distinct pairs, not rows, and nothing bounded the pairs. `diff::EDGE_CAP`
+now does: past 500,000 distinct edges a diff is refused, for an event nest as for this one, and says
+to narrow the range. The real ranges §16 and §18 measured are far under it (119,056 edges at the cap's
+two million GRT transfers).
+
+### Decisions the earlier sections did not settle
+
+- **One row is one row.** A row filed under two watched addresses is read once: a transaction by its
+  hash, an internal transfer by its hash and trace index (Etherscan's `traceId` is not unique), a
+  token transfer by its block and log index. A `tokentx` row for a log an event table already gave
+  the flow is skipped too. An address-history nest cannot declare contracts, so that last case is not
+  reachable today; it is one set lookup, kept so the two sources can never double a transfer.
+- **Reverted rows are listed and move nothing.** Etherscan lists them, and the gate is Etherscan's
+  rows; folding their value would draw money that never moved.
+- **A transaction value row is one that carried value.** `txlist` lists every transaction of a
+  watched address; the zero-value ones are counted, not listed.
+- **Order within a transaction is a convention.** Address-history rows sort by transaction index, then
+  the value, then internal transfers in trace order, then token transfers in log order: the rows do not
+  say how a call and a log interleaved. Positions print as `tx 29 trace 1` or `log 7`, and JSON carries
+  `tx_index` and `trace_index` beside `log_index`, each omitted when absent, so an event nest's
+  documents are unchanged.
+- **Finality is the store's finalized head.** Rows above it, served on demand, read as provisional with
+  "Finalized through N" where an event nest says "Sealed"; JSON keeps the field name `sealed_through`.
+  A store whose finalized history stopped matching the chain answers nothing, as `/api` does.
+- **Coverage is per watched address and action.** A range one address has not been read over, for any
+  of the three actions, is refused with the spans the nest does hold; an address whose history cannot
+  be proved (RFC-0063 §13) is refused from the block it had code.
+- **The native listing is bounded like a story's sentences.** JSON carries the first `--top` rows and
+  `native_rows`; `/api` serves every row. The gate asks with `--top 100000`.
+- **Decimals.** An ERC-20 from `tokentx` is named and scaled by `metadata.json` only, as everywhere; a
+  token without it prints in base units, once, without repeating its address as its name.
+- **The data identity skips `partitions/`.** It is computed once at `dev` and per CLI run, and a
+  partition cache is derived state of up to `cache_mb` that the identity would otherwise read whole.
+- **`--url --tx` sends `block`.** The route takes a transaction with its block; the CLI sent `from`
+  and `to`, which the route refused for every nest. Fixed for both kinds.
+- **A directory of chains serves no `/diff`.** One diff, one cursor: run the chain's nest on its own.
+
+### Mutation checks
+
+Fourteen, each applied to the committed tree by a script that refuses a target matching other than
+once, shown in the diff, restored from HEAD and checked clean. Thirteen went red at once, read by the
+panic line. Sharing: reading a row filed under both addresses twice, or keeping only rows with three
+watched parties for de-duplication, fails `a_row_two_watched_addresses_share_is_read_once`. Units:
+folding a `tokentx` amount into the native token fails `native_value_is_never_added_to_a_token`.
+Reverted rows: folding their value fails `a_reverted_row_is_listed_and_moves_nothing`; leaving them
+out of the listing fails the gate and the goldens. Listing zero-value transactions as value rows fails
+the gate. Finality: calling every block final fails the reorg property and the goldens. Coverage:
+ignoring a gap fails the refusal test and `first_gap`'s. The edge cap doubled fails
+`a_fold_past_the_edge_cap_is_refused`; dropping the address-history fold's last check fails
+`a_fold_one_edge_past_the_cap_is_refused`. Order within a transaction, token transfers before the
+value: the goldens. The route naming no data identity: "the route and the CLI differ". One survived
+the first run: keying an internal row by its hash alone, because the fixture's one shared internal
+transfer is alone in its transaction. `internal_rows_of_one_transaction_are_told_apart_by_trace_index`
+was added and the mutation now goes red. The 32 MiB page cache has no test; the measurement above is
+its evidence (3.7 GB at the event store's cache, about 800 MB less without).
+
+### Not verified
+
+- Linux byte-identity rests on CI running `tests/diff_history.rs`.
+- A residual chain (Optimism, Base, Gnosis, BSC, Polygon, Arbitrum): the code path is the same rows,
+  and the `not_seen` variant is a unit of text; no fixture was recorded there.
+- A `callcode` frame's value is drawn from caller to callee, as Etherscan lists it, though it stays
+  with the caller; the store does not keep which frames were `callcode`, so the diff cannot tell.
+- The edge cap was measured on synthetic counterparties on macOS. No real nest measured here comes
+  near it, and the event-side refusal has only the unit test.
+- Spend: one recording of about 318 windows; the Alchemy dashboard was not read.

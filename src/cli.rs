@@ -63,7 +63,8 @@ pub enum Command {
     Check(CheckArgs),
     /// What happened in a block range, a block or a transaction, in fixed sentences: ownership,
     /// pauses, upgrades and roles, movements, new holders, approvals (RFC-0071). `--flow` draws the
-    /// token flow. Read-only, from the rows the nest already holds.
+    /// token flow. Read-only, from the rows the nest already holds: its events, or for an
+    /// address-history nest the transactions, internal transfers and token transfers it watches.
     Diff(DiffArgs),
     /// Regenerate the derived artifacts (`schema.json`, `llms.txt`, `semantic.toml` footguns) from
     /// `nuthatch.toml` - run after hand-editing the config (e.g. adding a factory `[[template]]`), so
@@ -1156,13 +1157,15 @@ pub struct DiffArgs {
     #[arg(long, requires = "from")]
     pub to: Option<u64>,
 
-    /// From the block after the previous --since-last diff of this nest up to the sealed boundary.
+    /// From the block after the previous --since-last diff of this nest up to the sealed boundary
+    /// (an address-history nest's finalized head).
     /// The cursor is kept in $XDG_STATE_HOME/nuthatch/diff/ (else ~/.local/state), keyed by the
     /// nest's data identity, never in the nest directory.
     #[arg(long, conflicts_with_all = ["tx", "block", "from", "to"])]
     pub since_last: bool,
 
-    /// Refuse a range that reaches above the sealed boundary, rather than label it provisional.
+    /// Refuse a range that reaches above the sealed boundary (an address-history nest's finalized
+    /// head), rather than label it provisional.
     #[arg(long)]
     pub final_only: bool,
 
