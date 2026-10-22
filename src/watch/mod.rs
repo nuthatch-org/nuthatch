@@ -133,10 +133,9 @@ async fn run_lines(args: WatchArgs) -> Result<()> {
             args.interval
                 .unwrap_or_else(|| app.poll_interval_secs().unwrap_or(2).clamp(2, 30)),
         );
-        if args
-            .exit_after
-            .is_some_and(|s| started.elapsed() + every.saturating_sub(began.elapsed()) > Duration::from_secs(s))
-        {
+        if args.exit_after.is_some_and(|s| {
+            started.elapsed() + every.saturating_sub(began.elapsed()) > Duration::from_secs(s)
+        }) {
             return Ok(());
         }
         tokio::time::sleep(every.saturating_sub(began.elapsed())).await;

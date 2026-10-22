@@ -83,7 +83,7 @@ jq -n -r --slurpfile reads "$OUT/reads.jsonl" --rawfile lines "$OUT/lines.txt" '
             http_rps: $rps } }
     ] as $expected
   | if ($expected | length) != ($parsed | length) then
-      "FAIL: \($expected | length) expected lines, \($parsed | length) printed" | halt_error(1)
+      "FAIL: \($expected | length) expected lines, \($parsed | length) printed\n" | halt_error(1)
     else . end
   | [ range(0; $expected | length) as $i
       | $expected[$i] as $e | $parsed[$i] as $p
@@ -99,5 +99,5 @@ jq -n -r --slurpfile reads "$OUT/reads.jsonl" --rawfile lines "$OUT/lines.txt" '
   | "cycles \($by | length), lines \($parsed | length), fields compared \($checks | length), " +
     "of them NO SIGNAL \($checks | map(select(.got == ns)) | length), mismatches \($bad | length)",
     ($bad[] | "  MISMATCH cycle \(.cycle) \(.k): line \(.got), endpoint \(.want)"),
-    (if ($bad | length) > 0 then "FAIL" | halt_error(1) else "PASS" end)
+    (if ($bad | length) > 0 then "FAIL\n" | halt_error(1) else "PASS" end)
 '

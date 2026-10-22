@@ -51,7 +51,12 @@ pub fn lines(app: &App) -> Vec<String> {
     }
 }
 
-fn nest_line(name: Option<String>, chain: Option<String>, ready: &RouteState, process: &str) -> String {
+fn nest_line(
+    name: Option<String>,
+    chain: Option<String>,
+    ready: &RouteState,
+    process: &str,
+) -> String {
     // `/ready` serves `sealed_through: 0` before anything has sealed, beside a null seal lag.
     let sealed = ready.u64("sealed_through").filter(|s| *s > 0);
     format!(

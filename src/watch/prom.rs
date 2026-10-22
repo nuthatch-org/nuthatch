@@ -113,9 +113,6 @@ mod tests {
             m.label_values("nuthatch_nest_last_block", "nest"),
             vec!["a \"b\""]
         );
-        assert_eq!(
-            m.get("nuthatch_nest_last_block", &[("x", "y")]),
-            Some(7.0)
-        );
+        assert_eq!(m.get("nuthatch_nest_last_block", &[("x", "y")]), Some(7.0));
     }
 }
