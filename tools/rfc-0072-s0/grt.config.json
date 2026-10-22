@@ -1,0 +1,29 @@
+{
+  "roles": [
+    {
+      "col": "account",
+      "table": "graph_token__bridge_burned"
+    },
+    {
+      "col": "account",
+      "table": "graph_token__bridge_minted"
+    },
+    {
+      "col": "from",
+      "table": "graph_token__transfer"
+    },
+    {
+      "col": "to",
+      "table": "graph_token__transfer"
+    }
+  ],
+  "tables": [
+    "graph_token__bridge_burned",
+    "graph_token__bridge_minted",
+    "graph_token__transfer"
+  ],
+  "timestamps": false,
+  "transfer": [
+    "graph_token__transfer"
+  ]
+}

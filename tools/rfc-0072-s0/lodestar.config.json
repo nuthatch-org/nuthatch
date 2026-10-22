@@ -1,0 +1,588 @@
+{
+  "roles": [
+    {
+      "col": "curator",
+      "table": "curation__burned"
+    },
+    {
+      "col": "curator",
+      "table": "curation__signalled"
+    },
+    {
+      "col": "indexer",
+      "table": "disputes__dispute_accepted"
+    },
+    {
+      "col": "fisherman",
+      "table": "disputes__dispute_accepted"
+    },
+    {
+      "col": "indexer",
+      "table": "disputes__dispute_cancelled"
+    },
+    {
+      "col": "fisherman",
+      "table": "disputes__dispute_cancelled"
+    },
+    {
+      "col": "indexer",
+      "table": "disputes__dispute_drawn"
+    },
+    {
+      "col": "fisherman",
+      "table": "disputes__dispute_drawn"
+    },
+    {
+      "col": "indexer",
+      "table": "disputes__dispute_rejected"
+    },
+    {
+      "col": "fisherman",
+      "table": "disputes__dispute_rejected"
+    },
+    {
+      "col": "indexer",
+      "table": "disputes__indexing_dispute_created"
+    },
+    {
+      "col": "fisherman",
+      "table": "disputes__indexing_dispute_created"
+    },
+    {
+      "col": "indexer",
+      "table": "disputes__legacy_dispute_created"
+    },
+    {
+      "col": "fisherman",
+      "table": "disputes__legacy_dispute_created"
+    },
+    {
+      "col": "indexer",
+      "table": "disputes__query_dispute_created"
+    },
+    {
+      "col": "fisherman",
+      "table": "disputes__query_dispute_created"
+    },
+    {
+      "col": "payer",
+      "table": "escrow__cancel_thaw"
+    },
+    {
+      "col": "collector",
+      "table": "escrow__cancel_thaw"
+    },
+    {
+      "col": "receiver",
+      "table": "escrow__cancel_thaw"
+    },
+    {
+      "col": "payer",
+      "table": "escrow__deposit"
+    },
+    {
+      "col": "collector",
+      "table": "escrow__deposit"
+    },
+    {
+      "col": "receiver",
+      "table": "escrow__deposit"
+    },
+    {
+      "col": "payer",
+      "table": "escrow__escrow_collected"
+    },
+    {
+      "col": "collector",
+      "table": "escrow__escrow_collected"
+    },
+    {
+      "col": "payer",
+      "table": "escrow__thaw"
+    },
+    {
+      "col": "collector",
+      "table": "escrow__thaw"
+    },
+    {
+      "col": "receiver",
+      "table": "escrow__thaw"
+    },
+    {
+      "col": "payer",
+      "table": "escrow__withdraw"
+    },
+    {
+      "col": "collector",
+      "table": "escrow__withdraw"
+    },
+    {
+      "col": "receiver",
+      "table": "escrow__withdraw"
+    },
+    {
+      "col": "curator",
+      "table": "gns__g_r_t_withdrawn"
+    },
+    {
+      "col": "curator",
+      "table": "gns__signal_burned"
+    },
+    {
+      "col": "curator",
+      "table": "gns__signal_minted"
+    },
+    {
+      "col": "account",
+      "table": "graph_token__bridge_burned"
+    },
+    {
+      "col": "account",
+      "table": "graph_token__bridge_minted"
+    },
+    {
+      "col": "indexer",
+      "table": "rewards__horizon_rewards_assigned"
+    },
+    {
+      "col": "allocationID",
+      "table": "rewards__horizon_rewards_assigned"
+    },
+    {
+      "col": "indexer",
+      "table": "rewards__rewards_assigned"
+    },
+    {
+      "col": "allocationID",
+      "table": "rewards__rewards_assigned"
+    },
+    {
+      "col": "indexer",
+      "table": "rewards__rewards_denied_07b6"
+    },
+    {
+      "col": "allocationID",
+      "table": "rewards__rewards_denied_07b6"
+    },
+    {
+      "col": "indexer",
+      "table": "rewards__rewards_denied_9b13"
+    },
+    {
+      "col": "allocationID",
+      "table": "rewards__rewards_denied_9b13"
+    },
+    {
+      "col": "indexer",
+      "table": "service_registry__service_registered"
+    },
+    {
+      "col": "indexer",
+      "table": "service_registry__service_unregistered"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__delegated_tokens_withdrawn"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__delegated_tokens_withdrawn"
+    },
+    {
+      "col": "delegator",
+      "table": "staking__delegated_tokens_withdrawn"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__delegation_fee_cut_set"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__delegation_fee_cut_set"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__delegation_slashed"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__delegation_slashed"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__horizon_stake_deposited"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__horizon_stake_locked"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__horizon_stake_withdrawn"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__operator_set"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__operator_set"
+    },
+    {
+      "col": "operator",
+      "table": "staking__operator_set"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__provision_created"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__provision_created"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__provision_increased"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__provision_increased"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__provision_slashed"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__provision_slashed"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__provision_thawed"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__provision_thawed"
+    },
+    {
+      "col": "indexer",
+      "table": "staking__stake_delegated_withdrawn"
+    },
+    {
+      "col": "delegator",
+      "table": "staking__stake_delegated_withdrawn"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__thaw_request_created"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__thaw_request_created"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__thaw_requests_fulfilled"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__thaw_requests_fulfilled"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__tokens_delegated"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__tokens_delegated"
+    },
+    {
+      "col": "delegator",
+      "table": "staking__tokens_delegated"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__tokens_deprovisioned"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__tokens_deprovisioned"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__tokens_to_delegation_pool_added"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__tokens_to_delegation_pool_added"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "staking__tokens_undelegated"
+    },
+    {
+      "col": "verifier",
+      "table": "staking__tokens_undelegated"
+    },
+    {
+      "col": "delegator",
+      "table": "staking__tokens_undelegated"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__allocation_closed_7203"
+    },
+    {
+      "col": "allocationID",
+      "table": "staking_legacy__allocation_closed_7203"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__allocation_closed_f672"
+    },
+    {
+      "col": "allocationID",
+      "table": "staking_legacy__allocation_closed_f672"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__allocation_collected"
+    },
+    {
+      "col": "allocationID",
+      "table": "staking_legacy__allocation_collected"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__allocation_created"
+    },
+    {
+      "col": "allocationID",
+      "table": "staking_legacy__allocation_created"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__delegation_parameters_updated"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__rebate_claimed"
+    },
+    {
+      "col": "allocationID",
+      "table": "staking_legacy__rebate_claimed"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__rebate_collected"
+    },
+    {
+      "col": "allocationID",
+      "table": "staking_legacy__rebate_collected"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__set_operator"
+    },
+    {
+      "col": "operator",
+      "table": "staking_legacy__set_operator"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__set_rewards_destination"
+    },
+    {
+      "col": "destination",
+      "table": "staking_legacy__set_rewards_destination"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__stake_delegated"
+    },
+    {
+      "col": "delegator",
+      "table": "staking_legacy__stake_delegated"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__stake_delegated_locked"
+    },
+    {
+      "col": "delegator",
+      "table": "staking_legacy__stake_delegated_locked"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__stake_deposited"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__stake_locked"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__stake_slashed"
+    },
+    {
+      "col": "indexer",
+      "table": "staking_legacy__stake_withdrawn"
+    },
+    {
+      "col": "indexer",
+      "table": "subgraph_service__allocation_closed"
+    },
+    {
+      "col": "allocationId",
+      "table": "subgraph_service__allocation_closed"
+    },
+    {
+      "col": "indexer",
+      "table": "subgraph_service__allocation_created"
+    },
+    {
+      "col": "allocationId",
+      "table": "subgraph_service__allocation_created"
+    },
+    {
+      "col": "indexer",
+      "table": "subgraph_service__allocation_resized"
+    },
+    {
+      "col": "allocationId",
+      "table": "subgraph_service__allocation_resized"
+    },
+    {
+      "col": "indexer",
+      "table": "subgraph_service__indexing_rewards_collected"
+    },
+    {
+      "col": "allocationId",
+      "table": "subgraph_service__indexing_rewards_collected"
+    },
+    {
+      "col": "indexer",
+      "table": "subgraph_service__legacy_allocation_migrated"
+    },
+    {
+      "col": "allocationId",
+      "table": "subgraph_service__legacy_allocation_migrated"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "subgraph_service__query_fees_collected"
+    },
+    {
+      "col": "payer",
+      "table": "subgraph_service__query_fees_collected"
+    },
+    {
+      "col": "allocationId",
+      "table": "subgraph_service__query_fees_collected"
+    },
+    {
+      "col": "serviceProvider",
+      "table": "subgraph_service__service_provider_registered"
+    },
+    {
+      "col": "payer",
+      "table": "tally__payment_collected"
+    },
+    {
+      "col": "dataService",
+      "table": "tally__payment_collected"
+    },
+    {
+      "col": "payer",
+      "table": "tally__r_a_v_collected"
+    },
+    {
+      "col": "dataService",
+      "table": "tally__r_a_v_collected"
+    }
+  ],
+  "tables": [
+    "curation__burned",
+    "curation__collected",
+    "curation__signalled",
+    "disputes__dispute_accepted",
+    "disputes__dispute_cancelled",
+    "disputes__dispute_drawn",
+    "disputes__dispute_linked",
+    "disputes__dispute_rejected",
+    "disputes__indexing_dispute_created",
+    "disputes__legacy_dispute_created",
+    "disputes__query_dispute_created",
+    "epochs__epoch_length_update",
+    "epochs__epoch_run",
+    "escrow__cancel_thaw",
+    "escrow__deposit",
+    "escrow__escrow_collected",
+    "escrow__thaw",
+    "escrow__withdraw",
+    "gns__g_r_t_withdrawn",
+    "gns__signal_burned",
+    "gns__signal_minted",
+    "gns__subgraph_deprecated",
+    "gns__subgraph_published",
+    "graph_token__bridge_burned",
+    "graph_token__bridge_minted",
+    "rewards__horizon_rewards_assigned",
+    "rewards__parameter_updated",
+    "rewards__rewards_assigned",
+    "rewards__rewards_denied_07b6",
+    "rewards__rewards_denied_9b13",
+    "rewards__rewards_denylist_updated",
+    "service_registry__service_registered",
+    "service_registry__service_unregistered",
+    "staking__delegated_tokens_withdrawn",
+    "staking__delegation_fee_cut_set",
+    "staking__delegation_slashed",
+    "staking__horizon_stake_deposited",
+    "staking__horizon_stake_locked",
+    "staking__horizon_stake_withdrawn",
+    "staking__operator_set",
+    "staking__provision_created",
+    "staking__provision_increased",
+    "staking__provision_slashed",
+    "staking__provision_thawed",
+    "staking__stake_delegated_withdrawn",
+    "staking__thaw_request_created",
+    "staking__thaw_request_fulfilled",
+    "staking__thaw_requests_fulfilled",
+    "staking__tokens_delegated",
+    "staking__tokens_deprovisioned",
+    "staking__tokens_to_delegation_pool_added",
+    "staking__tokens_undelegated",
+    "staking_legacy__allocation_closed_7203",
+    "staking_legacy__allocation_closed_f672",
+    "staking_legacy__allocation_collected",
+    "staking_legacy__allocation_created",
+    "staking_legacy__delegation_parameters_updated",
+    "staking_legacy__rebate_claimed",
+    "staking_legacy__rebate_collected",
+    "staking_legacy__set_operator",
+    "staking_legacy__set_rewards_destination",
+    "staking_legacy__stake_delegated",
+    "staking_legacy__stake_delegated_locked",
+    "staking_legacy__stake_deposited",
+    "staking_legacy__stake_locked",
+    "staking_legacy__stake_slashed",
+    "staking_legacy__stake_withdrawn",
+    "subgraph_service__allocation_closed",
+    "subgraph_service__allocation_created",
+    "subgraph_service__allocation_resized",
+    "subgraph_service__indexing_rewards_collected",
+    "subgraph_service__legacy_allocation_migrated",
+    "subgraph_service__query_fees_collected",
+    "subgraph_service__service_provider_registered",
+    "tally__payment_collected",
+    "tally__r_a_v_collected"
+  ],
+  "timestamps": true,
+  "transfer": [],
+  "identifiers": [
+    "allocationID",
+    "allocationId"
+  ]
+}
