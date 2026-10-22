@@ -22,9 +22,11 @@ pub fn wasm_memory() -> JsValue {
 }
 
 /// `size(key)` and `read(key, offset, length)` read the nest directory; `inputs` is a JSON object of
-/// each authored input's path to its bytes in hex. Answers a JSON summary holding the frames and the
-/// manifest.
+/// each authored input's path to its bytes in hex, empty for a mirror, which publishes none, and then
+/// the manifest's NID and data identity are null. `progress(done, total)` is called after each chunk.
+/// Answers a JSON summary holding the frames and the manifest.
 #[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
 pub async fn replay(
     size: Function,
     read: Function,
@@ -33,6 +35,7 @@ pub async fn replay(
     schema: String,
     inputs: String,
     chunk_rows: f64,
+    progress: Option<Function>,
 ) -> Result<String, JsError> {
     let p = crate::prepare(
         &spec,
@@ -47,7 +50,11 @@ pub async fn replay(
         .map(|(k, v)| Ok((k, hex::decode(v)?)))
         .collect::<Result<BTreeMap<_, _>, hex::FromHexError>>()
         .map_err(err)?;
-    let id = identity(inputs).map_err(err)?;
+    let id = if inputs.is_empty() {
+        None
+    } else {
+        Some(identity(inputs).map_err(err)?)
+    };
 
     let store = Arc::new(JsStore::new(size, read));
     let mut engine = burrmill::Engine::open_empty().map_err(err)?;
@@ -56,6 +63,7 @@ pub async fn replay(
     let mut fold_ms = 0f64;
     let mut replay = Replay::new(&p.spec, &p.plan, &p.shape);
     let chunk_sql = Plan::chunk_sql(&p.spec.quantity.sql);
+    let mut done = 0usize;
     for &(lo, hi) in &p.plan.chunks {
         store.release();
         for s in &p.plan.sources {
@@ -93,11 +101,19 @@ pub async fn replay(
             return Err(err(format!("{e:#}")));
         }
         ran.map_err(err)?;
+        if let Some(f) = &progress {
+            done += 1;
+            let _ = f.call2(
+                &JsValue::NULL,
+                &JsValue::from_f64(done as f64),
+                &JsValue::from_f64(p.plan.chunks.len() as f64),
+            );
+        }
     }
     store.release();
     let rec = replay.finish();
     let replay_ms = js_sys::Date::now() - t0;
-    let m = crate::manifest(&p, spec.as_bytes(), &rec, Some(&id));
+    let m = crate::manifest(&p, spec.as_bytes(), &rec, id.as_ref());
     Ok(json!({
         "title": p.spec.title,
         "frames_sha256": rec.frames_sha256,
@@ -108,8 +124,8 @@ pub async fn replay(
         "live_keys_peak": rec.live_keys_peak,
         "replay_secs": replay_ms / 1e3,
         "fold_secs": fold_ms / 1e3,
-        "nid": id.nid,
-        "data_identity": id.data_identity,
+        "nid": id.as_ref().map(|i| &i.nid),
+        "data_identity": id.as_ref().map(|i| &i.data_identity),
         "jsonl": rec.jsonl,
         "manifest": m.to_json(),
     })

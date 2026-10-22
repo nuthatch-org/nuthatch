@@ -109,7 +109,12 @@ fn main() -> Result<()> {
         &std::fs::read(nest.join("schema.json"))?,
         chunk_rows,
     )?;
-    let id = identity(inputs(nest)?)?;
+    // A mirror's copy carries no authored inputs, so no identity, as in a tab.
+    let id = if nest.join("nuthatch.toml").exists() {
+        Some(identity(inputs(nest)?)?)
+    } else {
+        None
+    };
 
     let mut engine = burrmill::Engine::open_empty().map_err(|e| anyhow!("{e}"))?;
     let t0 = Instant::now();
@@ -137,7 +142,7 @@ fn main() -> Result<()> {
 
     std::fs::create_dir_all(out)?;
     std::fs::write(out.join("frames.jsonl"), &rec.jsonl)?;
-    let manifest = rfc_0070_s1::manifest(&p, &spec_bytes, &rec, Some(&id));
+    let manifest = rfc_0070_s1::manifest(&p, &spec_bytes, &rec, id.as_ref());
     std::fs::write(out.join("manifest.json"), manifest.to_json())?;
 
     let t1 = Instant::now();
@@ -190,8 +195,8 @@ fn main() -> Result<()> {
             "check_secs": t1.elapsed().as_secs_f64(),
             "checked": checked,
             "mismatches": mismatches,
-            "nid": id.nid,
-            "data_identity": id.data_identity,
+            "nid": id.as_ref().map(|i| &i.nid),
+            "data_identity": id.as_ref().map(|i| &i.data_identity),
         })
     );
     if !mismatches.is_empty() {
