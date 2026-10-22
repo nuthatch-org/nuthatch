@@ -403,3 +403,54 @@ fn the_recorded_ring_holds_no_query_text() {
         }
     }
 }
+
+/// What `/_admin/requests` answers decides what DISPATCH says: refused for want of a token, not
+/// there at all, or nothing heard yet. None of them reads as an idle nest.
+#[test]
+fn dispatch_names_why_it_has_no_feed() {
+    let (base, now) = replayed("solo.jsonl");
+    drop(base);
+    for (status, want) in [
+        (401, "NO TOKEN"),
+        (404, "NOT SERVED"),
+        (0, "REQUESTS  NO SIGNAL"),
+    ] {
+        let (mut app, _) = replayed("solo.jsonl");
+        app.apply(&read(
+            now - 100,
+            "/_admin/requests",
+            status,
+            "admin token required",
+        ));
+        let drawn = text(&buffer(&app, now, ColorMode::None, 120, 40));
+        assert!(drawn.contains(want), "{status}: want {want:?} in\n{drawn}");
+        assert!(!drawn.contains("none in the last minute"), "{status}");
+    }
+}
+
+/// After a reorg the panel gives its depth and age from the two gauges, and before one it says
+/// none, because the gauges are absent until a nest has reorged.
+#[test]
+fn reorg_reads_depth_and_age_from_the_gauges() {
+    let (mut app, now) = replayed("solo.jsonl");
+    let drawn = text(&buffer(&app, now, ColorMode::None, 120, 40));
+    assert!(drawn.contains(" LAST      none"), "{drawn}");
+    let name = app.solo_name().unwrap();
+    let at = now / 1000 - 125;
+    let body = format!(
+        "nuthatch_nest_last_block{{nest=\"{name}\"}} 1\n\
+         nuthatch_nest_reorgs_total{{nest=\"{name}\"}} 3\n\
+         nuthatch_nest_last_reorg_depth_blocks{{nest=\"{name}\"}} 4\n\
+         nuthatch_nest_last_reorg_unixtime{{nest=\"{name}\"}} {at}\n"
+    );
+    app.apply(&read(now - 50, "/metrics", 200, &body));
+    let drawn = text(&buffer(&app, now, ColorMode::None, 120, 40));
+    assert!(
+        drawn.contains(" REORGS    3 since the process started"),
+        "{drawn}"
+    );
+    assert!(
+        drawn.contains(" LAST      4 blocks rolled back, 2m ago"),
+        "{drawn}"
+    );
+}
