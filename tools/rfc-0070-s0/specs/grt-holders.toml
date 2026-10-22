@@ -1,0 +1,21 @@
+title = "GRT holders on Arbitrum by balance"
+nest = "grt-supply-nest"
+from_block = 42_449_227
+to_block = 512_624_354
+frames = 1200
+fps = 30
+top = 10
+
+# Mints and burns are transfers from and to the zero address, which is left out rather than shown
+# holding minus the supply.
+[quantity]
+fold = "sum"
+sql = """
+SELECT block_number, log_index, "to" AS key, value AS delta, 1 AS sign
+FROM graph_token__transfer
+WHERE "to" <> '0x0000000000000000000000000000000000000000'
+UNION ALL
+SELECT block_number, log_index, "from" AS key, value AS delta, -1 AS sign
+FROM graph_token__transfer
+WHERE "from" <> '0x0000000000000000000000000000000000000000'
+"""
