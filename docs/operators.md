@@ -1338,16 +1338,21 @@ per-nest `/<name>/ready`; page on the root.**
 
 ### Watching from a terminal: `nuthatch watch`
 
-`nuthatch watch --url http://127.0.0.1:8288` reads the routes above (`/ready`, `/`, `/metrics`,
-`/nests`) and nothing else (RFC-0069). On a terminal it draws the engine room: THE TIP (tip, indexed,
-lag in blocks, the age of the last poll and the countdown to the next), THE PRESS (the seal and its
-lag), BOILER (process RSS against 2 GiB per cursor), FEED LINES (each RPC endpoint, with `FAILOVER`
-when a retry landed on it), REORG (the count, and the last one's depth and age) and DISPATCH (the
-requests the nest served, from `/_admin/requests`, with their rate and median over the last minute).
-DISPATCH sends `NUTHATCH_ADMIN_TOKEN` from the watcher's own environment as a bearer header when the
-nest wants one, and says `NO TOKEN` when it is refused. A mark appears only when a counter moved between two reads, and
-a field the nest did not serve reads `NO SIGNAL`, never 0. `NO_COLOR` removes every colour; below 80
-columns the panels stack. Pointed at a runtime's root, `n` and `N` step through its mounts.
+`nuthatch watch --url http://127.0.0.1:8288` reads `/ready`, `/`, `/metrics`, `/nests` and
+`/_admin/requests`, and nothing else (RFC-0069). On a terminal it draws the engine room: THE TIP (tip,
+indexed, lag in blocks, the age of the last poll and the countdown to the next), THE PRESS (the seal
+and its lag), BOILER (process RSS against 2 GiB per cursor), FEED LINES (each RPC endpoint, with
+`FAILOVER` when a retry landed on it), REORG (the count, and the last one's depth and age) and
+DISPATCH (the requests the nest served, with their rate and median over the last minute). DISPATCH
+sends `NUTHATCH_ADMIN_TOKEN` from the watcher's own environment as a bearer header, and says `NO TOKEN`
+when it is refused. A mark appears only when a counter moved between two reads, and a field the nest
+did not serve reads `NO SIGNAL`, never 0. `NO_COLOR` removes every colour; below 80 columns the panels
+stack.
+
+Pointed at a runtime's root it draws one engine room per cursor: each mount's position under its own
+chain's tip, read from its own `/<name>/ready` and never from the process-global gauges. Cursors sit
+side by side when each gets 70 columns, and otherwise `n` and `N` step between them. BOILER, FEED LINES
+and DISPATCH are the process's and are drawn once, the budget being 2 GiB times the cursors.
 
 `--ssh host` opens an `ssh -N -L` forward in batch mode for a nest bound to loopback on that host,
 and reopens it if it drops. `--nest name` takes `url` and `ssh` from
