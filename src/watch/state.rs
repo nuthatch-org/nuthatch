@@ -254,7 +254,7 @@ impl App {
                 if let Some(name) = route
                     .strip_prefix('/')
                     .and_then(|r| r.strip_suffix("/_admin/requests"))
-                    .filter(|n| !n.is_empty() && !n.contains('/'))
+                    .filter(|n| !n.is_empty())
                 {
                     self.dispatch
                         .entry(name.to_string())
@@ -265,7 +265,7 @@ impl App {
                 if let Some(name) = route
                     .strip_prefix('/')
                     .and_then(|r| r.strip_suffix("/ready"))
-                    .filter(|n| !n.is_empty() && !n.contains('/'))
+                    .filter(|n| !n.is_empty())
                 {
                     let state = self.nest_ready.entry(name.to_string()).or_default();
                     state.take(t, read.status, &read.body, true);

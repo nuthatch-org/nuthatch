@@ -571,3 +571,30 @@ fn mounts_on_one_chain_share_a_cursor() {
     let own = app.nest_ready["pulse"].u64("last_block").unwrap();
     assert!(row("pulse").contains(&thousands(own)), "{}", row("pulse"));
 }
+
+/// A second tenant's mounts are routed `/<tenant>/<alias>`, and their reads land under that name.
+#[test]
+fn a_tenant_qualified_mount_reads_its_own_ready() {
+    let mut app = App::default();
+    app.apply(&read(
+        1,
+        "/nests",
+        200,
+        r#"{"nests":[{"name":"acme/usdc","chain":"base"}]}"#,
+    ));
+    app.apply(&read(
+        2,
+        "/acme/usdc/ready",
+        200,
+        r#"{"ready":true,"tip":52000000}"#,
+    ));
+    app.apply(&read(
+        3,
+        "/acme/usdc/_admin/requests",
+        401,
+        "admin token required",
+    ));
+    assert_eq!(app.nest_ready["acme/usdc"].u64("tip"), Some(52_000_000));
+    assert_eq!(app.dispatch["acme/usdc"].status, Some(401));
+    assert_eq!(app.view().ready.u64("tip"), Some(52_000_000));
+}
