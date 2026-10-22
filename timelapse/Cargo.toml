@@ -1,0 +1,25 @@
+[package]
+name = "nuthatch-timelapse"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "RFC-0070: a nest's sealed history replayed as frames, with no filesystem and no engine."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# No engine here: the caller runs each chunk's query (Burrmill natively or in a tab) and hands the
+# batches over, so the same fold runs in both and the binary is unchanged.
+[dependencies]
+alloy-primitives = { version = "1.6", default-features = false, features = ["std"] }
+anyhow = "1"
+arrow = { version = "59", default-features = false }
+hex = "0.4"
+nuthatch-identity = { path = "../identity" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlparser = { version = "0.62", features = ["visitor"] }
+toml = "0.8"
+
+[dev-dependencies]
+proptest = "1"

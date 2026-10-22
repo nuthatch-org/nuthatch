@@ -1,0 +1,4 @@
+# As burrmill-wasm: getrandom's browser backend, and an 8 MiB stack for the planner, which natively
+# plans on a thread of that size.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\"", "-C", "link-arg=-zstack-size=8388608", "-C", "link-arg=--max-memory=4294967296"]

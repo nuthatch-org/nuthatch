@@ -1,8 +1,8 @@
 # RFC-0070: Time-lapse - a contract's sealed history replayed at speed
 
-- Status: **Accepted (2026-10-21, Chief).** S0 measured 2026-10-22 (§13): the fold matches Burrmill's
-  `GROUP BY` at every sampled frame and hashes the same on both boxes; it waits on Chief watching the
-  first rendering.
+- Status: **Accepted (2026-10-21, Chief).** S0 measured 2026-10-22 (§13); Chief watched its rendering
+  the same day and said keep building. S1 built 2026-10-22 (§14): `nuthatch-timelapse` gives S0's three
+  frame hashes natively and as wasm in Node, and its validator refuses each forbidden construct by name.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: RFC-0047 (the sealed directory as a contract), RFC-0061 (256-bit values stay decimal
@@ -346,7 +346,7 @@ Three specs, in `tools/rfc-0070-s0/specs/`, on copies of two nests:
 | Same `frames_sha256` on the ThinkPad | **Pass**: the same three hashes, built and run on x86_64 Linux from the segments copied across |
 | Chunking does not change the frames | **Pass**: the demo cut into 3 chunks and into 1,200, the holders into 35 and into 427, give the same hash |
 | Peak RSS and time on the largest nest | Recorded below; nothing near the 1 GiB stop |
-| Chief watches the first rendering | **Open**: a self-contained `.html` of the demo, about 1 MB, waits for him |
+| Chief watches the first rendering | **Pass**, 2026-10-22: he watched the demo's `.html` and said keep building |
 
 | Replay (MacBook, fold only) | Rows | Live keys at peak | Time | Peak RSS |
 |---|---|---|---|---|
@@ -399,3 +399,76 @@ reads copies nothing else writes; the in-tab replay; and USDC.
 is unchanged (1, Chief). The producer stays off by default (2, §9's leaning). The demo is the
 delegation table (3). Specs stay outside the nest (4, §4.2's leaning). An RFC-0041 entity is not
 accepted by name (5, §4.2's leaning). Questions 6 and 7 were not exercised.
+
+## 14. S1, built 2026-10-22
+
+`nuthatch-timelapse` (`timelapse/`) is the spec, the row-local validator, the chunk plan, both folds,
+the frame encoding and the manifest, with no filesystem and no engine. The caller runs
+`Plan::chunk_sql` over each chunk's final segments and hands Burrmill's Arrow batches to a `Replay`;
+the crate folds them directly, so the same code folds natively and in a tab. It is not a dependency of
+the binary. CI runs its fmt, clippy and tests, adds it to the wasm `cargo check` beside `decode` and
+`seal` on both targets, and runs `cargo deny` over its tree, which the binary's never reaches.
+
+The gates were run through `tools/rfc-0070-s1/`, a driver outside the binary and outside CI: the same
+replay as a native binary and as `wasm32-unknown-unknown` through wasm-bindgen in Node 26, both over
+Burrmill `8ab3048` (the rev `burrmill-wasm` builds for the tab), on fresh copies of S0's two nests.
+
+| Gate | Result |
+|---|---|
+| The validator refuses each forbidden construct by name | **Pass**: 21 refusal tests, one per construct. 20 mutations of the validator, one removing each refusal (the join's turns both join tests red), and 4 of the plan and the replay; each applied to the committed tree, shown applied, red at its test's assertion, restored from `HEAD` to a clean tree |
+| Native and wasm give the same `frames_sha256` on S0's nests | **Pass**: both give S0's `fce5af90...a4174`, `43bbe523...5f101` and `26235ec1...ba906b`; the frame encoding is unchanged. A `last` spec (`tools/rfc-0070-s1/specs/indexer-reward-cut.toml`) gives `ea7ec80e...883cf21` on both |
+| Frames still equal Burrmill's own answer | **Pass**: 20 sampled frames per spec against `GROUP BY` for `sum` and `row_number() ... = 1` for `last`, 80 of 80 identical |
+| Chunk boundaries never change the frames | **Pass**: a property test over random segment tilings, chunk bounds and batch sizes, for both folds; on real segments the demo at 3 and 1,200 chunks and the holders at 35 and 427, native and wasm, give one hash each |
+| Peak RSS and time against S0 | Recorded below |
+
+| Replay, fold only (MacBook) | Rows | S0 | S1 native | S1 wasm in Node |
+|---|---|---|---|---|
+| Demo, 136 indexers | 499,514 | 0.32 to 0.40 s, 134 MB | 0.15 to 0.16 s, 132 to 134 MB | 0.48 s, 81 MiB of wasm memory |
+| Delegators, 307,788 live | 499,514 | 0.49 s, 244 MB | 0.32 to 0.34 s, 231 to 232 MB | 0.68 s, 149 MiB |
+| GRT holders, 119,270 live | 11,937,686 | 7.5 to 7.6 s, 268 MB | 4.2 s, 294 to 299 MB | 7.4 s, 138 MiB |
+| GRT holders, 20,000-row chunks | 11,937,686 | 8.5 s, 180 MB | 4.9 s, 194 MB | same hash |
+
+Folding Arrow directly took the holders replay from 1.57 to 2.8 million rows a second; the fold itself,
+decimal parsing included, is 3.0 s of the 4.2. The holders' peak rose by about 27 MB, and that is
+Burrmill's newer rev, not the fold: the same driver on S0's Burrmill `0777d76` peaked at 267 and 278 MB.
+
+**Bytes per live key.** Read off RSS as S0 read it (delegators less demo, over the 307,652 more live
+keys), S1 holds about 320 bytes a key against S0's 360. Counted by the allocator
+(`tools/rfc-0070-s1/src/bin/state-bytes.rs`), the state is 183 bytes a key at 307,788 keys and 165 at
+3 million, against 222 and 206 for S0's form. Interning the address saves about 40 bytes; §5's 100 was
+not reached because the value and the key are each held twice, once in the hash map and once in the
+ordered index, and both structures run part-empty. The 1 GiB cap is therefore about 3.3 million live
+keys by RSS, about 6.5 million by the allocator's count.
+
+Decisions the RFC did not settle:
+
+1. **No engine in the crate.** It takes Arrow 59 record batches, the Arrow Burrmill now uses, so §13's
+   JSON detour is gone. Integer and decimal columns and all three string layouts are read; any other
+   type is refused, naming the column.
+2. **Address keys.** A key spelled `0x` and 40 lower-case hex digits is held as 20 bytes; any other key
+   stays text. Both order and print exactly as their text, so the hash cannot tell.
+3. **The validator's reach.** Beyond §4.2's list it refuses `GROUP BY`, `HAVING`, `QUALIFY`, `WINDOW`,
+   `WITH`, subqueries, `UNION` without `ALL`, `INTERSECT` and `EXCEPT`, `TOP` and `FETCH`, derived
+   tables, table functions and `VALUES`, `*`, unnamed expressions, and any function outside a
+   twelve-name scalar allowlist. A source must be a table in `schema.json`, so an authored view is
+   refused. The arms of a `UNION ALL` must name their columns in one order, because the engine pairs
+   them by position. An optional `block_timestamp` column is accepted, as §13 finding 5 asked.
+4. **`last`.** A key given two values in one log is refused, since nothing orders them. A value of zero
+   leaves the state, and the total is the sum of the current values.
+5. **The spec** takes `frames` or `step_blocks`, exactly one. Blocks past the last whole frame are not
+   played, as in S0. The manifest gains `first_block`, where the pass began.
+6. **NID and data identity are in the manifest**, computed by `nuthatch-identity` from the nest's
+   authored inputs, found by the binary's own walk, with the registry hash `schema.json` records rather
+   than one regenerated from the config and ABIs, which needs the main crate. On `grt-supply-nest` both
+   equal what `nuthatch nest nid` (5.8.0) prints. On the allocations copy they do not, and the
+   difference is exactly that hash: 5.8.0 regenerates `9696fb0f...` where the 5.0.1 that sealed the
+   copy recorded `916324e2...`, and the binary's own bundle manifest with that one value swapped hashes
+   to S1's NID. The manifest therefore names the identity of the decode that sealed the segments read.
+   A tab holding only a mirror's manifest and segments has no authored inputs and writes both as null;
+   the registry hash and the segment list stay.
+7. **The provisional refusal is the enforcing surface.** The plan also filters provisional segments
+   out, but once the range check passes no provisional segment starts at or below the last frame, so
+   the filter cannot fire; the refusal is what the mutation checks.
+
+Not verified in S1: a run on the ThinkPad; a headless browser rather than Node; the in-tab replay and
+its memory (S2); a read lease (S3); USDC. The driver is not in CI, as S0's harness is not.
