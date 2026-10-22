@@ -1,0 +1,710 @@
+# semantic.toml - what this nest's data *means* (RFC-0016). Read by the MCP `schema`
+# tool, the admin UI, and the scaffolded skill. Edit descriptions freely; the
+# `[table.*.footguns]` are DERIVED from the ABI and regenerated - leave them be.
+
+schema_version = 1
+
+[nest]
+description = "The `control-plane` nest on mainnet. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_b__admin_changed]
+description = "`AdminChanged(address,address)` events emitted by the `deploy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AdminChanged(address,address) event"
+
+[table.deploy_b__admin_changed.columns]
+newAdmin = "The `newAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdmin = "The `previousAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_b__beacon_upgraded]
+description = "`BeaconUpgraded(address)` events emitted by the `deploy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per BeaconUpgraded(address) event"
+
+[table.deploy_b__beacon_upgraded.columns]
+beacon = "The `beacon` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_b__initialized]
+description = "`Initialized(uint64)` events emitted by the `deploy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint64) event"
+
+[table.deploy_b__initialized.columns]
+version = "The `version` uint64 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_b__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `deploy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.deploy_b__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_b__paused]
+description = "`Paused(address)` events emitted by the `deploy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Paused(address) event"
+
+[table.deploy_b__paused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_b__role_admin_changed]
+description = "`RoleAdminChanged(bytes32,bytes32,bytes32)` events emitted by the `deploy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleAdminChanged(bytes32,bytes32,bytes32) event"
+
+[table.deploy_b__role_admin_changed.columns]
+newAdminRole = "The `newAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdminRole = "The `previousAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_b__role_granted]
+description = "`RoleGranted(bytes32,address,address)` events emitted by the `deploy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleGranted(bytes32,address,address) event"
+
+[table.deploy_b__role_granted.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_b__role_revoked]
+description = "`RoleRevoked(bytes32,address,address)` events emitted by the `deploy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleRevoked(bytes32,address,address) event"
+
+[table.deploy_b__role_revoked.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_b__unpaused]
+description = "`Unpaused(address)` events emitted by the `deploy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Unpaused(address) event"
+
+[table.deploy_b__unpaused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_b__upgraded]
+description = "`Upgraded(address)` events emitted by the `deploy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Upgraded(address) event"
+
+[table.deploy_b__upgraded.columns]
+implementation = "The `implementation` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_c__admin_changed]
+description = "`AdminChanged(address,address)` events emitted by the `deploy_c` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AdminChanged(address,address) event"
+
+[table.deploy_c__admin_changed.columns]
+newAdmin = "The `newAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdmin = "The `previousAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_c__beacon_upgraded]
+description = "`BeaconUpgraded(address)` events emitted by the `deploy_c` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per BeaconUpgraded(address) event"
+
+[table.deploy_c__beacon_upgraded.columns]
+beacon = "The `beacon` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_c__initialized]
+description = "`Initialized(uint64)` events emitted by the `deploy_c` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint64) event"
+
+[table.deploy_c__initialized.columns]
+version = "The `version` uint64 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_c__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `deploy_c` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.deploy_c__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_c__paused]
+description = "`Paused(address)` events emitted by the `deploy_c` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Paused(address) event"
+
+[table.deploy_c__paused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_c__role_admin_changed]
+description = "`RoleAdminChanged(bytes32,bytes32,bytes32)` events emitted by the `deploy_c` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleAdminChanged(bytes32,bytes32,bytes32) event"
+
+[table.deploy_c__role_admin_changed.columns]
+newAdminRole = "The `newAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdminRole = "The `previousAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_c__role_granted]
+description = "`RoleGranted(bytes32,address,address)` events emitted by the `deploy_c` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleGranted(bytes32,address,address) event"
+
+[table.deploy_c__role_granted.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_c__role_revoked]
+description = "`RoleRevoked(bytes32,address,address)` events emitted by the `deploy_c` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleRevoked(bytes32,address,address) event"
+
+[table.deploy_c__role_revoked.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_c__unpaused]
+description = "`Unpaused(address)` events emitted by the `deploy_c` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Unpaused(address) event"
+
+[table.deploy_c__unpaused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.deploy_c__upgraded]
+description = "`Upgraded(address)` events emitted by the `deploy_c` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Upgraded(address) event"
+
+[table.deploy_c__upgraded.columns]
+implementation = "The `implementation` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.ens__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `ens` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.ens__approval.columns]
+approved = "The `approved` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+tokenId = "The `tokenId` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.ens__approval.footguns]
+big_ints = ["tokenId"]
+overflows_dec = ["tokenId"]
+
+[table.ens__approval_for_all]
+description = "`ApprovalForAll(address,address,bool)` events emitted by the `ens` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per ApprovalForAll(address,address,bool) event"
+
+[table.ens__approval_for_all.columns]
+approved = "The `approved` bool parameter - stored as exact text `'true'`/`'false'`, not a SQL boolean. `approved = true` and `AND`/`NOT` implicitly cast and work; `COALESCE`, `CASE`, `bool_and`/`bool_or` and `UNION` do not. Write `approved = 'true'` or `CAST(approved AS BOOLEAN)`. (seeded from the ABI - edit semantic.toml to improve this)"
+operator = "The `operator` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.ens__approval_for_all.footguns]
+bools = ["approved"]
+
+[table.ens__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `ens` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.ens__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+tokenId = "The `tokenId` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.ens__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["tokenId"]
+overflows_dec = ["tokenId"]
+
+[table.link__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `link` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.link__approval.columns]
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+spender = "The `spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.link__approval.footguns]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.link__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `link` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.link__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.link__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.pausable__admin_changed]
+description = "`AdminChanged(address,address)` events emitted by the `pausable` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AdminChanged(address,address) event"
+
+[table.pausable__admin_changed.columns]
+newAdmin = "The `newAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdmin = "The `previousAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pausable__beacon_upgraded]
+description = "`BeaconUpgraded(address)` events emitted by the `pausable` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per BeaconUpgraded(address) event"
+
+[table.pausable__beacon_upgraded.columns]
+beacon = "The `beacon` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pausable__initialized]
+description = "`Initialized(uint64)` events emitted by the `pausable` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint64) event"
+
+[table.pausable__initialized.columns]
+version = "The `version` uint64 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pausable__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `pausable` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.pausable__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pausable__paused]
+description = "`Paused(address)` events emitted by the `pausable` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Paused(address) event"
+
+[table.pausable__paused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pausable__role_admin_changed]
+description = "`RoleAdminChanged(bytes32,bytes32,bytes32)` events emitted by the `pausable` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleAdminChanged(bytes32,bytes32,bytes32) event"
+
+[table.pausable__role_admin_changed.columns]
+newAdminRole = "The `newAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdminRole = "The `previousAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pausable__role_granted]
+description = "`RoleGranted(bytes32,address,address)` events emitted by the `pausable` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleGranted(bytes32,address,address) event"
+
+[table.pausable__role_granted.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pausable__role_revoked]
+description = "`RoleRevoked(bytes32,address,address)` events emitted by the `pausable` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleRevoked(bytes32,address,address) event"
+
+[table.pausable__role_revoked.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pausable__unpaused]
+description = "`Unpaused(address)` events emitted by the `pausable` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Unpaused(address) event"
+
+[table.pausable__unpaused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pausable__upgraded]
+description = "`Upgraded(address)` events emitted by the `pausable` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Upgraded(address) event"
+
+[table.pausable__upgraded.columns]
+implementation = "The `implementation` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_a__admin_changed]
+description = "`AdminChanged(address,address)` events emitted by the `proxy_a` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AdminChanged(address,address) event"
+
+[table.proxy_a__admin_changed.columns]
+newAdmin = "The `newAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdmin = "The `previousAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_a__beacon_upgraded]
+description = "`BeaconUpgraded(address)` events emitted by the `proxy_a` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per BeaconUpgraded(address) event"
+
+[table.proxy_a__beacon_upgraded.columns]
+beacon = "The `beacon` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_a__initialized]
+description = "`Initialized(uint64)` events emitted by the `proxy_a` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint64) event"
+
+[table.proxy_a__initialized.columns]
+version = "The `version` uint64 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_a__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `proxy_a` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.proxy_a__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_a__paused]
+description = "`Paused(address)` events emitted by the `proxy_a` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Paused(address) event"
+
+[table.proxy_a__paused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_a__role_admin_changed]
+description = "`RoleAdminChanged(bytes32,bytes32,bytes32)` events emitted by the `proxy_a` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleAdminChanged(bytes32,bytes32,bytes32) event"
+
+[table.proxy_a__role_admin_changed.columns]
+newAdminRole = "The `newAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdminRole = "The `previousAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_a__role_granted]
+description = "`RoleGranted(bytes32,address,address)` events emitted by the `proxy_a` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleGranted(bytes32,address,address) event"
+
+[table.proxy_a__role_granted.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_a__role_revoked]
+description = "`RoleRevoked(bytes32,address,address)` events emitted by the `proxy_a` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleRevoked(bytes32,address,address) event"
+
+[table.proxy_a__role_revoked.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_a__unpaused]
+description = "`Unpaused(address)` events emitted by the `proxy_a` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Unpaused(address) event"
+
+[table.proxy_a__unpaused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_a__upgraded]
+description = "`Upgraded(address)` events emitted by the `proxy_a` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Upgraded(address) event"
+
+[table.proxy_a__upgraded.columns]
+implementation = "The `implementation` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_admin__admin_changed]
+description = "`AdminChanged(address,address)` events emitted by the `proxy_admin` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AdminChanged(address,address) event"
+
+[table.proxy_admin__admin_changed.columns]
+newAdmin = "The `newAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdmin = "The `previousAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_admin__beacon_upgraded]
+description = "`BeaconUpgraded(address)` events emitted by the `proxy_admin` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per BeaconUpgraded(address) event"
+
+[table.proxy_admin__beacon_upgraded.columns]
+beacon = "The `beacon` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_admin__initialized]
+description = "`Initialized(uint64)` events emitted by the `proxy_admin` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint64) event"
+
+[table.proxy_admin__initialized.columns]
+version = "The `version` uint64 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_admin__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `proxy_admin` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.proxy_admin__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_admin__paused]
+description = "`Paused(address)` events emitted by the `proxy_admin` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Paused(address) event"
+
+[table.proxy_admin__paused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_admin__role_admin_changed]
+description = "`RoleAdminChanged(bytes32,bytes32,bytes32)` events emitted by the `proxy_admin` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleAdminChanged(bytes32,bytes32,bytes32) event"
+
+[table.proxy_admin__role_admin_changed.columns]
+newAdminRole = "The `newAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdminRole = "The `previousAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_admin__role_granted]
+description = "`RoleGranted(bytes32,address,address)` events emitted by the `proxy_admin` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleGranted(bytes32,address,address) event"
+
+[table.proxy_admin__role_granted.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_admin__role_revoked]
+description = "`RoleRevoked(bytes32,address,address)` events emitted by the `proxy_admin` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleRevoked(bytes32,address,address) event"
+
+[table.proxy_admin__role_revoked.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_admin__unpaused]
+description = "`Unpaused(address)` events emitted by the `proxy_admin` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Unpaused(address) event"
+
+[table.proxy_admin__unpaused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_admin__upgraded]
+description = "`Upgraded(address)` events emitted by the `proxy_admin` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Upgraded(address) event"
+
+[table.proxy_admin__upgraded.columns]
+implementation = "The `implementation` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_b__admin_changed]
+description = "`AdminChanged(address,address)` events emitted by the `proxy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AdminChanged(address,address) event"
+
+[table.proxy_b__admin_changed.columns]
+newAdmin = "The `newAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdmin = "The `previousAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_b__beacon_upgraded]
+description = "`BeaconUpgraded(address)` events emitted by the `proxy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per BeaconUpgraded(address) event"
+
+[table.proxy_b__beacon_upgraded.columns]
+beacon = "The `beacon` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_b__initialized]
+description = "`Initialized(uint64)` events emitted by the `proxy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint64) event"
+
+[table.proxy_b__initialized.columns]
+version = "The `version` uint64 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_b__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `proxy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.proxy_b__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_b__paused]
+description = "`Paused(address)` events emitted by the `proxy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Paused(address) event"
+
+[table.proxy_b__paused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_b__role_admin_changed]
+description = "`RoleAdminChanged(bytes32,bytes32,bytes32)` events emitted by the `proxy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleAdminChanged(bytes32,bytes32,bytes32) event"
+
+[table.proxy_b__role_admin_changed.columns]
+newAdminRole = "The `newAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdminRole = "The `previousAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_b__role_granted]
+description = "`RoleGranted(bytes32,address,address)` events emitted by the `proxy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleGranted(bytes32,address,address) event"
+
+[table.proxy_b__role_granted.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_b__role_revoked]
+description = "`RoleRevoked(bytes32,address,address)` events emitted by the `proxy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleRevoked(bytes32,address,address) event"
+
+[table.proxy_b__role_revoked.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_b__unpaused]
+description = "`Unpaused(address)` events emitted by the `proxy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Unpaused(address) event"
+
+[table.proxy_b__unpaused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.proxy_b__upgraded]
+description = "`Upgraded(address)` events emitted by the `proxy_b` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Upgraded(address) event"
+
+[table.proxy_b__upgraded.columns]
+implementation = "The `implementation` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.roles__admin_changed]
+description = "`AdminChanged(address,address)` events emitted by the `roles` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AdminChanged(address,address) event"
+
+[table.roles__admin_changed.columns]
+newAdmin = "The `newAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdmin = "The `previousAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.roles__beacon_upgraded]
+description = "`BeaconUpgraded(address)` events emitted by the `roles` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per BeaconUpgraded(address) event"
+
+[table.roles__beacon_upgraded.columns]
+beacon = "The `beacon` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.roles__initialized]
+description = "`Initialized(uint64)` events emitted by the `roles` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint64) event"
+
+[table.roles__initialized.columns]
+version = "The `version` uint64 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.roles__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `roles` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.roles__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.roles__paused]
+description = "`Paused(address)` events emitted by the `roles` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Paused(address) event"
+
+[table.roles__paused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.roles__role_admin_changed]
+description = "`RoleAdminChanged(bytes32,bytes32,bytes32)` events emitted by the `roles` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleAdminChanged(bytes32,bytes32,bytes32) event"
+
+[table.roles__role_admin_changed.columns]
+newAdminRole = "The `newAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdminRole = "The `previousAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.roles__role_granted]
+description = "`RoleGranted(bytes32,address,address)` events emitted by the `roles` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleGranted(bytes32,address,address) event"
+
+[table.roles__role_granted.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.roles__role_revoked]
+description = "`RoleRevoked(bytes32,address,address)` events emitted by the `roles` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleRevoked(bytes32,address,address) event"
+
+[table.roles__role_revoked.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.roles__unpaused]
+description = "`Unpaused(address)` events emitted by the `roles` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Unpaused(address) event"
+
+[table.roles__unpaused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.roles__upgraded]
+description = "`Upgraded(address)` events emitted by the `roles` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Upgraded(address) event"
+
+[table.roles__upgraded.columns]
+implementation = "The `implementation` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.vlsquill__admin_changed]
+description = "`AdminChanged(address,address)` events emitted by the `vlsquill` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AdminChanged(address,address) event"
+
+[table.vlsquill__admin_changed.columns]
+newAdmin = "The `newAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdmin = "The `previousAdmin` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.vlsquill__beacon_upgraded]
+description = "`BeaconUpgraded(address)` events emitted by the `vlsquill` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per BeaconUpgraded(address) event"
+
+[table.vlsquill__beacon_upgraded.columns]
+beacon = "The `beacon` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.vlsquill__initialized]
+description = "`Initialized(uint64)` events emitted by the `vlsquill` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint64) event"
+
+[table.vlsquill__initialized.columns]
+version = "The `version` uint64 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.vlsquill__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `vlsquill` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.vlsquill__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.vlsquill__paused]
+description = "`Paused(address)` events emitted by the `vlsquill` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Paused(address) event"
+
+[table.vlsquill__paused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.vlsquill__role_admin_changed]
+description = "`RoleAdminChanged(bytes32,bytes32,bytes32)` events emitted by the `vlsquill` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleAdminChanged(bytes32,bytes32,bytes32) event"
+
+[table.vlsquill__role_admin_changed.columns]
+newAdminRole = "The `newAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousAdminRole = "The `previousAdminRole` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.vlsquill__role_granted]
+description = "`RoleGranted(bytes32,address,address)` events emitted by the `vlsquill` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleGranted(bytes32,address,address) event"
+
+[table.vlsquill__role_granted.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.vlsquill__role_revoked]
+description = "`RoleRevoked(bytes32,address,address)` events emitted by the `vlsquill` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RoleRevoked(bytes32,address,address) event"
+
+[table.vlsquill__role_revoked.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+role = "The `role` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.vlsquill__unpaused]
+description = "`Unpaused(address)` events emitted by the `vlsquill` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Unpaused(address) event"
+
+[table.vlsquill__unpaused.columns]
+account = "The `account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.vlsquill__upgraded]
+description = "`Upgraded(address)` events emitted by the `vlsquill` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Upgraded(address) event"
+
+[table.vlsquill__upgraded.columns]
+implementation = "The `implementation` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[view]
+
+# Authored views (views/*.sql) are described here so the MCP/`/schema` can render them:
+# [view.your_view_name]
+# description = "What this derivation computes."

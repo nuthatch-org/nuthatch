@@ -25,7 +25,8 @@ A self-hosted blockchain index. Query it locally; there is no third-party API.
 - `GET /queries`             the mount's SQL mode and the queries its operator declared in
                              `mounts.toml` (none on an open nest); `GET /q/{name}` runs one
 - `GET /derived`             the nest's incremental entities (`entities.toml`); `GET /derived/{entity}` reads one
+- `GET /diff?from=X&to=Y`    what happened in a range (`block=N`, or `tx=0x..&block=N`), as JSON, `format=text` or `markdown`
 
 ## MCP (for coding agents)
-Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, entity,
+Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, entity, diff,
 balance, top_balances. Fully offline against the local instance; nothing phones home.

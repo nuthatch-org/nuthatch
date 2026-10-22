@@ -1,0 +1,71 @@
+# RFC-0071 step 3's control-plane fixture: mainnet blocks 26,241,000 to 26,243,100, which hold a
+# Paused and an Unpaused, two proxies' AdminChanged, a RoleAdminChanged, and one transaction that
+# deploys an upgradeable system (Upgraded, OwnershipTransferred, RoleGranted, RoleRevoked). LINK and
+# the ENS registrar are indexed beside them for movements and approvals. Sealed by `bench backfill
+# --seal-direct`; tests/diff_range.rs tells its story and compares it with golden/.
+[nest]
+name = "control-plane"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.mevblocker.io", "https://eth.drpc.org", "https://1rpc.io/eth"]
+schema_version = 2
+
+[[contracts]]
+alias = "link"
+address = "0x514910771af9ca656af840dff83e8264ecf986ca"
+start_block = 26241000
+abi = "abis/erc20.json"
+
+[[contracts]]
+alias = "ens"
+address = "0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85"
+start_block = 26241000
+abi = "abis/erc721.json"
+
+[[contracts]]
+alias = "pausable"
+address = "0xebcb31a8465d6130c744c41060e7dcbfa17d1d8a"
+start_block = 26241000
+abi = "abis/control.json"
+
+[[contracts]]
+alias = "proxy_a"
+address = "0x9bdabf038eeaea56abc17a3b4b9c39e447cba57f"
+start_block = 26241000
+abi = "abis/control.json"
+
+[[contracts]]
+alias = "proxy_b"
+address = "0x0ed0c116a099b4e626499dc83a6e6799bdad1000"
+start_block = 26241000
+abi = "abis/control.json"
+
+[[contracts]]
+alias = "roles"
+address = "0xdd2a05fc735c4bc72f9da845c1a5109147d89136"
+start_block = 26241000
+abi = "abis/control.json"
+
+[[contracts]]
+alias = "vlsquill"
+address = "0x60e71dd36fa5bf92bcd9320e85cf0040ffe437bc"
+start_block = 26241000
+abi = "abis/control.json"
+
+[[contracts]]
+alias = "deploy_b"
+address = "0x3d5297b22b54d37df8da84e8951f711512a884fc"
+start_block = 26241000
+abi = "abis/control.json"
+
+[[contracts]]
+alias = "deploy_c"
+address = "0x8997c2469deedade760f84e9328baa2adede426c"
+start_block = 26241000
+abi = "abis/control.json"
+
+[[contracts]]
+alias = "proxy_admin"
+address = "0xfe05b05a60f34ae974cf6876809fa18f43dba4d1"
+start_block = 26241000
+abi = "abis/control.json"

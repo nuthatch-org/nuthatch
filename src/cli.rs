@@ -61,8 +61,9 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Run a nest's invariant/parity checks (`checks/*.sql`) against recorded expected results.
     Check(CheckArgs),
-    /// Draw the token flow of a transaction, a block or a block range: who sent what to whom, exactly
-    /// (RFC-0071). Read-only, from the rows the nest already holds.
+    /// What happened in a block range, a block or a transaction, in fixed sentences: ownership,
+    /// pauses, upgrades and roles, movements, new holders, approvals (RFC-0071). `--flow` draws the
+    /// token flow. Read-only, from the rows the nest already holds.
     Diff(DiffArgs),
     /// Regenerate the derived artifacts (`schema.json`, `llms.txt`, `semantic.toml` footguns) from
     /// `nuthatch.toml` - run after hand-editing the config (e.g. adding a factory `[[template]]`), so
@@ -1131,11 +1132,10 @@ pub struct SqlArgs {
 }
 
 #[derive(Args)]
-#[command(group(clap::ArgGroup::new("what").required(true).multiple(true).args(["tx", "block", "from"])))]
+#[command(group(clap::ArgGroup::new("what").required(true).multiple(true).args(["tx", "block", "from", "since_last"])))]
 pub struct DiffArgs {
-    /// Draw the token flow: one edge per (from, to, token) with the exact amount, and each address's
-    /// net flow. Every other table follows, told by its `story` line in semantic.toml or grouped by
-    /// its indexed parameters. The only mode built so far (RFC-0071 §15); the range story comes later.
+    /// Draw the token flow instead of telling the story: one edge per (from, to, token) with the
+    /// exact amount, and each address's net flow, then every other table told or grouped.
     #[arg(long)]
     pub flow: bool,
 
@@ -1156,14 +1156,26 @@ pub struct DiffArgs {
     #[arg(long, requires = "from")]
     pub to: Option<u64>,
 
-    /// `text`, `json` (the document every other format is drawn from), `dot` or `mermaid`.
+    /// From the block after the previous --since-last diff of this nest up to the sealed boundary.
+    /// The cursor is kept in $XDG_STATE_HOME/nuthatch/diff/ (else ~/.local/state), keyed by the
+    /// nest's data identity, never in the nest directory.
+    #[arg(long, conflicts_with_all = ["tx", "block", "from", "to"])]
+    pub since_last: bool,
+
+    /// Refuse a range that reaches above the sealed boundary, rather than label it provisional.
+    #[arg(long)]
+    pub final_only: bool,
+
+    /// `text`, `markdown`, `json` (the document every other format is drawn from), and for --flow
+    /// `dot` or `mermaid`.
     #[arg(long, value_enum, default_value_t = crate::diff::Format::Text)]
     pub format: crate::diff::Format,
 
-    /// Edges per token, and addresses per token in the net flow, that text, DOT and Mermaid show;
-    /// JSON carries every one. Also the sentences told per story table, in every format.
-    #[arg(long, default_value_t = crate::diff::DEFAULT_TOP)]
-    pub top: usize,
+    /// Items per list: transfers, addresses and approvals per token, and sentences per table
+    /// (default 10). With --flow, edges and net-flow addresses per token in text, DOT and Mermaid,
+    /// where JSON carries every one (default 25).
+    #[arg(long)]
+    pub top: Option<usize>,
 
     /// Nest directory. Read directly when it holds a store no `nuthatch dev` has open; its
     /// `metadata.json` and labels are read either way.

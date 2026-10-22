@@ -1,0 +1,58 @@
+Transaction 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e in block 26,243,031 on mainnet (chain 1).
+Nest control-plane, data identity 03760f3318a05cb7201fe0283a5c3a2dbe5cc431574c694bb9393578a2e9c2ba. 19 rows in range across 11 tables.
+All final: sealed through 26,243,100.
+
+Control plane: every ownership, admin, role, pause and upgrade event, uncapped
+  block 26,243,031 log 343 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): Upgraded at 0x60e71dd36fa5bf92bcd9320e85cf0040ffe437bc [vlsquill]: implementation upgraded to 0xe5c008a545206df87f5323f12dbb96282f3aecc1
+  block 26,243,031 log 344 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): OwnershipTransferred at 0xfe05b05a60f34ae974cf6876809fa18f43dba4d1 [proxy_admin]: owner changed from 0x0000000000000000000000000000000000000000 (zero address) to 0x4292433c772958ae93bebf32602ffde0f9c5fcd6
+  block 26,243,031 log 345 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): OwnershipTransferred at 0xfe05b05a60f34ae974cf6876809fa18f43dba4d1 [proxy_admin]: owner changed from 0x4292433c772958ae93bebf32602ffde0f9c5fcd6 to 0x0000000000000000000000000000000000000000 (zero address)
+  block 26,243,031 log 346 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): RoleGranted at 0x60e71dd36fa5bf92bcd9320e85cf0040ffe437bc [vlsquill]: role DEFAULT_ADMIN_ROLE (0x0000000000000000000000000000000000000000000000000000000000000000) granted to 0x4292433c772958ae93bebf32602ffde0f9c5fcd6 by 0x4292433c772958ae93bebf32602ffde0f9c5fcd6
+  block 26,243,031 log 353 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): Upgraded at 0x3d5297b22b54d37df8da84e8951f711512a884fc [deploy_b]: implementation upgraded to 0xd2c3d88c07d7c9cc6e4db353c9971e33d98a8d28
+  block 26,243,031 log 354 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): RoleGranted at 0x3d5297b22b54d37df8da84e8951f711512a884fc [deploy_b]: role DEFAULT_ADMIN_ROLE (0x0000000000000000000000000000000000000000000000000000000000000000) granted to 0x3d5297b22b54d37df8da84e8951f711512a884fc [deploy_b] by 0x4292433c772958ae93bebf32602ffde0f9c5fcd6
+  block 26,243,031 log 355 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): RoleGranted at 0x3d5297b22b54d37df8da84e8951f711512a884fc [deploy_b]: role DEFAULT_ADMIN_ROLE (0x0000000000000000000000000000000000000000000000000000000000000000) granted to 0x4292433c772958ae93bebf32602ffde0f9c5fcd6 by 0x4292433c772958ae93bebf32602ffde0f9c5fcd6
+  block 26,243,031 log 359 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): Upgraded at 0x8997c2469deedade760f84e9328baa2adede426c [deploy_c]: implementation upgraded to 0x55b58937b25d8540fb1d35c9eff1a53edc18cd5c
+  block 26,243,031 log 371 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): RoleGranted at 0x3d5297b22b54d37df8da84e8951f711512a884fc [deploy_b]: role 0xb09aa5aeb3702cfd50b6b62bc4532604938f21248a27a1d5ca736082b6819cc1 granted to 0x8997c2469deedade760f84e9328baa2adede426c [deploy_c] by 0x4292433c772958ae93bebf32602ffde0f9c5fcd6
+  block 26,243,031 log 372 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): RoleGranted at 0x3d5297b22b54d37df8da84e8951f711512a884fc [deploy_b]: role 0xd8aa0f3194971a2a116679f7c2090f6939c8d4e01a2a8d7e41d55e5351469e63 granted to 0x8997c2469deedade760f84e9328baa2adede426c [deploy_c] by 0x4292433c772958ae93bebf32602ffde0f9c5fcd6
+  block 26,243,031 log 373 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): RoleGranted at 0x3d5297b22b54d37df8da84e8951f711512a884fc [deploy_b]: role 0xfd643c72710c63c0180259aba6b2d05451e3591a24e58b62239378085726f783 granted to 0x8997c2469deedade760f84e9328baa2adede426c [deploy_c] by 0x4292433c772958ae93bebf32602ffde0f9c5fcd6
+  block 26,243,031 log 374 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): RoleGranted at 0x3d5297b22b54d37df8da84e8951f711512a884fc [deploy_b]: role 0xfd643c72710c63c0180259aba6b2d05451e3591a24e58b62239378085726f783 granted to 0xb432b0cf55df8d8f367d965a23198ccdaacc4b1f by 0x4292433c772958ae93bebf32602ffde0f9c5fcd6
+  block 26,243,031 log 375 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): RoleGranted at 0x3d5297b22b54d37df8da84e8951f711512a884fc [deploy_b]: role 0xfd643c72710c63c0180259aba6b2d05451e3591a24e58b62239378085726f783 granted to 0xde3b1a502a6f25b92434a00c4169b195b2f1528c by 0x4292433c772958ae93bebf32602ffde0f9c5fcd6
+  block 26,243,031 log 376 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): RoleRevoked at 0x3d5297b22b54d37df8da84e8951f711512a884fc [deploy_b]: role DEFAULT_ADMIN_ROLE (0x0000000000000000000000000000000000000000000000000000000000000000) revoked from 0x4292433c772958ae93bebf32602ffde0f9c5fcd6 by 0x4292433c772958ae93bebf32602ffde0f9c5fcd6
+  block 26,243,031 log 377 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): RoleGranted at 0x60e71dd36fa5bf92bcd9320e85cf0040ffe437bc [vlsquill]: role DEFAULT_ADMIN_ROLE (0x0000000000000000000000000000000000000000000000000000000000000000) granted to 0x3d5297b22b54d37df8da84e8951f711512a884fc [deploy_b] by 0x4292433c772958ae93bebf32602ffde0f9c5fcd6
+  block 26,243,031 log 378 (tx 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e): RoleRevoked at 0x60e71dd36fa5bf92bcd9320e85cf0040ffe437bc [vlsquill]: role DEFAULT_ADMIN_ROLE (0x0000000000000000000000000000000000000000000000000000000000000000) revoked from 0x4292433c772958ae93bebf32602ffde0f9c5fcd6 by 0x4292433c772958ae93bebf32602ffde0f9c5fcd6
+
+Largest movements, per token (amounts of two tokens are never compared)
+  No token movements in range.
+
+New holders: no transfer in of the token before block 26,243,031, in this nest's rows since block 26,241,000
+  None: every address that received a token in range had received it before.
+
+First rows: tables whose first row in this nest is in range
+  deploy_b__initialized: first row at block 26,243,031
+  deploy_b__role_granted: first row at block 26,243,031
+  deploy_b__role_revoked: first row at block 26,243,031
+  deploy_b__upgraded: first row at block 26,243,031
+  deploy_c__initialized: first row at block 26,243,031
+  deploy_c__upgraded: first row at block 26,243,031
+  proxy_admin__ownership_transferred: first row at block 26,243,031
+  vlsquill__initialized: first row at block 26,243,031
+  vlsquill__role_granted: first row at block 26,243,031
+  vlsquill__role_revoked: first row at block 26,243,031
+  vlsquill__upgraded: first row at block 26,243,031
+
+Approvals
+  None in range.
+
+Flags and labels
+  Threshold flags: not configured for this nest.
+  Labelled addresses seen: none.
+
+Other events in range, not part of the flow: 3 rows in 3 tables, 0 of them told by a story line.
+  deploy_b__initialized, Initialized(uint64): 1 row in block 26,243,031, from 1 contract
+  deploy_c__initialized, Initialized(uint64): 1 row in block 26,243,031, from 1 contract
+  vlsquill__initialized, Initialized(uint64): 1 row in block 26,243,031, from 1 contract
+Not seen by this nest: native ETH, internal calls, tokens it does not index, and any balance change made without one of these events (a rebase, for one). Net flow is the sum of the transfers seen, not a balance.
+
+nuthatch {version}; data identity 03760f3318a05cb7201fe0283a5c3a2dbe5cc431574c694bb9393578a2e9c2ba; sealed through 26,243,100.
+First row read: block 26,243,031 log 343 (0x0ad2bd8601f67c9bb85ea9be31845b97cf7bc90818e91bf2c5d42558d2962a2e). Last: block 26,243,031 log 378 (0x0ad2bd8601f67c9bb85ea9be31845b97cf7bc90818e91bf2c5d42558d2962a2e).
+metadata.json: sha256 34feba9edbf8c6d28119142dfc5990eb1a914d7ab1bec33465a20ee1b1e58c2a. Label snapshots: 2d67934b23d3623ba99b201ddc36004d9eb06739eb54de8e379830a9aefcbda2.
+semantic.toml: sha256 d9b9728e18c5af8e1248ecba9a4f7fe3011bec823de5f35351f944e84a42b0a7.

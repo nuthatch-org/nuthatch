@@ -33,6 +33,8 @@ mod cors_reaches_the_bind;
 mod deploy_nest_script;
 #[path = "diff_flow.rs"]
 mod diff_flow;
+#[path = "diff_range.rs"]
+mod diff_range;
 #[path = "diff_story.rs"]
 mod diff_story;
 #[path = "doc_command_check.rs"]

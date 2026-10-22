@@ -49,7 +49,7 @@ pub(crate) fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/diff/euler")
 }
 
-fn copy_dir(from: &Path, to: &Path) {
+pub(crate) fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap() {
         let e = e.unwrap();
@@ -225,12 +225,4 @@ fn a_tx_with_no_block_and_no_answering_rpc_names_block() {
     );
     assert!(!ok);
     assert!(err.contains("--block"), "{err}");
-}
-
-#[test]
-fn without_flow_only_the_built_mode_is_named() {
-    let nest = nest();
-    let (ok, _, err) = diff(nest.path(), &["--block", "16817996"]);
-    assert!(!ok);
-    assert!(err.contains("add --flow"), "{err}");
 }

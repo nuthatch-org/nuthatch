@@ -93,13 +93,29 @@ Each nest is isolated (own store, own reorg blast radius) but shares its cursor'
 per-cursor RAM budget (`max_rss_mb`, default 2048) refuses a mount projected to blow it; `GET /nests`
 reports the projection per runtime and per mount.
 
-## Trace where the tokens went (RFC-0071)
+## What happened, and where the tokens went (RFC-0071)
 
 ```sh
 nuthatch metadata fetch                                       # once: decimals and symbols
+nuthatch diff --from 16818024 --to 16818085                   # the range story
+nuthatch diff --since-last --format markdown                  # everything sealed since the last run
 nuthatch diff --flow --tx 0xHASH --block 16817996             # one transaction, every transfer in log order
 nuthatch diff --flow --from 16818024 --to 16818057 --format dot > flow.dot
 ```
+
+Without `--flow`, `diff` tells the range in a fixed order: every control-plane event (ownership,
+pause, upgrade, `AdminChanged`, roles) in chain order and never capped; per token the `--top`
+largest transfers and net flows; new holders (no transfer in of the token before the range, among
+the rows this nest holds); ERC-20 approvals with 2^256-1 named as unlimited, then ERC-721
+approvals; threshold flags and every labelled address seen; then every other table, told or
+grouped as below. Each standard event is matched by topic0 and parameter shape, never by name.
+New holders read the token's history before the range, and above 20,000,000 such rows the section
+is omitted with that count rather than computed slowly. `--since-last` runs from the block after the
+previous one to the sealed boundary and keeps its cursor in `$XDG_STATE_HOME/nuthatch/diff/` (or
+`~/.local/state`), never in the nest directory, whose files count towards the NID. A range above the
+sealed boundary is labelled provisional (`"final": false`); `--final-only` refuses it instead.
+`text` and `markdown` are rendered from the `json` document, which is what `GET /diff` and the MCP
+`diff` tool return byte for byte.
 
 The flow reads ERC-20 `Transfer` rows, matched by event signature and parameter position, never by
 name, and `Deposit`/`Withdrawal` as transfers from and to the zero address only when emitted by the

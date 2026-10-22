@@ -450,6 +450,7 @@ pub fn router(backing: SharedNest) -> Router {
             .route("/ipfs/gave-up", get(ipfs_gave_up))
             .route("/entity/{id}", get(entity))
             .route("/sql", get(sql))
+            .route("/diff", get(diff_route))
             .route("/explain", get(explain))
             .route("/queries", get(queries))
             .route("/q/{name}", get(named_query))
@@ -4851,6 +4852,232 @@ async fn run_sql_query_at(
         Ok(Err(e)) => sql_error_response(&s, e, &q.q),
         Err(e) => error(format!("{e}")),
     }
+}
+
+#[derive(Deserialize)]
+struct DiffQuery {
+    from: Option<u64>,
+    to: Option<u64>,
+    block: Option<u64>,
+    tx: Option<String>,
+    #[serde(default)]
+    flow: bool,
+    top: Option<usize>,
+    #[serde(default)]
+    final_only: bool,
+    format: Option<String>,
+}
+
+impl DiffQuery {
+    fn ask(&self) -> std::result::Result<(crate::diff::Ask, crate::diff::Format), String> {
+        use crate::diff::{Ask, Format, Mode, Request};
+        let tx = match &self.tx {
+            Some(t) => {
+                let t = t.to_ascii_lowercase();
+                let hex = t.strip_prefix("0x").unwrap_or("");
+                if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!(
+                        "tx={t} is not a transaction hash (0x and 64 hex digits)"
+                    ));
+                }
+                Some(t)
+            }
+            None => None,
+        };
+        let (from, to) = match (self.block, self.from, self.to) {
+            (Some(b), None, None) => (b, b),
+            (None, Some(f), Some(t)) if tx.is_none() => (f, t),
+            (None, None, None) if tx.is_some() => {
+                return Err(
+                    "tx needs its block: this route makes no RPC call, so pass block".into(),
+                )
+            }
+            _ => return Err("name what to diff: block, from with to, or tx with block".into()),
+        };
+        let format = match self.format.as_deref().unwrap_or("json") {
+            "json" => Format::Json,
+            "text" => Format::Text,
+            "markdown" => Format::Markdown,
+            "dot" => Format::Dot,
+            "mermaid" => Format::Mermaid,
+            other => {
+                return Err(format!(
+                    "format={other}: want json, text, markdown, dot or mermaid"
+                ))
+            }
+        };
+        let mode = if self.flow { Mode::Flow } else { Mode::Story };
+        Ok((
+            Ask {
+                req: Request { from, to, tx },
+                mode,
+                top: Ask::top_or_default(mode, self.top),
+                final_only: self.final_only,
+            },
+            format,
+        ))
+    }
+}
+
+/// The rows a `/diff` reads: one hot snapshot and one sealed watermark for every query of the diff,
+/// under the deadline `/sql` gives one query.
+struct DiffSource {
+    dir: PathBuf,
+    hot: Arc<crate::analytics::HotRows>,
+    tip_unavailable: bool,
+    sealed_through: u64,
+    tables: Arc<Vec<TableSchema>>,
+    deadline: std::time::Instant,
+}
+
+impl crate::diff::Source for DiffSource {
+    async fn query(&self, sql: &str) -> Result<crate::analytics::QueryOutput> {
+        let left = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(crate::analytics::QueryBudgetExceeded {
+                secs: SQL_TIMEOUT.as_secs(),
+            }
+            .into());
+        }
+        let (dir, hot, tables, sql) = (
+            self.dir.clone(),
+            self.hot.clone(),
+            self.tables.clone(),
+            sql.to_string(),
+        );
+        let sealed_through = self.sealed_through;
+        let mut out = tokio::task::spawn_blocking(move || {
+            analytics::query_hot_cold(
+                &dir,
+                &sql,
+                analytics::QueryGuard {
+                    timeout: left,
+                    max_rows: SQL_MAX_ROWS,
+                },
+                &hot,
+                sealed_through,
+                &tables,
+            )
+        })
+        .await??;
+        out.tip_unavailable = self.tip_unavailable;
+        Ok(out)
+    }
+}
+
+/// `GET /diff` (RFC-0071 §3): the same document `nuthatch diff --format json` prints for the same
+/// request, or its text or Markdown. One analytical permit is held for the whole diff, its hot rows
+/// are bounded as `/sql`'s are, and all its queries share `/sql`'s per-query deadline.
+async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> impl IntoResponse {
+    use crate::metrics::METRICS;
+    // A bounded mount answers only declared queries, and a diff reads every table.
+    if !s.surface.free_form_allowed() {
+        return refuse_free_form(&s.surface);
+    }
+    let (ask, format) = match q.ask() {
+        Ok(a) => a,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response();
+        }
+    };
+    let permit = match admit(&s).await {
+        Ok(p) => p,
+        Err(busy) => return busy,
+    };
+    METRICS.inc_sql();
+    let deadline = std::time::Instant::now() + SQL_TIMEOUT;
+    let st = s.clone();
+    let gathered = tokio::task::spawn_blocking(move || {
+        let (hot, tip_unavailable) = match st
+            .store
+            .hot_rows_by_table_bounded_with_bytes(st.sql_max_hot_rows, st.sql_max_hot_bytes)
+        {
+            Ok(snapshot) => (snapshot.rows, false),
+            Err(e)
+                if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
+                    || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
+                        .is_some() =>
+            {
+                return Err(e)
+            }
+            Err(e) => {
+                tracing::error!("hot-tip scan failed - refusing this diff: {e:#}");
+                (Default::default(), true)
+            }
+        };
+        let sealed_through = st.store.sealed_through();
+        let info = &st.nest_info;
+        let facts = crate::diff::Facts {
+            name: info["name"].as_str().unwrap_or_default().to_string(),
+            chain: info["chain"].as_str().unwrap_or_default().to_string(),
+            chain_id: info["chain_id"].as_u64(),
+            data_identity: info["data_identity"].as_str().map(str::to_string),
+            aliases: info["contracts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| {
+                    Some((
+                        c["address"].as_str()?.to_ascii_lowercase(),
+                        c["alias"].as_str()?.to_string(),
+                    ))
+                })
+                .collect(),
+            start_block: crate::config::Config::load(&st.dir)
+                .ok()
+                .and_then(|c| c.contracts.iter().filter_map(|c| c.start_block).min()),
+            threshold: st.threshold,
+        };
+        let mut ctx = crate::diff::NestContext::gather(&st.dir, st.store.as_ref(), facts)?;
+        ctx.sealed_through = sealed_through;
+        let stories = crate::diff::stories(&st.dir, &st.tables)?;
+        Ok((hot, tip_unavailable, sealed_through, ctx, stories))
+    })
+    .await;
+    let (hot, tip_unavailable, sealed_through, ctx, (stories, warnings)) = match gathered {
+        Ok(Ok(g)) => g,
+        Ok(Err(e)) => return sql_error_response(&s, e, ""),
+        Err(e) => return error(format!("{e}")),
+    };
+    let src = DiffSource {
+        dir: s.dir.clone(),
+        hot: Arc::new(hot),
+        tip_unavailable,
+        sealed_through,
+        tables: s.tables.clone(),
+        deadline,
+    };
+    let inputs = crate::diff::Inputs {
+        tables: &s.tables,
+        ctx: &ctx,
+        stories: &stories,
+        warnings,
+    };
+    let produced = crate::diff::produce(&src, inputs, &ask).await;
+    drop(permit);
+    let body = match produced.and_then(|p| p.render(format, ask.top)) {
+        Ok(b) => b,
+        Err(e) => {
+            if let Some(cut) = e.downcast_ref::<crate::analytics::QueryBudgetExceeded>() {
+                METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Timeout);
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(json!({ "error": format!("the diff exceeded its {}s budget: {cut}", SQL_TIMEOUT.as_secs()) })),
+                )
+                    .into_response();
+            }
+            let raw = sanitize_sql_error(&format!("{e:#}"), &s.dir);
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": raw }))).into_response();
+        }
+    };
+    let ctype = match format {
+        crate::diff::Format::Json => "application/json",
+        crate::diff::Format::Markdown => "text/markdown; charset=utf-8",
+        _ => "text/plain; charset=utf-8",
+    };
+    ([(axum::http::header::CONTENT_TYPE, ctype)], body).into_response()
 }
 
 fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::response::Response {

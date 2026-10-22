@@ -1,0 +1,77 @@
+# Transaction 0xc310a0affe2169d1f6feec1c63dbc7f7c62a887fa48795d327d4d2da2d6b111d in block 16,817,996 on mainnet (chain 1).
+
+Nest euler-exploit, data identity 7d7681b43831b5ef2cd1b7ed04773f83ade3324b7b71412cbb20765e14c29e28. 21 rows in range across 4 tables.  
+All final: sealed through 16,818,085.  
+
+## Control plane: every ownership, admin, role, pause and upgrade event, uncapped
+
+- None in range.
+
+## Largest movements, per token (amounts of two tokens are never compared)
+
+- DAI 0x6b175474e89094c44da98b954eedeac495271d0f (18 decimals): 7 movements among 5 addresses
+  - Largest transfers
+    - block 16,817,996 log 46: 0x27182842e098f60e3d576794a5bffb0777e025d3 -\> 0xa0b3ee897f233f385e5d61086c32685257d4f12b: 38,904,507.348306697267428294 DAI
+    - block 16,817,996 log 50: 0xa0b3ee897f233f385e5d61086c32685257d4f12b -\> 0xebc29199c817dc47ba12e3f86102564d640cbf99: 38,904,507.348306697267428294 DAI
+    - block 16,817,996 log 54: 0xebc29199c817dc47ba12e3f86102564d640cbf99 -\> 0x028171bca77440897b824ca71d1c56cac55b68a3: 30,027,000 DAI
+    - block 16,817,996 log 0: 0x028171bca77440897b824ca71d1c56cac55b68a3 -\> 0xebc29199c817dc47ba12e3f86102564d640cbf99: 30,000,000 DAI
+    - block 16,817,996 log 2: 0xebc29199c817dc47ba12e3f86102564d640cbf99 -\> 0x583c21631c48d442b5c0e605d624f54a0b366c72: 30,000,000 DAI
+    - block 16,817,996 log 5: 0x583c21631c48d442b5c0e605d624f54a0b366c72 -\> 0x27182842e098f60e3d576794a5bffb0777e025d3: 20,000,000 DAI
+    - block 16,817,996 log 17: 0x583c21631c48d442b5c0e605d624f54a0b366c72 -\> 0x27182842e098f60e3d576794a5bffb0777e025d3: 10,000,000 DAI
+  - Largest net flow of the transfers seen (not a balance)
+    - 0x27182842e098f60e3d576794a5bffb0777e025d3  -8,904,507.348306697267428294 DAI
+    - 0xebc29199c817dc47ba12e3f86102564d640cbf99  +8,877,507.348306697267428294 DAI
+    - 0x028171bca77440897b824ca71d1c56cac55b68a3  +27,000 DAI
+    - 2 addresses netted to exactly zero
+- dDAI 0x6085bc95f506c326dcbcd7a6dd6c79fbc18d4686 (18 decimals): 6 movements among 3 addresses
+  - Largest transfers
+    - block 16,817,996 log 34: 0x583c21631c48d442b5c0e605d624f54a0b366c72 -\> 0x0000000000000000000000000000000000000000 (zero address): 254,234,370.990601202559999999 dDAI
+    - block 16,817,996 log 36: 0x0000000000000000000000000000000000000000 (zero address) -\> 0xa0b3ee897f233f385e5d61086c32685257d4f12b: 254,234,370.990601202559999999 dDAI
+    - block 16,817,996 log 14: 0x0000000000000000000000000000000000000000 (zero address) -\> 0x583c21631c48d442b5c0e605d624f54a0b366c72: 200,000,000 dDAI
+    - block 16,817,996 log 25: 0x0000000000000000000000000000000000000000 (zero address) -\> 0x583c21631c48d442b5c0e605d624f54a0b366c72: 200,000,000 dDAI
+    - block 16,817,996 log 19: 0x583c21631c48d442b5c0e605d624f54a0b366c72 -\> 0x0000000000000000000000000000000000000000 (zero address): 10,000,000 dDAI
+    - block 16,817,996 log 38: 0x0000000000000000000000000000000000000000 (zero address) -\> 0xa0b3ee897f233f385e5d61086c32685257d4f12b: 5,084,687.419812024051199999 dDAI
+  - Largest net flow of the transfers seen (not a balance)
+    - 0x0000000000000000000000000000000000000000 (zero address)  -395,084,687.419812024051199999 dDAI
+    - 0xa0b3ee897f233f385e5d61086c32685257d4f12b  +259,319,058.410413226611199998 dDAI
+    - 0x583c21631c48d442b5c0e605d624f54a0b366c72  +135,765,629.009398797440000001 dDAI
+- eDAI 0xe025e3ca2be02316033184551d4d3aa22024d9dc (18 decimals): 6 movements among 3 addresses
+  - Largest transfers
+    - block 16,817,996 log 42: 0x583c21631c48d442b5c0e605d624f54a0b366c72 -\> 0xa0b3ee897f233f385e5d61086c32685257d4f12b: 310,930,612.374274603970808264 eDAI
+    - block 16,817,996 log 11: 0x0000000000000000000000000000000000000000 (zero address) -\> 0x583c21631c48d442b5c0e605d624f54a0b366c72: 195,681,243.987749811414670603 eDAI
+    - block 16,817,996 log 23: 0x0000000000000000000000000000000000000000 (zero address) -\> 0x583c21631c48d442b5c0e605d624f54a0b366c72: 195,681,243.987749811414670603 eDAI
+    - block 16,817,996 log 29: 0x583c21631c48d442b5c0e605d624f54a0b366c72 -\> 0x0000000000000000000000000000000000000000 (zero address): 100,000,000 eDAI
+    - block 16,817,996 log 48: 0xa0b3ee897f233f385e5d61086c32685257d4f12b -\> 0x0000000000000000000000000000000000000000 (zero address): 38,064,411.973236041314928395 eDAI
+    - block 16,817,996 log 7: 0x0000000000000000000000000000000000000000 (zero address) -\> 0x583c21631c48d442b5c0e605d624f54a0b366c72: 19,568,124.39877498114146706 eDAI
+  - Largest net flow of the transfers seen (not a balance)
+    - 0x0000000000000000000000000000000000000000 (zero address)  -272,866,200.401038562655879871 eDAI
+    - 0xa0b3ee897f233f385e5d61086c32685257d4f12b  +272,866,200.401038562655879869 eDAI
+    - 0x583c21631c48d442b5c0e605d624f54a0b366c72  +0.000000000000000002 eDAI
+
+## New holders: no transfer in of the token before block 16,817,996, in this nest's rows since block 16,817,996
+
+- Not counted: the range begins at this nest's first indexed block, 16,817,996, so the nest holds no earlier transfer to tell a new holder from an old one.
+
+## First rows: tables whose first row in this nest is in range
+
+- Not counted: the range begins at this nest's first indexed block, 16,817,996.
+
+## Approvals
+
+- DAI 0x6b175474e89094c44da98b954eedeac495271d0f (18 decimals): 2 approvals, 2 unlimited
+  - block 16,817,996 log 1: 0xebc29199c817dc47ba12e3f86102564d640cbf99 approved 0x7d2768de32b0b80b7a3454c06bdac94a69ddc7a9 to spend any amount of DAI (unlimited: 2^256-1)
+  - block 16,817,996 log 3: 0x583c21631c48d442b5c0e605d624f54a0b366c72 approved 0x27182842e098f60e3d576794a5bffb0777e025d3 to spend any amount of DAI (unlimited: 2^256-1)
+
+## Flags and labels
+
+- Threshold flags: not configured for this nest.
+- Labelled addresses seen: none.
+
+## Other events in range: none.
+
+Not seen by this nest: native ETH, internal calls, tokens it does not index, and any balance change made without one of these events (a rebase, for one). Net flow is the sum of the transfers seen, not a balance.
+
+nuthatch {version}; data identity 7d7681b43831b5ef2cd1b7ed04773f83ade3324b7b71412cbb20765e14c29e28; sealed through 16,818,085.  
+First row read: block 16,817,996 log 0 (0xde714b65354d54e684a95d80a1da7f668e8b2ee6ae8b5779f69ab9e04468b859). Last: block 16,817,996 log 54 (0xde714b65354d54e684a95d80a1da7f668e8b2ee6ae8b5779f69ab9e04468b859).  
+metadata.json: sha256 784e641498908da5d8a649b38f122c815ecaa29e687edfe7b88cc9acab2f34cb. Label snapshots: none.  
+semantic.toml: absent.  
