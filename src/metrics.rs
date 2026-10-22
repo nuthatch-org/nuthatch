@@ -363,6 +363,9 @@ impl NestMetrics {
         self.rows_sealed.fetch_add(n, Relaxed);
         METRICS.add_rows_sealed(n);
     }
+    pub fn rows_sealed(&self) -> u64 {
+        self.rows_sealed.load(Relaxed)
+    }
     pub fn inc_reorgs(&self) {
         self.reorgs.fetch_add(1, Relaxed);
         METRICS.inc_reorgs();
