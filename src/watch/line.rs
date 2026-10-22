@@ -1,6 +1,7 @@
 //! The line mode (RFC-0069 §9): with no terminal to draw on, one logfmt line per nest per interval,
 //! every number exactly as the endpoint served it and `NO SIGNAL` where it served nothing.
 
+use super::series;
 use super::state::{App, RouteState};
 
 pub const NO_SIGNAL: &str = "\"NO SIGNAL\"";
@@ -71,7 +72,7 @@ fn nest_line(
 }
 
 fn process_fields(app: &App) -> String {
-    let rss = app.metric("nuthatch_rss_bytes", &[]).map(|v| v as u64);
+    let rss = app.metric(series::RSS, &[]).map(|v| v as u64);
     let budget = app.budget_bytes().map(|v| v as u64);
     let rpc = app
         .rpc_up()

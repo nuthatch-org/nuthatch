@@ -488,9 +488,13 @@ Query a nest's data with SQL - the live tip and sealed history, one surface. Pri
 
 Watch a running nest from the terminal: the tip, the seal, memory against its budget, RPC endpoints. Read-only; it reads the endpoints the nest already serves (RFC-0069)
 
-- `--url <URL>` - The nest's API: a solo `dev`, or a runtime's root, whose mounts are each watched
-- `--interval <INTERVAL>` - Seconds between lines. Defaults to the nest's own poll interval, held between 2 and 30 s
-- `--record <RECORD>` - Append every body read to this file, one JSON object per line
+- `--url <URL>` - The nest's API: a solo `dev`, or a runtime's root, whose mounts are each watched. Defaults to http://127.0.0.1:8288, or to the named nest's
+- `--ssh <SSH>` - Reach the nest through an ssh forward to this host, for a nest bound to loopback there. Runs `ssh -N -L` in batch mode and reopens it if it drops
+- `--nest <NEST>` - Take --url and --ssh from this entry in ~/.config/nuthatch/watch.toml. With no target named and nests configured there, the screen offers the list
+- `--interval <INTERVAL>` - Seconds between reads (and between lines when piped). By default the screen reads `/ready` every second and `/metrics` every two; a line comes every poll interval of the nest, held between 2 and 30 s
+- `--record <RECORD>` - Append every body read to this file, one JSON object per line, for --replay
+- `--replay <REPLAY>` - Draw from a recording made with --record instead of a live nest
+- `--speed <SPEED>` - Replay at this multiple of the recorded pace
 - `--exit-after <EXIT_AFTER>` - Stop after this many seconds
 
 ## `nuthatch worker`

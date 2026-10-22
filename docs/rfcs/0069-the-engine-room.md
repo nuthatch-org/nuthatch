@@ -1,6 +1,6 @@
 # RFC-0069: The engine room - a running nest watched from a terminal
 
-- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI. S0 measured 2026-10-22 (§15): the feature adds 0.30 MiB on macOS and 0.34 MiB on Linux, `cargo deny` stays green, and one watcher leaves tip lag and RSS inside their unwatched spread. Chief watched the clip on 2026-10-22 and said build it, with §14 answered as the RFC recommends. S1 built 2026-10-22 (§16): the line mode, every number equal to the endpoint's in the same read on a solo nest and a two-chain runtime.
+- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI. S0 measured 2026-10-22 (§15): the feature adds 0.30 MiB on macOS and 0.34 MiB on Linux, `cargo deny` stays green, and one watcher leaves tip lag and RSS inside their unwatched spread. Chief watched the clip on 2026-10-22 and said build it, with §14 answered as the RFC recommends. S1 built 2026-10-22 (§16): the line mode, every number equal to the endpoint's in the same read on a solo nest and a two-chain runtime. S2 built 2026-10-22 (§17): the engine room on a terminal, its snapshots from recorded bodies, and one watcher still inside the unwatched spread.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: the endpoints a nest already serves (`/ready`, `/metrics`, `/`, `/nests`, the admin
@@ -445,3 +445,90 @@ mount on mainnet make both visible.
 Not verified in S1: `--no-default-features` beyond the help-group test and a lib build; the line on
 Linux (the client is plain reqwest and tokio, as `nuthatch sql` is); a nest behind a token, since the
 line reads no admin route.
+
+## 17. S2, one cursor's engine room, built 2026-10-22
+
+On a terminal `nuthatch watch` now draws the engine room; piped or under `TERM=dumb` it writes S1's
+line. The `watch` feature gains `ratatui` 0.30.2 (`crossterm`, `layout-cache`), the crates S0 measured.
+New in `src/watch/`: `theme.rs` (the Foundry palette, the only place a colour is named), `screen.rs`
+(the panels), `series.rs` (every `/metrics` name the client reads), `tunnel.rs` and `picker.rs`
+(ported from `nuthatch-tui-client`), and `tests.rs`. THE TIP, THE PRESS, BOILER, FEED LINES and REORG
+are drawn; DISPATCH waits for S3's route. Pointed at a runtime's root, the screen draws one mount at a
+time, `n` and `N` to step, from that mount's `/<name>/ready` and `nest`-labelled series; S4 groups them
+by cursor. `--record` and `--replay` go through the same `App::apply` as a live read.
+
+The recorded bodies are `tests/fixtures/watch/`: 45 s of the `defi-pulse` copy from S1's gate and 45 s
+of the two-chain runtime, each read at 1 s by S1's line mode with every sixth `/metrics` read kept, no
+body edited. `nuthatch-tui-client`'s recorded bodies are 3.10.0's and lack the `nest` label this client reads its
+per-nest series by, so its tests were ported (the ssh forward, the picker, the absent-is-not-zero
+cases) and its bodies were replaced by these.
+
+| Gate | Result |
+|---|---|
+| `TestBackend` snapshots at 120x40, 80x24 and 60x20 from recorded bodies | **Pass**: seven snapshots (solo at the three sizes and 50x16, runtime at the three and its second mount), and a test that reads the tip, indexed block, seal and nest name out of the recording and finds each on the screen, so a snapshot cannot quietly agree with a wrong drawing |
+| `NO_COLOR` output holds no colour escape | **Pass**: both recordings at all three sizes through `CrosstermBackend`, every SGR sequence parsed: no 30-37, 38, 40-47, 48, 58, 90-97 or 100-107. The same screen in truecolour does write them, so the check can see one. The state word stays reversed without colour |
+| No colour literal outside the theme | **Pass**: every file of `src/watch/` but `theme.rs` is free of `Color::`, `Rgb(`, `Indexed(` and escape literals, and a second test fails if a file is added to the module without being listed for the check. A third asserts no cell sets a background and 256-colour mode never uses one of the 16 named colours |
+| Every series the client reads is emitted by `METRICS.render()` | **Pass**: `every_series_the_client_reads_is_emitted` renders a fresh registry with one nest and one RPC call and finds all 16 names in `series::ALL`; `the_watcher_names_series_only_here` fails if a series name appears as a literal anywhere else in the client |
+| S0(b) repeated with the real client, ThinkPad | **Pass**: after-seen p50 18, 19 and 20 ms watched, inside 18 to 20 ms unwatched; RSS median 74,312, 74,188 and 74,524 KiB watched, inside 73,480 to 74,676 KiB unwatched; peaks inside too |
+
+S0(b), repeated as S0 ran it (`tools/rfc-0069-s0/watched-tip-lag.sh`, 100 samples, the footprint
+fixture, `--poll-interval 1s`, the watcher in a 120 by 40 pty at its defaults), with the S2 tree's
+`dist` build, alternating:
+
+| Run | Watched | Watcher reads | After-seen p50 | After-seen p99 | Lag p50 | RSS median | RSS peak |
+|---|---|---|---|---|---|---|---|
+| u1 | no | - | 19 ms | 30 ms | 460 ms | 74,676 KiB | 78,624 KiB |
+| w1 | yes | 287 | 18 ms | 32 ms | 517 ms | 74,312 KiB | 76,948 KiB |
+| u2 | no | - | 20 ms | 32 ms | 541 ms | 73,688 KiB | 76,196 KiB |
+| w2 | yes | 277 | 19 ms | 31 ms | 534 ms | 74,188 KiB | 76,272 KiB |
+| u3 | no | - | 20 ms | 30 ms | 508 ms | 73,480 KiB | 75,620 KiB |
+| w3 | yes | 274 | 20 ms | 31 ms | 453 ms | 74,524 KiB | 78,388 KiB |
+| u4 | no | - | 18 ms | 33 ms | 534 ms | 74,076 KiB | 76,268 KiB |
+
+The watcher read `/ready` and `/` every second and `/metrics` every two, about 2.5 reads a second, as
+in S0. The Linux `dist` binary of this tree is 118,581,200 bytes, 491,680 (0.47 MiB) above S0's
+118,089,520 for the same base without the feature; S0's prototype added 359,136.
+
+Decisions the RFC left open:
+
+1. **Lag in seconds is not drawn** (S0, finding 2): THE TIP shows the poll interval, the age of the
+   last poll and the countdown to the next, counted from the instant `/ready` was read.
+2. **RPC mean latency keeps the last interval that asked anything** (S0, finding 4), with its age
+   beside it, `57 ms 6s`; `-` until an interval has asked.
+3. **`/ready` is read every second regardless of the nest's poll interval**, not stretched to it as §4
+   suggested: the countdown and `STALE` need a fresh read, and S0(b) measured the cost at 1 Hz. `STALE`
+   is no answer from `/ready`, or none for three read periods (at least 5 s).
+4. **The nameplate's name is the `nest` label** (S0, finding 1), and in a runtime the mount's name.
+5. **`watch.toml`, not `nests.toml`.** Named targets live in `~/.config/nuthatch/watch.toml`, same
+   tables as the old client's file less `decimals`, which fed the `/sql` panel and is refused by name.
+   The list is offered only on a terminal, with no `--url`, `--ssh` or `--nest`.
+6. **Below 80 by 24 the panels stack** into one borderless column, strips and hints gone; below 60
+   columns RPC becomes one `up` line and the pool row goes. Inside a panel narrower than 50 columns the
+   long forms shorten and FEED LINES drops its RETRY column (a retry still lights `FAILOVER`).
+7. **The client reads the `nest`-labelled series only**, with no fallback to the process-global ones,
+   so the series test covers everything it reads; a nest too old to label them reads `NO SIGNAL`.
+8. **`/sql` is never read.** The old client's feed is not ported.
+
+Mutations, each applied to the committed tree, shown applied, run, and restored to a clean tree:
+
+| Mutation | Result |
+|---|---|
+| `NO_COLOR` mode still paints the 256-colour index | red: `no_color_writes_no_colour_escape` |
+| One ink's index set to 8, a named ANSI colour | red: `colours_come_from_the_palette` |
+| RPC mean shows `idle` instead of the last interval's figure | red: the solo and runtime snapshots, `rpc_mean_keeps_the_last_interval_that_asked_anything` |
+| `STALE` never fires | red: `a_nest_that_stops_answering_is_stale` |
+| A series named as a literal in `line.rs` | red: `the_watcher_names_series_only_here` |
+| A series renamed in `series.rs` | red: `every_series_the_client_reads_is_emitted`, both snapshot tests |
+| The nameplate named from `/` | red: the solo snapshots, `the_screen_shows_the_recordings_own_figures` |
+| The countdown frozen at the read | red: `the_poll_countdown_runs_between_reads` (the snapshots alone could not see it, so the test was added) |
+| Full layout from 81 columns | red: both snapshot tests |
+| A runtime mount drawn from the root `/ready` | red: `a_runtime_draws_its_selected_mount` |
+| A background set beside every foreground | red: `colours_come_from_the_palette` |
+
+`nuthatch-tui-client` is ready to be archived with a pointer to `nuthatch watch` once this lands;
+it has not been touched.
+
+Not verified in S2: the screen on a real terminal other than through `script` and the snapshots (the
+pty run on the two-chain runtime drew its tips and `mount 1 of 2`); 256-colour mode by eye; the ssh
+forward against a real host (the tests use a stand-in `ssh` that refuses a key or listens with `nc`);
+the picker on a terminal; macOS's watched cost, where `/metrics` forks `ps`.

@@ -1337,7 +1337,27 @@ per-nest `/<name>/ready`; page on the root.**
 ### Watching from a terminal: `nuthatch watch`
 
 `nuthatch watch --url http://127.0.0.1:8288` reads the routes above (`/ready`, `/`, `/metrics`,
-`/nests`) and nothing else (RFC-0069). It writes one logfmt line per nest per interval:
+`/nests`) and nothing else (RFC-0069). On a terminal it draws the engine room: THE TIP (tip, indexed,
+lag in blocks, the age of the last poll and the countdown to the next), THE PRESS (the seal and its
+lag), BOILER (process RSS against 2 GiB per cursor), FEED LINES (each RPC endpoint, with `FAILOVER`
+when a retry landed on it) and REORG. A mark appears only when a counter moved between two reads, and
+a field the nest did not serve reads `NO SIGNAL`, never 0. `NO_COLOR` removes every colour; below 80
+columns the panels stack. Pointed at a runtime's root, `n` and `N` step through its mounts.
+
+`--ssh host` opens an `ssh -N -L` forward in batch mode for a nest bound to loopback on that host,
+and reopens it if it drops. `--nest name` takes `url` and `ssh` from
+`~/.config/nuthatch/watch.toml`, one table per nest; with no target named and nests configured
+there, the screen offers the list first:
+
+```toml
+[lodestar]
+url = "http://127.0.0.1:8288"
+ssh = "helsinki"
+```
+
+`--record file` keeps every body read, and `--replay file` draws from it.
+
+Piped, or under `TERM=dumb`, it writes one logfmt line per nest per interval instead:
 
 ```
 nest=defi-pulse chain=mainnet tip=26249645 lag=0 sealed=26249579 rss=191430656 budget=2147483648 rpc_up=2/2 http_rps=2.0
