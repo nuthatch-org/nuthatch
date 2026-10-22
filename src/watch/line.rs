@@ -20,6 +20,7 @@ fn quoted(v: Option<String>) -> String {
 /// One line per nest: a solo nest's, or each of a runtime's mounts in `/nests` order. Nothing until
 /// `/nests` has said which.
 pub fn lines(app: &App) -> Vec<String> {
+    let app = &app.answered_only();
     let process = process_fields(app);
     if !app.shape_known() {
         return vec![format!(
@@ -157,6 +158,25 @@ mod tests {
                  rss=78000000 budget=2147483648 rpc_up=2/3 http_rps=2.5"
             ]
         );
+    }
+
+    /// A pass where `/ready` and `/metrics` did not answer prints none of the last pass's figures.
+    #[test]
+    fn a_read_that_fails_does_not_reprint_the_last_one() {
+        let mut app = solo(READY, ROOT, METRICS_0, METRICS_1);
+        for r in [
+            read(4000, "/ready", 0, ""),
+            read(4000, "/", 200, ROOT),
+            read(4000, "/nests", 404, "not found"),
+            read(4000, "/metrics", 0, ""),
+        ] {
+            app.apply(&r);
+        }
+        let line = &lines(&app)[0];
+        for key in ["nest", "tip", "lag", "sealed", "rss", "rpc_up", "http_rps"] {
+            assert_eq!(field(line, key), NO_SIGNAL, "{key} in {line}");
+        }
+        assert_eq!(field(line, "chain"), "mainnet");
     }
 
     /// Each field's source taken away in turn: the field says `NO SIGNAL`, never a zero.
