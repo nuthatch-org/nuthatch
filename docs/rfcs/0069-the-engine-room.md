@@ -1,6 +1,6 @@
 # RFC-0069: The engine room - a running nest watched from a terminal
 
-- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI. S0 measured 2026-10-22 (§15): the feature adds 0.30 MiB on macOS and 0.34 MiB on Linux, `cargo deny` stays green, and one watcher leaves tip lag and RSS inside their unwatched spread. Chief watched the clip on 2026-10-22 and said build it, with §14 answered as the RFC recommends. S1 built 2026-10-22 (§16): the line mode, every number equal to the endpoint's in the same read on a solo nest and a two-chain runtime. S2 built 2026-10-22 (§17): the engine room on a terminal, its snapshots from recorded bodies, and one watcher still inside the unwatched spread. S3 built 2026-10-22 (§18): `/_admin/requests` and the reorg depth gauges, with the CI benches unchanged; #2339 fixed. S4 built 2026-10-22 (§19): one engine room per cursor, each with its own chain's tip.
+- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI. S0 measured 2026-10-22 (§15): the feature adds 0.30 MiB on macOS and 0.34 MiB on Linux, `cargo deny` stays green, and one watcher leaves tip lag and RSS inside their unwatched spread. Chief watched the clip on 2026-10-22 and said build it, with §14 answered as the RFC recommends. S1 built 2026-10-22 (§16): the line mode, every number equal to the endpoint's in the same read on a solo nest and a two-chain runtime. S2 built 2026-10-22 (§17): the engine room on a terminal, its snapshots from recorded bodies, and one watcher still inside the unwatched spread. S3 built 2026-10-22 (§18): `/_admin/requests` and the reorg depth gauges, with the CI benches unchanged; #2339 fixed. S4 built 2026-10-22 (§19): one engine room per cursor, each with its own chain's tip. S5 built 2026-10-22 (§20): the tape and a 90 s recording from a live nest, the layout the same against a second fresh nest.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: the endpoints a nest already serves (`/ready`, `/metrics`, `/`, `/nests`, the admin
@@ -653,3 +653,59 @@ does not touch the screen; it did not recur in six further runs. The likeliest c
 
 Not verified in S4: more than two chains; a live runtime with a second tenant (the tenant route is
 tested from constructed bodies); a cursor whose mounts disagree on the tip.
+
+## 20. S5, the recording, built 2026-10-22
+
+`tools/rfc-0069/engine-room.tape` records the engine room live: hidden, it starts a fresh copy of
+`defi-pulse-nest` on `nuthatch dev --backfill 20000 --seal-direct --concurrency 2 --poll-interval 12s`
+over `ethereum-rpc.publicnode.com` and `eth.drpc.org`, waits for `/health`, and starts `traffic.sh`
+sending a few queries a second; shown, it runs `nuthatch watch --record engine-room.jsonl` for 90 s
+at real speed. The clip, the bodies the watcher read and the text of its frames are in
+`tools/rfc-0069/recording/`, whose README is the caption: it names the 12 s poll interval and that
+the default is 300 s. The clip opens on the seal-direct pass, BACKFILL with the seal stamping
+forward, and ends LIVE at the tip.
+
+| Gate | Result |
+|---|---|
+| A vhs tape in the tree, recorded from a real nest, with `--poll-interval` in the caption | **Pass**: the tape, and the recording made from it at 19:03:40 UTC with the release build, against mainnet over public RPCs; the caption gives `--poll-interval 12s` and the 300 s default |
+| Replaying the tape against a fresh nest produces the same screen layout | **Pass**: `tools/rfc-0069/layout-gate.sh` takes the last text frame of each recording, keeps the borders, panel titles and row labels and blanks every reading; the recording above and a second run of the tape against another fresh copy (whose seal-direct pass took 18 s where the first took 59) give the same 44 lines and 26 labels. The gate fails on a relabelled panel, on a moved border, and on a recording with no engine room in it |
+| No figure in the clip is synthetic | **Pass**: every frame is drawn from a body the nest served, kept in `engine-room.jsonl.gz` (318 reads); the 23,670 rows THE PRESS shows are the 23,670 events the nest logged sealing |
+
+Recording it found three things, each fixed and tested in this slice:
+
+1. **`/ready` serves 0 for the tip, the indexed block, the lag and `last_poll_unixtime` while a
+   seal-direct pass runs**, before the cursor has read the chain, and the screen drew `TIP 0` and
+   `LAG 0 blocks`.
+   The client now reads a tip or indexed block of 0, and a poll age beside a `last_poll_unixtime` of
+   0, as not yet read: `NO SIGNAL`, on the screen and on S1's line, and `line-gate.sh` was changed to
+   match. The server still serves the zeroes; whether `/ready` should serve null there instead is a
+   change to a public route, so it is filed as #2342 rather than made here.
+2. **The first block indexed counted as an arrival** of the whole chain's height. An arrival now needs
+   an indexed block before it.
+3. **vhs at its default 50 frames a second could not keep pace** at 1560 by 900 and wrote a 90 s run
+   as 38 s of clip, faster than real time. The tape sets 10 frames a second, and the clip runs 90 s.
+
+The first attempts at a longer backfill failed on public endpoints, which is worth knowing for the
+next recording: 60,000 blocks is past `ethereum-rpc.publicnode.com`'s history ("Archive requests
+require a personal token"), and `1rpc.io` sealed at 42 events a second. 20,000 over publicnode and
+drpc took 59 s and 18 s on two runs.
+
+Mutations, each applied to the committed tree, shown applied, run, and restored to a clean tree:
+
+| Mutation | Result |
+|---|---|
+| A tip of 0 drawn as a tip | red: `a_cursor_that_has_not_polled_shows_no_tip` |
+| The first block indexed counted as an arrival | red: `the_first_block_indexed_is_not_an_arrival` |
+| A poll age shown before the first poll | red: `a_cursor_that_has_not_polled_shows_no_tip` |
+| Layout gate: a panel title changed in the second recording | FAIL, "the layouts differ" |
+| Layout gate: a border moved one column | FAIL |
+| Layout gate: a recording with no engine room | FAIL |
+
+S1's line gate was rerun with this slice's client against the solo nest and the two-chain runtime: 135
+and 270 fields, no mismatches.
+
+`nuthatch-tui-client` can now be archived with a pointer to `nuthatch watch`; it has not been
+touched. The clip is not in the top-level README; where it goes is Chief's call.
+
+Not verified in S5: the clip on Linux or in 256-colour mode; the recording through `--ssh`; a
+recording long enough to show the tip path seal (mainnet seals every 1,800 blocks, about six hours).
