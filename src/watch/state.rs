@@ -130,7 +130,7 @@ pub struct Latency {
     pub at_ms: u64,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct App {
     pub ready: RouteState,
     pub root: RouteState,
@@ -238,6 +238,25 @@ impl App {
                 })
                 .collect(),
         )
+    }
+
+    /// This state with every route whose last read served nothing emptied, for a reader that has no
+    /// STALE to show: the screen keeps the old figures and marks them, the line cannot.
+    pub fn answered_only(&self) -> App {
+        let mut app = self.clone();
+        let fresh = |r: &mut RouteState| {
+            if r.body.as_ref().map(|(t, _)| *t) != r.last_status.map(|(t, _)| t) {
+                r.body = None;
+            }
+        };
+        fresh(&mut app.ready);
+        fresh(&mut app.root);
+        fresh(&mut app.nests);
+        app.nest_ready.values_mut().for_each(fresh);
+        if app.metrics_status != Some(200) {
+            app.metrics = None;
+        }
+        app
     }
 
     /// Whether `/nests` has said which kind of process this is: a 404 is a solo nest.
