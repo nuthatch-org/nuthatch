@@ -1,6 +1,6 @@
 # RFC-0069: The engine room - a running nest watched from a terminal
 
-- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI. S0 measured 2026-10-22 (§15): the feature adds 0.30 MiB on macOS and 0.34 MiB on Linux, `cargo deny` stays green, and one watcher leaves tip lag and RSS inside their unwatched spread. Chief watched the clip on 2026-10-22 and said build it, with §14 answered as the RFC recommends. S1 built 2026-10-22 (§16): the line mode, every number equal to the endpoint's in the same read on a solo nest and a two-chain runtime. S2 built 2026-10-22 (§17): the engine room on a terminal, its snapshots from recorded bodies, and one watcher still inside the unwatched spread.
+- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI. S0 measured 2026-10-22 (§15): the feature adds 0.30 MiB on macOS and 0.34 MiB on Linux, `cargo deny` stays green, and one watcher leaves tip lag and RSS inside their unwatched spread. Chief watched the clip on 2026-10-22 and said build it, with §14 answered as the RFC recommends. S1 built 2026-10-22 (§16): the line mode, every number equal to the endpoint's in the same read on a solo nest and a two-chain runtime. S2 built 2026-10-22 (§17): the engine room on a terminal, its snapshots from recorded bodies, and one watcher still inside the unwatched spread. S3 built 2026-10-22 (§18): `/_admin/requests` and the reorg depth gauges, with the CI benches unchanged; #2339 fixed.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: the endpoints a nest already serves (`/ready`, `/metrics`, `/`, `/nests`, the admin
@@ -532,3 +532,69 @@ Not verified in S2: the screen on a real terminal other than through `script` an
 pty run on the two-chain runtime drew its tips and `mount 1 of 2`); 256-colour mode by eye; the ssh
 forward against a real host (the tests use a stand-in `ssh` that refuses a key or listens with `nc`);
 the picker on a terminal; macOS's watched cost, where `/metrics` forks `ps`.
+
+## 18. S3, the request ring and the reorg gauges, built 2026-10-22
+
+**G1.** `src/requests.rs` holds a ring of the last 256 requests a nest's routes served. The
+`count_request` middleware, which already counted every request, now also keeps each one's route
+template, the declared query or entity name its template captured, status, milliseconds and response
+bytes. The ring belongs to the nest's route set, so a hot swap of the backing keeps it.
+`GET /_admin/requests?since=<seq>` serves it, registered with the other admin routes and refusing
+exactly as `/_admin/events` does. DISPATCH reads it every second from where its last read left off,
+sending `NUTHATCH_ADMIN_TOKEN` from the watcher's own environment as a bearer header, never in the URL.
+
+**G2.** `NestMetrics::record_reorg` replaces `inc_reorgs` at the one place a nest rolls back, and
+`nuthatch_nest_last_reorg_depth_blocks` and `nuthatch_nest_last_reorg_unixtime` render for a nest only
+once it has reorged. REORG draws the depth and the age.
+
+**#2339.** S0 found `nuthatch_rows_sealed_total` at 0 after a seal-direct pass, and THE PRESS shows that
+series, so S3 fixes it: the pipelined and factory seal-direct paths now count each segment's rows, as
+the tip path did. S5's recording shows it: 23,670 rows on THE PRESS against the 23,670 events the
+pass logged.
+
+| Gate | Result |
+|---|---|
+| Point-read p50 and tip-lag CI benches unchanged | **Pass**, ThinkPad, `.github/workflows/point-read.sh` and `tip-lag.sh` unchanged, S2's `dist` binary against S3's (built before the #2339 commit, which touches only the seal-direct path), alternating, three rounds: point-read p50 1.02, 0.87 and 0.88 µs before, 0.88, 0.88 and 0.88 µs after; tip-lag after-seen p50 18, 20 and 17 ms before, 18, 21 and 17 ms after. The point-read bench opens the store directly and never meets the middleware; tip lag goes through `/sql` and does |
+| The ring holds no query text | **Pass**: `the_request_ring_holds_no_query_text` sends `/sql?q=…`, `/q/…?…`, `/balance/<address>`, `/derived/<entity>/<key>`, an unrouted path and the monitoring routes through the real router under a runtime prefix, each carrying a marker, and finds no marker in `/_admin/requests`, the templates without the prefix, and the monitoring reads not kept. `the_recorded_ring_holds_no_query_text` checks the same of every `/_admin/requests` body in `tests/fixtures/watch/dispatch.jsonl`, read from a live nest while it answered SQL |
+| `/_admin/requests` gated as `admin_events_gated_like_the_admin_page` asserts | **Pass**: `admin_requests_gated_like_the_admin_page` makes the same five assertions of the new handler (open to a loopback `Host` with no token; 404 with admin off; 401 without the token; 200 with `?token=` and with `Authorization: Bearer`), and `admin_requests_is_not_routed_with_admin_off` checks the route is not registered |
+| Reorg gauges absent before a reorg, correct after the property test's fixtures | **Pass**: `reorg_converges_to_canonical` (nine cases) now asserts both gauges absent from `METRICS.render()` before the reorg, then the depth equal to the blocks rolled back and the time inside the reorg's window, each case under a nest name of its own; `reorg_gauges_are_absent_until_a_reorg` holds the rendering to a fresh registry |
+
+The Linux `dist` binary is 118,691,632 bytes, 110,432 above S2's.
+
+Decisions the RFC left open:
+
+1. **The depth is the blocks rolled back**, to the deepest checkpoint still canonical, which can be
+   more than the chain replaced: checkpoints sit at window boundaries. The property test's first run
+   found it (fork 23 rolled back 2 blocks); the test now expects the checkpoint, and the help text says
+   rolled back.
+2. **Monitoring reads are not kept**: `/`, `/health`, `/ready`, `/metrics` and `/_admin*`. A watcher
+   reading `/ready` every second would otherwise push every caller's request out of 256 slots in under
+   two minutes.
+3. **A name is kept only from `{name}` and `{entity}`, and only when the nest knows it.** Those are
+   names the nest's author declared; an address, key or id in a path is data. A 404 means the name was
+   whatever the caller typed, so it is dropped. Untested on a live nest with a declared query (below).
+4. **Bytes are the body's exact size when it has one**; a streamed body such as `/sql`'s has none and
+   omits the field.
+5. **An unmatched path is not kept.** Its text is the caller's.
+6. **DISPATCH reads `/_admin/requests` whether or not a token is set**: a loopback nest without one
+   serves it openly. A 401 reads `NO TOKEN`, any other refusal `NOT SERVED` with the status.
+
+Mutations, each applied to the committed tree, shown applied, run, and restored to a clean tree:
+
+| Mutation | Result |
+|---|---|
+| The ring keeps the path and query string, not the template | red: `the_request_ring_holds_no_query_text` |
+| Monitoring reads kept | red: the same |
+| A name kept on a 404 | red: the same |
+| `/_admin/requests` skips the token check | red: `admin_requests_gated_like_the_admin_page` |
+| The handler skips its own admin-enabled check | red: the same |
+| The gauges render 0 before a reorg | red: `reorg_gauges_are_absent_until_a_reorg` |
+| `record_reorg` given one block less | red: `reorg_converges_to_canonical`, "left: Some(1), right: Some(2)" |
+| DISPATCH treats a 401 as an empty feed | red: `dispatch_names_why_it_has_no_feed` |
+| REORG reads the depth from the count | red: `reorg_reads_depth_and_age_from_the_gauges` and three snapshot tests |
+| The seal-direct count dropped | red: `seal_direct_counts_the_rows_it_seals` |
+
+Not verified in S3: a name captured from a live nest's declared query (the router test's nest
+declares none, so every named route there is a 404; `captured_name` is tested alone); the factory
+seal-direct path's count, changed alongside the pipelined one but exercised by no test; the ring
+across a hot swap; the token path against a remote nest, beyond the handler tests.
