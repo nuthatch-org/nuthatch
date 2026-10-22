@@ -921,6 +921,7 @@ pub async fn read<S: Source>(
 
     let first_tables = first_tables(src, &tables, req, ctx).await?;
     let threshold_flags = threshold_flags(src, req, ctx, top).await?;
+    seen.extend(labelled_in_range(src, inputs.tables, &tables, req, ctx).await?);
     let labels = seen
         .iter()
         .filter_map(|a| {
@@ -1306,6 +1307,46 @@ async fn first_tables<S: Source>(
 }
 
 /// Threshold flags raised in range, where the nest has a threshold configured.
+/// Every labelled address in any address column of any table with rows in range, the emitter included.
+/// Labels are few and rows many, so each table is asked which labelled addresses it holds.
+async fn labelled_in_range<S: Source>(
+    src: &S,
+    schema: &[TableSchema],
+    tables: &[TableOut],
+    req: &Request,
+    ctx: &NestContext,
+) -> Result<BTreeSet<String>> {
+    let mut found = BTreeSet::new();
+    if ctx.labels.is_empty() {
+        return Ok(found);
+    }
+    let wanted: Vec<String> = ctx.labels.keys().map(|a| format!("'{a}'")).collect();
+    let names: BTreeSet<&str> = tables.iter().map(|t| t.table.as_str()).collect();
+    for t in schema.iter().filter(|t| names.contains(t.table.as_str())) {
+        for c in t
+            .columns
+            .iter()
+            .filter(|c| c.name == "address" || c.sol_type == "address")
+        {
+            let col = format!("lower(CAST({} AS VARCHAR))", quote(&c.name));
+            for chunk in wanted.chunks(500) {
+                let q = src
+                    .query(&format!(
+                        "SELECT DISTINCT {col} AS a FROM {} WHERE {} AND {col} IN ({})",
+                        quote(&t.table),
+                        diff::filter(req),
+                        chunk.join(", ")
+                    ))
+                    .await
+                    .with_context(|| format!("reading {}", t.table))?;
+                diff::complete(&q, &t.table)?;
+                found.extend(q.rows.iter().filter_map(|r| diff::text(r.get("a"))));
+            }
+        }
+    }
+    Ok(found)
+}
+
 async fn threshold_flags<S: Source>(
     src: &S,
     req: &Request,

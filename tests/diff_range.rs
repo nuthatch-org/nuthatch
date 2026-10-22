@@ -695,3 +695,28 @@ proptest::proptest! {
         proptest::prop_assert!(doc["rows_total"].as_u64().unwrap() >= hot_rows);
     }
 }
+
+#[test]
+fn a_label_seen_only_in_an_ordinary_table_is_listed() {
+    let nest = euler_nest();
+    let steth = "0xae7ab96520de3a18e5e111b5eaab095312d7fe84";
+    std::fs::create_dir_all(nest.path().join("labels")).unwrap();
+    std::fs::write(
+        nest.path().join("labels/test.json"),
+        format!(r#"[{{"address":"{steth}","label":"lido"}}]"#),
+    )
+    .unwrap();
+    let (ok, out, err) = diff(
+        nest.path(),
+        &["--from", "16818024", "--to", "16818085", "--format", "json"],
+    );
+    assert!(ok, "{err}");
+    let doc = json(&out);
+    let listed: Vec<&str> = doc["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|l| l["address"].as_str())
+        .collect();
+    assert_eq!(listed, [steth], "{}", doc["labels"]);
+}
