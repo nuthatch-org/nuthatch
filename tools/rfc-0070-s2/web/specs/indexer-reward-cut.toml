@@ -1,0 +1,14 @@
+title = "Indexers by indexing reward cut, legacy staking on Arbitrum"
+nest = "graph-allocations-nest"
+from_block = 59_486_400
+to_block = 268_558_064
+frames = 600
+fps = 30
+top = 10
+
+[quantity]
+fold = "last"
+sql = """
+SELECT block_number, log_index, block_timestamp, indexer AS key, "indexingRewardCut" AS value
+FROM staking_legacy__delegation_parameters_updated
+"""

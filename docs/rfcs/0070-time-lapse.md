@@ -3,6 +3,8 @@
 - Status: **Accepted (2026-10-21, Chief).** S0 measured 2026-10-22 (§13); Chief watched its rendering
   the same day and said keep building. S1 built 2026-10-22 (§14): `nuthatch-timelapse` gives S0's three
   frame hashes natively and as wasm in Node, and its validator refuses each forbidden construct by name.
+  S2 built 2026-10-22 (§15): the player page replays four specs over the public mirror in a tab, each to
+  the native hash, and its single-file export plays every frame offline with zero requests.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: RFC-0047 (the sealed directory as a contract), RFC-0061 (256-bit values stay decimal
@@ -472,3 +474,67 @@ Decisions the RFC did not settle:
 
 Not verified in S1: a run on the ThinkPad; a headless browser rather than Node; the in-tab replay and
 its memory (S2); a read lease (S3); USDC. The driver is not in CI, as S0's harness is not.
+
+## 15. S2, built 2026-10-22
+
+The page is `tools/rfc-0070-s2/web/`: `timelapse.html` and its script, a worker that runs the replay,
+`player.html`, the template every export is filled from, and four specs pinned to mirrored datasets. It
+replays a spec over the public mirror in the tab, loads a recording (`frames.jsonl` and `manifest.json`,
+refused unless the frames hash to the manifest), plays it, and exports one `.html`. The preview on the
+page is the export itself in a frame, so what plays there is the file that downloads. `export.mjs` fills
+the same template from a native recording. `gate.mjs` runs the gates in headless Chrome over the
+DevTools protocol.
+
+The tab's engine is S1's driver built for the web by `build.sh` (34.5 MB, 5.4 MB at brotli, the size of
+the playground's module), in a worker, reading segments from the mirror's Worker, each checked against
+the SHA-256 its key names before Burrmill sees it. Nothing in the binary changed.
+
+| Gate | Result |
+|---|---|
+| The export, opened with networking off, plays every frame and makes zero requests | **Pass** for all four in-tab exports: Chrome's headless shell 1243 with every host unresolvable and the page offline, played at 120 fps; every frame index was drawn (1,200, 1,200, 600 and 1,200) and the protocol saw no request but the file itself. Three mutants of the demo's export each fail it: an added image (one request), one altered address (the page's hash differs), a player that skips one frame (1,199 drawn) |
+| Its embedded frames hash equals the native harness's for the same spec | **Pass**, four of four. The native driver over a local copy of the same mirrored segments, and the tab over the mirror, give `fce5af90...a4174`, `43bbe523...5f101`, `ea7ec80e...883cf21` and `26235ec1...ba906b`, S0's and S1's hashes. A native recording loaded through the page's file input exports to the same hash; one with a single altered field is refused, naming both hashes |
+| The in-tab replay's peak memory, per nest | Recorded below. Every spec fitted; no nest was found that the tab could not hold |
+
+| In the tab (MacBook, headless Chrome) | Rows | Fetched and checked | Time | wasm memory | Largest process | Whole browser |
+|---|---|---|---|---|---|---|
+| Demo, 136 indexers | 499,514 | 410 segments, 56.5 MiB | 9.7 s | 76.3 MiB | 520 MiB | 719 MiB |
+| Delegators, 307,788 live | 499,514 | 410 segments, 56.5 MiB | 9.5 s | 144.6 MiB | 586 MiB | 786 MiB |
+| Indexer reward cut (`last`) | 1,001 | 1 segment, 0.1 MiB | 0.8 s | 18.7 MiB | 303 MiB | 503 MiB |
+| GRT holders, 119,270 live | 11,937,686 | 2,945 segments, 351.2 MiB | 66.2 s | 136.9 MiB | 641 MiB | 845 MiB |
+
+Peak RSS was sampled by `ps` every 250 ms over Chrome and every process under it; the same page idle
+measured 102 MiB in its largest process and 288 MiB in all. The reward-cut row is the engine's fixed
+cost, about 200 MiB over idle with 18.7 MiB of wasm memory, which is the compiled module. The fold's
+own state is the wasm memory, and it tracks S1's Node figures (81, 149 and 138 MiB). Segment bytes held
+by the page at any one time peaked at 5.6 MiB, because the worker drops a table's segments two behind
+the one the engine is reading. The holders' 66 s is the network: natively, over the same segments on
+disk, the replay took 3.7 s.
+
+Decisions the RFC did not settle:
+
+1. **Where it lives.** Here, beside S0's and S1's tools, because S2 was to change only this tree. The
+   directory is self-contained and meant to be copied as it is into `burrmill-wasm`'s `web/play/`,
+   where `/play/:path+` already proxies, so the site needs no Astro copy and no change. The tab runs a
+   second wasm module beside the playground's, since `burrmill-wasm` does not carry `nuthatch-timelapse`.
+2. **The mirror's copy and the Helsinki copies agree.** The mirrored allocations nest has every legacy
+   staking segment final to block 408,818,200, where S0's copy had its last rows provisional (§13 finding
+   4), yet over S0's ranges it gives S0's hashes. A spec in the page is pinned to a dataset, so a
+   replay reads the same final segments whenever it runs.
+3. **No identity from a mirror.** The tab, and the native driver over a directory without
+   `nuthatch.toml`, write the NID and data identity as null, as §14 decision 6 said a tab would. The
+   registry hash and the segment list stay.
+4. **The frames go in as one JSON string**, with `<` escaped, so the player hashes the bytes of
+   `frames.jsonl` and nothing a template could rewrite. The manifest goes in whole, segment list
+   included, as provenance.
+5. **How a recording reads is the player's.** Decimals, a unit and what the keys are counted as are
+   embedded beside the frames and never hashed. A recording of one of the page's own specs takes that
+   spec's; anything else starts as plain integers.
+6. **Two accents, not a hue per key.** S0's rendering gave each key its own hue; the house palette has
+   two, so a key gets one of the two at one of four strengths. Rows still move, so a key can be followed.
+   The export uses the system's fonts, since a font file would be a request.
+7. **Nothing is cached between replays.** No origin-private store as the playground keeps; a second
+   replay fetches again, and only the browser's HTTP cache may spare it.
+
+Not verified in S2: any browser but Chromium (no Firefox, no Safari, no phone); the page behind the live
+site's `/play` proxy, since nothing was deployed; a nest the tab cannot fit, since the largest
+mirrored replay available fitted; the ThinkPad; USDC; and §12 question 6, a recorded WebM.
