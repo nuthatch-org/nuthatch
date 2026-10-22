@@ -2,7 +2,10 @@
 
 - Status: **Accepted (2026-10-21, Chief).** Chief reshaped it the same day from a self-contained
   `.html` file to a link ("lets make postcards just a url or something not email"); this is that
-  shape. Nothing is built yet.
+  shape. **S0 measured 2026-10-22 (§14): the cut held on every pair, and Pages, raw GitHub and
+  jsDelivr each served the tab row-identical to native Burrmill in Chrome and Safari. R2 was not
+  tested, and the week of daily snapshots was not run.** §13: Chief said yes to any host named in a
+  link (2026-10-22); Q2 and Q3 take this RFC's leanings until he says otherwise.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: RFC-0065 (the nest in a tab: `/play`, Burrmill in wasm, hash-checked segments),
@@ -235,3 +238,91 @@ nest, live tail and all, with the page saying the answers are no longer the post
    in the docs, or leave it unmentioned until someone asks?
 3. **Follow to the head** on a postcard: in, as proposed, or should a postcard only ever show its
    snapshot?
+
+## 14. S0, measured 2026-10-22
+
+**(a) The cut holds on every pair found; the week of daily pairs was not run.** No snapshot job was
+installed. Instead every older catalogue that already existed was used: the mirror's catalogues today,
+the mirror copies in `burrmill-wasm/data/` (published 2026-10-13 and 2026-10-17), one taken from the
+mirror on 2026-10-21, the frozen release-gate copies on the ThinkPad (2026-10-11 and 2026-10-12, each
+checked against its `PROVENANCE` hash), and older local copies. A local catalogue counts as what a
+`publish sync` at that moment writes, its provisional entries removed, and only when a definition-only
+copy of its directory computes the mirror's data identity. Three that did not (`grt-supply-*` from
+2026-10-07, `alloc-l1` from 2026-10-05) also pass and are left out of the count.
+
+For each pair, the later catalogue is cut at the earlier one's per-table highest `to_block` and the
+entries compared whole, every field but `provisional`:
+
+| Nest | Snapshots | Pairs | Entries, first to last | Dropped, rewritten, back-filled |
+|---|---|---|---|---|
+| graph-allocations-nest | 10-11, 10-12, 10-13 (local), 10-13 (mirror), 10-22 | 10 | 4,727 to 5,157 | 0 |
+| qos-reo-nest | 10-11, 10-12, 10-22 | 3 | 11,554 to 12,662 | 0 |
+| defi-pulse-nest | 10-17, 10-21, 10-22 | 3 | 1,181 to 1,307 | 0 |
+| graph-gns-nest | 10-11, 10-12, 10-13, 10-22 | 6 | 16 to 44 | 0 |
+| dips-nest | 10-11, 10-12, 10-13, 10-22 | 6 | 24 to 28 | 0 |
+| betswirl-bnb-nest | 10-06, 10-22 | 1 | 260 to 260 | 0 |
+| data-services-nest | 10-11, 10-12, 10-13, 10-22 | 6 | 0 to 0 | vacuous |
+
+35 pairs over 7 nests, 29 of them over a non-empty catalogue, all exact; no entry straddled a cut.
+**Against the gate as written this falls short:** seven calendar days carry a snapshot (10-06, 10-11,
+10-12, 10-13, 10-17, 10-21, 10-22), the longest run of consecutive days is three, and 11 of the
+adjacent pairs are a day apart or less; the rest span 4.5 to 15.8 days. A long pair is the harder
+test of append-only, not the easier one: the allocations pair from 10-13 to 10-22 spans a restart and
+nuthatch 5.6.3 to 5.8.2. `schema.json` was byte-identical across all 33 pairs with both copies, the
+5.0.1 to 5.8.2 ones included.
+
+Three things S1 must carry from it:
+
+- **A table with nothing under the cut.** 27 allocations tables and 2 GNS tables held no entries at
+  the earlier snapshot and some later; 2 of the 27 were not listed at all. A link carries no cut for
+  such a table, so the reader must admit nothing for any table `c` does not name. Reading a missing cut
+  as unbounded would fail the digest on an honest host.
+- **Append-only is a property of sealing, not of publishing.** `publish sync` writes the local
+  catalogue whole, minus provisional entries (`published_catalogue` in `src/publish.rs`), and never
+  merges with or checks against the remote one. Nothing found here drops an entry, but a nest
+  re-indexed from scratch under the same identity with different seal boundaries would rewrite
+  entries under every cut. The digest refuses that, which is right; the page should say the host no
+  longer holds the pinned set, not that it lies.
+- `publish sync` to a folder leaves `manifest.json.lock` beside the catalogue; it went to Pages too.
+  Harmless, and worth leaving out of the directory a sender pushes.
+
+**(b) Three hosts served the tab; R2 was not tested.** `graph-gns-nest` from its frozen 2026-10-12 gate
+copy, PROVENANCE file removed so it computes the mirror's identity `494ce630…`: 16 segments, 73,176
+rows, published with `publish sync --target <folder>` by 5.8.2 and pushed to a new public repository,
+`nuthatch-org/postcard-s0-pages`, with `.nojekyll`. `/play` taking a base URL was prototyped in a local
+copy of the live page (its `play.js` and `worker.js` byte-identical to production), run on
+`localhost`, nothing deployed: `#v=1&m=<base>&d=<data identity>&w=<views>&q=<query>`, `w` and `q`
+raw-deflated, no seed tails and no live tail. Each run emptied the tab's segment cache first, so all
+13 segments the views reach came from the named host. Seven views, from the three view files at the
+commit `/play` lists, compared as RFC-0065 measures, against `examples/native.rs` over the same folder:
+
+| Host (`m`) | Allow-Origin, cache | Chrome 154 | Safari 26.5 | Firefox |
+|---|---|---|---|---|
+| `nuthatch-org.github.io/postcard-s0-pages` | `*`, `max-age=600` | 7 of 7 identical | 7 of 7 identical | not installed |
+| `raw.githubusercontent.com/…/main` | `*`, `max-age=300` | 7 of 7 identical | 7 of 7 identical | not installed |
+| `cdn.jsdelivr.net/gh/…@main` | `*`, `max-age=604800`, `s-maxage=43200` | 7 of 7 identical, third run | 7 of 7 identical | not installed |
+
+The digests, rows in brackets: `subgraph_publications` (17,159) `db04f6d5…`, `developer_activity_weekly`
+(187) `5d93158c…`, `subgraph_activity` (17,159) `40ba7288…`, `subgraph_versions` (30,282) `47974319…`,
+`subgraph_current` (17,159) `2ce4449e…`, `deployment_subgraphs` (30,282) `9af478ca…`,
+`account_default_names` (0) `e3b0c442…`. No request from the tab carried the query or the views.
+
+- **jsDelivr** lost one segment fetch on each of the first two Chrome runs, a cold CDN under sixteen
+  concurrent requests; the same file fetched alone answered. The worker caches a failed fetch's promise
+  for its life, so one transient failure fails every later view that reaches the segment. S1 retries a
+  failed fetch once and does not keep the rejection. jsDelivr also holds a branch ref for up to 12
+  hours at its edge, so it is the host most likely to read as behind a fresh link.
+- **Pages** took about 25 minutes to publish its first build, during a GitHub Actions incident.
+  `.nojekyll` kept `_seed/`.
+- **R2 not tested.** The mirror's key is scoped to `nestsss`: listing and creating buckets answer 403.
+  A CORS rule on `nestsss` would change the live mirror, and serving a new bucket publicly needs the
+  Cloudflare API rather than an S3 key. A sender's own bucket with a CORS rule is therefore unmeasured.
+- Firefox is not installed on this machine. Safari was driven by opening the link; the page posted its
+  digests back to the local server that served it.
+
+**§13 as taken.** Q1, any host named in a link: yes, Chief, 2026-10-22, the picker staying curated.
+Q2, IPFS: this RFC's leaning, supported by construction and not recommended. Q3, Follow to the head:
+in, as §8 proposes.
+
+The gate's stop condition is not met: three hosts serve the tab. S1 can start; the daily snapshots and
+R2 are Chief's to ask for.
