@@ -484,6 +484,15 @@ Query a nest's data with SQL - the live tip and sealed history, one surface. Pri
 - `--url <URL>` - The running instance's API, used when --dir holds no store or `nuthatch dev` has it open
 - `--json` - Emit newline-delimited JSON instead of a table (for piping to jq etc.)
 
+## `nuthatch watch`
+
+Watch a running nest from the terminal: the tip, the seal, memory against its budget, RPC endpoints. Read-only; it reads the endpoints the nest already serves (RFC-0069)
+
+- `--url <URL>` - The nest's API: a solo `dev`, or a runtime's root, whose mounts are each watched
+- `--interval <INTERVAL>` - Seconds between lines. Defaults to the nest's own poll interval, held between 2 and 30 s
+- `--record <RECORD>` - Append every body read to this file, one JSON object per line
+- `--exit-after <EXIT_AFTER>` - Stop after this many seconds
+
 ## `nuthatch worker`
 
 Run a **writer worker** for scaled mode (RFC-0022 §2): reconcile against the control plane, take cursor leases, index what this worker is assigned

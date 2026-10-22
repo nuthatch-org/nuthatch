@@ -1334,6 +1334,22 @@ Readiness is **advice to a supervisor, not a traffic gate**. A runtime with one 
 readiness to a load balancer and one sick tenant evicts every healthy tenant from rotation. **Route on
 per-nest `/<name>/ready`; page on the root.**
 
+### Watching from a terminal: `nuthatch watch`
+
+`nuthatch watch --url http://127.0.0.1:8288` reads the routes above (`/ready`, `/`, `/metrics`,
+`/nests`) and nothing else (RFC-0069). It writes one logfmt line per nest per interval:
+
+```
+nest=defi-pulse chain=mainnet tip=26249645 lag=0 sealed=26249579 rss=191430656 budget=2147483648 rpc_up=2/2 http_rps=2.0
+```
+
+Every number is the one the endpoint served in that pass. `rss` and `budget` are bytes, the budget
+being 2 GiB for each cursor in the process; `rpc_up` counts endpoints whose failure counter did not
+move since the previous pass; `http_rps` includes the watcher's own requests. A value the nest did
+not serve reads `"NO SIGNAL"`, never 0. Pointed at a runtime's root, it writes one line per mount from
+that mount's own `/<name>/ready`. It is a log line, not a health check: gate on `/ready`. The line
+comes every poll interval of the nest, held between 2 and 30 s, unless `--interval` says otherwise.
+
 ### Logs
 
 Structured `tracing` to stdout. Quarantine and re-admission are `warn!` with nest, chain, fault class

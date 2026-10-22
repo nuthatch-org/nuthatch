@@ -20,7 +20,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
     (
         "OPERATING",
         &[
-            "serve", "doctor", "check", "diff", "schema", "bench", "settle",
+            "serve", "watch", "doctor", "check", "diff", "schema", "bench", "settle",
         ],
     ),
     ("SCALED", &["worker", "control"]),
