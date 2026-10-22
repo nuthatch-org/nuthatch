@@ -5,7 +5,10 @@
   shape. **S0 measured 2026-10-22 (§14): the cut held on every pair, and Pages, raw GitHub and
   jsDelivr each served the tab row-identical to native Burrmill in Chrome and Safari. R2 was not
   tested, and the week of daily snapshots was not run.** §13: Chief said yes to any host named in a
-  link (2026-10-22); Q2 and Q3 take this RFC's leanings until he says otherwise.
+  link (2026-10-22); Q2 and Q3 take this RFC's leanings until he says otherwise. **S1 and S2 built
+  2026-10-22 (§15), in `burrmill-wasm` #18 and #19, not deployed:** every tamper, lag and re-index case
+  refused as it should against a scripted host, no request carried the query, and a copied postcard
+  gave the same answer digest in a fresh Chrome profile and in Safari.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: RFC-0065 (the nest in a tab: `/play`, Burrmill in wasm, hash-checked segments),
@@ -326,3 +329,100 @@ in, as §8 proposes.
 
 The gate's stop condition is not met: three hosts serve the tab. S1 can start; the daily snapshots and
 R2 are Chief's to ask for.
+
+## 15. S1 and S2, built 2026-10-22
+
+Chief said go on to S1 without the seven-day snapshot run (2026-10-22). Both slices are built in
+`burrmill-wasm`, S1 as PR #18 (`pete/rfc-0068-s1`) and S2 as PR #19 stacked on it, and neither is
+deployed. New controls are created by `play.js`, because nuthatch-indexer.com/play serves its own
+markup around the same script.
+
+**What the build settled that the sections above left open.**
+
+- **The link.** `#v=1&m=<base>&d=<data identity>&c=<table>:<block>,…&h=<digest>&w=<views>&q=<query>`,
+  `c` in table order and naming only tables with entries. `m` is omitted for our mirror. `q` and `w`
+  are raw-deflated base64url, or `sha256:<hex>` for the short form below.
+- **The digest's lines are `table hash from_block to_block rows`**, not `table hash`. A host that kept
+  the hashes and rewrote the other fields would otherwise pass; binding them costs nothing.
+- **Three refusals, said apart.** *Behind*: a table's highest `to_block` on the host is below the cut,
+  and the page offers Try again. *Moved*: the host reaches the cut but no segment ends there, so the
+  nest was sealed again with other boundaries, most likely re-indexed (§14's `publish sync` finding).
+  *Differs*: anything else that fails the digest. A dropped top entry reads as behind; nothing can
+  tell it from a lagging host.
+- **A table the link gives no cut for admits nothing**, and a failed segment fetch is retried once and
+  not kept, both from §14.
+- **The unpinned share link** is now `#nest=<name>&q=<deflated>`. An old `?nest=&q=` link still opens
+  and is rewritten into the fragment; its query has already reached the server once by then.
+- **Follow to the head** (Q3) opens the same nest unpinned: a curated nest with its live tail, any
+  other host with its seed tails and no live tail, since the page has no decoder config for it.
+- **Copy postcard** pins the sealed catalogue the tab has open, never its seed tails, live tail or
+  anything sealed in the tab, and carries only the view statements the query reaches. The sender's own
+  answer can therefore hold rows the postcard does not: 17,563 against 17,159 on the gns copy. The card
+  says so and links the postcard so the sender can see what is sent.
+- **The short form** moves `w` and `q`, each when its deflated form is 200 characters or more, into
+  `<m>/<d>/queries/<sha256>.sql`. It is offered only for a host named by `m`; the mirror is ours to
+  write, not the sender's, so a mirror postcard has no short form and the page says why.
+
+**S1's gates**, in headless Chrome for Testing 153, each case a fresh profile, against a local
+host serving §14's gns folder honestly or broken one way. The links are built by the gate script with
+Node's own SHA-256, independent of the page; the tamper cases pin with the page's own digest code, so
+a mutation that drops something from the digest cannot hide behind a link that no longer matches.
+
+| Case | Result |
+|---|---|
+| honest host | all 7 views equal native Burrmill (§14's digests), 73,176 rows sealed |
+| grown catalogue: today's mirror catalogue, including `gns__set_default_name`, empty at the cut | all 7 views equal native |
+| a segment served with a sibling's bytes; one byte flipped | refused, naming `gns__subgraph_published/e03958df…` |
+| an entry added under a cut; a middle entry dropped; one byte of `schema.json` changed | each fails the digest |
+| the top entry of one table missing | reads as behind |
+| the last two segments re-cut across the cut | reads as moved |
+| one 503 on a segment | retried, answered |
+| two 503s, then a second query | first refused as not arrived, second answered |
+| a session: postcard, a second query, reload, Follow to the head | no request line or header in Chrome's NetLog, and no request at either server, carries the query |
+
+Mutating each check turned its case red: the address check (the swap answered 16,499 rows, the flip
+17,159 rows with a wrong digest), the retry, the dropped failure, the digest comparison, `schema.json`
+in the digest, the no-cut rule, the cut filter, the behind check, the moved check, the pinned path,
+and writing the query to the query string (5 request lines carried it). Each was applied to the
+committed tree, shown in `git diff`, restored from HEAD and the tree checked clean. One gate was too
+weak on first run: with the retry removed, the one-503 case stayed green because the next query
+refetched. It now queries nothing on open, and the mutation turned it red.
+
+**S2's gates.** Profile A opens a nest unpinned, runs `SELECT * FROM "subgraph_current"`, copies the
+postcard, then opens it itself; a fresh profile B opens the same link.
+
+| Start | A via the link | Fresh B | Safari 26.5 |
+|---|---|---|---|
+| local host | 17,159 `2ce4449e…`, native | same | same |
+| our mirror, `#nest=graph-gns-nest` | 17,593 `9bd10f70…` | same | same |
+| GitHub Pages, `postcard-s0-pages` | 17,159 `2ce4449e…`, native | same | same, from its own segment cache |
+
+The fallback: a query with 40 random literals made a 3,911-character link, whose short form was 518
+characters with 2 files; with the files in place B answered as A did (30,282 rows `9af478ca…`), and
+with one byte of the query's file changed B refused it by URL. Mutated, the `.sql` hash check, the
+copied cut (moved one block down, which reads as moved) and the view closure (a dependency dropped)
+each turned red.
+
+**Link lengths**, for `SELECT * FROM "<view>"` on every curated nest's views, pinned to the mirror's
+catalogue on 2026-10-22, at `https://nuthatch-indexer.com/play/`:
+
+| Nest | Tables cut | Views | Link without query | Shortest | Median | Longest | Over 2,000 |
+|---|---|---|---|---|---|---|---|
+| graph-gns-nest | 7 | 7 | 409 | 713 | 1,089 | 2,014 | 1 |
+| graph-allocations-nest | 75 | 23 | 3,068 | 3,359 | 5,566 | 20,731 | 23 |
+| dips-nest | 22 | 2 | 1,271 | 1,650 | 1,906 | 1,906 | 0 |
+| data-services-nest | 0 | 1 | 151 | 384 | 384 | 384 | 0 |
+| defi-pulse-nest | 10 | 9 | 443 | 798 | 1,071 | 3,014 | 3 |
+| betswirl-bnb-nest | 33 | 20 | 1,163 | 1,751 | 5,791 | 7,916 | 19 |
+| qos-reo-nest | 5 | 23 | 319 | 713 | 2,274 | 4,197 | 15 |
+| grt-supply-arbitrum-one | 3 | 2 | 259 | 658 | 778 | 778 | 0 |
+| grt-supply-mainnet | 1 | 2 | 184 | 486 | 488 | 488 | 0 |
+
+61 of 89 are over Discord's 2,000. §4's estimate of about 300 characters of fixed fields held for
+small nests and not for wide ones: allocations' 75 cuts alone are 2,914 characters, which deflate to
+1,159. Deflating `c` is not built, and since these are mirror nests the short form does not apply.
+
+**Not verified.** Firefox, which is not installed. Safari ran the three copied links only, not the
+tamper cases or the fallback. The clipboard write under a real click: headless read the link from the
+page. The site's own `/play` page, which the new controls should appear on because `play.js` builds
+them. R2 and the week of daily snapshots, as §14 left them.
