@@ -281,6 +281,15 @@ jobs:
           cargo fmt --check --manifest-path scaffold/Cargo.toml
           cargo clippy --locked --all-targets --manifest-path scaffold/Cargo.toml -- -D warnings
           cargo test --locked --manifest-path scaffold/Cargo.toml
+      # RFC-0070 S1. The time-lapse spec, validator, plan and fold, with no engine, so a tab and a node
+      # fold the same batches into the same frames. Not a dependency of the binary.
+      - name: fmt · clippy · test (timelapse)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo fmt --check --manifest-path timelapse/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path timelapse/Cargo.toml -- -D warnings
+          cargo test --locked --manifest-path timelapse/Cargo.toml
       # The RFC-0016/RFC-0017 eval runners, outside the binary. Their tests run both self-tests,
       # which need no key, model or network (#1050, #1051).
       - name: fmt · clippy · test (eval runner)
@@ -294,7 +303,7 @@ jobs:
       # which needs a clang with the WebAssembly backend; the runner's LLVM clang has one. Ubuntu's
       # clang also searches the host's /usr/include, which cannot build for wasm: unknown-unknown gets
       # an empty sysroot (zstd-sys brings its own shim headers), wasip2 the WASI one.
-      - name: wasm check (decode, seal, identity, scaffold)
+      - name: wasm check (decode, seal, identity, scaffold, timelapse)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
@@ -307,7 +316,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/no-sysroot"
           export CFLAGS_wasm32_unknown_unknown="--sysroot=$RUNNER_TEMP/no-sysroot"
           export CFLAGS_wasm32_wasip2="--sysroot=/usr/share/wasi-sysroot"
-          for crate in decode seal identity scaffold; do
+          for crate in decode seal identity scaffold timelapse; do
             for target in wasm32-unknown-unknown wasm32-wasip2; do
               cargo check --locked --manifest-path "$crate/Cargo.toml" --target "$target"
             done
@@ -922,6 +931,12 @@ jobs:
       # blocking every release - so keep this current rather than pinned-and-forgotten.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
+          command: check advisories licenses bans sources
+      # RFC-0070 S1: nuthatch-timelapse is not a dependency of the binary, so the step above never
+      # sees its tree.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          manifest-path: timelapse/Cargo.toml
           command: check advisories licenses bans sources
 
   build-release:
