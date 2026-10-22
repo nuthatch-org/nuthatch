@@ -661,6 +661,36 @@ mod tests {
         assert_eq!(h.tables().iter().map(|t| t.rows).sum::<u64>(), 3);
     }
 
+    /// Address history meets the same edge cap as an event nest, the last row included.
+    #[test]
+    fn a_fold_one_edge_past_the_cap_is_refused() {
+        let many = |n: usize| -> DiffRows {
+            rows(
+                (0..n as u64)
+                    .map(|i| {
+                        let mut to = [0u8; 20];
+                        to[12..].copy_from_slice(&i.to_be_bytes());
+                        DiffRow {
+                            hash: {
+                                let mut h = [0u8; 32];
+                                h[24..].copy_from_slice(&i.to_be_bytes());
+                                h
+                            },
+                            ..tx(A, A, to, 1, false)
+                        }
+                    })
+                    .collect(),
+            )
+        };
+        let mut flow = Flow::default();
+        fold(&many(crate::diff::EDGE_CAP), &REQ, &ctx(), &mut flow, 1).unwrap();
+        let mut flow = Flow::default();
+        let e = fold(&many(crate::diff::EDGE_CAP + 1), &REQ, &ctx(), &mut flow, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("the diff's cap"), "{e}");
+    }
+
     /// Two internal transfers of one transaction between two watched addresses are two rows, told
     /// apart by trace index, each filed under both addresses and each read once.
     #[test]
