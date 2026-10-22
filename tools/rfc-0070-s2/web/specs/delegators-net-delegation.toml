@@ -1,0 +1,17 @@
+title = "Delegators by net GRT delegated, legacy staking on Arbitrum"
+nest = "graph-allocations-nest"
+from_block = 60_586_400
+to_block = 385_547_920
+frames = 1200
+fps = 30
+top = 10
+
+[quantity]
+fold = "sum"
+sql = """
+SELECT block_number, log_index, block_timestamp, delegator AS key, tokens AS delta, 1 AS sign
+FROM staking_legacy__stake_delegated
+UNION ALL
+SELECT block_number, log_index, block_timestamp, delegator AS key, tokens AS delta, -1 AS sign
+FROM staking_legacy__stake_delegated_locked
+"""

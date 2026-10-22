@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Time-lapse</title>
+<meta name="description" content="Replay a nuthatch nest's sealed history in your browser tab, play it, and export it as one self-contained page whose frames carry their own hash.">
+<style>
+:root {
+  --bg: #171614; --bg-elev: #201f1c; --bg-code: #1b1a17; --bg-inset: #262420;
+  --border: rgba(255, 255, 255, 0.09); --border-hi: rgba(255, 255, 255, 0.16);
+  --text: #ece9e3; --text-muted: #9c978c; --text-faint: #6e6a61;
+  --accent: #8bb8dc; --accent-ink: #cfe3f2; --rust: #cd8560; --ok: #86b592; --warn: #cdb06a;
+  --pale-blue-bg: rgba(139, 184, 220, 0.12); --pale-rust-bg: rgba(205, 133, 96, 0.12);
+  --sans: 'Space Grotesk', ui-sans-serif, system-ui, 'Helvetica Neue', sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.6 var(--sans); letter-spacing: -0.01em; }
+main { max-width: 64rem; margin: 0 auto; padding: 40px 16px 64px; }
+a { color: var(--accent); }
+.kicker { font: 500 0.72rem/1.4 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--rust); margin: 0 0 8px; }
+h1 { font-size: clamp(1.9rem, 5vw, 2.8rem); line-height: 1.1; letter-spacing: -0.03em; font-weight: 600; margin: 0 0 12px; max-width: 18ch; }
+h2 { font-size: 1.25rem; letter-spacing: -0.02em; font-weight: 600; margin: 0 0 6px; }
+.lede { color: var(--text-muted); max-width: 56ch; margin: 0 0 32px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 920px) { .grid { grid-template-columns: 1fr; } }
+.cell { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px; padding: 22px; min-width: 0; }
+.cell p { color: var(--text-muted); font-size: 0.92rem; margin: 0 0 14px; }
+label.f { display: block; font: 500 0.7rem var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--rust); margin: 12px 0 6px; }
+select, input[type=text], input[type=number], textarea {
+  width: 100%; font: 0.8rem/1.5 var(--mono); color: var(--text); background: var(--bg-code);
+  border: 1px solid var(--border-hi); border-radius: 6px; padding: 7px 9px;
+}
+textarea { min-height: 15rem; resize: vertical; white-space: pre; }
+input[type=file] { font: 0.78rem var(--mono); color: var(--text-muted); max-width: 100%; }
+button { font: 600 0.8rem var(--mono); padding: 8px 14px; border-radius: 6px; border: 1px solid var(--border-hi); background: var(--bg-inset); color: var(--text); cursor: pointer; }
+button.go { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+button:hover { border-color: var(--rust); }
+button:active { transform: scale(0.98); }
+button:disabled { opacity: 0.5; cursor: progress; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+.three { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+.status { font: 0.76rem/1.7 var(--mono); color: var(--text-muted); margin-top: 12px; min-height: 1.7em; overflow-wrap: anywhere; }
+.status .n { color: var(--accent); }
+.status.err { color: var(--warn); }
+section { margin-top: 40px; }
+#stage { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: var(--bg); }
+#stage iframe { display: block; width: 100%; height: 760px; border: 0; }
+#stage .empty { padding: 48px 22px; color: var(--text-muted); font-size: 0.92rem; }
+.facts { font: 0.74rem/1.8 var(--mono); color: var(--text-muted); margin-top: 10px; overflow-wrap: anywhere; }
+.facts b { color: var(--rust); font-weight: 500; text-transform: uppercase; letter-spacing: 0.08em; }
+.scope { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 720px) { .scope { grid-template-columns: 1fr; } }
+.scope ul { margin: 8px 0 0; padding-left: 1.1rem; color: var(--text-muted); font-size: 0.92rem; }
+.scope li::marker { color: var(--rust); }
+.cell p.kicker { color: var(--rust); font-size: 0.72rem; margin-bottom: 8px; }
+.cell p.kicker.in { color: var(--ok); }
+code { font: 0.85em var(--mono); background: var(--bg-inset); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <p class="kicker">Time-lapse · RFC-0070</p>
+  <h1>A nest's sealed history, replayed.</h1>
+  <p class="lede">Pick a spec and this tab replays it over the public mirror's segments: Burrmill and the fold compiled to WebAssembly, every segment checked against its hash before it is read. Or load a recording made by the native harness. Either way, export one <code>.html</code> that plays offline and checks its own frames.</p>
+
+  <div class="grid">
+    <div class="cell">
+      <p class="kicker">Replay in this tab</p>
+      <h2>From the mirror.</h2>
+      <p>The spec is the whole input. The same spec over the same sealed rows gives the same frames, byte for byte, here or on a server.</p>
+      <label class="f" for="spec-pick">Spec</label>
+      <select id="spec-pick"></select>
+      <label class="f" for="spec">spec.toml</label>
+      <textarea id="spec" spellcheck="false"></textarea>
+      <div class="row">
+        <button id="run" class="go" type="button">Replay</button>
+        <button id="stop" type="button" disabled>Stop</button>
+      </div>
+      <div class="status" id="run-status"></div>
+    </div>
+    <div class="cell">
+      <p class="kicker">Load a recording</p>
+      <h2>From a file.</h2>
+      <p>Choose <code>frames.jsonl</code> and <code>manifest.json</code> together. Nothing is uploaded; the frames are refused unless they hash to the manifest's <code>frames_sha256</code>.</p>
+      <label class="f" for="files">Recording</label>
+      <input id="files" type="file" multiple accept=".jsonl,.json,application/json">
+      <div class="status" id="load-status"></div>
+      <p class="kicker" style="margin-top:22px">How it reads</p>
+      <p>Playback only. None of this enters the hash.</p>
+      <div class="three">
+        <div><label class="f" for="decimals">Decimals</label><input id="decimals" type="number" min="0" max="77" value="0"></div>
+        <div><label class="f" for="unit">Unit</label><input id="unit" type="text" value=""></div>
+        <div><label class="f" for="noun">Counted as</label><input id="noun" type="text" value="keys"></div>
+      </div>
+    </div>
+  </div>
+
+  <section>
+    <p class="kicker">The film</p>
+    <h2>What the export will be.</h2>
+    <div id="stage"><div class="empty">Replay a spec or load a recording, and it plays here.</div></div>
+    <div class="row">
+      <button id="export" class="go" type="button" disabled>Export .html</button>
+      <button id="save-rec" type="button" disabled>Save the recording</button>
+    </div>
+    <div class="facts" id="facts"></div>
+  </section>
+
+  <section>
+    <p class="kicker">Scope</p>
+    <h2>What it does, and what it does not.</h2>
+    <div class="scope">
+      <div class="cell">
+        <p class="kicker in">Does</p>
+        <ul>
+          <li>Replays final sealed segments only, from the nest's first block, so the first frame is the true state.</li>
+          <li>Checks every segment's SHA-256 against its content address before reading it.</li>
+          <li>Hashes the frames in the export, so a viewer can check them against a replay of their own.</li>
+          <li>Plays offline: the exported file makes no request of any kind.</li>
+        </ul>
+      </div>
+      <div class="cell">
+        <p class="kicker">Does not</p>
+        <ul>
+          <li>Read the hot tail or a provisional segment: a time-lapse ends at the last final segment.</li>
+          <li>Run arbitrary SQL: the query is row-local, and anything else is refused by name.</li>
+          <li>Fit every nest in a tab. A large replay is recorded natively and loaded here.</li>
+          <li>Prove who published the mirror. A hash says the bytes are the bytes, not whose they are.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+</main>
+<script type="module" src="./timelapse.js"></script>
+</body>
+</html>

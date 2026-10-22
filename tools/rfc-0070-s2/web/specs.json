@@ -1,0 +1,25 @@
+{
+  "base": "https://nestsss.nestsss-worker.workers.dev",
+  "specs": [
+    {
+      "spec": "specs/indexers-net-delegation.toml",
+      "dataset": "d6fd43c87dd9593872b5c0f414b7291b230d3da7b2fcdf3ba2ad49e5ec496e8b",
+      "display": { "decimals": 18, "unit": "GRT", "noun": "indexers" }
+    },
+    {
+      "spec": "specs/delegators-net-delegation.toml",
+      "dataset": "d6fd43c87dd9593872b5c0f414b7291b230d3da7b2fcdf3ba2ad49e5ec496e8b",
+      "display": { "decimals": 18, "unit": "GRT", "noun": "delegators" }
+    },
+    {
+      "spec": "specs/indexer-reward-cut.toml",
+      "dataset": "d6fd43c87dd9593872b5c0f414b7291b230d3da7b2fcdf3ba2ad49e5ec496e8b",
+      "display": { "decimals": 4, "unit": "%", "noun": "indexers" }
+    },
+    {
+      "spec": "specs/grt-holders.toml",
+      "dataset": "f17503984e0051fcf0e9ff20a63b56b8144f8752c2b5277d15454165fc44a2de",
+      "display": { "decimals": 18, "unit": "GRT", "noun": "holders" }
+    }
+  ]
+}
