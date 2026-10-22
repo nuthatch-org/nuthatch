@@ -1,9 +1,10 @@
 # RFC-0072: Chain weather - a daily report a nest writes about itself
 
-- Status: **Accepted (2026-10-21, Chief).** S0 measured 2026-10-22 (§13): the answers are
-  byte-identical across passes and machines and a day's set runs in under 10 s, but the full-history
-  newcomer scan breaks the 256 MB rise on the GRT nest, so the 90-day fallback is taken. Waiting on
-  Chief reading the 28 reports.
+- Status: **Parked 2026-10-22 (Chief): stopped after S0.** Chief scratched it the day S0 reported;
+  the engine room (RFC-0069) is the only programme running. Do not start S1 unasked. Accepted
+  2026-10-21. S0 measured 2026-10-22 (§13): the answers are byte-identical across passes and
+  machines and a day's set runs in under 10 s, but the full-history newcomer scan breaks the 256 MB
+  rise on the GRT nest, so the 90-day fallback would have been taken.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: RFC-0071 (nuthatch diff), for its row-to-sentence templates and its ranking, and on

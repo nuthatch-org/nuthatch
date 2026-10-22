@@ -203,6 +203,8 @@ async fn main() -> Result<()> {
              is the embedded one and carries no database driver (CLAUDE.md non-negotiable 1)."
         ),
         cli::Command::Sql(args) => run_sql(args).await,
+        #[cfg(feature = "watch")]
+        cli::Command::Watch(args) => nuthatch::watch::run(args).await,
         cli::Command::Diff(args) => run_diff(args).await,
         cli::Command::Offchain(args) => match args.what {
             cli::OffchainWhat::Drop(args) => offchain::drop_file(

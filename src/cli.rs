@@ -55,6 +55,10 @@ pub enum Command {
     /// needs `--hot-store`; without it this still serves the nest's local redb, but exclusively -
     /// see `--hot-store`'s own help.
     Serve(ServeArgs),
+    /// Watch a running nest from the terminal: the tip, the seal, memory against its budget, RPC
+    /// endpoints. Read-only; it reads the endpoints the nest already serves (RFC-0069).
+    #[cfg(feature = "watch")]
+    Watch(crate::watch::WatchArgs),
     /// Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width, max JSON-RPC
     /// batch size, and archive depth - and print the largest safe `--window`. Each of those limits
     /// otherwise surfaces mid-backfill as a retry loop that looks like slowness.

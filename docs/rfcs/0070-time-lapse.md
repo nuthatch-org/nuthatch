@@ -1,7 +1,9 @@
 # RFC-0070: Time-lapse - a contract's sealed history replayed at speed
 
-- Status: **Accepted (2026-10-21, Chief).** S0 measured 2026-10-22 (§13); Chief watched its rendering
-  the same day and said keep building. S1 built 2026-10-22 (§14): `nuthatch-timelapse` gives S0's three
+- Status: **Parked 2026-10-22 (Chief): stopped after S2.** Chief scratched it the day S2 was built;
+  the engine room (RFC-0069) is the only programme running. Do not start S3 unasked. Accepted
+  2026-10-21. S0 measured 2026-10-22 (§13); Chief watched its rendering the same day and said keep
+  building. S1 built 2026-10-22 (§14): `nuthatch-timelapse` gives S0's three
   frame hashes natively and as wasm in Node, and its validator refuses each forbidden construct by name.
   S2 built 2026-10-22 (§15): the player page replays four specs over the public mirror in a tab, each to
   the native hash, and its single-file export plays every frame offline with zero requests.

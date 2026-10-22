@@ -178,7 +178,10 @@ url = { version = "2", optional = true }
 # the docs advertise simply did not exist. Measured cost of enabling it: **two** lines of dependency
 # tree, because `object_store` is already compiled (via dbsp/feldera-storage) and `url` is already
 # present; the feature only adds the `aws` transport on top of a crate we were building anyway.
-default = ["object-store"]
+default = ["object-store", "watch"]
+# RFC-0069: `nuthatch watch`, a read-only view of a running nest. On by default, so the binary the
+# README shows is the one that ships; `--no-default-features` removes it and nothing else.
+watch = []
 # Object-store (S3-compatible) nest-registry backend (RFC-0019 slice 2). Kept as a named feature so a
 # build that genuinely wants it gone can `--no-default-features`.
 object-store = ["dep:object_store", "dep:url"]

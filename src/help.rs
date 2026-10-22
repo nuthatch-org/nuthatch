@@ -20,7 +20,15 @@ pub const GROUPS: &[(&str, &[&str])] = &[
     (
         "OPERATING",
         &[
-            "serve", "doctor", "check", "diff", "schema", "bench", "settle",
+            "serve",
+            #[cfg(feature = "watch")]
+            "watch",
+            "doctor",
+            "check",
+            "diff",
+            "schema",
+            "bench",
+            "settle",
         ],
     ),
     ("SCALED", &["worker", "control"]),
