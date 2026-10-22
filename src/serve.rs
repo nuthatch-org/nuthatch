@@ -6069,6 +6069,29 @@ mod tests {
     use super::*;
     use crate::store::Store;
 
+    /// Behind a runtime prefix the ring keeps the nest's own route and the declared name: axum hands
+    /// a nested router the prefix-stripped path while `MatchedPath` keeps the prefix.
+    #[tokio::test]
+    async fn a_prefixed_request_keeps_its_route_and_name() {
+        use tower::ServiceExt;
+        let ring = std::sync::Arc::new(crate::requests::RequestRing::default());
+        let inner = Router::new()
+            .route("/q/{name}", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn({
+                let ring = ring.clone();
+                move |req, next| count_request(ring.clone(), req, next)
+            }));
+        let app = Router::new().nest("/pulse", inner);
+        let req = axum::http::Request::get("/pulse/q/top")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), 200);
+        let (served, _) = ring.since(0);
+        assert_eq!(served.len(), 1);
+        assert_eq!(&*served[0].route, "/q/{name}");
+        assert_eq!(served[0].name.as_deref(), Some("top"));
+    }
+
     #[cfg(feature = "graph")]
     #[test]
     fn a_derived_single_and_a_second_to_one_shape_as_graph_node_answers() {
