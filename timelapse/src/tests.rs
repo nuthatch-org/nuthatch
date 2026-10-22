@@ -215,7 +215,7 @@ fn keys() -> impl Strategy<Value = String> {
     ]
 }
 
-fn events(fold_last: bool) -> impl Strategy<Value = Vec<Event>> {
+fn events() -> impl Strategy<Value = Vec<Event>> {
     prop::collection::vec((0u64..400, keys(), -50i64..50, prop::bool::ANY), 0..120).prop_map(
         move |mut raw| {
             raw.sort_by_key(|r| r.0);
@@ -226,8 +226,8 @@ fn events(fold_last: bool) -> impl Strategy<Value = Vec<Event>> {
                     // A unique log per row, so a `last` fold's order is fully determined.
                     log: i as u64,
                     key,
-                    amount: if fold_last { amount.abs() } else { amount },
-                    sign: if neg && !fold_last { -1 } else { 1 },
+                    amount,
+                    sign: if neg { -1 } else { 1 },
                 })
                 .collect()
         },
@@ -240,7 +240,7 @@ proptest! {
     #[test]
     fn chunk_boundaries_never_change_the_frames(
         last in prop::bool::ANY,
-        events in events(false),
+        events in events(),
         ends in prop::collection::vec(0u64..400, 0..12),
         from in 0u64..300,
         frames in 1u64..40,
