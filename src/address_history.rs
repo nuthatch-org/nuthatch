@@ -391,6 +391,12 @@ fn row_key(a: &Address, block: u64, tx_index: u64, position: u64) -> [u8; KEY_LE
     k
 }
 
+/// A row key's block, tx index and position.
+fn key_parts(k: &[u8]) -> (u64, u64, u64) {
+    let at = |i: usize| u64::from_be_bytes(k[i..i + 8].try_into().expect("row keys are 44 bytes"));
+    (at(20), at(28), at(36))
+}
+
 fn reorgable_key(block: u64, tag: u8, id: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(9 + id.len());
     k.extend_from_slice(&block.to_be_bytes());
@@ -503,6 +509,171 @@ pub struct PageRequest {
     pub generation: Option<u64>,
     /// A token action's `contractaddress`: only that token's transfers, paged after filtering.
     pub contract: Option<Address>,
+}
+
+/// The actions a diff reads: value and token movements. NFT transfers, withdrawals and produced
+/// blocks are served at `/api` and not told.
+pub const DIFF_ACTIONS: [Action; 3] = [Action::TxList, Action::TxListInternal, Action::TokenTx];
+
+/// One stored row as a diff reads it: the watched address it is filed under, its key, and only the
+/// fields a diff tells, fixed-width, so the row cap's two million rows fit the cursor's budget.
+#[derive(Debug, Clone)]
+pub struct DiffRow {
+    pub action: Action,
+    pub address: Address,
+    pub block: u64,
+    pub tx_index: u64,
+    pub position: u64,
+    pub hash: [u8; 32],
+    pub block_hash: Option<[u8; 32]>,
+    pub from: Address,
+    /// Empty for a creation, whose new contract is `contract`.
+    pub to: Option<Address>,
+    /// The token of a `tokentx` row; the contract a creation made.
+    pub contract: Option<Address>,
+    pub value: alloy_primitives::U256,
+    pub failed: bool,
+    /// An internal row's `type`: `call`, `create`, `create2` or `self-destruct`.
+    pub kind: String,
+    pub log_index: Option<u64>,
+}
+
+fn fixed<const N: usize>(s: &str, what: &str) -> Result<[u8; N]> {
+    let hex = s.strip_prefix("0x").unwrap_or(s);
+    let mut out = [0u8; N];
+    alloy_primitives::hex::decode_to_slice(hex, &mut out)
+        .map_err(|_| anyhow!("{what} {s:?} is not {N} bytes of hex"))?;
+    Ok(out)
+}
+
+/// A transaction hash as its 32 bytes.
+pub fn fixed_hash(s: &str) -> Result<[u8; 32]> {
+    fixed(s, "transaction hash")
+}
+
+impl DiffRow {
+    fn from_record(
+        action: Action,
+        address: Address,
+        (block, tx_index, position): (u64, u64, u64),
+        r: &Map<String, Value>,
+    ) -> Result<DiffRow> {
+        let field = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("");
+        let addr = |k: &str| -> Result<Option<Address>> {
+            match field(k) {
+                "" => Ok(None),
+                a => fixed(a, k).map(Some),
+            }
+        };
+        let value = field("value");
+        Ok(DiffRow {
+            action,
+            address,
+            block,
+            tx_index,
+            position,
+            hash: fixed(field("hash"), "hash")?,
+            block_hash: match field("blockHash") {
+                "" => None,
+                h => Some(fixed(h, "blockHash")?),
+            },
+            from: addr("from")?
+                .ok_or_else(|| anyhow!("a {} row with no from", action.etherscan()))?,
+            to: addr("to")?,
+            contract: addr("contractAddress")?,
+            value: alloy_primitives::U256::from_str_radix(value, 10).map_err(|_| {
+                anyhow!(
+                    "{} value {value:?} is not a decimal uint256",
+                    action.etherscan()
+                )
+            })?,
+            failed: field("isError") == "1",
+            kind: field("type").to_string(),
+            log_index: match field("logIndex") {
+                "" => None,
+                l => Some(l.parse().context("logIndex")?),
+            },
+        })
+    }
+}
+
+/// A watched address, an action, and the block spans it is covered for.
+pub type Covered = (String, Action, Vec<(u64, u64)>);
+
+/// What a diff knows of an address-history store before it reads a row, and, held in memory, the
+/// rows themselves; a store's rows are streamed by [`DiffSnapshot`] instead.
+#[derive(Debug, Clone, Default)]
+pub struct DiffRows {
+    pub chain_id: u64,
+    pub watched: Vec<String>,
+    /// The finalized head: rows above it may still be reorganised.
+    pub head: Option<u64>,
+    pub tip: Option<u64>,
+    pub conflict: Option<String>,
+    pub coverage: Vec<Covered>,
+    pub unprovable: Vec<(String, u64)>,
+    /// Rows in range under every watched address, before any is decoded or shared rows are merged.
+    pub counted: u64,
+    pub rows: Vec<DiffRow>,
+}
+
+/// The rows a diff of an address-history nest folds, one at a time, in (address, action, key) order.
+pub trait DiffSource {
+    fn meta(&self) -> &DiffRows;
+    fn each_row(&self, f: &mut dyn FnMut(DiffRow) -> Result<()>) -> Result<()>;
+}
+
+impl DiffSource for DiffRows {
+    fn meta(&self) -> &DiffRows {
+        self
+    }
+
+    fn each_row(&self, f: &mut dyn FnMut(DiffRow) -> Result<()>) -> Result<()> {
+        self.rows.iter().cloned().try_for_each(f)
+    }
+}
+
+/// [`AddressHistory::diff_snapshot`]: the counts and coverage it read, and the read transaction they
+/// were read in, which the rows are streamed from.
+pub struct DiffSnapshot {
+    meta: DiffRows,
+    rtx: redb::ReadTransaction,
+    watched: Vec<Address>,
+    span: (u64, u64),
+}
+
+impl DiffSource for DiffSnapshot {
+    fn meta(&self) -> &DiffRows {
+        &self.meta
+    }
+
+    fn each_row(&self, f: &mut dyn FnMut(DiffRow) -> Result<()>) -> Result<()> {
+        let (from, to) = self.span;
+        if to < from {
+            return Ok(());
+        }
+        for a in &self.watched {
+            for action in DIFF_ACTIONS {
+                let t = self.rtx.open_table(action.table())?;
+                let (lo, hi) = (row_key(a, from, 0, 0), row_key(a, to, u64::MAX, u64::MAX));
+                for e in t.range(lo.as_slice()..=hi.as_slice())? {
+                    let (k, v) = e?;
+                    let key = key_parts(k.value());
+                    let row = DiffRow::from_record(action, *a, key, &decode_record(v.value())?)
+                        .with_context(|| {
+                            format!(
+                                "{} row of {} at block {}",
+                                action.etherscan(),
+                                address_hex(a),
+                                key.0
+                            )
+                        })?;
+                    f(row)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -661,6 +832,12 @@ impl AddressHistory {
         }
         wtx.commit()?;
         Ok(AddressHistory { store, chain_id })
+    }
+
+    /// The history in `store` for reading only: nothing is created, seeded or migrated, so a store a
+    /// diff reads is left as it was.
+    pub fn reader(store: Store, chain_id: u64) -> AddressHistory {
+        AddressHistory { store, chain_id }
     }
 
     pub fn store(&self) -> &Store {
@@ -1551,6 +1728,90 @@ impl AddressHistory {
         t.range(lo.as_slice()..=hi.as_slice())?
             .map(|e| decode_record(e?.1.value()))
             .collect()
+    }
+
+    /// What a diff reads of the watched addresses over `[from, to]` (RFC-0071 §15 step 4): one read
+    /// transaction, held so the rows streamed after are the ones counted here, whatever a cursor
+    /// writes meanwhile. Rows are counted by key; none is decoded until [`DiffSnapshot::each_row`].
+    pub fn diff_snapshot(&self, (from, to): (u64, u64)) -> Result<DiffSnapshot> {
+        let rtx = self.store.database().begin_read()?;
+        let watched: Vec<Address> = rtx
+            .open_table(WATCHED)?
+            .iter()?
+            .map(|e| {
+                let (k, _) = e?;
+                k.value().try_into().context("watched key is not 20 bytes")
+            })
+            .collect::<Result<_>>()?;
+        let meta = rtx.open_table(META)?;
+        let mut out = DiffRows {
+            chain_id: self.chain_id,
+            watched: watched.iter().map(address_hex).collect(),
+            head: meta.get(HEAD)?.map(|v| v.value()),
+            tip: meta.get(TIP)?.map(|v| v.value()),
+            conflict: rtx
+                .open_table(CONFLICT)?
+                .get("why")?
+                .map(|v| v.value().to_string()),
+            ..Default::default()
+        };
+        if to >= from {
+            let (cov, sweep, joined, unprovable) = (
+                rtx.open_table(COVERAGE)?,
+                rtx.open_table(SWEEP)?,
+                rtx.open_table(JOINED)?,
+                rtx.open_table(UNPROVABLE)?,
+            );
+            for a in &watched {
+                if let Some(b) = unprovable.get(a.as_slice())? {
+                    out.unprovable.push((address_hex(a), b.value()));
+                }
+                for action in DIFF_ACTIONS {
+                    let mut spans = match cov.get(coverage_key(a, action).as_slice())? {
+                        Some(v) => decode_spans(v.value())?,
+                        None => Vec::new(),
+                    };
+                    spans.extend(swept_for(&sweep, &joined, a, action)?);
+                    out.coverage.push((address_hex(a), action, merge(spans)));
+                    let t = rtx.open_table(action.table())?;
+                    let (lo, hi) = (row_key(a, from, 0, 0), row_key(a, to, u64::MAX, u64::MAX));
+                    out.counted += t.range(lo.as_slice()..=hi.as_slice())?.count() as u64;
+                }
+            }
+        }
+        drop(meta);
+        Ok(DiffSnapshot {
+            meta: out,
+            rtx,
+            watched,
+            span: (from, to),
+        })
+    }
+
+    /// The stored rows of (address, action) in `[from, to]` with their keys: block, tx index, position.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn keyed_rows(
+        &self,
+        rtx: &redb::ReadTransaction,
+        action: Action,
+        a: &Address,
+        (from, to): (u64, u64),
+    ) -> Result<Vec<((u64, u64, u64), Map<String, Value>)>> {
+        let t = rtx.open_table(action.table())?;
+        let (lo, hi) = (row_key(a, from, 0, 0), row_key(a, to, u64::MAX, u64::MAX));
+        t.range(lo.as_slice()..=hi.as_slice())?
+            .map(|e| {
+                let (k, v) = e?;
+                Ok((key_parts(k.value()), decode_record(v.value())?))
+            })
+            .collect()
+    }
+
+    /// A read transaction on the store, for [`AddressHistory::keyed_rows`].
+    #[cfg(test)]
+    pub(crate) fn begin_read(&self) -> Result<redb::ReadTransaction> {
+        Ok(self.store.database().begin_read()?)
     }
 
     /// What the relays said about `block`, if it was asked before.

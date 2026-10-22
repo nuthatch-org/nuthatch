@@ -1,0 +1,32 @@
+{
+  "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599": {
+    "decimals": 8,
+    "name": "Wrapped BTC",
+    "symbol": "WBTC"
+  },
+  "0x6b175474e89094c44da98b954eedeac495271d0f": {
+    "decimals": 18,
+    "name": "Dai Stablecoin",
+    "symbol": "DAI"
+  },
+  "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0": {
+    "decimals": 18,
+    "name": "Wrapped liquid staked Ether 2.0",
+    "symbol": "wstETH"
+  },
+  "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": {
+    "decimals": 6,
+    "name": "USD Coin",
+    "symbol": "USDC"
+  },
+  "0xae7ab96520de3a18e5e111b5eaab095312d7fe84": {
+    "decimals": 18,
+    "name": "Liquid staked Ether 2.0",
+    "symbol": "stETH"
+  },
+  "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": {
+    "decimals": 18,
+    "name": "Wrapped Ether",
+    "symbol": "WETH"
+  }
+}

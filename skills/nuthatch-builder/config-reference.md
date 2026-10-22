@@ -226,6 +226,10 @@ chain's state, and `/metrics` labels each sample with `chain_id`. Each chain rea
 `NUTHATCH_RPC_<chain id>` and `NUTHATCH_TRACE_RPC_<chain id>`, else from its nest's `rpc_urls`;
 `--rpc`, `--trace-rpc` and `--rpc-fallback` are refused there, because each names one chain's.
 
+`nuthatch diff` reads these rows too (RFC-0071 §19): the watched addresses' native value and internal
+transfers as movements of the chain's own currency, beside their token transfers, from the nest
+directory or from `GET /diff` on a solo `nuthatch dev`. A directory of chains serves no `/diff`.
+
 `getblocknobytime` answers from verified headers where they bracket the timestamp, and otherwise by
 searching the nest's own RPC, proving the answer against its neighbour block by parent hash and,
 above the finalized head, linking it by parent hashes to the head the search began from. It refuses a

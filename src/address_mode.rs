@@ -133,6 +133,8 @@ pub struct ModeState {
     /// Blocks the body scan has read, held until the validator pass can hang them from the
     /// finalized tag. A window proved only against its neighbour is not recorded on its own.
     held: Mutex<Option<HeldBridge>>,
+    /// The nest directory and its config's facts, for `GET /diff`; only a solo nest has them.
+    pub diff: Option<(std::path::PathBuf, crate::diff::Facts)>,
 }
 
 /// One tip block from the body scan, and the watched proposers' rows for the blocks before it.
@@ -260,7 +262,7 @@ impl Pace {
 }
 
 /// The address-history store's page cache.
-const STORE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+pub const STORE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// How many requests may wait for the cursor at once; past it a request answers incomplete at once.
 const QUEUE: usize = 64;
@@ -365,6 +367,7 @@ impl ModeState {
             mirror_last: AtomicU64::new(0),
             holding: Mutex::new(None),
             held: Mutex::new(None),
+            diff: None,
         }
     }
 
@@ -485,6 +488,11 @@ impl ModeState {
 
     pub fn with_sweep(mut self, sweep: Option<crate::address_history::SweepConfig>) -> Self {
         self.sweep = sweep;
+        self
+    }
+
+    pub fn with_diff(mut self, dir: &Path, facts: crate::diff::Facts) -> Self {
+        self.diff = Some((dir.to_path_buf(), facts));
         self
     }
 
@@ -3064,6 +3072,7 @@ pub fn router(state: Arc<ModeState>) -> Router {
         .route("/api/unwatch", post(unwatch))
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(ready))
+        .route("/diff", get(diff_route))
         .route("/metrics", get(metrics))
         .with_state(state)
 }
@@ -3079,6 +3088,49 @@ async fn blocking<T: Send + 'static>(
 
 fn failed(status: StatusCode, e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     (status, Json(json!({ "error": e.to_string() })))
+}
+
+/// `GET /diff` (RFC-0071 §15 step 4): the document `nuthatch diff` prints over this nest's store,
+/// read from one snapshot of it. It makes no RPC call and asks the cursor for nothing, so a range
+/// the nest has not covered is refused rather than fetched.
+async fn diff_route(
+    State(s): State<Arc<ModeState>>,
+    Query(q): Query<crate::serve::DiffQuery>,
+) -> axum::response::Response {
+    let Some((dir, facts)) = s.diff.clone() else {
+        return failed(
+            StatusCode::NOT_FOUND,
+            "a directory of chains serves no /diff; run the chain's nest on its own",
+        )
+        .into_response();
+    };
+    let (ask, format) = match q.ask() {
+        Ok(a) => a,
+        Err(e) => return failed(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    // The rows are streamed from one read transaction, so the whole diff runs off the runtime.
+    let history = s.history.clone();
+    let rt = tokio::runtime::Handle::current();
+    let produced = tokio::task::spawn_blocking(move || {
+        let snapshot = history
+            .diff_snapshot((ask.req.from, ask.req.to))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        rt.block_on(crate::diff_history::produce(&dir, facts, &snapshot, &ask))
+            .and_then(|p| p.render(format, ask.top))
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))
+    })
+    .await;
+    let body = match produced {
+        Ok(Ok(b)) => b,
+        Ok(Err((status, e))) => return failed(status, format!("{e:#}")).into_response(),
+        Err(e) => return failed(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let ctype = match format {
+        crate::diff::Format::Json => "application/json",
+        crate::diff::Format::Markdown => "text/markdown; charset=utf-8",
+        _ => "text/plain; charset=utf-8",
+    };
+    ([(axum::http::header::CONTENT_TYPE, ctype)], body).into_response()
 }
 
 /// The most an `/api` form POST may carry: a client posts when its GET would be too long, so an
@@ -4848,6 +4900,10 @@ pub async fn start_nest(
         )
         .with_deadline(ah.request_deadline()?)
         .with_sweep(ah.sweep.clone())
+        .with_diff(
+            dir,
+            crate::diff_history::facts(config, crate::diff_history::data_identity(dir)),
+        )
         .with_forward(forward(discovery.clone(), verified.clone()))
         .with_counter(counter(discovery.clone()))
         .with_hash_at({

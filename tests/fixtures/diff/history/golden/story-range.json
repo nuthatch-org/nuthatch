@@ -1,0 +1,1059 @@
+{
+  "kind": "story",
+  "nest": {
+    "name": "euler-exploiter-history",
+    "chain": "mainnet",
+    "chain_id": 1,
+    "data_identity": "5a5ea86dddc1fcdf913029c0809df095afe4339545f548d4b463256bef7aaad0"
+  },
+  "request": {
+    "from": 16817996,
+    "to": 16837739
+  },
+  "coverage": {
+    "start_block": 16817996,
+    "indexed_head": 16837739,
+    "sealed_through": 26244634,
+    "final": true
+  },
+  "tables": [
+    {
+      "table": "tokentx",
+      "section": "history",
+      "rows": 37
+    },
+    {
+      "table": "txlist",
+      "section": "history",
+      "rows": 17
+    },
+    {
+      "table": "txlistinternal",
+      "section": "history",
+      "rows": 14
+    }
+  ],
+  "rows_total": 68,
+  "top": 10,
+  "control": [],
+  "movements": [
+    {
+      "address": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "alias": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "symbol": "wstETH",
+      "decimals": 18,
+      "rows": 9,
+      "addresses": 7,
+      "largest": [
+        {
+          "block": 16818062,
+          "log_index": 63,
+          "tx_index": 11,
+          "from": "0x22c5cf8fc9891f8ef5a5e8630b95115018a09736",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "145200000000000000000000",
+          "reads": "transfer",
+          "text": "0x22c5cf8fc9891f8ef5a5e8630b95115018a09736 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 145,200 wstETH"
+        },
+        {
+          "block": 16818062,
+          "log_index": 117,
+          "tx_index": 11,
+          "from": "0xcec2981d8047c401f2a4e972a7e5ada3f5ecf838",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "119071498175683316786271",
+          "reads": "transfer",
+          "text": "0xcec2981d8047c401f2a4e972a7e5ada3f5ecf838 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 119,071.498175683316786271 wstETH"
+        },
+        {
+          "block": 16818062,
+          "log_index": 12,
+          "tx_index": 11,
+          "from": "0xba12222222228d8ba445958a75a0704d566bf2c8",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "99000000000000000000000",
+          "reads": "transfer",
+          "text": "0xba12222222228d8ba445958a75a0704d566bf2c8 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 99,000 wstETH"
+        },
+        {
+          "block": 16818062,
+          "log_index": 13,
+          "tx_index": 11,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a",
+          "amount": "99000000000000000000000",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a: 99,000 wstETH"
+        },
+        {
+          "block": 16818062,
+          "log_index": 64,
+          "tx_index": 11,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0xba12222222228d8ba445958a75a0704d566bf2c8",
+          "amount": "99000000000000000000000",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xba12222222228d8ba445958a75a0704d566bf2c8: 99,000 wstETH"
+        },
+        {
+          "block": 16818062,
+          "log_index": 66,
+          "tx_index": 11,
+          "from": "0xba12222222228d8ba445958a75a0704d566bf2c8",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "99000000000000000000000",
+          "reads": "transfer",
+          "text": "0xba12222222228d8ba445958a75a0704d566bf2c8 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 99,000 wstETH"
+        },
+        {
+          "block": 16818062,
+          "log_index": 67,
+          "tx_index": 11,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0x1e4446016f3fddfe2ecc046cf91a8010a30e9a9b",
+          "amount": "99000000000000000000000",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x1e4446016f3fddfe2ecc046cf91a8010a30e9a9b: 99,000 wstETH"
+        },
+        {
+          "block": 16818062,
+          "log_index": 118,
+          "tx_index": 11,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0xba12222222228d8ba445958a75a0704d566bf2c8",
+          "amount": "99000000000000000000000",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xba12222222228d8ba445958a75a0704d566bf2c8: 99,000 wstETH"
+        },
+        {
+          "block": 16818062,
+          "log_index": 120,
+          "tx_index": 11,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0x0000000000000000000000000000000000000000",
+          "amount": "66271498175683316786271",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x0000000000000000000000000000000000000000 (zero address): 66,271.498175683316786271 wstETH"
+        }
+      ],
+      "net": [
+        {
+          "address": "0x22c5cf8fc9891f8ef5a5e8630b95115018a09736",
+          "sent": "145200000000000000000000",
+          "received": "0",
+          "net": "-145200000000000000000000",
+          "text": "0x22c5cf8fc9891f8ef5a5e8630b95115018a09736  -145,200 wstETH"
+        },
+        {
+          "address": "0xcec2981d8047c401f2a4e972a7e5ada3f5ecf838",
+          "sent": "119071498175683316786271",
+          "received": "0",
+          "net": "-119071498175683316786271",
+          "text": "0xcec2981d8047c401f2a4e972a7e5ada3f5ecf838  -119,071.498175683316786271 wstETH"
+        },
+        {
+          "address": "0x1e4446016f3fddfe2ecc046cf91a8010a30e9a9b",
+          "sent": "0",
+          "received": "99000000000000000000000",
+          "net": "99000000000000000000000",
+          "text": "0x1e4446016f3fddfe2ecc046cf91a8010a30e9a9b  +99,000 wstETH"
+        },
+        {
+          "address": "0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a",
+          "sent": "0",
+          "received": "99000000000000000000000",
+          "net": "99000000000000000000000",
+          "text": "0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a  +99,000 wstETH"
+        },
+        {
+          "address": "0x0000000000000000000000000000000000000000",
+          "sent": "0",
+          "received": "66271498175683316786271",
+          "net": "66271498175683316786271",
+          "text": "0x0000000000000000000000000000000000000000 (zero address)  +66,271.498175683316786271 wstETH"
+        }
+      ],
+      "net_not_listed": 0,
+      "netted_to_zero": 2
+    },
+    {
+      "address": "native",
+      "alias": "native",
+      "symbol": "ETH",
+      "decimals": 18,
+      "rows": 9,
+      "addresses": 8,
+      "largest": [
+        {
+          "block": 16818102,
+          "tx_index": 33,
+          "trace_index": 1,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0xb66cd966670d962c227b3eaba30a872dbfb995db",
+          "amount": "88752697459828535340019",
+          "reads": "native_internal",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xb66cd966670d962c227b3eaba30a872dbfb995db: 88,752.697459828535340019 ETH (internal transfer)"
+        },
+        {
+          "block": 16818062,
+          "tx_index": 11,
+          "trace_index": 393,
+          "from": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "73347663060908361989345",
+          "reads": "native_internal",
+          "text": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 73,347.663060908361989345 ETH (internal transfer)"
+        },
+        {
+          "block": 16818057,
+          "tx_index": 1,
+          "trace_index": 188,
+          "from": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "11559126335382286632783",
+          "reads": "native_internal",
+          "text": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 11,559.126335382286632783 ETH (internal transfer)"
+        },
+        {
+          "block": 16818032,
+          "tx_index": 25,
+          "trace_index": 4,
+          "from": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "8080498391868396965958",
+          "reads": "native_internal",
+          "text": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 8,080.498391868396965958 ETH (internal transfer)"
+        },
+        {
+          "block": 16818034,
+          "tx_index": 29,
+          "trace_index": 1,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+          "amount": "8080498391868396965958",
+          "reads": "native_internal",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4: 8,080.498391868396965958 ETH (internal transfer)"
+        },
+        {
+          "block": 16818085,
+          "tx_index": 4,
+          "trace_index": 328,
+          "from": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "3845908063537886717891",
+          "reads": "native_internal",
+          "text": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 3,845.908063537886717891 ETH (internal transfer)"
+        },
+        {
+          "block": 16837528,
+          "tx_index": 62,
+          "from": "0xaf471a6d527b04dd1ac916d2c96e45f7e4b78bb8",
+          "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+          "amount": "1000000000000000",
+          "reads": "native_value",
+          "text": "0xaf471a6d527b04dd1ac916d2c96e45f7e4b78bb8 -> 0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4: 0.001 ETH (transaction value)"
+        },
+        {
+          "block": 16837739,
+          "tx_index": 116,
+          "from": "0x1ed1dab540433465c79ae82da0c418d5999e87d8",
+          "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+          "amount": "133700000000000",
+          "reads": "native_value",
+          "text": "0x1ed1dab540433465c79ae82da0c418d5999e87d8 -> 0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4: 0.0001337 ETH (transaction value)"
+        },
+        {
+          "block": 16835306,
+          "tx_index": 33,
+          "from": "0x4d47d0ae9224b414a7f38c2e73569f65c987f848",
+          "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+          "amount": "70000000000000",
+          "reads": "native_value",
+          "text": "0x4d47d0ae9224b414a7f38c2e73569f65c987f848 -> 0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4: 0.00007 ETH (transaction value)"
+        }
+      ],
+      "net": [
+        {
+          "address": "0xb66cd966670d962c227b3eaba30a872dbfb995db",
+          "sent": "0",
+          "received": "88752697459828535340019",
+          "net": "88752697459828535340019",
+          "text": "0xb66cd966670d962c227b3eaba30a872dbfb995db  +88,752.697459828535340019 ETH"
+        },
+        {
+          "address": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",
+          "sent": "77193571124446248707236",
+          "received": "0",
+          "net": "-77193571124446248707236",
+          "text": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022  -77,193.571124446248707236 ETH"
+        },
+        {
+          "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+          "sent": "19639624727250683598741",
+          "received": "0",
+          "net": "-19639624727250683598741",
+          "text": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2  -19,639.624727250683598741 ETH"
+        },
+        {
+          "address": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+          "sent": "0",
+          "received": "8080499595568396965958",
+          "net": "8080499595568396965958",
+          "text": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4  +8,080.499595568396965958 ETH"
+        },
+        {
+          "address": "0xaf471a6d527b04dd1ac916d2c96e45f7e4b78bb8",
+          "sent": "1000000000000000",
+          "received": "0",
+          "net": "-1000000000000000",
+          "text": "0xaf471a6d527b04dd1ac916d2c96e45f7e4b78bb8  -0.001 ETH"
+        },
+        {
+          "address": "0x1ed1dab540433465c79ae82da0c418d5999e87d8",
+          "sent": "133700000000000",
+          "received": "0",
+          "net": "-133700000000000",
+          "text": "0x1ed1dab540433465c79ae82da0c418d5999e87d8  -0.0001337 ETH"
+        },
+        {
+          "address": "0x4d47d0ae9224b414a7f38c2e73569f65c987f848",
+          "sent": "70000000000000",
+          "received": "0",
+          "net": "-70000000000000",
+          "text": "0x4d47d0ae9224b414a7f38c2e73569f65c987f848  -0.00007 ETH"
+        }
+      ],
+      "net_not_listed": 0,
+      "netted_to_zero": 1
+    },
+    {
+      "address": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "alias": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "symbol": "stETH",
+      "decimals": 18,
+      "rows": 7,
+      "addresses": 6,
+      "largest": [
+        {
+          "block": 16818062,
+          "log_index": 121,
+          "tx_index": 11,
+          "from": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "73821459345383044466413",
+          "reads": "transfer",
+          "text": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 73,821.459345383044466413 stETH"
+        },
+        {
+          "block": 16818062,
+          "log_index": 124,
+          "tx_index": 11,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",
+          "amount": "73821459345383044466412",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xdc24316b9ae028f1497c275eb9192a3ea0f67022: 73,821.459345383044466412 stETH"
+        },
+        {
+          "block": 16818085,
+          "log_index": 81,
+          "tx_index": 4,
+          "from": "0x12df82a443c77eae9d5bb0f5c8d0ec706ecb338c",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "24792504357548022052968",
+          "reads": "transfer",
+          "text": "0x12df82a443c77eae9d5bb0f5c8d0ec706ecb338c -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 24,792.504357548022052968 stETH"
+        },
+        {
+          "block": 16818085,
+          "log_index": 84,
+          "tx_index": 4,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0x1982b2f5814301d4e9a8b0201555376e62f82428",
+          "amount": "20913805500000000000000",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x1982b2f5814301d4e9a8b0201555376e62f82428: 20,913.8055 stETH"
+        },
+        {
+          "block": 16818085,
+          "log_index": 24,
+          "tx_index": 4,
+          "from": "0x1982b2f5814301d4e9a8b0201555376e62f82428",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "20895000000000000000000",
+          "reads": "transfer",
+          "text": "0x1982b2f5814301d4e9a8b0201555376e62f82428 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 20,895 stETH"
+        },
+        {
+          "block": 16818085,
+          "log_index": 27,
+          "tx_index": 4,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0xa4c0afeca6273b012382970c1ed8690c2929988d",
+          "amount": "20895000000000000000000",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xa4c0afeca6273b012382970c1ed8690c2929988d: 20,895 stETH"
+        },
+        {
+          "block": 16818085,
+          "log_index": 89,
+          "tx_index": 4,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",
+          "amount": "3878698857548022052968",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xdc24316b9ae028f1497c275eb9192a3ea0f67022: 3,878.698857548022052968 stETH"
+        }
+      ],
+      "net": [
+        {
+          "address": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",
+          "sent": "0",
+          "received": "77700158202931066519380",
+          "net": "77700158202931066519380",
+          "text": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022  +77,700.15820293106651938 stETH"
+        },
+        {
+          "address": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+          "sent": "73821459345383044466413",
+          "received": "0",
+          "net": "-73821459345383044466413",
+          "text": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0  -73,821.459345383044466413 stETH"
+        },
+        {
+          "address": "0x12df82a443c77eae9d5bb0f5c8d0ec706ecb338c",
+          "sent": "24792504357548022052968",
+          "received": "0",
+          "net": "-24792504357548022052968",
+          "text": "0x12df82a443c77eae9d5bb0f5c8d0ec706ecb338c  -24,792.504357548022052968 stETH"
+        },
+        {
+          "address": "0xa4c0afeca6273b012382970c1ed8690c2929988d",
+          "sent": "0",
+          "received": "20895000000000000000000",
+          "net": "20895000000000000000000",
+          "text": "0xa4c0afeca6273b012382970c1ed8690c2929988d  +20,895 stETH"
+        },
+        {
+          "address": "0x1982b2f5814301d4e9a8b0201555376e62f82428",
+          "sent": "20895000000000000000000",
+          "received": "20913805500000000000000",
+          "net": "18805500000000000000",
+          "text": "0x1982b2f5814301d4e9a8b0201555376e62f82428  +18.8055 stETH"
+        },
+        {
+          "address": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "sent": "119508963702931066519380",
+          "received": "119508963702931066519381",
+          "net": "1",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c  +0.000000000000000001 stETH"
+        }
+      ],
+      "net_not_listed": 0,
+      "netted_to_zero": 0
+    },
+    {
+      "address": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "alias": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "symbol": "WBTC",
+      "decimals": 8,
+      "rows": 5,
+      "addresses": 5,
+      "largest": [
+        {
+          "block": 16818057,
+          "log_index": 70,
+          "tx_index": 1,
+          "from": "0xd041709eb1c61ce6ec9d46126ac0e4b50eade576",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "384913597139",
+          "reads": "transfer",
+          "text": "0xd041709eb1c61ce6ec9d46126ac0e4b50eade576 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 3,849.13597139 WBTC"
+        },
+        {
+          "block": 16818057,
+          "log_index": 72,
+          "tx_index": 1,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656",
+          "amount": "300270000000",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656: 3,002.7 WBTC"
+        },
+        {
+          "block": 16818057,
+          "log_index": 20,
+          "tx_index": 1,
+          "from": "0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "300000000000",
+          "reads": "transfer",
+          "text": "0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 3,000 WBTC"
+        },
+        {
+          "block": 16818057,
+          "log_index": 22,
+          "tx_index": 1,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0xb324581ee258aa67bc144ad27f79f8dcac569af0",
+          "amount": "300000000000",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xb324581ee258aa67bc144ad27f79f8dcac569af0: 3,000 WBTC"
+        },
+        {
+          "block": 16818057,
+          "log_index": 75,
+          "tx_index": 1,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed",
+          "amount": "84643597139",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xcbcdf9626bc03e24f779434178a73a0b4bad62ed: 846.43597139 WBTC"
+        }
+      ],
+      "net": [
+        {
+          "address": "0xd041709eb1c61ce6ec9d46126ac0e4b50eade576",
+          "sent": "384913597139",
+          "received": "0",
+          "net": "-384913597139",
+          "text": "0xd041709eb1c61ce6ec9d46126ac0e4b50eade576  -3,849.13597139 WBTC"
+        },
+        {
+          "address": "0xb324581ee258aa67bc144ad27f79f8dcac569af0",
+          "sent": "0",
+          "received": "300000000000",
+          "net": "300000000000",
+          "text": "0xb324581ee258aa67bc144ad27f79f8dcac569af0  +3,000 WBTC"
+        },
+        {
+          "address": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed",
+          "sent": "0",
+          "received": "84643597139",
+          "net": "84643597139",
+          "text": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed  +846.43597139 WBTC"
+        },
+        {
+          "address": "0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656",
+          "sent": "300000000000",
+          "received": "300270000000",
+          "net": "270000000",
+          "text": "0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656  +2.7 WBTC"
+        }
+      ],
+      "net_not_listed": 0,
+      "netted_to_zero": 1
+    },
+    {
+      "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "alias": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "symbol": "USDC",
+      "decimals": 6,
+      "rows": 5,
+      "addresses": 5,
+      "largest": [
+        {
+          "block": 16818065,
+          "log_index": 194,
+          "tx_index": 35,
+          "from": "0xd444a7ac5d1c5eb8ebc9dab83834a412e9b7be76",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "244413863418460",
+          "reads": "transfer",
+          "text": "0xd444a7ac5d1c5eb8ebc9dab83834a412e9b7be76 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 244,413,863.41846 USDC"
+        },
+        {
+          "block": 16818065,
+          "log_index": 198,
+          "tx_index": 35,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0xbcca60bb61934080951369a648fb03df4f96263c",
+          "amount": "210189000000000",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xbcca60bb61934080951369a648fb03df4f96263c: 210,189,000 USDC"
+        },
+        {
+          "block": 16818065,
+          "log_index": 144,
+          "tx_index": 35,
+          "from": "0xbcca60bb61934080951369a648fb03df4f96263c",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "210000000000000",
+          "reads": "transfer",
+          "text": "0xbcca60bb61934080951369a648fb03df4f96263c -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 210,000,000 USDC"
+        },
+        {
+          "block": 16818065,
+          "log_index": 146,
+          "tx_index": 35,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0x7db7099b00d1d24ef2814cfcde723eacd958b05b",
+          "amount": "210000000000000",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x7db7099b00d1d24ef2814cfcde723eacd958b05b: 210,000,000 USDC"
+        },
+        {
+          "block": 16818068,
+          "log_index": 81,
+          "tx_index": 43,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0x6c6bc977e13df9b0de53b251522280bb72383700",
+          "amount": "34224863418460",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x6c6bc977e13df9b0de53b251522280bb72383700: 34,224,863.41846 USDC"
+        }
+      ],
+      "net": [
+        {
+          "address": "0xd444a7ac5d1c5eb8ebc9dab83834a412e9b7be76",
+          "sent": "244413863418460",
+          "received": "0",
+          "net": "-244413863418460",
+          "text": "0xd444a7ac5d1c5eb8ebc9dab83834a412e9b7be76  -244,413,863.41846 USDC"
+        },
+        {
+          "address": "0x7db7099b00d1d24ef2814cfcde723eacd958b05b",
+          "sent": "0",
+          "received": "210000000000000",
+          "net": "210000000000000",
+          "text": "0x7db7099b00d1d24ef2814cfcde723eacd958b05b  +210,000,000 USDC"
+        },
+        {
+          "address": "0x6c6bc977e13df9b0de53b251522280bb72383700",
+          "sent": "0",
+          "received": "34224863418460",
+          "net": "34224863418460",
+          "text": "0x6c6bc977e13df9b0de53b251522280bb72383700  +34,224,863.41846 USDC"
+        },
+        {
+          "address": "0xbcca60bb61934080951369a648fb03df4f96263c",
+          "sent": "210000000000000",
+          "received": "210189000000000",
+          "net": "189000000000",
+          "text": "0xbcca60bb61934080951369a648fb03df4f96263c  +189,000 USDC"
+        }
+      ],
+      "net_not_listed": 0,
+      "netted_to_zero": 1
+    },
+    {
+      "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "alias": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "symbol": "WETH",
+      "decimals": 18,
+      "rows": 5,
+      "addresses": 5,
+      "largest": [
+        {
+          "block": 16818024,
+          "log_index": 208,
+          "tx_index": 20,
+          "from": "0xd3b7cea28feb5e537fca4e657e3f60129456eaf3",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "28994303891868396965958",
+          "reads": "transfer",
+          "text": "0xd3b7cea28feb5e537fca4e657e3f60129456eaf3 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 28,994.303891868396965958 WETH"
+        },
+        {
+          "block": 16818024,
+          "log_index": 212,
+          "tx_index": 20,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0x030ba81f1c18d280636f32af80b9aad02cf0854e",
+          "amount": "20913805500000000000000",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x030ba81f1c18d280636f32af80b9aad02cf0854e: 20,913.8055 WETH"
+        },
+        {
+          "block": 16818024,
+          "log_index": 158,
+          "tx_index": 20,
+          "from": "0x030ba81f1c18d280636f32af80b9aad02cf0854e",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "20895000000000000000000",
+          "reads": "transfer",
+          "text": "0x030ba81f1c18d280636f32af80b9aad02cf0854e -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 20,895 WETH"
+        },
+        {
+          "block": 16818024,
+          "log_index": 160,
+          "tx_index": 20,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0x0b812c74729b6abc723f22986c61d95344ff7aba",
+          "amount": "20895000000000000000000",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x0b812c74729b6abc723f22986c61d95344ff7aba: 20,895 WETH"
+        },
+        {
+          "block": 16818057,
+          "log_index": 74,
+          "tx_index": 1,
+          "from": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "11559126335382286632783",
+          "reads": "transfer",
+          "text": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 11,559.126335382286632783 WETH"
+        }
+      ],
+      "net": [
+        {
+          "address": "0xd3b7cea28feb5e537fca4e657e3f60129456eaf3",
+          "sent": "28994303891868396965958",
+          "received": "0",
+          "net": "-28994303891868396965958",
+          "text": "0xd3b7cea28feb5e537fca4e657e3f60129456eaf3  -28,994.303891868396965958 WETH"
+        },
+        {
+          "address": "0x0b812c74729b6abc723f22986c61d95344ff7aba",
+          "sent": "0",
+          "received": "20895000000000000000000",
+          "net": "20895000000000000000000",
+          "text": "0x0b812c74729b6abc723f22986c61d95344ff7aba  +20,895 WETH"
+        },
+        {
+          "address": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "sent": "41808805500000000000000",
+          "received": "61448430227250683598741",
+          "net": "19639624727250683598741",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c  +19,639.624727250683598741 WETH"
+        },
+        {
+          "address": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed",
+          "sent": "11559126335382286632783",
+          "received": "0",
+          "net": "-11559126335382286632783",
+          "text": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed  -11,559.126335382286632783 WETH"
+        },
+        {
+          "address": "0x030ba81f1c18d280636f32af80b9aad02cf0854e",
+          "sent": "20895000000000000000000",
+          "received": "20913805500000000000000",
+          "net": "18805500000000000000",
+          "text": "0x030ba81f1c18d280636f32af80b9aad02cf0854e  +18.8055 WETH"
+        }
+      ],
+      "net_not_listed": 0,
+      "netted_to_zero": 0
+    },
+    {
+      "address": "0xa59af77c2288e44021867a741e67d7155d6fec66",
+      "alias": "0xa59af77c2288e44021867a741e67d7155d6fec66",
+      "symbol": null,
+      "decimals": null,
+      "rows": 4,
+      "addresses": 2,
+      "largest": [
+        {
+          "block": 16819020,
+          "log_index": 54,
+          "tx_index": 13,
+          "from": "0x003590b63c2b2583bcf89c38fe1bc3645f568215",
+          "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+          "amount": "25622032159041710071169896582547",
+          "reads": "transfer",
+          "text": "0x003590b63c2b2583bcf89c38fe1bc3645f568215 -> 0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4: 25,622,032,159,041,710,071,169,896,582,547 base units of 0xa59af77c2288e44021867a741e67d7155d6fec66 (decimals unknown)"
+        },
+        {
+          "block": 16819024,
+          "log_index": 7,
+          "tx_index": 2,
+          "from": "0x003590b63c2b2583bcf89c38fe1bc3645f568215",
+          "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+          "amount": "22555800000000000000000000000000",
+          "reads": "transfer",
+          "text": "0x003590b63c2b2583bcf89c38fe1bc3645f568215 -> 0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4: 22,555,800,000,000,000,000,000,000,000,000 base units of 0xa59af77c2288e44021867a741e67d7155d6fec66 (decimals unknown)"
+        },
+        {
+          "block": 16819034,
+          "log_index": 35,
+          "tx_index": 10,
+          "from": "0x003590b63c2b2583bcf89c38fe1bc3645f568215",
+          "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+          "amount": "21687927447252595865331879171315",
+          "reads": "transfer",
+          "text": "0x003590b63c2b2583bcf89c38fe1bc3645f568215 -> 0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4: 21,687,927,447,252,595,865,331,879,171,315 base units of 0xa59af77c2288e44021867a741e67d7155d6fec66 (decimals unknown)"
+        },
+        {
+          "block": 16819055,
+          "log_index": 45,
+          "tx_index": 8,
+          "from": "0x003590b63c2b2583bcf89c38fe1bc3645f568215",
+          "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+          "amount": "11737992903321762351549158898759",
+          "reads": "transfer",
+          "text": "0x003590b63c2b2583bcf89c38fe1bc3645f568215 -> 0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4: 11,737,992,903,321,762,351,549,158,898,759 base units of 0xa59af77c2288e44021867a741e67d7155d6fec66 (decimals unknown)"
+        }
+      ],
+      "net": [
+        {
+          "address": "0x003590b63c2b2583bcf89c38fe1bc3645f568215",
+          "sent": "81603752509616068288050934652621",
+          "received": "0",
+          "net": "-81603752509616068288050934652621",
+          "text": "0x003590b63c2b2583bcf89c38fe1bc3645f568215  -81,603,752,509,616,068,288,050,934,652,621 base units of 0xa59af77c2288e44021867a741e67d7155d6fec66 (decimals unknown)"
+        },
+        {
+          "address": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+          "sent": "0",
+          "received": "81603752509616068288050934652621",
+          "net": "81603752509616068288050934652621",
+          "text": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4  +81,603,752,509,616,068,288,050,934,652,621 base units of 0xa59af77c2288e44021867a741e67d7155d6fec66 (decimals unknown)"
+        }
+      ],
+      "net_not_listed": 0,
+      "netted_to_zero": 0
+    },
+    {
+      "address": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "alias": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "symbol": "DAI",
+      "decimals": 18,
+      "rows": 2,
+      "addresses": 3,
+      "largest": [
+        {
+          "block": 16818068,
+          "log_index": 80,
+          "tx_index": 43,
+          "from": "0x6c6bc977e13df9b0de53b251522280bb72383700",
+          "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "amount": "34186225919500945938720264",
+          "reads": "transfer",
+          "text": "0x6c6bc977e13df9b0de53b251522280bb72383700 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 34,186,225.919500945938720264 DAI"
+        },
+        {
+          "block": 16818102,
+          "log_index": 46,
+          "tx_index": 33,
+          "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+          "to": "0xb66cd966670d962c227b3eaba30a872dbfb995db",
+          "amount": "34186225919500945938720264",
+          "reads": "transfer",
+          "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xb66cd966670d962c227b3eaba30a872dbfb995db: 34,186,225.919500945938720264 DAI"
+        }
+      ],
+      "net": [
+        {
+          "address": "0x6c6bc977e13df9b0de53b251522280bb72383700",
+          "sent": "34186225919500945938720264",
+          "received": "0",
+          "net": "-34186225919500945938720264",
+          "text": "0x6c6bc977e13df9b0de53b251522280bb72383700  -34,186,225.919500945938720264 DAI"
+        },
+        {
+          "address": "0xb66cd966670d962c227b3eaba30a872dbfb995db",
+          "sent": "0",
+          "received": "34186225919500945938720264",
+          "net": "34186225919500945938720264",
+          "text": "0xb66cd966670d962c227b3eaba30a872dbfb995db  +34,186,225.919500945938720264 DAI"
+        }
+      ],
+      "net_not_listed": 0,
+      "netted_to_zero": 1
+    }
+  ],
+  "nft_movements": [],
+  "new_holders": {
+    "status": "not_applicable",
+    "reason": "address history holds only the transfers that touch a watched address, so it cannot say whether anyone else held a token before",
+    "before_block": 16817996,
+    "since": 16817996,
+    "history_rows": 0,
+    "budget": 20000000,
+    "tokens": []
+  },
+  "first_tables": {
+    "status": "not_applicable",
+    "reason": "an address-history nest has no event tables",
+    "tables": []
+  },
+  "approvals": [],
+  "nft_approvals": [],
+  "threshold_flags": {
+    "configured": false,
+    "count": 0,
+    "listed": []
+  },
+  "labels": [],
+  "events": {
+    "tables": [],
+    "rows_told": 0,
+    "story_warnings": []
+  },
+  "history": {
+    "watched": [
+      "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4"
+    ],
+    "native_symbol": "ETH",
+    "actions": [
+      {
+        "action": "txlist",
+        "rows": 17,
+        "moved": 3,
+        "no_value": 12,
+        "reverted": 2,
+        "shared": 12
+      },
+      {
+        "action": "txlistinternal",
+        "rows": 14,
+        "moved": 6,
+        "no_value": 6,
+        "reverted": 2,
+        "shared": 1
+      },
+      {
+        "action": "tokentx",
+        "rows": 37,
+        "moved": 37,
+        "no_value": 0,
+        "reverted": 0,
+        "shared": 0
+      }
+    ],
+    "native_rows": 17,
+    "native": [
+      {
+        "block": 16818013,
+        "tx_index": 44,
+        "trace_index": 11,
+        "tx_hash": "0xa476fad72c8f4ee15fd2d75ecda4701d8f3ac74431aa453521f13a01c8688142",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0x0b812c74729b6abc723f22986c61d95344ff7aba",
+        "value": "0",
+        "reverted": true,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x0b812c74729b6abc723f22986c61d95344ff7aba (created): 0 ETH, internal create, reverted: moved nothing"
+      },
+      {
+        "block": 16818024,
+        "tx_index": 20,
+        "trace_index": 11,
+        "tx_hash": "0x47ac3527d02e6b9631c77fad1cdee7bfa77a8a7bfd4880dccbda5146ace4088f",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0x0b812c74729b6abc723f22986c61d95344ff7aba",
+        "value": "0",
+        "reverted": false,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x0b812c74729b6abc723f22986c61d95344ff7aba (created): 0 ETH, internal create"
+      },
+      {
+        "block": 16818032,
+        "tx_index": 25,
+        "trace_index": 4,
+        "tx_hash": "0x68eb306c558d45e777c8d588e611db5323a6a5021a9f551bc0be915ef5e24691",
+        "kind": "call",
+        "from": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "value": "8080498391868396965958",
+        "reverted": false,
+        "text": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 8,080.498391868396965958 ETH, internal call"
+      },
+      {
+        "block": 16818034,
+        "tx_index": 29,
+        "trace_index": 1,
+        "tx_hash": "0xe237c57ccf8664411cae71a50b1e94b21dde7a0e096f0cceaa7f432db8151366",
+        "kind": "call",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+        "value": "8080498391868396965958",
+        "reverted": false,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4: 8,080.498391868396965958 ETH, internal call"
+      },
+      {
+        "block": 16818057,
+        "tx_index": 1,
+        "trace_index": 11,
+        "tx_hash": "0x71a908be0bef6174bccc3d493becdfd28395d78898e355d451cb52f7bac38617",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0xb324581ee258aa67bc144ad27f79f8dcac569af0",
+        "value": "0",
+        "reverted": false,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xb324581ee258aa67bc144ad27f79f8dcac569af0 (created): 0 ETH, internal create"
+      },
+      {
+        "block": 16818057,
+        "tx_index": 1,
+        "trace_index": 188,
+        "tx_hash": "0x71a908be0bef6174bccc3d493becdfd28395d78898e355d451cb52f7bac38617",
+        "kind": "call",
+        "from": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "value": "11559126335382286632783",
+        "reverted": false,
+        "text": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 11,559.126335382286632783 ETH, internal call"
+      },
+      {
+        "block": 16818060,
+        "tx_index": 43,
+        "trace_index": 16,
+        "tx_hash": "0x6e9bb8fa66c65dbdb23cfe1a50de1ace48593077f8609cff3ef9da19412062cc",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a",
+        "value": "0",
+        "reverted": true,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a (created): 0 ETH, internal create, reverted: moved nothing"
+      },
+      {
+        "block": 16818062,
+        "tx_index": 11,
+        "trace_index": 8,
+        "tx_hash": "0x62bd3d31a7b75c098ccf28bc4d4af8c4a191b4b9e451fab4232258079e8b18c4",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a",
+        "value": "0",
+        "reverted": false,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a (created): 0 ETH, internal create"
+      },
+      {
+        "block": 16818062,
+        "tx_index": 11,
+        "trace_index": 186,
+        "tx_hash": "0x62bd3d31a7b75c098ccf28bc4d4af8c4a191b4b9e451fab4232258079e8b18c4",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0x1e4446016f3fddfe2ecc046cf91a8010a30e9a9b",
+        "value": "0",
+        "reverted": false,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x1e4446016f3fddfe2ecc046cf91a8010a30e9a9b (created): 0 ETH, internal create"
+      },
+      {
+        "block": 16818062,
+        "tx_index": 11,
+        "trace_index": 393,
+        "tx_hash": "0x62bd3d31a7b75c098ccf28bc4d4af8c4a191b4b9e451fab4232258079e8b18c4",
+        "kind": "call",
+        "from": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",
+        "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "value": "73347663060908361989345",
+        "reverted": false,
+        "text": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 73,347.663060908361989345 ETH, internal call"
+      }
+    ]
+  },
+  "not_seen": "Seen by this nest: every transaction, internal transfer and ERC-20 Transfer of any token with a watched address as a party. Not seen: anything between two addresses it does not watch; gas fees, withdrawals and block rewards; the watched addresses' NFT transfers, which /api serves; any balance change made without one of these (a rebase, for one). A reverted row is listed and moved nothing. Net flow is the sum of the transfers seen, not a balance.",
+  "provenance": {
+    "version": "{version}",
+    "data_identity": "5a5ea86dddc1fcdf913029c0809df095afe4339545f548d4b463256bef7aaad0",
+    "first_row": {
+      "block": 16818024,
+      "log_index": 158,
+      "tx_index": 20,
+      "block_hash": "0x083aa605e65ec11990ce3b18e8ccdd0c3ff354ea35e10a49046c0dcafc4f40e0"
+    },
+    "last_row": {
+      "block": 16837739,
+      "tx_index": 116,
+      "block_hash": "0xf999515e42dedd7daf53a0f2dc52f3e63c437069b5e89f58fbc9af6c5216d32f"
+    },
+    "sealed_through": 26244634,
+    "metadata_sha256": "be3976d03f7fd1b867d58e6cb544a27892e59b4a9ada49c2e937405673b3de08",
+    "label_snapshots": [],
+    "semantic_sha256": null
+  }
+}

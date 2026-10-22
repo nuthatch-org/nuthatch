@@ -23,6 +23,11 @@ use crate::registry::{ColumnSchema, TableKind, TableSchema};
 /// the diff is refused with the count, never truncated.
 pub const ROW_CAP: u64 = 2_000_000;
 
+/// The most distinct (token, from, to) edges one diff folds. A diff's memory follows its distinct
+/// edges, not its rows: about 1 KB each in the story and 1.6 KB in the flow's JSON (RFC-0071 §19), so
+/// at this cap the worst case stays near a gigabyte, inside the cursor's 2 GB.
+pub const EDGE_CAP: usize = 500_000;
+
 /// Rows fetched per query. `/sql` answers at most 50,000, so a larger read is paged by key.
 const PAGE: u64 = 50_000;
 
@@ -48,6 +53,59 @@ pub enum Reads {
     Transfer,
     Weth9Deposit,
     Weth9Withdrawal,
+    /// A transaction's own value, from an address-history `txlist` row.
+    NativeValue,
+    /// Value moved by an internal call, creation or self-destruct, from `txlistinternal`.
+    NativeInternal,
+}
+
+/// Where a movement sits in its block. Event rows have a log index and nothing else; address-history
+/// rows have a transaction index, under which the value comes first, then internal transfers in trace
+/// order, then token transfers in log order. That order within a transaction is a convention: the rows
+/// do not say how an internal call and a log interleaved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Pos {
+    Log(u64),
+    Tx(u64, Leg),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Leg {
+    Value,
+    Trace(u64),
+    Log(u64),
+}
+
+impl Pos {
+    pub fn log_index(self) -> Option<u64> {
+        match self {
+            Pos::Log(l) | Pos::Tx(_, Leg::Log(l)) => Some(l),
+            Pos::Tx(..) => None,
+        }
+    }
+
+    pub fn tx_index(self) -> Option<u64> {
+        match self {
+            Pos::Tx(i, _) => Some(i),
+            Pos::Log(_) => None,
+        }
+    }
+
+    pub fn trace_index(self) -> Option<u64> {
+        match self {
+            Pos::Tx(_, Leg::Trace(t)) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// `log 7`, `tx 3`, `tx 3 trace 12`.
+    pub fn text(self) -> String {
+        match self {
+            Pos::Log(l) | Pos::Tx(_, Leg::Log(l)) => format!("log {l}"),
+            Pos::Tx(i, Leg::Value) => format!("tx {i}"),
+            Pos::Tx(i, Leg::Trace(t)) => format!("tx {i} trace {t}"),
+        }
+    }
 }
 
 /// A table the flow reads, with its parameters bound by position.
@@ -419,16 +477,35 @@ pub struct Inputs<'a> {
     pub ctx: &'a NestContext,
     pub stories: &'a BTreeMap<String, crate::story::Story>,
     pub warnings: Vec<String>,
+    /// An address-history nest's rows for the range: the second source, beside the SQL one.
+    pub history: Option<&'a (dyn crate::address_history::DiffSource + Sync)>,
+}
+
+/// The source an address-history nest gives the SQL side: it has no tables, so nothing asks it.
+pub struct NoTables;
+
+impl Source for NoTables {
+    async fn query(&self, _sql: &str) -> Result<QueryOutput> {
+        bail!("an address-history nest has no SQL tables")
+    }
 }
 
 /// The one diff pipeline the CLI, `GET /diff` and the MCP tool share, so one request gives one
 /// document on every surface.
 pub async fn produce<S: Source>(src: &S, inputs: Inputs<'_>, ask: &Ask) -> Result<Produced> {
     let (req, ctx) = (&ask.req, inputs.ctx);
-    check_coverage(req, ctx)?;
+    match inputs.history {
+        Some(h) => crate::diff_history::check(h.meta(), req)?,
+        None => check_coverage(req, ctx)?,
+    }
     if ask.final_only && req.to > ctx.sealed_through {
+        let word = if inputs.history.is_some() {
+            "finalized"
+        } else {
+            "sealed"
+        };
         bail!(
-            "--final-only: blocks {} to {} are not final (sealed through {}), so no diff is given. \
+            "--final-only: blocks {} to {} are not final ({word} through {}), so no diff is given. \
              Drop --final-only for a provisional one, or end the range at {}.",
             group(req.from.max(ctx.sealed_through + 1)),
             group(req.to),
@@ -439,7 +516,18 @@ pub async fn produce<S: Source>(src: &S, inputs: Inputs<'_>, ask: &Ask) -> Resul
     let classified = classify(inputs.tables, ctx.chain_id);
     match ask.mode {
         Mode::Flow => {
-            let flow = read(src, &classified, req, ROW_CAP).await?;
+            let mut flow = Flow::default();
+            if req.tx.is_some() {
+                flow.movements = Some(Vec::new());
+            }
+            if inputs.history.is_some() {
+                flow.logs = Some(Default::default());
+            }
+            let mut flow = read_into(src, &classified, req, ROW_CAP, flow).await?;
+            let history = inputs
+                .history
+                .map(|h| crate::diff_history::fold(h, req, ctx, &mut flow, ask.top))
+                .transpose()?;
             let plan = crate::story::Plan {
                 schema: inputs.tables,
                 classified: &classified,
@@ -448,7 +536,15 @@ pub async fn produce<S: Source>(src: &S, inputs: Inputs<'_>, ask: &Ask) -> Resul
                 warnings: inputs.warnings,
             };
             let events = crate::story::read(src, plan, req, ask.top, ctx).await?;
-            Ok(Produced::Flow(Box::new(document(&flow, events, ctx, req))))
+            let mut doc = document(&flow, events, ctx, req);
+            if let Some(h) = history {
+                doc.not_seen = crate::diff_history::not_seen(ctx.chain_id);
+                doc.tables.extend(h.tables());
+                doc.tables.sort_by(|a, b| a.table.cmp(&b.table));
+                doc.rows_total = doc.tables.iter().map(|t| t.rows).sum();
+                doc.history = Some(h);
+            }
+            Ok(Produced::Flow(Box::new(doc)))
         }
         Mode::Story => Ok(Produced::Story(Box::new(
             crate::range_story::read(src, &classified, inputs, ask).await?,
@@ -468,12 +564,27 @@ impl NestContext {
 
     /// Base units of the token at `token`, scaled by its `metadata.json` decimals when known.
     pub fn amount_text(&self, token: &str, base: &str) -> String {
-        let meta = self.metadata.get(token);
-        let name = meta
-            .and_then(|m| m.symbol.clone())
+        let (symbol, decimals) = self.token_meta(token);
+        let name = symbol
             .or_else(|| self.aliases.get(token).cloned())
             .unwrap_or_else(|| token.to_string());
-        amount_in(base, meta.and_then(|m| m.decimals), &name)
+        amount_in(base, decimals, &name)
+    }
+
+    /// A token's symbol and decimals: from `metadata.json`, or for the chain's own currency, its
+    /// symbol and the 18 decimals of wei.
+    pub fn token_meta(&self, token: &str) -> (Option<String>, Option<u8>) {
+        if token == crate::diff_history::NATIVE {
+            return (
+                Some(crate::diff_history::native_symbol(self.chain_id).to_string()),
+                Some(18),
+            );
+        }
+        let meta = self.metadata.get(token);
+        (
+            meta.and_then(|m| m.symbol.clone()),
+            meta.and_then(|m| m.decimals),
+        )
     }
 }
 
@@ -571,6 +682,19 @@ pub(crate) async fn count<S: Source>(src: &S, table: &str, req: &Request) -> Res
         .with_context(|| format!("counting {table}: no count came back"))
 }
 
+/// Refuse a diff whose fold has passed [`EDGE_CAP`], with how far the read got.
+pub(crate) fn check_edges(flow: &Flow, req: &Request) -> Result<()> {
+    if flow.edges.len() <= EDGE_CAP {
+        return Ok(());
+    }
+    bail!(
+        "{}: the read passed {} distinct (token, from, to) edges, the diff's cap, before it \
+         finished, so nothing was told rather than a part of it. Try a narrower range.",
+        capitalised(&what_text(req)),
+        group(EDGE_CAP)
+    );
+}
+
 /// A flow drawn from a partial read would be a wrong number, so an incomplete answer is refused.
 pub(crate) fn complete(out: &QueryOutput, table: &str) -> Result<()> {
     if out.tip_unavailable || !out.degraded_tables.is_empty() {
@@ -587,7 +711,7 @@ pub(crate) fn complete(out: &QueryOutput, table: &str) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Movement {
     pub block: u64,
-    pub log_index: u64,
+    pub pos: Pos,
     pub block_hash: String,
     pub table: String,
     pub token: String,
@@ -611,10 +735,11 @@ fn movement(f: &FlowTable, row: &Value) -> Result<Movement> {
         Reads::Transfer => (first, field("p1").context("a row with no recipient")?),
         Reads::Weth9Deposit => (ZERO_ADDRESS.to_string(), first),
         Reads::Weth9Withdrawal => (first, ZERO_ADDRESS.to_string()),
+        Reads::NativeValue | Reads::NativeInternal => bail!("{}: not an event table", f.table),
     };
     Ok(Movement {
         block,
-        log_index,
+        pos: Pos::Log(log_index),
         block_hash: field("block_hash").unwrap_or_default(),
         table: f.table.clone(),
         token,
@@ -695,13 +820,14 @@ pub async fn read_into<S: Source>(
             let n = out.rows.len() as u64;
             for row in &out.rows {
                 let m = movement(f, row)?;
-                after = Some((m.block, m.log_index));
+                after = Some((m.block, m.pos.log_index().unwrap_or(0)));
                 if f.emitters.is_empty() || f.emitters.contains(&m.token) {
                     flow.add(m);
                 } else {
                     *flow.other.entry(f.table.clone()).or_insert(0) += 1;
                 }
             }
+            check_edges(&flow, req)?;
             if n < PAGE {
                 break;
             }
@@ -727,11 +853,12 @@ pub async fn read_into<S: Source>(
     Ok(flow)
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct EdgeAcc {
     amount: U512,
-    counts: BTreeMap<Reads, u64>,
-    first: (u64, u64),
+    /// Rows folded into the edge, by [`Reads`] in declared order.
+    counts: [u64; 5],
+    first: (u64, Pos),
 }
 
 /// The fold of every movement read: edges by (token, from, to), sums by (token, address).
@@ -745,19 +872,22 @@ pub struct Flow {
     table_rows: BTreeMap<String, u64>,
     table_reads: BTreeMap<String, Reads>,
     other: BTreeMap<String, u64>,
-    pub(crate) first: Option<(u64, u64, String)>,
-    pub(crate) last: Option<(u64, u64, String)>,
+    pub(crate) first: Option<(u64, Pos, String)>,
+    pub(crate) last: Option<(u64, Pos, String)>,
     /// Every movement, kept only for one transaction, where each leg matters and the count is small.
-    movements: Option<Vec<Movement>>,
+    pub(crate) movements: Option<Vec<Movement>>,
     /// The largest movements per token, at most `.0` each once [`Flow::largest`] has trimmed them.
     largest: Option<(usize, HashMap<String, Vec<Movement>>)>,
+    /// The (block, log index) of every event-row movement, kept when an address-history source
+    /// follows, so its `tokentx` row for the same log is not counted twice.
+    pub(crate) logs: Option<std::collections::HashSet<(u64, u64)>>,
 }
 
 /// Largest amount first, then chain order.
 fn by_size(a: &Movement, b: &Movement) -> std::cmp::Ordering {
     b.amount
         .cmp(&a.amount)
-        .then((a.block, a.log_index).cmp(&(b.block, b.log_index)))
+        .then((a.block, a.pos).cmp(&(b.block, b.pos)))
 }
 
 impl Flow {
@@ -791,7 +921,18 @@ impl Flow {
         ms
     }
 
+    /// Fold an event row's movement, counting it against its table.
     pub fn add(&mut self, m: Movement) {
+        *self.table_rows.entry(m.table.clone()).or_insert(0) += 1;
+        self.table_reads.insert(m.table.clone(), m.reads);
+        if let (Some(logs), Pos::Log(l)) = (&mut self.logs, m.pos) {
+            logs.insert((m.block, l));
+        }
+        self.fold(m);
+    }
+
+    /// Fold a movement into the edges and sums only; its rows are counted by its source.
+    pub(crate) fn fold(&mut self, m: Movement) {
         if let Some(ms) = &mut self.movements {
             ms.push(m.clone());
         }
@@ -803,13 +944,11 @@ impl Flow {
                 v.truncate(*k);
             }
         }
-        *self.table_rows.entry(m.table.clone()).or_insert(0) += 1;
-        self.table_reads.insert(m.table.clone(), m.reads);
         *self.token_rows.entry(m.token.clone()).or_insert(0) += 1;
         self.token_alias
             .entry(m.token.clone())
             .or_insert_with(|| m.alias.clone());
-        let at = (m.block, m.log_index, m.block_hash.clone());
+        let at = (m.block, m.pos, m.block_hash.clone());
         if self
             .first
             .as_ref()
@@ -825,12 +964,13 @@ impl Flow {
             .edges
             .entry((m.token.clone(), m.from.clone(), m.to.clone()))
             .or_insert_with(|| EdgeAcc {
-                first: (m.block, m.log_index),
-                ..Default::default()
+                amount: U512::ZERO,
+                counts: [0; 5],
+                first: (m.block, m.pos),
             });
         e.amount += amount;
-        *e.counts.entry(m.reads).or_insert(0) += 1;
-        e.first = e.first.min((m.block, m.log_index));
+        e.counts[m.reads as usize] += 1;
+        e.first = e.first.min((m.block, m.pos));
         *self
             .sent
             .entry((m.token.clone(), m.from))
@@ -881,6 +1021,9 @@ pub struct Document {
     pub transfers: Option<Vec<TransferOut>>,
     /// The tables outside the flow, told by their story lines or grouped.
     pub events: crate::story::Events,
+    /// What an address-history nest's rows held: its watched addresses, every native movement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history: Option<crate::diff_history::HistoryOut>,
     pub not_seen: &'static str,
     pub provenance: ProvenanceOut,
 }
@@ -940,14 +1083,32 @@ pub struct EdgeOut {
     pub transfers: u64,
     pub weth9_deposits: u64,
     pub weth9_withdrawals: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub native_values: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub native_internal: u64,
     pub first_block: u64,
-    pub first_log_index: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_log_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_tx_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_trace_index: Option<u64>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Serialize)]
 pub struct TransferOut {
     pub block: u64,
-    pub log_index: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_index: Option<u64>,
     pub token: String,
     pub from: String,
     pub to: String,
@@ -980,8 +1141,50 @@ pub struct ProvenanceOut {
 #[derive(Debug, Serialize)]
 pub struct RowAt {
     pub block: u64,
-    pub log_index: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_index: Option<u64>,
     pub block_hash: String,
+}
+
+impl RowAt {
+    pub fn at(block: u64, pos: Pos, block_hash: &str) -> Self {
+        RowAt {
+            block,
+            log_index: pos.log_index(),
+            tx_index: pos.tx_index(),
+            trace_index: pos.trace_index(),
+            block_hash: block_hash.to_string(),
+        }
+    }
+
+    fn pos_text(&self) -> String {
+        pos_text(self.log_index, self.tx_index, self.trace_index)
+    }
+}
+
+/// A position as text from its JSON fields: `log 7`, `tx 3`, `tx 3 trace 12`.
+pub(crate) fn pos_text(log: Option<u64>, tx: Option<u64>, trace: Option<u64>) -> String {
+    match (log, tx, trace) {
+        (Some(l), _, _) => format!("log {l}"),
+        (None, Some(i), Some(t)) => format!("tx {i} trace {t}"),
+        (None, Some(i), None) => format!("tx {i}"),
+        _ => String::new(),
+    }
+}
+
+/// What a movement was, after its amount: nothing for a plain token transfer.
+pub(crate) fn reads_note(r: Reads) -> &'static str {
+    match r {
+        Reads::Transfer => "",
+        Reads::Weth9Deposit => " (WETH9 Deposit)",
+        Reads::Weth9Withdrawal => " (WETH9 Withdrawal)",
+        Reads::NativeValue => " (transaction value)",
+        Reads::NativeInternal => " (internal transfer)",
+    }
 }
 
 fn signed(received: U512, sent: U512) -> String {
@@ -1019,12 +1222,12 @@ pub fn document(
         .token_rows
         .iter()
         .map(|(addr, n)| {
-            let meta = ctx.metadata.get(addr);
+            let (symbol, decimals) = ctx.token_meta(addr);
             TokenOut {
                 address: addr.clone(),
                 alias: flow.token_alias[addr].clone(),
-                symbol: meta.and_then(|m| m.symbol.clone()),
-                decimals: meta.and_then(|m| m.decimals),
+                symbol,
+                decimals,
                 rows: *n,
             }
         })
@@ -1042,11 +1245,15 @@ pub fn document(
             from: from.clone(),
             to: to.clone(),
             amount: e.amount.to_string(),
-            transfers: e.counts.get(&Reads::Transfer).copied().unwrap_or(0),
-            weth9_deposits: e.counts.get(&Reads::Weth9Deposit).copied().unwrap_or(0),
-            weth9_withdrawals: e.counts.get(&Reads::Weth9Withdrawal).copied().unwrap_or(0),
+            transfers: e.counts[Reads::Transfer as usize],
+            weth9_deposits: e.counts[Reads::Weth9Deposit as usize],
+            weth9_withdrawals: e.counts[Reads::Weth9Withdrawal as usize],
+            native_values: e.counts[Reads::NativeValue as usize],
+            native_internal: e.counts[Reads::NativeInternal as usize],
             first_block: e.first.0,
-            first_log_index: e.first.1,
+            first_log_index: e.first.1.log_index(),
+            first_tx_index: e.first.1.tx_index(),
+            first_trace_index: e.first.1.trace_index(),
         })
         .collect();
 
@@ -1055,10 +1262,11 @@ pub fn document(
         nodes.insert(&e.from);
         nodes.insert(&e.to);
     }
+    // An address-history token has no nest alias; it is named by its own address.
     let alias_of = |a: &str| {
         ctx.aliases
             .get(a)
-            .or_else(|| flow.token_alias.get(a))
+            .or_else(|| flow.token_alias.get(a).filter(|x| x.as_str() != a))
             .cloned()
     };
     let nodes = nodes
@@ -1087,13 +1295,7 @@ pub fn document(
         })
         .collect();
 
-    let at = |p: &Option<(u64, u64, String)>| {
-        p.as_ref().map(|(b, l, h)| RowAt {
-            block: *b,
-            log_index: *l,
-            block_hash: h.clone(),
-        })
-    };
+    let at = |p: &Option<(u64, Pos, String)>| p.as_ref().map(|(b, l, h)| RowAt::at(*b, *l, h));
     Document {
         kind: "flow",
         nest: NestOut {
@@ -1117,11 +1319,13 @@ pub fn document(
         net,
         transfers: flow.movements.as_ref().map(|ms| {
             let mut ms: Vec<&Movement> = ms.iter().collect();
-            ms.sort_by_key(|m| (m.block, m.log_index));
+            ms.sort_by_key(|m| (m.block, m.pos));
             ms.into_iter()
                 .map(|m| TransferOut {
                     block: m.block,
-                    log_index: m.log_index,
+                    log_index: m.pos.log_index(),
+                    tx_index: m.pos.tx_index(),
+                    trace_index: m.pos.trace_index(),
                     token: m.token.clone(),
                     from: m.from.clone(),
                     to: m.to.clone(),
@@ -1131,6 +1335,7 @@ pub fn document(
                 .collect()
         }),
         events,
+        history: None,
         not_seen: NOT_SEEN,
         provenance: ProvenanceOut {
             version: ctx.version.clone(),
@@ -1255,7 +1460,30 @@ fn events(e: &EdgeOut) -> String {
             "WETH9 Withdrawals",
         ));
     }
+    if e.native_values > 0 {
+        parts.push(plural(
+            e.native_values,
+            "transaction value",
+            "transaction values",
+        ));
+    }
+    if e.native_internal > 0 {
+        parts.push(plural(
+            e.native_internal,
+            "internal transfer",
+            "internal transfers",
+        ));
+    }
     parts.join(", ")
+}
+
+/// What a boundary is called: an event nest seals, an address-history nest follows finality.
+pub(crate) fn boundary_word(history: bool) -> &'static str {
+    if history {
+        "finalized"
+    } else {
+        "sealed"
+    }
 }
 
 /// The edges a drawing shows: every token's `top` largest by amount, in first-transfer order, and
@@ -1319,12 +1547,13 @@ fn finality(doc: &Document) -> String {
         &doc.request,
         doc.coverage.sealed_through,
         doc.coverage.is_final,
+        boundary_word(doc.history.is_some()),
     )
 }
 
-pub(crate) fn finality_line(r: &Request, sealed: u64, is_final: bool) -> String {
+pub(crate) fn finality_line(r: &Request, sealed: u64, is_final: bool, word: &str) -> String {
     if is_final {
-        format!("All final: sealed through {}.", group(sealed))
+        format!("All final: {word} through {}.", group(sealed))
     } else {
         let from = r.from.max(sealed + 1);
         let span = if from == r.to {
@@ -1333,18 +1562,27 @@ pub(crate) fn finality_line(r: &Request, sealed: u64, is_final: bool) -> String 
             format!("blocks {} to {} are", group(from), group(r.to))
         };
         format!(
-            "Provisional: {span} not final and may be reorganised. Sealed through {}.",
+            "Provisional: {span} not final and may be reorganised. {} through {}.",
+            capitalised(word),
             group(sealed)
         )
     }
 }
 
-pub(crate) fn provenance_lines(p: &ProvenanceOut) -> Vec<String> {
+pub(crate) fn capitalised(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+pub(crate) fn provenance_lines(p: &ProvenanceOut, word: &str) -> Vec<String> {
     let at = |r: &Option<RowAt>| match r {
         Some(r) => format!(
-            "block {} log {} ({})",
+            "block {} {} ({})",
             group(r.block),
-            r.log_index,
+            r.pos_text(),
             if r.block_hash.is_empty() {
                 "hash not stored"
             } else {
@@ -1355,7 +1593,7 @@ pub(crate) fn provenance_lines(p: &ProvenanceOut) -> Vec<String> {
     };
     vec![
         format!(
-            "nuthatch {}; data identity {}; sealed through {}.",
+            "nuthatch {}; data identity {}; {word} through {}.",
             p.version,
             p.data_identity.as_deref().unwrap_or("unknown"),
             group(p.sealed_through)
@@ -1398,19 +1636,35 @@ fn text_out(doc: &Document, top: usize) -> String {
         .map(|t| t.rows)
         .sum();
     let flow_tables = doc.tables.iter().filter(|t| t.reads.is_some()).count();
-    let _ = writeln!(
-        o,
-        "Nest {}, data identity {}. {} in range: {} read as flow, {} of other events.",
-        doc.nest.name,
-        doc.nest.data_identity.as_deref().unwrap_or("unknown"),
-        rows(doc.rows_total),
-        group(flow_rows),
-        group(doc.rows_total - flow_rows)
-    );
+    match &doc.history {
+        Some(h) => {
+            let _ = writeln!(
+                o,
+                "Nest {}, data identity {}. {} of address history in range for {}.",
+                doc.nest.name,
+                doc.nest.data_identity.as_deref().unwrap_or("unknown"),
+                rows(doc.rows_total),
+                crate::diff_history::watched_text(h)
+            );
+        }
+        None => {
+            let _ = writeln!(
+                o,
+                "Nest {}, data identity {}. {} in range: {} read as flow, {} of other events.",
+                doc.nest.name,
+                doc.nest.data_identity.as_deref().unwrap_or("unknown"),
+                rows(doc.rows_total),
+                group(flow_rows),
+                group(doc.rows_total - flow_rows)
+            );
+        }
+    }
     let _ = writeln!(o, "{}", finality(doc));
     o.push('\n');
 
-    if flow_tables == 0 {
+    if doc.history.is_some() && doc.edges.is_empty() {
+        let _ = writeln!(o, "Nothing moved in range.");
+    } else if flow_tables == 0 {
         let _ = writeln!(
             o,
             "This nest indexes no ERC-20 Transfer and no WETH9 Deposit or Withdrawal, so it has no \
@@ -1425,30 +1679,27 @@ fn text_out(doc: &Document, top: usize) -> String {
                 Some(d) => format!("{d} decimals"),
                 None => "decimals unknown: run `nuthatch metadata fetch`".to_string(),
             };
-            let _ = writeln!(
-                o,
-                "  {} {} ({d}), {}",
-                names.token(&t.address),
-                t.address,
-                rows(t.rows)
-            );
+            let name = match names.token(&t.address) {
+                n if n == t.address => n,
+                n if t.address == crate::diff_history::NATIVE => {
+                    format!("{n}, the chain's own currency")
+                }
+                n => format!("{n} {}", t.address),
+            };
+            let _ = writeln!(o, "  {name} ({d}), {}", rows(t.rows));
         }
         o.push('\n');
         if let Some(ts) = &doc.transfers {
             let _ = writeln!(o, "Transfers, in log order");
             for t in ts {
-                let kind = match t.reads {
-                    Reads::Transfer => "",
-                    Reads::Weth9Deposit => " (WETH9 Deposit)",
-                    Reads::Weth9Withdrawal => " (WETH9 Withdrawal)",
-                };
                 let _ = writeln!(
                     o,
-                    "  log {}: {} -> {}: {}{kind}",
-                    t.log_index,
+                    "  {}: {} -> {}: {}{}",
+                    pos_text(t.log_index, t.tx_index, t.trace_index),
                     names.node(&t.from),
                     names.node(&t.to),
-                    names.amount(&t.token, &t.amount)
+                    names.amount(&t.token, &t.amount),
+                    reads_note(t.reads)
                 );
             }
             o.push('\n');
@@ -1458,14 +1709,14 @@ fn text_out(doc: &Document, top: usize) -> String {
         for e in shown {
             let _ = writeln!(
                 o,
-                "  {}. {} -> {}: {} ({}, first at block {} log {})",
+                "  {}. {} -> {}: {} ({}, first at block {} {})",
                 e.n,
                 names.node(&e.from),
                 names.node(&e.to),
                 names.amount(&e.token, &e.amount),
                 events(e),
                 group(e.first_block),
-                e.first_log_index
+                pos_text(e.first_log_index, e.first_tx_index, e.first_trace_index)
             );
         }
         for (token, n) in &left {
@@ -1521,10 +1772,17 @@ fn text_out(doc: &Document, top: usize) -> String {
         }
     }
     o.push('\n');
-    o.push_str(&crate::story::text(&doc.events, top));
+    match &doc.history {
+        Some(h) => {
+            for (d, l) in crate::diff_history::lines(h, top) {
+                let _ = writeln!(o, "{}{l}", "  ".repeat(d));
+            }
+        }
+        None => o.push_str(&crate::story::text(&doc.events, top)),
+    }
     let _ = writeln!(o, "{}", doc.not_seen);
     o.push('\n');
-    for l in provenance_lines(&doc.provenance) {
+    for l in provenance_lines(&doc.provenance, boundary_word(doc.history.is_some())) {
         let _ = writeln!(o, "{l}");
     }
     o
@@ -1565,7 +1823,7 @@ fn used_nodes<'a>(shown: &[&'a EdgeOut]) -> BTreeSet<&'a str> {
 
 fn edge_label(names: &Names, e: &EdgeOut) -> String {
     let mut l = format!("{}. {}", e.n, names.amount(&e.token, &e.amount));
-    if e.weth9_deposits + e.weth9_withdrawals > 0 {
+    if e.weth9_deposits + e.weth9_withdrawals + e.native_values + e.native_internal > 0 {
         let _ = write!(l, " ({})", events(e));
     }
     l
@@ -1577,7 +1835,7 @@ fn dot(doc: &Document, top: usize) -> String {
     let mut o = String::new();
     let _ = writeln!(o, "// {}.", heading(doc));
     let _ = writeln!(o, "// {}", finality(doc));
-    for l in provenance_lines(&doc.provenance) {
+    for l in provenance_lines(&doc.provenance, boundary_word(doc.history.is_some())) {
         let _ = writeln!(o, "// {l}");
     }
     let _ = writeln!(o, "digraph flow {{");
@@ -1622,7 +1880,7 @@ fn mermaid(doc: &Document, top: usize) -> String {
     let mut o = String::new();
     let _ = writeln!(o, "%% {}.", heading(doc));
     let _ = writeln!(o, "%% {}", finality(doc));
-    for l in provenance_lines(&doc.provenance) {
+    for l in provenance_lines(&doc.provenance, boundary_word(doc.history.is_some())) {
         let _ = writeln!(o, "%% {l}");
     }
     let _ = writeln!(o, "flowchart LR");
@@ -1789,7 +2047,7 @@ mod tests {
     fn m(log: u64, reads: Reads, from: &str, to: &str, amount: u64) -> Movement {
         Movement {
             block: 1,
-            log_index: log,
+            pos: Pos::Log(log),
             block_hash: "0xh".into(),
             table: "weth__transfer".into(),
             token: WETH.into(),
@@ -1799,6 +2057,28 @@ mod tests {
             amount: U256::from(amount),
             reads,
         }
+    }
+
+    /// A diff's memory follows its distinct edges, so past [`EDGE_CAP`] of them it is refused, not
+    /// told in part; at the cap it is told.
+    #[test]
+    fn a_fold_past_the_edge_cap_is_refused() {
+        let req = Request {
+            from: 1,
+            to: 1,
+            tx: None,
+        };
+        let mut flow = Flow::default();
+        for i in 0..EDGE_CAP as u64 {
+            flow.fold(m(i, Reads::Transfer, A, &format!("0x{i:040x}"), 1));
+        }
+        check_edges(&flow, &req).unwrap();
+        flow.fold(m(0, Reads::Transfer, B, A, 1));
+        let e = check_edges(&flow, &req).unwrap_err().to_string();
+        assert!(
+            e.starts_with("Block 1: the read passed 500,000 distinct (token, from, to) edges"),
+            "{e}"
+        );
     }
 
     fn ctx() -> NestContext {

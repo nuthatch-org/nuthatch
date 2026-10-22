@@ -157,15 +157,15 @@ Run the indexer: poll logs, store entities, and serve the API
 
 ## `nuthatch diff`
 
-What happened in a block range, a block or a transaction, in fixed sentences: ownership, pauses, upgrades and roles, movements, new holders, approvals (RFC-0071). `--flow` draws the token flow. Read-only, from the rows the nest already holds
+What happened in a block range, a block or a transaction, in fixed sentences: ownership, pauses, upgrades and roles, movements, new holders, approvals (RFC-0071). `--flow` draws the token flow. Read-only, from the rows the nest already holds: its events, or for an address-history nest the transactions, internal transfers and token transfers it watches
 
 - `--flow` - Draw the token flow instead of telling the story: one edge per (from, to, token) with the exact amount, and each address's net flow, then every other table told or grouped
 - `--tx <TX>` - One transaction. Its block is found with one `eth_getTransactionReceipt` unless --block names it
 - `--block <BLOCK>` - One block, or the block that holds --tx
 - `--from <FROM>` - First block of an inclusive range
 - `--to <TO>` - Last block of an inclusive range
-- `--since-last` - From the block after the previous --since-last diff of this nest up to the sealed boundary. The cursor is kept in $XDG_STATE_HOME/nuthatch/diff/ (else ~/.local/state), keyed by the nest's data identity, never in the nest directory
-- `--final-only` - Refuse a range that reaches above the sealed boundary, rather than label it provisional
+- `--since-last` - From the block after the previous --since-last diff of this nest up to the sealed boundary (an address-history nest's finalized head). The cursor is kept in $XDG_STATE_HOME/nuthatch/diff/ (else ~/.local/state), keyed by the nest's data identity, never in the nest directory
+- `--final-only` - Refuse a range that reaches above the sealed boundary (an address-history nest's finalized head), rather than label it provisional
 - `--format <FORMAT>` - `text`, `markdown`, `json` (the document every other format is drawn from), and for --flow `dot` or `mermaid`
 - `--top <TOP>` - Items per list: transfers, addresses and approvals per token, and sentences per table (default 10). With --flow, edges and net-flow addresses per token in text, DOT and Mermaid, where JSON carries every one (default 25)
 - `--dir <DIR>` - Nest directory. Read directly when it holds a store no `nuthatch dev` has open; its `metadata.json` and labels are read either way

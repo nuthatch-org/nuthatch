@@ -4855,7 +4855,7 @@ async fn run_sql_query_at(
 }
 
 #[derive(Deserialize)]
-struct DiffQuery {
+pub(crate) struct DiffQuery {
     from: Option<u64>,
     to: Option<u64>,
     block: Option<u64>,
@@ -4869,7 +4869,9 @@ struct DiffQuery {
 }
 
 impl DiffQuery {
-    fn ask(&self) -> std::result::Result<(crate::diff::Ask, crate::diff::Format), String> {
+    pub(crate) fn ask(
+        &self,
+    ) -> std::result::Result<(crate::diff::Ask, crate::diff::Format), String> {
         use crate::diff::{Ask, Format, Mode, Request};
         let tx = match &self.tx {
             Some(t) => {
@@ -5054,6 +5056,7 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
         ctx: &ctx,
         stories: &stories,
         warnings,
+        history: None,
     };
     let produced = crate::diff::produce(&src, inputs, &ask).await;
     drop(permit);

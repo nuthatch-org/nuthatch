@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::diff::{
     self, group, quote, Ask, Classified, CoverageOut, Flow, Format, Inputs, NestContext, NestOut,
-    ProvenanceOut, Reads, Request, RowAt, Source, ZERO_ADDRESS,
+    Pos, ProvenanceOut, Reads, Request, RowAt, Source, ZERO_ADDRESS,
 };
 use crate::registry::{TableKind, TableSchema};
 
@@ -109,6 +109,8 @@ pub enum Section {
     Control,
     Approvals,
     Events,
+    /// An address-history nest's `txlist`, `txlistinternal` and `tokentx` rows.
+    History,
 }
 
 const A: (&str, bool) = ("address", true);
@@ -458,7 +460,12 @@ pub struct ControlOut {
 #[derive(Debug, Serialize)]
 pub struct MoveOut {
     pub block: u64,
-    pub log_index: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_index: Option<u64>,
     pub from: String,
     pub to: String,
     /// Base units, as decimal text.
@@ -631,6 +638,9 @@ pub struct Document {
     pub labels: Vec<LabelOut>,
     /// The tables no section above claims, told by their story lines or grouped.
     pub events: crate::story::Events,
+    /// What an address-history nest's rows held: its watched addresses, every native movement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history: Option<crate::diff_history::HistoryOut>,
     pub not_seen: &'static str,
     pub provenance: ProvenanceOut,
 }
@@ -646,7 +656,7 @@ fn signed(received: U512, sent: U512) -> (String, U512, bool) {
     }
 }
 
-fn earliest(a: &mut Option<(u64, u64, String)>, b: (u64, u64, &str), first: bool) {
+fn earliest(a: &mut Option<(u64, Pos, String)>, b: (u64, Pos, &str), first: bool) {
     let better = a.as_ref().is_none_or(|x| {
         if first {
             (b.0, b.1) < (x.0, x.1)
@@ -692,14 +702,15 @@ pub async fn read<S: Source>(
         );
     }
 
-    let flow = diff::read_into(
-        src,
-        classified,
-        req,
-        diff::ROW_CAP,
-        Flow::keeping_largest(top),
-    )
-    .await?;
+    let mut flow = Flow::keeping_largest(top);
+    if inputs.history.is_some() {
+        flow.logs = Some(Default::default());
+    }
+    let mut flow = diff::read_into(src, classified, req, diff::ROW_CAP, flow).await?;
+    let history = inputs
+        .history
+        .map(|h| crate::diff_history::fold(h, req, ctx, &mut flow, top))
+        .transpose()?;
     let other = flow.other_counts().clone();
     let rows_in = |t: &str| other.get(t).copied().unwrap_or(0);
     let mut first = flow.first.clone();
@@ -738,8 +749,8 @@ pub async fn read<S: Source>(
             );
         }
         for r in &rows {
-            earliest(&mut first, (r.block, r.log, &r.hash), true);
-            earliest(&mut last, (r.block, r.log, &r.hash), false);
+            earliest(&mut first, (r.block, Pos::Log(r.log), &r.hash), true);
+            earliest(&mut last, (r.block, Pos::Log(r.log), &r.hash), false);
             seen.insert(r.address.clone());
             for v in r.p.iter().flatten() {
                 seen.insert(v.to_ascii_lowercase());
@@ -782,8 +793,8 @@ pub async fn read<S: Source>(
                 lower(r.at(0)).unwrap_or_default(),
                 lower(r.at(1)).unwrap_or_default(),
             );
-            earliest(&mut first, (r.block, r.log, &r.hash), true);
-            earliest(&mut last, (r.block, r.log, &r.hash), false);
+            earliest(&mut first, (r.block, Pos::Log(r.log), &r.hash), true);
+            earliest(&mut last, (r.block, Pos::Log(r.log), &r.hash), false);
             seen.insert(owner.clone());
             seen.insert(spender.clone());
             approval_alias
@@ -891,7 +902,36 @@ pub async fn read<S: Source>(
     }
 
     let movements = tokens(&flow, ctx, top);
-    let new_holders = new_holders(src, classified, &flow, req, ctx, top).await?;
+    let new_holders = match &history {
+        Some(_) => NewHoldersOut {
+            status: Status::NotApplicable,
+            reason: Some(
+                "address history holds only the transfers that touch a watched address, so it \
+                 cannot say whether anyone else held a token before"
+                    .into(),
+            ),
+            before_block: req.from,
+            since: ctx.start_block.unwrap_or(0),
+            history_rows: 0,
+            budget: NEW_HOLDERS_BUDGET,
+            tokens: Vec::new(),
+        },
+        None => new_holders(src, classified, &flow, req, ctx, top).await?,
+    };
+    if let Some(h) = &history {
+        for t in h.tables() {
+            tables.push(TableOut {
+                table: t.table,
+                section: Section::History,
+                rows: t.rows,
+            });
+        }
+        seen.extend(h.watched.iter().cloned());
+        for n in &h.native {
+            seen.insert(n.from.clone());
+            seen.insert(n.to.clone());
+        }
+    }
 
     // Everything else, through the story lines and the grouped fallback.
     let claimed: BTreeSet<&str> = cat.iter().map(|c| c.table.as_str()).collect();
@@ -919,7 +959,14 @@ pub async fn read<S: Source>(
     };
     let events = crate::story::read(src, plan, req, top, ctx).await?;
 
-    let first_tables = first_tables(src, &tables, req, ctx).await?;
+    let first_tables = match &history {
+        Some(_) => FirstTablesOut {
+            status: Status::NotApplicable,
+            reason: Some("an address-history nest has no event tables".into()),
+            tables: Vec::new(),
+        },
+        None => first_tables(src, &tables, req, ctx).await?,
+    };
     let threshold_flags = threshold_flags(src, req, ctx, top).await?;
     seen.extend(labelled_in_range(src, inputs.tables, &tables, req, ctx).await?);
     let labels = seen
@@ -932,14 +979,12 @@ pub async fn read<S: Source>(
         })
         .collect();
 
-    let at = |p: &Option<(u64, u64, String)>| {
-        p.as_ref().map(|(b, l, h)| RowAt {
-            block: *b,
-            log_index: *l,
-            block_hash: h.clone(),
-        })
-    };
+    let at = |p: &Option<(u64, Pos, String)>| p.as_ref().map(|(b, l, h)| RowAt::at(*b, *l, h));
     let rows_total = tables.iter().map(|t| t.rows).sum();
+    let not_seen = match &history {
+        Some(_) => crate::diff_history::not_seen(ctx.chain_id),
+        None => diff::NOT_SEEN,
+    };
     Ok(Document {
         kind: "story",
         nest: NestOut {
@@ -968,7 +1013,8 @@ pub async fn read<S: Source>(
         threshold_flags,
         labels,
         events,
-        not_seen: diff::NOT_SEEN,
+        history,
+        not_seen,
         provenance: ProvenanceOut {
             version: ctx.version.clone(),
             data_identity: ctx.data_identity.clone(),
@@ -988,7 +1034,7 @@ fn tokens(flow: &Flow, ctx: &NestContext, top: usize) -> Vec<TokenOut> {
         .token_rows
         .iter()
         .map(|(token, n)| {
-            let meta = ctx.metadata.get(token);
+            let (symbol, decimals) = ctx.token_meta(token);
             let mut addresses: BTreeSet<&str> = BTreeSet::new();
             let mut nets = Vec::new();
             let mut zero = 0u64;
@@ -1032,7 +1078,9 @@ fn tokens(flow: &Flow, ctx: &NestContext, top: usize) -> Vec<TokenOut> {
                 .into_iter()
                 .map(|m| MoveOut {
                     block: m.block,
-                    log_index: m.log_index,
+                    log_index: m.pos.log_index(),
+                    tx_index: m.pos.tx_index(),
+                    trace_index: m.pos.trace_index(),
                     from: m.from.clone(),
                     to: m.to.clone(),
                     amount: m.amount.to_string(),
@@ -1042,19 +1090,15 @@ fn tokens(flow: &Flow, ctx: &NestContext, top: usize) -> Vec<TokenOut> {
                         ctx.address_text(&m.from),
                         ctx.address_text(&m.to),
                         ctx.amount_text(token, &m.amount.to_string()),
-                        match m.reads {
-                            Reads::Transfer => "",
-                            Reads::Weth9Deposit => " (WETH9 Deposit)",
-                            Reads::Weth9Withdrawal => " (WETH9 Withdrawal)",
-                        }
+                        diff::reads_note(m.reads)
                     ),
                 })
                 .collect();
             TokenOut {
                 address: token.clone(),
                 alias: flow.token_alias[token].clone(),
-                symbol: meta.and_then(|m| m.symbol.clone()),
-                decimals: meta.and_then(|m| m.decimals),
+                symbol,
+                decimals,
                 rows: *n,
                 addresses: addresses.len() as u64,
                 largest,
@@ -1073,7 +1117,7 @@ fn holder_column(f: &diff::FlowTable) -> Option<(String, String)> {
     let col = match f.reads {
         Reads::Transfer => f.second.clone()?,
         Reads::Weth9Deposit => f.first.clone(),
-        Reads::Weth9Withdrawal => return None,
+        Reads::Weth9Withdrawal | Reads::NativeValue | Reads::NativeInternal => return None,
     };
     let emitters = if f.emitters.is_empty() {
         String::new()
@@ -1445,15 +1489,26 @@ fn token_heading(
         Some(d) => format!("{d} decimals"),
         None => "decimals unknown: run `nuthatch metadata fetch`".into(),
     };
+    if address == crate::diff_history::NATIVE {
+        return format!("{name}, the chain's own currency ({d})");
+    }
+    if name == address {
+        return format!("{address} ({d})");
+    }
     format!("{name} {address} ({d})")
 }
 
 fn blocks(doc: &Document) -> Vec<Block> {
     let mut out = Vec::new();
 
+    let none = if doc.history.is_some() {
+        "Not read: an address-history nest indexes no contract's events."
+    } else {
+        "None in range."
+    };
     let mut lines = Vec::new();
     if doc.control.is_empty() {
-        lines.push((0, "None in range.".to_string()));
+        lines.push((0, none.to_string()));
     }
     for c in &doc.control {
         lines.push((
@@ -1488,7 +1543,8 @@ fn blocks(doc: &Document) -> Vec<Block> {
         ));
         lines.push((1, "Largest transfers".into()));
         for m in &t.largest {
-            lines.push((2, format!("{}: {}", at(m.block, m.log_index), m.text)));
+            let pos = diff::pos_text(m.log_index, m.tx_index, m.trace_index);
+            lines.push((2, format!("block {} {pos}: {}", group(m.block), m.text)));
         }
         let more = t.rows.saturating_sub(t.largest.len() as u64);
         if more > 0 {
@@ -1545,6 +1601,15 @@ fn blocks(doc: &Document) -> Vec<Block> {
         title: "Largest movements, per token (amounts of two tokens are never compared)".into(),
         lines,
     });
+
+    if let Some(h) = &doc.history {
+        let mut all = crate::diff_history::lines(h, doc.top);
+        let title = all.remove(0).1;
+        out.push(Block {
+            title,
+            lines: all.into_iter().map(|(d, l)| (d - 1, l)).collect(),
+        });
+    }
 
     let h = &doc.new_holders;
     let mut lines = Vec::new();
@@ -1622,7 +1687,7 @@ fn blocks(doc: &Document) -> Vec<Block> {
 
     let mut lines = Vec::new();
     if doc.approvals.is_empty() && doc.nft_approvals.is_empty() {
-        lines.push((0, "None in range.".to_string()));
+        lines.push((0, none.to_string()));
     }
     for a in &doc.approvals {
         lines.push((
@@ -1769,6 +1834,7 @@ fn preamble(doc: &Document) -> Vec<String> {
             &doc.request,
             doc.coverage.sealed_through,
             doc.coverage.is_final,
+            diff::boundary_word(doc.history.is_some()),
         ),
     ]
 }
@@ -1794,10 +1860,12 @@ fn text_out(doc: &Document) -> String {
         }
     }
     o.push('\n');
-    o.push_str(&crate::story::text(&doc.events, doc.top));
+    if doc.history.is_none() {
+        o.push_str(&crate::story::text(&doc.events, doc.top));
+    }
     let _ = writeln!(o, "{}", doc.not_seen);
     o.push('\n');
-    for l in diff::provenance_lines(&doc.provenance) {
+    for l in diff::provenance_lines(&doc.provenance, diff::boundary_word(doc.history.is_some())) {
         let _ = writeln!(o, "{l}");
     }
     o
@@ -1825,18 +1893,16 @@ fn markdown_out(doc: &Document) -> String {
     }
     let mut all = blocks(doc);
     let mut ev = event_lines(doc);
-    let title = if ev.is_empty() {
-        String::new()
-    } else {
-        ev.remove(0).1
-    };
-    all.push(Block {
-        title,
-        lines: ev
-            .into_iter()
-            .map(|(d, l)| (d.saturating_sub(1), l))
-            .collect(),
-    });
+    if doc.history.is_none() && !ev.is_empty() {
+        let title = ev.remove(0).1;
+        all.push(Block {
+            title,
+            lines: ev
+                .into_iter()
+                .map(|(d, l)| (d.saturating_sub(1), l))
+                .collect(),
+        });
+    }
     for b in all {
         o.push('\n');
         let _ = writeln!(o, "## {}", md(&b.title));
@@ -1850,7 +1916,7 @@ fn markdown_out(doc: &Document) -> String {
     o.push('\n');
     let _ = writeln!(o, "{}", md(doc.not_seen));
     o.push('\n');
-    for l in diff::provenance_lines(&doc.provenance) {
+    for l in diff::provenance_lines(&doc.provenance, diff::boundary_word(doc.history.is_some())) {
         let _ = writeln!(o, "{}  ", md(&l));
     }
     o
@@ -1945,7 +2011,7 @@ mod tests {
         let mut flow = Flow::default();
         flow.add(diff::Movement {
             block: 150,
-            log_index: 0,
+            pos: Pos::Log(0),
             block_hash: "0xh".into(),
             table: "usdc__transfer".into(),
             token: TOKEN.into(),

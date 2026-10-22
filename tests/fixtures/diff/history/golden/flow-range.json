@@ -1,0 +1,1238 @@
+{
+  "kind": "flow",
+  "nest": {
+    "name": "euler-exploiter-history",
+    "chain": "mainnet",
+    "chain_id": 1,
+    "data_identity": "5a5ea86dddc1fcdf913029c0809df095afe4339545f548d4b463256bef7aaad0"
+  },
+  "request": {
+    "from": 16817996,
+    "to": 16837739
+  },
+  "coverage": {
+    "start_block": 16817996,
+    "indexed_head": 16837739,
+    "sealed_through": 26244634,
+    "final": true
+  },
+  "tables": [
+    {
+      "table": "tokentx",
+      "reads": "transfer",
+      "rows": 37
+    },
+    {
+      "table": "txlist",
+      "reads": "native_value",
+      "rows": 17
+    },
+    {
+      "table": "txlistinternal",
+      "reads": "native_internal",
+      "rows": 14
+    }
+  ],
+  "rows_total": 68,
+  "tokens": [
+    {
+      "address": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "alias": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "symbol": "wstETH",
+      "decimals": 18,
+      "rows": 9
+    },
+    {
+      "address": "native",
+      "alias": "native",
+      "symbol": "ETH",
+      "decimals": 18,
+      "rows": 9
+    },
+    {
+      "address": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "alias": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "symbol": "stETH",
+      "decimals": 18,
+      "rows": 7
+    },
+    {
+      "address": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "alias": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "symbol": "WBTC",
+      "decimals": 8,
+      "rows": 5
+    },
+    {
+      "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "alias": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "symbol": "USDC",
+      "decimals": 6,
+      "rows": 5
+    },
+    {
+      "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "alias": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "symbol": "WETH",
+      "decimals": 18,
+      "rows": 5
+    },
+    {
+      "address": "0xa59af77c2288e44021867a741e67d7155d6fec66",
+      "alias": "0xa59af77c2288e44021867a741e67d7155d6fec66",
+      "symbol": null,
+      "decimals": null,
+      "rows": 4
+    },
+    {
+      "address": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "alias": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "symbol": "DAI",
+      "decimals": 18,
+      "rows": 2
+    }
+  ],
+  "nodes": [
+    {
+      "address": "0x0000000000000000000000000000000000000000"
+    },
+    {
+      "address": "0x003590b63c2b2583bcf89c38fe1bc3645f568215"
+    },
+    {
+      "address": "0x030ba81f1c18d280636f32af80b9aad02cf0854e"
+    },
+    {
+      "address": "0x036cec1a199234fc02f72d29e596a09440825f1c"
+    },
+    {
+      "address": "0x0b812c74729b6abc723f22986c61d95344ff7aba"
+    },
+    {
+      "address": "0x12df82a443c77eae9d5bb0f5c8d0ec706ecb338c"
+    },
+    {
+      "address": "0x1982b2f5814301d4e9a8b0201555376e62f82428"
+    },
+    {
+      "address": "0x1e4446016f3fddfe2ecc046cf91a8010a30e9a9b"
+    },
+    {
+      "address": "0x1ed1dab540433465c79ae82da0c418d5999e87d8"
+    },
+    {
+      "address": "0x22c5cf8fc9891f8ef5a5e8630b95115018a09736"
+    },
+    {
+      "address": "0x4d47d0ae9224b414a7f38c2e73569f65c987f848"
+    },
+    {
+      "address": "0x6c6bc977e13df9b0de53b251522280bb72383700"
+    },
+    {
+      "address": "0x7db7099b00d1d24ef2814cfcde723eacd958b05b"
+    },
+    {
+      "address": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0"
+    },
+    {
+      "address": "0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a"
+    },
+    {
+      "address": "0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656"
+    },
+    {
+      "address": "0xa4c0afeca6273b012382970c1ed8690c2929988d"
+    },
+    {
+      "address": "0xaf471a6d527b04dd1ac916d2c96e45f7e4b78bb8"
+    },
+    {
+      "address": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4"
+    },
+    {
+      "address": "0xb324581ee258aa67bc144ad27f79f8dcac569af0"
+    },
+    {
+      "address": "0xb66cd966670d962c227b3eaba30a872dbfb995db"
+    },
+    {
+      "address": "0xba12222222228d8ba445958a75a0704d566bf2c8"
+    },
+    {
+      "address": "0xbcca60bb61934080951369a648fb03df4f96263c"
+    },
+    {
+      "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+    },
+    {
+      "address": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed"
+    },
+    {
+      "address": "0xcec2981d8047c401f2a4e972a7e5ada3f5ecf838"
+    },
+    {
+      "address": "0xd041709eb1c61ce6ec9d46126ac0e4b50eade576"
+    },
+    {
+      "address": "0xd3b7cea28feb5e537fca4e657e3f60129456eaf3"
+    },
+    {
+      "address": "0xd444a7ac5d1c5eb8ebc9dab83834a412e9b7be76"
+    },
+    {
+      "address": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022"
+    }
+  ],
+  "edges": [
+    {
+      "n": 1,
+      "token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "from": "0x030ba81f1c18d280636f32af80b9aad02cf0854e",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "20895000000000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818024,
+      "first_log_index": 158,
+      "first_tx_index": 20
+    },
+    {
+      "n": 2,
+      "token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0x0b812c74729b6abc723f22986c61d95344ff7aba",
+      "amount": "20895000000000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818024,
+      "first_log_index": 160,
+      "first_tx_index": 20
+    },
+    {
+      "n": 3,
+      "token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "from": "0xd3b7cea28feb5e537fca4e657e3f60129456eaf3",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "28994303891868396965958",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818024,
+      "first_log_index": 208,
+      "first_tx_index": 20
+    },
+    {
+      "n": 4,
+      "token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0x030ba81f1c18d280636f32af80b9aad02cf0854e",
+      "amount": "20913805500000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818024,
+      "first_log_index": 212,
+      "first_tx_index": 20
+    },
+    {
+      "n": 5,
+      "token": "native",
+      "from": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "19639624727250683598741",
+      "transfers": 0,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "native_internal": 2,
+      "first_block": 16818032,
+      "first_tx_index": 25,
+      "first_trace_index": 4
+    },
+    {
+      "n": 6,
+      "token": "native",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+      "amount": "8080498391868396965958",
+      "transfers": 0,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "native_internal": 1,
+      "first_block": 16818034,
+      "first_tx_index": 29,
+      "first_trace_index": 1
+    },
+    {
+      "n": 7,
+      "token": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "from": "0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "300000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818057,
+      "first_log_index": 20,
+      "first_tx_index": 1
+    },
+    {
+      "n": 8,
+      "token": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0xb324581ee258aa67bc144ad27f79f8dcac569af0",
+      "amount": "300000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818057,
+      "first_log_index": 22,
+      "first_tx_index": 1
+    },
+    {
+      "n": 9,
+      "token": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "from": "0xd041709eb1c61ce6ec9d46126ac0e4b50eade576",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "384913597139",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818057,
+      "first_log_index": 70,
+      "first_tx_index": 1
+    },
+    {
+      "n": 10,
+      "token": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656",
+      "amount": "300270000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818057,
+      "first_log_index": 72,
+      "first_tx_index": 1
+    },
+    {
+      "n": 11,
+      "token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "from": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "11559126335382286632783",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818057,
+      "first_log_index": 74,
+      "first_tx_index": 1
+    },
+    {
+      "n": 12,
+      "token": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed",
+      "amount": "84643597139",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818057,
+      "first_log_index": 75,
+      "first_tx_index": 1
+    },
+    {
+      "n": 13,
+      "token": "native",
+      "from": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "77193571124446248707236",
+      "transfers": 0,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "native_internal": 2,
+      "first_block": 16818062,
+      "first_tx_index": 11,
+      "first_trace_index": 393
+    },
+    {
+      "n": 14,
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "from": "0xba12222222228d8ba445958a75a0704d566bf2c8",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "198000000000000000000000",
+      "transfers": 2,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818062,
+      "first_log_index": 12,
+      "first_tx_index": 11
+    },
+    {
+      "n": 15,
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a",
+      "amount": "99000000000000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818062,
+      "first_log_index": 13,
+      "first_tx_index": 11
+    },
+    {
+      "n": 16,
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "from": "0x22c5cf8fc9891f8ef5a5e8630b95115018a09736",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "145200000000000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818062,
+      "first_log_index": 63,
+      "first_tx_index": 11
+    },
+    {
+      "n": 17,
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0xba12222222228d8ba445958a75a0704d566bf2c8",
+      "amount": "198000000000000000000000",
+      "transfers": 2,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818062,
+      "first_log_index": 64,
+      "first_tx_index": 11
+    },
+    {
+      "n": 18,
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0x1e4446016f3fddfe2ecc046cf91a8010a30e9a9b",
+      "amount": "99000000000000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818062,
+      "first_log_index": 67,
+      "first_tx_index": 11
+    },
+    {
+      "n": 19,
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "from": "0xcec2981d8047c401f2a4e972a7e5ada3f5ecf838",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "119071498175683316786271",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818062,
+      "first_log_index": 117,
+      "first_tx_index": 11
+    },
+    {
+      "n": 20,
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0x0000000000000000000000000000000000000000",
+      "amount": "66271498175683316786271",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818062,
+      "first_log_index": 120,
+      "first_tx_index": 11
+    },
+    {
+      "n": 21,
+      "token": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "from": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "73821459345383044466413",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818062,
+      "first_log_index": 121,
+      "first_tx_index": 11
+    },
+    {
+      "n": 22,
+      "token": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",
+      "amount": "77700158202931066519380",
+      "transfers": 2,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818062,
+      "first_log_index": 124,
+      "first_tx_index": 11
+    },
+    {
+      "n": 23,
+      "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "from": "0xbcca60bb61934080951369a648fb03df4f96263c",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "210000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818065,
+      "first_log_index": 144,
+      "first_tx_index": 35
+    },
+    {
+      "n": 24,
+      "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0x7db7099b00d1d24ef2814cfcde723eacd958b05b",
+      "amount": "210000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818065,
+      "first_log_index": 146,
+      "first_tx_index": 35
+    },
+    {
+      "n": 25,
+      "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "from": "0xd444a7ac5d1c5eb8ebc9dab83834a412e9b7be76",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "244413863418460",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818065,
+      "first_log_index": 194,
+      "first_tx_index": 35
+    },
+    {
+      "n": 26,
+      "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0xbcca60bb61934080951369a648fb03df4f96263c",
+      "amount": "210189000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818065,
+      "first_log_index": 198,
+      "first_tx_index": 35
+    },
+    {
+      "n": 27,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0x6c6bc977e13df9b0de53b251522280bb72383700",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "34186225919500945938720264",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818068,
+      "first_log_index": 80,
+      "first_tx_index": 43
+    },
+    {
+      "n": 28,
+      "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0x6c6bc977e13df9b0de53b251522280bb72383700",
+      "amount": "34224863418460",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818068,
+      "first_log_index": 81,
+      "first_tx_index": 43
+    },
+    {
+      "n": 29,
+      "token": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "from": "0x1982b2f5814301d4e9a8b0201555376e62f82428",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "20895000000000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818085,
+      "first_log_index": 24,
+      "first_tx_index": 4
+    },
+    {
+      "n": 30,
+      "token": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0xa4c0afeca6273b012382970c1ed8690c2929988d",
+      "amount": "20895000000000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818085,
+      "first_log_index": 27,
+      "first_tx_index": 4
+    },
+    {
+      "n": 31,
+      "token": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "from": "0x12df82a443c77eae9d5bb0f5c8d0ec706ecb338c",
+      "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "amount": "24792504357548022052968",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818085,
+      "first_log_index": 81,
+      "first_tx_index": 4
+    },
+    {
+      "n": 32,
+      "token": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0x1982b2f5814301d4e9a8b0201555376e62f82428",
+      "amount": "20913805500000000000000",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818085,
+      "first_log_index": 84,
+      "first_tx_index": 4
+    },
+    {
+      "n": 33,
+      "token": "native",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0xb66cd966670d962c227b3eaba30a872dbfb995db",
+      "amount": "88752697459828535340019",
+      "transfers": 0,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "native_internal": 1,
+      "first_block": 16818102,
+      "first_tx_index": 33,
+      "first_trace_index": 1
+    },
+    {
+      "n": 34,
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "to": "0xb66cd966670d962c227b3eaba30a872dbfb995db",
+      "amount": "34186225919500945938720264",
+      "transfers": 1,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16818102,
+      "first_log_index": 46,
+      "first_tx_index": 33
+    },
+    {
+      "n": 35,
+      "token": "0xa59af77c2288e44021867a741e67d7155d6fec66",
+      "from": "0x003590b63c2b2583bcf89c38fe1bc3645f568215",
+      "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+      "amount": "81603752509616068288050934652621",
+      "transfers": 4,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "first_block": 16819020,
+      "first_log_index": 54,
+      "first_tx_index": 13
+    },
+    {
+      "n": 36,
+      "token": "native",
+      "from": "0x4d47d0ae9224b414a7f38c2e73569f65c987f848",
+      "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+      "amount": "70000000000000",
+      "transfers": 0,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "native_values": 1,
+      "first_block": 16835306,
+      "first_tx_index": 33
+    },
+    {
+      "n": 37,
+      "token": "native",
+      "from": "0xaf471a6d527b04dd1ac916d2c96e45f7e4b78bb8",
+      "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+      "amount": "1000000000000000",
+      "transfers": 0,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "native_values": 1,
+      "first_block": 16837528,
+      "first_tx_index": 62
+    },
+    {
+      "n": 38,
+      "token": "native",
+      "from": "0x1ed1dab540433465c79ae82da0c418d5999e87d8",
+      "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+      "amount": "133700000000000",
+      "transfers": 0,
+      "weth9_deposits": 0,
+      "weth9_withdrawals": 0,
+      "native_values": 1,
+      "first_block": 16837739,
+      "first_tx_index": 116
+    }
+  ],
+  "net": [
+    {
+      "token": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "address": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "sent": "684913597139",
+      "received": "684913597139",
+      "net": "0"
+    },
+    {
+      "token": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "address": "0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656",
+      "sent": "300000000000",
+      "received": "300270000000",
+      "net": "270000000"
+    },
+    {
+      "token": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "address": "0xb324581ee258aa67bc144ad27f79f8dcac569af0",
+      "sent": "0",
+      "received": "300000000000",
+      "net": "300000000000"
+    },
+    {
+      "token": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "address": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed",
+      "sent": "0",
+      "received": "84643597139",
+      "net": "84643597139"
+    },
+    {
+      "token": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+      "address": "0xd041709eb1c61ce6ec9d46126ac0e4b50eade576",
+      "sent": "384913597139",
+      "received": "0",
+      "net": "-384913597139"
+    },
+    {
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "address": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "sent": "34186225919500945938720264",
+      "received": "34186225919500945938720264",
+      "net": "0"
+    },
+    {
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "address": "0x6c6bc977e13df9b0de53b251522280bb72383700",
+      "sent": "34186225919500945938720264",
+      "received": "0",
+      "net": "-34186225919500945938720264"
+    },
+    {
+      "token": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "address": "0xb66cd966670d962c227b3eaba30a872dbfb995db",
+      "sent": "0",
+      "received": "34186225919500945938720264",
+      "net": "34186225919500945938720264"
+    },
+    {
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "address": "0x0000000000000000000000000000000000000000",
+      "sent": "0",
+      "received": "66271498175683316786271",
+      "net": "66271498175683316786271"
+    },
+    {
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "address": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "sent": "462271498175683316786271",
+      "received": "462271498175683316786271",
+      "net": "0"
+    },
+    {
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "address": "0x1e4446016f3fddfe2ecc046cf91a8010a30e9a9b",
+      "sent": "0",
+      "received": "99000000000000000000000",
+      "net": "99000000000000000000000"
+    },
+    {
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "address": "0x22c5cf8fc9891f8ef5a5e8630b95115018a09736",
+      "sent": "145200000000000000000000",
+      "received": "0",
+      "net": "-145200000000000000000000"
+    },
+    {
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "address": "0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a",
+      "sent": "0",
+      "received": "99000000000000000000000",
+      "net": "99000000000000000000000"
+    },
+    {
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "address": "0xba12222222228d8ba445958a75a0704d566bf2c8",
+      "sent": "198000000000000000000000",
+      "received": "198000000000000000000000",
+      "net": "0"
+    },
+    {
+      "token": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "address": "0xcec2981d8047c401f2a4e972a7e5ada3f5ecf838",
+      "sent": "119071498175683316786271",
+      "received": "0",
+      "net": "-119071498175683316786271"
+    },
+    {
+      "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "address": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "sent": "454413863418460",
+      "received": "454413863418460",
+      "net": "0"
+    },
+    {
+      "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "address": "0x6c6bc977e13df9b0de53b251522280bb72383700",
+      "sent": "0",
+      "received": "34224863418460",
+      "net": "34224863418460"
+    },
+    {
+      "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "address": "0x7db7099b00d1d24ef2814cfcde723eacd958b05b",
+      "sent": "0",
+      "received": "210000000000000",
+      "net": "210000000000000"
+    },
+    {
+      "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "address": "0xbcca60bb61934080951369a648fb03df4f96263c",
+      "sent": "210000000000000",
+      "received": "210189000000000",
+      "net": "189000000000"
+    },
+    {
+      "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "address": "0xd444a7ac5d1c5eb8ebc9dab83834a412e9b7be76",
+      "sent": "244413863418460",
+      "received": "0",
+      "net": "-244413863418460"
+    },
+    {
+      "token": "0xa59af77c2288e44021867a741e67d7155d6fec66",
+      "address": "0x003590b63c2b2583bcf89c38fe1bc3645f568215",
+      "sent": "81603752509616068288050934652621",
+      "received": "0",
+      "net": "-81603752509616068288050934652621"
+    },
+    {
+      "token": "0xa59af77c2288e44021867a741e67d7155d6fec66",
+      "address": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+      "sent": "0",
+      "received": "81603752509616068288050934652621",
+      "net": "81603752509616068288050934652621"
+    },
+    {
+      "token": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "address": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "sent": "119508963702931066519380",
+      "received": "119508963702931066519381",
+      "net": "1"
+    },
+    {
+      "token": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "address": "0x12df82a443c77eae9d5bb0f5c8d0ec706ecb338c",
+      "sent": "24792504357548022052968",
+      "received": "0",
+      "net": "-24792504357548022052968"
+    },
+    {
+      "token": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "address": "0x1982b2f5814301d4e9a8b0201555376e62f82428",
+      "sent": "20895000000000000000000",
+      "received": "20913805500000000000000",
+      "net": "18805500000000000000"
+    },
+    {
+      "token": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "address": "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+      "sent": "73821459345383044466413",
+      "received": "0",
+      "net": "-73821459345383044466413"
+    },
+    {
+      "token": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "address": "0xa4c0afeca6273b012382970c1ed8690c2929988d",
+      "sent": "0",
+      "received": "20895000000000000000000",
+      "net": "20895000000000000000000"
+    },
+    {
+      "token": "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",
+      "address": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",
+      "sent": "0",
+      "received": "77700158202931066519380",
+      "net": "77700158202931066519380"
+    },
+    {
+      "token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "address": "0x030ba81f1c18d280636f32af80b9aad02cf0854e",
+      "sent": "20895000000000000000000",
+      "received": "20913805500000000000000",
+      "net": "18805500000000000000"
+    },
+    {
+      "token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "address": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "sent": "41808805500000000000000",
+      "received": "61448430227250683598741",
+      "net": "19639624727250683598741"
+    },
+    {
+      "token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "address": "0x0b812c74729b6abc723f22986c61d95344ff7aba",
+      "sent": "0",
+      "received": "20895000000000000000000",
+      "net": "20895000000000000000000"
+    },
+    {
+      "token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "address": "0xcbcdf9626bc03e24f779434178a73a0b4bad62ed",
+      "sent": "11559126335382286632783",
+      "received": "0",
+      "net": "-11559126335382286632783"
+    },
+    {
+      "token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "address": "0xd3b7cea28feb5e537fca4e657e3f60129456eaf3",
+      "sent": "28994303891868396965958",
+      "received": "0",
+      "net": "-28994303891868396965958"
+    },
+    {
+      "token": "native",
+      "address": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "sent": "96833195851696932305977",
+      "received": "96833195851696932305977",
+      "net": "0"
+    },
+    {
+      "token": "native",
+      "address": "0x1ed1dab540433465c79ae82da0c418d5999e87d8",
+      "sent": "133700000000000",
+      "received": "0",
+      "net": "-133700000000000"
+    },
+    {
+      "token": "native",
+      "address": "0x4d47d0ae9224b414a7f38c2e73569f65c987f848",
+      "sent": "70000000000000",
+      "received": "0",
+      "net": "-70000000000000"
+    },
+    {
+      "token": "native",
+      "address": "0xaf471a6d527b04dd1ac916d2c96e45f7e4b78bb8",
+      "sent": "1000000000000000",
+      "received": "0",
+      "net": "-1000000000000000"
+    },
+    {
+      "token": "native",
+      "address": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+      "sent": "0",
+      "received": "8080499595568396965958",
+      "net": "8080499595568396965958"
+    },
+    {
+      "token": "native",
+      "address": "0xb66cd966670d962c227b3eaba30a872dbfb995db",
+      "sent": "0",
+      "received": "88752697459828535340019",
+      "net": "88752697459828535340019"
+    },
+    {
+      "token": "native",
+      "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "sent": "19639624727250683598741",
+      "received": "0",
+      "net": "-19639624727250683598741"
+    },
+    {
+      "token": "native",
+      "address": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",
+      "sent": "77193571124446248707236",
+      "received": "0",
+      "net": "-77193571124446248707236"
+    }
+  ],
+  "events": {
+    "tables": [],
+    "rows_told": 0,
+    "story_warnings": []
+  },
+  "history": {
+    "watched": [
+      "0x036cec1a199234fc02f72d29e596a09440825f1c",
+      "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4"
+    ],
+    "native_symbol": "ETH",
+    "actions": [
+      {
+        "action": "txlist",
+        "rows": 17,
+        "moved": 3,
+        "no_value": 12,
+        "reverted": 2,
+        "shared": 12
+      },
+      {
+        "action": "txlistinternal",
+        "rows": 14,
+        "moved": 6,
+        "no_value": 6,
+        "reverted": 2,
+        "shared": 1
+      },
+      {
+        "action": "tokentx",
+        "rows": 37,
+        "moved": 37,
+        "no_value": 0,
+        "reverted": 0,
+        "shared": 0
+      }
+    ],
+    "native_rows": 17,
+    "native": [
+      {
+        "block": 16818013,
+        "tx_index": 44,
+        "trace_index": 11,
+        "tx_hash": "0xa476fad72c8f4ee15fd2d75ecda4701d8f3ac74431aa453521f13a01c8688142",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0x0b812c74729b6abc723f22986c61d95344ff7aba",
+        "value": "0",
+        "reverted": true,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x0b812c74729b6abc723f22986c61d95344ff7aba (created): 0 ETH, internal create, reverted: moved nothing"
+      },
+      {
+        "block": 16818024,
+        "tx_index": 20,
+        "trace_index": 11,
+        "tx_hash": "0x47ac3527d02e6b9631c77fad1cdee7bfa77a8a7bfd4880dccbda5146ace4088f",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0x0b812c74729b6abc723f22986c61d95344ff7aba",
+        "value": "0",
+        "reverted": false,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x0b812c74729b6abc723f22986c61d95344ff7aba (created): 0 ETH, internal create"
+      },
+      {
+        "block": 16818032,
+        "tx_index": 25,
+        "trace_index": 4,
+        "tx_hash": "0x68eb306c558d45e777c8d588e611db5323a6a5021a9f551bc0be915ef5e24691",
+        "kind": "call",
+        "from": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "value": "8080498391868396965958",
+        "reverted": false,
+        "text": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 8,080.498391868396965958 ETH, internal call"
+      },
+      {
+        "block": 16818034,
+        "tx_index": 29,
+        "trace_index": 1,
+        "tx_hash": "0xe237c57ccf8664411cae71a50b1e94b21dde7a0e096f0cceaa7f432db8151366",
+        "kind": "call",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+        "value": "8080498391868396965958",
+        "reverted": false,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4: 8,080.498391868396965958 ETH, internal call"
+      },
+      {
+        "block": 16818057,
+        "tx_index": 1,
+        "trace_index": 11,
+        "tx_hash": "0x71a908be0bef6174bccc3d493becdfd28395d78898e355d451cb52f7bac38617",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0xb324581ee258aa67bc144ad27f79f8dcac569af0",
+        "value": "0",
+        "reverted": false,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xb324581ee258aa67bc144ad27f79f8dcac569af0 (created): 0 ETH, internal create"
+      },
+      {
+        "block": 16818057,
+        "tx_index": 1,
+        "trace_index": 188,
+        "tx_hash": "0x71a908be0bef6174bccc3d493becdfd28395d78898e355d451cb52f7bac38617",
+        "kind": "call",
+        "from": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "value": "11559126335382286632783",
+        "reverted": false,
+        "text": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 11,559.126335382286632783 ETH, internal call"
+      },
+      {
+        "block": 16818060,
+        "tx_index": 43,
+        "trace_index": 16,
+        "tx_hash": "0x6e9bb8fa66c65dbdb23cfe1a50de1ace48593077f8609cff3ef9da19412062cc",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a",
+        "value": "0",
+        "reverted": true,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a (created): 0 ETH, internal create, reverted: moved nothing"
+      },
+      {
+        "block": 16818062,
+        "tx_index": 11,
+        "trace_index": 8,
+        "tx_hash": "0x62bd3d31a7b75c098ccf28bc4d4af8c4a191b4b9e451fab4232258079e8b18c4",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a",
+        "value": "0",
+        "reverted": false,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x84273bba41cd0ec99f59b5b4c85783cf514e4e1a (created): 0 ETH, internal create"
+      },
+      {
+        "block": 16818062,
+        "tx_index": 11,
+        "trace_index": 186,
+        "tx_hash": "0x62bd3d31a7b75c098ccf28bc4d4af8c4a191b4b9e451fab4232258079e8b18c4",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0x1e4446016f3fddfe2ecc046cf91a8010a30e9a9b",
+        "value": "0",
+        "reverted": false,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x1e4446016f3fddfe2ecc046cf91a8010a30e9a9b (created): 0 ETH, internal create"
+      },
+      {
+        "block": 16818062,
+        "tx_index": 11,
+        "trace_index": 393,
+        "tx_hash": "0x62bd3d31a7b75c098ccf28bc4d4af8c4a191b4b9e451fab4232258079e8b18c4",
+        "kind": "call",
+        "from": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",
+        "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "value": "73347663060908361989345",
+        "reverted": false,
+        "text": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 73,347.663060908361989345 ETH, internal call"
+      },
+      {
+        "block": 16818065,
+        "tx_index": 35,
+        "trace_index": 16,
+        "tx_hash": "0x465a6780145f1efe3ab52f94c006065575712d2003d83d85481f3d110ed131d9",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0x7db7099b00d1d24ef2814cfcde723eacd958b05b",
+        "value": "0",
+        "reverted": false,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0x7db7099b00d1d24ef2814cfcde723eacd958b05b (created): 0 ETH, internal create"
+      },
+      {
+        "block": 16818085,
+        "tx_index": 4,
+        "trace_index": 26,
+        "tx_hash": "0x3097830e9921e4063d334acb82f6a79374f76f0b1a8f857e89b89bc58df1f311",
+        "kind": "create",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0xa4c0afeca6273b012382970c1ed8690c2929988d",
+        "value": "0",
+        "reverted": false,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xa4c0afeca6273b012382970c1ed8690c2929988d (created): 0 ETH, internal create"
+      },
+      {
+        "block": 16818085,
+        "tx_index": 4,
+        "trace_index": 328,
+        "tx_hash": "0x3097830e9921e4063d334acb82f6a79374f76f0b1a8f857e89b89bc58df1f311",
+        "kind": "call",
+        "from": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",
+        "to": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "value": "3845908063537886717891",
+        "reverted": false,
+        "text": "0xdc24316b9ae028f1497c275eb9192a3ea0f67022 -> 0x036cec1a199234fc02f72d29e596a09440825f1c: 3,845.908063537886717891 ETH, internal call"
+      },
+      {
+        "block": 16818102,
+        "tx_index": 33,
+        "trace_index": 1,
+        "tx_hash": "0x298bde3f9e53f7a5d870f7f5d56ee2f5e41fa25e6eb5e74611ac97025405db55",
+        "kind": "call",
+        "from": "0x036cec1a199234fc02f72d29e596a09440825f1c",
+        "to": "0xb66cd966670d962c227b3eaba30a872dbfb995db",
+        "value": "88752697459828535340019",
+        "reverted": false,
+        "text": "0x036cec1a199234fc02f72d29e596a09440825f1c -> 0xb66cd966670d962c227b3eaba30a872dbfb995db: 88,752.697459828535340019 ETH, internal call"
+      },
+      {
+        "block": 16835306,
+        "tx_index": 33,
+        "tx_hash": "0x1bd4987e901362331ed9782dc46f976bd875b19ad2632d098cbb074526c3b264",
+        "kind": "transaction",
+        "from": "0x4d47d0ae9224b414a7f38c2e73569f65c987f848",
+        "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+        "value": "70000000000000",
+        "reverted": false,
+        "text": "0x4d47d0ae9224b414a7f38c2e73569f65c987f848 -> 0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4: 0.00007 ETH, transaction value"
+      },
+      {
+        "block": 16837528,
+        "tx_index": 62,
+        "tx_hash": "0xbb4feb6e1824e1c4f548bd0c3e61be3ae0092e9ef74716262cdb8db2aee89592",
+        "kind": "transaction",
+        "from": "0xaf471a6d527b04dd1ac916d2c96e45f7e4b78bb8",
+        "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+        "value": "1000000000000000",
+        "reverted": false,
+        "text": "0xaf471a6d527b04dd1ac916d2c96e45f7e4b78bb8 -> 0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4: 0.001 ETH, transaction value"
+      },
+      {
+        "block": 16837739,
+        "tx_index": 116,
+        "tx_hash": "0x07cd7c4cf0ef5090f8e2584760b84ee8cd861bdf828716e6843854eb44876b96",
+        "kind": "transaction",
+        "from": "0x1ed1dab540433465c79ae82da0c418d5999e87d8",
+        "to": "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+        "value": "133700000000000",
+        "reverted": false,
+        "text": "0x1ed1dab540433465c79ae82da0c418d5999e87d8 -> 0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4: 0.0001337 ETH, transaction value"
+      }
+    ]
+  },
+  "not_seen": "Seen by this nest: every transaction, internal transfer and ERC-20 Transfer of any token with a watched address as a party. Not seen: anything between two addresses it does not watch; gas fees, withdrawals and block rewards; the watched addresses' NFT transfers, which /api serves; any balance change made without one of these (a rebase, for one). A reverted row is listed and moved nothing. Net flow is the sum of the transfers seen, not a balance.",
+  "provenance": {
+    "version": "{version}",
+    "data_identity": "5a5ea86dddc1fcdf913029c0809df095afe4339545f548d4b463256bef7aaad0",
+    "first_row": {
+      "block": 16818024,
+      "log_index": 158,
+      "tx_index": 20,
+      "block_hash": "0x083aa605e65ec11990ce3b18e8ccdd0c3ff354ea35e10a49046c0dcafc4f40e0"
+    },
+    "last_row": {
+      "block": 16837739,
+      "tx_index": 116,
+      "block_hash": "0xf999515e42dedd7daf53a0f2dc52f3e63c437069b5e89f58fbc9af6c5216d32f"
+    },
+    "sealed_through": 26244634,
+    "metadata_sha256": "be3976d03f7fd1b867d58e6cb544a27892e59b4a9ada49c2e937405673b3de08",
+    "label_snapshots": [],
+    "semantic_sha256": null
+  }
+}
