@@ -1,6 +1,6 @@
 # RFC-0069: The engine room - a running nest watched from a terminal
 
-- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI.
+- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI. S0 measured 2026-10-22 (§15): the feature adds 0.30 MiB on macOS and 0.34 MiB on Linux, `cargo deny` stays green, and one watcher leaves tip lag and RSS inside their unwatched spread; it waits on Chief watching the clip.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: the endpoints a nest already serves (`/ready`, `/metrics`, `/`, `/nests`, the admin
@@ -288,3 +288,91 @@ address-history nests is the same case: one chain per subdirectory, one cursor e
    shows the route only.
 5. Is the 2026-10-03 preference for the cockpit over a TUI still the rule for operator work, with this
    as the exception made for the showpiece, or does it lift?
+
+## 15. S0, measured 2026-10-22
+
+The prototype is `tools/rfc-0069-s0/`: `watch.rs`, the subcommand as one module, and `wire.patch`,
+which compiles it into the binary behind a `watch` feature on by default (`ratatui` 0.30.2 with
+`crossterm` and `layout-cache`, a `Watch` arm in `cli.rs` and `main.rs`). Neither is merged; the
+measurements below are of the base commit `0a082a3d` with and without that patch. It reads `/ready`
+and `/` every second, `/metrics` every two, `/nests` every thirty, and `/_admin/requests` only with a
+token, and a recording made with `--record` or `capture.sh` replays through the same code with
+`--replay`.
+
+`nuthatch-tui-client` is `github.com/nuthatch-org/nuthatch-tui-client` (a clone sits at
+`~/Projects/nuthatch-tui-client`): `src/api.rs`, `app.rs`, `ui.rs`, `worker.rs`, `tunnel.rs`,
+`picker.rs`, `config.rs` and `format.rs`, with 1,694 of its 4,549 lines in `tests.rs`. S0 did not
+port it. It uses blocking reqwest on a worker thread and ratatui 0.29; the prototype is async on the
+binary's own tokio and reqwest. S2 ports its ssh forward (`tunnel.rs`), its `/nests` stepping
+(`picker.rs`) and its tests' recorded bodies, and leaves its `/sql` feed behind, as §4 says.
+
+| Gate | Result |
+|---|---|
+| (a) Binary growth, macOS arm64, `--profile dist` | **Pass**: 96,947,552 to 97,261,984 bytes, +314,432 (0.30 MiB, 0.32%) |
+| (a) Binary growth, Linux x86_64, `--profile dist` | **Pass**: 118,089,520 to 118,448,656 bytes, +359,136 (0.34 MiB, 0.30%), built on the ThinkPad |
+| (a) `cargo deny check` with the feature on | **Pass**: advisories, bans, licences and sources ok. Three new duplicate warnings, `darling`, `darling_core` and `darling_macro` 0.24 beside 0.23, build-time only |
+| (b) Tip-lag after-seen p50, one watcher | **Pass**: 23 and 26 ms watched, inside 19 to 29 ms unwatched |
+| (b) Nest RSS, one watcher | **Pass**: median 74,372 and 74,544 KiB watched, inside 73,852 to 74,596 KiB unwatched; peaks 76,472 and 78,100 KiB inside 75,808 to 78,488 |
+| (c) Panels from captured bodies, and a clip | **Done**: 300 s of a live mainnet nest, replayed. **Open**: Chief watching it |
+
+The feature adds 23 crates on both targets, by name and version against the same commit without it:
+§7's 20 and `darling` 0.24's three. Every one is MIT, Apache-2.0 or both.
+
+**(b), on the ThinkPad.** `watched-tip-lag.sh` runs `.github/workflows/tip-lag.sh` unchanged (100
+samples, 5 warm-up, the footprint fixture, `--poll-interval 1s`) with the `dist` binary above, samples
+the nest's `VmRSS` from `/proc` every second, and with `WATCH=1` attaches one `nuthatch watch` in a
+120 by 40 pty at the defaults, recording its reads. Runs alternated, unwatched first:
+
+| Run | Watched | Watcher reads | After-seen p50 | After-seen p99 | Lag p50 | RSS median | RSS peak |
+|---|---|---|---|---|---|---|---|
+| u1 | no | - | 24 ms | 48 ms | 538 ms | 73,852 KiB | 75,808 KiB |
+| w1 | yes | 277 | 23 ms | 46 ms | 456 ms | 74,372 KiB | 76,472 KiB |
+| u2 | no | - | 19 ms | 32 ms | 431 ms | 74,360 KiB | 76,396 KiB |
+| u3 | no | - | 29 ms | 49 ms | 535 ms | 74,596 KiB | 77,752 KiB |
+| w2 | yes | 279 | 26 ms | 43 ms | 566 ms | 74,544 KiB | 78,100 KiB |
+| u4 | no | - | 29 ms | 75 ms | 479 ms | 74,388 KiB | 78,488 KiB |
+
+About 2.5 reads a second over each watched run, which is the defaults. w2's lag p50 sits 28 ms above
+the unwatched range; lag moves with where a block lands in the poll interval, which is why it is
+tracked and not gated (`docs/benchmarks.md`), and the gate here is after-seen and RSS.
+
+§6 expected `/metrics` to be cheaper on Linux, and it is. On the ThinkPad, 300 sequential requests per
+route against an idle fixture nest, CPU from `/proc/<pid>/stat` in 10 ms ticks: `/ready` 750 B, p50
+0.49 ms, 0.33 ms of nest CPU a request; `/` 780 B, 0.48 ms, 0.33 ms; `/metrics` 17.7 KB, 0.78 ms, 0.63
+ms, against 1.5 ms on macOS. At the defaults that is about 1 ms of CPU a second, a tenth of a percent of
+one core. The tick makes each figure good to about 0.03 ms.
+
+**(c), the look.** `capture.sh` recorded 760 reads over 300 s from a copy of `defi-pulse-nest` run by
+the 5.9.0 release binary on this MacBook: `dev --backfill 4000 --seal-direct --concurrency 2
+--poll-interval 12s` against `ethereum-rpc.publicnode.com` and `eth.drpc.org`, from launch. The
+clip is `engine-room.tape` replaying that file at 5x with the `dist` build above, 48 s, GIF and MP4.
+Every figure on it is a body the nest served; the replay changes only the pace, and the footer says
+so with the recording's start time.
+
+What drawing real bodies turned up:
+
+1. **`/` does not name the nest.** Its `name` is `nuthatch`. The nameplate takes the nest's name from
+   the `nest` label on `/metrics`, so no further route is read.
+2. **Lag in seconds has no source.** `/ready` carries no tip timestamp, so §4's "lag in seconds" cannot
+   be drawn honestly. THE TIP shows the age of the last poll and the countdown to the next instead.
+3. **`nuthatch_rows_sealed_total` stays 0 across a seal-direct pass**, while the same nest reports
+   465.7 KiB of sealed segments; only the tip-seal path counts its rows. THE PRESS shows the 0 the nest
+   serves. Filed as #2339.
+4. **At a 12 s poll, FEED LINES is idle in most 2 s intervals**, so a per-interval mean latency reads
+   `idle` more often than a number. S2 should keep the last interval that asked anything, with its age.
+5. **The seal-direct pass on 4,000 blocks took about 2 s**, so the clip opens with it done and shows one
+   stamp in THE PRESS. Mainnet seals tip history every 1,800 blocks, about six hours, so a five-minute
+   recording shows the seal lag growing, not a second stamp. S5's recording wants a longer backfill.
+6. `/nests` answers 404 on a solo nest, and the budget line reads one cursor, as §8 expects.
+
+Not verified in S0: the line mode (S1); narrow terminals, `NO_COLOR` and 256-colour mode on a real
+terminal (the code paths exist, only truecolour was looked at); the ssh forward; a multichain runtime
+(§8, S4); the token path, since `/_admin/requests` does not exist until S3; the watched cost on macOS,
+where `/metrics` forks `ps`; and a clean build-time difference, because the four `dist` builds shared
+machines with each other.
+
+§14, as S0 took them, from the RFC's own recommendations: the feature is on by default (1, and the
+record in `CLAUDE.md` says so); the subcommand is `nuthatch watch` (2); `nuthatch-tui-client` is
+archived with a pointer once S2 lands (3); `/_admin/requests` carries the route only, never SQL text
+(4); and the 2026-10-03 preference is lifted for this RFC only, with the cockpit still the browser
+surface for operator work (5).
