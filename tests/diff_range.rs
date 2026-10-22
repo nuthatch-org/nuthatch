@@ -376,7 +376,7 @@ fn threshold_flags_raised_in_range_are_listed() {
 // ---------------------------------------------------------------------------------------------------
 // The three surfaces.
 
-fn free_port() -> u16 {
+pub(crate) fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -385,7 +385,7 @@ fn free_port() -> u16 {
 }
 
 /// One HTTP/1.0 GET: the body as sent, and the status.
-fn http_get(port: u16, path: &str) -> std::io::Result<(u16, String)> {
+pub(crate) fn http_get(port: u16, path: &str) -> std::io::Result<(u16, String)> {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port))?;
     write!(s, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n")?;
     let mut raw = Vec::new();
@@ -438,7 +438,7 @@ fn serve(dir: tempfile::TempDir) -> Served {
 }
 
 /// `tools/call diff` through `nuthatch mcp`, returning the tool's text.
-fn mcp_diff(port: u16, args: serde_json::Value) -> String {
+pub(crate) fn mcp_diff(port: u16, args: serde_json::Value) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
         .args(["mcp", "--url", &format!("http://127.0.0.1:{port}")])
         .stdin(Stdio::piped())
@@ -463,7 +463,7 @@ fn mcp_diff(port: u16, args: serde_json::Value) -> String {
         .to_string()
 }
 
-fn cli_over_http(port: u16, args: &[&str]) -> String {
+pub(crate) fn cli_over_http(port: u16, args: &[&str]) -> String {
     let empty = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
         .arg("diff")
@@ -599,6 +599,7 @@ async fn story_json(dir: &Path, store: &nuthatch::store::Store, from: u64, to: u
         ctx: &ctx,
         stories: &stories,
         warnings,
+        history: None,
     };
     diff::produce(&src, inputs, &ask)
         .await

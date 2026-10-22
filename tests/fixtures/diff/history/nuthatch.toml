@@ -1,0 +1,14 @@
+[nest]
+name = "euler-exploiter-history"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://ethereum-rpc.publicnode.com"]
+schema_version = 2
+
+[address_history]
+addresses = [
+  "0x036cec1a199234fc02f72d29e596a09440825f1c",
+  "0xb2698c2d99ad2c302a95a8db26b08d17a77cedd4",
+]
+start_block = 16817996
+end_block = 16837739

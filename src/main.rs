@@ -474,10 +474,34 @@ async fn run_diff(args: cli::DiffArgs) -> Result<()> {
     };
 
     let backend = SqlBackend::open(&args.dir, &args.url).await?;
-    // The running instance tells the story itself; only the flow is still drawn here from /sql.
-    if let (SqlBackend::Http { .. }, diff::Mode::Story) = (&backend, mode) {
+    let mut history_nest = local_config
+        .as_ref()
+        .is_some_and(|c| c.address_history.is_some());
+    // With no config here, the instance says what it is: an address-history nest has no /sql.
+    if !history_nest && mode == diff::Mode::Flow && matches!(backend, SqlBackend::Http { .. }) {
+        history_nest = backend
+            .get_json("/ready")
+            .await
+            .is_ok_and(|r| r["mode"] == "address_history");
+    }
+    if let (true, SqlBackend::Local { dir, .. }) = (history_nest, &backend) {
+        let dir = dir.clone();
+        // Reopened with address history's page cache, not the event store's gigabyte.
+        drop(backend);
+        let cfg = local_config
+            .as_ref()
+            .expect("an address-history config was read");
+        return diff_history_local(&dir, cfg, explicit, tx, mode, top, &args).await;
+    }
+    // The running instance tells the story itself, and an address-history nest its flow too, since
+    // it has no /sql; an event nest's flow is still drawn here from /sql.
+    if matches!(backend, SqlBackend::Http { .. }) && (mode == diff::Mode::Story || history_nest) {
         let (from, to, cursor) = match explicit {
             Some((f, t)) => (f, t, None),
+            None if history_nest => anyhow::bail!(
+                "--since-last over --url needs the nest's store; give --from and --to, or stop \
+                 `dev` and run it against the directory"
+            ),
             None => {
                 let ready = backend.get_json("/ready").await?;
                 let nest = backend.get_json("/nest").await?;
@@ -491,20 +515,26 @@ async fn run_diff(args: cli::DiffArgs) -> Result<()> {
                 }
             }
         };
-        let format = match args.format {
-            diff::Format::Text => "text",
-            diff::Format::Markdown => "markdown",
-            diff::Format::Json => "json",
-            diff::Format::Dot | diff::Format::Mermaid => anyhow::bail!(
+        let format = match (args.format, mode) {
+            (diff::Format::Text, _) => "text",
+            (diff::Format::Markdown, _) => "markdown",
+            (diff::Format::Json, _) => "json",
+            (diff::Format::Dot, diff::Mode::Flow) => "dot",
+            (diff::Format::Mermaid, diff::Mode::Flow) => "mermaid",
+            (diff::Format::Dot | diff::Format::Mermaid, _) => anyhow::bail!(
                 "--format dot and mermaid draw the flow: add --flow, or use text, markdown or json"
             ),
         };
-        let mut q: Vec<(&str, String)> = vec![
-            ("from", from.to_string()),
-            ("to", to.to_string()),
-            ("top", top.to_string()),
-            ("format", format.to_string()),
-        ];
+        // The route takes a transaction with its block, and a range as from and to.
+        let mut q: Vec<(&str, String)> = match &tx {
+            Some(_) => vec![("block", from.to_string())],
+            None => vec![("from", from.to_string()), ("to", to.to_string())],
+        };
+        q.push(("top", top.to_string()));
+        q.push(("format", format.to_string()));
+        if mode == diff::Mode::Flow {
+            q.push(("flow", "true".into()));
+        }
         if let Some(t) = &tx {
             q.push(("tx", t.clone()));
         }
@@ -612,8 +642,55 @@ async fn run_diff(args: cli::DiffArgs) -> Result<()> {
         ctx: &ctx,
         stories: &stories,
         warnings,
+        history: None,
     };
     let produced = diff::produce(&backend, inputs, &ask).await?;
+    print!("{}", produced.render(args.format, top)?);
+    if let Some((path, block)) = cursor {
+        diff::write_cursor(&path, block)?;
+    }
+    Ok(())
+}
+
+/// `nuthatch diff` over an address-history nest's own store (RFC-0071 §15 step 4). The store is only
+/// read: nothing is seeded or migrated, so the nest is as it was after.
+#[allow(clippy::too_many_arguments)]
+async fn diff_history_local(
+    dir: &std::path::Path,
+    cfg: &config::Config,
+    explicit: Option<(u64, u64)>,
+    tx: Option<String>,
+    mode: nuthatch::diff::Mode,
+    top: usize,
+    args: &cli::DiffArgs,
+) -> Result<()> {
+    use nuthatch::{address_history::AddressHistory, diff, diff_history};
+    let store = store::Store::open_with_cache(
+        &dir.join(config::DB_FILE),
+        nuthatch::address_mode::STORE_CACHE_BYTES,
+    )?;
+    let history = AddressHistory::reader(store, cfg.nest.chain_id);
+    let data_identity = diff_history::data_identity(dir);
+    let facts = diff_history::facts(cfg, data_identity.clone());
+    let (from, to, cursor) = match explicit {
+        Some((f, t)) => (f, t, None),
+        None => match next_since_last(
+            data_identity.as_deref(),
+            facts.start_block,
+            history.head()?.unwrap_or(0),
+        )? {
+            Some(x) => x,
+            None => return Ok(()),
+        },
+    };
+    let rows = history.diff_snapshot((from, to))?;
+    let ask = diff::Ask {
+        req: diff::Request { from, to, tx },
+        mode,
+        top,
+        final_only: args.final_only,
+    };
+    let produced = diff_history::produce(dir, facts, &rows, &ask).await?;
     print!("{}", produced.render(args.format, top)?);
     if let Some((path, block)) = cursor {
         diff::write_cursor(&path, block)?;
