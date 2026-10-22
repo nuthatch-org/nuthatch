@@ -197,7 +197,7 @@ impl Screen<'_> {
         if attention || views_failed || !ready.bool("ready") {
             return ("ATTENTION", Ink::Ember);
         }
-        if ready.bool("seal_direct_active") || ready.u64("lag_blocks").is_some_and(|l| l > 10) {
+        if ready.bool("seal_direct_active") || ready.lag().is_some_and(|l| l > 10) {
             return ("BACKFILL", Ink::Brass);
         }
         ("LIVE", Ink::Verdigris)
@@ -272,6 +272,8 @@ impl Screen<'_> {
         let t = &self.theme;
         let interval = ready.pointer_u64("/freshness/poll_interval_secs");
         let since = ready.u64("seconds_since_poll").zip(ready.read_at());
+        // A cursor that has not polled yet serves an age of 0, which is not a poll.
+        let since = since.filter(|_| ready.u64("last_poll_unixtime") != Some(0));
         // `/ready` carries no tip timestamp, so lag in seconds would be invented; the poll's age and
         // the countdown to the next are what it does carry.
         match (interval, since) {
@@ -308,14 +310,14 @@ impl Screen<'_> {
         let ready = view.ready;
         let poll = self.poll(ready, fit.roomy);
         let mut lines = vec![
-            self.row("TIP", vec![self.opt_block(ready.u64("tip"), Ink::BrassHi)]),
+            self.row("TIP", vec![self.opt_block(ready.tip(), Ink::BrassHi)]),
             self.row(
                 "INDEXED",
-                vec![self.opt_block(ready.u64("last_block"), Ink::Copper)],
+                vec![self.opt_block(ready.indexed(), Ink::Copper)],
             ),
             self.row(
                 "LAG",
-                match ready.u64("lag_blocks") {
+                match ready.lag() {
                     Some(l) => vec![t.value(format!("{} blocks", thousands(l)))],
                     None => vec![t.no_signal()],
                 },
@@ -779,7 +781,7 @@ impl Screen<'_> {
     fn cursor_lines(&self, cursor: &Cursor, fit: Fit) -> Vec<Line<'static>> {
         let t = &self.theme;
         let views = self.views_of(cursor);
-        let tip = views.iter().filter_map(|v| v.ready.u64("tip")).max();
+        let tip = views.iter().filter_map(|v| v.ready.tip()).max();
         let polled = views
             .iter()
             .find(|v| v.ready.value().is_some())
@@ -825,8 +827,8 @@ impl Screen<'_> {
                     ),
                     t.fg(Ink::Body),
                 ),
-                t.value(format!(" {:>11}", num(v.ready.u64("last_block")))),
-                t.value(format!(" {:>7}", num(v.ready.u64("lag_blocks")))),
+                t.value(format!(" {:>11}", num(v.ready.indexed()))),
+                t.value(format!(" {:>7}", num(v.ready.lag()))),
                 t.value(format!(" {:>11}", num(sealed))),
                 t.value(format!(" {:>7}", num(reorgs))),
                 t.dim("  "),

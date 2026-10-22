@@ -58,6 +58,22 @@ impl RouteState {
         self.value()?.get(key)?.as_str().map(str::to_string)
     }
 
+    /// The chain tip the cursor last read. `/ready` serves 0 before the first read (a seal-direct
+    /// pass runs before the cursor starts), and no chain a cursor follows is at height 0.
+    pub fn tip(&self) -> Option<u64> {
+        self.u64("tip").filter(|t| *t > 0)
+    }
+
+    /// The block the cursor has indexed through; 0, before it has indexed any, is not a position.
+    pub fn indexed(&self) -> Option<u64> {
+        self.u64("last_block").filter(|b| *b > 0)
+    }
+
+    /// Blocks behind the tip, only once there is a tip to be behind.
+    pub fn lag(&self) -> Option<u64> {
+        self.tip().and(self.u64("lag_blocks"))
+    }
+
     pub fn read_at(&self) -> Option<u64> {
         self.body.as_ref().map(|(t, _)| *t)
     }
@@ -91,7 +107,8 @@ impl Track {
         let block = body.get("last_block").and_then(Value::as_u64);
         if let (Some(poll), Some(block)) = (poll, block) {
             if let (Some(prev_poll), Some(prev_block)) = (self.last_poll, self.last_block) {
-                if poll > prev_poll {
+                // The first block indexed is not an arrival: the jump from 0 is the whole history.
+                if poll > prev_poll && prev_block > 0 {
                     push_capped(&mut self.arrivals, block.saturating_sub(prev_block));
                 }
             }

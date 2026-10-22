@@ -598,3 +598,57 @@ fn a_tenant_qualified_mount_reads_its_own_ready() {
     assert_eq!(app.dispatch["acme/usdc"].status, Some(401));
     assert_eq!(app.view().ready.u64("tip"), Some(52_000_000));
 }
+
+/// While a seal-direct pass runs, before the cursor has read the chain, `/ready` serves a tip, an
+/// indexed block, a lag and a poll age of 0. None of them is a reading, so none is drawn as one
+/// (found recording S5: the screen said `TIP 0` and `LAG 0 blocks` through the backfill).
+#[test]
+fn a_cursor_that_has_not_polled_shows_no_tip() {
+    let (mut app, now) = replayed("solo.jsonl");
+    let mut body = app.ready.value().unwrap().clone();
+    for key in [
+        "tip",
+        "last_block",
+        "lag_blocks",
+        "seconds_since_poll",
+        "last_poll_unixtime",
+    ] {
+        body[key] = 0.into();
+    }
+    body["seal_direct_active"] = true.into();
+    app.apply(&read(now - 100, "/ready", 200, &body.to_string()));
+    let drawn = text(&buffer(&app, now, ColorMode::None, 120, 40));
+    for want in [
+        " TIP       NO SIGNAL",
+        " INDEXED   NO SIGNAL",
+        " LAG       NO SIGNAL",
+        " POLL      NO SIGNAL",
+    ] {
+        assert!(drawn.contains(want), "want {want:?} in\n{drawn}");
+    }
+    assert!(drawn.contains("BACKFILL"), "{drawn}");
+    let line = super::line::lines(&app).remove(0);
+    for key in ["tip", "lag"] {
+        assert!(line.contains(&format!("{key}=\"NO SIGNAL\"")), "{line}");
+    }
+}
+
+/// The first block a cursor indexes is not an arrival: from 0 it would be the chain's whole height.
+#[test]
+fn the_first_block_indexed_is_not_an_arrival() {
+    let mut app = App::default();
+    let ready = |block: u64, poll: u64| {
+        format!(
+            r#"{{"ready":true,"tip":{block},"last_block":{block},"last_poll_unixtime":{poll}}}"#
+        )
+    };
+    app.apply(&read(1_000, "/ready", 200, &ready(0, 100)));
+    app.apply(&read(2_000, "/ready", 200, &ready(26_000_000, 112)));
+    assert!(
+        app.tracks[""].arrivals.is_empty(),
+        "{:?}",
+        app.tracks[""].arrivals
+    );
+    app.apply(&read(3_000, "/ready", 200, &ready(26_000_001, 124)));
+    assert_eq!(app.tracks[""].arrivals, [1]);
+}

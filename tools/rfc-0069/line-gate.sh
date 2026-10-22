@@ -74,8 +74,8 @@ jq -n -r --slurpfile reads "$OUT/reads.jsonl" --rawfile lines "$OUT/lines.txt" '
           expect: {
             nest: fmt_name($w.nest),
             chain: fmt_name($w.chain),
-            tip: num($rb.tip),
-            lag: num($rb.lag_blocks),
+            tip: num(if ($rb.tip // 0) > 0 then $rb.tip else null end),
+            lag: num(if ($rb.tip // 0) > 0 then $rb.lag_blocks else null end),
             sealed: num(if ($rb.sealed_through // 0) > 0 then $rb.sealed_through else null end),
             rss: num($rss),
             budget: num(if $cursors == null then null else $cursors * 2147483648 end),

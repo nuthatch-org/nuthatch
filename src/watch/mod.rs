@@ -340,7 +340,7 @@ async fn run_live_screen(
     ));
     let every = interval.unwrap_or(1);
     let footer = format!(
-        "reading {described} · /ready every {every} s, /metrics every {} s · n N mount · q quits",
+        "reading {described} · /ready every {every} s, /metrics every {} s · q quits",
         if interval.is_some() { every } else { 2 }
     );
     let mut app = App::default();
