@@ -528,3 +528,46 @@ fn a_cursor_takes_its_worst_mounts_state() {
     let pulse = drawn.lines().find(|l| l.contains(" pulse ")).unwrap();
     assert!(pulse.contains("LIVE"), "{pulse}");
 }
+
+/// Two mounts on one chain share one cursor, and each keeps its own position on it.
+#[test]
+fn mounts_on_one_chain_share_a_cursor() {
+    let (mut app, now) = replayed("runtime.jsonl");
+    let mut nests: serde_json::Value = app.nests.value().unwrap().clone();
+    let mut twin = nests["nests"][0].clone();
+    assert_eq!(twin["chain"], "mainnet");
+    twin["name"] = "pulse2".into();
+    nests["nests"].as_array_mut().unwrap().push(twin);
+    app.apply(&read(now - 20, "/nests", 200, &nests.to_string()));
+    let mut ready = app.nest_ready["pulse"].value().unwrap().clone();
+    let behind = ready["last_block"].as_u64().unwrap() - 1_234;
+    ready["last_block"] = behind.into();
+    app.apply(&read(now - 20, "/pulse2/ready", 200, &ready.to_string()));
+
+    let cursors = app.cursor_groups().unwrap();
+    assert_eq!(cursors.len(), 2, "{cursors:?}");
+    assert_eq!(cursors[0].mounts, vec!["pulse", "pulse2"]);
+    let drawn = text(&buffer(&app, now, ColorMode::None, 70, 40));
+    assert!(drawn.contains("2 cursors · 3 mounts"), "{drawn}");
+    let mainnet = drawn
+        .split("CURSOR mainnet\n")
+        .nth(1)
+        .unwrap()
+        .split("CURSOR base")
+        .next()
+        .unwrap();
+    let row = |m: &str| {
+        mainnet
+            .lines()
+            .find(|l| l.starts_with(&format!(" {m} ")))
+            .unwrap_or_else(|| panic!("no {m} under mainnet:\n{drawn}"))
+            .to_string()
+    };
+    assert!(
+        row("pulse2").contains(&thousands(behind)),
+        "{}",
+        row("pulse2")
+    );
+    let own = app.nest_ready["pulse"].u64("last_block").unwrap();
+    assert!(row("pulse").contains(&thousands(own)), "{}", row("pulse"));
+}
