@@ -1,11 +1,12 @@
- PULSE  LIVE  · mainnet · 5.9.0 · 1/2
- TIP       26,249,763
- INDEXED   26,249,763
- LAG       0 blocks
- POLL      every 12 s · last 10 s ago · next in 2 s
- SEALED    through 26,249,448
- SEAL LAG  315 blocks
- OUTPUT    2,515 rows · 231.1 KiB on disk
+ WATCH-GATE  LIVE  · 2 cursors · 2 mounts · nuthatch 5.9.0
+CURSOR mainnet
+ TIP       26,249,763  12 s: 10 s ago, next 2 s
+ NEST        INDEXED     LAG      SEALED  REORGS  STATE
+ pulse    26,249,763       0  26,249,448       0  LIVE
+CURSOR base
+ TIP       52,951,056  12 s: 6 s ago, next 6 s
+ NEST        INDEXED     LAG      SEALED  REORGS  STATE
+ baseus…  52,951,056       0  52,948,346       0  LIVE
  RSS       195.6 MiB of 4.0 GiB · process · 2 cursors
  CPU       0.7% of a core
  POOL      reserved 0 B · peak 0 B
@@ -15,6 +16,5 @@
  eth.drpc.org                   185    18     1    72 ms 6s
  ethereum-rpc.publicnode.com    409     1    18    59 ms 6s
  mainnet.base.org                81    39     0   135 ms 6s
- REORGS    0 since the process started
- LAST      none
+ REQUESTS  NO SIGNAL
  replaying a fixture

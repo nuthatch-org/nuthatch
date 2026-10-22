@@ -176,6 +176,13 @@ fn push_capped_served(ring: &mut VecDeque<Served>, s: Served) {
     ring.push_back(s);
 }
 
+/// One cursor of a runtime: a chain and the mounts it drives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cursor {
+    pub chain: Option<String>,
+    pub mounts: Vec<String>,
+}
+
 /// The last interval in which an endpoint was asked anything: its mean latency and when.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Latency {
@@ -348,18 +355,12 @@ impl App {
             .next()
     }
 
-    /// The nest the screen draws: the solo nest, or the selected mount.
+    /// The nest the screen draws: the solo nest, or the first mount of the selected cursor.
     pub fn view(&self) -> NestView<'_> {
-        match self.mounts().filter(|m| !m.is_empty()) {
-            Some(mounts) => {
-                let m = &mounts[self.selected.min(mounts.len() - 1)];
-                NestView {
-                    label: Some(m.name.clone()),
-                    chain: m.chain.clone(),
-                    ready: self.nest_ready.get(&m.name).unwrap_or(&EMPTY_ROUTE),
-                    track: self.tracks.get(&m.name),
-                    dispatch: self.dispatch.get(&m.name),
-                }
+        match self.cursor_groups().filter(|c| !c.is_empty()) {
+            Some(cursors) => {
+                let c = &cursors[self.selected.min(cursors.len() - 1)];
+                self.mount_view(&c.mounts[0], c.chain.clone())
             }
             None => NestView {
                 label: self.solo_name(),
@@ -429,9 +430,36 @@ impl App {
         }
     }
 
-    /// Step to the next (or previous) mount of a runtime.
+    /// One mount of a runtime, read from its own `/<name>/ready` and `nest`-labelled series.
+    pub fn mount_view(&self, name: &str, chain: Option<String>) -> NestView<'_> {
+        NestView {
+            label: Some(name.to_string()),
+            chain,
+            ready: self.nest_ready.get(name).unwrap_or(&EMPTY_ROUTE),
+            track: self.tracks.get(name),
+            dispatch: self.dispatch.get(name),
+        }
+    }
+
+    /// A runtime's cursors (RFC-0021): one per chain, holding its mounts, in the order `/nests` first
+    /// names them. `None` for a solo nest.
+    pub fn cursor_groups(&self) -> Option<Vec<Cursor>> {
+        let mut cursors: Vec<Cursor> = Vec::new();
+        for m in self.mounts()? {
+            match cursors.iter_mut().find(|c| c.chain == m.chain) {
+                Some(c) => c.mounts.push(m.name),
+                None => cursors.push(Cursor {
+                    chain: m.chain,
+                    mounts: vec![m.name],
+                }),
+            }
+        }
+        Some(cursors)
+    }
+
+    /// Step to the next (or previous) cursor of a runtime.
     pub fn step(&mut self, forward: bool) {
-        let n = self.mounts().map_or(0, |m| m.len());
+        let n = self.cursor_groups().map_or(0, |c| c.len());
         if n == 0 {
             return;
         }

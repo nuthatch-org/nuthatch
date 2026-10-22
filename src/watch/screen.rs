@@ -11,7 +11,7 @@ use ratatui::Frame;
 use serde_json::Value;
 
 use super::series;
-use super::state::{App, NestView};
+use super::state::{App, Cursor, Dispatch, NestView, RouteState, Served};
 use super::theme::{Ink, Theme};
 
 /// Below this the panels stack into one column of readouts and the strips go (RFC-0069 §9).
@@ -21,6 +21,8 @@ pub const FULL_HEIGHT: u16 = 24;
 pub const TERSE_WIDTH: u16 = 60;
 /// A panel this wide inside its border has room for the long forms and the hints.
 const ROOMY: u16 = 50;
+/// A cursor gets its own column when the screen gives each at least this many.
+const SIDE_BY_SIDE: u16 = 70;
 
 /// How long `/ready` may go unanswered before the screen says the nest is not being heard.
 pub fn stale_after_ms(read_every_secs: u64) -> u64 {
@@ -51,7 +53,9 @@ struct Fit {
 impl Screen<'_> {
     pub fn draw(&self, frame: &mut Frame) {
         let area = frame.area();
-        if area.width >= FULL_WIDTH && area.height >= FULL_HEIGHT {
+        if let Some(cursors) = self.app.cursor_groups().filter(|c| !c.is_empty()) {
+            self.draw_runtime(frame, area, &cursors);
+        } else if area.width >= FULL_WIDTH && area.height >= FULL_HEIGHT {
             self.draw_full(frame, area);
         } else {
             self.draw_compact(frame, area);
@@ -263,25 +267,25 @@ impl Screen<'_> {
         Line::from(spans)
     }
 
-    fn the_tip(&self, view: &NestView, fit: Fit) -> Vec<Line<'static>> {
+    /// The poll interval, the last poll's age and the countdown to the next.
+    fn poll(&self, ready: &RouteState, roomy: bool) -> Vec<Span<'static>> {
         let t = &self.theme;
-        let ready = view.ready;
         let interval = ready.pointer_u64("/freshness/poll_interval_secs");
         let since = ready.u64("seconds_since_poll").zip(ready.read_at());
         // `/ready` carries no tip timestamp, so lag in seconds would be invented; the poll's age and
         // the countdown to the next are what it does carry.
-        let poll = match (interval, since) {
+        match (interval, since) {
             (Some(every), Some((since, read_at))) => {
                 let since = since + self.now_ms.saturating_sub(read_at) / 1000;
                 let next = every.saturating_sub(since);
                 let next = if next == 0 {
                     "due".to_string()
-                } else if fit.roomy {
+                } else if roomy {
                     format!("in {next} s")
                 } else {
                     format!("{next} s")
                 };
-                if fit.roomy {
+                if roomy {
                     vec![
                         t.value(format!("every {every} s")),
                         t.dim(format!(" · last {since} s ago · next ")),
@@ -296,7 +300,13 @@ impl Screen<'_> {
                 }
             }
             _ => vec![t.no_signal()],
-        };
+        }
+    }
+
+    fn the_tip(&self, view: &NestView, fit: Fit) -> Vec<Line<'static>> {
+        let t = &self.theme;
+        let ready = view.ready;
+        let poll = self.poll(ready, fit.roomy);
         let mut lines = vec![
             self.row("TIP", vec![self.opt_block(ready.u64("tip"), Ink::BrassHi)]),
             self.row(
@@ -592,37 +602,60 @@ impl Screen<'_> {
 
     /// The requests the nest served, newest first, under the rate and median of the last minute.
     fn dispatch(&self, view: &NestView, fit: Fit, rows: u16) -> Vec<Line<'static>> {
+        let feeds: Vec<(Option<&str>, &Dispatch)> =
+            view.dispatch.map(|d| (None, d)).into_iter().collect();
+        self.dispatch_of(&feeds, fit, rows)
+    }
+
+    /// DISPATCH over one feed or several, each tagged with its mount when there are several.
+    fn dispatch_of(
+        &self,
+        feeds: &[(Option<&str>, &Dispatch)],
+        fit: Fit,
+        rows: u16,
+    ) -> Vec<Line<'static>> {
         let t = &self.theme;
-        let Some(d) = view.dispatch.filter(|d| d.status.is_some_and(|s| s != 0)) else {
+        let heard: Vec<&(Option<&str>, &Dispatch)> = feeds
+            .iter()
+            .filter(|(_, d)| d.status.is_some_and(|s| s != 0))
+            .collect();
+        let Some(first) = heard.first() else {
             return vec![self.row("REQUESTS", vec![t.no_signal()])];
         };
-        match d.status {
-            Some(200) => {}
-            Some(401) => {
-                let mut v = vec![Span::styled("NO TOKEN", t.alarm(Ink::Ember))];
-                if fit.roomy {
-                    v.push(t.dim(" set NUTHATCH_ADMIN_TOKEN to read it"));
-                }
-                return vec![self.row("REQUESTS", v)];
-            }
-            Some(status) => {
-                let mut v = vec![Span::styled("NOT SERVED", t.alarm(Ink::Ember))];
-                if fit.roomy {
-                    v.push(t.dim(format!(" /_admin/requests answered {status}")));
-                }
-                return vec![self.row("REQUESTS", v)];
-            }
-            None => unreachable!("filtered above"),
-        }
-        const WINDOW_MS: u64 = 60_000;
-        let mut recent: Vec<f64> = d
-            .served
+        let open: Vec<&(Option<&str>, &Dispatch)> = heard
             .iter()
-            .filter(|s| s.unix_ms + WINDOW_MS >= self.now_ms)
-            .map(|s| s.ms)
+            .copied()
+            .filter(|(_, d)| d.status == Some(200))
+            .collect();
+        if open.is_empty() {
+            let status = first.1.status.unwrap_or(0);
+            let (word, why) = if status == 401 {
+                (
+                    "NO TOKEN",
+                    " set NUTHATCH_ADMIN_TOKEN to read it".to_string(),
+                )
+            } else {
+                ("NOT SERVED", format!(" /_admin/requests answered {status}"))
+            };
+            let mut v = vec![Span::styled(word, t.alarm(Ink::Ember))];
+            if fit.roomy {
+                v.push(t.dim(why));
+            }
+            return vec![self.row("REQUESTS", v)];
+        }
+        let mut served: Vec<(Option<&str>, &Served)> = open
+            .iter()
+            .flat_map(|(m, d)| d.served.iter().map(move |s| (*m, s)))
+            .collect();
+        served.sort_by_key(|(_, s)| (s.unix_ms, s.seq));
+        const WINDOW_MS: u64 = 60_000;
+        let mut recent: Vec<f64> = served
+            .iter()
+            .filter(|(_, s)| s.unix_ms + WINDOW_MS >= self.now_ms)
+            .map(|(_, s)| s.ms)
             .collect();
         recent.sort_by(f64::total_cmp);
-        let summary = if recent.is_empty() {
+        let mut summary = if recent.is_empty() {
             vec![t.dim("none in the last minute")]
         } else {
             vec![
@@ -634,20 +667,23 @@ impl Screen<'_> {
                 t.value(format!("{} ms", millis(recent[recent.len() / 2]))),
             ]
         };
-        let mut summary = summary;
         if fit.roomy && !recent.is_empty() {
             summary.push(t.dim(format!(" · {} in the last minute", recent.len())));
         }
         let mut lines = vec![self.row("REQUESTS", summary)];
         let route_w = (fit.width as usize)
             .saturating_sub(5 + 4 + 9 + 3)
-            .clamp(8, 40);
-        for s in d.served.iter().rev().take(rows.saturating_sub(1) as usize) {
+            .clamp(8, 60);
+        for (mount, s) in served.iter().rev().take(rows.saturating_sub(1) as usize) {
             let age = short_age(self.now_ms.saturating_sub(s.unix_ms) / 1000);
-            let what = match &s.name {
-                Some(n) => format!("{} {n}", s.route),
+            let mut what = match mount {
+                Some(m) => format!("{m} {}", s.route),
                 None => s.route.clone(),
             };
+            if let Some(n) = &s.name {
+                what.push(' ');
+                what.push_str(n);
+            }
             lines.push(Line::from(vec![
                 t.dim(format!(" {age:>4} ")),
                 Span::styled(
@@ -668,6 +704,228 @@ impl Screen<'_> {
             ]));
         }
         lines
+    }
+
+    // --- A runtime: one engine room per cursor (RFC-0069 §8). ---
+
+    /// The worst of several nests' states, so a cursor or a runtime is never cheerier than its worst
+    /// mount.
+    fn worst(&self, views: &[NestView]) -> (&'static str, Ink) {
+        let rank = |s: &str| match s {
+            "QUARANTINED" => 5,
+            "STALE" => 4,
+            "ATTENTION" => 3,
+            "NO SIGNAL" => 2,
+            "BACKFILL" => 1,
+            _ => 0,
+        };
+        views
+            .iter()
+            .map(|v| self.state(v))
+            .max_by_key(|(s, _)| rank(s))
+            .unwrap_or(("NO SIGNAL", Ink::Faint))
+    }
+
+    fn views_of<'b>(&'b self, cursor: &Cursor) -> Vec<NestView<'b>> {
+        cursor
+            .mounts
+            .iter()
+            .map(|m| self.app.mount_view(m, cursor.chain.clone()))
+            .collect()
+    }
+
+    fn runtime_plate(&self, cursors: &[Cursor], shown_one: bool) -> Line<'static> {
+        let t = &self.theme;
+        let views: Vec<NestView> = cursors.iter().flat_map(|c| self.views_of(c)).collect();
+        let (state, ink) = self.worst(&views);
+        let name = self
+            .app
+            .nests
+            .str("runtime")
+            .unwrap_or_else(|| "runtime".into());
+        let version = views.iter().find_map(|v| v.ready.str("version"));
+        let sep = || Span::styled(" · ", t.fg(Ink::Seam));
+        let mut spans = vec![
+            Span::styled(
+                format!(" {} ", name.to_uppercase()),
+                t.fg(Ink::Body).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {state} "), t.state(ink)),
+            sep(),
+            t.dim(format!(
+                "{} cursor{} · {} mount{}",
+                cursors.len(),
+                if cursors.len() == 1 { "" } else { "s" },
+                views.len(),
+                if views.len() == 1 { "" } else { "s" }
+            )),
+            sep(),
+            t.dim(version.map_or_else(|| "NO SIGNAL".into(), |v| format!("nuthatch {v}"))),
+        ];
+        if shown_one && cursors.len() > 1 {
+            spans.push(sep());
+            spans.push(t.dim(format!(
+                "cursor {} of {}, n N",
+                self.app.selected.min(cursors.len() - 1) + 1,
+                cursors.len()
+            )));
+        }
+        Line::from(spans)
+    }
+
+    /// One cursor's tip, which its mounts share, and each mount's own position on it. The tip is
+    /// read from the mounts' own `/<name>/ready`: the process-global gauge reports whichever cursor
+    /// polled last.
+    fn cursor_lines(&self, cursor: &Cursor, fit: Fit) -> Vec<Line<'static>> {
+        let t = &self.theme;
+        let views = self.views_of(cursor);
+        let tip = views.iter().filter_map(|v| v.ready.u64("tip")).max();
+        let polled = views
+            .iter()
+            .find(|v| v.ready.value().is_some())
+            .map(|v| v.ready)
+            .unwrap_or(views[0].ready);
+        let mut tip_row = vec![self.opt_block(tip, Ink::BrassHi), t.dim("  ")];
+        tip_row.extend(self.poll(polled, fit.width >= 72));
+        let mut lines = vec![self.row("TIP", tip_row)];
+        if fit.strips {
+            let marks = views[0].track.map(|tr| &tr.arrivals);
+            lines.push(self.row(
+                "ARRIVALS",
+                vec![arrival_strip(
+                    t,
+                    marks,
+                    fit.width.saturating_sub(12) as usize,
+                )],
+            ));
+        }
+        let name_w = (fit.width as usize)
+            .saturating_sub(12 + 8 + 12 + 8 + 12 + 1)
+            .clamp(6, 24);
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {:<name_w$} {:>11} {:>7} {:>11} {:>7}  {}",
+                "NEST", "INDEXED", "LAG", "SEALED", "REORGS", "STATE"
+            ),
+            t.fg(Ink::Faint).add_modifier(Modifier::BOLD),
+        )));
+        for v in &views {
+            let (state, ink) = self.state(v);
+            let num = |n: Option<u64>| n.map_or_else(|| "NO SIGNAL".to_string(), thousands);
+            let sealed = v.ready.u64("sealed_through").filter(|s| *s > 0);
+            let reorgs = self
+                .app
+                .nest_metric(v, series::NEST_REORGS)
+                .map(|r| r as u64);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        " {:<name_w$}",
+                        clip(v.label.as_deref().unwrap_or_default(), name_w)
+                    ),
+                    t.fg(Ink::Body),
+                ),
+                t.value(format!(" {:>11}", num(v.ready.u64("last_block")))),
+                t.value(format!(" {:>7}", num(v.ready.u64("lag_blocks")))),
+                t.value(format!(" {:>11}", num(sealed))),
+                t.value(format!(" {:>7}", num(reorgs))),
+                t.dim("  "),
+                Span::styled(state, t.state(ink)),
+            ]));
+        }
+        lines
+    }
+
+    fn draw_runtime(&self, frame: &mut Frame, area: Rect, cursors: &[Cursor]) {
+        let full = area.width >= FULL_WIDTH && area.height >= FULL_HEIGHT;
+        let side_by_side = area.width / cursors.len() as u16 >= SIDE_BY_SIDE;
+        let shown: Vec<&Cursor> = if side_by_side {
+            cursors.iter().collect()
+        } else {
+            vec![&cursors[self.app.selected.min(cursors.len() - 1)]]
+        };
+        if !full {
+            let fit = Fit {
+                width: area.width,
+                strips: false,
+                roomy: area.width >= TERSE_WIDTH,
+                terse: area.width < TERSE_WIDTH,
+            };
+            let mut lines = vec![self.runtime_plate(cursors, false)];
+            for c in cursors {
+                lines.push(Line::from(Span::styled(
+                    format!("CURSOR {}", c.chain.as_deref().unwrap_or("NO SIGNAL")),
+                    self.theme.fg(Ink::Brass).add_modifier(Modifier::BOLD),
+                )));
+                lines.extend(self.cursor_lines(c, fit));
+            }
+            lines.extend(self.boiler(fit));
+            lines.extend(self.feed_lines(fit));
+            lines.extend(self.dispatch_of(&self.runtime_feeds(cursors), fit, 0));
+            let [body, foot] =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+            frame.render_widget(Paragraph::new(lines), body);
+            frame.render_widget(Paragraph::new(self.footer()), foot);
+            return;
+        }
+        let deepest = shown.iter().map(|c| c.mounts.len()).max().unwrap_or(1) as u16;
+        let [plate, row, middle, bottom, foot] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(5 + deepest),
+            Constraint::Length(8),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        let fit = |r: Rect| {
+            let width = r.width.saturating_sub(2);
+            Fit {
+                width,
+                strips: true,
+                roomy: width >= ROOMY,
+                terse: false,
+            }
+        };
+        frame.render_widget(
+            Paragraph::new(self.runtime_plate(cursors, !side_by_side)),
+            plate,
+        );
+        let columns = Layout::horizontal(
+            shown
+                .iter()
+                .map(|_| Constraint::Ratio(1, shown.len() as u32))
+                .collect::<Vec<_>>(),
+        )
+        .split(row);
+        for (c, col) in shown.iter().zip(columns.iter()) {
+            let title = format!("CURSOR {}", c.chain.as_deref().unwrap_or("NO SIGNAL"));
+            self.panel(frame, *col, &title, self.cursor_lines(c, fit(*col)));
+        }
+        let [boiler, feed] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(middle);
+        self.panel(frame, boiler, "BOILER", self.boiler(fit(boiler)));
+        self.panel(frame, feed, "FEED LINES", self.feed_lines(fit(feed)));
+        self.panel(
+            frame,
+            bottom,
+            "DISPATCH",
+            self.dispatch_of(
+                &self.runtime_feeds(cursors),
+                fit(bottom),
+                bottom.height.saturating_sub(2),
+            ),
+        );
+        frame.render_widget(Paragraph::new(self.footer()), foot);
+    }
+
+    /// Every mount's `/_admin/requests`, tagged with the mount.
+    fn runtime_feeds<'b>(&'b self, cursors: &'b [Cursor]) -> Vec<(Option<&'b str>, &'b Dispatch)> {
+        cursors
+            .iter()
+            .flat_map(|c| c.mounts.iter())
+            .filter_map(|m| self.app.dispatch.get(m).map(|d| (Some(m.as_str()), d)))
+            .collect()
     }
 
     fn footer(&self) -> Line<'static> {
