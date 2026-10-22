@@ -735,6 +735,13 @@ impl Metrics {
 
     /// Get (or create) the per-nest metrics handle for `name`. Called once per nest at build; the
     /// returned handle is cheap to clone and its updates also feed the process-global aggregates.
+    /// A registry of its own, so a test can render one nest's series without the process-global
+    /// one, whose solo-or-runtime shape depends on every other test's nests.
+    #[cfg(all(test, feature = "watch"))]
+    pub(crate) fn fresh_for_test() -> Self {
+        Self::new()
+    }
+
     pub fn nest(&self, name: &str) -> Arc<NestMetrics> {
         let mut map = self.per_nest.lock().unwrap();
         if let Some(h) = map.get(name) {

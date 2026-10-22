@@ -1,0 +1,40 @@
+ DEFI-PULSE  LIVE  · mainnet · nuthatch 5.9.0 · freshness tip · nid 7933ef4a1b5d
+┌ THE TIP ─────────────────────────────────────────────────┐┌ BOILER ──────────────────────────────────────────────────┐
+│ TIP       26,249,763                                     ││ RSS       ▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+│ INDEXED   26,249,763                                     ││           183.2 MiB of 2.0 GiB · process · 1 cursor      │
+│ LAG       0 blocks                                       ││ CPU       0.3% of a core                                 │
+│ POLL      every 12 s · last 6 s ago · next in 6 s        ││ POOL      reserved 0 B · peak 0 B                        │
+│ ARRIVALS  · · ▃                                          ││ HOT STORE 1.5 MiB                                        │
+│           one mark a poll; the taller, the more blocks   ││                                                          │
+└──────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘
+┌ THE PRESS ───────────────────────────────────────────────┐┌ FEED LINES ──────────────────────────────────────────────┐
+│ SEALED    through 26,249,579                             ││ ENDPOINT                     REQ  FAIL RETRY        MEAN │
+│ SEAL LAG  184 blocks                                     ││ eth.drpc.org                 198    18     2 1056 ms 18s │
+│ OUTPUT    0 rows · 369.3 KiB on disk                     ││ ethereum-rpc.publicnode.…    417     2    18    57 ms 6s │
+│ DIRECT    no seal-direct pass                            ││                                                          │
+│ STAMPS    none seen yet                                  ││                                                          │
+│           one mark an advance of sealed_through          ││                                                          │
+└──────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘
+┌ REORG ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ REORGS    0 since the process started                                                                                │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ replaying a fixture

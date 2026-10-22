@@ -1,0 +1,24 @@
+ DEFI-PULSE  LIVE  · mainnet · nuthatch 5.9.0 · freshness tip · nid 7933ef4a1b5d
+┌ THE TIP ─────────────────────────────┐┌ BOILER ──────────────────────────────┐
+│ TIP       26,249,763                 ││ RSS       ▓▓░░░░░░░░░░░░░░░░░░░░░░░░ │
+│ INDEXED   26,249,763                 ││           183.2 MiB of 2.0 GiB       │
+│ LAG       0 blocks                   ││ CPU       0.3% of a core             │
+│ POLL      12 s: 6 s ago, next 6 s    ││ POOL      reserved 0 B · peak 0 B    │
+│ ARRIVALS  · · ▃                      ││ HOT STORE 1.5 MiB                    │
+│                                      ││                                      │
+└──────────────────────────────────────┘└──────────────────────────────────────┘
+┌ THE PRESS ───────────────────────────┐┌ FEED LINES ──────────────────────────┐
+│ SEALED    through 26,249,579         ││ ENDPOINT       REQ  FAIL        MEAN │
+│ SEAL LAG  184 blocks                 ││ eth.drpc.o…    198    18 1056 ms 18s │
+│ OUTPUT    0 rows · 369.3 KiB         ││ ethereum-r…    417     2    57 ms 6s │
+│ DIRECT    no seal-direct pass        ││                                      │
+│ STAMPS    none seen yet              ││                                      │
+│                                      ││                                      │
+└──────────────────────────────────────┘└──────────────────────────────────────┘
+┌ REORG ───────────────────────────────────────────────────────────────────────┐
+│ REORGS    0 since the process started                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+
+
+ replaying a fixture
