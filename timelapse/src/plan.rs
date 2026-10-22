@@ -220,7 +220,10 @@ mod tests {
 
     #[test]
     fn a_provisional_segment_is_skipped_and_the_refusal_names_the_block() {
-        let cat = catalogue(vec![seg(0, 99, 5, false), seg(100, 149, 5, true)]);
+        let mut cat = catalogue(vec![seg(0, 99, 5, false), seg(100, 149, 5, true)]);
+        // Another table sealed further, so the watermark alone would admit the range.
+        cat.tables
+            .insert("u".to_string(), vec![seg(0, 299, 5, false)]);
         let err = Plan::new(&spec(0, 199, 2), &shape(), &cat, 1_000).unwrap_err();
         assert_eq!(
             err.to_string(),
