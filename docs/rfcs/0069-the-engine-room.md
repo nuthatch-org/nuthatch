@@ -1,6 +1,6 @@
 # RFC-0069: The engine room - a running nest watched from a terminal
 
-- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI. S0 measured 2026-10-22 (§15): the feature adds 0.30 MiB on macOS and 0.34 MiB on Linux, `cargo deny` stays green, and one watcher leaves tip lag and RSS inside their unwatched spread. Chief watched the clip on 2026-10-22 and said build it.
+- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI. S0 measured 2026-10-22 (§15): the feature adds 0.30 MiB on macOS and 0.34 MiB on Linux, `cargo deny` stays green, and one watcher leaves tip lag and RSS inside their unwatched spread. Chief watched the clip on 2026-10-22 and said build it, with §14 answered as the RFC recommends. S1 built 2026-10-22 (§16): the line mode, every number equal to the endpoint's in the same read on a solo nest and a two-chain runtime.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: the endpoints a nest already serves (`/ready`, `/metrics`, `/`, `/nests`, the admin
@@ -376,3 +376,72 @@ record in `CLAUDE.md` says so); the subcommand is `nuthatch watch` (2); `nuthatc
 archived with a pointer once S2 lands (3); `/_admin/requests` carries the route only, never SQL text
 (4); and the 2026-10-03 preference is lifted for this RFC only, with the cockpit still the browser
 surface for operator work (5).
+
+## 16. S1, the line mode, built 2026-10-22
+
+Chief watched S0's clip on 2026-10-22 and said build it, answering §14 as recommended: on by default,
+`nuthatch watch`, `nuthatch-tui-client` archived once S2 lands, route only in `/_admin/requests`, and
+the cockpit preference lifted for this RFC only. Engine room is the only programme running.
+
+`src/watch/` holds the subcommand behind the `watch` feature, on by default and adding no crate in
+this slice: `prom.rs` parses the exposition, `state.rs` folds each read into one `App` (S2 draws from
+the same state), and `line.rs` writes the line. Each pass reads `/ready`, `/`, `/metrics` and `/nests`
+together, then each mount's `/<name>/ready` when `/nests` lists any, and prints one logfmt line per
+nest:
+
+```
+nest=defi-pulse chain=mainnet tip=26249645 lag=0 sealed=26249579 rss=191430656 budget=2147483648 rpc_up=2/2 http_rps=2.0
+```
+
+`--record` writes every read with its pass number, so a line can be checked against the bodies it came
+from. `tools/rfc-0069/line-gate.sh` runs the line against a live nest with `--record`, recomputes every
+field from the recorded bodies in jq, which shares no code with the client's parser, and compares.
+
+| Gate | Result |
+|---|---|
+| Solo `dev` (`defi-pulse`, mainnet, `--poll-interval 12s`, two public RPCs), 60 s | **Pass**: 30 passes, 30 lines, 270 fields, 0 mismatches (2 `NO SIGNAL`, the first pass's two rates) |
+| Two-chain runtime (`defi-pulse` on mainnet, USDC on Base, public RPCs), 60 s | **Pass**: 30 passes, 60 lines, 540 fields, 0 mismatches (4 `NO SIGNAL`, as above per line) |
+| Each field's source removed in turn | **Pass**: `a_missing_source_reads_no_signal` drops each of the nine sources (the `nest` label, `/`'s chain, `tip`, `lag_blocks`, `sealed_through`, RSS, the failure counters, the HTTP counter, and `/nests` for the budget) and the field reads `"NO SIGNAL"` |
+
+The gate script can fail: a binary that reports the previous read's RSS (M5 below) gives 3 mismatches
+in 6 passes against the same solo nest.
+
+Decisions the RFC left open:
+
+1. **logfmt, raw integers.** Bytes and blocks print as the endpoint served them, so a line can be
+   compared exactly and parsed by anything; `"NO SIGNAL"` is quoted so the line stays logfmt.
+2. **One line per nest.** In a runtime, each mount's line comes from its own `/<name>/ready`, with its
+   chain from `/nests`; RSS, budget, RPC and HTTP are process-wide and repeat on each line.
+3. **`rpc_up` is endpoints whose failure counter did not move since the previous pass, of all listed.**
+   Counters cannot say "up"; a failure in the interval is the nearest honest reading. The first pass
+   has no previous one and reads `NO SIGNAL`, as does `http_rps`.
+4. **`sealed` is `NO SIGNAL` while `sealed_through` is 0**, which `/ready` serves beside a null seal lag
+   before anything has sealed.
+5. **The budget counts distinct chains in `/nests`**, not mounts: nests on one chain share a cursor.
+   A runtime with no mounts has a budget of 0.
+6. **The interval is the nest's own poll interval held between 2 and 30 s** (the shortest mount's in a
+   runtime), as `nuthatch-tui-client` did, unless `--interval` says otherwise.
+7. **`/` is never the nest's name** (S0, finding 1): the solo name is the `nest` label on
+   `nuthatch_nest_last_block`.
+8. In this slice the line is written whether or not stdout is a terminal; S2 draws the screen on a
+   terminal and keeps the line for a pipe and `TERM=dumb`.
+
+Mutations, each applied to the committed tree, shown applied, run, and restored from `HEAD` to a clean
+tree:
+
+| Mutation | Result |
+|---|---|
+| M1 `sealed` prints `sealed_through` 0 as 0 | red: `nothing_sealed_yet_is_no_signal_not_zero`, `a_runtime_writes_one_line_per_mount_from_its_own_ready` |
+| M2 `rpc_up` counts cumulative failures, not the interval's | red: `every_number_is_the_endpoints`, `a_missing_source_reads_no_signal` |
+| M3 a runtime's lines read the root `/ready` | red: `a_runtime_writes_one_line_per_mount_from_its_own_ready` |
+| M4 the budget counts mounts, not chains | red: `a_runtime_writes_one_line_per_mount_from_its_own_ready` |
+| M5 RSS from the previous `/metrics` read | red: `every_number_is_the_endpoints`, `a_missing_source_reads_no_signal`; and the live gate, 3 mismatches |
+| M6 an absent number printed as 0 | red: three tests |
+
+The first fixtures could not tell M2 or M4 from the code: one failing endpoint was also the only one
+with failures, and the runtime had one mount per chain. A third endpoint with old failures and a third
+mount on mainnet make both visible.
+
+Not verified in S1: `--no-default-features` beyond the help-group test and a lib build; the line on
+Linux (the client is plain reqwest and tokio, as `nuthatch sql` is); a nest behind a token, since the
+line reads no admin route.
