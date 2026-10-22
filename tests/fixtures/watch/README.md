@@ -10,6 +10,6 @@ the S1 line mode) from a MacBook:
 - `dispatch.jsonl` (S3): the same solo nest on the S3 build, recorded by the screen itself at its
   defaults while a script sent it `/sql`, `/tables`, `/entities` and a missing `/table/{name}`.
 
-Each is the last 45 s of a 90 s recording keeping every sixth `/metrics` read (every third in `dispatch.jsonl`), as a
-watcher reading it every 6 s would have; no body was edited. `snapshots/` is what `src/watch/tests.rs` draws
-from them; `NUTHATCH_WATCH_SNAPSHOTS=update cargo test --lib watch::` rewrites it.
+Each is the last 45 s of its recording (90 s, or 60 s for `dispatch.jsonl`), keeping every sixth
+`/metrics` read (every third in `dispatch.jsonl`), as a slower watcher would have read it; no body was
+edited. `snapshots/` is what `src/watch/tests.rs` draws from them; `NUTHATCH_WATCH_SNAPSHOTS=update cargo test --lib watch::` rewrites it.

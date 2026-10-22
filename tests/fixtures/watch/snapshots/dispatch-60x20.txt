@@ -1,18 +1,18 @@
  DEFI-PULSE  LIVE  · mainnet · 5.9.0
- TIP       26,249,904
- INDEXED   26,249,904
+ TIP       26,249,933
+ INDEXED   26,249,933
  LAG       0 blocks
- POLL      every 12 s · last 4 s ago · next in 8 s
+ POLL      every 12 s · last 14 s ago · next due
  SEALED    through 26,249,579
- SEAL LAG  325 blocks
+ SEAL LAG  354 blocks
  OUTPUT    0 rows · 369.3 KiB on disk
- RSS       181.0 MiB of 2.0 GiB · process · 1 cursor
- CPU       3.8% of a core
+ RSS       183.8 MiB of 2.0 GiB · process · 1 cursor
+ CPU       1.5% of a core
  POOL      reserved 0 B · peak 11.8 KiB
- HOT STORE 2.5 MiB
+ HOT STORE 4.5 MiB
  ENDPOINT                       REQ  FAIL RETRY        MEAN
- eth.drpc.org                    16     1     0       59 ms
- ethereum-rpc.publicnode.com     21     0     1       64 ms
+ eth.drpc.org                    18     2     1  2049 ms 6s
+ ethereum-rpc.publicnode.com     15     1     2    61 ms 6s
  REORGS    0 since the process started
  LAST      none
  REQUESTS  2.7/s · p50 0.9 ms · 160 in the last minute
