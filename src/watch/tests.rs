@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
-use super::screen::{stale_after_ms, Screen};
+use super::screen::{stale_after_ms, thousands, Screen};
 use super::state::{App, Read};
 use super::theme::{ColorMode, Theme};
 use super::{load_recording, SOURCES};
@@ -90,15 +90,17 @@ fn the_solo_engine_room_at_three_sizes() {
 }
 
 #[test]
-fn a_runtime_draws_its_selected_mount() {
+fn a_runtime_draws_one_room_per_cursor() {
     let (mut app, now) = replayed("runtime.jsonl");
     for (w, h) in [(120, 40), (80, 24), (60, 20)] {
         let drawn = text(&buffer(&app, now, ColorMode::True, w, h));
         snapshot(&format!("runtime-{w}x{h}"), &drawn);
     }
+    let drawn = text(&buffer(&app, now, ColorMode::True, 160, 40));
+    snapshot("runtime-160x40", &drawn);
     app.step(true);
     let drawn = text(&buffer(&app, now, ColorMode::True, 120, 40));
-    snapshot("runtime-120x40-second-mount", &drawn);
+    snapshot("runtime-120x40-second-cursor", &drawn);
 }
 
 /// The snapshots must show what the bodies say, not merely what they said last time: the figures
@@ -453,4 +455,146 @@ fn reorg_reads_depth_and_age_from_the_gauges() {
         drawn.contains(" LAST      4 blocks rolled back, 2m ago"),
         "{drawn}"
     );
+}
+
+/// RFC-0069 S4's gate: on a two-chain runtime each cursor's tip is its own chain's. The `/metrics`
+/// read here also carries the process-global `nuthatch_tip_height` and `nuthatch_last_block`, set to
+/// a height neither chain has, as a solo nest serves them and as a runtime once did with whichever
+/// cursor polled last (`src/serve.rs`, #828). A screen that read them would show that height.
+#[test]
+fn each_cursor_shows_its_own_chains_tip() {
+    let (mut app, now) = replayed("runtime.jsonl");
+    let cursors = app.cursor_groups().unwrap();
+    assert_eq!(cursors.len(), 2, "{cursors:?}");
+    let own: Vec<(String, u64)> = cursors
+        .iter()
+        .map(|c| {
+            let tip = app.nest_ready[&c.mounts[0]].u64("tip").unwrap();
+            (c.chain.clone().unwrap(), tip)
+        })
+        .collect();
+    assert_ne!(own[0].1, own[1].1, "the fixture's chains must differ");
+    let reads = load_recording(&fixture("runtime.jsonl")).unwrap();
+    let mut body = reads
+        .iter()
+        .rev()
+        .find(|r| r.route == "/metrics")
+        .unwrap()
+        .body
+        .clone();
+    body.push_str("nuthatch_tip_height 777777777\nnuthatch_last_block 777777770\n");
+    app.apply(&read(now - 10, "/metrics", 200, &body));
+
+    // Stacked, so each cursor's readouts follow its own heading.
+    let drawn = text(&buffer(&app, now, ColorMode::None, 70, 40));
+    assert!(
+        !drawn.contains("777,777,77"),
+        "a global gauge reached the screen:\n{drawn}"
+    );
+    for (chain, tip) in &own {
+        let after = drawn
+            .split(&format!("CURSOR {chain}\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("no CURSOR {chain} in\n{drawn}"));
+        let tip_line = after.lines().next().unwrap();
+        assert!(
+            tip_line.starts_with(" TIP") && tip_line.contains(&thousands(*tip)),
+            "{chain}: want tip {tip} in {tip_line:?}"
+        );
+    }
+    // Side by side, each panel carries its own chain's tip.
+    let drawn = text(&buffer(&app, now, ColorMode::None, 160, 40));
+    assert!(!drawn.contains("777,777,77"), "{drawn}");
+    let tip_row = drawn.lines().find(|l| l.contains(" TIP ")).unwrap();
+    let (left, right) = tip_row.split_at(tip_row.len() / 2);
+    assert!(left.contains(&thousands(own[0].1)), "{tip_row}");
+    assert!(right.contains(&thousands(own[1].1)), "{tip_row}");
+}
+
+/// A cursor is never cheerier than its worst mount, nor the runtime than its worst cursor.
+#[test]
+fn a_cursor_takes_its_worst_mounts_state() {
+    let (mut app, now) = replayed("runtime.jsonl");
+    let stalled = app.nest_ready["baseusdc"]
+        .value()
+        .unwrap()
+        .to_string()
+        .replace("\"stalled\":false", "\"stalled\":true");
+    assert!(stalled.contains("\"stalled\":true"));
+    app.apply(&read(now - 10, "/baseusdc/ready", 503, &stalled));
+    let drawn = text(&buffer(&app, now, ColorMode::None, 160, 40));
+    let plate = drawn.lines().next().unwrap();
+    assert!(plate.contains("ATTENTION"), "{plate}");
+    let pulse = drawn.lines().find(|l| l.contains(" pulse ")).unwrap();
+    assert!(pulse.contains("LIVE"), "{pulse}");
+}
+
+/// Two mounts on one chain share one cursor, and each keeps its own position on it.
+#[test]
+fn mounts_on_one_chain_share_a_cursor() {
+    let (mut app, now) = replayed("runtime.jsonl");
+    let mut nests: serde_json::Value = app.nests.value().unwrap().clone();
+    let mut twin = nests["nests"][0].clone();
+    assert_eq!(twin["chain"], "mainnet");
+    twin["name"] = "pulse2".into();
+    nests["nests"].as_array_mut().unwrap().push(twin);
+    app.apply(&read(now - 20, "/nests", 200, &nests.to_string()));
+    let mut ready = app.nest_ready["pulse"].value().unwrap().clone();
+    let behind = ready["last_block"].as_u64().unwrap() - 1_234;
+    ready["last_block"] = behind.into();
+    app.apply(&read(now - 20, "/pulse2/ready", 200, &ready.to_string()));
+
+    let cursors = app.cursor_groups().unwrap();
+    assert_eq!(cursors.len(), 2, "{cursors:?}");
+    assert_eq!(cursors[0].mounts, vec!["pulse", "pulse2"]);
+    let drawn = text(&buffer(&app, now, ColorMode::None, 70, 40));
+    assert!(drawn.contains("2 cursors · 3 mounts"), "{drawn}");
+    let mainnet = drawn
+        .split("CURSOR mainnet\n")
+        .nth(1)
+        .unwrap()
+        .split("CURSOR base")
+        .next()
+        .unwrap();
+    let row = |m: &str| {
+        mainnet
+            .lines()
+            .find(|l| l.starts_with(&format!(" {m} ")))
+            .unwrap_or_else(|| panic!("no {m} under mainnet:\n{drawn}"))
+            .to_string()
+    };
+    assert!(
+        row("pulse2").contains(&thousands(behind)),
+        "{}",
+        row("pulse2")
+    );
+    let own = app.nest_ready["pulse"].u64("last_block").unwrap();
+    assert!(row("pulse").contains(&thousands(own)), "{}", row("pulse"));
+}
+
+/// A second tenant's mounts are routed `/<tenant>/<alias>`, and their reads land under that name.
+#[test]
+fn a_tenant_qualified_mount_reads_its_own_ready() {
+    let mut app = App::default();
+    app.apply(&read(
+        1,
+        "/nests",
+        200,
+        r#"{"nests":[{"name":"acme/usdc","chain":"base"}]}"#,
+    ));
+    app.apply(&read(
+        2,
+        "/acme/usdc/ready",
+        200,
+        r#"{"ready":true,"tip":52000000}"#,
+    ));
+    app.apply(&read(
+        3,
+        "/acme/usdc/_admin/requests",
+        401,
+        "admin token required",
+    ));
+    assert_eq!(app.nest_ready["acme/usdc"].u64("tip"), Some(52_000_000));
+    assert_eq!(app.dispatch["acme/usdc"].status, Some(401));
+    assert_eq!(app.view().ready.u64("tip"), Some(52_000_000));
 }

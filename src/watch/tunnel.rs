@@ -224,12 +224,27 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    /// [`Tunnel::open`] on the stand-in, again if the spawn met ETXTBSY: another test's fork can still
+    /// hold the just-written script open for writing for the instant before its own exec.
+    #[cfg(unix)]
+    fn open(ssh: &str, url: &str) -> Result<Tunnel> {
+        for _ in 0..20 {
+            match Tunnel::open(ssh, "box", url) {
+                Err(e) if format!("{e:#}").contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                other => return other,
+            }
+        }
+        Tunnel::open(ssh, "box", url)
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_refused_key_is_reported_before_the_screen_opens() {
         let dir = tempfile::tempdir().unwrap();
         let ssh = fake_ssh(dir.path(), true);
-        let err = Tunnel::open(&ssh, "box", "http://127.0.0.1:8288")
+        let err = open(&ssh, "http://127.0.0.1:8288")
             .err()
             .expect("a refused key must fail the open");
         let text = format!("{err:#}");
@@ -244,7 +259,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let ssh = fake_ssh(dir.path(), false);
-        let tunnel = Tunnel::open(&ssh, "box", "http://10.0.0.5:8288").unwrap();
+        let tunnel = open(&ssh, "http://10.0.0.5:8288").unwrap();
         assert!(
             tunnel.forward.ends_with(":10.0.0.5:8288"),
             "{}",

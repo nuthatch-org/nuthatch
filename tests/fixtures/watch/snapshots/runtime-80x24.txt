@@ -1,24 +1,24 @@
- PULSE  LIVE  · mainnet · nuthatch 5.9.0 · freshness tip · mount 1 of 2 (n, N)
-┌ THE TIP ─────────────────────────────┐┌ BOILER ──────────────────────────────┐
-│ TIP       26,249,763                 ││ RSS       ▓░░░░░░░░░░░░░░░░░░░░░░░░░ │
-│ INDEXED   26,249,763                 ││           195.6 MiB of 4.0 GiB       │
-│ LAG       0 blocks                   ││ CPU       0.7% of a core             │
-│ POLL      12 s: 10 s ago, next 2 s   ││ POOL      reserved 0 B · peak 0 B    │
-│ ARRIVALS  ▃ · ▃                      ││ HOT STORE 4.5 MiB                    │
+ WATCH-GATE  LIVE  · 2 cursors · 2 mounts · nuthatch 5.9.0 · cursor 1 of 2, n N
+┌ CURSOR mainnet ──────────────────────────────────────────────────────────────┐
+│ TIP       26,249,763  every 12 s · last 10 s ago · next in 2 s               │
+│ ARRIVALS  ▃ · ▃                                                              │
+│ NEST                         INDEXED     LAG      SEALED  REORGS  STATE      │
+│ pulse                     26,249,763       0  26,249,448       0  LIVE       │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ BOILER ──────────────────────────────┐┌ FEED LINES ──────────────────────────┐
+│ RSS       ▓░░░░░░░░░░░░░░░░░░░░░░░░░ ││ ENDPOINT       REQ  FAIL        MEAN │
+│           195.6 MiB of 4.0 GiB       ││ base-rpc.p…    655     0       70 ms │
+│ CPU       0.7% of a core             ││ eth.drpc.o…    185    18    72 ms 6s │
+│ POOL      reserved 0 B · peak 0 B    ││ ethereum-r…    409     1    59 ms 6s │
+│ HOT STORE 4.5 MiB                    ││ mainnet.ba…     81    39   135 ms 6s │
 │                                      ││                                      │
 └──────────────────────────────────────┘└──────────────────────────────────────┘
-┌ THE PRESS ───────────────────────────┐┌ FEED LINES ──────────────────────────┐
-│ SEALED    through 26,249,448         ││ ENDPOINT       REQ  FAIL        MEAN │
-│ SEAL LAG  315 blocks                 ││ base-rpc.p…    655     0       70 ms │
-│ OUTPUT    2,515 rows · 231.1 KiB     ││ eth.drpc.o…    185    18    72 ms 6s │
-│ DIRECT    no seal-direct pass        ││ ethereum-r…    409     1    59 ms 6s │
-│ STAMPS    none seen yet              ││ mainnet.ba…     81    39   135 ms 6s │
-│                                      ││                                      │
-└──────────────────────────────────────┘└──────────────────────────────────────┘
-┌ REORG ───────────────────────────────┐┌ DISPATCH ────────────────────────────┐
-│ REORGS    0 since start              ││ REQUESTS  NO SIGNAL                  │
-│ LAST      none                       ││                                      │
-│                                      ││                                      │
-│                                      ││                                      │
-└──────────────────────────────────────┘└──────────────────────────────────────┘
+┌ DISPATCH ────────────────────────────────────────────────────────────────────┐
+│ REQUESTS  NO SIGNAL                                                          │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
  replaying a fixture

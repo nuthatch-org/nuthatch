@@ -1,6 +1,6 @@
 # RFC-0069: The engine room - a running nest watched from a terminal
 
-- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI. S0 measured 2026-10-22 (§15): the feature adds 0.30 MiB on macOS and 0.34 MiB on Linux, `cargo deny` stays green, and one watcher leaves tip lag and RSS inside their unwatched spread. Chief watched the clip on 2026-10-22 and said build it, with §14 answered as the RFC recommends. S1 built 2026-10-22 (§16): the line mode, every number equal to the endpoint's in the same read on a solo nest and a two-chain runtime. S2 built 2026-10-22 (§17): the engine room on a terminal, its snapshots from recorded bodies, and one watcher still inside the unwatched spread. S3 built 2026-10-22 (§18): `/_admin/requests` and the reorg depth gauges, with the CI benches unchanged; #2339 fixed.
+- Status: **Accepted (2026-10-21, Chief).** His acceptance lifts, for this RFC, his 2026-10-03 preference for the browser cockpit over a TUI. S0 measured 2026-10-22 (§15): the feature adds 0.30 MiB on macOS and 0.34 MiB on Linux, `cargo deny` stays green, and one watcher leaves tip lag and RSS inside their unwatched spread. Chief watched the clip on 2026-10-22 and said build it, with §14 answered as the RFC recommends. S1 built 2026-10-22 (§16): the line mode, every number equal to the endpoint's in the same read on a solo nest and a two-chain runtime. S2 built 2026-10-22 (§17): the engine room on a terminal, its snapshots from recorded bodies, and one watcher still inside the unwatched spread. S3 built 2026-10-22 (§18): `/_admin/requests` and the reorg depth gauges, with the CI benches unchanged; #2339 fixed. S4 built 2026-10-22 (§19): one engine room per cursor, each with its own chain's tip.
 - Author: Pete (cargopete)
 - Date: 2026-10-21
 - Depends on: the endpoints a nest already serves (`/ready`, `/metrics`, `/`, `/nests`, the admin
@@ -598,3 +598,58 @@ Not verified in S3: a name captured from a live nest's declared query (the route
 declares none, so every named route there is a 404; `captured_name` is tested alone); the factory
 seal-direct path's count, changed alongside the pipelined one but exercised by no test; the ring
 across a hot swap; the token path against a remote nest, beyond the handler tests.
+
+## 19. S4, one engine room per cursor, built 2026-10-22
+
+Pointed at a runtime's root, the screen groups `/nests` by chain, one cursor each in the order
+`/nests` first names them, and draws a CURSOR panel per chain: its tip, the poll's age and countdown,
+the arrivals strip, and a row per mount with that mount's indexed block, lag, seal, reorg count and
+state, each from the mount's own `/<name>/ready` and `nest`-labelled series. BOILER, FEED LINES and
+DISPATCH are the process's and are drawn once; DISPATCH merges every mount's `/_admin/requests`, each
+row tagged with its mount. Cursors sit side by side when each gets 70 columns; otherwise one is drawn
+and `n` and `N` step between them, and below 80 by 24 every cursor stacks in one column. The nameplate
+gives the runtime's name and the worst state of any mount, and each cursor row its own mount's.
+
+| Gate | Result |
+|---|---|
+| On a two-chain runtime each cursor's tip is its own chain's, from a test that fails if the process-global gauge is read | **Pass**: `each_cursor_shows_its_own_chains_tip` draws the recorded two-chain runtime (mainnet at 26,249,763, Base at 52,951,056) after a `/metrics` read that also carries `nuthatch_tip_height` and `nuthatch_last_block` at 777,777,777, a height neither chain has. Stacked at 70 columns, the line after `CURSOR mainnet` and the one after `CURSOR base` each carry their own chain's tip; side by side at 160, the left panel carries mainnet's and the right Base's; the global height appears nowhere. Reading the global gauge turns it red (below) |
+
+A runtime does not emit those global gauges (#828); the test adds them because a client that read them
+would be wrong on any process that did, and because nothing else would catch it reading them. The
+screen also ran against the live two-chain runtime in a 160 by 40 pty, and drew both chains' tips.
+
+Decisions the RFC left open:
+
+1. **A cursor's tip is the highest its mounts' `/ready` report.** Mounts on one cursor share it, so the
+   figures agree; the highest is what the cursor has seen.
+2. **The poll age and countdown are the first answering mount's.** They share the cursor's poll.
+3. **Side by side from 70 columns a cursor**, so two cursors need 140; below that, one at a time.
+4. **A cursor's state, and the runtime's, is the worst of its mounts'**, ranked quarantined, stale,
+   attention, no signal, backfill, live, so the nameplate is never cheerier than any mount.
+5. **DISPATCH is one feed across the runtime**, each request tagged with its mount, rather than one per
+   cursor: requests are made of mounts, not of chains.
+6. `n` and `N` now step cursors where S2 stepped mounts.
+7. **A second tenant's mount is read under its whole route**, `/acme/usdc/ready`: S1 to S3 refused
+   any mount name holding a `/`, which is how `/nests` names a mount outside the default tenant
+   (`MountRef::route_key`), so such a mount would have read `NO SIGNAL` throughout.
+
+Mutations, each applied to the committed tree, shown applied, run, and restored to a clean tree:
+
+| Mutation | Result |
+|---|---|
+| A cursor's tip read from `nuthatch_tip_height` when present | red: `each_cursor_shows_its_own_chains_tip` |
+| One cursor per mount rather than per chain | green against the recorded runtime, which has one mount per chain; red once `mounts_on_one_chain_share_a_cursor` was added |
+| Each mount's indexed block taken from the cursor's first mount | green likewise, then red under the same test |
+| A cursor takes its best mount's state | red: `a_cursor_takes_its_worst_mounts_state` |
+| Mount names holding a `/` refused again | red: `a_tenant_qualified_mount_reads_its_own_ready` |
+
+The two green mutations were the gate's fixture being unable to tell: the recorded runtime has one
+mount on each chain. The added test puts a second mount on mainnet, 1,234 blocks behind the first.
+
+A run of those mutations also failed `a_refused_key_is_reported_before_the_screen_opens` once, which
+does not touch the screen; it did not recur in six further runs. The likeliest cause is the stand-in
+`ssh` script still held open for writing by another test's fork at the instant it was executed
+(`ETXTBSY`), so the tunnel tests now retry that one error; the cause was not confirmed.
+
+Not verified in S4: more than two chains; a live runtime with a second tenant (the tenant route is
+tested from constructed bodies); a cursor whose mounts disagree on the tip.
