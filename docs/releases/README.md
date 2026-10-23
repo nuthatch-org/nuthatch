@@ -18,6 +18,11 @@ fix lands on `main` first, is cherry-picked onto the release branch with the ver
 notes, and the tag goes on that branch's merge commit. The notes file is then copied to `main` so the
 record is in one place. 4.0.1 was the first.
 
+Then merge the release branch back into `main` with `git merge -s ours release/<major>.<minor>`, as
+a merged PR (not a squash). The fixes are already on `main`, so this changes no file; it makes the
+release PR's merge commit an ancestor of `main`, which `sprint-landed`'s Rule B requires 14 days
+after the merge. `release/4.15` and `release/4.0` were not, and failed it (#2392).
+
 ## Pre-releases
 
 A tag carrying a semver pre-release identifier - the `-` in `v3.0.0-alpha.1` - is published as a
