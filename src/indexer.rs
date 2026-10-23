@@ -18624,8 +18624,15 @@ template = "pool"
         .await
         .unwrap()
         .expect("commits at the tip");
-        // The checkpoint above the row survived the reorg; the row under it did not.
+        // The checkpoint above the row survived the reorg; the row under it did not. Only this
+        // shape sets `rewound` (#2146): a stale checkpoint is rolled back by `handle_reorg`, which
+        // never does.
         nest.store.set_block_hash(9, "0xcanonical").unwrap();
+        assert_eq!(
+            detect_reorg(&Replaced, &nest.store, 9).await.unwrap(),
+            None,
+            "premise: the rollback comes from the window, not the reorg check"
+        );
 
         let cursor_at = || Some(90u64);
         let wanted = || true;
