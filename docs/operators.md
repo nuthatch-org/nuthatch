@@ -1293,7 +1293,8 @@ seal fields on this endpoint described the bulk `--seal-direct` backfill, so a n
 stopped sealing at tip answered `ready: true` with `lag_blocks: 0` indefinitely - measured at 739,192
 blocks behind on a live nest (#1199). `seal_lag_blocks` is `null` for a `serve`-only role, and `null`
 before anything has sealed at all, so read `sealed_through: 0` beside it as "nothing sealed yet"
-rather than as a caught-up seal.
+rather than as a caught-up seal. `tip` and `lag_blocks` are likewise `null` for a `serve`-only role and
+until the cursor first polls, which a long `--seal-direct` pass can delay by minutes (#2342).
 
 **A seal that fails says so at once.** `tip_seal_stalled` waits twelve hours and twice the seal span,
 because a seal holding rows is normal. A seal that errors is not, so from its first failed attempt
