@@ -7,7 +7,7 @@ keys in [config-reference.md](config-reference.md).
 
 ```sh
 nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc   # chain auto-detected
-nuthatch dev
+nuthatch dev --backfill 300    # the last 300 blocks; omit to backfill from deployment
 nuthatch sql "SELECT count(*) FROM usdc__transfer"
 ```
 
@@ -86,7 +86,7 @@ chain share that cursor and one getLogs per window - N nests for roughly one nes
 second chain gets a second cursor. Create a `mounts.toml` (see config-reference) and:
 
 ```sh
-nuthatch dev --dir .            # serves /nests + each nest under /<name>/… (/<tenant>/<name>/… once a second tenant mounts)
+nuthatch dev --dir .            # serves /nests + each nest: default tenant /<alias>/…, any other /<tenant>/<alias>/…
 ```
 
 Each nest is isolated (own store, own reorg blast radius) but shares its cursor's finality view. A

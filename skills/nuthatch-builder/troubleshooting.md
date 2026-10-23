@@ -5,11 +5,16 @@ Symptom → what to look at (`/metrics`, Prometheus) → remedy. All `/metrics` 
 
 ## Backfill seems stuck / hung
 
-- **Most common cause:** high `--concurrency` against a *single* RPC endpoint. Many concurrent requests
-  to one host can stall the whole runtime. Remedy: `--concurrency 1` for one endpoint, or configure
-  multiple `rpc_urls` (then 8-16 is fine).
-- Watch `nuthatch_rows_decoded_total` / `nuthatch_last_block` climb. On a TTY, `dev` shows a live progress
-  line with events/sec + ETA; if it's frozen, it's the concurrency stall above.
+- **Start at `/ready`.** A nest that is not ready names why: `quarantine` (a terminal fault, such as
+  an entity whose circuit stopped), `seal_fault` (sealing failing, hot still complete), `entities`,
+  `ipfs_gave_up_documents`, and a runtime's root lists each unready nest with its `reasons`. The
+  log line beside it names an RPC refusal or rate limit. `nuthatch watch` shows the same readings live.
+- **Is it actually slow, or just quiet?** At tip the default poll interval is five minutes, so
+  `seconds_since_poll` up to `poll_interval_secs` is normal. During backfill, watch
+  `nuthatch_rows_decoded_total` / `nuthatch_last_block` climb; on a TTY `dev` shows events/sec and ETA.
+- **`--seal-direct` on one endpoint runs one window at a time** whatever `--concurrency` says:
+  `seal_direct_concurrency.capped_by` reads `single_rpc_endpoint`. Add `rpc_urls` to get the
+  concurrency you asked for.
 - A *sparse* contract over millions of blocks looks slow because each window is near-empty - widen it:
   `--window 50000`. That is also the widest range it will ask for, so keep it within the provider's
   `getLogs` range cap.
@@ -27,7 +32,8 @@ use a provider with a higher/no result cap. This fails loudly rather than loopin
 - Check `nuthatch_tip_height` vs `nuthatch_last_block` - the gap is `nuthatch_tip_lag_blocks`. `nuthatch_sealed_through` trails
   further (past finality, by design).
 - Causes: slow/rate-limited RPC (add endpoints or your own node), or a dense contract on a fast chain.
-  The adaptive getLogs window self-tunes; a persistent gap means RPC throughput, not nuthatch.
+  The adaptive getLogs window self-tunes. Rule out the poll interval first (a gap that closes every
+  five minutes is the default cadence, `--poll-interval` to change it), then RPC throughput.
 
 ## Reorgs
 

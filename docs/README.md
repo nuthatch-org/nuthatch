@@ -32,7 +32,17 @@ not to infer work that remains.
 - [Reading sealed segments without nuthatch](reading-segments.md)
 - [Reading a published nest](reading-published-nest.md)
 - [Offchain data: file drops and scheduled price pulls](offchain.md)
+- [Address history](../skills/nuthatch-builder/config-reference.md#address_history---an-accounts-history-for-rotki-rfc-0063):
+  a nest that watches accounts and serves them Etherscan-shaped at `/api` (RFC-0063). Its rows live in
+  the nest's store, not in SQL tables or sealed segments.
+- [`nuthatch diff`](../skills/nuthatch-builder/cli-reference.md#nuthatch-diff): what happened between
+  two blocks, as sentences (RFC-0071).
 - [Release notes](releases/README.md)
+
+## In a browser
+
+- [nuthatch-indexer.com/play](https://nuthatch-indexer.com/play): query a published nest, or build and
+  index a new one from a contract address, in a tab (RFC-0065, RFC-0066). No install.
 
 ## Dated records
 

@@ -1,9 +1,15 @@
 # The release gate
 
 A release candidate is run against a copy of the Lodestar allocations nest, with the queries Lodestar
-and kittiwake actually send it, under the budget that nest runs on in production. A refusal, an
-error, an out-of-memory or a time regression past a stated bound turns the candidate red. Red stops
-the roll to production; it does not block the tag or the release (Chief, 2026-10-03). Issue #1749.
+and kittiwake sent it, under the budget that nest ran on in production. A refusal, an error, an
+out-of-memory or a time regression past a stated bound turns the candidate red. It does not block
+the tag or the release (Chief, 2026-10-03). Issue #1749.
+
+**There is no production behind it any more.** The Lodestar nests stopped on 2026-10-13, and since
+2026-10-16 the gate runs against frozen copies taken on 2026-10-12, with the latest full release
+other than the candidate as its baseline ([below](#every-production-nest-1794)). Where this page says
+"production", read the release those copies were last served by: the procedure is written as it ran,
+and holds for an operator gating against a live nest of their own.
 
 It exists because of 4.1.1. On 2026-10-03 it reached the Lodestar box and its allocations nest
 refused the dashboard's join-heavy views within minutes (`HashJoinInput` out of memory under a 2 GB
@@ -153,9 +159,9 @@ its answers reported as not compared. A run writing a baseline and the run readi
 `tests/release_gate_script.rs` runs the script against a nest sealed from the fixture chain: a
 refused query fails and is named, an answered set passes and writes a baseline, a regression fails
 past the bound and passes inside it, and a candidate answering differently from its baseline (a view
-edited between the runs) fails with the first differing row, while rows reordered under no top-level `ORDER
-BY` (none at all, or one in a subquery), a float 1e-13 off (as a number or as text) and a volatile statement's new
-answer pass.
+edited between the runs) fails with the first differing row, and so does a float 1e-13 off (as a number or as text). Rows
+reordered under no top-level `ORDER BY` (none at all, or one in a subquery) pass, as does a volatile
+statement's new answer with the same row count.
 
 ## What it does not catch
 

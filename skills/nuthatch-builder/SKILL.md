@@ -19,7 +19,7 @@ are node self-protection, not obstacles to remove.
 
 ```sh
 nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc   # USDC - chain auto-detected
-nuthatch dev            # backfill from deployment, follow the tip, serve an API on :8288
+nuthatch dev --backfill 300   # the last 300 blocks, follow the tip, serve an API on :8288
 nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT value_overflow"
 ```
 
@@ -29,6 +29,10 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT valu
   Without `--alias` the table prefix is the contract's name from the ABI (`fiat_token_v2_2__transfer`
   for USDC), so name it if you want `usdc__transfer`.
 - `dev` shows a live backfill progress line, then "caught up to tip". It *is* the serve command.
+  `--backfill 300` keeps this short: it indexes recent history only, so the sum is
+  not an absolute balance. Without it `dev` backfills from deployment (block 6,082,465 for USDC, tens
+  of millions of blocks on public endpoints), and `init` warns when the present ABI may not decode
+  every older implementation era; read that warning before trusting full history.
 - `nuthatch sql` with no query opens a REPL (`.tables`, `.schema <t>`, history).
 - `sum(value_dec)` is the amounts that fit. A full-width word is NULL and is not a term, so
   `WHERE NOT value_overflow` is that same sum. Ids, nonces and hashes stay on the raw column.

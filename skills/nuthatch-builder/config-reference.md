@@ -59,7 +59,8 @@ table = "usdc__transfer"
 where = "value_dec > 1e6"     # NOTE: the toml key is `where`
 url = "https://…"
 batch_max = 100               # optional
-finality = "sealed"           # optional: "sealed" (default) | "tip"
+finality = "sealed"           # optional; "sealed" (the default) is the only delivery path. "tip" is
+                              # reserved and refused at load until tip delivery ships (#577).
 since = "registration"        # optional: "genesis" | "registration" | a block number
 secret = "…"                  # optional HMAC signing secret
 
@@ -167,6 +168,18 @@ l1_blocks = true              # Arbitrum-family chains only (arbitrum-one, robin
                               # One header per such block, none for the rest. Refused beside
                               # `blocks = true`, whose `blocks` table already has the column for
                               # every block. Off: no table, no header fetched.
+blocks = false                # true: a `blocks` table, one header row per block (parent_hash, miner,
+                              # gas, base fee, size, transaction_count, `l1_block_number`, 0 where the
+                              # chain has none). Ordinary RPC, one header per block. A nest may declare
+                              # this and no [[contracts]].
+traces = false                # internal calls, and
+state = false                 #   storage writes. Both are node-gated: the config, decode and scoping
+                              #   validate, then startup refuses, because no source is wired (ExEx is
+                              #   designed, not built). A trace RPC does not unlock them.
+contracts = ["usdc"]          # scope for traces/state: these aliases. Empty is every address on the
+                              # chain, which is refused unless `unbounded = true` is typed.
+selectors = ["0xa9059cbb"]    # traces only: these 4-byte selectors. Scopes traces when `state` is off.
+unbounded = false             # accept an unscoped traces/state nest anyway; logged at startup.
 ```
 
 ### `[address_history]` - an account's history for rotki (RFC-0063)
@@ -581,8 +594,13 @@ nid = "9f2c…"        # same nest, same data, indexed once
 `shared_with` list, so a shared dataset is distinguishable from two separate backfills, and the
 alias's `estimated_rss_mb` is `0` because the footprint was charged once to the dataset.
 
-Sharing is by *identity*, so it survives nothing and forks on anything: edit either nest's inputs and
-the NID changes, the mounts stop matching, and the edited one gets its own dataset automatically.
+Sharing is by *identity*: edit either nest's inputs and the NID changes, the mounts stop matching,
+and the edited one gets its own dataset. That dataset does not always start from nothing. When the
+edit touched only inputs that cannot change stored data (`views/`, `entities.toml`, `queries.toml`,
+`maintained.toml`, `semantic.toml`, `llms.txt`, `README.md`, `.claude/`), the new NID adopts an
+existing dataset with the same data identity and the same recorded decode identity, and nothing is
+re-indexed; entities are rebuilt from the adopted facts. Any other edit, or a candidate that fails
+either check, means a re-index from the start block.
 
 ### `sql` and `[[mounts.queries]]` - bounding a public endpoint (RFC-0034)
 

@@ -28,7 +28,7 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 - **`--registry`** is where a mount fetches a NID the runtime does not hold: a filesystem path or
   `s3://bucket/prefix`. Publish to it with `nuthatch nest publish <bundle> --registry <path>`; a NID is
   what `nuthatch nest nid --dir <dir>` prints. Without `--registry`, only NIDs already under `data/` mount.
-- **A set `NUTHATCH_ADMIN_TOKEN` is required on every bind, localhost included**, presented as
+- **When `NUTHATCH_ADMIN_TOKEN` is set, every request must present it, localhost included**, as
   `Authorization: Bearer <token>` or `?token=<token>`. Off localhost the API needs it: without the
   variable an off-localhost runtime serves no admin routes at all. `--no-admin` removes them everywhere.
 - **Without a token, a localhost runtime answers only requests addressed to loopback**: a `Host` of

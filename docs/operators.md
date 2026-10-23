@@ -35,8 +35,10 @@ nuthatch is built to be **fronted**, not exposed raw. The dividing line, stated 
 per-nest health and metrics, and signals rich enough to alert, capacity-plan, and bill against.
 
 **Your platform provides:** identity, authentication, authorisation, per-caller rate limits, quotas,
-metering, billing, and TLS. There are no accounts and no tenancy inside the binary, and there will not
-be: `CLAUDE.md` puts hosted-SaaS multi-tenancy out of scope permanently.
+metering, billing, and TLS. There are no accounts, per-tenant authorisation, quotas or billing inside
+the binary, and there will not be: `CLAUDE.md` puts hosted-SaaS multi-tenancy out of scope
+permanently. A runtime does carry tenant labels: an opaque string per mount, with shared datasets
+reference-counted, and nothing more.
 
 **What it never does:** phone home unasked. No telemetry by default, no mandatory API tokens, no gated
 data service. Every outbound connection is one you configured - your RPC endpoints, your webhook
@@ -204,7 +206,7 @@ cp target/dist/nuthatch . && docker build -t nuthatch .
 
 ## Deployment model
 
-One static binary. No Postgres, no Docker daemon, no IPFS, no sidecar. State is a directory.
+One binary. No Postgres, no Docker daemon, no IPFS, no sidecar. State is a directory.
 
 | Topology | Command | Shape |
 |---|---|---|
@@ -612,7 +614,7 @@ own published pay-as-you-go rates, checked 2026-08-22. Sources:
 
 `nuthatch_rpc_methods_total` exposes method-labelled counters (e.g. `nuthatch_rpc_methods_total{method="eth_getBlockByNumber"}`), allowing operators to multiply each method by their provider's compute-unit schedule to compute exact invoices. `nuthatch_rpc_requests_total` tracks total outbound HTTP requests / batch envelopes.
 
-A nest sitting at tip on Arbitrum costs on the order of **~$134/month** against a paid provider (with ~$93 of that being the header fetches). That figure is this computation, not a measurement - the reference deployment itself paid nothing for it, because it runs against a free endpoint.
+Under the former two-second cadence, this computation put a nest at tip on Arbitrum at **~$134/month** against a paid provider (with ~$93 of that being the header fetches). It is a computation, not a measurement, and it no longer describes the default: the cadence has been five minutes since 4.15.2 (below). The reference deployment itself paid nothing for it, because it ran against a free endpoint.
 
 **Measured against a paid endpoint, 2026-09-06** ([#1173](https://github.com/nuthatch-org/nuthatch/issues/1173)):
 the allocations nest on the Lodestar box, at tip on Alchemy, over 45 seconds - 268 `eth_getBlockByNumber`,
@@ -942,6 +944,40 @@ each mount's `/metrics` serves the same).
 | `DELETE /_admin/nests/{name}` | unmount; `?reclaim=true` also frees the dataset once nothing mounts it |
 | `DELETE /_admin/datasets/{nid}` | reclaim a dataset unmounted earlier |
 
+### Address-history nests (RFC-0063)
+
+A nest whose `nuthatch.toml` has an `[address_history]` table and no `[[contracts]]` watches accounts
+rather than contracts, for rotki. It is a different service: no SQL engine, no sealing, none of the
+per-nest routes above except `/health`, `/ready`, `/metrics` and `/diff`, and one cursor polling the
+chain head every five minutes unless `poll_interval` in the table or `--poll-interval` says otherwise.
+
+```toml
+[nest]
+name = "wallet"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://…"]
+
+[address_history]
+addresses = []        # or seed some; rotki registers its own through /api/watch
+```
+
+- **`GET /api`** answers Etherscan-shaped (`module`, `action`, ...), and takes the same parameters as
+  a form `POST`. A range the nest has not covered answers `NUTHATCH_INCOMPLETE`, never an empty
+  list, so a client falls through to its next source.
+- **`POST /api/watch` and `/api/unwatch`** change the watched set at runtime and are accepted only on
+  a loopback bind, as are the RPC-backed actions (balances, the `proxy` module). Keep it on loopback.
+- **`/ready`** carries `mode: "address_history"`, `watched`, `stalled`, `stalled_backfill`, and
+  `served_through`: per action family, the block up to which every watched account is answered
+  without waiting, `null` before any is.
+- **A directory of chains**: `--dir` pointing at a directory of address-history nests, one per chain,
+  serves them all at one `/api`, routed by `chainid`.
+- **What leaves the machine**: the RPC provider sees the watched addresses in its filters. History
+  stays local; the provider's view of it does not.
+
+The full set of keys and actions, and the backfill and refusal rules, are in the builder's
+[config reference](../skills/nuthatch-builder/config-reference.md), under `[address_history]`.
+
 ---
 
 ### Control-plane endpoints (scaled mode only)
@@ -984,11 +1020,13 @@ job:
 |---|---|---|
 | statement timeout | 30 s | a runaway (e.g. cartesian) query is interrupted mid-flight |
 | max result rows | 50,000 | the Rust-side result buffer, outside the engine's own memory limit |
+| max result bytes | 64 MiB | the same buffer measured in bytes, against a wide-cell `SELECT`. Past either cap the answer stops there and carries `truncated: true`, so a caller checks that field rather than trusting a `200` as complete |
+| response bytes in flight | 256 MiB per process | `/sql` and `/q` bodies held while slow readers drain them, shared by every nest in the process. Past it a request is refused with `503` and counts as `busy` |
 | max concurrent queries | 2 | the real DoS multiplier: a semaphore. A request over the limit waits up to **250 ms** for a permit and only then returns `503`, so a short burst smooths instead of bouncing (#1319); the wait is charged against the statement timeout, so queuing cannot extend a request's total deadline. The permit count still decides how many queries run at once. `NUTHATCH_SQL_MAX_CONCURRENCY` still overrides it, ceiling 16, and is not an unconstrained config key |
 | max queued queries | 256 per nest | the bound that makes the wait above safe: it caps how *many* requests may be parked waiting, where the 250 ms caps how *long* each one waits. Without it a burst parks arrival-rate × 250 ms requests before any time out. Past the cap a request is refused immediately, as every over-limit request was before the wait existed. A parked request holds only its query string (≤ 16 KiB), so the worst case is roughly 4 MB per nest |
 | engine memory / threads | 512 MB / 2 (threads ceiling 16) | `analytics.memory_limit` / `analytics.threads`. Memory times the pools (the smaller of the permit count and the cursor's datasets) is refused at startup if it plus `ingestion_reservation` exceeds 2 GiB. Threads share the permit ceiling of 16 and are refused above it |
 | max query length | 16 KiB | rejects absurd query strings before the planner |
-| max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially |
+| max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially. The same holds past **64 MiB** of stored hot-row JSON, whichever comes first |
 | declared-query scan bound | 512 MiB | named queries (`/q/{name}`) only: source bytes the plan may read, each Parquet scan charged the widest table it can reach, plus the hot and maintained rows copied for it. Checked on the connection that runs the statement, before it is evaluated. Over the cap, or a plan that can rescan (nested-loop or delim join, recursive CTE), answers `422` |
 
 `/sql` is **read-only and single-statement**: a query must open with `SELECT` or `WITH`, filesystem
@@ -1198,7 +1236,7 @@ A nest that mirrors itself (RFC-0052, `--publish-target`) also carries, per nest
 | **Nest quarantined** | `nuthatch_nest_health == 0` | something is broken and a human should look |
 | **Cursor dead** | `nuthatch_cursor_live == 0` | a whole chain stopped advancing |
 | **Tip lag growing** | `nuthatch_tip_lag_blocks` trending up over 15m in solo mode, or `nuthatch_nest_tip_lag_blocks` per nest | RPC trouble or an overloaded box |
-| **Ingest stalled** | `time() - nuthatch_last_poll_unixtime > 300` | the loop is wedged even if the process is alive |
+| **Ingest stalled** | `time() - nuthatch_last_poll_unixtime > 900`, i.e. three poll intervals at the 5-minute default; scale it with `--poll-interval` | the loop is wedged even if the process is alive; one interval of silence is a healthy cursor waiting, which is why `/ready` also waits three |
 | **Outbox backing up** | `nuthatch_alert_outbox_depth` rising | a webhook sink is down or slow |
 | **Memory near budget** | `nuthatch_rss_bytes` over ~75% of the cursor ceiling | usually the `/sql` hot-scan |
 | **Query rejections spiking** | `rate(nuthatch_sql_rejections_total{reason="busy"}[5m])` | the node is at its analytical concurrency or queue bound; inspect the aggregate too, but do not confuse caller mistakes with saturation |
@@ -1612,19 +1650,23 @@ is never meant to leave the box.
 narrower than that RFC, and is stated here as it is):
 
 ```sh
-# There is no upgrade command. A pre-2.0 directory is migrated once; the runtime classifies the
+# There is no upgrade command. A pre-2.0 directory is migrated once; migrate classifies the
 # change and refuses a breaking one until you accept it.
 nuthatch migrate --dir <runtime> --dry-run    # prints the plan, including any BREAKING changes by name
 nuthatch migrate --dir <runtime>              # applies it; add --allow-breaking to accept one
 ```
 
 - **A new version is a new NID**, because the NID is a content address: any edit to the nest's
-  inputs, a view or a description included, yields a different dataset, and that dataset is indexed
-  from its start block. What it shares with the old one is disk, not work: a sealed segment is
-  content-addressed, so two datasets that decode the same contract over the same range hold one
-  copy under the runtime's `segments/`. Per-derivation reuse across an NID change (RFC-0033, #357)
-  is not built; `dev` computes the reuse keys at startup, warns about a view that could never be
-  reused, and acts on none of it.
+  inputs, a view or a description included, yields a different NID. Whether it is indexed again
+  depends on what the edit touched. Views, `entities.toml`, `semantic.toml`, `llms.txt` and the
+  scaffolded skill are outside the **data identity**. On a runtime, or through `migrate`, a new NID
+  whose data identity and recorded decode (registry hash) both match a dataset that holds data adopts
+  that dataset's decoded facts instead of re-indexing, and says so at startup (RFC-0033 §5). An edit
+  to the ABIs, contracts, labels or anything else in the data identity is indexed from its start
+  block; a single-nest directory whose decode changed refuses to start until you re-index it. Even then
+  a sealed segment is content-addressed, so two datasets that decode the same contract over the same
+  range hold one copy under the runtime's `segments/`. Per-derivation reuse across an NID change
+  (RFC-0033, #357) is not built: entity state is rebuilt from the adopted facts, not carried over.
 - **On a runtime the swap is `POST /_admin/move/<name> {"nid": "<new nid>"}`** (3.13.0): the new
   NID is mounted beside the old, caught up, then takes over the name's routes in one step, so a
   reader sees the old answers, then the new, and never an error between. The old dataset is left
@@ -1633,7 +1675,7 @@ nuthatch migrate --dir <runtime>              # applies it; add --allow-breaking
   on their own clock; nothing in the binary serves two versions of one name.
 - **`nuthatch migrate` classifies**, and only for a pre-2.0 directory: its plan names each
   `BREAKING` change per alias, and the run stops before anything moves unless `--allow-breaking`
-  accepts it. A 4.x directory has nothing for it to do.
+  accepts it. A directory from 2.0 or later has nothing for it to do.
 
 **Hosting nests on a runtime** (RFC-0027, 3.13.0). A runtime runs its own nests' lifecycle: a caller
 hands it a NID and it does the rest, with no restart and no co-tenant interrupted.
@@ -1707,9 +1749,9 @@ directory before upgrading.
 ### How releases are cut on 5.x
 
 - **A released 5.x only ever gets patch releases** (5.0.1, 5.0.2, ...), and a patch only fixes.
-- **Features wait for the next monthly minor** (5.1, 5.2, ...). A minor may add; it may not break
+- **Features wait for the next minor** (5.1, 5.2, ...). A minor may add; it may not break
   anything in the table below.
-- **Correctness and security fixes ship immediately**, as a patch, without waiting for the month.
+- **Correctness and security fixes ship immediately**, as a patch, without waiting for a minor.
 - **A correctness fix is not a break**, even where an answer changes: a wrong answer made right is
   the fix. Nuthatch never re-decodes stored history, so where rows were stored wrong the notes name
   the affected range to index again (3.13.2's Arbitrum timestamps are the model). Where a config was
@@ -1747,7 +1789,8 @@ Stated because a platform team will ask, and because a vague promise is worse th
 
 - **Downgrades**, above. Upgrade only.
 - **Off-by-default cargo features: `graph`, `folds` and `counter`.**
-  None is in the published binaries or images, and all are experimental: their config keys, routes,
+  None is in the default binary or the images; the separately published `nuthatch-graph-*` binaries
+  enable `graph`, and with it `folds`. All three are experimental: their config keys, routes,
   on-disk state and behaviour may change or go in any 5.x release. A build that enables one is not
   covered by any line above for what that feature adds. (`graph` is RFC-0053's partial read surface
   and RFC-0060's parked endpoint; `folds` is RFC-0059, parked; `counter` is x402.)
@@ -1961,7 +2004,7 @@ Before pointing real traffic at a nuthatch deployment:
 - [ ] Backup covering the nest directory, tested by restoring into a clean box.
 - [ ] `nuthatch check` passing for each nest, with parity fixtures committed.
 - [ ] A restart drill performed: SIGTERM, restart, confirm no gaps or duplicates.
-- [ ] A binary upgrade rehearsed on a copy of the data directory: the 4.x promise runs forwards only,
+- [ ] A binary upgrade rehearsed on a copy of the data directory: the 5.x promise runs forwards only,
       so the copy is the way back (see [Stability contract](#stability-contract)). A pre-2.0
       directory is rehearsed with `nuthatch migrate --dry-run` on the copy first.
 - [ ] Nest onboarding process agreed. *(Adding a nest no longer restarts the runtime - `POST

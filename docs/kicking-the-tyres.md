@@ -122,9 +122,17 @@ figures are in `docs/operators.md` under *What a nest costs at tip*):
 | HTTP requests they served | **~100** |
 | one Arbitrum nest, steady state | **~549,000 requests/day** |
 
-The dominant term is `block_timestamps`: a timestamp lives in the block header, not in the log, so
-serving `block_timestamp` costs an extra `eth_getBlockByNumber` per distinct block. It defaults on
-because most useful queries are time-filtered.
+Those 2.x figures were later traced to the poll loop's two-second cadence, not to the rows. Today a
+caught-up cursor polls every five minutes by default (`--poll-interval`), and since 3.11 a timestamp
+comes from the log wherever the node supplies `blockTimestamp`, with a header fetched only where it
+does not. Attribute your own bill by method:
+
+```sh
+curl -s localhost:8288/metrics | grep nuthatch_rpc_methods_total
+```
+
+and multiply each method by your provider's schedule. `/ready`'s `freshness` object shows the poll
+interval and whether the cursor follows the tip or finality.
 
 **Watch for the multiplier if you run the free-tier arm.** The 7x described in *Before you start*
 is the thing to look for: request count several times nominal, and rising as the endpoint throttles

@@ -1,6 +1,11 @@
 # Community and distribution - where nuthatch shows up
 
 - Status: **plan, not a commitment.** Records a strategy and a capacity limit. No dates are binding.
+- **Dated 2026-08-19; read as history.** Since then the port-queue nest was built and parked (its
+  §8), the Lodestar nests it leaned on stopped on 2026-10-13 ([release-gate.md](../release-gate.md)),
+  and the hosting offer was settled: it is public, on the stock binary, with no billing or accounts.
+  The 2026-10-08 hold on promoting the subgraph stopgap and on any approach through the Foundation
+  still stands, so nothing below authorises posting or contacting anyone.
 - Author: Pete (cargopete), with Jenny
 - Date: 2026-08-19
 - Related: [RFC-0007](../rfcs/0007-launch-and-validation.md) Phases 1-3, [home-turf.md](home-turf.md),
@@ -102,14 +107,14 @@ demonstrated exists is a standard trap. Find the first ports by posting and aski
 at port three.
 
 **Current, and the reason for it:** build it first after all, because the cost estimate the second
-draft was priced against turned out to be wrong. `graph-gns-nest` and `graph-staking-nest` are
-**already running in production on Arbitrum**, and the gns nest already indexes `SubgraphPublished`,
+draft was priced against turned out to be wrong. `graph-gns-nest` and `graph-staking-nest` were
+**running in production on Arbitrum** at the time (both stopped on 2026-10-13), and the gns nest indexes `SubgraphPublished`,
 which is the deployment universe. The queue is a three-contract join on live substrate, not a subgraph
 port. When the price of tooling drops that far, the objection to building it early goes with it.
 
 The design, the filter that makes it worth having (**curation signal with no open allocation**, not
-merely "no allocation"), and the one unverified claim it rests on are in
-[port-queue-nest.md](port-queue-nest.md). Read §5 before building §3.
+merely "no allocation"), and its results are in [port-queue-nest.md](port-queue-nest.md), which was
+built, proven and parked the same day.
 
 **Ask anyway, in parallel.** Posting the fallback piece and asking on the forum costs nothing, runs
 while the nest is built, and is not blocked on it. The first port should come from whichever arrives
@@ -161,17 +166,17 @@ what it is, and it burns rooms that a nest would have opened properly later.
 
 ## 5. Next actions
 
-In order. Nothing here blocks on anything below it.
+The sequence as written on 2026-08-19, kept as history. Items 1 and 5 are done: the hosting question
+was decided (a public offer, see the banner), and the port-queue nest was built and parked. The
+posting steps are not current instructions.
 
-1. **Settle the hosted-fallback paragraph** in the forum post. Its offer of "a bounded, rate-limited
-   temporary endpoint" edges toward the hosted-service line that [CLAUDE.md](../../CLAUDE.md) puts out
-   of scope. It reads as an operator courtesy rather than a product, but a forum will read it as a
-   product. Decide it deliberately rather than discovering it in a reply.
+1. **Settle the hosted-fallback paragraph** in the forum post. *(Settled: the offer is public, on the
+   stock binary, with no billing or accounts; see [CLAUDE.md](../../CLAUDE.md).)*
 2. **Post [home-turf.md](home-turf.md) on the Graph forum**, then the fallback piece. In that order.
 3. **Ask for the first unserved deployment** in the same thread and in `#indexers`. No tooling.
 4. **Run the loop three times**, chosen against the criteria in §2.
-5. **Build the port-queue nest** ([port-queue-nest.md](port-queue-nest.md)), starting by confirming
-   the one unverified claim in its §5. Runs in parallel with 3 and 4, blocks neither.
+5. **Build the port-queue nest** ([port-queue-nest.md](port-queue-nest.md)). *(Built, proven and
+   parked, 2026-08-19.)*
 6. **Then Show HN**, per [strategy-review-2026-08-19.md](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/launch/strategy-review-2026-08-19.md) and RFC-0007
    Phase 2.
 7. **Open the awesome-selfhosted PR** whenever. It is independent of all of the above and costs an

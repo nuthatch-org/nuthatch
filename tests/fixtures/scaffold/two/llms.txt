@@ -6,7 +6,7 @@ A self-hosted blockchain index. Query it locally; there is no third-party API.
 - `usdc` = 0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48
 - `pool` = 0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc
 
-## Tables (one per contract event)
+## Tables (one per contract event, plus any `[extract]` table)
 - `pool__approval` - Approval(address,address,uint256) (block_number, block_hash, tx_hash, log_index, address, _seq, owner, spender, value)
 - `pool__burn` - Burn(address,uint256,uint256,address) (block_number, block_hash, tx_hash, log_index, address, _seq, sender, amount0, amount1, to)
 - `pool__mint` - Mint(address,uint256,uint256) (block_number, block_hash, tx_hash, log_index, address, _seq, sender, amount0, amount1)
@@ -30,6 +30,14 @@ A self-hosted blockchain index. Query it locally; there is no third-party API.
 - `usdc__transfer` - Transfer(address,address,uint256) (block_number, block_hash, tx_hash, log_index, address, _seq, from, to, value)
 - `usdc__un_blacklisted` - UnBlacklisted(address) (block_number, block_hash, tx_hash, log_index, address, _seq, _account)
 - `usdc__unpause` - Unpause() (block_number, block_hash, tx_hash, log_index, address, _seq)
+
+## SQL types
+- `uint`/`int` columns wider than 64 bits are exact decimal text: never `SUM` the raw column.
+  `<col>_dec` is the value as `DECIMAL(38,0)`, NULL when it does not fit (`<col>_overflow` is
+  then true). Ids, nonces and hashes stay on the raw column.
+- `bool` columns are text `'true'`/`'false'`: write `col = 'true'` or `CAST(col AS BOOLEAN)`.
+- Reserved-word columns such as `"from"` and `"to"` must be double-quoted.
+- Call the MCP `schema` tool first: it lists the `_dec`, bool and reserved columns.
 
 ## Live HTTP API (run `nuthatch dev`)
 - `GET /`                    index status

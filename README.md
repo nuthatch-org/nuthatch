@@ -73,7 +73,8 @@ chain, no telemetry unless you opt in, no account. The built-in MCP server lets 
 ## Who runs it
 
 - **[Lodestar](https://www.lodestar-dashboard.com)**, an analytics dashboard for The Graph Protocol on
-  Arbitrum One, serves live panels from self-hosted nests instead of The Graph gateway.
+  Arbitrum One, served its panels from self-hosted nests instead of The Graph gateway until the
+  deployment was withdrawn on 2026-10-13 ([record](docs/release-gate.md)).
 - **[GraphOps](https://graphops.xyz)**, an indexer and core developer on The Graph, is a design
   partner. Its feedback is what led to maintained entities ([RFC-0041](docs/rfcs/0041-authored-incremental-entities.md)).
 
@@ -84,7 +85,8 @@ console rendered from them. The nests were stopped on 2026-09-29.
 
 More at [nuthatch-indexer.com/stories](https://www.nuthatch-indexer.com/stories).
 
-Nuthatch does not run a hosted nest service.
+There is no hosted platform. We will run a nest for you on the stock binary, with no billing and no
+accounts: ask on the [Discord](https://discord.gg/p9Xc45txWa).
 
 ---
 
@@ -212,19 +214,21 @@ Every declared event becomes a table named `{alias}__{event}` (e.g. `usdc__trans
 event's fields plus `block_number`, `block_hash`, `block_timestamp`, `tx_hash`, `log_index`,
 `address` and a `_seq` ordinal.
 
-> `block_timestamp` costs a block-header round trip per block: on OBIB case 1 it took the backfill
-> from 74.8 s to 1,689 s, 22.6x ([RFC-0029 §4c](docs/rfcs/0029-the-fastest-indexer.md), 2026-07-31). A
-> nest that will never ask a time-series question can drop the column with `init --no-timestamps` and
-> skip that entirely. It is an **init-time** choice: changing it later is a breaking schema change and
+> Since 3.11 `block_timestamp` is taken from the log, where current execution clients put
+> `blockTimestamp`. A node that leaves it out costs a block-header round trip per block: on OBIB
+> case 1, before 3.11, that took the backfill from 74.8 s to 1,689 s, 22.6x
+> ([RFC-0029 §4c](docs/rfcs/0029-the-fastest-indexer.md), 2026-07-31). A nest that will never ask a
+> time-series question can drop the column with `init --no-timestamps`. It is an **init-time**
+> choice: changing it later is a breaking schema change and
 > a full re-index, so it is worth a moment's thought and is deliberately not a flag you can flip.
 > [Details](docs/operators.md#configuration-surface).
 
 ```sh
 # one-shot from the terminal (prints an aligned table; --json to pipe to jq)
-nuthatch sql 'SELECT "from" AS sender, count(*) AS n FROM usdc__transfer GROUP BY 1 ORDER BY n DESC LIMIT 5'
+nuthatch sql 'SELECT src AS sender, count(*) AS n FROM weth__transfer GROUP BY 1 ORDER BY n DESC LIMIT 5'
 
 # or over HTTP, against a running `nuthatch dev`
-curl 'localhost:8288/sql?q=SELECT%20count(*)%20FROM%20usdc__transfer'
+curl 'localhost:8288/sql?q=SELECT%20count(*)%20FROM%20weth__transfer'
 ```
 
 - **`nuthatch sql`** queries the local store when `dev` is stopped, and transparently falls back to the
@@ -469,6 +473,16 @@ who need more - none of it in the way of the happy path:
   endpoint never blocks indexing.
 - **Built-in admin UI.** A self-contained page at `/_admin/` - status, tables, view/nest inspector.
   Localhost-open; off-localhost it requires a token per request.
+- **Address history** (RFC-0063, 5.1.0). A nest with an `[address_history]` table and no contracts
+  watches accounts rather than contracts and serves their history Etherscan-shaped at `/api`, for
+  rotki and anything else that speaks that interface. It runs locally on its own path, keeps its rows
+  in the nest's own store rather than SQL tables, and your RPC sees which addresses you watch.
+  [Config reference](skills/nuthatch-builder/config-reference.md#address_history---an-accounts-history-for-rotki-rfc-0063).
+- **A nest in a browser tab** (RFC-0065, RFC-0066, RFC-0068). [nuthatch-indexer.com/play](https://nuthatch-indexer.com/play)
+  queries a published nest, scaffolds and indexes a new one from a contract address with `init`'s own
+  code compiled to wasm, and opens postcards: links that pin a published nest's segments by hash, so a
+  host can withhold an answer but not change one. This is decode and Burrmill in wasm, not the removed
+  WASM handler layer.
 - **Many nests, one runtime, one or more chains** (RFC-0012, RFC-0021). Host many nests in one
   process; nests on the same chain share a single cursor and one `getLogs` per window, and a
   runtime can span **multiple chains** with **one isolated cursor per
@@ -518,15 +532,18 @@ who need more - none of it in the way of the happy path:
   block after the mirror ends. The hashes show each file is the one the catalogue names, not that
   the catalogue is true to the chain: seed from an operator you would trust to run the nest. Four
   Graph Protocol nests are published at [nuthatch-indexer.com/mirror](https://nuthatch-indexer.com/mirror).
-- **Safe upgrades - no resync tax** (RFC-0020, RFC-0033). Updating a nest is not a subgraph-style
-  genesis resync, and in 2.0 it needs no command to remember. The **runtime** classifies the update
-  when a nest's identity changes: *compatible* (additive only) is applied, *breaking* (a
-  consumer-observable change - a dropped column, a removed table) is **named and refused** until you
-  say `--allow-breaking`. Grafting does the rest: a **cosmetic** edit - a comment, a renamed view, a
-  doc change - moves the nest's identity and **adopts the existing dataset**, so nothing re-indexes.
+- **Safe upgrades - no resync tax** (RFC-0020, RFC-0033). Upgrading the binary is drop-in: the data
+  directory carries forward. Editing a nest depends on what the edit touches. A **cosmetic** edit - a
+  comment, a renamed view, a description - leaves its decode alone: a solo directory keeps serving
+  its data, and on a runtime the edited nest's new identity **adopts the existing dataset** when its
+  data identity and recorded decode identity both match, so nothing re-indexes. A **decode** edit -
+  a contract, an event, an ABI - changes what the rows are, so a solo directory refuses to start on
+  the old data and the new nest is indexed into a fresh directory; on a runtime,
+  `POST /_admin/move/<name>` swaps a name to the new NID once it has caught up, with no gap.
+  `--allow-breaking` belongs to `nuthatch migrate`, the one-time move of a pre-2.0 directory.
   Segments are content-addressed and shared across the runtime, so **two nests that decode the same
-  contract hold one copy**, not two. What a subgraph pays a full resync for, nuthatch answers with a
-  hash comparison.
+  contract hold one copy**, not two. What a subgraph pays a full resync for, a cosmetic edit here
+  answers with a hash comparison.
 - **Derive-first - the `eth_call` you don't need** (RFC-0023). The Graph Foundation's figure is that
   more than 70% of subgraphs call `eth_call`, much of it for reads that are *derivable* from the
   events they already index - they fetch only because they have no way to derive. Nuthatch does:
@@ -637,7 +654,7 @@ the findings we closed as *not ours to fix* and why, is in
 
 ## Project
 
-- **Design** lives in [RFCs](docs/rfcs/) (0001-0061, statuses in the
+- **Design** lives in [RFCs](docs/rfcs/) (statuses in the
   [index](docs/rfcs/README.md)); the north star and the CLI/UX direction are
   [RFC-0015](docs/rfcs/0015-the-delightful-core.md). Deferred/leftover work is in
   [`docs/backlog.md`](docs/backlog.md); what each release changed is in [`docs/releases/`](docs/releases/).
@@ -646,7 +663,8 @@ the findings we closed as *not ours to fix* and why, is in
   [`CLAUDE.md`](CLAUDE.md).
 - **Community:** the [Nuthatch Discord](https://discord.gg/p9Xc45txWa). Ask there if you would like a
   nest run for you, on the stock binary and with no billing, or need a chain nuthatch does not support
-  yet: non-EVM chains are added on request.
+  yet. Every supported chain is EVM today; a non-EVM chain asked for by a named user is considered
+  case by case, not promised.
 - **Out of scope:** a metered or billed service, or any deployment story beyond binary + compose.
 
 ## License

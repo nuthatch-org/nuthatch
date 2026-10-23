@@ -13,8 +13,9 @@ never as "this has not shipped" - as of 2026-08-04 the index lists Graph Horizon
 Uniswap V4, Livepeer and POA as 🟢 available, and two of those are not ranked in this file at all.
 Keeping a plan and a status board in one document is what let a shipped nest sit in Tier 3 for weeks.
 
-**Scope:** EVM-only - Ethereum mainnet + major L2s (Arbitrum, Optimism, Base, Polygon), per the
-[CLAUDE.md](../CLAUDE.md) non-negotiable that non-EVM is out of scope until EVM is airtight.
+**Scope:** EVM-only - Ethereum mainnet + major L2s (Arbitrum, Optimism, Base, Polygon), per
+[CLAUDE.md](../CLAUDE.md): non-EVM stays out of scope until EVM is airtight, except that a named user
+asking for a named chain is a decision for Chief. None is built.
 
 **Provenance:** ranking and figures come from a fact-checked research pass (fan-out web search →
 adversarial verification, 71/75 claims survived a 2-of-3-refute gate) over The Graph's own network
@@ -80,8 +81,10 @@ Before the tiers, the rubric that produced them. This is the reusable filter for
   raw storage). nuthatch defers firehose-class extraction until the reth ExEx path lands
   ([RFC-0014](rfcs/0014-firehose-class-extraction-traces-and-state.md), backlog-gated on a node).
   Don't ship a nest that silently needs `debug_*`.
-- **Churning upgradeable proxies** - if the ABI moves under a proxy, decode needs EIP-1967 proxy
-  introspection (a known [backlog](backlog.md) item, RFC-0001 leftover). Fine eventually, friction now.
+- **Churning upgradeable proxies** - `init` resolves an EIP-1967 (and legacy OpenZeppelin or beacon)
+  proxy to its current implementation's ABI and warns that history before the last upgrade may not
+  decode against it. A bespoke proxy, or events that only an earlier implementation emitted, still
+  need declaring by hand.
 - **Value lives in `eth_call` state, not logs** - e.g. a price that's only readable via a view
   function. That is a declared `[[calls]]` read pinned to a block, so it stays deterministic.
 - **Heavy off-chain math presented as "the data"** - APR→APY, USD pricing from `sqrtPriceX96`. Not
@@ -140,9 +143,9 @@ address), so the protocol is now a **stable, defined contract set on Arbitrum On
 - **Footprint / mechanism:** data is posted **on-chain as calldata** to a **DataEdge** contract
   (GIP-0025); on Arbitrum an `EventfulDataEdge` variant **emits events** rather than relying on
   traces. The **Epoch Subgraph** decodes the calldata payloads.
-- **Complexity:** 🟠 **Medium** - needs the **calldata decoder** (the node-independent RFC-0014 slice
-  the [backlog](backlog.md) already flags as *buildable now*). Nice forcing function: EBO turns that
-  decoder from a theoretical to-do into a concrete, high-value deliverable.
+- **Complexity:** 🟠 **Medium** - content work on the shipped calldata decoder: `[extract]
+  top_level_calls` decodes transactions sent directly to the nest's contracts over ordinary RPC. What
+  EBO adds is decoding the DataEdge payload itself, which is EBO-specific.
 
 ### 0.3 Gateway QoS / Rewards-Eligibility Oracle - watch the shape settle
 - **Why:** indexer quality-of-service (latency, availability, blocks-behind) feeds the gateway's
@@ -159,7 +162,7 @@ address), so the protocol is now a **stable, defined contract set on Arbitrum On
 - **Complexity:** 🟠 **Medium-High**, and the most likely to move under you.
 
 **Tier-0 sequencing:** network subgraph first (largely shipped as `horizon-nest`; extend it with the
-remaining surface), EBO second (it justifies building the calldata decoder), QoS/REO third (let the
+remaining surface), EBO second (on the shipped `top_level_calls` decoder), QoS/REO third (let the
 on-chain shape settle).
 Residual friction to be *deliberate* about, not accidental: positioning self-hosting-away-from-paid-
 queries with GraphOps - it's Lodestar-aligned and complementary, but it's the CLAUDE.md/Horizon
@@ -289,8 +292,8 @@ Real demand but narrower, more complex, or blocked on capabilities nuthatch hasn
   showcases (Uniswap V3, Aave) that prove factory discovery and declarative views. Ship the easy pair
   first for momentum; land the flagship pair for credibility.
 - **Respect the capability fence.** Every Tier-1/2 nest here is pure-event-decodable - no nest should
-  ship needing traces/state-diffs (deferred, RFC-0014) or churning-proxy introspection (backlog)
-  until those land. When a candidate needs them, that's a Tier-3-or-later signal, not a "make it work
+  ship needing traces/state-diffs (deferred, RFC-0014), or history from a proxy implementation era
+  `init` did not resolve, until that is declared. When a candidate needs them, that's a Tier-3-or-later signal, not a "make it work
   somehow."
 - **This dovetails with the Horizon nest work.** RFC-0002 (`horizon-nest`) and the Lodestar migration
   (RFC-0011) already prove the "publish a real nest" path; this catalogue is the demand-ranked list of

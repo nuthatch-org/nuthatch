@@ -249,7 +249,7 @@ level3() {
   fi
 
   skip 3.5 "one bad nest is quarantined without harming co-tenants" \
-    "manual: break one nest's authored view deliberately - see verification.md"
+    "proved in CI (e2e_cursor_death_isolation); the manual broken-view drill is in verification.md"
 }
 
 # ---------------------------------------------------------------------------------------------------

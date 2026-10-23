@@ -4,10 +4,14 @@ Draft. Refresh every number against the [README](../../README.md) at post time (
 number traces to a reproducible artifact). Post one channel per day; this is the Phase 2 artifact from
 [RFC-0007](../rfcs/0007-launch-and-validation.md).
 
-> **Note, 2026-10-05.** This copy predates 4.1. DuckDB is no longer in the binary: SQL runs on
-> Burrmill, on DataFusion, over the same sealed Parquet. The DuckDB lines below, including the
-> single-writer design and the 67 MB binary breakdown, describe the 3.x architecture and must be
-> rewritten before this is posted.
+> **Historical draft, not current copy (noted 2026-10-23).** Written for 2.7.1, never posted, and
+> wrong in several places now. SQL runs on Burrmill (DataFusion), not DuckDB, since 4.1, so the
+> single-writer design and the 67 MB binary breakdown no longer hold. wasmtime and the WASM transform
+> layer were removed on 2026-10-08, and the ExEx stub with them; ExEx is designed, not built. Authored
+> incremental entities (RFC-0041) shipped in 3.0.0-alpha. A partial GraphQL read surface exists in the
+> separate, experimental `graph` build. The RAM and size figures are dated 2.x measurements, and
+> "running in production" referred to the Lodestar nests, which stopped on 2026-10-13. Rewrite it
+> against the current README before any use.
 
 ---
 

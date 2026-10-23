@@ -2,11 +2,13 @@
 
 RFC-0053 S2 (#1266). What `/graphql` lowers to Burrmill SQL, what it refuses, and why each refusal is
 a refusal rather than an approximation. The route exists only in a nuthatch built with
-`--features graph`; the published binary is a default build and answers it 404 (see the last section).
+`--features graph`: the default binary answers it 404, and the published `nuthatch-graph-*` downloads
+are built with it (see the last section). Everything on this page describes that one build.
 
 **The governing rule is RFC-0053 §Design: "It must never silently approximate a value and call the
 endpoint drop-in."** Applied to a query, that means an argument this compiler does not implement is an
-error in the Graph envelope, never a query quietly run without it. A dropped `where` clause returns
+error in the Graph envelope, never a query quietly run without it. Two exceptions are stated where
+they apply: `subgraphError` is accepted and ignored, and a fragment's type condition is not checked. A dropped `where` clause returns
 *more* rows than the caller asked for, and a caller who cannot tell that from a correct answer is
 worse off than one who got an error.
 
@@ -239,13 +241,16 @@ after which the whole operation reads as garbage.
 
 ## Refused, by name
 
+Rows marked † are narrowed by [Network Subgraph client shapes](#network-subgraph-client-shapes-rfc-0060)
+below; the refusal holds outside the shapes listed there.
+
 | refused | why it is not approximated |
 |---|---|
-| `block: { number: N }`, `block: { hash: … }` | needs a block-ranged entity store the nest has not got (#1267). Answering as of head while the caller named a past block is a wrong answer that looks right. `number_gte` is **not** in this row - see above |
+| `block: { number: N }`, `block: { hash: … }` † | needs a block-ranged entity store the nest has not got (#1267). Answering as of head while the caller named a past block is a wrong answer that looks right. `number_gte` is **not** in this row - see above |
 | a `block` object carrying anything besides `number_gte` alone | `{ number_gte: N, number: M }` names two different requirements and only one of them is answerable |
-| arguments on a traversed field (`swaps(first: 5)`) | the relation would need its own `LIMIT`, and a dropped `first` there returns every related row. Refused **before** any traversal is lowered: the guard once sat after the aggregation branch, so this compiled with the argument silently gone |
+| arguments on a traversed field (`swaps(first: 5)`) † | the relation would need its own `LIMIT`, and a dropped `first` there returns every related row. Refused **before** any traversal is lowered: the guard once sat after the aggregation branch, so this compiled with the argument silently gone |
 | a **stored** list of entity ids (`Token.whitelistPools`, no `@derivedFrom`) | a different shape needing `unnest`, not the aggregation below, and using the wrong one would answer with the wrong join |
-| a traversal more than one level deep | refused by name rather than answered with an N+1 walk, which would answer slowly and with a different transaction view per row |
+| a traversal more than one level deep † | refused by name rather than answered with an N+1 walk, which would answer slowly and with a different transaction view per row |
 | an entity root with no selection set | not a legal GraphQL query, and answering `*` would invent a field list the caller never asked for |
 | an operator the schema does not declare for that field's type | `sender_starts_with` on a `Bytes` field: our own generated schema says it does not exist |
 | an empty `and`/`or`, or an empty filter object inside one | "no conditions" has no forced reading, and guessing one would be approximating a predicate |
@@ -258,17 +263,18 @@ after which the whole operation reads as garbage.
 | an `operationName` no operation in the document carries | `Operation name not found `X``, likewise. An anonymous operation carries no name, so it is never what a name selects |
 | directives on an operation | skipping one silently is the same class of mistake as a dropped filter |
 | an unbound non-null `$name` (`$first: Int!`) | neither the request nor the header supplies a value, and graph-node refuses it too. A *nullable* `$name` the request leaves out is an argument or input field that was not given, as the GraphQL spec and graph-node read it: BetSwirl's SDK declares `$where: Token_filter` and sends no `where` |
-| a `null` filter value, as a literal or through `variables` | in a filter it could mean `IS NULL` or the absence of the condition, and those select different rows. It used to parse as the enum `null` and compile to `= 'null'`, matching rows whose value is that four-character string |
+| a `null` filter value, as a literal or through `variables` † | in a filter it could mean `IS NULL` or the absence of the condition, and those select different rows. It used to parse as the enum `null` and compile to `= 'null'`, matching rows whose value is that four-character string |
 | a fractional number in `variables` | `BigInt` and `BigDecimal` travel as strings over GraphQL precisely because a float loses them, so a fractional JSON number is refused rather than rounded into a filter |
 
-## With `--features graph` (RFC-0060)
+## Network Subgraph client shapes (RFC-0060)
 
-A nuthatch built with `--features graph` serves the Network Subgraph client dialect on top of
-everything above. A default build registers none of these routes and never reads
+The same graph build serves the Network Subgraph client dialect on top of everything above; there is
+no further switch. A default build registers none of these routes and never reads
 `graph/history.toml` (`serve.rs`: the policy is `None` outside the feature). RFC-0059 and RFC-0060
 were parked on 2026-09-26 with their slices S0 to S3 left in the tree behind the feature, so what
-follows describes that build as it stands. In it four rows of the refusal table change:
-`block: { number: N }` and `block: { hash: … }` are answered in historical mode, a derived list takes
+follows describes that build as it stands. It narrows the four † rows of the refusal table:
+`block: { number: N }` and `block: { hash: … }` are answered where `graph/history.toml` declares a
+policy, a derived list takes
 its own arguments, the two-level shapes below are accepted, and `null` is accepted for equality and
 inequality.
 

@@ -5,13 +5,21 @@ A self-hosted blockchain index. Query it locally; there is no third-party API.
 ## Contracts
 - `uniswap_v2pair` = 0x9d593420cc4936b8a8435cdfa0d6bbde9bdff9a4
 
-## Tables (one per contract event)
+## Tables (one per contract event, plus any `[extract]` table)
 - `uniswap_v2pair__approval` - Approval(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, spender, value)
 - `uniswap_v2pair__burn` - Burn(address,uint256,uint256,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, sender, amount0, amount1, to)
 - `uniswap_v2pair__mint` - Mint(address,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, sender, amount0, amount1)
 - `uniswap_v2pair__swap` - Swap(address,uint256,uint256,uint256,uint256,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, sender, amount0In, amount1In, amount0Out, amount1Out, to)
 - `uniswap_v2pair__sync` - Sync(uint112,uint112) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, reserve0, reserve1)
 - `uniswap_v2pair__transfer` - Transfer(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, to, value)
+
+## SQL types
+- `uint`/`int` columns wider than 64 bits are exact decimal text: never `SUM` the raw column.
+  `<col>_dec` is the value as `DECIMAL(38,0)`, NULL when it does not fit (`<col>_overflow` is
+  then true). Ids, nonces and hashes stay on the raw column.
+- `bool` columns are text `'true'`/`'false'`: write `col = 'true'` or `CAST(col AS BOOLEAN)`.
+- Reserved-word columns such as `"from"` and `"to"` must be double-quoted.
+- Call the MCP `schema` tool first: it lists the `_dec`, bool and reserved columns.
 
 ## Live HTTP API (run `nuthatch dev`)
 - `GET /`                    index status

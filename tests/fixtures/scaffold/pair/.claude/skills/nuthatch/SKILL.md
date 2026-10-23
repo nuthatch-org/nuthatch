@@ -19,4 +19,5 @@ data model, then `sql` / `entity` / `balance` / `top_balances`.
 - Read-only SQL: `curl -G localhost:8288/sql --data-urlencode 'q=SELECT count(*) FROM uniswap_v2pair__approval'`
 
 `sql` reads hot and sealed rows together, so it covers the live tip. Each answer's
-`provenance.sealed_through` is where finalized data ends.
+`provenance.sealed_through` is the block through which this nest has sealed history; newer rows
+may still be hot, and it is not the chain's finality head.

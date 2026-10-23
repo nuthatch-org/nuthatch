@@ -8,7 +8,7 @@ Two harnesses: **backfill** (the write path - this page's main subject) and **qu
 recorded one). No hand-typed numbers, including flattering ones. `tests/bench_citations.rs` fails
 the build when a citation on this page has no such file, or when the file is missing those fields.
 This page documents the harness and the pinned workloads; the baseline matrix is filled in from
-real runs (an archive node is needed for the historical ranges).
+real runs (an endpoint retaining historical logs is needed for the historical ranges).
 
 ## The harness
 
@@ -30,7 +30,8 @@ Nothing here optimises anything. It exists so the seal-direct / adaptive-chunker
 
 ## Backfill throughput is tracked, not gated
 
-CLAUDE.md sets a backfill floor of 10K events/s, aiming for 30K. **No CI check fails on events/sec.**
+RFC-0004 set the original design targets, a floor of 10K events/s aiming for 30K; CLAUDE.md now has
+throughput measured and tracked, not gated. **No CI check fails on events/sec.**
 The `backfill throughput · tip lag` job runs `.github/workflows/backfill-throughput.sh` on every PR: three
 batches of 15 over the chain `fixture-rpc footprint` serves (blocks 1 to 20,000, 80,000 rows, seal-direct,
 concurrency 4). It reports the median to the step summary and an artifact, and fails only if a run
@@ -111,8 +112,10 @@ workload class - post-factory-flip, topic0-only, inflated by headers of logs lat
 must not be silently substituted.
 
 Price a backfill from a counted run (`nuthatch_rpc_methods_total` × the schedule above), not from
-this page. Steady-state **tip-following** on Arbitrum is computed in operators.md at **~$134/month**
-at those same rates, of which ~$93 is header fetches.
+this page. Steady-state **tip-following** on Arbitrum was computed in operators.md at **~$134/month**
+under the former two-second poll and a header per block; the default poll has been five minutes
+since 4.15.2 and logs usually carry timestamps since 3.11, so size tip cost from the counters as
+[operators.md](operators.md#turning-the-dial---poll-interval-and---finality-only) describes.
 
 ### The finding: our own default is the cost, not the indexing
 
@@ -146,8 +149,9 @@ throughput cap turns that into throttling instead of billing, and costs nothing 
 - **T2** - your own node (localhost `eth_getLogs`), via `--rpc`.
 - **T3** - a caching proxy (e.g. erpc) in front of T1.
 
-W1/W3 historical ranges and W2's full history require an **archive** node (public sequencer/
-non-archive endpoints don't serve old `eth_getLogs`). Public-RPC (T1) numbers are noisy - take the
+W1/W3 historical ranges and W2's full history need an endpoint that **retains those historical logs**,
+which many public endpoints do not. Archive *state* is a separate requirement, for declared calls
+and deployment probes. Public-RPC (T1) numbers are noisy - take the
 median of three runs, date them, and read them as "what a new user should expect," not as the
 product's capability.
 
@@ -233,16 +237,19 @@ rows are written. Seal-direct is 2.48× the hot store once the network is not in
 That is smaller than 8.7× or 5.2×, larger than 0.92×, and is the first of those figures that was
 measuring the storage path.
 
-Reproduce it:
+Reproduce the hot-store arm:
 
 ```sh
 nuthatch bench backfill --dir docs/bench/nests/usdc-120 \
   --from 25809368 --to 25809487 --runs 5 \
   --replay docs/bench/tapes/usdc-120-fixed-clean --keep /var/tmp/nuthatch-744-hot
-nuthatch bench backfill --dir docs/bench/nests/usdc-120 \
-  --from 25809368 --to 25809487 --runs 5 --seal-direct \
-  --replay docs/bench/tapes/usdc-120-fixed-clean --keep /var/tmp/nuthatch-744-seal
 ```
+
+**The seal-direct arm no longer replays from this tape** (checked 2026-10-23 on 5.10.0). Seal-direct
+now refetches a two-block overlap at each window's tail, and those requests
+(`logs:…|25809386|25809407`, for one) were never recorded, so the replay stops on a `tape miss`.
+The 2.48× above stands as the 2026-08 measurement at `9b3bb6f`; it has not been rerun on a
+current build, and doing so needs a tape recorded against the current fetch pattern.
 
 **12,933 was not wrong - it answers a different question.** This bench nest declares `Transfer`
 only, so 11,758 is the right count for *this* table; 12,933, reported by this PR's own earlier
@@ -316,7 +323,7 @@ of the old ~22.5× (hot store vs. pipeline): see the seal-direct-vs-hot-store di
 also #744, now measured on the rig at 2.48× rather than collapsed to 0.92×. Today's live hot-store
 baseline came in far faster than the 289 ev/s this page previously
 quoted, and that drags every live "vs hot store" ratio in this table down with it. RSS rose to ~68 MB with
-8 windows in flight - bounded by `K` and well within the 256 MB budget.
+8 windows in flight - bounded by `K` and well within the 256 MB single-nest regression ceiling, let alone the 2 GB per-cursor budget.
 
 **Caveats:** public-endpoint throughput varies several-fold run to run (see the note above) - the
 *ratios* here are the claim, not the absolute ev/s. All three arms declare no `[[calls]]` - a
