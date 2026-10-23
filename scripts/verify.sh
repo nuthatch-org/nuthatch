@@ -19,6 +19,7 @@
 #   CONTROL_TOKEN   control-plane bearer token    (required for level 5; same value the fleet uses)
 #   RPC             an RPC endpoint for level 1   (default: the chain's built-in)
 #   NEST_DIR        an existing nest to test       (default: a temp one is scaffolded)
+#   ADMIN_TOKEN     the nest's admin token        (default: NUTHATCH_ADMIN_TOKEN, else NEST_DIR/.admin-token)
 #
 # **A skip is not a pass.** Steps whose prerequisites are absent are reported as SKIP and counted
 # separately, because a green run that silently skipped the interesting half is worse than a red one.
@@ -242,10 +243,11 @@ level3() {
 
   # The live runtime. Mount/unmount is admin-gated, so a 401/404 means the admin surface is off rather
   # than the feature being broken - distinguished so the result is not misread.
-  if api "$NUTHATCH_URL/_admin/nests" >/dev/null 2>&1; then
+  admin_token="${ADMIN_TOKEN:-${NUTHATCH_ADMIN_TOKEN:-$(cat "${NEST_DIR:-.}/.admin-token" 2>/dev/null)}}"
+  if api -H "authorization: Bearer $admin_token" "$NUTHATCH_URL/_admin/mounts" >/dev/null 2>&1; then
     check 3.4 "the lifecycle routes are served (live mount/unmount)" true
   else
-    skip 3.4 "mount and unmount without a restart" "admin surface off (--no-admin or no token)"
+    skip 3.4 "mount and unmount without a restart" "admin surface off (--no-admin) or ADMIN_TOKEN not found"
   fi
 
   skip 3.5 "one bad nest is quarantined without harming co-tenants" \

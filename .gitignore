@@ -8,6 +8,7 @@
 
 # runtime artefacts
 *.redb
+.admin-token
 abi.json
 nuthatch.toml
 # …but the committed example nest configs are intentional (no secrets)

@@ -254,10 +254,11 @@ async fn a_configured_token_is_required_on_a_localhost_bind_too() {
     assert_eq!(with.as_u16(), 200, "the configured token must be accepted");
 }
 
-/// #2136: the open (token-less) localhost surface answers only requests addressed to loopback. A
-/// DNS-rebinding page reaches 127.0.0.1 under its own hostname, and its `Host` header gives it away.
+/// #2354: with no token set, a localhost runtime makes one, keeps it owner-only in the nest
+/// directory, and requires it. A loopback `Host` with no other sign is what nginx's default
+/// `proxy_pass` forwards for anyone on the internet, so it is refused like any other request.
 #[tokio::test]
-async fn the_open_localhost_admin_surface_refuses_a_foreign_host() {
+async fn an_unset_token_is_made_in_the_nest_directory_and_required() {
     let _env = ENV.lock().await;
     let _token = EnvGuard::unset();
 
@@ -265,84 +266,49 @@ async fn the_open_localhost_admin_surface_refuses_a_foreign_host() {
     scaffold_fe_nest(dir.path());
     let port = free_localhost_port().await;
     let (base, task) = start_fe_on(dir.path(), true, format!("127.0.0.1:{port}")).await;
+    let token = nuthatch::admin_token::read(dir.path()).expect("a token was made");
 
     let client = reqwest::Client::new();
-    let get = |host: String, origin: Option<&'static str>| {
-        let mut req = client
-            .get(format!("{base}/_admin/"))
-            .header(reqwest::header::HOST, host);
-        if let Some(o) = origin {
-            req = req.header(reqwest::header::ORIGIN, o);
-        }
-        async move { req.send().await.expect("admin request").status().as_u16() }
-    };
-    let local = get(format!("127.0.0.1:{port}"), None).await;
-    let named = get(format!("localhost:{port}"), None).await;
-    let rebound = get(format!("attacker.example:{port}"), None).await;
-    let cross_origin = get(format!("127.0.0.1:{port}"), Some("http://attacker.example")).await;
-    task.abort();
-
-    assert_eq!(local, 200, "a loopback Host must still be served");
-    assert_eq!(named, 200, "`localhost` is a loopback name");
-    assert_ne!(rebound, 200, "a rebound hostname must be refused");
-    assert_ne!(cross_origin, 200, "a foreign Origin must be refused");
-}
-
-/// The status line of one raw HTTP/1 exchange, for request shapes `reqwest` will not send.
-async fn raw_status(port: u16, request: &str) -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+    let proxied = client
+        .get(format!("{base}/_admin/"))
+        .header(reqwest::header::HOST, format!("127.0.0.1:{port}"))
+        .send()
         .await
-        .unwrap();
-    s.write_all(request.as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
-    String::from_utf8_lossy(&buf)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string()
-}
-
-/// #2136, over the real socket: a target named outside `Host` - absolute-form here, `:authority` in
-/// HTTP/2 - is what the server routes on, so it is what the check must read; no target is refused.
-#[tokio::test]
-async fn the_open_localhost_admin_surface_checks_the_request_target_not_only_host() {
-    let _env = ENV.lock().await;
-    let _token = EnvGuard::unset();
-
-    let dir = tempfile::tempdir().unwrap();
-    scaffold_fe_nest(dir.path());
-    let port = free_localhost_port().await;
-    let (_base, task) = start_fe_on(dir.path(), true, format!("127.0.0.1:{port}")).await;
-
-    let local = raw_status(
-        port,
-        &format!("GET /_admin/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
-    )
-    .await;
-    let absolute = raw_status(
-        port,
-        &format!(
-            "GET http://attacker.example:{port}/_admin/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
-             Connection: close\r\n\r\n"
-        ),
-    )
-    .await;
-    let no_host = raw_status(port, "GET /_admin/ HTTP/1.0\r\n\r\n").await;
+        .expect("admin request")
+        .status()
+        .as_u16();
+    let with = client
+        .get(format!("{base}/_admin/?token={token}"))
+        .send()
+        .await
+        .expect("admin request")
+        .status()
+        .as_u16();
     task.abort();
+    let _ = task.await;
 
-    assert!(
-        local.contains(" 200 "),
-        "premise: loopback is served: {local}"
-    );
-    assert!(
-        absolute.contains(" 401 "),
-        "a foreign absolute-form target must be refused: {absolute}"
-    );
-    assert!(
-        no_host.contains(" 401 "),
-        "a request naming no target must be refused: {no_host}"
+    assert_eq!(proxied, 401, "a loopback Host alone must not be admitted");
+    assert_eq!(with, 200, "the made token must be accepted");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(nuthatch::admin_token::path(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "the token file is readable by others: {mode:o}"
+        );
+    }
+
+    let (_base, again) = start_fe_on(dir.path(), true, format!("127.0.0.1:{port}")).await;
+    again.abort();
+    assert_eq!(
+        nuthatch::admin_token::read(dir.path()).as_deref(),
+        Some(token.as_str()),
+        "a restart keeps the token it made"
     );
 }
 

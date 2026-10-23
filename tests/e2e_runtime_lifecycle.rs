@@ -14,6 +14,9 @@ use nuthatch::{health::RuntimeHealth, indexer, runtime, serve, store::Store};
 
 use common::tape::*;
 
+/// The admin token of a route set that is not testing the token itself.
+const OPEN: &str = "open-token";
+
 /// A two-nest, one-chain mounts over a scripted tape, wrapped in the driver handles a live mounts keeps.
 /// A lifecycle change is written back, and a runtime with no table to write to reports that as a
 /// failure (#1639). A test that brought its own table keeps it.
@@ -1288,14 +1291,15 @@ async fn call(
     body: Option<&str>,
 ) -> (axum::http::StatusCode, String) {
     use tower::ServiceExt;
-    // A real client always names its target; the open surface refuses a request that does not (#2136).
-    let mut req = axum::http::Request::builder()
+    // With no bearer named, the token every `Some(OPEN)` route set takes; a route set with its own
+    // token refuses it.
+    let req = axum::http::Request::builder()
         .method(method)
         .uri(uri)
-        .header(axum::http::header::HOST, "127.0.0.1");
-    if let Some(t) = bearer {
-        req = req.header(axum::http::header::AUTHORIZATION, format!("Bearer {t}"));
-    }
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", bearer.unwrap_or(OPEN)),
+        );
     let req = match body {
         Some(b) => req
             .header(axum::http::header::CONTENT_TYPE, "application/json")
@@ -1987,7 +1991,7 @@ async fn a_mount_is_accepted_at_once_and_read_until_it_is_live() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
     let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
 
     // Hold the lock the mount needs: acceptance and status must not wait on it.
@@ -2166,7 +2170,7 @@ async fn a_mount_named_admin_is_refused_over_the_api_and_at_boot() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs.clone(), true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs.clone(), true, Some(OPEN.into()));
 
     for name in ["_admin", "_admin/suspend", "_admin/mounts", "acme/_admin"] {
         let body = format!(r#"{{"name":"{name}","nid":"{nid}"}}"#);
@@ -2211,7 +2215,7 @@ async fn a_waited_mount_repeated_is_idempotent() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
 
     for body in [
         format!(r#"{{"name":"usdc","nid":"{nid}"}}"#),
@@ -2281,7 +2285,7 @@ async fn a_failed_mount_is_reported_with_its_reason() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
 
     let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
     let (status, _) = call(&routes, "POST", "/_admin/nests", None, Some(&body)).await;
@@ -2317,7 +2321,7 @@ async fn a_restart_resumes_an_interrupted_mount() {
         .await
         .unwrap();
     assert!(!stale.exists(), "the killed fetch was left staged");
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
     let job = wait_for_phase(&routes, "usdc", "live").await;
     assert_eq!(
         job["phase"], "live",
@@ -2492,7 +2496,7 @@ async fn suspend_and_resume_over_the_admin_api() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
 
     let (status, _) = call(&routes, "POST", "/_admin/suspend/nope", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
@@ -2548,7 +2552,7 @@ async fn mounting_another_nid_over_a_suspended_name_is_refused() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
     let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
 
@@ -2594,7 +2598,12 @@ async fn a_cross_site_page_cannot_suspend_a_mount_through_the_real_bind() {
         .await
         .live
         .service()
-        .merge(runtime::lifecycle_routes(handles.clone(), jobs, true, None));
+        .merge(runtime::lifecycle_routes(
+            handles.clone(),
+            jobs,
+            true,
+            Some(OPEN.into()),
+        ));
     let cors = serve::cors_layer(&["*".to_string()]).unwrap();
     let addr = {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2668,7 +2677,7 @@ async fn reclaiming_a_suspended_mount_frees_its_dataset() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
     let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
 
     let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
@@ -2703,7 +2712,7 @@ async fn a_failed_jobs_write_after_a_reclaiming_unmount_names_the_nid() {
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
     let jobs_dir = tempfile::tempdir().unwrap();
     let jobs = Arc::new(nuthatch::mount_jobs::MountJobs::load(jobs_dir.path()));
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
 
     let (status, body) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
@@ -2991,7 +3000,8 @@ async fn a_dry_run_and_a_real_mount_agree_on_every_refusal() {
         let mounted_before = handles.states.len();
         let _ = intake.try_recv();
         let handles = Arc::new(tokio::sync::Mutex::new(handles));
-        let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+        let routes =
+            runtime::lifecycle_routes(handles.clone(), test_jobs(), true, Some(OPEN.into()));
         // A repeat of the live mount on its own nid is idempotent, so the refusal is another nid.
         let asked = if already_mounted {
             "7d".repeat(32)
@@ -3072,7 +3082,7 @@ async fn a_dry_run_fetches_what_it_needs_and_mounts_nothing() {
     std::fs::remove_dir_all(&data_dir).unwrap();
     handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, Some(OPEN.into()));
 
     let body = format!(r#"{{"name":"usdc","nid":"{nid}"}}"#);
     let (status, dry) = call(
@@ -3210,7 +3220,7 @@ async fn a_move_over_the_admin_api_is_a_job() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
 
     let (status, _) = call(
         &routes,
@@ -3254,7 +3264,7 @@ async fn a_refused_move_leaves_no_fetched_dataset_behind() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
 
     let body = format!(r#"{{"nid":"{new_nid}"}}"#);
     let (status, _) = call(&routes, "POST", "/_admin/move/usdc", None, Some(&body)).await;
@@ -3314,7 +3324,7 @@ async fn a_suspended_mount_reads_as_suspended_and_a_mount_resumes_it() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
 
     let (status, _) = call(&routes, "POST", "/_admin/suspend/usdc", None, Some("{}")).await;
     assert_eq!(status, axum::http::StatusCode::OK);
@@ -3326,7 +3336,7 @@ async fn a_suspended_mount_reads_as_suspended_and_a_mount_resumes_it() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
     let job = wait_for_phase(&routes, "usdc", "suspended").await;
     assert_eq!(job["phase"], "suspended", "after a restart: {job}");
 
@@ -3529,7 +3539,7 @@ async fn names_boot_would_refuse_are_refused_at_the_api() {
     let nid = "c3".repeat(32);
     let (handles, _t, _i) = empty_runtime(roost.path(), &nid).await;
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, Some(OPEN.into()));
 
     let long = "a".repeat(300);
     let wide = "é".repeat(70);
@@ -3640,7 +3650,7 @@ async fn a_restart_mid_move_resumes_the_move() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
     let job = wait_for_phase(&routes, "usdc", "live").await;
     assert_eq!(job["phase"], "live", "{job}");
     let served = handles
@@ -3674,7 +3684,7 @@ async fn identical_mounts_once() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
     let body = format!(r#"{{"name":"race","nid":"{nid}"}}"#);
     // One task per request, as hyper serves them: on a single task the check and insert never
     // interleave, and the race cannot happen.
@@ -3711,7 +3721,7 @@ async fn a_configured_default_tenant_spelled_out_is_refused_at_the_api() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
 
     let body = serde_json::json!({"name": "acme/usdc", "nid": nid}).to_string();
     let (status, answer) = call(&routes, "POST", "/_admin/nests", None, Some(&body)).await;
@@ -3793,7 +3803,7 @@ async fn a_mount_whose_routes_would_collide_is_refused_before_it_joins() {
     let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
         .await
         .unwrap();
-    let routes = runtime::lifecycle_routes(handles.clone(), jobs.clone(), true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs.clone(), true, Some(OPEN.into()));
 
     for name in ["ready", "metrics", "ready/usdc"] {
         let body = format!(r#"{{"name":"{name}","nid":"{nid}"}}"#);
@@ -3873,7 +3883,7 @@ async fn a_nid_in_upper_case_names_the_same_dataset() {
     let nid = "c3d4".repeat(16);
     let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, Some(OPEN.into()));
 
     let body = format!(
         r#"{{"name":"acme/usdc","nid":"{}"}}"#,
@@ -3912,7 +3922,7 @@ async fn a_dry_run_reads_the_cursors_tip_and_dials_nothing() {
     scaffold_nest(&other_dir, "usdc", USDC);
     tape.go_dark();
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
-    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, None);
+    let routes = runtime::lifecycle_routes(handles.clone(), test_jobs(), true, Some(OPEN.into()));
 
     let body = format!(r#"{{"name":"other-2139","nid":"{other}"}}"#);
     let (status, dry) = call(

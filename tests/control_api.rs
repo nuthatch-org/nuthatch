@@ -15,7 +15,7 @@ use nuthatch::control_api::routes;
 use nuthatch::controlplane::ControlPlane;
 use tower::ServiceExt;
 
-fn fixture(token: Option<&str>) -> Option<(axum::Router, Arc<ControlPlane>)> {
+fn fixture(token: &str) -> Option<(axum::Router, Arc<ControlPlane>)> {
     let url = match std::env::var("NUTHATCH_TEST_PG") {
         Ok(u) => u,
         Err(_) if std::env::var("NUTHATCH_REQUIRE_PG").is_ok() => {
@@ -33,7 +33,7 @@ fn fixture(token: Option<&str>) -> Option<(axum::Router, Arc<ControlPlane>)> {
     for w in cp.live_workers(86_400).unwrap() {
         cp.deregister(&w.id).unwrap();
     }
-    Some((routes(cp.clone(), token.map(|t| t.to_string())), cp))
+    Some((routes(cp.clone(), token.to_string()), cp))
 }
 
 async fn call(
@@ -45,7 +45,7 @@ async fn call(
     let req = Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", "127.0.0.1");
+        .header("authorization", "Bearer t");
     let req = match body {
         Some(b) => req
             .header("content-type", "application/json")
@@ -65,7 +65,7 @@ async fn call(
 /// The lifecycle the RFC asks for: declare, see it, remove it, see it gone. No restarts anywhere.
 #[tokio::test]
 async fn a_nest_can_be_declared_and_removed_over_http() {
-    let Some((app, cp)) = fixture(None) else {
+    let Some((app, cp)) = fixture("t") else {
         return;
     };
 
@@ -93,7 +93,7 @@ async fn a_nest_can_be_declared_and_removed_over_http() {
 /// name has to find out, and the only place they will look is the status code.
 #[tokio::test]
 async fn removing_an_unknown_nest_is_a_404() {
-    let Some((app, _)) = fixture(None) else {
+    let Some((app, _)) = fixture("t") else {
         return;
     };
     let (s, body) = call(&app, "DELETE", "/nests/never-existed", None).await;
@@ -105,7 +105,7 @@ async fn removing_an_unknown_nest_is_a_404() {
 /// scheduler overcommit a worker - the exact failure the budget exists to prevent.
 #[tokio::test]
 async fn an_unestimated_nest_is_costed_as_small_not_free() {
-    let Some((app, _)) = fixture(None) else {
+    let Some((app, _)) = fixture("t") else {
         return;
     };
     let (s, body) = call(
@@ -125,7 +125,7 @@ async fn an_unestimated_nest_is_costed_as_small_not_free() {
 /// Bad input is the caller's fault, and must read as such.
 #[tokio::test]
 async fn an_invalid_nest_is_a_400_not_a_500() {
-    let Some((app, _)) = fixture(None) else {
+    let Some((app, _)) = fixture("t") else {
         return;
     };
     let (s, _) = call(
@@ -142,7 +142,7 @@ async fn an_invalid_nest_is_a_400_not_a_500() {
 /// actually asks. A bare absence of rows would leave them guessing.
 #[tokio::test]
 async fn the_plan_endpoint_explains_why_something_cannot_run() {
-    let Some((app, cp)) = fixture(None) else {
+    let Some((app, cp)) = fixture("t") else {
         return;
     };
     cp.declare_nest(&nuthatch::scheduler::DesiredNest {
@@ -169,7 +169,7 @@ async fn the_plan_endpoint_explains_why_something_cannot_run() {
 
 #[tokio::test]
 async fn workers_are_listed_with_their_budgets() {
-    let Some((app, cp)) = fixture(None) else {
+    let Some((app, cp)) = fixture("t") else {
         return;
     };
     cp.heartbeat("w1", 2048).unwrap();
@@ -196,7 +196,7 @@ async fn workers_are_listed_with_their_budgets() {
 /// forms reach it - a weaker obligation, deliberately, because the strong one moved into the router.
 #[tokio::test]
 async fn every_route_demands_the_token_when_one_is_set() {
-    let Some((app, _)) = fixture(Some("s3cret")) else {
+    let Some((app, _)) = fixture("s3cret") else {
         return;
     };
     for (method, uri, body) in [
@@ -254,7 +254,7 @@ async fn every_route_demands_the_token_when_one_is_set() {
 /// route and the one whose guard #292 found deletable.
 #[tokio::test]
 async fn an_authorised_write_reaches_its_handler_with_its_body_intact() {
-    let Some((app, cp)) = fixture(Some("s3cret")) else {
+    let Some((app, cp)) = fixture("s3cret") else {
         return;
     };
     let (s, _) = call(
@@ -285,7 +285,7 @@ async fn an_authorised_write_reaches_its_handler_with_its_body_intact() {
 /// A wrong token is refused - the guard compares, it does not merely check for presence.
 #[tokio::test]
 async fn a_wrong_token_is_refused() {
-    let Some((app, _)) = fixture(Some("s3cret")) else {
+    let Some((app, _)) = fixture("s3cret") else {
         return;
     };
     let (s, _) = call(&app, "GET", "/nests?token=guess", None).await;
@@ -296,7 +296,7 @@ async fn a_wrong_token_is_refused() {
 /// nothing about the fleet.
 #[tokio::test]
 async fn health_needs_no_token() {
-    let Some((app, _)) = fixture(Some("s3cret")) else {
+    let Some((app, _)) = fixture("s3cret") else {
         return;
     };
     let res = app
@@ -322,7 +322,7 @@ async fn health_needs_no_token() {
 /// against the rows a previous run had orphaned. Fixing the fixture would have hidden this.
 #[tokio::test]
 async fn undeclaring_a_nest_removes_its_secrets() {
-    let Some((_app, cp)) = fixture(None) else {
+    let Some((_app, cp)) = fixture("t") else {
         return;
     };
     cp.declare_nest(&nuthatch::scheduler::DesiredNest {
@@ -352,7 +352,7 @@ async fn undeclaring_a_nest_removes_its_secrets() {
 #[tokio::test]
 async fn the_control_listener_drops_a_client_dribbling_its_headers() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let Some((_app, _cp)) = fixture(None) else {
+    let Some((_app, _cp)) = fixture("t") else {
         return;
     };
     let url = std::env::var("NUTHATCH_TEST_PG").unwrap();
@@ -362,7 +362,7 @@ async fn the_control_listener_drops_a_client_dribbling_its_headers() {
     };
     let server = {
         let addr = addr.clone();
-        tokio::spawn(async move { nuthatch::control_api::run(&addr, &url).await })
+        tokio::spawn(async move { nuthatch::control_api::serve(&addr, &url, "t".into()).await })
     };
     let started = std::time::Instant::now();
     while reqwest::get(format!("http://{addr}/health")).await.is_err() {
@@ -403,4 +403,17 @@ async fn the_control_listener_drops_a_client_dribbling_its_headers() {
         closed,
         "a connection dribbling its headers was held past {bound:?}"
     );
+}
+
+/// #2354: a loopback bind is refused without a token too, before any database is dialled. Behind a
+/// proxy or tunnel every caller is loopback, so being bound there admits no one.
+#[tokio::test]
+async fn a_localhost_control_plane_needs_a_token() {
+    if std::env::var_os("NUTHATCH_CONTROL_TOKEN").is_some() {
+        return;
+    }
+    let err = nuthatch::control_api::run("127.0.0.1:0", "postgres://127.0.0.1:1/none")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("without a token"), "{err:#}");
 }

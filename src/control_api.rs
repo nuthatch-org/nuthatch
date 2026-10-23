@@ -18,10 +18,10 @@
 //!
 //! ## Exposure
 //!
-//! Same posture as the admin UI: bound to localhost it is open; bound anywhere else it demands
-//! `NUTHATCH_CONTROL_TOKEN`, and **refuses to start without one**. A control plane is strictly more
-//! dangerous than the read API - it decides what the fleet runs - so an unauthenticated one on a
-//! public interface is not a warning, it is a refusal.
+//! It demands `NUTHATCH_CONTROL_TOKEN` on every bind and **refuses to start without one** (#2354). A
+//! control plane is strictly more dangerous than the read API - it decides what the fleet runs - and a
+//! loopback bind cannot tell a local caller from a reverse proxy, so an unauthenticated one is not a
+//! warning, it is a refusal.
 //!
 //! The guard is a [`route_layer`](Router::route_layer) over every route except `/health`, so a route
 //! is authenticated by virtue of being registered there. It used to be four lines at the top of each
@@ -46,9 +46,8 @@ use crate::scheduler::{plan, DesiredNest};
 #[derive(Clone)]
 struct Api {
     cp: Arc<ControlPlane>,
-    /// `None` on a localhost bind (open), `Some` otherwise - and startup refuses the latter without
-    /// a token, so this is never `None` off-localhost.
-    token: Option<String>,
+    /// Required on every bind; startup refuses to serve without one (#2354).
+    token: String,
 }
 
 #[derive(Deserialize)]
@@ -114,7 +113,7 @@ async fn require_token(State(api): State<Api>, req: Request, next: Next) -> Resp
     let from_query = Query::<TokenQuery>::try_from_uri(req.uri())
         .ok()
         .and_then(|Query(q)| q.token);
-    if crate::serve::token_ok(api.token.as_deref(), from_query.as_deref(), req.headers()) {
+    if crate::serve::token_ok(Some(&api.token), from_query.as_deref(), req.headers()) {
         next.run(req).await
     } else {
         unauthorised().into_response()
@@ -377,7 +376,7 @@ fn internal(e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
 /// Everything except `/health` is registered on `guarded`, which carries [`require_token`]. Adding a
 /// route there is the whole of authenticating it; the only way to ship an open one is to register it
 /// outside that block, next to the route whose doc comment says it is unauthenticated on purpose.
-pub fn routes(cp: Arc<ControlPlane>, token: Option<String>) -> Router {
+pub fn routes(cp: Arc<ControlPlane>, token: String) -> Router {
     let api = Api { cp, token };
     let guarded = Router::new()
         .route("/nests", get(list_nests).post(declare))
@@ -403,27 +402,25 @@ pub fn routes(cp: Arc<ControlPlane>, token: Option<String>) -> Router {
 
 /// Serve the control-plane API.
 pub async fn run(listen: &str, db_url: &str) -> Result<()> {
-    let token = std::env::var("NUTHATCH_CONTROL_TOKEN")
+    let Some(token) = std::env::var("NUTHATCH_CONTROL_TOKEN")
         .ok()
-        .filter(|t| !t.trim().is_empty());
-    if !crate::serve::is_localhost(listen) && token.is_none() {
-        // A refusal, not a warning. This endpoint decides what an entire fleet runs; leaving it open
-        // on a public interface is not a configuration choice anyone makes on purpose.
+        .filter(|t| !t.trim().is_empty())
+    else {
+        // A refusal on every bind: behind a proxy or a tunnel every caller is loopback (#2354).
         bail!(
             "refusing to serve the control-plane API on '{listen}' without a token - set \
-             NUTHATCH_CONTROL_TOKEN, or bind to 127.0.0.1 and reach it through a tunnel"
+             NUTHATCH_CONTROL_TOKEN, e.g. to the output of `openssl rand -hex 32`"
         );
-    }
+    };
 
+    serve(listen, db_url, token).await
+}
+
+/// [`run`] with the token in hand.
+pub async fn serve(listen: &str, db_url: &str, token: String) -> Result<()> {
     let cp = Arc::new(ControlPlane::connect(db_url)?);
-    let app = routes(cp, token.clone()).layer(tower::util::MapRequestLayer::new(
-        crate::serve::host_from_authority,
-    ));
-    tracing::info!(
-        listen = %listen,
-        auth = %if token.is_some() { "token" } else { "open (localhost)" },
-        "control-plane API listening (RFC-0022 §3)"
-    );
+    let app = routes(cp, token);
+    tracing::info!(listen = %listen, "control-plane API listening (RFC-0022 §3)");
     let listener = tokio::net::TcpListener::bind(listen).await?;
     crate::serve::serve_bound(listener, app, None).await
 }

@@ -282,10 +282,11 @@ never multiplexed across chains. Stalling one chain's RPC must not stall the oth
 **3.4 Mount and unmount without a restart**
 
 ```sh
-curl -XPOST   localhost:8288/_admin/nests -H 'Content-Type: application/json' \
+T="authorization: Bearer $(cat /tmp/v-runtime/.admin-token)"   # made on first start
+curl -XPOST   -H "$T" localhost:8288/_admin/nests -H 'Content-Type: application/json' \
               -d '{"name":"another","nid":"<nid>"}'                  # 202 and the job
-curl          localhost:8288/_admin/mounts/another                   # until "phase": "live"
-curl -XDELETE localhost:8288/_admin/nests/another
+curl          -H "$T" localhost:8288/_admin/mounts/another         # until "phase": "live"
+curl -XDELETE -H "$T" localhost:8288/_admin/nests/another
 ```
 
 The `nid` is what `nuthatch nest nid --dir <nest>` prints; a body without one resolves only a name
@@ -395,8 +396,10 @@ nest rather than index timestamps into it; check that too if you have an old bin
 **4.5 Admin exposure**
 
 Bind off-localhost without `NUTHATCH_ADMIN_TOKEN` and expect the admin routes to be unavailable; with a
-token, expect requests lacking it to be refused. *Proves* the admin surface is not reachable
-unauthenticated off-localhost.
+token, expect requests lacking it to be refused. On localhost without the variable, expect
+`.admin-token` in the nest directory, mode `600`, and `curl -H 'Host: 127.0.0.1:8288'
+localhost:8288/_admin/` answered `401` without it. *Proves* the admin surface is not reachable
+unauthenticated, from a proxy on the same box included (#2354).
 
 ---
 

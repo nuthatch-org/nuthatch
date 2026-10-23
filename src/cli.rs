@@ -1404,7 +1404,7 @@ pub struct WorkerArgs {
 
 #[derive(Args)]
 pub struct ControlArgs {
-    /// Address to bind the control-plane API to. Off-localhost requires NUTHATCH_CONTROL_TOKEN and
+    /// Address to bind the control-plane API to. Requires NUTHATCH_CONTROL_TOKEN on every bind and
     /// refuses to start without it.
     #[arg(long, default_value = "127.0.0.1:8290")]
     pub listen: String,
@@ -1631,8 +1631,9 @@ pub struct DevArgs {
     pub audit_seed: Option<u64>,
 
     /// Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that
-    /// front their own dashboard (RFC-0010 Part A). Off-localhost the UI requires `NUTHATCH_ADMIN_TOKEN`
-    /// to be set AND each request to present it as `?token=…` (or it self-disables with a log line).
+    /// front their own dashboard (RFC-0010 Part A). Every request presents a token as `?token=…` or
+    /// `Authorization: Bearer`: `NUTHATCH_ADMIN_TOKEN`, or on localhost without it the one made in
+    /// `<dir>/.admin-token`. Off-localhost without the variable the UI self-disables with a log line.
     #[arg(long)]
     pub no_admin: bool,
 

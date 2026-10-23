@@ -79,9 +79,9 @@ WorkingDirectory=/var/lib/nuthatch/mynest        # the nest directory (holds nut
 ExecStart=/usr/local/bin/nuthatch dev --listen 127.0.0.1:8288 --seal-direct --concurrency 8
 Restart=on-failure
 RestartSec=5
-# Remote admin is OFF as written: the bind above is localhost and no token is set, so the admin UI
-# answers only requests addressed to loopback. To reach it through a reverse proxy, set a token; it is
-# then required on this bind too. Generate one, never paste a literal:
+# No token is set, so the first start makes one in .admin-token in the nest directory, owner-only,
+# and every admin request must present it; the journal prints the admin URL carrying it. To choose
+# your own, generate one, never paste a literal:
 #   Environment=NUTHATCH_ADMIN_TOKEN=<openssl rand -hex 32>
 # Keep it inside the footprint budget; the box needs headroom for analytical queries.
 MemoryMax=2G
@@ -991,8 +991,9 @@ The full set of keys and actions, and the backfill and refusal rules, are in the
 | `GET /plan` | placement, including what cannot be placed and why |
 | `GET /health` | unauthenticated, for load balancers |
 
-Bound off-localhost the control plane **refuses to start** without `NUTHATCH_CONTROL_TOKEN`. This is a
-refusal rather than a warning because the endpoint decides what an entire fleet runs.
+The control plane **refuses to start** without `NUTHATCH_CONTROL_TOKEN`, on any bind. This is a
+refusal rather than a warning because the endpoint decides what an entire fleet runs, and a localhost
+bind cannot tell a local caller from a reverse proxy or tunnel ending on the same box.
 
 ## Security posture
 
@@ -1137,11 +1138,17 @@ too. The rate limit is one layer of a stack, not the stack. See [The division of
 
 ### Enabling remote admin
 
-The recipes above ship with remote admin off. Not caution for its own sake: the admin surface mounts
-and unmounts nests, so a reachable one behind a guessable token is full control of what the runtime
-serves.
+The admin surface always requires a token. With `NUTHATCH_ADMIN_TOKEN` unset, a localhost bind makes
+one on first start (32 random bytes, hex) and keeps it in `.admin-token` in the nest or runtime
+directory, readable by its owner alone, reusing it on later starts. The startup log prints
+`http://127.0.0.1:8288/_admin/?token=…` for a local browser, and `nuthatch watch --dir <dir>` reads the
+file itself. The file is never part of a NID, a bundle or a publish. A request without the token is
+refused whatever its `Host`, so the recipes above forward nothing to the admin surface that the caller
+did not authenticate. That matters: the admin surface mounts and unmounts nests, so a reachable one
+behind a guessable token is full control of what the runtime serves.
 
-If you need it, generate the token. Never copy a literal out of documentation, including this page:
+To reach it remotely, choose the token yourself. Never copy a literal out of documentation, including
+this page:
 
 ```sh
 openssl rand -hex 32
@@ -1152,11 +1159,12 @@ Set it as `NUTHATCH_ADMIN_TOKEN`, keep the published port (Docker) or the bind (
 shell history, not in a committed compose file, and not in a world-readable unit file (`chmod 600`,
 or `EnvironmentFile=` pointing at a root-owned file).
 
-Two things worth knowing first:
+Three things worth knowing first:
 
-- **The token is required on a localhost bind too.** Behind a proxy every request arrives from
-  loopback, so the token is what gates it; a localhost bind with no token refuses any request whose
-  `Host` is not loopback, which includes everything your proxy forwards under a public name.
+- **The token is required on every bind, for every request.** A proxy reaches a localhost bind from
+  loopback with whatever `Host` it chooses (nginx's default is `127.0.0.1:8288`), so nothing is
+  admitted on where a request appears to come from (#2354). A set `NUTHATCH_ADMIN_TOKEN` wins over
+  `.admin-token`.
 - **Setting a token also removes a refusal.** `nuthatch` declines to serve the admin routes
   off-localhost *unless* a token is set. So setting one is not purely "adding auth", it also lifts
   the guard that was protecting you. Correct behaviour, but it means the token is the only thing

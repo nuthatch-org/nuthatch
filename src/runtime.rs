@@ -1959,7 +1959,13 @@ pub async fn dev(
         groups.len(),
     );
 
-    let admin_token = indexer::admin_required_token(admin_enabled);
+    let ui = mounts
+        .mount_refs()
+        .first()
+        .map_or("/_admin/mounts".to_string(), |m| {
+            format!("/{}/_admin/", m.route_key(&mounts.tenant_default()))
+        });
+    let admin_token = indexer::admin_required_token(admin_enabled, &dir, &listen, &ui)?;
     // The RSS budget is now **per active-chain cursor** (RFC-0021), not per whole runtime.
     let max_rss = meta.max_rss_mb.unwrap_or(DEFAULT_MAX_RSS_MB);
 
@@ -7351,7 +7357,7 @@ mod tests {
         std::fs::write(data.join(CONFIG_FILE), "fetched").unwrap();
         let jobs = Arc::new(crate::mount_jobs::MountJobs::load(dir.path()));
         let handles = Arc::new(tokio::sync::Mutex::new(idle_handles(dir.path())));
-        let routes = lifecycle_routes(handles.clone(), jobs.clone(), true, None);
+        let routes = lifecycle_routes(handles.clone(), jobs.clone(), true, Some("t".into()));
         let claimed = jobs
             .claim(MountJob::new("joining", Some(&nid), MountPhase::Accepted))
             .unwrap();
@@ -7366,7 +7372,7 @@ mod tests {
             (dir.path().to_path_buf(), "joining".to_string()),
             Arc::new(move || {
                 let req = axum::http::Request::delete(&uri)
-                    .header(axum::http::header::HOST, "127.0.0.1")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer t")
                     .body(axum::body::Body::empty())
                     .unwrap();
                 let resp = tokio::task::block_in_place(|| {
@@ -7413,10 +7419,10 @@ mod tests {
         failed.reason = Some("refused".into());
         jobs.put(failed).unwrap();
         let req = axum::http::Request::delete(format!("/_admin/datasets/{nid}"))
-            .header(axum::http::header::HOST, "127.0.0.1")
+            .header(axum::http::header::AUTHORIZATION, "Bearer t")
             .body(axum::body::Body::empty())
             .unwrap();
-        let resp = lifecycle_routes(handles, jobs, true, None)
+        let resp = lifecycle_routes(handles, jobs, true, Some("t".into()))
             .oneshot(req)
             .await
             .unwrap();
@@ -7643,7 +7649,7 @@ mod tests {
             .claim(MountJob::new("usdc", None, MountPhase::Accepted))
             .unwrap();
 
-        let routes = lifecycle_routes(handles.clone(), jobs.clone(), true, None);
+        let routes = lifecycle_routes(handles.clone(), jobs.clone(), true, Some("t".into()));
         let answer = Arc::new(std::sync::Mutex::new(None));
         let answer_hook = answer.clone();
         let hook_key = (root.path().to_path_buf(), "usdc".to_string());
@@ -7651,7 +7657,7 @@ mod tests {
             hook_key.clone(),
             Arc::new(move || {
                 let req = axum::http::Request::post("/_admin/nests?wait=true")
-                    .header("host", "127.0.0.1")
+                    .header("authorization", "Bearer t")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(r#"{"name":"usdc"}"#))
                     .unwrap();
@@ -8298,10 +8304,14 @@ mod tests {
                 incoming_mb: 0,
             });
             let jobs = Arc::new(crate::mount_jobs::MountJobs::load(dir.path()));
-            let routes =
-                lifecycle_routes(Arc::new(tokio::sync::Mutex::new(handles)), jobs, true, None);
+            let routes = lifecycle_routes(
+                Arc::new(tokio::sync::Mutex::new(handles)),
+                jobs,
+                true,
+                Some("t".into()),
+            );
             let req = axum::http::Request::post("/_admin/nests?wait=true")
-                .header("host", "127.0.0.1")
+                .header("authorization", "Bearer t")
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(format!(r#"{{"name":"{second}"}}"#)))
                 .unwrap();

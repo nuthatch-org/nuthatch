@@ -2,7 +2,7 @@
 //! concurrently. One process, one cursor, one failure boundary (per the standing brief).
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::alerts::{self, AlertRouter};
@@ -246,7 +246,7 @@ pub async fn upgrade(
         &[&old_config.nest.name, &new_config.nest.name],
     );
     let admin_enabled = admin_enabled(no_admin, &listen);
-    let admin_token = admin_required_token(admin_enabled);
+    let admin_token = admin_required_token(admin_enabled, &old_dir, &listen, "/_admin/")?;
 
     // Both versions index concurrently. Keep `source` and `old_dir` so a post-quiesce stall
     // can restart the old writer against the still-open store.
@@ -764,7 +764,7 @@ pub async fn run(
     // (auth is the operator's gateway's job, but the local UI should never appear unguarded on a public
     // bind); `--no-admin` removes it entirely. Computed here since it depends on the process's `listen`.
     let admin_enabled = admin_enabled(no_admin, &listen);
-    let admin_token = admin_required_token(admin_enabled);
+    let admin_token = admin_required_token(admin_enabled, &dir, &listen, "/_admin/")?;
     let publisher = publish
         .map(|settings| crate::publish::spawn(dir.clone(), config.nest.name.clone(), settings))
         .transpose()?;
@@ -829,11 +829,29 @@ pub fn admin_enabled(no_admin: bool, listen: &str) -> bool {
     enabled
 }
 
-/// The token an admin-UI request must present (SEC-5): the configured one on every bind, localhost
-/// included, since behind a reverse proxy every request arrives from loopback (#2132). `None` only for
-/// a localhost bind with no token, which is open to loopback-addressed requests.
-pub fn admin_required_token(admin_enabled: bool) -> Option<String> {
-    admin_token_env().filter(|_| admin_enabled)
+/// The token every admin request must present (SEC-5), on every bind: `NUTHATCH_ADMIN_TOKEN` when set,
+/// else the one kept in `dir` (#2354). Behind a reverse proxy every request arrives from loopback, so
+/// nothing is admitted without it (#2132). `None` only when the admin surface is off.
+///
+/// `ui` is where the admin page answers, for the startup line that hands the operator a working URL.
+pub fn admin_required_token(
+    admin_enabled: bool,
+    dir: &Path,
+    listen: &str,
+    ui: &str,
+) -> Result<Option<String>> {
+    if !admin_enabled {
+        return Ok(None);
+    }
+    if let Some(token) = admin_token_env() {
+        return Ok(Some(token));
+    }
+    let token = crate::admin_token::load_or_create(dir)?;
+    tracing::info!(
+        "admin token in {}; open http://{listen}{ui}?token={token}",
+        crate::admin_token::path(dir).display()
+    );
+    Ok(Some(token))
 }
 
 /// Build one nest's runtime: open its store, build its decode registry + IVM views, spawn its
@@ -3646,7 +3664,7 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
     // one role an operator actually puts on a network, was the one role with no credential (#292).
     // `--admin` is opt-in here and opt-out on `dev`, which is the only asymmetry that survives.
     let admin_enabled = admin_enabled(!args.admin, &args.listen);
-    let admin_token = admin_required_token(admin_enabled);
+    let admin_token = admin_required_token(admin_enabled, &dir, &args.listen, "/_admin/")?;
     let (_ingest, state, alert_worker, _window) = build_nest(
         &source,
         dir.clone(),
