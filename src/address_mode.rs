@@ -4903,6 +4903,8 @@ pub async fn start_nest(
             dir.join(crate::config::CONFIG_FILE).display()
         );
     }
+    // A symlinked input is read here but invisible to the NID (#2355).
+    crate::blob::collect_files(dir, None)?;
     // redb caches every page it reads or writes up to its cache size, and a backfill touches all of
     // them; an address-history nest reads by key, so a small cache costs it nothing.
     let path = dir.join(crate::config::DB_FILE);
@@ -10227,5 +10229,33 @@ mod tests {
             "served_through, not sweeping, {n} watched: {:?}",
             t.elapsed()
         );
+    }
+
+    /// #2355: an address-history nest starts through `start_nest`, not `build_nest`, so it refuses a
+    /// symlinked input itself, before opening a store.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_config_is_refused_by_start_nest() {
+        let (dir, elsewhere) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let real = elsewhere.path().join("nuthatch.toml");
+        std::fs::write(
+            &real,
+            "[nest]\nname = \"r\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [address_history]\naddresses = [\"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\"]\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join(crate::config::CONFIG_FILE)).unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        let rpcs = Rpcs {
+            main: vec!["http://127.0.0.1:9".into()],
+            fallback: Vec::new(),
+            trace: vec!["http://127.0.0.1:9".into()],
+        };
+        let Err(err) = start_nest(dir.path(), &config, rpcs, Duration::from_secs(300), true).await
+        else {
+            panic!("a symlinked config must not start");
+        };
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert!(!dir.path().join(crate::config::DB_FILE).exists());
     }
 }

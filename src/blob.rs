@@ -67,7 +67,7 @@ pub(crate) fn collect_files(root: &Path, skip: Option<&Path>) -> Result<Vec<Path
             // so a deeper authored directory of either name keeps its place in the identity.
             if dir == root
                 && (name == crate::maintained::COPIES_DIR || name == crate::seal::QUARANTINE_DIR)
-                && entry.file_type()?.is_dir()
+                && path.is_dir()
             {
                 continue;
             }
@@ -81,8 +81,16 @@ pub(crate) fn collect_files(root: &Path, skip: Option<&Path>) -> Result<Vec<Path
                 stack.push(path);
             } else if ft.is_file() {
                 out.push(path);
+            } else if ft.is_symlink() {
+                // The runtime reads through a link and the identity cannot, so two nests linking to
+                // different configs would share one NID (#2355).
+                bail!(
+                    "{} is a symbolic link: a nest's files must be regular files, because its \
+                     identity is taken from what is in the directory. Replace the link with a copy \
+                     of what it points to",
+                    path.display()
+                );
             }
-            // Symlinks are deliberately ignored - a blob must be self-contained.
         }
     }
     out.sort();
@@ -1742,6 +1750,28 @@ url = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
             found.iter().any(|(k, _, ll)| *k == "rpc" && !*ll),
             "a normal rpc endpoint must not be flagged: {found:?}"
         );
+    }
+
+    /// #2355: `Config::load` and the registry read through a symlink and the identity cannot, so two
+    /// nests linking to different configs would share one NID. Every identity refuses a link instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_input_is_refused_by_the_identity() {
+        let (a, cfgs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        write_nest(a.path());
+        let real = cfgs.path().join("one.toml");
+        std::fs::rename(a.path().join(CONFIG_FILE), &real).unwrap();
+        std::os::unix::fs::symlink(&real, a.path().join(CONFIG_FILE)).unwrap();
+        assert!(Config::load(a.path()).is_ok());
+        let err = format!("{:#}", build_manifest(a.path(), None).unwrap_err());
+        assert!(err.contains("nuthatch.toml is a symbolic link"), "{err}");
+
+        // Derived state may live on another disk: a linked `segments/` is not an input.
+        std::fs::remove_file(a.path().join(CONFIG_FILE)).unwrap();
+        std::fs::rename(&real, a.path().join(CONFIG_FILE)).unwrap();
+        let before = build_manifest(a.path(), None).unwrap().nid();
+        std::os::unix::fs::symlink(cfgs.path(), a.path().join("segments")).unwrap();
+        assert_eq!(build_manifest(a.path(), None).unwrap().nid(), before);
     }
 
     /// #2369: a manifest whose name or file order was edited still lists another nest's exact files,

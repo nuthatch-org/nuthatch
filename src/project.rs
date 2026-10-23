@@ -1089,6 +1089,9 @@ fn init_from(source: &str, target: &Path) -> Result<()> {
         println!("→ copying nest from {} …", src.display());
         copy_dir_except(&src, target, &crate::blob::is_excluded)?;
     }
+    // A clone keeps a committed symlink, which `dev` would refuse (#2355): say so now.
+    crate::blob::collect_files(target, None)
+        .with_context(|| format!("'{}' is not a valid nuthatch nest", target.display()))?;
 
     // Validate: it must be a real nest - toml at a supported schema version, ABIs present + decodable.
     let config = Config::load(target)
@@ -2472,6 +2475,46 @@ mod tests {
             crate::blob::build_manifest(&target, None).unwrap().nid(),
             nid
         );
+    }
+
+    /// #2355: a clone keeps a committed symlink, which `dev` would refuse, so `init --from` does.
+    #[cfg(unix)]
+    #[test]
+    fn init_from_a_repo_with_a_symlinked_input_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("nest.git");
+        copy_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scaffold/two"),
+            &repo,
+        )
+        .unwrap();
+        std::fs::rename(repo.join("nuthatch.toml"), repo.join("real.toml")).unwrap();
+        std::os::unix::fs::symlink("real.toml", repo.join("nuthatch.toml")).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["add", "."],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "x",
+            ],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let err = format!(
+            "{:#}",
+            init_from(repo.to_str().unwrap(), &dir.path().join("out")).unwrap_err()
+        );
+        assert!(err.contains("symbolic link"), "{err}");
     }
 
     // #2193: the failure names every chain that was probed.
