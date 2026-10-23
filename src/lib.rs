@@ -15,6 +15,7 @@ pub mod address_proposers;
 pub mod address_proxy;
 pub mod address_residual;
 pub mod address_validators;
+pub mod admin_token;
 pub mod alerts;
 pub mod allowlist;
 pub mod analytics;

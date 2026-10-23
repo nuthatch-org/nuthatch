@@ -160,4 +160,6 @@ compact results with a provenance stamp. Fully offline; nothing phones home.
 `dev` is the serve command. Put it under systemd or Docker and a reverse proxy - copy-paste recipes are
 in [`docs/operators.md`](https://github.com/nuthatch-org/nuthatch/blob/main/docs/operators.md).
 Off-localhost, set `NUTHATCH_ADMIN_TOKEN` and bind behind a gateway (the `/sql` guards bound *how much*,
-never *who* - auth is the operator's layer).
+never *who* - auth is the operator's layer). On localhost without it, `dev` makes an admin token in
+`<dir>/.admin-token` (owner-only) on first start and logs the `/_admin/?token=…` URL; every admin
+request needs it, and `nuthatch watch --dir <dir>` reads it from there.

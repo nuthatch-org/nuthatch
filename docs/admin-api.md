@@ -28,13 +28,13 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 - **`--registry`** is where a mount fetches a NID the runtime does not hold: a filesystem path or
   `s3://bucket/prefix`. Publish to it with `nuthatch nest publish <bundle> --registry <path>`; a NID is
   what `nuthatch nest nid --dir <dir>` prints. Without `--registry`, only NIDs already under `data/` mount.
-- **When `NUTHATCH_ADMIN_TOKEN` is set, every request must present it, localhost included**, as
-  `Authorization: Bearer <token>` or `?token=<token>`. Off localhost the API needs it: without the
-  variable an off-localhost runtime serves no admin routes at all. `--no-admin` removes them everywhere.
-- **Without a token, a localhost runtime answers only requests addressed to loopback**: a `Host` of
-  `localhost`, `127.0.0.1`, `[::1]` or another loopback address, and an `Origin`, if sent, of the same.
-  Anything else is answered `401`, which is what stops a DNS-rebinding page (#2136). A reverse proxy
-  forwarding a public `Host` therefore needs the token set (#2132).
+- **Every request must present the admin token, localhost included**, as `Authorization: Bearer
+  <token>` or `?token=<token>`; without it the answer is `401`, whatever the `Host` (#2132, #2354).
+  The token is `NUTHATCH_ADMIN_TOKEN` when set. Without it, a localhost runtime makes one on first
+  start and keeps it in `<dir>/.admin-token`, owner-only, where `<dir>` is the runtime's `--dir`; the
+  startup log prints an admin URL carrying it, and `TOKEN=$(cat <dir>/.admin-token)` is what a script
+  reads. An off-localhost runtime without the variable serves no admin routes at all. `--no-admin`
+  removes them everywhere.
 - **Request bodies are JSON** and need `Content-Type: application/json`; without it a `POST` is
   answered `415`. That holds for suspend and resume too, though they read no body, so
   a cross-site form cannot reach them (#1642).

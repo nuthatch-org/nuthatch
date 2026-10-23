@@ -634,7 +634,7 @@ impl Screen<'_> {
             let (word, why) = if status == 401 {
                 (
                     "NO TOKEN",
-                    " set NUTHATCH_ADMIN_TOKEN to read it".to_string(),
+                    " pass --dir or set NUTHATCH_ADMIN_TOKEN".to_string(),
                 )
             } else {
                 ("NOT SERVED", format!(" /_admin/requests answered {status}"))

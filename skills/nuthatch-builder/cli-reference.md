@@ -97,7 +97,7 @@ Run a nest's invariant/parity checks (`checks/*.sql`) against recorded expected 
 
 Run the control-plane API for scaled mode (RFC-0022 §3): declare what the fleet should run
 
-- `--listen <LISTEN>` - Address to bind the control-plane API to. Off-localhost requires NUTHATCH_CONTROL_TOKEN and refuses to start without it
+- `--listen <LISTEN>` - Address to bind the control-plane API to. Requires NUTHATCH_CONTROL_TOKEN on every bind and refuses to start without it
 - `--db <DB>` - The control-plane Postgres URL, e.g. `postgres://user:pass@host/db`. This is desired state, **not** a nest's hot store - keep them separate so a fleet-wide outage and a single cursor's outage are different events
 
 ## `nuthatch count`
@@ -152,7 +152,7 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--audit-per-day <AUDIT_PER_DAY>` - Ranges the background audit samples a day, spread evenly
 - `--audit-span <AUDIT_SPAN>` - Blocks in each range the background audit samples
 - `--audit-seed <AUDIT_SEED>` - Seed for the background audit's samples. Defaults to the start time; it is logged with every sample, as is the range, which `nuthatch audit sealed --from --to` re-checks
-- `--no-admin` - Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that front their own dashboard (RFC-0010 Part A). Off-localhost the UI requires `NUTHATCH_ADMIN_TOKEN` to be set AND each request to present it as `?token=…` (or it self-disables with a log line)
+- `--no-admin` - Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that front their own dashboard (RFC-0010 Part A). Every request presents a token as `?token=…` or `Authorization: Bearer`: `NUTHATCH_ADMIN_TOKEN`, or on localhost without it the one made in `<dir>/.admin-token`. Off-localhost without the variable the UI self-disables with a log line
 - `--registry <REGISTRY>` - A runtime (`--dir` holding a `mounts.toml`): the registry a live mount fetches a NID from when this runtime does not hold it (RFC-0019, #1543). A filesystem path, or `s3://bucket/prefix`
 
 ## `nuthatch diff`
@@ -490,6 +490,7 @@ Watch a running nest from the terminal: the tip, the seal, memory against its bu
 
 - `--url <URL>` - The nest's API: a solo `dev`, or a runtime's root, whose mounts are each watched. Defaults to http://127.0.0.1:8288, or to the named nest's
 - `--ssh <SSH>` - Reach the nest through an ssh forward to this host, for a nest bound to loopback there. Runs `ssh -N -L` in batch mode and reopens it if it drops
+- `--dir <DIR>` - The nest or runtime directory whose admin token (`.admin-token`) to present to a loopback --url, when NUTHATCH_ADMIN_TOKEN is unset
 - `--nest <NEST>` - Take --url and --ssh from this entry in ~/.config/nuthatch/watch.toml. With no target named and nests configured there, the screen offers the list
 - `--interval <INTERVAL>` - Seconds between reads (and between lines when piped). By default the screen reads `/ready` every second and `/metrics` every two; a line comes every poll interval of the nest, held between 2 and 30 s
 - `--record <RECORD>` - Append every body read to this file, one JSON object per line, for --replay

@@ -33,6 +33,11 @@ pub struct WatchArgs {
     #[arg(long, value_name = "HOST")]
     pub ssh: Option<String>,
 
+    /// The nest or runtime directory whose admin token (`.admin-token`) to present to a loopback --url,
+    /// when NUTHATCH_ADMIN_TOKEN is unset.
+    #[arg(long, default_value = ".")]
+    pub dir: PathBuf,
+
     /// Take --url and --ssh from this entry in ~/.config/nuthatch/watch.toml. With no target named
     /// and nests configured there, the screen offers the list.
     #[arg(long, value_name = "NAME")]
@@ -95,6 +100,15 @@ pub async fn run(args: WatchArgs) -> Result<()> {
     };
     let base = tunnel.as_ref().map_or(url.clone(), |t| t.local_url.clone());
     let recorder = open_recorder(args.record.as_deref())?;
+    // The file is this machine's, so it goes only to a nest on this machine.
+    let token = std::env::var("NUTHATCH_ADMIN_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            (target.ssh.is_none() && crate::blob::is_loopback_url(&url))
+                .then(|| crate::admin_token::read(&args.dir))
+                .flatten()
+        });
     if on_screen {
         let described = match &target.ssh {
             Some(host) => format!("{url} via {host}"),
@@ -103,6 +117,7 @@ pub async fn run(args: WatchArgs) -> Result<()> {
         run_live_screen(
             &base,
             described,
+            token,
             args.interval,
             recorder,
             tunnel.as_mut(),
@@ -322,15 +337,13 @@ async fn poll_screen(
 async fn run_live_screen(
     base: &str,
     described: String,
+    token: Option<String>,
     interval: Option<u64>,
     mut recorder: Option<std::fs::File>,
     mut tunnel: Option<&mut tunnel::Tunnel>,
     exit_after: Option<u64>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Read>();
-    let token = std::env::var("NUTHATCH_ADMIN_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
     tokio::spawn(poll_screen(
         client()?,
         base.to_string(),

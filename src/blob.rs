@@ -24,11 +24,24 @@ pub use nuthatch_identity::{FileEntry, Manifest, BLOB_FORMAT_VERSION};
 /// including them would make the hash depend on runtime state instead of inputs. Matched by exact name
 /// at any depth.
 #[cfg(not(feature = "folds"))]
-const EXCLUDE: &[&str] = &[DB_FILE, "segments", ".git", ".DS_Store"];
+const EXCLUDE: &[&str] = &[
+    DB_FILE,
+    "segments",
+    crate::admin_token::FILE,
+    ".git",
+    ".DS_Store",
+];
 /// RFC-0059: fold checkpoints are derived state. Excluded only where folds exist, because a name
 /// matched at any depth would otherwise move the NID of a default-build nest that owns such a directory.
 #[cfg(feature = "folds")]
-const EXCLUDE: &[&str] = &[DB_FILE, "segments", "checkpoints", ".git", ".DS_Store"];
+const EXCLUDE: &[&str] = &[
+    DB_FILE,
+    "segments",
+    "checkpoints",
+    crate::admin_token::FILE,
+    ".git",
+    ".DS_Store",
+];
 
 /// Whether a file or directory of this name is left out of a nest's inputs, at any depth.
 pub(crate) fn is_excluded(name: &std::ffi::OsStr) -> bool {
@@ -450,7 +463,7 @@ fn url_carries_credential(url: &str) -> bool {
     })
 }
 
-fn is_loopback_url(url: &str) -> bool {
+pub(crate) fn is_loopback_url(url: &str) -> bool {
     let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let authority = after_scheme
         .split(['/', '?', '#'])
@@ -1129,6 +1142,22 @@ abi = "abis/c.json"
             DERIVED_STATE.contains(&DB_FILE) && DERIVED_STATE.contains(&"segments"),
             "adoption must carry both halves of a dataset - hot store and sealed segments"
         );
+    }
+
+    /// #2354: the admin token sits in the nest directory and must never travel with the nest.
+    #[test]
+    fn the_admin_token_is_not_an_input() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        let before = build_manifest(a.path(), None).unwrap();
+        crate::admin_token::load_or_create(a.path()).unwrap();
+        let after = build_manifest(a.path(), None).unwrap();
+        assert_eq!(after.nid(), before.nid());
+        assert_eq!(after.data_identity(), before.data_identity());
+        assert!(after
+            .files
+            .iter()
+            .all(|f| f.path != crate::admin_token::FILE));
     }
 
     /// The committed fixture nests keep the NID and data identity they had before the 2026-10-23

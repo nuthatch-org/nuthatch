@@ -1049,9 +1049,7 @@ async fn serve_until(
     grace: Duration,
 ) {
     let (stop, stopping) = tokio::sync::watch::channel(false);
-    let app = app
-        .layer(axum::Extension(Stopping(stopping)))
-        .layer(tower::util::MapRequestLayer::new(host_from_authority));
+    let app = app.layer(axum::Extension(Stopping(stopping)));
     // Not `axum::serve`: it gives hyper no timer, so the header-read timeout never fires (#1660).
     let mut http = hyper::server::conn::http1::Builder::new();
     http.timer(hyper_util::rt::TokioTimer::new())
@@ -1109,8 +1107,7 @@ struct AdminQuery {
 
 /// Whether a request may reach the admin surface (SEC-5; header support is audit L7).
 ///
-/// With no token configured (a localhost bind) the surface is open to requests addressed to loopback.
-/// A configured token is required per request on every bind, and may arrive either way:
+/// A token is required per request on every bind (#2354), and may arrive either way:
 ///
 /// - **`?token=…`** - the original form, and it has to stay: the admin UI's own live updates use
 ///   `EventSource`, which cannot set request headers. It is already constant-time compared and
@@ -1125,14 +1122,15 @@ struct AdminQuery {
 ///
 /// Shared with the runtime's lifecycle routes (RFC-0027 §5) so mount/unmount are gated by exactly the
 /// same rule as the admin UI - one credential, one comparison, no second auth concept to get subtly
-/// wrong. `None` means a localhost bind with no token, open to loopback-addressed requests only.
+/// wrong. `None` admits nothing: an enabled surface always has a token, made in the nest directory
+/// when `NUTHATCH_ADMIN_TOKEN` is unset.
 pub fn token_ok(
     required: Option<&str>,
     token: Option<&str>,
     headers: &axum::http::HeaderMap,
 ) -> bool {
     let Some(required) = required else {
-        return addressed_to_loopback(headers);
+        return false;
     };
     if token.is_some_and(|t| ct_eq(t, required)) {
         return true;
@@ -1149,45 +1147,6 @@ pub fn token_ok(
 
 fn admin_authorized(state: &AppState, q: &AdminQuery, headers: &axum::http::HeaderMap) -> bool {
     token_ok(state.admin_token.as_deref(), q.token.as_deref(), headers)
-}
-
-/// An HTTP/2 request names its target in `:authority` and an absolute-form one in its URI, and the
-/// target overrides `Host` (RFC 9112 §3.2.2), so the URI's authority is what [`token_ok`] must see.
-pub fn host_from_authority<B>(mut req: axum::http::Request<B>) -> axum::http::Request<B> {
-    if let Some(v) = req
-        .uri()
-        .authority()
-        .and_then(|a| axum::http::HeaderValue::from_str(a.as_str()).ok())
-    {
-        req.headers_mut().insert(axum::http::header::HOST, v);
-    }
-    req
-}
-
-/// A DNS-rebinding page reaches 127.0.0.1 same-origin under its own hostname, so the open surface
-/// answers only a loopback `Host` and, when present, a loopback `Origin` (#2136). A request with no
-/// `Host` is refused: every server path fills it from the URI authority when one was sent.
-fn addressed_to_loopback(headers: &axum::http::HeaderMap) -> bool {
-    let loopback = |authority: &str| {
-        let host = match authority.strip_prefix('[') {
-            Some(v6) => v6.split(']').next().unwrap_or(""),
-            None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
-        };
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    };
-    let header = |name| {
-        headers
-            .get(name)
-            .map(|v: &axum::http::HeaderValue| v.to_str().unwrap_or(""))
-    };
-    header(axum::http::header::HOST).is_some_and(loopback)
-        && header(axum::http::header::ORIGIN).is_none_or(|o| {
-            o.split_once("://")
-                .is_some_and(|(_, authority)| loopback(authority))
-        })
 }
 
 async fn admin_index(
@@ -6140,6 +6099,7 @@ mod tests {
         use tower::ServiceExt;
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.admin_token = Some("s3cret".into());
         state.tables = Arc::new(vec![crate::registry::TableSchema {
             table: "t".into(),
             alias: "t".into(),
@@ -6157,8 +6117,7 @@ mod tests {
                 .unwrap();
             assert_eq!(app.clone().oneshot(req).await.unwrap().status(), 400);
         }
-        let req = axum::http::Request::get("/_admin/requests")
-            .header(axum::http::header::HOST, "127.0.0.1:8288")
+        let req = axum::http::Request::get("/_admin/requests?token=s3cret")
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -10533,18 +10492,31 @@ mod tests {
     async fn admin_ui_gated_and_nest_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.admin_token = Some("s3cret".into());
         let no_tok = || Query(AdminQuery { token: None });
+        let tok = || {
+            Query(AdminQuery {
+                token: Some("s3cret".into()),
+            })
+        };
         let no_hdr = || {
             let mut h = axum::http::HeaderMap::new();
             h.insert(axum::http::header::HOST, "127.0.0.1:8288".parse().unwrap());
             h
         };
 
-        // Localhost (admin_token None): open.
         let resp = admin_index(State(state.clone()), no_tok(), no_hdr())
             .await
             .into_response();
-        assert_eq!(resp.status(), StatusCode::OK, "admin UI open on localhost");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "localhost needs the token too"
+        );
+        let resp = admin_index(State(state.clone()), tok(), no_hdr())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
 
         state.admin_enabled = false;
         let resp = admin_index(State(state.clone()), no_tok(), no_hdr())
@@ -10672,10 +10644,12 @@ mod tests {
         );
     }
 
-    /// #2136: with no token the surface is open only to requests addressed to loopback. The lifecycle
-    /// routes and the control plane share `token_ok`, so this is their gate too.
+    /// #2354: nothing is admitted on where a request appears to come from. A reverse proxy forwards
+    /// a loopback `Host` with no other sign, so with no token the gate refuses every request. The
+    /// lifecycle routes and the control plane share `token_ok`, so this is their gate too.
     #[test]
-    fn an_open_surface_checks_host_and_origin() {
+    fn no_token_admits_nothing() {
+        use axum::http::header::{AUTHORIZATION, HOST, ORIGIN};
         let hdr = |pairs: &[(axum::http::HeaderName, &str)]| {
             let mut h = axum::http::HeaderMap::new();
             for (k, v) in pairs {
@@ -10683,74 +10657,22 @@ mod tests {
             }
             h
         };
-        use axum::http::header::{HOST, ORIGIN};
-        for host in [
-            "127.0.0.1:8288",
-            "localhost:8288",
-            "LOCALHOST",
-            "[::1]:8288",
-            "127.0.0.2",
+        for h in [
+            hdr(&[(HOST, "127.0.0.1:8288")]),
+            hdr(&[(HOST, "localhost:8288"), (ORIGIN, "http://localhost:8288")]),
+            hdr(&[(HOST, "[::1]:8288"), (AUTHORIZATION, "Bearer ")]),
         ] {
-            assert!(
-                token_ok(None, None, &hdr(&[(HOST, host)])),
-                "{host} is loopback"
-            );
+            assert!(!token_ok(None, None, &h), "{h:?}");
+            assert!(!token_ok(None, Some(""), &h), "{h:?}");
         }
-        assert!(
-            !token_ok(None, None, &hdr(&[])),
-            "no Host and no authority names no target, so it is refused"
-        );
-        let h2 = host_from_authority(
-            axum::http::Request::get("http://attacker.example:8288/_admin/")
-                .body(())
-                .unwrap(),
-        );
-        assert!(
-            !token_ok(None, None, h2.headers()),
-            "an HTTP/2 or absolute-form target must be checked like a Host"
-        );
-        let mut abs = axum::http::Request::get("http://attacker.example/")
-            .body(())
-            .unwrap();
-        abs.headers_mut()
-            .insert(HOST, axum::http::HeaderValue::from_static("127.0.0.1:8288"));
-        assert!(
-            !token_ok(None, None, host_from_authority(abs).headers()),
-            "the request target overrides a loopback Host"
-        );
+        let local = hdr(&[(HOST, "127.0.0.1:8288")]);
+        assert!(token_ok(Some("s3cret"), Some("s3cret"), &local));
+        assert!(!token_ok(Some("s3cret"), None, &local));
         assert!(token_ok(
+            Some("s3cret"),
             None,
-            None,
-            &hdr(&[(HOST, "127.0.0.1:8288"), (ORIGIN, "http://localhost:8288")])
+            &hdr(&[(HOST, "nest.example.com"), (AUTHORIZATION, "bearer s3cret")])
         ));
-        for host in [
-            "attacker.example:8288",
-            "localhost.attacker.example",
-            "10.0.0.1:8288",
-        ] {
-            assert!(
-                !token_ok(None, None, &hdr(&[(HOST, host)])),
-                "{host} must be refused"
-            );
-        }
-        for origin in ["http://attacker.example", "null"] {
-            assert!(
-                !token_ok(
-                    None,
-                    None,
-                    &hdr(&[(HOST, "127.0.0.1:8288"), (ORIGIN, origin)])
-                ),
-                "Origin {origin} must be refused"
-            );
-        }
-        assert!(
-            token_ok(
-                Some("s3cret"),
-                Some("s3cret"),
-                &hdr(&[(HOST, "nuthatch.example.com")])
-            ),
-            "a token-gated surface is reached through a proxy under any name"
-        );
     }
 
     /// #2219: a cell's `html` member is trusted only from the page's own formatters. A named tuple
@@ -10944,7 +10866,7 @@ mod tests {
             })
         };
 
-        // Localhost, no token required → the stream opens.
+        // No token, even on loopback → refused (#2354).
         assert_eq!(
             admin_events(
                 State(state.clone()),
@@ -10959,7 +10881,7 @@ mod tests {
             .await
             .into_response()
             .status(),
-            StatusCode::OK
+            StatusCode::UNAUTHORIZED
         );
         // Admin disabled → 404, exactly like the page.
         state.admin_enabled = false;
@@ -11018,8 +10940,8 @@ mod tests {
         );
     }
 
-    /// RFC-0069 G1: `/_admin/requests` is gated exactly as the event stream above is - open on a
-    /// loopback bind with no token, 404 with admin off, 401 without the token and 200 with it in
+    /// RFC-0069 G1: `/_admin/requests` is gated exactly as the event stream above is - refused with
+    /// no token even on loopback, 404 with admin off, 401 without the token and 200 with it in
     /// either form.
     #[tokio::test]
     async fn admin_requests_gated_like_the_admin_page() {
@@ -11044,7 +10966,7 @@ mod tests {
         };
         assert_eq!(
             status(state.clone(), q(None), loopback()).await,
-            StatusCode::OK
+            StatusCode::UNAUTHORIZED
         );
         state.admin_enabled = false;
         assert_eq!(
@@ -11081,8 +11003,8 @@ mod tests {
     async fn the_request_ring_holds_no_query_text() {
         use tower::ServiceExt;
         let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
-        assert!(state.admin_enabled && state.admin_token.is_none());
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.admin_token = Some("s3cret".into());
         let app = Router::new().nest("/pulse", router(SharedNest::new(state)));
         let get = |uri: &str| {
             axum::http::Request::builder()
@@ -11106,7 +11028,7 @@ mod tests {
         }
         let resp = app
             .clone()
-            .oneshot(get("/pulse/_admin/requests"))
+            .oneshot(get("/pulse/_admin/requests?token=s3cret"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -11151,7 +11073,9 @@ mod tests {
         // From where the last read left off there is nothing new: the monitor's own read is not kept.
         let last = v["last_seq"].as_u64().unwrap();
         let resp = app
-            .oneshot(get(&format!("/pulse/_admin/requests?since={last}")))
+            .oneshot(get(&format!(
+                "/pulse/_admin/requests?since={last}&token=s3cret"
+            )))
             .await
             .unwrap();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -11210,10 +11134,12 @@ mod tests {
     #[tokio::test]
     async fn shutdown_ends_an_open_admin_events_stream() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = router(SharedNest::new(test_state(tmp.path(), SQL_MAX_CONCURRENCY)));
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.admin_token = Some("s3cret".into());
+        let app = router(SharedNest::new(state));
         let (addr, fire, server) = served(app, Duration::from_secs(600)).await;
 
-        let mut events = reqwest::get(format!("http://{addr}/_admin/events"))
+        let mut events = reqwest::get(format!("http://{addr}/_admin/events?token=s3cret"))
             .await
             .unwrap();
         assert_eq!(events.status(), StatusCode::OK);

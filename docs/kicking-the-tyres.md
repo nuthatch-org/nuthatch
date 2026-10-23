@@ -181,8 +181,9 @@ Both were ours. So:
 - Try to read a file. Try it quoted, unquoted, and with whatever casing and whitespace you can think
   of. **We have been caught by exactly this twice.**
 - Try to write one. Try stacked statements.
-- Check what binds where. `/sql` binds `127.0.0.1` by default and the admin UI at `/_admin/` is
-  localhost-gated - verify that on your box rather than believing this sentence.
+- Check what binds where. `/sql` binds `127.0.0.1` by default and the admin UI at `/_admin/`
+  needs a token on every request, made in `.admin-token` when you set none - verify that on your box
+  rather than believing this sentence.
 - If you put it behind a proxy, check the proxy is not the only thing standing between the internet
   and an unauthenticated SQL endpoint.
 - Webhook signatures: `X-Nuthatch-Signature` is HMAC. Verify it actually verifies.

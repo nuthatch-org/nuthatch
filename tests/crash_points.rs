@@ -703,6 +703,9 @@ fn a_move_killed_between_its_fetch_and_its_join_is_finished_by_the_restart() {
     poll("the old dataset to serve every transfer", 120, || {
         count(&format!("{api}/usdc")).filter(|&n| n == TRANSFERS)
     });
+    let token = std::fs::read_to_string(runtime.join(".admin-token"))
+        .expect("the runtime made its admin token");
+    let token = token.trim().to_string();
     let accepted = Command::new("curl")
         .args([
             "-fsS",
@@ -713,7 +716,7 @@ fn a_move_killed_between_its_fetch_and_its_join_is_finished_by_the_restart() {
             "content-type: application/json",
         ])
         .args(["-d", &format!("{{\"nid\": \"{new_nid}\"}}")])
-        .arg(format!("{api}/_admin/move/usdc"))
+        .arg(format!("{api}/_admin/move/usdc?token={token}"))
         .output()
         .expect("curl");
     assert!(
@@ -726,7 +729,7 @@ fn a_move_killed_between_its_fetch_and_its_join_is_finished_by_the_restart() {
         if let Some(status) = first.0.try_wait().ok().flatten() {
             return Some(status);
         }
-        let job = get(&format!("{api}/_admin/mounts/usdc")).unwrap_or_default();
+        let job = get(&format!("{api}/_admin/mounts/usdc?token={token}")).unwrap_or_default();
         assert!(
             !job.contains("\"live\"") && !job.contains("\"failed\""),
             "the move ended without dying at `move:before-join`, so a restart would prove nothing: \
@@ -752,7 +755,7 @@ fn a_move_killed_between_its_fetch_and_its_join_is_finished_by_the_restart() {
     let api = format!("http://127.0.0.1:{port}");
     let job = poll("the resumed move to go live", 120, || {
         let job: serde_json::Value =
-            serde_json::from_str(&get(&format!("{api}/_admin/mounts/usdc"))?).ok()?;
+            serde_json::from_str(&get(&format!("{api}/_admin/mounts/usdc?token={token}"))?).ok()?;
         (job["phase"] == "live").then_some(job)
     });
     assert_eq!(
@@ -769,7 +772,7 @@ fn a_move_killed_between_its_fetch_and_its_join_is_finished_by_the_restart() {
         mounts.contains(&new_nid) && !mounts.contains("__moving"),
         "mounts.toml does not name the new dataset alone:\n{mounts}"
     );
-    let listed = get(&format!("{api}/_admin/mounts")).expect("the mounts listing");
+    let listed = get(&format!("{api}/_admin/mounts?token={token}")).expect("the mounts listing");
     assert!(
         !listed.contains("__moving"),
         "a staging mount survived: {listed}"

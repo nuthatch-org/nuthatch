@@ -8,6 +8,8 @@
 # NIDs, which must be two versions of one nest on one chain. RESTART stops and starts it.
 set -uo pipefail
 
+# The token a runtime made for itself (#2354) when TOKEN is not given.
+TOKEN="${TOKEN:-$(cat "${RUNTIME_DIR:-.}/.admin-token" 2>/dev/null)}"
 : "${BASE:?}" "${TOKEN:?}" "${NID1:?}" "${NID2:?}" "${RUNTIME_DIR:?}" "${RESTART:?}"
 MOUNT_TIMEOUT=${MOUNT_TIMEOUT:-1800}
 H_AUTH="Authorization: Bearer $TOKEN"

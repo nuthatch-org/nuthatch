@@ -404,7 +404,7 @@ async fn the_admin_config_reports_the_live_value() {
         1,
         Some(2),
         true,
-        None,
+        Some("t".into()),
     )
     .await
     .expect("spawn_nest");
@@ -412,7 +412,7 @@ async fn the_admin_config_reports_the_live_value() {
     let resp = router
         .oneshot(
             axum::http::Request::get("/_admin/config")
-                .header("host", "127.0.0.1")
+                .header("authorization", "Bearer t")
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )
