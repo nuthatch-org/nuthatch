@@ -4432,7 +4432,7 @@ mod tests {
     #[tokio::test]
     async fn a_slow_body_narrows_but_a_malformed_one_does_not() {
         use super::{class_of, FailureClass, RpcClient};
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // A server that sends headers and a Content-Length it never satisfies, so the client blocks
         // reading the body until its own timeout fires - exactly the shape a large-but-slow response
@@ -4442,6 +4442,10 @@ mod tests {
             let addr = l.local_addr().unwrap();
             tokio::spawn(async move {
                 if let Ok((mut sock, _)) = l.accept().await {
+                    // Answer only after the request is in, as a real server does: a reply that lands
+                    // while the client is still sending reads as a send error, not a slow body.
+                    let mut buf = vec![0u8; 1 << 16];
+                    let _ = sock.read(&mut buf).await;
                     let body = if stall {
                         // Promise 4 MB, send 3 bytes, then hold the connection open.
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 4194304\r\n\r\n{\"j"
