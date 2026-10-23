@@ -767,6 +767,8 @@ received from in range, so a WETH holder who wrapped by `Deposit` before the ran
 ### Decisions the earlier sections did not settle
 
 - **`--top` defaults to 10 for the story** (§4's K) and stays 25 for `--flow`.
+- **`--top` is capped at 1,000** on every surface, the route, the MCP tool and the CLI. It sizes what
+  each fold holds, so a larger one is refused with the cap, like the row and edge caps, not clamped.
 - **The row cap counts every row read whole**: transfers, control-plane rows and ERC-20 approvals, at
   2,000,000. NFT tables and every other table are counted, never read whole.
 - **New holders are relative to the nest.** "No transfer in of the token before block X, in this
@@ -889,7 +891,7 @@ two million GRT transfers).
   of the three actions, is refused with the spans the nest does hold; an address whose history cannot
   be proved (RFC-0063 §13) is refused from the block it had code.
 - **The native listing is bounded like a story's sentences.** JSON carries the first `--top` rows and
-  `native_rows`; `/api` serves every row. The gate asks with `--top 100000`.
+  `native_rows`; `/api` serves every row. The gate asks with `--top 1000`, the cap.
 - **Decimals.** An ERC-20 from `tokentx` is named and scaled by `metadata.json` only, as everywhere; a
   token without it prints in base units, once, without repeating its address as its name.
 - **The data identity skips `partitions/`.** It is computed once at `dev` and per CLI run, and a
@@ -897,6 +899,9 @@ two million GRT transfers).
 - **`--url --tx` sends `block`.** The route takes a transaction with its block; the CLI sent `from`
   and `to`, which the route refused for every nest. Fixed for both kinds.
 - **A directory of chains serves no `/diff`.** One diff, one cursor: run the chain's nest on its own.
+- **The route is admitted like the event nest's** (#2358): a diff holds one of the nest's analytical
+  permits, is refused `503 busy` when none frees within the wait, and stops at the 30 s budget
+  with a 504.
 
 ### Mutation checks
 

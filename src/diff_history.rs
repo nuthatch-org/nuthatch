@@ -410,7 +410,7 @@ pub fn fold(
             _ => 0,
         };
         kept.push(((r.block, r.tx_index, rank, r.hash), r));
-        if kept.len() >= 2 * top + 16 {
+        if kept.len() >= top.saturating_mul(2).saturating_add(16) {
             kept.sort_by_key(|k| k.0);
             kept.truncate(top);
         }

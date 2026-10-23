@@ -633,6 +633,7 @@ impl Config {
             }
         }
         cfg.refuse_tip_finality_webhooks()?;
+        cfg.refuse_unknown_since()?;
         refuse_feature_only_files(dir)?;
         refuse_removed_screening(&raw)?;
         Ok(cfg)
@@ -741,6 +742,22 @@ impl Config {
              `finality = \"sealed\"` (or omit it) until tip delivery ships.",
             tip_webhooks.join(", "),
         )
+    }
+
+    /// Refuse a webhook `since` that is not `"registration"`, `"genesis"` or a block number (#2365):
+    /// anything else used to start the cursor at the tip, as `"registration"` does, without a word.
+    fn refuse_unknown_since(&self) -> Result<()> {
+        for w in &self.webhooks {
+            match w.since.as_deref() {
+                None | Some("registration" | "genesis") => {}
+                Some(s) if s.parse::<u64>().is_ok() => {}
+                Some(s) => bail!(
+                    "webhook '{}': `since = \"{s}\"` is not \"registration\", \"genesis\" or a block number",
+                    w.name
+                ),
+            }
+        }
+        Ok(())
     }
 
     /// Reader and feature gates shared by normal and diagnostic loading.
@@ -1395,6 +1412,45 @@ finality = "tip"
             err.contains("sealed"),
             "a refusal should name the working alternative: {err}"
         );
+    }
+
+    /// #2365: a `since` that is not one of the three forms is refused, not read as "registration".
+    #[test]
+    fn an_unknown_webhook_since_is_refused_by_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let nest = |since: &str| {
+            format!(
+                r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://rpc.example"]
+schema_version = 1
+
+[[contracts]]
+alias = "c"
+address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+abi = "abis/c.json"
+
+[[webhooks]]
+name = "hist"
+table = "c__transfer"
+url = "http://127.0.0.1:8099/"
+since = "{since}"
+"#
+            )
+        };
+        for ok in ["registration", "genesis", "1234"] {
+            std::fs::write(dir.path().join(CONFIG_FILE), nest(ok)).unwrap();
+            Config::load(dir.path()).unwrap_or_else(|e| panic!("{ok}: {e:#}"));
+        }
+        for bad in ["Genesis", "genesis ", "-1"] {
+            std::fs::write(dir.path().join(CONFIG_FILE), nest(bad)).unwrap();
+            let err = format!("{:#}", Config::load(dir.path()).unwrap_err());
+            assert!(err.contains("`since"), "{bad}: name the field: {err}");
+            assert!(err.contains("hist"), "{bad}: name the webhook: {err}");
+        }
     }
 
     #[test]

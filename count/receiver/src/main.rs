@@ -91,9 +91,11 @@ pub fn increment(store: &mut Store, day: &str, keys: &[String]) {
         let key = if tallies.contains_key(key) || tallies.len() < MAX_KEYS_PER_DAY {
             key.clone()
         } else {
-            match key.rsplit_once('.') {
-                Some((prefix, _)) => format!("{prefix}.other"),
-                None => key.clone(),
+            // Fold to one key per field: a version holds dots, so cutting at the last one made a new key each time.
+            let mut parts = key.splitn(3, '.');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(event), Some(field), Some(_)) => format!("{event}.{field}.other"),
+                _ => key.clone(),
             }
         };
         *tallies.entry(key).or_default() += 1;
@@ -230,6 +232,22 @@ mod tests {
     use super::*;
 
     const INIT: &str = r#"{"v":1,"event":"init","version":"4.14.0","os":"linux","arch":"x86_64","chain":42161,"source":"addresses"}"#;
+
+    #[test]
+    fn invented_versions_fold_to_one_key_past_the_cap() {
+        let mut store = Store::new();
+        for i in 0..(MAX_KEYS_PER_DAY * 4) {
+            let ping = INIT.replace("4.14.0", &format!("x{i}.0"));
+            increment(
+                &mut store,
+                "2026-10-23",
+                &keys_for(ping.as_bytes()).unwrap(),
+            );
+        }
+        let day = &store["2026-10-23"];
+        assert!(day.len() <= MAX_KEYS_PER_DAY + 4, "{} keys", day.len());
+        assert!(day.contains_key("init.version.other"));
+    }
 
     #[test]
     fn an_init_increments_its_five_tallies() {

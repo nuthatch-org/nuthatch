@@ -434,7 +434,7 @@ async fn run_diff(args: cli::DiffArgs) -> Result<()> {
     } else {
         diff::Mode::Story
     };
-    let top = diff::Ask::top_or_default(mode, args.top);
+    let top = diff::Ask::top_or_default(mode, args.top)?;
     let tx = match &args.tx {
         Some(t) => {
             let t = t.to_ascii_lowercase();
