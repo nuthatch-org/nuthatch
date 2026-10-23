@@ -64,7 +64,8 @@ that. See [operators.md](operators.md#data-lifecycle).
 
 Startup moves a per-dataset file that is missing, unreadable, or hash-mismatched into a sibling
 `quarantine/` directory. It never moves a shared-store file (other mounts may still name it).
-`quarantine/` is outside `segments/` and is not in the catalogue.
+`quarantine/` is outside `segments/`, is not in the catalogue, and does not change the nest's NID or
+data identity.
 
 ## Catalogue schema
 
