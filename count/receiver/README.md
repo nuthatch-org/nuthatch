@@ -22,7 +22,7 @@ else; there is no code path that writes any of them. Caddy is configured with no
 this site, so ingress keeps no access log either. Process logs are operational only.
 
 Anyone can send a valid ping, so the totals are floors with noise on top, never counts. A day's
-distinct keys are capped at 512; past that a new key is tallied under `<prefix>.other`, so a flood
+distinct keys are capped at 512; past that a new key is tallied under `init.<field>.other`, so a flood
 of invented chain ids or versions cannot grow the store without bound.
 
 `GET /totals` returns the whole store as JSON. It holds nothing that is not published anyway.
