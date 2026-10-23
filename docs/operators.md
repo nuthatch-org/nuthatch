@@ -79,9 +79,9 @@ WorkingDirectory=/var/lib/nuthatch/mynest        # the nest directory (holds nut
 ExecStart=/usr/local/bin/nuthatch dev --listen 127.0.0.1:8288 --seal-direct --concurrency 8
 Restart=on-failure
 RestartSec=5
-# Remote admin is OFF as written: the bind above is localhost and no token is set, so the admin UI
-# answers only requests addressed to loopback. To reach it through a reverse proxy, set a token; it is
-# then required on this bind too. Generate one, never paste a literal:
+# With no token the admin UI answers only local clients: a loopback Host and no forwarding headers.
+# A reverse proxy in front makes every caller look local unless it adds them, so behind one set a
+# token; it is then required on this bind too. Generate one, never paste a literal:
 #   Environment=NUTHATCH_ADMIN_TOKEN=<openssl rand -hex 32>
 # Keep it inside the footprint budget; the box needs headroom for analytical queries.
 MemoryMax=2G
@@ -992,7 +992,9 @@ The full set of keys and actions, and the backfill and refusal rules, are in the
 | `GET /health` | unauthenticated, for load balancers |
 
 Bound off-localhost the control plane **refuses to start** without `NUTHATCH_CONTROL_TOKEN`. This is a
-refusal rather than a warning because the endpoint decides what an entire fleet runs.
+refusal rather than a warning because the endpoint decides what an entire fleet runs. On
+localhost without a token it answers the same callers as the token-less admin surface: a loopback
+`Host` and no forwarding headers (see [Enabling remote admin](#enabling-remote-admin)).
 
 ## Security posture
 
@@ -1127,6 +1129,10 @@ http {
         location / {
             limit_req zone=api burst=20 nodelay;
             proxy_pass http://127.0.0.1:8288;
+            # Without these nginx forwards Host: 127.0.0.1:8288 and nothing else, which the
+            # token-less admin surface cannot tell from a local client. Keep them.
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         }
     }
 }
@@ -1155,8 +1161,13 @@ or `EnvironmentFile=` pointing at a root-owned file).
 Two things worth knowing first:
 
 - **The token is required on a localhost bind too.** Behind a proxy every request arrives from
-  loopback, so the token is what gates it; a localhost bind with no token refuses any request whose
-  `Host` is not loopback, which includes everything your proxy forwards under a public name.
+  loopback, so the token is what gates it. With no token the admin surface answers only what looks
+  like a local client: a loopback `Host`, a loopback `Origin` if one is sent, and none of
+  `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Real-IP` or `Via`.
+  Caddy and Apache add `X-Forwarded-For` by default and are refused. nginx adds nothing and rewrites
+  `Host` to `127.0.0.1:8288` unless told otherwise, so a bare `proxy_pass` with no token hands the
+  admin surface to the internet; the recipe above sets both headers for that reason. Set the token
+  whenever a proxy is in front, whatever it forwards.
 - **Setting a token also removes a refusal.** `nuthatch` declines to serve the admin routes
   off-localhost *unless* a token is set. So setting one is not purely "adding auth", it also lifts
   the guard that was protecting you. Correct behaviour, but it means the token is the only thing

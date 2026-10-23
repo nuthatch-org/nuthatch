@@ -1166,7 +1166,22 @@ pub fn host_from_authority<B>(mut req: axum::http::Request<B>) -> axum::http::Re
 /// A DNS-rebinding page reaches 127.0.0.1 same-origin under its own hostname, so the open surface
 /// answers only a loopback `Host` and, when present, a loopback `Origin` (#2136). A request with no
 /// `Host` is refused: every server path fills it from the URI authority when one was sent.
+///
+/// A reverse proxy is a loopback peer and by default forwards a loopback `Host` (#2354), so a request
+/// carrying any forwarding header is refused too. A proxy that adds none is indistinguishable from a
+/// local client, which is why a proxied runtime needs the token.
 fn addressed_to_loopback(headers: &axum::http::HeaderMap) -> bool {
+    const RELAYED: [&str; 6] = [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+        "via",
+    ];
+    if RELAYED.iter().any(|h| headers.contains_key(*h)) {
+        return false;
+    }
     let loopback = |authority: &str| {
         let host = match authority.strip_prefix('[') {
             Some(v6) => v6.split(']').next().unwrap_or(""),
@@ -10634,6 +10649,29 @@ mod tests {
             ),
             "a token-gated surface is reached through a proxy under any name"
         );
+    }
+
+    /// #2354: a proxy forwards under a loopback `Host` by default (nginx's `$proxy_host`, Apache's
+    /// `ProxyPreserveHost Off`), so the open surface also refuses a request that says it was relayed.
+    #[test]
+    fn an_open_surface_refuses_a_forwarded_request() {
+        for (name, value) in [
+            ("x-forwarded-for", "203.0.113.9"),
+            ("forwarded", "for=203.0.113.9"),
+            ("x-real-ip", "203.0.113.9"),
+            ("x-forwarded-host", "nest.example.com"),
+            ("x-forwarded-proto", "https"),
+            ("via", "1.1 proxy"),
+        ] {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(axum::http::header::HOST, "127.0.0.1:8288".parse().unwrap());
+            h.insert(name, value.parse().unwrap());
+            assert!(!token_ok(None, None, &h), "{name} marks a relayed request");
+            assert!(
+                token_ok(Some("s3cret"), Some("s3cret"), &h),
+                "the token still admits a proxied {name} request"
+            );
+        }
     }
 
     /// #2219: a cell's `html` member is trusted only from the page's own formatters. A named tuple

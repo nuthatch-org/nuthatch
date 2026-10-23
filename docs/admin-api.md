@@ -33,8 +33,11 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
   variable an off-localhost runtime serves no admin routes at all. `--no-admin` removes them everywhere.
 - **Without a token, a localhost runtime answers only requests addressed to loopback**: a `Host` of
   `localhost`, `127.0.0.1`, `[::1]` or another loopback address, and an `Origin`, if sent, of the same.
-  Anything else is answered `401`, which is what stops a DNS-rebinding page (#2136). A reverse proxy
-  forwarding a public `Host` therefore needs the token set (#2132).
+  A request carrying `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`,
+  `X-Real-IP` or `Via` is a proxied one and is refused too (#2354). Anything else is answered `401`,
+  which is what stops a DNS-rebinding page (#2136). A runtime behind a reverse proxy needs the token
+  set (#2132): a proxy that rewrites `Host` to loopback and adds no forwarding header, which is
+  nginx's default, cannot be told from a local client.
 - **Request bodies are JSON** and need `Content-Type: application/json`; without it a `POST` is
   answered `415`. That holds for suspend and resume too, though they read no body, so
   a cross-site form cannot reach them (#1642).
