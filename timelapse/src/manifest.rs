@@ -62,7 +62,9 @@ fn one() -> u32 {
 /// IPFS and `[[calls]]` declarations, so it differs for those nests.
 fn registry_hash(config: &Config, files: &BTreeMap<String, Vec<u8>>) -> Result<String> {
     let abi = |path: &str| -> Result<JsonAbi> {
-        let raw = files.get(path.trim_start_matches("./")).with_context(|| format!("no ABI {path}"))?;
+        let raw = files
+            .get(path.trim_start_matches("./"))
+            .with_context(|| format!("no ABI {path}"))?;
         serde_json::from_slice(raw).with_context(|| format!("parsing ABI {path}"))
     };
     let mut specs = Vec::with_capacity(config.contracts.len());
