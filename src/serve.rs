@@ -2134,10 +2134,11 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         "initial_poll_failed": initial_failure,
         // Null rather than 0 for a cursorless role: it has no tip and no lag, and **0 is a value**
         // an operator or a dashboard will read as "exactly at tip" (the #1020 lesson, on the other
-        // surface). Absent is honest; zero is a claim.
-        "tip": if s.cursorless { serde_json::Value::Null } else { tip.into() },
+        // surface). Absent is honest; zero is a claim. The same holds before a cursor's first poll,
+        // which a long seal-direct pass can postpone by minutes (#2342).
+        "tip": if s.cursorless || last_poll == 0 { serde_json::Value::Null } else { tip.into() },
         "last_block": last,
-        "lag_blocks": if s.cursorless { serde_json::Value::Null } else { lag.into() },
+        "lag_blocks": if s.cursorless || last_poll == 0 { serde_json::Value::Null } else { lag.into() },
         "cursorless": s.cursorless,
         // RFC-0040 §4: a deliberately stale cursor says so here. `lag_blocks` above is then the
         // distance the operator chose, and the stall thresholds behind `ready` are scaled to
@@ -8470,7 +8471,11 @@ mod tests {
     ///
     /// Setting `runtime_health` puts `/ready` on its per-nest branch, so each case owns a
     /// uniquely-named `NestMetrics` and nothing is shared.
-    async fn ready_of(cursorless: bool, started_secs_ago: u64) -> serde_json::Value {
+    async fn ready_of(
+        cursorless: bool,
+        started_secs_ago: u64,
+        polled: Option<(u64, u64)>,
+    ) -> serde_json::Value {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let name = format!("cursorless-probe-{}", N.fetch_add(1, Ordering::SeqCst));
@@ -8488,6 +8493,11 @@ mod tests {
         // Never polled, started long enough ago that any grace has expired - the live shape.
         m.set_started_at_for_test(now.saturating_sub(started_secs_ago));
         assert_eq!(m.last_poll_ok(), 0, "premise: this nest has never polled");
+        if let Some((tip, last)) = polled {
+            m.set_tip(tip);
+            m.set_last_block(last);
+            m.set_last_poll_ok_for_test(now);
+        }
 
         let (_code, body) = get(router, "/ready").await;
         serde_json::from_slice(&body).unwrap()
@@ -8495,7 +8505,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cursorless_role_that_never_polls_is_ready() {
-        let b = ready_of(true, 86_400).await;
+        let b = ready_of(true, 86_400, None).await;
         assert_eq!(
             b["ready"],
             json!(true),
@@ -8508,7 +8518,7 @@ mod tests {
     /// The control that stops the fix being a blanket exemption.
     #[tokio::test]
     async fn a_cursor_owning_role_that_never_polls_is_still_stalled() {
-        let b = ready_of(false, 86_400).await;
+        let b = ready_of(false, 86_400, None).await;
         assert_eq!(
             b["ready"],
             json!(false),
@@ -8525,7 +8535,7 @@ mod tests {
     /// cursor has no lag at all, and saying so is honest where saying zero is a claim.
     #[tokio::test]
     async fn a_cursorless_role_reports_no_tip_rather_than_a_tip_of_zero() {
-        let b = ready_of(true, 86_400).await;
+        let b = ready_of(true, 86_400, None).await;
         assert!(
             b["tip"].is_null(),
             "`tip` must be null for a role with no cursor, not 0 - 0 reads as a block height: {b}"
@@ -8545,11 +8555,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_cursor_owning_role_still_reports_its_numbers() {
-        let b = ready_of(false, 86_400).await;
-        assert!(
-            b["tip"].is_number() && b["lag_blocks"].is_number(),
+        let b = ready_of(false, 86_400, Some((26_000_100, 26_000_090))).await;
+        assert_eq!(
+            (&b["tip"], &b["lag_blocks"]),
+            (&json!(26_000_100), &json!(10)),
             "nulling these for a cursor-owning role would remove the figures an operator uses: {b}"
         );
+    }
+
+    /// #2342: before the first poll a 0 tip and 0 lag read as "at the tip"; they are absent instead.
+    #[tokio::test]
+    async fn a_cursor_that_has_not_polled_serves_no_tip_or_lag() {
+        let b = ready_of(false, 86_400, None).await;
+        assert!(b["tip"].is_null() && b["lag_blocks"].is_null(), "{b}");
+        assert_eq!(b["cursorless"], json!(false));
     }
 
     #[test]
