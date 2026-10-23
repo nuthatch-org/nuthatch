@@ -2151,10 +2151,15 @@ impl AddressHistory {
             let mut buf = Vec::new();
             encode_record(record, &mut buf)?;
             wtx.open_table(RELAY_CACHE)?.insert(block, buf.as_slice())?;
+            let mut wrote = false;
             for (address, rows) in changes {
                 let a = parse_address(address)?;
                 if let Some(r) = rows.iter().find(|r| r.block != block) {
                     bail!("a row at block {} is not at block {block}", r.block);
+                }
+                // Unwatch does not move the generation, so an address unwatched mid-ask is caught here.
+                if wtx.open_table(WATCHED)?.get(a.as_slice())?.is_none() {
+                    continue;
                 }
                 drain(
                     &mut wtx.open_table(Action::ProducedBlocks.table())?,
@@ -2162,8 +2167,9 @@ impl AddressHistory {
                     &row_key(&a, block, u64::MAX, u64::MAX),
                 )?;
                 put_rows(&wtx, Action::ProducedBlocks, &a, rows)?;
+                wrote = true;
             }
-            if !changes.is_empty() {
+            if wrote {
                 bump_generation(&wtx)?;
             }
             let mut p = wtx.open_table(MEV_PENDING)?;
@@ -4606,6 +4612,27 @@ mod tests {
         );
         assert!(h.mev_pending().unwrap().is_empty());
         assert!(h.generation().unwrap() > g);
+    }
+
+    /// A re-ask that finishes after the account was unwatched writes none of its rows back (#2367).
+    #[test]
+    fn a_reask_finishing_after_an_unwatch_writes_no_rows() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        h.record_produced(ALICE, &[tx(100, 0)], (100, 100), g, &[100], 1)
+            .unwrap();
+        let g = h.generation().unwrap();
+        h.unwatch(ALICE).unwrap();
+        let changes = vec![(ALICE.to_string(), vec![tx(100, 1)])];
+        h.apply_reask(100, &Map::new(), &changes, false, 2, g)
+            .unwrap();
+        assert!(h
+            .rows_in(Action::ProducedBlocks, ALICE, (0, 1_000))
+            .unwrap()
+            .is_empty());
+        assert!(h.relay_record(100).unwrap().is_some());
+        assert!(h.mev_pending().unwrap().is_empty());
+        assert_eq!(h.generation().unwrap(), g);
     }
 
     /// A txhash lookup is paged as Etherscan pages it, reverted frames included: 1,500 rows at an
