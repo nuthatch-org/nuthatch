@@ -135,6 +135,9 @@ pub struct ModeState {
     held: Mutex<Option<HeldBridge>>,
     /// The nest directory and its config's facts, for `GET /diff`; only a solo nest has them.
     pub diff: Option<(std::path::PathBuf, crate::diff::Facts)>,
+    /// `GET /diff`'s admission, as the event nest's: each diff holds a permit, and a busy nest refuses.
+    diff_gate: Arc<tokio::sync::Semaphore>,
+    diff_queued: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// One tip block from the body scan, and the watched proposers' rows for the blocks before it.
@@ -368,6 +371,8 @@ impl ModeState {
             holding: Mutex::new(None),
             held: Mutex::new(None),
             diff: None,
+            diff_gate: crate::serve::new_sql_gate(),
+            diff_queued: Arc::default(),
         }
     }
 
@@ -3108,13 +3113,21 @@ async fn diff_route(
         Ok(a) => a,
         Err(e) => return failed(StatusCode::BAD_REQUEST, e).into_response(),
     };
+    let permit = match crate::serve::admit_to(&s.diff_gate, &s.diff_queued).await {
+        Ok(p) => p,
+        Err(busy) => return busy,
+    };
+    let budget = crate::serve::SQL_TIMEOUT;
+    let deadline = Instant::now() + budget;
     // The rows are streamed from one read transaction, so the whole diff runs off the runtime.
     let history = s.history.clone();
     let rt = tokio::runtime::Handle::current();
     let produced = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let snapshot = history
             .diff_snapshot((ask.req.from, ask.req.to))
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .until(deadline, budget);
         rt.block_on(crate::diff_history::produce(&dir, facts, &snapshot, &ask))
             .and_then(|p| p.render(format, ask.top))
             .map_err(|e| (StatusCode::BAD_REQUEST, e))
@@ -3122,6 +3135,16 @@ async fn diff_route(
     .await;
     let body = match produced {
         Ok(Ok(b)) => b,
+        Ok(Err((_, e)))
+            if e.downcast_ref::<crate::analytics::QueryBudgetExceeded>()
+                .is_some() =>
+        {
+            return failed(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("the diff exceeded its {}s budget: {e:#}", budget.as_secs()),
+            )
+            .into_response()
+        }
         Ok(Err((status, e))) => return failed(status, format!("{e:#}")).into_response(),
         Err(e) => return failed(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
@@ -5804,6 +5827,21 @@ mod tests {
         let v = serde_json::from_slice(&bytes)
             .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into()));
         (status, v)
+    }
+
+    /// #2358: `/diff` is admitted as the event nest's is, so with every permit held another diff is
+    /// refused busy rather than run beside them.
+    #[tokio::test]
+    async fn a_diff_with_every_permit_held_is_refused_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let mut s = ModeState::new(history, 1, Duration::from_secs(300), true)
+            .with_diff(dir.path(), crate::diff::Facts::default());
+        s.diff_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (status, body) = call(router(Arc::new(s)), "GET", "/diff?block=1", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("busy"), "{body}");
     }
 
     fn chain_state(dir: &Path, chain_id: u64) -> Arc<ModeState> {

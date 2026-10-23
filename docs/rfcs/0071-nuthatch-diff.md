@@ -899,6 +899,9 @@ two million GRT transfers).
 - **`--url --tx` sends `block`.** The route takes a transaction with its block; the CLI sent `from`
   and `to`, which the route refused for every nest. Fixed for both kinds.
 - **A directory of chains serves no `/diff`.** One diff, one cursor: run the chain's nest on its own.
+- **The route is admitted like the event nest's** (#2358): a diff holds one of the nest's analytical
+  permits, is refused `503 busy` when none frees within the wait, and stops at the 30 s budget
+  with a 504.
 
 ### Mutation checks
 
