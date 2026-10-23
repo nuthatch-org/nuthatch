@@ -35,6 +35,10 @@ const PAGE: u64 = 50_000;
 /// show by default. JSON always carries all of them.
 pub const DEFAULT_TOP: usize = 25;
 
+/// The most items per list a diff will give. `top` sizes what each fold holds, so above it the
+/// request is refused, never clamped.
+pub const TOP_CAP: usize = 1_000;
+
 pub const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 /// Printed at the end of every flow, because a short flow must never read as "nothing else moved".
@@ -441,12 +445,20 @@ pub struct Ask {
 }
 
 impl Ask {
-    /// `--top` when given, else the mode's own default.
-    pub fn top_or_default(mode: Mode, top: Option<usize>) -> usize {
-        top.unwrap_or(match mode {
-            Mode::Flow => DEFAULT_TOP,
-            Mode::Story => crate::range_story::DEFAULT_TOP,
-        })
+    /// `--top` when given, else the mode's own default; above [`TOP_CAP`] it is refused.
+    pub fn top_or_default(mode: Mode, top: Option<usize>) -> Result<usize> {
+        match top {
+            Some(n) if n > TOP_CAP => bail!(
+                "top {} is above {}, the most items per list a diff gives; ask for fewer",
+                group(n),
+                group(TOP_CAP)
+            ),
+            Some(n) => Ok(n),
+            None => Ok(match mode {
+                Mode::Flow => DEFAULT_TOP,
+                Mode::Story => crate::range_story::DEFAULT_TOP,
+            }),
+        }
     }
 }
 
@@ -939,7 +951,7 @@ impl Flow {
         if let Some((k, by)) = &mut self.largest {
             let v = by.entry(m.token.clone()).or_default();
             v.push(m.clone());
-            if v.len() >= 2 * *k + 16 {
+            if v.len() >= k.saturating_mul(2).saturating_add(16) {
                 v.sort_by(by_size);
                 v.truncate(*k);
             }
@@ -2057,6 +2069,28 @@ mod tests {
             amount: U256::from(amount),
             reads,
         }
+    }
+
+    /// `top` sizes what each fold holds, so a request above the cap is refused on every surface.
+    #[test]
+    fn a_top_above_the_cap_is_refused() {
+        for mode in [Mode::Flow, Mode::Story] {
+            assert_eq!(Ask::top_or_default(mode, Some(TOP_CAP)).unwrap(), TOP_CAP);
+            let e = Ask::top_or_default(mode, Some(TOP_CAP + 1))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("top 1,001 is above 1,000"), "{e}");
+            assert!(Ask::top_or_default(mode, Some(usize::MAX)).is_err());
+        }
+    }
+
+    #[test]
+    fn the_largest_k_trim_cannot_overflow() {
+        let mut flow = Flow::keeping_largest(usize::MAX);
+        for i in 0..3u64 {
+            flow.fold(m(i, Reads::Transfer, A, B, i));
+        }
+        assert_eq!(flow.largest(WETH).len(), 3);
     }
 
     /// A diff's memory follows its distinct edges, so past [`EDGE_CAP`] of them it is refused, not

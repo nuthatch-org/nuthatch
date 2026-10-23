@@ -4978,7 +4978,7 @@ impl DiffQuery {
             Ask {
                 req: Request { from, to, tx },
                 mode,
-                top: Ask::top_or_default(mode, self.top),
+                top: Ask::top_or_default(mode, self.top).map_err(|e| e.to_string())?,
                 final_only: self.final_only,
             },
             format,
