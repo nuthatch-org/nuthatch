@@ -283,6 +283,12 @@ unconfigured.
 > [0069](docs/rfcs/0069-the-engine-room.md) (the engine room, a watch subcommand behind a `watch`
 > feature on by default, which lifts his 2026-10-03 preference for the cockpit over a TUI for this
 > one). Each slice keeps its own gate; an S0 that fails stops its RFC.
+>
+> **Where they stand (2026-10-23).** 0071 shipped in 5.9.0. 0068's postcards are live in `/play`.
+> 0069 is built in full, S1 to S5 (#2343 to #2347): `nuthatch watch` is in the default binary.
+> **0070 and 0072 are parked by Chief (2026-10-22, "scratch off weather and time lapse")**: time-lapse
+> stopped after S2, live at `/play/timelapse/` with no binary producer; chain weather stopped after
+> S0, with nothing in the binary. Do not resume either unasked.
 
 >
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.
