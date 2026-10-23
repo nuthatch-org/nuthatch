@@ -63,9 +63,12 @@ pub(crate) fn collect_files(root: &Path, skip: Option<&Path>) -> Result<Vec<Path
             if EXCLUDE.iter().any(|x| *x == name) {
                 continue;
             }
-            // RFC-0062's copies are derived state written beside `segments/`. Only that directory, at
-            // the root, so a deeper authored one keeps its place in the identity.
-            if dir == root && name == crate::maintained::COPIES_DIR && entry.file_type()?.is_dir() {
+            // RFC-0062's copies and quarantined segments sit beside `segments/`. Only those, at the root,
+            // so a deeper authored directory of either name keeps its place in the identity.
+            if dir == root
+                && (name == crate::maintained::COPIES_DIR || name == crate::seal::QUARANTINE_DIR)
+                && entry.file_type()?.is_dir()
+            {
                 continue;
             }
             if let Some(skip) = skip {
@@ -1109,6 +1112,30 @@ abi = "abis/c.json"
             DERIVED_STATE.contains(&DB_FILE) && DERIVED_STATE.contains(&"segments"),
             "adoption must carry both halves of a dataset - hot store and sealed segments"
         );
+    }
+
+    /// The committed fixture nests keep the NID and data identity they had before the 2026-10-23
+    /// identity fixes (#2355, #2362, #2363, #2368, #2369). A change that moves one re-indexes every
+    /// operator holding that nest.
+    #[test]
+    fn the_fixture_nests_keep_their_identities() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut moved = Vec::new();
+        for (nest, nid, data) in [
+            ("scaffold/pair", "9286e466fb1e8c5007ac26c04931947effcba6a462fb4c6cd36f8059843ece49", "b28a5043b11263e8adb9e24f5c02535b2c34d7e561e010348db3907941199c57"),
+            ("scaffold/two", "1d2fa19f2ef741dadb0b650f4389ac54f0592897f3b251c675ffb94500730b4a", "1f7906dd2421d89b7b03fa2a6e9f3e6c7a964200e4dced7b4fc9f40c0c9dfe49"),
+            ("diff/control", "409f7c7db35d5dab9db410e849be7420e7ab69460c06d3114024df2d7fe1c164", "8a12eac0c6604e0df102425c78ce588b7ac1b58434208e561166b9cc4e19ceff"),
+            ("diff/euler", "acca6893a2ed1511c04d2253504997e5da27002ffd1b97a31744e964e592913d", "e6162f0e1ee5162c714412d942cc107de22a51fb84055a0b369b899834b11a0e"),
+            ("diff/history", "2cc9884d9e3422ad8b311e737046318fe220099ab2be184700aa4b9541911fbf", "2f76fe63740f1b7b618bf0aca425d86629ad59acae19da85e0124f2d821a3e7c"),
+            ("upgrade/config-4.0/nest", "9fac46172d71472f25f6f8f93d1dc27c995195cff238854a43854210704b33fc", "b52c44602be972b99191267aac8601223b4c4f76a94b044f9ef50759cf3e9274"),
+            ("upgrade/v3.13.2/runtime/data/2bca092694c5833d2fecec20983b307f23c3a5507402c39bab4d3fab91231576", "2bca092694c5833d2fecec20983b307f23c3a5507402c39bab4d3fab91231576", "7b00631d0d80332b9539164e78941bf368dba7917919549721386432dc788c21"),
+        ] {
+            let m = build_manifest(&root.join(nest), None).unwrap();
+            if (m.nid().as_str(), m.data_identity().as_str()) != (nid, data) {
+                moved.push(format!("{nest}: {} {}", m.nid(), m.data_identity()));
+            }
+        }
+        assert!(moved.is_empty(), "identities moved:\n{}", moved.join("\n"));
     }
 
     #[test]

@@ -1306,6 +1306,10 @@ fn segments_to_verify(dir: &Path, tables: &BTreeSet<String>) -> Vec<(String, Seg
         .collect()
 }
 
+/// Where [`verify_and_quarantine`] moves a bad segment, at the dataset root. Outside the identity: a
+/// corrupt file changes what a nest holds, never what it is.
+pub const QUARANTINE_DIR: &str = "quarantine";
+
 /// Startup integrity pass: verify every manifest segment's file exists and its bytes hash to the
 /// recorded content address. A file that's missing, unreadable, or hash-mismatched is corrupt or
 /// tampered with - quarantine it (move to a sibling `quarantine/` dir so `define_views` skips it) and
@@ -1315,7 +1319,7 @@ fn segments_to_verify(dir: &Path, tables: &BTreeSet<String>) -> Vec<(String, Seg
 pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     let mut manifest = load_manifest(dir)?;
     // Sibling of `segments/`, deliberately *outside* it - nothing globs or SQL-reads the quarantine.
-    let quarantine = dir.join("quarantine");
+    let quarantine = dir.join(QUARANTINE_DIR);
     let mut quarantined = 0usize;
     // A bad provisional tail stays catalogued, so its loss stays visible, but is never folded or aged
     // again: both read its file, and the failed read stopped every later seal (#2172).
@@ -2484,6 +2488,27 @@ mod tests {
         );
         // Idempotent: the already-quarantined (now-missing) segment isn't re-counted.
         assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
+    }
+
+    /// #2363: a quarantined segment changes what a nest holds, never what it is. Every identity is a
+    /// function of `collect_files`, so the inputs it sees must be the same either side of the move.
+    #[test]
+    fn a_quarantined_segment_is_outside_the_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        std::fs::write(dir.path().join("nuthatch.toml"), "[nest]\n").unwrap();
+        let before = crate::blob::collect_files(dir.path(), None).unwrap();
+
+        let seg = &load_manifest(dir.path()).unwrap().tables["usdc__transfer"][0];
+        std::fs::write(dir.path().join(SEGMENTS_DIR).join(&seg.file), b"rot").unwrap();
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 1);
+        assert!(dir.path().join(QUARANTINE_DIR).join(&seg.file).exists());
+
+        assert_eq!(
+            crate::blob::collect_files(dir.path(), None).unwrap(),
+            before
+        );
     }
 
     #[test]
