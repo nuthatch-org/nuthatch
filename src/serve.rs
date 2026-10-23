@@ -471,7 +471,8 @@ pub fn router(backing: SharedNest) -> Router {
     // the backing keeps it.
     .layer(axum::middleware::from_fn({
         let ring = std::sync::Arc::new(crate::requests::RequestRing::default());
-        move |req, next| count_request(ring.clone(), req, next)
+        let backing = backing.clone();
+        move |req, next| count_request(ring.clone(), backing.clone(), req, next)
     }))
     .with_state(backing)
 }
@@ -1279,6 +1280,7 @@ async fn shutdown_signal() {
 /// Middleware: bump the request counter, then pass through, keeping the request's shape in `ring`.
 async fn count_request(
     ring: std::sync::Arc<crate::requests::RequestRing>,
+    backing: SharedNest,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -1308,10 +1310,22 @@ async fn count_request(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     let status = resp.status().as_u16();
-    // A name the nest does not know is whatever the caller typed.
-    let name = name.filter(|_| status != 404);
+    // A name the nest does not declare is whatever the caller typed, whatever the status (#2364).
+    let name = name.filter(|n| declares(&backing.current(), &route, n));
     ring.push(unix_ms, route, name, status, ms, bytes);
     resp
+}
+
+/// Whether `name`, captured by `route`, is a table, named query or entity this nest declares.
+fn declares(s: &AppState, route: &str, name: &str) -> bool {
+    match route {
+        "/table/{name}" => s.tables.iter().any(|t| t.table == name),
+        "/q/{name}" => s.surface.get(name).is_some(),
+        "/derived/{entity}" | "/derived/{entity}/{key}" => {
+            s.entities.iter().any(|e| e.name() == name)
+        }
+        _ => false,
+    }
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -6075,12 +6089,23 @@ mod tests {
     #[tokio::test]
     async fn a_prefixed_request_keeps_its_route_and_name() {
         use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.surface = Arc::new(crate::allowlist::Surface {
+            queries: vec![crate::allowlist::NamedQuery {
+                name: "top".into(),
+                sql: "SELECT 1".into(),
+                params: Default::default(),
+            }],
+            ..Default::default()
+        });
         let ring = std::sync::Arc::new(crate::requests::RequestRing::default());
         let inner = Router::new()
             .route("/q/{name}", axum::routing::get(|| async { "ok" }))
             .layer(axum::middleware::from_fn({
                 let ring = ring.clone();
-                move |req, next| count_request(ring.clone(), req, next)
+                let backing = SharedNest::new(state);
+                move |req, next| count_request(ring.clone(), backing.clone(), req, next)
             }));
         let app = Router::new().nest("/pulse", inner);
         let req = axum::http::Request::get("/pulse/q/top")
@@ -6091,6 +6116,48 @@ mod tests {
         assert_eq!(served.len(), 1);
         assert_eq!(&*served[0].route, "/q/{name}");
         assert_eq!(served[0].name.as_deref(), Some("top"));
+    }
+
+    /// #2364: an extractor refuses `?limit=x` with a 400 before the handler looks the name up, so the
+    /// ring keeps a name only when the nest declares it, not on the status.
+    #[tokio::test]
+    async fn the_ring_drops_an_undeclared_name_whatever_the_status() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.tables = Arc::new(vec![crate::registry::TableSchema {
+            table: "t".into(),
+            alias: "t".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "T".into(),
+            topic0: "0x".into(),
+            columns: crate::registry::implicit_columns(false),
+        }]);
+        let app = router(SharedNest::new(state));
+        for path in ["/table/alice%20my%20secret?limit=x", "/table/t?limit=x"] {
+            let req = axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(app.clone().oneshot(req).await.unwrap().status(), 400);
+        }
+        let req = axum::http::Request::get("/_admin/requests")
+            .header(axum::http::header::HOST, "127.0.0.1:8288")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<_> = v["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].clone())
+            .collect();
+        assert_eq!(names, [serde_json::Value::Null, json!("t")]);
     }
 
     #[cfg(feature = "graph")]
