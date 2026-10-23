@@ -63,9 +63,12 @@ pub(crate) fn collect_files(root: &Path, skip: Option<&Path>) -> Result<Vec<Path
             if EXCLUDE.iter().any(|x| *x == name) {
                 continue;
             }
-            // RFC-0062's copies are derived state written beside `segments/`. Only that directory, at
-            // the root, so a deeper authored one keeps its place in the identity.
-            if dir == root && name == crate::maintained::COPIES_DIR && entry.file_type()?.is_dir() {
+            // RFC-0062's copies and quarantined segments sit beside `segments/`. Only those, at the root,
+            // so a deeper authored directory of either name keeps its place in the identity.
+            if dir == root
+                && (name == crate::maintained::COPIES_DIR || name == crate::seal::QUARANTINE_DIR)
+                && entry.file_type()?.is_dir()
+            {
                 continue;
             }
             if let Some(skip) = skip {
