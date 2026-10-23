@@ -175,13 +175,18 @@ async fn download(url: &str) -> Result<String> {
         .context("reading list response body")
 }
 
+/// A set already recorded for this list keeps its first record, so `fetched_at` is when it was first
+/// seen: the index is a nest input, and rewriting it for the same set would move the nest's identity
+/// (#2368).
 fn record_fetch(dir: &Path, list: &str, hash: &str, count: usize, source: &str) -> Result<()> {
     let index_path = dir.join(INDEX_FILE);
     let mut records: Vec<FetchRecord> = std::fs::read_to_string(&index_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    records.retain(|r| !(r.list == list && r.snapshot == hash));
+    if records.iter().any(|r| r.list == list && r.snapshot == hash) {
+        return Ok(());
+    }
     records.push(FetchRecord {
         list: list.to_string(),
         snapshot: hash.to_string(),
@@ -255,5 +260,18 @@ mod tests {
             vec!["0x1111111111111111111111111111111111111111".to_string()]
         );
         assert_eq!(snapshots(dir.path()).len(), 1);
+    }
+
+    /// #2368: fetching the same set again leaves the index, a nest input, as it was.
+    #[tokio::test]
+    async fn refetching_the_same_set_leaves_the_index_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        std::fs::write(&a, "0x1111111111111111111111111111111111111111\n").unwrap();
+        std::fs::write(&b, "0x1111111111111111111111111111111111111111\n").unwrap();
+        fetch(dir.path(), "ofac-sdn", None, Some(&a)).await.unwrap();
+        let index = std::fs::read(dir.path().join(INDEX_FILE)).unwrap();
+        fetch(dir.path(), "ofac-sdn", None, Some(&b)).await.unwrap();
+        assert_eq!(std::fs::read(dir.path().join(INDEX_FILE)).unwrap(), index);
     }
 }

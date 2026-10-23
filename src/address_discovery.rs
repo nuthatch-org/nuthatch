@@ -513,6 +513,22 @@ fn str_field<'a>(v: &'a Value, k: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("missing `{k}` in {v}"))
 }
 
+/// Block `b`'s hash, refused unless it names `previous`, the body before it, as its parent: a pool's
+/// endpoints can be on different forks, and a body from another fork would otherwise pass as this
+/// chain's. `previous` moves on to this body.
+fn linked(previous: &mut Option<[u8; 32]>, b: u64, header: &Value) -> Result<[u8; 32]> {
+    let hash = word32(str_field(header, "hash")?)?;
+    let parent = word32(str_field(header, "parentHash")?)?;
+    if previous.is_some_and(|p| p != parent) {
+        bail!(
+            "block {b} does not name block {} as its parent; the bodies are from two chains",
+            b - 1
+        );
+    }
+    *previous = Some(hash);
+    Ok(hash)
+}
+
 fn topic_address(word: &str) -> Result<String> {
     let hex = word.trim_start_matches("0x");
     // Only the shape is checked: the counterparty topic comes from whatever contract emitted the
@@ -877,10 +893,14 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         let mut bodies: BTreeMap<u64, Vec<String>> = BTreeMap::new();
         let mut creations: Vec<(String, u64, [u8; 32])> = Vec::new();
         let mut may_transfer = BTreeSet::new();
-        for block in blocks {
+        let mut previous = None;
+        for (b, block) in (from..=to).zip(blocks) {
             let block = block?;
             let number = hex_u64(block.get("number").unwrap_or(&Value::Null))?;
-            let hash = word32(str_field(&block, "hash")?)?;
+            if number != b {
+                bail!("asked for block {b}, the main endpoint answered block {number}");
+            }
+            let hash = linked(&mut previous, number, &block)?;
             hashes.insert(number, hash);
             let bloom = block
                 .get("logsBloom")
@@ -927,6 +947,10 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                     });
                 }
             }
+        }
+        // Held against the anchor and the main endpoint by the caller's check, as a scan's is.
+        if let Some(&last) = hashes.get(&to) {
+            pending.named.lock().expect("pending lock").push((to, last));
         }
         // A creation names its contract only in its receipt; Etherscan lists it for that contract.
         let created: Vec<Result<Option<(String, TxRef)>>> = futures::stream::iter(creations)
@@ -985,7 +1009,11 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         // A provider can answer `[]` for blocks it has not indexed: a block whose bloom may hold a
         // transfer and that no log names is read from its receipts, as #2118 probes empty traces.
         for log in &logs {
-            may_transfer.remove(&hex_u64(log.get("blockNumber").unwrap_or(&Value::Null))?);
+            let b = hex_u64(log.get("blockNumber").unwrap_or(&Value::Null))?;
+            if hashes.get(&b) != Some(&word32(str_field(log, "blockHash")?)?) {
+                bail!("a transfer log names another block {b} than the swept body's: {log}");
+            }
+            may_transfer.remove(&b);
         }
         for b in may_transfer {
             if bodies[&b].is_empty() {
@@ -1325,23 +1353,14 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         let mut timestamps = Vec::new();
         let mut summaries = Vec::new();
         let mut kept = Vec::new();
-        // The bodies must be one chain, each naming the one before as its parent, and the last one's
-        // hash is named for the caller to hold against the main endpoint: a pool's endpoints can be
-        // on different forks, and a body from another fork would otherwise pass as this chain's.
-        let mut previous: Option<String> = None;
+        // The bodies must be one chain, and the last one's hash is named for the caller to hold
+        // against the main endpoint.
+        let mut previous = None;
         let mut last: Option<(u64, [u8; 32])> = None;
         for body in bodies {
             let (b, header) = body?;
-            let hash = str_field(&header, "hash")?.to_ascii_lowercase();
-            let parent = str_field(&header, "parentHash")?.to_ascii_lowercase();
-            if let Some(p) = &previous {
-                if *p != parent {
-                    bail!("block {b} does not name block {} as its parent; the bodies are from two chains", b - 1);
-                }
-            }
-            let hash_bytes = word32(&hash)?;
+            let hash_bytes = linked(&mut previous, b, &header)?;
             last = Some((b, hash_bytes));
-            previous = Some(hash);
             let ts = hex_u64(header.get("timestamp").unwrap_or(&Value::Null))
                 .with_context(|| format!("block {b} timestamp"))?;
             timestamps.push((b, ts, Some(hash_bytes)));
@@ -2114,6 +2133,8 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         let tx_block_hash = str_field(&tx, "blockHash")?;
         if tx_block != r.block
             || !str_field(&receipt, "blockHash")?.eq_ignore_ascii_case(tx_block_hash)
+            || r.block_hash
+                .is_some_and(|want| word32(tx_block_hash).ok() != Some(want))
         {
             bail!(
                 "{hash}: the trace source puts it in block {}, the main endpoint in {tx_block}, and \
@@ -3751,8 +3772,10 @@ mod tests {
             let bh = bh.clone();
             script(move |m, _| {
                 Ok(match m {
-                    "eth_getBlockByNumber" => json!({"number": format!("0x{n:x}"), "hash": bh,
-                        "timestamp": "0x64", "transactions": []}),
+                    "eth_getBlockByNumber" => {
+                        json!({"number": format!("0x{n:x}"), "hash": bh, "parentHash": bh,
+                        "timestamp": "0x64", "transactions": []})
+                    }
                     "eth_getLogs" => json!([]),
                     other => bail!("unexpected {other}"),
                 })
@@ -3829,6 +3852,73 @@ mod tests {
 
     /// One pass over a block finds every watched address's transactions and transfers, both
     /// directions, and nothing for anyone outside the set (RFC-0064 S1).
+    /// A sweep window is one chain: each body names the one before as its parent, and every log and
+    /// transaction it records is at its body's hash. A pool on two forks fails it (#2360).
+    #[tokio::test]
+    async fn a_sweep_window_mixing_two_forks_is_refused() {
+        const OUT: &str = "0x00000000000000000000000000000000000000ee";
+        let n = 17_000_000u64;
+        let hash = |b: u64| format!("0x{:064x}", b);
+        let other = format!("0x{:0>64}", "77");
+        for broken in ["none", "parent", "log", "tx"] {
+            let dir = tempfile::tempdir().unwrap();
+            let h = history(dir.path());
+            let at = |what: &str, b: u64| {
+                if broken == what {
+                    other.clone()
+                } else {
+                    hash(b)
+                }
+            };
+            let tx = json!({"blockNumber": format!("0x{n:x}"), "blockHash": at("tx", n),
+                "hash": format!("0x{:0>64}", "1"), "nonce": "0x0", "transactionIndex": "0x0",
+                "from": OUT, "to": A, "value": "0x1", "gas": "0x5208", "gasPrice": "0x1",
+                "input": "0x"});
+            let log = json!({"address": "0x00000000000000000000000000000000000000c0",
+                "topics": [TRANSFER, padded(OUT), padded(A)],
+                "data": format!("0x{:0>64}", "64"), "blockNumber": format!("0x{:x}", n + 1),
+                "transactionHash": format!("0x{:0>64}", "5"), "transactionIndex": "0x0",
+                "logIndex": "0x0", "blockHash": at("log", n + 1), "removed": false});
+            let (parent, receipt_hash) = (at("parent", n), at("tx", n));
+            let main = script(move |m, p| {
+                Ok(match m {
+                    "eth_getBlockByNumber" => {
+                        let b = hex_u64(&p[0]).unwrap();
+                        let (parent, txs) = if b == n {
+                            (hash(n - 1), json!([tx.clone()]))
+                        } else {
+                            (parent.clone(), json!([]))
+                        };
+                        json!({"number": format!("0x{b:x}"), "hash": hash(b), "parentHash": parent,
+                            "timestamp": "0x64", "transactions": txs, "logsBloom": format!("0x{}", "00".repeat(256))})
+                    }
+                    "eth_getLogs" => json!([log]),
+                    "eth_getTransactionByHash" => tx.clone(),
+                    "eth_getTransactionReceipt" => json!({"status": "0x1", "gasUsed": "0x5208",
+                        "cumulativeGasUsed": "0x5208", "effectiveGasPrice": "0x1",
+                        "contractAddress": null, "blockHash": receipt_hash}),
+                    other => bail!("unexpected {other}"),
+                })
+            });
+            let d = Discoverer::new(main, script(|m, _| bail!("no trace call expected: {m}")));
+            let set: std::collections::HashSet<String> = [A].map(String::from).into();
+            let pending = Pending::begin(&h).unwrap();
+            let swept = d.sweep(&h, &set, n, n + 1, &pending, false).await;
+            if broken != "none" {
+                assert!(swept.is_err(), "{broken}: a window on two forks is refused");
+                continue;
+            }
+            let found = swept.unwrap();
+            assert_eq!(found[A].txlist.len(), 1);
+            assert_eq!(found[A].tokentx.len(), 1);
+            assert_eq!(
+                pending.named(),
+                [(n + 1, word32(&hash(n + 1)).unwrap())],
+                "the last body is named for the anchor check"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_sweep_matches_a_block_against_the_whole_set() {
         let dir = tempfile::tempdir().unwrap();
@@ -3859,8 +3949,10 @@ mod tests {
         let (block_txs, by_hash, bh2) = (txs.clone(), txs, bh.clone());
         let main = script(move |m, p| {
             Ok(match m {
-                "eth_getBlockByNumber" => json!({"number": format!("0x{n:x}"), "hash": bh2,
-                    "timestamp": "0x64", "transactions": block_txs}),
+                "eth_getBlockByNumber" => {
+                    json!({"number": format!("0x{n:x}"), "hash": bh2, "parentHash": bh2,
+                    "timestamp": "0x64", "transactions": block_txs})
+                }
                 "eth_getLogs" => json!(logs),
                 "eth_getTransactionByHash" => {
                     by_hash.iter().find(|t| t["hash"] == p[0]).cloned().unwrap()
@@ -3904,8 +3996,10 @@ mod tests {
         let n = 17_000_000u64;
         let bh = format!("0x{:0>64}", "b1");
         script(move |m, p| match m {
-            "eth_getBlockByNumber" => Ok(json!({"number": format!("0x{n:x}"), "hash": bh,
-                "timestamp": "0x64", "transactions": txs, "logsBloom": format!("0x{}", "00".repeat(256))})),
+            "eth_getBlockByNumber" => Ok(
+                json!({"number": format!("0x{n:x}"), "hash": bh, "parentHash": bh,
+                "timestamp": "0x64", "transactions": txs, "logsBloom": format!("0x{}", "00".repeat(256))}),
+            ),
             _ => rest(m, p),
         })
     }
@@ -4005,7 +4099,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let h = history(dir.path());
             let (bh, h1) = (bh.clone(), h1.clone());
-            let mut block = json!({"number": format!("0x{n:x}"), "hash": bh, "timestamp": "0x64",
+            let mut block = json!({"number": format!("0x{n:x}"), "hash": bh, "parentHash": bh, "timestamp": "0x64",
                 "transactions": [sweep_tx(&h1, OUT, Some(OUT))]});
             if let Some(b) = &bloom {
                 block["logsBloom"] = json!(b);
@@ -4043,7 +4137,7 @@ mod tests {
             Ok(match m {
                 "eth_getBlockByNumber" => {
                     let b = hex_u64(&p[0])?;
-                    json!({"number": format!("0x{b:x}"), "hash": bh(b), "timestamp": "0x64",
+                    json!({"number": format!("0x{b:x}"), "hash": bh(b), "parentHash": bh(b - 1), "timestamp": "0x64",
                            "transactions": []})
                 }
                 "eth_getLogs" => {

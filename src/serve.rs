@@ -161,7 +161,7 @@ pub fn sql_max_concurrency() -> usize {
 /// Ten times that under test: the tests through the router are built unoptimised, where the engine
 /// plans the network nest's thirty-view queries in tens of seconds and not the release build's one.
 /// They test answers, not latency, as `tests/network_contract.rs` says of its own allowance.
-const SQL_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 300 } else { 30 });
+pub(crate) const SQL_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 300 } else { 30 });
 /// How long a request waits for an analytical permit before it is told the node is busy (#1319).
 ///
 /// The permit count still caps what *runs*; this only caps how long a caller waits to be told no.
@@ -471,7 +471,8 @@ pub fn router(backing: SharedNest) -> Router {
     // the backing keeps it.
     .layer(axum::middleware::from_fn({
         let ring = std::sync::Arc::new(crate::requests::RequestRing::default());
-        move |req, next| count_request(ring.clone(), req, next)
+        let backing = backing.clone();
+        move |req, next| count_request(ring.clone(), backing.clone(), req, next)
     }))
     .with_state(backing)
 }
@@ -1279,6 +1280,7 @@ async fn shutdown_signal() {
 /// Middleware: bump the request counter, then pass through, keeping the request's shape in `ring`.
 async fn count_request(
     ring: std::sync::Arc<crate::requests::RequestRing>,
+    backing: SharedNest,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -1308,10 +1310,22 @@ async fn count_request(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     let status = resp.status().as_u16();
-    // A name the nest does not know is whatever the caller typed.
-    let name = name.filter(|_| status != 404);
+    // A name the nest does not declare is whatever the caller typed, whatever the status (#2364).
+    let name = name.filter(|n| declares(&backing.current(), &route, n));
     ring.push(unix_ms, route, name, status, ms, bytes);
     resp
+}
+
+/// Whether `name`, captured by `route`, is a table, named query or entity this nest declares.
+fn declares(s: &AppState, route: &str, name: &str) -> bool {
+    match route {
+        "/table/{name}" => s.tables.iter().any(|t| t.table == name),
+        "/q/{name}" => s.surface.get(name).is_some(),
+        "/derived/{entity}" | "/derived/{entity}/{key}" => {
+            s.entities.iter().any(|e| e.name() == name)
+        }
+        _ => false,
+    }
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -2663,6 +2677,16 @@ async fn graph_graphql(
     State(s): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // The caller's filters and ordering compile to SQL, so a bounded mount refuses it as `/sql` (#2366).
+    if !s.surface.free_form_allowed() {
+        crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Bounded);
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"errors":[{"message":
+                "this mount does not answer GraphQL: its SQL surface is bounded \
+                 (sql = \"deny\" or \"allowlist\"); GET /queries lists what it answers"}]})),
+        );
+    }
     let query = body
         .get("query")
         .and_then(|q| q.as_str())
@@ -3610,7 +3634,7 @@ async fn admit(
 }
 
 /// [`admit`] to any gate, parking in the nest's one queue.
-async fn admit_to(
+pub(crate) async fn admit_to(
     gate: &Arc<Semaphore>,
     queued: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, axum::response::Response> {
@@ -4978,7 +5002,7 @@ impl DiffQuery {
             Ask {
                 req: Request { from, to, tx },
                 mode,
-                top: Ask::top_or_default(mode, self.top),
+                top: Ask::top_or_default(mode, self.top).map_err(|e| e.to_string())?,
                 final_only: self.final_only,
             },
             format,
@@ -5057,11 +5081,11 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
     let deadline = std::time::Instant::now() + SQL_TIMEOUT;
     let st = s.clone();
     let gathered = tokio::task::spawn_blocking(move || {
-        let (hot, tip_unavailable) = match st
+        let (hot, tip_unavailable, hot_head) = match st
             .store
             .hot_rows_by_table_bounded_with_bytes(st.sql_max_hot_rows, st.sql_max_hot_bytes)
         {
-            Ok(snapshot) => (snapshot.rows, false),
+            Ok(snapshot) => (snapshot.rows, false, Some(snapshot.last_block)),
             Err(e)
                 if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
                     || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
@@ -5071,7 +5095,7 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
             }
             Err(e) => {
                 tracing::error!("hot-tip scan failed - refusing this diff: {e:#}");
-                (Default::default(), true)
+                (Default::default(), true, None)
             }
         };
         let sealed_through = st.store.sealed_through();
@@ -5099,6 +5123,11 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
         };
         let mut ctx = crate::diff::NestContext::gather(&st.dir, st.store.as_ref(), facts)?;
         ctx.sealed_through = sealed_through;
+        // Coverage is the snapshot's own head: a block committed after the scan is not in its rows.
+        if let Some(last) = hot_head {
+            let head = last.unwrap_or(0).max(sealed_through);
+            ctx.indexed_head = (head > 0).then_some(head);
+        }
         let stories = crate::diff::stories(&st.dir, &st.tables)?;
         Ok((hot, tip_unavailable, sealed_through, ctx, stories))
     })
@@ -6075,12 +6104,23 @@ mod tests {
     #[tokio::test]
     async fn a_prefixed_request_keeps_its_route_and_name() {
         use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.surface = Arc::new(crate::allowlist::Surface {
+            queries: vec![crate::allowlist::NamedQuery {
+                name: "top".into(),
+                sql: "SELECT 1".into(),
+                params: Default::default(),
+            }],
+            ..Default::default()
+        });
         let ring = std::sync::Arc::new(crate::requests::RequestRing::default());
         let inner = Router::new()
             .route("/q/{name}", axum::routing::get(|| async { "ok" }))
             .layer(axum::middleware::from_fn({
                 let ring = ring.clone();
-                move |req, next| count_request(ring.clone(), req, next)
+                let backing = SharedNest::new(state);
+                move |req, next| count_request(ring.clone(), backing.clone(), req, next)
             }));
         let app = Router::new().nest("/pulse", inner);
         let req = axum::http::Request::get("/pulse/q/top")
@@ -6091,6 +6131,48 @@ mod tests {
         assert_eq!(served.len(), 1);
         assert_eq!(&*served[0].route, "/q/{name}");
         assert_eq!(served[0].name.as_deref(), Some("top"));
+    }
+
+    /// #2364: an extractor refuses `?limit=x` with a 400 before the handler looks the name up, so the
+    /// ring keeps a name only when the nest declares it, not on the status.
+    #[tokio::test]
+    async fn the_ring_drops_an_undeclared_name_whatever_the_status() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.tables = Arc::new(vec![crate::registry::TableSchema {
+            table: "t".into(),
+            alias: "t".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "T".into(),
+            topic0: "0x".into(),
+            columns: crate::registry::implicit_columns(false),
+        }]);
+        let app = router(SharedNest::new(state));
+        for path in ["/table/alice%20my%20secret?limit=x", "/table/t?limit=x"] {
+            let req = axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(app.clone().oneshot(req).await.unwrap().status(), 400);
+        }
+        let req = axum::http::Request::get("/_admin/requests")
+            .header(axum::http::header::HOST, "127.0.0.1:8288")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<_> = v["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].clone())
+            .collect();
+        assert_eq!(names, [serde_json::Value::Null, json!("t")]);
     }
 
     #[cfg(feature = "graph")]
@@ -8918,12 +9000,13 @@ mod tests {
     }
 
     /// #1659: with the SQL gate saturated `/table` cannot read the sealed rows, and its answer must
-    /// A redb store whose byte-exact tip scan fails, as a damaged hot store would (#472). Every
-    /// other call reaches the real store.
-    struct TipFails(Store);
+    /// A redb store whose byte-exact tip scan fails, as a damaged hot store would (#472), or, given a
+    /// block, succeeds and has that block committed right behind it (#2357). Every other call reaches
+    /// the real store.
+    struct OddTip(Store, Option<u64>);
 
     #[async_trait::async_trait]
-    impl crate::store::HotStore for TipFails {
+    impl crate::store::HotStore for OddTip {
         fn write_generation(&self) -> Option<u64> {
             crate::store::HotStore::write_generation(&self.0)
         }
@@ -8975,10 +9058,19 @@ mod tests {
         }
         fn hot_rows_by_table_bounded_with_bytes(
             &self,
-            _max_rows: usize,
-            _max_bytes: u64,
+            max_rows: usize,
+            max_bytes: u64,
         ) -> Result<crate::store::HotRowsSnapshot> {
-            anyhow::bail!("hot store would not scan")
+            let Some(block) = self.1 else {
+                anyhow::bail!("hot store would not scan")
+            };
+            let snapshot = self
+                .0
+                .hot_rows_by_table_bounded_with_bytes(max_rows, max_bytes)?;
+            let row = json!({"table":"t","block_number":block,"log_index":0,"v":"x"}).to_string();
+            self.0
+                .commit_window(&[(Store::entity_key(block, 0), row)], None, block)?;
+            Ok(snapshot)
         }
         fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
             crate::store::HotStore::entities_in_range(&self.0, from, to)
@@ -9118,12 +9210,37 @@ mod tests {
     async fn a_cold_only_sql_answer_says_its_source_is_sealed() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = table_fixture(tmp.path(), 1..=3, 4..=5);
-        state.store =
-            std::sync::Arc::new(TipFails(Store::open(&tmp.path().join("f.redb")).unwrap()));
+        state.store = std::sync::Arc::new(OddTip(
+            Store::open(&tmp.path().join("f.redb")).unwrap(),
+            None,
+        ));
         let (status, body) = get_json(state, "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20t").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["tip_unavailable"], true, "{body}");
         assert_eq!(body["provenance"]["source"], "sealed", "{body}");
+    }
+
+    /// #2357: a block committed between the diff's hot scan and its coverage check is not in the
+    /// rows, so it is refused as uncovered rather than told as an empty story.
+    #[tokio::test]
+    async fn a_block_committed_after_the_diff_scan_is_not_covered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = table_fixture(tmp.path(), 1..=3, 4..=4);
+        let store = Store::open(&tmp.path().join("f.redb")).unwrap();
+        let row = json!({"table":"t","block_number":5,"log_index":0,"v":"x"}).to_string();
+        store
+            .commit_window(&[(Store::entity_key(5, 0), row)], None, 5)
+            .unwrap();
+        state.store = std::sync::Arc::new(OddTip(store, Some(6)));
+        let (status, body) = get_json(state, "/diff?block=6").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("outside what this nest has indexed"),
+            "{body}"
+        );
     }
 
     /// say it is degraded rather than pass the hot rows off as the merged table.
@@ -11830,6 +11947,61 @@ mod tests {
             serde_json::json!({"rolled": ["9007199254740993", "5"], "weights": [1, 2]}),
             "graph-node sends BigInt as a string, inside a list too: {answer}"
         );
+    }
+
+    /// #2366: GraphQL compiles the caller's filters to SQL, so a bounded mount refuses it like `/sql`.
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn a_bounded_mount_refuses_graphql() {
+        use tower::ServiceExt;
+        reset_graph_budget();
+        let _guard = GraphBudgetGuard;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("graph/schema.graphql"),
+            "type Bet @entity { id: ID! weights: [Int!]! }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/bet.sql"),
+            "CREATE VIEW bet AS SELECT '1' AS id, [1, 2] AS weights;",
+        )
+        .unwrap();
+        let ask = |path: &'static str, state: AppState| async move {
+            router(SharedNest::new(state))
+                .oneshot(
+                    axum::http::Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            json!({ "query": "{ bets { weights } }" }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        };
+        let open = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        assert_eq!(ask("/graphql", open.clone()).await, StatusCode::OK);
+        for access in [
+            crate::allowlist::SqlAccess::Deny,
+            crate::allowlist::SqlAccess::Allowlist,
+        ] {
+            let mut bounded = open.clone();
+            bounded.surface = Arc::new(crate::allowlist::Surface {
+                access,
+                queries: vec![],
+            });
+            for path in ["/graphql", "/subgraphs/id/QmAbc", "/subgraphs/name/a/b"] {
+                assert_eq!(
+                    ask(path, bounded.clone()).await,
+                    StatusCode::FORBIDDEN,
+                    "{path} under {access:?}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "graph")]

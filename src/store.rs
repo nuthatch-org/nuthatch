@@ -269,6 +269,8 @@ pub struct HotRowsSnapshot {
     /// Values read, whether or not they parsed into a row.
     pub source_rows: u64,
     pub source_bytes: u64,
+    /// `last_block` as of this same read, so a head taken from it never runs ahead of these rows.
+    pub last_block: Option<u64>,
 }
 
 /// A declared query's hot copy passed the byte budget its cold reservation left (RFC-0048 §3).
@@ -1292,7 +1294,13 @@ impl Store {
     ) -> Result<HotRowsSnapshot> {
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(ENTITIES)?;
-        let mut out = HotRowsSnapshot::default();
+        let mut out = HotRowsSnapshot {
+            last_block: rtx
+                .open_table(META)?
+                .get("last_block")?
+                .and_then(|v| v.value().parse().ok()),
+            ..Default::default()
+        };
         let mut seen = 0usize;
         for row in t.iter()? {
             let (_k, v) = row?;
