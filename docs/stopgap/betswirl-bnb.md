@@ -46,8 +46,10 @@ naming the time budget. Both are being worked on in
 ## Run it yourself
 
 **What you need:**
-- an x86_64 Linux machine or an Apple Silicon Mac. There is no Linux arm64 release, and an x86_64
-  binary under emulation is too slow for `bet` and `bets` to finish inside the 29 s budget;
+- an x86_64 Linux machine, an Apple Silicon Mac, or an arm64 Linux machine on 4.12.0 or later
+  (`nuthatch-graph-aarch64-unknown-linux-gnu.tar.gz`; this package was cold-tested on 4.11.0 only).
+  On 2026-10-06 an x86_64 binary under emulation was too slow for `bet` and `bets` to finish inside
+  the 29 s budget;
 - about 2 GB of RAM;
 - `curl`, `git`, `jq`, `sha256sum` (Linux) or `shasum` (Mac), and optionally `gh` 2.49 or later to verify
   provenance. Distribution packages of `gh` can be older (Ubuntu 24.04 ships 2.45): install it from
@@ -55,7 +57,7 @@ naming the time budget. Both are being worked on in
 - an archive BNB Chain RPC endpoint. The public ones do not serve this much history.
 
 ```sh
-VERSION=v4.11.0                                   # or the latest release
+VERSION=v4.11.0                                   # the version this was tested on; 4.11.0 is the floor
 FILE=nuthatch-graph-x86_64-unknown-linux-gnu.tar.gz   # Apple Silicon: nuthatch-graph-aarch64-apple-darwin.tar.gz
 export BNB_ARCHIVE_RPC=   # required: your archive endpoint
 : "${BNB_ARCHIVE_RPC:?set BNB_ARCHIVE_RPC first}"
@@ -89,7 +91,9 @@ inside the 2 GB budget.
 afterwards. Without the mirror, `dev` alone backfills from the deployment block: about 16 minutes on
 a 32-core machine against a paid endpoint.
 
-**Check your copy against the hosted one**, once yours has caught up:
+**Check your copy** once it has caught up: the nest's `tests/run.sh` compares it with an independent
+reference built from raw chain logs (see Limits). The hosted comparison below is historical: that
+endpoint was retired on 2026-10-07 and the `hosted.json` line no longer answers.
 
 ```sh
 curl -s 127.0.0.1:8288/ready | jq '.ready, .lag_blocks'   # wait for true and 0
@@ -112,12 +116,11 @@ The stopgap ends when an indexer allocates to the deployment again. Watch for it
 
 Then point your client back at the gateway URL it used before
 (`https://gateway.thegraph.com/api/<key>/deployments/id/Qmd5oqyojVx5wWSFuWfKz3YVLPHdE3KU5458Qqq3SVeGEB`),
-send the comparison query to both, and switch once they agree. When the hosted endpoint is retired, a
-dated note goes here.
+send the comparison query to both, and switch once they agree.
 
 ## Limits
 
-One machine on a home connection serves the hosted endpoint: no uptime promise, no proof of
-indexing, no allocation and no dispute path. The answers are checked against an independent
+A nest you run yourself carries no proof of indexing, no allocation and no dispute path. (The hosted
+endpoint, retired 2026-10-07, was one machine on a home connection with no uptime promise.) The answers are checked against an independent
 reference built from raw chain logs (32,257 bets, zero differences, `tests/run.sh` in the nest), not
 against a graph-node running the subgraph, because none serves it.

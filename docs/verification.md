@@ -74,8 +74,9 @@ above says which release it was verified on; this section says what none of them
 **We do not verify that the chain we indexed is the chain consensus agreed on.** Nuthatch follows an
 execution-layer RPC endpoint and hash-links the headers it is served. That proves the blocks it holds
 form an **internally consistent** chain, and it is what makes reorg convergence checkable. It does not
-prove that chain is the network's canonical one, because settling that needs consensus-layer data -
-attestations and finality from the beacon chain - which nuthatch does not read.
+prove that chain is the network's canonical one, because settling that needs attestations and finality
+from the beacon chain, which nuthatch does not verify. An address-history nest with `beacon_url` set
+does read beacon headers, to prove a block's proposer; that is not consensus verification.
 
 In practice the gap is narrow: a single honest endpoint closes it, and disagreement between two
 endpoints surfaces as a reorg the hot store handles. But the failure it leaves open is real. **An
@@ -183,7 +184,9 @@ who ran this page verbatim before 2026-08-14.
 you have hit a proxy whose implementation ABI the public resolvers did not return, or one whose
 earlier implementation emitted different events (USDC warns about its pre-upgrade history). Re-run
 with `--abi path/to/implementation.json`, or add the earlier ABI as a second `[[contracts]]` entry
-bounded to its era. A nest that indexes nothing is the failure this warning exists to prevent.
+at the same address, under a new alias, with an `events` allowlist of the events the current ABI
+lacks. There is no end block, and an event both ABIs define decodes under whichever entry comes
+first. A nest that indexes nothing is the failure this warning exists to prevent.
 
 **1.2 Index and serve**
 
@@ -236,8 +239,11 @@ count means duplicates; a lower one means a gap. Either is a serious finding.
 nuthatch check --dir /tmp/v-usdc
 ```
 
-Expect a pass. *Proves* the nest's committed fixtures still decode to the same entities, the
-regression net for decode changes.
+Expect a pass. On a freshly scaffolded nest that pass is narrower than it looks: `init` writes no
+`checks/*.sql`, so `check` validates the authored views and entity declarations and says there is
+nothing else to run. Parity needs a `checks/*.sql` query and its expected answer, recorded once
+against known-good sealed data with `nuthatch check --update`. With those in place, a pass *proves*
+the nest still decodes to the same answers, the regression net for decode changes.
 
 **2.3 A reorg converges** *(needs a chain that reorgs, or trust CI)*
 
@@ -294,9 +300,15 @@ feature; a budget that can be quietly exceeded is not a budget.
 
 **3.5 Per-nest blast radius**
 
-Break one nest deliberately; an invalid authored view is easiest. Expect that nest to be quarantined
-and reported, and **every other nest to keep serving**. *Proves* isolation. A runtime-wide failure here
-is the most serious finding in this document.
+Quarantine needs a terminal fault: a reorg below the sealed watermark, a dead entity circuit, a
+single block over the provider's `getLogs` cap. None is cheap to cause against a live chain, so the
+quarantine half is proved in CI (`tests/e2e_cursor_death_isolation.rs`): the faulted nest is
+quarantined and a sibling cursor indexes blocks it had not reached when the fault fired.
+
+What you can break by hand is an authored view. Expect a loud startup warning naming the view, a
+`nuthatch check` failure, and **that nest's other views and every other nest to keep serving**: a bad
+view is isolated without quarantining anything. *Proves* isolation. A runtime-wide failure here is the
+most serious finding in this document.
 
 **3.6 Cross-nest dataset adoption**
 
@@ -353,6 +365,7 @@ partial tip would silently change the answer to an aggregate.
 ```sh
 nuthatch init 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 --dir ts-nest
 nuthatch dev --dir ts-nest --backfill 500       # let it index, then stop
+# GNU sed; on macOS write `sed -i ''` in both lines below
 sed -i 's/block_timestamps = true/block_timestamps = false/' ts-nest/nuthatch.toml
 nuthatch dev --dir ts-nest                      # refused: the declaration needs `schema_version = 2`
 sed -i 's/schema_version = 1/schema_version = 2/' ts-nest/nuthatch.toml
@@ -368,14 +381,15 @@ query hits the wrong half.
 Then the other direction, which is the one an operator actually wants:
 
 ```sh
-nuthatch init 0xA0b8…eB48 --alias usdc --dir fast-nest --no-timestamps
+nuthatch init 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 --alias usdc --dir fast-nest --no-timestamps
 grep -E 'schema_version|block_timestamps' fast-nest/nuthatch.toml
 nuthatch dev --dir fast-nest --backfill 5000 --seal-direct
 nuthatch sql --dir fast-nest 'SELECT * FROM usdc__transfer LIMIT 1'
 ```
 
-Expect `schema_version = 2`, no `block_timestamp` column in the result, and a **visibly faster**
-backfill than the same range with timestamps on. The v2 stamp is what makes a 0.8.x binary refuse this
+Expect `schema_version = 2` and no `block_timestamp` column in the result. Do not expect a faster
+backfill unless your endpoint lacks `blockTimestamp` on logs: since 3.11 a node that supplies it costs
+no header fetch either way. The v2 stamp is what makes a 0.8.x binary refuse this
 nest rather than index timestamps into it; check that too if you have an old binary to hand.
 
 **4.5 Admin exposure**
@@ -478,8 +492,8 @@ Our automated tests run against a live Postgres in CI and cover every invariant 
 fleet has since been brought up end to end on real machines: `fleet-lab.sh up multi`, three Hetzner
 boxes on a private network, installing the **published v0.9.3** artifacts (#255), then two machines
 on the published 2.4.0 artifacts (2026-08-15, the table above). That run has not been repeated on
-3.x or 4.x, so for the release you are holding this level rests on CI's compose job plus a
-cross-machine run two majors old. If you verify one level from this document, this is still the one
+a later major, so for the release you are holding this level rests on CI's compose job plus a
+cross-machine run last recorded on 2.4.0. If you verify one level from this document, this is still the one
 worth your time.
 
 Needs the **scaled** artifact: `…:<version>-scaled` or `nuthatch-scaled-…tar.gz`. The default build
@@ -514,7 +528,7 @@ started with); the commands below omit it for brevity.
 
 *Proves* the topology: control plane reachable, workers registering, FE nodes up. We have run this on a
 single host, on 2026-08-02 across three machines on published v0.9.3 artifacts (#255), and on
-2026-08-15 across two machines on 2.4.0. **It has not been run on 3.x or 4.x**, so a report against
+2026-08-15 across two machines on 2.4.0. **It has not been repeated on a later major**, so a report against
 the release you are holding still helps most.
 
 **5.2 Declaring a nest starts it, without a restart**
@@ -589,12 +603,15 @@ change the nest's bundle hash; if it does, every rotation invalidates segment re
 **5.9 A control-plane outage does not stop ingestion**
 
 ```sh
-docker compose -f docker-compose.scaled.yml stop postgres   # or just the control plane
+docker compose -f docker-compose.scaled.yml stop control    # leave postgres up
 ```
 
-Expect workers to log failed reconcile ticks and **keep indexing** cursors whose leases have not
+Stop only the control plane. Workers write the hot store and renew their leases in Postgres, so
+stopping Postgres is a store outage, not this drill. Expect workers to log failed reconcile ticks and
+**keep indexing** cursors whose leases have not
 expired. *Proves* the deliberate independence: a control-plane outage must stop *rescheduling*, not
-*ingestion*. Workers exiting here would turn a database blip into a fleet-wide outage.
+*ingestion*. Workers exiting here would turn a control-plane blip into a fleet-wide outage. Start
+`control` again and expect the reconcile ticks to succeed with no change of owner.
 
 **5.10 Under-scheduling is loud**
 

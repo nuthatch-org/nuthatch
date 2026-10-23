@@ -1,6 +1,6 @@
 # Subgraph stopgap: nests for subgraphs the network does not serve
 
-**Opened 2026-10-06. Status: S0 in progress, S2 done.** This file is the central tracker. Issues carry the
+**Opened 2026-10-06. Status: S0 measured and its gate failed, S2 done, BetSwirl's handback package written and its nest retired; the offer stands on demand.** This file is the central tracker. Issues carry the
 detail and are labelled [`subgraph-stopgap`](https://github.com/nuthatch-org/nuthatch/labels/subgraph-stopgap).
 
 ## Why
@@ -18,8 +18,9 @@ Chief decided on 2026-10-06 to build it now rather than wait for that conversati
 
 A nest reproduces what a subgraph derives **from decoded events**: ids, addresses, block numbers,
 timestamps, event parameters, `@derivedFrom` relations. Every field answers exactly or is refused by
-name. It does **not** reproduce what mappings accumulate: prices, running totals, day and hour
-aggregates. GraphQL fails a whole query for one refused field, so an analytics dashboard will
+name. Sums and counts over events can answer exactly where a view reproduces them, as BetSwirl's token
+counters (`betCount`, `totalWagered`) do; that is decided field by field. Prices and other ordered,
+mapping-derived values are not reproduced. GraphQL fails a whole query for one refused field, so an analytics dashboard will
 usually not work unmodified, while bots, audit trails and event readers usually will.
 
 This is **not a drop-in replacement** and must not be described as one anywhere.
@@ -52,10 +53,10 @@ further slices of either.
 
 | slice | issue | what | fails if | status |
 | --- | --- | --- | --- | --- |
-| S0 | [#1940](https://github.com/nuthatch-org/nuthatch/issues/1940) | `init --from-subgraph` and `port-emit` on 15-20 published `bsc` and `matic` deployments, mixed shapes; record init success, fields answered, backfill cost | fewer than half the sample yield a serving nest that answers at least a third of its report-exact fields, or BetSwirl BNB Chain does not; the offer then narrows to S2 alone | not started |
-| S1 | [#1941](https://github.com/nuthatch-org/nuthatch/issues/1941) | fix what S0 broke; CID to serving GraphQL surface end to end on both chains, golden tests from the sample | a sample deployment that should port does not | waits on S0 |
+| S0 | [#1940](https://github.com/nuthatch-org/nuthatch/issues/1940) | `init --from-subgraph` and `port-emit` on 15-20 published `bsc` and `matic` deployments, mixed shapes; record init success, fields answered, backfill cost | fewer than half the sample yield a serving nest that answers at least a third of its report-exact fields, or BetSwirl BNB Chain does not; the offer then narrows to S2 alone | measured 2026-10-06: **gate failed**, 0 of 21 from a CID alone ([report](subgraph-stopgap-s0.md)) |
+| S1 | [#1941](https://github.com/nuthatch-org/nuthatch/issues/1941) | fix what S0 broke; CID to serving GraphQL surface end to end on both chains, golden tests from the sample | a sample deployment that should port does not | S0 failed; no decision on S1 is recorded here |
 | S2 | [#1942](https://github.com/nuthatch-org/nuthatch/issues/1942) | resolve each manifest's `network:` from IPFS; view of `bsc`/`matic` deployments with signal or an indexing agreement and zero active allocations; alert on new entries | the list disagrees with the network subgraph's allocation counts at a pinned block | done: Lodestar's `/subgraphs/migration` is the list, verified exact at a pinned block; verifier and alert in #1945 |
-| S3 | [#1943](https://github.com/nuthatch-org/nuthatch/issues/1943) | per-subgraph handback package: coverage report, how to run, how to point back at the network | someone who did not build it cannot stand one up from the package alone | waits on S1 |
+| S3 | [#1943](https://github.com/nuthatch-org/nuthatch/issues/1943) | per-subgraph handback package: coverage report, how to run, how to point back at the network | someone who did not build it cannot stand one up from the package alone | BetSwirl BNB Chain's package written and cold-tested twice ([stopgap/betswirl-bnb.md](stopgap/betswirl-bnb.md)) |
 
 S0 and S2 are independent and run in parallel. S0 is the slice that can stop the stopgap half.
 
@@ -85,8 +86,8 @@ covering the list, the numbers above, what the nest answers and what it refuses 
 - **BNB backfill needs a paid archive endpoint.** The only working public BNB endpoint refuses
   history a million blocks back (`src/chains.rs`), and Polygon's archive coverage is narrow. S0
   measures the cost per subgraph before anything is promised.
-- **Mapping logic is not run.** No AssemblyScript, anywhere, per RFC-0038 §8. Pricing and
-  accumulated fields are refused permanently, not pending.
+- **Mapping logic is not run.** No AssemblyScript, anywhere, per RFC-0038 §8. Pricing and other
+  ordered, mapping-derived fields are refused permanently, not pending.
 
 ## Decided
 
@@ -105,5 +106,6 @@ covering the list, the numbers above, what the nest answers and what it refuses 
 - **2026-10-06** Tracker opened, S0 to S3 filed as #1940 to #1943.
 - **2026-10-06** Chief lifted the no-hosting rule for the stopgap: we serve the nests ourselves.
 - **2026-10-06** S2 done (#1945). S0 gate raised from "any answered field" to a third of fields on half the sample, on review.
+- **2026-10-06** S0 measured: the gate failed under both wordings ([report](subgraph-stopgap-s0.md)).
 - **2026-10-06** Orphan alert live on the ThinkPad (user timer, 15 min, its own webhook). BetSwirl BNB Chain chosen as the first stopgap nest.
 - **2026-10-07** BetSwirl BNB Chain retired by Chief: no users in its first day (about 198 requests in five hours, about 180 of them our own cache warm-up), no bet since March. Service stopped and disabled on the ThinkPad, data and mirror kept; the hosted URL answers 410 once `.deploy/helsinki-caddy-retire.sh` runs on Helsinki. The orphan alert keeps running.

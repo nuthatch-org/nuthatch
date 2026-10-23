@@ -35,8 +35,9 @@ along a line:
 | answers | does not answer |
 | --- | --- |
 | ids, timestamps, block numbers, log indices | prices and anything derived from one |
-| addresses, token ids, transaction hashes | running totals - volume, fees, TVL, counts |
-| values taken straight from an event's parameters | anything a mapping accumulated over time |
+| addresses, token ids, transaction hashes | priced totals - volume in USD, fees, TVL |
+| values taken straight from an event's parameters | values from ordered, stateful mapping code |
+| sums and counts over events, where a view reproduces them | |
 | `@derivedFrom` relations between the above | day and hour aggregate entities |
 
 On Uniswap V4 that means `Swap.id`, `pool`, `sender`, `timestamp` and `logIndex` answer, while
@@ -56,11 +57,17 @@ hash and log index. Bots, reconciliation, audit trails, backfills, anything read
 than what it was worth. You get exact answers over the full history, hot storage and sealed Parquet
 alike.
 
-**No, if** you are backing a dashboard. Every number on it is a price or a total, and those are the
-fields a nest refuses.
+**Probably not, if** you are backing a dashboard. Most numbers on one are prices or priced totals, and
+one refused field fails the whole query. Event-derived counts and sums are decided field by field:
+BetSwirl's SDK documents, token counters included, answer in full
+([stopgap/betswirl-bnb.md](stopgap/betswirl-bnb.md)).
 
-**Find out in one command**, rather than guessing. `nuthatch port-emit` prints a coverage line and writes
-it into the nest's `README.md`. For the pinned Uniswap V4 port, measured 2026-09-12:
+**Find out**, rather than guessing. Scaffold the nest with `nuthatch init --from-subgraph <CID>`, then
+run `nuthatch port-emit --dir <subgraph source> --out <nest>`, which prints a coverage line and writes
+it into the nest's `README.md`. `--dir` needs the subgraph's `schema.graphql` and AssemblyScript
+mappings: a deployment CID holds only compiled WASM, so get the source from the subgraph's repository
+([how the Uniswap V4 port pinned it](port-uniswap-v4-mainnet.md)). Aimed at a CID's files alone, every
+field but `@derivedFrom` reads as unanswered. For the pinned Uniswap V4 port, measured 2026-09-12:
 
 ```
 coverage: 70 of 184 fields the report calls exact are answered (38%): 54 in views,

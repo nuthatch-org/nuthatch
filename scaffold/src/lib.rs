@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use alloy_json_abi::JsonAbi;
 use alloy_primitives::Address;
 use anyhow::{anyhow, bail, Context, Result};
-use nuthatch_decode::registry::{ContractSpec, DecodeRegistry, TableSchema};
+use nuthatch_decode::registry::{ContractSpec, DecodeRegistry, TableKind, TableSchema};
 use serde::Serialize;
 
 pub mod resolve;
@@ -180,15 +180,18 @@ pub const GITATTRIBUTES: &str = "* -text\n*.sql linguist-detectable\nabis/** lin
 pub const VIEWS_README: &str =
         "# views/ - this nest's authored logic (RFC-0018 §1)\n\n\
          Drop `*.sql` files here, each a `CREATE VIEW …` over your nest's tables (the live tip ∪ sealed\n\
-         history, one surface - recomputed per query, never materialised). Query a view by name with\n\
-         `nuthatch sql` or the MCP `sql` tool. Files load in sorted filename order (`10-…`, `20-…`), so\n\
-         a later view can build on an earlier one. Describe what a view *means* in `semantic.toml` under\n\
-         `[view.<name>]` so an agent sees it. A broken/drifted view fails `nuthatch check` loudly.
-         \
-         `views/` is the broad query-time surface. `entities/` plus `entities.toml` is separate: use it
-         only for a keyed relation in the bounded incremental SQL subset, maintained at indexing time
-         with explicit memory, reorg and restart semantics. `nuthatch check` refuses unsupported entity
-         SQL rather than silently turning an ordinary view into stored state.\n";
+         history, one surface - recomputed per query unless the view is named in `maintained.toml`).\n\
+         Query a view by name with `nuthatch sql` or the MCP `sql` tool. Files load in sorted filename\n\
+         order (`10-…`, `20-…`), so a later view can build on an earlier one. Describe what a view\n\
+         *means* in `semantic.toml` under `[view.<name>]` so an agent sees it. A broken/drifted view\n\
+         fails `nuthatch check` loudly.\n\n\
+         A view listed in `maintained.toml` (`[[view]]` with `name = \"<view>\"`) is answered from a\n\
+         stored copy of its own evaluation, used only while every input it reads is unchanged, so the\n\
+         answer is the same either way.\n\n\
+         `entities/` plus `entities.toml` is separate: use it only for a keyed relation in the bounded\n\
+         incremental SQL subset, maintained at indexing time with explicit memory, reorg and restart\n\
+         semantics. `nuthatch check` refuses unsupported entity SQL rather than silently turning an\n\
+         ordinary view into stored state.\n";
 
 /// `views/10-example.sql`: entirely comments, so it validates clean until the author uncomments it.
 /// It names this nest's real first table when there is one, so it's copy-paste-true.
@@ -225,7 +228,13 @@ pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
         .iter()
         .map(|t| {
             let cols: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
-            format!("- `{}` - {} ({})\n", t.table, t.event, cols.join(", "))
+            let source = match t.kind {
+                TableKind::Event => t.event.clone(),
+                TableKind::Block => "block headers".to_string(),
+                TableKind::Call => format!("calls to {}", t.function),
+                TableKind::State => "storage writes".to_string(),
+            };
+            format!("- `{}` - {} ({})\n", t.table, source, cols.join(", "))
         })
         .collect();
     format!(
@@ -234,7 +243,14 @@ pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
          A self-hosted blockchain index. Query it locally; there is no third-party API.\n\
          \n\
          ## Contracts\n{list}\n\
-         ## Tables (one per contract event)\n{tables}\n\
+         ## Tables (one per contract event, plus any `[extract]` table)\n{tables}\n\
+         ## SQL types\n\
+         - `uint`/`int` columns wider than 64 bits are exact decimal text: never `SUM` the raw column.\n\
+         \x20 `<col>_dec` is the value as `DECIMAL(38,0)`, NULL when it does not fit (`<col>_overflow` is\n\
+         \x20 then true). Ids, nonces and hashes stay on the raw column.\n\
+         - `bool` columns are text `'true'`/`'false'`: write `col = 'true'` or `CAST(col AS BOOLEAN)`.\n\
+         - Reserved-word columns such as `\"from\"` and `\"to\"` must be double-quoted.\n\
+         - Call the MCP `schema` tool first: it lists the `_dec`, bool and reserved columns.\n\n\
          ## Live HTTP API (run `nuthatch dev`)\n\
          - `GET /`                    index status\n\
          - `GET /tables`              every table with its columns\n\
@@ -284,7 +300,8 @@ pub fn skill_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
          - Read-only SQL: `curl -G localhost:8288/sql --data-urlencode 'q=SELECT count(*) FROM {example}'`\n\
          \n\
          `sql` reads hot and sealed rows together, so it covers the live tip. Each answer's\n\
-         `provenance.sealed_through` is where finalized data ends.\n"
+         `provenance.sealed_through` is the block through which this nest has sealed history; newer rows\n\
+         may still be hot, and it is not the chain's finality head.\n"
     )
 }
 

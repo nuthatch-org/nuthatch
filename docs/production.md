@@ -68,7 +68,7 @@ restored is a belief. [Data lifecycle](operators.md#data-lifecycle).
 ### 9. Rehearse the upgrade you will eventually do at 2am
 
 Swap the binary and restart against a non-production copy of the data directory, which is how a
-4.x upgrade goes and the copy is the only way back; `nuthatch migrate --dry-run` is for a pre-2.0
+5.x upgrade goes and the copy is the only way back; `nuthatch migrate --dry-run` is for a pre-2.0
 directory only: [nest lifecycle operations](operators.md#nest-lifecycle-operations). Each release's notes carry a
 **Compatibility and upgrade** section saying whether it is replace-the-binary-and-restart or needs a
 migration or re-index; that section is the one thing to read before upgrading, and what it promises
@@ -102,9 +102,10 @@ calendar rather than a monitor.
 
 **Scaled mode is the least-verified path.** `verification.md` says which levels have been verified by
 the maintainers and on which release. CI brings the compose stack up on every change; the last
-multi-machine run was on 2.4.0, and nothing on 3.x or 4.x. If you are running scaled mode, you are
+multi-machine run was on 2.4.0, and it has not been repeated on a later major. If you are running scaled mode, you are
 ahead of the verification, and outside evidence is worth sending back.
 
-**The macOS binary is built but untested.** `aarch64-apple-darwin` is compiled and published, and no
-CI job runs on macOS - see [prod-readiness §8](prod-readiness.md#8-release-engineering). Fine for a
+**The macOS binary has no CI tests.** `aarch64-apple-darwin` is compiled and published, and it has
+been run by hand: [verification.md](verification.md) records a live index, restart and `check` on
+4.10.1. No CI job runs on macOS, though; see [prod-readiness §8](prod-readiness.md#8-release-engineering). Fine for a
 laptop; think twice before it is the thing you leave running.

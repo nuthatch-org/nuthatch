@@ -8,9 +8,12 @@ for the ecosystem, not a pitch. Paulie credited and given a heads-up before it p
 announcement lands first, keep the one-sentence hosted-option mention below; if not, delete it and let
 the post stand alone.
 
-> **Note, 2026-10-05.** This copy predates 4.1. DuckDB is no longer in the binary: SQL runs on
-> Burrmill, on DataFusion, over the same sealed Parquet. The DuckDB lines below describe the 3.x
-> architecture and must be rewritten before this is posted.
+> **Historical draft, not current copy (noted 2026-10-23).** Written for 2.x and 3.x, never posted,
+> and wrong in several places now. SQL runs on Burrmill (DataFusion), not DuckDB, since 4.1. The WASM
+> transform layer and its WIT interfaces were removed on 2026-10-08, and the ExEx stub with them; ExEx
+> is designed, not built. Authored incremental entities (RFC-0041) shipped in 3.0.0-alpha. The
+> 58 MB figure is a dated 2.x measurement. Rewrite it
+> against the current README before any use.
 
 ---
 

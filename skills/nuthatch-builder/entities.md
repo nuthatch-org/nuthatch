@@ -112,9 +112,10 @@ An entity may read or join `offchain__<table>`, the snapshots `nuthatch offchain
   lands the entity answers from the old snapshots and says so.
 - **Offchain rows never retract.** A reorg retracts the chain side only.
 - **What an entity holds from its offchain tables is bounded by its own `max_rows`,** in rows and
-  at 3,200 bytes a row, across all of them. Past that the entity faults, naming the table, and the
-  rest of the nest carries on. Admission charges such an entity twice its `max_rows`, so declare a
-  larger one to hold a larger table.
+  at 3,200 bytes a row, across all of them. Past that the entity faults, naming the table. An
+  entity fault is terminal: the next health check quarantines the nest (an `entity_fault` alert,
+  if declared, says why), while other nests in the runtime carry on. Admission charges such an entity
+  twice its `max_rows`, so declare a larger one to hold a larger table.
 - **New snapshots are picked up at window boundaries.** A chain that stops producing blocks also
   stops the entity picking up snapshots.
 

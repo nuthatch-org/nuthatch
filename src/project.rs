@@ -1459,8 +1459,11 @@ fn report_abi_fit(fit: AbiFit, alias: &str, address: &str) {
             eprintln!("    {sampled} log(s) matching none of the current implementation's events.");
             eprintln!("    This contract appears to have been upgraded across an event rename or ABI change.");
             eprintln!("    Pre-upgrade history will index **zero rows** under the current ABI.");
-            eprintln!("    Fix: add an older [[contracts]] entry for {alias} in nuthatch.toml with the legacy ABI,");
-            eprintln!("    bounded to the era that emitted those events.");
+            eprintln!("    Fix: add a second [[contracts]] entry at the same address with the legacy ABI, a new");
+            eprintln!("    alias and an `events` allowlist of the events the current ABI lacks. There is no end");
+            eprintln!(
+                "    block: an event both ABIs define decodes under whichever entry comes first."
+            );
             eprintln!();
         }
         _ => {}
@@ -1684,8 +1687,8 @@ async fn report_proxy_history_gap(
              will not be decoded by this scaffold."
         );
         eprintln!(
-            "    Add the earlier ABI as a second contract entry at the same address, bounded to its \
-             implementation era, before trusting historical totals."
+            "    Before trusting historical totals, add the earlier ABI as a second contract entry at the \
+             same address, with an `events` allowlist of the events the current ABI lacks."
         );
         eprintln!();
     }

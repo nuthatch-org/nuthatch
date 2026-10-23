@@ -37,8 +37,9 @@ meaningful; they are not. Read the emoji.
 
 - **Embedded / single-chain runtime** (the primary deliverable): one binary, one chain, tip-follow +
   serve, `≤2 GB` RAM. This is the thing that can be "prod ready" *now*.
-- **Scaled mode** (docker-compose, Postgres + DataFusion federation): greenfield. Nowhere near a
-  release, and honestly so - most of its checklist is ⛔ by design, not neglect.
+- **Scaled mode** (docker-compose, Postgres + DataFusion federation): built and published as a separate
+  opt-in artifact, with CI compose verification and a dated multi-machine run (§11). Younger than
+  embedded and without production workload evidence; its open items are in §11.
 
 A green embedded column with a red scaled column is a **legitimate ship** - just say which one you're
 shipping.
@@ -102,7 +103,7 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
 - [ ] ✅ Single-writer discipline: only the ingestion thread writes redb and the sealed segments; queries attach
   read-only. No concurrent-writer design anywhere.
 - [ ] ✅ Single cursor / single process / one observable failure boundary. A second chain = a second
-  process (never multiplex chains behind one cursor).
+  isolated cursor, in this or another process (never multiplex chains behind one cursor).
 - [ ] ✅ Per-nest blast-radius isolation in a runtime: one nest's bad view / runaway factory can't harm
   another. *(RFC-0012)*
 - [ ] ✅ Graceful recovery from a corrupt/partial segment on startup (detect + quarantine + resume
@@ -116,8 +117,9 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
   provider no longer costs a request-timeout on every round-robin hit), the tip loop retries the same
   window (no silent gaps), and a stall is now **loud**: `nuthatch_last_poll_unixtime` in `/metrics`, an
   escalating tip-loop log (warn on the first miss → error every ~60 s of "all endpoints unreachable →
-  STALLED"), and `/ready` returns 503 once no poll has succeeded within the stall threshold, 90 s at
-  the default poll interval and scaled with `--poll-interval` since RFC-0040 (§7). `/ready` now also
+  STALLED"), and `/ready` returns 503 once no poll has succeeded within the stall threshold, at
+  least three poll intervals (15 minutes at the current five-minute default) and scaled with
+  `--poll-interval` since RFC-0040 (§7). `/ready` now also
   catches a second, distinct failure shape: a **wedged** cursor that keeps polling successfully but
   makes no block progress, not just a dead one (`#578`, `804249f`, 2026-08-14).*
 
@@ -202,12 +204,9 @@ with date/provider/hardware/commit (the RFC-0004 house rule).
   a 25-character path segment), `/nest` `/` `/health` `/tables` probed for host, path segment and full
   URL, no match (**#428**).*
 - [ ] ✅ Dependency vulnerability scan (`cargo deny`) wired into CI. - *`deny` job runs advisories +
-  licences + bans + sources against `deny.toml`; the permissive-only licence gate is now enforced. Four
-  transitive advisories ignored with written rationale (quick-xml not-reachable ×2; rkyv shared-pointer
-  validation not-reachable; h2 0.3-line HTTP/2-server DoS not-reachable - we never enable axum's http2
-  feature or run actix as a server). The wasmtime-wasi `FilePerms` bypass this row used to name as
-  "tracked for a runtime bump" is no longer ignored at all - it's fixed, cleared by the wasmtime 44→46
-  bump.*
+  licences + bans + sources against `deny.toml`; the permissive-only licence gate is now enforced. Every
+  ignored advisory carries its written rationale in `deny.toml` itself, which is the current list.
+  wasmtime is no longer a dependency: the transform layer that needed it was removed on 2026-10-08.*
 
 ## 5. The ≤2 GB budget under realistic load
 
@@ -278,7 +277,8 @@ case.
 - [ ] ✅ Health/readiness endpoint suitable for a supervisor. - *0.5.x: `/health` = liveness (plain
   `200 "ok"`); `/ready` = readiness - JSON with tip / last_block / lag / sealed_through / last-poll age,
   `200` when fresh and **`503` when stalled** (no successful source poll within the stall threshold,
-  90 s at the default poll interval and scaled with `--poll-interval` since RFC-0040 ⇒ every RPC
+  at least three poll intervals, 15 minutes at the current default, and scaled with `--poll-interval` since
+  RFC-0040 ⇒ every RPC
   endpoint down). A just-started node gets grace (never-polled ≠ stalled). **0.6.x (RFC-0026):** `/ready` is now
   also mounted at the **runtime root** - `200` only when every cursor and nest is indexing, `503` naming
   what is quarantined - with per-nest `/<name>/ready` answering for that nest alone. Route traffic on
@@ -319,14 +319,13 @@ case.
 
   | Target | Built by | Tested by |
   |---|---|---|
-  | `x86_64-unknown-linux-gnu` | `release.yml` | full `cargo test --locked` on every CI run |
+  | `x86_64-unknown-linux-gnu` (default, graph) | `release.yml` | full `cargo test --locked` on every CI run |
   | `x86_64-unknown-linux-gnu` (scaled) | `release.yml` | the `--features postgres-store` job |
-  | `aarch64-apple-darwin` | `release.yml` | **nothing - built and published, never exercised** |
+  | `aarch64-unknown-linux-gnu` (default, graph) | `release.yml`, native arm64 runner | no CI test job |
+  | `aarch64-apple-darwin` (default, graph) | `release.yml` | no CI test job; manual live runs in [verification.md](verification.md) |
 
-  The macOS arm64 binary is compiled on a macOS runner and attached to the release, and no job in
-  `ci.yml` runs on macOS. So the install path is covered but the behaviour is not: a macOS-only
-  regression reaches a user before it reaches us. Scope the claim that way or add a macOS test job;
-  do not leave it ambiguous.
+  Scaled is x86_64 Linux only. No job in `ci.yml` runs on macOS or arm64 Linux, so a regression
+  specific to either reaches a user before CI sees it; the macOS manual runs are dated, not standing.
 - [ ] ✅ CHANGELOG / release-note discipline per tag. The standing rule, from the v0.9.1 incident:
   before tagging, run `git log --stat <previous-tag>..HEAD` and read every entry against the draft
   notes. Anything in the range that is not in the notes is either added or explained. The notes
@@ -342,7 +341,7 @@ case.
 - [ ] ✅ MCP server compiled into the binary (`mcp.rs`), works offline against the local instance.
 - [ ] ✅ `init` scaffolds `nuthatch.toml`, `schema.json`, `semantic.toml`, `views/`, `llms.txt` and
   `.claude/skills/` from the ABI. - *No handlers and no tests: that is what a 4.10.1 `init` writes
-  (scratch run, 2026-10-05), and CLAUDE.md's "handlers + tests" wording still promises both.*
+  (scratch run, 2026-10-05).*
 - [ ] ✅ Ships `llms.txt` / docs-as-MCP / `.claude/skills/` in scaffolded projects.
 - [ ] ✅ The RFC-0016 governed semantic layer (`semantic.toml`, enriched `schema`, errors-as-prompts,  **[#815]**
   `explain`) - *The layer is in the binary, and the Tier-B keyed baseline was delivered in #1049
@@ -426,9 +425,12 @@ Almost everything un-buildable-on-a-laptop traces to one missing box.
   2026-08-31, deferred, and RFC-0003 was deferred again on 2026-09-08 (`docs/frozen-for-2027.md`).*
 - [ ] ⛔ ExEx tip mode wired to a real node; `nuthatch-node` binary; honest tip-latency number. *(0003;  **[#276]**
   groundwork in, **blocked on** the node.)*
-- [ ] ⛔ Firehose-class extraction (traces + state diffs), own-node/ExEx only. *(0014; **blocked on**  **[#277]**
-  0003; #277 closed for the freeze with #276.)* - *One node-independent slice is buildable now and forward-compatible: the calldata decoder,
-  `[extract]` config, `traces`/`state_diffs` schemas, and the unbounded-volume guard.*
+- [ ] ⛔ Firehose-class extraction (traces + state diffs) in the event pipeline, own-node/ExEx only.
+  *(0014; **blocked on** 0003.)* - *Shipped without a node: top-level calldata decoding
+  (`[extract] top_level_calls`), block headers (`blocks`), the `[extract]` config and its
+  unbounded-volume guard. #277 was reopened 2026-10-09 as an RFC-0063 slice, internal transactions
+  from remote traces for address-history nests, so it no longer waits on #276; generic trace and
+  state extraction for event nests still does.*
 
 ---
 
@@ -445,8 +447,8 @@ the decode path** is a required check this file never named (§6, #290); and the
 this file spent §11 calling unproven for months finally happened, on 2.4.0 (§11, #281/#597).
 
 What is still genuinely open, not time-based, as of the 2026-10-05 re-read: the **factory
-watch-set and wildcard decode** (§1, #271/#272) and everything **node-gated** (§12, #276/#277),
-all closed for the 2026 freeze as deferred rather than fixed, and the **scaled-mode plan across
+watch-set and wildcard decode** (§1, #271/#272) and everything **node-gated** (§12, #276),
+deferred rather than fixed (#272 and #277 were reopened 2026-10-09 as RFC-0063 slices), and the **scaled-mode plan across
 Postgres hot and Parquet cold** (§11), which nothing tracks. Closed on evidence since the 2.6.0
 walk: the **published backfill number** is a runner artifact on every PR (§3, #285/#1723), **tip
 lag** is measured and gated (§3, #282/#1884), the **DuckDB file-access defence** (§4, #289) is moot

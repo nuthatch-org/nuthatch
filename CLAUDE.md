@@ -295,7 +295,7 @@ unconfigured.
 > `docs/frozen-for-2027.md` stands unchanged, with its own rule: reopen one item at a time, naming
 > the new demand or evidence and an acceptance criterion that can fail. Chief separately deferred
 > RFC-0003, RFC-0023, RFC-0031, RFC-0033, RFC-0034 and RFC-0036 again on 2026-09-08, and closed
-> RFC-0013 and RFC-0021 the same day. Slice 6 below (ExEx, scaled mode) is not started. RFC-0042 is
+> RFC-0013 and RFC-0021 the same day. Of slice 6 below, ExEx is not started; scaled mode is built (the `postgres-store` feature, RFC-0022) and every release publishes it as the separate `scaled` artifact. RFC-0042 is
 > moot: Burrmill replaced DuckDB in 4.1, so its trigger on RFC-0033 slice 4 (#357) no longer applies.
 >
 > **The out-of-scope list below is unchanged and still binds.** No hosted service, no token, no

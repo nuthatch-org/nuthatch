@@ -2,89 +2,95 @@
   "registry_hash": "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "tables": [
     {
+      "table": "blocks",
       "alias": "chain",
+      "kind": "block",
       "columns": [
         {
-          "indexed": false,
           "name": "block_number",
           "sol_type": "implicit",
-          "storage": "u64"
+          "storage": "u64",
+          "indexed": false
         },
         {
-          "indexed": false,
           "name": "block_hash",
           "sol_type": "implicit",
-          "storage": "bytes32"
+          "storage": "bytes32",
+          "indexed": false
         },
         {
-          "indexed": false,
           "name": "tx_hash",
           "sol_type": "implicit",
-          "storage": "bytes32"
+          "storage": "bytes32",
+          "indexed": false
         },
         {
-          "indexed": false,
           "name": "log_index",
           "sol_type": "implicit",
-          "storage": "u64"
+          "storage": "u64",
+          "indexed": false
         },
         {
-          "indexed": false,
           "name": "address",
           "sol_type": "implicit",
-          "storage": "address"
+          "storage": "address",
+          "indexed": false
         },
         {
-          "indexed": false,
           "name": "_seq",
           "sol_type": "implicit",
-          "storage": "u64"
+          "storage": "u64",
+          "indexed": false
         },
         {
-          "indexed": false,
           "name": "parent_hash",
           "sol_type": "bytes32",
-          "storage": "fixed_bytes"
+          "storage": "fixed_bytes",
+          "indexed": false
         },
         {
-          "indexed": false,
           "name": "miner",
           "sol_type": "address",
-          "storage": "address"
+          "storage": "address",
+          "indexed": false
         },
         {
-          "indexed": false,
           "name": "gas_used",
           "sol_type": "uint64",
-          "storage": "u64"
+          "storage": "u64",
+          "indexed": false
         },
         {
-          "indexed": false,
           "name": "gas_limit",
           "sol_type": "uint64",
-          "storage": "u64"
+          "storage": "u64",
+          "indexed": false
         },
         {
-          "indexed": false,
           "name": "base_fee_per_gas",
           "sol_type": "uint64",
-          "storage": "u64"
+          "storage": "u64",
+          "indexed": false
         },
         {
-          "indexed": false,
           "name": "size",
           "sol_type": "uint64",
-          "storage": "u64"
+          "storage": "u64",
+          "indexed": false
         },
         {
-          "indexed": false,
           "name": "transaction_count",
           "sol_type": "uint64",
-          "storage": "u64"
+          "storage": "u64",
+          "indexed": false
+        },
+        {
+          "name": "l1_block_number",
+          "sol_type": "uint64",
+          "storage": "u64",
+          "indexed": false
         }
-      ],
-      "kind": "block",
-      "table": "blocks"
+      ]
     }
   ]
 }

@@ -4,18 +4,31 @@ A self-hosted blockchain index. Query it locally; there is no third-party API.
 
 ## Contracts
 
-## Tables (one per contract event)
-- `blocks` -  (block_number, block_hash, tx_hash, log_index, address, _seq, parent_hash, miner, gas_used, gas_limit, base_fee_per_gas, size, transaction_count)
+## Tables (one per contract event, plus any `[extract]` table)
+- `blocks` - block headers (block_number, block_hash, tx_hash, log_index, address, _seq, parent_hash, miner, gas_used, gas_limit, base_fee_per_gas, size, transaction_count, l1_block_number)
+
+## SQL types
+- `uint`/`int` columns wider than 64 bits are exact decimal text: never `SUM` the raw column.
+  `<col>_dec` is the value as `DECIMAL(38,0)`, NULL when it does not fit (`<col>_overflow` is
+  then true). Ids, nonces and hashes stay on the raw column.
+- `bool` columns are text `'true'`/`'false'`: write `col = 'true'` or `CAST(col AS BOOLEAN)`.
+- Reserved-word columns such as `"from"` and `"to"` must be double-quoted.
+- Call the MCP `schema` tool first: it lists the `_dec`, bool and reserved columns.
 
 ## Live HTTP API (run `nuthatch dev`)
 - `GET /`                    index status
 - `GET /tables`              every table with its columns
 - `GET /table/{name}?limit=N` recent rows of one table (hot + sealed)
 - `GET /entity/{id}`         one row by id (`{block:012}-{logindex:06}`)
-- `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{alias}__{event}`
+- `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{alias}__{event}`, and each
+                             authored view (`views/*.sql`) answers by its own name
 - `GET /balances?limit=N`    top holder balances (when an ERC-20 Transfer table is present)
 - `GET /balance/{address}`   one address's derived balance
+- `GET /queries`             the mount's SQL mode and the queries its operator declared in
+                             `mounts.toml` (none on an open nest); `GET /q/{name}` runs one
+- `GET /derived`             the nest's incremental entities (`entities.toml`); `GET /derived/{entity}` reads one
+- `GET /diff?from=X&to=Y`    what happened in a range (`block=N`, or `tx=0x..&block=N`), as JSON, `format=text` or `markdown`
 
 ## MCP (for coding agents)
-Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, entity,
+Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, entity, diff,
 balance, top_balances. Fully offline against the local instance; nothing phones home.

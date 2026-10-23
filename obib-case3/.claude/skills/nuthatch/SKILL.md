@@ -15,6 +15,8 @@ data model, then `sql` / `entity` / `balance` / `top_balances`.
 
 ## Fallback: HTTP (a `nuthatch dev` must be running)
 - Recent rows:  `curl localhost:8288/entities?limit=20`
-- Read-only SQL: `curl -G localhost:8288/sql --data-urlencode 'q=SELECT count(*) FROM transfers'`
+- Read-only SQL: `curl -G localhost:8288/sql --data-urlencode 'q=SELECT count(*) FROM blocks'`
 
-`sql` sees finalized data only; balances/entity cover the live tip.
+`sql` reads hot and sealed rows together, so it covers the live tip. Each answer's
+`provenance.sealed_through` is the block through which this nest has sealed history; newer rows
+may still be hot, and it is not the chain's finality head.
