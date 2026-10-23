@@ -5057,11 +5057,11 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
     let deadline = std::time::Instant::now() + SQL_TIMEOUT;
     let st = s.clone();
     let gathered = tokio::task::spawn_blocking(move || {
-        let (hot, tip_unavailable) = match st
+        let (hot, tip_unavailable, hot_head) = match st
             .store
             .hot_rows_by_table_bounded_with_bytes(st.sql_max_hot_rows, st.sql_max_hot_bytes)
         {
-            Ok(snapshot) => (snapshot.rows, false),
+            Ok(snapshot) => (snapshot.rows, false, Some(snapshot.last_block)),
             Err(e)
                 if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
                     || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
@@ -5071,7 +5071,7 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
             }
             Err(e) => {
                 tracing::error!("hot-tip scan failed - refusing this diff: {e:#}");
-                (Default::default(), true)
+                (Default::default(), true, None)
             }
         };
         let sealed_through = st.store.sealed_through();
@@ -5099,6 +5099,11 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
         };
         let mut ctx = crate::diff::NestContext::gather(&st.dir, st.store.as_ref(), facts)?;
         ctx.sealed_through = sealed_through;
+        // Coverage is the snapshot's own head: a block committed after the scan is not in its rows.
+        if let Some(last) = hot_head {
+            let head = last.unwrap_or(0).max(sealed_through);
+            ctx.indexed_head = (head > 0).then_some(head);
+        }
         let stories = crate::diff::stories(&st.dir, &st.tables)?;
         Ok((hot, tip_unavailable, sealed_through, ctx, stories))
     })
@@ -8918,12 +8923,13 @@ mod tests {
     }
 
     /// #1659: with the SQL gate saturated `/table` cannot read the sealed rows, and its answer must
-    /// A redb store whose byte-exact tip scan fails, as a damaged hot store would (#472). Every
-    /// other call reaches the real store.
-    struct TipFails(Store);
+    /// A redb store whose byte-exact tip scan fails, as a damaged hot store would (#472), or, given a
+    /// block, succeeds and has that block committed right behind it (#2357). Every other call reaches
+    /// the real store.
+    struct OddTip(Store, Option<u64>);
 
     #[async_trait::async_trait]
-    impl crate::store::HotStore for TipFails {
+    impl crate::store::HotStore for OddTip {
         fn write_generation(&self) -> Option<u64> {
             crate::store::HotStore::write_generation(&self.0)
         }
@@ -8975,10 +8981,19 @@ mod tests {
         }
         fn hot_rows_by_table_bounded_with_bytes(
             &self,
-            _max_rows: usize,
-            _max_bytes: u64,
+            max_rows: usize,
+            max_bytes: u64,
         ) -> Result<crate::store::HotRowsSnapshot> {
-            anyhow::bail!("hot store would not scan")
+            let Some(block) = self.1 else {
+                anyhow::bail!("hot store would not scan")
+            };
+            let snapshot = self
+                .0
+                .hot_rows_by_table_bounded_with_bytes(max_rows, max_bytes)?;
+            let row = json!({"table":"t","block_number":block,"log_index":0,"v":"x"}).to_string();
+            self.0
+                .commit_window(&[(Store::entity_key(block, 0), row)], None, block)?;
+            Ok(snapshot)
         }
         fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
             crate::store::HotStore::entities_in_range(&self.0, from, to)
@@ -9118,12 +9133,37 @@ mod tests {
     async fn a_cold_only_sql_answer_says_its_source_is_sealed() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = table_fixture(tmp.path(), 1..=3, 4..=5);
-        state.store =
-            std::sync::Arc::new(TipFails(Store::open(&tmp.path().join("f.redb")).unwrap()));
+        state.store = std::sync::Arc::new(OddTip(
+            Store::open(&tmp.path().join("f.redb")).unwrap(),
+            None,
+        ));
         let (status, body) = get_json(state, "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20t").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["tip_unavailable"], true, "{body}");
         assert_eq!(body["provenance"]["source"], "sealed", "{body}");
+    }
+
+    /// #2357: a block committed between the diff's hot scan and its coverage check is not in the
+    /// rows, so it is refused as uncovered rather than told as an empty story.
+    #[tokio::test]
+    async fn a_block_committed_after_the_diff_scan_is_not_covered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = table_fixture(tmp.path(), 1..=3, 4..=4);
+        let store = Store::open(&tmp.path().join("f.redb")).unwrap();
+        let row = json!({"table":"t","block_number":5,"log_index":0,"v":"x"}).to_string();
+        store
+            .commit_window(&[(Store::entity_key(5, 0), row)], None, 5)
+            .unwrap();
+        state.store = std::sync::Arc::new(OddTip(store, Some(6)));
+        let (status, body) = get_json(state, "/diff?block=6").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("outside what this nest has indexed"),
+            "{body}"
+        );
     }
 
     /// say it is degraded rather than pass the hot rows off as the merged table.
