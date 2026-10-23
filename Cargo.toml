@@ -206,6 +206,8 @@ crash-points = []
 [dev-dependencies]
 # The fixture chains the end-to-end tests point the real binary at, served in-process.
 nuthatch-fixture-rpc = { path = "tools/fixture-rpc" }
+# RFC-0070: the time-lapse tool must compute the NID the node does.
+nuthatch-timelapse = { path = "timelapse" }
 proptest = "1"
 # `start_paused` for virtual time in tests. Dev-only, so the shipped binary is unchanged: it lets a
 # retry-pacing test assert *how long* a pause was without actually waiting for it (#361).

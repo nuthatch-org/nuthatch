@@ -346,7 +346,7 @@ fn tool_specs(shape: &Shape) -> Value {
             "block": { "type": "integer", "description": "One block, or the block holding `tx`." },
             "tx": { "type": "string", "description": "One transaction hash; needs `block`." },
             "flow": { "type": "boolean", "description": "The token flow instead of the story.", "default": false },
-            "top": { "type": "integer", "description": "Items per list (story default 10)." },
+            "top": { "type": "integer", "description": "Items per list (story default 10, at most 1000)." },
             "final_only": { "type": "boolean", "description": "Refuse a range above the sealed boundary.", "default": false } } } }),
     ];
     // ERC-20-shaped tools (RFC-0025): advertised only where a transfer-shaped decoder exists - the same

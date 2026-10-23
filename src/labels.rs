@@ -82,7 +82,7 @@ struct ImportRecord {
 
 /// Import a label file (CSV or JSON) into `dir`: parse → normalise → write a content-addressed
 /// snapshot under `labels/` → record provenance. Returns the snapshot hash and the entry count.
-/// Idempotent by content address: re-importing the identical set rewrites the same file.
+/// Idempotent by content address: re-importing the identical set changes nothing on disk.
 pub fn import(dir: &Path, source: &Path) -> Result<(String, usize)> {
     let raw = std::fs::read_to_string(source)
         .with_context(|| format!("cannot read label file {}", source.display()))?;
@@ -222,13 +222,17 @@ struct RawEntry {
 
 /// Append an import to the provenance index (best-effort - provenance, not correctness; the snapshots
 /// themselves are the source of truth). Uses wall-clock time only for the human-readable record.
+/// A set already recorded keeps its first record: the index is a nest input, so rewriting it for the
+/// same set would move the nest's identity (#2368).
 fn record_import(dir: &Path, hash: &str, entries: usize, source: &Path) -> Result<()> {
     let index_path = dir.join(INDEX_FILE);
     let mut records: Vec<ImportRecord> = std::fs::read_to_string(&index_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    records.retain(|r| r.snapshot != hash); // re-import of the same set replaces its record
+    if records.iter().any(|r| r.snapshot == hash) {
+        return Ok(());
+    }
     records.push(ImportRecord {
         snapshot: hash.to_string(),
         entries,
@@ -339,5 +343,25 @@ mod tests {
         assert_eq!(labels, vec!["cex".to_string(), "exchange".to_string()]);
         assert!(set.is_labeled("0x2222222222222222222222222222222222222222"));
         assert!(!set.is_labeled("0x9999999999999999999999999999999999999999"));
+    }
+
+    /// #2368: the index is a nest input, so the same set imported again, from anywhere, leaves it as it
+    /// was. A new set is still recorded.
+    #[test]
+    fn reimporting_the_same_set_leaves_the_index_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.csv"), dir.path().join("b.csv"));
+        std::fs::write(&a, "0x1111111111111111111111111111111111111111,exchange\n").unwrap();
+        std::fs::write(&b, "0x1111111111111111111111111111111111111111,exchange\n").unwrap();
+        import(dir.path(), &a).unwrap();
+        let index = std::fs::read(dir.path().join(INDEX_FILE)).unwrap();
+        import(dir.path(), &b).unwrap();
+        assert_eq!(std::fs::read(dir.path().join(INDEX_FILE)).unwrap(), index);
+
+        std::fs::write(&b, "0x2222222222222222222222222222222222222222,mixer\n").unwrap();
+        import(dir.path(), &b).unwrap();
+        let records: Vec<ImportRecord> =
+            serde_json::from_slice(&std::fs::read(dir.path().join(INDEX_FILE)).unwrap()).unwrap();
+        assert_eq!(records.len(), 2);
     }
 }

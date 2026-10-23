@@ -640,6 +640,16 @@ pub struct DiffSnapshot {
     rtx: redb::ReadTransaction,
     watched: Vec<Address>,
     span: (u64, u64),
+    /// Where streaming the rows stops, and the budget that set it, for the error.
+    deadline: Option<(std::time::Instant, Duration)>,
+}
+
+impl DiffSnapshot {
+    /// Stop [`DiffSource::each_row`] at `deadline` with a [`crate::analytics::QueryBudgetExceeded`].
+    pub fn until(mut self, deadline: std::time::Instant, budget: Duration) -> Self {
+        self.deadline = Some((deadline, budget));
+        self
+    }
 }
 
 impl DiffSource for DiffSnapshot {
@@ -657,6 +667,14 @@ impl DiffSource for DiffSnapshot {
                 let t = self.rtx.open_table(action.table())?;
                 let (lo, hi) = (row_key(a, from, 0, 0), row_key(a, to, u64::MAX, u64::MAX));
                 for e in t.range(lo.as_slice()..=hi.as_slice())? {
+                    if let Some((at, budget)) = self.deadline {
+                        if std::time::Instant::now() >= at {
+                            return Err(crate::analytics::QueryBudgetExceeded {
+                                secs: budget.as_secs(),
+                            }
+                            .into());
+                        }
+                    }
                     let (k, v) = e?;
                     let key = key_parts(k.value());
                     let row = DiffRow::from_record(action, *a, key, &decode_record(v.value())?)
@@ -1785,6 +1803,7 @@ impl AddressHistory {
             rtx,
             watched,
             span: (from, to),
+            deadline: None,
         })
     }
 
@@ -2151,10 +2170,15 @@ impl AddressHistory {
             let mut buf = Vec::new();
             encode_record(record, &mut buf)?;
             wtx.open_table(RELAY_CACHE)?.insert(block, buf.as_slice())?;
+            let mut wrote = false;
             for (address, rows) in changes {
                 let a = parse_address(address)?;
                 if let Some(r) = rows.iter().find(|r| r.block != block) {
                     bail!("a row at block {} is not at block {block}", r.block);
+                }
+                // Unwatch does not move the generation, so an address unwatched mid-ask is caught here.
+                if wtx.open_table(WATCHED)?.get(a.as_slice())?.is_none() {
+                    continue;
                 }
                 drain(
                     &mut wtx.open_table(Action::ProducedBlocks.table())?,
@@ -2162,8 +2186,9 @@ impl AddressHistory {
                     &row_key(&a, block, u64::MAX, u64::MAX),
                 )?;
                 put_rows(&wtx, Action::ProducedBlocks, &a, rows)?;
+                wrote = true;
             }
-            if !changes.is_empty() {
+            if wrote {
                 bump_generation(&wtx)?;
             }
             let mut p = wtx.open_table(MEV_PENDING)?;
@@ -4179,6 +4204,35 @@ mod tests {
 
     /// Rows the RPC scan recorded in a mirror's blocks are set aside unless a verified partition
     /// replaced them, and a verified record replaces what its span held.
+    /// #2358: a diff's rows stop streaming at its deadline, with the budget error the route answers
+    /// 504 for, rather than running on after the caller has gone.
+    #[test]
+    fn a_diff_snapshot_stops_at_its_deadline() {
+        let (_d, h) = history();
+        let mut row = tx(5, 0);
+        row.record.insert("from".into(), Value::String(BOB.into()));
+        row.record.insert("value".into(), Value::String("1".into()));
+        let g = h.generation().unwrap();
+        h.record(Action::TxList, ALICE, &[row], (0, 10), g).unwrap();
+        let budget = Duration::from_secs(30);
+        let count = |deadline: std::time::Instant| {
+            let mut n = 0;
+            let snapshot = h.diff_snapshot((0, 10)).unwrap().until(deadline, budget);
+            snapshot.each_row(&mut |_| {
+                n += 1;
+                Ok(())
+            })?;
+            anyhow::Ok(n)
+        };
+        assert_eq!(count(std::time::Instant::now() + budget).unwrap(), 1);
+        let e = count(std::time::Instant::now()).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<crate::analytics::QueryBudgetExceeded>(),
+            Some(&crate::analytics::QueryBudgetExceeded { secs: 30 }),
+            "{e:#}"
+        );
+    }
+
     /// An RPC scan over blocks a partition supplied replaces their rows: a row the scan did not
     /// produce is not left beside the rows it did.
     #[test]
@@ -4606,6 +4660,27 @@ mod tests {
         );
         assert!(h.mev_pending().unwrap().is_empty());
         assert!(h.generation().unwrap() > g);
+    }
+
+    /// A re-ask that finishes after the account was unwatched writes none of its rows back (#2367).
+    #[test]
+    fn a_reask_finishing_after_an_unwatch_writes_no_rows() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        h.record_produced(ALICE, &[tx(100, 0)], (100, 100), g, &[100], 1)
+            .unwrap();
+        let g = h.generation().unwrap();
+        h.unwatch(ALICE).unwrap();
+        let changes = vec![(ALICE.to_string(), vec![tx(100, 1)])];
+        h.apply_reask(100, &Map::new(), &changes, false, 2, g)
+            .unwrap();
+        assert!(h
+            .rows_in(Action::ProducedBlocks, ALICE, (0, 1_000))
+            .unwrap()
+            .is_empty());
+        assert!(h.relay_record(100).unwrap().is_some());
+        assert!(h.mev_pending().unwrap().is_empty());
+        assert_eq!(h.generation().unwrap(), g);
     }
 
     /// A txhash lookup is paged as Etherscan pages it, reverted frames included: 1,500 rows at an

@@ -146,7 +146,7 @@ fn the_native_rows_are_etherscans_row_for_row_and_wei_for_wei() {
     let nest = history_nest();
     let (ok, out, err) = diff(
         nest.path(),
-        &args(&whole(), &["--format", "json", "--top", "100000"]),
+        &args(&whole(), &["--format", "json", "--top", "1000"]),
     );
     assert!(ok, "{err}");
     let doc = json(&out);
