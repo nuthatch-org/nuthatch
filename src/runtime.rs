@@ -1376,7 +1376,7 @@ pub(crate) fn adopt_staging(dataset: &Path) -> PathBuf {
 ///
 /// Nothing here touches `dataset`. That is the whole point: every way this can fail - disk full,
 /// permissions, an unreadable segment - leaves the destination untouched.
-fn stage_derived_state(from: &Path, staging: &Path) -> Result<Vec<&'static str>> {
+pub(crate) fn stage_derived_state(from: &Path, staging: &Path) -> Result<Vec<&'static str>> {
     std::fs::create_dir_all(staging)
         .with_context(|| format!("cannot create {}", staging.display()))?;
     let mut staged = Vec::new();
