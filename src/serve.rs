@@ -2663,6 +2663,16 @@ async fn graph_graphql(
     State(s): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // The caller's filters and ordering compile to SQL, so a bounded mount refuses it as `/sql` (#2366).
+    if !s.surface.free_form_allowed() {
+        crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Bounded);
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"errors":[{"message":
+                "this mount does not answer GraphQL: its SQL surface is bounded \
+                 (sql = \"deny\" or \"allowlist\"); GET /queries lists what it answers"}]})),
+        );
+    }
     let query = body
         .get("query")
         .and_then(|q| q.as_str())
@@ -11830,6 +11840,61 @@ mod tests {
             serde_json::json!({"rolled": ["9007199254740993", "5"], "weights": [1, 2]}),
             "graph-node sends BigInt as a string, inside a list too: {answer}"
         );
+    }
+
+    /// #2366: GraphQL compiles the caller's filters to SQL, so a bounded mount refuses it like `/sql`.
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn a_bounded_mount_refuses_graphql() {
+        use tower::ServiceExt;
+        reset_graph_budget();
+        let _guard = GraphBudgetGuard;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("graph/schema.graphql"),
+            "type Bet @entity { id: ID! weights: [Int!]! }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/bet.sql"),
+            "CREATE VIEW bet AS SELECT '1' AS id, [1, 2] AS weights;",
+        )
+        .unwrap();
+        let ask = |path: &'static str, state: AppState| async move {
+            router(SharedNest::new(state))
+                .oneshot(
+                    axum::http::Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            json!({ "query": "{ bets { weights } }" }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        };
+        let open = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        assert_eq!(ask("/graphql", open.clone()).await, StatusCode::OK);
+        for access in [
+            crate::allowlist::SqlAccess::Deny,
+            crate::allowlist::SqlAccess::Allowlist,
+        ] {
+            let mut bounded = open.clone();
+            bounded.surface = Arc::new(crate::allowlist::Surface {
+                access,
+                queries: vec![],
+            });
+            for path in ["/graphql", "/subgraphs/id/QmAbc", "/subgraphs/name/a/b"] {
+                assert_eq!(
+                    ask(path, bounded.clone()).await,
+                    StatusCode::FORBIDDEN,
+                    "{path} under {access:?}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "graph")]
