@@ -130,11 +130,28 @@ fn signing_bytes(body: &Body) -> Result<Vec<u8>> {
 /// `nuthatch pack build [--key <file>]` - assemble the manifest from the nest's config, sign it if a
 /// key is given, and write `compliance-pack.toml`.
 pub fn build(dir: &Path, key: Option<&Path>, created: &str) -> Result<()> {
-    let body = describe(dir, created)?;
+    let mut body = describe(dir, created)?;
+    let sk = key.map(load_signing_key).transpose()?;
 
-    let signature = match key {
-        Some(k) => {
-            let sk = load_signing_key(k)?;
+    // A rebuild that changes nothing but the time keeps the pack's bytes: the file is a nest input,
+    // and a new `created` would move the nest's identity (#2368).
+    if let Some(prev) = std::fs::read_to_string(dir.join(PACK_FILE))
+        .ok()
+        .and_then(|raw| toml::from_str::<Manifest>(&raw).ok())
+    {
+        let signer = sk
+            .as_ref()
+            .map(|k| hex::encode(k.verifying_key().to_bytes()));
+        body.created = prev.pack.created.clone();
+        if prev.signature.map(|s| s.pubkey) != signer
+            || serde_json::to_value(&prev.pack)? != serde_json::to_value(&body)?
+        {
+            body.created = created.to_string();
+        }
+    }
+
+    let signature = match sk {
+        Some(sk) => {
             let sig = sk.sign(&signing_bytes(&body)?);
             Some(Signature {
                 pubkey: hex::encode(sk.verifying_key().to_bytes()),
@@ -502,6 +519,27 @@ threshold = "1000"
         let report = verify(dir.path(), &vk).unwrap();
         assert_eq!(report.signature, None);
         assert!(!report.ok(), "{report:?}");
+    }
+
+    /// #2368: the pack is a nest input, so rebuilding it unchanged keeps its bytes. A changed body or
+    /// signer still takes the new time.
+    #[test]
+    fn rebuilding_an_unchanged_pack_keeps_its_bytes() {
+        let dir = nest();
+        let (keyfile, _) = keypair(dir.path(), "key.json");
+        let path = dir.path().join(PACK_FILE);
+        build(dir.path(), Some(&keyfile), "unix:1").unwrap();
+        let first = std::fs::read(&path).unwrap();
+        build(dir.path(), Some(&keyfile), "unix:2").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+
+        build(dir.path(), None, "unix:3").unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("unix:3"));
+        let cfg = dir.path().join(crate::config::CONFIG_FILE);
+        let raw = std::fs::read_to_string(&cfg).unwrap();
+        std::fs::write(&cfg, raw.replace("\"1000\"", "\"5000\"")).unwrap();
+        build(dir.path(), None, "unix:4").unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("unix:4"));
     }
 
     /// #2186: a genuine pack for an older config no longer describes the nest beside it.
