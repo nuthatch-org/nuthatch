@@ -161,7 +161,7 @@ pub fn sql_max_concurrency() -> usize {
 /// Ten times that under test: the tests through the router are built unoptimised, where the engine
 /// plans the network nest's thirty-view queries in tens of seconds and not the release build's one.
 /// They test answers, not latency, as `tests/network_contract.rs` says of its own allowance.
-const SQL_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 300 } else { 30 });
+pub(crate) const SQL_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 300 } else { 30 });
 /// How long a request waits for an analytical permit before it is told the node is busy (#1319).
 ///
 /// The permit count still caps what *runs*; this only caps how long a caller waits to be told no.
@@ -3610,7 +3610,7 @@ async fn admit(
 }
 
 /// [`admit`] to any gate, parking in the nest's one queue.
-async fn admit_to(
+pub(crate) async fn admit_to(
     gate: &Arc<Semaphore>,
     queued: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, axum::response::Response> {
