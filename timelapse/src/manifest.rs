@@ -3,7 +3,10 @@
 
 use std::collections::BTreeMap;
 
+use alloy_json_abi::JsonAbi;
+use alloy_primitives::Address;
 use anyhow::{Context, Result};
+use nuthatch_decode::registry::{ContractSpec, DecodeRegistry, TemplateSpec};
 use serde::{Deserialize, Serialize};
 
 use crate::plan::Plan;
@@ -20,6 +23,27 @@ pub struct Identity {
 #[derive(Deserialize)]
 struct Config {
     nest: NestSection,
+    #[serde(default)]
+    contracts: Vec<ContractDecl>,
+    #[serde(default)]
+    templates: Vec<TemplateDecl>,
+}
+
+#[derive(Deserialize)]
+struct ContractDecl {
+    alias: String,
+    address: String,
+    abi: String,
+    #[serde(default)]
+    events: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct TemplateDecl {
+    name: String,
+    abi: String,
+    #[serde(default)]
+    events: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -33,25 +57,47 @@ fn one() -> u32 {
     1
 }
 
-#[derive(Deserialize)]
-struct SchemaDoc {
-    registry_hash: String,
+/// The event registry hash the node pins in a manifest, rebuilt from the config and ABIs in `files` as
+/// `registry::from_nest` does. `schema.json` is not a source for it: its hash also folds in calldata,
+/// IPFS and `[[calls]]` declarations, so it differs for those nests.
+fn registry_hash(config: &Config, files: &BTreeMap<String, Vec<u8>>) -> Result<String> {
+    let abi = |path: &str| -> Result<JsonAbi> {
+        let raw = files.get(path.trim_start_matches("./")).with_context(|| format!("no ABI {path}"))?;
+        serde_json::from_slice(raw).with_context(|| format!("parsing ABI {path}"))
+    };
+    let mut specs = Vec::with_capacity(config.contracts.len());
+    for c in &config.contracts {
+        let bytes = hex::decode(c.address.trim_start_matches("0x")).context("bad address hex")?;
+        anyhow::ensure!(bytes.len() == 20, "address is not 20 bytes");
+        specs.push(ContractSpec {
+            alias: c.alias.clone(),
+            address: Address::from_slice(&bytes),
+            abi: abi(&c.abi)?,
+            events: c.events.clone(),
+        });
+    }
+    let mut templates = Vec::with_capacity(config.templates.len());
+    for t in &config.templates {
+        templates.push(TemplateSpec {
+            name: t.name.clone(),
+            abi: abi(&t.abi)?,
+            events: t.events.clone(),
+        });
+    }
+    Ok(hex::encode(
+        DecodeRegistry::build_with_templates(specs, templates)?.hash(),
+    ))
 }
 
 /// The identity of a nest whose authored inputs are `files`, by path relative to the nest root, as
-/// `nuthatch_identity` computes it. The registry hash is the one `schema.json` records rather than one
-/// regenerated from the config and ABIs, which only the main crate can do: a `schema.json` written by
-/// a different decode would give a different identity from the node's.
+/// `nuthatch_identity` computes it.
 pub fn identity(files: BTreeMap<String, Vec<u8>>) -> Result<Identity> {
     let config: Config = toml::from_str(
         std::str::from_utf8(files.get("nuthatch.toml").context("no nuthatch.toml")?)
             .context("nuthatch.toml is not UTF-8")?,
     )
     .context("nuthatch.toml")?;
-    let schema: SchemaDoc =
-        serde_json::from_slice(files.get("schema.json").context("no schema.json")?)
-            .context("schema.json has no registry_hash")?;
-    let registry = schema.registry_hash.trim_start_matches("0x").to_string();
+    let registry = registry_hash(&config, &files)?;
     let m = nuthatch_identity::manifest(
         config.nest.name,
         config.nest.schema_version,

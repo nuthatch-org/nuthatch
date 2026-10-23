@@ -280,15 +280,14 @@ fn identity_matches_what_nuthatch_identity_computes_from_the_same_inputs() {
             "nuthatch.toml".to_string(),
             b"[nest]\nname = \"n\"\nschema_version = 2\n".to_vec(),
         ),
-        (
-            "schema.json".to_string(),
-            br#"{"registry_hash":"0xabcd","tables":[]}"#.to_vec(),
-        ),
         ("views/a.sql".to_string(), b"SELECT 1".to_vec()),
     ]
     .into();
     let got = manifest::identity(files.clone()).unwrap();
-    let m = nuthatch_identity::manifest("n".into(), 2, "x".into(), "abcd".into(), files).unwrap();
+    let m = nuthatch_identity::manifest("n".into(), 2, "x".into(),
+        hex::encode(nuthatch_decode::registry::DecodeRegistry::build(vec![]).unwrap().hash()),
+        files,
+    ).unwrap();
     assert_eq!(got.nid, m.nid());
     assert_eq!(got.data_identity, m.data_identity());
 }
