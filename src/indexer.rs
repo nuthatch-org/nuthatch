@@ -3778,6 +3778,35 @@ fn tail_hold(w_to: u64, final_pass_done: bool) -> u64 {
 /// the block it touched, and the segment's content address depends on that order.
 pub(crate) type SealRow = (u64, u64, String);
 
+/// Decoded rows as seal rows, each qualifying transfer followed by its `[flags] threshold` row,
+/// where the tip path's store key (`{block}-{log}-thr`) puts it (#2372). The flag shares its
+/// transfer's `(block, log_index)`.
+fn seal_rows(rows: &[crate::registry::DecodedRow], threshold: Option<i128>) -> Vec<SealRow> {
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push((r.block_number, r.log_index, r.to_json().to_string()));
+        let Some(t) = threshold else { continue };
+        let Some((from, to, Some(value), _)) = r.erc20_transfer_fields() else {
+            continue;
+        };
+        let Some(v) = views::transfer_value(&value) else {
+            continue;
+        };
+        if let Some((_, ann)) = crate::flags::threshold_annotation(
+            &from,
+            &to,
+            v,
+            r.block_number,
+            r.log_index,
+            &r.tx_hash,
+            t,
+        ) {
+            out.push((r.block_number, r.log_index, ann.to_string()));
+        }
+    }
+    out
+}
+
 /// Logs one seal-direct window may hold, in whole blocks, before it hands the rest of its range back
 /// (#1671). Exceeded by at most one block's logs, because a block is never split. Ten times the
 /// controller's target, so only a window that overshot reaches it.
@@ -3834,10 +3863,12 @@ fn merge_window_rows_seeing(
     mut fresh_row: impl FnMut(&SealRow),
 ) -> Result<u64> {
     let start = buf.partition_point(|r| r.0 < merge_from);
-    let held: std::collections::HashMap<(u64, u64), &str> = buf[start..]
-        .iter()
-        .map(|r| ((r.0, r.1), r.2.as_str()))
-        .collect();
+    // A threshold flag shares its transfer's key (#2372), so a key can hold two rows.
+    let mut held: std::collections::HashMap<(u64, u64), Vec<&str>> =
+        std::collections::HashMap::new();
+    for r in &buf[start..] {
+        held.entry((r.0, r.1)).or_default().push(r.2.as_str());
+    }
     let mut fresh = Vec::new();
     for r in rows {
         match held.get(&(r.0, r.1)) {
@@ -3845,7 +3876,7 @@ fn merge_window_rows_seeing(
                 fresh_row(&r);
                 fresh.push(r)
             }
-            Some(json) if *json == r.2 => {}
+            Some(json) if json.contains(&r.2.as_str()) => {}
             Some(_) => anyhow::bail!(
                 "block {} log {} came back with different content on refetch - the provider \
                  answered the same block two ways, refusing to seal either",
@@ -4484,6 +4515,8 @@ pub struct DirectExtras<'a> {
     pub store: Option<&'a dyn crate::store::HotStore>,
     /// An explicit `--window`, which the adaptive window never grows past.
     pub window_ceiling: Option<u64>,
+    /// `[flags] threshold`, whose rows the tip path stores beside each qualifying transfer.
+    pub threshold: Option<i128>,
 }
 
 impl Default for DirectExtras<'_> {
@@ -4496,6 +4529,7 @@ impl Default for DirectExtras<'_> {
             ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
             store: None,
             window_ceiling: None,
+            threshold: None,
         }
     }
 }
@@ -6037,10 +6071,7 @@ pub async fn backfill_direct_pipelined_with(
         }
         // Carry each row's block so the consumer can seal on a data-determined boundary
         // (RFC-0028 §4) instead of at whichever window filled the buffer.
-        let mut json: Vec<SealRow> = rows
-            .iter()
-            .map(|r| (r.block_number, r.log_index, r.to_json().to_string()))
-            .collect();
+        let mut json = seal_rows(&rows, extras.threshold);
         // RFC-0036 §4.2: one row per block in the window. Enumerated from the **window**, not
         // from `rows` - a blocks table has to cover blocks that emitted nothing, and OBIB case 3
         // is 100,001 blocks with no contract in the nest at all.
@@ -6546,8 +6577,7 @@ pub async fn backfill_direct_factory_with(
         let row_count = merge_window_rows_seeing(
             &mut buf,
             fetch_from,
-            rows.iter()
-                .map(|r| (r.block_number, r.log_index, r.to_json().to_string())),
+            seal_rows(&rows, extras.threshold),
             |r| documents += u64::from(crate::ipfs_resolve::is_document_row(r.1)),
         )?;
         if let (Some(metrics), true) = (extras.metrics, documents > 0) {
@@ -6883,6 +6913,7 @@ impl NestIngest {
                     ipfs_policy: self.seal_direct_policy(),
                     store: Some(self.store.as_ref()),
                     window_ceiling: self.window_ceiling,
+                    threshold: self.threshold,
                 };
                 let deadline = match (&self.ipfs_gate, extras.ipfs_policy.deadline) {
                     (None, _) => String::new(),
@@ -12132,6 +12163,123 @@ template="pool"
         );
     }
 
+    /// #2372, the factory half: a child's transfers seal their `[flags] threshold` rows too.
+    #[tokio::test]
+    async fn factory_seal_direct_seals_threshold_flags() {
+        use crate::registry::{ContractSpec, DecodeRegistry, TemplateSpec};
+        use crate::rpc::Log;
+
+        let factory_addr = "0x1111111111111111111111111111111111111111";
+        let tok = "0x2222222222222222222222222222222222222222";
+        let reg = DecodeRegistry::build_with_templates(
+            vec![ContractSpec {
+                alias: "factory".into(),
+                address: factory_addr.parse().unwrap(),
+                abi: serde_json::from_str(
+                    r#"[{"type":"event","name":"PoolCreated","anonymous":false,"inputs":[{"name":"pool","type":"address","indexed":false}]}]"#,
+                ).unwrap(),
+                events: Vec::new(),
+            }],
+            vec![TemplateSpec {
+                name: "tok".into(),
+                abi: serde_json::from_str(
+                    r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+                ).unwrap(),
+                events: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let config: Config = toml::from_str(
+            r#"
+[nest]
+name="t"
+chain="mainnet"
+chain_id=1
+rpc_urls=["https://rpc"]
+[[contracts]]
+alias="factory"
+address="0x1111111111111111111111111111111111111111"
+abi="abis/f.json"
+[[templates]]
+name="tok"
+abi="abis/t.json"
+[[factories]]
+watch="factory"
+event="PoolCreated"
+child_param="pool"
+template="tok"
+"#,
+        )
+        .unwrap();
+        let fs = FactorySet::build(&config).unwrap();
+        let topic0 = |table: &str| {
+            format!(
+                "0x{}",
+                hex::encode(
+                    reg.tables()
+                        .iter()
+                        .find(|d| d.table == table)
+                        .unwrap()
+                        .topic0
+                )
+            )
+        };
+        let mut logs = vec![Log {
+            address: factory_addr.into(),
+            topics: vec![topic0("factory__pool_created")],
+            data: format!("0x{:0>64}", tok.trim_start_matches("0x")),
+            block_number: 10,
+            block_hash: "0xbh".into(),
+            tx_hash: "0xt".into(),
+            log_index: 0,
+        }];
+        for b in 11..=13u64 {
+            let mut t = transfer_log(b, 0);
+            t.address = tok.into();
+            t.topics[0] = topic0("tok__transfer");
+            logs.push(t);
+        }
+        let source = FilteringSource { logs };
+        let dir = tempfile::tempdir().unwrap();
+        let mut children = ChildRegistry::new();
+        let topic0s = [topic0("factory__pool_created"), topic0("tok__transfer")];
+        backfill_direct_factory_with(
+            &source,
+            &reg,
+            &fs,
+            &mut children,
+            dir.path(),
+            &topic0s,
+            &[],
+            None,
+            0,
+            10,
+            20,
+            100,
+            SPAN_OFF,
+            false,
+            DirectExtras {
+                threshold: Some(1),
+                ..DirectExtras::default()
+            },
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        let m = crate::seal::load_manifest(dir.path()).unwrap();
+        let flags: usize = m
+            .tables
+            .get("threshold_flag")
+            .map_or(0, |s| s.iter().map(|s| s.rows).sum());
+        assert_eq!(
+            flags,
+            3,
+            "sealed tables: {:?}",
+            m.tables.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// RFC-0009 step 2 gate: a child created and active in the *same* window is decoded - the
     /// factory's `PoolCreated` (log 0) discovers the pool, so the pool's `Swap` (log 1) routes to the
     /// template decoder in one in-order pass, no extra RPC. Verifies both rows and the child registry.
@@ -15915,6 +16063,7 @@ template = "pool"
                 ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
                 store: None,
                 window_ceiling: None,
+                threshold: None,
             },
             |_| Ok(()),
             |reached, _, _| {
@@ -15974,6 +16123,7 @@ template = "pool"
                 ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
                 store: None,
                 window_ceiling: None,
+                threshold: None,
             },
             |_| Ok(()),
             |_, _, _| {},
@@ -16050,6 +16200,7 @@ template = "pool"
                 ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
                 store: None,
                 window_ceiling: None,
+                threshold: None,
             },
             |_| Ok(()),
             |_, _, _| {},
@@ -16546,6 +16697,7 @@ template = "pool"
                 ipfs_policy: one_quick_attempt(),
                 store: Some(&store as &dyn crate::store::HotStore),
                 window_ceiling: None,
+                threshold: None,
             };
             let mut rows = Vec::new();
             extras
@@ -16624,6 +16776,7 @@ template = "pool"
                     ipfs_policy: one_quick_attempt(),
                     store: record.then_some(&store as &dyn crate::store::HotStore),
                     window_ceiling: None,
+                    threshold: None,
                 },
                 |_| Ok(()),
                 |_, _, _| {},
@@ -18402,6 +18555,55 @@ template = "pool"
         ) -> Result<std::collections::HashMap<u64, u64>> {
             Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
         }
+    }
+
+    /// #2372: `[flags] threshold` rows are part of a nest's history. Seal-direct sealed none, so the
+    /// segments, and where they were cut, depended on a CLI flag.
+    #[tokio::test]
+    async fn seal_direct_seals_the_threshold_flags_the_tip_path_seals() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let abi = r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#;
+        let flags = "[flags]\nthreshold = \"1\"\n";
+        // 12,000 transfers alone stay under SEAL_DIRECT_BATCH; their flags carry it past.
+        let history: Vec<_> = (10u64..130)
+            .flat_map(|b| (0..100).map(move |i| transfer_log(b, i)))
+            .collect();
+        let mut logs = history.clone();
+        logs.push(transfer_log(5_000, 0));
+        let source = MockSource { logs };
+
+        let d1 = tempfile::tempdir().unwrap();
+        let mut direct = build_test_nest_with(d1.path(), addr, abi, flags).await;
+        direct
+            .prepare(&source, Some(5_000), true, 1, 50)
+            .await
+            .unwrap();
+
+        let d2 = tempfile::tempdir().unwrap();
+        let mut tip = build_test_nest_with(d2.path(), addr, abi, flags).await;
+        tip.process_window(&source, &history, 0, 129, 5_000)
+            .await
+            .unwrap()
+            .expect("commits");
+
+        // `from_block` is left out: the tip path starts its first segment at the first held row.
+        let first = |d: &std::path::Path| {
+            seal::load_manifest(d)
+                .unwrap()
+                .tables
+                .into_iter()
+                .filter_map(|(t, segs)| {
+                    let s = segs.into_iter().find(|s| !s.provisional)?;
+                    Some((t, (s.to_block, s.hash)))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let want = first(d2.path());
+        assert!(
+            want.contains_key("threshold_flag"),
+            "premise: the tip path cut a segment of flags: {want:?}"
+        );
+        assert_eq!(first(d1.path()), want);
     }
 
     #[tokio::test]
