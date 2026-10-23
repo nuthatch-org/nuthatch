@@ -301,7 +301,7 @@ mod tests {
         columns.push(crate::registry::ColumnSchema {
             name: "value".into(),
             sol_type: "uint256".into(),
-            storage: "varchar".into(),
+            storage: "word32".into(),
             indexed: false,
             components: Vec::new(),
         });
@@ -318,6 +318,9 @@ mod tests {
         let mut good = wh("w", "t__transfer", "registration");
         good.where_clause = Some("CAST(value AS HUGEINT) > 100".into());
         refuse_unbound(dir.path(), &declared, &[good]).expect("a webhook that binds is accepted");
+        let mut derived = wh("w", "t__transfer", "registration");
+        derived.where_clause = Some("value_dec > 1000000".into());
+        refuse_unbound(dir.path(), &declared, &[derived]).expect("a derived `_dec` column binds");
 
         let err = format!(
             "{:#}",
