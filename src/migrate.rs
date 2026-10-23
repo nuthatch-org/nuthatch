@@ -405,26 +405,28 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                 // A **copy**, not a move or a rename: the source dataset may still be mounted by
                 // another alias or another tenant, and early cutoff must never take data away from a
                 // mount that is using it. Costs disk; the alternative costs a full backfill.
-                crate::project::copy_dir(from, to).with_context(|| {
+                //
+                // Only the source's derived state: its authored files are the old version's, and a
+                // file the new version deleted would come back (#587, #2362). The package supplies
+                // every authored file.
+                crate::runtime::stage_derived_state(from, to).with_context(|| {
                     format!("adopting {} into {}", from.display(), to.display())
                 })?;
-                // The copy above brings the *source* dataset — its data, and its
-                // package files with it. That leaves the adopting nest wearing
-                // someone else's authored work: a `views/large-transfers.sql`
-                // this nest wrote is absent afterwards, and its semantic.toml is
-                // the source's (#587). Adoption is meant to save a backfill, not
-                // to replace what the operator wrote.
-                //
-                // So overlay the incoming nest's own package on top. Data is
-                // skipped by name: the redb store and segments/ belong to the
-                // source and are the whole reason this was an adopt.
                 let overlaid = overlay_package(package, to).with_context(|| {
                     format!(
-                        "overlaying {}'s authored files onto {}",
+                        "copying {}'s authored files into {}",
                         package.display(),
                         to.display()
                     )
                 })?;
+                let landed = blob::nest_nid(to)?;
+                if landed != *nid {
+                    std::fs::remove_dir_all(to).ok();
+                    bail!(
+                        "adopting {alias} produced {} hashing to {landed}, not {nid}",
+                        to.display()
+                    );
+                }
                 if overlaid > 0 {
                     println!(
                         "  {alias}: adopted without re-indexing ({overlaid} authored file(s) kept)"
@@ -1361,5 +1363,48 @@ mod tests {
         assert!(mounts
             .dir_for(d.path(), "broken")
             .starts_with(d.path().join(NESTS_DIR)));
+    }
+
+    /// #2362: an adopt takes the source's data and nothing it authored, so a file the new version
+    /// deleted stays deleted and the dataset hashes to the NID its mount record claims.
+    #[test]
+    fn an_adopt_does_not_bring_back_a_file_the_new_version_deleted() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write_roost(root, &[("a", "0x0000000000000000000000000000000000000001")]);
+        let nest = root.join(NESTS_DIR).join("a");
+        std::fs::create_dir_all(nest.join("views")).unwrap();
+        std::fs::write(nest.join("views/old.sql"), "CREATE VIEW old AS SELECT 1").unwrap();
+        run(root, false, false).unwrap();
+        let first = MountTable::load(root).unwrap().mounts[0].nid.clone();
+        let dataset = root.join(DATA_DIR).join(&first);
+        let data = std::fs::read(dataset.join(crate::config::DB_FILE)).unwrap();
+
+        // The new version drops the view: same data identity, new NID.
+        let staged = root.join(NESTS_DIR).join("a");
+        crate::project::copy_dir(&dataset, &staged).unwrap();
+        std::fs::remove_file(staged.join(crate::config::DB_FILE)).unwrap();
+        std::fs::remove_file(staged.join("views/old.sql")).unwrap();
+        let staged_nid = nid_of(&staged).unwrap();
+        let mut mounts = MountTable::load(root).unwrap();
+        mounts.mounts.clear();
+        mounts.runtime.nests = vec!["a".into()];
+        std::fs::write(
+            root.join(MOUNTS_FILE),
+            toml::to_string_pretty(&mounts).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(plan(root).unwrap()[0], Plan::Adopt { .. }));
+        run(root, false, false).unwrap();
+
+        let after = MountTable::load(root).unwrap().mounts[0].nid.clone();
+        assert_eq!(after, staged_nid);
+        let new_dir = root.join(DATA_DIR).join(&after);
+        assert!(!new_dir.join("views/old.sql").exists());
+        assert_eq!(
+            std::fs::read(new_dir.join(crate::config::DB_FILE)).unwrap(),
+            data
+        );
+        assert_eq!(crate::blob::nest_nid(&new_dir).unwrap(), after);
     }
 }

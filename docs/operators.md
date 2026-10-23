@@ -917,7 +917,7 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /schema` | the full data model |
 | `GET /sql?q=…` | read-only analytical SQL over hot and sealed data; the answer carries `cached`, `degraded`, `tip_unavailable` and a `provenance` block (`as_of`, `sealed_through`, `nid`, `registry_hash`) |
 | `GET /explain` | binds caller-supplied SQL without running it (`valid`, `note`); guarded like `/sql` |
-| `GET /diff` | what happened in a range (`from`, `to`), a `block`, or a `tx` with its `block`: the document `nuthatch diff --format json` prints, or `format=text`/`markdown`; `flow=true` for the token flow. One `/sql` permit per diff, `/sql`'s hot-row ceilings and its 30 s budget; refused on a mount whose `sql` mode is not `open` (RFC-0071). A diff whose read passes 500,000 distinct (token, from, to) edges is refused. An address-history nest under `nuthatch dev` serves the same route over its watched addresses' rows, read from one snapshot of its store, with no `/sql` permit; a directory of chains serves none |
+| `GET /diff` | what happened in a range (`from`, `to`), a `block`, or a `tx` with its `block`: the document `nuthatch diff --format json` prints, or `format=text`/`markdown`; `flow=true` for the token flow. One `/sql` permit per diff, `/sql`'s hot-row ceilings and its 30 s budget; refused on a mount whose `sql` mode is not `open` (RFC-0071). A diff whose read passes 500,000 distinct (token, from, to) edges is refused. An address-history nest under `nuthatch dev` serves the same route over its watched addresses' rows, read from one snapshot of its store, under the same permit count and 30 s budget; a directory of chains serves none |
 | `GET /queries`, `GET /q/{name}` | the mount's `sql` mode (`open`, `allowlist`, `deny`) and its declared queries (RFC-0034), and one of them by name |
 | `GET /derived`, `GET /derived/{entity}`, `GET /derived/{entity}/{key}` | authored incremental entities (RFC-0041): the list with its head, one relation, one row |
 | `GET /ipfs/gave-up?limit=100` | the `[[ipfs]]` documents the nest stopped trying to fetch, in block order |
@@ -1006,8 +1006,9 @@ decision that matters here: `sql = "open"` is the default and it is the right de
 `nuthatch dev`, where exploration is the point - but on an endpoint strangers can reach, it means
 anyone may run arbitrary analytical SQL over your disk, bounded only by the guards below. If that is
 not what you want, set `sql = "allowlist"` on the mount and declare the queries it answers, or
-`sql = "deny"` to close SQL entirely while the typed routes keep serving. A nest whose author
-ships a `queries.toml` caps every mount of it: a mount may name fewer of those queries or deny SQL,
+`sql = "deny"` to close SQL entirely while the typed routes keep serving. In a `graph` build
+the GraphQL routes compile a caller's filters to SQL, so either bound refuses them too. A nest whose
+author ships a `queries.toml` caps every mount of it: a mount may name fewer of those queries or deny SQL,
 an allowlist wider than the author's is refused, and a mount left on `open` answers exactly the
 author's queries, never free-form SQL. See
 [Bounding what a mount will answer](https://nuthatch-indexer.com/docs/operate/security/#bounding-what-a-mount-will-answer).
@@ -1493,7 +1494,7 @@ duplicates.
 | A nest stuck at a block | its `quarantine.reason` on `/nests`; logs | a `getLogs` provider cap on a busy template usually wants a smaller `--window` |
 | RSS approaching the ceiling | which nest, via `nuthatch_nest_*`; recent `/sql` traffic | the hot-scan is the usual cause. Restrict `/sql` at the gateway, or move the nest to its own cursor |
 | Backfill crawling | `--window` versus contract sparsity; `--concurrency` | a sparse contract wants a *large* window; a dense one wants concurrency against your own node |
-| Webhook backlog | `nuthatch_alert_outbox_depth`, sink availability | a drain posts eight deliveries at once with a 10 s timeout each, so one slow sink delays its own alerts, not the others'; past 10,000 undelivered alerts the oldest are shed, loudly |
+| Webhook backlog | `nuthatch_alert_outbox_depth`, sink availability | a drain posts eight deliveries at once with a 10 s timeout each, so one slow sink delays its own alerts, not the others'; past 10,000 undelivered alerts the oldest are shed, loudly. A `[[webhooks]]` subscription stops queueing at 5,000 and holds its cursor until the outbox drains, so its rows arrive late rather than not at all |
 | Chain-id mismatch at startup | the startup error names the endpoint | an endpoint in the pool is on the wrong network. Every endpoint is verified at boot, on purpose |
 | Suspect data | `nuthatch check --dir <nest>` | runs the nest's committed invariant and parity checks against recorded fixtures |
 
@@ -1665,7 +1666,9 @@ nuthatch migrate --dir <runtime>              # applies it; add --allow-breaking
 ```
 
 - **A new version is a new NID**, because the NID is a content address: any edit to the nest's
-  inputs, a view or a description included, yields a different NID. Whether it is indexed again
+  inputs, a view or a description included, yields a different NID. Its files must be regular files:
+  a symbolic link anywhere in the nest other than `nuthatch.redb` or `segments/` is refused by `dev`,
+  `init --from` and every command that computes the NID, because the NID cannot see what it points to. Whether it is indexed again
   depends on what the edit touched. Views, `entities.toml`, `semantic.toml`, `llms.txt` and the
   scaffolded skill are outside the **data identity**. On a runtime, or through `migrate`, a new NID
   whose data identity and recorded decode (registry hash) both match a dataset that holds data adopts

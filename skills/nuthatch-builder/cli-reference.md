@@ -167,7 +167,7 @@ What happened in a block range, a block or a transaction, in fixed sentences: ow
 - `--since-last` - From the block after the previous --since-last diff of this nest up to the sealed boundary (an address-history nest's finalized head). The cursor is kept in $XDG_STATE_HOME/nuthatch/diff/ (else ~/.local/state), keyed by the nest's data identity, never in the nest directory
 - `--final-only` - Refuse a range that reaches above the sealed boundary (an address-history nest's finalized head), rather than label it provisional
 - `--format <FORMAT>` - `text`, `markdown`, `json` (the document every other format is drawn from), and for --flow `dot` or `mermaid`
-- `--top <TOP>` - Items per list: transfers, addresses and approvals per token, and sentences per table (default 10). With --flow, edges and net-flow addresses per token in text, DOT and Mermaid, where JSON carries every one (default 25)
+- `--top <TOP>` - Items per list: transfers, addresses and approvals per token, and sentences per table (default 10). With --flow, edges and net-flow addresses per token in text, DOT and Mermaid, where JSON carries every one (default 25). At most 1,000
 - `--dir <DIR>` - Nest directory. Read directly when it holds a store no `nuthatch dev` has open; its `metadata.json` and labels are read either way
 - `--url <URL>` - The running instance's API, used when --dir holds no store or `nuthatch dev` has it open
 - `--rpc <RPC>` - RPC for the --tx receipt lookup. Defaults to the nest's `rpc_urls`
