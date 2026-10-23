@@ -1089,6 +1089,9 @@ fn init_from(source: &str, target: &Path) -> Result<()> {
         println!("→ copying nest from {} …", src.display());
         copy_dir_except(&src, target, &crate::blob::is_excluded)?;
     }
+    // A clone keeps a committed symlink, which `dev` would refuse (#2355): say so now.
+    crate::blob::collect_files(target, None)
+        .with_context(|| format!("'{}' is not a valid nuthatch nest", target.display()))?;
 
     // Validate: it must be a real nest - toml at a supported schema version, ABIs present + decodable.
     let config = Config::load(target)

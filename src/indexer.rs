@@ -3001,6 +3001,8 @@ async fn build_nest(
         );
     }
     crate::analytics_budget::validate_cursor_budget(1)?;
+    // A symlinked input is read here but invisible to the NID (#2355).
+    crate::blob::collect_files(&dir, None)?;
     // RFC-0014 extraction is configured but not yet sourceable. Refuse rather than start, because the
     // failure mode of starting is the worse one: `traces`/`state_diffs` would exist, answer queries,
     // and return nothing - and an empty table is indistinguishable from "no matching rows" to whoever
@@ -12697,6 +12699,39 @@ template = "pool"
             !dir.path().join(crate::config::DB_FILE).exists(),
             "refused before opening a store"
         );
+    }
+
+    /// #2355: a nest whose config is a symlink would run one config under an identity that never saw
+    /// it, so `build_nest` refuses it before opening anything.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_config_is_refused_by_build_nest() {
+        let (dir, elsewhere) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let real = elsewhere.path().join("nuthatch.toml");
+        std::fs::write(
+            &real,
+            "[nest]\nname = \"r\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join(crate::config::CONFIG_FILE)).unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let Err(err) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        else {
+            panic!("a symlinked config must not build");
+        };
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert!(!dir.path().join(crate::config::DB_FILE).exists());
     }
 
     /// Seed a nest's hot store with one row per block and set `LAST_BLOCK` to the max.
