@@ -1180,7 +1180,7 @@ pub struct DiffArgs {
 
     /// Items per list: transfers, addresses and approvals per token, and sentences per table
     /// (default 10). With --flow, edges and net-flow addresses per token in text, DOT and Mermaid,
-    /// where JSON carries every one (default 25).
+    /// where JSON carries every one (default 25). At most 1,000.
     #[arg(long)]
     pub top: Option<usize>,
 

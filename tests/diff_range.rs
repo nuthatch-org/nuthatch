@@ -538,6 +538,10 @@ fn the_route_refuses_what_it_cannot_answer() {
             "/diff?block=26243031&format=dot".to_string(),
             "draw the flow",
         ),
+        (
+            "/diff?block=26243031&top=9223372036854775808".to_string(),
+            "the most items per list",
+        ),
     ] {
         let (status, body) = http_get(served.port, &path).unwrap();
         assert_eq!(status, 400, "{path}: {body}");
