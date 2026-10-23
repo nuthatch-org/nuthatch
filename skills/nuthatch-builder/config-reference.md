@@ -56,12 +56,14 @@ start = 12369621             # optional: ignore discoveries before this block
 [[webhooks]]                  # optional (RFC-0010 Part B)
 name = "large-transfers"
 table = "usdc__transfer"
-where = "value_dec > 1e6"     # NOTE: the toml key is `where`
+where = "value_dec > 1e6"     # NOTE: the toml key is `where`. A `table` or `where` that does not
+                              # bind against the nest's schema refuses the nest at startup.
 url = "https://…"
 batch_max = 100               # optional
 finality = "sealed"           # optional; "sealed" (the default) is the only delivery path. "tip" is
                               # reserved and refused at load until tip delivery ships (#577).
-since = "registration"        # optional: "genesis" | "registration" | a block number
+since = "registration"        # optional: "genesis" | "registration" | a block number; anything else
+                              # is a load error.
 secret = "…"                  # optional HMAC signing secret
 
 [[alerts]]                    # optional (RFC-0008 C5)

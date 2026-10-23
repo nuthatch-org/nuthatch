@@ -147,6 +147,56 @@ pub fn deliver_sealed(
     Ok(enqueued)
 }
 
+/// Refuse a webhook whose `table` or `where` does not bind against the nest's declared schema (#2365).
+/// The delivery query would fail the same way on every seal, and the webhook would never fire.
+pub fn refuse_unbound(
+    dir: &std::path::Path,
+    declared: &[crate::registry::TableSchema],
+    webhooks: &[Webhook],
+) -> Result<()> {
+    let plan = |sql: &str| {
+        let guard = crate::analytics::QueryGuard {
+            timeout: std::time::Duration::from_secs(10),
+            max_rows: 1,
+        };
+        crate::analytics::plan_hot_cold(
+            dir,
+            sql,
+            guard,
+            &crate::analytics::HotRows::new(),
+            u64::MAX,
+            declared,
+        )
+    };
+    for w in webhooks {
+        let base = format!(
+            "SELECT * FROM \"{}\" WHERE block_number > 0 ORDER BY block_number, log_index",
+            w.table
+        );
+        if let Err(e) = plan(&base) {
+            anyhow::bail!(
+                "webhook '{}': `table = \"{}\"` is not a table this nest can deliver from: {e:#}",
+                w.name,
+                w.table
+            );
+        }
+        if let Some(p) = &w.where_clause {
+            let sql = format!(
+                "SELECT * FROM \"{}\" WHERE block_number > 0 AND ({p}) ORDER BY block_number, log_index",
+                w.table
+            );
+            if let Err(e) = plan(&sql) {
+                anyhow::bail!(
+                    "webhook '{}': `where = \"{p}\"` does not bind against `{}`: {e:#}",
+                    w.name,
+                    w.table
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +290,55 @@ mod tests {
             deliver_sealed(&store, dir.path(), &webhooks, 14).unwrap(),
             0
         );
+    }
+
+    /// #2365: a webhook whose `table` or `where` cannot bind is refused at registration, by field,
+    /// before any segment exists, instead of failing at debug on every seal.
+    #[test]
+    fn an_unbound_table_or_where_is_refused_by_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut columns = crate::registry::implicit_columns(false);
+        columns.push(crate::registry::ColumnSchema {
+            name: "value".into(),
+            sol_type: "uint256".into(),
+            storage: "word32".into(),
+            indexed: false,
+            components: Vec::new(),
+        });
+        let declared = vec![crate::registry::TableSchema {
+            table: "t__transfer".into(),
+            alias: "t".into(),
+            kind: crate::registry::TableKind::Event,
+            event: "Transfer".into(),
+            topic0: "0x".into(),
+            function: String::new(),
+            selector: String::new(),
+            columns,
+        }];
+        let mut good = wh("w", "t__transfer", "registration");
+        good.where_clause = Some("CAST(value AS HUGEINT) > 100".into());
+        refuse_unbound(dir.path(), &declared, &[good]).expect("a webhook that binds is accepted");
+        let mut derived = wh("w", "t__transfer", "registration");
+        derived.where_clause = Some("value_dec > 1000000".into());
+        refuse_unbound(dir.path(), &declared, &[derived]).expect("a derived `_dec` column binds");
+
+        let err = format!(
+            "{:#}",
+            refuse_unbound(
+                dir.path(),
+                &declared,
+                &[wh("w", "t__transfr", "registration")]
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("`table = \"t__transfr\"`"), "{err}");
+
+        let mut bad = wh("w", "t__transfer", "registration");
+        bad.where_clause = Some("vlaue > 100".into());
+        let err = format!(
+            "{:#}",
+            refuse_unbound(dir.path(), &declared, &[bad]).unwrap_err()
+        );
+        assert!(err.contains("`where = \"vlaue > 100\"`"), "{err}");
     }
 }
