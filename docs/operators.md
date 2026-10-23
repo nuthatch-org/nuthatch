@@ -1486,7 +1486,7 @@ duplicates.
 | A nest stuck at a block | its `quarantine.reason` on `/nests`; logs | a `getLogs` provider cap on a busy template usually wants a smaller `--window` |
 | RSS approaching the ceiling | which nest, via `nuthatch_nest_*`; recent `/sql` traffic | the hot-scan is the usual cause. Restrict `/sql` at the gateway, or move the nest to its own cursor |
 | Backfill crawling | `--window` versus contract sparsity; `--concurrency` | a sparse contract wants a *large* window; a dense one wants concurrency against your own node |
-| Webhook backlog | `nuthatch_alert_outbox_depth`, sink availability | a drain posts eight deliveries at once with a 10 s timeout each, so one slow sink delays its own alerts, not the others'; past 10,000 undelivered alerts the oldest are shed, loudly |
+| Webhook backlog | `nuthatch_alert_outbox_depth`, sink availability | a drain posts eight deliveries at once with a 10 s timeout each, so one slow sink delays its own alerts, not the others'; past 10,000 undelivered alerts the oldest are shed, loudly. A `[[webhooks]]` subscription stops queueing at 5,000 and holds its cursor until the outbox drains, so its rows arrive late rather than not at all |
 | Chain-id mismatch at startup | the startup error names the endpoint | an endpoint in the pool is on the wrong network. Every endpoint is verified at boot, on purpose |
 | Suspect data | `nuthatch check --dir <nest>` | runs the nest's committed invariant and parity checks against recorded fixtures |
 

@@ -54,6 +54,10 @@ fn cursor_key(name: &str) -> String {
     format!("webhook_cursor_{name}")
 }
 
+fn partial_key(name: &str) -> String {
+    format!("webhook_partial_{name}")
+}
+
 /// Whether a webhook delivers on the sealed path (the default and only path in this step; `"tip"`
 /// finality lands in a later step with retraction deliveries).
 fn is_sealed(w: &Webhook) -> bool {
@@ -83,15 +87,32 @@ pub fn init_cursors(store: &dyn HotStore, webhooks: &[Webhook], tip: u64) -> Res
     Ok(())
 }
 
+/// How far webhook batches may fill the shared outbox. Half of [`crate::alerts::OUTBOX_MAX`], so
+/// webhooks alone never push it to the bound where `alerts::trim` sheds entries: a webhook can wait
+/// behind its cursor, a compliance alert cannot.
+pub const WEBHOOK_OUTBOX_MAX: u64 = crate::alerts::OUTBOX_MAX / 2;
+
 /// Deliver newly-sealed rows for every sealed webhook up to `sealed_to`: for each, query its table's
 /// rows in `(cursor, sealed_to]` matching its `where`, enqueue them (batched) onto the outbox, and
-/// advance the cursor. Returns the number of deliveries enqueued. Best-effort per webhook - a table
-/// with no sealed segment yet just yields nothing.
+/// advance the cursor past what was enqueued. Returns the number of deliveries enqueued. Best-effort
+/// per webhook - a table with no sealed segment yet just yields nothing.
 pub fn deliver_sealed(
     store: &dyn HotStore,
     dir: &std::path::Path,
     webhooks: &[Webhook],
     sealed_to: u64,
+) -> Result<usize> {
+    deliver_sealed_within(store, dir, webhooks, sealed_to, WEBHOOK_OUTBOX_MAX)
+}
+
+/// [`deliver_sealed`] with the outbox room as a parameter. A full outbox is back-pressure, never a
+/// trim: the cursor stops at the last whole block enqueued and the rest is re-queried next seal.
+fn deliver_sealed_within(
+    store: &dyn HotStore,
+    dir: &std::path::Path,
+    webhooks: &[Webhook],
+    sealed_to: u64,
+    outbox_max: u64,
 ) -> Result<usize> {
     let mut enqueued = 0usize;
     for w in webhooks.iter().filter(|w| is_sealed(w)) {
@@ -102,25 +123,65 @@ pub fn deliver_sealed(
         if cursor >= sealed_to {
             continue;
         }
+        let room = outbox_max.saturating_sub(store.outbox_len());
+        if room == 0 {
+            tracing::debug!(
+                "webhook '{}' held at block {cursor}: outbox full ({outbox_max})",
+                w.name
+            );
+            continue;
+        }
+        let batch_max = w.batch_max.unwrap_or(DEFAULT_BATCH_MAX).max(1);
+        let limit = room.saturating_mul(batch_max as u64);
         // `table`/`where` are operator-authored (trusted, like nest views); block bounds are ours.
         let predicate = w
             .where_clause
             .as_deref()
             .map(|p| format!(" AND ({p})"))
             .unwrap_or_default();
-        let sql = format!(
-            "SELECT * FROM \"{}\" WHERE block_number > {cursor} AND block_number <= {sealed_to}{predicate} \
-             ORDER BY block_number, log_index",
-            w.table
-        );
-        let rows = match crate::analytics::query(dir, &sql) {
+        let select = |lo: u64, hi: u64, offset: u64| {
+            format!(
+                "SELECT * FROM \"{}\" WHERE block_number > {lo} AND block_number <= {hi}{predicate} \
+                 ORDER BY block_number, log_index LIMIT {limit} OFFSET {offset}",
+                w.table,
+            )
+        };
+        // A block with more rows than the room is queued in pieces across passes: the cursor stays
+        // below it and this records how far into it we are, so the outbox never passes `outbox_max`.
+        let partial = store.get_meta(&partial_key(&w.name))?.and_then(|s| {
+            let (b, p) = s.split_once(':')?;
+            Some((b.parse::<u64>().ok()?, p.parse::<u64>().ok()?))
+        });
+        let (lo, hi, offset) = match partial {
+            Some((b, pos)) => (b - 1, b, pos),
+            None => (cursor, sealed_to, 0),
+        };
+        let mut rows = match crate::analytics::query(dir, &select(lo, hi, offset)) {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!("webhook '{}' query skipped: {e:#}", w.name);
                 continue;
             }
         };
-        let batch_max = w.batch_max.unwrap_or(DEFAULT_BATCH_MAX).max(1);
+        let mut through = sealed_to;
+        let mut next_partial = None;
+        if let Some((b, pos)) = partial {
+            through = b;
+            if rows.len() as u64 >= limit {
+                next_partial = Some((b, pos + rows.len() as u64));
+            }
+        } else if rows.len() as u64 >= limit {
+            // The limit may have cut the last block short, and the cursor is per block: keep only whole
+            // blocks. If one block alone fills the room, queue what fits and come back for the rest.
+            let first = row_block(&rows[0])?;
+            let last = row_block(&rows[rows.len() - 1])?;
+            if first == last {
+                next_partial = Some((first, rows.len() as u64));
+            } else {
+                rows.retain(|r| row_block(r).is_ok_and(|b| b < last));
+                through = last - 1;
+            }
+        }
         for chunk in rows.chunks(batch_max) {
             let payload = json!({
                 "event": "rows",
@@ -134,17 +195,31 @@ pub fn deliver_sealed(
             store.outbox_push(&payload.to_string())?;
             enqueued += 1;
         }
-        store.set_meta(&cursor_key(&w.name), &sealed_to.to_string())?;
+        match next_partial {
+            Some((b, pos)) => store.set_meta(&partial_key(&w.name), &format!("{b}:{pos}"))?,
+            None => {
+                store.set_meta(&cursor_key(&w.name), &through.to_string())?;
+                if partial.is_some() {
+                    store.set_meta(&partial_key(&w.name), "")?;
+                }
+            }
+        }
         if !rows.is_empty() {
             tracing::info!(
-                "webhook '{}': {} row(s) sealed in ({cursor}, {sealed_to}] → queued",
+                "webhook '{}': {} row(s) sealed in ({cursor}, {through}] → queued",
                 w.name,
                 rows.len()
             );
         }
     }
-    let _ = store.outbox_trim(crate::alerts::OUTBOX_MAX);
     Ok(enqueued)
+}
+
+fn row_block(row: &serde_json::Value) -> Result<u64> {
+    let v = &row["block_number"];
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        .ok_or_else(|| anyhow::anyhow!("webhook row has no block_number: {v}"))
 }
 
 /// Refuse a webhook whose `table` or `where` does not bind against the nest's declared schema (#2365).
@@ -289,6 +364,115 @@ mod tests {
         assert_eq!(
             deliver_sealed(&store, dir.path(), &webhooks, 14).unwrap(),
             0
+        );
+    }
+
+    fn transfer(block: u64, log_index: u64) -> String {
+        format!(
+            r#"{{"table":"t__transfer","from":"0xa","to":"0xb","value":"1","block_number":{block},"log_index":{log_index},"tx_hash":"0xt"}}"#
+        )
+    }
+
+    /// Drain the outbox as the delivery worker would, returning each row's (block, log_index).
+    fn drain(store: &Store) -> Vec<(u64, u64)> {
+        let mut out = vec![];
+        for (seq, p) in store.outbox_pending(usize::MAX).unwrap() {
+            let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+            for r in v["rows"].as_array().into_iter().flatten() {
+                out.push((row_block(r).unwrap(), r["log_index"].as_u64().unwrap()));
+            }
+            store.outbox_remove(seq).unwrap();
+        }
+        out
+    }
+
+    /// #2359: a webhook with more history than the outbox holds is back-pressured, not trimmed. Every
+    /// row arrives exactly once and the outbox never passes its bound.
+    #[test]
+    fn a_full_outbox_holds_the_cursor_and_loses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let mut w = wh("g", "t__transfer", "genesis");
+        w.batch_max = Some(1);
+        let webhooks = vec![w];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        let rows: Vec<String> = (1..=7).map(|b| transfer(b, 0)).collect();
+        crate::seal::seal_range(dir.path(), &rows, 1, 7).unwrap();
+
+        let mut got = vec![];
+        for _ in 0..10 {
+            deliver_sealed_within(&store, dir.path(), &webhooks, 7, 3).unwrap();
+            assert!(
+                store.outbox_len() <= 3,
+                "the outbox stayed within its bound"
+            );
+            got.extend(drain(&store));
+        }
+        assert_eq!(got, (1..=7).map(|b| (b, 0)).collect::<Vec<_>>());
+    }
+
+    /// A compliance alert already queued is never shed by a webhook filling the outbox.
+    #[test]
+    fn a_webhook_never_sheds_a_queued_alert() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let mut w = wh("g", "t__transfer", "genesis");
+        w.batch_max = Some(1);
+        let webhooks = vec![w];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        let rows: Vec<String> = (1..=7).map(|b| transfer(b, 0)).collect();
+        crate::seal::seal_range(dir.path(), &rows, 1, 7).unwrap();
+        store.outbox_push(r#"{"event":"flag","kind":"k"}"#).unwrap();
+
+        deliver_sealed_within(&store, dir.path(), &webhooks, 7, 3).unwrap();
+        let pending = store.outbox_pending(usize::MAX).unwrap();
+        assert!(pending.len() <= 3);
+        assert_eq!(pending[0].1, r#"{"event":"flag","kind":"k"}"#);
+    }
+
+    /// One block with more matching rows than the webhook's share of the outbox is queued in pieces
+    /// across passes: the outbox never passes that share, so the alert trim above it never fires and a
+    /// queued alert survives, every row arrives once and in order, and the cursor still reaches it.
+    #[test]
+    fn a_block_larger_than_the_room_is_queued_in_pieces_and_sheds_no_alert() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let mut w = wh("g", "t__transfer", "genesis");
+        w.batch_max = Some(1);
+        let webhooks = vec![w];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        let mut rows: Vec<String> = (0..10).map(|i| transfer(5, i)).collect();
+        rows.push(transfer(6, 0));
+        crate::seal::seal_range(dir.path(), &rows, 5, 6).unwrap();
+        let alert = r#"{"event":"flag","kind":"k"}"#;
+        store.outbox_push(alert).unwrap();
+
+        let mut got = vec![];
+        for _ in 0..20 {
+            deliver_sealed_within(&store, dir.path(), &webhooks, 6, 3).unwrap();
+            assert!(
+                store.outbox_len() <= 3,
+                "the outbox stayed within the webhook's share"
+            );
+            // The alert path's own bound, twice the webhook share as in production.
+            assert_eq!(store.outbox_trim(6).unwrap(), 0, "nothing was shed");
+            for (seq, p) in store.outbox_pending(usize::MAX).unwrap() {
+                let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+                for r in v["rows"].as_array().into_iter().flatten() {
+                    got.push((row_block(r).unwrap(), r["log_index"].as_u64().unwrap()));
+                }
+                if v.get("webhook").is_some() {
+                    store.outbox_remove(seq).unwrap();
+                }
+            }
+        }
+        let mut want: Vec<(u64, u64)> = (0..10).map(|i| (5, i)).collect();
+        want.push((6, 0));
+        assert_eq!(got, want);
+        assert_eq!(store.outbox_pending(usize::MAX).unwrap()[0].1, alert);
+        assert_eq!(
+            store.get_meta("webhook_cursor_g").unwrap().as_deref(),
+            Some("6")
         );
     }
 
