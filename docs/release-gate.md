@@ -5,8 +5,7 @@ and kittiwake sent it, under the budget that nest ran on in production. A refusa
 out-of-memory or a time regression past a stated bound turns the candidate red. It does not block
 the tag or the release (Chief, 2026-10-03). Issue #1749.
 
-**There is no production behind it any more.** The Lodestar nests stopped on 2026-10-13, and since
-2026-10-16 the gate runs against frozen copies taken on 2026-10-12, with the latest full release
+**The gate runs against frozen copies.** Since 2026-10-16 it has used copies taken on 2026-10-12, with the latest full release
 other than the candidate as its baseline ([below](#every-production-nest-1794)). Where this page says
 "production", read the release those copies were last served by: the procedure is written as it ran,
 and holds for an operator gating against a live nest of their own.
@@ -279,7 +278,7 @@ config file, `GATE_NESTS`, which the ThinkPad holds at `~/release-gate/nests.con
 | `data-services-nest` | data-services-nest, Helsinki | from Helsinki |
 | `staking-archive-nest` | graph-staking-legacy-readonly (serve-only), Helsinki | from Helsinki |
 
-**Since 2026-10-16 the copies are frozen.** The Helsinki nests stopped with the Lodestar withdrawal on
+**Since 2026-10-16 the copies are frozen.** The Helsinki nests stopped on
 2026-10-13 and the QoS nest is gone, so every refresh failed and every release from 5.4.0 to 5.6.3
 carried `error` on all six contexts. Each line in the ThinkPad's `nests.conf` now has refresh `none`,
 gating against the copies taken on 2026-10-12, and each copy's `PROVENANCE` is kept as

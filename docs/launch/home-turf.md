@@ -12,7 +12,7 @@ the post stand alone.
 > and wrong in several places now. SQL runs on Burrmill (DataFusion), not DuckDB, since 4.1. The WASM
 > transform layer and its WIT interfaces were removed on 2026-10-08, and the ExEx stub with them; ExEx
 > is designed, not built. Authored incremental entities (RFC-0041) shipped in 3.0.0-alpha. The
-> 58 MB figure is a dated 2.x measurement. The Lodestar nests stopped on 2026-10-13. Rewrite it
+> 58 MB figure is a dated 2.x measurement. Rewrite it
 > against the current README before any use.
 
 ---

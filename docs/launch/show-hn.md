@@ -9,8 +9,7 @@ number traces to a reproducible artifact). Post one channel per day; this is the
 > single-writer design and the 67 MB binary breakdown no longer hold. wasmtime and the WASM transform
 > layer were removed on 2026-10-08, and the ExEx stub with them; ExEx is designed, not built. Authored
 > incremental entities (RFC-0041) shipped in 3.0.0-alpha. A partial GraphQL read surface exists in the
-> separate, experimental `graph` build. The RAM and size figures are dated 2.x measurements, and
-> "running in production" referred to the Lodestar nests, which stopped on 2026-10-13. Rewrite it
+> separate, experimental `graph` build. The RAM and size figures are dated 2.x measurements. Rewrite it
 > against the current README before any use.
 
 ---

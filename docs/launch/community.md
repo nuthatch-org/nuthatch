@@ -2,8 +2,7 @@
 
 - Status: **plan, not a commitment.** Records a strategy and a capacity limit. No dates are binding.
 - **Dated 2026-08-19; read as history.** Since then the port-queue nest was built and parked (its
-  §8), the Lodestar nests it leaned on stopped on 2026-10-13 ([release-gate.md](../release-gate.md)),
-  and the hosting offer was settled: it is public, on the stock binary, with no billing or accounts.
+  §8), and the hosting offer was settled: it is public, on the stock binary, with no billing or accounts.
   The 2026-10-08 hold on promoting the subgraph stopgap and on any approach through the Foundation
   still stands, so nothing below authorises posting or contacting anyone.
 - Author: Pete (cargopete), with Jenny
@@ -108,7 +107,7 @@ at port three.
 
 **Current, and the reason for it:** build it first after all, because the cost estimate the second
 draft was priced against turned out to be wrong. `graph-gns-nest` and `graph-staking-nest` were
-**running in production on Arbitrum** at the time (both stopped on 2026-10-13), and the gns nest indexes `SubgraphPublished`,
+**running in production on Arbitrum**, as they still are behind Lodestar, and the gns nest indexes `SubgraphPublished`,
 which is the deployment universe. The queue is a three-contract join on live substrate, not a subgraph
 port. When the price of tooling drops that far, the objection to building it early goes with it.
 
