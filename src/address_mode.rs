@@ -965,16 +965,22 @@ fn final_conflict(block: u64) -> String {
 /// Fail a fetch unless every main and trace endpoint is on one chain at `block`: a trace source on
 /// another fork, or behind, would answer an empty range the main chain does not have, and a pool
 /// rotates its calls across its endpoints, so all of them must agree, not the one that was asked.
+/// Without `traced` the trace endpoints are not asked: a read that uses none need not wait for them.
 async fn same_chain_at<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     block: u64,
+    traced: bool,
 ) -> Result<()> {
     let params = json!([format!("0x{block:x}"), false]);
     let main = d
         .main
         .call_each("eth_getBlockByNumber", params.clone())
         .await?;
-    let trace = d.trace.call_each("eth_getBlockByNumber", params).await?;
+    let trace = if traced {
+        d.trace.call_each("eth_getBlockByNumber", params).await?
+    } else {
+        Vec::new()
+    };
     let hashes: std::collections::BTreeSet<Option<String>> = main
         .iter()
         .chain(&trace)
@@ -1010,12 +1016,12 @@ async fn discover_window<M: Rpc, T: Rpc>(
         // The trace endpoints must be on the main chain before the fetch as well as after it: one
         // that catches up in between would otherwise pass with the empty answers it gave from
         // another fork.
-        same_chain_at(d, end).await?;
+        same_chain_at(d, end, true).await?;
         let found = d
             .discover(&state.history, address, next, end, &pending)
             .await;
         let checked = match check_anchor(d, &state.history, anchor, &pending.named()).await {
-            Ok(()) => same_chain_at(d, end).await,
+            Ok(()) => same_chain_at(d, end, true).await,
             Err(e) => Err(e),
         };
         Ok((anchor, found, checked))
@@ -1192,10 +1198,15 @@ async fn sweep_window<M: Rpc, T: Rpc>(
         if let Some((b, h)) = anchor {
             pending.anchor(b, h);
         }
+        // As discover_window: a pool's endpoints rotate under the read, so all must be on one chain.
+        same_chain_at(d, end, traced).await?;
         let found = d
             .sweep(&state.history, set, from, end, &pending, traced)
             .await;
-        let checked = check_anchor(d, &state.history, anchor, &pending.named()).await;
+        let checked = match check_anchor(d, &state.history, anchor, &pending.named()).await {
+            Ok(()) => same_chain_at(d, end, traced).await,
+            Err(e) => Err(e),
+        };
         Ok::<_, anyhow::Error>((anchor, found, checked))
     }
     .await;
@@ -7903,6 +7914,9 @@ mod tests {
         reorg_next: AtomicU64,
         /// `(block, n, depth)`: a reorg of `depth` lands once block `block` has been read `n` times.
         reorg_on_read: std::sync::Mutex<Option<(u64, u64, u64)>>,
+        /// A block whose full body and logs the sweep node answers from another fork, as one endpoint
+        /// of a pool still on an orphaned branch would.
+        forked_body: std::sync::Mutex<Option<u64>>,
         /// No rows anywhere: discovery finds nothing to hydrate.
         quiet: std::sync::atomic::AtomicBool,
         /// Microseconds a trace_filter call takes per block of its span, as a provider's does.
@@ -8188,8 +8202,14 @@ mod tests {
         Counted<crate::address_partitions::tests::Fake>,
         Counted<crate::address_partitions::tests::Fake>,
     > {
+        let trace = crate::address_partitions::tests::Fake::new(|m, _| bail!("unexpected {m}"));
+        Discoverer::new(Counted::new(sweep_main(chain)), Counted::new(trace))
+    }
+
+    /// [`sweep_node`]'s main endpoint.
+    fn sweep_main(chain: &Arc<Chain>) -> crate::address_partitions::tests::Fake {
         let c = chain.clone();
-        let main = crate::address_partitions::tests::Fake::new(move |m, p| match m {
+        crate::address_partitions::tests::Fake::new(move |m, p| match m {
             "eth_blockNumber" => Ok(json!(format!("0x{:x}", c.latest()))),
             "eth_getBlockByNumber" if p[0] == "finalized" => {
                 Ok(json!({"number": format!("0x{:x}", c.finalized.load(Ordering::Relaxed))}))
@@ -8201,6 +8221,9 @@ mod tests {
                 } else {
                     let mut block = c.block_json(b);
                     block["transactions"] = json!([]);
+                    if p[1] == true && *c.forked_body.lock().unwrap() == Some(b) {
+                        block["hash"] = json!(FORK);
+                    }
                     block
                 };
                 c.after_read(b);
@@ -8214,20 +8237,108 @@ mod tests {
                     "0x{:0>64}",
                     ALICE.trim_start_matches("0x").to_ascii_lowercase()
                 );
+                let forked = *c.forked_body.lock().unwrap();
                 Ok(json!((s..=e)
-                    .filter(|b| c.row_at(*b))
+                    .filter(|b| c.row_at(*b) || forked == Some(*b))
                     .map(|b| json!({"address": "0x00000000000000000000000000000000000000c0",
                         "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
                                    format!("0x{:0>64}", "3"), to],
                         "data": format!("0x{:0>64}", "5"), "blockNumber": format!("0x{b:x}"),
                         "transactionHash": c.hex(b), "transactionIndex": "0x0", "logIndex": "0x0",
-                        "blockHash": c.hex(b), "removed": false}))
+                        "blockHash": if forked == Some(b) { FORK.to_string() } else { c.hex(b) },
+                        "removed": false}))
                     .collect::<Vec<_>>()))
             }
             other => bail!("unexpected {other}"),
-        });
-        let trace = crate::address_partitions::tests::Fake::new(|m, _| bail!("unexpected {m}"));
-        Discoverer::new(Counted::new(main), Counted::new(trace))
+        })
+    }
+
+    /// The hash of the orphaned branch [`Chain::forked_body`] answers from.
+    const FORK: &str = "0x0000000000000000000000000000000000000000000000000000000000000077";
+
+    /// A pool endpoint still on an orphaned branch answers one block of a sweep above finality: a
+    /// body inside the window, or the last one, against the canonical anchor. The window is refused
+    /// whole, with no row, no swept span and no deposit, so nothing needs retracting; read again on
+    /// one chain it is recorded (#2360).
+    #[tokio::test]
+    async fn a_sweep_window_read_from_two_forks_records_nothing() {
+        use crate::address_history::Action;
+        for at in [57, 59] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("t.redb")).unwrap();
+            let history = AddressHistory::open(store, 100, &[ALICE.into()]).unwrap();
+            let s = Arc::new(
+                ModeState::new(history, 100, Duration::from_secs(300), true)
+                    .with_range(0, None, 20),
+            );
+            let chain = Chain::new(60, 30);
+            let d = sweep_node(&chain);
+            let set: Arc<std::collections::HashSet<String>> =
+                Arc::new([ALICE.to_ascii_lowercase()].into());
+            d.reconcile(&s, chain.latest()).await.unwrap();
+            *chain.forked_body.lock().unwrap() = Some(at);
+            let err = sweep_window(&d, &s, &set, (40, 59), false)
+                .await
+                .unwrap_err();
+            assert!(s.history.swept().unwrap().is_none(), "block {at}: {err:#}");
+            assert!(s.history.deposits_after(0, 100).unwrap().is_empty());
+            assert!(s
+                .history
+                .rows_in(Action::TokenTx, ALICE, (0, 59))
+                .unwrap()
+                .is_empty());
+            *chain.forked_body.lock().unwrap() = None;
+            sweep_window(&d, &s, &set, (40, 59), false).await.unwrap();
+            assert_eq!(s.history.swept().unwrap(), Some((40, 59)));
+            let feed = s.history.deposits_after(0, 100).unwrap();
+            assert!(!feed.is_empty());
+            assert!(
+                feed.iter().all(|e| e["row"]["blockHash"] != FORK),
+                "{feed:?}"
+            );
+        }
+    }
+
+    /// A sweep holds every endpoint of a pool to one chain at the window's end, as discovery does:
+    /// one on another fork could answer any of the window's calls (#2360).
+    #[tokio::test]
+    async fn a_sweep_refuses_a_pool_whose_endpoints_disagree() {
+        use crate::address_partitions::tests::Fake;
+        struct Pool(Fake);
+        impl Rpc for Pool {
+            async fn call(&self, m: &str, p: Value) -> Result<Value> {
+                self.0.call(m, p).await
+            }
+            async fn call_each(&self, m: &str, p: Value) -> Result<Vec<Value>> {
+                let one = self.0.call(m, p).await?;
+                let mut other = one.clone();
+                other["hash"] = json!(FORK);
+                Ok(vec![one, other])
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 100, &[ALICE.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 100, Duration::from_secs(300), true).with_range(0, None, 20),
+        );
+        let chain = Chain::new(60, 30);
+        sweep_node(&chain)
+            .reconcile(&s, chain.latest())
+            .await
+            .unwrap();
+        let d = Discoverer::new(
+            Counted::new(Pool(sweep_main(&chain))),
+            Counted::new(Fake::new(|m, _| bail!("unexpected {m}"))),
+        );
+        let set: Arc<std::collections::HashSet<String>> =
+            Arc::new([ALICE.to_ascii_lowercase()].into());
+        let err = sweep_window(&d, &s, &set, (40, 59), false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not all on one chain"), "{err:#}");
+        assert!(s.history.swept().unwrap().is_none());
+        assert!(s.history.deposits_after(0, 100).unwrap().is_empty());
     }
 
     proptest::proptest! {
@@ -9529,10 +9640,10 @@ mod tests {
         let main = chain.discoverer().main;
         let trace = other.discoverer().main;
         let d = Discoverer::new(main, trace);
-        let err = same_chain_at(&d, 119).await.unwrap_err();
+        let err = same_chain_at(&d, 119, true).await.unwrap_err();
         assert!(err.to_string().contains("not all on one chain"), "{err:#}");
         assert!(
-            same_chain_at(&d, 99).await.is_ok(),
+            same_chain_at(&d, 99, true).await.is_ok(),
             "below the fork they agree"
         );
     }
@@ -9554,12 +9665,12 @@ mod tests {
             Counted::new(Pool(vec!["0xb"])),
             Counted::new(Pool(vec!["0xb", "0xb"])),
         );
-        assert!(same_chain_at(&agree, 7).await.is_ok());
+        assert!(same_chain_at(&agree, 7, true).await.is_ok());
         let split = Discoverer::new(
             Counted::new(Pool(vec!["0xb"])),
             Counted::new(Pool(vec!["0xb", "0xa"])),
         );
-        assert!(same_chain_at(&split, 7).await.is_err());
+        assert!(same_chain_at(&split, 7, true).await.is_err());
     }
 
     /// An answer read before a reorg was taken back is read again, not served.
