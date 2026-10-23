@@ -676,6 +676,15 @@ pub fn install_verified(
     // The load-bearing check: regenerate the decode registry from the *installed* inputs and assert it
     // matches the manifest. Same inputs + same generator → same decode, verifiably.
     verify_registry_reproduces(&target, &manifest)?;
+    // The manifest's name, schema version and file order are its own say-so; only the installed
+    // files are evidence of which nest this is (#2369).
+    let installed = nest_nid(&target)?;
+    if installed != manifest.nid() {
+        bail!(
+            "the bundle's manifest claims nid {}, but its files are nid {installed}",
+            manifest.nid()
+        );
+    }
 
     // Audit L6 (defence in depth): a freshly-loaded nest is third-party config, and its `nuthatch.toml`
     // decides where this process makes *outbound* requests - webhook/alert sinks it POSTs decoded rows
@@ -1763,6 +1772,36 @@ url = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
         let before = build_manifest(a.path(), None).unwrap().nid();
         std::os::unix::fs::symlink(cfgs.path(), a.path().join("segments")).unwrap();
         assert_eq!(build_manifest(a.path(), None).unwrap().nid(), before);
+    }
+
+    /// #2369: a manifest whose name or file order was edited still lists another nest's exact files,
+    /// so its hashes all check out; only recomputing the installed nest's NID catches it.
+    #[test]
+    fn a_manifest_that_misnames_its_files_is_refused() {
+        let src = tempfile::tempdir().unwrap();
+        write_nest(src.path());
+        let out = tempfile::tempdir().unwrap();
+        let bdir = out.path().join("b");
+        bundle(src.path(), Some(&bdir), true, false).unwrap();
+        for edit in [
+            |m: &mut Manifest| m.nest_name = "someone-else".into(),
+            |m: &mut Manifest| m.files.reverse(),
+        ] {
+            let mut m = load_manifest(&bdir).unwrap();
+            edit(&mut m);
+            let dir = tempfile::tempdir().unwrap();
+            let blob = dir.path().join("b");
+            crate::project::copy_dir(&bdir, &blob).unwrap();
+            std::fs::write(
+                blob.join("manifest.json"),
+                serde_json::to_string(&m).unwrap(),
+            )
+            .unwrap();
+            let err = install_verified(&blob, Some(&dir.path().join("t")), Some(&m.blob_hash()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("its files are nid"), "{err}");
+        }
     }
 
     /// RFC-0070: the time-lapse crate has no registry builder of the main crate's, so its NID is only
