@@ -7071,7 +7071,8 @@ impl NestIngest {
 
     /// Phase 1 of a live mount (RFC-0027 §4): index this nest on its own, through the same window path
     /// a solo `dev` runs, until `next` is within one window of the furthest co-tenant on its cursor.
-    /// A reorg meanwhile is caught when it joins (#2165).
+    /// It checks for a reorg before each window as the solo loop does: a remounted dataset's last
+    /// window may have been orphaned while it sat out (#2371).
     async fn catch_up(
         &mut self,
         source: &dyn Source,
@@ -7115,6 +7116,12 @@ impl NestIngest {
             };
             self.metrics.set_tip(tip);
             let ceiling = cursor_ceiling(source, self.finality, self.freshness, tip).await;
+            if reorg_check_due(self.freshness, next, ceiling) {
+                if let Some(resume) = self.handle_reorg(source, next).await? {
+                    next = resume;
+                    continue;
+                }
+            }
             if next > ceiling {
                 return Ok(next);
             }
@@ -7140,13 +7147,13 @@ impl NestIngest {
                                 p.tick(to, n);
                             }
                         }
-                        Ok(None) => no_progress_tick(
-                            &mut no_progress,
-                            next,
-                            to,
-                            false,
-                            "timestamps unavailable",
-                        )?,
+                        Ok(None) => {
+                            if let Some(b) = self.rewound.take() {
+                                next = b;
+                                continue;
+                            }
+                            no_progress_tick(&mut no_progress, next, to, false, "window refused")?
+                        }
                         Err(e) if e.downcast_ref::<ProviderGaveUp>().is_some() => {
                             if retrying_cannot_help(&e) {
                                 return Err(e);
@@ -18670,6 +18677,182 @@ template = "pool"
         assert_eq!(
             store.get_block_hash(10).unwrap().as_deref(),
             Some("0xcanonical")
+        );
+    }
+
+    /// #2371: a remounted dataset whose last block was reorged while it sat out. Its catch-up
+    /// refused every window on the stale parent until it gave up, and rolled nothing back.
+    #[tokio::test(start_paused = true)]
+    async fn catch_up_rolls_back_a_reorged_tail_within_finality() {
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        nest.store.set_block_hash(9, "0xold").unwrap();
+        nest.store.set_meta(LAST_BLOCK_KEY, "9").unwrap();
+        let source = MovedTip {
+            canonical: "0xcanonical".into(),
+        };
+        let cursor_at = || Some(90u64);
+        let wanted = || true;
+        let join = CatchUp {
+            cursor_at: &cursor_at,
+            wanted: &wanted,
+        };
+        let next = nest.catch_up(&source, 10, 20, &join).await.unwrap();
+        assert_ne!(
+            nest.store.get_block_hash(9).unwrap().as_deref(),
+            Some("0xold")
+        );
+        assert_eq!(
+            detect_reorg(&source, &nest.store, next - 1).await.unwrap(),
+            None
+        );
+    }
+
+    /// #2371, past the finality depth: the parent check no longer applies, so the catch-up
+    /// committed on top of the orphaned row and sealed it.
+    #[tokio::test(start_paused = true)]
+    async fn catch_up_never_seals_an_orphaned_tail() {
+        struct Canonical;
+        #[async_trait::async_trait]
+        impl Source for Canonical {
+            async fn tip(&self) -> Result<u64> {
+                Ok(5_000)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(Some("0xcanonical".into()))
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                Ok(Vec::new())
+            }
+            async fn block_timestamps(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+            }
+        }
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        nest.seal_span = 1;
+        let orphan = transfer_log(9, 0);
+        nest.process_window(
+            &MockSource {
+                logs: vec![orphan.clone()],
+            },
+            &[orphan],
+            9,
+            9,
+            9,
+        )
+        .await
+        .unwrap()
+        .expect("commits at the tip");
+        nest.store.set_block_hash(9, "0xold").unwrap();
+        assert_eq!(nest.store.sealed_through(), 0);
+
+        let cursor_at = || Some(4_000u64);
+        let wanted = || true;
+        let join = CatchUp {
+            cursor_at: &cursor_at,
+            wanted: &wanted,
+        };
+        nest.catch_up(&Canonical, 10, 20, &join).await.unwrap();
+        assert!(nest.store.sealed_through() >= 9, "premise: block 9 sealed");
+        let m = seal::load_manifest(d.path()).unwrap();
+        let rows: usize = m
+            .tables
+            .values()
+            .flatten()
+            .filter(|s| s.from_block <= 9 && s.to_block >= 9)
+            .map(|s| s.rows)
+            .sum();
+        assert_eq!(rows, 0, "the orphaned row was sealed");
+    }
+
+    /// #2371: a window that rolled the nest back resumes where it rolled back to, as the solo
+    /// loop does. Catch-up ignored it, and the stale resume point outlived it for the shared cursor
+    /// to rewind to on some later, unrelated refusal.
+    #[tokio::test(start_paused = true)]
+    async fn catch_up_resumes_from_a_window_that_rolled_back() {
+        struct Replaced;
+        #[async_trait::async_trait]
+        impl Source for Replaced {
+            async fn tip(&self) -> Result<u64> {
+                Ok(100)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(Some("0xcanonical".into()))
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                from: u64,
+                to: u64,
+            ) -> Result<Vec<crate::rpc::Log>> {
+                let mut log = transfer_log(8, 0);
+                log.block_hash = "0xcanonical".into();
+                Ok((from..=to)
+                    .contains(&8)
+                    .then_some(log)
+                    .into_iter()
+                    .collect())
+            }
+            async fn block_timestamps(
+                &self,
+                blocks: &[u64],
+            ) -> Result<std::collections::HashMap<u64, u64>> {
+                Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+            }
+        }
+        let addr = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let d = tempfile::tempdir().unwrap();
+        let mut nest = build_test_nest(d.path(), addr).await;
+        let stale = transfer_log(8, 0);
+        nest.process_window(
+            &MockSource {
+                logs: vec![stale.clone()],
+            },
+            &[stale],
+            8,
+            9,
+            9,
+        )
+        .await
+        .unwrap()
+        .expect("commits at the tip");
+        // The checkpoint above the row survived the reorg; the row under it did not. Only this
+        // shape sets `rewound` (#2146): a stale checkpoint is rolled back by `handle_reorg`, which
+        // never does.
+        nest.store.set_block_hash(9, "0xcanonical").unwrap();
+        assert_eq!(
+            detect_reorg(&Replaced, &nest.store, 9).await.unwrap(),
+            None,
+            "premise: the rollback comes from the window, not the reorg check"
+        );
+
+        let cursor_at = || Some(90u64);
+        let wanted = || true;
+        let join = CatchUp {
+            cursor_at: &cursor_at,
+            wanted: &wanted,
+        };
+        nest.catch_up(&Replaced, 10, 20, &join).await.unwrap();
+        let row = nest
+            .store
+            .get_entity(&Store::entity_key(8, 0))
+            .unwrap()
+            .expect("block 8 was rolled back and never indexed again");
+        assert!(row.contains("0xcanonical"), "{row}");
+        assert_eq!(
+            nest.rewound, None,
+            "a rollback's resume point outlived the catch-up"
         );
     }
 
