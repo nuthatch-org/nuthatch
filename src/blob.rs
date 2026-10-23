@@ -1731,4 +1731,40 @@ url = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
             "a normal rpc endpoint must not be flagged: {found:?}"
         );
     }
+
+    /// RFC-0070: the time-lapse crate has no registry builder of the main crate's, so its NID is only
+    /// the node's if it rebuilds the same event registry, whatever else the nest folds into schema.json.
+    #[test]
+    fn the_timelapse_identity_is_the_nodes_whether_or_not_the_nest_decodes_calls() {
+        for calls in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_nest(dir.path());
+            if calls {
+                let cfg = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+                std::fs::write(
+                    dir.path().join(CONFIG_FILE),
+                    cfg + "\n[extract]\ntop_level_calls = true\n",
+                )
+                .unwrap();
+            }
+            let config = Config::load(dir.path()).unwrap();
+            crate::project::refresh_stale_artifacts(dir.path(), &config).unwrap();
+            let m = build_manifest(dir.path(), None).unwrap();
+            let files = collect_files(dir.path(), None)
+                .unwrap()
+                .into_iter()
+                .map(|p| {
+                    let rel = p
+                        .strip_prefix(dir.path())
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    (rel, std::fs::read(&p).unwrap())
+                })
+                .collect();
+            let tab = nuthatch_timelapse::manifest::identity(files).unwrap();
+            assert_eq!(tab.nid, m.nid(), "calls = {calls}");
+            assert_eq!(tab.data_identity, m.data_identity(), "calls = {calls}");
+        }
+    }
 }
