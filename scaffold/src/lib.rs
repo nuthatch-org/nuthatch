@@ -137,7 +137,7 @@ pub fn config_toml(nest: &Nest) -> Result<String> {
 pub fn registry(nest: &Nest) -> Result<DecodeRegistry> {
     let mut specs = Vec::with_capacity(nest.contracts.len());
     for c in &nest.contracts {
-        let abi: JsonAbi = serde_json::from_value(c.abi.clone())
+        let abi: JsonAbi = nuthatch_decode::abi::parse(c.abi.clone())
             .with_context(|| format!("parsing ABI {}", c.abi_path()))?;
         let address = parse_address(&c.address)?;
         if address.is_zero() {
