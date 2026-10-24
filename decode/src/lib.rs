@@ -4,5 +4,6 @@
 //! without pulling in dbsp - which causes a rustc ICE under sanitizer instrumentation
 //! (nuthatch#581). This crate has no dbsp dependency.
 
+pub mod abi;
 pub mod registry;
 pub mod rpc;

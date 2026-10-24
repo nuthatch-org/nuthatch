@@ -1591,7 +1591,7 @@ fn read_local_abi(path: &str) -> Result<(serde_json::Value, Option<String>)> {
         Some(inner) => inner.clone(),
         None => parsed,
     };
-    serde_json::from_value::<alloy_json_abi::JsonAbi>(abi.clone())
+    nuthatch_decode::abi::parse(abi.clone())
         .with_context(|| format!("'{path}' does not parse as a contract ABI"))?;
     Ok((abi, name))
 }
@@ -1599,7 +1599,7 @@ fn read_local_abi(path: &str) -> Result<(serde_json::Value, Option<String>)> {
 /// `0x`-prefixed topic0 of every event in an ABI. Uses the same `alloy_json_abi` selector the decode
 /// registry keys on, so a match here means a match at decode time - not an approximation of one.
 fn abi_event_topic0s(abi: &serde_json::Value) -> Vec<String> {
-    let Ok(parsed) = serde_json::from_value::<alloy_json_abi::JsonAbi>(abi.clone()) else {
+    let Ok(parsed) = nuthatch_decode::abi::parse(abi.clone()) else {
         return Vec::new();
     };
     parsed
@@ -2735,6 +2735,24 @@ mod tests {
             "a wrong file must fail here, not silently become an empty registry"
         );
         assert!(read_local_abi(dir.path().join("nope.json").to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_viem_abi_without_anonymous_is_accepted_and_vendored_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let viem = dir.path().join("viem.json");
+        let raw = IMPL_ABI.replace(r#","anonymous":false"#, "");
+        assert!(
+            !raw.contains("anonymous"),
+            "the fixture must exercise the missing field"
+        );
+        std::fs::write(&viem, &raw).unwrap();
+        let (abi, _) = read_local_abi(viem.to_str().unwrap()).unwrap();
+        assert_eq!(abi_event_topic0s(&abi).len(), 1);
+        assert!(
+            !abi.to_string().contains("anonymous"),
+            "the vendored ABI is the file as given, so the nest's identity does not depend on it"
+        );
     }
 
     /// **Issue #241 item 2.** A hand-written `nuthatch.toml` has no `schema.json`, and the schema tool

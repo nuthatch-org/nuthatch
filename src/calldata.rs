@@ -120,7 +120,7 @@ impl CallRegistry {
             let path = crate::blob::checked_join(dir, &c.abi)?;
             let raw = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow!("cannot read ABI {}: {e}", path.display()))?;
-            let abi: JsonAbi = serde_json::from_str(&raw)
+            let abi: JsonAbi = nuthatch_decode::abi::parse_str(&raw)
                 .map_err(|e| anyhow!("cannot parse ABI {}: {e}", path.display()))?;
             let address: Address = c
                 .address
