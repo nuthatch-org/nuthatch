@@ -68,6 +68,13 @@ ignore = [
   "RUSTSEC-2026-0367", # zip: SUID/SGID bits kept on extraction
   "RUSTSEC-2026-0368", # zip: extract() follows symlinks out of the destination
   "RUSTSEC-2026-0369", # zip: extract() applies permissions through symlinks
+  #
+  # crypto-bigint 0.5.5 (transitive: alloy-primitives 1.6 → k256 0.13 → elliptic-curve 0.13). A timing
+  # leak matters only where a secret scalar is computed on, and nuthatch holds no secp256k1 key: the
+  # x402 verifier (feature `counter`, off by default) recovers a signer from a public signature, pack
+  # signing is ed25519, and the only secp256k1 signing is in tests with fixed keys. The fix is 0.7.6,
+  # which needs k256 0.14; drop this on the alloy bump that takes it. Checked 2026-10-24.
+  "RUSTSEC-2026-0387", # crypto-bigint: timing variability in constant-time operations
 ]
 
 [licenses]
