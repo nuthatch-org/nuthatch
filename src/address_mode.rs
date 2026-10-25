@@ -3249,9 +3249,9 @@ async fn off_loopback(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Result
                 .map(str::to_string)
                 .collect();
             let watched = blocking(s, move |h| {
-                asked
-                    .iter()
-                    .try_fold(true, |all, a| Ok(all && h.is_watched(a).unwrap_or(false)))
+                asked.iter().try_fold(!asked.is_empty(), |all, a| {
+                    Ok(all && h.is_watched(a).unwrap_or(false))
+                })
             })
             .await
             .unwrap_or(false);
@@ -7180,6 +7180,8 @@ mod tests {
         for ask in [
             format!("/api?module=account&action=balance&address={BOB}"),
             format!("/api?module=account&action=balancemulti&address={ALICE},{BOB}"),
+            "/api?module=account&action=balance".to_string(),
+            "/api?module=account&action=balancemulti&address=,".to_string(),
         ] {
             let (_, v) = call(router(s.clone()), "GET", &ask, None).await;
             let why = v["result"].as_str().unwrap();
