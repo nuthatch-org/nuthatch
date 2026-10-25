@@ -30,6 +30,9 @@ pub const DISCOVERED: [Action; 5] = [
     Action::Token1155Tx,
 ];
 
+/// The discovered actions a log filter finds, with no proof of the account's balance.
+pub const TOKENS: [Action; 3] = [Action::TokenTx, Action::TokenNftTx, Action::Token1155Tx];
+
 /// The actions a scan of block bodies fills, once per block for every watched address.
 pub const BLOCK_SCANNED: [Action; 2] = [Action::BeaconWithdrawals, Action::MinedBlocks];
 
@@ -811,20 +814,24 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         }
     }
 
-    /// Discover `[from, to]` for `address` (lowercase `0x…`). An error means nothing may be recorded;
-    /// what was fetched before it is in `pending` either way.
+    /// Discover `actions` (all of [`DISCOVERED`], or [`TOKENS`]) over `[from, to]` for `address`
+    /// (lowercase `0x…`). An error means nothing may be recorded; what was fetched before it is in
+    /// `pending` either way.
     pub async fn discover(
         &self,
         history: &AddressHistory,
         address: &str,
         from: u64,
         to: u64,
+        actions: &[Action],
         pending: &Pending,
     ) -> Result<Found> {
         let a = address.to_ascii_lowercase();
         let ((txs, internal), logs) = futures::try_join!(
             async {
-                if self.residual {
+                if !actions.contains(&Action::TxList) {
+                    Ok((Vec::new(), Vec::new()))
+                } else if self.residual {
                     self.residual_transactions(&a, from, to).await
                 } else {
                     self.normal_transactions(&a, from, to).await
@@ -2607,6 +2614,26 @@ pub fn next_uncovered(history: &AddressHistory, address: &str, start: u64) -> Re
     next_uncovered_for(history, address, start, &DISCOVERED)
 }
 
+/// The first block at or after `start` discovery owes `address`, the actions it owes there, and the
+/// last block they may be fetched through. From an unprovable marker on the residual proves nothing,
+/// but a log filter finds a contract's token transfers as completely as anyone's, so those go on.
+pub fn next_owed(
+    history: &AddressHistory,
+    address: &str,
+    start: u64,
+) -> Result<(u64, &'static [Action], u64)> {
+    let next = next_uncovered(history, address, start)?;
+    Ok(match history.unprovable_from(address)? {
+        Some(m) if next >= m => (
+            next_uncovered_for(history, address, start, &TOKENS)?,
+            &TOKENS,
+            u64::MAX,
+        ),
+        Some(m) => (next, &DISCOVERED, m - 1),
+        None => (next, &DISCOVERED, u64::MAX),
+    })
+}
+
 /// [`next_uncovered`] over the given actions.
 pub fn next_uncovered_for(
     history: &AddressHistory,
@@ -2636,10 +2663,18 @@ pub fn record(
     found: Found,
     generation: u64,
 ) -> Result<()> {
-    record_anchored(history, address, (from, to), found, generation, None)
+    record_anchored(
+        history,
+        address,
+        (from, to),
+        found,
+        generation,
+        None,
+        &DISCOVERED,
+    )
 }
 
-/// [`record`] for a window read against block `anchor.0` with hash `anchor.1`.
+/// [`record`] for a window read against block `anchor.0` with hash `anchor.1`, of `actions` only.
 pub fn record_anchored(
     history: &AddressHistory,
     address: &str,
@@ -2647,6 +2682,7 @@ pub fn record_anchored(
     found: Found,
     generation: u64,
     anchor: Option<(u64, [u8; 32])>,
+    actions: &[Action],
 ) -> Result<()> {
     for (action, rows) in [
         (Action::TxList, found.txlist),
@@ -2655,6 +2691,9 @@ pub fn record_anchored(
         (Action::TokenNftTx, found.tokennfttx),
         (Action::Token1155Tx, found.token1155tx),
     ] {
+        if !actions.contains(&action) {
+            continue;
+        }
         history.record_anchored(action, address, &rows, (from, to), generation, anchor)?;
     }
     Ok(())
@@ -3204,7 +3243,9 @@ mod tests {
             to: u64,
         ) -> Result<Found> {
             let pending = Pending::begin(history)?;
-            let found = self.discover(history, address, from, to, &pending).await;
+            let found = self
+                .discover(history, address, from, to, &DISCOVERED, &pending)
+                .await;
             pending.persist(history, true)?;
             found
         }

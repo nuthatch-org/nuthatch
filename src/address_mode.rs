@@ -996,12 +996,14 @@ async fn same_chain_at<M: Rpc, T: Rpc>(
     Ok(())
 }
 
-/// Discover one window of `address` and record it, anchored when it ends above the finalized head.
+/// Discover one window of `actions` for `address` and record it, anchored when it ends above the
+/// finalized head.
 async fn discover_window<M: Rpc, T: Rpc>(
     d: &Discoverer<Counted<M>, Counted<T>>,
     state: &ModeState,
     address: &str,
     (next, end): (u64, u64),
+    actions: &'static [crate::address_history::Action],
     deadline: Option<Instant>,
 ) -> Result<()> {
     let pending = crate::address_discovery::Pending::begin(&state.history)?;
@@ -1018,7 +1020,7 @@ async fn discover_window<M: Rpc, T: Rpc>(
         // another fork.
         same_chain_at(d, end, true).await?;
         let found = d
-            .discover(&state.history, address, next, end, &pending)
+            .discover(&state.history, address, next, end, actions, &pending)
             .await;
         let checked = match check_anchor(d, &state.history, anchor, &pending.named()).await {
             Ok(()) => same_chain_at(d, end, true).await,
@@ -1044,6 +1046,7 @@ async fn discover_window<M: Rpc, T: Rpc>(
             found?,
             generation,
             anchor,
+            actions,
         )
     })
     .await?
@@ -1411,7 +1414,8 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                     continue;
                 }
                 yield_cursor(state, self).await;
-                let next = match crate::address_discovery::next_uncovered(
+                // Past where the account's history stops being provable only its token transfers are owed.
+                let (next, actions, limit) = match crate::address_discovery::next_owed(
                     &state.history,
                     &address,
                     state.start_block,
@@ -1436,18 +1440,6 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                     stopped.insert(address);
                     continue;
                 }
-                // Past where the account's history stops being provable there is nothing to fetch.
-                let limit = match state.history.unprovable_from(&address) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        tracing::warn!("address history: reading {address}'s marker: {e:#}");
-                        stopped.insert(address);
-                        continue;
-                    }
-                };
-                if limit.is_some_and(|l| next >= l) {
-                    continue;
-                }
                 let span = {
                     let mut paces = state.backfill_paces.lock().unwrap();
                     let pace = paces.entry(address.clone()).or_insert_with(fresh);
@@ -1458,13 +1450,10 @@ impl<M: Rpc, T: Rpc> Discovery for Discoverer<Counted<M>, Counted<T>> {
                     }
                     pace.span()
                 };
-                let end = next
-                    .saturating_add(span - 1)
-                    .min(to)
-                    .min(limit.map_or(u64::MAX, |l| l - 1));
+                let end = next.saturating_add(span - 1).min(to).min(limit);
                 // Tokio's clock, std's outside a paused test: there it simulates what a pace measures.
                 let started = tokio::time::Instant::now();
-                let done = discover_window(self, state, &address, (next, end), None).await;
+                let done = discover_window(self, state, &address, (next, end), actions, None).await;
                 let took = started.elapsed();
                 if let Some(p) = state.backfill_paces.lock().unwrap().get_mut(&address) {
                     match &done {
@@ -1740,7 +1729,7 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
                 bail!("produced blocks are served through the finalized block {head}, not {to}");
             }
         }
-        use crate::address_discovery::{BLOCK_SCANNED, DISCOVERED};
+        use crate::address_discovery::BLOCK_SCANNED;
         use crate::address_history::Action;
         // The deadline is checked between windows, never by cancelling one: a window's write runs
         // on a blocking thread a cancellation would orphan, and the cursor must stay the only writer.
@@ -1763,20 +1752,19 @@ impl<M: Rpc, T: Rpc> Discoverer<Counted<M>, Counted<T>> {
             if need == Need::Bodies {
                 break;
             }
-            let next = crate::address_discovery::next_uncovered(history, address, from)?;
+            // The page answers transactions unsupported from the marker on: past it only token
+            // transfers are fetched.
+            let (next, actions, limit) =
+                crate::address_discovery::next_owed(history, address, from)?;
             if next > to {
                 break;
             }
-            // The page answers unsupported from the marker on; nothing past it is fetched.
-            let limit = history.unprovable_from(address)?;
-            if limit.is_some_and(|l| next >= l) {
-                break;
-            }
             late()?;
-            let end = hole_end(history, address, &DISCOVERED, next, to)?
+            let end = hole_end(history, address, actions, next, to)?
                 .min(next.saturating_add(COVER_WINDOW - 1))
-                .min(limit.map_or(u64::MAX, |l| l - 1));
-            if let Err(e) = discover_window(self, state, address, (next, end), Some(deadline)).await
+                .min(limit);
+            if let Err(e) =
+                discover_window(self, state, address, (next, end), actions, Some(deadline)).await
             {
                 match e.downcast_ref::<crate::address_residual::Unprovable>() {
                     Some(u) => history.mark_unprovable(address, u.0)?,
@@ -3534,7 +3522,13 @@ async fn beyond_reach(s: &Arc<ModeState>, want: &(String, Need, u64, u64)) -> Op
     let (nexts, owed) = blocking(s, move |h| {
         let nexts = sets
             .into_iter()
-            .map(|set| next_uncovered_for(h, &who, from, set))
+            .map(|set| {
+                if set == DISCOVERED {
+                    crate::address_discovery::next_owed(h, &who, from).map(|(n, ..)| n)
+                } else {
+                    next_uncovered_for(h, &who, from, set)
+                }
+            })
             .collect::<Result<Vec<u64>>>()?;
         let owed = if need == Need::Produced {
             crate::address_mev::overdue(h, unix_now(), Some((from, to)))?.len() as u64
@@ -4215,11 +4209,13 @@ fn served_through(s: &ModeState, h: &AddressHistory) -> Result<Value> {
     let through = |accounts: &[String], set: &[Action]| -> Result<Value> {
         let mut next = u64::MAX;
         for a in accounts {
-            let n = next_uncovered_for(h, a, s.start_block, set)?;
-            // Covered to its marker, an unprovable account is refused above it at once, for good.
-            if set == DISCOVERED && h.unprovable_from(a)?.is_some_and(|m| n >= m) {
-                continue;
-            }
+            // Covered to its marker, an unprovable account's transactions are refused above it at
+            // once, for good; its token transfers are still to come.
+            let n = if set == DISCOVERED {
+                crate::address_discovery::next_owed(h, a, s.start_block)?.0
+            } else {
+                next_uncovered_for(h, a, s.start_block, set)?
+            };
             next = next.min(n);
         }
         Ok(match next {
@@ -6811,7 +6807,8 @@ mod tests {
 
     /// `served_through` is a prefix every watched account is answered under without waiting: a plain
     /// wallet the body scan never reads does not pin `bodies` at null, and an account covered up to
-    /// where it became unprovable, refused for good above it, does not pin `transactions` there.
+    /// where it became unprovable, its transactions refused for good above it, pins `transactions`
+    /// only where its token transfers, still followed, have yet to reach.
     #[tokio::test]
     async fn served_through_is_not_pinned_by_accounts_the_family_never_waits_on() {
         let dir = tempfile::tempdir().unwrap();
@@ -6828,6 +6825,11 @@ mod tests {
         }
         s.history.mark_unprovable(BOB, 201).unwrap();
         let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
+        assert_eq!(r["served_through"]["transactions"], 200, "{r}");
+        for action in crate::address_discovery::TOKENS {
+            s.history.record(action, BOB, &[], (201, 500), g).unwrap();
+        }
+        let (_, r) = call(router(s.clone()), "GET", "/ready", None).await;
         assert_eq!(
             r["served_through"],
             json!({"transactions": 300, "bodies": 450}),
@@ -6838,6 +6840,27 @@ mod tests {
         s.history.mark_unprovable(BOB, 150).unwrap();
         let (_, r) = call(router(s), "GET", "/ready", None).await;
         assert_eq!(r["served_through"]["transactions"], 300, "{r}");
+    }
+
+    /// Past its unprovable marker an account owes only its token transfers, so a request reaching just
+    /// beyond them is within reach, however far the marker lies behind.
+    #[tokio::test]
+    async fn an_unprovable_accounts_reach_is_measured_from_its_token_transfers() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        let g = s.history.generation().unwrap();
+        for action in crate::address_discovery::DISCOVERED {
+            s.history.record(action, ALICE, &[], (0, 999), g).unwrap();
+        }
+        for action in crate::address_discovery::TOKENS {
+            s.history
+                .record(action, ALICE, &[], (1_000, 1_000_000), g)
+                .unwrap();
+        }
+        s.history.mark_unprovable(ALICE, 1_000).unwrap();
+        s.backfill_rate.store(60_000, Ordering::Relaxed);
+        let want = (ALICE.to_string(), Need::Discovered, 0, 1_000_100);
+        assert_eq!(beyond_reach(&s, &want).await, None);
     }
 
     /// A sweep never reads back: a range below where an account joined it, or already swept without
@@ -8377,6 +8400,94 @@ mod tests {
         })
     }
 
+    /// On a residual chain an account that gets code at a block is refused its transactions from
+    /// there, and its token transfers on both sides are discovered through the finalized head, poll
+    /// after poll (VISIALIS/alter#168).
+    #[tokio::test]
+    async fn an_account_with_code_has_its_token_transfers_followed_to_the_head() {
+        use crate::address_history::{Action, Answer, PageRequest, Sort};
+        use crate::address_partitions::tests::Fake;
+        const CODE: u64 = 250;
+        struct Residual(Fake);
+        impl Rpc for Residual {
+            async fn call(&self, m: &str, p: Value) -> Result<Value> {
+                match m {
+                    "eth_getCode" => {
+                        let b = crate::address_discovery::hex_u64(&p[1])?;
+                        Ok(json!(if b >= CODE { "0x6080" } else { "0x" }))
+                    }
+                    "eth_getTransactionCount" | "eth_getBalance" => Ok(json!("0x0")),
+                    _ => self.0.call(m, p).await,
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 100, &[ALICE.into()]).unwrap();
+        let s = Arc::new(
+            ModeState::new(history, 100, Duration::from_secs(300), true).with_range(0, None, 20),
+        );
+        let chain = Chain::new(400, 300);
+        let mut d = Discoverer::new(
+            Counted::new(Residual(sweep_main(&chain))),
+            Counted::new(Residual(sweep_main(&chain))),
+        );
+        d.residual = true;
+        let page = |action: Action, end: u64| {
+            s.history
+                .page(
+                    action,
+                    &PageRequest {
+                        address: ALICE.into(),
+                        start_block: Some(0),
+                        end_block: Some(end),
+                        sort: Sort::Asc,
+                        page: 1,
+                        offset: 1_000,
+                        generation: None,
+                        contract: None,
+                    },
+                )
+                .unwrap()
+        };
+        for finalized in [300, 350] {
+            chain.finalized.store(finalized, Ordering::Relaxed);
+            let safe = d.reconcile(&s, chain.latest()).await.unwrap();
+            assert_eq!(safe, finalized);
+            d.catch_up(&s, safe).await;
+            assert_eq!(s.history.unprovable_from(ALICE).unwrap(), Some(CODE));
+            for action in [Action::TxList, Action::TxListInternal] {
+                assert_eq!(
+                    s.history.coverage(action, ALICE).unwrap(),
+                    vec![(0, CODE - 1)]
+                );
+                assert!(matches!(page(action, safe), Answer::Unsupported(_)));
+            }
+            for action in crate::address_discovery::TOKENS {
+                assert_eq!(
+                    s.history.coverage(action, ALICE).unwrap(),
+                    vec![(0, safe)],
+                    "{action:?} is covered through the head"
+                );
+            }
+            let want: Vec<String> = (0..=safe)
+                .filter(|b| chain.row_at(*b))
+                .map(|b| b.to_string())
+                .collect();
+            assert!(want.iter().any(|b| b.parse::<u64>().unwrap() < CODE));
+            assert!(want.iter().any(|b| b.parse::<u64>().unwrap() > CODE));
+            match page(Action::TokenTx, safe) {
+                Answer::Rows(r) => assert_eq!(
+                    r.iter()
+                        .map(|r| r["blockNumber"].clone())
+                        .collect::<Vec<_>>(),
+                    want
+                ),
+                other => panic!("tokentx through {safe}: {other:?}"),
+            }
+        }
+    }
+
     /// The hash of the orphaned branch [`Chain::forked_body`] answers from.
     const FORK: &str = "0x0000000000000000000000000000000000000000000000000000000000000077";
 
@@ -8800,14 +8911,14 @@ mod tests {
                         2 => {
                             let w = window(&s, &chain);
                             if w.0 <= w.1 {
-                                let _ = discover_window(&d, &s, ALICE, w, None).await;
+                                let _ = discover_window(&d, &s, ALICE, w, &crate::address_discovery::DISCOVERED, None).await;
                             }
                         }
                         3 => {
                             let w = window(&s, &chain);
                             if w.0 <= w.1 {
                                 chain.reorg_next.store(n.min(tail(&chain)), Ordering::Relaxed);
-                                let _ = discover_window(&d, &s, ALICE, w, None).await;
+                                let _ = discover_window(&d, &s, ALICE, w, &crate::address_discovery::DISCOVERED, None).await;
                                 chain.reorg_next.store(0, Ordering::Relaxed);
                             }
                         }
@@ -8840,7 +8951,7 @@ mod tests {
                 d.reconcile(&s, chain.latest()).await.unwrap();
                 let w = window(&s, &chain);
                 if w.0 <= w.1 {
-                    discover_window(&d, &s, ALICE, w, None).await.unwrap();
+                    discover_window(&d, &s, ALICE, w, &crate::address_discovery::DISCOVERED, None).await.unwrap();
                 }
                 d.reconcile(&s, chain.latest()).await.unwrap();
                 let (held, wanted) = held_and_wanted_of(&chain, &s.history, Action::TxListInternal);
@@ -8893,7 +9004,16 @@ mod tests {
         let chain = Chain::new(100, 70);
         let d = chain.node();
         d.reconcile(&s, chain.latest()).await.unwrap();
-        discover_window(&d, &s, ALICE, (0, 99), None).await.unwrap();
+        discover_window(
+            &d,
+            &s,
+            ALICE,
+            (0, 99),
+            &crate::address_discovery::DISCOVERED,
+            None,
+        )
+        .await
+        .unwrap();
         chain.grow(10);
         chain.finalized.store(90, Ordering::Relaxed);
         d.reconcile(&s, chain.latest()).await.unwrap();
@@ -8904,9 +9024,16 @@ mod tests {
             chain.reorg_on_read.lock().unwrap().is_none(),
             "the switch landed"
         );
-        let err = discover_window(&d, &s, ALICE, (91, chain.latest()), None)
-            .await
-            .unwrap_err();
+        let err = discover_window(
+            &d,
+            &s,
+            ALICE,
+            (91, chain.latest()),
+            &crate::address_discovery::DISCOVERED,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("block 90"), "{err:#}");
         assert_eq!(
             s.history
@@ -9216,9 +9343,16 @@ mod tests {
         let chain = Chain::new(130, 100);
         let d = chain.node();
         d.reconcile(&s, chain.latest()).await.unwrap();
-        discover_window(&d, &s, ALICE, (0, 129), None)
-            .await
-            .unwrap();
+        discover_window(
+            &d,
+            &s,
+            ALICE,
+            (0, 129),
+            &crate::address_discovery::DISCOVERED,
+            None,
+        )
+        .await
+        .unwrap();
         chain.finalized.store(80, Ordering::Relaxed);
         // 95 onward replaced once the poll's finality check has read 100.
         *chain.reorg_on_read.lock().unwrap() = Some((100, 1, 35));
@@ -9261,7 +9395,16 @@ mod tests {
             let chain = Chain::new(100, 70);
             let d = chain.node();
             d.reconcile(&s, chain.latest()).await.unwrap();
-            discover_window(&d, &s, ALICE, (0, 70), None).await.unwrap();
+            discover_window(
+                &d,
+                &s,
+                ALICE,
+                (0, 70),
+                &crate::address_discovery::DISCOVERED,
+                None,
+            )
+            .await
+            .unwrap();
             let q = format!(
                 "/api?module=account&action=txlistinternal&address={ALICE}&startblock=0&endblock=70"
             );
@@ -9860,9 +10003,16 @@ mod tests {
         let d = Discoverer::new(Counted::new(Slow), Counted::new(Slow));
         let started = Instant::now();
         let deadline = Some(Instant::now() + Duration::from_millis(100));
-        let err = discover_window(&d, &s, ALICE, (101, 120), deadline)
-            .await
-            .unwrap_err();
+        let err = discover_window(
+            &d,
+            &s,
+            ALICE,
+            (101, 120),
+            &crate::address_discovery::DISCOVERED,
+            deadline,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("deadline"), "{err:#}");
         let err = body_window(&d, &s, vec![ALICE.to_string()], (101, 120), deadline, false)
             .await
