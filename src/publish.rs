@@ -635,17 +635,39 @@ fn want_entries(manifest: &Manifest) -> Vec<(String, &Segment)> {
     out
 }
 
+/// The segments a running publisher has seen on the mirror, for the dataset it saw them under. A
+/// segment is content-addressed and never rewritten, so one sighting holds for the life of the
+/// process: without this, every pass HEADed every segment ever published (#2401).
+#[derive(Debug, Default)]
+pub(crate) struct Present {
+    dataset: String,
+    held: BTreeSet<(String, String)>,
+}
+
+impl Present {
+    fn of(&mut self, dataset: &str) -> &mut BTreeSet<(String, String)> {
+        if self.dataset != dataset {
+            self.dataset = dataset.to_string();
+            self.held.clear();
+        }
+        &mut self.held
+    }
+}
+
 async fn remote_present(
     mirror: &dyn Mirror,
     prefix: &str,
     remote: &Manifest,
+    known: &mut BTreeSet<(String, String)>,
 ) -> Result<BTreeSet<(String, String)>> {
     let mut have = BTreeSet::new();
     for (table, segs) in &remote.tables {
         for s in segs.iter().filter(|s| !s.provisional) {
+            let id = (table.clone(), s.hash.clone());
             let key = format!("{prefix}/{}", parquet_key(table, &s.hash));
-            if mirror.head(&key).await?.is_some() {
-                have.insert((table.clone(), s.hash.clone()));
+            if known.contains(&id) || mirror.head(&key).await?.is_some() {
+                known.insert(id.clone());
+                have.insert(id);
             }
         }
     }
@@ -804,12 +826,13 @@ async fn missing_entries<'a>(
     dataset: &str,
     want: &[(String, &'a Segment)],
     remote_catalogue: Option<&[u8]>,
+    present: &mut Present,
 ) -> Result<(Vec<(String, &'a Segment)>, usize)> {
     let remote: Manifest = match remote_catalogue {
         Some(b) => serde_json::from_slice(b).context("corrupt remote catalogue")?,
         None => Manifest::default(),
     };
-    let have = remote_present(mirror, dataset, &remote).await?;
+    let have = remote_present(mirror, dataset, &remote, present.of(dataset)).await?;
     let (held, missing): (Vec<_>, Vec<_>) = want
         .iter()
         .cloned()
@@ -861,6 +884,26 @@ pub async fn sync_with(
     parallelism: usize,
     metrics: Option<&crate::metrics::NestMetrics>,
 ) -> Result<SyncReport> {
+    sync_pass(
+        dir,
+        target,
+        dry_run,
+        parallelism,
+        metrics,
+        &mut Present::default(),
+    )
+    .await
+}
+
+/// One reconcile pass, skipping the HEAD for every segment `present` already holds.
+async fn sync_pass(
+    dir: &Path,
+    target: &str,
+    dry_run: bool,
+    parallelism: usize,
+    metrics: Option<&crate::metrics::NestMetrics>,
+    present: &mut Present,
+) -> Result<SyncReport> {
     // Before the catalogue: a seal writes its catalogue entry before its watermark, so a watermark
     // read first can only understate what the catalogue read after it holds.
     let (indexed_from, watermark) = match metrics {
@@ -880,6 +923,7 @@ pub async fn sync_with(
         &data_identity,
         &want,
         remote_bytes.as_deref(),
+        present,
     )
     .await?;
 
@@ -906,7 +950,7 @@ pub async fn sync_with(
         m.set_publish_pending(missing.len() as u64);
     }
     let mirror_ref = mirror.as_ref();
-    let attempts: Vec<(String, Result<u64>)> =
+    let attempts: Vec<((String, String), String, Result<u64>)> =
         futures::stream::iter(missing.iter().map(|(table, seg)| {
             let src = seal::segment_path(dir, &seg.file, &seg.hash);
             let name = parquet_key(table, &seg.hash);
@@ -927,7 +971,7 @@ pub async fn sync_with(
                     }
                     Ok(len)
                 };
-                (name, upload.await)
+                ((table.clone(), seg.hash.clone()), name, upload.await)
             }
         }))
         .buffer_unordered(parallelism.max(1))
@@ -935,9 +979,12 @@ pub async fn sync_with(
         .await;
     let mut parquet = Vec::with_capacity(attempts.len());
     let mut failed = Vec::new();
-    for (name, attempt) in attempts {
+    for (id, name, attempt) in attempts {
         match attempt {
-            Ok(len) => parquet.push((name, len)),
+            Ok(len) => {
+                present.of(&data_identity).insert(id);
+                parquet.push((name, len))
+            }
             Err(e) => failed.push((name, e)),
         }
     }
@@ -1174,6 +1221,7 @@ pub async fn status(dir: &Path, target: &str) -> Result<Status> {
         &dataset,
         &want,
         remote_catalogue.as_deref(),
+        &mut Present::default(),
     )
     .await?;
     let mut last_error = None;
@@ -1429,13 +1477,15 @@ async fn reconcile(
     metrics.set_publish_enabled(&settings.target);
     let mut changes = seal::manifest_changes(&dir);
     let mut failures = Failures::default();
+    let mut present = Present::default();
     loop {
-        let pass = sync_with(
+        let pass = sync_pass(
             &dir,
             &settings.target,
             false,
             settings.parallelism,
             Some(metrics.as_ref()),
+            &mut present,
         );
         tokio::select! {
             _ = &mut stopped => return,
@@ -1981,6 +2031,87 @@ mod tests {
             .count();
         assert_eq!(parquet, 4);
         assert_eq!(counting.most.load(SeqCst), 2);
+    }
+
+    struct HeadCounting {
+        inner: FsMirror,
+        heads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Mirror for HeadCounting {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.put(key, bytes).await
+        }
+        async fn put_file(&self, key: &str, src: &Path) -> Result<()> {
+            self.inner.put_file(key, src).await
+        }
+        async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()> {
+            self.inner.put_if(key, bytes, expected).await
+        }
+        async fn head(&self, key: &str) -> Result<Option<Head>> {
+            self.heads.fetch_add(1, SeqCst);
+            self.inner.head(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_running_publisher_heads_each_segment_once_not_every_pass() {
+        let nest = tempfile::tempdir().unwrap();
+        write_nest(nest.path());
+        test_set_table_floor(nest.path(), 0);
+        for block in 10..13 {
+            seal_range(nest.path(), &[row(block, block)], block, block)
+                .unwrap()
+                .expect("sealed");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let counting = std::sync::Arc::new(HeadCounting {
+            inner: FsMirror {
+                root: root.path().to_path_buf(),
+            },
+            heads: AtomicUsize::new(0),
+        });
+        let target = install("head-counting", counting.clone());
+        let heads = || counting.heads.swap(0, SeqCst);
+
+        let mut present = Present::default();
+        let first = sync_pass(nest.path(), &target, false, 1, None, &mut present)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .uploaded
+                .iter()
+                .filter(|k| k.ends_with(".parquet"))
+                .count(),
+            3
+        );
+        heads();
+
+        sync_pass(nest.path(), &target, false, 1, None, &mut present)
+            .await
+            .unwrap();
+        assert_eq!(heads(), 0, "a pass re-checked segments it uploaded itself");
+
+        // A publisher that remembers nothing, as after a restart, checks each segment once.
+        let mut fresh = Present::default();
+        let report = sync_pass(nest.path(), &target, false, 1, None, &mut fresh)
+            .await
+            .unwrap();
+        assert_eq!(report.skipped, 3);
+        assert_eq!(heads(), 3);
+        sync_pass(nest.path(), &target, false, 1, None, &mut fresh)
+            .await
+            .unwrap();
+        assert_eq!(
+            heads(),
+            0,
+            "a pass re-checked segments an earlier pass found"
+        );
     }
 
     fn row(block: u64, value: u64) -> String {
