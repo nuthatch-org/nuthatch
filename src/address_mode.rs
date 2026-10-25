@@ -3226,6 +3226,47 @@ async fn api_form(
     }
 }
 
+/// What a nest off a loopback bind answers without lending its RPC: `eth_blockNumber` from its own
+/// head, which a client reads before every range. `Ok(true)` lends the RPC for a balance of watched
+/// accounts only, the accounts the operator chose to follow.
+async fn off_loopback(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Result<bool, Value> {
+    let get = |k: &str| q.get(k).map(String::as_str);
+    if get("chainid").is_some_and(|c| c.parse::<u64>().ok() != Some(s.chain_id)) {
+        return Ok(false);
+    }
+    match (get("module"), get("action")) {
+        (Some("proxy"), Some("eth_blockNumber")) => Err(match blocking(s, |h| h.head()).await {
+            Ok(Some(b)) => json!({ "jsonrpc": "2.0", "id": 1, "result": format!("0x{b:x}") }),
+            Ok(None) => crate::address_history::incomplete("the chain head has not been read yet"),
+            Err(e) => crate::address_history::incomplete(&format!("{e:#}")),
+        }),
+        (Some("account"), Some("balance" | "balancemulti")) => {
+            let asked: Vec<String> = get("address")
+                .unwrap_or("")
+                .split(',')
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+                .map(str::to_string)
+                .collect();
+            let watched = blocking(s, move |h| {
+                asked.iter().try_fold(!asked.is_empty(), |all, a| {
+                    Ok(all && h.is_watched(a).unwrap_or(false))
+                })
+            })
+            .await
+            .unwrap_or(false);
+            if watched {
+                Ok(true)
+            } else {
+                Err(crate::address_history::unsupported(
+                    "off a loopback bind only a watched account's balance is read",
+                ))
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
 async fn serve_api(s: Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
     let conflict = |s: &ModeState| s.conflicted();
     if let Some(why) = conflict(&s) {
@@ -3252,8 +3293,17 @@ async fn serve_api(s: Arc<ModeState>, q: HashMap<String, String>) -> Json<Value>
 
 async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>, deadline: Instant) -> Json<Value> {
     let s = s.clone();
-    // The RPC behind the nest is the operator's; only a loopback bind lends it out.
-    if let Some(forward) = s.forward.clone().filter(|_| s.loopback) {
+    let lend = if s.loopback {
+        true
+    } else {
+        match off_loopback(&s, &q).await {
+            Ok(lend) => lend,
+            Err(v) => return Json(v),
+        }
+    };
+    // The RPC behind the nest is the operator's; only a loopback bind lends it out, and off it only
+    // for a watched account's balance.
+    if let Some(forward) = s.forward.clone().filter(|_| lend) {
         let _permit = if q.get("module").map(String::as_str) == Some("logs") {
             match s.logs.try_acquire() {
                 Ok(p) => Some(p),
@@ -7053,7 +7103,7 @@ mod tests {
             let (_, v) = call(
                 router(state),
                 "GET",
-                "/api?module=proxy&action=eth_blockNumber",
+                "/api?module=proxy&action=eth_call&to=0x0000000000000000000000000000000000000001&data=0x",
                 None,
             )
             .await;
@@ -7069,6 +7119,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn counted_forward() -> (crate::address_proxy::Forward, Arc<AtomicU64>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let c = calls.clone();
+        let forward: crate::address_proxy::Forward = Arc::new(move |_, _| {
+            c.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(json!("0x10")) })
+        });
+        (forward, calls)
+    }
+
+    /// Off a loopback bind `eth_blockNumber` is the nest's own head, so a client that reads the head
+    /// before each range works through a proxy without the RPC being lent.
+    #[tokio::test]
+    async fn off_loopback_the_block_number_is_the_nests_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let (forward, calls) = counted_forward();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), false).with_forward(forward),
+        );
+        let ask = "/api?module=proxy&action=eth_blockNumber";
+        let (_, v) = call(router(s.clone()), "GET", ask, None).await;
+        assert!(
+            v["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("NUTHATCH_INCOMPLETE:"),
+            "no head yet: {v}"
+        );
+        s.history.set_head(0x1234).unwrap();
+        let (_, v) = call(router(s), "GET", ask, None).await;
+        assert_eq!(v["result"], "0x1234", "{v}");
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "the RPC was asked");
+    }
+
+    /// Off a loopback bind a balance is read from the RPC only when every address asked is watched.
+    #[tokio::test]
+    async fn off_loopback_only_a_watched_accounts_balance_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let (forward, calls) = counted_forward();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), false).with_forward(forward),
+        );
+        let (_, v) = call(
+            router(s.clone()),
+            "GET",
+            &format!("/api?module=account&action=balance&address={ALICE}"),
+            None,
+        )
+        .await;
+        assert_eq!(v["result"], "16", "{v}");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 1);
+
+        for ask in [
+            format!("/api?module=account&action=balance&address={BOB}"),
+            format!("/api?module=account&action=balancemulti&address={ALICE},{BOB}"),
+            "/api?module=account&action=balance".to_string(),
+            "/api?module=account&action=balancemulti&address=,".to_string(),
+        ] {
+            let (_, v) = call(router(s.clone()), "GET", &ask, None).await;
+            let why = v["result"].as_str().unwrap();
+            assert!(
+                why.starts_with("NUTHATCH_UNSUPPORTED:") && why.contains("watched"),
+                "{ask}: {v}"
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "the RPC was asked");
     }
 
     #[tokio::test]

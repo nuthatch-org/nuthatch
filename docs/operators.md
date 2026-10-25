@@ -966,7 +966,9 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
   a form `POST`. A range the nest has not covered answers `NUTHATCH_INCOMPLETE`, never an empty
   list, so a client falls through to its next source.
 - **`POST /api/watch` and `/api/unwatch`** change the watched set at runtime and are accepted only on
-  a loopback bind, as are the RPC-backed actions (balances, the `proxy` module). Keep it on loopback.
+  a loopback bind, as are the RPC-backed actions (balances, the `proxy` module). Off loopback,
+  `proxy/eth_blockNumber` answers the nest's own head and a watched account's balance is still read;
+  everything else that would lend the RPC is refused. Keep it on loopback unless a client needs it.
 - **`/ready`** carries `mode: "address_history"`, `watched`, `stalled`, `stalled_backfill`, and
   `served_through`: per action family, the block up to which every watched account is answered
   without waiting, `null` before any is.

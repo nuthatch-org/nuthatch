@@ -379,7 +379,9 @@ watched account: like the proxy, the operator's trace RPC and disk are lent to a
 loopback. The token actions take `contractaddress` with an `address`; a token alone answers
 `NUTHATCH_UNSUPPORTED`. On loopback, `account/balance` and `account/balancemulti` (at most 20
 addresses, `tag` latest or a block) are read from the RPC, as are `proxy/eth_estimateGas`,
-`eth_gasPrice` and `eth_getTransactionCount`; `eth_sendRawTransaction` is refused. `logs/getLogs` honours `page` and `offset` (at most 1,000), asks the RPC in spans that
+`eth_gasPrice` and `eth_getTransactionCount`; `eth_sendRawTransaction` is refused. Off loopback,
+`proxy/eth_blockNumber` answers the nest's own head and a balance is read only when every address
+asked is watched. `logs/getLogs` honours `page` and `offset` (at most 1,000), asks the RPC in spans that
 start at 16 blocks and grow while they come back sparse, narrows any answer past 4 MiB, stops once
 it holds the page, and runs two
 requests at a time; a range that needs more than 64 calls answers `NUTHATCH_INCOMPLETE`, and a first

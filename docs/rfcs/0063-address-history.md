@@ -109,7 +109,9 @@ block in hex or decimal, read from the nest's RPC by `eth_getBalance` and stored
 RPC passthroughs rotki and BitBoxApp use (`eth_blockNumber`, `eth_getBlockByNumber`,
 `eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getCode`, `eth_call`,
 `eth_estimateGas`, `eth_gasPrice`, `eth_getTransactionCount`) and `logs/getLogs`. Like the proxy,
-balances are answered only on a loopback bind. `proxy/eth_sendRawTransaction` is refused: a history
+balances are answered only on a loopback bind. *(Amended 2026-10-25 by Chief: off loopback,
+`proxy/eth_blockNumber` answers the nest's own head and a balance is read for watched accounts
+only, so a client behind a proxy or in a container works without the RPC being lent.)* `proxy/eth_sendRawTransaction` is refused: a history
 service never broadcasts. `contract/getabi`, `contract/getcontractcreation` and
 `block/getblockreward` answer unsupported until built.
 
