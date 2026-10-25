@@ -403,8 +403,13 @@ residual**:
   equal the balance's rise to the wei, or the window is not recorded.
 - **Accounts it cannot prove** are a contract or an account with EIP-7702 delegated code, whose balance
   another account's code can spend. They are found at the first block with code, or the block whose
-  nonce rose for an authorisation, and every account action answers `NUTHATCH_UNSUPPORTED` from there,
-  so rotki asks another source. A reorg below that block removes the mark.
+  nonce rose for an authorisation, and `txlist` and `txlistinternal` answer `NUTHATCH_UNSUPPORTED`
+  from there, so rotki asks another source. Their token transfers are still served: a log filter finds
+  them with no proof of the balance, as completely as an externally owned account's, and discovery
+  goes on following them past the mark. A reorg below that block removes the mark. *(Amended
+  2026-10-25 by Chief: every account action was refused from the mark, token transfers included,
+  which refused a RealT wallet on Gnosis, a proxy contract from its first block, all of its more
+  than 10,000 token transfers, VISIALIS/alter#168.)*
 - **What it does not list**: an incoming transaction that moves no value, a zero-value call or a
   failed transfer to the account. Etherscan lists them; they change nothing in rotki's books.
 - **A contract that comes and goes.** `CREATE` cannot target an address with a nonce or code

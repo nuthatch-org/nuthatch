@@ -226,10 +226,11 @@ not served. Outgoing transactions are the blocks where the account's nonce rises
 found where its balance rises by more than its own transactions explain, and only those blocks are
 traced, with `debug_traceBlockByNumber`, which the trace RPC must serve. Each traced block's credits
 must equal the balance's rise to the wei, or the window is not recorded. This proves the history of an
-externally owned account: for a contract, or an account with EIP-7702 delegated code, every account
-action answers `NUTHATCH_UNSUPPORTED` from the first block it had code, so the caller asks another
-source. An incoming transaction that moves no value, a zero-value call or a failed transfer to the
-account, is not listed, though Etherscan lists it; token transfers are found from logs as everywhere.
+externally owned account: for a contract, or an account with EIP-7702 delegated code, `txlist` and
+`txlistinternal` answer `NUTHATCH_UNSUPPORTED` from the first block it had code, so the caller asks
+another source; its token transfers are still served. An incoming transaction that moves no value, a
+zero-value call or a failed transfer to the account, is not listed, though Etherscan lists it; token
+transfers are found from logs as everywhere.
 
 One `nuthatch dev` can serve several chains at one address: point `--dir` at a directory holding no
 `nuthatch.toml` of its own, only one subdirectory per chain, each an address-history nest. Each runs its
@@ -359,8 +360,8 @@ read, and still carries `chain_id`; `served_through` gives, per action family th
 up to which every account the family reads for is answered without waiting, `null` before any is:
 `transactions` (the five discovered actions, every watched account), `bodies` (withdrawals and mined
 blocks, Ethereum) and `produced` (with `mev_relays`), both over the accounts asked for them (every account while validators are watched), since a plain
-wallet is not body-scanned until it asks. An account above its unprovable marker is refused for
-good rather than waited on, and so does not hold `transactions` back. A sweeping nest reports the end
+wallet is not body-scanned until it asks. Above its unprovable marker an account's transactions are refused
+for good rather than waited on, so only its token transfers, still followed, hold `transactions` back. A sweeping nest reports the end
 of its swept span as `transactions`: it never reads back, so below that nothing is still to come. A
 client that stops there is answered without waiting. It reports `stalled: true` while the last poll failed or no window advances, lists each address
 whose windows keep failing under `stalled_backfill` (failures, span, `retry_in_polls`, the last error),

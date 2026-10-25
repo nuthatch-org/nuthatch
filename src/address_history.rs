@@ -2581,15 +2581,19 @@ impl AddressHistory {
             ));
         }
         let start = req.start_block.unwrap_or(0);
+        // Only transactions are proved by the balance; token transfers come from log filters.
+        let proved = matches!(action, Action::TxList | Action::TxListInternal);
         if let Some(from) = rtx
             .open_table(UNPROVABLE)?
             .get(a.as_slice())?
             .map(|v| v.value())
+            .filter(|_| proved)
         {
             if req.end_block.is_none_or(|e| e >= from) {
                 return answer(Answer::Unsupported(format!(
-                    "{} had code from block {from}, and this chain's history is proved by its balance, \
-                     which another account's code can spend; ask another source for blocks from {from}",
+                    "{} had code from block {from}, and this chain's transactions are proved by its \
+                     balance, which another account's code can spend; ask another source for blocks \
+                     from {from}",
                     req.address
                 )));
             }
@@ -5176,6 +5180,59 @@ mod tests {
             None,
             "a reorg below the mark removes it"
         );
+    }
+
+    /// The residual proves only an account's transactions, so the mark refuses those from its block
+    /// while the token transfers a log filter found are served across it (VISIALIS/alter#168).
+    #[test]
+    fn an_unprovable_mark_refuses_transactions_and_serves_token_transfers() {
+        let (_d, h) = history();
+        let g = h.generation().unwrap();
+        for action in [Action::TxList, Action::TxListInternal] {
+            h.record(action, ALICE, &[tx(10, 0)], (0, 79), g).unwrap();
+        }
+        h.record(
+            Action::TokenTx,
+            ALICE,
+            &[tx(10, 1), tx(150, 0)],
+            (0, 200),
+            g,
+        )
+        .unwrap();
+        h.mark_unprovable(ALICE, 80).unwrap();
+        let page = |action: Action, end: u64| {
+            h.page(
+                action,
+                &PageRequest {
+                    address: ALICE.into(),
+                    start_block: Some(0),
+                    end_block: Some(end),
+                    sort: Sort::Asc,
+                    page: 1,
+                    offset: 100,
+                    generation: None,
+                    contract: None,
+                },
+            )
+            .unwrap()
+        };
+        for action in [Action::TxList, Action::TxListInternal] {
+            assert!(
+                matches!(page(action, 80), Answer::Unsupported(_)),
+                "{action:?} from the mark is refused"
+            );
+            assert!(matches!(page(action, 79), Answer::Rows(r) if r.len() == 1));
+        }
+        match page(Action::TokenTx, 200) {
+            Answer::Rows(r) => assert_eq!(
+                r.iter()
+                    .map(|r| r["blockNumber"].clone())
+                    .collect::<Vec<_>>(),
+                vec!["10", "150"],
+                "rows on both sides of the mark"
+            ),
+            other => panic!("tokentx across the mark: {other:?}"),
+        }
     }
 
     /// RFC-0064 S3: the feed carries each incoming row once as a deposit, a reorg that takes it back
