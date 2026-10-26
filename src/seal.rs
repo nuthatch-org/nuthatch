@@ -3030,6 +3030,28 @@ mod tests {
         assert!(!only(&m, "t__quiet").provisional);
     }
 
+    /// Each kind of lost tail is written back on its own. Together, either one's save hid the other.
+    #[test]
+    fn the_startup_pass_saves_a_lost_tail_of_either_kind() {
+        for corrupt in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            seal_range(dir.path(), &[stamped("t__sparse", 10, T0)], 10, 10).unwrap();
+            let tail = only(&load_manifest(dir.path()).unwrap(), "t__sparse");
+            assert!(tail.provisional, "premise: a tail");
+            let path = dir.path().join(SEGMENTS_DIR).join(&tail.file);
+            if corrupt {
+                std::fs::write(&path, b"rotted").unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            verify_and_quarantine(dir.path()).unwrap();
+            assert!(
+                !only(&load_manifest(dir.path()).unwrap(), "t__sparse").provisional,
+                "corrupt={corrupt}: the lost tail is still a tail on disk"
+            );
+        }
+    }
+
     /// #2169: the state a crash between a fold's manifest and its prune leaves.
     #[test]
     fn an_unpruned_fold_is_found_and_an_ordinary_unpruned_seal_is_not() {
@@ -3044,6 +3066,14 @@ mod tests {
         );
         seal_range(dir.path(), &[transfer(12, 0, "2")], 12, 12).unwrap();
         assert_eq!(unpruned_fold(dir.path(), 11).unwrap(), Some((10, 12)));
+
+        let pruned = only(&load_manifest(dir.path()).unwrap(), "usdc__approval");
+        std::fs::remove_file(dir.path().join(SEGMENTS_DIR).join(&pruned.file)).unwrap();
+        assert_eq!(
+            unpruned_fold(dir.path(), 11).unwrap(),
+            Some((10, 12)),
+            "a segment wholly under the watermark has no hot copy left for the finish to lose"
+        );
 
         let folded = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
         std::fs::remove_file(dir.path().join(SEGMENTS_DIR).join(&folded.file)).unwrap();

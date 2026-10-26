@@ -8185,14 +8185,18 @@ mod tests {
         let claimed = jobs
             .claim(MountJob::new("usdc", None, MountPhase::Accepted))
             .unwrap();
-        let job = spawn_mount_job(
+        let mut job = spawn_mount_job(
             handles.clone(),
             jobs.clone(),
             "usdc".into(),
             None,
             claimed.generation,
         );
-        entered.notified().await;
+        tokio::select! {
+            biased;
+            _ = entered.notified() => {}
+            _ = &mut job => panic!("the mount job ended before it asked for the tip"),
+        }
         let free = tokio::time::timeout(std::time::Duration::from_secs(5), handles.lock())
             .await
             .is_ok();
@@ -8217,7 +8221,10 @@ mod tests {
             .put(MountJob::new("usdc", None, MountPhase::Joining))
             .unwrap();
         let jobs = start_mount_jobs(root.path(), &handles, true).await.unwrap();
-        entered.notified().await;
+        // Bounded: a job that fails before its tip call never notifies, and the test would hang (#2404).
+        tokio::time::timeout(std::time::Duration::from_secs(60), entered.notified())
+            .await
+            .expect("the resumed mount job never asked for the tip");
         let free = tokio::time::timeout(std::time::Duration::from_secs(5), handles.lock())
             .await
             .is_ok();
