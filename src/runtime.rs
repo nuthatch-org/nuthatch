@@ -8193,6 +8193,7 @@ mod tests {
             claimed.generation,
         );
         tokio::select! {
+            biased;
             _ = entered.notified() => {}
             _ = &mut job => panic!("the mount job ended before it asked for the tip"),
         }
