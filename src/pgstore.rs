@@ -113,6 +113,16 @@ impl Conn {
         &self,
         f: impl FnOnce(&mut postgres::Client) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.start(f)?
+            .recv()
+            .map_err(|_| anyhow!("the Postgres connection thread dropped a request"))?
+    }
+
+    /// Queue `f` on the connection thread; its result arrives on the receiver.
+    fn start<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut postgres::Client) -> Result<T> + Send + 'static,
+    ) -> Result<mpsc::Receiver<Result<T>>> {
         let (tx, rx) = mpsc::channel();
         let job: Job = Box::new(move |client| {
             let _ = tx.send(f(client));
@@ -122,8 +132,7 @@ impl Conn {
             .map_err(|_| anyhow!("the Postgres connection lock was poisoned"))?
             .send(job)
             .map_err(|_| anyhow!("the Postgres connection thread has stopped"))?;
-        rx.recv()
-            .map_err(|_| anyhow!("the Postgres connection thread dropped a request"))?
+        Ok(rx)
     }
 }
 
@@ -544,6 +553,77 @@ impl HotStore for PgStore {
             }
             Ok(out)
         })
+    }
+
+    /// Sized and copied in one repeatable-read transaction. The connection thread hands the size
+    /// back and waits for the charge before it fetches a row.
+    fn hot_rows_charged(
+        &self,
+        max_rows: usize,
+        max_bytes: u64,
+        charge: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<crate::store::HotRowsSnapshot> {
+        let size_sql = format!(
+            "SELECT count(*), coalesce(sum(octet_length(value)), 0)::bigint FROM \"{}\".entities",
+            self.schema
+        );
+        let sql = format!(
+            "SELECT value FROM \"{}\".entities ORDER BY key",
+            self.schema
+        );
+        let (sized_tx, sized_rx) = mpsc::channel::<u64>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let done = self.conn.start(move |c| {
+            let mut tx = c
+                .build_transaction()
+                .isolation_level(postgres::IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()?;
+            let sized = tx.query_one(&size_sql, &[])?;
+            let (total, bytes) = (
+                sized.get::<_, i64>(0) as usize,
+                sized.get::<_, i64>(1) as u64,
+            );
+            if total > max_rows {
+                return Err(HotScanTooLarge { cap: max_rows }.into());
+            }
+            if bytes > max_bytes {
+                return Err(crate::store::HotScanBudgetExceeded {
+                    source_bytes: bytes,
+                    budget: max_bytes,
+                }
+                .into());
+            }
+            sized_tx.send(bytes)?;
+            go_rx.recv().context("the hot copy was not charged")?;
+            let mut out = crate::store::HotRowsSnapshot::default();
+            for row in tx.query(&sql, &[])? {
+                let raw: String = row.get(0);
+                out.source_rows += 1;
+                out.source_bytes = out.source_bytes.saturating_add(raw.len() as u64);
+                // Bounded by what was charged, should the server count a value differently.
+                if out.source_bytes > bytes {
+                    return Err(crate::store::HotScanBudgetExceeded {
+                        source_bytes: out.source_bytes,
+                        budget: bytes,
+                    }
+                    .into());
+                }
+                let v = serde_json::from_str::<serde_json::Value>(&raw)
+                    .context("unparseable hot row in an analytical scan")?;
+                let Some(t) = v.get("table").and_then(|t| t.as_str()) else {
+                    continue;
+                };
+                out.rows.entry(t.to_string()).or_default().push(v);
+            }
+            Ok(out)
+        })?;
+        if let Ok(bytes) = sized_rx.recv() {
+            charge(bytes)?;
+            let _ = go_tx.send(());
+        }
+        done.recv()
+            .map_err(|_| anyhow!("the Postgres connection thread dropped a request"))?
     }
 
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {

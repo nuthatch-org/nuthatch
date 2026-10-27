@@ -5647,6 +5647,7 @@ impl RuntimeHandles {
             *mounts.entry(tenant.to_string()).or_default() += 1;
         }
         let held: Vec<BTreeMap<String, usize>> = gates.iter().map(|g| g.held()).collect();
+        let hot: Vec<BTreeMap<String, usize>> = gates.iter().map(|g| g.hot_used()).collect();
         let bytes = self
             .states
             .first()
@@ -5662,6 +5663,7 @@ impl RuntimeHandles {
                     "mounts": mounted,
                     "permits_held": held.iter().filter_map(|h| h.get(&tenant)).sum::<usize>(),
                     "response_kib_in_flight": bytes.get(&tenant).copied().unwrap_or(0),
+                    "hot_kib_in_flight": hot.iter().filter_map(|h| h.get(&tenant)).sum::<usize>(),
                 })
             })
             .collect()

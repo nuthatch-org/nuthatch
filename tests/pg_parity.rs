@@ -484,6 +484,50 @@ async fn the_hot_scan_guard_refuses_on_both_backends() {
     );
 }
 
+/// RFC-0073 FR5: both backends charge a hot copy before they copy it, the same bytes, and a refused
+/// charge returns no rows.
+#[tokio::test]
+async fn the_hot_charge_comes_before_the_copy_on_both_backends() {
+    let Some((redb, pg, _dir)) = pair("hot_charge") else {
+        return;
+    };
+    let both: [&dyn HotStore; 2] = [redb.as_ref(), pg.as_ref()];
+    for b in 1..=5u64 {
+        let (k, v) = row("t", b, 0);
+        for s in both {
+            s.put_entity(&k, &v).unwrap();
+        }
+    }
+    let mut charged = Vec::new();
+    for s in both {
+        let mut seen = None;
+        let snapshot = s
+            .hot_rows_charged(10, u64::MAX, &mut |b| {
+                seen = Some(b);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, Some(snapshot.source_bytes));
+        assert_eq!(snapshot.rows["t"].len(), 5);
+        charged.push(snapshot.source_bytes);
+
+        let refused = s.hot_rows_charged(10, u64::MAX, &mut |_| anyhow::bail!("no room"));
+        assert_eq!(refused.unwrap_err().to_string(), "no room");
+        let mut called = false;
+        let over = s.hot_rows_charged(2, u64::MAX, &mut |_| {
+            called = true;
+            Ok(())
+        });
+        assert!(
+            over.is_err() && !called,
+            "a copy over the row cap is never charged"
+        );
+    }
+    assert_eq!(charged[0], charged[1], "the same rows cost the same bytes");
+    // The connection still serves after a charge was refused mid-transaction.
+    assert!(pg.hot_rows_by_table_bounded(500).is_ok());
+}
+
 /// RFC-0022 slice 4: the two backends must fence **identically**. A backend that enforces ownership
 /// differently is a backend on which the single-owner guarantee means something different, which is
 /// the same as it not being a guarantee.

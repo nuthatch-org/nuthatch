@@ -853,7 +853,8 @@ Opaque means nuthatch does not interpret it, not that it may contain `..`.
 
 **A tenant's share of query capacity (RFC-0073 FR2).** Each chain's SQL gate and the process's
 response bytes in flight are divided by tenant label. Every tenant with a mount on a gate holds one
-permit in reserve, and half the response-bytes budget is reserved by weight, so one tenant's burst
+permit in reserve, and half the response-bytes budget and of the gate's 128 MiB of hot-tip copies
+(FR5) is reserved by weight, so one tenant's burst
 cannot hold another's query past the 250 ms admission wait. Past its own share a tenant is answered
 `429` with `"reason": "tenant_share"`; a full gate is still `503` `busy`. A runtime with one tenant
 behaves as before. Shares live under `[tenants.<tenant>]` and are set live, with no restart, by
