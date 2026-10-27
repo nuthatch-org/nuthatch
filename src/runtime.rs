@@ -4868,6 +4868,8 @@ impl RuntimeHandles {
                     crate::metrics::METRICS.remove_nest(name);
                 }
             }
+            // An alias has serving series under its own name and no ingest series to keep.
+            crate::metrics::METRICS.remove_nest(name);
             self.health.unregister(name);
             self.publishers.retain(|(n, _)| n != name);
             self.states.remove(idx);

@@ -61,6 +61,10 @@ name = "memory_gauges_are_published"
 path = "tests/memory_gauges_are_published.rs"
 
 [[test]]
+name = "nest_serving_metrics"
+path = "tests/nest_serving_metrics.rs"
+
+[[test]]
 name = "skill_refs"
 path = "tests/skill_refs.rs"
 

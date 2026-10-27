@@ -737,6 +737,9 @@ pub struct Metrics {
     /// Per-nest handles, keyed by nest name (SEC-9). `BTreeMap` so `/metrics` renders in a stable
     /// order. Populated once per nest at build; a solo `dev` has a single entry.
     per_nest: Mutex<BTreeMap<String, Arc<NestMetrics>>>,
+    /// RFC-0073 FR4: per-mount serving counters, keyed by route. Separate from `per_nest`, which is
+    /// keyed by dataset: an alias of a shared dataset has routes but no ingest of its own.
+    serving: Mutex<BTreeMap<String, Arc<NestServing>>>,
 }
 
 /// Prometheus histogram bounds for RPC duration (seconds). The `+Inf` bucket is implicit.
@@ -808,6 +811,7 @@ impl Metrics {
             last_seal_progress: AtomicU64::new(0),
             rpc_endpoints: Mutex::new(BTreeMap::new()),
             per_nest: Mutex::new(BTreeMap::new()),
+            serving: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -830,6 +834,16 @@ impl Metrics {
         h
     }
 
+    /// The serving counters of the mount routed as `label`, registered on first use.
+    pub fn serving(&self, label: &str) -> Arc<NestServing> {
+        self.serving
+            .lock()
+            .unwrap()
+            .entry(label.to_string())
+            .or_default()
+            .clone()
+    }
+
     /// [`Metrics::nest`] without registering a nest nobody has reported under.
     pub fn nest_if_known(&self, name: &str) -> Option<Arc<NestMetrics>> {
         self.per_nest.lock().unwrap().get(name).cloned()
@@ -839,6 +853,7 @@ impl Metrics {
     /// in-flight request, but it is no longer reachable from `/metrics` (#827).
     pub fn remove_nest(&self, name: &str) {
         self.per_nest.lock().unwrap().remove(name);
+        self.serving.lock().unwrap().remove(name);
     }
 
     /// Carry a nest's series over to a new name (#1549), replacing any the new name had.
@@ -991,13 +1006,23 @@ impl Metrics {
     }
     pub fn inc_http(&self) {
         self.http_requests.fetch_add(1, Relaxed);
+        in_serving_scope(|s| {
+            s.nest.http_requests.fetch_add(1, Relaxed);
+        });
     }
     pub fn inc_sql(&self) {
         self.sql_queries.fetch_add(1, Relaxed);
+        in_serving_scope(|s| {
+            s.nest.sql_queries.fetch_add(1, Relaxed);
+            s.ran_sql.store(true, Relaxed);
+        });
     }
     pub fn inc_sql_rejected(&self, reason: SqlRejection) {
         self.sql_rejections.fetch_add(1, Relaxed);
         self.sql_rejections_by_reason[reason.index()].fetch_add(1, Relaxed);
+        in_serving_scope(|s| {
+            s.nest.sql_rejections[reason.index()].fetch_add(1, Relaxed);
+        });
     }
     /// A declared query answered under the scan cap, with the source bytes it was admitted at.
     pub fn observe_named_scan(&self, bytes: u64) {
@@ -1863,7 +1888,138 @@ impl Metrics {
                 );
             }
         }
+        self.render_serving(&mut s);
         s
+    }
+
+    /// RFC-0073 FR4: the serving counters per mount, beside the unlabelled totals they sum to.
+    fn render_serving(&self, s: &mut String) {
+        let serving = self.serving.lock().unwrap();
+        if serving.is_empty() {
+            return;
+        }
+        let mut labelled = |name: &str, help: &str, get: &dyn Fn(&NestServing) -> u64| {
+            s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+            for (nest, m) in serving.iter() {
+                s.push_str(&format!("{name}{{nest=\"{nest}\"}} {}\n", get(m)));
+            }
+        };
+        labelled(
+            "nuthatch_nest_http_requests_total",
+            "HTTP API requests served by this mount since start.",
+            &|m| m.http_requests.load(Relaxed),
+        );
+        labelled(
+            "nuthatch_nest_sql_queries_total",
+            "Analytical queries this mount accepted since start.",
+            &|m| m.sql_queries.load(Relaxed),
+        );
+        s.push_str(
+            "# HELP nuthatch_nest_sql_rejections_total Analytical requests this mount refused since start, by the fixed refusal classification.\n\
+             # TYPE nuthatch_nest_sql_rejections_total counter\n",
+        );
+        for (nest, m) in serving.iter() {
+            for reason in SqlRejection::ALL {
+                s.push_str(&format!(
+                    "nuthatch_nest_sql_rejections_total{{nest=\"{nest}\",reason=\"{}\"}} {}\n",
+                    reason.label(),
+                    m.sql_rejections[reason.index()].load(Relaxed),
+                ));
+            }
+        }
+        s.push_str(
+            "# HELP nuthatch_nest_sql_duration_seconds Wall time of this mount's requests that ran an analytical query, admission wait included.\n\
+             # TYPE nuthatch_nest_sql_duration_seconds histogram\n",
+        );
+        for (nest, m) in serving.iter() {
+            for (i, bound) in SQL_DURATION_BOUNDS.iter().enumerate() {
+                s.push_str(&format!(
+                    "nuthatch_nest_sql_duration_seconds_bucket{{nest=\"{nest}\",le=\"{bound}\"}} {}\n",
+                    m.sql_duration_buckets[i].load(Relaxed)
+                ));
+            }
+            let count = m.sql_duration_buckets[SQL_DURATION_BOUNDS.len()].load(Relaxed);
+            s.push_str(&format!(
+                "nuthatch_nest_sql_duration_seconds_bucket{{nest=\"{nest}\",le=\"+Inf\"}} {count}\n\
+                 nuthatch_nest_sql_duration_seconds_sum{{nest=\"{nest}\"}} {}\n\
+                 nuthatch_nest_sql_duration_seconds_count{{nest=\"{nest}\"}} {count}\n",
+                m.sql_duration_micros.load(Relaxed) as f64 / 1e6
+            ));
+        }
+    }
+}
+
+/// Bounds, in seconds, of `nuthatch_nest_sql_duration_seconds`. The `+Inf` bucket is implicit.
+const SQL_DURATION_BOUNDS: [f64; 13] = [
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// One mount's serving counters (RFC-0073 FR4), under the label its routes answer to: a runtime's
+/// route key, so an alias of a shared dataset is told apart from the mount that indexes it, or a solo
+/// nest's name.
+#[derive(Default)]
+pub struct NestServing {
+    http_requests: AtomicU64,
+    sql_queries: AtomicU64,
+    sql_rejections: [AtomicU64; 7],
+    /// Cumulative per [`SQL_DURATION_BOUNDS`] entry, then `+Inf`.
+    sql_duration_buckets: [AtomicU64; 14],
+    sql_duration_micros: AtomicU64,
+}
+
+impl NestServing {
+    fn observe_sql(&self, elapsed: Duration) {
+        let secs = elapsed.as_secs_f64();
+        self.sql_duration_micros
+            .fetch_add(elapsed.as_micros() as u64, Relaxed);
+        for (i, bound) in SQL_DURATION_BOUNDS.iter().enumerate() {
+            if secs <= *bound {
+                self.sql_duration_buckets[i].fetch_add(1, Relaxed);
+            }
+        }
+        self.sql_duration_buckets[SQL_DURATION_BOUNDS.len()].fetch_add(1, Relaxed);
+    }
+}
+
+/// The mount a request is being served for, and whether it has run an analytical query yet.
+#[derive(Clone)]
+pub struct ServingScope {
+    nest: Arc<NestServing>,
+    ran_sql: Arc<AtomicBool>,
+}
+
+tokio::task_local! {
+    static SERVING: ServingScope;
+}
+
+fn in_serving_scope(f: impl FnOnce(&ServingScope)) {
+    let _ = SERVING.try_with(f);
+}
+
+/// Serve one request with its counters attributed to `nest`, and time it if it ran SQL.
+pub async fn serve_for<F: std::future::Future>(nest: Arc<NestServing>, f: F) -> F::Output {
+    let scope = ServingScope {
+        nest,
+        ran_sql: Arc::default(),
+    };
+    let started = std::time::Instant::now();
+    let out = SERVING.scope(scope.clone(), f).await;
+    if scope.ran_sql.load(Relaxed) {
+        scope.nest.observe_sql(started.elapsed());
+    }
+    out
+}
+
+/// The request's scope, to carry into a blocking task: a task-local does not cross `spawn_blocking`.
+pub fn serving_scope() -> Option<ServingScope> {
+    SERVING.try_with(Clone::clone).ok()
+}
+
+/// Run blocking work under a scope taken by [`serving_scope`].
+pub fn within_serving_scope<R>(scope: Option<ServingScope>, f: impl FnOnce() -> R) -> R {
+    match scope {
+        Some(scope) => SERVING.sync_scope(scope, f),
+        None => f(),
     }
 }
 
@@ -2123,6 +2279,52 @@ mod tests {
         assert!(out.contains("nuthatch_nest_checkpoints_missed_total{nest=\"graph-network\"} 1"));
         // A per-nest update also feeds the process-global aggregate (backward-compatible).
         assert_eq!(horizon.last_block.load(Relaxed), 500);
+    }
+
+    /// RFC-0073 FR4: a request's counters land on the mount it was served for, including work it
+    /// carried into a blocking task, and only a request that ran SQL is timed.
+    #[tokio::test]
+    async fn serving_counters_follow_the_request_scope() {
+        let m = Metrics::new();
+        let (one, two) = (m.serving("org-a/one"), m.serving("two"));
+        serve_for(one.clone(), async {
+            m.inc_http();
+            let scope = serving_scope();
+            tokio::task::spawn_blocking(move || {
+                within_serving_scope(scope, || METRICS.inc_sql());
+            })
+            .await
+            .unwrap();
+        })
+        .await;
+        serve_for(two.clone(), async {
+            m.inc_http();
+            m.inc_sql_rejected(SqlRejection::Timeout);
+        })
+        .await;
+        m.inc_http();
+
+        let out = m.render();
+        assert!(out.contains("nuthatch_http_requests_total 3\n"), "{out}");
+        assert!(out.contains("nuthatch_nest_http_requests_total{nest=\"org-a/one\"} 1\n"));
+        assert!(out.contains("nuthatch_nest_http_requests_total{nest=\"two\"} 1\n"));
+        assert!(out.contains("nuthatch_nest_sql_queries_total{nest=\"org-a/one\"} 1\n"));
+        assert!(out.contains("nuthatch_nest_sql_queries_total{nest=\"two\"} 0\n"));
+        assert!(
+            out.contains("nuthatch_nest_sql_rejections_total{nest=\"two\",reason=\"timeout\"} 1\n")
+        );
+        assert!(out.contains(
+            "nuthatch_nest_sql_rejections_total{nest=\"org-a/one\",reason=\"timeout\"} 0\n"
+        ));
+        assert!(out.contains("# TYPE nuthatch_nest_sql_duration_seconds histogram\n"));
+        assert!(out.contains(
+            "nuthatch_nest_sql_duration_seconds_bucket{nest=\"org-a/one\",le=\"30\"} 1\n"
+        ));
+        assert!(out.contains("nuthatch_nest_sql_duration_seconds_count{nest=\"org-a/one\"} 1\n"));
+        assert!(out.contains("nuthatch_nest_sql_duration_seconds_count{nest=\"two\"} 0\n"));
+
+        m.remove_nest("two");
+        assert!(!m.render().contains("nest=\"two\""));
     }
 
     /// RFC-0069 G2: the last reorg's depth and time are absent until a nest reorgs, then labelled

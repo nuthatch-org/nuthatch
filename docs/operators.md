@@ -1238,6 +1238,14 @@ the CID, block, attempt, error and the wait before the next; a window paused on 
 suspended mount has no series),
 `nuthatch_nest_quarantine_total`, and `nuthatch_cursor_live{chain}`.
 
+The serving counters are broken down the same way, by the mount a request arrived through (RFC-0073
+FR4): `nuthatch_nest_http_requests_total`, `nuthatch_nest_sql_queries_total`,
+`nuthatch_nest_sql_rejections_total{nest,reason}` (the same fixed reasons), and
+`nuthatch_nest_sql_duration_seconds`, a histogram from 1 ms to 30 s of the wall time of each request
+that ran an analytical query (`/sql`, `/q/{name}`, `/diff`, GraphQL), admission wait included. Two
+mounts of one dataset are counted apart, and summed over mounts each equals its unlabelled total. A
+mount's series go when it is unmounted.
+
 A nest that mirrors itself (RFC-0052, `--publish-target`) also carries, per nest and only then:
 `nuthatch_publish_sealed_through` (what the published catalogue covers),
 `nuthatch_publish_lag_blocks` (blocks spanned by the final local segments the mirror does not hold, summed over tables; a quiet table's provisional tail is not owed, so a fully published nest reads 0), `nuthatch_publish_pending_segments`,
