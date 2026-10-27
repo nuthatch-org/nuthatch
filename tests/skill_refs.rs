@@ -320,6 +320,10 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "mount-jobs.json: live-mount progress the runtime writes and resumes (#1544), never operator input",
     ),
     (
+        "src/seed.rs",
+        "a seed's progress inside mount-jobs.json (RFC-0073 FR16), never operator input",
+    ),
+    (
         "src/distribution.rs",
         "a failed mount job's failure code in mount-jobs.json, never operator input",
     ),

@@ -681,6 +681,21 @@ runtime directory refuses that flag.
 **This is mount config, not manifest**, so adding or changing it moves neither the NID nor the data.
 Two mounts of the same dataset that name the same target publish one copy.
 
+Once for the whole runtime, the same table goes under `[runtime]` (RFC-0073 FR16):
+
+```toml
+[runtime]
+name = "my-runtime"
+
+[runtime.publish]
+target = "s3://my-bucket/nuthatch"   # same keys and refusals as [mounts.publish]
+```
+
+It mirrors each dataset none of whose mounts names its own `[mounts.publish]`, once, from the first
+mount of it. It is also where `POST /_admin/nests {"seed": true}` reads from when the request and the
+mount record name no mirror. A mirror set in that request's `publish` body (the `[mounts.publish]`
+keys as JSON) is written to the mount's record once the mount is live.
+
 ### `[mounts.limits]` - lowering one mount's query guards (RFC-0073 FR3)
 
 Each `/sql` guard is a process ceiling, lowered for the whole process by its `NUTHATCH_SQL_*` env

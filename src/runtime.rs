@@ -436,6 +436,10 @@ pub struct RuntimeMeta {
     /// are not indexed or served until resumed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspended: Vec<String>,
+    /// `[runtime.publish]`: the mirror of every dataset whose mounts name none of their own, and
+    /// where `seed: true` reads from (RFC-0073 FR16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<MountPublish>,
 }
 
 /// SEC-10: anything that becomes a filesystem path segment *and* a route segment gets this charset.
@@ -804,6 +808,9 @@ impl MountTable {
     fn validate_mounts(&self) -> Result<()> {
         // The primary key is `(tenant, alias)`: two tenants may each call their mount "usdc" and
         // both must work, so uniqueness is *within* a tenant and never global (RFC-0032 §4.1).
+        if let Some(publish) = &self.runtime.publish {
+            publish.settings().context("invalid [runtime.publish]")?;
+        }
         let mut seen = std::collections::HashSet::new();
         for m in &self.mounts {
             let nid = Nid::parse(&m.nid)
@@ -1545,18 +1552,21 @@ pub fn load_mounted(
     Ok(out)
 }
 
-/// A publisher for every mount that declares `[mounts.publish]` (RFC-0052 S2), keyed by route. One
-/// per record: two mounts of one dataset naming one target contend on S1's conditional catalogue put.
+/// A publisher for every mount that declares `[mounts.publish]` (RFC-0052 S2), keyed by route, and
+/// for each dataset `[runtime.publish]` covers. One per record: two mounts of one dataset naming one
+/// target contend on S1's conditional catalogue put.
 pub fn spawn_publishers(
     dir: &Path,
     mounts: &[Mount],
+    default: Option<&MountPublish>,
     default_tenant: &str,
 ) -> Result<Vec<(String, crate::publish::Publisher)>> {
     let mut out = Vec::new();
     for m in mounts {
-        if let Some(publish) = &m.publish {
-            // The first mount of a dataset is the one its cursor indexes under, as `Dataset::canonical`.
-            let canonical = mounts.iter().find(|first| first.nid == m.nid).unwrap_or(m);
+        // The first mount of a dataset is the one its cursor indexes under, as `Dataset::canonical`.
+        let canonical = mounts.iter().find(|first| first.nid == m.nid).unwrap_or(m);
+        let first = std::ptr::eq(canonical, m);
+        if let Some(publish) = mirror_of(m, mounts, default, first) {
             let cursor_key = mount_route(canonical, default_tenant);
             out.push(spawn_publisher(
                 dir,
@@ -1568,6 +1578,20 @@ pub fn spawn_publishers(
         }
     }
     Ok(out)
+}
+
+/// Where `m`'s dataset is mirrored: its own `[mounts.publish]`, else the runtime's, taken by the
+/// `first` mount of a dataset none of whose mounts names its own, so the default publishes it once.
+fn mirror_of<'a>(
+    m: &'a Mount,
+    mounts: &[Mount],
+    default: Option<&'a MountPublish>,
+    first: bool,
+) -> Option<&'a MountPublish> {
+    m.publish.as_ref().or_else(|| {
+        let own = mounts.iter().any(|s| s.nid == m.nid && s.publish.is_some());
+        default.filter(|_| first && !own)
+    })
 }
 
 fn mount_route(m: &Mount, default_tenant: &str) -> String {
@@ -2332,7 +2356,7 @@ pub async fn dev(
         &all_mounts.tenants,
     )?;
     let all_states = all_states;
-    let publishers = spawn_publishers(&dir, &mounts.mounts, default_tenant)?;
+    let publishers = spawn_publishers(&dir, &mounts.mounts, meta.publish.as_ref(), default_tenant)?;
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // mounts's real resident set alongside the projection so operators can calibrate.
@@ -2391,6 +2415,7 @@ pub async fn dev(
             fail_fast,
             cursors: admin_enabled.then_some(cursor_feed),
             registry: registry.clone(),
+            publish: meta.publish.clone(),
         },
     }));
 
@@ -2671,6 +2696,11 @@ pub fn lifecycle_routes(
         queries: Option<Vec<crate::allowlist::NamedQuery>>,
         #[serde(default)]
         limits: Option<crate::limits::MountLimits>,
+        /// Fill the dataset from its mirror before it indexes (RFC-0073 FR16).
+        #[serde(default)]
+        seed: bool,
+        /// This mount's `[mounts.publish]`: where it mirrors to, and where `seed` reads from.
+        publish: Option<MountPublish>,
     }
 
     type Shared = (
@@ -2780,6 +2810,20 @@ pub fn lifecycle_routes(
                 Json(serde_json::json!({"error": format!("{refused:#}")})),
             );
         }
+        if let Some(Err(e)) = body.publish.as_ref().map(MountPublish::settings) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid publish: {e:#}")})),
+            );
+        }
+        if body.seed && q.wait {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "a seed runs as a mount job and is read at GET /_admin/mounts/{name}; drop `wait`"
+                })),
+            );
+        }
 
         if q.dry_run {
             let (status, report) = dry_run_report(&handles, &body.name, nid.as_ref(), None).await;
@@ -2823,6 +2867,14 @@ pub fn lifecycle_routes(
             }
             return match mount_releasing(&handles, h, &body.name, nid, &|| true).await {
                 Ok(()) => {
+                    if let Some(publish) = &body.publish {
+                        if let Err(e) = handles.lock().await.set_publish(&body.name, publish) {
+                            tracing::error!(
+                                "mounted '{}' but its mirror did not start: {e:#}",
+                                body.name
+                            );
+                        }
+                    }
                     if let Err(e) = jobs.put(MountJob::new(
                         &body.name,
                         nid_str.as_deref(),
@@ -2870,11 +2922,10 @@ pub fn lifecycle_routes(
                 }
             }
         }
-        let job = match jobs.claim(MountJob::new(
-            &body.name,
-            nid_str.as_deref(),
-            MountPhase::Accepted,
-        )) {
+        let mut job = MountJob::new(&body.name, nid_str.as_deref(), MountPhase::Accepted);
+        job.seed = body.seed;
+        job.publish = body.publish;
+        let job = match jobs.claim(job) {
             Ok(job) => job,
             Err(ClaimError::Persist(e)) => return write_failed(&e),
             Err(ClaimError::Running(running)) if running.nid == nid_str => {
@@ -3790,6 +3841,10 @@ fn persist_mounted_nests(
                 m.sql = k.sql;
                 m.queries = k.queries.clone();
                 m.limits = k.limits.clone();
+                // A mirror set through the admin API (RFC-0073 FR16); none in memory leaves the file's.
+                if k.publish.is_some() {
+                    m.publish = k.publish.clone();
+                }
             }
         }
         // Add records for live mounts with no entry on disk yet - a nest mounted live via `POST
@@ -3972,6 +4027,8 @@ pub struct MountContext {
     pub cursors: Option<CursorFeed>,
     /// `--registry`: where a mount fetches a NID this runtime does not hold (#1543).
     pub registry: Option<String>,
+    /// `[runtime.publish]`, for a mount whose records name no mirror (RFC-0073 FR16).
+    pub publish: Option<MountPublish>,
 }
 
 /// A cursor's ingest task, handed to [`supervise_cursors`] after boot.
@@ -4536,6 +4593,95 @@ async fn fetch_nid(registry: &str, nid: &str, dir: &Path, name: &str) -> Result<
     Ok(())
 }
 
+/// Fill a mount's dataset from its mirror before it joins (RFC-0073 FR16), with `nuthatch seed`'s
+/// checks. The mirror is the request's, else the mount record's, else `[runtime.publish]`. A dataset
+/// another mount serves, or one that has already indexed, is left as it is and carries on from there.
+async fn seed_mount(
+    handles: &Arc<tokio::sync::Mutex<RuntimeHandles>>,
+    jobs: &crate::mount_jobs::MountJobs,
+    name: &str,
+    generation: u64,
+    dir: &Path,
+    asked: Option<&MountPublish>,
+) -> Result<()> {
+    let (from, served) = {
+        let h = handles.lock().await;
+        let recorded = h
+            .mount_ctx
+            .mounts
+            .iter()
+            .find(|m| mount_route(m, &h.default_tenant) == name)
+            .and_then(|m| m.publish.clone());
+        let from = asked
+            .cloned()
+            .or(recorded)
+            .or_else(|| h.mount_ctx.publish.clone());
+        (from, h.states.iter().any(|(_, s)| s.dir == dir))
+    };
+    let Some(from) = from else {
+        bail!(
+            "seed was asked for and '{name}' has no mirror: send `publish` with the mount, or set \
+             [runtime.publish]"
+        );
+    };
+    if served {
+        tracing::info!("'{name}' mounts a dataset already served here; nothing to seed");
+        return Ok(());
+    }
+    jobs.advance_if_owned(
+        name,
+        generation,
+        crate::mount_jobs::MountPhase::Seeding,
+        None,
+    )?;
+    let _seeding = SeedingDataset::claim(dir)?;
+    if crate::seed::holds_indexed_data(&dir.join(crate::config::DB_FILE))? {
+        tracing::info!("'{name}': the dataset has already indexed, so it is not seeded again");
+        return Ok(());
+    }
+    let report = crate::seed::seed_dataset(dir, &from.target, &|p| {
+        jobs.seed_progress_if_owned(name, generation, p)
+    })
+    .await
+    .with_context(|| format!("seeding '{name}' from {}", from.target))?;
+    tracing::info!(
+        "seeded '{name}' from {}: blocks {}..={}, {} segments ({} fetched)",
+        from.target,
+        report.indexed_from,
+        report.complete_through,
+        report.segments,
+        report.fetched
+    );
+    Ok(())
+}
+
+/// One seed at a time per dataset directory: two would write the same temp files.
+struct SeedingDataset(PathBuf);
+
+fn seeding_datasets() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static SEEDING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    SEEDING.get_or_init(Default::default)
+}
+
+impl SeedingDataset {
+    fn claim(dir: &Path) -> Result<SeedingDataset> {
+        if !seeding_datasets().lock().unwrap().insert(dir.to_path_buf()) {
+            bail!(
+                "another mount is seeding {} now; mount again once it is done",
+                dir.display()
+            );
+        }
+        Ok(SeedingDataset(dir.to_path_buf()))
+    }
+}
+
+impl Drop for SeedingDataset {
+    fn drop(&mut self) {
+        seeding_datasets().lock().unwrap().remove(&self.0);
+    }
+}
+
 /// The mount jobs a runtime starts with (#1544): every mounted nest as live, and every job a restart
 /// interrupted running again. Nothing resumes without the admin API, which is what mounts.
 pub async fn start_mount_jobs(
@@ -4628,6 +4774,11 @@ pub fn spawn_mount_job(
 ) -> tokio::task::JoinHandle<()> {
     use crate::mount_jobs::MountPhase;
     let wanted = nid.as_ref().map(|n| n.as_str().to_string());
+    let asked = jobs
+        .get(&name)
+        .filter(|j| j.generation == generation)
+        .map(|j| (j.seed, j.publish));
+    let (seed, publish) = asked.unwrap_or_default();
     tokio::spawn(async move {
         let outcome = async {
             let plan = handles.lock().await.plan_mount(&name, nid.as_ref())?;
@@ -4639,6 +4790,19 @@ pub fn spawn_mount_job(
                 }
                 _ => false,
             };
+            // A seed's download is kept whatever follows, so the next attempt resumes it.
+            let fetched = fetched && !seed;
+            if seed {
+                seed_mount(
+                    &handles,
+                    &jobs,
+                    &name,
+                    generation,
+                    &plan.dir,
+                    publish.as_ref(),
+                )
+                .await?;
+            }
             jobs.advance_if_owned(&name, generation, MountPhase::Joining, None)?;
             #[cfg(test)]
             {
@@ -4678,6 +4842,11 @@ pub fn spawn_mount_job(
         };
         match outcome {
             Ok(()) => {
+                if let Some(publish) = &publish {
+                    if let Err(e) = handles.lock().await.set_publish(&name, publish) {
+                        tracing::error!("mounted '{name}' but its mirror did not start: {e:#}");
+                    }
+                }
                 if let Err(e) = jobs.advance_if_owned(&name, generation, MountPhase::Live, None) {
                     tracing::warn!("'{name}' is mounted but the job file was not updated: {e:#}");
                 }
@@ -5782,31 +5951,6 @@ impl RuntimeHandles {
         if let Some(worker) = worker {
             self.alert_workers.push((name.to_string(), worker));
         }
-        // The cursor already holds the nest, so a publisher that will not start is reported rather
-        // than unwinding a mount that is otherwise complete.
-        if let Some(record) = self
-            .mount_ctx
-            .mounts
-            .iter()
-            .find(|m| mount_route(m, &self.default_tenant) == name)
-        {
-            if let (Some(publish), Some(_)) = (&record.publish, &nid) {
-                match spawn_publisher(
-                    &self.mount_ctx.dir,
-                    record,
-                    publish,
-                    &self.default_tenant,
-                    cursor_key,
-                ) {
-                    Ok((_, publisher)) => self.publishers.push((name.to_string(), publisher)),
-                    Err(e) => {
-                        tracing::error!("mounted '{name}' but its mirror did not start: {e:#}")
-                    }
-                }
-            }
-        }
-        self.estimates.insert(name.to_string(), incoming);
-        self.states.push((name.to_string(), state));
         // A 2.0 mount gets (or refreshes) its record here, so the persist just below can write it into
         // `mounts.toml` even though it had none on disk - the durable half of the fix, matching what
         // unmount already does for removal. A pre-2.0 mount (no `nid`) has no record to keep; `persist`
@@ -5833,6 +5977,41 @@ impl RuntimeHandles {
                 }),
             }
         }
+        // The cursor already holds the nest, so a publisher that will not start is reported rather
+        // than unwinding a mount that is otherwise complete.
+        if let Some(record) = self
+            .mount_ctx
+            .mounts
+            .iter()
+            .find(|m| mount_route(m, &self.default_tenant) == name)
+        {
+            let first = !self
+                .states
+                .iter()
+                .any(|(_, s)| s.nid.as_deref() == Some(record.nid.as_str()));
+            let mirror = mirror_of(
+                record,
+                &self.mount_ctx.mounts,
+                self.mount_ctx.publish.as_ref(),
+                first,
+            );
+            if let (Some(publish), Some(_)) = (mirror, &nid) {
+                match spawn_publisher(
+                    &self.mount_ctx.dir,
+                    record,
+                    publish,
+                    &self.default_tenant,
+                    cursor_key,
+                ) {
+                    Ok((_, publisher)) => self.publishers.push((name.to_string(), publisher)),
+                    Err(e) => {
+                        tracing::error!("mounted '{name}' but its mirror did not start: {e:#}")
+                    }
+                }
+            }
+        }
+        self.estimates.insert(name.to_string(), incoming);
+        self.states.push((name.to_string(), state));
         // The roster (`GET /nests`) is rebuilt from the live `states`, not patched - #554 was exactly
         // this step missing, which left the roster reporting its startup snapshot while the mount
         // otherwise worked in full: dataset resolved, cursor caught up, routes serving.
@@ -5852,6 +6031,44 @@ impl RuntimeHandles {
         self.suspended.remove(name);
         self.live.swap(self.compose()?);
         self.persist()?;
+        Ok(())
+    }
+
+    /// Mirror a live mount to `publish` (RFC-0073 FR16): its record, its publisher and `mounts.toml`.
+    pub fn set_publish(&mut self, name: &str, publish: &MountPublish) -> Result<()> {
+        let default_tenant = self.default_tenant.clone();
+        let Some(state) = self.states.iter().find(|(n, _)| n == name).map(|(_, s)| s) else {
+            bail!("'{name}' is not mounted");
+        };
+        let cursor_key = state
+            .runtime_health
+            .as_ref()
+            .map_or_else(|| name.to_string(), |(n, _)| n.clone());
+        let Some(record) = self
+            .mount_ctx
+            .mounts
+            .iter_mut()
+            .find(|m| mount_route(m, &default_tenant) == name)
+        else {
+            bail!("'{name}' has no mount record to mirror");
+        };
+        if record.publish.as_ref() == Some(publish)
+            && self.publishers.iter().any(|(n, _)| n == name)
+        {
+            return Ok(());
+        }
+        record.publish = Some(publish.clone());
+        let record = record.clone();
+        self.persist()?;
+        self.publishers.retain(|(n, _)| n != name);
+        let (_, publisher) = spawn_publisher(
+            &self.mount_ctx.dir,
+            &record,
+            publish,
+            &default_tenant,
+            &cursor_key,
+        )?;
+        self.publishers.push((name.to_string(), publisher));
         Ok(())
     }
 
@@ -6513,6 +6730,38 @@ mod tests {
         }
     }
 
+    /// RFC-0073 FR16: `[runtime.publish]` mirrors each dataset once, and never beside a mount's own.
+    #[test]
+    fn the_runtime_mirror_covers_each_dataset_once_and_yields_to_a_mounts_own() {
+        let table = |publish: &str| -> Result<MountTable> {
+            let t: MountTable = toml::from_str(&format!(
+                "[runtime]\nname = \"t\"\nchain = \"ethereum\"\nchain_id = 1\n\n\
+                 [runtime.publish]\n{publish}\n\n\
+                 [[mounts]]\nalias = \"a\"\nnid = \"{a}\"\n\n\
+                 [[mounts]]\nalias = \"b\"\nnid = \"{a}\"\n\n\
+                 [[mounts]]\nalias = \"c\"\nnid = \"{c}\"\n\n\
+                 [[mounts]]\nalias = \"d\"\nnid = \"{c}\"\n\
+                 [mounts.publish]\ntarget = \"/own\"\n",
+                a = "a".repeat(64),
+                c = "c".repeat(64),
+            ))?;
+            t.validate_mounts()?;
+            Ok(t)
+        };
+        let err = table("target = \"\"").unwrap_err();
+        assert!(format!("{err:#}").contains("[runtime.publish]"), "{err:#}");
+
+        let t = table("target = \"/shared\"").unwrap();
+        let default = t.runtime.publish.as_ref();
+        let m = &t.mounts;
+        let target =
+            |i: usize, first: bool| mirror_of(&m[i], m, default, first).map(|p| &*p.target);
+        assert_eq!(target(0, true), Some("/shared"));
+        assert_eq!(target(1, false), None, "a second mount of one dataset");
+        assert_eq!(target(2, true), None, "a sibling names its own mirror");
+        assert_eq!(target(3, false), Some("/own"));
+    }
+
     #[tokio::test]
     async fn spawn_publishers_mirrors_each_mount_that_asks_and_skips_the_rest() {
         let root = tempfile::tempdir().unwrap();
@@ -6570,7 +6819,7 @@ mod tests {
         // First, so `quiet` is the route the dataset's cursor records under (#1415).
         table.mounts.insert(0, quiet);
 
-        let publishers = spawn_publishers(root.path(), &table.mounts, "default").unwrap();
+        let publishers = spawn_publishers(root.path(), &table.mounts, None, "default").unwrap();
         let keys: Vec<&str> = publishers.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["usdc"]);
 
@@ -7505,6 +7754,7 @@ mod tests {
                 fail_fast: false,
                 cursors: None,
                 registry: None,
+                publish: None,
             },
         };
         use std::os::unix::fs::PermissionsExt;
@@ -8217,6 +8467,7 @@ mod tests {
                 fail_fast: false,
                 cursors: None,
                 registry: None,
+                publish: None,
             },
         };
 
@@ -8925,6 +9176,7 @@ mod tests {
                 fail_fast: false,
                 cursors: None,
                 registry: None,
+                publish: None,
             },
         }
     }
@@ -10270,6 +10522,7 @@ mod fr5_tests {
                 fail_fast: false,
                 cursors: None,
                 registry: None,
+                publish: None,
             },
         }
     }

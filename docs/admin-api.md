@@ -44,6 +44,7 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 | Do | Call | Answers |
 |---|---|---|
 | Mount a NID under a name | `POST /_admin/nests` `{"name": "usdc", "nid": "<nid>"}` | `202` and the job |
+| Mount it filled from its mirror | the same, with `"seed": true` and optionally `"publish": {"target": "…"}` | `202` and the job |
 | Read a mount's progress | `GET /_admin/mounts/<name>` | the job, and its mount record under `record` |
 | List every mount | `GET /_admin/mounts` | `{"mounts": [job, …]}` |
 | Price a mount first | `POST /_admin/nests?dry_run=true` with the same body | `200` and a report |
@@ -80,7 +81,7 @@ A mount can take minutes when it fetches, so it answers `202` at once with a job
 
 `generation` is the claim this job holds on the name, from a counter the runtime never reuses, so a
 job that was forgotten cannot mount over a later one. `phase` moves through `accepted`, `fetching`
-(only when the registry is needed), `joining` (catching up beside the cursor before it joins), and
+(only when the registry is needed), `seeding` (only for `"seed": true`), `joining` (catching up beside the cursor before it joins), and
 ends at `live` or `failed`, with a `reason` and a `code` on a failure. A suspended mount reads `suspended`. Poll
 `GET /_admin/mounts/<name>`; reading it never waits on a mount in progress. Unfinished jobs survive a
 restart and resume; failed ones stay readable until the name is mounted again or unmounted.
@@ -102,16 +103,43 @@ of a live mount is `200` there too. Use it from a script; a platform should poll
 
 | `code` | Why |
 |---|---|
-| `not_found` | the registry holds no bundle under that NID |
+| `not_found` | the registry holds no bundle under that NID, or the mirror holds no dataset for it or lacks a file its catalogue names |
 | `access_denied` | the registry refused the credential, or has none for a private bucket (an S3 `401` or `403`) |
-| `verification_failed` | the registry served bytes that are not that nest: the bundle computes to another NID, a file's hash or the content address does not match, or the decode registry does not reproduce |
+| `verification_failed` | the registry served bytes that are not that nest: the bundle computes to another NID, a file's hash or the content address does not match, or the decode registry does not reproduce; or a mirror served a segment that does not hash to its address, or a seed snapshot whose tails do not match their digest |
 | `other` | anything else, including every refusal below |
+
+### Seeding a mount from its mirror
+
+`POST /_admin/nests {"name": "usdc", "nid": "<nid>", "seed": true}` fills the dataset from a mirror
+before it indexes, which is how a lost runtime is rebuilt without re-indexing every nest over RPC
+(RFC-0073 FR16). The mirror is the request's `publish`, else the mount record's `[mounts.publish]`,
+else `[runtime.publish]` in `mounts.toml`; with none of them the job fails. `publish` takes the
+`[mounts.publish]` keys as JSON, `{"target": "s3://bucket/prefix", "interval": "60s", "parallelism":
+2}`, and once the mount is live it is written to the mount's record and the mount publishes there.
+Credentials come from the runtime's `AWS_*` environment, never the request.
+
+The seed is `nuthatch seed --from <mirror>` run on the dataset: the same refusals, and every file
+checked against its content address. While it runs the job reads `seeding`, with progress:
+
+```json
+{"name": "usdc", "phase": "seeding", "seed": true,
+ "seed_progress": {"segments": 42, "done": 17, "fetched": 17, "fetched_bytes": 803225344}, …}
+```
+
+`done` counts files on disk and checked, and `fetched` those this attempt downloaded. Once every file
+is in, the mount joins and follows the chain from the block after the mirror ends.
+
+A refused or interrupted seed ends the job `failed` with its `code`, and keeps the dataset and every
+file it checked, so a second `POST` of the same body resumes it and fetches only what is missing. A
+restart resumes an unfinished seed by itself. The seed is skipped, and the mount carries on from its
+own data, when the dataset has already indexed or another mount already serves it. `"seed": true` with
+`?wait=true` is `400`: a seed is read on its job.
 
 ### Refusals
 
 | Status | Why |
 |---|---|
-| `400` | a malformed NID, a name the runtime would not accept, or a tenant that shares a mount's name (see above) |
+| `400` | a malformed NID, a name the runtime would not accept, or a tenant that shares a mount's name (see above), an invalid `publish`, or `seed` with `wait` |
 | `404` | the runtime does not hold the NID and was started without `--registry` |
 | `409` | the name is taken, the chain is not declared, the chain's cursor has died (restart the runtime), the nest declares authored entities and the runtime runs `--seal-direct`, or another mount of that name or dataset is still catching up |
 | `507` | the mount would breach the chain cursor's RAM ceiling, the reason carrying projected and ceiling MB, or its authored entities would put the cursor over its cap (32 at 2048 MB, proportionally fewer below) |
@@ -119,7 +147,8 @@ of a live mount is `200` there too. Use it from a script; a platform should poll
 On the job route a refusal ends the job `failed` with the same reason. With `--registry`, a NID the
 registry does not hold is accepted like any mount and ends the job `failed`, its reason naming the NID;
 with `?wait=true` it answers `500` with the same reason. A mount the runtime fetched and
-then refused is removed again: a refusal leaves nothing on disk.
+then refused is removed again: a refusal leaves nothing on disk, except after a seed was asked for,
+which keeps what it fetched so the next attempt resumes it.
 
 ### Per-mount limits
 
