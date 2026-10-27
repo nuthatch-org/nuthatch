@@ -142,6 +142,7 @@ async fn two_nest_roost(
             registry: None,
             publish: None,
             chains: Default::default(),
+            isolation: Default::default(),
         },
     };
     // The ingest task is deliberately leaked into the handles' lifetime here: the cursor must stay
@@ -397,6 +398,47 @@ async fn a_second_alias_serves_its_own_recorded_surface() {
         .expect("mount");
     assert_eq!(surface_of(&handles, "usdc2"), narrow);
     assert_eq!(surface_of(&handles, "usdc"), Default::default());
+}
+
+/// RFC-0073 FR8: a second tenant mounting a strict runtime's dataset over the admin API queries in
+/// its tenant's partition, under the function allow-list, as a mount made at boot does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_strict_runtimes_live_mount_queries_in_its_tenants_partition() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "c9".repeat(32);
+    let (mut handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    handles.mount_ctx.isolation = nuthatch::isolation::Isolation::Strict;
+    handles.mount_ctx.mounts.push(runtime::Mount {
+        tenant: "acme".to_string(),
+        alias: "usdc".to_string(),
+        nid: nid.clone(),
+        sql: Default::default(),
+        queries: Vec::new(),
+        publish: None,
+        limits: Default::default(),
+        #[cfg(feature = "counter")]
+        counter: None,
+    });
+    handles
+        .mount("acme/usdc", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("mount");
+    let (_, acme) = handles
+        .states
+        .iter()
+        .find(|(n, _)| n == "acme/usdc")
+        .expect("acme/usdc mounted");
+    assert_eq!(acme.isolation.as_deref(), Some("acme"));
+    let version = "sql?q=SELECT%20version()";
+    assert_eq!(
+        status(&handles.live, &format!("/acme/usdc/{version}")).await,
+        axum::http::StatusCode::BAD_REQUEST
+    );
+    // Mounted before the runtime turned strict, so it still shares.
+    assert_eq!(
+        status(&handles.live, &format!("/usdc/{version}")).await,
+        axum::http::StatusCode::OK
+    );
 }
 
 /// #2129: a move stages the new NID under another name, which has no record of its own. The name
@@ -764,6 +806,7 @@ async fn route_named_runtime(
             registry: None,
             publish: None,
             chains: Default::default(),
+            isolation: Default::default(),
         },
     };
     std::mem::forget(cursor.ingest);
@@ -992,6 +1035,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
             registry: None,
             publish: None,
             chains: Default::default(),
+            isolation: Default::default(),
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1176,6 +1220,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
             registry: None,
             publish: None,
             chains: Default::default(),
+            isolation: Default::default(),
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1564,6 +1609,7 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
             registry: None,
             publish: None,
             chains: Default::default(),
+            isolation: Default::default(),
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1717,6 +1763,7 @@ pub(crate) async fn empty_runtime(
             registry: None,
             publish: None,
             chains: Default::default(),
+            isolation: Default::default(),
         },
     };
     (handles, tape, intake)
@@ -2898,6 +2945,7 @@ async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it(
             registry: None,
             publish: None,
             chains: Default::default(),
+            isolation: Default::default(),
         },
     };
     std::mem::forget(cursor.ingest);

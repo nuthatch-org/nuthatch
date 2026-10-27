@@ -453,6 +453,7 @@ async fn bring_up_live(
             registry: None,
             publish: None,
             chains: Default::default(),
+            isolation: Default::default(),
         },
     };
     // The cursor has to keep running for the mount handshake to be answered at a window boundary.

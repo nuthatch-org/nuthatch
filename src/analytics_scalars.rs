@@ -15,6 +15,10 @@ const FUNCTIONS: [(&str, u8, usize); 7] = [
     ("nuthatch_abi_tuple", 7, 2),
 ];
 
+pub(crate) fn names() -> impl Iterator<Item = &'static str> {
+    FUNCTIONS.iter().map(|(name, _, _)| *name)
+}
+
 /// A NULL argument answers NULL without reaching `evaluate`.
 pub(crate) fn register(engine: &mut burrmill::Engine) {
     for (name, kind, arity) in FUNCTIONS {

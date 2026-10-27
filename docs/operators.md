@@ -1081,6 +1081,15 @@ with the reason rather than reporting on sealed data alone, which would bind aga
 schema than a following `/sql` would see. Anywhere you bound `/sql`, bound `/explain` with it: a
 guard on one and not the other leaves the cheaper-looking route as the expensive one.
 
+**Tenants who do not trust each other: `[runtime] isolation = "strict"`** (RFC-0073 FR8). By default
+every mount of one dataset shares its SQL session, engine memory pool and memo, which is right when
+one operator owns every mount. `strict` gives each tenant its own of all three, holds `/sql` and the
+views it reaches to a function allow-list, runs only `CREATE VIEW` from `views/*.sql`, and makes the
+boot budget charge one engine pool per SQL permit. What it defends, what it does not (timing, shared
+permits and CPU, the engine's own memory safety) and how it is tested are in
+[`docs/security/shared-runtime.md`](security/shared-runtime.md). **The guarantee is not claimed** until
+the independent review that document describes has run.
+
 **Admin surface.** A set `NUTHATCH_ADMIN_TOKEN` is required on every request, on every bind, localhost
 included (#2132); off-localhost the routes are not served without one. Token comparison is
 constant-time. With no token, a localhost bind answers only requests whose `Host` (and `Origin`, if

@@ -474,6 +474,13 @@ pub struct RuntimeMeta {
     /// where `seed: true` reads from (RFC-0073 FR16).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<MountPublish>,
+    /// `strict` gives each tenant its own SQL sessions, memory pools and memo entries and holds
+    /// `/sql` to a function allow-list (RFC-0073 FR8, `docs/security/shared-runtime.md`).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::isolation::Isolation::is_shared"
+    )]
+    pub isolation: crate::isolation::Isolation,
 }
 
 /// SEC-10: anything that becomes a filesystem path segment *and* a route segment gets this charset.
@@ -1678,6 +1685,7 @@ fn overlay_boot_records(
     datasets: &[Dataset],
     default_tenant: &str,
     shares: &BTreeMap<String, TenantShare>,
+    isolation: crate::isolation::Isolation,
 ) -> Result<()> {
     for (key, state) in states.iter_mut() {
         let record = records
@@ -1703,6 +1711,7 @@ fn overlay_boot_records(
         let seating = Seating {
             default_tenant,
             shares,
+            isolation,
         };
         overlay_mount_record(state, nid.as_deref(), record, surface, key, seating);
     }
@@ -2114,6 +2123,9 @@ pub async fn dev(
         );
     }
     let groups = group_by_chain(&endpoints, mounted)?;
+    if meta.isolation == crate::isolation::Isolation::Strict {
+        crate::analytics_budget::validate_strict_budget()?;
+    }
 
     // A mount may narrow its author's ceiling, never widen it (RFC-0034 §3). Checked before any
     // store is opened, so a nest exposing more than its author sanctioned fails to start rather than
@@ -2398,6 +2410,7 @@ pub async fn dev(
         &datasets,
         default_tenant,
         &all_mounts.tenants,
+        meta.isolation,
     )?;
     let all_states = all_states;
     let publishers = spawn_publishers(&dir, &mounts.mounts, meta.publish.as_ref(), default_tenant)?;
@@ -2465,6 +2478,7 @@ pub async fn dev(
                 pools,
                 rpc_flags: !(rpc_override.is_empty() && rpc_fallback.is_empty()),
             },
+            isolation: meta.isolation,
         },
     }));
 
@@ -4519,6 +4533,8 @@ pub struct MountContext {
     pub publish: Option<MountPublish>,
     /// What `/_admin/chains` changes (RFC-0073 FR9).
     pub chains: ChainControl,
+    /// `[runtime] isolation`, so a mount made over the admin API is partitioned as one made at boot.
+    pub isolation: crate::isolation::Isolation,
 }
 
 /// The chains as `mounts.toml` declares them, and the replaceable pool behind each running cursor.
@@ -5568,11 +5584,21 @@ fn served_surface(
     }
 }
 
+/// The tenant a route serves, which strict isolation partitions its queries by (RFC-0073 FR8).
+pub fn query_partition(
+    isolation: crate::isolation::Isolation,
+    route_key: &str,
+    default_tenant: &str,
+) -> Option<Arc<str>> {
+    isolation.partition(route_key.split_once('/').map_or(default_tenant, |(t, _)| t))
+}
+
 /// The tenant shares a runtime holds, and the tenant an unqualified route key belongs to.
 #[derive(Clone, Copy)]
 struct Seating<'a> {
     default_tenant: &'a str,
     shares: &'a BTreeMap<String, TenantShare>,
+    isolation: crate::isolation::Isolation,
 }
 
 /// Stamp a mount's dataset identity, record, [`served_surface`] and tenant seat onto the state served
@@ -5591,6 +5617,7 @@ fn overlay_mount_record(
     state.limits = record.map_or_else(crate::limits::Limits::process, |r| {
         r.limits.resolve(&format!("{}/{}", r.tenant, r.alias))
     });
+    state.isolation = query_partition(seating.isolation, name, seating.default_tenant);
     // A state cloned from a co-tenant's arrives in that tenant's seat; it takes its own.
     let tenant = split_route_key(name).0.unwrap_or(seating.default_tenant);
     let share = seating.shares.get(tenant).copied().unwrap_or_default();
@@ -5612,6 +5639,7 @@ impl RuntimeHandles {
         Seating {
             default_tenant: &self.default_tenant,
             shares: &self.tenant_shares,
+            isolation: self.mount_ctx.isolation,
         }
     }
 
@@ -8305,6 +8333,7 @@ mod tests {
                 registry: None,
                 publish: None,
                 chains: Default::default(),
+                isolation: Default::default(),
             },
         };
         use std::os::unix::fs::PermissionsExt;
@@ -8341,6 +8370,28 @@ mod tests {
             on_disk.contains("usdc"),
             "the failed rewrite must leave the old table: {on_disk}"
         );
+    }
+
+    /// RFC-0073 FR8: `isolation` is read from `[runtime]`, written back only when strict, and a strict
+    /// route's queries are partitioned by the tenant its key names.
+    #[test]
+    fn strict_isolation_partitions_each_route_by_its_tenant() {
+        use crate::isolation::Isolation;
+        let head = "[runtime]\nname = \"r\"\nchain = \"x\"\nchain_id = 1\n";
+        let shared: MountTable = toml::from_str(head).unwrap();
+        assert_eq!(shared.runtime.isolation, Isolation::Shared);
+        assert!(!toml::to_string(&shared).unwrap().contains("isolation"));
+        let strict: MountTable =
+            toml::from_str(&format!("{head}isolation = \"strict\"\n")).unwrap();
+        assert_eq!(strict.runtime.isolation, Isolation::Strict);
+        let again: MountTable = toml::from_str(&toml::to_string(&strict).unwrap()).unwrap();
+        assert_eq!(again.runtime.isolation, Isolation::Strict);
+        assert!(toml::from_str::<MountTable>(&format!("{head}isolation = \"loose\"\n")).is_err());
+
+        let p = |i, key| query_partition(i, key, "default").map(|t| t.to_string());
+        assert_eq!(p(Isolation::Strict, "usdc"), Some("default".into()));
+        assert_eq!(p(Isolation::Strict, "acme/usdc"), Some("acme".into()));
+        assert_eq!(p(Isolation::Shared, "acme/usdc"), None);
     }
 
     /// #1565, and the 3.13.0 tyre-kick: a mount's route key depends on its own tenant alone, so it
@@ -9019,6 +9070,7 @@ mod tests {
                 registry: None,
                 publish: None,
                 chains: Default::default(),
+                isolation: Default::default(),
             },
         };
 
@@ -9387,6 +9439,7 @@ mod tests {
             nid: None,
             runtime_health: None,
             address_history: None,
+            isolation: None,
         }
     }
 
@@ -9426,10 +9479,36 @@ mod tests {
             record("closed", SqlAccess::Deny),
             record("bounded", SqlAccess::Open),
         ];
-        overlay_boot_records(&mut states, &records, &[], DEFAULT_TENANT, &BTreeMap::new()).unwrap();
+        overlay_boot_records(
+            &mut states,
+            &records,
+            &[],
+            DEFAULT_TENANT,
+            &BTreeMap::new(),
+            Default::default(),
+        )
+        .unwrap();
         assert_eq!(states[0].1.surface.access, SqlAccess::Deny);
         assert_eq!(states[1].1.surface.access, SqlAccess::Allowlist);
         assert_eq!(states[1].1.surface.queries[0].name, "total");
+        assert!(states.iter().all(|(_, s)| s.isolation.is_none()));
+
+        // RFC-0073 FR8: a strict boot partitions each route by the tenant its key names.
+        states.push(("acme/closed".to_string(), states[0].1.clone()));
+        overlay_boot_records(
+            &mut states,
+            &records,
+            &[],
+            DEFAULT_TENANT,
+            &BTreeMap::new(),
+            crate::isolation::Isolation::Strict,
+        )
+        .unwrap();
+        let partitions: Vec<_> = states.iter().map(|(_, s)| s.isolation.as_deref()).collect();
+        assert_eq!(
+            partitions,
+            [Some(DEFAULT_TENANT), Some(DEFAULT_TENANT), Some("acme")]
+        );
     }
 
     /// #1647: every write of mounts.toml a suspend makes still holds the mount, so a crash at any
@@ -9729,6 +9808,7 @@ mod tests {
                 registry: None,
                 publish: None,
                 chains: Default::default(),
+                isolation: Default::default(),
             },
         }
     }
@@ -11076,6 +11156,7 @@ mod fr5_tests {
                 registry: None,
                 publish: None,
                 chains: Default::default(),
+                isolation: Default::default(),
             },
         }
     }
