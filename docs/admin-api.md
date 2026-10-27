@@ -301,7 +301,7 @@ what the next start runs; a write that fails answers `500` and changes nothing.
 |---|---|
 | `400` | a chain name the runtime would not accept (letters, digits, `_` and `-`, at most 64), no `rpc_urls`, an endpoint that is not `http(s)`, a `log_window` of 0, or `finality_depth` or `log_window` for a registry chain |
 | `404` | `PUT` for a chain the runtime does not declare |
-| `409` | the name is declared with other settings (only the pool can change live; anything else is an edit of `mounts.toml` and a restart), a registry name with another `chain_id`, a registry `chain_id` under another name, a `chain_id` already declared under another name, or a runtime started with `--rpc`, `--rpc-fallback` or `--state-rpc`, which would rewrite the pool at every start or refuse a second chain |
+| `409` | the name is declared with other settings (only the pool can change live; anything else is an edit of `mounts.toml` and a restart), a registry name with another `chain_id`, a registry `chain_id` under another name, a `chain_id` already declared under another name, or a runtime started with `--rpc` or `--rpc-fallback`, which rewrite the pool at every start. Declaring a chain is also refused under `--state-rpc`, because a runtime with an archive endpoint takes one chain; replacing a pool is not, since `--state-rpc` is a separate endpoint the swap leaves alone |
 | `422` | an endpoint reports another chain id, or a body field the API does not take |
 | `502` | no endpoint in `rpc_urls` answered |
 
