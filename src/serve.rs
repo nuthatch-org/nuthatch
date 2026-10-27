@@ -9307,6 +9307,22 @@ mod tests {
                 .commit_window(&[(Store::entity_key(block, 0), row)], None, block)?;
             Ok(snapshot)
         }
+        fn hot_rows_charged(
+            &self,
+            max_rows: usize,
+            max_bytes: u64,
+            charge: &mut dyn FnMut(u64) -> Result<()>,
+        ) -> Result<crate::store::HotRowsSnapshot> {
+            let Some(block) = self.1 else {
+                anyhow::bail!("hot store would not scan")
+            };
+            let snapshot =
+                crate::store::HotStore::hot_rows_charged(&self.0, max_rows, max_bytes, charge)?;
+            let row = json!({"table":"t","block_number":block,"log_index":0,"v":"x"}).to_string();
+            self.0
+                .commit_window(&[(Store::entity_key(block, 0), row)], None, block)?;
+            Ok(snapshot)
+        }
         fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
             crate::store::HotStore::entities_in_range(&self.0, from, to)
         }
@@ -9944,6 +9960,26 @@ mod tests {
         assert!(gate.hot_used().is_empty());
         let held: Vec<_> = std::iter::from_fn(|| full().ok()).collect();
         assert_eq!(held.len(), 4, "the panicked query's copy came back");
+    }
+
+    /// A tip past the mount's row bound is refused for its size, as it was before shares, even with
+    /// the tenant at its share: the copy would be refused, so it is neither charged nor queued for.
+    #[tokio::test]
+    async fn a_tip_over_the_row_bound_is_too_large_whatever_the_share() {
+        let (ta, tb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let gate = SqlGate::with_hot_bytes(4, 16 * 1024);
+        let bytes = ResponseBytes::new(SQL_MAX_INFLIGHT_RESPONSE_KIB);
+        let mut a = seated(ta.path(), &gate, &bytes, "acme");
+        let _b = seated(tb.path(), &gate, &bytes, "globex");
+        a.limits.max_hot_rows = 2;
+        kilo_tip(&a, 3);
+        let copies: Vec<_> =
+            std::iter::from_fn(|| gate.charge_hot(3000, Some("acme")).ok()).collect();
+        let resp = sql_response(a, "SELECT 5 AS n").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(resp).await;
+        assert!(body.get("reason").is_none(), "{body}");
+        assert_eq!(gate.hot_used().get("acme"), Some(&(3 * copies.len())));
     }
 
     /// A lone nest charges no tenant: a copy is refused only when the gate's whole budget is in use,

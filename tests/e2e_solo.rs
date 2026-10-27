@@ -1188,6 +1188,14 @@ impl nuthatch::store::HotStore for HotScanFails {
     ) -> anyhow::Result<std::collections::HashMap<String, Vec<serde_json::Value>>> {
         anyhow::bail!("simulated hot store failure (#472 fixture)")
     }
+    fn hot_rows_charged(
+        &self,
+        _max_rows: usize,
+        _max_bytes: u64,
+        _charge: &mut dyn FnMut(u64) -> anyhow::Result<()>,
+    ) -> anyhow::Result<nuthatch::store::HotRowsSnapshot> {
+        anyhow::bail!("simulated hot store failure (#472 fixture)")
+    }
     fn entities_in_range(&self, from: u64, to: u64) -> anyhow::Result<Vec<String>> {
         self.0.entities_in_range(from, to)
     }

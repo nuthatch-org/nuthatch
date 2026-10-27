@@ -393,17 +393,13 @@ pub trait HotStore: Send + Sync {
         anyhow::bail!("this hot-store backend cannot report a byte-exact query snapshot")
     }
     /// As `hot_rows_by_table_bounded_with_bytes`, handing `charge` the snapshot's source bytes before
-    /// a row is parsed (RFC-0073 FR5). This default can only charge once it has copied.
+    /// a row is parsed (RFC-0073 FR5). A tip the copy would refuse is refused before `charge`.
     fn hot_rows_charged(
         &self,
         max_rows: usize,
         max_bytes: u64,
         charge: &mut dyn FnMut(u64) -> Result<()>,
-    ) -> Result<HotRowsSnapshot> {
-        let snapshot = self.hot_rows_by_table_bounded_with_bytes(max_rows, max_bytes)?;
-        charge(snapshot.source_bytes)?;
-        Ok(snapshot)
-    }
+    ) -> Result<HotRowsSnapshot>;
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>>;
     /// Rows in `[from, to]` in chain order, handed to `visit` as `(block, json)` until it returns
     /// `false`. Choosing a seal cut reads only as far as the cut; this default still loads the range.
@@ -1318,7 +1314,14 @@ impl Store {
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(ENTITIES)?;
         if let Some(charge) = charge {
-            let mut bytes = 0u64;
+            // The copy's own refusals, in its order, reading `table` without building the row: a tip
+            // the copy refuses is refused for its size here, never charged or refused for a share.
+            #[derive(serde::Deserialize)]
+            struct Tabled<'a> {
+                #[serde(borrow, default)]
+                table: Option<&'a serde_json::value::RawValue>,
+            }
+            let (mut bytes, mut seen) = (0u64, 0usize);
             for row in t.iter()? {
                 let (_k, v) = row?;
                 bytes = bytes
@@ -1330,6 +1333,22 @@ impl Store {
                         budget: max_bytes,
                     }
                     .into());
+                }
+                let raw = serde_json::from_str::<&serde_json::value::RawValue>(v.value())
+                    .context("unparseable hot row in an analytical scan")?;
+                let tabled = raw.get().trim_start().starts_with('{')
+                    && match serde_json::from_str::<Tabled>(raw.get()) {
+                        Ok(t) => t.table.is_some_and(|t| t.get().starts_with('"')),
+                        // A duplicated key, which `Value` resolves to the last one.
+                        Err(_) => serde_json::from_str::<serde_json::Value>(raw.get())?
+                            .get("table")
+                            .is_some_and(serde_json::Value::is_string),
+                    };
+                if tabled {
+                    seen += 1;
+                    if seen > max_rows {
+                        return Err(HotScanTooLarge { cap: max_rows }.into());
+                    }
                 }
             }
             charge(bytes)?;
@@ -2593,6 +2612,46 @@ mod tests {
         assert!(store
             .hot_rows_by_table_bounded_with_bytes(1, row.len() as u64 - 1)
             .is_err());
+    }
+
+    /// RFC-0073 FR5: the charge is made against the copy's own bounds. Values that are not rows
+    /// cost bytes but no row, and a tip over the row bound is refused for its size before any charge.
+    #[test]
+    fn a_hot_charge_measures_exactly_what_the_copy_takes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("hot.redb")).unwrap();
+        let values = [
+            r#"{"table":"t","block_number":1,"log_index":0}"#,
+            r#"{"table":"t","block_number":2,"log_index":0}"#,
+            r#"{"note":"no table"}"#,
+            r#"{"table":7}"#,
+            r#"[{"table":"t"}]"#,
+        ];
+        for (i, v) in values.iter().enumerate() {
+            store.put_entity(&format!("{i:012}-000000"), v).unwrap();
+        }
+        let all: u64 = values.iter().map(|v| v.len() as u64).sum();
+        let charge = |max_rows| {
+            let mut charged = Vec::new();
+            let got = HotStore::hot_rows_charged(&store, max_rows, all, &mut |b| {
+                charged.push(b);
+                Ok(())
+            });
+            (got, charged)
+        };
+
+        let (got, charged) = charge(2);
+        let snapshot = got.unwrap();
+        assert_eq!(snapshot.rows["t"].len(), 2);
+        assert_eq!(charged, vec![snapshot.source_bytes]);
+        assert_eq!(snapshot.source_bytes, all);
+
+        let (got, charged) = charge(1);
+        assert!(got.unwrap_err().downcast_ref::<HotScanTooLarge>().is_some());
+        assert!(
+            charged.is_empty(),
+            "charged {charged:?} for a copy that is refused"
+        );
     }
     use proptest::prelude::*;
 
