@@ -289,6 +289,15 @@ unconfigured.
 > **0070 and 0072 are parked by Chief (2026-10-22, "scratch off weather and time lapse")**: time-lapse
 > stopped after S2, live at `/play/timelapse/` with no binary producer; chain weather stopped after
 > S0, with nothing in the binary. Do not resume either unasked.
+>
+> **RFC-0073 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
+> [RFC-0073](docs/rfcs/0073-the-shared-runtime.md) (the shared runtime) on 2026-10-27, all sixteen of
+> GraphOps's requests: "lets do ALL of it". It is new capability in the default binary for an operator
+> who hosts many organisations' nests in one runtime, and the out-of-scope list below is amended the
+> same day for the three items that crossed it. The order is the RFC's: the small operability items
+> first, then per-mount limits and fault containment, then fair share and runtime memory, then the
+> hardened SQL surface, with read replicas and upgrades without an outage as the last and largest
+> slices. FR8's isolation guarantee ships only after an independent review.
 
 >
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.
@@ -365,6 +374,16 @@ Do not start slice N+1 while slice N has failing tests or an unmet budget.
   nuthatch-indexer.com/subgraphs says so, and people reach out on the Nuthatch Discord server. The
   other terms of the 2026-10-09 amendment still bind: the stock binary, no billing, no accounts,
   nothing in this tree built for it.
+  **Amended 2026-10-27 by Chief: the shared runtime ([RFC-0073](docs/rfcs/0073-the-shared-runtime.md)).**
+  GraphOps asked for sixteen things to host every customer's nests in one runtime, and Chief said
+  "lets do ALL of it". Three of them crossed this list and are now in scope, as operator
+  configuration the binary enforces without knowing who anyone is: **per-tenant-label shares and caps
+  on query execution** (FR2), **query isolation between mounts hardened for mutually untrusted
+  tenants** (FR8), and **a per-request cost report** (FR4). The guarantee FR8 makes holds for the
+  shared-runtime configuration RFC-0073 defines, and is not claimed before an independent review has
+  tried to break it. Authentication, API keys, accounts, billing and identity stay out and stay the
+  gateway's job: nuthatch still sees a string. The 2026-09-29 retirement stands; we do not run the
+  service.
 - Token, staking, decentralized network features (a possible future Graph Horizon data
   service is explicitly deferred).
 - Non-EVM chains before EVM is airtight. **Amended 2026-10-21 by Chief:** "Non evm chains could be
