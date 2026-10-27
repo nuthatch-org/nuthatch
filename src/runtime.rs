@@ -362,8 +362,9 @@ pub struct RuntimeMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_tenant: Option<String>,
     /// Resident-set ceiling **per active-chain cursor**, in MB (RFC-0021 - the footprint budget is
-    /// per-cursor; a runtime's total is Σ cursors). A cursor whose *projected* RSS exceeds this is refused
-    /// before it starts. Absent → the CLAUDE.md 2 GB budget ([`DEFAULT_MAX_RSS_MB`]).
+    /// per-cursor; a runtime's total is Σ cursors). A mount that would take its cursor's *projected*
+    /// RSS past this is refused, at boot as live (RFC-0073 FR5). `PUT /_admin/runtime` rewrites it.
+    /// Absent → the CLAUDE.md 2 GB budget ([`DEFAULT_MAX_RSS_MB`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rss_mb: Option<u64>,
     /// Route keys of mounts suspended by the operator (#1548). Their records and data are kept; they
@@ -568,8 +569,14 @@ pub(crate) fn entity_allowance_bytes(max_rows: u64, reads_offchain: bool) -> u64
 /// generous rather than fitted, since the MB budget is what should bind first on any realistic nest.
 const MAX_ENTITIES_PER_CURSOR: usize = 32;
 
-/// Rough projected RSS (MB) for one nest: base + a chunk per active IVM view / factory child registry.
-/// `has_labels` gates the exposure view (only spun up when the nest has labeled addresses).
+/// The entity ceiling of a cursor held to `ceiling_mb` (RFC-0073 FR5): [`MAX_ENTITIES_PER_CURSOR`] at
+/// the 2 GiB budget, proportionally fewer below it, and never more above it, so a `mounts.toml` past
+/// 2048 (#2441) buys no threads.
+pub fn max_entities_per_cursor(ceiling_mb: u64) -> usize {
+    (MAX_ENTITIES_PER_CURSOR as u64 * ceiling_mb.min(DEFAULT_MAX_RSS_MB) / DEFAULT_MAX_RSS_MB)
+        as usize
+}
+
 /// RFC-0041 §7 criterion 11: the explicit per-cursor ceiling on authored entities.
 ///
 /// Its own function so the arithmetic in the message is testable. A refusal whose numbers are wrong
@@ -579,8 +586,9 @@ fn refuse_over_entity_ceiling(
     nests: usize,
     mounts: &str,
     chain: &str,
+    ceiling: usize,
 ) -> Result<()> {
-    if on_cursor <= MAX_ENTITIES_PER_CURSOR {
+    if on_cursor <= ceiling {
         return Ok(());
     }
     Err(MountRefusal::EntityCeiling {
@@ -588,6 +596,7 @@ fn refuse_over_entity_ceiling(
         chain: chain.to_string(),
         on_cursor,
         nests,
+        ceiling,
     }
     .into())
 }
@@ -1808,6 +1817,74 @@ pub fn group_by_chain(
     Ok(groups)
 }
 
+/// One cursor's mounts as boot admits them (RFC-0073 FR5).
+pub struct BootAdmission {
+    pub nests: Vec<(String, PathBuf, Config)>,
+    /// Route key to the refusal a live mount would have answered.
+    pub refused: Vec<(String, String)>,
+    /// The admitted mounts' projected MB, without [`RUNTIME_BASE_RSS_MB`].
+    pub cursor_mb: u64,
+}
+
+/// Admit a cursor's mounts at boot in `mounts.toml` order, priced as a live mount is (RFC-0073 FR5).
+/// Each that fits the ceiling and the entity cap boots; the rest boot quarantined with the refusal,
+/// where one over-budget mount used to stop the whole runtime.
+pub fn admit_at_boot(
+    nests: Vec<(String, PathBuf, Config)>,
+    max_rss_mb: u64,
+    runtime: &str,
+    chain: &str,
+    health: &crate::health::RuntimeHealth,
+    estimates: &mut std::collections::HashMap<String, u64>,
+) -> BootAdmission {
+    let entity_cap = max_entities_per_cursor(max_rss_mb);
+    let mut admitted = BootAdmission {
+        nests: Vec::new(),
+        refused: Vec::new(),
+        cursor_mb: 0,
+    };
+    let mut entities = 0usize;
+    for (name, path, config) in nests {
+        health.register(&name, chain);
+        let has_labels = !crate::labels::load(&path).is_empty();
+        let (entity_count, entity_rows) = declared_entities(&path);
+        let mb = estimate_nest_rss_mb(&config, has_labels, entity_count, entity_rows)
+            + hot_store_cache_mb(&path);
+        let projected_mb = RUNTIME_BASE_RSS_MB + admitted.cursor_mb + mb;
+        let refusal = refuse_over_entity_ceiling(
+            entities + entity_count,
+            admitted.nests.len() + 1,
+            runtime,
+            chain,
+            entity_cap,
+        )
+        .err()
+        .or_else(|| {
+            (projected_mb > max_rss_mb).then(|| {
+                MountRefusal::OverBudget {
+                    nest: name.clone(),
+                    chain: chain.to_string(),
+                    projected_mb,
+                    ceiling_mb: max_rss_mb,
+                }
+                .into()
+            })
+        });
+        if let Some(refusal) = refusal {
+            let reason = format!("refused at boot: {refusal:#}");
+            tracing::error!("nest '{name}' {reason}");
+            health.quarantine_nest(&name, reason.clone(), 0, None);
+            admitted.refused.push((name, reason));
+            continue;
+        }
+        entities += entity_count;
+        admitted.cursor_mb += mb;
+        estimates.insert(name.clone(), mb);
+        admitted.nests.push((name, path, config));
+    }
+    admitted
+}
+
 /// `nuthatch dev --dir <dir>` where `<dir>` holds a mount table: bring up every mounted nest and
 /// serve them behind one listener. Reached from the same `dev` a single nest uses (RFC-0032).
 ///
@@ -2023,54 +2100,33 @@ pub async fn dev(
             indexer::backfill_concurrency_for(rpc_urls.len(), concurrency, seal_direct, &names);
         endpoint_counts.insert(group.endpoint.chain.clone(), rpc_urls.len());
 
-        // Per-cursor footprint budget (RFC-0021): this chain's nests must fit ≤ max_rss.
-        let mut cursor_mb = 0u64;
-        // RFC-0041 §7, criterion 11: nests on the same chain are accounted **together**, so the
-        // ceiling is the cursor's rather than each nest's.
-        //
-        // Summed rather than accumulated in the loop below. A `+=` written as `=` counts the last
-        // nest instead of the cursor, which is the whole of what this criterion is about, and it
-        // survives every unit test because the loop lives inside an async function no unit test
-        // reaches. There is no assignment here to get wrong.
-        let entities_on_cursor: usize = group
-            .nests
-            .iter()
-            .map(|(_, path, _)| declared_entities(path).0)
-            .sum();
-        for (name, path, config) in &group.nests {
-            let has_labels = !crate::labels::load(path).is_empty();
-            let (entity_count, entity_rows) = declared_entities(path);
-            let mb = estimate_nest_rss_mb(config, has_labels, entity_count, entity_rows)
-                + hot_store_cache_mb(path);
-            estimates.insert(name.clone(), mb);
-            cursor_mb += mb;
+        // Per-cursor footprint budget (RFC-0021), held per mount as a live mount is (RFC-0073 FR5).
+        // Every nest is registered to this chain's cursor, so a cursor fault marks all of them.
+        let admitted = admit_at_boot(
+            std::mem::take(&mut group.nests),
+            max_rss,
+            &meta.name,
+            &group.endpoint.chain,
+            &health,
+            &mut estimates,
+        );
+        for (name, reason) in admitted.refused {
+            failed_chain.insert(name.clone(), group.endpoint.chain.clone());
+            failed.insert(name, reason);
         }
+        group.nests = admitted.nests;
+        let cursor_mb = admitted.cursor_mb;
         tracing::info!(
-            "mounts cursor on {} (chain_id {}): {} nest(s), ~{cursor_mb} MB projected; budget {max_rss} MB/cursor",
+            "mounts cursor on {} (chain_id {}): {} nest(s), ~{} MB projected; budget {max_rss} MB/cursor",
             group.endpoint.chain,
             group.endpoint.chain_id,
             group.nests.len(),
+            RUNTIME_BASE_RSS_MB + cursor_mb,
         );
-        refuse_over_entity_ceiling(
-            entities_on_cursor,
-            group.nests.len(),
-            &meta.name,
-            &group.endpoint.chain,
-        )?;
-        if cursor_mb > max_rss {
-            bail!(
-                "mounts '{}' cursor on {} projects ~{cursor_mb} MB but max_rss is {max_rss} MB/cursor - \
-                 raise max_rss, drop a nest, or move it to another mounts",
-                meta.name,
-                group.endpoint.chain
-            );
+        if group.nests.is_empty() {
+            continue;
         }
         runtime_total_mb += cursor_mb;
-
-        // Attribute each nest to this chain's cursor, so a cursor fault marks all of them (§5).
-        for (name, _, _) in &group.nests {
-            health.register(name, &group.endpoint.chain);
-        }
 
         // One source + one shared cursor per chain - per-nest tables stay byte-identical to solo `dev`.
         let endpoint = ChainEndpoint {
@@ -2124,7 +2180,7 @@ pub async fn dev(
 
     if all_states.is_empty() && !failed.is_empty() {
         bail!(
-            "every nest in mounts '{}' failed to build - {}",
+            "no nest in mounts '{}' could start - {}",
             meta.name,
             failed
                 .iter()
@@ -2988,7 +3044,51 @@ pub fn lifecycle_routes(
         (StatusCode::ACCEPTED, Json(serde_json::json!(job)))
     }
 
+    #[derive(serde::Deserialize)]
+    struct RuntimeBody {
+        max_rss_mb: u64,
+    }
+
+    async fn get_runtime(
+        State((handles, _, required)): State<Shared>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        (StatusCode::OK, Json(handles.lock().await.runtime_report()))
+    }
+
+    /// RFC-0073 FR5: raise or lower the per-cursor ceiling without a restart.
+    async fn put_runtime(
+        State((handles, _, required)): State<Shared>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+        body: Result<Json<RuntimeBody>, axum::extract::rejection::JsonRejection>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let body = match body {
+            Ok(Json(body)) => body,
+            Err(e) => return bad_body(e),
+        };
+        let mut h = handles.lock().await;
+        match h.set_max_rss_mb(body.max_rss_mb) {
+            Ok(()) => (StatusCode::OK, Json(h.runtime_report())),
+            Err(e) => {
+                let status = e
+                    .downcast_ref::<CeilingRefusal>()
+                    .and_then(|r| StatusCode::from_u16(r.status()).ok())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                (status, Json(serde_json::json!({"error": format!("{e:#}")})))
+            }
+        }
+    }
+
     axum::Router::new()
+        .route("/_admin/runtime", get(get_runtime).put(put_runtime))
         .route("/_admin/nests", post(mount_nest))
         .route("/_admin/nests/{*name}", delete(unmount_nest))
         .route("/_admin/mounts", get(list_mounts))
@@ -3075,7 +3175,23 @@ fn persist_mounted_nests(
         mounts.runtime.nests.clear(); // `[[mounts]]` is authoritative; a stale list beside it lies
     }
     mounts.runtime.suspended = suspended.to_vec();
-    let out = toml::to_string_pretty(&mounts).context("serialising mounts.toml")?;
+    write_mounts_table(dir, &mounts)
+}
+
+/// Persist a per-cursor ceiling set over the admin API (RFC-0073 FR5).
+fn persist_max_rss_mb(dir: &Path, max_rss_mb: u64) -> Result<()> {
+    let path = dir.join(MOUNTS_FILE);
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {} to persist max_rss_mb", path.display()))?;
+    let mut mounts: MountTable = toml::from_str(&raw)
+        .with_context(|| format!("parsing {} before rewriting it", path.display()))?;
+    mounts.runtime.max_rss_mb = Some(max_rss_mb);
+    write_mounts_table(dir, &mounts)
+}
+
+fn write_mounts_table(dir: &Path, mounts: &MountTable) -> Result<()> {
+    let path = dir.join(MOUNTS_FILE);
+    let out = toml::to_string_pretty(mounts).context("serialising mounts.toml")?;
     #[cfg(test)]
     persisted_tables()
         .lock()
@@ -3127,8 +3243,8 @@ pub struct RuntimeHandles {
     pub default_tenant: String,
     /// Suspended mounts (#1548), route key to NID: kept on disk and in `mounts.toml`, answering 503.
     pub suspended: std::collections::BTreeMap<String, String>,
-    /// Mounts that failed to build at boot (RFC-0073 FR6), route key to why: kept in `mounts.toml`,
-    /// terminally quarantined, answering 503 until an unmount or a restart.
+    /// Mounts that failed to build at boot (RFC-0073 FR6) or were refused there (FR5), route key to
+    /// why: kept in `mounts.toml`, terminally quarantined, answering 503 until an unmount or a restart.
     pub failed: std::collections::BTreeMap<String, String>,
     /// Mounts admitted onto a running cursor and still catching up beside it, with no lock held.
     pub joining: JoiningMounts,
@@ -3269,6 +3385,7 @@ pub enum MountRefusal {
         chain: String,
         on_cursor: usize,
         nests: usize,
+        ceiling: usize,
     },
     /// The runtime seals direct, which would serve the nest's authored entities empty (#1537).
     SealDirectEntities { nest: String },
@@ -3323,13 +3440,14 @@ impl std::fmt::Display for MountRefusal {
                 chain,
                 on_cursor,
                 nests,
+                ceiling,
             } => write!(
                 f,
                 "mounts '{mounts}' cursor on {chain} declares {on_cursor} authored entities across {nests} \
-                 nest(s), over the ceiling of {MAX_ENTITIES_PER_CURSOR} per cursor. Each entity is a circuit \
+                 nest(s), over the ceiling of {ceiling} per cursor. Each entity is a circuit \
                  on its own thread; nests sharing a chain share the cursor and are counted together \
                  (RFC-0041 §7). Move some to another chain's runtime, or drop {} of them.",
-                on_cursor - MAX_ENTITIES_PER_CURSOR,
+                on_cursor - ceiling,
             ),
             MountRefusal::SealDirectEntities { nest } => write!(
                 f,
@@ -3355,6 +3473,87 @@ impl MountRefusal {
             MountRefusal::OverBudget { .. } | MountRefusal::EntityCeiling { .. } => 507,
             MountRefusal::NotHeld { .. } => 404,
             MountRefusal::InvalidName(_) => 400,
+        }
+    }
+}
+
+/// One cursor's use, as admission prices it.
+struct CursorUse {
+    /// [`RUNTIME_BASE_RSS_MB`] plus every live and joining mount's estimate.
+    projected_mb: u64,
+    /// Authored entities across the cursor's datasets, each dataset once.
+    entities: usize,
+    dirs: std::collections::HashSet<PathBuf>,
+}
+
+/// Why `PUT /_admin/runtime` refused a ceiling (RFC-0073 FR5).
+#[derive(Debug)]
+pub enum CeilingRefusal {
+    /// The ≤2 GB budget per cursor is the ceiling: more nests than fit is a second runtime.
+    AboveBudget { requested: u64 },
+    /// A cursor already projects more than the value asked for. `chain` is `None` for the
+    /// runtime's own base, which every cursor pays.
+    BelowUse {
+        requested: u64,
+        chain: Option<String>,
+        projected_mb: u64,
+    },
+    /// The value scales the entity cap below what a cursor already carries.
+    BelowEntities {
+        requested: u64,
+        chain: String,
+        entities: usize,
+        cap: usize,
+    },
+}
+
+impl std::fmt::Display for CeilingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CeilingRefusal::AboveBudget { requested } => write!(
+                f,
+                "max_rss_mb {requested} is above the {DEFAULT_MAX_RSS_MB} MB budget per cursor; a \
+                 runtime that needs more nests than fit is split into a second runtime"
+            ),
+            CeilingRefusal::BelowUse {
+                requested,
+                chain: Some(chain),
+                projected_mb,
+            } => write!(
+                f,
+                "max_rss_mb {requested} is below the {chain} cursor's projected {projected_mb} MB; \
+                 unmount something first"
+            ),
+            CeilingRefusal::BelowUse {
+                requested,
+                chain: None,
+                projected_mb,
+            } => write!(
+                f,
+                "max_rss_mb {requested} is below the runtime's own {projected_mb} MB, which every \
+                 cursor pays"
+            ),
+            CeilingRefusal::BelowEntities {
+                requested,
+                chain,
+                entities,
+                cap,
+            } => write!(
+                f,
+                "max_rss_mb {requested} caps a cursor at {cap} authored entities, and the {chain} \
+                 cursor carries {entities}; unmount something first"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CeilingRefusal {}
+
+impl CeilingRefusal {
+    pub fn status(&self) -> u16 {
+        match self {
+            CeilingRefusal::AboveBudget { .. } => 400,
+            CeilingRefusal::BelowUse { .. } | CeilingRefusal::BelowEntities { .. } => 409,
         }
     }
 }
@@ -3894,10 +4093,11 @@ fn suspended_router(name: &str) -> axum::Router {
     })
 }
 
-/// What a mount that failed to build at boot serves, `/ready` included: a 503 naming the failure.
+/// What a mount that failed to build or was refused at boot serves, `/ready` included: a 503 naming
+/// why.
 fn failed_router(name: &str, reason: &str) -> axum::Router {
     let body = serde_json::json!({
-        "error": format!("'{name}' failed to build at boot and is quarantined: {reason}"),
+        "error": format!("'{name}' did not start at boot and is quarantined: {reason}"),
         "ready": false,
         "quarantined": [{"nest": name, "reason": reason}],
     });
@@ -4121,46 +4321,22 @@ impl RuntimeHandles {
         }
         let incoming_mb = estimate_nest_rss_mb(config, has_labels, entity_count, entity_rows)
             + hot_store_cache_mb(dir);
-        let joining: Vec<Joining> = self
-            .joining
-            .list()
-            .into_iter()
-            .filter(|j| j.chain == chain)
-            .collect();
-        let existing: u64 = self
-            .states
-            .iter()
-            .filter(|(_, s)| s.chain == chain)
-            .map(|(n, _)| self.estimates.get(n).copied().unwrap_or(NEST_BASE_RSS_MB))
-            .chain(joining.iter().map(|j| j.incoming_mb))
-            .sum();
-        let projected_mb = RUNTIME_BASE_RSS_MB + existing + incoming_mb;
-        // An alias clones the dataset's state, so counting every state would tax a shared nest
-        // twice. Boot groups by dataset; this does the same by directory.
+        let used = self.cursor_use(&chain);
+        let projected_mb = used.projected_mb + incoming_mb;
         let runtime = self.roster["runtime"].as_str().unwrap_or("runtime");
-        let mut seen_dirs = std::collections::HashSet::new();
-        let mut already = 0usize;
-        let mut nests_here = 0usize;
-        for (_, state) in self.states.iter().filter(|(_, s)| s.chain == chain) {
-            if !seen_dirs.insert(state.dir.clone()) {
-                continue;
-            }
-            already += declared_entities(&state.dir).0;
-            nests_here += 1;
-        }
-        for j in &joining {
-            if seen_dirs.insert(j.dir.clone()) {
-                already += declared_entities(&j.dir).0;
-                nests_here += 1;
-            }
-        }
         // A second name for a directory already on the cursor shares that dataset.
-        let (on_cursor, nests) = if seen_dirs.contains(dir) {
-            (already, nests_here)
+        let (on_cursor, nests) = if used.dirs.contains(dir) {
+            (used.entities, used.dirs.len())
         } else {
-            (already + entity_count, nests_here + 1)
+            (used.entities + entity_count, used.dirs.len() + 1)
         };
-        refuse_over_entity_ceiling(on_cursor, nests, runtime, &chain)?;
+        refuse_over_entity_ceiling(
+            on_cursor,
+            nests,
+            runtime,
+            &chain,
+            max_entities_per_cursor(self.mount_ctx.max_rss_mb),
+        )?;
         if projected_mb > self.mount_ctx.max_rss_mb {
             return Err(MountRefusal::OverBudget {
                 nest: name.to_string(),
@@ -4177,6 +4353,123 @@ impl RuntimeHandles {
             incoming_mb,
             projected_mb,
         })
+    }
+
+    /// What one chain's cursor holds now, priced as admission prices it: its live mounts and those
+    /// still joining it.
+    fn cursor_use(&self, chain: &str) -> CursorUse {
+        let joining: Vec<Joining> = self
+            .joining
+            .list()
+            .into_iter()
+            .filter(|j| j.chain == chain)
+            .collect();
+        let existing: u64 = self
+            .states
+            .iter()
+            .filter(|(_, s)| s.chain == chain)
+            .map(|(n, _)| self.estimates.get(n).copied().unwrap_or(NEST_BASE_RSS_MB))
+            .chain(joining.iter().map(|j| j.incoming_mb))
+            .sum();
+        // An alias clones the dataset's state, so counting every state would tax a shared nest
+        // twice. Boot groups by dataset; this does the same by directory.
+        let mut dirs = std::collections::HashSet::new();
+        let mut entities = 0usize;
+        let on_chain = self.states.iter().filter(|(_, s)| s.chain == chain);
+        for dir in on_chain
+            .map(|(_, s)| &s.dir)
+            .chain(joining.iter().map(|j| &j.dir))
+        {
+            if dirs.insert(dir.clone()) {
+                entities += declared_entities(dir).0;
+            }
+        }
+        CursorUse {
+            projected_mb: RUNTIME_BASE_RSS_MB + existing,
+            entities,
+            dirs,
+        }
+    }
+
+    /// The chains with a cursor in use: a live mount on it, or one joining it.
+    fn chains_in_use(&self) -> std::collections::BTreeSet<String> {
+        self.states
+            .iter()
+            .map(|(_, s)| s.chain.clone())
+            .chain(self.joining.list().into_iter().map(|j| j.chain))
+            .collect()
+    }
+
+    /// `GET /_admin/runtime`: the per-cursor ceiling and what each cursor holds against it.
+    pub fn runtime_report(&self) -> serde_json::Value {
+        let ceiling = self.mount_ctx.max_rss_mb;
+        let cursors: Vec<_> = self
+            .chains_in_use()
+            .into_iter()
+            .map(|chain| {
+                let used = self.cursor_use(&chain);
+                serde_json::json!({
+                    "chain": chain,
+                    "projected_mb": used.projected_mb,
+                    "entities": used.entities,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "max_rss_mb": ceiling,
+            "max_rss_mb_limit": DEFAULT_MAX_RSS_MB,
+            "max_entities_per_cursor": max_entities_per_cursor(ceiling),
+            "cursors": cursors,
+        })
+    }
+
+    /// Raise or lower the per-cursor ceiling live (RFC-0073 FR5), refusing a value above the 2 GiB
+    /// budget or below what a cursor already holds. Persisted before it applies, so a ceiling a
+    /// restart would not keep is never in force.
+    pub fn set_max_rss_mb(&mut self, max_rss_mb: u64) -> Result<()> {
+        if max_rss_mb > DEFAULT_MAX_RSS_MB {
+            return Err(CeilingRefusal::AboveBudget {
+                requested: max_rss_mb,
+            }
+            .into());
+        }
+        if max_rss_mb < RUNTIME_BASE_RSS_MB {
+            return Err(CeilingRefusal::BelowUse {
+                requested: max_rss_mb,
+                chain: None,
+                projected_mb: RUNTIME_BASE_RSS_MB,
+            }
+            .into());
+        }
+        let entity_cap = max_entities_per_cursor(max_rss_mb);
+        for chain in self.chains_in_use() {
+            let used = self.cursor_use(&chain);
+            if used.projected_mb > max_rss_mb {
+                return Err(CeilingRefusal::BelowUse {
+                    requested: max_rss_mb,
+                    chain: Some(chain),
+                    projected_mb: used.projected_mb,
+                }
+                .into());
+            }
+            if used.entities > entity_cap {
+                return Err(CeilingRefusal::BelowEntities {
+                    requested: max_rss_mb,
+                    chain,
+                    entities: used.entities,
+                    cap: entity_cap,
+                }
+                .into());
+            }
+        }
+        persist_max_rss_mb(&self.mount_ctx.dir, max_rss_mb).with_context(|| {
+            format!("the ceiling is unchanged: {MOUNTS_FILE} could not be updated")
+        })?;
+        self.mount_ctx.max_rss_mb = max_rss_mb;
+        self.roster["max_rss_mb_per_cursor"] = serde_json::json!(max_rss_mb);
+        self.live.swap(self.compose()?);
+        tracing::info!("per-cursor ceiling set to {max_rss_mb} MB");
+        Ok(())
     }
 
     /// A mount's dry run (#1550), once [`Self::plan_mount`] has placed its dataset on disk. Runs the
@@ -6861,20 +7154,47 @@ mod tests {
     /// carries the arithmetic an operator needs to act on it.
     #[test]
     fn the_entity_ceiling_is_per_cursor_and_says_how_far_over_it_is() {
-        assert!(refuse_over_entity_ceiling(MAX_ENTITIES_PER_CURSOR, 1, "m", "c").is_ok());
+        assert!(refuse_over_entity_ceiling(
+            MAX_ENTITIES_PER_CURSOR,
+            1,
+            "m",
+            "c",
+            MAX_ENTITIES_PER_CURSOR
+        )
+        .is_ok());
         assert!(
-            refuse_over_entity_ceiling(MAX_ENTITIES_PER_CURSOR, 8, "m", "c").is_ok(),
+            refuse_over_entity_ceiling(
+                MAX_ENTITIES_PER_CURSOR,
+                8,
+                "m",
+                "c",
+                MAX_ENTITIES_PER_CURSOR
+            )
+            .is_ok(),
             "spread across eight nests is still exactly at the ceiling, not over it"
         );
         assert!(
-            refuse_over_entity_ceiling(MAX_ENTITIES_PER_CURSOR + 1, 1, "m", "c").is_err(),
+            refuse_over_entity_ceiling(
+                MAX_ENTITIES_PER_CURSOR + 1,
+                1,
+                "m",
+                "c",
+                MAX_ENTITIES_PER_CURSOR
+            )
+            .is_err(),
             "one over is over - the boundary, which a wildly-over case cannot see"
         );
 
         let err = format!(
             "{:#}",
-            refuse_over_entity_ceiling(MAX_ENTITIES_PER_CURSOR + 3, 4, "prod", "arbitrum-one")
-                .expect_err("three over the ceiling is over the ceiling")
+            refuse_over_entity_ceiling(
+                MAX_ENTITIES_PER_CURSOR + 3,
+                4,
+                "prod",
+                "arbitrum-one",
+                MAX_ENTITIES_PER_CURSOR
+            )
+            .expect_err("three over the ceiling is over the ceiling")
         );
         assert!(err.contains("cursor on arbitrum-one"), "{err}");
         assert!(err.contains("across 4 nest(s)"), "{err}");
@@ -6994,6 +7314,46 @@ mod tests {
         if let Err(e) = handles.admit("alias", &nest_config("ethereum"), &held) {
             panic!("an alias of a dataset already on the cursor is not a second nest: {e:#}");
         }
+
+        // RFC-0073 FR5: the cap follows the ceiling. At 1664 MB it is 26, which the cursor already
+        // carries, so the six that fitted at 2048 no longer do, and a lower ceiling is refused.
+        let mut handles = handles;
+        let err = handles.set_max_rss_mb(1600).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<CeilingRefusal>(),
+                Some(CeilingRefusal::BelowEntities {
+                    entities: 26,
+                    cap: 25,
+                    ..
+                })
+            ),
+            "{err:#}"
+        );
+        assert_eq!(handles.mount_ctx.max_rss_mb, DEFAULT_MAX_RSS_MB);
+        handles.mount_ctx.max_rss_mb = 1664;
+        let err = format!(
+            "{:#}",
+            handles
+                .admit("new", &nest_config("ethereum"), &exact)
+                .err()
+                .expect("32 is past a 1664 MB cursor's cap")
+        );
+        assert!(err.contains("over the ceiling of 26"), "{err}");
+    }
+
+    /// RFC-0073 FR5: 32 entity circuits at 2 GiB, proportionally fewer below, and no more above.
+    #[test]
+    fn the_entity_cap_is_a_function_of_the_ceiling() {
+        assert_eq!(max_entities_per_cursor(DEFAULT_MAX_RSS_MB), 32);
+        assert_eq!(max_entities_per_cursor(1024), 16);
+        assert_eq!(max_entities_per_cursor(1536), 24);
+        assert_eq!(max_entities_per_cursor(1663), 25, "rounded down, never up");
+        assert_eq!(
+            max_entities_per_cursor(4096),
+            32,
+            "a mounts.toml past 2048 buys no threads"
+        );
     }
 
     /// A `max_rows` large enough to overflow the multiplication must not wrap into a small
@@ -8779,5 +9139,381 @@ mod tests {
         handles.states.clear();
         drop(handles);
         cursor.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fr5_tests {
+    use super::*;
+    use crate::source::Source;
+    use std::sync::Arc;
+
+    /// A chain with no logs, held at one tip.
+    struct StillChain;
+
+    #[async_trait::async_trait]
+    impl Source for StillChain {
+        async fn tip(&self) -> Result<u64> {
+            Ok(1_000)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("0x{n:064x}")))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn write_nest(root: &Path, name: &str) -> (String, PathBuf, Config) {
+        let dir = MountTable::nest_dir(root, name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            format!(
+                "[nest]\nname = \"{name}\"\nchain = \"ethereum\"\nchain_id = 1\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"t\"\n\
+                 address = \"0x0000000000000000000000000000000000000001\"\nabi = \"abi.json\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("abi.json"), "[]").unwrap();
+        load_nest(root, name)
+    }
+
+    fn load_nest(root: &Path, name: &str) -> (String, PathBuf, Config) {
+        let dir = MountTable::nest_dir(root, name);
+        let config = Config::load(&dir).unwrap();
+        (name.to_string(), dir, config)
+    }
+
+    fn priced(nest: &(String, PathBuf, Config)) -> u64 {
+        estimate_nest_rss_mb(&nest.2, false, 0, 0) + hot_store_cache_mb(&nest.1)
+    }
+
+    fn handles_at(root: &Path) -> RuntimeHandles {
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let roster = serde_json::json!({"runtime": "t", "nests": []});
+        RuntimeHandles {
+            live: crate::serve::LiveRuntime::new(crate::serve::compose_runtime(
+                roster.clone(),
+                Vec::new(),
+                health.clone(),
+            )),
+            states: Vec::new(),
+            alert_workers: Vec::new(),
+            publishers: Vec::new(),
+            lifecycle: std::collections::HashMap::new(),
+            health,
+            roster,
+            estimates: std::collections::HashMap::new(),
+            default_tenant: DEFAULT_TENANT.to_string(),
+            suspended: std::collections::BTreeMap::new(),
+            failed: Default::default(),
+            joining: Default::default(),
+            mount_ctx: MountContext {
+                dir: root.to_path_buf(),
+                mounts: Vec::new(),
+                sources: std::collections::HashMap::new(),
+                endpoint_counts: std::collections::HashMap::new(),
+                backfill: None,
+                seal_direct: false,
+                concurrency: 1,
+                ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
+                ipfs_gateways: Vec::new(),
+                state_rpc: Vec::new(),
+                window_override: None,
+                admin_enabled: true,
+                admin_token: None,
+                max_rss_mb: DEFAULT_MAX_RSS_MB,
+                freshness: Default::default(),
+                chain_freshness: std::collections::HashMap::new(),
+                dormant: std::collections::HashMap::new(),
+                fail_fast: false,
+                cursors: None,
+                registry: None,
+            },
+        }
+    }
+
+    async fn call(
+        router: &axum::Router,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(axum::http::header::AUTHORIZATION, "Bearer t");
+        if body.is_some() {
+            req = req.header(axum::http::header::CONTENT_TYPE, "application/json");
+        }
+        let req = req
+            .body(axum::body::Body::from(
+                body.map(|b| b.to_string()).unwrap_or_default(),
+            ))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::json!(String::from_utf8_lossy(&bytes)));
+        (status, json)
+    }
+
+    async fn get(router: &axum::Router, path: &str) -> (axum::http::StatusCode, String) {
+        let (status, body) = call(router, "GET", path, None).await;
+        (status, body.to_string())
+    }
+
+    fn persisted(root: &Path) -> Option<u64> {
+        MountTable::load(root).unwrap().runtime.max_rss_mb
+    }
+
+    /// What `dev` does for one chain at boot: admit, then start the cursor on what was admitted.
+    async fn boot(
+        nests: Vec<(String, PathBuf, Config)>,
+        max_rss_mb: u64,
+        handles: &mut RuntimeHandles,
+    ) -> (indexer::ChainCursor, Vec<(String, String)>) {
+        let admitted = admit_at_boot(
+            nests,
+            max_rss_mb,
+            "t",
+            "ethereum",
+            &handles.health,
+            &mut handles.estimates,
+        );
+        let source: Arc<dyn Source> = Arc::new(StillChain);
+        let cursor = indexer::spawn_runtime_at_boot(
+            source.clone(),
+            admitted.nests,
+            Some(990),
+            false,
+            1,
+            Some(5),
+            false,
+            None,
+            handles.health.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        handles.states = cursor.states.clone();
+        handles.failed = admitted.refused.iter().cloned().collect();
+        handles
+            .mount_ctx
+            .sources
+            .insert("ethereum".to_string(), source);
+        handles
+            .lifecycle
+            .insert("ethereum".to_string(), cursor.lifecycle.clone());
+        handles.mount_ctx.max_rss_mb = max_rss_mb;
+        (cursor, admitted.refused)
+    }
+
+    async fn stop(mut handles: RuntimeHandles, cursor: indexer::ChainCursor) {
+        handles.states.clear();
+        handles.lifecycle.clear();
+        drop(handles);
+        cursor.shutdown().await.unwrap();
+    }
+
+    /// RFC-0073 FR5: `PUT /_admin/runtime` lowers and raises the per-cursor ceiling with no restart,
+    /// a mount's admission follows it at once, `mounts.toml` keeps it, and the next boot is held to
+    /// it. Above 2048, or below what the cursor projects, is refused and nothing is written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_ceiling_moves_live_and_a_restart_keeps_it() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"t\"\nchain = \"ethereum\"\nchain_id = 1\nrpc_urls = []\n",
+        )
+        .unwrap();
+        let (a, b, c) = (
+            write_nest(root.path(), "fr5-a"),
+            write_nest(root.path(), "fr5-b"),
+            write_nest(root.path(), "fr5-c"),
+        );
+        // Larger than the restart's headroom below; it is never opened.
+        std::fs::File::create(c.1.join(crate::config::DB_FILE))
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        let used = RUNTIME_BASE_RSS_MB + priced(&a) + priced(&b);
+        let mut handles = handles_at(root.path());
+        let (cursor, refused) = boot(vec![a, b], DEFAULT_MAX_RSS_MB, &mut handles).await;
+        assert!(refused.is_empty(), "{refused:?}");
+        let handles = Arc::new(tokio::sync::Mutex::new(handles));
+        let jobs = Arc::new(crate::mount_jobs::MountJobs::load(root.path()));
+        let routes = lifecycle_routes(handles.clone(), jobs, true, Some("t".into()));
+
+        let (status, body) = call(&routes, "GET", "/_admin/runtime", None).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(body["max_rss_mb"], DEFAULT_MAX_RSS_MB);
+        assert_eq!(body["max_entities_per_cursor"], 32);
+        assert_eq!(body["cursors"][0]["projected_mb"], used, "{body}");
+
+        let put = |mb: u64| Some(serde_json::json!({ "max_rss_mb": mb }));
+        for over in [2049, 4096] {
+            let (status, body) = call(&routes, "PUT", "/_admin/runtime", put(over)).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(body["error"].as_str().unwrap().contains("2048"), "{body}");
+        }
+        let (status, body) = call(&routes, "PUT", "/_admin/runtime", put(used - 1)).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("ethereum"),
+            "{body}"
+        );
+        assert_eq!(persisted(root.path()), None, "a refusal wrote mounts.toml");
+        assert_eq!(
+            handles.lock().await.mount_ctx.max_rss_mb,
+            DEFAULT_MAX_RSS_MB
+        );
+
+        // Lowered to exactly what the cursor holds: a third mount no longer fits.
+        let (status, body) = call(&routes, "PUT", "/_admin/runtime", put(used)).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(body["max_rss_mb"], used);
+        assert_eq!(persisted(root.path()), Some(used));
+        {
+            let h = handles.lock().await;
+            assert_eq!(h.roster["max_rss_mb_per_cursor"], used);
+            let err = h.admit("fr5-c", &c.2, &c.1).err().expect("admitted");
+            assert!(
+                matches!(
+                    err.downcast_ref::<MountRefusal>(),
+                    Some(MountRefusal::OverBudget { ceiling_mb, .. }) if *ceiling_mb == used
+                ),
+                "{err:#}"
+            );
+        }
+
+        // Raised again: it fits, with no restart between.
+        let (status, body) = call(&routes, "PUT", "/_admin/runtime", put(2048)).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(persisted(root.path()), Some(2048));
+        if let Err(e) = handles.lock().await.admit("fr5-c", &c.2, &c.1) {
+            panic!("the raised ceiling refused it: {e:#}");
+        }
+
+        // Boot prices each store at its size then, so leave room for the two that were built.
+        let (status, _) = call(&routes, "PUT", "/_admin/runtime", put(used + 16)).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        drop(routes);
+        let Ok(handles) = Arc::try_unwrap(handles) else {
+            panic!("the routes still hold the handles");
+        };
+        stop(handles.into_inner(), cursor).await;
+
+        // The restart: the ceiling is read back from mounts.toml and holds the boot to it.
+        let max_rss = persisted(root.path()).expect("persisted");
+        let mut restarted = handles_at(root.path());
+        let (cursor, refused) = boot(
+            ["fr5-a", "fr5-b", "fr5-c"]
+                .map(|n| load_nest(root.path(), n))
+                .into(),
+            max_rss,
+            &mut restarted,
+        )
+        .await;
+        assert_eq!(
+            refused.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["fr5-c"]
+        );
+        stop(restarted, cursor).await;
+    }
+
+    /// RFC-0073 FR5: a cursor over its ceiling at boot boots the mounts that fit, in `mounts.toml`
+    /// order, and the rest quarantined with the refusal. It used to refuse the whole runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_over_budget_cursor_boots_the_mounts_that_fit_and_reports_the_rest() {
+        let root = tempfile::tempdir().unwrap();
+        let (first, over, after) = (
+            write_nest(root.path(), "fr5-first"),
+            write_nest(root.path(), "fr5-over"),
+            write_nest(root.path(), "fr5-after"),
+        );
+        // A sparse 32 MiB store prices `over` above the room left; it is never opened.
+        std::fs::File::create(over.1.join(crate::config::DB_FILE))
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        assert!(priced(&over) > priced(&after));
+        let ceiling = RUNTIME_BASE_RSS_MB + priced(&first) + priced(&after);
+        let mut handles = handles_at(root.path());
+        let (cursor, refused) = boot(vec![first, over, after], ceiling, &mut handles).await;
+        assert_eq!(
+            refused.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["fr5-over"],
+            "a refused mount takes no room from the next"
+        );
+        assert_eq!(
+            handles
+                .states
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fr5-first", "fr5-after"]
+        );
+        let reason = &refused[0].1;
+        assert!(reason.contains("refused at boot"), "{reason}");
+        assert!(
+            reason.contains(&format!("{ceiling} MB ceiling")),
+            "{reason}"
+        );
+        let q = handles.health.status("fr5-over").expect("not quarantined");
+        assert_eq!(q.class, "terminal");
+        assert!(handles.health.status("fr5-first").is_none());
+
+        handles.roster["nests"] = serde_json::json!([{"name": "fr5-first"}, {"name": "fr5-after"}]);
+        let router = handles.compose().unwrap();
+        for name in ["fr5-first", "fr5-after"] {
+            let (status, body) = get(&router, &format!("/{name}/sql?q=select%201")).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{name}: {body}");
+            let (status, body) = get(&router, &format!("/{name}/ready")).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{name}: {body}");
+        }
+        let (status, body) = get(&router, "/fr5-over/ready").await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body}"
+        );
+        assert!(body.contains("refused at boot"), "{body}");
+        let (status, body) = get(&router, "/ready").await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body}"
+        );
+        assert!(body.contains("fr5-over"), "{body}");
+        let (_, body) = call(&router, "GET", "/nests", None).await;
+        let entry = body["nests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "fr5-over")
+            .unwrap_or_else(|| panic!("/nests does not list the refused mount: {body}"))
+            .clone();
+        assert_eq!(entry["health"], "quarantined", "{body}");
+        assert!(
+            entry["quarantine"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("refused at boot"),
+            "{body}"
+        );
+        drop(router);
+        stop(handles, cursor).await;
     }
 }
