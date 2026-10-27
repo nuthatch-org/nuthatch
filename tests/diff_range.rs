@@ -568,6 +568,7 @@ impl nuthatch::diff::Source for Local<'_> {
             nuthatch::analytics::QueryGuard {
                 timeout: std::time::Duration::from_secs(30),
                 max_rows: 50_000,
+                ..Default::default()
             },
             &hot,
             self.store.sealed_through(),

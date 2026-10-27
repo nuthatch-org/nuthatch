@@ -78,6 +78,7 @@ fn scalar(dir: &std::path::Path, n: usize, sql: &str) -> i128 {
         nuthatch::analytics::QueryGuard {
             timeout: std::time::Duration::from_secs(60),
             max_rows: 1_000_000,
+            ..Default::default()
         },
         &hot(n),
         0,
@@ -190,6 +191,7 @@ fn rows_out(dir: &std::path::Path, n: usize, sql: &str) -> Vec<Value> {
         nuthatch::analytics::QueryGuard {
             timeout: std::time::Duration::from_secs(60),
             max_rows: 1_000_000,
+            ..Default::default()
         },
         &hot(n),
         0,
@@ -311,6 +313,7 @@ fn refused_sql_is_still_refused_past_the_boundary() {
         nuthatch::analytics::QueryGuard {
             timeout: std::time::Duration::from_secs(60),
             max_rows: 1_000_000,
+            ..Default::default()
         },
         &hot(n),
         0,
@@ -373,6 +376,7 @@ fn union_scalar(
         nuthatch::analytics::QueryGuard {
             timeout: std::time::Duration::from_secs(60),
             max_rows: 1_000_000,
+            ..Default::default()
         },
         hot,
         cold,
@@ -580,6 +584,7 @@ fn the_timeout_guard_still_fires_past_the_boundary() {
         nuthatch::analytics::QueryGuard {
             timeout: std::time::Duration::from_secs(1),
             max_rows: 1_000_000,
+            ..Default::default()
         },
         &hot(n),
         0,

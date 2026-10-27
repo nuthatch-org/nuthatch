@@ -3665,9 +3665,7 @@ async fn build_nest(
         sql_queued: Default::default(),
         memo_gate: Default::default(),
         sql_response_bytes: Default::default(),
-        sql_max_hot_rows: serve::SQL_MAX_HOT_ROWS,
-        sql_max_hot_bytes: serve::SQL_MAX_HOT_BYTES,
-        sql_max_named_scan_bytes: serve::SQL_MAX_NAMED_SCAN_BYTES,
+        limits: crate::limits::Limits::process(),
         // Every cursor-owning role builds through here; `serve_role` flips it after (#1025).
         cursorless: false,
         seal_span,

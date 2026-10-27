@@ -824,6 +824,7 @@ pub fn query(args: crate::cli::QueryBenchArgs) -> Result<()> {
     let guard = || crate::analytics::QueryGuard {
         timeout: Duration::from_secs(60),
         max_rows: 5_000_000,
+        ..Default::default()
     };
     // Warm-up (attach segments + build temp tables) kept out of the percentiles.
     crate::analytics::query_hot_cold(&dir, &sql, guard(), &hot, sealed_through, &[])

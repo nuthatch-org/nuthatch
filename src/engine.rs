@@ -19,6 +19,9 @@ pub(crate) use crate::analytics::FactWindow;
 /// contract whenever a row cap is given.
 pub(crate) const SQL_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
+/// A reading of a session's memory pool, from any thread.
+pub(crate) type MemoryGauge = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 /// A cheap lower-bound byte estimate of a materialised cell - dominated by string payloads, which is
 /// exactly the wide-cell attack vector. Numbers/bools/null count a small fixed cost.
 pub(crate) fn value_bytes(v: &Value) -> usize {
@@ -117,8 +120,8 @@ pub(crate) trait Session: Send {
     /// Prepare, execute and materialise the result as nuthatch-encoded JSON rows. With
     /// `cap = Some(n)` it stops after `n + 1` rows so the caller can report truncation precisely
     /// (`truncated` is true when that extra row existed), and also caps cumulative result bytes;
-    /// `cap = None` materialises every row.
-    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<Collected, Died>;
+    /// `cap = None` materialises every row. The cap is `(rows, bytes)`.
+    fn collect(&self, sql: &str, cap: Option<(usize, usize)>) -> Result<Collected, Died>;
 
     /// Stream a result row by row, each as its cells in column order, so a large result is never
     /// held whole.
@@ -175,6 +178,11 @@ pub(crate) trait Session: Send {
     /// This session's private spill directory and the bytes it may hold, for the `/sql` guard to
     /// measure. `None` for a session that does not spill to a directory of its own.
     fn spill_limit(&self) -> Option<(std::path::PathBuf, u64)> {
+        None
+    }
+
+    /// Bytes the pool this session draws on holds now, readable from the watchdog's thread.
+    fn memory_gauge(&self) -> Option<MemoryGauge> {
         None
     }
 

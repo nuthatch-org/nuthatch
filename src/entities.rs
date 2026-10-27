@@ -329,6 +329,7 @@ pub fn validate(dir: &Path) -> Vec<EntityIssue> {
                                     // an unlimited reference result during `nuthatch check`.
                                     timeout: Duration::from_secs(60),
                                     max_rows: entity.max_rows.saturating_add(1),
+                                    ..Default::default()
                                 },
                             ) {
                                 Ok(result) => {
@@ -652,6 +653,7 @@ fn first_unnarrowable(
             let guard = crate::analytics::QueryGuard {
                 timeout: Duration::from_secs(60),
                 max_rows: 1,
+                ..Default::default()
             };
             let out = nest_query(dir, schema, data, &probe, guard).with_context(|| {
                 format!("checking {table}.{col} fits the entity's integer type")

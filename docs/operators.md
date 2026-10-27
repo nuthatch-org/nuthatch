@@ -1033,6 +1033,28 @@ job:
 | max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially. The same holds past **64 MiB** of stored hot-row JSON, whichever comes first |
 | declared-query scan bound | 512 MiB | named queries (`/q/{name}`) only: source bytes the plan may read, each Parquet scan charged the widest table it can reach, plus the hot and maintained rows copied for it. Checked on the connection that runs the statement, before it is evaluated. Over the cap, or a plan that can rescan (nested-loop or delim join, recursive CTE), answers `422` |
 
+**Lowering the guards.** The statement timeout, row, result-byte, unsealed-row, unsealed-byte,
+declared-query and queue limits above are each the ceiling, and each can be lowered for the whole
+process by env: `NUTHATCH_SQL_TIMEOUT_MS`, `NUTHATCH_SQL_MAX_ROWS`, `NUTHATCH_SQL_MAX_RESULT_BYTES`,
+`NUTHATCH_SQL_MAX_HOT_ROWS`, `NUTHATCH_SQL_MAX_HOT_BYTES`, `NUTHATCH_SQL_MAX_NAMED_SCAN_BYTES` and
+`NUTHATCH_SQL_MAX_QUEUED`. A value above the ceiling is clamped to it with a warning; none can be raised.
+In a runtime, a mount can lower them further for itself, and cap the analytics memory its statements
+may run with, through `[mounts.limits]` in `mounts.toml` or the admin API; [the admin API
+guide](admin-api.md#per-mount-limits) lists the fields and says how analytics memory behaves when two
+mounts share a dataset. A recorded limit the process has since been lowered past is held to the
+process value at boot, with a warning, rather than refusing the boot.
+
+```toml
+[[mounts]]
+tenant = "acme"
+alias = "usdc"
+nid = "9f2c…"
+
+[mounts.limits]
+statement_timeout_ms = 5000
+max_rows = 1000
+```
+
 `/sql` is **read-only and single-statement**: a query must open with `SELECT` or `WITH`, filesystem
 and network table functions are refused, and `;`-stacking a second statement is rejected outright.
 Rejections surface as a `4xx` or `503` and count in the backward-compatible aggregate

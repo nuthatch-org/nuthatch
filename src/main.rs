@@ -1049,6 +1049,7 @@ impl SqlBackend {
                     analytics::QueryGuard {
                         timeout: std::time::Duration::from_secs(30),
                         max_rows: 50_000,
+                        ..Default::default()
                     },
                     &hot,
                     sealed_through,

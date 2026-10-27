@@ -122,6 +122,8 @@ pub(crate) struct BurrmillSession {
     /// The declared columns of each maintained relation `load_relation` staged, with the SQL type
     /// its plan gives each, so one with no rows still binds and a count is a number (#1598).
     relations: Mutex<HashMap<String, Vec<(String, &'static str)>>>,
+    /// The dataset pool this session draws on, which every session over `dir` shares.
+    pool: Option<burrmill::SharedPool>,
 }
 
 impl BurrmillSession {
@@ -209,12 +211,10 @@ impl BurrmillSession {
     fn new(dir: Option<&Path>) -> Result<Self> {
         let spill = crate::spill::new_spill_dir()?;
         let budget = budget(&crate::analytics_budget::from_env(), &spill.0);
+        let pool = dir.map(|dir| nest_pool(dir, budget.memory_bytes));
         #[allow(unused_mut)]
-        let mut engine = match dir {
-            Some(dir) => {
-                let pool = nest_pool(dir, budget.memory_bytes);
-                burrmill::Engine::open_empty_sharing(budget, &pool)
-            }
+        let mut engine = match &pool {
+            Some(pool) => burrmill::Engine::open_empty_sharing(budget, pool),
             None => burrmill::Engine::open_empty_budgeted(budget),
         }
         .map_err(engine_err)?;
@@ -232,6 +232,7 @@ impl BurrmillSession {
             _spill: spill,
             views: Mutex::new(std::collections::BTreeMap::new()),
             relations: Mutex::new(HashMap::new()),
+            pool,
         })
     }
 
@@ -520,9 +521,9 @@ impl Session for BurrmillSession {
         Ok(())
     }
 
-    fn collect(&self, sql: &str, cap: Option<usize>) -> Result<Collected, Died> {
-        let hard = cap.map(|c| c + 1);
-        let byte_cap = cap.map(|_| crate::engine::SQL_MAX_RESULT_BYTES);
+    fn collect(&self, sql: &str, cap: Option<(usize, usize)>) -> Result<Collected, Died> {
+        let hard = cap.map(|(rows, _)| rows + 1);
+        let byte_cap = cap.map(|(_, bytes)| bytes);
         let mut bytes = 0usize;
         let mut out = Vec::new();
         let mut over = false;
@@ -638,7 +639,7 @@ impl Session for BurrmillSession {
     }
 
     fn one_value(&self, sql: &str) -> Result<Value> {
-        let out = self.collect(sql, Some(1))?;
+        let out = self.collect(sql, Some((1, crate::engine::SQL_MAX_RESULT_BYTES)))?;
         let first = out.columns.first();
         out.rows
             .first()
@@ -713,6 +714,11 @@ impl Session for BurrmillSession {
 
     fn interrupt_handle(&self) -> Arc<dyn Interrupt> {
         Arc::new(Cancel(self.reader().cancel_token()))
+    }
+
+    fn memory_gauge(&self) -> Option<crate::engine::MemoryGauge> {
+        let pool = self.pool.clone()?;
+        Some(Arc::new(move || pool.reserved() as u64))
     }
 
     fn cold_scan_operators(&self, sql: &str) -> Result<u64> {

@@ -89,6 +89,7 @@ pub mod ipfs;
 pub mod ipfs_resolve;
 pub mod labels;
 pub mod lifecycle;
+pub mod limits;
 pub mod lists;
 pub mod maintained;
 pub mod mcp;

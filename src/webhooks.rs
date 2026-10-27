@@ -233,6 +233,7 @@ pub fn refuse_unbound(
         let guard = crate::analytics::QueryGuard {
             timeout: std::time::Duration::from_secs(10),
             max_rows: 1,
+            ..Default::default()
         };
         crate::analytics::plan_hot_cold(
             dir,

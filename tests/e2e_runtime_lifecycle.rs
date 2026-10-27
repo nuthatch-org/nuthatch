@@ -290,6 +290,7 @@ async fn a_live_mount_applies_the_recorded_surface_and_shares_the_sql_gate() {
         sql: SqlAccess::Deny,
         queries: Vec::new(),
         publish: None,
+        limits: Default::default(),
         #[cfg(feature = "counter")]
         counter: None,
     });
@@ -383,6 +384,7 @@ async fn a_second_alias_serves_its_own_recorded_surface() {
         sql: narrow.access,
         queries: narrow.queries.clone(),
         publish: None,
+        limits: Default::default(),
         #[cfg(feature = "counter")]
         counter: None,
     });
@@ -956,6 +958,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
                 sql: Default::default(),
                 queries: Vec::new(),
                 publish: None,
+                limits: Default::default(),
                 #[cfg(feature = "counter")]
                 counter: None,
             }],
@@ -1136,6 +1139,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
                 sql: Default::default(),
                 queries: Vec::new(),
                 publish: None,
+                limits: Default::default(),
                 #[cfg(feature = "counter")]
                 counter: None,
             }],
@@ -1520,6 +1524,7 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
                 sql: Default::default(),
                 queries: Vec::new(),
                 publish: None,
+                limits: Default::default(),
                 #[cfg(feature = "counter")]
                 counter: None,
             }],
@@ -1669,6 +1674,7 @@ pub(crate) async fn empty_runtime(
                 sql: Default::default(),
                 queries: Vec::new(),
                 publish: None,
+                limits: Default::default(),
                 #[cfg(feature = "counter")]
                 counter: None,
             }],
@@ -2844,6 +2850,7 @@ async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it(
                 sql: Default::default(),
                 queries: Vec::new(),
                 publish: None,
+                limits: Default::default(),
                 #[cfg(feature = "counter")]
                 counter: None,
             }],
@@ -4454,4 +4461,239 @@ async fn concurrent_publishes_and_prunes_never_leave_a_ref_dangling() {
         t.await.unwrap();
     }
     no_ref_dangles(registry.path()).await;
+}
+
+/// One `/sql` GET through a live composition: its status and JSON body.
+async fn sql_get(
+    handles: &tokio::sync::Mutex<runtime::RuntimeHandles>,
+    mount: &str,
+    sql: &str,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use tower::ServiceExt;
+    let q: String = sql
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let req = axum::http::Request::builder()
+        .uri(format!("/{mount}/sql?q={q}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let service = handles.lock().await.live.service();
+    let resp = service.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// A statement whose sort holds pool memory for a while: a million rows from three cross-joined
+/// hundred-row lists. `tag` keeps one answer from being remembered for another request.
+fn heavy_sort(tag: u32) -> String {
+    let values: Vec<String> = (0..100).map(|i| format!("({i})")).collect();
+    format!(
+        "WITH a(v) AS (VALUES {}) SELECT x.v AS i, y.v AS j, z.v + {tag} AS k FROM a x, a y, a z \
+         ORDER BY k DESC, j DESC, i DESC",
+        values.join(",")
+    )
+}
+
+/// RFC-0073 FR3: limits on one mount of a shared dataset bound that mount's queries and not its
+/// co-tenant's, change on the next request after a `PATCH` with no remount, refuse a value above
+/// the process ceiling by name, survive a restart from `mounts.toml`, and move neither the NID nor
+/// the data identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_mount_limits_bound_one_mount_and_not_its_co_tenant() {
+    use axum::http::StatusCode;
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "7c".repeat(32);
+    let (handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+    let identity = || {
+        (
+            nuthatch::migrate::nid_of(&data_dir).unwrap(),
+            nuthatch::blob::build_manifest(&data_dir, None)
+                .unwrap()
+                .data_identity(),
+        )
+    };
+    let before = identity();
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
+
+    let over = format!(r#"{{"name":"capped","nid":"{nid}","limits":{{"max_rows":50001}}}}"#);
+    let (status, body) = call(
+        &routes,
+        "POST",
+        "/_admin/nests?wait=true",
+        None,
+        Some(&over),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains("limits.max_rows") && body.contains("50000"),
+        "the refusal names the field and the ceiling: {body}"
+    );
+    for (name, limits) in [("usdc", ""), ("capped", r#","limits":{"max_rows":1}"#)] {
+        let mount = format!(r#"{{"name":"{name}","nid":"{nid}"{limits}}}"#);
+        let (status, body) = call(
+            &routes,
+            "POST",
+            "/_admin/nests?wait=true",
+            None,
+            Some(&mount),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+    }
+    assert!(
+        wait_until(POLL_TIMEOUT, || handles
+            .try_lock()
+            .is_ok_and(|h| last_block(&h, "usdc").as_deref() == Some("3")))
+        .await,
+        "premise: the dataset indexes to the tip"
+    );
+
+    let rows = "SELECT * FROM (VALUES (1), (2), (3)) AS t(x) ORDER BY x";
+    let (status, capped) = sql_get(&handles, "capped", rows).await;
+    assert_eq!(status, StatusCode::OK, "{capped}");
+    assert_eq!(capped["rows"].as_array().unwrap().len(), 1, "{capped}");
+    assert_eq!(capped["truncated"], true, "{capped}");
+    let (status, open) = sql_get(&handles, "usdc", rows).await;
+    assert_eq!(status, StatusCode::OK, "{open}");
+    assert_eq!(open["rows"].as_array().unwrap().len(), 3, "{open}");
+
+    let (status, record) = call(&routes, "GET", "/_admin/mounts/capped", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{record}");
+    let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+    assert_eq!(record["phase"], "live", "the job is still there: {record}");
+    assert_eq!(record["record"]["nid"], nid.as_str(), "{record}");
+    assert_eq!(record["record"]["alias"], "capped", "{record}");
+    assert_eq!(record["record"]["sql"], "open", "{record}");
+    assert_eq!(record["record"]["limits"]["max_rows"], 1, "{record}");
+
+    // The admin token guards PATCH as it guards POST, and a refused PATCH changes nothing.
+    let timeout = r#"{"limits":{"statement_timeout_ms":1}}"#;
+    let (status, _) = call(
+        &routes,
+        "PATCH",
+        "/_admin/mounts/capped",
+        Some("wrong"),
+        Some(timeout),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = call(
+        &routes,
+        "PATCH",
+        "/_admin/mounts/capped",
+        None,
+        Some(r#"{"limits":{"max_hot_bytes":67108865}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("limits.max_hot_bytes"), "{body}");
+    let (status, still) = sql_get(&handles, "capped", &heavy_sort(0)).await;
+    assert_eq!(status, StatusCode::OK, "neither PATCH applied: {still}");
+
+    // A PATCH reaches the next request on the same store: nothing was remounted.
+    let store = |h: &runtime::RuntimeHandles| {
+        h.states
+            .iter()
+            .find(|(n, _)| n == "capped")
+            .map(|(_, s)| s.store.clone())
+            .unwrap()
+    };
+    let held = store(&*handles.lock().await);
+    let (status, body) = call(
+        &routes,
+        "PATCH",
+        "/_admin/mounts/capped",
+        None,
+        Some(timeout),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(Arc::ptr_eq(&held, &store(&*handles.lock().await)));
+    let (status, cut) = sql_get(&handles, "capped", &heavy_sort(1)).await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{cut}");
+    let (status, open) = sql_get(&handles, "usdc", &heavy_sort(1)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the co-tenant has no timeout: {open}"
+    );
+    // `limits` replaces the table, so `max_rows` went with this PATCH.
+    let (_, record) = call(&routes, "GET", "/_admin/mounts/capped", None, None).await;
+    let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+    assert_eq!(
+        record["record"]["limits"],
+        serde_json::json!({"statement_timeout_ms": 1}),
+        "{record}"
+    );
+
+    let hot = r#"{"limits":{"max_hot_rows":1}}"#;
+    let (status, body) = call(&routes, "PATCH", "/_admin/mounts/capped", None, Some(hot)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, refused) = sql_get(&handles, "capped", "SELECT 42 AS b").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refused}");
+    let (status, open) = sql_get(&handles, "usdc", "SELECT 42 AS b").await;
+    assert_eq!(status, StatusCode::OK, "{open}");
+
+    // Analytics memory: the dataset's pool, which the co-tenant shares, held to this mount's cap
+    // while its statement runs.
+    let memory = r#"{"limits":{"analytics_memory_bytes":1024}}"#;
+    let (status, body) = call(
+        &routes,
+        "PATCH",
+        "/_admin/mounts/capped",
+        None,
+        Some(memory),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, cut) = sql_get(&handles, "capped", &heavy_sort(2)).await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{cut}");
+    assert_eq!(cut["analytics_memory_bytes"], 1024, "{cut}");
+    let (status, open) = sql_get(&handles, "usdc", &heavy_sort(2)).await;
+    assert_eq!(status, StatusCode::OK, "{open}");
+
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    let recorded = file.mounts.iter().find(|m| m.alias == "capped").unwrap();
+    assert_eq!(recorded.limits.analytics_memory_bytes, Some(1024));
+    assert_eq!(recorded.limits.max_hot_rows, None);
+    let usdc = file.mounts.iter().find(|m| m.alias == "usdc").unwrap();
+    assert!(usdc.limits.is_unset());
+    assert_eq!(identity(), before, "limits are mount config, not the nest");
+    for name in ["capped", "usdc"] {
+        let (_, v) = sql_get(&handles, name, "SELECT 43 AS c").await;
+        assert_eq!(v["provenance"]["nid"], nid.as_str(), "{name}: {v}");
+    }
+
+    // A restart reads the limits back from `mounts.toml`.
+    let restarted = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        roost.path().join(runtime::MOUNTS_FILE),
+        restarted.path().join(runtime::MOUNTS_FILE),
+    )
+    .unwrap();
+    let (mut again, _tape, _intake) = empty_runtime(restarted.path(), &nid).await;
+    again.mount_ctx.mounts = runtime::MountTable::load(restarted.path()).unwrap().mounts;
+    again
+        .mount("capped", Some(runtime::Nid::parse(&nid).unwrap()))
+        .await
+        .expect("remount after a restart");
+    let state = &again.states.iter().find(|(n, _)| n == "capped").unwrap().1;
+    assert_eq!(state.limits.analytics_memory_bytes, Some(1024));
+    assert_eq!(
+        state.limits.max_rows,
+        nuthatch::limits::Limits::process().max_rows
+    );
 }
