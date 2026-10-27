@@ -389,7 +389,7 @@ pub(crate) mod tests {
             crate::serve::SQL_MAX_HOT_INFLIGHT_BYTES,
             "more permits do not buy more hot copies"
         );
-        assert!(crate::serve::SQL_MAX_HOT_INFLIGHT_BYTES <= RESERVATION_MINIMUM_MB << 20);
+        const { assert!(crate::serve::SQL_MAX_HOT_INFLIGHT_BYTES <= RESERVATION_MINIMUM_MB << 20) };
     }
 
     /// Held by every test that sets or reads the `NUTHATCH_ANALYTICS_*` environment.
