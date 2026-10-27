@@ -1563,7 +1563,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "burrmill"
 version = "0.0.1"
-source = "git+https://github.com/nuthatch-org/burrmill?rev=ac36b838e7dd54a132a8ed59772efed4ed9e54b4#ac36b838e7dd54a132a8ed59772efed4ed9e54b4"
+source = "git+https://github.com/nuthatch-org/burrmill?rev=242d73eb2308744ead95e69aebf436b739bb3a43#242d73eb2308744ead95e69aebf436b739bb3a43"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.0",

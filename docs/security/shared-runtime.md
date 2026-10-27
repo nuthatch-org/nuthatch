@@ -114,8 +114,8 @@ Said plainly, because a shared runtime is a shared machine.
   egress the tenant chose (`nest load` lists them). An HTTPS endpoint on the operator's network is
   reachable from a tenant's offchain pull. Ingest faults are FR6.
 - **The engine itself.** A panic in a query is confined to its request; the fuzz target found one on
-  its first run (Burrmill `listcomp.rs:231` slices non-ASCII text after `[` mid-character), which is
-  Burrmill's to fix. A memory-safety bug in Burrmill, DataFusion or Arrow is not confined, and
+  its first run (Burrmill `listcomp.rs:231` sliced non-ASCII text after `[` mid-character), fixed
+  in burrmill 242d73e. A memory-safety bug in Burrmill, DataFusion or Arrow is not confined, and
   nothing here would contain one.
 - **`isolation = "shared"`.** Points 1 to 4 above do not apply. It remains right for one operator's
   own mounts.
