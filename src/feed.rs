@@ -1580,6 +1580,63 @@ mod tests {
         assert_eq!(tap.generation(), 1);
     }
 
+    /// What a delta tells a follower's derived state: a window's new rows, a reorg's dropped ones,
+    /// a seal's prune as no change at all, and rows sealed without passing through hot as unseen.
+    #[test]
+    fn a_delta_says_which_stored_rows_it_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
+        let mut sub = store.feed_subscribe().unwrap();
+        let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot.clone());
+        let mut next = || copy.apply(&sub.deltas.try_recv().unwrap()).unwrap();
+
+        store
+            .commit_window(&[row(1, 0, "t"), row(2, 0, "t")], None, 2)
+            .unwrap();
+        let window = next();
+        assert_eq!(window.added.len(), 2);
+        assert!(window.removed.is_empty());
+        assert_eq!(window.through, Some(2));
+
+        // A refetched row already held as it is changes nothing.
+        store.commit_window(&[row(2, 0, "t")], None, 2).unwrap();
+        let again = next();
+        assert!(again.added.is_empty() && again.removed.is_empty());
+
+        write_catalogue(tmp.path(), 1);
+        store
+            .prune_and_set_meta(1, 1, "sealed_through", "1")
+            .unwrap();
+        let seal = next();
+        assert!(seal.added.is_empty() && seal.removed.is_empty());
+        assert_eq!(
+            (seal.pruned, seal.through, seal.sealed_unseen),
+            (1, None, false)
+        );
+
+        store
+            .rollback_to_and_set_meta(1, "last_block", "1", &[])
+            .unwrap();
+        let reorg = next();
+        assert_eq!(reorg.removed, vec![row(2, 0, "t").1]);
+        assert_eq!(reorg.through, Some(1));
+
+        // Sealed straight to a segment: the catalogue grows and nothing left hot.
+        std::fs::write(
+            tmp.path()
+                .join(crate::seal::SEGMENTS_DIR)
+                .join(crate::seal::MANIFEST_FILE),
+            serde_json::json!({"tables": {"t": [
+                {"hash": "h1", "from_block": 1, "to_block": 1, "rows": 1, "file": "t-h1.parquet"},
+                {"hash": "h9", "from_block": 2, "to_block": 9, "rows": 40, "file": "t-h9.parquet"}]}})
+            .to_string(),
+        )
+        .unwrap();
+        store.set_meta("sealed_through", "9").unwrap();
+        assert!(next().sealed_unseen);
+        crate::seal::unpin_catalogue(tmp.path());
+    }
+
     /// A snapshot is read under the cap its dataset is given, a line at a time, its entity rows, meta,
     /// checkpoints and catalogue all counted against it. One over it in any of them keeps nothing;
     /// the lines either side of it read as they were sent.

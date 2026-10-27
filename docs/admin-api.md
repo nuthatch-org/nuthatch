@@ -480,6 +480,12 @@ and the catalogue as it stood at the commit, so a follower moves from "rows in h
 segment under the watermark" in one step. A follower reads the catalogue from the feed, never from
 the disk, which may already be a seal ahead of the generation it applied.
 
+**Derived state.** A follower feeds its own views and entities from the deltas: a window's new rows,
+and the rows a reorg drops (the one drop with no upper bound), but never a seal's prune, which moves
+rows without changing the history. A seal whose catalogue grows by more rows than it pruned from hot,
+as `--seal-direct` writes them, carried rows no delta did, and the follower rebuilds that dataset's
+derived state from the sealed segments.
+
 **A slow follower never slows the writer.** A follower more than 1,024 commits behind on a dataset is
 sent a fresh snapshot of it instead of the commits it missed, and nothing is gathered for the feed
 while nothing is following. The writer's own tip path is unchanged in either case.

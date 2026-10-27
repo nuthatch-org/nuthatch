@@ -11,9 +11,11 @@
 //! applied, reports how long the writer has been absent, and reconnects. A restarted writer is a new
 //! epoch, so the follower takes fresh snapshots, swapping each in only once it is complete.
 //!
-//! What a follower does not serve: state the writer derives in memory rather than stores, which is
-//! the built-in balance, exposure and velocity views and RFC-0041's entities. Those routes, and SQL
-//! that names an entity, answer `503` with `reason: "writer_only"` rather than an empty answer.
+//! State the writer derives in memory, the built-in balance, exposure and velocity views and
+//! RFC-0041's entities, the follower derives itself: rebuilt from its snapshot and the sealed
+//! segments as a writer's restart rebuilds it, then fed the rows each window stores or a reorg
+//! drops ([`crate::indexer::FollowerDerived`]). An entity that reads offchain tables is not
+//! maintained here; its routes, and SQL naming it, answer `503` with `reason: "writer_only"`.
 
 use crate::feed::{Line, MemStore};
 use crate::serve::{AppState, LiveRuntime, SharedNest};

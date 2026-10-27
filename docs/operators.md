@@ -265,11 +265,15 @@ the same `as_of`, `sealed_through` and `nid`.
   `applied_generation`, `writer_generation` and `lag_generations`, and `absent_for_secs` while the
   writer is away. A follower without its writer stays ready and keeps answering; it reports the
   absence rather than failing.
-- **What it does not serve.** State the writer derives in memory rather than stores: `/balances`,
-  `/balance/…`, `/exposure/…`, `/flags` and `/derived…`, and RFC-0041 entities. Those routes, and SQL
-  that names an entity, answer `503` with `"reason": "writer_only"`. A nest that declares entities has
-  its `/q/<name>` routes refused the same way, since a named query may read one. Send those to the
-  writer.
+- **Derived state, derived again.** What the writer keeps in memory rather than stores, the
+  balances, exposure and velocity views behind `/balances`, `/balance/…`, `/exposure/…` and `/flags`,
+  and RFC-0041 entities behind `/derived…`, `/sql` and `/q/<name>`, a follower builds for itself the
+  way a writer's restart does, from its snapshot and the sealed segments, and then feeds with the
+  rows each window stores and each reorg drops. The answers are the writer's. It costs a follower
+  what admission charges the writer for those views and entities, and building it makes a snapshot,
+  and a writer restart, slower to apply on a nest with a long history. One exception: an entity that
+  reads offchain tables is not maintained here, and its routes and SQL naming it answer `503` with
+  `"reason": "writer_only"`; send those to the writer.
 - **Its own budget.** A follower holds each dataset's hot window in memory, as the writer's `/sql`
   already copies it per query, and charges it to its cursor's `[runtime] max_rss_mb` from the
   runtime's `mounts.toml`, together with what admission charges each nest. A snapshot that would
