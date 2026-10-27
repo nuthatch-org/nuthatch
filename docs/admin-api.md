@@ -381,7 +381,9 @@ and both are safe to repeat, so a caller whose request timed out sends it again.
 `GET /_admin/feed` is what a follower (`nuthatch serve --runtime <dir> --follow <writer-url>`,
 RFC-0073 FR1) keeps its copy of the hot window from. It is behind the admin token like the rest of
 this surface, absent when the admin API is off, and answers `401` without the token. Nothing in it is
-meant for a person; it is documented so an operator knows what is on the wire.
+meant for a person; it is documented so an operator knows what is on the wire. `?exclude=` names
+datasets, comma-separated, whose snapshots and deltas are not sent: a follower asks it for a
+dataset whose snapshot ran past what it can hold.
 
 The answer is a stream of newline-delimited JSON, one connection for every mount:
 

@@ -273,10 +273,13 @@ the same `as_of`, `sealed_through` and `nid`.
 - **Its own budget.** A follower holds each dataset's hot window in memory, as the writer's `/sql`
   already copies it per query, and charges it to its cursor's `[runtime] max_rss_mb` from the
   runtime's `mounts.toml`, together with what admission charges each nest. A snapshot that would
-  not fit is read without keeping its rows, and a mount whose deltas grow it past the budget is let
-  go: either way its routes and its `/ready` answer `503` with `"reason": "over_budget"` and the
-  figures, the root `/ready` is `503`, and its co-mounts keep serving. The writer still serves it;
-  a later snapshot that fits, on a reconnect, lifts the refusal. Each mount's SQL surface, tenant share and `[mounts.limits]` come
+  not fit is read without keeping its rows; one whose bytes on the wire run past twice what its
+  cursor has left (escaping can inflate a stored row that much) is not read to the end at all, so no
+  single value in it is ever held, and the follower reconnects asking the writer to leave that
+  dataset out until `max_rss_mb` changes or the follower restarts. A mount whose deltas grow it past
+  the budget is let go too. Each way its routes and its `/ready` answer `503` with
+  `"reason": "over_budget"` and the figures, the root `/ready` is `503`, and its co-mounts keep
+  serving. The writer still serves it. Each mount's SQL surface, tenant share and `[mounts.limits]` come
   over the feed, so it admits and guards a query as the writer would, with its own per-chain gates
   and never wider than its own process values. It has no admin surface; mount changes, limits and
   shares go to the writer.
