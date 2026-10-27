@@ -410,6 +410,18 @@ impl axum::extract::FromRef<SharedNest> for AppState {
 /// a 404 *in the admin UI's own words* still tells an unauthenticated caller that this is a nuthatch
 /// with the admin surface switched off (#292).
 pub fn router(backing: SharedNest) -> Router {
+    let label = {
+        let s = backing.current();
+        match &s.runtime_health {
+            Some((name, _)) => name.clone(),
+            None => s.nest_info["name"].as_str().unwrap_or_default().to_string(),
+        }
+    };
+    mount_router(backing, &label)
+}
+
+/// [`router`] with its requests counted under `label` (RFC-0073 FR4), the route a runtime mounts it at.
+pub fn mount_router(backing: SharedNest, label: &str) -> Router {
     // Read once, at composition time: `admin_enabled` is derived from the process's flags and bind
     // (`indexer::admin_enabled`), so it is constant for the life of the endpoint - a hot swap (RFC-0020
     // slice 2) re-points the *data*, never the admin decision.
@@ -472,7 +484,13 @@ pub fn router(backing: SharedNest) -> Router {
     .layer(axum::middleware::from_fn({
         let ring = std::sync::Arc::new(crate::requests::RequestRing::default());
         let backing = backing.clone();
-        move |req, next| count_request(ring.clone(), backing.clone(), req, next)
+        let serving = crate::metrics::METRICS.serving(label);
+        move |req, next| {
+            crate::metrics::serve_for(
+                serving.clone(),
+                count_request(ring.clone(), backing.clone(), req, next),
+            )
+        }
     }))
     .with_state(backing)
 }
@@ -631,7 +649,7 @@ pub fn compose_runtime(
     for (name, nest) in shared {
         // `Router::nest` re-roots the whole per-nest router under `/<name>`, so `/lodestar/tables`,
         // `/lodestar/sql`, `/lodestar/_admin/` … all resolve to that nest's isolated state.
-        app = app.nest(&format!("/{name}"), router(nest));
+        app = app.nest(&format!("/{name}"), mount_router(nest, &name));
     }
     app
 }
@@ -4692,9 +4710,10 @@ async fn run_sql_query_at(
             },
         };
         let (st, sql) = (s.clone(), q.q.clone());
+        let scope = crate::metrics::serving_scope();
         match tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            remembered(&st, &sql, max_rows)
+            crate::metrics::within_serving_scope(scope, || remembered(&st, &sql, max_rows))
         })
         .await
         {
