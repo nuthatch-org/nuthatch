@@ -116,11 +116,110 @@ pub struct Delta {
 pub struct Snapshot {
     pub epoch: u64,
     pub generation: u64,
-    pub entities: Vec<(String, String)>,
-    pub meta: Vec<(String, String)>,
-    pub blocks: Vec<(String, String)>,
+    pub entities: Rows,
+    pub meta: BTreeMap<String, String>,
+    pub blocks: BTreeMap<String, String>,
     /// The catalogue's raw bytes, `None` where the dataset has never sealed.
     pub catalogue: Option<String>,
+}
+
+/// What a follower charges one stored row beyond its key and value: the map's node and two string
+/// headers, rounded up.
+pub const ROW_OVERHEAD: u64 = 96;
+
+/// The bytes a follower charges for holding `key` and `row`.
+pub fn row_bytes(key: &str, row: &str) -> u64 {
+    (key.len() + row.len()) as u64 + ROW_OVERHEAD
+}
+
+/// A snapshot's hot rows, sent as one JSON object and read into the map directly. Read under the cap
+/// [`read_lines`] sets for its dataset: past it, rows are counted and dropped rather than kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rows {
+    pub map: BTreeMap<String, String>,
+    /// The bytes the rows came to, set only when they went past the cap and none were kept.
+    pub over: Option<u64>,
+}
+
+impl Serialize for Rows {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        self.map.serialize(s)
+    }
+}
+
+thread_local! {
+    /// The cap for the snapshot being read on this thread, set by its dataset name ahead of it.
+    static ROWS_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// What [`read_lines`] was given to work a dataset's cap out with.
+    static CAP_FOR: std::cell::RefCell<Option<CapFor>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The most a dataset's snapshot rows may come to, `None` for no cap.
+pub type CapFor = Box<dyn Fn(&str) -> Option<u64>>;
+
+impl<'de> Deserialize<'de> for Rows {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Visit(Option<u64>);
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = Rows;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a map of entity key to stored row")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> std::result::Result<Rows, A::Error> {
+                let mut rows = Rows::default();
+                let mut bytes = 0u64;
+                while let Some((k, v)) = access.next_entry::<String, String>()? {
+                    bytes += row_bytes(&k, &v);
+                    if self.0.is_some_and(|cap| bytes > cap) {
+                        rows.map.clear();
+                        rows.over = Some(bytes);
+                    } else if rows.over.is_none() {
+                        rows.map.insert(k, v);
+                    }
+                }
+                if rows.over.is_some() {
+                    rows.over = Some(bytes);
+                }
+                Ok(rows)
+            }
+        }
+        d.deserialize_map(Visit(ROWS_CAP.with(|c| c.get())))
+    }
+}
+
+/// A snapshot's dataset name, whose reading sets the cap its rows, which follow it, are read under.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct DatasetName(pub String);
+
+impl<'de> Deserialize<'de> for DatasetName {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let name = String::deserialize(d)?;
+        let cap = CAP_FOR.with(|f| f.borrow().as_ref().and_then(|f| f(&name)));
+        ROWS_CAP.with(|c| c.set(cap));
+        Ok(DatasetName(name))
+    }
+}
+
+/// Read the feed's lines from `body` as they arrive, never holding a whole line's text, handing each
+/// to `each` until it returns false. Blocking: run it on its own thread.
+pub fn read_lines(
+    body: impl std::io::Read,
+    cap_for: CapFor,
+    mut each: impl FnMut(Line) -> bool,
+) -> Result<()> {
+    CAP_FOR.with(|f| *f.borrow_mut() = Some(cap_for));
+    for line in serde_json::Deserializer::from_reader(body).into_iter::<Line>() {
+        ROWS_CAP.with(|c| c.set(None));
+        if !each(line.context("an unreadable line on the feed")?) {
+            break;
+        }
+    }
+    CAP_FOR.with(|f| *f.borrow_mut() = None);
+    Ok(())
 }
 
 /// A mount's resolved guards ([`crate::limits::Limits`]) as the feed carries them.
@@ -212,12 +311,19 @@ pub enum Line {
         share: Option<crate::runtime::TenantShare>,
         #[serde(default)]
         limits: Option<WireLimits>,
+        /// The chain whose cursor the mount is on, which a follower charges its memory to.
+        #[serde(default)]
+        chain: Option<String>,
     },
+    /// Every route mounted when the connection opened has been sent: a route not named by now does
+    /// not exist, rather than not having arrived yet.
+    Mounted,
     Unmount {
         route: String,
     },
+    /// `dataset` before `snapshot`: reading the name sets the cap the rows are read under.
     Snapshot {
-        dataset: String,
+        dataset: DatasetName,
         snapshot: Snapshot,
     },
     Delta {
@@ -385,15 +491,26 @@ struct Mirror {
     blocks: BTreeMap<String, String>,
     epoch: u64,
     generation: u64,
+    /// What the three tables are charged, by [`row_bytes`].
+    bytes: u64,
+}
+
+/// Insert into `map`, keeping `bytes` the charge for what it holds.
+fn put(map: &mut BTreeMap<String, String>, bytes: &mut u64, key: &str, value: &str) {
+    *bytes += row_bytes(key, value);
+    if let Some(old) = map.insert(key.to_string(), value.to_string()) {
+        *bytes -= row_bytes(key, &old);
+    }
+}
+
+fn charge(map: &BTreeMap<String, String>) -> u64 {
+    map.iter().map(|(k, v)| row_bytes(k, v)).sum()
 }
 
 impl Mirror {
-    fn apply(&mut self, op: &Op) -> bool {
+    fn apply(&mut self, op: &Op) {
         match op {
-            Op::Put { key, row } => {
-                self.entities.insert(key.clone(), row.clone());
-                true
-            }
+            Op::Put { key, row } => put(&mut self.entities, &mut self.bytes, key, row),
             Op::Drop { from, to } => {
                 let doomed: Vec<String> = match to {
                     Some(to) => self
@@ -408,29 +525,26 @@ impl Mirror {
                         .collect(),
                 };
                 for k in &doomed {
-                    self.entities.remove(k);
+                    if let Some(v) = self.entities.remove(k) {
+                        self.bytes -= row_bytes(k, &v);
+                    }
                 }
-                !doomed.is_empty()
             }
-            Op::Meta { key, value } => {
-                self.meta.insert(key.clone(), value.clone());
-                false
-            }
+            Op::Meta { key, value } => put(&mut self.meta, &mut self.bytes, key, value),
             Op::Unmeta { key } => {
-                self.meta.remove(key);
-                false
+                if let Some(v) = self.meta.remove(key) {
+                    self.bytes -= row_bytes(key, &v);
+                }
             }
-            Op::Block { key, record } => {
-                self.blocks.insert(key.clone(), record.clone());
-                false
-            }
+            Op::Block { key, record } => put(&mut self.blocks, &mut self.bytes, key, record),
             Op::Unblock { key } => {
-                self.blocks.remove(key);
-                false
+                if let Some(v) = self.blocks.remove(key) {
+                    self.bytes -= row_bytes(key, &v);
+                }
             }
             Op::UnblockFrom { key } => {
-                self.blocks.split_off(key);
-                false
+                let gone = self.blocks.split_off(key);
+                self.bytes -= charge(&gone);
             }
         }
     }
@@ -455,14 +569,18 @@ pub struct MemStore {
 
 impl MemStore {
     pub fn from_snapshot(dir: &Path, snapshot: Snapshot) -> MemStore {
+        let entities = snapshot.entities.map;
+        let meta: BTreeMap<String, String> = snapshot
+            .meta
+            .into_iter()
+            .filter(|(k, _)| mirrored_meta(k))
+            .collect();
+        let blocks = snapshot.blocks;
         let mirror = Mirror {
-            entities: snapshot.entities.into_iter().collect(),
-            meta: snapshot
-                .meta
-                .into_iter()
-                .filter(|(k, _)| mirrored_meta(k))
-                .collect(),
-            blocks: snapshot.blocks.into_iter().collect(),
+            bytes: charge(&entities) + charge(&meta) + charge(&blocks),
+            entities,
+            meta,
+            blocks,
             epoch: snapshot.epoch,
             generation: snapshot.generation,
         };
@@ -473,6 +591,11 @@ impl MemStore {
             rows: AtomicU64::new(rows_epoch()),
             dir: dir.to_path_buf(),
         }
+    }
+
+    /// What this copy is charged against its cursor's budget, by [`row_bytes`].
+    pub fn bytes(&self) -> u64 {
+        self.read().bytes
     }
 
     /// `(epoch, generation)` of the last delta applied.
@@ -539,14 +662,14 @@ pub struct MirroredTables {
 impl MirroredTables {
     pub fn of(snapshot: &Snapshot) -> MirroredTables {
         MirroredTables {
-            entities: snapshot.entities.iter().cloned().collect(),
+            entities: snapshot.entities.map.clone(),
             meta: snapshot
                 .meta
                 .iter()
                 .filter(|(k, _)| mirrored_meta(k))
-                .cloned()
+                .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            blocks: snapshot.blocks.iter().cloned().collect(),
+            blocks: snapshot.blocks.clone(),
         }
     }
 }

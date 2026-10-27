@@ -894,28 +894,28 @@ impl Store {
                 let (k, v) = row?;
                 snapshot
                     .entities
-                    .push((k.value().to_string(), v.value().to_string()));
+                    .map
+                    .insert(k.value().to_string(), v.value().to_string());
             }
             for row in rtx.open_table(META)?.iter()? {
                 let (k, v) = row?;
                 if crate::feed::mirrored_meta(k.value()) {
                     snapshot
                         .meta
-                        .push((k.value().to_string(), v.value().to_string()));
+                        .insert(k.value().to_string(), v.value().to_string());
                 }
             }
             for row in rtx.open_table(BLOCKS)?.iter()? {
                 let (k, v) = row?;
                 snapshot
                     .blocks
-                    .push((k.value().to_string(), v.value().to_string()));
+                    .insert(k.value().to_string(), v.value().to_string());
             }
             drop(rtx);
             let sealed = snapshot
                 .meta
-                .iter()
-                .find(|(k, _)| k == "sealed_through")
-                .and_then(|(_, v)| v.parse().ok())
+                .get("sealed_through")
+                .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
             snapshot.catalogue = self.tap.catalogue();
             // A seal between its catalogue and its commit: take the snapshot again after the commit.

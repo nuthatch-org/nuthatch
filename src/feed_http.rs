@@ -33,6 +33,7 @@ pub struct Served {
     pub tenant: Option<String>,
     pub share: Option<crate::runtime::TenantShare>,
     pub limits: crate::limits::Limits,
+    pub chain: String,
     pub store: Arc<dyn HotStore>,
 }
 
@@ -52,6 +53,7 @@ impl Served {
             share: tenant.as_ref().and_then(|t| shares.get(t).copied()),
             tenant,
             limits: state.limits,
+            chain: state.chain.clone(),
             store: state.store.clone(),
         }
     }
@@ -166,6 +168,7 @@ async fn serve_connection(s: FeedState, tx: mpsc::Sender<bytes::Bytes>) {
         return;
     }
     let mut routes: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut announced = false;
     let mut forwarders = Forwarders(HashMap::new());
     let mut stores: BTreeMap<String, Arc<dyn HotStore>> = BTreeMap::new();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_EVERY);
@@ -192,12 +195,19 @@ async fn serve_connection(s: FeedState, tx: mpsc::Sender<bytes::Bytes>) {
                         tenant: m.tenant.clone(),
                         share: m.share,
                         limits: Some((&m.limits).into()),
+                        chain: Some(m.chain.clone()),
                     });
                     if routes.get(route).is_some_and(|sent| sent[..] == mount[..]) {
                         continue;
                     }
                     routes.insert(route.clone(), mount.to_vec());
                     if tx.send(mount).await.is_err() {
+                        return;
+                    }
+                }
+                if !announced {
+                    announced = true;
+                    if tx.send(line(&Line::Mounted)).await.is_err() {
                         return;
                     }
                 }
@@ -247,7 +257,7 @@ async fn forward(dataset: String, store: Arc<dyn HotStore>, tx: mpsc::Sender<byt
             let sub = st.feed_subscribe()?;
             Ok::<_, anyhow::Error>(sub.map(|sub| {
                 let bytes = line(&Line::Snapshot {
-                    dataset: ds,
+                    dataset: crate::feed::DatasetName(ds),
                     snapshot: sub.snapshot,
                 });
                 (bytes, sub.deltas)

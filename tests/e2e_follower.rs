@@ -29,7 +29,13 @@ struct Writer {
 
 impl Writer {
     fn start(root: &Path, tape: Arc<TapeSource>, port: u16) -> Writer {
+        Writer::start_many(root, tape, port, &[ROUTE])
+    }
+
+    /// One cursor over every nest named, each at `data/<route>`; `store` is the first one's.
+    fn start_many(root: &Path, tape: Arc<TapeSource>, port: u16, routes: &[&str]) -> Writer {
         let root = root.to_path_buf();
+        let routes: Vec<String> = routes.iter().map(|r| r.to_string()).collect();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -37,13 +43,19 @@ impl Writer {
                 .build()
                 .unwrap();
             let (addr, store) = rt.block_on(async {
-                let dir = root.join("data").join(ROUTE);
-                let config = nuthatch::config::Config::load(&dir).unwrap();
                 let health = Arc::new(RuntimeHealth::new());
-                health.register(ROUTE, "arbitrum-one");
+                let nests = routes
+                    .iter()
+                    .map(|route| {
+                        let dir = root.join("data").join(route);
+                        let config = nuthatch::config::Config::load(&dir).unwrap();
+                        health.register(route, "arbitrum-one");
+                        (route.clone(), dir, config)
+                    })
+                    .collect();
                 let cursor = indexer::spawn_runtime(
                     tape,
-                    vec![(ROUTE.to_string(), dir, config)],
+                    nests,
                     None,
                     false,
                     1,
@@ -311,7 +323,8 @@ async fn a_route_is_catching_up_until_its_snapshot_and_derived_state_is_the_writ
     tape.insert_block(1, block(1, 0, 5));
     tape.advance_tip_to(1);
 
-    // Nobody listening at the writer's address: nothing has been snapshotted.
+    // Nobody listening at the writer's address: it cannot say what exists, so nothing is ready and
+    // an unheard-of route is catching up rather than absent.
     let (_f, base) = {
         let follower = Follower::start(
             via.clone(),
@@ -325,11 +338,11 @@ async fn a_route_is_catching_up_until_its_snapshot_and_derived_state_is_the_writ
         (follower, format!("http://{addr}"))
     };
     let (status, ready) = get(&base, "/ready").await;
-    assert_eq!(
-        status, 200,
-        "nothing mounted is nothing to wait for: {ready}"
-    );
+    assert_eq!(status, 503, "{ready}");
     assert_eq!(ready["writer"], "absent");
+    assert_eq!(ready["mounts_known"], false);
+    let (status, body) = get(&base, &format!("/{ROUTE}/tables")).await;
+    assert_eq!((status, &body["reason"]), (503, &"catching_up".into()));
 
     let writer = Writer::start(&root, tape.clone(), 0);
     let (_g, fbase) = bind_follower(&via, &writer).await;
@@ -339,7 +352,7 @@ async fn a_route_is_catching_up_until_its_snapshot_and_derived_state_is_the_writ
         if status == 503 {
             assert_eq!(body["reason"], "catching_up", "{body}");
         } else {
-            assert_eq!(status, 200);
+            assert_eq!(status, 200, "{body}");
             caught = true;
             break;
         }
@@ -354,5 +367,117 @@ async fn a_route_is_catching_up_until_its_snapshot_and_derived_state_is_the_writ
     let (status, root_ready) = get(&fbase, "/ready").await;
     assert_eq!(status, 200, "{root_ready}");
     assert_eq!(root_ready["nests"][ROUTE]["ready"], true);
+    writer.stop(&root);
+}
+
+async fn route_status(base: &str, route: &str) -> (u16, serde_json::Value) {
+    get(base, &format!("/{route}/tables")).await
+}
+
+/// A follower charges each dataset's hot copy, and its nest's admission estimate, to its cursor's
+/// `max_rss_mb`. A snapshot that would not fit is refused by name while its co-mount serves, and a
+/// mount that grows past the budget through its deltas is let go the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_over_the_cursor_budget_is_refused_and_its_co_mount_serves() {
+    const SMALL: &str = "arb";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("runtime");
+    std::fs::create_dir_all(&root).unwrap();
+    // 12 MiB: each nest is charged 5 by admission, and the padded one's hot rows come to about 14.
+    std::fs::write(
+        root.join(nuthatch::runtime::MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\nmax_rss_mb = 12\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+         chain_id = 42161\nrpc_urls = []\n",
+    )
+    .unwrap();
+    for (route, address) in [(ROUTE, USDC), (SMALL, ARB)] {
+        let dir = root.join("data").join(route);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_nest(&dir, route, address);
+    }
+    let via: PathBuf = tmp.path().join("follower-view");
+    std::os::unix::fs::symlink(&root, &via).unwrap();
+
+    let tape = Arc::new(TapeSource::new());
+    let mut padded = block(1, 0, 100);
+    pad_address_to_seal(&mut padded, USDC, 0);
+    padded.logs.push(transfer_log(
+        ARB,
+        1,
+        padded.logs.len() as u64,
+        &padded.hash.clone(),
+        &account(3),
+        &account(4),
+        7,
+    ));
+    tape.insert_block(1, padded);
+    tape.advance_tip_to(1);
+    let writer = Writer::start_many(&root, tape.clone(), 0, &[ROUTE, SMALL]);
+    writer.reaches(1).await;
+
+    let (_f, fbase) = bind_follower(&via, &writer).await;
+    let mut seen = (0, serde_json::Value::Null);
+    for _ in 0..400 {
+        seen = route_status(&fbase, SMALL).await;
+        if seen.0 == 200 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(seen.0, 200, "the co-mount serves: {}", seen.1);
+    let small_sql = "SELECT count(*) AS n FROM arb__transfer";
+    let wbase = format!("http://{}", writer.addr);
+    let resp = |base: String| async move {
+        reqwest::Client::new()
+            .get(format!("{base}/{SMALL}/sql"))
+            .query(&[("q", small_sql)])
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["rows"]
+            .clone()
+    };
+    assert_eq!(resp(fbase.clone()).await, resp(wbase).await);
+
+    let mut big = route_status(&fbase, ROUTE).await;
+    for _ in 0..400 {
+        if big.1["reason"] != "catching_up" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        big = route_status(&fbase, ROUTE).await;
+    }
+    let (status, body) = big;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["reason"], "over_budget", "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("max_rss_mb 12"),
+        "{body}"
+    );
+    let (status, ready) = get(&fbase, &format!("/{ROUTE}/ready")).await;
+    assert_eq!((status, &ready["reason"]), (503, &"over_budget".into()));
+    let (status, root_ready) = get(&fbase, "/ready").await;
+    assert_eq!(status, 503, "{root_ready}");
+    assert_eq!(root_ready["nests"][ROUTE]["reason"], "over_budget");
+    assert_eq!(root_ready["nests"][SMALL]["ready"], true);
+
+    // The co-mount's own deltas take it past what its cursor has left: it is let go by name.
+    let mut grown = block(2, 0, 1);
+    pad_address_to_seal(&mut grown, ARB, 0);
+    tape.insert_block(2, grown);
+    tape.advance_tip_to(2);
+    writer.reaches(2).await;
+    let mut refused = serde_json::Value::Null;
+    for _ in 0..400 {
+        let (status, body) = route_status(&fbase, SMALL).await;
+        if status == 503 {
+            refused = body;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(refused["reason"], "over_budget", "{refused}");
     writer.stop(&root);
 }

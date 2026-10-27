@@ -91,6 +91,7 @@ struct Spec {
     tenant: Option<String>,
     share: Option<crate::runtime::TenantShare>,
     limits: Option<crate::feed::WireLimits>,
+    chain: Option<String>,
 }
 
 struct Route {
@@ -110,6 +111,63 @@ struct Inner {
     /// The writer's `(epoch, generation)` per dataset at its last heartbeat.
     positions: HashMap<String, (u64, u64)>,
     link: Link,
+    /// Whether a connection has delivered the writer's whole mount set, so that a route not in it
+    /// does not exist rather than not having arrived yet.
+    mounts_known: bool,
+    /// The per-cursor budget, `[runtime] max_rss_mb`, as the writer's admission reads it.
+    max_rss_mb: u64,
+    /// What admission charges each dataset's nest besides its hot rows, in bytes.
+    estimates: HashMap<String, u64>,
+    /// Datasets whose hot copy would not fit their cursor's budget, with why.
+    over_budget: HashMap<String, String>,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// The runtime's per-cursor budget in MiB, read from its `mounts.toml` as the writer reads it.
+fn max_rss_mb(root: &Path) -> u64 {
+    crate::runtime::MountTable::load(root)
+        .ok()
+        .and_then(|t| t.runtime.max_rss_mb)
+        .unwrap_or(crate::runtime::DEFAULT_MAX_RSS_MB)
+}
+
+/// What the writer's admission charges `dir`'s nest besides its store, in bytes.
+fn nest_estimate(dir: &Path) -> u64 {
+    let Ok(config) = crate::config::Config::load(dir) else {
+        return 0;
+    };
+    let (count, rows) = crate::runtime::declared_entities(dir);
+    let labels = !crate::labels::load(dir).is_empty();
+    crate::runtime::estimate_nest_rss_mb(&config, labels, count, rows) * MIB
+}
+
+fn budget_reason(dataset: &str, held: u64, cap: u64, max_rss_mb: u64) -> String {
+    format!(
+        "{dataset}'s hot rows come to {held} bytes, over the {cap} its cursor has left of \
+         max_rss_mb {max_rss_mb} here; the writer still serves it"
+    )
+}
+
+/// The feed's body as a blocking reader over the chunks the connection delivers, so a line is parsed
+/// as it arrives and its text is never held whole.
+struct ChunkReader {
+    rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    cur: bytes::Bytes,
+}
+
+impl std::io::Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.cur.is_empty() {
+            match self.rx.blocking_recv() {
+                Some(chunk) => self.cur = chunk,
+                None => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.cur.len());
+        buf[..n].copy_from_slice(&self.cur.split_to(n));
+        Ok(n)
+    }
 }
 
 /// A running follower: its state, and the composition it serves.
@@ -127,7 +185,6 @@ impl Follower {
     /// Start following `writer` for the runtime at `root`.
     pub fn start(root: PathBuf, writer: String, token: String) -> Arc<Follower> {
         let follower = Arc::new(Follower {
-            root,
             writer: writer.trim_end_matches('/').to_string(),
             token,
             live: LiveRuntime::new(axum::Router::new()),
@@ -135,12 +192,17 @@ impl Follower {
                 routes: BTreeMap::new(),
                 datasets: HashMap::new(),
                 positions: HashMap::new(),
+                mounts_known: false,
+                max_rss_mb: max_rss_mb(&root),
+                estimates: HashMap::new(),
+                over_budget: HashMap::new(),
                 link: Link {
                     connected: false,
                     since: Instant::now(),
                     version: None,
                 },
             }),
+            root,
             gates: Mutex::default(),
         });
         follower.recompose();
@@ -198,26 +260,96 @@ impl Follower {
             inner.link.connected = true;
             inner.link.since = Instant::now();
         }
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+        let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<Line>(16);
         let mut body = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
+        let pump = tokio::spawn(async move {
+            loop {
+                let chunk = match tokio::time::timeout(SILENCE, body.next()).await {
+                    Err(_) => bail!("the writer has been silent for {}s", SILENCE.as_secs()),
+                    Ok(None) => return Ok(()),
+                    Ok(Some(chunk)) => chunk
+                        .map_err(reqwest::Error::without_url)
+                        .context("reading the feed")?,
+                };
+                if chunk_tx.send(chunk).await.is_err() {
+                    return Ok(());
+                }
+            }
+        });
+        let weak = Arc::downgrade(self);
+        let parser = tokio::task::spawn_blocking(move || {
+            let reader = std::io::BufReader::new(ChunkReader {
+                rx: chunk_rx,
+                cur: bytes::Bytes::new(),
+            });
+            let cap_for: crate::feed::CapFor =
+                Box::new(move |dataset| weak.upgrade().and_then(|f| f.cap_for(dataset)));
+            crate::feed::read_lines(reader, cap_for, |line| line_tx.blocking_send(line).is_ok())
+        });
         // Datasets snapshotted on this connection: a delta for any other is a gap.
         let mut fresh: BTreeSet<String> = BTreeSet::new();
-        loop {
-            let chunk = match tokio::time::timeout(SILENCE, body.next()).await {
-                Err(_) => bail!("the writer has been silent for {}s", SILENCE.as_secs()),
-                Ok(None) => return Ok(()),
-                Ok(Some(chunk)) => chunk
-                    .map_err(reqwest::Error::without_url)
-                    .context("reading the feed")?,
-            };
-            buf.extend_from_slice(&chunk);
-            while let Some(end) = buf.iter().position(|b| *b == b'\n') {
-                let raw: Vec<u8> = buf.drain(..=end).collect();
-                let line: Line =
-                    serde_json::from_slice(&raw).context("an unreadable line on the feed")?;
+        let handled = async {
+            while let Some(line) = line_rx.recv().await {
                 self.handle(line, &mut fresh).await?;
             }
+            Ok::<_, anyhow::Error>(())
         }
+        .await;
+        drop(line_rx);
+        pump.abort();
+        handled?;
+        let pumped = pump.await.unwrap_or(Ok(()));
+        parser.await.context("the feed parser stopped")??;
+        pumped
+    }
+
+    /// The most `dataset`'s snapshot may hold: its cursor's budget, less what the other datasets held
+    /// on that cursor take and what admission charges this one's nest. `None` before its mount is
+    /// known.
+    fn cap_for(&self, dataset: &str) -> Option<u64> {
+        let inner = self.lock();
+        let chain = inner
+            .routes
+            .values()
+            .find(|r| r.spec.dataset == dataset)?
+            .spec
+            .chain
+            .clone();
+        let others: u64 = inner
+            .routes
+            .values()
+            .filter(|r| r.spec.chain == chain && r.spec.dataset != dataset)
+            .map(|r| r.spec.dataset.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|d| {
+                let held = inner.datasets.get(d)?;
+                Some(held.bytes() + inner.estimates.get(d).copied().unwrap_or(0))
+            })
+            .sum();
+        let own = inner.estimates.get(dataset).copied().unwrap_or(0);
+        Some((inner.max_rss_mb * MIB).saturating_sub(others + own))
+    }
+
+    /// Whether `dataset`'s cursor holds more than its budget, and by how much, with this dataset's
+    /// share of it.
+    fn over_budget(&self, dataset: &str) -> Option<String> {
+        let cap = self.cap_for(dataset)?;
+        let held = self.lock().datasets.get(dataset)?.bytes();
+        (held > cap).then(|| budget_reason(dataset, held, cap, self.lock().max_rss_mb))
+    }
+
+    /// Stop holding `dataset`, and serve its routes the reason.
+    fn refuse(self: &Arc<Self>, dataset: &str, why: String) {
+        tracing::warn!("{dataset}: {why}");
+        {
+            let mut inner = self.lock();
+            inner.datasets.remove(dataset);
+            inner.over_budget.insert(dataset.to_string(), why);
+        }
+        crate::seal::unpin_catalogue(&self.root.join(dataset));
+        self.recompose();
     }
 
     async fn handle(self: &Arc<Self>, line: Line, fresh: &mut BTreeSet<String>) -> Result<()> {
@@ -242,7 +374,9 @@ impl Follower {
                 tenant,
                 share,
                 limits,
+                chain,
             } => {
+                let estimate = nest_estimate(&self.root.join(&dataset));
                 let spec = Spec {
                     dataset,
                     nid,
@@ -253,9 +387,11 @@ impl Follower {
                     tenant,
                     share,
                     limits,
+                    chain,
                 };
                 {
                     let mut inner = self.lock();
+                    inner.estimates.insert(spec.dataset.clone(), estimate);
                     // A reconnect repeats every mount; only a changed one is rebuilt.
                     if inner.routes.get(&route).is_some_and(|r| r.spec == spec) {
                         return Ok(());
@@ -263,6 +399,14 @@ impl Follower {
                     inner.routes.insert(route, Route { spec, served: None });
                 }
                 self.realise();
+                self.recompose();
+            }
+            Line::Mounted => {
+                {
+                    let mut inner = self.lock();
+                    inner.mounts_known = true;
+                    inner.max_rss_mb = max_rss_mb(&self.root);
+                }
                 self.recompose();
             }
             Line::Unmount { route } => {
@@ -280,24 +424,51 @@ impl Follower {
                 self.recompose();
             }
             Line::Snapshot { dataset, snapshot } => {
+                let dataset = dataset.0;
+                fresh.insert(dataset.clone());
+                // Read under its cap, so a snapshot over budget arrives holding no rows.
+                if let Some(held) = snapshot.entities.over {
+                    let cap = self.cap_for(&dataset).unwrap_or(0);
+                    let max = self.lock().max_rss_mb;
+                    self.refuse(&dataset, budget_reason(&dataset, held, cap, max));
+                    return Ok(());
+                }
                 let dir = self.root.join(&dataset);
                 let store = tokio::task::spawn_blocking(move || {
                     Arc::new(MemStore::from_snapshot(&dir, snapshot))
                 })
                 .await
                 .context("building a snapshot's store")?;
-                self.lock().datasets.insert(dataset.clone(), store);
-                fresh.insert(dataset);
+                let lifted = {
+                    let mut inner = self.lock();
+                    inner.datasets.insert(dataset.clone(), store);
+                    inner.over_budget.remove(&dataset).is_some()
+                };
                 self.realise();
+                if lifted {
+                    self.recompose();
+                }
             }
             Line::Delta { dataset, delta } => {
-                let store = self.lock().datasets.get(&dataset).cloned();
+                let (store, refused) = {
+                    let inner = self.lock();
+                    (
+                        inner.datasets.get(&dataset).cloned(),
+                        inner.over_budget.contains_key(&dataset),
+                    )
+                };
+                if refused {
+                    return Ok(());
+                }
                 let applied = match (fresh.contains(&dataset), store) {
                     (true, Some(store)) => store.apply(&delta).map_err(anyhow::Error::from),
                     _ => Err(anyhow::anyhow!("a delta before its snapshot")),
                 };
                 // The old state keeps serving while a new connection takes fresh snapshots.
                 applied.with_context(|| format!("{dataset}: resnapshotting"))?;
+                if let Some(why) = self.over_budget(&dataset) {
+                    self.refuse(&dataset, why);
+                }
             }
             Line::Heartbeat { positions } => {
                 self.lock().positions = positions.into_iter().collect();
@@ -454,6 +625,13 @@ impl Follower {
                 }),
             );
         for (route, r) in &inner.routes {
+            if let Some(why) = inner.over_budget.get(&r.spec.dataset) {
+                app = app.nest(
+                    &format!("/{route}"),
+                    refusing("over_budget", format!("'{route}' is not held here: {why}")),
+                );
+                continue;
+            }
             let sub = match &r.served {
                 Some(Ok(shared)) => {
                     let entities = crate::entities::load(&self.root.join(&r.spec.dataset))
@@ -478,6 +656,12 @@ impl Follower {
                 ),
             };
             app = app.nest(&format!("/{route}"), sub);
+        }
+        if !inner.mounts_known {
+            app = app.merge(refusing(
+                "catching_up",
+                "this follower has not yet heard the writer's mounts".to_string(),
+            ));
         }
         self.live.swap(app);
     }
@@ -508,6 +692,15 @@ impl Follower {
         let Some(r) = inner.routes.get(route) else {
             return StatusCode::NOT_FOUND.into_response();
         };
+        if let Some(why) = inner.over_budget.get(&r.spec.dataset) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "ready": false, "nest": route, "reason": "over_budget", "error": why,
+                })),
+            )
+                .into_response();
+        }
         let Some(store) = inner.datasets.get(&r.spec.dataset) else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -536,13 +729,19 @@ impl Follower {
     fn root_ready(&self) -> Response {
         let inner = self.lock();
         let mut nests = serde_json::Map::new();
-        let mut all = true;
+        let mut all = inner.mounts_known;
         for (route, r) in &inner.routes {
-            let ready =
-                inner.datasets.contains_key(&r.spec.dataset) && matches!(r.served, Some(Ok(_)));
+            let refused = inner.over_budget.get(&r.spec.dataset);
+            let ready = refused.is_none()
+                && inner.datasets.contains_key(&r.spec.dataset)
+                && matches!(r.served, Some(Ok(_)));
             all &= ready;
             let mut v = self.lag(&inner, &r.spec.dataset);
             v["ready"] = ready.into();
+            if let Some(why) = refused {
+                v["reason"] = "over_budget".into();
+                v["error"] = why.as_str().into();
+            }
             nests.insert(route.clone(), v);
         }
         let status = if all {
@@ -556,6 +755,7 @@ impl Follower {
                 "ready": all,
                 "follower": true,
                 "writer": if inner.link.connected { "connected" } else { "absent" },
+                "mounts_known": inner.mounts_known,
                 "nests": nests,
             })),
         )
