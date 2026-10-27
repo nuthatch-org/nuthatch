@@ -513,6 +513,7 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
             .route("/shape", get(shape))
             .route("/api", get(etherscan_api)),
     ))
+    .route_layer(axum::middleware::from_fn(crate::cost::layer))
     // Count every served request for `/metrics` (the operator's billing signal), and keep the last
     // few for `/_admin/requests` (RFC-0069 G1). The ring belongs to the route set, so a hot swap of
     // the backing keeps it.
@@ -1032,7 +1033,8 @@ pub fn cors_layer(origins: &[String]) -> Result<Option<tower_http::cors::CorsLay
         CorsLayer::new()
             .allow_origin(allow)
             .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-            .allow_headers(AllowHeaders::mirror_request()),
+            .allow_headers(AllowHeaders::mirror_request())
+            .expose_headers([axum::http::HeaderName::from_static(crate::cost::HEADER)]),
     ))
 }
 
@@ -3767,7 +3769,10 @@ pub(crate) async fn admit_to(
     let Some(_slot) = QueueSlot::take(queued, cap) else {
         return Err(busy());
     };
-    match tokio::time::timeout(SQL_ADMISSION_WAIT, Arc::clone(gate).acquire_owned()).await {
+    let asked = std::time::Instant::now();
+    let waited = tokio::time::timeout(SQL_ADMISSION_WAIT, Arc::clone(gate).acquire_owned()).await;
+    crate::cost::queued(asked.elapsed());
+    match waited {
         Ok(Ok(permit)) => Ok(permit),
         _ => Err(busy()),
     }
@@ -3779,7 +3784,7 @@ async fn admitted<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> std::result::Result<T, axum::response::Response> {
     let permit = admit(s).await?;
-    tokio::task::spawn_blocking(move || {
+    crate::cost::spawn_blocking(move || {
         let _permit = permit;
         work()
     })
@@ -3861,6 +3866,7 @@ async fn table(
         Ok(hot) => hot,
         Err(refused) => return refused,
     };
+    crate::cost::hot_rows(items.len() as u64);
 
     // Fill from cold (sealed segments) if the hot store didn't satisfy the limit. This runs under
     // the same analytical admission gate as `/sql`; if it's saturated we serve the hot rows we
@@ -3891,7 +3897,7 @@ async fn table(
                 let declared = Arc::clone(&s.tables);
                 let tenant = s.isolation.clone();
                 let guard = s.query_guard(s.limits.timeout, need);
-                match tokio::task::spawn_blocking(move || {
+                match crate::cost::spawn_blocking(move || {
                     let _permit = permit; // held for the whole blocking query
                                           // Declared, so a table nothing has been sealed for yet reads empty, not failed.
                     let hot = analytics::HotRows::new();
@@ -4030,10 +4036,13 @@ async fn entity(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoR
     // Hot path first (redb). On a miss, fall back to the sealed segments (Burrmill), so a point-read
     // keeps working across the hot→cold seam even after the hot store has been pruned.
     match s.store.get_entity(&id) {
-        Ok(Some(raw)) => match serde_json::from_str::<Value>(&raw) {
-            Ok(v) => return Json(v).into_response(),
-            Err(e) => return error(format!("{e:#}")),
-        },
+        Ok(Some(raw)) => {
+            crate::cost::hot_rows(1);
+            return match serde_json::from_str::<Value>(&raw) {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => error(format!("{e:#}")),
+            };
+        }
         Ok(None) => {}
         Err(e) => return error(format!("{e:#}")),
     }
@@ -4046,10 +4055,11 @@ async fn entity(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoR
                 Ok(p) => p,
                 Err(refused) => return refused,
             };
+            crate::cost::queued(admission.elapsed());
             let guard = s.query_guard(s.limits.timeout.saturating_sub(admission.elapsed()), 1);
             let dir = s.dir.clone();
             let tenant = s.isolation.clone();
-            let sealed = tokio::task::spawn_blocking(move || {
+            let sealed = crate::cost::spawn_blocking(move || {
                 let _permit = permit;
                 analytics::isolated(tenant.as_ref(), || {
                     analytics::get_row_guarded(&dir, block, log_index, guard)
@@ -4353,7 +4363,7 @@ async fn named_scan(
     let guard = s.query_guard(s.limits.timeout, s.limits.max_rows);
     let hot_charge = s.hot_charge();
     let tenant = s.isolation.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<NamedRun> {
+    crate::cost::spawn_blocking(move || -> anyhow::Result<NamedRun> {
         let _permit = permit;
         let started = std::time::Instant::now();
         let catalogue_hash = crate::seal::catalogue_hash(&dir)?;
@@ -4386,6 +4396,7 @@ async fn named_scan(
         let (snapshot, _hot_permit) =
             charged_hot_rows(store.as_ref(), &hot_charge, (max_hot_rows, budget))?;
         let mut hot = snapshot.rows;
+        crate::cost::hot_rows(snapshot.source_rows);
         let mut hot_rows = snapshot.source_rows;
         let mut hot_bytes = snapshot.source_bytes;
         let mut watermarks = std::collections::BTreeMap::new();
@@ -4953,6 +4964,7 @@ async fn run_sql_query_at(
             Ok(p) => p,
             Err(refused) => return refused,
         };
+        crate::cost::queued(admission.elapsed());
         // Charged against the query's own deadline, so queuing can never extend the total time a
         // request occupies the node.
         (
@@ -4975,7 +4987,7 @@ async fn run_sql_query_at(
     let guard = s.query_guard(sql_timeout, max_rows);
     let hot_charge = s.hot_charge();
     let tenant = s.isolation.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = crate::cost::spawn_blocking(move || {
         let _permit = permit; // held for the whole blocking query, released on return
                               // Scan the hot tip (redb, blocking) inside the same blocking task, so `/sql` sees the unsealed
                               // rows alongside the sealed segments (RFC-0013). A scan failure degrades to cold-only.
@@ -5020,6 +5032,7 @@ async fn run_sql_query_at(
         // relation and an unavailable one are different facts, and a query cannot tell them apart
         // from zero rows - `/derived` is where the reason lives.
         let mut hot = hot;
+        crate::cost::hot_rows(spent.0);
         // #932: take the rows and the watermark that describes them in one acquisition, and carry
         // that watermark into the provenance below. Re-reading `applied_through()` after the query
         // ran is a race - measured at 1 in 12 on a 0.25s-block chain - and it reports an answer as
@@ -6171,6 +6184,7 @@ async fn flags(State(s): State<AppState>, Query(q): Query<FlagsQuery>) -> impl I
                 .transpose()
         })
         .await?;
+        crate::cost::hot_rows(rows.len() as u64);
         Ok(rows)
     }
 
@@ -12065,6 +12079,222 @@ mod tests {
         (status, serde_json::from_slice(&body).unwrap())
     }
 
+    /// `Nuthatch-Cost` from one GET through the router, its `result_bytes` checked against the body.
+    /// Held by every test that asks for a cost, so one counting Burrmill's selection passes sees only its own.
+    static COST_ASKED: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn cost_of(state: &AppState, path: &str) -> std::collections::BTreeMap<String, u64> {
+        use tower::ServiceExt;
+        let _asked = COST_ASKED.lock().await;
+        let req = axum::http::Request::builder()
+            .uri(path)
+            .header(crate::cost::HEADER, "1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router(SharedNest::new(state.clone()))
+            .oneshot(req)
+            .await
+            .unwrap();
+        let status = resp.status();
+        let header = resp.headers()[crate::cost::HEADER]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{path}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let cost: std::collections::BTreeMap<String, u64> = header
+            .split("; ")
+            .map(|kv| {
+                let (k, v) = kv.split_once('=').unwrap();
+                (k.to_string(), v.parse().unwrap())
+            })
+            .collect();
+        let order: Vec<&str> = header
+            .split("; ")
+            .filter_map(|kv| kv.split('=').next())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "sealed_bytes",
+                "hot_rows",
+                "engine_us",
+                "peak_mem_bytes",
+                "queue_us",
+                "result_bytes",
+                "sealed_bytes_read"
+            ],
+            "{header}"
+        );
+        assert_eq!(cost["result_bytes"], body.len() as u64, "{header}");
+        cost
+    }
+
+    fn sql_path(q: &str) -> String {
+        let q: String = q
+            .bytes()
+            .map(|b| match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        format!("/sql?q={q}")
+    }
+
+    /// RFC-0073 FR4: the sealed bytes a statement selects are the same each time it runs over the same
+    /// segments, in one engine and in another opened on a copy, a TopK and `/table`'s sealed fill
+    /// included, whose bytes read move with the race. `random()` keeps `/sql` out of the memo.
+    #[tokio::test]
+    async fn the_same_statement_over_the_same_segments_reports_the_same_sealed_bytes() {
+        let a = tempfile::tempdir().unwrap();
+        // A segment a block, so the statements read different sets of segments.
+        for block in 1..=4u64 {
+            let rows: Vec<String> = (0..100)
+                .map(|i| {
+                    format!(
+                        r#"{{"table":"t__big","memo":"{}","block_number":{block},"tx_hash":"0x{i:x}","log_index":{i}}}"#,
+                        "wide ".repeat(40 + i)
+                    )
+                })
+                .collect();
+            crate::seal::seal_range(a.path(), &rows, block, block).unwrap();
+        }
+        let b = tempfile::tempdir().unwrap();
+        crate::project::copy_dir(a.path(), b.path()).unwrap();
+        let (mut a, mut b) = (test_state(a.path(), 2), test_state(b.path(), 2));
+        for s in [&mut a, &mut b] {
+            s.store.set_meta("sealed_through", "4").unwrap();
+            s.tables = Arc::new(vec![crate::registry::TableSchema {
+                table: "t__big".into(),
+                alias: "t__big".into(),
+                kind: crate::registry::TableKind::Event,
+                function: String::new(),
+                selector: String::new(),
+                event: "Big".into(),
+                topic0: "0x".into(),
+                columns: crate::registry::implicit_columns(false),
+            }]);
+        }
+        for path in [
+            sql_path(r#"SELECT *, random() AS r FROM "t__big""#),
+            sql_path(r#"SELECT memo, random() AS r FROM "t__big" WHERE block_number = 2"#),
+            sql_path(
+                r#"SELECT block_number, count(*) AS n, random() AS r FROM "t__big" GROUP BY 1"#,
+            ),
+            sql_path(
+                r#"SELECT *, random() AS r FROM "t__big" ORDER BY block_number DESC, log_index DESC LIMIT 5"#,
+            ),
+            "/table/t__big?limit=5".to_string(),
+        ] {
+            let first = cost_of(&a, &path).await;
+            assert!(first["sealed_bytes"] > 0, "{path}: {first:?}");
+            for _ in 0..10 {
+                assert_eq!(
+                    cost_of(&a, &path).await["sealed_bytes"],
+                    first["sealed_bytes"],
+                    "{path}, again"
+                );
+            }
+            assert_eq!(
+                cost_of(&b, &path).await["sealed_bytes"],
+                first["sealed_bytes"],
+                "{path}, another engine over a copy"
+            );
+        }
+    }
+
+    /// A remembered answer reads nothing, and a typed route is metered as `/sql` is.
+    #[tokio::test]
+    async fn a_memo_hit_and_a_typed_route_carry_the_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 2);
+        state
+            .store
+            .put_entity(
+                "1-0",
+                &json!({"table": "t", "block_number": 1, "log_index": 0}).to_string(),
+            )
+            .unwrap();
+        let q = sql_path("SELECT count(*) AS n FROM t");
+        let first = cost_of(&state, &q).await;
+        assert_eq!(first["hot_rows"], 1);
+        let hit = cost_of(&state, &q).await;
+        assert_eq!(
+            (hit["sealed_bytes"], hit["hot_rows"], hit["engine_us"]),
+            (0, 0, 0)
+        );
+        assert_eq!(cost_of(&state, "/entity/1-0").await["hot_rows"], 1);
+        let resp = {
+            use tower::ServiceExt;
+            router(SharedNest::new(state.clone()))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/tables")
+                        .header(crate::cost::HEADER, "1")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        assert!(
+            resp.headers().get(crate::cost::HEADER).is_none(),
+            "an unmetered route"
+        );
+    }
+
+    /// The cost is opt-in: a request that does not send `Nuthatch-Cost: 1` gets no header, and the
+    /// statement behind it runs no selection pass over the footers.
+    #[tokio::test]
+    async fn a_request_that_does_not_ask_pays_nothing_for_its_cost() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let rows: Vec<String> = (0..10)
+            .map(|i| {
+                format!(
+                    r#"{{"table":"t__s","block_number":1,"tx_hash":"0x{i:x}","log_index":{i}}}"#
+                )
+            })
+            .collect();
+        crate::seal::seal_range(tmp.path(), &rows, 1, 1).unwrap();
+        let state = test_state(tmp.path(), 2);
+        state.store.set_meta("sealed_through", "1").unwrap();
+        let path = sql_path(r#"SELECT *, random() AS r FROM "t__s""#);
+        let ask = |value: Option<&'static str>| {
+            let mut req = axum::http::Request::builder().uri(path.clone());
+            if let Some(v) = value {
+                req = req.header(crate::cost::HEADER, v);
+            }
+            router(SharedNest::new(state.clone()))
+                .oneshot(req.body(axum::body::Body::empty()).unwrap())
+        };
+        let _asked = COST_ASKED.lock().await;
+        for value in [None, Some("0")] {
+            let before = burrmill::df::selection_passes();
+            let resp = ask(value).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(
+                resp.headers().get(crate::cost::HEADER).is_none(),
+                "{value:?}"
+            );
+            assert_eq!(burrmill::df::selection_passes(), before, "{value:?}");
+        }
+        let before = burrmill::df::selection_passes();
+        let resp = ask(Some("1")).await.unwrap();
+        assert!(resp.headers().get(crate::cost::HEADER).is_some());
+        assert!(
+            burrmill::df::selection_passes() > before,
+            "the probe must see a pass when one runs"
+        );
+    }
+
     /// A remembered answer is the computed one byte for byte bar `cached`, rows written from the
     /// stored JSON in the same place (#2072).
     #[tokio::test]
@@ -12734,6 +12964,59 @@ mod tests {
             answer["data"]["bets"][0],
             serde_json::json!({"rolled": ["9007199254740993", "5"], "weights": [1, 2]}),
             "graph-node sends BigInt as a string, inside a list too: {answer}"
+        );
+    }
+
+    /// RFC-0073 FR4: a GraphQL answer is metered across its roots, as `/sql` is.
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn a_graphql_answer_carries_its_cost() {
+        use tower::ServiceExt;
+        let _asked = COST_ASKED.lock().await;
+        reset_graph_budget();
+        let _guard = GraphBudgetGuard;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("graph/schema.graphql"),
+            "type Bet @entity { id: ID! weights: [Int!]! }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/bet.sql"),
+            "CREATE VIEW bet AS SELECT '1' AS id, [1, 2] AS weights;",
+        )
+        .unwrap();
+        let state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        let res = router(SharedNest::new(state))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("content-type", "application/json")
+                    .header(crate::cost::HEADER, "1")
+                    .body(axum::body::Body::from(
+                        json!({ "query": "{ bets { weights } }" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cost = res.headers()[crate::cost::HEADER]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(
+            cost.contains(&format!("; result_bytes={}; ", body.len())),
+            "{cost}"
+        );
+        assert!(
+            !cost.contains("engine_us=0;"),
+            "the roots ran in Burrmill: {cost}"
         );
     }
 

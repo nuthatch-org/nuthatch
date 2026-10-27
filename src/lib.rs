@@ -39,6 +39,7 @@ pub mod control_api;
 /// The control plane for scaled mode (RFC-0022 §3): desired state and the worker registry.
 #[cfg(feature = "postgres-store")]
 pub mod controlplane;
+pub mod cost;
 pub mod count; // RFC-0054 hook
 /// RFC-0046 S2: an optional, local-only x402 counter. The default binary does not compile this
 /// module, which is the S0 deletion boundary rather than an assurance about it.
