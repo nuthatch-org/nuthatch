@@ -243,6 +243,23 @@ async fn a_follower_answers_as_the_writer_does_through_reorg_seal_and_restart() 
     assert_eq!(first["as_of"], 8);
     agree(&writer, &fa, COUNT, "counting").await;
 
+    // Asked for, the cost report (RFC-0073 FR4) comes back from a follower as from the writer.
+    for base in [&wbase, &fa] {
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/{ROUTE}/sql"))
+            .query(&[("q", COUNT)])
+            .header(nuthatch::cost::HEADER, "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let cost = resp.headers().get(nuthatch::cost::HEADER);
+        assert!(
+            cost.is_some_and(|c| c.to_str().unwrap().contains("hot_rows")),
+            "{base}: {cost:?}"
+        );
+    }
+
     // A reorg is a hot-store write like any other.
     tape.reorg(
         6,
