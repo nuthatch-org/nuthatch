@@ -4009,7 +4009,8 @@ impl WideTemplates {
 /// Past the flip, only a template with more than [`FACTORY_FLIP_THRESHOLD`] children of its own is
 /// fetched without an address. Static contracts never are: one declaring a generic event (ENS's
 /// BaseRegistrar and its ERC-721 `Transfer`) would otherwise ask for every such log on the chain.
-/// Many small templates that together cross the threshold all go wide, as the whole nest used to.
+/// Small templates that together cross the threshold go wide, but only those with a child: a
+/// template with none has nothing to cover, and its events may be as generic as ERC-1155 transfers.
 fn wide_templates(
     registry: &DecodeRegistry,
     factory: &FactorySet,
@@ -4024,7 +4025,12 @@ fn wide_templates(
         .cloned()
         .collect();
     if names.is_empty() && base + children.len() > FACTORY_FLIP_THRESHOLD {
-        names = factory.templates().iter().cloned().collect();
+        names = factory
+            .templates()
+            .iter()
+            .filter(|t| !children.addresses_for_template(t).is_empty())
+            .cloned()
+            .collect();
     }
     let mut topic0s: Vec<String> = names
         .iter()
@@ -14664,6 +14670,78 @@ template = "pool"
         assert!(
             wide.iter().all(|(_, t)| t == &vec![ping.clone()]),
             "an address-less fetch may carry only the template's topics: {calls:?}"
+        );
+    }
+
+    /// Crossing the threshold together widens only the templates that have a child. ENS's v2
+    /// registry template has none for its first 26M blocks and declares ERC-1155 transfers.
+    #[test]
+    fn a_template_without_children_never_goes_wide() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("abis")).unwrap();
+        std::fs::write(
+            d.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"w\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"fac\"\naddress = \"0x0000000000000000000000000000000000000022\"\n\
+             abi = \"abis/fac.json\"\n\n\
+             [[templates]]\nname = \"busy\"\nabi = \"abis/busy.json\"\n\n\
+             [[templates]]\nname = \"idle\"\nabi = \"abis/idle.json\"\n\n\
+             [[factories]]\nwatch = \"fac\"\nevent = \"BusyCreated\"\nchild_param = \"child\"\ntemplate = \"busy\"\n\n\
+             [[factories]]\nwatch = \"fac\"\nevent = \"IdleCreated\"\nchild_param = \"child\"\ntemplate = \"idle\"\n",
+        )
+        .unwrap();
+        let created = |n: &str| {
+            format!(
+                r#"{{"type":"event","name":"{n}","inputs":[{{"name":"child","type":"address","indexed":true}}],"anonymous":false}}"#
+            )
+        };
+        std::fs::write(
+            d.join("abis/fac.json"),
+            format!("[{},{}]", created("BusyCreated"), created("IdleCreated")),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("abis/busy.json"),
+            r#"[{"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("abis/idle.json"),
+            r#"[{"type":"event","name":"Pong","inputs":[],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let config = Config::load(d).unwrap();
+        let registry = crate::registry::from_nest(d, &config).unwrap();
+        let factory = FactorySet::resolved(&config, &registry).unwrap();
+        let mut children = ChildRegistry::new();
+        for i in 0..FACTORY_FLIP_THRESHOLD {
+            children.insert(crate::factory::ChildEntry {
+                template: "busy".into(),
+                address: format!("0x{:040x}", 0x1000 + i),
+                discovered_block: 1,
+                discovered_log_index: i as u64,
+                discovered_timestamp: 0,
+                parent_address: "0x0000000000000000000000000000000000000022".into(),
+                depth: 1,
+            });
+        }
+        let w =
+            wide_templates(&registry, &factory, &children, 1, false).expect("past the threshold");
+        assert_eq!(w.names.iter().collect::<Vec<_>>(), ["busy"]);
+        assert_eq!(
+            w.topic0s,
+            registry
+                .template_topic0s("busy")
+                .iter()
+                .map(|t| format!("0x{}", hex::encode(t)))
+                .collect::<Vec<_>>()
+        );
+        let forced = wide_templates(&registry, &factory, &children, 1, true).unwrap();
+        assert_eq!(
+            forced.names.len(),
+            2,
+            "a forced flip still widens every template"
         );
     }
 
