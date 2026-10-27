@@ -10350,7 +10350,6 @@ mod confinement {
                 json!({"tables": {"stolen": [snapshot]}}).to_string(),
             )
             .unwrap();
-            assert!(crate::offchain::load(&f.a).is_err(), "{file}");
             for tenant in [None, Some(Arc::from("a"))] {
                 let got = isolated(tenant.as_ref(), || {
                     query_hot_cold(
@@ -10364,6 +10363,7 @@ mod confinement {
                 });
                 assert!(got.is_err(), "{file} was bound: {:?}", got.map(|o| o.rows));
             }
+            assert!(crate::offchain::load(&f.a).is_err(), "{file}");
         }
     }
 
