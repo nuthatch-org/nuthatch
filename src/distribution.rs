@@ -1746,16 +1746,25 @@ abi = "abis/c.json"
         assert_eq!(store.get_ref("a", "2").await.unwrap(), ha);
     }
 
-    /// A store whose first ref write runs a prune, landing it exactly between a publish's blob and
-    /// its refs: the one interleaving that could leave a ref naming a missing blob.
-    struct PruneMidPublish {
+    /// A store that lands one operation inside another, at the interleavings that could leave a ref
+    /// naming a missing blob. Without `late`, its first ref write runs a prune, between a publish's
+    /// blob and its refs. With `late`, a prune's first ref delete writes `late@1` naming that hash, as
+    /// a publish of a blob already present would, after the prune listed its refs.
+    struct Interleaved {
         inner: FsStore,
         grace: std::time::Duration,
+        late: Option<String>,
         fired: std::sync::atomic::AtomicBool,
     }
 
+    impl Interleaved {
+        fn first(&self) -> bool {
+            !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
     #[async_trait]
-    impl BundleStore for PruneMidPublish {
+    impl BundleStore for Interleaved {
         async fn put_blob(&self, hash: &str, bytes: &[u8]) -> Result<()> {
             self.inner.put_blob(hash, bytes).await
         }
@@ -1775,6 +1784,11 @@ abi = "abis/c.json"
             self.inner.delete_blob(hash).await
         }
         async fn delete_ref(&self, name: &str, version: &str) -> Result<()> {
+            if let Some(hash) = &self.late {
+                if self.first() {
+                    self.inner.set_ref("late", "1", hash).await?;
+                }
+            }
             self.inner.delete_ref(name, version).await
         }
         async fn delete_nid_ref(&self, nid: &str) -> Result<()> {
@@ -1784,7 +1798,7 @@ abi = "abis/c.json"
             self.inner.get_blob(hash).await
         }
         async fn set_ref(&self, name: &str, version: &str, hash: &str) -> Result<()> {
-            if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if self.late.is_none() && self.first() {
                 prune(&self.inner, &Default::default(), self.grace, false)
                     .await
                     .unwrap();
@@ -1811,9 +1825,10 @@ abi = "abis/c.json"
         let hash = write_bundle_fixture(&file, "a");
         for grace in [PRUNE_GRACE, std::time::Duration::ZERO] {
             let reg = tempfile::tempdir().unwrap();
-            let store = PruneMidPublish {
+            let store = Interleaved {
                 inner: FsStore::new(reg.path()),
                 grace,
+                late: None,
                 fired: Default::default(),
             };
             publish(&store, &file, Some("a"), Some("1")).await.unwrap();
@@ -1821,5 +1836,32 @@ abi = "abis/c.json"
             assert_eq!(store.list_blobs().await.unwrap(), vec![hash.clone()]);
             no_ref_dangles(&store).await;
         }
+    }
+
+    /// A ref written after a prune listed the refs keeps the blob it names: the prune lists them
+    /// again before it deletes any blob.
+    #[tokio::test]
+    async fn a_ref_written_during_a_prune_keeps_its_blob() {
+        let reg = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ((ha, _), _) = two_published(&FsStore::new(reg.path()), dir.path()).await;
+        let store = Interleaved {
+            inner: FsStore::new(reg.path()),
+            grace: std::time::Duration::ZERO,
+            late: Some(ha.clone()),
+            fired: Default::default(),
+        };
+        let report = prune(
+            &store,
+            &Default::default(),
+            std::time::Duration::ZERO,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(store.fired.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!report.deleted_blobs.contains(&ha), "{report:?}");
+        assert_eq!(store.get_ref("late", "1").await.unwrap(), ha);
+        no_ref_dangles(&store).await;
     }
 }

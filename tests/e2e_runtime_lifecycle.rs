@@ -4009,8 +4009,8 @@ async fn post_bundle(
     (status, body)
 }
 
-/// Every file under `root`, with its bytes.
-fn tree(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+/// Every file under `root`, with a digest of its bytes.
+fn tree(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, String> {
     let mut out = std::collections::BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -4020,10 +4020,13 @@ fn tree(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf
         for e in entries.flatten() {
             let path = e.path();
             if path.is_dir() {
-                out.insert(path.clone(), Vec::new());
+                out.insert(path.clone(), String::new());
                 stack.push(path);
             } else {
-                out.insert(path.clone(), std::fs::read(&path).unwrap());
+                out.insert(path.clone(), {
+                    use sha2::Digest;
+                    hex::encode(sha2::Sha256::digest(std::fs::read(&path).unwrap()))
+                });
             }
         }
     }
