@@ -213,7 +213,15 @@ impl Follower {
 
     async fn handle(self: &Arc<Self>, line: Line, fresh: &mut BTreeSet<String>) -> Result<()> {
         match line {
-            Line::Hello { version } => {
+            Line::Hello { version, feed } => {
+                if feed != crate::feed::FEED_VERSION {
+                    bail!(
+                        "the writer ({version}) speaks feed version {feed} and this follower ({}) \
+                         speaks {}: upgrade them to one release",
+                        env!("CARGO_PKG_VERSION"),
+                        crate::feed::FEED_VERSION
+                    );
+                }
                 self.lock().link.version = Some(version);
             }
             Line::Mount {

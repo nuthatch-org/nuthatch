@@ -28,6 +28,9 @@ use std::sync::{Arc, Mutex, RwLock};
 /// drops what it would have sent rather than wait: a slow reader never holds up a commit.
 pub const DELTA_BACKLOG: usize = 1024;
 
+/// The wire format of `GET /_admin/feed`. Bump it on any change an older follower would misread.
+pub const FEED_VERSION: u32 = 1;
+
 /// One change to the mirrored tables, in the order the commit made it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -134,8 +137,12 @@ pub struct Subscription {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Line {
+    /// `feed` is [`FEED_VERSION`]; a follower refuses a writer speaking another, so a rolling
+    /// upgrade across a change to this format stops at the follower rather than misreading it.
     Hello {
         version: String,
+        #[serde(default)]
+        feed: u32,
     },
     /// A route and the SQL surface the writer serves it with (RFC-0034), which a follower serves too.
     Mount {

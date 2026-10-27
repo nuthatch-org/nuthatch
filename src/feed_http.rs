@@ -144,6 +144,7 @@ impl Drop for Forwarders {
 async fn serve_connection(s: FeedState, tx: mpsc::Sender<bytes::Bytes>) {
     let hello = Line::Hello {
         version: env!("CARGO_PKG_VERSION").to_string(),
+        feed: crate::feed::FEED_VERSION,
     };
     if tx.send(line(&hello)).await.is_err() {
         return;

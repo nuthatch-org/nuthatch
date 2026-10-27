@@ -474,6 +474,8 @@ Serve a nest without indexing it (RFC-0022 slice 3)
 - `--publish-target <PUBLISH_TARGET>` - Mirror sealed segments to this prefix as they seal (RFC-0052), exactly as on `dev`
 - `--publish-interval <PUBLISH_INTERVAL>` - How often the mirror reconciles when no seal has woken it
 - `--publish-parallelism <PUBLISH_PARALLELISM>` - Objects the mirror uploads at once
+- `--runtime <RUNTIME>` - Serve every mount of the runtime at this directory, read-only, beside the writer named by `--follow` (RFC-0073 FR1). Sealed segments are read from here; redb is never opened
+- `--follow <FOLLOW>` - The writer's address, e.g. `http://127.0.0.1:8288`, whose hot-state feed this process follows. Its admin token comes from `NUTHATCH_ADMIN_TOKEN`, or the token file the writer keeps in the runtime directory; never from the command line
 
 ## `nuthatch settle`
 
