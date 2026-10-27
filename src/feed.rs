@@ -196,8 +196,17 @@ fn charge_read(bytes: u64) -> bool {
     })
 }
 
-/// The most a dataset's snapshot may come to, `None` for no cap.
-pub type CapFor = Box<dyn Fn(&str) -> Option<u64>>;
+/// Which kind of line a dataset's cap is asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A whole snapshot, replacing what is held: its cap is the dataset's budget.
+    Snapshot,
+    /// A delta, added to what is held: its cap is what the dataset has left.
+    Delta,
+}
+
+/// The most a dataset's line of `Kind` may come to, `None` for no cap.
+pub type CapFor = Box<dyn Fn(&str, Kind) -> Option<u64>>;
 
 impl<'de> Deserialize<'de> for Rows {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
@@ -243,43 +252,64 @@ pub struct DatasetName(pub String);
 impl<'de> Deserialize<'de> for DatasetName {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let name = String::deserialize(d)?;
-        let cap = CAP_FOR.with(|f| f.borrow().as_ref().and_then(|f| f(&name)));
+        let cap = CAP_FOR.with(|f| f.borrow().as_ref().and_then(|f| f(&name, Kind::Snapshot)));
         BUDGET.with(|b| b.set(Budget { cap, seen: 0 }));
-        limit_snapshot(&name, cap);
+        limit_line(&name, cap, Kind::Snapshot);
         Ok(DatasetName(name))
     }
 }
 
-/// Fixed room above a snapshot's byte limit for its JSON framing.
+/// A delta's dataset name, which comes first in its line: reading it sets the byte limit the rest
+/// of the delta is read under, from what the dataset has left.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct DeltaDataset(pub String);
+
+impl<'de> Deserialize<'de> for DeltaDataset {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let name = String::deserialize(d)?;
+        let cap = CAP_FOR.with(|f| f.borrow().as_ref().and_then(|f| f(&name, Kind::Delta)));
+        limit_line(&name, cap, Kind::Delta);
+        Ok(DeltaDataset(name))
+    }
+}
+
+/// Fixed room above a line's byte limit for its JSON framing.
 pub const SNAPSHOT_SLACK: u64 = 64 * 1024;
 
-/// A snapshot's wire bytes passed its dataset's limit, so it was not read to the end: no value in it
-/// was allocated past the limit. The stream cannot be resumed mid-value; the follower reconnects.
+/// A snapshot's or delta's wire bytes passed its dataset's limit, so it was not read to the end: no
+/// value in it was allocated past the limit, and none of it was applied. The stream cannot be resumed
+/// mid-value; the follower reconnects without that dataset.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotOverBudget {
+pub struct LineOverBudget {
     pub dataset: String,
-    /// Wire bytes of the snapshot read before stopping.
+    pub kind: Kind,
+    /// Wire bytes of the line read before stopping.
     pub read: u64,
     pub limit: u64,
 }
 
-impl std::fmt::Display for SnapshotOverBudget {
+impl std::fmt::Display for LineOverBudget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self.kind {
+            Kind::Snapshot => "snapshot",
+            Kind::Delta => "delta",
+        };
         write!(
             f,
-            "{}'s snapshot passed {} wire bytes, its limit; stopped reading it at {}",
+            "{}'s {what} passed {} wire bytes, its limit; stopped reading it at {}",
             self.dataset, self.limit, self.read
         )
     }
 }
 
-impl std::error::Error for SnapshotOverBudget {}
+impl std::error::Error for LineOverBudget {}
 
 /// Where the snapshot being read must stop, as a position in the stream, and which dataset it is.
 #[derive(Clone, Default)]
 struct WireLimit {
     position: u64,
-    stop_at: Option<(u64, u64, String)>,
+    stop_at: Option<(u64, u64, String, Kind)>,
 }
 
 thread_local! {
@@ -294,9 +324,11 @@ impl<R: std::io::Read> std::io::Read for Limited<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let allowed = WIRE.with(|w| {
             let w = w.borrow();
-            w.stop_at.as_ref().map_or(buf.len() as u64, |(_, stop, _)| {
-                stop.saturating_sub(w.position)
-            })
+            w.stop_at
+                .as_ref()
+                .map_or(buf.len() as u64, |(_, stop, _, _)| {
+                    stop.saturating_sub(w.position)
+                })
         });
         if allowed == 0 {
             return Err(std::io::Error::other("a snapshot passed its byte limit"));
@@ -310,7 +342,7 @@ impl<R: std::io::Read> std::io::Read for Limited<R> {
 
 /// Start limiting the snapshot whose dataset name has just been read to `cap`, doubled because a
 /// stored row is itself JSON and escaping can inflate it on the wire, plus the framing slack.
-fn limit_snapshot(dataset: &str, cap: Option<u64>) {
+fn limit_line(dataset: &str, cap: Option<u64>, kind: Kind) {
     WIRE.with(|w| {
         let mut w = w.borrow_mut();
         let start = w.position;
@@ -319,6 +351,7 @@ fn limit_snapshot(dataset: &str, cap: Option<u64>) {
                 start,
                 start + cap.saturating_mul(2) + SNAPSHOT_SLACK,
                 dataset.to_string(),
+                kind,
             )
         });
     });
@@ -326,7 +359,7 @@ fn limit_snapshot(dataset: &str, cap: Option<u64>) {
 
 /// Read the feed's lines from `body` as they arrive, never holding a whole line's text, handing each
 /// to `each` until it returns false. Blocking: run it on its own thread. A snapshot that runs past
-/// its dataset's byte limit ends the read with [`SnapshotOverBudget`].
+/// its dataset's byte limit ends the read with [`LineOverBudget`].
 pub fn read_lines(
     body: impl std::io::Read,
     cap_for: CapFor,
@@ -339,14 +372,14 @@ pub fn read_lines(
         let stopped = WIRE.with(|w| {
             let mut w = w.borrow_mut();
             let at = w.position;
-            w.stop_at
-                .take()
-                .filter(|(_, stop, _)| at >= *stop)
-                .map(|(start, stop, dataset)| SnapshotOverBudget {
+            w.stop_at.take().filter(|(_, stop, _, _)| at >= *stop).map(
+                |(start, stop, dataset, kind)| LineOverBudget {
                     dataset,
+                    kind,
                     read: at - start,
                     limit: stop - start,
-                })
+                },
+            )
         });
         if let (Err(_), Some(over)) = (&line, stopped) {
             CAP_FOR.with(|f| *f.borrow_mut() = None);
@@ -474,8 +507,9 @@ pub enum Line {
         dataset: DatasetName,
         snapshot: Snapshot,
     },
+    /// `dataset` before `delta`: reading the name sets the byte limit the delta is read under.
     Delta {
-        dataset: String,
+        dataset: DeltaDataset,
         delta: Delta,
     },
     /// Each followed dataset's `(epoch, generation)` now, sent every second so a follower can say how
@@ -748,6 +782,96 @@ impl MemStore {
     /// What this copy is charged against its cursor's budget, by [`row_bytes`].
     pub fn bytes(&self) -> u64 {
         self.read().bytes
+    }
+
+    /// The most this copy would be charged at any point while `delta` is applied, by the accounting
+    /// [`MemStore::apply`] keeps, worked out without applying it.
+    pub fn peak_with(&self, delta: &Delta) -> u64 {
+        // What each key a delta touches is charged once touched; `None` is removed.
+        type Touched = BTreeMap<String, Option<u64>>;
+        fn now(base: &BTreeMap<String, String>, touched: &Touched, key: &str) -> u64 {
+            touched
+                .get(key)
+                .copied()
+                .unwrap_or_else(|| base.get(key).map(|v| row_bytes(key, v)))
+                .unwrap_or(0)
+        }
+        fn set(
+            base: &BTreeMap<String, String>,
+            touched: &mut Touched,
+            held: &mut i128,
+            key: &str,
+            to: Option<u64>,
+        ) {
+            *held += i128::from(to.unwrap_or(0)) - i128::from(now(base, touched, key));
+            touched.insert(key.to_string(), to);
+        }
+        fn in_range(key: &str, from: &str, to: Option<&String>) -> bool {
+            key >= from && to.is_none_or(|t| key <= t.as_str())
+        }
+        fn drop_range(
+            base: &BTreeMap<String, String>,
+            touched: &mut Touched,
+            held: &mut i128,
+            from: &str,
+            to: Option<&String>,
+        ) {
+            let mut keys: Vec<String> = match to {
+                Some(to) => base
+                    .range(from.to_string()..=to.clone())
+                    .map(|(k, _)| k.clone())
+                    .collect(),
+                None => base
+                    .range(from.to_string()..)
+                    .map(|(k, _)| k.clone())
+                    .collect(),
+            };
+            keys.extend(touched.keys().filter(|k| in_range(k, from, to)).cloned());
+            for k in keys {
+                set(base, touched, held, &k, None);
+            }
+        }
+        let m = self.read();
+        let (mut entities, mut meta, mut blocks) = (Touched::new(), Touched::new(), Touched::new());
+        let mut held = i128::from(m.bytes);
+        let mut peak = held;
+        for op in &delta.ops {
+            match op {
+                Op::Put { key, row } => set(
+                    &m.entities,
+                    &mut entities,
+                    &mut held,
+                    key,
+                    Some(row_bytes(key, row)),
+                ),
+                Op::Drop { from, to } => {
+                    drop_range(&m.entities, &mut entities, &mut held, from, to.as_ref())
+                }
+                Op::Meta { key, value } => set(
+                    &m.meta,
+                    &mut meta,
+                    &mut held,
+                    key,
+                    Some(row_bytes(key, value)),
+                ),
+                Op::Unmeta { key } => set(&m.meta, &mut meta, &mut held, key, None),
+                Op::Block { key, record } => set(
+                    &m.blocks,
+                    &mut blocks,
+                    &mut held,
+                    key,
+                    Some(row_bytes(key, record)),
+                ),
+                Op::Unblock { key } => set(&m.blocks, &mut blocks, &mut held, key, None),
+                Op::UnblockFrom { key } => drop_range(&m.blocks, &mut blocks, &mut held, key, None),
+            }
+            peak = peak.max(held);
+        }
+        if let Some(raw) = &delta.catalogue {
+            held += raw.len() as i128 - i128::from(m.catalogue_bytes);
+            peak = peak.max(held);
+        }
+        peak.max(0) as u64
     }
 
     /// `(epoch, generation)` of the last delta applied.
@@ -1443,7 +1567,7 @@ mod tests {
         let mut got = BTreeMap::new();
         read_lines(
             &wire[..],
-            Box::new(move |d: &str| (d != "data/free").then_some(cap)),
+            Box::new(move |d: &str, _| (d != "data/free").then_some(cap)),
             |line| {
                 if let Line::Snapshot { dataset, snapshot } = line {
                     got.insert(dataset.0, snapshot);
@@ -1498,7 +1622,7 @@ mod tests {
         let mut seen = Vec::new();
         let err = read_lines(
             std::io::BufReader::with_capacity(4096, Counted(&wire, consumed.clone())),
-            Box::new(|_| Some(1_000)),
+            Box::new(|_, _| Some(1_000)),
             |line| {
                 if let Line::Snapshot { dataset, .. } = line {
                     seen.push(dataset.0);
@@ -1507,7 +1631,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        let over = err.downcast_ref::<SnapshotOverBudget>().expect("{err:#}");
+        let over = err.downcast_ref::<LineOverBudget>().expect("{err:#}");
         assert_eq!(over.dataset, "data/huge");
         assert_eq!(over.limit, 2_000 + SNAPSHOT_SLACK);
         assert_eq!(seen, vec!["data/small".to_string()]);
@@ -1517,6 +1641,81 @@ mod tests {
             consumed.get(),
             wire.len()
         );
+    }
+
+    /// A delta's charge is worked out before it is applied, at its peak: a put a later drop in the
+    /// same delta takes back still counts, and the figure after is what applying it leaves.
+    #[test]
+    fn a_deltas_peak_is_known_before_it_is_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
+        store.commit_window(&[row(1, 0, "t")], None, 1).unwrap();
+        let sub = store.feed_subscribe().unwrap();
+        let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot);
+        let before = copy.bytes();
+        let (k, big) = (Store::entity_key(2, 0), "x".repeat(10_000));
+        let (epoch, generation) = copy.applied();
+        let delta = Delta {
+            epoch,
+            generation: generation + 1,
+            ops: vec![
+                Op::Put {
+                    key: k.clone(),
+                    row: big.clone(),
+                },
+                Op::Drop {
+                    from: format!("{:012}-", 2),
+                    to: None,
+                },
+                Op::Meta {
+                    key: "last_block".into(),
+                    value: "1".into(),
+                },
+            ],
+            catalogue: None,
+            resync: false,
+        };
+        assert_eq!(copy.peak_with(&delta), before + row_bytes(&k, &big));
+        copy.apply(&delta).unwrap();
+        assert_eq!(
+            copy.bytes(),
+            before,
+            "the put taken back, the meta rewritten as it was"
+        );
+        crate::seal::unpin_catalogue(tmp.path());
+    }
+
+    /// A delta's bytes are limited by what its dataset has left, as a snapshot's are by its budget.
+    #[test]
+    fn a_delta_over_what_is_left_stops_the_read_at_its_byte_limit() {
+        let delta = Delta {
+            epoch: 1,
+            generation: 2,
+            ops: vec![Op::Put {
+                key: "000000000001-000000".into(),
+                row: "x".repeat(8 << 20),
+            }],
+            catalogue: None,
+            resync: false,
+        };
+        let mut wire = serde_json::to_vec(&Line::Delta {
+            dataset: DeltaDataset("data/huge".into()),
+            delta,
+        })
+        .unwrap();
+        wire.push(b'\n');
+        let err = read_lines(
+            &wire[..],
+            Box::new(|_, kind| (kind == Kind::Delta).then_some(1_000)),
+            |_| true,
+        )
+        .unwrap_err();
+        let over = err.downcast_ref::<LineOverBudget>().expect("{err:#}");
+        assert_eq!(
+            (over.dataset.as_str(), over.kind),
+            ("data/huge", Kind::Delta)
+        );
+        assert_eq!(over.read, 2_000 + SNAPSHOT_SLACK);
     }
 
     /// A mount's lowered guards survive the wire, and a follower never serves wider than its own.

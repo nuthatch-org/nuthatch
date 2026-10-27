@@ -295,8 +295,16 @@ impl Follower {
                 rx: chunk_rx,
                 cur: bytes::Bytes::new(),
             });
-            let cap_for: crate::feed::CapFor =
-                Box::new(move |dataset| weak.upgrade().and_then(|f| f.cap_for(dataset)));
+            let cap_for: crate::feed::CapFor = Box::new(move |dataset, kind| {
+                let f = weak.upgrade()?;
+                let cap = f.cap_for(dataset)?;
+                Some(match kind {
+                    crate::feed::Kind::Snapshot => cap,
+                    // A dataset not held has nothing left to grow into: its deltas are skipped.
+                    crate::feed::Kind::Delta => cap
+                        .saturating_sub(f.lock().datasets.get(dataset).map_or(cap, |s| s.bytes())),
+                })
+            });
             crate::feed::read_lines(reader, cap_for, |line| line_tx.blocking_send(line).is_ok())
         });
         // Datasets snapshotted on this connection: a delta for any other is a gap.
@@ -313,7 +321,7 @@ impl Follower {
         handled?;
         let pumped = pump.await.unwrap_or(Ok(()));
         if let Err(e) = parser.await.context("the feed parser stopped")? {
-            if let Some(over) = e.downcast_ref::<crate::feed::SnapshotOverBudget>() {
+            if let Some(over) = e.downcast_ref::<crate::feed::LineOverBudget>() {
                 // Not read to the end, so the stream cannot go on: reconnect without it.
                 let dataset = over.dataset.clone();
                 let max = {
@@ -360,14 +368,6 @@ impl Follower {
             .sum();
         let own = inner.estimates.get(dataset).copied().unwrap_or(0);
         Some((inner.max_rss_mb * MIB).saturating_sub(others + own))
-    }
-
-    /// Whether `dataset`'s cursor holds more than its budget, and by how much, with this dataset's
-    /// share of it.
-    fn over_budget(&self, dataset: &str) -> Option<String> {
-        let cap = self.cap_for(dataset)?;
-        let held = self.lock().datasets.get(dataset)?.bytes();
-        (held > cap).then(|| budget_reason(dataset, held, cap, self.lock().max_rss_mb))
     }
 
     /// Stop holding `dataset`, and serve its routes the reason.
@@ -486,6 +486,7 @@ impl Follower {
                 }
             }
             Line::Delta { dataset, delta } => {
+                let dataset = dataset.0;
                 let (store, refused) = {
                     let inner = self.lock();
                     (
@@ -496,15 +497,32 @@ impl Follower {
                 if refused {
                     return Ok(());
                 }
-                let applied = match (fresh.contains(&dataset), store) {
-                    (true, Some(store)) => store.apply(&delta).map_err(anyhow::Error::from),
-                    _ => Err(anyhow::anyhow!("a delta before its snapshot")),
+                let store = match (fresh.contains(&dataset), store) {
+                    (true, Some(store)) => store,
+                    _ => bail!("{dataset}: a delta before its snapshot; resnapshotting"),
                 };
-                // The old state keeps serving while a new connection takes fresh snapshots.
-                applied.with_context(|| format!("{dataset}: resnapshotting"))?;
-                if let Some(why) = self.over_budget(&dataset) {
-                    self.refuse(&dataset, why);
+                // Charged before it is applied, at its peak, so the copy never holds more than its
+                // budget even part-way through a delta.
+                let peak = store.peak_with(&delta);
+                if let Some(cap) = self.cap_for(&dataset).filter(|cap| peak > *cap) {
+                    let max = {
+                        let mut inner = self.lock();
+                        inner.excluded.insert(dataset.clone());
+                        inner.max_rss_mb
+                    };
+                    self.refuse(
+                        &dataset,
+                        format!(
+                            "{}; refused before it was applied",
+                            budget_reason(&dataset, peak, cap, max)
+                        ),
+                    );
+                    return Ok(());
                 }
+                // The old state keeps serving while a new connection takes fresh snapshots.
+                store
+                    .apply(&delta)
+                    .with_context(|| format!("{dataset}: resnapshotting"))?;
             }
             Line::Heartbeat { positions } => {
                 self.lock().positions = positions.into_iter().collect();

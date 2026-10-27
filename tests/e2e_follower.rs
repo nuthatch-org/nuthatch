@@ -499,14 +499,11 @@ async fn a_snapshot_over_the_cursor_budget_is_refused_and_its_co_mount_serves() 
     writer.stop(&root);
 }
 
-/// One stored value larger than its cursor's whole budget: the follower stops reading that snapshot
-/// at its byte limit rather than allocating the value, refuses the mount by name, reconnects without
-/// it, and its co-mount goes on following the writer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_single_value_over_the_budget_is_refused_without_being_read() {
-    const SMALL: &str = "arb";
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join("runtime");
+const SMALL: &str = "arb";
+
+/// Two small nests on one cursor whose budget is 12 MiB, block 1 carrying a transfer for each.
+fn two_mounts(tmp: &Path) -> (PathBuf, PathBuf, Arc<TapeSource>) {
+    let root = tmp.join("runtime");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
         root.join(nuthatch::runtime::MOUNTS_FILE),
@@ -519,62 +516,51 @@ async fn a_single_value_over_the_budget_is_refused_without_being_read() {
         std::fs::create_dir_all(&dir).unwrap();
         scaffold_nest(&dir, route, address);
     }
-    let via: PathBuf = tmp.path().join("follower-view");
+    let via: PathBuf = tmp.join("follower-view");
     std::os::unix::fs::symlink(&root, &via).unwrap();
     let tape = Arc::new(TapeSource::new());
-    let mut first = block(1, 0, 100);
-    first.logs.push(transfer_log(
+    tape.insert_block(1, both(1));
+    tape.advance_tip_to(1);
+    (root, via, tape)
+}
+
+/// A block with one transfer on each of the two nests.
+fn both(b: u64) -> BlockFixture {
+    let mut fx = block(b, 0, b as u128);
+    let at = fx.logs.len() as u64;
+    let hash = fx.hash.clone();
+    fx.logs.push(transfer_log(
         ARB,
-        1,
-        first.logs.len() as u64,
-        &first.hash.clone(),
+        b,
+        at,
+        &hash,
         &account(3),
         &account(4),
-        7,
+        b as u128,
     ));
-    tape.insert_block(1, first);
-    tape.advance_tip_to(1);
-    let writer = Writer::start_many(&root, tape.clone(), 0, &[ROUTE, SMALL]);
-    writer.reaches(1).await;
-    // 32 MiB in one meta value, against a cursor budget of 12.
-    writer
-        .store
-        .set_meta("ballast", &"x".repeat(32 << 20))
-        .unwrap();
+    fx
+}
 
-    let (_f, fbase) = bind_follower(&via, &writer).await;
-    let mut big = (0, serde_json::Value::Null);
+/// Wait for `route` to be refused `over_budget`, and return its body.
+async fn refused_by_budget(fbase: &str, route: &str) -> serde_json::Value {
+    let mut seen = (0, serde_json::Value::Null);
     for _ in 0..800 {
-        big = route_status(&fbase, ROUTE).await;
-        if big.1["reason"] == "over_budget" {
+        seen = route_status(fbase, route).await;
+        if seen.1["reason"] == "over_budget" {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(big.0, 503, "{}", big.1);
-    assert_eq!(big.1["reason"], "over_budget", "{}", big.1);
-    assert!(
-        big.1["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("wire bytes")),
-        "refused at the byte limit, not after reading the value: {}",
-        big.1
-    );
+    assert_eq!(seen.0, 503, "{}", seen.1);
+    assert_eq!(seen.1["reason"], "over_budget", "{}", seen.1);
+    seen.1
+}
 
-    // The co-mount follows the writer past the refusal: a block it had never seen arrives.
-    let mut next = block(2, 0, 1);
-    next.logs.push(transfer_log(
-        ARB,
-        2,
-        next.logs.len() as u64,
-        &next.hash.clone(),
-        &account(3),
-        &account(4),
-        9,
-    ));
-    tape.insert_block(2, next);
-    tape.advance_tip_to(2);
-    writer.reaches(2).await;
+/// The co-mount follows the writer to block `b`, which it has never seen, and stays ready.
+async fn co_mount_follows(writer: &Writer, tape: &TapeSource, fbase: &str, b: u64) {
+    tape.insert_block(b, both(b));
+    tape.advance_tip_to(b);
+    writer.reaches(b).await;
     let q = "SELECT count(*) AS n FROM arb__transfer";
     let mut followed = serde_json::Value::Null;
     for _ in 0..800 {
@@ -585,14 +571,81 @@ async fn a_single_value_over_the_budget_is_refused_without_being_read() {
             .await
             .unwrap();
         followed = resp.json().await.unwrap_or_default();
-        if followed["rows"][0]["n"] == 2 {
+        if followed["rows"][0]["n"] == b {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(followed["rows"][0]["n"], 2, "{followed}");
-    let (status, ready) = get(&fbase, "/ready").await;
+    assert_eq!(followed["rows"][0]["n"], b, "{followed}");
+    let (status, ready) = get(fbase, "/ready").await;
     assert_eq!(status, 503, "{ready}");
     assert_eq!(ready["nests"][SMALL]["ready"], true, "{ready}");
+}
+
+/// One stored value larger than its cursor's whole budget: the follower stops reading that snapshot
+/// at its byte limit rather than allocating the value, refuses the mount by name, reconnects without
+/// it, and its co-mount goes on following the writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_value_over_the_budget_is_refused_without_being_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, via, tape) = two_mounts(tmp.path());
+    let writer = Writer::start_many(&root, tape.clone(), 0, &[ROUTE, SMALL]);
+    writer.reaches(1).await;
+    // 32 MiB in one meta value, against a cursor budget of 12.
+    writer
+        .store
+        .set_meta("ballast", &"x".repeat(32 << 20))
+        .unwrap();
+    let (_f, fbase) = bind_follower(&via, &writer).await;
+    let body = refused_by_budget(&fbase, ROUTE).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("snapshot passed")),
+        "refused at the byte limit, not after reading the value: {body}"
+    );
+    co_mount_follows(&writer, &tape, &fbase, 2).await;
     writer.stop(&root);
+}
+
+/// A held mount's delta that would take it past what its cursor has left is refused before any of
+/// it is applied: by its peak, worked out from the decoded delta, or before that by its wire bytes.
+/// The co-mount goes on following.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delta_over_the_budget_is_refused_before_it_is_applied() {
+    for (size, refused_by) in [
+        (3 << 20, "refused before it was applied"),
+        (32 << 20, "delta passed"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, via, tape) = two_mounts(tmp.path());
+        let writer = Writer::start_many(&root, tape.clone(), 0, &[ROUTE, SMALL]);
+        writer.reaches(1).await;
+        let (_f, fbase) = bind_follower(&via, &writer).await;
+        let mut held = 0;
+        for _ in 0..800 {
+            held = route_status(&fbase, ROUTE).await.0;
+            if held == 200 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(held, 200, "the mount is held before the delta");
+        // One row of `size` bytes: about 2 MiB is left, so 3 MiB passes the wire limit (twice that) but
+        // not the charge; 32 MiB passes neither.
+        let row = serde_json::json!({"table": "blob", "block_number": 1, "pad": "x".repeat(size)});
+        writer
+            .store
+            .put_entity("000000000001-999999", &row.to_string())
+            .unwrap();
+        let body = refused_by_budget(&fbase, ROUTE).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains(refused_by)),
+            "{size}: {body}"
+        );
+        co_mount_follows(&writer, &tape, &fbase, 2).await;
+        writer.stop(&root);
+    }
 }
