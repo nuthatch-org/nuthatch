@@ -928,8 +928,9 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /shape` | capability probe: what this nest can answer (drives adaptive MCP) |
 | `GET /_admin/`, `/_admin/events`, `/_admin/config`, `/_admin/storage`, `/_admin/requests` | admin UI (eight tabs since 4.2.1), its event stream, the authored files and limits as JSON with every URL cut to scheme and host and every secret withheld, the sealed catalogue per table (`?table=` for one table's segments), and the last 256 requests served (`?since=<seq>` for those after one): route template, the declared query or entity name when the nest knows it, status, milliseconds and bytes, never SQL text, a query string, a path value or a client address, and not the monitoring reads (`/`, `/health`, `/ready`, `/metrics`, `/_admin*`). Token-gated off-localhost; removable with `--no-admin` |
 
-**Response header:** `/sql`, `/q/{name}`, GraphQL and the typed routes answer with `Nuthatch-Cost`,
-a report of what the request read and held; [The cost header](#the-cost-header) has its format.
+**Cost header:** a request to `/sql`, `/q/{name}`, GraphQL or a typed route that sends
+`Nuthatch-Cost: 1` is answered with a `Nuthatch-Cost` header, a report of what it read and held;
+[The cost header](#the-cost-header) has its format. Without the request header nothing is sent.
 
 **Runtime root routes:** `GET /nests` (roster with live per-nest health), `GET /ready` (runtime-wide),
 `GET /health`, and `GET /metrics` (the whole runtime's exposition, served before anything is mounted;
@@ -1073,8 +1074,8 @@ nuthatch dev --cors https://app.example.com --cors http://localhost:3000
 nuthatch serve --cors '*'          # any origin; fine for a public read-only nest
 ```
 
-It sets allow-origin, allow-methods `GET,POST,OPTIONS` and allow-headers, exposes
-[`Nuthatch-Cost`](#the-cost-header), and answers preflight.
+It sets allow-origin, allow-methods `GET,POST,OPTIONS` and allow-headers (mirrored, so a page may
+send `Nuthatch-Cost: 1`), exposes the [`Nuthatch-Cost`](#the-cost-header) answer, and answers preflight.
 `POST` is there for the GraphQL routes (`/graphql`, `/subgraphs/id/{id}`, `/subgraphs/name/…`,
 present only in a `--features graph` build), which take their query in a body - a `GET`-only list would leave a browser GraphQL client
 preflighting `POST`, being refused, and never sending the query. No `/_admin` path is ever
@@ -1252,12 +1253,19 @@ mount's series go when it is unmounted.
 
 ### The cost header
 
-Every answer from `/sql`, `/q/{name}`, the GraphQL routes and the typed routes (`/table/{name}`,
+A request to `/sql`, `/q/{name}`, the GraphQL routes or the typed routes (`/table/{name}`,
 `/entities`, `/entity/{id}`, the three `/derived` routes, `/balances`, `/balance/{address}`,
-`/exposure/{address}`, `/flags`) carries a `Nuthatch-Cost` header saying what that request read and
-held (RFC-0073 FR4):
+`/exposure/{address}`, `/flags`) that sends `Nuthatch-Cost: 1` is answered with a `Nuthatch-Cost`
+header saying what that request read and held (RFC-0073 FR4). A gateway that wants it adds the
+request header itself. A request without it, or with any other value, gets no header and computes
+none of it: the footer pass behind `sealed_bytes` costs a filtered query over 1,500 segments roughly
+a sixth more, and most callers never read the answer.
 
 ```
+GET /sql?q=… HTTP/1.1
+Nuthatch-Cost: 1
+
+HTTP/1.1 200 OK
 Nuthatch-Cost: sealed_bytes=1409; hot_rows=12; engine_us=3793; peak_mem_bytes=0; queue_us=0; result_bytes=219712; sealed_bytes_read=1409
 ```
 

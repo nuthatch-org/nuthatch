@@ -11616,10 +11616,15 @@ mod tests {
     }
 
     /// `Nuthatch-Cost` from one GET through the router, its `result_bytes` checked against the body.
+    /// Held by every test that asks for a cost, so one counting Burrmill's selection passes sees only its own.
+    static COST_ASKED: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn cost_of(state: &AppState, path: &str) -> std::collections::BTreeMap<String, u64> {
         use tower::ServiceExt;
+        let _asked = COST_ASKED.lock().await;
         let req = axum::http::Request::builder()
             .uri(path)
+            .header(crate::cost::HEADER, "1")
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = router(SharedNest::new(state.clone()))
@@ -11768,13 +11773,62 @@ mod tests {
                 .oneshot(
                     axum::http::Request::builder()
                         .uri("/tables")
+                        .header(crate::cost::HEADER, "1")
                         .body(axum::body::Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap()
         };
-        assert!(resp.headers().get(crate::cost::HEADER).is_none());
+        assert!(
+            resp.headers().get(crate::cost::HEADER).is_none(),
+            "an unmetered route"
+        );
+    }
+
+    /// The cost is opt-in: a request that does not send `Nuthatch-Cost: 1` gets no header, and the
+    /// statement behind it runs no selection pass over the footers.
+    #[tokio::test]
+    async fn a_request_that_does_not_ask_pays_nothing_for_its_cost() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let rows: Vec<String> = (0..10)
+            .map(|i| {
+                format!(
+                    r#"{{"table":"t__s","block_number":1,"tx_hash":"0x{i:x}","log_index":{i}}}"#
+                )
+            })
+            .collect();
+        crate::seal::seal_range(tmp.path(), &rows, 1, 1).unwrap();
+        let state = test_state(tmp.path(), 2);
+        state.store.set_meta("sealed_through", "1").unwrap();
+        let path = sql_path(r#"SELECT *, random() AS r FROM "t__s""#);
+        let ask = |value: Option<&'static str>| {
+            let mut req = axum::http::Request::builder().uri(path.clone());
+            if let Some(v) = value {
+                req = req.header(crate::cost::HEADER, v);
+            }
+            router(SharedNest::new(state.clone()))
+                .oneshot(req.body(axum::body::Body::empty()).unwrap())
+        };
+        let _asked = COST_ASKED.lock().await;
+        for value in [None, Some("0")] {
+            let before = burrmill::df::selection_passes();
+            let resp = ask(value).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(
+                resp.headers().get(crate::cost::HEADER).is_none(),
+                "{value:?}"
+            );
+            assert_eq!(burrmill::df::selection_passes(), before, "{value:?}");
+        }
+        let before = burrmill::df::selection_passes();
+        let resp = ask(Some("1")).await.unwrap();
+        assert!(resp.headers().get(crate::cost::HEADER).is_some());
+        assert!(
+            burrmill::df::selection_passes() > before,
+            "the probe must see a pass when one runs"
+        );
     }
 
     /// A remembered answer is the computed one byte for byte bar `cached`, rows written from the
@@ -12454,6 +12508,7 @@ mod tests {
     #[tokio::test]
     async fn a_graphql_answer_carries_its_cost() {
         use tower::ServiceExt;
+        let _asked = COST_ASKED.lock().await;
         reset_graph_budget();
         let _guard = GraphBudgetGuard;
         let dir = tempfile::tempdir().unwrap();
@@ -12476,6 +12531,7 @@ mod tests {
                     .method("POST")
                     .uri("/graphql")
                     .header("content-type", "application/json")
+                    .header(crate::cost::HEADER, "1")
                     .body(axum::body::Body::from(
                         json!({ "query": "{ bets { weights } }" }).to_string(),
                     ))

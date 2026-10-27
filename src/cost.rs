@@ -1,5 +1,6 @@
 //! The `Nuthatch-Cost` response header (RFC-0073 FR4): what one request read and held, reported to
-//! the operator's gateway. It is a report, not a price; nuthatch meters and bills nothing.
+//! the operator's gateway. It is a report, not a price; nuthatch meters and bills nothing. A caller
+//! asks for it per request with `Nuthatch-Cost: 1`; without that nothing below runs.
 //!
 //! The figures come from where the work happens: Burrmill's count of the sealed bytes a plan selects
 //! and reads, the hot rows copied for the statement, the time spent waiting for a permit, and the
@@ -11,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The header's name. Lower case, as `http` stores every header name.
+/// The header's name, asked for and answered under the same name. Lower case, as `http` stores it.
 pub const HEADER: &str = "nuthatch-cost";
 
 /// Routes whose responses carry the header, by the pattern each is registered under.
@@ -86,6 +87,11 @@ pub fn spawn_blocking<R: Send + 'static>(
     })
 }
 
+/// Whether the work on this task or thread is for a request that asked for its cost.
+pub fn asked() -> bool {
+    current().is_some()
+}
+
 /// What one Burrmill statement did.
 pub fn engine(m: &burrmill::QueryMetrics) {
     with(|t| {
@@ -128,19 +134,24 @@ impl Meter {
     }
 }
 
-/// Meter a metered route's request and stamp its response. A route layer, so the matched pattern is
-/// known; any other route passes through untouched.
+/// Meter a metered route's request that asked for it, and stamp its response. A route layer, so the
+/// matched pattern is known; anything else passes through untouched.
 pub async fn layer(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let metered = req
-        .extensions()
-        .get::<axum::extract::MatchedPath>()
-        .is_some_and(|p| {
-            let p = p.as_str();
-            METERED.iter().any(|m| p == *m || p.ends_with(m))
-        });
+    let asked = req
+        .headers()
+        .get(HEADER)
+        .is_some_and(|v| v.as_bytes() == b"1");
+    let metered = asked
+        && req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .is_some_and(|p| {
+                let p = p.as_str();
+                METERED.iter().any(|m| p == *m || p.ends_with(m))
+            });
     if !metered {
         return next.run(req).await;
     }
