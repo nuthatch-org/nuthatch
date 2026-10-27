@@ -3976,7 +3976,7 @@ impl FoldBinder {
     /// Bounded and locked down like `/sql`'s connection: the same memory, thread and spill limits.
     pub(crate) fn open(dir: &Path) -> Result<Self> {
         Ok(Self {
-            session: open_session(dir)?,
+            session: open_session(dir, None)?,
             parser: crate::graft::Parser::new()?,
         })
     }
@@ -4212,7 +4212,7 @@ impl FoldEvaluator {
             std::fs::create_dir_all(shared)?;
         }
         Ok(Self {
-            session: open_session(dir)?,
+            session: open_session(dir, None)?,
             dir: dir.to_path_buf(),
             schema: schema.to_vec(),
             views_defined: false,
