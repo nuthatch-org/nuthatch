@@ -9953,6 +9953,67 @@ mod tests {
         assert!(gate.hot_used().is_empty());
     }
 
+    /// RFC-0073 FR1 with FR5: a follower's hot copy is charged and refused as the writer's is. The
+    /// test above, with each tenant served from a follower's in-memory copy of its store.
+    #[tokio::test]
+    async fn a_followers_hot_copies_are_charged_as_the_writers_are() {
+        let (ta, tb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let gate = SqlGate::with_hot_bytes(4, 16 * 1024);
+        let bytes = ResponseBytes::new(SQL_MAX_INFLIGHT_RESPONSE_KIB);
+        let followed = |state: AppState| {
+            let sub = state
+                .store
+                .feed_subscribe()
+                .unwrap()
+                .expect("a redb store has a feed");
+            AppState {
+                store: Arc::new(crate::feed::MemStore::from_snapshot(
+                    &state.dir,
+                    sub.snapshot,
+                )),
+                ..state
+            }
+        };
+        let a = seated(ta.path(), &gate, &bytes, "acme");
+        let b = seated(tb.path(), &gate, &bytes, "globex");
+        kilo_tip(&a, 3);
+        kilo_tip(&b, 3);
+        let (a, b) = (followed(a), followed(b));
+
+        let mut copies = Vec::new();
+        while let Ok(p) = gate.charge_hot(3000, Some("acme")) {
+            copies.push(p);
+        }
+        assert_eq!(copies.len(), 4);
+        let resp = sql_response(a.clone(), "SELECT 1 AS n").await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body_json(resp).await["reason"], "tenant_share");
+        assert_eq!(
+            gate.hot_used().get("acme"),
+            Some(&12),
+            "nothing more charged"
+        );
+
+        let resp = sql_response(b.clone(), "SELECT 2445 AS n").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rows"][0]["n"], 2445);
+        let seen = hot_held_while_running().lock().unwrap().clone();
+        let during = seen.iter().rev().find(|(d, _)| d == tb.path());
+        assert_eq!(
+            during.and_then(|(_, held)| held.get("globex")),
+            Some(&3),
+            "the follower's 3 KiB tip, held for the life of the query"
+        );
+        assert_eq!(gate.hot_used().get("globex"), None);
+
+        drop(copies);
+        let resp = sql_response(a, "SELECT 4 AS n").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(gate.hot_used().is_empty());
+        crate::seal::unpin_catalogue(ta.path());
+        crate::seal::unpin_catalogue(tb.path());
+    }
+
     /// A hot copy is given back however the query ends: a SQL error, or a panic after the copy.
     #[tokio::test]
     async fn a_hot_copy_is_released_on_error_and_on_panic() {

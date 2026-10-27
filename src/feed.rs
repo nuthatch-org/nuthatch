@@ -794,6 +794,83 @@ impl MemStore {
         Ok(())
     }
 
+    /// `Store::hot_rows_snapshot` over the copy: with `charge`, the rows the copy will take are
+    /// measured first, in its order and with its refusals, and charged before any is parsed. One read
+    /// lock covers both passes, so the copy is exactly the bytes charged.
+    fn hot_rows_snapshot(
+        &self,
+        max_rows: usize,
+        max_bytes: u64,
+        charge: Option<&mut dyn FnMut(u64) -> Result<()>>,
+    ) -> Result<HotRowsSnapshot> {
+        let m = self.read();
+        if let Some(charge) = charge {
+            #[derive(serde::Deserialize)]
+            struct Tabled<'a> {
+                #[serde(borrow, default)]
+                table: Option<&'a serde_json::value::RawValue>,
+            }
+            let (mut bytes, mut seen) = (0u64, 0usize);
+            for v in m.entities.values() {
+                bytes = bytes
+                    .checked_add(v.len() as u64)
+                    .context("hot source byte count overflow")?;
+                if bytes > max_bytes {
+                    return Err(HotScanBudgetExceeded {
+                        source_bytes: bytes,
+                        budget: max_bytes,
+                    }
+                    .into());
+                }
+                let raw = serde_json::from_str::<&serde_json::value::RawValue>(v)
+                    .context("unparseable hot row in an analytical scan")?;
+                let tabled = raw.get().trim_start().starts_with('{')
+                    && match serde_json::from_str::<Tabled>(raw.get()) {
+                        Ok(t) => t.table.is_some_and(|t| t.get().starts_with('"')),
+                        Err(_) => serde_json::from_str::<serde_json::Value>(raw.get())?
+                            .get("table")
+                            .is_some_and(serde_json::Value::is_string),
+                    };
+                if tabled {
+                    seen += 1;
+                    if seen > max_rows {
+                        return Err(HotScanTooLarge { cap: max_rows }.into());
+                    }
+                }
+            }
+            charge(bytes)?;
+        }
+        let mut out = HotRowsSnapshot {
+            last_block: m.meta.get("last_block").and_then(|v| v.parse().ok()),
+            ..Default::default()
+        };
+        let mut seen = 0usize;
+        for v in m.entities.values() {
+            out.source_rows += 1;
+            out.source_bytes = out
+                .source_bytes
+                .checked_add(v.len() as u64)
+                .context("hot source byte count overflow")?;
+            if out.source_bytes > max_bytes {
+                return Err(HotScanBudgetExceeded {
+                    source_bytes: out.source_bytes,
+                    budget: max_bytes,
+                }
+                .into());
+            }
+            let json = serde_json::from_str::<serde_json::Value>(v)
+                .context("unparseable hot row in an analytical scan")?;
+            if let Some(table) = json.get("table").and_then(|t| t.as_str()) {
+                seen += 1;
+                if seen > max_rows {
+                    return Err(HotScanTooLarge { cap: max_rows }.into());
+                }
+                out.rows.entry(table.to_string()).or_default().push(json);
+            }
+        }
+        Ok(out)
+    }
+
     /// Every mirrored table, for comparing a copy against the store it follows.
     pub fn tables(&self) -> MirroredTables {
         let m = self.read();
@@ -920,36 +997,15 @@ impl HotStore for MemStore {
         max_rows: usize,
         max_bytes: u64,
     ) -> Result<HotRowsSnapshot> {
-        let m = self.read();
-        let mut out = HotRowsSnapshot {
-            last_block: m.meta.get("last_block").and_then(|v| v.parse().ok()),
-            ..Default::default()
-        };
-        let mut seen = 0usize;
-        for v in m.entities.values() {
-            out.source_rows += 1;
-            out.source_bytes = out
-                .source_bytes
-                .checked_add(v.len() as u64)
-                .context("hot source byte count overflow")?;
-            if out.source_bytes > max_bytes {
-                return Err(HotScanBudgetExceeded {
-                    source_bytes: out.source_bytes,
-                    budget: max_bytes,
-                }
-                .into());
-            }
-            let json = serde_json::from_str::<serde_json::Value>(v)
-                .context("unparseable hot row in an analytical scan")?;
-            if let Some(table) = json.get("table").and_then(|t| t.as_str()) {
-                seen += 1;
-                if seen > max_rows {
-                    return Err(HotScanTooLarge { cap: max_rows }.into());
-                }
-                out.rows.entry(table.to_string()).or_default().push(json);
-            }
-        }
-        Ok(out)
+        self.hot_rows_snapshot(max_rows, max_bytes, None)
+    }
+    fn hot_rows_charged(
+        &self,
+        max_rows: usize,
+        max_bytes: u64,
+        charge: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<HotRowsSnapshot> {
+        self.hot_rows_snapshot(max_rows, max_bytes, Some(charge))
     }
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
         let lo = format!("{from:012}-000000");
