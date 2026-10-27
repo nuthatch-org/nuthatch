@@ -614,6 +614,39 @@ fn now_stamp() -> String {
 mod tests {
     use super::*;
 
+    fn manifest_naming(dir: &Path, table: &str, file: &str) {
+        std::fs::create_dir_all(dir.join(DIR)).unwrap();
+        let raw = serde_json::json!({"tables": {table: [{
+            "hash": "h", "file": file, "rows": 1, "columns": ["x"],
+            "source": "s", "ingested_at": "t", "tool_version": "v"
+        }]}});
+        std::fs::write(catalogue_path(dir), raw.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_cannot_name_a_file_outside_offchain_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in [
+            "/etc/other/segments/abc.parquet",
+            "../../data/other/segments/abc.parquet",
+            "sub/abc.parquet",
+            "abc.csv",
+            ".parquet",
+        ] {
+            manifest_naming(dir.path(), "prices", file);
+            assert!(load(dir.path()).is_err(), "{file} was accepted");
+        }
+        manifest_naming(dir.path(), "../prices", "prices-abc.parquet");
+        assert!(
+            load(dir.path()).is_err(),
+            "a table name with a path was accepted"
+        );
+
+        manifest_naming(dir.path(), "prices", "prices-abc123.parquet");
+        let c = load(dir.path()).unwrap();
+        assert_eq!(c.tables["prices"][0].file, "prices-abc123.parquet");
+    }
+
     async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
