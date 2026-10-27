@@ -204,7 +204,7 @@ fn the_graph_lane_reads_through_the_same_sql_path() {
         "admission must remain bounded"
     );
     assert!(
-        shared.contains("SQL_TIMEOUT"),
+        shared.contains("limits.timeout"),
         "execution must remain bounded"
     );
     for forbidden in [

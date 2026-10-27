@@ -218,12 +218,37 @@ impl std::fmt::Display for QuerySpillExceeded {
 
 impl std::error::Error for QuerySpillExceeded {}
 
+/// A query the guard stopped because its dataset's analytics pool held more than the mount allows
+/// (RFC-0073 FR3). Answered 507 with the cap, as a spill is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryMemoryExceeded {
+    pub cap_bytes: u64,
+}
+
+impl std::fmt::Display for QueryMemoryExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "query held more than this mount's analytics memory of {} bytes on the read-only SQL \
+             surface; narrow it",
+            self.cap_bytes
+        )
+    }
+}
+
+impl std::error::Error for QueryMemoryExceeded {}
+
 /// How often the `/sql` watchdog measures a running query's spill directory.
 const SPILL_POLL: Duration = Duration::from_millis(250);
+/// How often it reads the pool under a mount's memory cap: an atomic load, so cheap.
+const MEMORY_POLL: Duration = Duration::from_millis(5);
 
 /// The error for a query the watchdog interrupted: the spill cap when that was what it hit, else the
 /// deadline.
-fn stopped(guard: Option<QueryGuard>, spilled: &AtomicU64) -> anyhow::Error {
+fn stopped(guard: Option<QueryGuard>, spilled: &AtomicU64, held: &AtomicU64) -> anyhow::Error {
+    if let cap_bytes @ 1.. = held.load(Ordering::SeqCst) {
+        return QueryMemoryExceeded { cap_bytes }.into();
+    }
     match spilled.load(Ordering::SeqCst) {
         0 => QueryBudgetExceeded {
             secs: guard.map(|g| g.timeout.as_secs()).unwrap_or(0),
@@ -257,6 +282,22 @@ fn spilled_bytes(dir: &Path) -> u64 {
 pub struct QueryGuard {
     pub timeout: Duration,
     pub max_rows: usize,
+    /// Encoded result bytes before the answer is truncated, beside `max_rows`.
+    pub max_result_bytes: usize,
+    /// RFC-0073 FR3: how much of the dataset's analytics pool may be held while this statement
+    /// runs. Polled, so exact only to [`MEMORY_POLL`], and it counts every statement on the pool.
+    pub memory_bytes: Option<u64>,
+}
+
+impl Default for QueryGuard {
+    fn default() -> Self {
+        Self {
+            timeout: crate::serve::SQL_TIMEOUT,
+            max_rows: crate::serve::SQL_MAX_ROWS,
+            max_result_bytes: crate::engine::SQL_MAX_RESULT_BYTES,
+            memory_bytes: None,
+        }
+    }
 }
 
 /// The result of a query: the rows, plus the two ways they can fail to be the whole answer.
@@ -1420,7 +1461,7 @@ fn attempt(
     }
     let mut slot = slot.expect("just inserted");
     slot.last_used = SESSION_USE.fetch_add(1, Ordering::Relaxed);
-    let (referenced, offchain, degraded_tables, interrupted, spilled, outcome, cap, scan) = {
+    let (referenced, offchain, degraded_tables, interrupted, (spilled, held), outcome, cap, scan) = {
         let session: &dyn Session = slot.session.as_ref();
         session.set_deadline(deadline);
         // The token outlives the previous statement. Clear it before the watchdog or the shutdown
@@ -1523,16 +1564,20 @@ fn attempt(
         let interrupted = Arc::new(AtomicBool::new(false));
         // The cap, set before `interrupted`, when it was the spill and not the deadline that stopped it.
         let spilled = Arc::new(AtomicU64::new(0));
-        let watchdog = guard.zip(deadline).map(|(_, d)| {
+        // Likewise the mount's analytics memory cap (RFC-0073 FR3).
+        let held = Arc::new(AtomicU64::new(0));
+        let watchdog = guard.zip(deadline).map(|(g, d)| {
             let handle = session.interrupt_handle();
             let spill = session.spill_limit();
-            let (flag, over) = (interrupted.clone(), spilled.clone());
+            let memory = g.memory_bytes.zip(session.memory_gauge());
+            let (flag, over, held) = (interrupted.clone(), spilled.clone(), held.clone());
             let (tx, rx) = mpsc::channel::<()>();
             let join = std::thread::spawn(move || loop {
                 let remaining = d.saturating_duration_since(Instant::now());
-                let tick = match spill {
-                    Some(_) => remaining.min(SPILL_POLL),
-                    None => remaining,
+                let tick = match (&spill, &memory) {
+                    (_, Some(_)) => remaining.min(MEMORY_POLL),
+                    (Some(_), None) => remaining.min(SPILL_POLL),
+                    (None, None) => remaining,
                 };
                 // Only a genuine timeout interrupts; a value (normal completion) or a dropped sender
                 // (panic) leaves the query alone.
@@ -1542,6 +1587,14 @@ fn attempt(
                 if let Some((dir, cap)) = &spill {
                     if spilled_bytes(dir) > *cap {
                         over.store(*cap, Ordering::SeqCst);
+                        flag.store(true, Ordering::SeqCst);
+                        handle.interrupt();
+                        break;
+                    }
+                }
+                if let Some((cap, gauge)) = &memory {
+                    if gauge() > *cap {
+                        held.store(*cap, Ordering::SeqCst);
                         flag.store(true, Ordering::SeqCst);
                         handle.interrupt();
                         break;
@@ -1585,7 +1638,7 @@ fn attempt(
         if let Some(f) = test_remove_after_define().lock().unwrap().remove(dir) {
             std::fs::remove_file(&f).expect("test hook: remove the planned segment");
         }
-        let cap = guard.map(|g| g.max_rows);
+        let cap = guard.map(|g| (g.max_rows, g.max_result_bytes));
         let _live = LiveQuery::register(dir, session.interrupt_handle());
         let outcome = evaluate.then(|| match want {
             Want::Rows => session.collect(sql, cap),
@@ -1620,7 +1673,7 @@ fn attempt(
             offchain,
             degraded_tables,
             interrupted,
-            spilled,
+            (spilled, held),
             outcome,
             cap,
             scan,
@@ -1635,7 +1688,7 @@ fn attempt(
 
     let scan = match scan {
         Some(Err(_)) if interrupted.load(Ordering::SeqCst) => {
-            return Err(stopped(guard, &spilled));
+            return Err(stopped(guard, &spilled, &held));
         }
         Some(Err(e)) => return Err(e),
         Some(Ok(bound)) => Some(bound),
@@ -1664,7 +1717,7 @@ fn attempt(
         // `/sql` surface must say "query exceeded budget" rather than an internal engine string.
         Err(Died::Binding(e)) => {
             if interrupted.load(Ordering::SeqCst) {
-                return Err(stopped(guard, &spilled));
+                return Err(stopped(guard, &spilled, &held));
             }
             // A copy is planned lazily, so one that will not read can fail here too; `run` answers
             // around it from the definition, where a fault of the statement's own fails again.
@@ -1679,7 +1732,7 @@ fn attempt(
         }
         Err(Died::Executing(e)) => {
             if interrupted.load(Ordering::SeqCst) {
-                return Err(stopped(guard, &spilled));
+                return Err(stopped(guard, &spilled, &held));
             }
             // Handed back rather than returned: the caller decides whether a corrupt segment explains
             // it and is worth one reduced retry (#433). The tables ride along because they come from
@@ -1694,7 +1747,7 @@ fn attempt(
     };
 
     let truncated = match cap {
-        Some(max) if over_cap => {
+        Some((max, _)) if over_cap => {
             rows.truncate(max);
             true
         }
@@ -4265,6 +4318,7 @@ mod tests {
         let guard = || super::QueryGuard {
             timeout: std::time::Duration::from_secs(10),
             max_rows: 10,
+            ..Default::default()
         };
         let run = |rows: Vec<serde_json::Value>, sql: &str| {
             let hot: super::HotRows = [("totals".to_string(), rows)].into_iter().collect();
@@ -4340,6 +4394,7 @@ mod tests {
             let guard = super::QueryGuard {
                 timeout: std::time::Duration::from_secs(10),
                 max_rows: 10,
+                ..Default::default()
             };
             super::query_hot_cold(
                 dir.path(),
@@ -4622,6 +4677,7 @@ mod tests {
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 100,
+            ..Default::default()
         };
         // Alternating blocks also proves a cached historical connection cannot leak a later view.
         for (block, expected) in [(10, 5), (30, 23), (20, 12), (10, 5)] {
@@ -4659,6 +4715,7 @@ mod tests {
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 100,
+            ..Default::default()
         };
         let hot = HotRows::new();
         let sql = "SELECT symbol FROM offchain__prices";
@@ -4703,6 +4760,7 @@ mod tests {
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 100,
+            ..Default::default()
         };
         let run = |sql: &str| query_hot_cold(dir.path(), sql, guard, &HotRows::new(), 0, &[]);
         let widened = run("SELECT count(*) AS n FROM offchain__prices").expect("two widths widen");
@@ -4735,6 +4793,7 @@ mod tests {
             QueryGuard {
                 timeout: Duration::from_secs(5),
                 max_rows: 100,
+                ..Default::default()
             },
             &hot,
             0,
@@ -4768,6 +4827,7 @@ mod tests {
             QueryGuard {
                 timeout: Duration::from_secs(5),
                 max_rows: 100,
+                ..Default::default()
             },
             &HotRows::new(),
             20,
@@ -4799,6 +4859,7 @@ mod tests {
         let guard = QueryGuard {
             timeout: Duration::from_secs(30),
             max_rows: 2,
+            ..Default::default()
         };
         let out = query_guarded(dir.path(), r#"SELECT * FROM "t__transfer""#, guard).unwrap();
         assert_eq!(out.rows.len(), 2, "capped at max_rows");
@@ -4808,6 +4869,7 @@ mod tests {
         let guard = QueryGuard {
             timeout: Duration::from_secs(30),
             max_rows: 3,
+            ..Default::default()
         };
         let out = query_guarded(dir.path(), r#"SELECT * FROM "t__transfer""#, guard).unwrap();
         assert_eq!(out.rows.len(), 3);
@@ -4820,6 +4882,7 @@ mod tests {
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 10,
+            ..Default::default()
         };
         let out = query_guarded(
             dir.path(),
@@ -4927,6 +4990,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_millis(250),
             max_rows: 1000,
+            ..Default::default()
         };
         // Which guard fires is the assertion, so no other test's spill cap may be in the environment.
         let _env = crate::analytics_budget::tests::env_lock()
@@ -4972,6 +5036,7 @@ template="pool"
             QueryGuard {
                 timeout: Duration::from_secs(30),
                 max_rows: 1,
+                ..Default::default()
             },
         )
         .unwrap()
@@ -5043,6 +5108,7 @@ template="pool"
             QueryGuard {
                 timeout: Duration::from_secs(30),
                 max_rows: 100,
+                ..Default::default()
             },
             &HotRows::new(),
             u64::MAX,
@@ -5296,6 +5362,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(30),
             max_rows: 10,
+            ..Default::default()
         };
         query_guarded(dir, r#"SELECT count(*) AS n FROM "usdc__transfer""#, guard).unwrap()
     }
@@ -5611,6 +5678,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 1000,
+            ..Default::default()
         };
         // Watermark = 10: cold keeps block 10, hot keeps only block 20 → 2 rows, not 3.
         let out = query_hot_cold(
@@ -5644,6 +5712,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 1000,
+            ..Default::default()
         };
         let out = query_hot_cold(
             dir.path(),
@@ -5686,6 +5755,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 1000,
+            ..Default::default()
         };
         let out = query_hot_cold(
             dir.path(),
@@ -5765,6 +5835,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 1000,
+            ..Default::default()
         };
         // Absolute path outside the allowlist → refused.
         assert!(
@@ -5846,6 +5917,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 1000,
+            ..Default::default()
         };
         let out = query_hot_cold(
             dir.path(),
@@ -5881,6 +5953,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 1000,
+            ..Default::default()
         };
         // Cold-only sees the 2 sealed rows; hot+cold sees all 3.
         let cold_only = query_guarded(
@@ -6125,6 +6198,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 1000,
+            ..Default::default()
         };
         let out = query_hot_cold(
             dir.path(),
@@ -6206,6 +6280,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 1000,
+            ..Default::default()
         };
         let out = query_hot_cold(
             dir.path(),
@@ -6272,6 +6347,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 1000,
+            ..Default::default()
         };
         let hot = HotRows::new();
         query_hot_cold(dir.path(), "SELECT 1 AS n", guard, &hot, 0, &[]).unwrap();
@@ -7057,6 +7133,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(30),
             max_rows: 50_000,
+            ..Default::default()
         };
         let out = query_guarded(
             dir.path(),
@@ -7110,6 +7187,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(120),
             max_rows: 50_000,
+            ..Default::default()
         };
         let out = query_guarded(
             dir.path(),
@@ -7136,6 +7214,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(30),
             max_rows: 50_000,
+            ..Default::default()
         };
         let out = query_guarded(
             dir.path(),
@@ -7180,6 +7259,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(120),
             max_rows: 50_000,
+            ..Default::default()
         };
         let out = query_guarded(
             dir.path(),
@@ -7423,6 +7503,7 @@ template="pool"
             QueryGuard {
                 timeout: Duration::from_secs(30),
                 max_rows: 10_000,
+                ..Default::default()
             },
         )
         .expect("a reduced table must still answer")
@@ -8016,6 +8097,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_secs(300),
             max_rows: 10,
+            ..Default::default()
         };
         let result = {
             let _env = crate::analytics_budget::tests::env_lock()
@@ -8083,6 +8165,7 @@ template="pool"
         let guard = QueryGuard {
             timeout: Duration::from_millis(200),
             max_rows: 10,
+            ..Default::default()
         };
         let result = query_guarded(dir.path(), r#"SELECT "from" FROM "t__transfer""#, guard);
         test_set_first_attempt_delay_ms(dir.path(), 0);
@@ -8849,6 +8932,7 @@ events = ["Transfer"]
         let guard = QueryGuard {
             timeout: Duration::from_secs(5),
             max_rows: 1000,
+            ..Default::default()
         };
         // Before the fix this is a binder error ("Referenced column memo not found"); with everything
         // built through the real chain, it must resolve, and `memo` must read back NULL for the segment
@@ -9205,6 +9289,7 @@ events = ["Transfer"]
             QueryGuard {
                 timeout: Duration::from_secs(5),
                 max_rows: 100,
+                ..Default::default()
             },
         )
         .expect_err("the guarded surface must refuse it too");
@@ -9229,7 +9314,12 @@ mod fold_connections {
                 "SELECT * FROM read_csv_auto('/etc/hosts')",
                 "SELECT * FROM '/etc/hosts'",
             ] {
-                assert!(session.collect(sql, Some(1)).is_err(), "{what} ran {sql}");
+                assert!(
+                    session
+                        .collect(sql, Some((1, crate::engine::SQL_MAX_RESULT_BYTES)))
+                        .is_err(),
+                    "{what} ran {sql}"
+                );
             }
         }
     }
@@ -9410,6 +9500,7 @@ FROM bet GROUP BY player;
         QueryGuard {
             timeout: Duration::from_secs(60),
             max_rows: 10_000,
+            ..Default::default()
         }
     }
 

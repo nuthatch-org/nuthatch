@@ -348,6 +348,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                 sql: crate::allowlist::SqlAccess::Open,
                 queries: Vec::new(),
                 publish: None,
+                limits: Default::default(),
                 #[cfg(feature = "counter")]
                 counter: None,
             }),
@@ -366,6 +367,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                     sql: crate::allowlist::SqlAccess::Open,
                     queries: Vec::new(),
                     publish: None,
+                    limits: Default::default(),
                     #[cfg(feature = "counter")]
                     counter: None,
                 });
@@ -390,6 +392,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                     sql: crate::allowlist::SqlAccess::Open,
                     queries: Vec::new(),
                     publish: None,
+                    limits: Default::default(),
                     #[cfg(feature = "counter")]
                     counter: None,
                 });
@@ -441,6 +444,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                     sql: crate::allowlist::SqlAccess::Open,
                     queries: Vec::new(),
                     publish: None,
+                    limits: Default::default(),
                     #[cfg(feature = "counter")]
                     counter: None,
                 });

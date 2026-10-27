@@ -44,9 +44,10 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 | Do | Call | Answers |
 |---|---|---|
 | Mount a NID under a name | `POST /_admin/nests` `{"name": "usdc", "nid": "<nid>"}` | `202` and the job |
-| Read a mount's progress | `GET /_admin/mounts/<name>` | the job |
+| Read a mount's progress | `GET /_admin/mounts/<name>` | the job, and its mount record under `record` |
 | List every mount | `GET /_admin/mounts` | `{"mounts": [job, …]}` |
 | Price a mount first | `POST /_admin/nests?dry_run=true` with the same body | `200` and a report |
+| Change its SQL surface or limits | `PATCH /_admin/mounts/<name>` `{"limits": {"max_rows": 1000}}` | `200` and the record |
 | Pause a mount | `POST /_admin/suspend/<name>` | `200` |
 | Resume it | `POST /_admin/resume/<name>` | `202` and the job |
 | Move a name to a new NID | `POST /_admin/move/<name>` `{"nid": "<new nid>"}` | `202` and the job |
@@ -117,6 +118,51 @@ On the job route a refusal ends the job `failed` with the same reason. With `--r
 registry does not hold is accepted like any mount and ends the job `failed`, its reason naming the NID;
 with `?wait=true` it answers `500` with the same reason. A mount the runtime fetched and
 then refused is removed again: a refusal leaves nothing on disk.
+
+### Per-mount limits
+
+A mount may lower the `/sql` guards for itself (RFC-0073 FR3). `POST /_admin/nests` takes optional
+`sql`, `queries` and `limits` beside `name` and `nid`, and `PATCH /_admin/mounts/<name>` changes them
+on a live mount:
+
+```json
+{"name": "acme/usdc", "nid": "9f2c…", "sql": "open",
+ "limits": {"statement_timeout_ms": 5000, "max_rows": 1000, "analytics_memory_bytes": 134217728}}
+```
+
+| Field | Process value it may not exceed |
+|---|---|
+| `statement_timeout_ms` | `NUTHATCH_SQL_TIMEOUT_MS`, 30 s at most |
+| `max_rows` | `NUTHATCH_SQL_MAX_ROWS`, 50,000 at most |
+| `max_result_bytes` | `NUTHATCH_SQL_MAX_RESULT_BYTES`, 64 MiB at most |
+| `max_hot_rows` | `NUTHATCH_SQL_MAX_HOT_ROWS`, 2,000,000 at most |
+| `max_hot_bytes` | `NUTHATCH_SQL_MAX_HOT_BYTES`, 64 MiB at most |
+| `max_named_scan_bytes` | `NUTHATCH_SQL_MAX_NAMED_SCAN_BYTES`, 512 MiB at most |
+| `analytics_memory_bytes` | the analytics pool, `analytics.memory_limit` |
+| `max_queued` | `NUTHATCH_SQL_MAX_QUEUED`, 256 at most |
+
+A limit only ever lowers: a value above the process's, or zero, is refused with `400` naming the field
+and the ceiling, never clamped. An absent field is the process value. The limits are recorded in the
+mount's `[mounts.limits]` in `mounts.toml`, outside the NID: setting them re-indexes nothing and moves
+no data, and two mounts of one NID may carry different ones.
+
+`PATCH` takes any of `sql`, `queries` and `limits`. Each one given replaces the record's whole value, so
+`{"limits": {}}` returns a mount to the process values. Nothing is remounted or restarted: the next
+request runs under the new limits, and a request already in flight finishes under the ones it started
+with. A mount still being mounted or moved answers `409` with its job; a name with no mount record
+`404`. On `POST`, giving `sql` or `limits` for a name that is already live is `409` unless they match
+its record: change a live mount with `PATCH`.
+
+**Analytics memory on a shared dataset.** Two mounts of one NID share the dataset's analytics pool,
+sized by `analytics.memory_limit`. A mount's `analytics_memory_bytes` is checked against that shared
+pool while the mount's statement runs, every 5 ms, and the statement is stopped with `507` once the
+pool holds more. It bounds what the pool may hold while this mount is querying, so a co-tenant's
+statements count against it too: a tight cap on one mount can refuse its query because another is
+busy. It cannot raise the pool, and a mount with no cap still runs to the pool's own limit.
+
+The other guards are this mount's alone. Its timeout answers `504`, its unsealed-row and byte caps
+`503`, and its row and byte caps truncate the answer with `truncated: true`. A mount that lowers
+`max_result_bytes` neither reads nor fills the dataset's memo, whose key does not carry the byte cap.
 
 ### Dry run
 

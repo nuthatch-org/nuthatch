@@ -185,7 +185,7 @@ const SQL_ADMISSION_WAIT: Duration = Duration::from_millis(250);
 /// case here is roughly 4 MB of parked requests per nest. The cap is per-nest rather than
 /// per-cursor - unlike the permit count, which is shared because it bounds Burrmill - because what
 /// this protects is the memory of requests that are not running at all.
-const SQL_MAX_QUEUED: usize = 256;
+pub(crate) const SQL_MAX_QUEUED: usize = 256;
 
 /// A reservation to *wait* for an analytical permit, released however the wait ends (#1319).
 ///
@@ -196,11 +196,11 @@ struct QueueSlot(Arc<std::sync::atomic::AtomicUsize>);
 impl QueueSlot {
     /// `None` when this nest already has [`SQL_MAX_QUEUED`] requests parked, which is an immediate
     /// refusal rather than a wait.
-    fn take(queued: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+    fn take(queued: &Arc<std::sync::atomic::AtomicUsize>, cap: usize) -> Option<Self> {
         use std::sync::atomic::Ordering;
         let mut cur = queued.load(Ordering::Relaxed);
         loop {
-            if cur >= SQL_MAX_QUEUED {
+            if cur >= cap {
                 return None;
             }
             match queued.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed) {
@@ -218,7 +218,7 @@ impl Drop for QueueSlot {
 }
 /// Cap on rows materialised from one analytical query - bounds the Rust-side result buffer, which
 /// lives outside Burrmill's own memory limit. Beyond this the result is truncated and flagged.
-const SQL_MAX_ROWS: usize = 50_000;
+pub(crate) const SQL_MAX_ROWS: usize = 50_000;
 
 /// The most unsealed rows `/sql` will materialise for one query.
 ///
@@ -232,7 +232,7 @@ const SQL_MAX_ROWS: usize = 50_000;
 /// safety is the node's job, not the gateway's - which is why this is a hard limit here rather than
 /// advice in the docs.
 ///
-/// `pub(crate)` rather than private: it is the default [`AppState::sql_max_hot_rows`] is built
+/// `pub(crate)` rather than private: it is the default [`AppState::limits`] is built
 /// with, both in `indexer.rs` and in `test_state` (#378) - a real handler test can lower the seam
 /// instead of genuinely putting two million rows in the hot store to reach the 503 arm.
 pub(crate) const SQL_MAX_HOT_ROWS: usize = 2_000_000;
@@ -309,14 +309,11 @@ pub struct AppState {
     pub memo_gate: MemoGate,
     /// `/sql` response bytes in flight, process-wide in production (#2212).
     pub sql_response_bytes: ResponseBytes,
-    /// The most unsealed rows `/sql` and `/explain` will materialise for one query before refusing
-    /// with a `503` (`HotScanTooLarge`) - the live value [`SQL_MAX_HOT_ROWS`] documents. A field
-    /// rather than the handlers reading the const directly, so a test can lower the ceiling instead
-    /// of genuinely putting two million rows in the hot store to reach the refusal arm (#378).
-    pub sql_max_hot_rows: usize,
-    /// [`SQL_MAX_HOT_BYTES`] in production; lowered by tests.
-    pub sql_max_hot_bytes: u64,
-    pub sql_max_named_scan_bytes: u64,
+    /// The guards this mount's requests run under (RFC-0073 FR3): the process values, lowered by
+    /// the mount record. A field rather than the constants, so a mount can lower one and a test can
+    /// reach a refusal arm without two million hot rows (#378). A `PATCH` swaps it in a fresh
+    /// composition, so a request in flight keeps the copy it was routed with.
+    pub limits: crate::limits::Limits,
     /// This process owns **no cursor**: it serves a nest it does not index (`nuthatch serve`).
     ///
     /// `/ready`'s liveness terms are all about a cursor - has it polled recently, has `last_block`
@@ -361,6 +358,18 @@ pub struct AppState {
     /// RFC-0063: the watched-address history `/api` serves. `None` on a nest without
     /// `[address_history]`, which answers every `/api` request unsupported.
     pub address_history: Option<crate::address_history::AddressHistory>,
+}
+
+impl AppState {
+    /// An analytics guard under this mount's limits.
+    fn query_guard(&self, timeout: Duration, max_rows: usize) -> analytics::QueryGuard {
+        analytics::QueryGuard {
+            timeout,
+            max_rows,
+            max_result_bytes: self.limits.max_result_bytes,
+            memory_bytes: self.limits.analytics_memory_bytes,
+        }
+    }
 }
 
 /// A hot-swappable handle to the `AppState` backing one served endpoint (RFC-0020 slice 2). The router
@@ -2504,12 +2513,12 @@ async fn admin_config(
             "seal_table_floor": crate::seal::SEAL_TABLE_FLOOR,
             "sql": {
                 "max_concurrency": sql_max_concurrency(),
-                "max_queued": SQL_MAX_QUEUED,
-                "max_rows": SQL_MAX_ROWS,
+                "max_queued": s.limits.max_queued,
+                "max_rows": s.limits.max_rows,
                 "max_query_len": SQL_MAX_QUERY_LEN,
-                "max_hot_rows": s.sql_max_hot_rows,
-                "max_hot_bytes": s.sql_max_hot_bytes,
-                "max_named_scan_bytes": s.sql_max_named_scan_bytes,
+                "max_hot_rows": s.limits.max_hot_rows,
+                "max_hot_bytes": s.limits.max_hot_bytes,
+                "max_named_scan_bytes": s.limits.max_named_scan_bytes,
             },
         },
     }))
@@ -2641,11 +2650,11 @@ fn graph_sql_root(name: &str) -> bool {
 
 /// One clock for every root. A fresh instant per root is how one request runs for hours (#1658).
 #[cfg(feature = "graph")]
-fn graph_remaining(started: std::time::Instant) -> Duration {
+fn graph_remaining(budget: Duration, started: std::time::Instant) -> Duration {
     let elapsed = started.elapsed();
     #[cfg(all(test, feature = "graph"))]
     let elapsed = elapsed.saturating_add(GRAPH_CLOCK_SKEW.with(|c| c.get()).unwrap_or_default());
-    SQL_TIMEOUT.saturating_sub(elapsed)
+    budget.saturating_sub(elapsed)
 }
 
 /// The enriched schema document (RFC-0016 §2): the composition of registry **structure**, the
@@ -2796,7 +2805,7 @@ async fn graph_graphql(
         let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                let Some(_slot) = QueueSlot::take(&s.sql_queued) else {
+                let Some(_slot) = QueueSlot::take(&s.sql_queued, s.limits.max_queued) else {
                     return (
                         StatusCode::OK,
                         Json(gql_error("server busy: too many concurrent SQL queries")),
@@ -2828,9 +2837,9 @@ async fn graph_graphql(
     #[cfg(all(test, feature = "graph"))]
     let byte_cap = GRAPH_BYTE_CAP
         .with(|c| c.get())
-        .unwrap_or(crate::engine::SQL_MAX_RESULT_BYTES);
+        .unwrap_or(s.limits.max_result_bytes);
     #[cfg(not(all(test, feature = "graph")))]
-    let byte_cap = crate::engine::SQL_MAX_RESULT_BYTES;
+    let byte_cap = s.limits.max_result_bytes;
     let mut bytes_left = byte_cap;
     // Rendered at most once, and only if a root asks for it.
     let doc = if roots
@@ -2970,12 +2979,12 @@ async fn graph_graphql(
         {
             return (StatusCode::OK, Json(gql_error(&e)));
         }
-        if graph_remaining(started).is_zero() {
+        if graph_remaining(s.limits.timeout, started).is_zero() {
             return (
                 StatusCode::OK,
                 Json(gql_error(&format!(
                     "the operation exceeded its {}s budget",
-                    SQL_TIMEOUT.as_secs()
+                    s.limits.timeout.as_secs()
                 ))),
             );
         }
@@ -3504,10 +3513,10 @@ async fn graph_rows(
     started: std::time::Instant,
     byte_budget: usize,
 ) -> Result<(Vec<serde_json::Map<String, serde_json::Value>>, usize), String> {
-    if graph_remaining(started).is_zero() {
+    if graph_remaining(s.limits.timeout, started).is_zero() {
         return Err(format!(
             "the operation exceeded its {}s budget",
-            SQL_TIMEOUT.as_secs()
+            s.limits.timeout.as_secs()
         ));
     }
     #[cfg(all(test, feature = "graph"))]
@@ -3520,7 +3529,7 @@ async fn graph_rows(
         compiled.sql.clone(),
         None,
         historical_block,
-        Some(graph_remaining(started)),
+        Some(graph_remaining(s.limits.timeout, started)),
     )
     .await;
     let body = axum::body::to_bytes(resp.into_response().into_body(), byte_budget)
@@ -3622,13 +3631,14 @@ const INLINE_SCAN_ROWS: usize = 4096;
 async fn admit(
     s: &AppState,
 ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, axum::response::Response> {
-    admit_to(&s.sql_gate, &s.sql_queued).await
+    admit_to(&s.sql_gate, &s.sql_queued, s.limits.max_queued).await
 }
 
 /// [`admit`] to any gate, parking in the nest's one queue.
 pub(crate) async fn admit_to(
     gate: &Arc<Semaphore>,
     queued: &Arc<std::sync::atomic::AtomicUsize>,
+    cap: usize,
 ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, axum::response::Response> {
     let busy = || {
         crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
@@ -3641,7 +3651,7 @@ pub(crate) async fn admit_to(
     if let Ok(permit) = Arc::clone(gate).try_acquire_owned() {
         return Ok(permit);
     }
-    let Some(_slot) = QueueSlot::take(queued) else {
+    let Some(_slot) = QueueSlot::take(queued, cap) else {
         return Err(busy());
     };
     match tokio::time::timeout(SQL_ADMISSION_WAIT, Arc::clone(gate).acquire_owned()).await {
@@ -3690,7 +3700,7 @@ async fn bounded_hot_read<T: Send + 'static>(
         Err(e) => return Err(error(format!("{e:#}"))),
     }
     let permit = admit(s).await?;
-    let cap = s.sql_max_hot_rows;
+    let cap = s.limits.max_hot_rows;
     match tokio::task::spawn_blocking(move || read(cap)).await {
         Ok(Ok(Some(rows))) => Ok((rows, Some(permit))),
         Ok(Ok(None)) => Err((
@@ -3765,10 +3775,7 @@ async fn table(
                 );
                 let dir = s.dir.clone();
                 let declared = Arc::clone(&s.tables);
-                let guard = analytics::QueryGuard {
-                    timeout: SQL_TIMEOUT,
-                    max_rows: need,
-                };
+                let guard = s.query_guard(s.limits.timeout, need);
                 match tokio::task::spawn_blocking(move || {
                     let _permit = permit; // held for the whole blocking query
                                           // Declared, so a table nothing has been sealed for yet reads empty, not failed.
@@ -3929,7 +3936,7 @@ async fn entity(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoR
             let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    let Some(_slot) = QueueSlot::take(&s.sql_queued) else {
+                    let Some(_slot) = QueueSlot::take(&s.sql_queued, s.limits.max_queued) else {
                         return busy();
                     };
                     match tokio::time::timeout(
@@ -3943,19 +3950,11 @@ async fn entity(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoR
                     }
                 }
             };
-            let timeout = SQL_TIMEOUT.saturating_sub(admission.elapsed());
+            let guard = s.query_guard(s.limits.timeout.saturating_sub(admission.elapsed()), 1);
             let dir = s.dir.clone();
             let sealed = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                analytics::get_row_guarded(
-                    &dir,
-                    block,
-                    log_index,
-                    analytics::QueryGuard {
-                        timeout,
-                        max_rows: 1,
-                    },
-                )
+                analytics::get_row_guarded(&dir, block, log_index, guard)
             })
             .await;
             match sealed {
@@ -4249,8 +4248,9 @@ async fn named_scan(
     let store = s.store.clone();
     let tables = s.tables.clone();
     let entities = s.entities.clone();
-    let cap = s.sql_max_named_scan_bytes;
-    let max_hot_rows = s.sql_max_hot_rows;
+    let cap = s.limits.max_named_scan_bytes;
+    let max_hot_rows = s.limits.max_hot_rows;
+    let guard = s.query_guard(s.limits.timeout, s.limits.max_rows);
     tokio::task::spawn_blocking(move || -> anyhow::Result<NamedRun> {
         let _permit = permit;
         let started = std::time::Instant::now();
@@ -4318,10 +4318,10 @@ async fn named_scan(
         if let Some(refusal) = stale(sealed_through) {
             return Err(refusal.into());
         }
-        let timeout = SQL_TIMEOUT.saturating_sub(started.elapsed());
+        let timeout = guard.timeout.saturating_sub(started.elapsed());
         if timeout.is_zero() {
             return Err(crate::analytics::QueryBudgetExceeded {
-                secs: SQL_TIMEOUT.as_secs(),
+                secs: guard.timeout.as_secs(),
             }
             .into());
         }
@@ -4334,10 +4334,7 @@ async fn named_scan(
         let out = crate::analytics::query_named(
             &dir,
             &sql,
-            QueryGuard {
-                timeout,
-                max_rows: SQL_MAX_ROWS,
-            },
+            QueryGuard { timeout, ..guard },
             &hot,
             sealed_through,
             &tables,
@@ -4399,7 +4396,7 @@ fn named_failure(s: &AppState, failure: NamedFailure, sql: &str) -> axum::respon
                 "error": over.to_string(),
                 "hot_source_bytes": over.source_bytes,
                 "budget": over.budget,
-                "cap": s.sql_max_named_scan_bytes,
+                "cap": s.limits.max_named_scan_bytes,
             })),
         )
             .into_response();
@@ -4784,7 +4781,10 @@ async fn run_sql_query_at(
     };
     // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
     // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
-    let max_rows = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
+    let max_rows = q
+        .max_rows
+        .unwrap_or(s.limits.max_rows)
+        .clamp(1, s.limits.max_rows);
     // The deterministic memo (#1186): the identity of this answer is the statement plus every input
     // it reads - the served segments, the hot rows' generation, entity watermarks, authored files. A
     // remembered answer for that identity is the answer, and it is returned before the permit gate,
@@ -4792,14 +4792,17 @@ async fn run_sql_query_at(
     // cannot report a rows generation; that backend simply computes every time.
     // Building the key reads the manifest and hashes the authored files, so it runs off the
     // executor, a few at a time per nest, before this request may queue for a permit (#2213).
+    // The memo is per dataset and its key has no byte cap, so a mount that lowers one neither reads
+    // nor writes it: a co-tenant's remembered answer may be larger than this mount allows.
     let memo = if historical_block.is_none()
+        && s.limits.max_result_bytes == crate::limits::Limits::process().max_result_bytes
         && s.store.rows_generation().is_some()
         && crate::sqlmemo::is_deterministic(&q.q)
     {
         // A GraphQL operation already holds its SQL permit for every root.
         let slot = match operation_timeout {
             Some(_) => None,
-            None => match admit_to(&s.memo_gate.0, &s.sql_queued).await {
+            None => match admit_to(&s.memo_gate.0, &s.sql_queued, s.limits.max_queued).await {
                 Ok(slot) => Some(slot),
                 Err(busy) => return busy,
             },
@@ -4828,9 +4831,9 @@ async fn run_sql_query_at(
                 Json(json!({
                     "error": format!(
                         "the operation exceeded its {}s budget",
-                        SQL_TIMEOUT.as_secs()
+                        s.limits.timeout.as_secs()
                     ),
-                    "timeout_secs": SQL_TIMEOUT.as_secs(),
+                    "timeout_secs": s.limits.timeout.as_secs(),
                 })),
             )
                 .into_response();
@@ -4859,7 +4862,7 @@ async fn run_sql_query_at(
             Ok(p) => p,
             Err(_) => {
                 // Saturated: park, but only if this nest has room to park another.
-                let Some(_slot) = QueueSlot::take(&s.sql_queued) else {
+                let Some(_slot) = QueueSlot::take(&s.sql_queued, s.limits.max_queued) else {
                     return busy();
                 };
                 match tokio::time::timeout(
@@ -4880,21 +4883,22 @@ async fn run_sql_query_at(
         // request occupies the node.
         (
             Some(permit),
-            SQL_TIMEOUT.saturating_sub(admission.elapsed()),
+            s.limits.timeout.saturating_sub(admission.elapsed()),
         )
     };
     METRICS.inc_sql();
     let dir = s.dir.clone();
     let sql = q.q.clone();
     let store = s.store.clone();
-    let sql_max_hot_rows = s.sql_max_hot_rows;
-    let sql_max_hot_bytes = s.sql_max_hot_bytes;
-    let sql_max_named_scan_bytes = s.sql_max_named_scan_bytes;
+    let sql_max_hot_rows = s.limits.max_hot_rows;
+    let sql_max_hot_bytes = s.limits.max_hot_bytes;
+    let sql_max_named_scan_bytes = s.limits.max_named_scan_bytes;
     // The live, registry-derived schema - every table the config declares, whether or not it has
     // populated yet. Threaded into `define_views` so a declared-but-never-fired event still gets an
     // empty typed view instead of the whole nest view failing to bind on a missing table (#663).
     let tables = s.tables.clone();
     let declared_entities = s.entities.clone();
+    let guard = s.query_guard(sql_timeout, max_rows);
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit; // held for the whole blocking query, released on return
         #[cfg(test)]
@@ -4960,10 +4964,6 @@ async fn run_sql_query_at(
             )?
         };
         let sealed_through = store.sealed_through();
-        let guard = analytics::QueryGuard {
-            timeout: sql_timeout,
-            max_rows,
-        };
         let mut out = if let Some(block) = historical_block {
             analytics::query_hot_cold_at(&dir, &sql, guard, &hot, sealed_through, &tables, block)?
         } else {
@@ -5094,6 +5094,8 @@ struct DiffSource {
     sealed_through: u64,
     tables: Arc<Vec<TableSchema>>,
     deadline: std::time::Instant,
+    /// The mount's guard; its timeout is the whole diff's, which `deadline` counts down.
+    guard: analytics::QueryGuard,
 }
 
 impl crate::diff::Source for DiffSource {
@@ -5103,10 +5105,14 @@ impl crate::diff::Source for DiffSource {
             .saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
             return Err(crate::analytics::QueryBudgetExceeded {
-                secs: SQL_TIMEOUT.as_secs(),
+                secs: self.guard.timeout.as_secs(),
             }
             .into());
         }
+        let guard = analytics::QueryGuard {
+            timeout: left,
+            ..self.guard
+        };
         let (dir, hot, tables, sql) = (
             self.dir.clone(),
             self.hot.clone(),
@@ -5115,17 +5121,7 @@ impl crate::diff::Source for DiffSource {
         );
         let sealed_through = self.sealed_through;
         let mut out = tokio::task::spawn_blocking(move || {
-            analytics::query_hot_cold(
-                &dir,
-                &sql,
-                analytics::QueryGuard {
-                    timeout: left,
-                    max_rows: SQL_MAX_ROWS,
-                },
-                &hot,
-                sealed_through,
-                &tables,
-            )
+            analytics::query_hot_cold(&dir, &sql, guard, &hot, sealed_through, &tables)
         })
         .await??;
         out.tip_unavailable = self.tip_unavailable;
@@ -5153,12 +5149,12 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
         Err(busy) => return busy,
     };
     METRICS.inc_sql();
-    let deadline = std::time::Instant::now() + SQL_TIMEOUT;
+    let deadline = std::time::Instant::now() + s.limits.timeout;
     let st = s.clone();
     let gathered = tokio::task::spawn_blocking(move || {
         let (hot, tip_unavailable, hot_head) = match st
             .store
-            .hot_rows_by_table_bounded_with_bytes(st.sql_max_hot_rows, st.sql_max_hot_bytes)
+            .hot_rows_by_table_bounded_with_bytes(st.limits.max_hot_rows, st.limits.max_hot_bytes)
         {
             Ok(snapshot) => (snapshot.rows, false, Some(snapshot.last_block)),
             Err(e)
@@ -5219,6 +5215,7 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
         sealed_through,
         tables: s.tables.clone(),
         deadline,
+        guard: s.query_guard(s.limits.timeout, s.limits.max_rows),
     };
     let inputs = crate::diff::Inputs {
         tables: &s.tables,
@@ -5236,7 +5233,7 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
                 METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Timeout);
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
-                    Json(json!({ "error": format!("the diff exceeded its {}s budget: {cut}", SQL_TIMEOUT.as_secs()) })),
+                    Json(json!({ "error": format!("the diff exceeded its {}s budget: {cut}", s.limits.timeout.as_secs()) })),
                 )
                     .into_response();
             }
@@ -5269,6 +5266,14 @@ fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::respon
         return (
             StatusCode::INSUFFICIENT_STORAGE,
             Json(json!({ "error": cut.to_string(), "spill_cap_bytes": cut.cap_bytes })),
+        )
+            .into_response();
+    }
+    if let Some(cut) = e.downcast_ref::<crate::analytics::QueryMemoryExceeded>() {
+        METRICS.inc_sql_rejected(crate::metrics::SqlRejection::OutOfMemory);
+        return (
+            StatusCode::INSUFFICIENT_STORAGE,
+            Json(json!({ "error": cut.to_string(), "analytics_memory_bytes": cut.cap_bytes })),
         )
             .into_response();
     }
@@ -5368,10 +5373,11 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
     let dir = s.dir.clone();
     let query = q.q.clone();
     let store = s.store.clone();
-    let sql_max_hot_rows = s.sql_max_hot_rows;
-    let sql_max_hot_bytes = s.sql_max_hot_bytes;
-    let sql_max_named_scan_bytes = s.sql_max_named_scan_bytes;
+    let sql_max_hot_rows = s.limits.max_hot_rows;
+    let sql_max_hot_bytes = s.limits.max_hot_bytes;
+    let sql_max_named_scan_bytes = s.limits.max_named_scan_bytes;
     let tables = s.tables.clone();
+    let guard = s.query_guard(s.limits.timeout, 1);
     let declared_entities = s.entities.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -5424,17 +5430,7 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
             (sql_max_hot_rows, sql_max_named_scan_bytes),
         )?;
         let sealed_through = store.sealed_through();
-        let mut out = analytics::plan_hot_cold(
-            &dir,
-            &query,
-            analytics::QueryGuard {
-                timeout: SQL_TIMEOUT,
-                max_rows: 1,
-            },
-            &hot,
-            sealed_through,
-            &tables,
-        )?;
+        let mut out = analytics::plan_hot_cold(&dir, &query, guard, &hot, sealed_through, &tables)?;
         out.tip_unavailable = tip_unavailable;
         Ok(out)
     })
@@ -7080,9 +7076,7 @@ mod tests {
             sql_queued: Default::default(),
             memo_gate: Default::default(),
             sql_response_bytes: Default::default(),
-            sql_max_hot_rows: SQL_MAX_HOT_ROWS,
-            sql_max_hot_bytes: SQL_MAX_HOT_BYTES,
-            sql_max_named_scan_bytes: SQL_MAX_NAMED_SCAN_BYTES,
+            limits: crate::limits::Limits::process(),
             surface: Arc::new(crate::allowlist::Surface::default()),
             #[cfg(feature = "counter")]
             counter: None,
@@ -8352,6 +8346,7 @@ mod tests {
             let guard = crate::analytics::QueryGuard {
                 timeout: std::time::Duration::from_secs(5),
                 max_rows: 10,
+                ..Default::default()
             };
             let hot = crate::analytics::HotRows::new();
             crate::analytics::query_hot_cold(
@@ -9524,7 +9519,7 @@ mod tests {
     async fn a_hot_read_past_the_row_ceiling_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = deep_hot_fixture(tmp.path(), INLINE_SCAN_ROWS as u64 + 10);
-        state.sql_max_hot_rows = INLINE_SCAN_ROWS + 5;
+        state.limits.max_hot_rows = INLINE_SCAN_ROWS + 5;
         for uri in ["/table/rare?limit=10", "/table/rare?from_block=0", "/flags"] {
             let (status, body) = get_json(state.clone(), uri).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
@@ -9536,7 +9531,7 @@ mod tests {
                 "{uri}: {body}"
             );
         }
-        state.sql_max_hot_rows = INLINE_SCAN_ROWS + 12;
+        state.limits.max_hot_rows = INLINE_SCAN_ROWS + 12;
         let (status, body) = get_json(state, "/table/rare?from_block=0").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["count"], 1, "{body}");
@@ -9596,17 +9591,17 @@ mod tests {
         use std::sync::atomic::Ordering;
         let queued: Arc<std::sync::atomic::AtomicUsize> = Default::default();
         let held: Vec<QueueSlot> = (0..SQL_MAX_QUEUED)
-            .map(|_| QueueSlot::take(&queued).expect("under the cap"))
+            .map(|_| QueueSlot::take(&queued, SQL_MAX_QUEUED).expect("under the cap"))
             .collect();
         assert_eq!(queued.load(Ordering::Relaxed), SQL_MAX_QUEUED);
         assert!(
-            QueueSlot::take(&queued).is_none(),
+            QueueSlot::take(&queued, SQL_MAX_QUEUED).is_none(),
             "the {SQL_MAX_QUEUED}th+1 request must be refused rather than parked"
         );
         // A slot is released however its wait ended, so the queue recovers rather than wedging.
         drop(held);
         assert_eq!(queued.load(Ordering::Relaxed), 0);
-        assert!(QueueSlot::take(&queued).is_some());
+        assert!(QueueSlot::take(&queued, SQL_MAX_QUEUED).is_some());
     }
 
     /// #2212: a `/sql` body holds its bytes until it has been taken to be sent, and past the budget
@@ -10261,7 +10256,7 @@ mod tests {
     async fn a_named_query_over_its_scan_budget_is_refused_whole() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
-        state.sql_max_named_scan_bytes = 16;
+        state.limits.max_named_scan_bytes = 16;
         state
             .store
             .put_entity(
@@ -10374,21 +10369,21 @@ mod tests {
         state.entities = Arc::new(vec![entity]);
         state.surface = named_surface("SELECT count(*) AS n FROM e");
 
-        state.sql_max_named_scan_bytes = bytes;
+        state.limits.max_named_scan_bytes = bytes;
         let app = router(SharedNest::new(state.clone()));
         let (status, _, body) = call_named(&app, named_request(&[])).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["rows"][0]["n"], 2, "{body}");
 
-        state.sql_max_named_scan_bytes = bytes - 1;
+        state.limits.max_named_scan_bytes = bytes - 1;
         let app = router(SharedNest::new(state.clone()));
         let (status, _, body) = call_named(&app, named_request(&[])).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["hot_source_bytes"], bytes, "{body}");
 
         // They count against the hot-row cap the tip copy respects, too.
-        state.sql_max_named_scan_bytes = bytes;
-        state.sql_max_hot_rows = 1;
+        state.limits.max_named_scan_bytes = bytes;
+        state.limits.max_hot_rows = 1;
         let app = router(SharedNest::new(state));
         let (status, _, body) = call_named(&app, named_request(&[])).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -10429,7 +10424,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["rows"][0]["n"], 2, "{body}");
 
-        state.sql_max_hot_rows = 1;
+        state.limits.max_hot_rows = 1;
         for uri in [
             "/sql?q=SELECT%20count(*)%20AS%20m%20FROM%20holders",
             "/sql?q=SELECT%20count(*)%20AS%20m%20FROM%20whales",
@@ -10457,8 +10452,8 @@ mod tests {
         let (status, body) = get(&state, "/sql?q=SELECT%20holders%20FROM%20other").await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
-        state.sql_max_hot_rows = SQL_MAX_HOT_ROWS;
-        state.sql_max_named_scan_bytes = 1;
+        state.limits.max_hot_rows = SQL_MAX_HOT_ROWS;
+        state.limits.max_named_scan_bytes = 1;
         let (status, body) = get(&state, "/sql?q=SELECT%20*%20FROM%20holders").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert!(body["hot_source_bytes"].as_u64().unwrap() > 1, "{body}");
@@ -10546,7 +10541,7 @@ mod tests {
             .put_entity("k1", r#"{"table":"t","block_number":1}"#)
             .unwrap();
         state.surface = named_surface("SELECT count(*) AS n FROM t");
-        state.sql_max_named_scan_bytes = 1;
+        state.limits.max_named_scan_bytes = 1;
         let (config, _) = crate::counter::x402::tests::payment_for_http_test();
         state.counter = Some(Arc::new(config));
         let app = router(SharedNest::new(state));
@@ -10560,7 +10555,7 @@ mod tests {
         use tower::ServiceExt;
         let dir = tempfile::tempdir().unwrap();
         let mut state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
-        state.sql_max_named_scan_bytes = 1;
+        state.limits.max_named_scan_bytes = 1;
         state
             .store
             .put_entity("k1", r#"{"table":"t","block_number":1}"#)
@@ -10575,7 +10570,7 @@ mod tests {
             .unwrap();
         assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(!dir.path().join("authorisations.jsonl").exists());
-        state.sql_max_named_scan_bytes = SQL_MAX_NAMED_SCAN_BYTES;
+        state.limits.max_named_scan_bytes = SQL_MAX_NAMED_SCAN_BYTES;
         let app = router(SharedNest::new(state));
         let (first, second) = tokio::join!(
             app.clone().oneshot(request()),
@@ -10725,7 +10720,7 @@ mod tests {
     async fn a_hot_tip_over_the_byte_cap_is_refused_by_sql_and_explain() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
-        state.sql_max_hot_bytes = 64;
+        state.limits.max_hot_bytes = 64;
         for b in 1..=3u64 {
             state
                 .store
@@ -10768,13 +10763,13 @@ mod tests {
     /// deleting either handler's refusal arm left the suite green.
     ///
     /// `SQL_MAX_HOT_ROWS` is `2_000_000`; reaching the refusal for real would mean putting two
-    /// million rows in the hot store. `AppState::sql_max_hot_rows` exists so this test can lower the
+    /// million rows in the hot store. `AppState::limits` exists so this test can lower the
     /// seam instead, exactly as production leaves it at the real constant (`test_state`, `indexer.rs`).
     #[tokio::test]
     async fn a_hot_tip_over_the_configured_cap_is_refused_by_sql_and_explain() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
-        state.sql_max_hot_rows = 2;
+        state.limits.max_hot_rows = 2;
         for b in 1..=3u64 {
             state
                 .store
@@ -10854,6 +10849,7 @@ mod tests {
         let guard = crate::analytics::QueryGuard {
             timeout: SQL_TIMEOUT,
             max_rows: SQL_MAX_ROWS,
+            ..Default::default()
         };
         crate::analytics::query_hot_cold(tmp.path(), statement, guard, &hot, 0, &[])
             .expect("premise: /sql answers it");

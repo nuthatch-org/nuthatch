@@ -828,7 +828,7 @@ mod through_burrmill {
     }
 
     fn fails(s: &dyn Session, sql: &str) -> String {
-        match s.collect(sql, Some(10)) {
+        match s.collect(sql, Some((10, crate::engine::SQL_MAX_RESULT_BYTES))) {
             Ok(_) => panic!("`{sql}` answered"),
             Err(Died::Binding(e) | Died::Executing(e)) => format!("{e:#}"),
         }

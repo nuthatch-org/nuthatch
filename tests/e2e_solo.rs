@@ -18,6 +18,7 @@ fn guard() -> analytics::QueryGuard {
     analytics::QueryGuard {
         timeout: Duration::from_secs(10),
         max_rows: 100_000,
+        ..Default::default()
     }
 }
 

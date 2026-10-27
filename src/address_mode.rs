@@ -3112,7 +3112,13 @@ async fn diff_route(
         Ok(a) => a,
         Err(e) => return failed(StatusCode::BAD_REQUEST, e).into_response(),
     };
-    let permit = match crate::serve::admit_to(&s.diff_gate, &s.diff_queued).await {
+    let permit = match crate::serve::admit_to(
+        &s.diff_gate,
+        &s.diff_queued,
+        crate::limits::Limits::process().max_queued,
+    )
+    .await
+    {
         Ok(p) => p,
         Err(busy) => return busy,
     };

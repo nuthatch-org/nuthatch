@@ -50,7 +50,7 @@ fn sparse_delegation_fold_matches_the_original_event_by_event() {
         include_str!("fixtures/network-clients/delegation-ledger-reference.sql"),
     )
     .unwrap();
-    let result = analytics::query_hot_cold(dir.path(), "SELECT count(*) AS differing FROM ((SELECT * FROM delegation_ledger EXCEPT ALL SELECT * FROM delegation_ledger_reference) UNION ALL (SELECT * FROM delegation_ledger_reference EXCEPT ALL SELECT * FROM delegation_ledger))", analytics::QueryGuard { timeout: REPLAY_QUERY_TIMEOUT, max_rows: 1 }, &analytics::HotRows::new(), 0, &[]).unwrap();
+    let result = analytics::query_hot_cold(dir.path(), "SELECT count(*) AS differing FROM ((SELECT * FROM delegation_ledger EXCEPT ALL SELECT * FROM delegation_ledger_reference) UNION ALL (SELECT * FROM delegation_ledger_reference EXCEPT ALL SELECT * FROM delegation_ledger))", analytics::QueryGuard { timeout: REPLAY_QUERY_TIMEOUT, max_rows: 1, ..Default::default() }, &analytics::HotRows::new(), 0, &[]).unwrap();
     assert!(!result.degraded(), "{result:?}");
     assert_eq!(result.rows, vec![json!({"differing":0})]);
     let count = analytics::query_hot_cold(
@@ -59,6 +59,7 @@ fn sparse_delegation_fold_matches_the_original_event_by_event() {
         analytics::QueryGuard {
             timeout: REPLAY_QUERY_TIMEOUT,
             max_rows: 1,
+            ..Default::default()
         },
         &analytics::HotRows::new(),
         0,
@@ -126,6 +127,7 @@ fn sparse_lock_fold_matches_the_original_event_by_event() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 1,
+                ..Default::default()
             },
             &analytics::HotRows::new(),
             0,
@@ -198,6 +200,7 @@ fn allocation_clock_only_defaults_empty_or_reverted_reads() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 10,
+                ..Default::default()
             },
             hot,
             0,
@@ -309,6 +312,7 @@ fn independently_ingested_cold_history_matches_genesis_reference() {
                 analytics::QueryGuard {
                     timeout: REPLAY_QUERY_TIMEOUT,
                     max_rows: 1000,
+                    ..Default::default()
                 },
                 &analytics::HotRows::new(),
                 u64::MAX,
@@ -348,6 +352,7 @@ fn independently_ingested_cold_history_matches_genesis_reference() {
         analytics::QueryGuard {
             timeout: REPLAY_QUERY_TIMEOUT,
             max_rows: 1,
+            ..Default::default()
         },
         &analytics::HotRows::new(),
         u64::MAX,
@@ -456,6 +461,7 @@ fn capacity_uses_the_last_refresh_event_and_its_protocol_parameters() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 10,
+                ..Default::default()
             },
             &hot,
             0,
@@ -521,6 +527,7 @@ fn independently_indexed_allocations_match_reference_including_arbitrum_l1_numbe
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             hot,
             0,
@@ -603,6 +610,7 @@ fn captured_genesis_facts_match_same_block_network_subgraph() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 1000,
+                ..Default::default()
             },
             &hot,
             0,
@@ -632,6 +640,7 @@ fn captured_genesis_facts_match_same_block_network_subgraph() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 10,
+                ..Default::default()
             },
             hot,
             0,
@@ -689,7 +698,7 @@ fn network_contract_addresses_and_supply_follow_historical_events() {
     let query = |block| {
         analytics::query_hot_cold_at(dir.path(),
         "SELECT staking, \"totalSupply\", \"totalGRTMinted\", \"totalGRTBurned\" FROM graph_network",
-        analytics::QueryGuard { timeout: REPLAY_QUERY_TIMEOUT, max_rows: 100 }, &hot, 0, &schema, block).unwrap().rows
+        analytics::QueryGuard { timeout: REPLAY_QUERY_TIMEOUT, max_rows: 100,     ..Default::default() }, &hot, 0, &schema, block).unwrap().rows
     };
     assert!(query(0).is_empty());
     assert_eq!(
@@ -754,6 +763,7 @@ fn network_clock_refreshes_on_token_events_but_not_unrelated_logs() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             hot,
             0,
@@ -781,7 +791,7 @@ fn network_clock_refreshes_on_token_events_but_not_unrelated_logs() {
     );
     let financial = analytics::query_hot_cold_at(dir.path(),
         "SELECT id, \"signalledTokens\", \"stakeDeposited\", \"totalRewards\" FROM epoch ORDER BY id",
-        analytics::QueryGuard { timeout: REPLAY_QUERY_TIMEOUT, max_rows: 100 }, &hot, 0, &schema, 3000).unwrap();
+        analytics::QueryGuard { timeout: REPLAY_QUERY_TIMEOUT, max_rows: 100,     ..Default::default() }, &hot, 0, &schema, 3000).unwrap();
     assert!(!financial.degraded(), "{financial:?}");
     assert_eq!(
         financial.rows,
@@ -793,7 +803,7 @@ fn network_clock_refreshes_on_token_events_but_not_unrelated_logs() {
     );
     let network = analytics::query_hot_cold_at(
         dir.path(), "SELECT id, \"currentEpoch\", \"epochLength\", \"epochCount\", \"currentL1BlockNumber\", \"totalTokensStaked\", \"isPaused\" FROM graph_network",
-        analytics::QueryGuard { timeout: REPLAY_QUERY_TIMEOUT, max_rows: 100 }, &hot, 0, &schema, 3000).unwrap();
+        analytics::QueryGuard { timeout: REPLAY_QUERY_TIMEOUT, max_rows: 100,     ..Default::default() }, &hot, 0, &schema, 3000).unwrap();
     assert!(!network.degraded(), "{network:?}");
     assert_eq!(
         network.rows,
@@ -901,6 +911,7 @@ fn network_clock_refreshes_on_token_events_but_not_unrelated_logs() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 10,
+                ..Default::default()
             },
             &saved_clock,
             0,
@@ -1002,6 +1013,7 @@ fn disputes_apply_linked_rejection_draw_and_horizon_cancellation_at_their_blocks
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             &hot,
             0,
@@ -1076,6 +1088,7 @@ fn protocol_parameters_require_matching_reads_and_horizon_clear_wins_in_order() 
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             hot,
             0,
@@ -1146,6 +1159,7 @@ fn controller_pause_and_ownership_are_independent_historical_state() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             &hot,
             0,
@@ -1201,6 +1215,7 @@ fn epoch_length_changes_keep_the_old_epoch_start_and_require_pinned_l1_reads() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             hot,
             0,
@@ -1372,6 +1387,7 @@ fn delegation_rewards_use_the_pool_and_cut_at_the_event_not_the_query_head() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             &hot,
             0,
@@ -1554,6 +1570,7 @@ fn indexer_registration_migration_and_stake_are_reconstructed_at_each_block() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             &hot,
             0,
@@ -1684,6 +1701,7 @@ fn publishing_versions_and_deployment_creation_follow_the_upstream_event_sequenc
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             &hot,
             0,
@@ -1909,6 +1927,7 @@ fn fee_splits_curation_and_rewards_preserve_event_order_without_double_counting(
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             &hot,
             0,
@@ -2128,6 +2147,7 @@ fn provision_history_separates_thawing_deprovisioning_and_staged_parameters() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             &hot,
             0,
@@ -2289,6 +2309,7 @@ fn issuance_follows_the_allocator_and_denylist_changes_are_historical() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             &hot,
             0,
@@ -2401,6 +2422,7 @@ fn escrow_history_matches_the_upstream_balance_signer_and_redemption_rules() {
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             &hot,
             0,
@@ -2530,6 +2552,7 @@ fn allocation_lifecycle_keeps_legacy_history_and_uses_the_closure_block_epoch() 
             analytics::QueryGuard {
                 timeout: REPLAY_QUERY_TIMEOUT,
                 max_rows: 100,
+                ..Default::default()
             },
             &hot,
             0,
@@ -2576,6 +2599,7 @@ fn allocation_lifecycle_keeps_legacy_history_and_uses_the_closure_block_epoch() 
         analytics::QueryGuard {
             timeout: REPLAY_QUERY_TIMEOUT,
             max_rows: 100,
+            ..Default::default()
         },
         &hot,
         0,

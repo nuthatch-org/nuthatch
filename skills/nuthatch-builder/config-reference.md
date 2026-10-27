@@ -678,6 +678,34 @@ runtime directory refuses that flag.
 **This is mount config, not manifest**, so adding or changing it moves neither the NID nor the data.
 Two mounts of the same dataset that name the same target publish one copy.
 
+### `[mounts.limits]` - lowering one mount's query guards (RFC-0073 FR3)
+
+Each `/sql` guard is a process ceiling, lowered for the whole process by its `NUTHATCH_SQL_*` env
+var. A mount can lower any of them further for itself, and cap the analytics memory its statements
+may hold:
+
+```toml
+[[mounts]]
+alias = "usdc"
+nid = "9f2c…"
+
+[mounts.limits]                  # every field optional; absent means the process value
+statement_timeout_ms = 5000
+max_rows = 1000
+max_result_bytes = 8388608
+max_hot_rows = 500000
+max_hot_bytes = 33554432
+max_named_scan_bytes = 268435456
+analytics_memory_bytes = 268435456
+max_queued = 64
+```
+
+An unknown field is refused at load. The admin API sets the same table on a running mount
+(`docs/admin-api.md`) and refuses zero or a value above the process value; a recorded value above
+it is held to the process value at boot, with a warning, rather than refusing the boot.
+
+**This is mount config, not manifest**, so changing it moves neither the NID nor the data.
+
 ### `[mounts.counter]` - charging at your own endpoint (RFC-0046 S2)
 
 **Absent from an ordinary build.** The counter is behind the off-by-default `counter` Cargo feature,

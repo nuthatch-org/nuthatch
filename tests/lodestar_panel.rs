@@ -63,6 +63,7 @@ fn the_lodestar_panel_before_and_after() {
     let guard = nuthatch::analytics::QueryGuard {
         timeout: std::time::Duration::from_secs(120),
         max_rows: 1_000_000,
+        ..Default::default()
     };
     let empty = nuthatch::analytics::HotRows::new();
 

@@ -180,6 +180,10 @@ pub struct Mount {
     /// moves neither the NID nor the data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<MountPublish>,
+    /// `[mounts.limits]`: this mount's `/sql` guards, each at most the process value (RFC-0073 FR3).
+    /// Mount config like `sql`, so it moves neither the NID nor the data.
+    #[serde(default, skip_serializing_if = "crate::limits::MountLimits::is_unset")]
+    pub limits: crate::limits::MountLimits,
     /// Optional x402 price at this operator-owned mount. It exists only in a binary built with the
     /// off-by-default `counter` feature; an ordinary self-hosting build remains unpriced (#1217).
     #[cfg(feature = "counter")]
@@ -2528,6 +2532,13 @@ pub fn lifecycle_routes(
         /// `mount_nest` runs it through [`Nid::parse`] itself, before the credential-gated work
         /// below even starts (NIG-185).
         nid: Option<String>,
+        /// RFC-0073 FR3: the mount record's SQL surface and limits, set before it mounts.
+        #[serde(default)]
+        sql: Option<crate::allowlist::SqlAccess>,
+        #[serde(default)]
+        queries: Option<Vec<crate::allowlist::NamedQuery>>,
+        #[serde(default)]
+        limits: Option<crate::limits::MountLimits>,
     }
 
     type Shared = (
@@ -2626,10 +2637,48 @@ pub fn lifecycle_routes(
             }
         };
         let nid_str = nid.as_ref().map(|n| n.as_str().to_string());
+        let config = MountConfig {
+            sql: body.sql,
+            queries: body.queries.clone(),
+            limits: body.limits.clone(),
+        };
+        if let Some(refused) = config.limits.as_ref().and_then(|l| l.check().err()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{refused:#}")})),
+            );
+        }
 
         if q.dry_run {
             let (status, report) = dry_run_report(&handles, &body.name, nid.as_ref(), None).await;
             return (status, Json(report));
+        }
+
+        if !config.is_empty() {
+            if let Some(job) = jobs.get(&body.name).filter(|j| !j.phase.finished()) {
+                return (StatusCode::CONFLICT, Json(serde_json::json!(job)));
+            }
+            let mut h = handles.lock().await;
+            if h.states.iter().any(|(n, _)| *n == body.name) {
+                let unchanged = repeats_live(&h, &body.name, nid_str.as_deref())
+                    && h.record(&body.name)
+                        .is_some_and(|r| config.applied(r).ok().as_ref() == Some(r));
+                if !unchanged {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"error": format!(
+                            "'{}' is already mounted; changing its sql or limits is \
+                             `PATCH /_admin/mounts/{}`",
+                            body.name, body.name
+                        )})),
+                    );
+                }
+            } else if let Err(e) = h.configure_mount(&body.name, nid.as_ref(), &config) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                );
+            }
         }
 
         if q.wait {
@@ -2849,7 +2898,7 @@ pub fn lifecycle_routes(
     }
 
     async fn get_mount(
-        State((_, jobs, required)): State<Shared>,
+        State((handles, jobs, required)): State<Shared>,
         AxPath(name): AxPath<String>,
         Query(q): Query<TokenQuery>,
         headers: HeaderMap,
@@ -2857,13 +2906,62 @@ pub fn lifecycle_routes(
         if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
             return unauthorized();
         }
-        match jobs.get(&name) {
-            Some(job) => (StatusCode::OK, Json(serde_json::json!(job))),
-            None => (
+        let job = jobs.get(&name).map(|job| serde_json::json!(job));
+        // Never waits on the runtime's lock, which a mount in progress holds; the job says enough then.
+        let record = handles
+            .try_lock()
+            .ok()
+            .and_then(|h| h.record(&name).map(record_json));
+        if job.is_none() && record.is_none() {
+            return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": format!("no mount named '{name}'")})),
-            ),
+            );
         }
+        let mut out = job.unwrap_or_else(|| serde_json::json!({ "name": name }));
+        out["record"] = record.unwrap_or_default();
+        (StatusCode::OK, Json(out))
+    }
+
+    /// `PATCH /_admin/mounts/<name>`: change a mount's SQL surface and limits without remounting it
+    /// (RFC-0073 FR3).
+    async fn patch_mount(
+        State((handles, jobs, required)): State<Shared>,
+        AxPath(name): AxPath<String>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+        body: Result<Json<MountConfig>, axum::extract::rejection::JsonRejection>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let config = match body {
+            Ok(Json(config)) => config,
+            Err(e) => return bad_body(e),
+        };
+        if let Some(job) = jobs.get(&name).filter(|j| !j.phase.finished()) {
+            return (StatusCode::CONFLICT, Json(serde_json::json!(job)));
+        }
+        let mut h = handles.lock().await;
+        if h.record(&name).is_none() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("no mount record named '{name}'")})),
+            );
+        }
+        let record = match h.reconfigure(&name, &config) {
+            Ok(record) => record,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("{e:#}")})),
+                )
+            }
+        };
+        if let Err(e) = h.persist() {
+            return write_failed(&e);
+        }
+        (StatusCode::OK, Json(record_json(&record)))
     }
 
     async fn suspend_nest(
@@ -3028,7 +3126,7 @@ pub fn lifecycle_routes(
         .route("/_admin/nests", post(mount_nest))
         .route("/_admin/nests/{*name}", delete(unmount_nest))
         .route("/_admin/mounts", get(list_mounts))
-        .route("/_admin/mounts/{*name}", get(get_mount))
+        .route("/_admin/mounts/{*name}", get(get_mount).patch(patch_mount))
         .route("/_admin/suspend/{*name}", post(suspend_nest))
         .route("/_admin/resume/{*name}", post(resume_nest))
         .route("/_admin/move/{*name}", post(move_nest))
@@ -3465,6 +3563,10 @@ fn persist_mounted_nests(
         for m in mounts.mounts.iter_mut() {
             if let Some(k) = known.iter().find(|k| key_of(k) == key_of(m)) {
                 m.nid = k.nid.clone();
+                // And so does what `PATCH /_admin/mounts` changed (RFC-0073 FR3).
+                m.sql = k.sql;
+                m.queries = k.queries.clone();
+                m.limits = k.limits.clone();
             }
         }
         // Add records for live mounts with no entry on disk yet - a nest mounted live via `POST
@@ -4387,6 +4489,54 @@ pub fn spawn_move_job(
     })
 }
 
+/// What `POST /_admin/nests` and `PATCH /_admin/mounts/<name>` may set on a mount record
+/// (RFC-0073 FR3). Each field given replaces the record's; `limits` replaces the whole table.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MountConfig {
+    #[serde(default)]
+    pub sql: Option<crate::allowlist::SqlAccess>,
+    #[serde(default)]
+    pub queries: Option<Vec<crate::allowlist::NamedQuery>>,
+    #[serde(default)]
+    pub limits: Option<crate::limits::MountLimits>,
+}
+
+impl MountConfig {
+    pub fn is_empty(&self) -> bool {
+        self.sql.is_none() && self.queries.is_none() && self.limits.is_none()
+    }
+
+    fn apply(&self, m: &mut Mount) {
+        if let Some(sql) = self.sql {
+            m.sql = sql;
+        }
+        if let Some(queries) = &self.queries {
+            m.queries = queries.clone();
+        }
+        if let Some(limits) = &self.limits {
+            m.limits = limits.clone();
+        }
+    }
+
+    /// `record` with this applied, refused when a limit is above the process value or the surface
+    /// would not load at boot.
+    fn applied(&self, record: &Mount) -> Result<Mount> {
+        let mut next = record.clone();
+        self.apply(&mut next);
+        next.limits.check()?;
+        next.surface().validate(&next.alias)?;
+        Ok(next)
+    }
+}
+
+/// A mount record as `GET /_admin/mounts/<name>` shows it: always with its `limits`.
+fn record_json(m: &Mount) -> serde_json::Value {
+    let mut v = serde_json::json!(m);
+    v["limits"] = serde_json::json!(m.limits);
+    v
+}
+
 /// The SQL surface a mount serves over `dataset`: its record's, or open with none, bounded by the
 /// author's ceiling (RFC-0034 §3). Refused when the record widens the ceiling.
 fn served_surface(
@@ -4412,12 +4562,13 @@ fn overlay_mount_record(
 ) {
     state.nid = nid.map(Arc::from);
     state.surface = Arc::new(surface);
+    state.limits = record.map_or_else(crate::limits::Limits::process, |r| {
+        r.limits.resolve(&format!("{}/{}", r.tenant, r.alias))
+    });
     #[cfg(feature = "counter")]
     {
         state.counter = record.and_then(|r| r.counter.clone()).map(Arc::new);
     }
-    #[cfg(not(feature = "counter"))]
-    let _ = record;
 }
 
 impl RuntimeHandles {
@@ -5137,6 +5288,7 @@ impl RuntimeHandles {
                     sql: Default::default(),
                     queries: Vec::new(),
                     publish: None,
+                    limits: Default::default(),
                     #[cfg(feature = "counter")]
                     counter: None,
                 }),
@@ -5424,6 +5576,87 @@ impl RuntimeHandles {
             .iter()
             .find(|m| mount_route(m, &self.default_tenant) == owner)
             .cloned()
+    }
+
+    /// Record `config` on `name` before it mounts, so the mount reads it as a boot record would
+    /// (RFC-0073 FR3). Without a NID there is no record to hold it.
+    fn configure_mount(
+        &mut self,
+        name: &str,
+        nid: Option<&Nid>,
+        config: &MountConfig,
+    ) -> Result<()> {
+        let at = self
+            .mount_ctx
+            .mounts
+            .iter()
+            .position(|m| mount_route(m, &self.default_tenant) == name);
+        let base = match (at, nid) {
+            (Some(i), _) => self.mount_ctx.mounts[i].clone(),
+            (None, Some(nid)) => {
+                let (tenant, alias) = split_route_key(name);
+                Mount {
+                    tenant: tenant.unwrap_or(&self.default_tenant).to_string(),
+                    alias: alias.to_string(),
+                    nid: nid.as_str().to_string(),
+                    sql: Default::default(),
+                    queries: Vec::new(),
+                    publish: None,
+                    limits: Default::default(),
+                    #[cfg(feature = "counter")]
+                    counter: None,
+                }
+            }
+            (None, None) => {
+                bail!("'{name}' has no mount record to hold sql or limits; give its nid")
+            }
+        };
+        // An existing record keeps its nid: a mount that succeeds on another one records it then.
+        let next = config.applied(&base)?;
+        match at {
+            Some(i) => self.mount_ctx.mounts[i] = next,
+            None => self.mount_ctx.mounts.push(next),
+        }
+        Ok(())
+    }
+
+    /// `name`'s mount record, if it has one.
+    pub fn record(&self, name: &str) -> Option<&Mount> {
+        self.mount_ctx
+            .mounts
+            .iter()
+            .find(|m| mount_route(m, &self.default_tenant) == name)
+    }
+
+    /// Change a mount's SQL surface and limits in place (RFC-0073 FR3). A live mount is re-routed to
+    /// a copy of its state carrying them, so the next request sees them while one in flight finishes
+    /// under the state it was routed with. Nothing is rebuilt or remounted. The caller persists.
+    pub fn reconfigure(&mut self, name: &str, config: &MountConfig) -> Result<Mount> {
+        let Some(at) = self
+            .mount_ctx
+            .mounts
+            .iter()
+            .position(|m| mount_route(m, &self.default_tenant) == name)
+        else {
+            bail!("'{name}' has no mount record");
+        };
+        let next = config.applied(&self.mount_ctx.mounts[at])?;
+        if let Some(i) = self.states.iter().position(|(n, _)| n == name) {
+            let mut state = self.states[i].1.clone();
+            let surface = served_surface(Some(&next), &state.dir, name)?;
+            let nid = state.nid.clone();
+            overlay_mount_record(&mut state, nid.as_deref(), Some(&next), surface);
+            let previous = std::mem::replace(&mut self.states[i].1, state);
+            match self.compose() {
+                Ok(router) => self.live.swap(router),
+                Err(e) => {
+                    self.states[i].1 = previous;
+                    return Err(e);
+                }
+            }
+        }
+        self.mount_ctx.mounts[at] = next.clone();
+        Ok(next)
     }
 
     /// Undo a move's staging mount and return `cause`, the reason the move stopped. An unmount keeps a
@@ -7718,9 +7951,7 @@ mod tests {
             sql_queued: Default::default(),
             memo_gate: Default::default(),
             sql_response_bytes: Default::default(),
-            sql_max_hot_rows: crate::serve::SQL_MAX_HOT_ROWS,
-            sql_max_hot_bytes: crate::serve::SQL_MAX_HOT_BYTES,
-            sql_max_named_scan_bytes: crate::serve::SQL_MAX_NAMED_SCAN_BYTES,
+            limits: crate::limits::Limits::process(),
             cursorless: true,
             seal_span: crate::chains::DEFAULT_SEAL_SPAN,
             freshness: Default::default(),
@@ -7751,6 +7982,7 @@ mod tests {
             sql,
             queries: Vec::new(),
             publish: None,
+            limits: Default::default(),
             #[cfg(feature = "counter")]
             counter: None,
         };
