@@ -223,7 +223,7 @@ async fn follower_snapshot_and_derive_over_a_long_sealed_history() {
     })
     .unwrap();
     let mut snapshot = None;
-    nuthatch::feed::read_lines(&wire[..], Box::new(|_| None), |line| {
+    nuthatch::feed::read_lines(&wire[..], Box::new(|_, _| None), |line| {
         if let nuthatch::feed::Line::Snapshot { snapshot: s, .. } = line {
             snapshot = Some(s);
         }

@@ -365,8 +365,12 @@ impl Follower {
                 Some(match kind {
                     crate::feed::Kind::Snapshot => cap,
                     // A dataset not held has nothing left to grow into: its deltas are skipped.
-                    crate::feed::Kind::Delta => cap
-                        .saturating_sub(f.lock().datasets.get(dataset).map_or(cap, |s| s.bytes())),
+                    crate::feed::Kind::Delta => cap.saturating_sub(
+                        f.lock()
+                            .datasets
+                            .get(dataset)
+                            .map_or(cap, |s| s.store.bytes()),
+                    ),
                 })
             });
             crate::feed::read_lines(reader, cap_for, |line| line_tx.blocking_send(line).is_ok())
