@@ -68,10 +68,29 @@ pub fn segment_path(dir: &Path, snapshot: &Snapshot) -> PathBuf {
     dir.join(DIR).join(SEGMENTS).join(&snapshot.file)
 }
 
+/// The manifest is an authored input that ships in a bundle, so a snapshot's `file` is chosen by
+/// whoever wrote the bundle. Only a plain name under `offchain/segments/` is read: an absolute or
+/// `..` path made `/sql` read any Parquet file the process could (RFC-0073 FR8).
+fn checked(c: Catalogue) -> Result<Catalogue> {
+    for table in c.tables.keys().chain(c.refreshes.keys()) {
+        crate::runtime::safe_segment(table, "offchain table")?;
+    }
+    for (table, snapshots) in &c.tables {
+        for s in snapshots {
+            let stem = s.file.strip_suffix(".parquet").unwrap_or("");
+            crate::runtime::safe_segment(stem, "offchain snapshot file")
+                .with_context(|| format!("offchain table {table}: snapshot file {:?}", s.file))?;
+        }
+    }
+    Ok(c)
+}
+
 pub fn load(dir: &Path) -> Result<Catalogue> {
     let path = catalogue_path(dir);
     match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).context("corrupt offchain provenance manifest"),
+        Ok(raw) => {
+            checked(serde_json::from_str(&raw).context("corrupt offchain provenance manifest")?)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Catalogue::default()),
         Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
     }
