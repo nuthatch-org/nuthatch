@@ -1,10 +1,10 @@
 //! The `Nuthatch-Cost` response header (RFC-0073 FR4): what one request read and held, reported to
 //! the operator's gateway. It is a report, not a price; nuthatch meters and bills nothing.
 //!
-//! The figures come from where the work happens: Burrmill's own count of the sealed bytes a plan read,
-//! the hot rows copied for the statement, the time spent waiting for a permit, and the serialized
-//! body. A request is metered through a task-local, carried onto the blocking thread that runs its
-//! statement by [`spawn_blocking`].
+//! The figures come from where the work happens: Burrmill's count of the sealed bytes a plan selects
+//! and reads, the hot rows copied for the statement, the time spent waiting for a permit, and the
+//! serialized body. A request is metered through a task-local, carried onto the blocking thread that
+//! runs its statement by [`spawn_blocking`].
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -36,6 +36,7 @@ const METERED: &[&str] = &[
 #[derive(Default)]
 struct Tally {
     sealed_bytes: AtomicU64,
+    sealed_bytes_read: AtomicU64,
     hot_rows: AtomicU64,
     engine_nanos: AtomicU64,
     peak_memory: AtomicU64,
@@ -89,6 +90,7 @@ pub fn spawn_blocking<R: Send + 'static>(
 pub fn engine(m: &burrmill::QueryMetrics) {
     with(|t| {
         t.sealed_bytes.fetch_add(m.sealed_bytes_scanned, Relaxed);
+        t.sealed_bytes_read.fetch_add(m.sealed_bytes_read, Relaxed);
         t.engine_nanos.fetch_add(m.exec_nanos, Relaxed);
         t.peak_memory.fetch_max(m.peak_memory_bytes, Relaxed);
     });
@@ -109,17 +111,19 @@ pub fn queued(d: Duration) {
 }
 
 impl Meter {
-    /// The header value: `key=value` pairs in a fixed order, every value an integer.
+    /// The header value: `key=value` pairs in a fixed order, every value an integer. A field is only
+    /// ever added at the end.
     pub fn header(&self, result_bytes: u64) -> String {
         let t = &self.0;
         format!(
-            "sealed_bytes={}; hot_rows={}; engine_us={}; peak_mem_bytes={}; queue_us={}; result_bytes={}",
+            "sealed_bytes={}; hot_rows={}; engine_us={}; peak_mem_bytes={}; queue_us={}; result_bytes={}; sealed_bytes_read={}",
             t.sealed_bytes.load(Relaxed),
             t.hot_rows.load(Relaxed),
             t.engine_nanos.load(Relaxed) / 1_000,
             t.peak_memory.load(Relaxed),
             t.queue_nanos.load(Relaxed) / 1_000,
             result_bytes,
+            t.sealed_bytes_read.load(Relaxed),
         )
     }
 }
@@ -164,6 +168,7 @@ mod tests {
         METER.sync_scope(m.clone(), || {
             engine(&burrmill::QueryMetrics {
                 sealed_bytes_scanned: 4096,
+                sealed_bytes_read: 3000,
                 output_rows: 3,
                 exec_nanos: 2_500_000,
                 peak_memory_bytes: 1 << 20,
@@ -178,7 +183,7 @@ mod tests {
         });
         assert_eq!(
             m.header(12),
-            "sealed_bytes=4097; hot_rows=7; engine_us=2500; peak_mem_bytes=1048576; queue_us=250; result_bytes=12"
+            "sealed_bytes=4097; hot_rows=7; engine_us=2500; peak_mem_bytes=1048576; queue_us=250; result_bytes=12; sealed_bytes_read=3000"
         );
     }
 

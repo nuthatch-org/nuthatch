@@ -11647,7 +11647,23 @@ mod tests {
                 (k.to_string(), v.parse().unwrap())
             })
             .collect();
-        assert_eq!(cost.len(), 6, "{header}");
+        let order: Vec<&str> = header
+            .split("; ")
+            .filter_map(|kv| kv.split('=').next())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "sealed_bytes",
+                "hot_rows",
+                "engine_us",
+                "peak_mem_bytes",
+                "queue_us",
+                "result_bytes",
+                "sealed_bytes_read"
+            ],
+            "{header}"
+        );
         assert_eq!(cost["result_bytes"], body.len() as u64, "{header}");
         cost
     }
@@ -11663,8 +11679,9 @@ mod tests {
         format!("/sql?q={q}")
     }
 
-    /// RFC-0073 FR4: the sealed bytes a statement reads are the same each time it runs over the same
-    /// segments, in one engine and in another opened on a copy. `random()` keeps it out of the memo.
+    /// RFC-0073 FR4: the sealed bytes a statement selects are the same each time it runs over the same
+    /// segments, in one engine and in another opened on a copy, a TopK and `/table`'s sealed fill
+    /// included, whose bytes read move with the race. `random()` keeps `/sql` out of the memo.
     #[tokio::test]
     async fn the_same_statement_over_the_same_segments_reports_the_same_sealed_bytes() {
         let a = tempfile::tempdir().unwrap();
@@ -11682,28 +11699,44 @@ mod tests {
         }
         let b = tempfile::tempdir().unwrap();
         crate::project::copy_dir(a.path(), b.path()).unwrap();
-        let (a, b) = (test_state(a.path(), 2), test_state(b.path(), 2));
-        for s in [&a, &b] {
+        let (mut a, mut b) = (test_state(a.path(), 2), test_state(b.path(), 2));
+        for s in [&mut a, &mut b] {
             s.store.set_meta("sealed_through", "4").unwrap();
+            s.tables = Arc::new(vec![crate::registry::TableSchema {
+                table: "t__big".into(),
+                alias: "t__big".into(),
+                kind: crate::registry::TableKind::Event,
+                function: String::new(),
+                selector: String::new(),
+                event: "Big".into(),
+                topic0: "0x".into(),
+                columns: crate::registry::implicit_columns(false),
+            }]);
         }
-        for q in [
-            r#"SELECT *, random() AS r FROM "t__big""#,
-            r#"SELECT memo, random() AS r FROM "t__big" WHERE block_number = 2"#,
-            r#"SELECT block_number, count(*) AS n, random() AS r FROM "t__big" GROUP BY 1"#,
+        for path in [
+            sql_path(r#"SELECT *, random() AS r FROM "t__big""#),
+            sql_path(r#"SELECT memo, random() AS r FROM "t__big" WHERE block_number = 2"#),
+            sql_path(
+                r#"SELECT block_number, count(*) AS n, random() AS r FROM "t__big" GROUP BY 1"#,
+            ),
+            sql_path(
+                r#"SELECT *, random() AS r FROM "t__big" ORDER BY block_number DESC, log_index DESC LIMIT 5"#,
+            ),
+            "/table/t__big?limit=5".to_string(),
         ] {
-            let first = cost_of(&a, &sql_path(q)).await;
-            assert!(first["sealed_bytes"] > 0, "{q}: {first:?}");
-            for _ in 0..3 {
+            let first = cost_of(&a, &path).await;
+            assert!(first["sealed_bytes"] > 0, "{path}: {first:?}");
+            for _ in 0..10 {
                 assert_eq!(
-                    cost_of(&a, &sql_path(q)).await["sealed_bytes"],
+                    cost_of(&a, &path).await["sealed_bytes"],
                     first["sealed_bytes"],
-                    "{q}, again"
+                    "{path}, again"
                 );
             }
             assert_eq!(
-                cost_of(&b, &sql_path(q)).await["sealed_bytes"],
+                cost_of(&b, &path).await["sealed_bytes"],
                 first["sealed_bytes"],
-                "{q}, another engine over a copy"
+                "{path}, another engine over a copy"
             );
         }
     }
@@ -12458,7 +12491,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            cost.ends_with(&format!("; result_bytes={}", body.len())),
+            cost.contains(&format!("; result_bytes={}; ", body.len())),
             "{cost}"
         );
         assert!(
