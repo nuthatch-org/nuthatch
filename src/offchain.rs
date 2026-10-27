@@ -92,14 +92,16 @@ pub fn load(dir: &Path) -> Result<Catalogue> {
             let c = checked(
                 serde_json::from_str(&raw).context("corrupt offchain provenance manifest")?,
             )?;
-            // A plain name can still be a link placed by someone with write access to the directory.
-            for s in c.tables.values().flatten() {
-                let p = segment_path(dir, s);
+            // A plain name can still resolve outside the nest through a link: the file, or a directory on
+            // the way to it. A swap after this check needs write access to the nest, which is out of scope.
+            let segments = dir.join(DIR).join(SEGMENTS);
+            let files = c.tables.values().flatten().map(|s| segment_path(dir, s));
+            for p in [dir.join(DIR), segments].into_iter().chain(files) {
                 if p.symlink_metadata()
                     .is_ok_and(|m| m.file_type().is_symlink())
                 {
                     anyhow::bail!(
-                        "offchain snapshot {} is a symbolic link; it must be a regular file",
+                        "offchain path {} is a symbolic link; offchain files and their directories must be real",
                         p.display()
                     );
                 }
@@ -636,6 +638,18 @@ mod tests {
             "source": "s", "ingested_at": "t", "tool_version": "v"
         }]}});
         std::fs::write(catalogue_path(dir), raw.to_string()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_segments_directory_that_is_a_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("prices-abc.parquet"), b"PAR1").unwrap();
+        manifest_naming(dir.path(), "prices", "prices-abc.parquet");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(DIR).join(SEGMENTS)).unwrap();
+        let err = load(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
     }
 
     #[cfg(unix)]
