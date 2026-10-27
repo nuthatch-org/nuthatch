@@ -312,6 +312,10 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "mount-jobs.json: live-mount progress the runtime writes and resumes (#1544), never operator input",
     ),
     (
+        "src/distribution.rs",
+        "a failed mount job's failure code in mount-jobs.json, never operator input",
+    ),
+    (
         // RFC-0037 slice 6. `Head` reads a stored row's table, block and log index back out of the hot
         // store to plan which documents it names. It is never operator input.
         "src/ipfs_resolve.rs",
