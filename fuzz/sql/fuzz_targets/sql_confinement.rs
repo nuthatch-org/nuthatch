@@ -51,6 +51,9 @@ fn files_under(root: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
 fn fixture() -> &'static Fixture {
     static F: OnceLock<Fixture> = OnceLock::new();
     F.get_or_init(|| {
+        // libFuzzer's hook aborts before unwinding, which `catch_unwind` below could never see. A
+        // failed assertion still aborts: libfuzzer-sys catches the unwind out of the target.
+        let _ = std::panic::take_hook();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -114,6 +117,7 @@ fn guard() -> QueryGuard {
     QueryGuard {
         timeout: Duration::from_secs(2),
         max_rows: 100,
+        ..Default::default()
     }
 }
 
@@ -210,11 +214,23 @@ enum Piece {
 #[derive(Arbitrary, Debug)]
 struct Input {
     strict: bool,
+    base: u8,
     pieces: Vec<Piece>,
 }
 
+/// Statements that already answer, so the fuzzer spends its time on what follows them rather than on
+/// assembling a first `SELECT`. The empty one leaves the pieces on their own.
+const BASES: &[&str] = &[
+    "",
+    "SELECT * FROM t__e",
+    "SELECT x FROM v",
+    "SELECT * FROM information_schema.tables",
+    "WITH c AS (SELECT * FROM t__e) SELECT * FROM c",
+    "SELECT * FROM t__e WHERE x IN (SELECT x FROM t__e)",
+];
+
 fn render(f: &Fixture, input: &Input) -> String {
-    let mut sql = String::new();
+    let mut sql = format!("{} ", BASES[input.base as usize % BASES.len()]);
     for piece in &input.pieces {
         match piece {
             Piece::Word(i) => sql.push_str(WORDS[*i as usize % WORDS.len()]),
@@ -241,12 +257,17 @@ fuzz_target!(|input: Input| {
         return;
     }
     let tenant = input.strict.then(|| Arc::<str>::from("a"));
-    let got = isolated(tenant.as_ref(), || {
-        query_hot_cold(&f.a, &sql, guard(), &HotRows::new(), 10, &[])
+    // `/sql` confines a panic to its request, so one is an outcome here, not a finding; the checks
+    // below still run after it.
+    let got = std::panic::catch_unwind(|| {
+        isolated(tenant.as_ref(), || {
+            query_hot_cold(&f.a, &sql, guard(), &HotRows::new(), 10, &[])
+        })
     });
     let text = match &got {
-        Ok(out) => serde_json::to_string(&out.rows).unwrap(),
-        Err(e) => format!("{e:#}"),
+        Ok(Ok(out)) => serde_json::to_string(&out.rows).unwrap(),
+        Ok(Err(e)) => format!("{e:#}"),
+        Err(_) => String::new(),
     };
     if !sql.contains(&f.secret) {
         assert!(

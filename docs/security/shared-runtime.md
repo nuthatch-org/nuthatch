@@ -113,8 +113,10 @@ Said plainly, because a shared runtime is a shared machine.
 - **Everything outside SQL.** A nest's webhooks, offchain pulls, IPFS gateways and RPC endpoints are
   egress the tenant chose (`nest load` lists them). An HTTPS endpoint on the operator's network is
   reachable from a tenant's offchain pull. Ingest faults are FR6.
-- **The engine itself.** A panic in a query is confined to its request. A memory-safety bug in
-  Burrmill, DataFusion or Arrow is not, and nothing here would contain one.
+- **The engine itself.** A panic in a query is confined to its request; the fuzz target found one on
+  its first run (Burrmill `listcomp.rs:231` slices non-ASCII text after `[` mid-character), which is
+  Burrmill's to fix. A memory-safety bug in Burrmill, DataFusion or Arrow is not confined, and
+  nothing here would contain one.
 - **`isolation = "shared"`.** Points 1 to 4 above do not apply. It remains right for one operator's
   own mounts.
 
@@ -146,7 +148,10 @@ by the permits and the two process-wide caps above, none of which a mount moves.
 sealed rows, hot rows, config and view text, and runs fuzzed statements on A, shared and strict. It
 fails on an answer or error carrying B's secret that the statement did not spell out, and on any
 file under the runtime directory created, removed or changed. Statements are assembled from fragments
-of every attack above, so the fuzzer recombines escapes rather than discovering `SELECT`.
+of every attack above, appended to statements that already answer, so the fuzzer recombines escapes
+rather than discovering `SELECT`. A panic is an outcome rather than a finding, as `/sql` confines one
+to its request. Planting the secret in A's own rows makes it fail within seconds, which is the check
+that it can see a leak at all.
 
 ```sh
 cargo fuzz run --fuzz-dir fuzz/sql -s none -O sql_confinement
