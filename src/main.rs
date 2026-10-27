@@ -251,10 +251,10 @@ async fn main() -> Result<()> {
         cli::Command::Partitions(a) => nuthatch::address_partitions::run(&a).await,
         cli::Command::Mcp(args) => {
             if args.print_config {
-                mcp::print_client_config(&args.url);
+                mcp::print_client_config(&args.url, args.token_env.as_deref());
                 Ok(())
             } else {
-                mcp::serve(args.url).await
+                mcp::serve(args.url, args.token_env).await
             }
         }
         cli::Command::Settle(args) => {

@@ -19,20 +19,20 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 /// subprocess. When a human runs `nuthatch mcp` in a terminal, stdin is a TTY and no client is
 /// driving it - so instead of silently blocking on a read that never comes, show how to wire it up.
 /// Returns true if we short-circuited (printed guidance and should exit).
-fn guide_if_interactive(base: &str) -> bool {
+fn guide_if_interactive(base: &str, token_env: Option<&str>) -> bool {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         return false; // a client is piping JSON-RPC in - run the server.
     }
     eprintln!("`nuthatch mcp` is a stdio server for an AI client to launch, not to run by hand.\n");
-    print_client_config(base);
+    print_client_config(base, token_env);
     true
 }
 
 /// Emit a copy-paste MCP client configuration for this binary bridging to `base`. One documented
 /// command wires a coding agent to a running nest (RFC-0015 slice 5): print it, paste it, ask your
 /// contract's data in plain English - fully offline, nothing phones home.
-pub fn print_client_config(base: &str) {
+pub fn print_client_config(base: &str, token_env: Option<&str>) {
     // Prefer this binary's absolute path so the snippet works even off `PATH`; fall back to the bare
     // command name.
     let exe = std::env::current_exe()
@@ -40,12 +40,15 @@ pub fn print_client_config(base: &str) {
         .and_then(|p| p.to_str().map(str::to_owned))
         .unwrap_or_else(|| "nuthatch".to_string());
 
-    let snippet = client_config_json(&exe, base);
+    let snippet = client_config_json(&exe, base, token_env);
+    let token_arg = token_env
+        .map(|v| format!(" --token-env {v}"))
+        .unwrap_or_default();
 
     println!("First run your index:   nuthatch dev");
     println!("Then point an AI client at it - either way is one step:\n");
     println!("  Claude Code (one-liner):");
-    println!("    claude mcp add nuthatch -- {exe} mcp --url {base}\n");
+    println!("    claude mcp add nuthatch -- {exe} mcp --url {base}{token_arg}\n");
     println!("  Or add to .mcp.json / your client's MCP config:");
     println!(
         "{}",
@@ -58,12 +61,16 @@ pub fn print_client_config(base: &str) {
 
 /// The MCP-client server entry for this binary bridging to `base` - the value that goes under
 /// `mcpServers.nuthatch` in a client's config.
-fn client_config_json(exe: &str, base: &str) -> Value {
+fn client_config_json(exe: &str, base: &str, token_env: Option<&str>) -> Value {
+    let mut args = vec!["mcp", "--url", base];
+    if let Some(var) = token_env {
+        args.extend(["--token-env", var]);
+    }
     json!({
         "mcpServers": {
             "nuthatch": {
                 "command": exe,
-                "args": ["mcp", "--url", base]
+                "args": args
             }
         }
     })
@@ -112,11 +119,12 @@ async fn next_message<R: tokio::io::AsyncBufRead + Unpin>(
 }
 
 /// Run the stdio MCP loop, bridging tool calls to `base` (a running `nuthatch dev` HTTP API).
-pub async fn serve(base: String) -> Result<()> {
-    if guide_if_interactive(&base) {
+pub async fn serve(base: String, token_env: Option<String>) -> Result<()> {
+    if guide_if_interactive(&base, token_env.as_deref()) {
         return Ok(());
     }
-    let client = http_client()?;
+    let token = bearer_token(token_env.as_deref(), |v| std::env::var(v).ok())?;
+    let client = http_client(token.as_deref())?;
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
     while let Some(line) = next_message(&mut stdin, MAX_MESSAGE_BYTES).await? {
@@ -127,7 +135,7 @@ pub async fn serve(base: String) -> Result<()> {
         let Ok(req) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if let Some(resp) = handle(&req, &client, &base).await {
+        if let Some(resp) = respond(&req, &client, &base, token.as_deref()).await {
             stdout
                 .write_all(serde_json::to_string(&resp)?.as_bytes())
                 .await?;
@@ -136,6 +144,49 @@ pub async fn serve(base: String) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Read when `--token-env` is not given.
+const DEFAULT_TOKEN_ENV: &str = "NUTHATCH_MCP_TOKEN";
+
+/// The bearer token from the variable `--token-env` names, else `NUTHATCH_MCP_TOKEN`. A named variable
+/// that is unset or empty is an error; the default one is optional.
+fn bearer_token(
+    token_env: Option<&str>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<String>> {
+    let var = token_env.unwrap_or(DEFAULT_TOKEN_ENV);
+    let token = lookup(var)
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    if token.is_none() && token_env.is_some() {
+        bail!("--token-env {var}: the environment variable {var} is unset or empty");
+    }
+    Ok(token)
+}
+
+/// `handle`, with the token scrubbed from everything the model will read: a 401 body or a proxy's
+/// error page can echo the header back.
+async fn respond(
+    req: &Value,
+    client: &reqwest::Client,
+    base: &str,
+    token: Option<&str>,
+) -> Option<Value> {
+    let mut resp = handle(req, client, base).await?;
+    if let Some(t) = token {
+        redact_token(&mut resp, t);
+    }
+    Some(resp)
+}
+
+fn redact_token(v: &mut Value, token: &str) {
+    match v {
+        Value::String(s) if s.contains(token) => *s = s.replace(token, "[redacted]"),
+        Value::Array(a) => a.iter_mut().for_each(|x| redact_token(x, token)),
+        Value::Object(o) => o.values_mut().for_each(|x| redact_token(x, token)),
+        _ => {}
+    }
 }
 
 /// Dispatch one JSON-RPC message. Returns None for notifications (no response expected).
@@ -604,9 +655,17 @@ fn cell(v: &Value) -> String {
     }
 }
 
-fn http_client() -> Result<reqwest::Client> {
+fn http_client(token: Option<&str>) -> Result<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(t) = token {
+        let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}"))
+            .map_err(|_| anyhow!("the MCP token is not a valid HTTP header value"))?;
+        auth.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, auth);
+    }
     Ok(reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
+        .default_headers(headers)
         .build()?)
 }
 
@@ -780,7 +839,7 @@ mod tests {
         let call = json!({ "name": "table", "arguments": { "name": "t" } });
         let answered = tokio::time::timeout(
             REQUEST_TIMEOUT * 5,
-            call_tool(&call, &http_client().unwrap(), &base),
+            call_tool(&call, &http_client(None).unwrap(), &base),
         )
         .await;
         assert!(matches!(answered, Ok(Err(_))), "{answered:?}");
@@ -854,7 +913,7 @@ mod tests {
 
     #[test]
     fn client_config_launches_this_binary_and_bridges_to_base() {
-        let cfg = client_config_json("/usr/local/bin/nuthatch", "http://127.0.0.1:8288");
+        let cfg = client_config_json("/usr/local/bin/nuthatch", "http://127.0.0.1:8288", None);
         let srv = &cfg["mcpServers"]["nuthatch"];
         assert_eq!(srv["command"], "/usr/local/bin/nuthatch");
         // The client launches `nuthatch mcp --url <base>` as a stdio subprocess.
@@ -862,6 +921,98 @@ mod tests {
             srv["args"],
             json!(["mcp", "--url", "http://127.0.0.1:8288"])
         );
+    }
+
+    /// RFC-0073 FR13: the variable is named, the token never, and a named variable must be set.
+    #[test]
+    fn the_token_comes_from_a_named_variable_or_the_default() {
+        let cfg = client_config_json("nuthatch", "https://n.example", Some("MY_TOKEN"));
+        assert_eq!(
+            cfg["mcpServers"]["nuthatch"]["args"],
+            json!([
+                "mcp",
+                "--url",
+                "https://n.example",
+                "--token-env",
+                "MY_TOKEN"
+            ])
+        );
+
+        let env = |set: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                set.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let both = env(&[("MY_TOKEN", "s3cret\n"), ("NUTHATCH_MCP_TOKEN", "dflt")]);
+        assert_eq!(
+            bearer_token(Some("MY_TOKEN"), both).unwrap().as_deref(),
+            Some("s3cret")
+        );
+        assert_eq!(bearer_token(None, both).unwrap().as_deref(), Some("dflt"));
+        assert_eq!(bearer_token(None, env(&[])).unwrap(), None);
+        let err = bearer_token(Some("MY_TOKEN"), env(&[("MY_TOKEN", " ")])).unwrap_err();
+        assert!(err.to_string().contains("MY_TOKEN"), "{err}");
+    }
+
+    /// RFC-0073 FR13: every request carries the bearer, and nothing the model reads repeats it.
+    #[tokio::test]
+    async fn the_bearer_goes_on_every_request_and_never_back_to_the_model() {
+        use axum::http::{HeaderMap, StatusCode, Uri};
+        use std::sync::{Arc, Mutex};
+        const TOKEN: &str = "tok-7f3a9c";
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let s = seen.clone();
+        let app = axum::Router::new().fallback(move |uri: Uri, h: HeaderMap| async move {
+            let auth = h
+                .get("authorization")
+                .map(|v| v.to_str().unwrap().to_string());
+            s.lock().unwrap().push(auth.clone());
+            if uri.path() == "/tables" {
+                let echo = auth.unwrap_or_default();
+                (StatusCode::UNAUTHORIZED, format!("bad credentials: {echo}"))
+            } else {
+                (StatusCode::OK, "{}".to_string())
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = http_client(Some(TOKEN)).unwrap();
+
+        let reqs = [
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "resources/read",
+                "params": { "uri": "nuthatch://schema" } }),
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": { "name": "tables", "arguments": {} } }),
+            json!({ "jsonrpc": "2.0", "id": 4, "method": "resources/read",
+                "params": { "uri": "nuthatch://tables" } }),
+        ];
+        let mut out = String::new();
+        for r in &reqs {
+            let resp = respond(r, &client, &base, Some(TOKEN)).await.unwrap();
+            out.push_str(&resp.to_string());
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 4, "{seen:?}");
+        assert!(
+            seen.iter()
+                .all(|a| a.as_deref() == Some(&format!("Bearer {TOKEN}")[..])),
+            "{seen:?}"
+        );
+        assert!(out.contains("bad credentials: Bearer [redacted]"), "{out}");
+        assert!(!out.contains(TOKEN), "{out}");
+
+        // An unreachable nest's error names no token either.
+        let gone = json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": { "name": "tables", "arguments": {} } });
+        let resp = respond(&gone, &client, "http://127.0.0.1:1", Some(TOKEN))
+            .await
+            .unwrap();
+        assert!(!resp.to_string().contains(TOKEN), "{resp}");
+        server.abort();
     }
 
     #[tokio::test]

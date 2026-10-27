@@ -1114,6 +1114,12 @@ pub struct McpArgs {
     /// and exit, instead of running the stdio server. This is the "wire it up in one step" helper.
     #[arg(long)]
     pub print_config: bool,
+
+    /// Name of an environment variable holding a bearer token, sent as `Authorization: Bearer` on every
+    /// request to --url. Defaults to `NUTHATCH_MCP_TOKEN` when that is set. The token itself never
+    /// goes on the command line.
+    #[arg(long, value_name = "VAR")]
+    pub token_env: Option<String>,
 }
 
 #[derive(Args)]
