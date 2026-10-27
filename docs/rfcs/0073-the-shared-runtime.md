@@ -261,7 +261,7 @@ response. The same for `/explain`. `/q/{name}` gains a JSON body form for its ar
 
 ### FR12. A supported release line
 
-Policy, decided by Chief, recorded in `SECURITY.md`. The proposal: security fixes are backported to the
+Policy, decided by Chief on 2026-10-27 and recorded in `SECURITY.md`: security fixes are backported to the
 previous minor release for 30 days after a new minor ships, on the `release/<maj>.<min>` branches the
 release docs already describe; hosting operators who ask get private advance notice of a security
 release, under a disclosure agreement.

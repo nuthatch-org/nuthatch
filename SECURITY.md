@@ -29,9 +29,20 @@ anonymous.
 
 ## Supported versions
 
-Only the latest release receives security fixes: the newest tag on
-[GitHub Releases](https://github.com/nuthatch-org/nuthatch/releases/latest). A fix ships as a new
-release on that line, not as a backport to an older one, so upgrading is the remedy. Releases are
-cut from tagged commits on `main`, published to GitHub Releases with per-artifact SHA-256, and
-reproducible from the pinned toolchain (see
+The latest minor release receives security fixes, and so does the **previous minor for 30 days**
+after the next one ships. When 5.13.0 is released, 5.12 keeps receiving security fixes until 30 days
+after that date, then only 5.13 does. A backport is a patch release cut from `release/<major>.<minor>`
+by the process in [docs/releases/README.md](docs/releases/README.md#patch-releases-on-4x); it
+carries the security fix and nothing else, so an operator pinned to that minor can take it without
+taking the next minor's features. Older lines are not patched: upgrading is the remedy.
+
+**Advance notice for hosting operators.** An operator who runs nuthatch for other people may ask
+for private notice of a security release before it is public. Write to the address under
+Reporting, naming the deployment and a security contact. Notice is given under a disclosure
+agreement, normally a few days before the release, with the affected versions and the fix; it
+carries no exploit detail beyond what is needed to judge urgency. It is offered to any such
+operator on the same terms, and it is not a support contract.
+
+Releases are cut from tagged commits on `main` or a `release/<major>.<minor>` branch,
+published to GitHub Releases with per-artifact SHA-256, and reproducible from the pinned toolchain (see
 [GOVERNANCE.md § Release integrity](GOVERNANCE.md#release-integrity--key-custody)).
