@@ -1114,6 +1114,18 @@ impl DecodeRegistry {
         set
     }
 
+    /// The topic0s one template decodes.
+    pub fn template_topic0s(&self, template: &str) -> Vec<B256> {
+        let mut set: Vec<B256> = self
+            .templates_by_topic0
+            .iter()
+            .filter(|(_, ds)| ds.iter().any(|d| d.alias == template))
+            .map(|(t, _)| *t)
+            .collect();
+        set.sort();
+        set
+    }
+
     /// True if this nest declares any templates (i.e. is a factory nest).
     pub fn has_templates(&self) -> bool {
         !self.templates_by_topic0.is_empty()
