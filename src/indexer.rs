@@ -3009,7 +3009,7 @@ pub async fn build_and_prepare_nest(
     // is handed the shared store the writer is filling; `None` keeps the embedded behaviour, which is
     // every existing caller.
     store_override: Option<Arc<dyn crate::store::HotStore>>,
-    sql_gate: Arc<tokio::sync::Semaphore>,
+    sql_gate: crate::serve::SqlGate,
     join: CatchUp<'_>,
 ) -> Result<(
     NestIngest,
@@ -3115,7 +3115,7 @@ async fn build_nest(
     store_override: Option<Arc<dyn crate::store::HotStore>>,
     // The cursor's analytical gate, shared by every nest on this cursor (#1024). Created by the
     // caller because only the caller knows the cursor boundary: `spawn_runtime` is one cursor.
-    sql_gate: Arc<tokio::sync::Semaphore>,
+    sql_gate: crate::serve::SqlGate,
 ) -> Result<(
     NestIngest,
     serve::AppState,
@@ -3662,6 +3662,7 @@ async fn build_nest(
         velocity_threshold: velocity_cfg.map(|(amt, _)| amt),
         tables: Arc::new(full_schema(&registry, config)),
         sql_gate,
+        tenant: None,
         sql_queued: Default::default(),
         memo_gate: Default::default(),
         sql_response_bytes: Default::default(),

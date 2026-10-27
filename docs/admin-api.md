@@ -239,6 +239,47 @@ An unmount that fails part-way answers `500` with the `nid`, so the dataset can 
 Inside a running runtime this removes the dataset and the segments only it references. Segments a live
 fold left behind stay for an offline `nuthatch prune`.
 
+## Tenant shares
+
+Each chain's cursor has one SQL gate, two permits by default, shared by every mount on that chain, and
+the process has one budget of response bytes in flight. Both are divided by tenant label (RFC-0073
+FR2). Nuthatch still knows nothing about who a tenant is; the label is the first part of a mount's name.
+
+| Do | Call | Answers |
+|---|---|---|
+| Set a tenant's share | `PUT /_admin/tenants/<tenant>` `{"weight": 2, "max_permits": 1, "max_response_mib": 32}` | `200`, `{"tenant", "share"}` |
+| Restore the default | `PUT /_admin/tenants/<tenant>` `{}` | `200` |
+| Read every tenant's share and use | `GET /_admin/tenants` | `{"tenants": [{"tenant", "share", "mounts", "permits_held", "response_kib_in_flight"}, …]}` |
+
+A `PUT` replaces the tenant's whole share, every field optional. It is written to `mounts.toml` under
+`[tenants.<tenant>]` first and then applied to every running mount, with no restart; a share the file
+could not take is refused and changes nothing. A tenant may be given a share before it mounts anything.
+`weight` is 1 to 1000, default 1; `max_permits` caps the permits it holds on any one gate;
+`max_response_mib` caps its response bytes in flight across the process. A bad value is `400`, an
+unknown field `422`.
+
+**How the gate is divided.** Every tenant with a mount on a gate holds a reservation of one permit. A
+tenant may borrow more only while every other tenant's reservation stays free, so a tenant below its
+reservation is admitted within the 250 ms admission wait however busy another tenant is: it waits
+behind its own queries, never another's. When several tenants wait, a freed permit goes to the one
+holding the fewest permits per unit of weight. Half the response-bytes budget is reserved the same way,
+split by weight between the tenants mounted; the other half is borrowed first come.
+
+**The trade.** A permit already running is never taken back, so a reservation is held whether or not
+its tenant is busy. A tenant can use every permit only when it is the only tenant on the gate. With as
+many tenants as permits each holds at most one, and with more tenants than permits a tenant without a
+permit waits for any reservation to free. Raising `NUTHATCH_SQL_MAX_CONCURRENCY` buys room, within the
+per-cursor memory budget its ceiling protects.
+
+**Refusals.** A tenant at its own share, at its cap, or waiting with every reservation taken, is
+answered `429` with `"reason": "tenant_share"` and counted as `nuthatch_sql_rejections_total
+{reason="tenant_share"}`. A full gate while the tenant is under its share is still `503`, `server busy`,
+and `reason="busy"`. A runtime with one tenant behaves as it did before shares existed: it may hold
+every permit and is only ever told `busy`. A lone nest outside a runtime has no tenant at all.
+
+A maintained-view build takes a permit as a tenant mounting its dataset, so it never takes another
+tenant's reservation.
+
 ## Faults
 
 A chain's cursor carries every nest on that chain, and a fault in one nest takes out that nest alone.

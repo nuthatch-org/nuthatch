@@ -87,9 +87,12 @@ pub const SQL_MAX_CONCURRENCY_CEILING: usize = 16;
 /// is the safe direction, but it is a real reduction for a dense cursor.
 /// `docs/bench/1006-sql-concurrency-hetzner.md` measures what a permit buys and recommends raising
 /// the default; that is a separate board decision and is not taken here.
-pub fn new_sql_gate() -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(sql_max_concurrency()))
+pub fn new_sql_gate() -> SqlGate {
+    SqlGate::new(sql_max_concurrency())
 }
+
+pub use crate::fair_share::SqlGate;
+use crate::fair_share::{GatePermit, Refusal};
 
 /// Memo keys one nest builds at once. Each reads the segment manifest and hashes the authored
 /// files, and a hit re-stats every segment, so a flood of distinct statements queues here, off the
@@ -110,23 +113,35 @@ impl Default for MemoGate {
 /// gigabytes nothing else counts (#2212). Four of the largest result `engine` will build.
 const SQL_MAX_INFLIGHT_RESPONSE_KIB: usize = 4 * crate::engine::SQL_MAX_RESULT_BYTES / 1024;
 
-/// The budget for [`SQL_MAX_INFLIGHT_RESPONSE_KIB`]. Every default shares the process's one.
+/// The budget for [`SQL_MAX_INFLIGHT_RESPONSE_KIB`], shared between tenant labels (RFC-0073 FR2).
+/// Every default shares the process's one.
 #[derive(Clone)]
-pub struct ResponseBytes(Arc<Semaphore>);
+pub struct ResponseBytes(pub Arc<crate::fair_share::ByteShares>);
 
 impl Default for ResponseBytes {
     fn default() -> Self {
-        static PROCESS: std::sync::LazyLock<Arc<Semaphore>> =
-            std::sync::LazyLock::new(|| Arc::new(Semaphore::new(SQL_MAX_INFLIGHT_RESPONSE_KIB)));
+        static PROCESS: std::sync::LazyLock<Arc<crate::fair_share::ByteShares>> =
+            std::sync::LazyLock::new(|| {
+                Arc::new(crate::fair_share::ByteShares::new(
+                    SQL_MAX_INFLIGHT_RESPONSE_KIB,
+                ))
+            });
         Self(Arc::clone(&PROCESS))
     }
 }
 
 impl ResponseBytes {
-    /// Room for a body of `len` bytes, held until the body is sent or dropped; `None` when full.
-    fn reserve(&self, len: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let kib = len.div_ceil(1024).clamp(1, SQL_MAX_INFLIGHT_RESPONSE_KIB) as u32;
-        Arc::clone(&self.0).try_acquire_many_owned(kib).ok()
+    pub fn new(kib: usize) -> Self {
+        Self(Arc::new(crate::fair_share::ByteShares::new(kib)))
+    }
+
+    /// Room for a body of `len` bytes, held until the body is sent or dropped.
+    fn reserve(
+        &self,
+        len: usize,
+        tenant: Option<&str>,
+    ) -> std::result::Result<crate::fair_share::BytePermit, Refusal> {
+        self.0.reserve(len, tenant)
     }
 }
 
@@ -299,7 +314,10 @@ pub struct AppState {
     /// Admission control for the analytical (Burrmill) surface: bounds how many `/sql` and cold
     /// `/table` queries run at once so a burst can't multiply Burrmill's per-query footprint past the
     /// process budget. Constructed with [`SQL_MAX_CONCURRENCY`] permits.
-    pub sql_gate: Arc<Semaphore>,
+    pub sql_gate: SqlGate,
+    /// This mount's seat at the gate under its tenant label (RFC-0073 FR2). `None` outside a
+    /// runtime: a lone nest is untenanted and admitted by the bare semaphore.
+    pub tenant: Option<Arc<crate::fair_share::Seat>>,
     /// Requests currently parked waiting for [`Self::sql_gate`], bounded by [`SQL_MAX_QUEUED`].
     ///
     /// Per-nest and not shared across a cursor, unlike the gate itself: the gate bounds what runs
@@ -2802,29 +2820,19 @@ async fn graph_graphql(
     // Taken once for the document. Re-acquiring per root resets the 30s clock (#1658).
     let started = std::time::Instant::now();
     let _operation_permit = if roots.iter().any(|r| graph_sql_root(&r.name)) {
-        let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
+        let permit = match gate_admit(&s).await {
             Ok(p) => p,
-            Err(_) => {
-                let Some(_slot) = QueueSlot::take(&s.sql_queued, s.limits.max_queued) else {
-                    return (
-                        StatusCode::OK,
-                        Json(gql_error("server busy: too many concurrent SQL queries")),
-                    );
-                };
-                match tokio::time::timeout(
-                    SQL_ADMISSION_WAIT,
-                    Arc::clone(&s.sql_gate).acquire_owned(),
-                )
-                .await
-                {
-                    Ok(Ok(p)) => p,
-                    _ => {
-                        return (
-                            StatusCode::OK,
-                            Json(gql_error("server busy: too many concurrent SQL queries")),
-                        );
-                    }
-                }
+            Err(Refusal::Busy) => {
+                return (
+                    StatusCode::OK,
+                    Json(gql_error("server busy: too many concurrent SQL queries")),
+                );
+            }
+            Err(Refusal::TenantShare) => {
+                return (
+                    StatusCode::OK,
+                    Json(gql_error(&share_message(&s, "concurrent SQL queries"))),
+                );
             }
         };
         #[cfg(all(test, feature = "graph"))]
@@ -3628,10 +3636,58 @@ async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
 const INLINE_SCAN_ROWS: usize = 4096;
 
 /// `/sql`'s admission: a free permit, or a wait bounded in time and in how many wait, else `503`.
-async fn admit(
-    s: &AppState,
-) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, axum::response::Response> {
-    admit_to(&s.sql_gate, &s.sql_queued, s.limits.max_queued).await
+async fn admit(s: &AppState) -> std::result::Result<GatePermit, axum::response::Response> {
+    gate_admit(s)
+        .await
+        .map_err(|why| refused(s, why, "concurrent SQL queries"))
+}
+
+/// The gate's admission under this mount's tenant label: a free permit, or a wait bounded in time
+/// and in how many wait.
+async fn gate_admit(s: &AppState) -> std::result::Result<GatePermit, Refusal> {
+    let tenant = s.tenant_label();
+    let first = match s.sql_gate.try_admit(tenant) {
+        Ok(permit) => return Ok(permit),
+        Err(why) => why,
+    };
+    let Some(_slot) = QueueSlot::take(&s.sql_queued, s.limits.max_queued) else {
+        return Err(first);
+    };
+    s.sql_gate.wait_admit(tenant, SQL_ADMISSION_WAIT).await
+}
+
+/// A refusal from the gate or the response-bytes budget, counted under its reason. `busy` keeps its
+/// `503`; a tenant at its own share is told so with `429` and `reason: "tenant_share"`.
+fn refused(s: &AppState, why: Refusal, what: &str) -> axum::response::Response {
+    crate::metrics::METRICS.inc_sql_rejected(why.metric());
+    match why {
+        Refusal::Busy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": format!("server busy: too many {what}") })),
+        )
+            .into_response(),
+        Refusal::TenantShare => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": share_message(s, what),
+                "reason": "tenant_share",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+impl AppState {
+    fn tenant_label(&self) -> Option<&str> {
+        self.tenant.as_deref().map(crate::fair_share::Seat::tenant)
+    }
+}
+
+fn share_message(s: &AppState, what: &str) -> String {
+    format!(
+        "tenant '{}' is at its share of {what}",
+        s.tenant_label().unwrap_or_default()
+    )
 }
 
 /// [`admit`] to any gate, parking in the nest's one queue.
@@ -3693,7 +3749,7 @@ async fn sized<T: Send + 'static>(
 async fn bounded_hot_read<T: Send + 'static>(
     s: &AppState,
     read: impl Fn(usize) -> Result<Option<T>> + Send + 'static,
-) -> std::result::Result<(T, Option<tokio::sync::OwnedSemaphorePermit>), axum::response::Response> {
+) -> std::result::Result<(T, Option<GatePermit>), axum::response::Response> {
     match read(INLINE_SCAN_ROWS) {
         Ok(Some(rows)) => return Ok((rows, None)),
         Ok(None) => {}
@@ -3757,10 +3813,11 @@ async fn table(
     if items.len() < limit {
         let permit = match held {
             Some(permit) => Ok(permit),
-            None => Arc::clone(&s.sql_gate).try_acquire_owned(),
+            None => s.sql_gate.try_admit(s.tenant_label()),
         };
         let cold = match permit {
-            Err(_) => Err("the SQL gate is saturated".to_string()),
+            Err(Refusal::Busy) => Err("the SQL gate is saturated".to_string()),
+            Err(Refusal::TenantShare) => Err(share_message(&s, "the SQL gate")),
             Ok(permit) => {
                 let need = limit - items.len();
                 let mut where_ = String::new();
@@ -3925,30 +3982,9 @@ async fn entity(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoR
         Some((block, log_index)) => {
             // A hot miss scans sealed segments. Same admission and deadline as `/sql` (#1657).
             let admission = std::time::Instant::now();
-            let busy = || {
-                crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
-                )
-                    .into_response()
-            };
-            let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
+            let permit = match admit(&s).await {
                 Ok(p) => p,
-                Err(_) => {
-                    let Some(_slot) = QueueSlot::take(&s.sql_queued, s.limits.max_queued) else {
-                        return busy();
-                    };
-                    match tokio::time::timeout(
-                        SQL_ADMISSION_WAIT,
-                        Arc::clone(&s.sql_gate).acquire_owned(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(p)) => p,
-                        _ => return busy(),
-                    }
-                }
+                Err(refused) => return refused,
             };
             let guard = s.query_guard(s.limits.timeout.saturating_sub(admission.elapsed()), 1);
             let dir = s.dir.clone();
@@ -4224,7 +4260,7 @@ impl NamedRun {
 }
 
 enum NamedFailure {
-    Busy,
+    Refused(Refusal),
     Query(anyhow::Error),
     Task(String),
 }
@@ -4240,9 +4276,10 @@ async fn named_scan(
     execute: bool,
 ) -> Result<NamedRun, NamedFailure> {
     use crate::analytics::{AdmissionRefusal, NamedAdmission, QueryGuard, ScanBound};
-    let permit = Arc::clone(&s.sql_gate)
-        .try_acquire_owned()
-        .map_err(|_| NamedFailure::Busy)?;
+    let permit = s
+        .sql_gate
+        .try_admit(s.tenant_label())
+        .map_err(NamedFailure::Refused)?;
     crate::metrics::METRICS.inc_sql();
     let dir = s.dir.clone();
     let store = s.store.clone();
@@ -4362,14 +4399,7 @@ fn named_failure(s: &AppState, failure: NamedFailure, sql: &str) -> axum::respon
     use crate::analytics::AdmissionRefusal;
     use crate::metrics::METRICS;
     let e = match failure {
-        NamedFailure::Busy => {
-            METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
-            )
-                .into_response();
-        }
+        NamedFailure::Refused(why) => return refused(s, why, "concurrent SQL queries"),
         NamedFailure::Task(e) => return error(e),
         NamedFailure::Query(e) => e,
     };
@@ -4848,36 +4878,11 @@ async fn run_sql_query_at(
         // failure than the bouncing this change exists to stop. The permit count is untouched and
         // still decides how many queries run at once (#1319).
         let admission = std::time::Instant::now();
-        let busy = || {
-            METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": "server busy: too many concurrent SQL queries" })),
-            )
-                .into_response()
-        };
-        let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
-            // A free permit needs no queue at all, so the uncontended path never touches
-            // the counter.
+        // Only a request that is refused is counted; one that waited and was then admitted is an
+        // accepted query.
+        let permit = match admit(&s).await {
             Ok(p) => p,
-            Err(_) => {
-                // Saturated: park, but only if this nest has room to park another.
-                let Some(_slot) = QueueSlot::take(&s.sql_queued, s.limits.max_queued) else {
-                    return busy();
-                };
-                match tokio::time::timeout(
-                    SQL_ADMISSION_WAIT,
-                    Arc::clone(&s.sql_gate).acquire_owned(),
-                )
-                .await
-                {
-                    Ok(Ok(p)) => p,
-                    // Elapsed, or the semaphore was closed on shutdown. Only a request that
-                    // gets the 503 is counted; one that waited and was then admitted is an accepted
-                    // query.
-                    _ => return busy(),
-                }
-            }
+            Err(refused) => return refused,
         };
         // Charged against the query's own deadline, so queuing can never extend the total time a
         // request occupies the node.
@@ -5360,12 +5365,23 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
         )
             .into_response();
     }
-    let permit = match Arc::clone(&s.sql_gate).try_acquire_owned() {
+    let permit = match s.sql_gate.try_admit(s.tenant_label()) {
         Ok(p) => p,
-        Err(_) => {
+        Err(Refusal::Busy) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "valid": false, "error": "server busy" })),
+            )
+                .into_response()
+        }
+        Err(Refusal::TenantShare) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "valid": false,
+                    "error": share_message(&s, "concurrent SQL queries"),
+                    "reason": "tenant_share",
+                })),
             )
                 .into_response()
         }
@@ -5700,23 +5716,17 @@ fn sql_response(
     }
     // Room for the body is taken before a remembered one is copied, and after a computed one,
     // already bounded by the permit that computed it, is serialized (#2212).
-    let full = || {
-        crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Busy);
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "server busy: too many SQL response bytes in flight" })),
-        )
-            .into_response()
-    };
+    let full = |why| refused(s, why, "SQL response bytes in flight");
+    let tenant = s.tenant_label();
     let early = match rows {
         SqlRows::Serialized { json, .. } => {
             let len = json
                 .get()
                 .len()
                 .saturating_add(json_len(&response) as usize);
-            match s.sql_response_bytes.reserve(len) {
-                Some(permit) => Some(permit),
-                None => return full(),
+            match s.sql_response_bytes.reserve(len, tenant) {
+                Ok(permit) => Some(permit),
+                Err(why) => return full(why),
             }
         }
         SqlRows::Values(_) => None,
@@ -5735,14 +5745,14 @@ fn sql_response(
                 .into_response()
         }
     };
-    match early.or_else(|| s.sql_response_bytes.reserve(body.len())) {
-        Some(permit) => held_body(body, permit),
-        None => full(),
+    match early.map_or_else(|| s.sql_response_bytes.reserve(body.len(), tenant), Ok) {
+        Ok(permit) => held_body(body, permit),
+        Err(why) => full(why),
     }
 }
 
 /// `body` as a JSON response that holds `permit` until its last chunk has been taken to be sent.
-fn held_body(body: Vec<u8>, permit: tokio::sync::OwnedSemaphorePermit) -> axum::response::Response {
+fn held_body(body: Vec<u8>, permit: crate::fair_share::BytePermit) -> axum::response::Response {
     use futures::StreamExt;
     const CHUNK: usize = 64 * 1024;
     let len = body.len();
@@ -7069,7 +7079,8 @@ mod tests {
             threshold: None,
             velocity_threshold: None,
             tables: Arc::new(vec![]),
-            sql_gate: Arc::new(Semaphore::new(permits)),
+            sql_gate: SqlGate::new(permits),
+            tenant: None,
             cursorless: false,
             seal_span: crate::chains::DEFAULT_SEAL_SPAN,
             freshness: Default::default(),
@@ -9604,6 +9615,167 @@ mod tests {
         assert!(QueueSlot::take(&queued, SQL_MAX_QUEUED).is_some());
     }
 
+    /// A mount seated under `tenant` at `gate`, as the runtime seats one (RFC-0073 FR2).
+    fn seated(
+        dir: &std::path::Path,
+        gate: &SqlGate,
+        bytes: &ResponseBytes,
+        tenant: &str,
+    ) -> AppState {
+        let mut s = test_state(dir, gate.total());
+        s.sql_gate = gate.clone();
+        s.sql_response_bytes = bytes.clone();
+        s.tenant = Some(Arc::new(crate::fair_share::Seat::new(
+            tenant,
+            dir,
+            gate,
+            &bytes.0,
+            crate::runtime::TenantShare::default(),
+        )));
+        s
+    }
+
+    fn sql_response(
+        state: AppState,
+        q: &str,
+    ) -> impl std::future::Future<Output = axum::response::Response> + Send + 'static {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .uri(format!("/sql?q={}", q.replace(' ', "%20")))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        async move { router(SharedNest::new(state)).oneshot(req).await.unwrap() }
+    }
+
+    async fn body_json(resp: axum::response::Response) -> Value {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// RFC-0073 FR2's acceptance bound: tenant A holds every permit it can and keeps a queue of
+    /// further queries parked, and tenant B's query is still admitted at once and answered.
+    #[tokio::test]
+    async fn a_tenant_saturating_its_share_cannot_delay_another_tenants_query() {
+        let (ta, tb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let gate = SqlGate::new(SQL_MAX_CONCURRENCY);
+        let bytes = ResponseBytes::new(SQL_MAX_INFLIGHT_RESPONSE_KIB);
+        let a = seated(ta.path(), &gate, &bytes, "acme");
+        let b = seated(tb.path(), &gate, &bytes, "globex");
+
+        // A's long queries: every permit its admission will give it, held as a running query holds one.
+        let mut running = Vec::new();
+        while let Ok(p) = gate.try_admit(Some("acme")) {
+            running.push(p);
+        }
+        assert_eq!(
+            running.len(),
+            SQL_MAX_CONCURRENCY - 1,
+            "one reservation stays B's"
+        );
+        let parked: Vec<_> = (0..4)
+            .map(|i| tokio::spawn(sql_response(a.clone(), &format!("SELECT {i} AS n"))))
+            .collect();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(a.sql_queued.load(std::sync::atomic::Ordering::Relaxed), 4);
+
+        let started = std::time::Instant::now();
+        let admitted = gate_admit(&b).await.expect("B is under its reservation");
+        assert!(
+            started.elapsed() < SQL_ADMISSION_WAIT,
+            "B waited {:?} behind A",
+            started.elapsed()
+        );
+        drop(admitted);
+        let resp = sql_response(b.clone(), "SELECT 2422 AS n").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rows"][0]["n"], 2422);
+
+        for p in parked {
+            let resp = p.await.unwrap();
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(body_json(resp).await["reason"], "tenant_share");
+        }
+        drop(running);
+    }
+
+    /// A tenant at its own share and a gate that is simply full answer differently, and count under
+    /// their own reasons in `nuthatch_sql_rejections_total`.
+    #[tokio::test]
+    async fn tenant_share_and_busy_are_told_apart() {
+        let (ta, tb, tc) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let bytes = ResponseBytes::new(SQL_MAX_INFLIGHT_RESPONSE_KIB);
+
+        let shared = SqlGate::new(2);
+        let a = seated(ta.path(), &shared, &bytes, "acme");
+        let _b = seated(tb.path(), &shared, &bytes, "globex");
+        let _held = shared.try_admit(Some("acme")).unwrap();
+        let before = rejections("tenant_share").unwrap_or(0);
+        let resp = sql_response(a, "SELECT 1 AS n").await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = body_json(resp).await;
+        assert_eq!(body["reason"], "tenant_share", "{body}");
+        assert!(rejections("tenant_share").unwrap() > before);
+
+        // One tenant alone on a full gate is the process at capacity, exactly as before FR2.
+        let alone = SqlGate::new(1);
+        let c = seated(tc.path(), &alone, &bytes, "initech");
+        let _full = alone.try_admit(Some("initech")).unwrap();
+        let before = rejections("busy").unwrap_or(0);
+        let resp = sql_response(c, "SELECT 1 AS n").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body,
+            json!({ "error": "server busy: too many concurrent SQL queries" })
+        );
+        assert!(rejections("busy").unwrap() > before);
+    }
+
+    /// The response-bytes budget is divided the same way: a tenant holding unread answers past its
+    /// slice is refused for its own share, and the other tenant's answer still has room.
+    #[tokio::test]
+    async fn a_tenants_unread_answers_cannot_take_another_tenants_bytes() {
+        let (ta, tb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let gate = SqlGate::new(SQL_MAX_CONCURRENCY);
+        // Half of 4 KiB reserved, one each; every small answer costs one.
+        let bytes = ResponseBytes::new(4);
+        let a = seated(ta.path(), &gate, &bytes, "acme");
+        let b = seated(tb.path(), &gate, &bytes, "globex");
+        let mut unread = Vec::new();
+        for i in 0..3 {
+            let resp = sql_response(a.clone(), &format!("SELECT {i} AS n")).await;
+            assert_eq!(resp.status(), StatusCode::OK, "answer {i}");
+            unread.push(resp);
+        }
+        let refused = sql_response(a.clone(), "SELECT 9 AS n").await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body_json(refused).await["reason"], "tenant_share");
+        let resp = sql_response(b, "SELECT 7 AS n").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rows"][0]["n"], 7);
+        drop(unread);
+    }
+
+    /// A lone nest has no seat and is admitted by the bare semaphore, as before FR2.
+    #[tokio::test]
+    async fn an_untenanted_nest_is_admitted_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 1);
+        assert!(state.tenant.is_none());
+        let held = state.sql_gate.try_admit(None).unwrap();
+        let resp = sql_response(state.clone(), "SELECT 1 AS n").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(held);
+        let resp = sql_response(state, "SELECT 1 AS n").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// #2212: a `/sql` body holds its bytes until it has been taken to be sent, and past the budget
     /// the next answer is refused rather than buffered, a remembered one included.
     #[tokio::test]
@@ -9611,7 +9783,7 @@ mod tests {
         use tower::ServiceExt;
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
-        state.sql_response_bytes = ResponseBytes(Arc::new(Semaphore::new(1)));
+        state.sql_response_bytes = ResponseBytes::new(1);
         let app = router(SharedNest::new(state));
         let get = |q: &str| {
             let req = axum::http::Request::builder()

@@ -38,6 +38,7 @@ use crate::rpc::{self, RpcClient};
 use crate::source::Source;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -153,7 +154,8 @@ impl std::fmt::Display for Nid {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Mount {
     /// Who mounted it (RFC-0032 §6). An **opaque string** - nuthatch refcounts it and knows nothing
-    /// else about it. No authz, no quotas, no metering; identity stays the gateway's job.
+    /// else about it. No authz, no metering; identity stays the gateway's job. Its share of query
+    /// capacity is [`MountTable::tenants`] (RFC-0073 FR2).
     ///
     /// Always a real value, never `Option<String>` and never null. Single-tenant is `N=1` with
     /// [`DEFAULT_TENANT`], not a special case, so there is one code path rather than two - and the
@@ -331,6 +333,65 @@ pub struct MountTable {
     /// has not been migrated and still resolves nests by name under [`NESTS_DIR`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<Mount>,
+    /// Each tenant label's share of SQL capacity (RFC-0073 FR2), set live by
+    /// `PUT /_admin/tenants/<tenant>`. A tenant absent here has the default share.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tenants: BTreeMap<String, TenantShare>,
+}
+
+/// `[tenants.<tenant>]`: what one tenant label may hold of each cursor's SQL permits and of the
+/// process's response bytes in flight (RFC-0073 FR2). Nuthatch still knows nothing about who it is.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TenantShare {
+    /// Relative weight against the other tenants on a gate. Default 1.
+    #[serde(default = "default_tenant_weight")]
+    pub weight: u32,
+    /// The most SQL permits this tenant holds at once on any one cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_permits: Option<usize>,
+    /// The most response bytes, in MiB, this tenant holds in flight across the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_mib: Option<u64>,
+}
+
+/// The most a weight may be, so a sum over every tenant cannot overflow.
+pub const MAX_TENANT_WEIGHT: u32 = 1000;
+
+fn default_tenant_weight() -> u32 {
+    1
+}
+
+impl Default for TenantShare {
+    fn default() -> Self {
+        Self {
+            weight: default_tenant_weight(),
+            max_permits: None,
+            max_response_mib: None,
+        }
+    }
+}
+
+impl TenantShare {
+    pub fn validate(&self, tenant: &str) -> Result<()> {
+        if tenant.len() > 64 {
+            bail!("tenant '{tenant}' is longer than 64 characters");
+        }
+        safe_segment(tenant, "tenant")?;
+        if !(1..=MAX_TENANT_WEIGHT).contains(&self.weight) {
+            bail!(
+                "tenant '{tenant}': weight must be between 1 and {MAX_TENANT_WEIGHT}, not {}",
+                self.weight
+            );
+        }
+        if self.max_permits == Some(0) {
+            bail!("tenant '{tenant}': max_permits must be at least 1");
+        }
+        if self.max_response_mib == Some(0) {
+            bail!("tenant '{tenant}': max_response_mib must be at least 1");
+        }
+        Ok(())
+    }
 }
 
 /// One chain the runtime follows, plus how to reach it - a cursor's substrate (RFC-0021).
@@ -783,6 +844,9 @@ impl MountTable {
             if !seen.insert((&m.tenant, &m.alias)) {
                 bail!("tenant '{}' mounts '{}' more than once", m.tenant, m.alias);
             }
+        }
+        for (tenant, share) in &self.tenants {
+            share.validate(tenant).context("invalid [tenants] entry")?;
         }
         Ok(())
     }
@@ -1550,6 +1614,7 @@ fn overlay_boot_records(
     records: &[Mount],
     datasets: &[Dataset],
     default_tenant: &str,
+    shares: &BTreeMap<String, TenantShare>,
 ) -> Result<()> {
     for (key, state) in states.iter_mut() {
         let record = records
@@ -1572,7 +1637,11 @@ fn overlay_boot_records(
             Some(_) => ds_nid_for(datasets, key, default_tenant),
             None => state.nid.clone(),
         };
-        overlay_mount_record(state, nid.as_deref(), record, surface);
+        let seating = Seating {
+            default_tenant,
+            shares,
+        };
+        overlay_mount_record(state, nid.as_deref(), record, surface, key, seating);
     }
     Ok(())
 }
@@ -2255,7 +2324,13 @@ pub async fn dev(
         default_tenant,
     );
 
-    overlay_boot_records(&mut all_states, &mounts.mounts, &datasets, default_tenant)?;
+    overlay_boot_records(
+        &mut all_states,
+        &mounts.mounts,
+        &datasets,
+        default_tenant,
+        &all_mounts.tenants,
+    )?;
     let all_states = all_states;
     let publishers = spawn_publishers(&dir, &mounts.mounts, default_tenant)?;
 
@@ -2294,6 +2369,7 @@ pub async fn dev(
         suspended,
         failed,
         joining: Default::default(),
+        tenant_shares: all_mounts.tenants.clone(),
         mount_ctx: MountContext {
             dir: dir.clone(),
             mounts: all_mounts.mounts.clone(),
@@ -2557,7 +2633,7 @@ pub fn lifecycle_routes(
     use crate::mount_jobs::{ClaimError, MountJob, MountPhase};
     use axum::extract::{Path as AxPath, Query, State};
     use axum::http::{HeaderMap, StatusCode};
-    use axum::routing::{delete, get, post};
+    use axum::routing::{delete, get, post, put};
     use axum::Json;
 
     #[derive(serde::Deserialize)]
@@ -2939,6 +3015,51 @@ pub fn lifecycle_routes(
         }
     }
 
+    async fn list_tenants(
+        State((handles, _, required)): State<Shared>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let tenants = handles.lock().await.tenant_report();
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "tenants": tenants })),
+        )
+    }
+
+    /// Replace one tenant's share, live and in `mounts.toml` (RFC-0073 FR2). `{}` restores the default.
+    async fn put_tenant(
+        State((handles, _, required)): State<Shared>,
+        AxPath(tenant): AxPath<String>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+        body: Result<Json<TenantShare>, axum::extract::rejection::JsonRejection>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let share = match body {
+            Ok(Json(share)) => share,
+            Err(e) => return bad_body(e),
+        };
+        if let Err(e) = share.validate(&tenant) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            );
+        }
+        match handles.lock().await.set_tenant_share(&tenant, share) {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(serde_json::json!({"tenant": tenant, "share": share})),
+            ),
+            Err(e) => write_failed(&e),
+        }
+    }
+
     async fn list_mounts(
         State((_, jobs, required)): State<Shared>,
         Query(q): Query<TokenQuery>,
@@ -3231,6 +3352,8 @@ pub fn lifecycle_routes(
         .route("/_admin/resume/{*name}", post(resume_nest))
         .route("/_admin/move/{*name}", post(move_nest))
         .route("/_admin/datasets/{nid}", delete(reclaim_dataset))
+        .route("/_admin/tenants", get(list_tenants))
+        .route("/_admin/tenants/{tenant}", put(put_tenant))
         .with_state((handles, jobs, admin_token))
 }
 
@@ -3718,6 +3841,25 @@ fn write_mounts_table(dir: &Path, mounts: &MountTable) -> Result<()> {
     Ok(())
 }
 
+/// Write one tenant's share into `mounts.toml`'s `[tenants]`, temp-then-rename as the nest list is.
+fn persist_tenant_share(dir: &Path, tenant: &str, share: TenantShare) -> Result<()> {
+    let path = dir.join(MOUNTS_FILE);
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {} to persist a tenant share", path.display()))?;
+    let mut mounts: MountTable = toml::from_str(&raw)
+        .with_context(|| format!("parsing {} before rewriting it", path.display()))?;
+    if share == TenantShare::default() {
+        mounts.tenants.remove(tenant);
+    } else {
+        mounts.tenants.insert(tenant.to_string(), share);
+    }
+    let out = toml::to_string_pretty(&mounts).context("serialising mounts.toml")?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
 /// Every `mounts.toml` a test build writes, by runtime directory, so a test can see each one (#1647).
 #[cfg(test)]
 fn persisted_tables() -> &'static std::sync::Mutex<Vec<(PathBuf, String)>> {
@@ -3763,6 +3905,8 @@ pub struct RuntimeHandles {
     pub failed: std::collections::BTreeMap<String, String>,
     /// Mounts admitted onto a running cursor and still catching up beside it, with no lock held.
     pub joining: JoiningMounts,
+    /// `[tenants]` as last set (RFC-0073 FR2): what each tenant label's seat is given.
+    pub tenant_shares: BTreeMap<String, TenantShare>,
     /// What a mount needs that an unmount does not: where nests live, how to reach each chain, and the
     /// settings a new nest must be built with so it behaves identically to one mounted at boot.
     pub mount_ctx: MountContext,
@@ -4267,7 +4411,7 @@ struct PendingJoin {
     window_override: Option<u64>,
     admin_enabled: bool,
     admin_token: Option<String>,
-    sql_gate: Arc<tokio::sync::Semaphore>,
+    sql_gate: crate::serve::SqlGate,
     /// The names the cursor knows its other nests by, to read how far it has got.
     co_tenants: Vec<String>,
 }
@@ -4751,20 +4895,39 @@ fn served_surface(
     }
 }
 
-/// Stamp a mount's dataset identity, record and [`served_surface`] onto the state served under its
-/// name. Every path that installs a state under a name goes through here: boot, mount, resume and
-/// move (#1536, #2129).
+/// The tenant shares a runtime holds, and the tenant an unqualified route key belongs to.
+#[derive(Clone, Copy)]
+struct Seating<'a> {
+    default_tenant: &'a str,
+    shares: &'a BTreeMap<String, TenantShare>,
+}
+
+/// Stamp a mount's dataset identity, record, [`served_surface`] and tenant seat onto the state served
+/// under its name. Every path that installs a state under a name goes through here: boot, mount,
+/// resume and move (#1536, #2129).
 fn overlay_mount_record(
     state: &mut crate::serve::AppState,
     nid: Option<&str>,
     record: Option<&Mount>,
     surface: crate::allowlist::Surface,
+    name: &str,
+    seating: Seating<'_>,
 ) {
     state.nid = nid.map(Arc::from);
     state.surface = Arc::new(surface);
     state.limits = record.map_or_else(crate::limits::Limits::process, |r| {
         r.limits.resolve(&format!("{}/{}", r.tenant, r.alias))
     });
+    // A state cloned from a co-tenant's arrives in that tenant's seat; it takes its own.
+    let tenant = split_route_key(name).0.unwrap_or(seating.default_tenant);
+    let share = seating.shares.get(tenant).copied().unwrap_or_default();
+    state.tenant = Some(Arc::new(crate::fair_share::Seat::new(
+        tenant,
+        &state.dir,
+        &state.sql_gate,
+        &state.sql_response_bytes.0,
+        share,
+    )));
     #[cfg(feature = "counter")]
     {
         state.counter = record.and_then(|r| r.counter.clone()).map(Arc::new);
@@ -4772,6 +4935,65 @@ fn overlay_mount_record(
 }
 
 impl RuntimeHandles {
+    fn seating(&self) -> Seating<'_> {
+        Seating {
+            default_tenant: &self.default_tenant,
+            shares: &self.tenant_shares,
+        }
+    }
+
+    /// Set `tenant`'s share on disk first, then on every gate and the response-bytes budget, so a
+    /// share the next start would not keep is never applied (RFC-0073 FR2).
+    pub fn set_tenant_share(&mut self, tenant: &str, share: TenantShare) -> Result<()> {
+        share.validate(tenant)?;
+        persist_tenant_share(&self.mount_ctx.dir, tenant, share)?;
+        if share == TenantShare::default() {
+            self.tenant_shares.remove(tenant);
+        } else {
+            self.tenant_shares.insert(tenant.to_string(), share);
+        }
+        for (_, s) in &self.states {
+            s.sql_gate.set_share(tenant, share);
+            s.sql_response_bytes.0.set_share(tenant, share);
+        }
+        Ok(())
+    }
+
+    /// Every tenant configured or mounted, with its share and what it holds right now.
+    pub fn tenant_report(&self) -> Vec<serde_json::Value> {
+        let mut gates: Vec<&crate::serve::SqlGate> = Vec::new();
+        for (_, s) in &self.states {
+            if !gates.iter().any(|g| Arc::ptr_eq(g, &s.sql_gate)) {
+                gates.push(&s.sql_gate);
+            }
+        }
+        let mut mounts: BTreeMap<String, usize> =
+            self.tenant_shares.keys().map(|t| (t.clone(), 0)).collect();
+        for (name, _) in &self.states {
+            let tenant = split_route_key(name).0.unwrap_or(&self.default_tenant);
+            *mounts.entry(tenant.to_string()).or_default() += 1;
+        }
+        let held: Vec<BTreeMap<String, usize>> = gates.iter().map(|g| g.held()).collect();
+        let bytes = self
+            .states
+            .first()
+            .map(|(_, s)| s.sql_response_bytes.0.used())
+            .unwrap_or_default();
+        mounts
+            .into_iter()
+            .map(|(tenant, mounted)| {
+                let share = self.tenant_shares.get(&tenant).copied().unwrap_or_default();
+                serde_json::json!({
+                    "tenant": tenant,
+                    "share": share,
+                    "mounts": mounted,
+                    "permits_held": held.iter().filter_map(|h| h.get(&tenant)).sum::<usize>(),
+                    "response_kib_in_flight": bytes.get(&tenant).copied().unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
     /// Mount a nest into the running mounts (RFC-0027 §3-§4).
     ///
     /// Admission first, work second: every refusal is decided before a store is opened or a block is
@@ -5236,7 +5458,15 @@ impl RuntimeHandles {
                 let record = self.surface_record(name);
                 let surface = served_surface(record.as_ref(), &dir, name)?;
                 let held = state.nid.clone();
-                overlay_mount_record(&mut state, held.as_deref(), record.as_ref(), surface);
+                let seating = self.seating();
+                overlay_mount_record(
+                    &mut state,
+                    held.as_deref(),
+                    record.as_ref(),
+                    surface,
+                    name,
+                    seating,
+                );
                 (state, None, 0, cursor_key)
             }
             None => {
@@ -5348,7 +5578,15 @@ impl RuntimeHandles {
                         let (_, mut state) =
                             cursor.states.pop().expect("one nest in, one state out");
                         let worker = cursor.alert_workers.pop().map(|(_, w)| w);
-                        overlay_mount_record(&mut state, nid.as_deref(), record.as_ref(), surface);
+                        let seating = self.seating();
+                        overlay_mount_record(
+                            &mut state,
+                            nid.as_deref(),
+                            record.as_ref(),
+                            surface,
+                            name,
+                            seating,
+                        );
                         self.lifecycle.insert(chain.clone(), cursor.lifecycle);
                         match &self.mount_ctx.cursors {
                             Some(feed) => {
@@ -5370,7 +5608,7 @@ impl RuntimeHandles {
                             .states
                             .iter()
                             .find(|(_, s)| s.chain == chain)
-                            .map(|(_, s)| Arc::clone(&s.sql_gate))
+                            .map(|(_, s)| s.sql_gate.clone())
                             .unwrap_or_else(crate::serve::new_sql_gate);
                         let co_tenants = self
                             .states
@@ -5475,7 +5713,15 @@ impl RuntimeHandles {
         // and the same one persisted into the mount record below. `dev()`'s startup path stamps this
         // from the dataset scan (`ds_nid_for`); a live mount has no such scan to run, so it must stamp
         // it here or serve `nid: null` until the next restart (#557).
-        overlay_mount_record(&mut state, nid.as_deref(), record.as_ref(), surface);
+        let seating = self.seating();
+        overlay_mount_record(
+            &mut state,
+            nid.as_deref(),
+            record.as_ref(),
+            surface,
+            name,
+            seating,
+        );
 
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let refused = if lifecycle
@@ -5938,7 +6184,14 @@ impl RuntimeHandles {
             let mut state = self.states[i].1.clone();
             let surface = served_surface(Some(&next), &state.dir, name)?;
             let nid = state.nid.clone();
-            overlay_mount_record(&mut state, nid.as_deref(), Some(&next), surface);
+            overlay_mount_record(
+                &mut state,
+                nid.as_deref(),
+                Some(&next),
+                surface,
+                name,
+                self.seating(),
+            );
             let previous = std::mem::replace(&mut self.states[i].1, state);
             match self.compose() {
                 Ok(router) => self.live.swap(router),
@@ -6083,7 +6336,15 @@ impl RuntimeHandles {
         } else {
             self.health.register_alias(name, &new_key, &chain);
         }
-        overlay_mount_record(&mut new_state, Some(nid.as_str()), record.as_ref(), surface);
+        let seating = self.seating();
+        overlay_mount_record(
+            &mut new_state,
+            Some(nid.as_str()),
+            record.as_ref(),
+            surface,
+            name,
+            seating,
+        );
         let old_idx = self
             .states
             .iter()
@@ -7222,6 +7483,7 @@ mod tests {
             suspended: std::collections::BTreeMap::from([("usdc".to_string(), nid.clone())]),
             failed: Default::default(),
             joining: Default::default(),
+            tenant_shares: Default::default(),
             mount_ctx: MountContext {
                 dir: root.path().to_path_buf(),
                 mounts: Vec::new(),
@@ -7933,6 +8195,7 @@ mod tests {
             suspended: std::collections::BTreeMap::new(),
             failed: Default::default(),
             joining: Default::default(),
+            tenant_shares: Default::default(),
             mount_ctx: MountContext {
                 dir: root.path().to_path_buf(),
                 mounts: Vec::new(),
@@ -8307,7 +8570,8 @@ mod tests {
             admin_token: None,
             nest_info: Arc::new(serde_json::json!({})),
             tables: Arc::new(vec![]),
-            sql_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            sql_gate: crate::serve::SqlGate::new(1),
+            tenant: None,
             sql_queued: Default::default(),
             memo_gate: Default::default(),
             sql_response_bytes: Default::default(),
@@ -8360,7 +8624,7 @@ mod tests {
             record("closed", SqlAccess::Deny),
             record("bounded", SqlAccess::Open),
         ];
-        overlay_boot_records(&mut states, &records, &[], DEFAULT_TENANT).unwrap();
+        overlay_boot_records(&mut states, &records, &[], DEFAULT_TENANT, &BTreeMap::new()).unwrap();
         assert_eq!(states[0].1.surface.access, SqlAccess::Deny);
         assert_eq!(states[1].1.surface.access, SqlAccess::Allowlist);
         assert_eq!(states[1].1.surface.queries[0].name, "total");
@@ -8516,6 +8780,108 @@ mod tests {
         assert!(!data.exists(), "a failed job kept its dataset from reclaim");
     }
 
+    /// RFC-0073 FR2: a share set over the admin API binds running mounts with no restart, is written
+    /// to `mounts.toml`, and binds the mounts of the next start too.
+    #[tokio::test]
+    async fn a_tenant_share_applies_live_and_survives_a_restart() {
+        use crate::fair_share::Refusal;
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+             chain_id = 42161\nrpc_urls = []\n",
+        )
+        .unwrap();
+        let mount = |h: &RuntimeHandles, gate: &crate::serve::SqlGate, name: &str, at: &str| {
+            let at = dir.path().join(at);
+            std::fs::create_dir_all(&at).unwrap();
+            let mut s = nest_state(&at, "arbitrum-one");
+            s.sql_gate = gate.clone();
+            s.sql_response_bytes = crate::serve::ResponseBytes::new(1024);
+            let surface = crate::allowlist::Surface::default();
+            overlay_mount_record(&mut s, None, None, surface, name, h.seating());
+            s
+        };
+        let mut h = idle_handles(dir.path());
+        let gate = crate::serve::SqlGate::new(2);
+        let acme = mount(&h, &gate, "acme/usdc", "before");
+        h.states.push(("acme/usdc".into(), acme));
+        let handles = Arc::new(tokio::sync::Mutex::new(h));
+        let jobs = Arc::new(crate::mount_jobs::MountJobs::load(dir.path()));
+        let routes = lifecycle_routes(handles.clone(), jobs, true, Some("t".into()));
+        let put = |tenant: &str, body: &str, token: &str| {
+            let req = axum::http::Request::put(format!("/_admin/tenants/{tenant}"))
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            routes.clone().oneshot(req)
+        };
+
+        // Alone on the gate, acme takes both permits.
+        let both = [gate.try_admit(Some("acme")), gate.try_admit(Some("acme"))];
+        assert!(both.iter().all(Result::is_ok));
+        drop(both);
+
+        let resp = put("acme", r#"{"max_permits": 1}"#, "t").await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let _one = gate.try_admit(Some("acme")).unwrap();
+        assert_eq!(
+            gate.try_admit(Some("acme")).err(),
+            Some(Refusal::TenantShare),
+            "the cap binds the running mount"
+        );
+
+        let req = axum::http::Request::get("/_admin/tenants")
+            .header(axum::http::header::AUTHORIZATION, "Bearer t")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = routes.clone().oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed["tenants"][0]["tenant"], "acme");
+        assert_eq!(listed["tenants"][0]["share"]["max_permits"], 1);
+        assert_eq!(listed["tenants"][0]["permits_held"], 1);
+
+        // The next start reads it back and seats its mounts with it.
+        let table = MountTable::load(dir.path()).unwrap();
+        assert_eq!(table.tenants["acme"].max_permits, Some(1));
+        let mut restarted = idle_handles(dir.path());
+        restarted.tenant_shares = table.tenants.clone();
+        let fresh = crate::serve::SqlGate::new(2);
+        let _seated = mount(&restarted, &fresh, "acme/usdc", "after");
+        let _first = fresh.try_admit(Some("acme")).unwrap();
+        assert_eq!(
+            fresh.try_admit(Some("acme")).err(),
+            Some(Refusal::TenantShare)
+        );
+
+        for (tenant, body, token, status) in [
+            ("acme", r#"{"weight": 0}"#, "t", 400),
+            ("acme", r#"{"wieght": 2}"#, "t", 422),
+            ("a.b", "{}", "t", 400),
+            ("acme", "{}", "wrong", 401),
+        ] {
+            let resp = put(tenant, body, token).await.unwrap();
+            assert_eq!(resp.status().as_u16(), status, "{tenant} {body}");
+        }
+        assert_eq!(
+            MountTable::load(dir.path()).unwrap().tenants["acme"].max_permits,
+            Some(1),
+            "a refused change leaves the file alone"
+        );
+
+        // `{}` is the default share, which leaves nothing on disk.
+        let resp = put("acme", "{}", "t").await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(MountTable::load(dir.path()).unwrap().tenants.is_empty());
+        assert!(gate.try_admit(Some("acme")).is_ok());
+    }
+
     fn idle_handles(dir: &std::path::Path) -> RuntimeHandles {
         let health = std::sync::Arc::new(crate::health::RuntimeHealth::new());
         let roster = serde_json::json!({"runtime": "t", "nests": []});
@@ -8537,6 +8903,7 @@ mod tests {
             suspended: std::collections::BTreeMap::new(),
             failed: Default::default(),
             joining: Default::default(),
+            tenant_shares: Default::default(),
             mount_ctx: MountContext {
                 dir: dir.to_path_buf(),
                 mounts: Vec::new(),
@@ -9878,6 +10245,7 @@ mod fr5_tests {
             roster,
             estimates: std::collections::HashMap::new(),
             default_tenant: DEFAULT_TENANT.to_string(),
+            tenant_shares: Default::default(),
             suspended: std::collections::BTreeMap::new(),
             failed: Default::default(),
             joining: Default::default(),

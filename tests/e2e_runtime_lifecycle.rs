@@ -114,6 +114,7 @@ async fn two_nest_roost(
         suspended: Default::default(),
         failed: Default::default(),
         joining: Default::default(),
+        tenant_shares: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.to_path_buf(),
             // Un-migrated: no mount records, so resolution stays on the pre-2.0 `nests/<name>` path.
@@ -734,6 +735,7 @@ async fn route_named_runtime(
         suspended: Default::default(),
         failed: Default::default(),
         joining: Default::default(),
+        tenant_shares: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: nest_dir.to_path_buf(),
             mounts: Vec::new(),
@@ -947,6 +949,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
         suspended: Default::default(),
         failed: Default::default(),
         joining: Default::default(),
+        tenant_shares: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             // Only `usdc` is on record - `gamma` below is exactly the "runtime has never seen this
@@ -1130,6 +1133,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
         suspended: Default::default(),
         failed: Default::default(),
         joining: Default::default(),
+        tenant_shares: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -1515,6 +1519,7 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
         suspended: Default::default(),
         failed: Default::default(),
         joining: Default::default(),
+        tenant_shares: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -1665,6 +1670,7 @@ pub(crate) async fn empty_runtime(
         suspended: Default::default(),
         failed: Default::default(),
         joining: Default::default(),
+        tenant_shares: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.to_path_buf(),
             mounts: vec![runtime::Mount {
@@ -2841,6 +2847,7 @@ async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it(
         suspended: Default::default(),
         failed: Default::default(),
         joining: Default::default(),
+        tenant_shares: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: roost_dir.path().to_path_buf(),
             mounts: vec![runtime::Mount {

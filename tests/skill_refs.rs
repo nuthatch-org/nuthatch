@@ -265,7 +265,13 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     // Mount config lives here since RFC-0032 retired the roost; the rest of runtime.rs is not config.
     (
         "src/runtime.rs",
-        Some(&["Mount", "MountTable", "RuntimeMeta", "ChainEndpoint"]),
+        Some(&[
+            "Mount",
+            "MountTable",
+            "RuntimeMeta",
+            "ChainEndpoint",
+            "TenantShare",
+        ]),
     ),
     // `queries.toml` (RFC-0034 phase 2, #353): the author's ceiling. `Surface` also lives here but is
     // not `Deserialize` (it's the mount-side runtime type, not something read from a file).

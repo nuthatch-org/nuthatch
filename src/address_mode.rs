@@ -371,7 +371,9 @@ impl ModeState {
             holding: Mutex::new(None),
             held: Mutex::new(None),
             diff: None,
-            diff_gate: crate::serve::new_sql_gate(),
+            diff_gate: Arc::new(tokio::sync::Semaphore::new(
+                crate::serve::sql_max_concurrency(),
+            )),
             diff_queued: Arc::default(),
         }
     }

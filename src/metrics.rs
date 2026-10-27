@@ -25,10 +25,12 @@ pub enum SqlRejection {
     Admission,
     Timeout,
     OutOfMemory,
+    /// A tenant label at its own share of the gate (RFC-0073 FR2), where `Busy` is the gate full.
+    TenantShare,
 }
 
 impl SqlRejection {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Busy,
         Self::TooLarge,
         Self::Invalid,
@@ -36,6 +38,7 @@ impl SqlRejection {
         Self::Admission,
         Self::Timeout,
         Self::OutOfMemory,
+        Self::TenantShare,
     ];
 
     const fn index(self) -> usize {
@@ -47,6 +50,7 @@ impl SqlRejection {
             Self::Admission => 4,
             Self::Timeout => 5,
             Self::OutOfMemory => 6,
+            Self::TenantShare => 7,
         }
     }
 
@@ -59,6 +63,7 @@ impl SqlRejection {
             Self::Admission => "admission",
             Self::Timeout => "timeout",
             Self::OutOfMemory => "out_of_memory",
+            Self::TenantShare => "tenant_share",
         }
     }
 }
@@ -711,7 +716,7 @@ pub struct Metrics {
     sql_queries: AtomicU64,
     /// Backward-compatible aggregate of every member of `sql_rejections_by_reason`.
     sql_rejections: AtomicU64,
-    sql_rejections_by_reason: [AtomicU64; 7],
+    sql_rejections_by_reason: [AtomicU64; SqlRejection::ALL.len()],
     /// Cumulative per [`NAMED_SCAN_BOUNDS`] entry, then `+Inf`.
     named_scan_buckets: [AtomicU64; 7],
     named_scan_bytes_sum: AtomicU64,
@@ -796,7 +801,7 @@ impl Metrics {
             http_requests: AtomicU64::new(0),
             sql_queries: AtomicU64::new(0),
             sql_rejections: AtomicU64::new(0),
-            sql_rejections_by_reason: [const { AtomicU64::new(0) }; 7],
+            sql_rejections_by_reason: [const { AtomicU64::new(0) }; SqlRejection::ALL.len()],
             named_scan_buckets: [const { AtomicU64::new(0) }; 7],
             named_scan_bytes_sum: AtomicU64::new(0),
             named_scan_refusals: AtomicU64::new(0),
@@ -1961,7 +1966,7 @@ const SQL_DURATION_BOUNDS: [f64; 13] = [
 pub struct NestServing {
     http_requests: AtomicU64,
     sql_queries: AtomicU64,
-    sql_rejections: [AtomicU64; 7],
+    sql_rejections: [AtomicU64; SqlRejection::ALL.len()],
     /// Cumulative per [`SQL_DURATION_BOUNDS`] entry, then `+Inf`.
     sql_duration_buckets: [AtomicU64; 14],
     sql_duration_micros: AtomicU64,
