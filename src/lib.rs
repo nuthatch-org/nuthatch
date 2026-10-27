@@ -89,6 +89,7 @@ pub mod indexer;
 pub mod inspect;
 pub mod ipfs;
 pub mod ipfs_resolve;
+pub mod isolation;
 pub mod labels;
 pub mod lifecycle;
 pub mod limits;

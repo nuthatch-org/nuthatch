@@ -1387,3 +1387,29 @@ jobs:
           echo "::group::abi_arbitrary"
           cargo fuzz run abi_arbitrary -- -runs=300000 -max_total_time=60 -print_final_stats=1
           echo "::endgroup::"
+
+  fuzz-sql:
+    name: fuzz smoke (SQL confinement)
+    runs-on: ubuntu-latest
+    # RFC-0073 FR8: read-only enforcement and confinement under fuzzed statements, shared and strict
+    # (docs/security/shared-runtime.md). A tripwire like fuzz-smoke, not a campaign.
+    #
+    # Its own job and its own crate because it links the whole engine. That rules out the nightly
+    # fuzz-smoke uses: nightly does not compile dbsp (rust-toolchain.toml), so this builds on the
+    # pinned stable with `-s none`. SanitizerCoverage needs only stable codegen flags; address
+    # sanitising is what needs nightly.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: fuzz/sql -> target
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: fuzz /sql confinement
+        run: |
+          cargo fuzz run --fuzz-dir fuzz/sql -s none -O sql_confinement -- \
+            -runs=200000 -max_total_time=300 -print_final_stats=1

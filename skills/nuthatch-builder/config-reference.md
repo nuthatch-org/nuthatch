@@ -544,6 +544,10 @@ default_tenant = "acme"       # optional (default "default"); the tenant a mount
                               # nuthatch refcounts a tenant, nothing more.
 suspended = ["usdc"]          # runtime state: mounts suspended over the admin API. Kept on disk,
                               # neither indexed nor served (503) until `POST /_admin/resume/<name>`.
+isolation = "strict"          # optional (default "shared"). "strict" gives each tenant its own SQL
+                              # sessions, memory pools and memo entries, and refuses any SQL function
+                              # not on the allow-list. For tenants who do not trust each other; read
+                              # docs/security/shared-runtime.md first, the guarantee is not yet claimed.
 nests = []                    # pre-2.0: the nests resolved at nests/<name>/. Still read, but only
                               # for an alias no [[mounts]] record names; `migrate` moves them across.
 

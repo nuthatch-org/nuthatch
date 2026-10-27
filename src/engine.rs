@@ -41,8 +41,9 @@ pub(crate) fn value_bytes(v: &Value) -> usize {
 /// Opens sessions.
 pub(crate) trait Engine: Send + Sync {
     /// A session bounded and locked to `dir`: the nest's memory, thread and spill limits, file
-    /// access confined to its data directories.
-    fn open(&self, dir: &Path) -> Result<Box<dyn Session>>;
+    /// access confined to its data directories. A `tenant` gets a memory pool of its own rather than
+    /// the one every session over `dir` shares (RFC-0073 FR8).
+    fn open(&self, dir: &Path, tenant: Option<&str>) -> Result<Box<dyn Session>>;
     /// An unbounded session with no nest behind it, for binding authored SQL to see whether it
     /// parses and validates. Nothing untrusted runs on one.
     fn open_bare(&self) -> Result<Box<dyn Session>>;
@@ -149,6 +150,9 @@ pub(crate) trait Session: Send {
     /// Each defined view's name and its stored `CREATE VIEW` text; `None` when the catalogue
     /// cannot be listed.
     fn view_definitions(&self) -> Option<Vec<(String, String)>>;
+
+    /// Every scalar, aggregate and window function a statement can call (RFC-0073 FR8).
+    fn function_names(&self) -> Vec<String>;
 
     /// The security walk: what the statement reaches, from the engine's own parse. `None` when the
     /// parser could not say (it fails open; the denylist is still in front), `Some(Err)` when the
