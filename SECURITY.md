@@ -8,6 +8,10 @@ off-localhost. Authentication is deliberately *not* in the core (see [GOVERNANCE
 that is the operator layer). A report that defeats the guards, reads outside the attached read-only
 segments, or escalates a read into a write is in scope.
 
+On a runtime with `[runtime] isolation = "strict"`, a query on one tenant's mount that reaches
+another tenant's data, sessions or files is in scope too; the threat model is
+[docs/security/shared-runtime.md](docs/security/shared-runtime.md).
+
 Also in scope: reorg / finality handling that could corrupt sealed segments, decode paths that
 panic or mis-attribute on adversarial ABIs/logs, and any path that breaks the ≤2 GB footprint
 budget into an OOM DoS.
