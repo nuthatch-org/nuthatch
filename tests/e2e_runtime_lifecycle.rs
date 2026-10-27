@@ -4323,11 +4323,26 @@ async fn prune_keeps_kept_and_mounted_nids_and_deletes_the_rest() {
     let (usdc, usdc_nid) = a_bundle(work.path(), "usdc", USDC);
     let (arb, arb_nid) = a_bundle(work.path(), "arb", ARB);
     let (gone, gone_nid) = a_bundle(work.path(), "gone", &account(9));
+    let (filed, filed_nid) = a_bundle(work.path(), "filed", &account(10));
     let (handles, jobs, _tape, _intake) =
         bundle_runtime(roost.path(), registry.path(), &usdc_nid).await;
+    // On record in the file alone, as a restart would mount it.
+    std::fs::write(
+        roost.path().join(runtime::MOUNTS_FILE),
+        format!(
+            "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = []\n\n[[mounts]]\nalias = \"filed\"\nnid = \"{filed_nid}\"\n"
+        ),
+    )
+    .unwrap();
     let routes = bundle_routes(&handles, &jobs, Some(registry.path()), graceless());
     let mut hashes = Vec::new();
-    for (file, r) in [(&usdc, "usdc@1"), (&arb, "arb@1"), (&gone, "gone@1")] {
+    for (file, r) in [
+        (&usdc, "usdc@1"),
+        (&arb, "arb@1"),
+        (&gone, "gone@1"),
+        (&filed, "filed@1"),
+    ] {
         let (status, out) = post_bundle(
             &routes,
             &format!("/_admin/bundles?as={r}"),
@@ -4369,10 +4384,13 @@ async fn prune_keeps_kept_and_mounted_nids_and_deletes_the_rest() {
     let store = nuthatch::distribution::open(registry.path().to_str().unwrap()).unwrap();
     let mut left = store.list_blobs().await.unwrap();
     left.sort();
-    let mut want = vec![hashes[0].clone(), hashes[1].clone()];
+    let mut want = vec![hashes[0].clone(), hashes[1].clone(), hashes[3].clone()];
     want.sort();
-    assert_eq!(left, want, "the mounted usdc and the kept arb survive");
-    for nid in [&usdc_nid, &arb_nid] {
+    assert_eq!(
+        left, want,
+        "the mounted usdc and filed and the kept arb survive"
+    );
+    for nid in [&usdc_nid, &arb_nid, &filed_nid] {
         nuthatch::distribution::pull_by_nid(store.as_ref(), nid)
             .await
             .unwrap();
