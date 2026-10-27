@@ -5048,6 +5048,11 @@ async fn run_sql_query_at(
         });
         // The watermarks ride out with the result: they describe the rows this query was answered
         // from, and re-reading them out here is the race #932 is about.
+        #[cfg(test)]
+        hot_held_while_running()
+            .lock()
+            .unwrap()
+            .push((dir.clone(), hot_charge.gate.hot_used()));
         Ok((out, watermarks, after, as_of))
     })
     .await;
@@ -6268,6 +6273,16 @@ fn panic_if_queries_armed(dir: &std::path::Path) {
     if panicking_queries().lock().unwrap().iter().any(|d| d == dir) {
         panic!("injected query panic in {}", dir.display());
     }
+}
+
+/// Each `/sql` query's dataset and its gate's hot copies, read after its own copy was charged.
+#[cfg(test)]
+type HotHeld = std::sync::Mutex<Vec<(PathBuf, std::collections::BTreeMap<String, usize>)>>;
+
+#[cfg(test)]
+fn hot_held_while_running() -> &'static HotHeld {
+    static SEEN: std::sync::OnceLock<HotHeld> = std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
 }
 
 #[cfg(test)]
@@ -9885,6 +9900,13 @@ mod tests {
         let resp = sql_response(b.clone(), "SELECT 2445 AS n").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_json(resp).await["rows"][0]["n"], 2445);
+        let seen = hot_held_while_running().lock().unwrap().clone();
+        let during = seen.iter().rev().find(|(d, _)| d == tb.path());
+        assert_eq!(
+            during.and_then(|(_, held)| held.get("globex")),
+            Some(&3),
+            "held for the life of the query"
+        );
         assert_eq!(
             gate.hot_used().get("globex"),
             None,
