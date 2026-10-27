@@ -161,6 +161,7 @@ async fn main() -> Result<()> {
                     ),
                     args.cors,
                     args.registry,
+                    args.max_bundle_mb,
                 )
                 .await
             } else {

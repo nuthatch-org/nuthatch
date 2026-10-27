@@ -154,6 +154,7 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--audit-seed <AUDIT_SEED>` - Seed for the background audit's samples. Defaults to the start time; it is logged with every sample, as is the range, which `nuthatch audit sealed --from --to` re-checks
 - `--no-admin` - Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that front their own dashboard (RFC-0010 Part A). Every request presents a token as `?token=…` or `Authorization: Bearer`: `NUTHATCH_ADMIN_TOKEN`, or on localhost without it the one made in `<dir>/.admin-token`. Off-localhost without the variable the UI self-disables with a log line
 - `--registry <REGISTRY>` - A runtime (`--dir` holding a `mounts.toml`): the registry a live mount fetches a NID from when this runtime does not hold it (RFC-0019, #1543). A filesystem path, or `s3://bucket/prefix`
+- `--max-bundle-mb <MAX_BUNDLE_MB>` - A runtime: the largest bundle `POST /_admin/bundles` accepts, in MiB (RFC-0073 FR10). A larger body is answered `413`
 
 ## `nuthatch diff`
 

@@ -253,6 +253,16 @@ pub fn inspect(target: &Path) -> Result<Inspection> {
     describe(target, &manifest, None)
 }
 
+/// The inspection of a bundle already checked and installed, as the admin API's bundle routes hold
+/// one.
+pub fn checked(bundle: &crate::blob::CheckedBundle) -> Result<Inspection> {
+    describe(
+        &bundle.nest_dir(),
+        &bundle.manifest,
+        Some(bundle.hash.clone()),
+    )
+}
+
 fn inspect_blob(blob_dir: &Path, scratch: &Path) -> Result<Inspection> {
     let manifest = crate::blob::load_manifest(blob_dir)?;
     crate::blob::verify_blob(blob_dir, &manifest, None)?;

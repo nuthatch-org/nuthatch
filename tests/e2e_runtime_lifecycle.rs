@@ -3948,3 +3948,489 @@ async fn a_dry_run_reads_the_cursors_tip_and_dials_nothing() {
     let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
     assert_eq!(dry["tip"], 3, "{dry}");
 }
+
+// RFC-0073 FR10: the bundle lifecycle over the admin API.
+
+/// A bundle of a scaffolded nest named `name` watching `address`, and its NID.
+fn a_bundle(dir: &std::path::Path, name: &str, address: &str) -> (std::path::PathBuf, String) {
+    let src = dir.join(format!("{name}-src"));
+    std::fs::create_dir_all(&src).unwrap();
+    scaffold_nest(&src, name, address);
+    let nid = nuthatch::blob::nest_nid(&src).unwrap();
+    let file = dir.join(format!("{name}.bundle"));
+    nuthatch::blob::bundle(&src, Some(&file), false, false).unwrap();
+    (file, nid)
+}
+
+fn bundle_routes(
+    handles: &Arc<tokio::sync::Mutex<runtime::RuntimeHandles>>,
+    jobs: &Arc<nuthatch::mount_jobs::MountJobs>,
+    registry: Option<&std::path::Path>,
+    limits: runtime::BundleLimits,
+) -> axum::Router {
+    runtime::bundle_routes(
+        handles.clone(),
+        jobs.clone(),
+        true,
+        Some(OPEN.into()),
+        registry.map(|r| r.to_str().unwrap().to_string()),
+        limits,
+    )
+}
+
+/// No grace, so a prune in a test may take a blob published a moment ago.
+fn graceless() -> runtime::BundleLimits {
+    runtime::BundleLimits {
+        prune_grace: std::time::Duration::ZERO,
+        ..Default::default()
+    }
+}
+
+async fn post_bundle(
+    routes: &axum::Router,
+    uri: &str,
+    bytes: Vec<u8>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use tower::ServiceExt;
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {OPEN}"))
+        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+        .body(axum::body::Body::from(bytes))
+        .unwrap();
+    let resp = routes.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| serde_json::json!(String::from_utf8_lossy(&bytes)));
+    (status, body)
+}
+
+/// Every file under `root`, with its bytes.
+fn tree(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                out.insert(path.clone(), Vec::new());
+                stack.push(path);
+            } else {
+                out.insert(path.clone(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// Every ref and NID entry in the registry names a blob it holds.
+async fn no_ref_dangles(registry: &std::path::Path) {
+    let store = nuthatch::distribution::open(registry.to_str().unwrap()).unwrap();
+    let blobs: std::collections::BTreeSet<String> =
+        store.list_blobs().await.unwrap().into_iter().collect();
+    for (name, version, hash) in store.list_refs().await.unwrap() {
+        assert!(
+            blobs.contains(&hash),
+            "{name}@{version} names missing {hash}"
+        );
+    }
+    for (nid, hash) in store.list_nid_refs().await.unwrap() {
+        assert!(blobs.contains(&hash), "nid {nid} names missing {hash}");
+    }
+}
+
+/// A runtime holding nothing, with a registry, and its admin routes.
+async fn bundle_runtime(
+    roost: &std::path::Path,
+    registry: &std::path::Path,
+    nid: &str,
+) -> (
+    Arc<tokio::sync::Mutex<runtime::RuntimeHandles>>,
+    Arc<nuthatch::mount_jobs::MountJobs>,
+    Arc<TapeSource>,
+    CursorIntake,
+) {
+    let (mut handles, tape, intake) = empty_runtime(roost, nid).await;
+    std::fs::remove_dir_all(runtime::MountTable::data_dir(roost, nid)).unwrap();
+    handles.mount_ctx.registry = Some(registry.to_str().unwrap().to_string());
+    (
+        Arc::new(tokio::sync::Mutex::new(handles)),
+        test_jobs(),
+        tape,
+        intake,
+    )
+}
+
+/// A bundle's dry run is `nest load`'s checks, `nest inspect --json`'s document and a NID dry run's
+/// admission, and writes nothing to the runtime's directory or its registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bundle_dry_run_inspects_and_prices_it_and_writes_nothing() {
+    let (roost, registry, work) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let (file, nid) = a_bundle(work.path(), "usdc", USDC);
+    let (handles, jobs, _tape, mut intake) =
+        bundle_runtime(roost.path(), registry.path(), &nid).await;
+    let routes = bundle_routes(&handles, &jobs, Some(registry.path()), Default::default());
+    let before = (tree(roost.path()), tree(registry.path()));
+
+    let (status, dry) = post_bundle(
+        &routes,
+        "/_admin/bundles?dry_run=true",
+        std::fs::read(&file).unwrap(),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{dry}");
+    assert_eq!(
+        (tree(roost.path()), tree(registry.path())),
+        before,
+        "a dry run wrote to the runtime or its registry"
+    );
+    assert!(handles.lock().await.states.is_empty());
+    assert!(intake.try_recv().is_err());
+
+    let inspect = std::process::Command::new(env!("CARGO_BIN_EXE_nuthatch"))
+        .args(["nest", "inspect", file.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(inspect.status.success());
+    let inspected: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(dry["inspection"], inspected);
+    assert_eq!(dry["nid"], nid.as_str());
+    assert_eq!(dry["data_identity"], inspected["data_identity"]);
+    assert_eq!(dry["blob_hash"], inspected["blob_hash"]);
+    assert!(dry["admission"]["refusal"].is_null(), "{dry}");
+    assert!(dry["admission"]["projected_mb"].is_u64(), "{dry}");
+
+    // The same admission a NID dry run reports, once the registry can serve that NID.
+    nuthatch::distribution::publish(
+        nuthatch::distribution::open(registry.path().to_str().unwrap())
+            .unwrap()
+            .as_ref(),
+        &file,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let lifecycle = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
+    let (status, by_nid) = call(
+        &lifecycle,
+        "POST",
+        "/_admin/nests?dry_run=true",
+        None,
+        Some(&format!(r#"{{"name":"usdc","nid":"{nid}"}}"#)),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{by_nid}");
+    let mut by_nid: serde_json::Value = serde_json::from_str(&by_nid).unwrap();
+    assert_eq!(by_nid["fetched"], true);
+    by_nid["fetched"] = false.into();
+    assert_eq!(dry["admission"], by_nid);
+}
+
+/// A bundle whose file does not match its manifest is refused with the reason `nest load` gives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tampered_bundle_is_refused_with_nest_loads_reason() {
+    let (roost, registry, work) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let (file, nid) = a_bundle(work.path(), "usdc", USDC);
+    let mut bytes = std::fs::read(&file).unwrap();
+    let at = bytes
+        .windows(8)
+        .rposition(|w| w == b"Transfer")
+        .expect("the ABI is in the bundle");
+    bytes[at] = b'X';
+    let tampered = work.path().join("tampered.bundle");
+    std::fs::write(&tampered, &bytes).unwrap();
+    let load = nuthatch::blob::load(
+        tampered.to_str().unwrap(),
+        Some(&work.path().join("loaded")),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    let (handles, jobs, _tape, _intake) = bundle_runtime(roost.path(), registry.path(), &nid).await;
+    let routes = bundle_routes(&handles, &jobs, Some(registry.path()), Default::default());
+    for uri in ["/_admin/bundles?dry_run=true", "/_admin/bundles?as=usdc@1"] {
+        let (status, body) = post_bundle(&routes, uri, bytes.clone()).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}"
+        );
+        assert_eq!(body["error"], format!("{load:#}"), "{uri}");
+    }
+    assert!(
+        tree(registry.path()).is_empty(),
+        "a refused bundle was published"
+    );
+}
+
+/// Publish answers the NID and hash, twice alike; the registry then serves it, by NID, to a mount
+/// and to `GET /_admin/bundles/<nid>`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_published_bundle_mounts_by_nid_and_republishing_it_changes_nothing() {
+    let (roost, registry, work) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let (file, nid) = a_bundle(work.path(), "usdc", USDC);
+    let (handles, jobs, _tape, _intake) = bundle_runtime(roost.path(), registry.path(), &nid).await;
+    let routes = bundle_routes(&handles, &jobs, Some(registry.path()), Default::default());
+    let bytes = std::fs::read(&file).unwrap();
+
+    let (status, first) =
+        post_bundle(&routes, "/_admin/bundles?as=usdc@1.0.0", bytes.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{first}");
+    assert_eq!(first["nid"], nid.as_str());
+    let after_first = tree(registry.path());
+    let (status, second) = post_bundle(&routes, "/_admin/bundles?as=usdc@1.0.0", bytes).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{second}");
+    assert_eq!(first, second);
+    assert_eq!(
+        tree(registry.path()).keys().collect::<Vec<_>>(),
+        after_first.keys().collect::<Vec<_>>(),
+        "a republish added to the registry"
+    );
+
+    let (status, held) = call(
+        &routes,
+        "GET",
+        &format!("/_admin/bundles/{nid}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{held}");
+    let held: serde_json::Value = serde_json::from_str(&held).unwrap();
+    assert_eq!(held["held"], true);
+    assert_eq!(held["blob_hash"], first["blob_hash"]);
+    assert_eq!(held["inspection"]["nid"], nid.as_str());
+    let (status, absent) = call(
+        &routes,
+        "GET",
+        &format!("/_admin/bundles/{}", "e".repeat(64)),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{absent}");
+
+    let lifecycle = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
+    let (status, mounted) = call(
+        &lifecycle,
+        "POST",
+        "/_admin/nests?wait=true",
+        None,
+        Some(&format!(r#"{{"name":"usdc","nid":"{nid}"}}"#)),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{mounted}");
+    assert!(runtime::MountTable::data_dir(roost.path(), &nid)
+        .join(nuthatch::config::CONFIG_FILE)
+        .exists());
+}
+
+/// A runtime without a registry, or one it may not write, refuses to publish and says which; an
+/// oversized body, a wrong content type or no token is turned away before anything is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publishing_is_refused_without_a_writable_registry_or_a_proper_request() {
+    use std::os::unix::fs::PermissionsExt;
+    let (roost, registry, work) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let (file, nid) = a_bundle(work.path(), "usdc", USDC);
+    let bytes = std::fs::read(&file).unwrap();
+    let (handles, jobs, _tape, _intake) = bundle_runtime(roost.path(), registry.path(), &nid).await;
+
+    let none = bundle_routes(&handles, &jobs, None, Default::default());
+    let (status, body) = post_bundle(&none, "/_admin/bundles?as=usdc@1", bytes.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("--registry"),
+        "{body}"
+    );
+
+    let routes = bundle_routes(&handles, &jobs, Some(registry.path()), Default::default());
+    std::fs::set_permissions(registry.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (status, body) = post_bundle(&routes, "/_admin/bundles?as=usdc@1", bytes.clone()).await;
+    std::fs::set_permissions(registry.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    let why = body["error"].as_str().unwrap();
+    assert!(why.contains(registry.path().to_str().unwrap()), "{why}");
+
+    let small = bundle_routes(
+        &handles,
+        &jobs,
+        Some(registry.path()),
+        runtime::BundleLimits {
+            max_bytes: 1024,
+            ..Default::default()
+        },
+    );
+    let (status, body) = post_bundle(&small, "/_admin/bundles?dry_run=true", bytes.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+
+    let (status, _) = call(
+        &routes,
+        "POST",
+        "/_admin/bundles?dry_run=true",
+        None,
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let (status, _) = call(
+        &routes,
+        "POST",
+        "/_admin/bundles/prune",
+        Some("wrong"),
+        Some(r#"{"keep":[]}"#),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    let (status, body) = post_bundle(&routes, "/_admin/bundles", bytes).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert!(tree(registry.path()).is_empty());
+}
+
+/// Prune keeps what is kept and what this runtime mounts, deletes the rest, refs before blobs, and
+/// a dry run only lists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prune_keeps_kept_and_mounted_nids_and_deletes_the_rest() {
+    let (roost, registry, work) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let (usdc, usdc_nid) = a_bundle(work.path(), "usdc", USDC);
+    let (arb, arb_nid) = a_bundle(work.path(), "arb", ARB);
+    let (gone, gone_nid) = a_bundle(work.path(), "gone", &account(9));
+    let (handles, jobs, _tape, _intake) =
+        bundle_runtime(roost.path(), registry.path(), &usdc_nid).await;
+    let routes = bundle_routes(&handles, &jobs, Some(registry.path()), graceless());
+    let mut hashes = Vec::new();
+    for (file, r) in [(&usdc, "usdc@1"), (&arb, "arb@1"), (&gone, "gone@1")] {
+        let (status, out) = post_bundle(
+            &routes,
+            &format!("/_admin/bundles?as={r}"),
+            std::fs::read(file).unwrap(),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{out}");
+        hashes.push(out["blob_hash"].as_str().unwrap().to_string());
+    }
+    let keep = format!(r#"{{"keep":["{arb_nid}"]}}"#);
+
+    let before = tree(registry.path());
+    let (status, dry) = call(
+        &routes,
+        "POST",
+        "/_admin/bundles/prune?dry_run=true",
+        None,
+        Some(&keep),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{dry}");
+    let dry: serde_json::Value = serde_json::from_str(&dry).unwrap();
+    assert_eq!(
+        dry["deleted_blobs"],
+        serde_json::json!([hashes[2]]),
+        "{dry}"
+    );
+    assert_eq!(dry["deleted_nids"], serde_json::json!([gone_nid]), "{dry}");
+    assert_eq!(tree(registry.path()), before, "a dry run deleted");
+
+    let (status, done) = call(&routes, "POST", "/_admin/bundles/prune", None, Some(&keep)).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{done}");
+    let done: serde_json::Value = serde_json::from_str(&done).unwrap();
+    assert_eq!(done["deleted_blobs"], dry["deleted_blobs"]);
+    assert_eq!(
+        done["deleted_refs"],
+        serde_json::json!(["gone@1", "gone@latest"])
+    );
+    let store = nuthatch::distribution::open(registry.path().to_str().unwrap()).unwrap();
+    let mut left = store.list_blobs().await.unwrap();
+    left.sort();
+    let mut want = vec![hashes[0].clone(), hashes[1].clone()];
+    want.sort();
+    assert_eq!(left, want, "the mounted usdc and the kept arb survive");
+    for nid in [&usdc_nid, &arb_nid] {
+        nuthatch::distribution::pull_by_nid(store.as_ref(), nid)
+            .await
+            .unwrap();
+    }
+    no_ref_dangles(registry.path()).await;
+
+    let (status, _) = call(
+        &routes,
+        "POST",
+        "/_admin/bundles/prune",
+        None,
+        Some(r#"{"keep":["nope"]}"#),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+}
+
+/// Publishes and prunes racing leave every ref naming a blob: through one runtime, which serialises
+/// them, and from a second route set sharing the registry as another runtime would, which only the
+/// ordering and the grace period guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_publishes_and_prunes_never_leave_a_ref_dangling() {
+    let (roost, registry, work) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let (_, usdc_nid) = a_bundle(work.path(), "usdc", USDC);
+    let (handles, jobs, _tape, _intake) =
+        bundle_runtime(roost.path(), registry.path(), &usdc_nid).await;
+    let here = bundle_routes(&handles, &jobs, Some(registry.path()), graceless());
+    let elsewhere = bundle_routes(&handles, &jobs, Some(registry.path()), Default::default());
+    let mut tasks = Vec::new();
+    for i in 0..8u64 {
+        let (file, _) = a_bundle(work.path(), &format!("n{i}"), &account(100 + i));
+        let bytes = std::fs::read(file).unwrap();
+        let routes = here.clone();
+        tasks.push(tokio::spawn(async move {
+            let (status, out) =
+                post_bundle(&routes, &format!("/_admin/bundles?as=n{i}@1"), bytes).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{out}");
+        }));
+        for routes in [here.clone(), elsewhere.clone()] {
+            tasks.push(tokio::spawn(async move {
+                let (status, out) = call(
+                    &routes,
+                    "POST",
+                    "/_admin/bundles/prune",
+                    None,
+                    Some(r#"{"keep":[]}"#),
+                )
+                .await;
+                assert_eq!(status, axum::http::StatusCode::OK, "{out}");
+            }));
+        }
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    no_ref_dangles(registry.path()).await;
+}
