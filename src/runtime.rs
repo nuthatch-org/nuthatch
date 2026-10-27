@@ -436,6 +436,13 @@ pub struct RuntimeMeta {
     /// are not indexed or served until resumed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspended: Vec<String>,
+    /// `strict` gives each tenant its own SQL sessions, memory pools and memo entries and holds
+    /// `/sql` to a function allow-list (RFC-0073 FR8, `docs/security/shared-runtime.md`).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::isolation::Isolation::is_shared"
+    )]
+    pub isolation: crate::isolation::Isolation,
 }
 
 /// SEC-10: anything that becomes a filesystem path segment *and* a route segment gets this charset.
@@ -1615,6 +1622,7 @@ fn overlay_boot_records(
     datasets: &[Dataset],
     default_tenant: &str,
     shares: &BTreeMap<String, TenantShare>,
+    isolation: crate::isolation::Isolation,
 ) -> Result<()> {
     for (key, state) in states.iter_mut() {
         let record = records
@@ -1640,6 +1648,7 @@ fn overlay_boot_records(
         let seating = Seating {
             default_tenant,
             shares,
+            isolation,
         };
         overlay_mount_record(state, nid.as_deref(), record, surface, key, seating);
     }
@@ -2330,6 +2339,7 @@ pub async fn dev(
         &datasets,
         default_tenant,
         &all_mounts.tenants,
+        meta.isolation,
     )?;
     let all_states = all_states;
     let publishers = spawn_publishers(&dir, &mounts.mounts, default_tenant)?;
@@ -2391,6 +2401,7 @@ pub async fn dev(
             fail_fast,
             cursors: admin_enabled.then_some(cursor_feed),
             registry: registry.clone(),
+            isolation: meta.isolation,
         },
     }));
 
@@ -3972,6 +3983,8 @@ pub struct MountContext {
     pub cursors: Option<CursorFeed>,
     /// `--registry`: where a mount fetches a NID this runtime does not hold (#1543).
     pub registry: Option<String>,
+    /// `[runtime] isolation`, so a mount made over the admin API is partitioned as one made at boot.
+    pub isolation: crate::isolation::Isolation,
 }
 
 /// A cursor's ingest task, handed to [`supervise_cursors`] after boot.
@@ -4895,11 +4908,21 @@ fn served_surface(
     }
 }
 
+/// The tenant a route serves, which strict isolation partitions its queries by (RFC-0073 FR8).
+pub fn query_partition(
+    isolation: crate::isolation::Isolation,
+    route_key: &str,
+    default_tenant: &str,
+) -> Option<Arc<str>> {
+    isolation.partition(route_key.split_once('/').map_or(default_tenant, |(t, _)| t))
+}
+
 /// The tenant shares a runtime holds, and the tenant an unqualified route key belongs to.
 #[derive(Clone, Copy)]
 struct Seating<'a> {
     default_tenant: &'a str,
     shares: &'a BTreeMap<String, TenantShare>,
+    isolation: crate::isolation::Isolation,
 }
 
 /// Stamp a mount's dataset identity, record, [`served_surface`] and tenant seat onto the state served
@@ -4918,6 +4941,7 @@ fn overlay_mount_record(
     state.limits = record.map_or_else(crate::limits::Limits::process, |r| {
         r.limits.resolve(&format!("{}/{}", r.tenant, r.alias))
     });
+    state.isolation = query_partition(seating.isolation, name, seating.default_tenant);
     // A state cloned from a co-tenant's arrives in that tenant's seat; it takes its own.
     let tenant = split_route_key(name).0.unwrap_or(seating.default_tenant);
     let share = seating.shares.get(tenant).copied().unwrap_or_default();
@@ -4939,6 +4963,7 @@ impl RuntimeHandles {
         Seating {
             default_tenant: &self.default_tenant,
             shares: &self.tenant_shares,
+            isolation: self.mount_ctx.isolation,
         }
     }
 
@@ -7505,6 +7530,7 @@ mod tests {
                 fail_fast: false,
                 cursors: None,
                 registry: None,
+                isolation: Default::default(),
             },
         };
         use std::os::unix::fs::PermissionsExt;
@@ -8217,6 +8243,7 @@ mod tests {
                 fail_fast: false,
                 cursors: None,
                 registry: None,
+                isolation: Default::default(),
             },
         };
 
@@ -8585,6 +8612,7 @@ mod tests {
             nid: None,
             runtime_health: None,
             address_history: None,
+            isolation: None,
         }
     }
 
@@ -8624,7 +8652,15 @@ mod tests {
             record("closed", SqlAccess::Deny),
             record("bounded", SqlAccess::Open),
         ];
-        overlay_boot_records(&mut states, &records, &[], DEFAULT_TENANT, &BTreeMap::new()).unwrap();
+        overlay_boot_records(
+            &mut states,
+            &records,
+            &[],
+            DEFAULT_TENANT,
+            &BTreeMap::new(),
+            Default::default(),
+        )
+        .unwrap();
         assert_eq!(states[0].1.surface.access, SqlAccess::Deny);
         assert_eq!(states[1].1.surface.access, SqlAccess::Allowlist);
         assert_eq!(states[1].1.surface.queries[0].name, "total");
@@ -8925,6 +8961,7 @@ mod tests {
                 fail_fast: false,
                 cursors: None,
                 registry: None,
+                isolation: Default::default(),
             },
         }
     }
@@ -10270,6 +10307,7 @@ mod fr5_tests {
                 fail_fast: false,
                 cursors: None,
                 registry: None,
+                isolation: Default::default(),
             },
         }
     }

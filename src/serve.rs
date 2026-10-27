@@ -369,6 +369,9 @@ pub struct AppState {
     /// dataset identity; a solo `dev` nest carries the NID it computed from its manifest. `None`
     /// only when that manifest could not be built.
     pub nid: Option<Arc<str>>,
+    /// The tenant this mount's queries are isolated to under `[runtime] isolation = "strict"`
+    /// (RFC-0073 FR8); `None` shares the dataset's session, pool and memo with every mount of it.
+    pub isolation: Option<Arc<str>>,
     /// This nest's name and the runtime health surface it should answer `/ready` from (RFC-0026 §5).
     /// `None` for a solo `dev` nest, which has no mounts around it and falls back to the global
     /// poll-freshness check.
@@ -3832,12 +3835,15 @@ async fn table(
                 );
                 let dir = s.dir.clone();
                 let declared = Arc::clone(&s.tables);
+                let tenant = s.isolation.clone();
                 let guard = s.query_guard(s.limits.timeout, need);
                 match tokio::task::spawn_blocking(move || {
                     let _permit = permit; // held for the whole blocking query
                                           // Declared, so a table nothing has been sealed for yet reads empty, not failed.
                     let hot = analytics::HotRows::new();
-                    analytics::query_hot_cold(&dir, &sql, guard, &hot, u64::MAX, &declared)
+                    analytics::isolated(tenant.as_ref(), || {
+                        analytics::query_hot_cold(&dir, &sql, guard, &hot, u64::MAX, &declared)
+                    })
                 })
                 .await
                 {
@@ -3988,9 +3994,12 @@ async fn entity(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoR
             };
             let guard = s.query_guard(s.limits.timeout.saturating_sub(admission.elapsed()), 1);
             let dir = s.dir.clone();
+            let tenant = s.isolation.clone();
             let sealed = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                analytics::get_row_guarded(&dir, block, log_index, guard)
+                analytics::isolated(tenant.as_ref(), || {
+                    analytics::get_row_guarded(&dir, block, log_index, guard)
+                })
             })
             .await;
             match sealed {
@@ -4288,6 +4297,7 @@ async fn named_scan(
     let cap = s.limits.max_named_scan_bytes;
     let max_hot_rows = s.limits.max_hot_rows;
     let guard = s.query_guard(s.limits.timeout, s.limits.max_rows);
+    let tenant = s.isolation.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<NamedRun> {
         let _permit = permit;
         let started = std::time::Instant::now();
@@ -4368,15 +4378,17 @@ async fn named_scan(
             pinned_catalogue: pin.map(|(catalogue, _)| catalogue),
             execute,
         };
-        let out = crate::analytics::query_named(
-            &dir,
-            &sql,
-            QueryGuard { timeout, ..guard },
-            &hot,
-            sealed_through,
-            &tables,
-            &admission,
-        )?;
+        let out = crate::analytics::isolated(tenant.as_ref(), || {
+            crate::analytics::query_named(
+                &dir,
+                &sql,
+                QueryGuard { timeout, ..guard },
+                &hot,
+                sealed_through,
+                &tables,
+                &admission,
+            )
+        })?;
         let as_of = store
             .get_meta("last_block")
             .ok()
@@ -4714,6 +4726,7 @@ fn memo_identity(
     let files = crate::analytics::cache_inputs(&s.dir);
     let key = crate::sqlmemo::Inputs {
         dir: &s.dir,
+        tenant: s.isolation.as_deref(),
         sql,
         max_rows,
         sealed: &sealed,
@@ -4904,6 +4917,7 @@ async fn run_sql_query_at(
     let tables = s.tables.clone();
     let declared_entities = s.entities.clone();
     let guard = s.query_guard(sql_timeout, max_rows);
+    let tenant = s.isolation.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit; // held for the whole blocking query, released on return
         #[cfg(test)]
@@ -4969,11 +4983,18 @@ async fn run_sql_query_at(
             )?
         };
         let sealed_through = store.sealed_through();
-        let mut out = if let Some(block) = historical_block {
-            analytics::query_hot_cold_at(&dir, &sql, guard, &hot, sealed_through, &tables, block)?
-        } else {
-            analytics::query_hot_cold(&dir, &sql, guard, &hot, sealed_through, &tables)?
-        };
+        let mut out = analytics::isolated(tenant.as_ref(), || match historical_block {
+            Some(block) => analytics::query_hot_cold_at(
+                &dir,
+                &sql,
+                guard,
+                &hot,
+                sealed_through,
+                &tables,
+                block,
+            ),
+            None => analytics::query_hot_cold(&dir, &sql, guard, &hot, sealed_through, &tables),
+        })?;
         out.tip_unavailable = tip_unavailable;
         // The state after the query, for the memo: an answer is remembered only if nothing it reads
         // moved while it ran, so a remembered answer always describes exactly the state its key names.
@@ -5094,6 +5115,7 @@ impl DiffQuery {
 /// under the deadline `/sql` gives one query.
 struct DiffSource {
     dir: PathBuf,
+    tenant: Option<Arc<str>>,
     hot: Arc<crate::analytics::HotRows>,
     tip_unavailable: bool,
     sealed_through: u64,
@@ -5118,6 +5140,7 @@ impl crate::diff::Source for DiffSource {
             timeout: left,
             ..self.guard
         };
+        let tenant = self.tenant.clone();
         let (dir, hot, tables, sql) = (
             self.dir.clone(),
             self.hot.clone(),
@@ -5126,7 +5149,9 @@ impl crate::diff::Source for DiffSource {
         );
         let sealed_through = self.sealed_through;
         let mut out = tokio::task::spawn_blocking(move || {
-            analytics::query_hot_cold(&dir, &sql, guard, &hot, sealed_through, &tables)
+            analytics::isolated(tenant.as_ref(), || {
+                analytics::query_hot_cold(&dir, &sql, guard, &hot, sealed_through, &tables)
+            })
         })
         .await??;
         out.tip_unavailable = self.tip_unavailable;
@@ -5215,6 +5240,7 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
     };
     let src = DiffSource {
         dir: s.dir.clone(),
+        tenant: s.isolation.clone(),
         hot: Arc::new(hot),
         tip_unavailable,
         sealed_through,
@@ -5395,6 +5421,7 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
     let tables = s.tables.clone();
     let guard = s.query_guard(s.limits.timeout, 1);
     let declared_entities = s.entities.clone();
+    let tenant = s.isolation.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         // Planning materialises no result rows, but the tip is still parsed
@@ -5446,7 +5473,9 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
             (sql_max_hot_rows, sql_max_named_scan_bytes),
         )?;
         let sealed_through = store.sealed_through();
-        let mut out = analytics::plan_hot_cold(&dir, &query, guard, &hot, sealed_through, &tables)?;
+        let mut out = analytics::isolated(tenant.as_ref(), || {
+            analytics::plan_hot_cold(&dir, &query, guard, &hot, sealed_through, &tables)
+        })?;
         out.tip_unavailable = tip_unavailable;
         Ok(out)
     })
@@ -7097,6 +7126,7 @@ mod tests {
             nest_info: Arc::new(json!({ "name": "t" })),
             runtime_health: None,
             address_history: None,
+            isolation: None,
         }
     }
 

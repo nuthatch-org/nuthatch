@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex, RwLock, TryLockError, Weak};
 pub(crate) struct BurrmillEngine;
 
 impl Engine for BurrmillEngine {
-    fn open(&self, dir: &Path) -> Result<Box<dyn Session>> {
-        Ok(Box::new(BurrmillSession::new(Some(dir))?))
+    fn open(&self, dir: &Path, tenant: Option<&str>) -> Result<Box<dyn Session>> {
+        Ok(Box::new(BurrmillSession::new(Some((dir, tenant)))?))
     }
 
     fn open_bare(&self) -> Result<Box<dyn Session>> {
@@ -74,12 +74,11 @@ fn pools() -> Pools {
             (dir, reserved)
         })
         .collect();
-    let nest_pools: Vec<_> = NEST_POOLS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .map(|(dir, pool)| (dir.clone(), pool.reserved() as u64))
-        .collect();
+    let mut by_dir = std::collections::BTreeMap::<PathBuf, u64>::new();
+    for ((dir, _), pool) in NEST_POOLS.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+        *by_dir.entry(dir.clone()).or_default() += pool.reserved() as u64;
+    }
+    let nest_pools: Vec<_> = by_dir.into_iter().collect();
     let mut out = tally(engines, &nest_pools);
     let peaks = PEAKS.lock().unwrap_or_else(|p| p.into_inner());
     out.total.peak = peaks.all;
@@ -208,10 +207,10 @@ impl BurrmillSession {
         }
     }
 
-    fn new(dir: Option<&Path>) -> Result<Self> {
+    fn new(nest: Option<(&Path, Option<&str>)>) -> Result<Self> {
         let spill = crate::spill::new_spill_dir()?;
         let budget = budget(&crate::analytics_budget::from_env(), &spill.0);
-        let pool = dir.map(|dir| nest_pool(dir, budget.memory_bytes));
+        let pool = nest.map(|(dir, tenant)| nest_pool(dir, tenant, budget.memory_bytes));
         #[allow(unused_mut)]
         let mut engine = match &pool {
             Some(pool) => burrmill::Engine::open_empty_sharing(budget, pool),
@@ -221,7 +220,7 @@ impl BurrmillSession {
         #[cfg(feature = "graph")]
         crate::analytics_scalars::register(&mut engine);
         let engine = Arc::new(RwLock::new(engine));
-        let dir = dir.map(Path::to_path_buf);
+        let dir = nest.map(|(dir, _)| dir.to_path_buf());
         LIVE.lock()
             .unwrap_or_else(|p| p.into_inner())
             .push((dir.clone(), Arc::downgrade(&engine)));
@@ -261,17 +260,31 @@ impl Drop for BurrmillSession {
 }
 
 // A statement that finds the cached session busy opens another, so the limit has to bound the
-// nest's sessions together (#1792). The pool keeps the size its first session gave it.
-static NEST_POOLS: Mutex<std::collections::BTreeMap<PathBuf, burrmill::SharedPool>> =
+// nest's sessions together (#1792). The pool keeps the size its first session gave it. Under strict
+// isolation each tenant of a dataset has its own (RFC-0073 FR8).
+type PoolKey = (PathBuf, Option<String>);
+static NEST_POOLS: Mutex<std::collections::BTreeMap<PoolKey, burrmill::SharedPool>> =
     Mutex::new(std::collections::BTreeMap::new());
 
-fn nest_pool(dir: &Path, memory_bytes: usize) -> burrmill::SharedPool {
+fn nest_pool(dir: &Path, tenant: Option<&str>, memory_bytes: usize) -> burrmill::SharedPool {
     NEST_POOLS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .entry(dir.to_path_buf())
+        .entry((dir.to_path_buf(), tenant.map(str::to_string)))
         .or_insert_with(|| burrmill::SharedPool::new(memory_bytes))
         .clone()
+}
+
+/// The tenants with a pool of their own over `dir`, `None` being the shared one.
+#[cfg(test)]
+pub(crate) fn pool_tenants(dir: &Path) -> Vec<Option<String>> {
+    NEST_POOLS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .keys()
+        .filter(|(d, _)| d == dir)
+        .map(|(_, t)| t.clone())
+        .collect()
 }
 
 /// The walls `analytics_budget` sets, as Burrmill's budget.
@@ -687,6 +700,10 @@ impl Session for BurrmillSession {
         Some(views.iter().map(|(n, s)| (n.clone(), s.clone())).collect())
     }
 
+    fn function_names(&self) -> Vec<String> {
+        self.reader().function_names()
+    }
+
     fn canonical_plan(&self, sql: &str) -> Option<String> {
         burrmill::inspect::canonical(sql)
     }
@@ -928,7 +945,7 @@ mod tests {
     /// A session over `dir` with `table` bound to `n` rows in scrambled order.
     fn sorting_session(dir: &std::path::Path, tables: &[(&str, u64)]) -> super::BurrmillSession {
         use crate::engine::{FactWindow, Session};
-        let s = super::BurrmillSession::new(Some(dir)).unwrap();
+        let s = super::BurrmillSession::new(Some((dir, None))).unwrap();
         for (table, n) in tables {
             let rows: Vec<serde_json::Value> = (1..=*n)
                 .map(|b| serde_json::json!({ "block_number": b, "n": format!("{:09}", 7919 * b % 100_003) }))
@@ -1043,7 +1060,7 @@ mod tests {
             std::env::set_var(ENV_MAX_TEMP_SIZE, "0MB");
             let opened = dirs
                 .iter()
-                .map(|d| super::BurrmillEngine.open(d).unwrap())
+                .map(|d| super::BurrmillEngine.open(d, None).unwrap())
                 .collect();
             std::env::remove_var(ENV_BURRMILL_MEMORY_LIMIT);
             std::env::remove_var(ENV_MAX_TEMP_SIZE);
