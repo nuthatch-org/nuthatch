@@ -8698,6 +8698,7 @@ mod tests {
             &records,
             &[],
             DEFAULT_TENANT,
+            &BTreeMap::new(),
             crate::isolation::Isolation::Strict,
         )
         .unwrap();
