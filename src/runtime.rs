@@ -1991,6 +1991,8 @@ pub async fn dev(
     // per request. Replaces the roster snapshot that was built once at startup and could not express
     // "partly working".
     let health = Arc::new(crate::health::RuntimeHealth::new());
+    let mut failed: std::collections::BTreeMap<String, String> = Default::default();
+    let mut failed_chain: std::collections::HashMap<String, String> = Default::default();
 
     for mut group in groups {
         let rpc_urls = rpc::select_rpcs(&rpc_override, group.endpoint.rpc_urls.clone());
@@ -2084,7 +2086,7 @@ pub async fn dev(
         // Retained so a mount can build a nest against the same source its co-tenants use - a nest
         // mounted at runtime must be indistinguishable from one mounted at boot.
         sources.insert(group.endpoint.chain.clone(), source.clone());
-        let cursor = indexer::spawn_runtime(
+        let cursor = indexer::spawn_runtime_at_boot(
             source,
             group.nests,
             backfill,
@@ -2103,6 +2105,15 @@ pub async fn dev(
                 meta.name, group.endpoint.chain
             )
         })?;
+        for (name, reason) in cursor.failed {
+            failed_chain.insert(name.clone(), group.endpoint.chain.clone());
+            failed.insert(name, reason);
+        }
+        if cursor.states.is_empty() {
+            // Nothing on this chain built, so it stays dormant: a later mount starts its cursor.
+            cursor.ingest.abort();
+            continue;
+        }
         // Retain the per-nest handles: the driver needs them to re-compose the router (and abort the
         // right alert worker) when a nest is unmounted (RFC-0027 §6).
         lifecycle.insert(group.endpoint.chain.clone(), cursor.lifecycle);
@@ -2111,6 +2122,32 @@ pub async fn dev(
         alert_workers.extend(cursor.alert_workers);
     }
 
+    if all_states.is_empty() && !failed.is_empty() {
+        bail!(
+            "every nest in mounts '{}' failed to build - {}",
+            meta.name,
+            failed
+                .iter()
+                .map(|(n, r)| format!("{n}: {r}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    // A failed canonical mount has no state to share, so its aliases fail with it.
+    for ds in &datasets {
+        let canonical = ds.canonical().route_key(default_tenant);
+        let (Some(reason), Some(chain)) = (
+            failed.get(&canonical).cloned(),
+            failed_chain.get(&canonical),
+        ) else {
+            continue;
+        };
+        for m in &ds.mounts[1..] {
+            let key = m.route_key(default_tenant);
+            health.register_alias(&key, &canonical, chain);
+            failed.insert(key, reason.clone());
+        }
+    }
     // `--rpc` and `--rpc-fallback` only ever mean something for a single-chain runtime.
     let single_chain = endpoints.len() == 1;
     let dormant: std::collections::HashMap<String, DormantChain> = endpoints
@@ -2194,6 +2231,7 @@ pub async fn dev(
         estimates: estimates.clone(),
         default_tenant: default_tenant_owned.clone(),
         suspended,
+        failed,
         joining: Default::default(),
         mount_ctx: MountContext {
             dir: dir.clone(),
@@ -2226,7 +2264,7 @@ pub async fn dev(
         for name in h.suspended.keys() {
             h.health.suspend_nest(name);
         }
-        if !h.suspended.is_empty() {
+        if !h.suspended.is_empty() || !h.failed.is_empty() {
             h.live.swap(h.compose()?);
         }
     }
@@ -2659,8 +2697,9 @@ pub fn lifecycle_routes(
             );
         }
         let mut h = handles.lock().await;
-        let was_mounted =
-            h.states.iter().any(|(n, _)| *n == name) || h.suspended.contains_key(&name);
+        let was_mounted = h.states.iter().any(|(n, _)| *n == name)
+            || h.suspended.contains_key(&name)
+            || h.failed.contains_key(&name);
         let nid = h
             .states
             .iter()
@@ -3088,6 +3127,9 @@ pub struct RuntimeHandles {
     pub default_tenant: String,
     /// Suspended mounts (#1548), route key to NID: kept on disk and in `mounts.toml`, answering 503.
     pub suspended: std::collections::BTreeMap<String, String>,
+    /// Mounts that failed to build at boot (RFC-0073 FR6), route key to why: kept in `mounts.toml`,
+    /// terminally quarantined, answering 503 until an unmount or a restart.
+    pub failed: std::collections::BTreeMap<String, String>,
     /// Mounts admitted onto a running cursor and still catching up beside it, with no lock held.
     pub joining: JoiningMounts,
     /// What a mount needs that an unmount does not: where nests live, how to reach each chain, and the
@@ -3852,6 +3894,24 @@ fn suspended_router(name: &str) -> axum::Router {
     })
 }
 
+/// What a mount that failed to build at boot serves, `/ready` included: a 503 naming the failure.
+fn failed_router(name: &str, reason: &str) -> axum::Router {
+    let body = serde_json::json!({
+        "error": format!("'{name}' failed to build at boot and is quarantined: {reason}"),
+        "ready": false,
+        "quarantined": [{"nest": name, "reason": reason}],
+    });
+    axum::Router::new().fallback(move || {
+        let body = body.clone();
+        async move {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(body),
+            )
+        }
+    })
+}
+
 /// Run a move as a job (#1549): fetch and catch up the new NID with no lock held, then move under it.
 pub fn spawn_move_job(
     handles: Arc<tokio::sync::Mutex<RuntimeHandles>>,
@@ -4193,7 +4253,7 @@ impl RuntimeHandles {
     /// Resolve a mount's dataset and whether it must be fetched first, refusing what can be refused
     /// without doing any work.
     pub fn plan_mount(&self, name: &str, nid: Option<&Nid>) -> Result<MountPlan> {
-        if self.states.iter().any(|(n, _)| n == name) {
+        if self.states.iter().any(|(n, _)| n == name) || self.failed.contains_key(name) {
             return Err(MountRefusal::AlreadyMounted(name.to_string()).into());
         }
         if self.joining.list().iter().any(|j| j.name == name) {
@@ -4676,25 +4736,32 @@ impl RuntimeHandles {
     pub fn compose(&self) -> Result<axum::Router> {
         // `plan_mount` refuses a colliding name before it joins; this keeps a miss from panicking.
         refuse_route_collisions(self.routes())?;
-        let mut router = crate::serve::compose_runtime(
-            self.roster.clone(),
-            self.states.clone(),
-            self.health.clone(),
-        );
+        let mut roster = self.roster.clone();
+        if let Some(entries) = roster.get_mut("nests").and_then(|n| n.as_array_mut()) {
+            for name in self.failed.keys() {
+                entries.push(serde_json::json!({"name": name, "base_path": format!("/{name}")}));
+            }
+        }
+        let mut router =
+            crate::serve::compose_runtime(roster, self.states.clone(), self.health.clone());
         for name in self.suspended.keys() {
             if !self.states.iter().any(|(n, _)| n == name) {
                 router = router.nest(&format!("/{name}"), suspended_router(name));
             }
         }
+        for (name, reason) in &self.failed {
+            router = router.nest(&format!("/{name}"), failed_router(name, reason));
+        }
         Ok(router)
     }
 
-    /// Every name [`Self::compose`] serves: the live mounts and the suspended ones.
+    /// Every name [`Self::compose`] serves: the live mounts, the suspended ones and the failed ones.
     fn routes(&self) -> impl Iterator<Item = &str> {
         self.states
             .iter()
             .map(|(n, _)| n.as_str())
             .chain(self.suspended.keys().map(String::as_str))
+            .chain(self.failed.keys().map(String::as_str))
     }
 
     /// Suspend a mount (#1548): drain it off its cursor as an unmount does, but keep its record and
@@ -4731,6 +4798,7 @@ impl RuntimeHandles {
             .iter()
             .map(|(n, _)| n.clone())
             .filter(|n| !n.ends_with(STAGING_SUFFIX))
+            .chain(self.failed.keys().cloned())
             .collect();
         let suspended: Vec<String> = self.suspended.keys().cloned().collect();
         persist_mounted_nests(
@@ -4816,7 +4884,7 @@ impl RuntimeHandles {
     pub async fn unmount(&mut self, name: &str) -> Result<()> {
         let Some(idx) = self.states.iter().position(|(n, _)| n == name) else {
             // A suspended mount is already off its cursor; unmounting it drops the record.
-            if self.suspended.remove(name).is_some() {
+            if self.suspended.remove(name).is_some() || self.failed.remove(name).is_some() {
                 self.health.retire_nest(name);
                 self.live.swap(self.compose()?);
                 return self.persist();
@@ -6194,6 +6262,7 @@ mod tests {
             estimates: std::collections::HashMap::new(),
             default_tenant: DEFAULT_TENANT.to_string(),
             suspended: std::collections::BTreeMap::from([("usdc".to_string(), nid.clone())]),
+            failed: Default::default(),
             joining: Default::default(),
             mount_ctx: MountContext {
                 dir: root.path().to_path_buf(),
@@ -6877,6 +6946,7 @@ mod tests {
             estimates: std::collections::HashMap::new(),
             default_tenant: DEFAULT_TENANT.to_string(),
             suspended: std::collections::BTreeMap::new(),
+            failed: Default::default(),
             joining: Default::default(),
             mount_ctx: MountContext {
                 dir: root.path().to_path_buf(),
@@ -7441,6 +7511,7 @@ mod tests {
             estimates: std::collections::HashMap::new(),
             default_tenant: DEFAULT_TENANT.to_string(),
             suspended: std::collections::BTreeMap::new(),
+            failed: Default::default(),
             joining: Default::default(),
             mount_ctx: MountContext {
                 dir: dir.to_path_buf(),
@@ -8441,5 +8512,272 @@ mod tests {
             bare + ceiling,
             "the cache is a ceiling, not a copy of the file"
         );
+    }
+
+    /// A chain with no logs whose tip a test raises.
+    struct RisingChain(std::sync::atomic::AtomicU64);
+
+    #[async_trait::async_trait]
+    impl Source for RisingChain {
+        async fn tip(&self) -> Result<u64> {
+            Ok(self.0.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("0x{n:064x}")))
+        }
+        async fn logs(
+            &self,
+            _filter: &crate::source::LogFilter,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn get_body(router: &axum::Router, path: &str) -> (axum::http::StatusCode, String) {
+        use tower::ServiceExt;
+        let req = axum::http::Request::get(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn last_block(states: &[(String, crate::serve::AppState)], name: &str) -> u64 {
+        let (_, state) = states.iter().find(|(n, _)| n == name).unwrap();
+        state
+            .store
+            .get_meta("last_block")
+            .unwrap()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    async fn indexed_through(
+        states: &[(String, crate::serve::AppState)],
+        name: &str,
+        block: u64,
+    ) -> bool {
+        for _ in 0..600 {
+            if last_block(states, name) >= block {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// Two nests on one `ethereum` cursor, the first of them `doomed`.
+    fn two_nests(root: &Path, doomed: &str, healthy: &str) -> Vec<(String, PathBuf, Config)> {
+        [doomed, healthy]
+            .into_iter()
+            .map(|name| {
+                write_nest_dir(root, name, "ethereum", 1);
+                let dir = MountTable::nest_dir(root, name);
+                let config = Config::load(&dir).unwrap();
+                (name.to_string(), dir, config)
+            })
+            .collect()
+    }
+
+    /// RFC-0073 FR6: a panic in one nest's window is that nest's terminal quarantine, named by its
+    /// message. It used to unwind the cursor task and take every nest on the chain with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ingest_panic_quarantines_one_nest_and_its_co_tenant_keeps_indexing_and_serving() {
+        let root = tempfile::tempdir().unwrap();
+        let (doomed, healthy) = ("fr6-panics", "fr6-carries-on");
+        let nests = two_nests(root.path(), doomed, healthy);
+        indexer::panic_in_windows_of(&nests[0].1);
+        let chain = Arc::new(RisingChain(std::sync::atomic::AtomicU64::new(1_000)));
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        for name in [doomed, healthy] {
+            health.register(name, "ethereum");
+        }
+        let cursor = indexer::spawn_runtime(
+            chain.clone(),
+            nests,
+            Some(20),
+            false,
+            1,
+            Some(5),
+            false,
+            None,
+            health.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(indexed_through(&cursor.states, healthy, 1_000).await);
+        chain.0.store(1_040, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            indexed_through(&cursor.states, healthy, 1_040).await,
+            "the co-tenant stopped at {} after its neighbour panicked",
+            last_block(&cursor.states, healthy)
+        );
+
+        let q = health
+            .status(doomed)
+            .expect("the panicking nest was not quarantined");
+        assert_eq!((q.kind, q.class), ("nest", "terminal"));
+        assert!(q.reason.contains("injected window panic"), "{}", q.reason);
+        assert!(health.status(healthy).is_none());
+        assert!(!health.cursor_quarantined("ethereum"));
+        assert!(
+            !cursor.ingest.is_finished(),
+            "the cursor died with the panic"
+        );
+
+        let router =
+            crate::serve::compose_runtime(serde_json::json!({}), cursor.states.clone(), health);
+        let (status, body) = get_body(&router, &format!("/{doomed}/ready")).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body}"
+        );
+        assert!(body.contains("injected window panic"), "{body}");
+        let (status, body) = get_body(&router, &format!("/{healthy}/ready")).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        for name in [healthy, doomed] {
+            let (status, body) = get_body(&router, &format!("/{name}/sql?q=select%201")).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{name}: {body}");
+        }
+        drop(router);
+        cursor.shutdown().await.unwrap();
+    }
+
+    /// RFC-0073 FR6: a query that panics fails its own request. The cursor's shared SQL gate gets its
+    /// permit back, so the co-tenant on that gate still answers, and neither nest's ingest is touched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_query_panic_fails_its_request_and_the_co_tenant_keeps_serving() {
+        let root = tempfile::tempdir().unwrap();
+        let (doomed, healthy) = ("fr6-query-panics", "fr6-query-answers");
+        let nests = two_nests(root.path(), doomed, healthy);
+        crate::serve::panic_in_queries_of(&nests[0].1);
+        let chain = Arc::new(RisingChain(std::sync::atomic::AtomicU64::new(1_000)));
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        for name in [doomed, healthy] {
+            health.register(name, "ethereum");
+        }
+        let cursor = indexer::spawn_runtime(
+            chain.clone(),
+            nests,
+            Some(20),
+            false,
+            1,
+            Some(5),
+            false,
+            None,
+            health.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        let router =
+            crate::serve::compose_runtime(serde_json::json!({}), cursor.states.clone(), health);
+        // More panics than the gate has permits: a leaked permit would refuse the co-tenant.
+        for i in 0..crate::serve::new_sql_gate().available_permits() + 2 {
+            let (status, body) = get_body(&router, &format!("/{doomed}/sql?q=select%20{i}")).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{body}"
+            );
+        }
+        let (status, body) = get_body(&router, &format!("/{healthy}/sql?q=select%201")).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        chain.0.store(1_040, std::sync::atomic::Ordering::SeqCst);
+        for name in [doomed, healthy] {
+            assert!(indexed_through(&cursor.states, name, 1_040).await, "{name}");
+            let (status, body) = get_body(&router, &format!("/{name}/ready")).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{name}: {body}");
+        }
+        drop(router);
+        cursor.shutdown().await.unwrap();
+    }
+
+    /// RFC-0073 FR6: a nest that fails to build at boot is booted quarantined, answering 503 with why,
+    /// and its co-tenant indexes and serves. Before, the one error aborted the whole boot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_nest_that_fails_to_build_boots_quarantined_beside_a_working_co_tenant() {
+        let root = tempfile::tempdir().unwrap();
+        let (doomed, healthy) = ("fr6-unbuildable", "fr6-builds");
+        let nests = two_nests(root.path(), doomed, healthy);
+        std::fs::write(nests[0].1.join(crate::config::DB_FILE), b"not a redb file").unwrap();
+        let mut handles = idle_handles(root.path());
+        for name in [doomed, healthy] {
+            handles.health.register(name, "ethereum");
+        }
+        let chain = Arc::new(RisingChain(std::sync::atomic::AtomicU64::new(1_000)));
+        let cursor = indexer::spawn_runtime_at_boot(
+            chain.clone(),
+            nests,
+            Some(20),
+            false,
+            1,
+            Some(5),
+            false,
+            None,
+            handles.health.clone(),
+            false,
+        )
+        .await
+        .expect("one nest's build failure failed the cursor");
+        assert_eq!(
+            cursor
+                .failed
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec![doomed]
+        );
+        assert!(indexed_through(&cursor.states, healthy, 1_000).await);
+        chain.0.store(1_040, std::sync::atomic::Ordering::SeqCst);
+        assert!(indexed_through(&cursor.states, healthy, 1_040).await);
+
+        let q = handles.health.status(doomed).expect("not quarantined");
+        assert_eq!(q.class, "terminal");
+        assert!(q.reason.contains("failed to build"), "{}", q.reason);
+        assert!(handles.health.status(healthy).is_none());
+
+        handles.roster["nests"] = serde_json::json!([{"name": healthy}]);
+        handles.states = cursor.states.clone();
+        handles.failed = cursor.failed.iter().cloned().collect();
+        let router = handles.compose().unwrap();
+        let (status, body) = get_body(&router, &format!("/{doomed}/ready")).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body}"
+        );
+        assert!(body.contains("failed to build"), "{body}");
+        let (status, body) = get_body(&router, &format!("/{healthy}/sql?q=select%201")).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let (status, body) = get_body(&router, &format!("/{healthy}/ready")).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let (status, body) = get_body(&router, "/ready").await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body}"
+        );
+        let (_, body) = get_body(&router, "/nests").await;
+        let roster: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let entry = roster["nests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == doomed)
+            .unwrap_or_else(|| panic!("/nests does not list the failed nest: {body}"));
+        assert_eq!(entry["health"], "quarantined", "{body}");
+        drop(router);
+        handles.states.clear();
+        drop(handles);
+        cursor.shutdown().await.unwrap();
     }
 }

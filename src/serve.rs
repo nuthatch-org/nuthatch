@@ -4897,10 +4897,12 @@ async fn run_sql_query_at(
     let declared_entities = s.entities.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit; // held for the whole blocking query, released on return
-                              // Scan the hot tip (redb, blocking) inside the same blocking task, so `/sql` sees the unsealed
-                              // rows alongside the sealed segments (RFC-0013). A scan failure degrades to cold-only.
-                              // A scan failure degrades to cold-only, *except* an over-budget tip: that must surface, or a
-                              // query would quietly answer from sealed data alone and report a different number.
+        #[cfg(test)]
+        panic_if_queries_armed(&dir);
+        // Scan the hot tip (redb, blocking) inside the same blocking task, so `/sql` sees the unsealed
+        // rows alongside the sealed segments (RFC-0013). A scan failure degrades to cold-only.
+        // A scan failure degrades to cold-only, *except* an over-budget tip: that must surface, or a
+        // query would quietly answer from sealed data alone and report a different number.
         let (hot, tip_unavailable, spent) = match store
             .hot_rows_by_table_bounded_with_bytes(sql_max_hot_rows, sql_max_hot_bytes)
         {
@@ -6180,6 +6182,25 @@ fn sanitize_sql_error(raw: &str, dir: &std::path::Path) -> String {
         }
     }
     out
+}
+
+/// Every `/sql` query on the nest at `dir` panics from now on.
+#[cfg(test)]
+pub(crate) fn panic_in_queries_of(dir: &std::path::Path) {
+    panicking_queries().lock().unwrap().push(dir.to_path_buf());
+}
+
+#[cfg(test)]
+fn panicking_queries() -> &'static std::sync::Mutex<Vec<PathBuf>> {
+    static DIRS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn panic_if_queries_armed(dir: &std::path::Path) {
+    if panicking_queries().lock().unwrap().iter().any(|d| d == dir) {
+        panic!("injected query panic in {}", dir.display());
+    }
 }
 
 #[cfg(test)]

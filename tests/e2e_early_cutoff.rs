@@ -422,6 +422,7 @@ async fn bring_up_live(
         estimates: std::collections::HashMap::new(),
         default_tenant: default_tenant.to_string(),
         suspended: Default::default(),
+        failed: Default::default(),
         joining: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: root.to_path_buf(),

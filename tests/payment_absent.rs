@@ -812,7 +812,7 @@ fn the_http_boundary_is_wired_through_the_real_router() {
         "the HTTP half of #1217 is missing from serve.rs - a tree gate with no router probe \
          cannot see a default-on 402"
     );
-    let tests = src.split("#[cfg(test)]").nth(1).unwrap_or("");
+    let tests = src.split("#[cfg(test)]\nmod tests {").nth(1).unwrap_or("");
     assert!(
         tests.contains("fn an_unpriced_nest_does_not_charge_on_the_default_surface"),
         "the HTTP half must sit in the test module so production_src does not match it"
