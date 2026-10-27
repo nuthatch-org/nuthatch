@@ -2060,6 +2060,9 @@ pub async fn dev(
         );
     }
     let groups = group_by_chain(&endpoints, mounted)?;
+    if meta.isolation == crate::isolation::Isolation::Strict {
+        crate::analytics_budget::validate_strict_budget()?;
+    }
 
     // A mount may narrow its author's ceiling, never widen it (RFC-0034 §3). Checked before any
     // store is opened, so a nest exposing more than its author sanctioned fails to start rather than
