@@ -109,19 +109,34 @@ A **read-only `serve` role over the runtime's data directory**: `nuthatch serve 
 --follow <writer-url>`. It opens sealed segments directly (they are immutable files), never opens redb,
 and takes the hot tip from a **hot-state feed** the writer exposes on its admin listener: a stream of
 committed hot-window deltas per nest, keyed by `write_generation`, from which the reader keeps its own
-in-memory `HotStore`. Mount changes arrive on the same feed. A reader reports per-nest readiness and its
-lag behind the writer, and answers with the same `as_of`, `sealed_through` and `nid`. Adding a reader
-needs no re-index and no writer restart. The feed is an operator-only endpoint behind the admin token.
+in-memory `HotStore`. Mount changes arrive on the same feed. Adding a reader needs no re-index and no
+writer restart. The feed is an operator-only endpoint behind the admin token.
+
+**Bootstrap is a snapshot, then ordered replay.** A reader asks the writer for each nest's hot window
+as of one `write_generation` G, read in one hot-store transaction, then subscribes to deltas from G+1.
+A delta that does not follow the last generation applied is a gap: the reader drops that nest's hot
+state and takes a fresh snapshot. A reorg arrives as a delta like any other, since it is a hot-store
+write. Until a nest's snapshot is applied, the reader answers that nest's routes `503` with
+`reason="catching_up"`; after it, the reader answers with the `as_of` and `sealed_through` of the
+generation it has applied, and its readiness reports the generations it trails the writer by.
 
 ### FR2. Fair share between tenant labels
 
 Weighted fair queueing in front of each gate, keyed by **tenant label**, the same opaque string the
 runtime already refcounts. Each tenant gets a share of permits and of response bytes in flight,
-weights default to equal, and an idle tenant's share is lent. A tenant at its own share is refused with
-`reason="tenant_share"`, distinguishable from process saturation (`reason="busy"`). Weights and caps are
-set by `PUT /_admin/tenants/<tenant>` and persisted in `mounts.toml`. The acceptance bound is theirs:
-a saturating tenant delays another tenant's admitted query by no more than the 250 ms admission wait.
-Nuthatch still does not know who a tenant is.
+weights default to equal. A tenant at its own share is refused with `reason="tenant_share"`,
+distinguishable from process saturation (`reason="busy"`). Weights and caps are set by
+`PUT /_admin/tenants/<tenant>` and persisted in `mounts.toml`. Nuthatch still does not know who a
+tenant is.
+
+**Queueing alone cannot hold the bound, because admitted work is not preempted:** a tenant that borrows
+every idle permit can hold them for the 30 s statement timeout. So each active tenant also has a
+**reserved minimum** of one permit and a slice of the response-bytes budget, and borrowing may take a
+permit only while every other active tenant's reservation stays free. With that, a tenant's query
+waits behind its own work and never behind another's. The acceptance bound becomes: a tenant that is
+under its reservation is admitted within the 250 ms admission wait however busy another tenant is.
+Reservations cap the number of tenants one gate can serve at once at its permit count; beyond that, a
+tenant waits for a reservation to free and is refused `reason="tenant_share"` if none does in time.
 
 ### FR3. Per-mount resource limits
 
@@ -146,7 +161,11 @@ them. It is a report, not a price: nuthatch does not meter or bill.
 ### FR5. Memory budgets that grow
 
 `PUT /_admin/runtime` raises (or lowers, refusing below current use) `max_rss_mb` live, persisted in
-`mounts.toml`. The entity-circuit cap becomes a function of the ceiling (32 per 2 GiB, at least 32).
+`mounts.toml`. **This does not change the ≤2 GB budget.** The budget is what nuthatch's own design must
+fit per cursor, gated in CI for a default runtime, and the default ceiling stays 2048 MB. An operator
+can already set `max_rss_mb` above it in `mounts.toml` to pack more nests onto one cursor, and the 507
+refusal says so (`runtime.rs:3257`); FR5 makes that existing operator choice live instead of
+restart-only. The entity-circuit cap becomes a function of the ceiling (32 per 2 GiB, at least 32).
 Boot stops refusing the whole runtime for an over-budget cursor: it boots the mounts that fit, in
 `mounts.toml` order, and marks the rest refused with the reason. The per-query hot-tip copy is charged
 to the requesting tenant's share (FR2) and bounded by the mount's limits (FR3); replacing the copy
