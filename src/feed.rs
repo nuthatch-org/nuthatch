@@ -245,20 +245,113 @@ impl<'de> Deserialize<'de> for DatasetName {
         let name = String::deserialize(d)?;
         let cap = CAP_FOR.with(|f| f.borrow().as_ref().and_then(|f| f(&name)));
         BUDGET.with(|b| b.set(Budget { cap, seen: 0 }));
+        limit_snapshot(&name, cap);
         Ok(DatasetName(name))
     }
 }
 
+/// Fixed room above a snapshot's byte limit for its JSON framing.
+pub const SNAPSHOT_SLACK: u64 = 64 * 1024;
+
+/// A snapshot's wire bytes passed its dataset's limit, so it was not read to the end: no value in it
+/// was allocated past the limit. The stream cannot be resumed mid-value; the follower reconnects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotOverBudget {
+    pub dataset: String,
+    /// Wire bytes of the snapshot read before stopping.
+    pub read: u64,
+    pub limit: u64,
+}
+
+impl std::fmt::Display for SnapshotOverBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}'s snapshot passed {} wire bytes, its limit; stopped reading it at {}",
+            self.dataset, self.limit, self.read
+        )
+    }
+}
+
+impl std::error::Error for SnapshotOverBudget {}
+
+/// Where the snapshot being read must stop, as a position in the stream, and which dataset it is.
+#[derive(Clone, Default)]
+struct WireLimit {
+    position: u64,
+    stop_at: Option<(u64, u64, String)>,
+}
+
+thread_local! {
+    static WIRE: std::cell::RefCell<WireLimit> = std::cell::RefCell::new(WireLimit::default());
+}
+
+/// The body as the parser reads it, refusing to give it a byte past the current snapshot's limit:
+/// a string can be no longer than the bytes it was read from, so this bounds every value in it.
+struct Limited<R>(R);
+
+impl<R: std::io::Read> std::io::Read for Limited<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let allowed = WIRE.with(|w| {
+            let w = w.borrow();
+            w.stop_at.as_ref().map_or(buf.len() as u64, |(_, stop, _)| {
+                stop.saturating_sub(w.position)
+            })
+        });
+        if allowed == 0 {
+            return Err(std::io::Error::other("a snapshot passed its byte limit"));
+        }
+        let take = (allowed as usize).min(buf.len());
+        let n = self.0.read(&mut buf[..take])?;
+        WIRE.with(|w| w.borrow_mut().position += n as u64);
+        Ok(n)
+    }
+}
+
+/// Start limiting the snapshot whose dataset name has just been read to `cap`, doubled because a
+/// stored row is itself JSON and escaping can inflate it on the wire, plus the framing slack.
+fn limit_snapshot(dataset: &str, cap: Option<u64>) {
+    WIRE.with(|w| {
+        let mut w = w.borrow_mut();
+        let start = w.position;
+        w.stop_at = cap.map(|cap| {
+            (
+                start,
+                start + cap.saturating_mul(2) + SNAPSHOT_SLACK,
+                dataset.to_string(),
+            )
+        });
+    });
+}
+
 /// Read the feed's lines from `body` as they arrive, never holding a whole line's text, handing each
-/// to `each` until it returns false. Blocking: run it on its own thread.
+/// to `each` until it returns false. Blocking: run it on its own thread. A snapshot that runs past
+/// its dataset's byte limit ends the read with [`SnapshotOverBudget`].
 pub fn read_lines(
     body: impl std::io::Read,
     cap_for: CapFor,
     mut each: impl FnMut(Line) -> bool,
 ) -> Result<()> {
     CAP_FOR.with(|f| *f.borrow_mut() = Some(cap_for));
-    for line in serde_json::Deserializer::from_reader(body).into_iter::<Line>() {
+    WIRE.with(|w| *w.borrow_mut() = WireLimit::default());
+    for line in serde_json::Deserializer::from_reader(Limited(body)).into_iter::<Line>() {
         let budget = BUDGET.with(|b| b.replace(Budget::default()));
+        let stopped = WIRE.with(|w| {
+            let mut w = w.borrow_mut();
+            let at = w.position;
+            w.stop_at
+                .take()
+                .filter(|(_, stop, _)| at >= *stop)
+                .map(|(start, stop, dataset)| SnapshotOverBudget {
+                    dataset,
+                    read: at - start,
+                    limit: stop - start,
+                })
+        });
+        if let (Err(_), Some(over)) = (&line, stopped) {
+            CAP_FOR.with(|f| *f.borrow_mut() = None);
+            return Err(over.into());
+        }
         let mut line = line.context("an unreadable line on the feed")?;
         if let Line::Snapshot { snapshot, .. } = &mut line {
             // A table read before the cap was passed kept its rows; none of them is kept now.
@@ -1314,6 +1407,60 @@ mod tests {
         assert_eq!(got["entities"].over, Some(entry * 50));
         assert_eq!(got["data/free"].blocks.map.len(), 50);
         assert_eq!(got["data/free"].over, None);
+    }
+
+    /// One value larger than its dataset's budget is never read whole: the body stops at the
+    /// snapshot's byte limit, so the parser cannot allocate past it, and the read ends naming the
+    /// dataset. The lines before it were handed over.
+    #[test]
+    fn one_value_over_the_budget_stops_the_read_at_its_byte_limit() {
+        struct Counted<'a>(&'a [u8], std::rc::Rc<std::cell::Cell<usize>>);
+        impl std::io::Read for Counted<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = std::io::Read::read(&mut self.0, buf)?;
+                self.1.set(self.1.get() + n);
+                Ok(n)
+            }
+        }
+        let mut wire = Vec::new();
+        let mut small = Snapshot::default();
+        small.meta.map.insert("last_block".into(), "1".into());
+        let mut huge = Snapshot::default();
+        huge.meta.map.insert("ballast".into(), "x".repeat(8 << 20));
+        for (dataset, snapshot) in [("data/small", small), ("data/huge", huge)] {
+            serde_json::to_writer(
+                &mut wire,
+                &Line::Snapshot {
+                    dataset: DatasetName(dataset.into()),
+                    snapshot,
+                },
+            )
+            .unwrap();
+            wire.push(b'\n');
+        }
+        let consumed = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut seen = Vec::new();
+        let err = read_lines(
+            std::io::BufReader::with_capacity(4096, Counted(&wire, consumed.clone())),
+            Box::new(|_| Some(1_000)),
+            |line| {
+                if let Line::Snapshot { dataset, .. } = line {
+                    seen.push(dataset.0);
+                }
+                true
+            },
+        )
+        .unwrap_err();
+        let over = err.downcast_ref::<SnapshotOverBudget>().expect("{err:#}");
+        assert_eq!(over.dataset, "data/huge");
+        assert_eq!(over.limit, 2_000 + SNAPSHOT_SLACK);
+        assert_eq!(seen, vec!["data/small".to_string()]);
+        assert!(
+            consumed.get() < 200 * 1024,
+            "read {} of {} bytes",
+            consumed.get(),
+            wire.len()
+        );
     }
 
     /// A mount's lowered guards survive the wire, and a follower never serves wider than its own.

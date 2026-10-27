@@ -481,3 +481,101 @@ async fn a_snapshot_over_the_cursor_budget_is_refused_and_its_co_mount_serves() 
     assert_eq!(refused["reason"], "over_budget", "{refused}");
     writer.stop(&root);
 }
+
+/// One stored value larger than its cursor's whole budget: the follower stops reading that snapshot
+/// at its byte limit rather than allocating the value, refuses the mount by name, reconnects without
+/// it, and its co-mount goes on following the writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_value_over_the_budget_is_refused_without_being_read() {
+    const SMALL: &str = "arb";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("runtime");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join(nuthatch::runtime::MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\nmax_rss_mb = 12\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+         chain_id = 42161\nrpc_urls = []\n",
+    )
+    .unwrap();
+    for (route, address) in [(ROUTE, USDC), (SMALL, ARB)] {
+        let dir = root.join("data").join(route);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_nest(&dir, route, address);
+    }
+    let via: PathBuf = tmp.path().join("follower-view");
+    std::os::unix::fs::symlink(&root, &via).unwrap();
+    let tape = Arc::new(TapeSource::new());
+    let mut first = block(1, 0, 100);
+    first.logs.push(transfer_log(
+        ARB,
+        1,
+        first.logs.len() as u64,
+        &first.hash.clone(),
+        &account(3),
+        &account(4),
+        7,
+    ));
+    tape.insert_block(1, first);
+    tape.advance_tip_to(1);
+    let writer = Writer::start_many(&root, tape.clone(), 0, &[ROUTE, SMALL]);
+    writer.reaches(1).await;
+    // 32 MiB in one meta value, against a cursor budget of 12.
+    writer
+        .store
+        .set_meta("ballast", &"x".repeat(32 << 20))
+        .unwrap();
+
+    let (_f, fbase) = bind_follower(&via, &writer).await;
+    let mut big = (0, serde_json::Value::Null);
+    for _ in 0..800 {
+        big = route_status(&fbase, ROUTE).await;
+        if big.1["reason"] == "over_budget" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(big.0, 503, "{}", big.1);
+    assert_eq!(big.1["reason"], "over_budget", "{}", big.1);
+    assert!(
+        big.1["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("wire bytes")),
+        "refused at the byte limit, not after reading the value: {}",
+        big.1
+    );
+
+    // The co-mount follows the writer past the refusal: a block it had never seen arrives.
+    let mut next = block(2, 0, 1);
+    next.logs.push(transfer_log(
+        ARB,
+        2,
+        next.logs.len() as u64,
+        &next.hash.clone(),
+        &account(3),
+        &account(4),
+        9,
+    ));
+    tape.insert_block(2, next);
+    tape.advance_tip_to(2);
+    writer.reaches(2).await;
+    let q = "SELECT count(*) AS n FROM arb__transfer";
+    let mut followed = serde_json::Value::Null;
+    for _ in 0..800 {
+        let resp = reqwest::Client::new()
+            .get(format!("{fbase}/{SMALL}/sql"))
+            .query(&[("q", q)])
+            .send()
+            .await
+            .unwrap();
+        followed = resp.json().await.unwrap_or_default();
+        if followed["rows"][0]["n"] == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(followed["rows"][0]["n"], 2, "{followed}");
+    let (status, ready) = get(&fbase, "/ready").await;
+    assert_eq!(status, 503, "{ready}");
+    assert_eq!(ready["nests"][SMALL]["ready"], true, "{ready}");
+    writer.stop(&root);
+}

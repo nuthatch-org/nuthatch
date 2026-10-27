@@ -87,6 +87,9 @@ struct FeedState {
 #[derive(serde::Deserialize)]
 struct TokenQuery {
     token: Option<String>,
+    /// Datasets, comma-separated, whose snapshots and deltas the follower cannot hold: their mounts
+    /// are still sent, their data is not.
+    exclude: Option<String>,
 }
 
 /// The feed's route. Absent, like the rest of the admin surface, when the admin API is off.
@@ -135,7 +138,15 @@ async fn feed(
             .into_response();
     }
     let (tx, rx) = mpsc::channel::<bytes::Bytes>(QUEUED_LINES);
-    tokio::spawn(serve_connection(s, tx));
+    let excluded = q
+        .exclude
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+        .collect();
+    tokio::spawn(serve_connection(s, tx, excluded));
     let body = futures::stream::unfold(rx, |mut rx| async move {
         rx.recv()
             .await
@@ -159,7 +170,11 @@ impl Drop for Forwarders {
     }
 }
 
-async fn serve_connection(s: FeedState, tx: mpsc::Sender<bytes::Bytes>) {
+async fn serve_connection(
+    s: FeedState,
+    tx: mpsc::Sender<bytes::Bytes>,
+    excluded: std::collections::BTreeSet<String>,
+) {
     let hello = Line::Hello {
         version: env!("CARGO_PKG_VERSION").to_string(),
         feed: crate::feed::FEED_VERSION,
@@ -214,6 +229,7 @@ async fn serve_connection(s: FeedState, tx: mpsc::Sender<bytes::Bytes>) {
                 let live: BTreeMap<String, Arc<dyn HotStore>> = served
                     .iter()
                     .map(|m| (dataset_key(&s.root, &m.dir), m.store.clone()))
+                    .filter(|(d, _)| !excluded.contains(d))
                     .collect();
                 for (dataset, store) in &live {
                     let same = stores.get(dataset).is_some_and(|old| Arc::ptr_eq(old, store));

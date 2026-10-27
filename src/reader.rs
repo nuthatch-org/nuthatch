@@ -120,6 +120,9 @@ struct Inner {
     estimates: HashMap<String, u64>,
     /// Datasets whose hot copy would not fit their cursor's budget, with why.
     over_budget: HashMap<String, String>,
+    /// Datasets whose snapshot ran past its byte limit, which the writer is asked not to send
+    /// until `max_rss_mb` changes or the mount goes.
+    excluded: BTreeSet<String>,
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -196,6 +199,7 @@ impl Follower {
                 max_rss_mb: max_rss_mb(&root),
                 estimates: HashMap::new(),
                 over_budget: HashMap::new(),
+                excluded: BTreeSet::new(),
                 link: Link {
                     connected: false,
                     since: Instant::now(),
@@ -245,8 +249,16 @@ impl Follower {
 
     async fn follow_once(self: &Arc<Self>, client: &reqwest::Client) -> Result<()> {
         use futures::StreamExt;
+        let excluded = self
+            .lock()
+            .excluded
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
         let resp = client
             .get(format!("{}/_admin/feed", self.writer))
+            .query(&[("exclude", excluded)])
             .bearer_auth(&self.token)
             .send()
             .await
@@ -300,7 +312,25 @@ impl Follower {
         pump.abort();
         handled?;
         let pumped = pump.await.unwrap_or(Ok(()));
-        parser.await.context("the feed parser stopped")??;
+        if let Err(e) = parser.await.context("the feed parser stopped")? {
+            if let Some(over) = e.downcast_ref::<crate::feed::SnapshotOverBudget>() {
+                // Not read to the end, so the stream cannot go on: reconnect without it.
+                let dataset = over.dataset.clone();
+                let max = {
+                    let mut inner = self.lock();
+                    inner.excluded.insert(dataset.clone());
+                    inner.max_rss_mb
+                };
+                self.refuse(
+                    &dataset,
+                    format!(
+                        "{over}, set by what its cursor has left of max_rss_mb {max} here; the \
+                         writer still serves it, and this follower stops asking for it"
+                    ),
+                );
+            }
+            return Err(e);
+        }
         pumped
     }
 
@@ -405,7 +435,12 @@ impl Follower {
                 {
                     let mut inner = self.lock();
                     inner.mounts_known = true;
-                    inner.max_rss_mb = max_rss_mb(&self.root);
+                    let max = max_rss_mb(&self.root);
+                    // A new budget may fit what an old one could not: ask again on the next connection.
+                    if max != inner.max_rss_mb {
+                        inner.excluded.clear();
+                    }
+                    inner.max_rss_mb = max;
                 }
                 self.recompose();
             }
@@ -417,6 +452,7 @@ impl Follower {
                         if !inner.routes.values().any(|r| r.spec.dataset == dataset) {
                             inner.datasets.remove(&dataset);
                             inner.positions.remove(&dataset);
+                            inner.excluded.remove(&dataset);
                             crate::seal::unpin_catalogue(&self.root.join(&dataset));
                         }
                     }
