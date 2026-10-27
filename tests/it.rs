@@ -80,6 +80,8 @@ mod e2e_resolution;
 mod e2e_runtime_lifecycle;
 #[path = "e2e_runtime_parity.rs"]
 mod e2e_runtime_parity;
+#[path = "e2e_s3_registry.rs"]
+mod e2e_s3_registry;
 #[path = "e2e_seal_determinism.rs"]
 mod e2e_seal_determinism;
 #[path = "e2e_seed_from_mirror.rs"]

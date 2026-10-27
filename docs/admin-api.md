@@ -78,7 +78,7 @@ A mount can take minutes when it fetches, so it answers `202` at once with a job
 `generation` is the claim this job holds on the name, from a counter the runtime never reuses, so a
 job that was forgotten cannot mount over a later one. `phase` moves through `accepted`, `fetching`
 (only when the registry is needed), `joining` (catching up beside the cursor before it joins), and
-ends at `live` or `failed`, with a `reason` on a failure. A suspended mount reads `suspended`. Poll
+ends at `live` or `failed`, with a `reason` and a `code` on a failure. A suspended mount reads `suspended`. Poll
 `GET /_admin/mounts/<name>`; reading it never waits on a mount in progress. Unfinished jobs survive a
 restart and resume; failed ones stay readable until the name is mounted again or unmounted.
 
@@ -94,6 +94,15 @@ changing a live mount's nest is a move.
 
 `?wait=true` answers only when the mount has finished, with the synchronous statuses below, and a repeat
 of a live mount is `200` there too. Use it from a script; a platform should poll.
+
+`code` is for a caller to branch on, where `reason` is for a person to read:
+
+| `code` | Why |
+|---|---|
+| `not_found` | the registry holds no bundle under that NID |
+| `access_denied` | the registry refused the credential, or has none for a private bucket (an S3 `401` or `403`) |
+| `verification_failed` | the registry served bytes that are not that nest: the bundle computes to another NID, a file's hash or the content address does not match, or the decode registry does not reproduce |
+| `other` | anything else, including every refusal below |
 
 ### Refusals
 

@@ -1649,7 +1649,12 @@ nuthatch nest load <nid> --registry <ref>         # pull by NID, refused unless 
 
 The registry is **decoupled** from the binary: a filesystem path or S3-compatible object storage, with
 private-nest authentication. nuthatch pulls; it never becomes the registry, and resolution stays
-local-first. (Live S3 verification against a real bucket is still pending an operator run.)
+local-first. S3 credentials come only from the environment, through object_store's standard AWS chain:
+`AWS_*` variables (static keys, web identity, container credentials), then instance metadata.
+`AWS_PROFILE` is not read. The S3 backend was first verified live against Hetzner Object Storage, and
+CI's versitygw job now runs it against a private bucket: `nest publish`, a runtime mount by NID through
+the admin API, and each failure `code` a mount job reports (`not_found`, `access_denied`,
+`verification_failed`; see [admin-api.md](admin-api.md)).
 
 A bundle carries `nuthatch.toml` verbatim, so `nest bundle` refuses one holding a webhook `secret`, or an RPC,
 webhook or alert URL that looks keyed (userinfo, a key-named query parameter, or a long token in the

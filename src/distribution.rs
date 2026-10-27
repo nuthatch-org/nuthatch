@@ -85,6 +85,73 @@ fn access_denied(subject: &str) -> String {
     )
 }
 
+/// Why a registry fetch failed, as a failed mount job reports it beside its reason (RFC-0073 FR15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCode {
+    NotFound,
+    AccessDenied,
+    /// The registry served bytes that are not the nest asked for.
+    VerificationFailed,
+    Other,
+}
+
+impl FailureCode {
+    /// The code of the first typed cause in `e`'s chain; anything untyped is `Other`.
+    pub fn of(e: &anyhow::Error) -> FailureCode {
+        e.chain()
+            .find_map(|c| {
+                if let Some(r) = c.downcast_ref::<RegistryError>() {
+                    Some(r.code)
+                } else if c.downcast_ref::<crate::blob::Unverified>().is_some() {
+                    Some(FailureCode::VerificationFailed)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(FailureCode::Other)
+    }
+}
+
+/// A registry read that failed for a reason a caller acts on differently: absent, or refused.
+#[derive(Debug)]
+pub struct RegistryError {
+    pub code: FailureCode,
+    message: String,
+}
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RegistryError {}
+
+#[cfg(test)]
+impl RegistryError {
+    pub(crate) fn for_test(code: FailureCode) -> RegistryError {
+        RegistryError {
+            code,
+            message: format!("{code:?}"),
+        }
+    }
+}
+
+fn not_found_err(subject: &str) -> anyhow::Error {
+    anyhow::Error::new(RegistryError {
+        code: FailureCode::NotFound,
+        message: format!("{subject} not found in this registry"),
+    })
+}
+
+fn access_denied_err(subject: &str) -> anyhow::Error {
+    anyhow::Error::new(RegistryError {
+        code: FailureCode::AccessDenied,
+        message: access_denied(subject),
+    })
+}
+
 /// A content-addressed bundle store: immutable blobs keyed by hash, plus a thin name→hash index. Both
 /// a local directory ([`FsStore`]) and an S3 bucket ([`ObjectStore`]) implement this; callers never see
 /// which. Async because object storage is - the FS impl just does its (fast) sync work in an async fn.
@@ -195,10 +262,8 @@ impl BundleStore for FsStore {
 /// keeps its context. Read-side only - where the private-vs-absent distinction matters to a puller.
 fn map_io_err(e: std::io::Error, subject: &str, path: &Path) -> anyhow::Error {
     match e.kind() {
-        std::io::ErrorKind::NotFound => {
-            anyhow::anyhow!("{subject} not found in this registry")
-        }
-        std::io::ErrorKind::PermissionDenied => anyhow::anyhow!(access_denied(subject)),
+        std::io::ErrorKind::NotFound => not_found_err(subject),
+        std::io::ErrorKind::PermissionDenied => access_denied_err(subject),
         _ => anyhow::Error::new(e).context(format!("reading {}", path.display())),
     }
 }
@@ -303,10 +368,16 @@ pub async fn pull_by_nid(store: &dyn BundleStore, nid: &str) -> Result<(String, 
     let bundle_file = tmp.path().join("pulled.bundle");
     std::fs::write(&bundle_file, &bytes).context("writing pulled bundle")?;
     let actual = crate::blob::bundle_manifest(&bundle_file)
-        .with_context(|| format!("reading the manifest of bundle {hash}"))?
+        .map_err(|e| {
+            anyhow::Error::new(crate::blob::Unverified(format!(
+                "the registry's bundle {hash} for nid {nid} has no readable manifest: {e:#}"
+            )))
+        })?
         .nid();
     if actual != nid {
-        bail!("the registry maps nid {nid} to bundle {hash}, whose nid is {actual} - refusing it");
+        return Err(anyhow::Error::new(crate::blob::Unverified(format!(
+            "the registry maps nid {nid} to bundle {hash}, whose nid is {actual} - refusing it"
+        ))));
     }
     Ok((hash, bytes))
 }
@@ -472,16 +543,23 @@ mod object_store_impl {
             }
             let url = url::Url::parse(locator)
                 .with_context(|| format!("parsing registry URL {locator:?}"))?;
-            // `parse_url_opts` matches option keys **case-sensitively and in lower case**, while every
-            // operator on earth exports the AWS convention in upper case (`AWS_ACCESS_KEY_ID`). Passing
-            // `std::env::vars()` raw therefore matched nothing: credentials were silently ignored and
-            // the S3 client fell through to EC2 instance metadata, spending ~5s on ten retries against
-            // 169.254.169.254 before failing with "Host is down" - an error naming an address the
-            // operator never configured.
-            //
-            // Found by the RFC-0019 live verification against Hetzner Object Storage; the backend was
-            // effectively unusable as documented, including by our own error text ("check your AWS_*
-            // env").
+            let (scheme, prefix) = object_store::ObjectStoreScheme::parse(&url)
+                .with_context(|| format!("parsing registry URL {locator:?}"))?;
+            if scheme == object_store::ObjectStoreScheme::AmazonS3 {
+                // object_store's standard AWS chain: `AWS_*` env (static keys, web identity, container
+                // credentials), then instance metadata. This crate does not read `AWS_PROFILE`.
+                let store = object_store::aws::AmazonS3Builder::from_env()
+                    .with_url(locator)
+                    .build()
+                    .with_context(|| format!("opening object-store registry {locator:?}"))?;
+                return Ok(ObjStore {
+                    inner: Arc::new(store),
+                    prefix,
+                });
+            }
+            // `parse_url_opts` matches option keys only in lower case, while operators export the AWS
+            // convention in upper case; raw env matched nothing and fell through to instance metadata.
+            // Found by the RFC-0019 live verification against Hetzner Object Storage.
             let opts = crate::distribution::object_store_options(std::env::vars());
             let (store, path) = object_store::parse_url_opts(&url, opts)
                 .with_context(|| format!("opening object-store registry {locator:?}"))?;
@@ -510,13 +588,10 @@ mod object_store_impl {
     /// distinctly, never as a bare "not found".
     fn map_obj_err(e: object_store::Error, subject: &str) -> anyhow::Error {
         match e {
-            object_store::Error::NotFound { .. } => {
-                anyhow::anyhow!("{subject} not found in this registry")
-            }
+            object_store::Error::NotFound { .. } => not_found_err(subject),
+            // An S3 403 arrives as PermissionDenied and a 401 as Unauthenticated, from the status.
             object_store::Error::PermissionDenied { .. }
-            | object_store::Error::Unauthenticated { .. } => {
-                anyhow::anyhow!(access_denied(subject))
-            }
+            | object_store::Error::Unauthenticated { .. } => access_denied_err(subject),
             other => anyhow::Error::new(other).context(subject.to_string()),
         }
     }
@@ -594,6 +669,59 @@ mod object_store_impl {
                 .context("ref is not valid utf-8")?
                 .trim()
                 .to_string())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn code(e: object_store::Error) -> FailureCode {
+            FailureCode::of(&map_obj_err(e, "nid x"))
+        }
+
+        fn source() -> Box<dyn std::error::Error + Send + Sync> {
+            "status 403".into()
+        }
+
+        /// RFC-0073 FR15: each object-store error kind a fetch can meet, as a mount job reports it.
+        #[test]
+        fn object_store_errors_map_to_failure_codes() {
+            let path = || "p".to_string();
+            assert_eq!(
+                code(object_store::Error::NotFound {
+                    path: path(),
+                    source: source()
+                }),
+                FailureCode::NotFound
+            );
+            assert_eq!(
+                code(object_store::Error::PermissionDenied {
+                    path: path(),
+                    source: source()
+                }),
+                FailureCode::AccessDenied
+            );
+            assert_eq!(
+                code(object_store::Error::Unauthenticated {
+                    path: path(),
+                    source: source()
+                }),
+                FailureCode::AccessDenied
+            );
+            assert_eq!(
+                code(object_store::Error::Generic {
+                    store: "S3",
+                    source: source()
+                }),
+                FailureCode::Other
+            );
+        }
+
+        #[test]
+        fn an_s3_locator_keeps_its_prefix() {
+            let store = ObjStore::from_locator("s3://bucket/some/prefix").unwrap();
+            assert_eq!(store.prefix.as_ref(), "some/prefix");
         }
     }
 }
@@ -692,9 +820,56 @@ abi = "abis/c.json"
         let err = load_from_registry(registry, &nid_a, Some(&installed))
             .await
             .expect_err("a substituted bundle must be refused");
+        assert_eq!(FailureCode::of(&err), FailureCode::VerificationFailed);
         let err = format!("{err:#}");
         assert!(err.contains(&nid_a) && err.contains(&nid_b), "{err}");
         assert!(!installed.join(crate::config::CONFIG_FILE).exists());
+
+        // Bytes that are not a bundle at all are as unverified as the wrong bundle.
+        store
+            .put_blob("f".repeat(64).as_str(), b"not a tar")
+            .await
+            .unwrap();
+        store.set_nid_ref(&nid_a, &"f".repeat(64)).await.unwrap();
+        let err = install_by_nid(registry, &nid_a, &installed)
+            .await
+            .expect_err("a blob that is not a bundle must be refused");
+        assert_eq!(
+            FailureCode::of(&err),
+            FailureCode::VerificationFailed,
+            "{err:#}"
+        );
+    }
+
+    /// RFC-0073 FR15: a blob whose bytes are not the content address it was fetched by fails
+    /// verification, not as an untyped error.
+    #[tokio::test]
+    async fn a_pinned_hash_the_blob_does_not_match_is_a_verification_failure() {
+        let reg = tempfile::tempdir().unwrap();
+        let registry = reg.path().to_str().unwrap();
+        let store = open(registry).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.bundle"), dir.path().join("b.bundle"));
+        let hash_a = write_bundle_fixture(&a, "one");
+        write_bundle_fixture(&b, "two");
+        store
+            .put_blob(&hash_a, &std::fs::read(&b).unwrap())
+            .await
+            .unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let err = load_pinned_from_registry(
+            registry,
+            "a",
+            Some(&hash_a),
+            Some(&target.path().join("nest")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            FailureCode::of(&err),
+            FailureCode::VerificationFailed,
+            "{err:#}"
+        );
     }
 
     /// #1551: a NID nothing was published under fails loudly, and a nest name shaped like a NID is
@@ -707,6 +882,7 @@ abi = "abis/c.json"
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("not found"), "{err:#}");
+        assert_eq!(FailureCode::of(&err), FailureCode::NotFound);
 
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("t.bundle");
@@ -777,12 +953,10 @@ abi = "abis/c.json"
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
             return;
         }
-        let err = store
-            .get_ref("secret", "1.0.0")
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = store.get_ref("secret", "1.0.0").await.unwrap_err();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
+        assert_eq!(FailureCode::of(&err), FailureCode::AccessDenied);
+        let err = err.to_string();
         assert!(err.contains("access denied"), "got: {err}");
         assert!(
             !err.contains("not found"),

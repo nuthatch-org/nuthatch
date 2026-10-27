@@ -15,7 +15,7 @@ use nuthatch::{health::RuntimeHealth, indexer, runtime, serve, store::Store};
 use common::tape::*;
 
 /// The admin token of a route set that is not testing the token itself.
-const OPEN: &str = "open-token";
+pub(crate) const OPEN: &str = "open-token";
 
 /// A two-nest, one-chain mounts over a scripted tape, wrapped in the driver handles a live mounts keeps.
 /// A lifecycle change is written back, and a runtime with no table to write to reports that as a
@@ -157,7 +157,7 @@ async fn status(live: &serve::LiveRuntime, path: &str) -> axum::http::StatusCode
 }
 
 /// Drive one GET through the served composition and return its parsed JSON body.
-async fn body_json(live: &serve::LiveRuntime, path: &str) -> serde_json::Value {
+pub(crate) async fn body_json(live: &serve::LiveRuntime, path: &str) -> serde_json::Value {
     use tower::ServiceExt;
     let req = axum::http::Request::builder()
         .uri(path)
@@ -1283,7 +1283,7 @@ async fn a_disabled_admin_surface_exposes_no_lifecycle_routes() {
 /// Drive one request through the lifecycle routes as an HTTP caller would, and return
 /// (status, body). Built from `lifecycle_routes` itself rather than from the handlers, so route
 /// registration and extractor order are part of what is under test.
-async fn call(
+pub(crate) async fn call(
     routes: &axum::Router,
     method: &str,
     uri: &str,
@@ -1605,12 +1605,12 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
         .expect("after the last mount goes, the shared store must be reopenable");
 }
 
-type CursorIntake =
+pub(crate) type CursorIntake =
     tokio::sync::mpsc::UnboundedReceiver<(String, tokio::task::JoinHandle<anyhow::Result<()>>)>;
 
 /// A runtime that started with nothing mounted (#1545): `arbitrum-one` has a source and no cursor,
 /// and the nest at `data/<nid>/` is recorded but not running.
-async fn empty_runtime(
+pub(crate) async fn empty_runtime(
     roost_dir: &std::path::Path,
     nid: &str,
 ) -> (runtime::RuntimeHandles, Arc<TapeSource>, CursorIntake) {
@@ -1964,7 +1964,11 @@ fn test_jobs() -> Arc<nuthatch::mount_jobs::MountJobs> {
 }
 
 /// Poll `GET /_admin/mounts/<name>` until the job reaches `phase`, returning its last body.
-async fn wait_for_phase(routes: &axum::Router, name: &str, phase: &str) -> serde_json::Value {
+pub(crate) async fn wait_for_phase(
+    routes: &axum::Router,
+    name: &str,
+    phase: &str,
+) -> serde_json::Value {
     let deadline = std::time::Instant::now() + POLL_TIMEOUT;
     loop {
         let (_, body) = call(routes, "GET", &format!("/_admin/mounts/{name}"), None, None).await;

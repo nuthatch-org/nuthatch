@@ -3797,12 +3797,7 @@ pub fn spawn_mount_job(
             }
             Err(e) => {
                 tracing::warn!("mounting '{name}' failed: {e:#}");
-                if let Err(write) = jobs.advance_if_owned(
-                    &name,
-                    generation,
-                    MountPhase::Failed,
-                    Some(format!("{e:#}")),
-                ) {
+                if let Err(write) = jobs.fail_if_owned(&name, generation, &e) {
                     tracing::warn!(
                         "mount of '{name}' failed and the job file was not updated: {write:#}"
                     );
@@ -3909,12 +3904,7 @@ pub fn spawn_move_job(
             }
             Err(e) => {
                 tracing::warn!("moving '{name}' failed: {e:#}");
-                if let Err(write) = jobs.advance_if_owned(
-                    &name,
-                    generation,
-                    MountPhase::Failed,
-                    Some(format!("{e:#}")),
-                ) {
+                if let Err(write) = jobs.fail_if_owned(&name, generation, &e) {
                     tracing::warn!(
                         "move of '{name}' failed and the job file was not updated: {write:#}"
                     );
