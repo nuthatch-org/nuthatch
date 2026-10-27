@@ -4857,7 +4857,7 @@ dependencies = [
 
 [[package]]
 name = "nuthatch"
-version = "5.12.0"
+version = "5.12.1"
 dependencies = [
  "Inflector",
  "alloy-consensus",
