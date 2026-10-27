@@ -1003,6 +1003,10 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /shape` | capability probe: what this nest can answer (drives adaptive MCP) |
 | `GET /_admin/`, `/_admin/events`, `/_admin/config`, `/_admin/storage`, `/_admin/requests` | admin UI (eight tabs since 4.2.1), its event stream, the authored files and limits as JSON with every URL cut to scheme and host and every secret withheld, the sealed catalogue per table (`?table=` for one table's segments), and the last 256 requests served (`?since=<seq>` for those after one): route template, the declared query or entity name when the nest knows it, status, milliseconds and bytes, never SQL text, a query string, a path value or a client address, and not the monitoring reads (`/`, `/health`, `/ready`, `/metrics`, `/_admin*`). Token-gated off-localhost; removable with `--no-admin` |
 
+**Cost header:** a request to `/sql`, `/q/{name}`, GraphQL or a typed route that sends
+`Nuthatch-Cost: 1` is answered with a `Nuthatch-Cost` header, a report of what it read and held;
+[The cost header](#the-cost-header) has its format. Without the request header nothing is sent.
+
 **Runtime root routes:** `GET /nests` (roster with live per-nest health), `GET /ready` (runtime-wide),
 `GET /health`, and `GET /metrics` (the whole runtime's exposition, served before anything is mounted;
 each mount's `/metrics` serves the same).
@@ -1103,10 +1107,11 @@ job:
 | response bytes in flight | 256 MiB per process | `/sql` and `/q` bodies held while slow readers drain them, shared by every nest in the process. Past it a request is refused with `503` and counts as `busy` |
 | max concurrent queries | 2 | the real DoS multiplier: a semaphore. A request over the limit waits up to **250 ms** for a permit and only then returns `503`, so a short burst smooths instead of bouncing (#1319); the wait is charged against the statement timeout, so queuing cannot extend a request's total deadline. The permit count still decides how many queries run at once. `NUTHATCH_SQL_MAX_CONCURRENCY` still overrides it, ceiling 16, and is not an unconstrained config key |
 | max queued queries | 256 per nest | the bound that makes the wait above safe: it caps how *many* requests may be parked waiting, where the 250 ms caps how *long* each one waits. Without it a burst parks arrival-rate × 250 ms requests before any time out. Past the cap a request is refused immediately, as every over-limit request was before the wait existed. A parked request holds only its query string (≤ 16 KiB), so the worst case is roughly 4 MB per nest |
-| tenant share | one permit per tenant on each gate, and half the response bytes split by weight, reserved | in a runtime, each tenant label's part of its chain's gate and of the response bytes (RFC-0073 FR2). A tenant borrows past its reservation only while every other tenant's stays free, so one tenant's burst cannot hold another's query past the 250 ms wait. Past its share a tenant is refused `429` with `"reason": "tenant_share"`; a runtime with one tenant, and a lone nest, are only ever told `busy`. Weights and caps are `[tenants.<tenant>]` in `mounts.toml`, set live by `PUT /_admin/tenants/<tenant>`; see [admin-api.md](admin-api.md#tenant-shares) |
+| tenant share | one permit per tenant on each gate, and half the response bytes and of the hot-tip copies split by weight, reserved | in a runtime, each tenant label's part of its chain's gate and of the response bytes (RFC-0073 FR2). A tenant borrows past its reservation only while every other tenant's stays free, so one tenant's burst cannot hold another's query past the 250 ms wait. Past its share a tenant is refused `429` with `"reason": "tenant_share"`; a runtime with one tenant, and a lone nest, are only ever told `busy`. Weights and caps are `[tenants.<tenant>]` in `mounts.toml`, set live by `PUT /_admin/tenants/<tenant>`; see [admin-api.md](admin-api.md#tenant-shares) |
 | engine memory / threads | 512 MB / 2 (threads ceiling 16) | `analytics.memory_limit` / `analytics.threads`. Memory times the pools (the smaller of the permit count and the cursor's datasets) is refused at startup if it plus `ingestion_reservation` exceeds 2 GiB. Threads share the permit ceiling of 16 and are refused above it |
 | max query length | 16 KiB | rejects absurd query strings before the planner |
 | max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially. The same holds past **64 MiB** of stored hot-row JSON, whichever comes first |
+| hot-tip copies in flight | 128 MiB per chain gate | the stored hot-row JSON every query on one chain's gate holds copied at once, `/sql`, `/explain`, `/diff`, `/q` and GraphQL alike, measured before a row is parsed and given back when the query ends (RFC-0073 FR5). It is what the two default permits could already hold, so it adds nothing to the 2 GiB budget, and raising the permit count no longer multiplies it. A copy that does not fit now is refused `503` `busy`; one larger than the whole budget is refused as an over-budget tip. In a runtime it is divided between tenants like response bytes, and a tenant past its share is refused `429` `tenant_share` before copying |
 | declared-query scan bound | 512 MiB | named queries (`/q/{name}`) only: source bytes the plan may read, each Parquet scan charged the widest table it can reach, plus the hot and maintained rows copied for it. Checked on the connection that runs the statement, before it is evaluated. Over the cap, or a plan that can rescan (nested-loop or delim join, recursive CTE), answers `422` |
 
 **Lowering the guards.** The statement timeout, row, result-byte, unsealed-row, unsealed-byte,
@@ -1168,7 +1173,8 @@ nuthatch dev --cors https://app.example.com --cors http://localhost:3000
 nuthatch serve --cors '*'          # any origin; fine for a public read-only nest
 ```
 
-It sets allow-origin, allow-methods `GET,POST,OPTIONS` and allow-headers, and answers preflight.
+It sets allow-origin, allow-methods `GET,POST,OPTIONS` and allow-headers (mirrored, so a page may
+send `Nuthatch-Cost: 1`), exposes the [`Nuthatch-Cost`](#the-cost-header) answer, and answers preflight.
 `POST` is there for the GraphQL routes (`/graphql`, `/subgraphs/id/{id}`, `/subgraphs/name/…`,
 present only in a `--features graph` build), which take their query in a body - a `GET`-only list would leave a browser GraphQL client
 preflighting `POST`, being refused, and never sending the query. No `/_admin` path is ever
@@ -1343,6 +1349,59 @@ FR4): `nuthatch_nest_http_requests_total`, `nuthatch_nest_sql_queries_total`,
 that ran an analytical query (`/sql`, `/q/{name}`, `/diff`, GraphQL), admission wait included. Two
 mounts of one dataset are counted apart, and summed over mounts each equals its unlabelled total. A
 mount's series go when it is unmounted.
+
+### The cost header
+
+A request to `/sql`, `/q/{name}`, the GraphQL routes or the typed routes (`/table/{name}`,
+`/entities`, `/entity/{id}`, the three `/derived` routes, `/balances`, `/balance/{address}`,
+`/exposure/{address}`, `/flags`) that sends `Nuthatch-Cost: 1` is answered with a `Nuthatch-Cost`
+header saying what that request read and held (RFC-0073 FR4). A gateway that wants it adds the
+request header itself. A request without it, or with any other value, gets no header and computes
+none of it: the footer pass behind `sealed_bytes` costs a filtered query over 1,500 segments roughly
+a sixth more, and most callers never read the answer.
+
+```
+GET /sql?q=… HTTP/1.1
+Nuthatch-Cost: 1
+
+HTTP/1.1 200 OK
+Nuthatch-Cost: sealed_bytes=1409; hot_rows=12; engine_us=3793; peak_mem_bytes=0; queue_us=0; result_bytes=219712; sealed_bytes_read=1409
+```
+
+It is a report, not a price. Nuthatch meters and bills nothing; a gateway that wants to charge, cap
+or simply log by it does so on its own terms. The fields are always present, in this order,
+separated by `; `, each an integer. A new field is only ever added at the end, so a parser that
+reads by name, or by position for the fields it knows, keeps working:
+
+| Field | Meaning |
+|---|---|
+| `sealed_bytes` | Parquet data bytes the request's statements select from sealed segments: the column chunks each scan projects or filters on, in every row group its file and row-group statistics keep, footers excluded. Decided from the footers before the statement runs |
+| `hot_rows` | rows read from the hot tip: the tip snapshot a statement was given, or the rows a typed route took from it |
+| `engine_us` | wall time of the request's statements in Burrmill, from admission inside the engine to the last batch, encoding the rows included |
+| `peak_mem_bytes` | the most any one statement held against the analytics memory pool |
+| `queue_us` | time spent waiting for a `/sql` permit |
+| `result_bytes` | the serialized body |
+| `sealed_bytes_read` | Parquet data bytes the statements actually fetched, footers excluded |
+
+`sealed_bytes` is the figure to build on. Segments are immutable and the selection is made from
+their footers before anything runs, so the same statement over the same sealed segments reports the
+same number, in one process or another; tests hold `/sql`, an `ORDER BY … LIMIT`, and the sealed fill
+of `/table/{name}` to it. It does not count what a running statement then skips: a page index,
+a bloom filter, or the dynamic filter a TopK or a join narrows as it goes.
+
+`sealed_bytes_read` is what was fetched, and it can vary between runs of the same statement. A TopK
+(`ORDER BY … LIMIT`, and `/table/{name}`'s sealed fill) prunes by what its other partitions have
+found so far, and a plain `LIMIT` stops whichever partitions are behind, so the read follows the race:
+up to half as much again from one run to the next in Burrmill's own test. Nor is it bounded by
+`sealed_bytes`: a filtered statement in those tests read 19,289 bytes against 17,714 selected.
+
+A remembered answer (the [analytical memo](#the-analytical-memo)) runs nothing and reports `0` for
+both. The other fields move with the machine and its load. There is no CPU-time field: a scan
+registers each segment's compute time into its DataFusion metrics as it opens the segment, so reading
+it at the end means holding those metrics through the scan, which Burrmill's scan-memory gate
+measured at 7 KiB a segment outside the memory pool against 1 KiB without (burrmill#86). `engine_us`
+is wall time instead. A route that reads only maintained state, `/balances` or `/derived` for
+instance, reads no sealed bytes and no hot rows.
 
 A nest that mirrors itself (RFC-0052, `--publish-target`) also carries, per nest and only then:
 `nuthatch_publish_sealed_through` (what the published catalogue covers),
@@ -1705,6 +1764,12 @@ The hashes show every file is the one the mirror's catalogue names. They do not 
 catalogue or that it is true to the chain, so seed from an operator you would trust to run the nest
 for you. A seed that is interrupted leaves the nest marked, and `dev` refuses it until `seed` is run
 again.
+A runtime seeds a mount over the admin API instead (RFC-0073 FR16): `POST /_admin/nests` with
+`"seed": true` reads the mirror the request's `publish` names, else the mount's `[mounts.publish]`,
+else `[runtime.publish]`, which also mirrors every dataset whose mounts name none of their own. To
+rebuild a lost runtime, keep `[runtime.publish]` pointed at the bucket, and on the new box mount each
+NID again with `"seed": true`; every nest comes back from the mirror and follows the chain from where
+the mirror ends. The job reports progress and resumes as `docs/admin-api.md` describes.
 
 **Restore.** Put the directory back and start. Progress resumes from the checkpoint.
 

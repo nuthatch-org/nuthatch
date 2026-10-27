@@ -168,7 +168,9 @@ cap becomes a function of the ceiling (32 at 2 GiB, proportionally fewer below).
 Boot stops refusing the whole runtime for an over-budget cursor: it boots the mounts that fit, in
 `mounts.toml` order, and marks the rest refused with the reason. The per-query hot-tip copy is charged
 to the requesting tenant's share (FR2) and bounded by the mount's limits (FR3); replacing the copy
-with a scan of the hot store is a later optimisation, not a launch item. GraphOps's alternative, several
+with a scan of the hot store is a later optimisation, not a launch item. *(Built: each gate holds 128 MiB
+of hot-tip copies in flight, measured before parsing and divided between tenants as response bytes are;
+FR5 is complete.)* GraphOps's alternative, several
 cursors per chain, is not taken: one cursor per chain stays a law, and a second runtime is the way to
 split a chain's load.
 

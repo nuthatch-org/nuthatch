@@ -80,6 +80,8 @@ mod e2e_reconcile;
 mod e2e_reorg;
 #[path = "e2e_resolution.rs"]
 mod e2e_resolution;
+#[path = "e2e_runtime_chains.rs"]
+mod e2e_runtime_chains;
 #[path = "e2e_runtime_lifecycle.rs"]
 mod e2e_runtime_lifecycle;
 #[path = "e2e_runtime_parity.rs"]
@@ -90,6 +92,8 @@ mod e2e_s3_registry;
 mod e2e_seal_determinism;
 #[path = "e2e_seed_from_mirror.rs"]
 mod e2e_seed_from_mirror;
+#[path = "e2e_seed_mount.rs"]
+mod e2e_seed_mount;
 #[path = "e2e_serve_local_store.rs"]
 mod e2e_serve_local_store;
 #[path = "e2e_shared_dataset.rs"]

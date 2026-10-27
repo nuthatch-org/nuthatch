@@ -401,6 +401,40 @@ pub struct ChainEndpoint {
     pub chain_id: u64,
     #[serde(default)]
     pub rpc_urls: Vec<String>,
+    /// Blocks behind the tip before sealing, for a chain the registry does not know (RFC-0073 FR9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finality_depth: Option<u64>,
+    /// The `eth_getLogs` window, likewise only for a chain the registry does not know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_window: Option<u64>,
+}
+
+impl ChainEndpoint {
+    pub fn policy(&self) -> crate::chains::DeclaredPolicy {
+        crate::chains::DeclaredPolicy {
+            finality_depth: self.finality_depth,
+            log_window: self.log_window,
+        }
+    }
+
+    /// The registry's policy wins for a chain it knows, so declaring one there is refused rather than
+    /// silently ignored.
+    fn check_policy(&self) -> Result<()> {
+        if self.log_window == Some(0) {
+            bail!("chain '{}' declares log_window = 0", self.chain);
+        }
+        if let Some(known) = crate::chains::lookup(&self.chain) {
+            if self.finality_depth.is_some() || self.log_window.is_some() {
+                bail!(
+                    "chain '{}' is in the built-in registry as '{}', which sets its finality and \
+                     window; drop finality_depth and log_window",
+                    self.chain,
+                    known.name
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,6 +470,10 @@ pub struct RuntimeMeta {
     /// are not indexed or served until resumed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspended: Vec<String>,
+    /// `[runtime.publish]`: the mirror of every dataset whose mounts name none of their own, and
+    /// where `seed: true` reads from (RFC-0073 FR16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<MountPublish>,
 }
 
 /// SEC-10: anything that becomes a filesystem path segment *and* a route segment gets this charset.
@@ -773,6 +811,9 @@ impl MountTable {
             &raw,
         );
         mounts.validate_mounts()?;
+        for chain in &mounts.chains {
+            chain.check_policy()?;
+        }
         // Every mount, whichever form declared it, must be a safe path segment and must not collide
         // with a reserved top-level route - the roster and the per-nest prefixes share one namespace.
         let mut seen = std::collections::HashSet::new();
@@ -804,6 +845,9 @@ impl MountTable {
     fn validate_mounts(&self) -> Result<()> {
         // The primary key is `(tenant, alias)`: two tenants may each call their mount "usdc" and
         // both must work, so uniqueness is *within* a tenant and never global (RFC-0032 §4.1).
+        if let Some(publish) = &self.runtime.publish {
+            publish.settings().context("invalid [runtime.publish]")?;
+        }
         let mut seen = std::collections::HashSet::new();
         for m in &self.mounts {
             let nid = Nid::parse(&m.nid)
@@ -1061,6 +1105,8 @@ impl MountTable {
                 chain,
                 chain_id,
                 rpc_urls: self.runtime.rpc_urls.clone(),
+                finality_depth: None,
+                log_window: None,
             }),
             _ => None,
         }
@@ -1545,18 +1591,21 @@ pub fn load_mounted(
     Ok(out)
 }
 
-/// A publisher for every mount that declares `[mounts.publish]` (RFC-0052 S2), keyed by route. One
-/// per record: two mounts of one dataset naming one target contend on S1's conditional catalogue put.
+/// A publisher for every mount that declares `[mounts.publish]` (RFC-0052 S2), keyed by route, and
+/// for each dataset `[runtime.publish]` covers. One per record: two mounts of one dataset naming one
+/// target contend on S1's conditional catalogue put.
 pub fn spawn_publishers(
     dir: &Path,
     mounts: &[Mount],
+    default: Option<&MountPublish>,
     default_tenant: &str,
 ) -> Result<Vec<(String, crate::publish::Publisher)>> {
     let mut out = Vec::new();
     for m in mounts {
-        if let Some(publish) = &m.publish {
-            // The first mount of a dataset is the one its cursor indexes under, as `Dataset::canonical`.
-            let canonical = mounts.iter().find(|first| first.nid == m.nid).unwrap_or(m);
+        // The first mount of a dataset is the one its cursor indexes under, as `Dataset::canonical`.
+        let canonical = mounts.iter().find(|first| first.nid == m.nid).unwrap_or(m);
+        let first = std::ptr::eq(canonical, m);
+        if let Some(publish) = mirror_of(m, mounts, default, first) {
             let cursor_key = mount_route(canonical, default_tenant);
             out.push(spawn_publisher(
                 dir,
@@ -1568,6 +1617,20 @@ pub fn spawn_publishers(
         }
     }
     Ok(out)
+}
+
+/// Where `m`'s dataset is mirrored: its own `[mounts.publish]`, else the runtime's, taken by the
+/// `first` mount of a dataset none of whose mounts names its own, so the default publishes it once.
+fn mirror_of<'a>(
+    m: &'a Mount,
+    mounts: &[Mount],
+    default: Option<&'a MountPublish>,
+    first: bool,
+) -> Option<&'a MountPublish> {
+    m.publish.as_ref().or_else(|| {
+        let own = mounts.iter().any(|s| s.nid == m.nid && s.publish.is_some());
+        default.filter(|_| first && !own)
+    })
 }
 
 fn mount_route(m: &Mount, default_tenant: &str) -> String {
@@ -2133,6 +2196,8 @@ pub async fn dev(
     let mut estimates: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut sources: std::collections::HashMap<String, Arc<dyn Source>> =
         std::collections::HashMap::new();
+    let mut pools: std::collections::HashMap<String, Arc<crate::source::LivePool>> =
+        std::collections::HashMap::new();
     let mut endpoint_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut chain_freshness: std::collections::HashMap<String, crate::freshness::Freshness> =
@@ -2207,10 +2272,13 @@ pub async fn dev(
             rpc_urls,
             ..group.endpoint.clone()
         };
-        let (source, dial) =
+        let (pool, dial) =
             open_chain(&endpoint, rpc_fallback.clone(), &meta.name, freshness).await?;
+        pools.insert(group.endpoint.chain.clone(), pool.clone());
+        let source: Arc<dyn Source> = pool;
         for (_, _, config) in &mut group.nests {
             config.freshness = dial;
+            config.chain_policy = group.endpoint.policy();
         }
         chain_freshness.insert(group.endpoint.chain.clone(), dial);
         // Retained so a mount can build a nest against the same source its co-tenants use - a nest
@@ -2332,7 +2400,7 @@ pub async fn dev(
         &all_mounts.tenants,
     )?;
     let all_states = all_states;
-    let publishers = spawn_publishers(&dir, &mounts.mounts, default_tenant)?;
+    let publishers = spawn_publishers(&dir, &mounts.mounts, meta.publish.as_ref(), default_tenant)?;
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // mounts's real resident set alongside the projection so operators can calibrate.
@@ -2391,6 +2459,12 @@ pub async fn dev(
             fail_fast,
             cursors: admin_enabled.then_some(cursor_feed),
             registry: registry.clone(),
+            publish: meta.publish.clone(),
+            chains: ChainControl {
+                declared: endpoints.clone(),
+                pools,
+                rpc_flags: !(rpc_override.is_empty() && rpc_fallback.is_empty()),
+            },
         },
     }));
 
@@ -2677,6 +2751,11 @@ pub fn lifecycle_routes(
         queries: Option<Vec<crate::allowlist::NamedQuery>>,
         #[serde(default)]
         limits: Option<crate::limits::MountLimits>,
+        /// Fill the dataset from its mirror before it indexes (RFC-0073 FR16).
+        #[serde(default)]
+        seed: bool,
+        /// This mount's `[mounts.publish]`: where it mirrors to, and where `seed` reads from.
+        publish: Option<MountPublish>,
     }
 
     type Shared = (
@@ -2786,6 +2865,20 @@ pub fn lifecycle_routes(
                 Json(serde_json::json!({"error": format!("{refused:#}")})),
             );
         }
+        if let Some(Err(e)) = body.publish.as_ref().map(MountPublish::settings) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid publish: {e:#}")})),
+            );
+        }
+        if body.seed && q.wait {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "a seed runs as a mount job and is read at GET /_admin/mounts/{name}; drop `wait`"
+                })),
+            );
+        }
 
         if q.dry_run {
             let (status, report) = dry_run_report(&handles, &body.name, nid.as_ref(), None).await;
@@ -2829,6 +2922,14 @@ pub fn lifecycle_routes(
             }
             return match mount_releasing(&handles, h, &body.name, nid, &|| true).await {
                 Ok(()) => {
+                    if let Some(publish) = &body.publish {
+                        if let Err(e) = handles.lock().await.set_publish(&body.name, publish) {
+                            tracing::error!(
+                                "mounted '{}' but its mirror did not start: {e:#}",
+                                body.name
+                            );
+                        }
+                    }
                     if let Err(e) = jobs.put(MountJob::new(
                         &body.name,
                         nid_str.as_deref(),
@@ -2876,11 +2977,10 @@ pub fn lifecycle_routes(
                 }
             }
         }
-        let job = match jobs.claim(MountJob::new(
-            &body.name,
-            nid_str.as_deref(),
-            MountPhase::Accepted,
-        )) {
+        let mut job = MountJob::new(&body.name, nid_str.as_deref(), MountPhase::Accepted);
+        job.seed = body.seed;
+        job.publish = body.publish;
+        let job = match jobs.claim(job) {
             Ok(job) => job,
             Err(ClaimError::Persist(e)) => return write_failed(&e),
             Err(ClaimError::Running(running)) if running.nid == nid_str => {
@@ -3348,6 +3448,108 @@ pub fn lifecycle_routes(
         }
     }
 
+    fn chain_error(err: &anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
+        let status = err
+            .downcast_ref::<ChainRefusal>()
+            .and_then(|r| StatusCode::from_u16(r.status).ok())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (
+            status,
+            Json(serde_json::json!({"error": format!("{err:#}")})),
+        )
+    }
+
+    async fn list_chains(
+        State((handles, _, required)): State<Shared>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        (StatusCode::OK, Json(handles.lock().await.chains_view()))
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ChainBody {
+        chain: String,
+        chain_id: u64,
+        rpc_urls: Vec<String>,
+        finality_depth: Option<u64>,
+        log_window: Option<u64>,
+    }
+
+    async fn add_chain(
+        State((handles, _, required)): State<Shared>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+        body: Result<Json<ChainBody>, axum::extract::rejection::JsonRejection>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let body = match body {
+            Ok(Json(body)) => body,
+            Err(e) => return bad_body(e),
+        };
+        let endpoint = ChainEndpoint {
+            chain: body.chain,
+            chain_id: body.chain_id,
+            rpc_urls: body.rpc_urls,
+            finality_depth: body.finality_depth,
+            log_window: body.log_window,
+        };
+        let declared = match declare_chain(&handles, endpoint.clone()).await {
+            Ok(declared) => declared,
+            Err(e) => return chain_error(&e),
+        };
+        let view = handles.lock().await.chains_view();
+        let entry = view["chains"]
+            .as_array()
+            .and_then(|c| c.iter().find(|c| c["chain"] == endpoint.chain.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        let status = if declared {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        };
+        (status, Json(entry))
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RpcBody {
+        rpc_urls: Vec<String>,
+    }
+
+    async fn put_chain_rpc(
+        State((handles, _, required)): State<Shared>,
+        AxPath(chain): AxPath<String>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+        body: Result<Json<RpcBody>, axum::extract::rejection::JsonRejection>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let body = match body {
+            Ok(Json(body)) => body,
+            Err(e) => return bad_body(e),
+        };
+        if let Err(e) = replace_rpc(&handles, &chain, body.rpc_urls).await {
+            return chain_error(&e);
+        }
+        let view = handles.lock().await.chains_view();
+        let entry = view["chains"]
+            .as_array()
+            .and_then(|c| c.iter().find(|c| c["chain"] == chain.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        (StatusCode::OK, Json(entry))
+    }
+
     axum::Router::new()
         .route("/_admin/runtime", get(get_runtime).put(put_runtime))
         .route("/_admin/nests", post(mount_nest))
@@ -3360,6 +3562,8 @@ pub fn lifecycle_routes(
         .route("/_admin/datasets/{nid}", delete(reclaim_dataset))
         .route("/_admin/tenants", get(list_tenants))
         .route("/_admin/tenants/{tenant}", put(put_tenant))
+        .route("/_admin/chains", get(list_chains).post(add_chain))
+        .route("/_admin/chains/{chain}/rpc", put(put_chain_rpc))
         .with_state((handles, jobs, admin_token))
 }
 
@@ -3796,6 +4000,10 @@ fn persist_mounted_nests(
                 m.sql = k.sql;
                 m.queries = k.queries.clone();
                 m.limits = k.limits.clone();
+                // A mirror set through the admin API (RFC-0073 FR16); none in memory leaves the file's.
+                if k.publish.is_some() {
+                    m.publish = k.publish.clone();
+                }
             }
         }
         // Add records for live mounts with no entry on disk yet - a nest mounted live via `POST
@@ -3819,7 +4027,7 @@ fn persist_mounted_nests(
         mounts.runtime.nests.clear(); // `[[mounts]]` is authoritative; a stale list beside it lies
     }
     mounts.runtime.suspended = suspended.to_vec();
-    write_mounts_table(dir, &mounts)
+    write_mount_table(dir, &mounts)
 }
 
 /// Persist a per-cursor ceiling set over the admin API (RFC-0073 FR5).
@@ -3830,10 +4038,345 @@ fn persist_max_rss_mb(dir: &Path, max_rss_mb: u64) -> Result<()> {
     let mut mounts: MountTable = toml::from_str(&raw)
         .with_context(|| format!("parsing {} before rewriting it", path.display()))?;
     mounts.runtime.max_rss_mb = Some(max_rss_mb);
-    write_mounts_table(dir, &mounts)
+    write_mount_table(dir, &mounts)
 }
 
-fn write_mounts_table(dir: &Path, mounts: &MountTable) -> Result<()> {
+/// Record one chain in `mounts.toml`'s `[[chains]]`, replacing the entry of that name (RFC-0073 FR9).
+fn persist_chain(dir: &Path, endpoint: &ChainEndpoint) -> Result<()> {
+    let path = dir.join(MOUNTS_FILE);
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {} to persist a chain", path.display()))?;
+    let mut mounts: MountTable = toml::from_str(&raw)
+        .with_context(|| format!("parsing {} before rewriting it", path.display()))?;
+    match mounts.chains.iter_mut().find(|c| c.chain == endpoint.chain) {
+        Some(c) => *c = endpoint.clone(),
+        None => mounts.chains.push(endpoint.clone()),
+    }
+    write_mount_table(dir, &mounts)
+}
+
+/// Why `/_admin/chains` refused a change, and the status it answers with (RFC-0073 FR9). The text
+/// never carries an RPC URL beyond its scheme and host.
+#[derive(Debug)]
+pub struct ChainRefusal {
+    pub status: u16,
+    pub why: String,
+}
+
+impl std::fmt::Display for ChainRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl std::error::Error for ChainRefusal {}
+
+fn chain_refusal(status: u16, why: impl Into<String>) -> anyhow::Error {
+    ChainRefusal {
+        status,
+        why: why.into(),
+    }
+    .into()
+}
+
+fn check_rpc_urls(chain: &str, urls: &[String]) -> Result<()> {
+    if urls.is_empty() {
+        return Err(chain_refusal(
+            400,
+            format!("chain '{chain}' needs at least one rpc_url"),
+        ));
+    }
+    for url in urls {
+        let ok = reqwest::Url::parse(url)
+            .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some());
+        if !ok {
+            return Err(chain_refusal(
+                400,
+                format!(
+                    "rpc_url {} for chain '{chain}' is not an http(s) URL",
+                    crate::rpc::redact_url(url)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Hold a pool to its chain id before anything uses it: refused if any endpoint reports another
+/// chain, or if none of `rpc_urls` answers at all.
+async fn verify_pool(endpoint: &ChainEndpoint, fallback: &[String]) -> Result<RpcClient> {
+    let rpc = RpcClient::with_fallbacks(endpoint.rpc_urls.clone(), fallback.to_vec())?;
+    if let Err(e) = rpc.verify_chain_ids(endpoint.chain_id).await {
+        return Err(chain_refusal(422, format!("{e:#}")));
+    }
+    let answered = rpc.chain_id_answered();
+    if !answered.iter().take(endpoint.rpc_urls.len()).any(|a| *a) {
+        return Err(chain_refusal(
+            502,
+            format!(
+                "no rpc_url for chain '{}' answered eth_chainId: {}",
+                endpoint.chain,
+                rpc.redacted_urls()
+                    .into_iter()
+                    .take(endpoint.rpc_urls.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    Ok(rpc)
+}
+
+/// `POST /_admin/chains` (RFC-0073 FR9): declare a chain, dormant until a nest mounts onto it, and
+/// record it in `mounts.toml`. `Ok(false)` when the same declaration already stands.
+pub async fn declare_chain(
+    handles: &tokio::sync::Mutex<RuntimeHandles>,
+    endpoint: ChainEndpoint,
+) -> Result<bool> {
+    if handles.lock().await.check_declare(&endpoint)? {
+        return Ok(false);
+    }
+    // Dialled without the lock, so a slow endpoint holds up no mount.
+    verify_pool(&endpoint, &[]).await?;
+    let mut h = handles.lock().await;
+    if h.check_declare(&endpoint)? {
+        return Ok(false);
+    }
+    persist_chain(&h.mount_ctx.dir, &endpoint)?;
+    h.mount_ctx.dormant.insert(
+        endpoint.chain.clone(),
+        DormantChain {
+            endpoint: endpoint.clone(),
+            rpc_fallback: Vec::new(),
+        },
+    );
+    h.mount_ctx.chains.declared.push(endpoint.clone());
+    if let Some(chains) = h.roster.get_mut("chains").and_then(|c| c.as_array_mut()) {
+        chains.push(serde_json::json!(endpoint.chain));
+    }
+    let router = h.compose()?;
+    h.live.swap(router);
+    tracing::info!(
+        "chain {} (chain_id {}) declared over the admin API; dormant until a nest mounts onto it",
+        endpoint.chain,
+        endpoint.chain_id
+    );
+    Ok(true)
+}
+
+/// `PUT /_admin/chains/<chain>/rpc` (RFC-0073 FR9): replace a chain's RPC pool. A running cursor's
+/// next call goes to the new pool, and calls already in flight finish on the old one.
+pub async fn replace_rpc(
+    handles: &tokio::sync::Mutex<RuntimeHandles>,
+    chain: &str,
+    rpc_urls: Vec<String>,
+) -> Result<ChainEndpoint> {
+    let (endpoint, fallback) = handles.lock().await.rpc_target(chain, &rpc_urls)?;
+    let rpc = verify_pool(&endpoint, &fallback).await?;
+    let mut h = handles.lock().await;
+    let (endpoint, _) = h.rpc_target(chain, &rpc_urls)?;
+    // Persisted first: a pool the next start would not use is not swapped in.
+    persist_chain(&h.mount_ctx.dir, &endpoint)?;
+    if let Some(pool) = h.mount_ctx.chains.pools.get(chain) {
+        pool.replace(rpc);
+        h.mount_ctx
+            .endpoint_counts
+            .insert(chain.to_string(), rpc_urls.len());
+    } else if let Some(d) = h.mount_ctx.dormant.get_mut(chain) {
+        d.endpoint.rpc_urls = rpc_urls;
+    }
+    if let Some(e) = h
+        .mount_ctx
+        .chains
+        .declared
+        .iter_mut()
+        .find(|e| e.chain == chain)
+    {
+        *e = endpoint.clone();
+    }
+    tracing::info!(
+        "chain {chain}: RPC pool replaced over the admin API with {}",
+        endpoint
+            .rpc_urls
+            .iter()
+            .map(|u| crate::rpc::redact_url(u))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(endpoint)
+}
+
+impl RuntimeHandles {
+    /// Every refusal a declaration can meet without dialling it. `Ok(true)` when the same declaration
+    /// already stands.
+    fn check_declare(&self, e: &ChainEndpoint) -> Result<bool> {
+        let bad = |why: String| Err(chain_refusal(400, why));
+        if e.chain.len() > 64 {
+            return bad(format!(
+                "chain '{}…' is longer than 64 characters",
+                e.chain.chars().take(16).collect::<String>()
+            ));
+        }
+        if let Err(err) = safe_segment(&e.chain, "chain") {
+            return bad(format!("{err:#}"));
+        }
+        check_rpc_urls(&e.chain, &e.rpc_urls)?;
+        let declared = &self.mount_ctx.chains.declared;
+        if let Some(same) = declared.iter().find(|d| d.chain == e.chain) {
+            if same == e {
+                return Ok(true);
+            }
+            return Err(chain_refusal(
+                409,
+                format!(
+                    "chain '{}' is already declared with other settings (chain_id {}); its RPC pool \
+                     is replaced with `PUT /_admin/chains/{}/rpc`, and anything else by editing \
+                     {MOUNTS_FILE} and restarting",
+                    e.chain, same.chain_id, e.chain
+                ),
+            ));
+        }
+        if let Err(err) = e.check_policy() {
+            return bad(format!("{err:#}"));
+        }
+        match crate::chains::lookup(&e.chain) {
+            Some(known) if known.chain_id != e.chain_id => {
+                return Err(chain_refusal(
+                    409,
+                    format!(
+                        "'{}' is the built-in registry's name for chain_id {}, not {}",
+                        e.chain, known.chain_id, e.chain_id
+                    ),
+                ))
+            }
+            None => {
+                if let Some(known) = crate::chains::lookup_by_id(e.chain_id) {
+                    return Err(chain_refusal(
+                        409,
+                        format!(
+                            "chain_id {} is '{}' in the built-in registry; declare it under that \
+                             name so it keeps the registry's finality and window",
+                            e.chain_id, known.name
+                        ),
+                    ));
+                }
+            }
+            Some(_) => {}
+        }
+        if let Some(other) = declared.iter().find(|d| d.chain_id == e.chain_id) {
+            return Err(chain_refusal(
+                409,
+                format!(
+                    "chain_id {} is already declared as '{}'; one chain has one cursor",
+                    e.chain_id, other.chain
+                ),
+            ));
+        }
+        // Boot refuses either flag for a runtime of several chains, so this file would not start.
+        if self.mount_ctx.chains.rpc_flags {
+            return Err(chain_refusal(
+                409,
+                "this runtime was started with --rpc or --rpc-fallback, which a runtime of several \
+                 chains refuses; set rpc_urls under [[chains]] instead and restart without them",
+            ));
+        }
+        if !self.mount_ctx.state_rpc.is_empty() {
+            return Err(chain_refusal(
+                409,
+                "this runtime was started with --state-rpc, which a runtime of several chains \
+                 refuses: an archive endpoint answers for one chain",
+            ));
+        }
+        Ok(false)
+    }
+
+    /// The chain a pool replacement applies to, with its new endpoints, and the fallbacks it keeps.
+    fn rpc_target(&self, chain: &str, rpc_urls: &[String]) -> Result<(ChainEndpoint, Vec<String>)> {
+        let Some(declared) = self
+            .mount_ctx
+            .chains
+            .declared
+            .iter()
+            .find(|e| e.chain == chain)
+        else {
+            return Err(chain_refusal(
+                404,
+                format!("this runtime declares no chain '{chain}'"),
+            ));
+        };
+        if self.mount_ctx.chains.rpc_flags {
+            return Err(chain_refusal(
+                409,
+                "this runtime was started with --rpc or --rpc-fallback, which replace the pool at \
+                 every start; restart without them to manage it over the API",
+            ));
+        }
+        check_rpc_urls(chain, rpc_urls)?;
+        let fallback = if let Some(pool) = self.mount_ctx.chains.pools.get(chain) {
+            pool.fallback().to_vec()
+        } else if let Some(d) = self.mount_ctx.dormant.get(chain) {
+            d.rpc_fallback.clone()
+        } else {
+            return Err(chain_refusal(
+                409,
+                format!("chain '{chain}' is served by a source whose pool cannot be replaced live"),
+            ));
+        };
+        let endpoint = ChainEndpoint {
+            rpc_urls: rpc_urls.to_vec(),
+            ..declared.clone()
+        };
+        Ok((endpoint, fallback))
+    }
+
+    /// `GET /_admin/chains`: every declared chain, its state, and its endpoints as scheme and host.
+    pub fn chains_view(&self) -> serde_json::Value {
+        let chains: Vec<serde_json::Value> = self
+            .mount_ctx
+            .chains
+            .declared
+            .iter()
+            .map(|e| {
+                let running = self
+                    .lifecycle
+                    .get(&e.chain)
+                    .is_some_and(|tx| !tx.is_closed());
+                let state = if self.mount_ctx.dormant.contains_key(&e.chain) {
+                    "dormant"
+                } else if self.health.cursor_quarantined(&e.chain) {
+                    "stopped"
+                } else if running {
+                    "running"
+                } else {
+                    "idle"
+                };
+                let redact = |urls: &[String]| -> Vec<String> {
+                    urls.iter().map(|u| crate::rpc::redact_url(u)).collect()
+                };
+                let rpc_urls = match (
+                    self.mount_ctx.chains.pools.get(&e.chain),
+                    self.mount_ctx.dormant.get(&e.chain),
+                ) {
+                    (Some(pool), _) => pool.current().redacted_urls(),
+                    (None, Some(d)) => redact(&d.endpoint.rpc_urls),
+                    (None, None) => redact(&e.rpc_urls),
+                };
+                serde_json::json!({
+                    "chain": e.chain,
+                    "chain_id": e.chain_id,
+                    "state": state,
+                    "rpc_urls": rpc_urls,
+                    "finality_depth": e.finality_depth,
+                    "log_window": e.log_window,
+                })
+            })
+            .collect();
+        serde_json::json!({ "chains": chains })
+    }
+}
+
+/// Temp-then-rename, so a crash mid-write cannot leave a truncated manifest.
+fn write_mount_table(dir: &Path, mounts: &MountTable) -> Result<()> {
     let path = dir.join(MOUNTS_FILE);
     let out = toml::to_string_pretty(mounts).context("serialising mounts.toml")?;
     #[cfg(test)]
@@ -3978,6 +4521,21 @@ pub struct MountContext {
     pub cursors: Option<CursorFeed>,
     /// `--registry`: where a mount fetches a NID this runtime does not hold (#1543).
     pub registry: Option<String>,
+    /// `[runtime.publish]`, for a mount whose records name no mirror (RFC-0073 FR16).
+    pub publish: Option<MountPublish>,
+    /// What `/_admin/chains` changes (RFC-0073 FR9).
+    pub chains: ChainControl,
+}
+
+/// The chains as `mounts.toml` declares them, and the replaceable pool behind each running cursor.
+#[derive(Clone, Default)]
+pub struct ChainControl {
+    /// As written in `mounts.toml`, before `--rpc` is applied.
+    pub declared: Vec<ChainEndpoint>,
+    pub pools: std::collections::HashMap<String, Arc<crate::source::LivePool>>,
+    /// `--rpc` or `--rpc-fallback` was given. Either rewrites the pool at every start, so a change
+    /// made over the API would not survive one.
+    pub rpc_flags: bool,
 }
 
 /// A cursor's ingest task, handed to [`supervise_cursors`] after boot.
@@ -3997,7 +4555,7 @@ async fn open_chain(
     rpc_fallback: Vec<String>,
     runtime: &str,
     freshness: crate::freshness::Freshness,
-) -> Result<(Arc<dyn Source>, crate::freshness::Freshness)> {
+) -> Result<(Arc<crate::source::LivePool>, crate::freshness::Freshness)> {
     if endpoint.rpc_urls.is_empty() {
         bail!(
             "mounts '{runtime}' chain {} has no rpc_urls (set them under [[chains]], or pass --rpc for a \
@@ -4007,7 +4565,7 @@ async fn open_chain(
     }
     // Verify the whole pool is on this chain (issue #150): pasting one chain's endpoint under
     // another's `[[chains]]` entry is an easy slip, and failover would mask it indefinitely.
-    let rpc = RpcClient::with_fallbacks(endpoint.rpc_urls.clone(), rpc_fallback)?;
+    let rpc = RpcClient::with_fallbacks(endpoint.rpc_urls.clone(), rpc_fallback.clone())?;
     rpc.verify_chain_ids(endpoint.chain_id)
         .await
         .with_context(|| {
@@ -4017,7 +4575,10 @@ async fn open_chain(
             )
         })?;
     let dial = freshness.for_chain(&endpoint.chain, &rpc).await;
-    Ok((Arc::new(rpc), dial))
+    Ok((
+        Arc::new(crate::source::LivePool::new(rpc, rpc_fallback)),
+        dial,
+    ))
 }
 
 /// Why a mount was refused (RFC-0027 §3). Typed so the control surface can map each to its status
@@ -4026,7 +4587,7 @@ async fn open_chain(
 pub enum MountRefusal {
     /// Mounting over a live name is an *upgrade*, and that is RFC-0020's job.
     AlreadyMounted(String),
-    /// The mounts declares no cursor for this nest's chain. Adding a chain at runtime is a non-goal.
+    /// The runtime declares no cursor for this nest's chain; `POST /_admin/chains` declares one.
     UndeclaredChain { nest: String, chain: String },
     /// The cursor's projected footprint would exceed its ceiling. A refusal, not a warning - the
     /// budget stops being a budget the moment it becomes advisory.
@@ -4067,8 +4628,8 @@ impl std::fmt::Display for MountRefusal {
             ),
             MountRefusal::UndeclaredChain { nest, chain } => write!(
                 f,
-                "nest '{nest}' is on {chain}, which this runtime declares no cursor for - add it under \
-                 [[chains]] and restart"
+                "nest '{nest}' is on {chain}, which this runtime declares no cursor for - declare it \
+                 with `POST /_admin/chains`"
             ),
             MountRefusal::OverBudget {
                 nest,
@@ -4542,6 +5103,95 @@ async fn fetch_nid(registry: &str, nid: &str, dir: &Path, name: &str) -> Result<
     Ok(())
 }
 
+/// Fill a mount's dataset from its mirror before it joins (RFC-0073 FR16), with `nuthatch seed`'s
+/// checks. The mirror is the request's, else the mount record's, else `[runtime.publish]`. A dataset
+/// another mount serves, or one that has already indexed, is left as it is and carries on from there.
+async fn seed_mount(
+    handles: &Arc<tokio::sync::Mutex<RuntimeHandles>>,
+    jobs: &crate::mount_jobs::MountJobs,
+    name: &str,
+    generation: u64,
+    dir: &Path,
+    asked: Option<&MountPublish>,
+) -> Result<()> {
+    let (from, served) = {
+        let h = handles.lock().await;
+        let recorded = h
+            .mount_ctx
+            .mounts
+            .iter()
+            .find(|m| mount_route(m, &h.default_tenant) == name)
+            .and_then(|m| m.publish.clone());
+        let from = asked
+            .cloned()
+            .or(recorded)
+            .or_else(|| h.mount_ctx.publish.clone());
+        (from, h.states.iter().any(|(_, s)| s.dir == dir))
+    };
+    let Some(from) = from else {
+        bail!(
+            "seed was asked for and '{name}' has no mirror: send `publish` with the mount, or set \
+             [runtime.publish]"
+        );
+    };
+    if served {
+        tracing::info!("'{name}' mounts a dataset already served here; nothing to seed");
+        return Ok(());
+    }
+    jobs.advance_if_owned(
+        name,
+        generation,
+        crate::mount_jobs::MountPhase::Seeding,
+        None,
+    )?;
+    let _seeding = SeedingDataset::claim(dir)?;
+    if crate::seed::holds_indexed_data(&dir.join(crate::config::DB_FILE))? {
+        tracing::info!("'{name}': the dataset has already indexed, so it is not seeded again");
+        return Ok(());
+    }
+    let report = crate::seed::seed_dataset(dir, &from.target, &|p| {
+        jobs.seed_progress_if_owned(name, generation, p)
+    })
+    .await
+    .with_context(|| format!("seeding '{name}' from {}", from.target))?;
+    tracing::info!(
+        "seeded '{name}' from {}: blocks {}..={}, {} segments ({} fetched)",
+        from.target,
+        report.indexed_from,
+        report.complete_through,
+        report.segments,
+        report.fetched
+    );
+    Ok(())
+}
+
+/// One seed at a time per dataset directory: two would write the same temp files.
+struct SeedingDataset(PathBuf);
+
+fn seeding_datasets() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static SEEDING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    SEEDING.get_or_init(Default::default)
+}
+
+impl SeedingDataset {
+    fn claim(dir: &Path) -> Result<SeedingDataset> {
+        if !seeding_datasets().lock().unwrap().insert(dir.to_path_buf()) {
+            bail!(
+                "another mount is seeding {} now; mount again once it is done",
+                dir.display()
+            );
+        }
+        Ok(SeedingDataset(dir.to_path_buf()))
+    }
+}
+
+impl Drop for SeedingDataset {
+    fn drop(&mut self) {
+        seeding_datasets().lock().unwrap().remove(&self.0);
+    }
+}
+
 /// The mount jobs a runtime starts with (#1544): every mounted nest as live, and every job a restart
 /// interrupted running again. Nothing resumes without the admin API, which is what mounts.
 pub async fn start_mount_jobs(
@@ -4634,6 +5284,11 @@ pub fn spawn_mount_job(
 ) -> tokio::task::JoinHandle<()> {
     use crate::mount_jobs::MountPhase;
     let wanted = nid.as_ref().map(|n| n.as_str().to_string());
+    let asked = jobs
+        .get(&name)
+        .filter(|j| j.generation == generation)
+        .map(|j| (j.seed, j.publish));
+    let (seed, publish) = asked.unwrap_or_default();
     tokio::spawn(async move {
         let outcome = async {
             let plan = handles.lock().await.plan_mount(&name, nid.as_ref())?;
@@ -4645,6 +5300,19 @@ pub fn spawn_mount_job(
                 }
                 _ => false,
             };
+            // A seed's download is kept whatever follows, so the next attempt resumes it.
+            let fetched = fetched && !seed;
+            if seed {
+                seed_mount(
+                    &handles,
+                    &jobs,
+                    &name,
+                    generation,
+                    &plan.dir,
+                    publish.as_ref(),
+                )
+                .await?;
+            }
             jobs.advance_if_owned(&name, generation, MountPhase::Joining, None)?;
             #[cfg(test)]
             {
@@ -4684,6 +5352,11 @@ pub fn spawn_mount_job(
         };
         match outcome {
             Ok(()) => {
+                if let Some(publish) = &publish {
+                    if let Err(e) = handles.lock().await.set_publish(&name, publish) {
+                        tracing::error!("mounted '{name}' but its mirror did not start: {e:#}");
+                    }
+                }
                 if let Err(e) = jobs.advance_if_owned(&name, generation, MountPhase::Live, None) {
                     tracing::warn!("'{name}' is mounted but the job file was not updated: {e:#}");
                 }
@@ -4980,6 +5653,7 @@ impl RuntimeHandles {
             *mounts.entry(tenant.to_string()).or_default() += 1;
         }
         let held: Vec<BTreeMap<String, usize>> = gates.iter().map(|g| g.held()).collect();
+        let hot: Vec<BTreeMap<String, usize>> = gates.iter().map(|g| g.hot_used()).collect();
         let bytes = self
             .states
             .first()
@@ -4995,6 +5669,7 @@ impl RuntimeHandles {
                     "mounts": mounted,
                     "permits_held": held.iter().filter_map(|h| h.get(&tenant)).sum::<usize>(),
                     "response_kib_in_flight": bytes.get(&tenant).copied().unwrap_or(0),
+                    "hot_kib_in_flight": hot.iter().filter_map(|h| h.get(&tenant)).sum::<usize>(),
                 })
             })
             .collect()
@@ -5491,6 +6166,15 @@ impl RuntimeHandles {
                     &self.mount_ctx.ipfs_gateways,
                     &self.mount_ctx.state_rpc,
                 );
+                if let Some(e) = self
+                    .mount_ctx
+                    .chains
+                    .declared
+                    .iter()
+                    .find(|e| e.chain == config.nest.chain)
+                {
+                    config.chain_policy = e.policy();
+                }
                 let Admission {
                     chain,
                     dormant,
@@ -5507,14 +6191,18 @@ impl RuntimeHandles {
                         .as_str()
                         .unwrap_or("runtime")
                         .to_string();
-                    let (source, dial) = open_chain(
+                    let (pool, dial) = open_chain(
                         &d.endpoint,
                         d.rpc_fallback,
                         &runtime,
                         self.mount_ctx.freshness,
                     )
                     .await?;
-                    self.mount_ctx.sources.insert(chain.clone(), source);
+                    self.mount_ctx
+                        .chains
+                        .pools
+                        .insert(chain.clone(), pool.clone());
+                    self.mount_ctx.sources.insert(chain.clone(), pool);
                     self.mount_ctx
                         .endpoint_counts
                         .insert(chain.clone(), d.endpoint.rpc_urls.len());
@@ -5788,31 +6476,6 @@ impl RuntimeHandles {
         if let Some(worker) = worker {
             self.alert_workers.push((name.to_string(), worker));
         }
-        // The cursor already holds the nest, so a publisher that will not start is reported rather
-        // than unwinding a mount that is otherwise complete.
-        if let Some(record) = self
-            .mount_ctx
-            .mounts
-            .iter()
-            .find(|m| mount_route(m, &self.default_tenant) == name)
-        {
-            if let (Some(publish), Some(_)) = (&record.publish, &nid) {
-                match spawn_publisher(
-                    &self.mount_ctx.dir,
-                    record,
-                    publish,
-                    &self.default_tenant,
-                    cursor_key,
-                ) {
-                    Ok((_, publisher)) => self.publishers.push((name.to_string(), publisher)),
-                    Err(e) => {
-                        tracing::error!("mounted '{name}' but its mirror did not start: {e:#}")
-                    }
-                }
-            }
-        }
-        self.estimates.insert(name.to_string(), incoming);
-        self.states.push((name.to_string(), state));
         // A 2.0 mount gets (or refreshes) its record here, so the persist just below can write it into
         // `mounts.toml` even though it had none on disk - the durable half of the fix, matching what
         // unmount already does for removal. A pre-2.0 mount (no `nid`) has no record to keep; `persist`
@@ -5839,6 +6502,41 @@ impl RuntimeHandles {
                 }),
             }
         }
+        // The cursor already holds the nest, so a publisher that will not start is reported rather
+        // than unwinding a mount that is otherwise complete.
+        if let Some(record) = self
+            .mount_ctx
+            .mounts
+            .iter()
+            .find(|m| mount_route(m, &self.default_tenant) == name)
+        {
+            let first = !self
+                .states
+                .iter()
+                .any(|(_, s)| s.nid.as_deref() == Some(record.nid.as_str()));
+            let mirror = mirror_of(
+                record,
+                &self.mount_ctx.mounts,
+                self.mount_ctx.publish.as_ref(),
+                first,
+            );
+            if let (Some(publish), Some(_)) = (mirror, &nid) {
+                match spawn_publisher(
+                    &self.mount_ctx.dir,
+                    record,
+                    publish,
+                    &self.default_tenant,
+                    cursor_key,
+                ) {
+                    Ok((_, publisher)) => self.publishers.push((name.to_string(), publisher)),
+                    Err(e) => {
+                        tracing::error!("mounted '{name}' but its mirror did not start: {e:#}")
+                    }
+                }
+            }
+        }
+        self.estimates.insert(name.to_string(), incoming);
+        self.states.push((name.to_string(), state));
         // The roster (`GET /nests`) is rebuilt from the live `states`, not patched - #554 was exactly
         // this step missing, which left the roster reporting its startup snapshot while the mount
         // otherwise worked in full: dataset resolved, cursor caught up, routes serving.
@@ -5858,6 +6556,44 @@ impl RuntimeHandles {
         self.suspended.remove(name);
         self.live.swap(self.compose()?);
         self.persist()?;
+        Ok(())
+    }
+
+    /// Mirror a live mount to `publish` (RFC-0073 FR16): its record, its publisher and `mounts.toml`.
+    pub fn set_publish(&mut self, name: &str, publish: &MountPublish) -> Result<()> {
+        let default_tenant = self.default_tenant.clone();
+        let Some(state) = self.states.iter().find(|(n, _)| n == name).map(|(_, s)| s) else {
+            bail!("'{name}' is not mounted");
+        };
+        let cursor_key = state
+            .runtime_health
+            .as_ref()
+            .map_or_else(|| name.to_string(), |(n, _)| n.clone());
+        let Some(record) = self
+            .mount_ctx
+            .mounts
+            .iter_mut()
+            .find(|m| mount_route(m, &default_tenant) == name)
+        else {
+            bail!("'{name}' has no mount record to mirror");
+        };
+        if record.publish.as_ref() == Some(publish)
+            && self.publishers.iter().any(|(n, _)| n == name)
+        {
+            return Ok(());
+        }
+        record.publish = Some(publish.clone());
+        let record = record.clone();
+        self.persist()?;
+        self.publishers.retain(|(n, _)| n != name);
+        let (_, publisher) = spawn_publisher(
+            &self.mount_ctx.dir,
+            &record,
+            publish,
+            &default_tenant,
+            &cursor_key,
+        )?;
+        self.publishers.push((name.to_string(), publisher));
         Ok(())
     }
 
@@ -6519,6 +7255,38 @@ mod tests {
         }
     }
 
+    /// RFC-0073 FR16: `[runtime.publish]` mirrors each dataset once, and never beside a mount's own.
+    #[test]
+    fn the_runtime_mirror_covers_each_dataset_once_and_yields_to_a_mounts_own() {
+        let table = |publish: &str| -> Result<MountTable> {
+            let t: MountTable = toml::from_str(&format!(
+                "[runtime]\nname = \"t\"\nchain = \"ethereum\"\nchain_id = 1\n\n\
+                 [runtime.publish]\n{publish}\n\n\
+                 [[mounts]]\nalias = \"a\"\nnid = \"{a}\"\n\n\
+                 [[mounts]]\nalias = \"b\"\nnid = \"{a}\"\n\n\
+                 [[mounts]]\nalias = \"c\"\nnid = \"{c}\"\n\n\
+                 [[mounts]]\nalias = \"d\"\nnid = \"{c}\"\n\
+                 [mounts.publish]\ntarget = \"/own\"\n",
+                a = "a".repeat(64),
+                c = "c".repeat(64),
+            ))?;
+            t.validate_mounts()?;
+            Ok(t)
+        };
+        let err = table("target = \"\"").unwrap_err();
+        assert!(format!("{err:#}").contains("[runtime.publish]"), "{err:#}");
+
+        let t = table("target = \"/shared\"").unwrap();
+        let default = t.runtime.publish.as_ref();
+        let m = &t.mounts;
+        let target =
+            |i: usize, first: bool| mirror_of(&m[i], m, default, first).map(|p| &*p.target);
+        assert_eq!(target(0, true), Some("/shared"));
+        assert_eq!(target(1, false), None, "a second mount of one dataset");
+        assert_eq!(target(2, true), None, "a sibling names its own mirror");
+        assert_eq!(target(3, false), Some("/own"));
+    }
+
     #[tokio::test]
     async fn spawn_publishers_mirrors_each_mount_that_asks_and_skips_the_rest() {
         let root = tempfile::tempdir().unwrap();
@@ -6576,7 +7344,7 @@ mod tests {
         // First, so `quiet` is the route the dataset's cursor records under (#1415).
         table.mounts.insert(0, quiet);
 
-        let publishers = spawn_publishers(root.path(), &table.mounts, "default").unwrap();
+        let publishers = spawn_publishers(root.path(), &table.mounts, None, "default").unwrap();
         let keys: Vec<&str> = publishers.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["usdc"]);
 
@@ -7388,6 +8156,36 @@ mod tests {
         );
     }
 
+    /// RFC-0073 FR9: a declared finality or window loads for an unregistered chain and is refused for
+    /// one the registry sets, rather than starting with a setting nothing reads.
+    #[test]
+    fn a_declared_chain_policy_loads_only_for_an_unregistered_chain() {
+        let load = |chain: &str, chain_id: u64, extra: &str| {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::write(
+                d.path().join(MOUNTS_FILE),
+                format!(
+                    "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"{chain}\"\n\
+                     chain_id = {chain_id}\nrpc_urls = []\n{extra}"
+                ),
+            )
+            .unwrap();
+            MountTable::load(d.path()).map(|t| t.chains)
+        };
+        let chains = load("devnet", 31337, "finality_depth = 3\nlog_window = 7\n").unwrap();
+        assert_eq!(
+            chains[0].policy(),
+            crate::chains::DeclaredPolicy {
+                finality_depth: Some(3),
+                log_window: Some(7)
+            }
+        );
+        let err = load("base", 8453, "finality_depth = 3\n").unwrap_err();
+        assert!(format!("{err:#}").contains("registry"), "{err:#}");
+        assert!(load("devnet", 31337, "log_window = 0\n").is_err());
+        assert!(load("base", 8453, "").is_ok());
+    }
+
     /// The unmount path rewrites `mounts.toml` from **route keys**, which are tenant-qualified in a
     /// multi-tenant runtime. Matching them against `alias` alone would retain nothing and silently
     /// unmount every co-tenant on the first unmount - so this asserts the survivor, not the casualty.
@@ -7511,6 +8309,8 @@ mod tests {
                 fail_fast: false,
                 cursors: None,
                 registry: None,
+                publish: None,
+                chains: Default::default(),
             },
         };
         use std::os::unix::fs::PermissionsExt;
@@ -8223,6 +9023,8 @@ mod tests {
                 fail_fast: false,
                 cursors: None,
                 registry: None,
+                publish: None,
+                chains: Default::default(),
             },
         };
 
@@ -8931,6 +9733,8 @@ mod tests {
                 fail_fast: false,
                 cursors: None,
                 registry: None,
+                publish: None,
+                chains: Default::default(),
             },
         }
     }
@@ -10276,6 +11080,8 @@ mod fr5_tests {
                 fail_fast: false,
                 cursors: None,
                 registry: None,
+                publish: None,
+                chains: Default::default(),
             },
         }
     }

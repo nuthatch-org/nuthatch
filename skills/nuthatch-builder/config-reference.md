@@ -557,6 +557,14 @@ chain = "base"                # mounted on it yet starts its cursor on the first
 chain_id = 8453
 rpc_urls = ["https://…"]
 
+[[chains]]                    # a chain the built-in registry does not know
+chain = "devnet"
+chain_id = 31337
+rpc_urls = ["https://…"]
+finality_depth = 12           # optional: blocks behind the tip before sealing (default 64)
+log_window = 500              # optional: blocks per eth_getLogs (default 20). Both are refused
+                              # on a registry chain, which sets its own
+
 [[mounts]]                    # what is mounted, by identity
 alias = "usdc"
 nid = "9f2c…"
@@ -566,6 +574,9 @@ The pre-2.0 top-level form (`chain`/`chain_id`/`rpc_urls` directly under `[runti
 at startup**: `runtime 'my-runtime' uses the pre-2.0 top-level chain form. 2.0 declares chains under
 [[chains]] - one form, one meaning. nuthatch migrate rewrites it for you.` The single-cursor law
 holds per chain - never multiplex two chains behind one cursor.
+
+A running runtime adds a `[[chains]]` entry itself on `POST /_admin/chains`, and rewrites a chain's
+`rpc_urls` on `PUT /_admin/chains/<chain>/rpc` (RFC-0073 FR9, `docs/admin-api.md`).
 
 ### `[[mounts]]` - where a nest's data actually lives (RFC-0032)
 
@@ -680,6 +691,21 @@ runtime directory refuses that flag.
 
 **This is mount config, not manifest**, so adding or changing it moves neither the NID nor the data.
 Two mounts of the same dataset that name the same target publish one copy.
+
+Once for the whole runtime, the same table goes under `[runtime]` (RFC-0073 FR16):
+
+```toml
+[runtime]
+name = "my-runtime"
+
+[runtime.publish]
+target = "s3://my-bucket/nuthatch"   # same keys and refusals as [mounts.publish]
+```
+
+It mirrors each dataset none of whose mounts names its own `[mounts.publish]`, once, from the first
+mount of it. It is also where `POST /_admin/nests {"seed": true}` reads from when the request and the
+mount record name no mirror. A mirror set in that request's `publish` body (the `[mounts.publish]`
+keys as JSON) is written to the mount's record once the mount is live.
 
 ### `[mounts.limits]` - lowering one mount's query guards (RFC-0073 FR3)
 
@@ -827,7 +853,8 @@ Opaque means nuthatch does not interpret it, not that it may contain `..`.
 
 **A tenant's share of query capacity (RFC-0073 FR2).** Each chain's SQL gate and the process's
 response bytes in flight are divided by tenant label. Every tenant with a mount on a gate holds one
-permit in reserve, and half the response-bytes budget is reserved by weight, so one tenant's burst
+permit in reserve, and half the response-bytes budget and of the gate's 128 MiB of hot-tip copies
+(FR5) is reserved by weight, so one tenant's burst
 cannot hold another's query past the 250 ms admission wait. Past its own share a tenant is answered
 `429` with `"reason": "tenant_share"`; a full gate is still `503` `busy`. A runtime with one tenant
 behaves as before. Shares live under `[tenants.<tenant>]` and are set live, with no restart, by

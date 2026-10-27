@@ -85,7 +85,7 @@ fn access_denied(subject: &str) -> String {
     )
 }
 
-/// Why a registry fetch failed, as a failed mount job reports it beside its reason (RFC-0073 FR15).
+/// Why a registry fetch or a seed failed, as a failed mount job reports it beside its reason (RFC-0073 FR15).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureCode {
@@ -127,6 +127,12 @@ impl std::fmt::Display for RegistryError {
 }
 
 impl std::error::Error for RegistryError {}
+
+impl RegistryError {
+    pub(crate) fn new(code: FailureCode, message: String) -> RegistryError {
+        RegistryError { code, message }
+    }
+}
 
 #[cfg(test)]
 impl RegistryError {

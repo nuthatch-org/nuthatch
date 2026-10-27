@@ -23,8 +23,9 @@ rpc_urls = ["https://…"]
 NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --registry s3://bucket/nests
 ```
 
-- **Chains are declared here, at boot.** A runtime may start with nothing mounted; the first mount onto
-  a chain starts that chain's cursor and dials its RPC only then. Chains cannot be added over the API.
+- **Chains are declared here, at boot, or later over the API** ([Chains](#chains)). A runtime may start
+  with nothing mounted; the first mount onto a chain starts that chain's cursor and dials its RPC only
+  then.
 - **`--registry`** is where a mount fetches a NID the runtime does not hold: a filesystem path or
   `s3://bucket/prefix`. Publish to it with `nuthatch nest publish <bundle> --registry <path>`; a NID is
   what `nuthatch nest nid --dir <dir>` prints. Without `--registry`, only NIDs already under `data/` mount.
@@ -44,6 +45,7 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 | Do | Call | Answers |
 |---|---|---|
 | Mount a NID under a name | `POST /_admin/nests` `{"name": "usdc", "nid": "<nid>"}` | `202` and the job |
+| Mount it filled from its mirror | the same, with `"seed": true` and optionally `"publish": {"target": "…"}` | `202` and the job |
 | Read a mount's progress | `GET /_admin/mounts/<name>` | the job, and its mount record under `record` |
 | List every mount | `GET /_admin/mounts` | `{"mounts": [job, …]}` |
 | Price a mount first | `POST /_admin/nests?dry_run=true` with the same body | `200` and a report |
@@ -80,7 +82,7 @@ A mount can take minutes when it fetches, so it answers `202` at once with a job
 
 `generation` is the claim this job holds on the name, from a counter the runtime never reuses, so a
 job that was forgotten cannot mount over a later one. `phase` moves through `accepted`, `fetching`
-(only when the registry is needed), `joining` (catching up beside the cursor before it joins), and
+(only when the registry is needed), `seeding` (only for `"seed": true`), `joining` (catching up beside the cursor before it joins), and
 ends at `live` or `failed`, with a `reason` and a `code` on a failure. A suspended mount reads `suspended`. Poll
 `GET /_admin/mounts/<name>`; reading it never waits on a mount in progress. Unfinished jobs survive a
 restart and resume; failed ones stay readable until the name is mounted again or unmounted.
@@ -102,24 +104,52 @@ of a live mount is `200` there too. Use it from a script; a platform should poll
 
 | `code` | Why |
 |---|---|
-| `not_found` | the registry holds no bundle under that NID |
+| `not_found` | the registry holds no bundle under that NID, or the mirror holds no dataset for it or lacks a file its catalogue names |
 | `access_denied` | the registry refused the credential, or has none for a private bucket (an S3 `401` or `403`) |
-| `verification_failed` | the registry served bytes that are not that nest: the bundle computes to another NID, a file's hash or the content address does not match, or the decode registry does not reproduce |
+| `verification_failed` | the registry served bytes that are not that nest: the bundle computes to another NID, a file's hash or the content address does not match, or the decode registry does not reproduce; or a mirror served a segment that does not hash to its address, or a seed snapshot whose tails do not match their digest |
 | `other` | anything else, including every refusal below |
+
+### Seeding a mount from its mirror
+
+`POST /_admin/nests {"name": "usdc", "nid": "<nid>", "seed": true}` fills the dataset from a mirror
+before it indexes, which is how a lost runtime is rebuilt without re-indexing every nest over RPC
+(RFC-0073 FR16). The mirror is the request's `publish`, else the mount record's `[mounts.publish]`,
+else `[runtime.publish]` in `mounts.toml`; with none of them the job fails. `publish` takes the
+`[mounts.publish]` keys as JSON, `{"target": "s3://bucket/prefix", "interval": "60s", "parallelism":
+2}`, and once the mount is live it is written to the mount's record and the mount publishes there.
+Credentials come from the runtime's `AWS_*` environment, never the request.
+
+The seed is `nuthatch seed --from <mirror>` run on the dataset: the same refusals, and every file
+checked against its content address. While it runs the job reads `seeding`, with progress:
+
+```json
+{"name": "usdc", "phase": "seeding", "seed": true,
+ "seed_progress": {"segments": 42, "done": 17, "fetched": 17, "fetched_bytes": 803225344}, …}
+```
+
+`done` counts files on disk and checked, and `fetched` those this attempt downloaded. Once every file
+is in, the mount joins and follows the chain from the block after the mirror ends.
+
+A refused or interrupted seed ends the job `failed` with its `code`, and keeps the dataset and every
+file it checked, so a second `POST` of the same body resumes it and fetches only what is missing. A
+restart resumes an unfinished seed by itself. The seed is skipped, and the mount carries on from its
+own data, when the dataset has already indexed or another mount already serves it. `"seed": true` with
+`?wait=true` is `400`: a seed is read on its job.
 
 ### Refusals
 
 | Status | Why |
 |---|---|
-| `400` | a malformed NID, a name the runtime would not accept, or a tenant that shares a mount's name (see above) |
+| `400` | a malformed NID, a name the runtime would not accept, or a tenant that shares a mount's name (see above), an invalid `publish`, or `seed` with `wait` |
 | `404` | the runtime does not hold the NID and was started without `--registry` |
-| `409` | the name is taken, the chain is not declared, the chain's cursor has died (restart the runtime), the nest declares authored entities and the runtime runs `--seal-direct`, or another mount of that name or dataset is still catching up |
+| `409` | the name is taken, the chain is not declared (`POST /_admin/chains` declares it), the chain's cursor has died (restart the runtime), the nest declares authored entities and the runtime runs `--seal-direct`, or another mount of that name or dataset is still catching up |
 | `507` | the mount would breach the chain cursor's RAM ceiling, the reason carrying projected and ceiling MB, or its authored entities would put the cursor over its cap (32 at 2048 MB, proportionally fewer below) |
 
 On the job route a refusal ends the job `failed` with the same reason. With `--registry`, a NID the
 registry does not hold is accepted like any mount and ends the job `failed`, its reason naming the NID;
 with `?wait=true` it answers `500` with the same reason. A mount the runtime fetched and
-then refused is removed again: a refusal leaves nothing on disk.
+then refused is removed again: a refusal leaves nothing on disk, except after a seed was asked for,
+which keeps what it fetched so the next attempt resumes it.
 
 ### Per-mount limits
 
@@ -239,6 +269,42 @@ An unmount that fails part-way answers `500` with the `nid`, so the dataset can 
 Inside a running runtime this removes the dataset and the segments only it references. Segments a live
 fold left behind stay for an offline `nuthatch prune`.
 
+### Chains
+
+Adding a network or rotating an RPC endpoint needs no restart (RFC-0073 FR9).
+
+| Do | Call | Answers |
+|---|---|---|
+| List the chains | `GET /_admin/chains` | `{"chains": [chain, …]}` |
+| Declare a chain | `POST /_admin/chains` `{"chain": "devnet", "chain_id": 31337, "rpc_urls": ["https://…"]}` | `201` and the chain; `200` when the same declaration already stands |
+| Replace a chain's RPC pool | `PUT /_admin/chains/<chain>/rpc` `{"rpc_urls": ["https://…"]}` | `200` and the chain |
+
+```json
+{"chain": "devnet", "chain_id": 31337, "state": "dormant", "rpc_urls": ["https://rpc.example"],
+ "finality_depth": 12, "log_window": 500}
+```
+
+A declared chain is dormant, as one declared at boot is: its cursor starts on the first mount onto it.
+`finality_depth` and `log_window` are optional and only for a chain the built-in registry does not
+know, which otherwise takes a depth of 64 and a window of 20. `state` is `dormant`, `running`, `idle`
+(dialled, with no cursor running) or `stopped` (its cursor died; restart the runtime). **`rpc_urls` are shown as
+scheme and host only**, here and in every error and log line, since a provider's key travels in the
+path, the query or the userinfo. `mounts.toml` keeps them whole, because the next start dials them.
+
+Before either change is made, every endpoint is asked `eth_chainId`: one reporting another chain refuses
+the change, and so does a list in which no endpoint answers at all. A replacement takes effect at the
+next call: calls the cursor already has in flight finish on the old pool, and nothing after them is
+sent there. Both changes are written to `mounts.toml` before they take effect, so what is running is
+what the next start runs; a write that fails answers `500` and changes nothing.
+
+| Status | Why |
+|---|---|
+| `400` | a chain name the runtime would not accept (letters, digits, `_` and `-`, at most 64), no `rpc_urls`, an endpoint that is not `http(s)`, a `log_window` of 0, or `finality_depth` or `log_window` for a registry chain |
+| `404` | `PUT` for a chain the runtime does not declare |
+| `409` | the name is declared with other settings (only the pool can change live; anything else is an edit of `mounts.toml` and a restart), a registry name with another `chain_id`, a registry `chain_id` under another name, a `chain_id` already declared under another name, or a runtime started with `--rpc` or `--rpc-fallback`, which rewrite the pool at every start. Declaring a chain is also refused under `--state-rpc`, because a runtime with an archive endpoint takes one chain; replacing a pool is not, since `--state-rpc` is a separate endpoint the swap leaves alone |
+| `422` | an endpoint reports another chain id, or a body field the API does not take |
+| `502` | no endpoint in `rpc_urls` answered |
+
 ## Tenant shares
 
 Each chain's cursor has one SQL gate, two permits by default, shared by every mount on that chain, and
@@ -249,7 +315,7 @@ FR2). Nuthatch still knows nothing about who a tenant is; the label is the first
 |---|---|---|
 | Set a tenant's share | `PUT /_admin/tenants/<tenant>` `{"weight": 2, "max_permits": 1, "max_response_mib": 32}` | `200`, `{"tenant", "share"}` |
 | Restore the default | `PUT /_admin/tenants/<tenant>` `{}` | `200` |
-| Read every tenant's share and use | `GET /_admin/tenants` | `{"tenants": [{"tenant", "share", "mounts", "permits_held", "response_kib_in_flight"}, …]}` |
+| Read every tenant's share and use | `GET /_admin/tenants` | `{"tenants": [{"tenant", "share", "mounts", "permits_held", "response_kib_in_flight", "hot_kib_in_flight"}, …]}` |
 
 A `PUT` replaces the tenant's whole share, every field optional. It is written to `mounts.toml` under
 `[tenants.<tenant>]` first and then applied to every running mount, with no restart; a share the file
@@ -264,6 +330,12 @@ reservation is admitted within the 250 ms admission wait however busy another te
 behind its own queries, never another's. When several tenants wait, a freed permit goes to the one
 holding the fewest permits per unit of weight. Half the response-bytes budget is reserved the same way,
 split by weight between the tenants mounted; the other half is borrowed first come.
+
+**Hot-tip copies.** A query over the unsealed tip copies those rows for as long as it runs, a memory
+apart from its response. Each gate has 128 MiB of them in flight (RFC-0073 FR5), divided between its
+tenants exactly as response bytes are, and `max_response_mib` does not cap it. The copy is measured
+before a row is parsed and charged to the tenant until the query ends, however it ends, so a tenant
+past its share is refused before it copies anything. `hot_kib_in_flight` is what each tenant holds.
 
 **The trade.** A permit already running is never taken back, so a reservation is held whether or not
 its tenant is busy. A tenant can use every permit only when it is the only tenant on the gate. With as
