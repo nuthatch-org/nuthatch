@@ -557,6 +557,14 @@ chain = "base"                # mounted on it yet starts its cursor on the first
 chain_id = 8453
 rpc_urls = ["https://…"]
 
+[[chains]]                    # a chain the built-in registry does not know
+chain = "devnet"
+chain_id = 31337
+rpc_urls = ["https://…"]
+finality_depth = 12           # optional: blocks behind the tip before sealing (default 64)
+log_window = 500              # optional: blocks per eth_getLogs (default 20). Both are refused
+                              # on a registry chain, which sets its own
+
 [[mounts]]                    # what is mounted, by identity
 alias = "usdc"
 nid = "9f2c…"
@@ -566,6 +574,9 @@ The pre-2.0 top-level form (`chain`/`chain_id`/`rpc_urls` directly under `[runti
 at startup**: `runtime 'my-runtime' uses the pre-2.0 top-level chain form. 2.0 declares chains under
 [[chains]] - one form, one meaning. nuthatch migrate rewrites it for you.` The single-cursor law
 holds per chain - never multiplex two chains behind one cursor.
+
+A running runtime adds a `[[chains]]` entry itself on `POST /_admin/chains`, and rewrites a chain's
+`rpc_urls` on `PUT /_admin/chains/<chain>/rpc` (RFC-0073 FR9, `docs/admin-api.md`).
 
 ### `[[mounts]]` - where a nest's data actually lives (RFC-0032)
 

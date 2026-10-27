@@ -6,10 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::alerts::{self, AlertRouter};
-use crate::chains::{
-    self, Finality, UNREGISTERED_FINALITY as DEFAULT_FINALITY,
-    UNREGISTERED_WINDOW as DEFAULT_WINDOW,
-};
+use crate::chains::{self, Finality, UNREGISTERED_WINDOW as DEFAULT_WINDOW};
 use crate::chunker::{self, AdaptiveWindow};
 use crate::cli::DevArgs;
 use crate::config::{Config, DB_FILE};
@@ -3366,7 +3363,11 @@ async fn build_nest(
     // Per-chain policy from the registry; a custom (unregistered) chain falls back to defaults.
     let (finality, chain_window, seal_span) = match chains::lookup(&config.nest.chain) {
         Some(c) => (c.finality, c.log_window, c.seal_span),
-        None => (DEFAULT_FINALITY, DEFAULT_WINDOW, chains::DEFAULT_SEAL_SPAN),
+        None => (
+            config.chain_policy.finality(),
+            config.chain_policy.log_window(),
+            chains::DEFAULT_SEAL_SPAN,
+        ),
     };
     // A `--window` override wins over the chain default (for sparse-contract long backfills).
     let window = effective_window(window_override, chain_window);
@@ -24494,6 +24495,56 @@ template="pool"
         assert!(
             text.contains("https://eth.drpc.org keeps no blocks"),
             "{text}"
+        );
+    }
+
+    /// RFC-0073 FR9: a runtime's declared finality and window reach a nest on a chain the registry
+    /// does not know, and a nest with none declared keeps the unregistered defaults.
+    #[tokio::test]
+    async fn a_declared_chain_policy_sets_an_unregistered_nests_finality_and_window() {
+        let build = |policy: chains::DeclaredPolicy| async move {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+            std::fs::write(
+                dir.path().join(crate::config::CONFIG_FILE),
+                "[nest]\nname = \"devnet-policy\"\nchain = \"devnet\"\nchain_id = 31337\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"tok\"\naddress = \"0x1111111111111111111111111111111111111111\"\n\
+                 abi = \"abis/tok.json\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("abis/tok.json"),
+                r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#,
+            )
+            .unwrap();
+            let mut config = Config::load(dir.path()).unwrap();
+            config.chain_policy = policy;
+            let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+            let (nest, _state, worker, window) = build_nest(
+                &source,
+                dir.path().to_path_buf(),
+                &config,
+                None,
+                false,
+                None,
+                None,
+                serve::new_sql_gate(),
+            )
+            .await
+            .unwrap();
+            if let Some(w) = worker {
+                w.abort();
+            }
+            (nest.finality, window)
+        };
+        let declared = chains::DeclaredPolicy {
+            finality_depth: Some(3),
+            log_window: Some(7),
+        };
+        assert_eq!(build(declared).await, (Finality::Depth(3), 7));
+        assert_eq!(
+            build(chains::DeclaredPolicy::default()).await,
+            (chains::UNREGISTERED_FINALITY, DEFAULT_WINDOW)
         );
     }
 
