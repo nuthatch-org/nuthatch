@@ -1661,6 +1661,11 @@ pub struct DevArgs {
     /// this runtime does not hold it (RFC-0019, #1543). A filesystem path, or `s3://bucket/prefix`.
     #[arg(long)]
     pub registry: Option<String>,
+
+    /// A runtime: the largest bundle `POST /_admin/bundles` accepts, in MiB (RFC-0073 FR10). A larger
+    /// body is answered `413`.
+    #[arg(long, default_value_t = crate::runtime::DEFAULT_MAX_BUNDLE_MB)]
+    pub max_bundle_mb: usize,
 }
 
 #[derive(Args)]

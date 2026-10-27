@@ -687,6 +687,43 @@ pub fn install_verified(
     Ok(())
 }
 
+/// A bundle received as bytes, put through every check `nest load` runs and installed in a temporary
+/// directory that is removed when this is dropped. The admin API's bundle routes (RFC-0073 FR10)
+/// read a bundle this way, so they refuse exactly what `nest load` refuses and write nothing else.
+pub struct CheckedBundle {
+    dir: tempfile::TempDir,
+    pub manifest: Manifest,
+    pub hash: String,
+}
+
+impl CheckedBundle {
+    pub fn from_bytes(bytes: &[u8], expect: Option<&str>) -> Result<CheckedBundle> {
+        let dir = tempfile::tempdir().context("temp dir for bundle")?;
+        let file = dir.path().join("in.bundle");
+        std::fs::write(&file, bytes).context("writing bundle")?;
+        let blob_dir = dir.path().join("unpacked");
+        extract_bundle(&file, &blob_dir)?;
+        let manifest = load_manifest(&blob_dir)?;
+        let hash = verify_blob(&blob_dir, &manifest, expect)?;
+        install_files(&blob_dir, &manifest, &dir.path().join("nest"))?;
+        Ok(CheckedBundle {
+            dir,
+            manifest,
+            hash,
+        })
+    }
+
+    /// The installed nest.
+    pub fn nest_dir(&self) -> PathBuf {
+        self.dir.path().join("nest")
+    }
+
+    /// The bundle exactly as received.
+    pub fn bundle_file(&self) -> PathBuf {
+        self.dir.path().join("in.bundle")
+    }
+}
+
 /// The format gate, the optional content-address check and every file's integrity, for a blob
 /// directory about to be installed. Returns the blob hash.
 pub(crate) fn verify_blob(

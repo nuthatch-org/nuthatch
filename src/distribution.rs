@@ -152,14 +152,47 @@ fn access_denied_err(subject: &str) -> anyhow::Error {
     })
 }
 
+/// Whether `e` is the registry saying it does not hold the thing asked for.
+pub fn is_not_found(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<RegistryError>(),
+        Some(r) if r.code == FailureCode::NotFound
+    )
+}
+
+/// Whether `e` is the registry refusing this credential, as a read-only registry refuses a write.
+pub fn is_denied(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<RegistryError>(),
+            Some(r) if r.code == FailureCode::AccessDenied
+        )
+    })
+}
+
 /// A content-addressed bundle store: immutable blobs keyed by hash, plus a thin name→hash index. Both
 /// a local directory ([`FsStore`]) and an S3 bucket ([`ObjectStore`]) implement this; callers never see
 /// which. Async because object storage is - the FS impl just does its (fast) sync work in an async fn.
 #[async_trait]
 pub trait BundleStore: Send + Sync {
     /// Store a blob's bytes under its content address. Idempotent - the same hash is the same blob, so
-    /// re-publishing identical bytes is a no-op (dedup is free).
+    /// re-publishing identical bytes changes nothing but the blob's age, which [`prune`]'s grace
+    /// period reads: a publish of a blob already present must look as fresh as a new one.
     async fn put_blob(&self, hash: &str, bytes: &[u8]) -> Result<()>;
+    /// How long ago a blob was last written, `None` when it is absent.
+    async fn blob_age(&self, hash: &str) -> Result<Option<std::time::Duration>>;
+    /// Every blob's content address.
+    async fn list_blobs(&self) -> Result<Vec<String>>;
+    /// Every `(name, version, hash)` ref, `latest` included.
+    async fn list_refs(&self) -> Result<Vec<(String, String, String)>>;
+    /// Every `(nid, hash)` entry.
+    async fn list_nid_refs(&self) -> Result<Vec<(String, String)>>;
+    /// Remove a blob; an absent one is not an error.
+    async fn delete_blob(&self, hash: &str) -> Result<()>;
+    /// Remove a `name@version` ref; an absent one is not an error.
+    async fn delete_ref(&self, name: &str, version: &str) -> Result<()>;
+    /// Remove a NID entry; an absent one is not an error.
+    async fn delete_nid_ref(&self, nid: &str) -> Result<()>;
     /// Fetch a blob's bytes by content address.
     async fn get_blob(&self, hash: &str) -> Result<Vec<u8>>;
     /// Point `name@version` at a hash (the caller advances `latest` separately). The only mutation.
@@ -200,21 +233,124 @@ impl FsStore {
     fn nid_path(&self, nid: &str) -> PathBuf {
         self.root.join("nids").join(nid)
     }
+
+    /// Written whole or not at all: a prune listing refs beside a publish must never read a ref
+    /// half-written. Staged outside `index/`, whose every entry is a ref.
+    fn write_atomic(&self, path: &Path, bytes: &[u8], subject: &str) -> Result<()> {
+        use std::io::Write;
+        let staging = self.root.join(".staging");
+        for dir in [Some(staging.as_path()), path.parent()]
+            .into_iter()
+            .flatten()
+        {
+            std::fs::create_dir_all(dir).map_err(|e| map_write_err(e, subject, dir))?;
+        }
+        let mut tmp = tempfile::NamedTempFile::new_in(&staging)
+            .map_err(|e| map_write_err(e, subject, &staging))?;
+        tmp.write_all(bytes)
+            .map_err(|e| map_write_err(e, subject, path))?;
+        tmp.persist(path)
+            .map_err(|e| map_write_err(e.error, subject, path))?;
+        Ok(())
+    }
+
+    fn list_dir(&self, dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(map_io_err(e, "the registry listing", dir)),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry.with_context(|| format!("listing {}", dir.display()))?;
+            if let Some(name) = entry.file_name().to_str() {
+                out.push((name.to_string(), entry.path()));
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    fn read_hash(path: &Path, subject: &str) -> Result<String> {
+        let raw = std::fs::read_to_string(path).map_err(|e| map_io_err(e, subject, path))?;
+        Ok(raw.trim().to_string())
+    }
+}
+
+fn remove_if_present(path: &Path, subject: &str) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(map_write_err(e, subject, path)),
+        _ => Ok(()),
+    }
 }
 
 #[async_trait]
 impl BundleStore for FsStore {
     async fn put_blob(&self, hash: &str, bytes: &[u8]) -> Result<()> {
         let path = self.blob_path(hash);
+        let subject = format!("blob {hash}");
         if path.exists() {
-            return Ok(()); // content-addressed: identical bytes already present, nothing to do
+            // Identical bytes already present; only the age moves.
+            return std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+                .map_err(|e| map_write_err(e, &subject, &path));
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+        self.write_atomic(&path, bytes, &subject)
+    }
+
+    async fn blob_age(&self, hash: &str) -> Result<Option<std::time::Duration>> {
+        let path = self.blob_path(hash);
+        let modified = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(map_io_err(e, &format!("blob {hash}"), &path)),
+        };
+        Ok(Some(modified.elapsed().unwrap_or_default()))
+    }
+
+    async fn list_blobs(&self) -> Result<Vec<String>> {
+        Ok(self
+            .list_dir(&self.root.join("blobs"))?
+            .into_iter()
+            .filter_map(|(n, _)| n.strip_suffix(".bundle").map(str::to_string))
+            .collect())
+    }
+
+    async fn list_refs(&self) -> Result<Vec<(String, String, String)>> {
+        let mut out = Vec::new();
+        for (name, dir) in self.list_dir(&self.root.join("index"))? {
+            for (version, path) in self.list_dir(&dir)? {
+                let hash = Self::read_hash(&path, &format!("nest '{name}@{version}'"))?;
+                out.push((name.clone(), version, hash));
+            }
         }
-        std::fs::write(&path, bytes).with_context(|| format!("writing blob {}", path.display()))?;
-        Ok(())
+        Ok(out)
+    }
+
+    async fn list_nid_refs(&self) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        for (nid, path) in self.list_dir(&self.root.join("nids"))? {
+            let hash = Self::read_hash(&path, &format!("nid {nid}"))?;
+            out.push((nid, hash));
+        }
+        Ok(out)
+    }
+
+    async fn delete_blob(&self, hash: &str) -> Result<()> {
+        remove_if_present(&self.blob_path(hash), &format!("blob {hash}"))
+    }
+
+    async fn delete_ref(&self, name: &str, version: &str) -> Result<()> {
+        remove_if_present(
+            &self.ref_path(name, version),
+            &format!("nest '{name}@{version}'"),
+        )
+    }
+
+    async fn delete_nid_ref(&self, nid: &str) -> Result<()> {
+        remove_if_present(&self.nid_path(nid), &format!("nid {nid}"))
     }
 
     async fn get_blob(&self, hash: &str) -> Result<Vec<u8>> {
@@ -224,36 +360,23 @@ impl BundleStore for FsStore {
 
     async fn set_ref(&self, name: &str, version: &str, hash: &str) -> Result<()> {
         let path = self.ref_path(name, version);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        std::fs::write(&path, hash).with_context(|| format!("writing ref {}", path.display()))?;
-        Ok(())
+        self.write_atomic(&path, hash.as_bytes(), &format!("nest '{name}@{version}'"))
     }
 
     async fn get_ref(&self, name: &str, version: &str) -> Result<String> {
-        let path = self.ref_path(name, version);
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| map_io_err(e, &format!("nest '{name}@{version}'"), &path))?;
-        Ok(raw.trim().to_string())
+        Self::read_hash(
+            &self.ref_path(name, version),
+            &format!("nest '{name}@{version}'"),
+        )
     }
 
     async fn set_nid_ref(&self, nid: &str, hash: &str) -> Result<()> {
         let path = self.nid_path(nid);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        std::fs::write(&path, hash).with_context(|| format!("writing ref {}", path.display()))?;
-        Ok(())
+        self.write_atomic(&path, hash.as_bytes(), &format!("nid {nid}"))
     }
 
     async fn get_nid_ref(&self, nid: &str) -> Result<String> {
-        let path = self.nid_path(nid);
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| map_io_err(e, &format!("nid {nid}"), &path))?;
-        Ok(raw.trim().to_string())
+        Self::read_hash(&self.nid_path(nid), &format!("nid {nid}"))
     }
 }
 
@@ -265,6 +388,17 @@ fn map_io_err(e: std::io::Error, subject: &str, path: &Path) -> anyhow::Error {
         std::io::ErrorKind::NotFound => not_found_err(subject),
         std::io::ErrorKind::PermissionDenied => access_denied_err(subject),
         _ => anyhow::Error::new(e).context(format!("reading {}", path.display())),
+    }
+}
+
+/// [`map_io_err`] for a write: a registry this process may read but not write is denied, by name.
+fn map_write_err(e: std::io::Error, subject: &str, path: &Path) -> anyhow::Error {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem => {
+            access_denied_err(&format!("writing {subject}"))
+                .context(format!("writing {}", path.display()))
+        }
+        _ => anyhow::Error::new(e).context(format!("writing {}", path.display())),
     }
 }
 
@@ -334,16 +468,168 @@ pub async fn publish(
     validate_token(&name).context("resolved nest name")?;
     validate_token(&version).context("resolved version")?;
 
+    // The blob before any ref, so a ref never names a blob not yet written.
     store.put_blob(&hash, &bytes).await?;
     store.set_ref(&name, &version, &hash).await?;
     store.set_ref(&name, LATEST, &hash).await?;
     store.set_nid_ref(&nid, &hash).await?;
+    // A prune in another process may have taken the blob between its write and these refs.
+    if store.blob_age(&hash).await?.is_none() {
+        store.put_blob(&hash, &bytes).await?;
+    }
     Ok(PublishOutcome {
         name,
         version,
         hash,
         nid,
     })
+}
+
+/// How young a blob [`prune`] leaves alone however unreferenced it looks: a publish writes its blob
+/// before its refs, and a blob that young may be one whose refs have not landed yet.
+pub const PRUNE_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// What a [`prune`] removed, or with `dry_run` would remove.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct PruneReport {
+    pub dry_run: bool,
+    /// Blobs a reachable NID still reaches.
+    pub kept_blobs: Vec<String>,
+    /// `name@version` refs, `latest` among them.
+    pub deleted_refs: Vec<String>,
+    pub deleted_nids: Vec<String>,
+    pub deleted_blobs: Vec<String>,
+    /// Unreachable blobs left in place, each with why.
+    pub skipped_blobs: Vec<SkippedBlob>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SkippedBlob {
+    pub blob: String,
+    pub why: String,
+}
+
+/// The NID a blob's own manifest computes to, `None` when the blob is gone.
+async fn blob_nid(store: &dyn BundleStore, hash: &str) -> Result<Option<String>> {
+    let bytes = match store.get_blob(hash).await {
+        Ok(b) => b,
+        Err(e) if is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let tmp = tempfile::tempdir().context("temp dir for a registry blob")?;
+    let file = tmp.path().join("blob.bundle");
+    std::fs::write(&file, &bytes).context("writing a registry blob")?;
+    Ok(Some(crate::blob::bundle_manifest(&file)?.nid()))
+}
+
+/// Delete every blob, NID entry and `name@version` ref that no NID in `reachable` reaches (RFC-0073
+/// FR10). Refs go first and blobs after, and a blob is deleted only once a fresh listing shows no
+/// ref naming it and it is older than `grace`, so a publish beside a prune, which writes its blob
+/// before its refs, is never left with a ref naming a missing blob. A blob whose manifest cannot be
+/// read is kept: what it reaches is unknown.
+pub async fn prune(
+    store: &dyn BundleStore,
+    reachable: &std::collections::BTreeSet<String>,
+    grace: std::time::Duration,
+    dry_run: bool,
+) -> Result<PruneReport> {
+    use std::collections::BTreeSet;
+    let mut report = PruneReport {
+        dry_run,
+        ..Default::default()
+    };
+    let refs = store.list_refs().await?;
+    let nid_refs = store.list_nid_refs().await?;
+    let blobs = store.list_blobs().await?;
+
+    let mut kept: BTreeSet<String> = nid_refs
+        .iter()
+        .filter(|(nid, _)| reachable.contains(nid))
+        .map(|(_, hash)| hash.clone())
+        .collect();
+    let mut doomed = Vec::new();
+    for hash in blobs {
+        if kept.contains(&hash) {
+            continue;
+        }
+        match blob_nid(store, &hash).await {
+            Ok(Some(nid)) if reachable.contains(&nid) => {
+                kept.insert(hash);
+            }
+            Ok(Some(_)) => doomed.push(hash),
+            Ok(None) => {}
+            Err(e) => report.skipped_blobs.push(SkippedBlob {
+                blob: hash,
+                why: format!("its manifest cannot be read: {e:#}"),
+            }),
+        }
+    }
+    report.kept_blobs = kept.iter().cloned().collect();
+
+    for (name, version, hash) in &refs {
+        if kept.contains(hash) {
+            continue;
+        }
+        if !dry_run {
+            // Re-read: a publish may have re-pointed it at a blob that is kept.
+            match store.get_ref(name, version).await {
+                Ok(now) if now == *hash => store.delete_ref(name, version).await?,
+                Ok(_) => continue,
+                Err(e) if is_not_found(&e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        report.deleted_refs.push(format!("{name}@{version}"));
+    }
+    for (nid, hash) in &nid_refs {
+        if reachable.contains(nid) {
+            continue;
+        }
+        if !dry_run {
+            match store.get_nid_ref(nid).await {
+                Ok(now) if now == *hash => store.delete_nid_ref(nid).await?,
+                Ok(_) => continue,
+                Err(e) if is_not_found(&e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        report.deleted_nids.push(nid.clone());
+    }
+
+    for hash in doomed {
+        if !dry_run {
+            let named = store.list_refs().await?.iter().any(|(_, _, h)| *h == hash)
+                || store.list_nid_refs().await?.iter().any(|(_, h)| *h == hash);
+            if named {
+                report.skipped_blobs.push(SkippedBlob {
+                    blob: hash,
+                    why: "a ref written during this prune names it".into(),
+                });
+                continue;
+            }
+        }
+        // The age is read after the refs: a ref this listing missed was written after its blob was
+        // touched, so that blob is younger than `grace` here unless its publisher stalled past it.
+        let Some(age) = store.blob_age(&hash).await? else {
+            continue;
+        };
+        if age < grace {
+            report.skipped_blobs.push(SkippedBlob {
+                blob: hash,
+                why: format!(
+                    "written {}s ago, inside the {}s grace period",
+                    age.as_secs(),
+                    grace.as_secs()
+                ),
+            });
+            continue;
+        }
+        if !dry_run {
+            store.delete_blob(&hash).await?;
+        }
+        report.deleted_blobs.push(hash);
+    }
+    Ok(report)
 }
 
 /// Resolve a `name[@version]` reference and fetch its bundle bytes. Returns `(content-address, bytes)`.
@@ -580,6 +866,31 @@ mod object_store_impl {
         fn nid_key(&self, nid: &str) -> ObjPath {
             self.prefix.child("nids").child(nid)
         }
+
+        /// Every key under `<prefix>/<dir>/`, as its parts below the prefix.
+        async fn list_under(&self, dir: &str) -> Result<Vec<Vec<String>>> {
+            use futures::TryStreamExt;
+            let metas: Vec<object_store::ObjectMeta> = self
+                .inner
+                .list(Some(&self.prefix.child(dir)))
+                .try_collect()
+                .await
+                .map_err(|e| map_obj_err(e, "the registry listing"))?;
+            let mut out: Vec<Vec<String>> = metas
+                .iter()
+                .filter_map(|m| m.location.prefix_match(&self.prefix))
+                .map(|parts| parts.map(|p| p.as_ref().to_string()).collect())
+                .collect();
+            out.sort();
+            Ok(out)
+        }
+
+        async fn delete_key(&self, key: &ObjPath, subject: &str) -> Result<()> {
+            match self.inner.delete(key).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(e) => Err(map_obj_err(e, subject)),
+            }
+        }
     }
 
     /// Map an object-store error into a legible registry error: `NotFound` → "not found",
@@ -599,16 +910,79 @@ mod object_store_impl {
     #[async_trait]
     impl BundleStore for ObjStore {
         async fn put_blob(&self, hash: &str, bytes: &[u8]) -> Result<()> {
-            let key = self.blob_key(hash);
-            // Content-addressed → immutable: if it's already there, the bytes are identical.
-            if self.inner.head(&key).await.is_ok() {
-                return Ok(());
-            }
+            // Written even when present: the bytes are identical, and only a write moves the
+            // object's age, which `prune`'s grace period reads.
             self.inner
-                .put(&key, object_store::PutPayload::from(bytes.to_vec()))
+                .put(
+                    &self.blob_key(hash),
+                    object_store::PutPayload::from(bytes.to_vec()),
+                )
                 .await
                 .map_err(|e| map_obj_err(e, &format!("blob {hash}")))?;
             Ok(())
+        }
+
+        async fn blob_age(&self, hash: &str) -> Result<Option<std::time::Duration>> {
+            match self.inner.head(&self.blob_key(hash)).await {
+                Ok(meta) => Ok(Some(
+                    std::time::SystemTime::from(meta.last_modified)
+                        .elapsed()
+                        .unwrap_or_default(),
+                )),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(map_obj_err(e, &format!("blob {hash}"))),
+            }
+        }
+
+        async fn list_blobs(&self) -> Result<Vec<String>> {
+            Ok(self
+                .list_under("blobs")
+                .await?
+                .into_iter()
+                .filter_map(|parts| match parts.as_slice() {
+                    [_, file] => file.strip_suffix(".bundle").map(str::to_string),
+                    _ => None,
+                })
+                .collect())
+        }
+
+        async fn list_refs(&self) -> Result<Vec<(String, String, String)>> {
+            let mut out = Vec::new();
+            for parts in self.list_under("index").await? {
+                if let [_, name, version] = parts.as_slice() {
+                    let hash = self.get_ref(name, version).await?;
+                    out.push((name.clone(), version.clone(), hash));
+                }
+            }
+            Ok(out)
+        }
+
+        async fn list_nid_refs(&self) -> Result<Vec<(String, String)>> {
+            let mut out = Vec::new();
+            for parts in self.list_under("nids").await? {
+                if let [_, nid] = parts.as_slice() {
+                    out.push((nid.clone(), self.get_nid_ref(nid).await?));
+                }
+            }
+            Ok(out)
+        }
+
+        async fn delete_blob(&self, hash: &str) -> Result<()> {
+            self.delete_key(&self.blob_key(hash), &format!("blob {hash}"))
+                .await
+        }
+
+        async fn delete_ref(&self, name: &str, version: &str) -> Result<()> {
+            self.delete_key(
+                &self.ref_key(name, version),
+                &format!("nest '{name}@{version}'"),
+            )
+            .await
+        }
+
+        async fn delete_nid_ref(&self, nid: &str) -> Result<()> {
+            self.delete_key(&self.nid_key(nid), &format!("nid {nid}"))
+                .await
         }
 
         async fn get_blob(&self, hash: &str) -> Result<Vec<u8>> {
@@ -1273,5 +1647,221 @@ abi = "abis/c.json"
             Ok(_) => panic!("s3:// should require the object-store feature"),
         };
         assert!(err.contains("object-store"), "got: {err}");
+    }
+
+    /// Every ref and NID entry names a blob the store holds.
+    async fn no_ref_dangles(store: &dyn BundleStore) {
+        let blobs: std::collections::BTreeSet<String> =
+            store.list_blobs().await.unwrap().into_iter().collect();
+        for (name, version, hash) in store.list_refs().await.unwrap() {
+            assert!(
+                blobs.contains(&hash),
+                "{name}@{version} names missing {hash}"
+            );
+        }
+        for (nid, hash) in store.list_nid_refs().await.unwrap() {
+            assert!(blobs.contains(&hash), "nid {nid} names missing {hash}");
+        }
+    }
+
+    /// Two nests published, `a` twice under two versions; returns their (hash, nid).
+    async fn two_published(
+        store: &dyn BundleStore,
+        dir: &Path,
+    ) -> ((String, String), (String, String)) {
+        let (fa, fb) = (dir.join("a.bundle"), dir.join("b.bundle"));
+        let a = write_bundle_fixture_with_nid(&fa, "a");
+        let b = write_bundle_fixture_with_nid(&fb, "b");
+        publish(store, &fa, Some("a"), Some("1")).await.unwrap();
+        publish(store, &fa, Some("a"), Some("2")).await.unwrap();
+        publish(store, &fb, Some("b"), Some("1")).await.unwrap();
+        (a, b)
+    }
+
+    async fn prune_keeps_what_is_reachable_and_nothing_else(store: &dyn BundleStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let ((ha, na), (hb, nb)) = two_published(store, dir.path()).await;
+        let keep = std::collections::BTreeSet::from([na.clone()]);
+        let zero = std::time::Duration::ZERO;
+
+        let dry = prune(store, &keep, zero, true).await.unwrap();
+        assert_eq!(dry.deleted_blobs, vec![hb.clone()]);
+        assert_eq!(dry.deleted_nids, vec![nb.clone()]);
+        assert_eq!(
+            dry.deleted_refs,
+            vec!["b@1".to_string(), "b@latest".to_string()]
+        );
+        assert_eq!(
+            store.list_blobs().await.unwrap().len(),
+            2,
+            "a dry run deleted"
+        );
+        assert_eq!(store.get_ref("b", "1").await.unwrap(), hb);
+
+        let held = prune(store, &keep, std::time::Duration::from_secs(3600), false)
+            .await
+            .unwrap();
+        assert!(held.deleted_blobs.is_empty(), "{held:?}");
+        assert_eq!(held.skipped_blobs.len(), 1, "{held:?}");
+        assert!(store.get_ref("b", "1").await.is_err(), "the refs go first");
+        no_ref_dangles(store).await;
+
+        let done = prune(store, &keep, zero, false).await.unwrap();
+        assert_eq!(done.deleted_blobs, vec![hb]);
+        assert_eq!(store.list_blobs().await.unwrap(), vec![ha.clone()]);
+        assert_eq!(store.get_ref("a", "1").await.unwrap(), ha);
+        assert_eq!(store.get_ref("a", "latest").await.unwrap(), ha);
+        assert_eq!(store.get_nid_ref(&na).await.unwrap(), ha);
+        assert!(store.get_nid_ref(&nb).await.is_err());
+        no_ref_dangles(store).await;
+    }
+
+    #[tokio::test]
+    async fn fs_prune_keeps_what_is_reachable_and_nothing_else() {
+        let reg = tempfile::tempdir().unwrap();
+        prune_keeps_what_is_reachable_and_nothing_else(&FsStore::new(reg.path())).await;
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn object_store_prune_keeps_what_is_reachable_and_nothing_else() {
+        let store = open("memory://reg").unwrap();
+        prune_keeps_what_is_reachable_and_nothing_else(store.as_ref()).await;
+    }
+
+    /// A blob whose NID entry was re-pointed at another bundle of the same NID is still that NID's,
+    /// so a prune keeping the NID keeps both, read from the blob's own manifest.
+    #[tokio::test]
+    async fn a_blob_no_nid_entry_names_is_kept_by_its_manifest() {
+        let reg = tempfile::tempdir().unwrap();
+        let store = FsStore::new(reg.path());
+        let dir = tempfile::tempdir().unwrap();
+        let ((ha, na), _) = two_published(&store, dir.path()).await;
+        store.delete_nid_ref(&na).await.unwrap();
+        let keep = std::collections::BTreeSet::from([na]);
+        let report = prune(&store, &keep, std::time::Duration::ZERO, false)
+            .await
+            .unwrap();
+        assert_eq!(report.kept_blobs, vec![ha.clone()]);
+        assert_eq!(store.get_ref("a", "2").await.unwrap(), ha);
+    }
+
+    /// A store that lands one operation inside another, at the interleavings that could leave a ref
+    /// naming a missing blob. Without `late`, its first ref write runs a prune, between a publish's
+    /// blob and its refs. With `late`, a prune's first ref delete writes `late@1` naming that hash, as
+    /// a publish of a blob already present would, after the prune listed its refs.
+    struct Interleaved {
+        inner: FsStore,
+        grace: std::time::Duration,
+        late: Option<String>,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl Interleaved {
+        fn first(&self) -> bool {
+            !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl BundleStore for Interleaved {
+        async fn put_blob(&self, hash: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.put_blob(hash, bytes).await
+        }
+        async fn blob_age(&self, hash: &str) -> Result<Option<std::time::Duration>> {
+            self.inner.blob_age(hash).await
+        }
+        async fn list_blobs(&self) -> Result<Vec<String>> {
+            self.inner.list_blobs().await
+        }
+        async fn list_refs(&self) -> Result<Vec<(String, String, String)>> {
+            self.inner.list_refs().await
+        }
+        async fn list_nid_refs(&self) -> Result<Vec<(String, String)>> {
+            self.inner.list_nid_refs().await
+        }
+        async fn delete_blob(&self, hash: &str) -> Result<()> {
+            self.inner.delete_blob(hash).await
+        }
+        async fn delete_ref(&self, name: &str, version: &str) -> Result<()> {
+            if let Some(hash) = &self.late {
+                if self.first() {
+                    self.inner.set_ref("late", "1", hash).await?;
+                }
+            }
+            self.inner.delete_ref(name, version).await
+        }
+        async fn delete_nid_ref(&self, nid: &str) -> Result<()> {
+            self.inner.delete_nid_ref(nid).await
+        }
+        async fn get_blob(&self, hash: &str) -> Result<Vec<u8>> {
+            self.inner.get_blob(hash).await
+        }
+        async fn set_ref(&self, name: &str, version: &str, hash: &str) -> Result<()> {
+            if self.late.is_none() && self.first() {
+                prune(&self.inner, &Default::default(), self.grace, false)
+                    .await
+                    .unwrap();
+            }
+            self.inner.set_ref(name, version, hash).await
+        }
+        async fn get_ref(&self, name: &str, version: &str) -> Result<String> {
+            self.inner.get_ref(name, version).await
+        }
+        async fn set_nid_ref(&self, nid: &str, hash: &str) -> Result<()> {
+            self.inner.set_nid_ref(nid, hash).await
+        }
+        async fn get_nid_ref(&self, nid: &str) -> Result<String> {
+            self.inner.get_nid_ref(nid).await
+        }
+    }
+
+    /// The grace period keeps a blob whose refs have not landed; with none, the publisher's own
+    /// re-check restores it. Either way the publish ends with every ref naming a blob.
+    #[tokio::test]
+    async fn a_prune_between_a_publish_blob_and_its_refs_leaves_no_ref_dangling() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.bundle");
+        let hash = write_bundle_fixture(&file, "a");
+        for grace in [PRUNE_GRACE, std::time::Duration::ZERO] {
+            let reg = tempfile::tempdir().unwrap();
+            let store = Interleaved {
+                inner: FsStore::new(reg.path()),
+                grace,
+                late: None,
+                fired: Default::default(),
+            };
+            publish(&store, &file, Some("a"), Some("1")).await.unwrap();
+            assert!(store.fired.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(store.list_blobs().await.unwrap(), vec![hash.clone()]);
+            no_ref_dangles(&store).await;
+        }
+    }
+
+    /// A ref written after a prune listed the refs keeps the blob it names: the prune lists them
+    /// again before it deletes any blob.
+    #[tokio::test]
+    async fn a_ref_written_during_a_prune_keeps_its_blob() {
+        let reg = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ((ha, _), _) = two_published(&FsStore::new(reg.path()), dir.path()).await;
+        let store = Interleaved {
+            inner: FsStore::new(reg.path()),
+            grace: std::time::Duration::ZERO,
+            late: Some(ha.clone()),
+            fired: Default::default(),
+        };
+        let report = prune(
+            &store,
+            &Default::default(),
+            std::time::Duration::ZERO,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(store.fired.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!report.deleted_blobs.contains(&ha), "{report:?}");
+        assert_eq!(store.get_ref("late", "1").await.unwrap(), ha);
+        no_ref_dangles(&store).await;
     }
 }

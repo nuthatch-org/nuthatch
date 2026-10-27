@@ -204,6 +204,67 @@ windows are slow but succeed slows every nest on its chain. There is no per-nest
 yet: abandoning a window part-way can let its commit land after its derived state was dropped, so a
 deadline needs the window split into a part that can be abandoned and a commit that cannot.
 
+## Bundles
+
+A caller that never runs the binary checks, publishes and collects bundles here (RFC-0073 FR10). A
+bundle is the file `nuthatch nest bundle` writes, sent as the request body with `Content-Type:
+application/octet-stream`; any other content type is answered `415`.
+
+| Do | Call | Answers |
+|---|---|---|
+| Check a bundle and price its mount | `POST /_admin/bundles?dry_run=true` | `200` and the report below |
+| Publish it to `--registry` | `POST /_admin/bundles?as=<name>@<version>` | `200`, `{"nid", "blob_hash", "name", "version"}` |
+| Read what the registry holds for a NID | `GET /_admin/bundles/<nid>` | `200` with `"held": true` and the inspection, or `404` with `"held": false` |
+| Delete what nothing reaches | `POST /_admin/bundles/prune` `{"keep": ["<nid>", …]}` | `200` and what was deleted; `?dry_run=true` lists only |
+
+**Every bundle is checked as `nuthatch nest load` checks it**: its format, every file's hash, the decode
+registry reproduced from its inputs, and its files computing to the NID its manifest claims. One that
+fails is answered `422` with the reason `nest load` gives, and nothing is written. The check unpacks the
+bundle into a temporary directory that is removed before the answer; neither `data/`, `mounts.toml`
+nor the registry is touched by a dry run.
+
+```json
+{
+  "nid": "9f2c…", "data_identity": "41ab…", "blob_hash": "c07e…",
+  "inspection": {"schema": "nuthatch.nest-inspect/1", "nid": "9f2c…", …},
+  "admission": {"name": "usdc", "nid": "9f2c…", "fetched": false, "shares": null, "chain": "mainnet",
+                "per_block_rpc": [], "projected_mb": 420, "ceiling_mb": 2048, "refusal": null, …}
+}
+```
+
+`inspection` is the document `nuthatch nest inspect <bundle> --json` prints for the same bundle.
+`admission` is what `POST /_admin/nests?dry_run=true` answers for its NID, under the bundle's nest name
+or `?name=<name>`; it never fetches, since the bundle is in hand.
+
+**Publish** needs `?as=`; `name` alone publishes as version `h<first 12 of the hash>`, as `nest publish`
+does. Publishing the same bundle again changes nothing and answers the same. A runtime started without
+`--registry` answers `409`, and a registry that refuses this runtime's write (a read-only directory, or
+S3 credentials without write) answers `403`, naming the registry. A `POST /_admin/bundles` with neither
+`?dry_run=true` nor `?as=` is `400`.
+
+**The size limit** is 64 MiB a bundle, past which the answer is `413`; `--max-bundle-mb` changes it. A
+bundle is a nest's config, ABIs and views, so a real one is far smaller.
+
+**Prune** deletes every blob, NID entry and `name@version` ref, `latest` included, that is reachable
+neither from a NID in `keep` nor from any mount of this runtime: live, suspended, joining, with a job,
+or recorded in `mounts.toml`. A blob is reachable from a NID when that NID's entry names it or its own
+manifest computes to it. An invalid NID in `keep` is `400`. The answer lists `deleted_refs`,
+`deleted_nids`, `deleted_blobs`, `kept_blobs` and `skipped_blobs`, each skip with why, and `reachable`,
+the NIDs the prune kept. A `latest` whose version was pruned is deleted, not moved to an older one.
+
+Prune never leaves a ref naming a missing blob. It deletes refs first and blobs after, re-reading each
+ref before deleting it and listing every ref again before each blob; a publish writes its blob before
+its refs, and checks its blob is still there after them. A blob younger than 15 minutes is skipped,
+because it may be one whose publisher has not written its refs yet; a publisher stalled longer than
+that between its blob and its refs finds its blob gone and writes it again. Within one runtime, publishes and
+prunes take turns. Against a second runtime or `nest publish` sharing the registry, one window remains:
+a publish of a blob that already exists, landing entirely between this prune's last check of that blob
+and its delete, a few milliseconds, leaves its refs naming nothing. Publishing again repairs it. A ref
+re-pointed in the same instant may be deleted rather than kept; it never dangles.
+
+Publish and prune answer synchronously. Neither dials an RPC, a bundle is bounded by the size limit,
+and both are safe to repeat, so a caller whose request timed out sends it again.
+
 ## What to meter
 
 The runtime serves `/metrics` at its root, before anything is mounted, with per-nest series labelled `{nest="<name>"}`, among them

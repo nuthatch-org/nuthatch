@@ -1834,6 +1834,7 @@ pub async fn dev(
     freshness: crate::freshness::Freshness,
     cors: Vec<String>,
     registry: Option<String>,
+    max_bundle_mb: usize,
 ) -> Result<()> {
     // Before the mount table is even read: a malformed origin should fail the command, not the
     // fifteenth minute of a backfill.
@@ -2253,7 +2254,7 @@ pub async fn dev(
             dormant,
             fail_fast,
             cursors: admin_enabled.then_some(cursor_feed),
-            registry,
+            registry: registry.clone(),
         },
     }));
 
@@ -2269,12 +2270,28 @@ pub async fn dev(
         }
     }
     let jobs = start_mount_jobs(&dir, &handles, admin_enabled).await?;
-    let service = handles.lock().await.live.service().merge(lifecycle_routes(
-        handles.clone(),
-        jobs.clone(),
-        admin_enabled,
-        admin_token.clone(),
-    ));
+    let service = handles
+        .lock()
+        .await
+        .live
+        .service()
+        .merge(lifecycle_routes(
+            handles.clone(),
+            jobs.clone(),
+            admin_enabled,
+            admin_token.clone(),
+        ))
+        .merge(bundle_routes(
+            handles.clone(),
+            jobs.clone(),
+            admin_enabled,
+            admin_token.clone(),
+            registry,
+            BundleLimits {
+                max_bytes: max_bundle_mb.saturating_mul(1024 * 1024),
+                ..Default::default()
+            },
+        ));
     let result = tokio::select! {
         r = crate::serve::bind_and_serve(&listen, service, cors) => r,
         r = supervise_cursors(&mut ingests, &mut cursor_intake, &health, fail_fast) => r,
@@ -2386,6 +2403,79 @@ pub async fn supervise_cursors(
         "every mounts cursor is dead, so nothing will advance again - {}",
         failures.join("; ")
     )
+}
+
+/// Whether a mount of `name` on `nid` is already live, which makes it idempotent (#1646).
+fn repeats_live(h: &RuntimeHandles, name: &str, nid: Option<&str>) -> bool {
+    h.states
+        .iter()
+        .any(|(n, s)| n == name && (nid.is_none() || s.nid.as_deref() == nid))
+}
+
+/// A mount's dry run as `POST /_admin/nests?dry_run=true` answers it (#1550). `carried` is the nest a
+/// bundle's dry run holds itself (RFC-0073 FR10): nothing is fetched, and the report reads it unless
+/// the runtime already holds the NID, which names the same files.
+async fn dry_run_report(
+    handles: &tokio::sync::Mutex<RuntimeHandles>,
+    name: &str,
+    nid: Option<&Nid>,
+    carried: Option<&Path>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use axum::http::StatusCode;
+    let nid_str = nid.map(|n| n.as_str().to_string());
+    let plan = {
+        let h = handles.lock().await;
+        if repeats_live(&h, name, nid_str.as_deref()) {
+            return (
+                StatusCode::OK,
+                serde_json::json!({
+                    "name": name,
+                    "nid": nid_str,
+                    "mounted": true,
+                    "refusal": null,
+                    "refusal_status": null,
+                }),
+            );
+        }
+        h.plan(name, nid, carried.is_some())
+    };
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(e) => {
+            return (
+                StatusCode::OK,
+                serde_json::json!({
+                    "name": name,
+                    "refusal": format!("{e:#}"),
+                    "refusal_status": e.downcast_ref::<MountRefusal>().map(MountRefusal::status),
+                }),
+            )
+        }
+    };
+    let fetched = match (&plan.fetch_from, &plan.nid) {
+        (Some(registry), Some(n)) => {
+            if let Err(e) = fetch_nid(registry, n, &plan.dir, name).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({"error": format!("{e:#}")}),
+                );
+            }
+            true
+        }
+        _ => false,
+    };
+    let nest_dir = match carried {
+        Some(dir) if !plan.dir.join(crate::config::CONFIG_FILE).exists() => dir,
+        _ => plan.dir.as_path(),
+    };
+    let h = handles.lock().await;
+    match h.dry_run_in(name, &plan, fetched, nest_dir).await {
+        Ok(report) => (StatusCode::OK, serde_json::json!(report)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error": format!("{e:#}")}),
+        ),
+    }
 }
 
 /// The lifecycle control surface (RFC-0027 §5): mount and unmount a nest on a running mounts.
@@ -2504,13 +2594,6 @@ pub fn lifecycle_routes(
         )
     }
 
-    /// Whether a mount of `name` on `nid` is already live, which makes it idempotent (#1646).
-    fn repeats_live(h: &RuntimeHandles, name: &str, nid: Option<&str>) -> bool {
-        h.states
-            .iter()
-            .any(|(n, s)| n == name && (nid.is_none() || s.nid.as_deref() == nid))
-    }
-
     async fn mount_nest(
         State((handles, jobs, required)): State<Shared>,
         Query(q): Query<MountQuery>,
@@ -2545,55 +2628,8 @@ pub fn lifecycle_routes(
         let nid_str = nid.as_ref().map(|n| n.as_str().to_string());
 
         if q.dry_run {
-            let plan = {
-                let h = handles.lock().await;
-                if repeats_live(&h, &body.name, nid_str.as_deref()) {
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "name": body.name,
-                            "nid": nid_str,
-                            "mounted": true,
-                            "refusal": null,
-                            "refusal_status": null,
-                        })),
-                    );
-                }
-                h.plan_mount(&body.name, nid.as_ref())
-            };
-            let plan = match plan {
-                Ok(plan) => plan,
-                Err(e) => {
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "name": body.name,
-                            "refusal": format!("{e:#}"),
-                            "refusal_status": e.downcast_ref::<MountRefusal>().map(MountRefusal::status),
-                        })),
-                    )
-                }
-            };
-            let fetched = match (&plan.fetch_from, &plan.nid) {
-                (Some(registry), Some(n)) => {
-                    if let Err(e) = fetch_nid(registry, n, &plan.dir, &body.name).await {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({"error": format!("{e:#}")})),
-                        );
-                    }
-                    true
-                }
-                _ => false,
-            };
-            let h = handles.lock().await;
-            return match h.dry_run(&body.name, &plan, fetched).await {
-                Ok(report) => (StatusCode::OK, Json(serde_json::json!(report))),
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("{e:#}")})),
-                ),
-            };
+            let (status, report) = dry_run_report(&handles, &body.name, nid.as_ref(), None).await;
+            return (status, Json(report));
         }
 
         if q.wait {
@@ -2998,6 +3034,383 @@ pub fn lifecycle_routes(
         .route("/_admin/move/{*name}", post(move_nest))
         .route("/_admin/datasets/{nid}", delete(reclaim_dataset))
         .with_state((handles, jobs, admin_token))
+}
+
+/// The bundle size `--max-bundle-mb` defaults to: far above any real nest's config, ABIs and views.
+pub const DEFAULT_MAX_BUNDLE_MB: usize = 64;
+
+/// Limits on the bundle routes (RFC-0073 FR10).
+#[derive(Clone, Debug)]
+pub struct BundleLimits {
+    /// The largest bundle a request may carry; past it the answer is `413`.
+    pub max_bytes: usize,
+    /// How young a blob a prune leaves alone, [`crate::distribution::PRUNE_GRACE`] unless a test
+    /// needs otherwise.
+    pub prune_grace: std::time::Duration,
+}
+
+impl Default for BundleLimits {
+    fn default() -> BundleLimits {
+        BundleLimits {
+            max_bytes: DEFAULT_MAX_BUNDLE_MB * 1024 * 1024,
+            prune_grace: crate::distribution::PRUNE_GRACE,
+        }
+    }
+}
+
+/// The bundle lifecycle over the admin API (RFC-0073 FR10): check a bundle as `nest load` would and
+/// price its mount, publish it to the runtime's `--registry`, read what the registry holds for a NID,
+/// and prune what nothing reaches. Gated by the admin token as the lifecycle routes are.
+///
+/// Publish and prune run synchronously: a bundle is bounded by `max_bytes` and dials no RPC, and both
+/// are safe to repeat, so a caller that timed out retries rather than polling a job. They are
+/// serialised against each other in this process; against another process sharing the registry,
+/// [`crate::distribution::prune`]'s ordering and grace period are the guard.
+pub fn bundle_routes(
+    handles: Arc<tokio::sync::Mutex<RuntimeHandles>>,
+    jobs: Arc<crate::mount_jobs::MountJobs>,
+    admin_enabled: bool,
+    admin_token: Option<String>,
+    registry: Option<String>,
+    limits: BundleLimits,
+) -> axum::Router {
+    use axum::extract::{Path as AxPath, Query, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::{get, post};
+    use axum::Json;
+
+    if !admin_enabled {
+        return axum::Router::new();
+    }
+
+    #[derive(Clone)]
+    struct Shared {
+        handles: Arc<tokio::sync::Mutex<RuntimeHandles>>,
+        jobs: Arc<crate::mount_jobs::MountJobs>,
+        token: Option<String>,
+        registry: Option<String>,
+        grace: std::time::Duration,
+        writing: Arc<tokio::sync::Mutex<()>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct BundleQuery {
+        token: Option<String>,
+        #[serde(default)]
+        dry_run: bool,
+        /// `name@version` to publish under.
+        #[serde(rename = "as")]
+        publish_as: Option<String>,
+        /// The mount name a dry run prices, the bundle's nest name by default.
+        name: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct TokenQuery {
+        token: Option<String>,
+        #[serde(default)]
+        dry_run: bool,
+    }
+    #[derive(serde::Deserialize)]
+    struct PruneBody {
+        keep: Vec<String>,
+    }
+    type Answer = (StatusCode, Json<serde_json::Value>);
+
+    fn refuse(status: StatusCode, why: impl std::fmt::Display) -> Answer {
+        (status, Json(serde_json::json!({"error": why.to_string()})))
+    }
+
+    fn unauthorized() -> Answer {
+        refuse(StatusCode::UNAUTHORIZED, "admin token required")
+    }
+
+    fn no_registry() -> Answer {
+        refuse(
+            StatusCode::CONFLICT,
+            "this runtime was started without --registry, so it has no registry to publish to or read",
+        )
+    }
+
+    /// A registry error: `403` naming the registry when it refused this runtime's credential.
+    fn registry_failed(registry: &str, e: &anyhow::Error) -> Answer {
+        if crate::distribution::is_denied(e) {
+            return refuse(
+                StatusCode::FORBIDDEN,
+                format!("the registry {registry} refused this runtime: {e:#}"),
+            );
+        }
+        refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+    }
+
+    /// A binary body must say so: a cross-site form cannot send `application/octet-stream` without a
+    /// preflight, as it cannot send JSON (#1642).
+    fn not_octets(headers: &HeaderMap) -> Option<Answer> {
+        let octets = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case("application/octet-stream"));
+        (!octets).then(|| {
+            refuse(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Expected a bundle with `Content-Type: application/octet-stream`",
+            )
+        })
+    }
+
+    /// `nest load`'s checks and `nest inspect`'s document, off the async threads.
+    async fn check(
+        bytes: Vec<u8>,
+        expect: Option<String>,
+    ) -> Result<(crate::blob::CheckedBundle, crate::inspect::Inspection)> {
+        tokio::task::spawn_blocking(move || {
+            let bundle = crate::blob::CheckedBundle::from_bytes(&bytes, expect.as_deref())?;
+            let inspection = crate::inspect::checked(&bundle)?;
+            Ok((bundle, inspection))
+        })
+        .await
+        .context("the bundle check panicked")?
+    }
+
+    async fn post_bundle(
+        State(s): State<Shared>,
+        Query(q): Query<BundleQuery>,
+        headers: HeaderMap,
+        body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
+    ) -> Answer {
+        if !crate::serve::token_ok(s.token.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        if let Some(refused) = not_octets(&headers) {
+            return refused;
+        }
+        let bytes = match body {
+            Ok(b) => b,
+            Err(e) => return refuse(e.status(), e.body_text()),
+        };
+        let publish_as =
+            match (q.dry_run, q.publish_as.as_deref()) {
+                (true, None) => None,
+                (false, Some(r)) => match crate::distribution::NestRef::parse(r) {
+                    Ok(r) if crate::distribution::is_nid_shaped(&r.name) => {
+                        return refuse(
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "nest name {:?} is shaped like a NID; choose another",
+                                r.name
+                            ),
+                        )
+                    }
+                    Ok(r) => Some(r),
+                    Err(e) => return refuse(StatusCode::BAD_REQUEST, format!("{e:#}")),
+                },
+                _ => return refuse(
+                    StatusCode::BAD_REQUEST,
+                    "pass ?dry_run=true to check a bundle, or ?as=<name>@<version> to publish it",
+                ),
+            };
+        if publish_as.is_some() && s.registry.is_none() {
+            return no_registry();
+        }
+        let (bundle, inspection) = match check(bytes.to_vec(), None).await {
+            Ok(checked) => checked,
+            Err(e) => return refuse(StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")),
+        };
+
+        let Some(r) = publish_as else {
+            let name = q.name.unwrap_or_else(|| bundle.manifest.nest_name.clone());
+            let admission = match check_mount_name(&name, s.jobs.default_tenant())
+                .and_then(|()| Nid::parse(&inspection.nid))
+            {
+                Ok(nid) => {
+                    let (status, report) =
+                        dry_run_report(&s.handles, &name, Some(&nid), Some(&bundle.nest_dir()))
+                            .await;
+                    if !status.is_success() {
+                        return (status, Json(report));
+                    }
+                    report
+                }
+                Err(e) => serde_json::json!({
+                    "name": name,
+                    "refusal": format!("{e:#}"),
+                    "refusal_status": e.downcast_ref::<MountRefusal>().map(MountRefusal::status),
+                }),
+            };
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "nid": inspection.nid,
+                    "data_identity": inspection.data_identity,
+                    "blob_hash": bundle.hash,
+                    "inspection": inspection,
+                    "admission": admission,
+                })),
+            );
+        };
+
+        let registry = s.registry.as_deref().unwrap_or_default();
+        let _writing = s.writing.lock().await;
+        let store = match crate::distribution::open(registry) {
+            Ok(store) => store,
+            Err(e) => return registry_failed(registry, &e),
+        };
+        match crate::distribution::publish(
+            store.as_ref(),
+            &bundle.bundle_file(),
+            Some(&r.name),
+            r.version.as_deref(),
+        )
+        .await
+        {
+            Ok(out) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "nid": out.nid,
+                    "blob_hash": out.hash,
+                    "name": out.name,
+                    "version": out.version,
+                })),
+            ),
+            Err(e) => registry_failed(registry, &e),
+        }
+    }
+
+    async fn get_bundle(
+        State(s): State<Shared>,
+        AxPath(nid): AxPath<String>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+    ) -> Answer {
+        if !crate::serve::token_ok(s.token.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let nid = match Nid::parse(&nid) {
+            Ok(nid) => nid,
+            Err(e) => return refuse(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        };
+        let Some(registry) = s.registry.as_deref() else {
+            return no_registry();
+        };
+        let pulled = match crate::distribution::open(registry) {
+            Ok(store) => crate::distribution::pull_by_nid(store.as_ref(), nid.as_str()).await,
+            Err(e) => Err(e),
+        };
+        let (hash, bytes) = match pulled {
+            Ok(pulled) => pulled,
+            Err(e) if crate::distribution::is_not_found(&e) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "nid": nid.as_str(),
+                        "held": false,
+                        "reason": format!("{e:#}"),
+                    })),
+                )
+            }
+            Err(e) => return registry_failed(registry, &e),
+        };
+        match check(bytes, Some(hash.clone())).await {
+            Ok((_, inspection)) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "nid": nid.as_str(),
+                    "held": true,
+                    "blob_hash": hash,
+                    "inspection": inspection,
+                })),
+            ),
+            Err(e) => refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "the registry's bundle {hash} for nid {nid} fails nest load's checks: {e:#}"
+                ),
+            ),
+        }
+    }
+
+    async fn prune_bundles(
+        State(s): State<Shared>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+        body: Result<Json<PruneBody>, axum::extract::rejection::JsonRejection>,
+    ) -> Answer {
+        if !crate::serve::token_ok(s.token.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let body = match body {
+            Ok(Json(body)) => body,
+            Err(e) => return refuse(e.status(), e.body_text()),
+        };
+        let mut reachable = std::collections::BTreeSet::new();
+        for n in &body.keep {
+            match Nid::parse(n) {
+                Ok(nid) => reachable.insert(nid.as_str().to_string()),
+                Err(e) => return refuse(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            };
+        }
+        let Some(registry) = s.registry.as_deref() else {
+            return no_registry();
+        };
+        let _writing = s.writing.lock().await;
+        // Everything mounted, suspended, joining or with a job: a NID any of them names is never
+        // pruned, kept or not. The file is read too, since it is what a restart mounts.
+        let dir = {
+            let h = s.handles.lock().await;
+            reachable.extend(
+                h.states
+                    .iter()
+                    .filter_map(|(_, st)| st.nid.as_deref().map(str::to_string)),
+            );
+            reachable.extend(h.suspended.values().cloned());
+            reachable.extend(h.mount_ctx.mounts.iter().map(|m| m.nid.clone()));
+            reachable.extend(h.joining.list().iter().filter_map(|j| {
+                j.dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+            }));
+            h.mount_ctx.dir.clone()
+        };
+        reachable.extend(s.jobs.list().into_iter().filter_map(|j| j.nid));
+        match MountTable::load(&dir) {
+            Ok(table) => reachable.extend(table.mounts.into_iter().map(|m| m.nid)),
+            Err(e) => {
+                return refuse(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("cannot read what this runtime mounts, so nothing is pruned: {e:#}"),
+                )
+            }
+        }
+        let store = match crate::distribution::open(registry) {
+            Ok(store) => store,
+            Err(e) => return registry_failed(registry, &e),
+        };
+        match crate::distribution::prune(store.as_ref(), &reachable, s.grace, q.dry_run).await {
+            Ok(report) => {
+                let mut out = serde_json::json!(report);
+                out["reachable"] = serde_json::json!(reachable);
+                (StatusCode::OK, Json(out))
+            }
+            Err(e) => registry_failed(registry, &e),
+        }
+    }
+
+    let max_bytes = limits.max_bytes;
+    axum::Router::new()
+        .route(
+            "/_admin/bundles",
+            post(post_bundle).layer(axum::extract::DefaultBodyLimit::max(max_bytes)),
+        )
+        .route("/_admin/bundles/prune", post(prune_bundles))
+        .route("/_admin/bundles/{nid}", get(get_bundle))
+        .with_state(Shared {
+            handles,
+            jobs,
+            token: admin_token,
+            registry,
+            grace: limits.prune_grace,
+            writing: Default::default(),
+        })
 }
 
 /// Persist the mounted-nest list to `mounts.toml` (RFC-0027 §5).
@@ -4182,6 +4595,18 @@ impl RuntimeHandles {
     /// A mount's dry run (#1550), once [`Self::plan_mount`] has placed its dataset on disk. Runs the
     /// same admission a mount does and changes nothing.
     pub async fn dry_run(&self, name: &str, plan: &MountPlan, fetched: bool) -> Result<DryRun> {
+        self.dry_run_in(name, plan, fetched, &plan.dir).await
+    }
+
+    /// [`Self::dry_run`], reading the nest from `nest_dir`: a bundle's dry run (RFC-0073 FR10) carries
+    /// its nest in a temporary directory rather than under `data/`.
+    async fn dry_run_in(
+        &self,
+        name: &str,
+        plan: &MountPlan,
+        fetched: bool,
+        nest_dir: &Path,
+    ) -> Result<DryRun> {
         let mut report = DryRun {
             name: name.to_string(),
             nid: plan.nid.clone(),
@@ -4203,8 +4628,8 @@ impl RuntimeHandles {
             report.shares = Some(holder.clone());
             return Ok(report);
         }
-        let config = Config::load(&plan.dir)
-            .with_context(|| format!("loading nest '{name}' from {}", plan.dir.display()))?;
+        let config = Config::load(nest_dir)
+            .with_context(|| format!("loading nest '{name}' from {}", nest_dir.display()))?;
         report.chain = Some(config.nest.chain.clone());
         report.start_block = self
             .mount_ctx
@@ -4222,7 +4647,7 @@ impl RuntimeHandles {
                 report.per_block_rpc.push(what);
             }
         }
-        match self.admit(name, &config, &plan.dir) {
+        match self.admit(name, &config, nest_dir) {
             Ok(adm) => {
                 report.incoming_mb = Some(adm.incoming_mb);
                 report.projected_mb = Some(adm.projected_mb);
@@ -4253,6 +4678,12 @@ impl RuntimeHandles {
     /// Resolve a mount's dataset and whether it must be fetched first, refusing what can be refused
     /// without doing any work.
     pub fn plan_mount(&self, name: &str, nid: Option<&Nid>) -> Result<MountPlan> {
+        self.plan(name, nid, false)
+    }
+
+    /// `carried`: the caller holds the nest itself, as a bundle's dry run does, so a NID the runtime
+    /// does not hold needs no fetch and is no refusal.
+    fn plan(&self, name: &str, nid: Option<&Nid>, carried: bool) -> Result<MountPlan> {
         if self.states.iter().any(|(n, _)| n == name) || self.failed.contains_key(name) {
             return Err(MountRefusal::AlreadyMounted(name.to_string()).into());
         }
@@ -4309,6 +4740,7 @@ impl RuntimeHandles {
             None => MountTable::nest_dir(&self.mount_ctx.dir, alias),
         };
         let fetch_from = match &nid {
+            Some(_) if carried => None,
             Some(nid) if !dir.exists() => match &self.mount_ctx.registry {
                 Some(registry) => Some(registry.clone()),
                 None => return Err(MountRefusal::NotHeld { nid: nid.clone() }.into()),
@@ -8431,6 +8863,7 @@ mod tests {
                 Default::default(),
                 Vec::new(),
                 None,
+                DEFAULT_MAX_BUNDLE_MB,
             ),
         )
         .await
@@ -8470,6 +8903,7 @@ mod tests {
                 Default::default(),
                 Vec::new(),
                 None,
+                DEFAULT_MAX_BUNDLE_MB,
             ),
         )
         .await
