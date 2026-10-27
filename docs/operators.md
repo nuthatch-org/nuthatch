@@ -928,6 +928,9 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /shape` | capability probe: what this nest can answer (drives adaptive MCP) |
 | `GET /_admin/`, `/_admin/events`, `/_admin/config`, `/_admin/storage`, `/_admin/requests` | admin UI (eight tabs since 4.2.1), its event stream, the authored files and limits as JSON with every URL cut to scheme and host and every secret withheld, the sealed catalogue per table (`?table=` for one table's segments), and the last 256 requests served (`?since=<seq>` for those after one): route template, the declared query or entity name when the nest knows it, status, milliseconds and bytes, never SQL text, a query string, a path value or a client address, and not the monitoring reads (`/`, `/health`, `/ready`, `/metrics`, `/_admin*`). Token-gated off-localhost; removable with `--no-admin` |
 
+**Response header:** `/sql`, `/q/{name}`, GraphQL and the typed routes answer with `Nuthatch-Cost`,
+a report of what the request read and held; [The cost header](#the-cost-header) has its format.
+
 **Runtime root routes:** `GET /nests` (roster with live per-nest health), `GET /ready` (runtime-wide),
 `GET /health`, and `GET /metrics` (the whole runtime's exposition, served before anything is mounted;
 each mount's `/metrics` serves the same).
@@ -1070,7 +1073,8 @@ nuthatch dev --cors https://app.example.com --cors http://localhost:3000
 nuthatch serve --cors '*'          # any origin; fine for a public read-only nest
 ```
 
-It sets allow-origin, allow-methods `GET,POST,OPTIONS` and allow-headers, and answers preflight.
+It sets allow-origin, allow-methods `GET,POST,OPTIONS` and allow-headers, exposes
+[`Nuthatch-Cost`](#the-cost-header), and answers preflight.
 `POST` is there for the GraphQL routes (`/graphql`, `/subgraphs/id/{id}`, `/subgraphs/name/…`,
 present only in a `--features graph` build), which take their query in a body - a `GET`-only list would leave a browser GraphQL client
 preflighting `POST`, being refused, and never sending the query. No `/_admin` path is ever
@@ -1245,6 +1249,42 @@ FR4): `nuthatch_nest_http_requests_total`, `nuthatch_nest_sql_queries_total`,
 that ran an analytical query (`/sql`, `/q/{name}`, `/diff`, GraphQL), admission wait included. Two
 mounts of one dataset are counted apart, and summed over mounts each equals its unlabelled total. A
 mount's series go when it is unmounted.
+
+### The cost header
+
+Every answer from `/sql`, `/q/{name}`, the GraphQL routes and the typed routes (`/table/{name}`,
+`/entities`, `/entity/{id}`, the three `/derived` routes, `/balances`, `/balance/{address}`,
+`/exposure/{address}`, `/flags`) carries a `Nuthatch-Cost` header saying what that request read and
+held (RFC-0073 FR4):
+
+```
+Nuthatch-Cost: sealed_bytes=1409; hot_rows=12; engine_us=3793; peak_mem_bytes=0; queue_us=0; result_bytes=219712
+```
+
+It is a report, not a price. Nuthatch meters and bills nothing; a gateway that wants to charge, cap
+or simply log by it does so on its own terms. The six fields are always present, in this order,
+separated by `; `, each an integer:
+
+| Field | Meaning |
+|---|---|
+| `sealed_bytes` | Parquet data bytes Burrmill read from sealed segments, footers excluded, summed over every statement the request ran |
+| `hot_rows` | rows read from the hot tip: the tip snapshot a statement was given, or the rows a typed route took from it |
+| `engine_us` | wall time of the request's statements in Burrmill, from admission inside the engine to the last batch, encoding the rows included |
+| `peak_mem_bytes` | the most any one statement held against the analytics memory pool |
+| `queue_us` | time spent waiting for a `/sql` permit |
+| `result_bytes` | the serialized body |
+
+`sealed_bytes` is the figure to build on: the same statement over the same sealed segments reads the
+same byte ranges, in one process or another, and a test holds it to that. Three things move it
+honestly. A remembered answer (the [analytical memo](#the-analytical-memo)) reads nothing and reports
+`0`. A statement with `ORDER BY … LIMIT` prunes by what its other partitions have found so far, so
+it can read more on one run than the next, up to half as much again in Burrmill's own test; the
+sealed fill of `/table/{name}` is such a statement. An answer cut at the row cap reports what was
+read up to the cut. The other fields move with the machine and its load. There is no CPU-time field:
+DataFusion's per-operator compute time can only be read from a plan held until it finishes, and
+holding one keeps every segment's metrics alive for the statement (burrmill#86), so `engine_us` is
+wall time instead. A route that reads only maintained state, `/balances` or `/derived` for instance,
+reads no sealed bytes and no hot rows.
 
 A nest that mirrors itself (RFC-0052, `--publish-target`) also carries, per nest and only then:
 `nuthatch_publish_sealed_through` (what the published catalogue covers),

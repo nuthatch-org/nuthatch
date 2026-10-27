@@ -528,7 +528,8 @@ impl Session for BurrmillSession {
         let mut over = false;
         let mut columns: Vec<String> = Vec::new();
         let engine = self.reader();
-        let r = engine.sql_for_each(sql, |batch| {
+        let mut cost = burrmill::QueryMetrics::default();
+        let r = engine.sql_for_each_metered(sql, &mut cost, |batch| {
             if columns.is_empty() {
                 columns = batch
                     .schema()
@@ -581,6 +582,7 @@ impl Session for BurrmillSession {
             }
             Ok(())
         });
+        crate::cost::engine(&cost);
         let truncated = match r {
             Ok(()) => false,
             Err(_) if over => true,
@@ -602,7 +604,8 @@ impl Session for BurrmillSession {
     fn for_each_row(&self, sql: &str, f: &mut dyn FnMut(&[Value]) -> Result<()>) -> Result<()> {
         let engine = self.reader();
         let mut failed: Option<anyhow::Error> = None;
-        let r = engine.sql_for_each(sql, |batch| {
+        let mut cost = burrmill::QueryMetrics::default();
+        let r = engine.sql_for_each_metered(sql, &mut cost, |batch| {
             let names: Vec<String> = batch
                 .schema()
                 .fields()
@@ -630,6 +633,7 @@ impl Session for BurrmillSession {
             }
             Ok(())
         });
+        crate::cost::engine(&cost);
         match (r, failed) {
             (_, Some(e)) => Err(e),
             (Ok(()), None) => Ok(()),
