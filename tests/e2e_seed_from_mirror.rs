@@ -15,7 +15,7 @@ use std::sync::Arc;
 use common::tape::*;
 use nuthatch::indexer;
 
-const PUBLISHER: &str = "seedpub";
+pub(crate) const PUBLISHER: &str = "seedpub";
 
 fn transfer_at(b: u64) -> BlockFixture {
     transfers_block(
@@ -29,7 +29,7 @@ fn transfer_at(b: u64) -> BlockFixture {
 
 /// Transfers in blocks `1..=10`, block 5 padded so `1..=5` seals as a full segment, then empty
 /// blocks up to `tip`.
-fn chain(tip: u64) -> Arc<TapeSource> {
+pub(crate) fn chain(tip: u64) -> Arc<TapeSource> {
     let tape = Arc::new(TapeSource::new());
     for b in 1..=10u64 {
         let mut fx = transfer_at(b);
@@ -86,7 +86,7 @@ async fn run_to(dir: &Path, tape: Arc<TapeSource>, name: &str, block: u64) -> Ve
 
 /// A stopped publisher holding a full segment `1..=5`, a provisional tail `6..=8`, and blocks
 /// `9..=12` unsealed, mirrored to `mirror`.
-async fn published(dir: &Path, mirror: &Path) -> nuthatch::publish::SyncReport {
+pub(crate) async fn published(dir: &Path, mirror: &Path) -> nuthatch::publish::SyncReport {
     let tape = chain(11);
     let rt = spawn(dir, tape.clone(), PUBLISHER).await;
     let store = rt.state.store.clone();

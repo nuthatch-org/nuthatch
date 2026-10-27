@@ -12,8 +12,10 @@
 
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::blob::Unverified;
 use crate::config::Config;
 use crate::indexer::{LAST_BLOCK_KEY, SEALED_THROUGH_KEY, START_BLOCK_KEY};
 use crate::publish::{self, Mirror, SeedEnvelope};
@@ -42,13 +44,36 @@ pub struct SeedReport {
 }
 
 pub async fn seed(dir: &Path, from: &str) -> Result<SeedReport> {
-    let config = Config::load(dir)?;
     if seal::shared_store(dir).is_some() {
         bail!(
             "{} is a mounted dataset, and seed only fills a nest's own directory",
             dir.display()
         );
     }
+    seed_dataset(dir, from, &|_| {}).await
+}
+
+/// How far a seed has got, as a mount job reports it (RFC-0073 FR16).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedProgress {
+    /// Files the catalogue and snapshot name.
+    pub segments: usize,
+    /// Of those, on disk and checked against their hash.
+    pub done: usize,
+    /// Downloaded by this attempt; the rest were already on disk.
+    pub fetched: usize,
+    pub fetched_bytes: u64,
+}
+
+/// [`seed`] without its refusal of a runtime's dataset, reporting `progress` as each file lands.
+/// Segments stay in the dataset's own `segments/`, which every read falls back to, so a reclaim of
+/// the shared store cannot take a file this seed has fetched and not yet catalogued.
+pub async fn seed_dataset(
+    dir: &Path,
+    from: &str,
+    progress: &(dyn Fn(&SeedProgress) + Sync),
+) -> Result<SeedReport> {
+    let config = Config::load(dir)?;
     let db = dir.join(crate::config::DB_FILE);
     refuse_an_indexed_nest(&db)?;
     // `schema.json` is part of the data identity, and `dev` writes a missing one at its first start,
@@ -64,7 +89,8 @@ pub async fn seed(dir: &Path, from: &str) -> Result<SeedReport> {
     check_snapshot(&snapshot, &dataset, chain_id, &config)?;
     let (catalogue, wanted) = local_catalogue(published, &snapshot)?;
 
-    let (fetched, fetched_bytes) = download(mirror.as_ref(), dir, &dataset, &wanted).await?;
+    let (fetched, fetched_bytes) =
+        download(mirror.as_ref(), dir, &dataset, &wanted, progress).await?;
     let store = Store::open(&db)?;
     store.set_meta(SEED_PENDING_KEY, &dataset)?;
     seal::install_manifest(dir, &catalogue)?;
@@ -114,21 +140,27 @@ pub async fn run(dir: &Path, from: &str) -> Result<()> {
 }
 
 fn refuse_an_indexed_nest(db: &Path) -> Result<()> {
-    if !db.exists() {
-        return Ok(());
-    }
-    let store = Store::open_existing(db)
-        .context("opening this nest's store (is the nest running? stop it first)")?;
-    if store.get_meta(SEED_PENDING_KEY)?.is_some() {
-        return Ok(());
-    }
-    if store.get_meta(LAST_BLOCK_KEY)?.is_some() || store.sealed_through() > 0 {
+    if holds_indexed_data(db)? {
         bail!(
             "this nest has already indexed. Seeding fills a nest that holds no data; to replace \
              what is here, remove `nuthatch.redb` and `segments/` first."
         );
     }
     Ok(())
+}
+
+/// Whether the store at `db` has indexed, or finished a seed: a seed would refuse it. A half-seeded
+/// store has not, since a seed finishes it.
+pub fn holds_indexed_data(db: &Path) -> Result<bool> {
+    if !db.exists() {
+        return Ok(false);
+    }
+    let store = Store::open_existing(db)
+        .context("opening this nest's store (is the nest running? stop it first)")?;
+    if store.get_meta(SEED_PENDING_KEY)?.is_some() {
+        return Ok(false);
+    }
+    Ok(store.get_meta(LAST_BLOCK_KEY)?.is_some() || store.sealed_through() > 0)
 }
 
 async fn read_snapshot(mirror: &dyn Mirror, dataset: &str) -> Result<(SeedEnvelope, Manifest)> {
@@ -145,11 +177,15 @@ async fn read_snapshot(mirror: &dyn Mirror, dataset: &str) -> Result<(SeedEnvelo
                 .await?
                 .is_none()
             {
-                bail!(
-                    "the mirror holds no dataset {dataset}. Its name is this nest's data identity, \
-                     so either nothing was published there or this directory differs from the publisher's: \
-                     an edit, a stray file, or a schema.json written by another release."
-                );
+                return Err(crate::distribution::RegistryError::new(
+                    crate::distribution::FailureCode::NotFound,
+                    format!(
+                        "the mirror holds no dataset {dataset}. Its name is this nest's data identity, \
+                         so either nothing was published there or this directory differs from the \
+                         publisher's: an edit, a stray file, or a schema.json written by another release."
+                    ),
+                )
+                .into());
             }
             bail!(
                 "the mirror holds dataset {dataset} but no seed snapshot. A snapshot is written by a \
@@ -183,10 +219,12 @@ fn check_snapshot(s: &SeedEnvelope, dataset: &str, chain_id: u64, config: &Confi
         );
     }
     if publish::tails_digest(&s.tails) != s.tails_sha256 {
-        bail!(
+        return Err(Unverified(
             "the seed snapshot's tails do not match its own digest: an entry was lost or changed, and \
              seeding from it would leave a table missing rows"
-        );
+                .into(),
+        )
+        .into());
     }
     if s.data_identity != dataset {
         bail!(
@@ -302,60 +340,89 @@ async fn download(
     dir: &Path,
     dataset: &str,
     wanted: &[Wanted],
+    progress: &(dyn Fn(&SeedProgress) + Sync),
 ) -> Result<(usize, u64)> {
     let segments = dir.join(seal::SEGMENTS_DIR);
     std::fs::create_dir_all(&segments)
         .with_context(|| format!("creating {}", segments.display()))?;
-    let segments = &segments;
-    let results: Vec<Result<u64>> = futures::stream::iter(wanted.iter().map(|w| async move {
-        let dest = segments.join(&w.segment.file);
-        if let Ok(have) = std::fs::read(&dest) {
-            if publish::sha256_hex(&have) == w.segment.hash {
-                return Ok(0);
+    // Built before the stream, not inside it: a closure there makes the future too general to be
+    // `Send`, and a mount job spawns it.
+    let fetches: Vec<_> = wanted
+        .iter()
+        .map(|w| fetch_one(mirror, &segments, dataset, w))
+        .collect();
+    let mut results = futures::stream::iter(fetches).buffer_unordered(PARALLELISM);
+    let mut seen = SeedProgress {
+        segments: wanted.len(),
+        ..Default::default()
+    };
+    progress(&seen);
+    // Every file is waited for, not only up to the first failure, so the next attempt keeps them all.
+    let mut first_err = None;
+    while let Some(r) = results.next().await {
+        match r {
+            Ok(n) => {
+                seen.done += 1;
+                if n > 0 {
+                    seen.fetched += 1;
+                    seen.fetched_bytes += n;
+                }
+                progress(&seen);
             }
-        }
-        let tmp = dest.with_extension("parquet.tmp");
-        let got = mirror
-            .get_file(&format!("{dataset}/{}", w.key), &tmp, MAX_SEGMENT_BYTES)
-            .await;
-        let got = match got {
-            Ok(Some(h)) => h,
-            Ok(None) => bail!("the mirror's catalogue names {} but it is not there", w.key),
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
+                first_err.get_or_insert(e);
             }
-        };
-        if got != w.segment.hash {
-            let _ = std::fs::remove_file(&tmp);
-            if w.segment.provisional {
-                bail!(
-                    "{} is not the tail the seed snapshot names. The publisher rewrites tails as \
-                     it seals; run seed again, it keeps what it has fetched.",
-                    w.key
-                );
-            }
-            bail!("{} does not hash to its content address", w.key);
-        }
-        let len = std::fs::metadata(&tmp)
-            .with_context(|| format!("reading {}", tmp.display()))?
-            .len();
-        std::fs::rename(&tmp, &dest).with_context(|| format!("installing {}", dest.display()))?;
-        Ok(len)
-    }))
-    .buffer_unordered(PARALLELISM)
-    .collect()
-    .await;
-    let mut fetched = 0;
-    let mut bytes = 0;
-    for r in results {
-        let n = r?;
-        if n > 0 {
-            fetched += 1;
-            bytes += n;
         }
     }
-    Ok((fetched, bytes))
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok((seen.fetched, seen.fetched_bytes)),
+    }
+}
+
+/// One wanted file onto disk: its length if fetched now, 0 if it was already there and intact.
+async fn fetch_one(mirror: &dyn Mirror, segments: &Path, dataset: &str, w: &Wanted) -> Result<u64> {
+    let dest = segments.join(&w.segment.file);
+    if let Ok(have) = std::fs::read(&dest) {
+        if publish::sha256_hex(&have) == w.segment.hash {
+            return Ok(0);
+        }
+    }
+    let tmp = dest.with_extension("parquet.tmp");
+    let got = mirror
+        .get_file(&format!("{dataset}/{}", w.key), &tmp, MAX_SEGMENT_BYTES)
+        .await;
+    let got = match got {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            return Err(crate::distribution::RegistryError::new(
+                crate::distribution::FailureCode::NotFound,
+                format!("the mirror's catalogue names {} but it is not there", w.key),
+            )
+            .into())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    if got != w.segment.hash {
+        let _ = std::fs::remove_file(&tmp);
+        if w.segment.provisional {
+            return Err(Unverified(format!(
+                "{} is not the tail the seed snapshot names. The publisher rewrites tails as \
+                 it seals; run seed again, it keeps what it has fetched.",
+                w.key
+            ))
+            .into());
+        }
+        return Err(Unverified(format!("{} does not hash to its content address", w.key)).into());
+    }
+    let len = std::fs::metadata(&tmp)
+        .with_context(|| format!("reading {}", tmp.display()))?
+        .len();
+    std::fs::rename(&tmp, &dest).with_context(|| format!("installing {}", dest.display()))?;
+    Ok(len)
 }
 
 #[cfg(test)]

@@ -1636,6 +1636,12 @@ The hashes show every file is the one the mirror's catalogue names. They do not 
 catalogue or that it is true to the chain, so seed from an operator you would trust to run the nest
 for you. A seed that is interrupted leaves the nest marked, and `dev` refuses it until `seed` is run
 again.
+A runtime seeds a mount over the admin API instead (RFC-0073 FR16): `POST /_admin/nests` with
+`"seed": true` reads the mirror the request's `publish` names, else the mount's `[mounts.publish]`,
+else `[runtime.publish]`, which also mirrors every dataset whose mounts name none of their own. To
+rebuild a lost runtime, keep `[runtime.publish]` pointed at the bucket, and on the new box mount each
+NID again with `"seed": true`; every nest comes back from the mirror and follows the chain from where
+the mirror ends. The job reports progress and resumes as `docs/admin-api.md` describes.
 
 **Restore.** Put the directory back and start. Progress resumes from the checkpoint.
 

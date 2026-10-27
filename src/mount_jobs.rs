@@ -24,6 +24,8 @@ pub const JOBS_FILE: &str = "mount-jobs.json";
 pub enum MountPhase {
     Accepted,
     Fetching,
+    /// Filling the dataset from its mirror before it indexes (RFC-0073 FR16).
+    Seeding,
     Joining,
     Live,
     Failed,
@@ -59,6 +61,14 @@ pub struct MountJob {
     /// or the worker that was forgotten mounts over the new one (#1638).
     #[serde(default)]
     pub generation: u64,
+    /// Seed the dataset from its mirror before it indexes (RFC-0073 FR16).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub seed: bool,
+    /// The mirror the request named, kept so a restart resumes the job with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<crate::runtime::MountPublish>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_progress: Option<crate::seed::SeedProgress>,
 }
 
 impl MountJob {
@@ -72,6 +82,9 @@ impl MountJob {
             since_unixtime: now_unix(),
             is_move: false,
             generation: 0,
+            seed: false,
+            publish: None,
+            seed_progress: None,
         }
     }
 }
@@ -164,7 +177,7 @@ impl MountJobs {
     pub fn claim(&self, mut job: MountJob) -> std::result::Result<MountJob, ClaimError> {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(running) = jobs.get(&job.name).filter(|j| !j.phase.finished()) {
-            return Err(ClaimError::Running(running.clone()));
+            return Err(ClaimError::Running(Box::new(running.clone())));
         }
         job.generation = self
             .next_generation
@@ -214,6 +227,23 @@ impl MountJobs {
             return self.persist(&jobs);
         }
         Ok(())
+    }
+
+    /// Record how far an owned job's seed has got. Kept in memory until the job next moves on: a
+    /// restart reruns the seed, which counts again from what is on disk.
+    pub fn seed_progress_if_owned(
+        &self,
+        name: &str,
+        generation: u64,
+        progress: &crate::seed::SeedProgress,
+    ) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(job) = jobs
+            .get_mut(name)
+            .filter(|job| job.generation == generation)
+        {
+            job.seed_progress = Some(progress.clone());
+        }
     }
 
     /// End an owned job `failed` with `e`'s text and its [`FailureCode`].
@@ -273,7 +303,7 @@ impl MountJobs {
 /// write leaves no claim: the name is free, or it still holds the finished job it had.
 #[derive(Debug)]
 pub enum ClaimError {
-    Running(MountJob),
+    Running(Box<MountJob>),
     Persist(anyhow::Error),
 }
 
@@ -357,6 +387,33 @@ mod tests {
 
         again.forget("b").unwrap();
         assert!(MountJobs::load(d.path()).get("b").is_none());
+    }
+
+    /// RFC-0073 FR16: a restart resumes a seed with the mirror it was asked for.
+    #[test]
+    fn a_seed_job_keeps_its_mirror_through_a_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let jobs = MountJobs::load(d.path());
+        let mut job = MountJob::new("a", Some("aa"), MountPhase::Accepted);
+        job.seed = true;
+        job.publish = Some(crate::runtime::MountPublish {
+            target: "s3://bucket/mirror".into(),
+            interval: "60s".into(),
+            parallelism: 4,
+        });
+        let job = jobs.claim(job).unwrap();
+        jobs.advance_if_owned("a", job.generation, MountPhase::Seeding, None)
+            .unwrap();
+
+        let again = MountJobs::load(d.path());
+        let resumed = again.unfinished();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].phase, MountPhase::Seeding);
+        assert!(resumed[0].seed);
+        assert_eq!(
+            resumed[0].publish.as_ref().map(|p| p.target.as_str()),
+            Some("s3://bucket/mirror")
+        );
     }
 
     /// RFC-0073 FR15: a failure carries its code in the job, through a restart, and a retry clears it.

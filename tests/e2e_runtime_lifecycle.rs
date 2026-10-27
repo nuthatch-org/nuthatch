@@ -140,6 +140,7 @@ async fn two_nest_roost(
             fail_fast: false,
             cursors: None,
             registry: None,
+            publish: None,
         },
     };
     // The ingest task is deliberately leaked into the handles' lifetime here: the cursor must stay
@@ -760,6 +761,7 @@ async fn route_named_runtime(
             fail_fast: false,
             cursors: None,
             registry: None,
+            publish: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -986,6 +988,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
             fail_fast: false,
             cursors: None,
             registry: None,
+            publish: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1168,6 +1171,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
             fail_fast: false,
             cursors: None,
             registry: None,
+            publish: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1554,6 +1558,7 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
             fail_fast: false,
             cursors: None,
             registry: None,
+            publish: None,
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1705,6 +1710,7 @@ pub(crate) async fn empty_runtime(
             fail_fast: false,
             cursors: Some(feed),
             registry: None,
+            publish: None,
         },
     };
     (handles, tape, intake)
@@ -2882,6 +2888,7 @@ async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it(
             fail_fast: false,
             cursors: None,
             registry: None,
+            publish: None,
         },
     };
     std::mem::forget(cursor.ingest);
