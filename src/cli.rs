@@ -660,6 +660,20 @@ pub enum NestWhat {
     /// Run `nuthatch schema` first. The derived files it writes are part of the identity, and a nest
     /// under `data/<nid>/` never regenerates them.
     Nid(NestNidArgs),
+    /// Describe a bundle or nest directory without running it: its NID, chain, contracts, entities,
+    /// the cargo features and RPC kinds it needs, and every endpoint it would reach (RFC-0073 FR10).
+    /// Reads only local files; a bundle is verified as `nest load` verifies it. Keys in URLs are
+    /// never printed.
+    Inspect(NestInspectArgs),
+}
+
+#[derive(Args)]
+pub struct NestInspectArgs {
+    /// A `.bundle` file, an unpacked bundle directory, or a nest directory.
+    pub target: String,
+    /// Print the versioned JSON form (`"schema": "nuthatch.nest-inspect/1"`).
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]

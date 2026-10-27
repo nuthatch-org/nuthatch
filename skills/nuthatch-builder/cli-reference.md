@@ -280,6 +280,13 @@ Bundle a nest into one portable, content-addressed `.bundle` file - its authored
 - `--as-dir` - Write an unpacked bundle directory instead of a single `.bundle` file (handy for inspecting a bundle's contents)
 - `--allow-secrets` - Bundle even though `nuthatch.toml` holds credentials (a keyed RPC URL, a webhook secret). The bundle carries the file verbatim, so they are published with it
 
+## `nuthatch nest inspect`
+
+Describe a bundle or nest directory without running it: its NID, chain, contracts, entities, the cargo features and RPC kinds it needs, and every endpoint it would reach (RFC-0073 FR10). Reads only local files; a bundle is verified as `nest load` verifies it. Keys in URLs are never printed
+
+- `<TARGET>` - A `.bundle` file, an unpacked bundle directory, or a nest directory
+- `--json` - Print the versioned JSON form (`"schema": "nuthatch.nest-inspect/1"`)
+
 ## `nuthatch nest load`
 
 Load a bundle: verify a `.bundle` (or a URL to one, or an unpacked bundle dir) and install it as a runnable nest. Checks the manifest format, every file's hash, and that the decode registry regenerated from the inputs matches the manifest - so a loaded nest decodes exactly as authored. With `--registry`, the positional is a `name[@version]` reference resolved against that store

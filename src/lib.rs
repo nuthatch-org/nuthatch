@@ -84,6 +84,7 @@ pub mod graph_validate;
 pub mod health;
 pub mod help;
 pub mod indexer;
+pub mod inspect;
 pub mod ipfs;
 pub mod ipfs_resolve;
 pub mod labels;

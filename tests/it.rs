@@ -62,6 +62,8 @@ mod e2e_l1_blocks;
 mod e2e_migrate_parity;
 #[path = "e2e_minio_publish.rs"]
 mod e2e_minio_publish;
+#[path = "e2e_nest_inspect.rs"]
+mod e2e_nest_inspect;
 #[path = "e2e_nest_nid.rs"]
 mod e2e_nest_nid;
 #[path = "e2e_plane_split.rs"]

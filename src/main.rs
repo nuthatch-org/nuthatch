@@ -316,6 +316,9 @@ async fn main() -> Result<()> {
                 println!("{}", nuthatch::migrate::nid_of(std::path::Path::new(&a.dir))?);
                 Ok(())
             }
+            cli::NestWhat::Inspect(a) => {
+                nuthatch::inspect::run(std::path::Path::new(&a.target), a.json)
+            }
             cli::NestWhat::RenameAlias(a) => {
                 project::rename_alias(std::path::Path::new(&a.dir), &a.old, &a.new)
             }

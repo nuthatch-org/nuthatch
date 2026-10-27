@@ -70,6 +70,7 @@ A nest is a self-contained, content-addressed deploy unit - ABIs vendored, confi
 ```sh
 nuthatch nest bundle .                     # → a <name>-<hash>.bundle file; prints the content-address
 nuthatch nest load ./my-nest.bundle        # verifies every file hash + re-derives the decode registry
+nuthatch nest inspect ./my-nest.bundle --json  # what it is and every endpoint it reaches, offline
 # load also accepts an http(s):// URL to a .bundle, so a nest is shareable from any static host:
 nuthatch nest load https://host/my-nest.bundle --expect <hash>
 ```

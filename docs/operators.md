@@ -1645,7 +1645,26 @@ nuthatch nest load <ref> --registry <ref>         # pull and install, hash-verif
 nuthatch nest load <bundle|url|dir> --expect <h>  # or install directly, asserting the hash
 nuthatch nest nid --dir <dir>                     # the NID a runtime stores the nest under
 nuthatch nest load <nid> --registry <ref>         # pull by NID, refused unless the bundle computes to it
+nuthatch nest inspect <bundle|dir> --json         # describe it without running it (RFC-0073 FR10)
 ```
+
+`nest inspect` reads a `.bundle`, an unpacked bundle or a nest directory, with no runtime and no
+network; a bundle is verified as `nest load` verifies it. The JSON form carries `"schema":
+"nuthatch.nest-inspect/1"` and gives the NID, data identity, bundle hash (`null` for a directory),
+chain, contracts, templates, factories and entities; the cargo features the nest needs (`graph` for
+config schema v3 or `graph/history.toml`, `folds` for `folds/`); extraction that needs more than a
+plain RPC (`archive` for `[[calls]]`, `trace` for `[extract] traces` and `[address_history]`, `state`
+for `[extract] state`); and every egress: RPC URLs, webhook and alert hosts, `[[ipfs]]` declarations
+with the gateways they resolve through, and offchain pull sources. An RPC URL that looks keyed is
+reduced to its scheme and host and marked `redacted`; webhooks, alerts and offchain sources are shown
+by host only. Without `--json` it prints the same as text. A nest that declares a feature this build
+lacks fails to load here as it would anywhere else, with the error naming the feature.
+
+`nest load` warns about the same egress list at install, IPFS gateways and offchain sources included.
+
+A bundle carries `offchain/manifest.json`, the provenance of offchain snapshots, but not
+`offchain/segments/`, because the `segments` exclusion matches at any depth: the snapshots' sources
+travel with the bundle and their data does not.
 
 The registry is **decoupled** from the binary: a filesystem path or S3-compatible object storage, with
 private-nest authentication. nuthatch pulls; it never becomes the registry, and resolution stays
