@@ -1182,6 +1182,54 @@ mod tests {
     }
 
     /// A mount's lowered guards survive the wire, and a follower never serves wider than its own.
+    /// A snapshot is read under the cap its dataset is given, a line at a time, and one over it keeps
+    /// no rows; the lines either side of it read as they were sent.
+    #[test]
+    fn snapshot_rows_are_read_under_their_datasets_cap() {
+        let snap = |rows: usize| {
+            let mut s = Snapshot::default();
+            for i in 0..rows {
+                s.entities
+                    .map
+                    .insert(format!("{i:012}-000000"), "x".repeat(100));
+            }
+            s
+        };
+        let mut wire = Vec::new();
+        for (dataset, rows) in [("data/small", 3), ("data/big", 50), ("data/free", 50)] {
+            serde_json::to_writer(
+                &mut wire,
+                &Line::Snapshot {
+                    dataset: DatasetName(dataset.into()),
+                    snapshot: snap(rows),
+                },
+            )
+            .unwrap();
+            wire.push(b'\n');
+        }
+        let cap = row_bytes("000000000000-000000", &"x".repeat(100)) * 10;
+        let mut got = Vec::new();
+        read_lines(
+            &wire[..],
+            Box::new(move |d: &str| (d != "data/free").then_some(cap)),
+            |line| {
+                if let Line::Snapshot { dataset, snapshot } = line {
+                    got.push((
+                        dataset.0,
+                        snapshot.entities.map.len(),
+                        snapshot.entities.over,
+                    ));
+                }
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(got[0], ("data/small".into(), 3, None));
+        assert_eq!(got[1].1, 0);
+        assert_eq!(got[1].2, Some(cap / 10 * 50));
+        assert_eq!(got[2], ("data/free".into(), 50, None));
+    }
+
     #[test]
     fn a_mounts_guards_cross_the_feed_and_stay_within_the_follower() {
         let process = crate::limits::Limits::process();

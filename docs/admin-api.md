@@ -388,9 +388,10 @@ The answer is a stream of newline-delimited JSON, one connection for every mount
 | Line | When | Carries |
 |---|---|---|
 | `{"hello": …}` | first | the writer's version and `feed`, the format's version; a follower refuses a writer speaking another |
-| `{"mount": …}` | per route, then on any change | `route`, `dataset` (`data/<nid>`, relative to the runtime), `nid`, and the SQL surface the writer serves it with |
+| `{"mount": …}` | per route, then on any change | `route`, `dataset` (`data/<nid>`, relative to the runtime), `nid`, `chain`, and the SQL surface, tenant share and limits the writer serves it with |
+| `"mounted"` | once, after the first `mount`s | every route mounted when the connection opened has been sent |
 | `{"unmount": …}` | a route goes | `route` |
-| `{"snapshot": …}` | per dataset, after its mounts | the dataset's hot window as of one generation: entity rows, meta, block checkpoints and the segment catalogue, read in one hot-store transaction |
+| `{"snapshot": …}` | per dataset, after its mounts | `dataset` first, then the hot window as of one generation: entity rows, meta and block checkpoints as JSON objects keyed by key, and the segment catalogue, read in one hot-store transaction |
 | `{"delta": …}` | every hot-store commit after it | `epoch`, `generation`, the commit's changes, and the catalogue when the commit raised `sealed_through` |
 | `{"heartbeat": …}` | every second | each dataset's `[epoch, generation]` now |
 

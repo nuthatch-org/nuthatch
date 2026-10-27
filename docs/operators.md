@@ -258,7 +258,9 @@ followers, and the writer if you like, behind one load balancer: their answers a
 the same `as_of`, `sealed_through` and `nid`.
 
 - **Until a mount's snapshot arrives** its routes answer `503` with `"reason": "catching_up"`; the root
-  `/ready` is `503` until every mount has one.
+  `/ready` is `503` until every mount has one. Before a follower has heard the writer's mount set at
+  all, every path answers that way, since it cannot yet tell a route that is coming from one that
+  does not exist.
 - **`/<tenant>/<alias>/ready`** adds a `follower` object: `writer` (`connected` or `absent`),
   `applied_generation`, `writer_generation` and `lag_generations`, and `absent_for_secs` while the
   writer is away. A follower without its writer stays ready and keeps answering; it reports the
@@ -269,7 +271,12 @@ the same `as_of`, `sealed_through` and `nid`.
   its `/q/<name>` routes refused the same way, since a named query may read one. Send those to the
   writer.
 - **Its own budget.** A follower holds each dataset's hot window in memory, as the writer's `/sql`
-  already copies it per query. Each mount's SQL surface, tenant share and `[mounts.limits]` come
+  already copies it per query, and charges it to its cursor's `[runtime] max_rss_mb` from the
+  runtime's `mounts.toml`, together with what admission charges each nest. A snapshot that would
+  not fit is read without keeping its rows, and a mount whose deltas grow it past the budget is let
+  go: either way its routes and its `/ready` answer `503` with `"reason": "over_budget"` and the
+  figures, the root `/ready` is `503`, and its co-mounts keep serving. The writer still serves it;
+  a later snapshot that fits, on a reconnect, lifts the refusal. Each mount's SQL surface, tenant share and `[mounts.limits]` come
   over the feed, so it admits and guards a query as the writer would, with its own per-chain gates
   and never wider than its own process values. It has no admin surface; mount changes, limits and
   shares go to the writer.
