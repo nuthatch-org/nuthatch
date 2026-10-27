@@ -269,8 +269,10 @@ the same `as_of`, `sealed_through` and `nid`.
   its `/q/<name>` routes refused the same way, since a named query may read one. Send those to the
   writer.
 - **Its own budget.** A follower holds each dataset's hot window in memory, as the writer's `/sql`
-  already copies it per query, and runs queries under the same per-chain admission and guards. It
-  has no admin surface; mount changes go to the writer.
+  already copies it per query. Each mount's SQL surface, tenant share and `[mounts.limits]` come
+  over the feed, so it admits and guards a query as the writer would, with its own per-chain gates
+  and never wider than its own process values. It has no admin surface; mount changes, limits and
+  shares go to the writer.
 - **Beside the writer only, for now.** It reads segments from the runtime directory; following from
   another host with a segment mirror is RFC-0073's open question 2, not built.
 

@@ -123,6 +123,58 @@ pub struct Snapshot {
     pub catalogue: Option<String>,
 }
 
+/// A mount's resolved guards ([`crate::limits::Limits`]) as the feed carries them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireLimits {
+    pub timeout_ms: u64,
+    pub max_rows: usize,
+    pub max_result_bytes: usize,
+    pub max_hot_rows: usize,
+    pub max_hot_bytes: u64,
+    pub max_named_scan_bytes: u64,
+    pub analytics_memory_bytes: Option<u64>,
+    pub max_queued: usize,
+}
+
+impl From<&crate::limits::Limits> for WireLimits {
+    fn from(l: &crate::limits::Limits) -> Self {
+        WireLimits {
+            timeout_ms: l.timeout.as_millis() as u64,
+            max_rows: l.max_rows,
+            max_result_bytes: l.max_result_bytes,
+            max_hot_rows: l.max_hot_rows,
+            max_hot_bytes: l.max_hot_bytes,
+            max_named_scan_bytes: l.max_named_scan_bytes,
+            analytics_memory_bytes: l.analytics_memory_bytes,
+            max_queued: l.max_queued,
+        }
+    }
+}
+
+impl WireLimits {
+    /// The writer's guards, never wider than this process's own.
+    pub fn within(self, process: crate::limits::Limits) -> crate::limits::Limits {
+        crate::limits::Limits {
+            timeout: process
+                .timeout
+                .min(std::time::Duration::from_millis(self.timeout_ms)),
+            max_rows: process.max_rows.min(self.max_rows),
+            max_result_bytes: process.max_result_bytes.min(self.max_result_bytes),
+            max_hot_rows: process.max_hot_rows.min(self.max_hot_rows),
+            max_hot_bytes: process.max_hot_bytes.min(self.max_hot_bytes),
+            max_named_scan_bytes: process.max_named_scan_bytes.min(self.max_named_scan_bytes),
+            analytics_memory_bytes: match (
+                process.analytics_memory_bytes,
+                self.analytics_memory_bytes,
+            ) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+            max_queued: process.max_queued.min(self.max_queued),
+        }
+    }
+}
+
 /// A snapshot and the deltas that follow it.
 pub struct Subscription {
     pub snapshot: Snapshot,
@@ -144,7 +196,8 @@ pub enum Line {
         #[serde(default)]
         feed: u32,
     },
-    /// A route and the SQL surface the writer serves it with (RFC-0034), which a follower serves too.
+    /// A route and what the writer serves it under: its SQL surface (RFC-0034), its tenant label and
+    /// share (RFC-0073 FR2) and its guards (FR3). A follower serves it under the same.
     Mount {
         route: String,
         dataset: String,
@@ -153,6 +206,12 @@ pub enum Line {
         sql: crate::allowlist::SqlAccess,
         #[serde(default)]
         queries: Vec<crate::allowlist::NamedQuery>,
+        #[serde(default)]
+        tenant: Option<String>,
+        #[serde(default)]
+        share: Option<crate::runtime::TenantShare>,
+        #[serde(default)]
+        limits: Option<WireLimits>,
     },
     Unmount {
         route: String,
@@ -997,5 +1056,26 @@ mod tests {
         rec.push(|| panic!("an unfollowed commit must not build its ops"));
         tap.commit(rec, || Ok(())).unwrap();
         assert_eq!(tap.generation(), 1);
+    }
+
+    /// A mount's lowered guards survive the wire, and a follower never serves wider than its own.
+    #[test]
+    fn a_mounts_guards_cross_the_feed_and_stay_within_the_follower() {
+        let process = crate::limits::Limits::process();
+        let lowered = crate::limits::Limits {
+            max_rows: 10,
+            timeout: std::time::Duration::from_millis(1_500),
+            analytics_memory_bytes: Some(1 << 20),
+            ..process
+        };
+        let wire: WireLimits =
+            serde_json::from_str(&serde_json::to_string(&WireLimits::from(&lowered)).unwrap())
+                .unwrap();
+        assert_eq!(wire.within(process), lowered);
+        let tighter = crate::limits::Limits {
+            max_rows: 5,
+            ..process
+        };
+        assert_eq!(wire.within(tighter).max_rows, 5);
     }
 }

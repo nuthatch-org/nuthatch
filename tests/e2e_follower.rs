@@ -62,13 +62,7 @@ impl Writer {
                     Box::pin(async move {
                         states
                             .iter()
-                            .map(|(route, s)| feed_http::Served {
-                                route: route.clone(),
-                                dir: s.dir.clone(),
-                                nid: s.nid.as_deref().map(str::to_string),
-                                surface: (*s.surface).clone(),
-                                store: s.store.clone(),
-                            })
+                            .map(|(route, s)| feed_http::Served::of(route, s, &Default::default()))
                             .collect()
                     })
                 });

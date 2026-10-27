@@ -30,7 +30,31 @@ pub struct Served {
     pub dir: PathBuf,
     pub nid: Option<String>,
     pub surface: crate::allowlist::Surface,
+    pub tenant: Option<String>,
+    pub share: Option<crate::runtime::TenantShare>,
+    pub limits: crate::limits::Limits,
     pub store: Arc<dyn HotStore>,
+}
+
+impl Served {
+    /// `state` as served under `route`, with its tenant's share from `shares`.
+    pub fn of(
+        route: &str,
+        state: &crate::serve::AppState,
+        shares: &BTreeMap<String, crate::runtime::TenantShare>,
+    ) -> Served {
+        let tenant = state.tenant.as_ref().map(|s| s.tenant().to_string());
+        Served {
+            route: route.to_string(),
+            dir: state.dir.clone(),
+            nid: state.nid.as_deref().map(str::to_string),
+            surface: (*state.surface).clone(),
+            share: tenant.as_ref().and_then(|t| shares.get(t).copied()),
+            tenant,
+            limits: state.limits,
+            store: state.store.clone(),
+        }
+    }
 }
 
 /// What is mounted now.
@@ -42,18 +66,10 @@ pub fn runtime_roster(handles: Arc<tokio::sync::Mutex<crate::runtime::RuntimeHan
     Arc::new(move || {
         let handles = handles.clone();
         Box::pin(async move {
-            handles
-                .lock()
-                .await
-                .states
+            let h = handles.lock().await;
+            h.states
                 .iter()
-                .map(|(route, s)| Served {
-                    route: route.clone(),
-                    dir: s.dir.clone(),
-                    nid: s.nid.as_deref().map(str::to_string),
-                    surface: (*s.surface).clone(),
-                    store: s.store.clone(),
-                })
+                .map(|(route, s)| Served::of(route, s, &h.tenant_shares))
                 .collect()
         })
     })
@@ -173,6 +189,9 @@ async fn serve_connection(s: FeedState, tx: mpsc::Sender<bytes::Bytes>) {
                         nid: m.nid.clone(),
                         sql: m.surface.access,
                         queries: m.surface.queries.clone(),
+                        tenant: m.tenant.clone(),
+                        share: m.share,
+                        limits: Some((&m.limits).into()),
                     });
                     if routes.get(route).is_some_and(|sent| sent[..] == mount[..]) {
                         continue;

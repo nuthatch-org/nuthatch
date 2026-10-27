@@ -82,10 +82,19 @@ pub async fn serve(args: crate::cli::ServeArgs) -> Result<()> {
     crate::serve::bind_and_serve(&args.listen, follower.service(), cors).await
 }
 
-struct Route {
+/// What the writer serves a route under, as its `mount` line says.
+#[derive(Clone, PartialEq)]
+struct Spec {
     dataset: String,
     nid: Option<String>,
     surface: crate::allowlist::Surface,
+    tenant: Option<String>,
+    share: Option<crate::runtime::TenantShare>,
+    limits: Option<crate::feed::WireLimits>,
+}
+
+struct Route {
+    spec: Spec,
     served: Option<std::result::Result<SharedNest, String>>,
 }
 
@@ -111,7 +120,7 @@ pub struct Follower {
     live: LiveRuntime,
     inner: Mutex<Inner>,
     /// One analytical gate per chain, as the writer has one per cursor.
-    gates: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    gates: Mutex<HashMap<String, crate::serve::SqlGate>>,
 }
 
 impl Follower {
@@ -230,32 +239,41 @@ impl Follower {
                 nid,
                 sql,
                 queries,
+                tenant,
+                share,
+                limits,
             } => {
+                let spec = Spec {
+                    dataset,
+                    nid,
+                    surface: crate::allowlist::Surface {
+                        access: sql,
+                        queries,
+                    },
+                    tenant,
+                    share,
+                    limits,
+                };
                 {
                     let mut inner = self.lock();
-                    inner.routes.insert(
-                        route,
-                        Route {
-                            dataset,
-                            nid,
-                            surface: crate::allowlist::Surface {
-                                access: sql,
-                                queries,
-                            },
-                            served: None,
-                        },
-                    );
+                    // A reconnect repeats every mount; only a changed one is rebuilt.
+                    if inner.routes.get(&route).is_some_and(|r| r.spec == spec) {
+                        return Ok(());
+                    }
+                    inner.routes.insert(route, Route { spec, served: None });
                 }
                 self.realise();
+                self.recompose();
             }
             Line::Unmount { route } => {
                 {
                     let mut inner = self.lock();
                     if let Some(gone) = inner.routes.remove(&route) {
-                        if !inner.routes.values().any(|r| r.dataset == gone.dataset) {
-                            inner.datasets.remove(&gone.dataset);
-                            inner.positions.remove(&gone.dataset);
-                            crate::seal::unpin_catalogue(&self.root.join(&gone.dataset));
+                        let dataset = gone.spec.dataset;
+                        if !inner.routes.values().any(|r| r.spec.dataset == dataset) {
+                            inner.datasets.remove(&dataset);
+                            inner.positions.remove(&dataset);
+                            crate::seal::unpin_catalogue(&self.root.join(&dataset));
                         }
                     }
                 }
@@ -297,17 +315,16 @@ impl Follower {
                 routes, datasets, ..
             } = &mut *inner;
             for (route, r) in routes.iter_mut() {
-                let Some(store) = datasets.get(&r.dataset).cloned() else {
+                let Some(store) = datasets.get(&r.spec.dataset).cloned() else {
                     continue;
                 };
                 let store: Arc<dyn HotStore> = store;
                 match &r.served {
                     Some(Ok(shared)) => {
                         let current = shared.current();
-                        if !Arc::ptr_eq(&current.store, &store) || *current.surface != r.surface {
+                        if !Arc::ptr_eq(&current.store, &store) {
                             shared.swap(AppState {
                                 store,
-                                surface: Arc::new(r.surface.clone()),
                                 ..(*current).clone()
                             });
                         }
@@ -315,7 +332,7 @@ impl Follower {
                     Some(Err(_)) => {}
                     None => {
                         r.served = Some(
-                            self.build(route, r, store)
+                            self.build(route, &r.spec, store)
                                 .map(SharedNest::new)
                                 .map_err(|e| format!("{e:#}")),
                         );
@@ -332,7 +349,7 @@ impl Follower {
         }
     }
 
-    fn gate(&self, chain: &str) -> Arc<tokio::sync::Semaphore> {
+    fn gate(&self, chain: &str) -> crate::serve::SqlGate {
         self.gates
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -343,7 +360,7 @@ impl Follower {
 
     /// A route's serving state over `store`: what `build_nest` assembles for a nest it does not
     /// index, with no circuit, no ingest and no admin surface.
-    fn build(&self, route: &str, r: &Route, store: Arc<dyn HotStore>) -> Result<AppState> {
+    fn build(&self, route: &str, r: &Spec, store: Arc<dyn HotStore>) -> Result<AppState> {
         let dir = self.root.join(&r.dataset);
         let mut config = crate::config::Config::load(&dir)
             .with_context(|| format!("no nest at '{}'", dir.display()))?;
@@ -369,6 +386,18 @@ impl Follower {
             "factories": config.factories,
             "follower": true,
         });
+        let sql_gate = self.gate(&config.nest.chain);
+        let sql_response_bytes = crate::serve::ResponseBytes::default();
+        let tenant = r.tenant.as_deref().map(|t| {
+            Arc::new(crate::fair_share::Seat::new(
+                t,
+                &dir,
+                &sql_gate,
+                &sql_response_bytes.0,
+                r.share.unwrap_or_default(),
+            ))
+        });
+        let process = crate::limits::Limits::process();
         Ok(AppState {
             freshness: config.freshness,
             store,
@@ -384,13 +413,12 @@ impl Follower {
             threshold: config.flags.threshold_amount(),
             velocity_threshold: config.flags.velocity().map(|(amt, _)| amt),
             tables: Arc::new(crate::indexer::full_schema(&registry, &config)),
-            sql_gate: self.gate(&config.nest.chain),
+            sql_gate,
+            tenant,
             sql_queued: Default::default(),
             memo_gate: Default::default(),
-            sql_response_bytes: Default::default(),
-            sql_max_hot_rows: crate::serve::SQL_MAX_HOT_ROWS,
-            sql_max_hot_bytes: crate::serve::SQL_MAX_HOT_BYTES,
-            sql_max_named_scan_bytes: crate::serve::SQL_MAX_NAMED_SCAN_BYTES,
+            sql_response_bytes,
+            limits: r.limits.map_or(process, |l| l.within(process)),
             cursorless: true,
             seal_span,
             surface: Arc::new(r.surface.clone()),
@@ -428,7 +456,7 @@ impl Follower {
         for (route, r) in &inner.routes {
             let sub = match &r.served {
                 Some(Ok(shared)) => {
-                    let entities = crate::entities::load(&self.root.join(&r.dataset))
+                    let entities = crate::entities::load(&self.root.join(&r.spec.dataset))
                         .unwrap_or_default()
                         .into_iter()
                         .map(|e| e.name.to_ascii_lowercase())
@@ -480,7 +508,7 @@ impl Follower {
         let Some(r) = inner.routes.get(route) else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        let Some(store) = inner.datasets.get(&r.dataset) else {
+        let Some(store) = inner.datasets.get(&r.spec.dataset) else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"ready": false, "nest": route, "reason": "catching_up"})),
@@ -499,7 +527,7 @@ impl Follower {
                 "nest": route,
                 "as_of": as_of,
                 "sealed_through": store.sealed_through(),
-                "follower": self.lag(&inner, &r.dataset),
+                "follower": self.lag(&inner, &r.spec.dataset),
             })),
         )
             .into_response()
@@ -510,9 +538,10 @@ impl Follower {
         let mut nests = serde_json::Map::new();
         let mut all = true;
         for (route, r) in &inner.routes {
-            let ready = inner.datasets.contains_key(&r.dataset) && matches!(r.served, Some(Ok(_)));
+            let ready =
+                inner.datasets.contains_key(&r.spec.dataset) && matches!(r.served, Some(Ok(_)));
             all &= ready;
-            let mut v = self.lag(&inner, &r.dataset);
+            let mut v = self.lag(&inner, &r.spec.dataset);
             v["ready"] = ready.into();
             nests.insert(route.clone(), v);
         }
@@ -539,8 +568,8 @@ impl Follower {
             "follower": true,
             "nests": inner.routes.iter().map(|(route, r)| serde_json::json!({
                 "name": route,
-                "nid": r.nid,
-                "ready": inner.datasets.contains_key(&r.dataset),
+                "nid": r.spec.nid,
+                "ready": inner.datasets.contains_key(&r.spec.dataset),
             })).collect::<Vec<_>>(),
         })
     }
