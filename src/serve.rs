@@ -4026,12 +4026,9 @@ async fn named_query_post(
     }
 }
 
-/// A named query's JSON arguments as the string map the query string gives. An empty body is no
-/// arguments.
+/// A named query's JSON arguments as the string map the query string gives. A query with none
+/// takes `{}`; an empty body is refused, as it is on `/sql`.
 fn named_args_body(body: &[u8]) -> Result<std::collections::HashMap<String, String>, String> {
-    if body.iter().all(u8::is_ascii_whitespace) {
-        return Ok(Default::default());
-    }
     let object: serde_json::Map<String, Value> = serde_json::from_slice(body)
         .map_err(|e| format!("the body must be a JSON object of arguments: {e}"))?;
     object
@@ -9726,11 +9723,18 @@ mod tests {
         let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
         state.surface = Arc::new(crate::allowlist::Surface {
             access: crate::allowlist::SqlAccess::Allowlist,
-            queries: vec![crate::allowlist::NamedQuery {
-                name: "answer".into(),
-                sql: "SELECT {n} AS n".into(),
-                params: [("n".to_string(), crate::allowlist::ParamType::Int)].into(),
-            }],
+            queries: vec![
+                crate::allowlist::NamedQuery {
+                    name: "answer".into(),
+                    sql: "SELECT {n} AS n".into(),
+                    params: [("n".to_string(), crate::allowlist::ParamType::Int)].into(),
+                },
+                crate::allowlist::NamedQuery {
+                    name: "one".into(),
+                    sql: "SELECT 1 AS one".into(),
+                    params: Default::default(),
+                },
+            ],
         });
         let got = send(&state, "/q/answer?n=-7", None).await;
         assert_eq!(got.0, StatusCode::OK, "{}", String::from_utf8_lossy(&got.1));
@@ -9753,6 +9757,18 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) = send(&state, "/q/answer", Some("".into())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "an empty body is no `n`");
+        let (status, _) = send(&state, "/q/one", Some("".into())).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an empty body is not a JSON object"
+        );
+        let (status, _) = send(&state, "/q/one", Some("{}".into())).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a query with no arguments takes {{}}"
+        );
     }
 
     /// A request refused because the queue is full is refused *immediately* - it must not also sit
