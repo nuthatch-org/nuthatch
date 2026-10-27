@@ -14673,6 +14673,111 @@ template = "pool"
         );
     }
 
+    /// A static contract and a wide template declaring the same event: the address-less fetch returns
+    /// a stranger's copy too, and decode must keep it out of the static contract's table.
+    #[tokio::test]
+    async fn a_topic_shared_with_a_wide_template_admits_no_stranger() {
+        let d = tempfile::tempdir().unwrap();
+        let d = d.path();
+        std::fs::create_dir_all(d.join("abis")).unwrap();
+        std::fs::write(
+            d.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"s\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"fac\"\naddress = \"0x0000000000000000000000000000000000000022\"\n\
+             abi = \"abis/fac.json\"\n\n\
+             [[templates]]\nname = \"child\"\nabi = \"abis/child.json\"\nfilter = \"topic0\"\n\n\
+             [[factories]]\nwatch = \"fac\"\nevent = \"ChildCreated\"\nchild_param = \"child\"\ntemplate = \"child\"\n",
+        )
+        .unwrap();
+        let ping = r#"{"type":"event","name":"Ping","inputs":[],"anonymous":false}"#;
+        std::fs::write(
+            d.join("abis/fac.json"),
+            format!(
+                r#"[{{"type":"event","name":"ChildCreated","inputs":[{{"name":"child","type":"address","indexed":true}}],"anonymous":false}},{ping}]"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(d.join("abis/child.json"), format!("[{ping}]")).unwrap();
+        let config = Config::load(d).unwrap();
+        let registry = crate::registry::from_nest(d, &config).unwrap();
+        let factory = FactorySet::resolved(&config, &registry).unwrap();
+        let topic0s: Vec<String> = registry
+            .topic0s()
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect();
+        let topic = |t: &str| {
+            format!(
+                "0x{}",
+                hex::encode(alloy_primitives::keccak256(t.as_bytes()))
+            )
+        };
+        let log = |address: &str, topics: Vec<String>, log_index: u64| crate::rpc::Log {
+            address: address.into(),
+            topics,
+            data: "0x".into(),
+            block_number: 7,
+            block_hash: "0xbh".into(),
+            tx_hash: format!("0xt{log_index}"),
+            log_index,
+        };
+        let fac = "0x0000000000000000000000000000000000000022";
+        let child = "0x0000000000000000000000000000000000000033";
+        let source = OpenSource {
+            logs: vec![
+                log(
+                    fac,
+                    vec![
+                        topic("ChildCreated(address)"),
+                        format!("0x{:0>64}", child.trim_start_matches("0x")),
+                    ],
+                    0,
+                ),
+                log(child, vec![topic("Ping()")], 1),
+                log(
+                    "0x0000000000000000000000000000000000000099",
+                    vec![topic("Ping()")],
+                    2,
+                ),
+                log(fac, vec![topic("Ping()")], 3),
+            ],
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let out = tempfile::tempdir().unwrap();
+        let mut children = ChildRegistry::new();
+        let sealed = backfill_direct_factory(
+            &source,
+            &registry,
+            &factory,
+            &mut children,
+            out.path(),
+            &topic0s,
+            &[],
+            None,
+            0,
+            0,
+            10,
+            64,
+            SPAN_OFF,
+            true,
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        let calls = source.calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|(a, t)| a.is_empty() && t == &vec![topic("Ping()")]),
+            "the template must be fetched by topic0 alone: {calls:?}"
+        );
+        assert_eq!(
+            sealed, 3,
+            "the factory's two events and the child's ping, never the stranger's"
+        );
+    }
+
     /// Crossing the threshold together widens only the templates that have a child. ENS's v2
     /// registry template has none for its first 26M blocks and declares ERC-1155 transfers.
     #[test]
