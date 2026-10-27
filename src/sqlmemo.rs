@@ -593,6 +593,12 @@ mod tests {
         let mut i = inputs(&d, "SELECT 1", 3, &wm, &files);
         i.max_rows = 101;
         assert_ne!(base, i.key(), "row cap");
+        // RFC-0073 FR8: a strict runtime's tenants of one dataset never share an entry.
+        let mut a = inputs(&d, "SELECT 1", 3, &wm, &files);
+        a.tenant = Some("a");
+        let mut b = inputs(&d, "SELECT 1", 3, &wm, &files);
+        b.tenant = Some("b");
+        assert!(base != a.key() && a.key() != b.key(), "tenant");
         let wm2 = at(6, &[]);
         assert_ne!(
             base,

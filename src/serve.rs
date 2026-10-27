@@ -9174,6 +9174,36 @@ mod tests {
         state
     }
 
+    /// RFC-0073 FR8: a strict mount's queries run in its tenant's session on every SQL route, never
+    /// in the one its dataset's other mounts share, and the allow-list holds on the route.
+    #[tokio::test]
+    async fn a_strict_mount_queries_in_its_tenants_session_on_every_sql_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = table_fixture(tmp.path(), 1..=3, 4..=5);
+        let tenant = |t: &str| AppState {
+            isolation: Some(Arc::from(t)),
+            ..shared.clone()
+        };
+        for t in ["a", "b"] {
+            for uri in [
+                "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20t",
+                "/explain?q=SELECT%20count(*)%20AS%20n%20FROM%20t",
+                "/table/t?limit=10",
+                "/entity/000000000001-000000",
+            ] {
+                let (status, body) = get_json(tenant(t), uri).await;
+                assert_eq!(status, StatusCode::OK, "{t} {uri}: {body}");
+            }
+            let (status, body) = get_json(tenant(t), "/sql?q=SELECT%20version()").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{t}: {body}");
+        }
+        let opens = |t| crate::analytics::session_opens_in(tmp.path(), t);
+        assert!(opens(Some("a")) >= 1 && opens(Some("b")) >= 1);
+        assert_eq!(opens(None), 0, "a strict route used the shared session");
+        let (status, body) = get_json(shared, "/sql?q=SELECT%20version()").await;
+        assert_eq!(status, StatusCode::OK, "shared: {body}");
+    }
+
     async fn get_json(state: AppState, uri: &str) -> (StatusCode, Value) {
         use tower::ServiceExt;
         let req = axum::http::Request::builder()
