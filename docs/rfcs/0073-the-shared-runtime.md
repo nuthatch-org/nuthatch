@@ -1,8 +1,9 @@
 # RFC-0073: The shared runtime - one runtime, many organisations' nests
 
-- Status: **Accepted (2026-10-27, Chief): "lets do ALL of it".** All fifteen requests in GraphOps's
+- Status: **Accepted (2026-10-27, Chief): "lets do ALL of it".** All sixteen requests in GraphOps's
   "Feature requests: hosting every customer's nests in one shared runtime" (written against
-  `efbcb3f`, v5.12.0). The out-of-scope list in `CLAUDE.md` is amended the same day for FR2, FR4's
+  `efbcb3f`, v5.12.0; revised the same day to gist revision `43c7892d`, which moved bundle handling
+  behind the admin API and added FR16). The out-of-scope list in `CLAUDE.md` is amended the same day for FR2, FR4's
   cost half and FR8.
 - Author: Pete (cargopete)
 - Date: 2026-10-27
@@ -195,14 +196,45 @@ window for a chain the registry does not know), dormant until mounted, as boot-d
 `PUT /_admin/chains/<chain>/rpc` replaces the RPC pool live; in-flight requests finish on the old pool.
 Both persist in `mounts.toml`.
 
-### FR10. Machine-readable bundle inspection
+### FR10. Bundle lifecycle over the admin API
 
-`nuthatch nest inspect <bundle|dir> --json`, no runtime needed, with a versioned schema
-(`"schema": "nuthatch.nest-inspect/1"`): NID, data identity, chain, contracts and events, factories and
-templates, entities, feature-gated declarations, extraction that needs archive or trace RPC (`[[calls]]`,
-`[extract]` traces and state, address history), and every egress (RPC URLs, webhooks, alerts, IPFS
-gateways and declarations, offchain sources). `nest load` gains the same egress list, closing its IPFS
-and offchain gap.
+GraphOps drives nuthatch only over HTTP and never runs the binary itself, so verifying, inspecting,
+publishing and pruning bundles move behind the admin token, as mounting already is.
+
+**The inspection** is `nuthatch nest inspect <bundle|dir> --json` for a customer working locally, with
+a versioned schema (`"schema": "nuthatch.nest-inspect/1"`): NID, data identity, chain, contracts and
+events, factories and templates, entities, feature-gated declarations, extraction that needs archive
+or trace RPC (`[[calls]]`, `[extract]` traces and state, address history), and every egress (RPC URLs,
+webhooks, alerts, IPFS gateways and declarations, offchain sources). `nest load` gains the same egress
+list, closing its IPFS and offchain gap. The endpoints below return the same document.
+
+**The endpoints:**
+
+- `POST /_admin/bundles?dry_run=true`, a bundle as the body: the `nest load` checks with the same
+  refusals, then the NID, data identity, inspection, and the admission report a NID dry run gives
+  (`shares`, backfill, per-block RPC, `projected_mb`, `refusal`). Writes nothing to `data/`,
+  `mounts.toml` or the registry.
+- `POST /_admin/bundles?as=<name>@<version>`: the same checks, then publish to the runtime's
+  `--registry`, idempotent per content hash. A runtime without write access refuses, naming why.
+- `GET /_admin/bundles/<nid>`: whether the registry holds the NID, with its inspection.
+- `POST /_admin/bundles/prune` with `{"keep": [<nid>…]}` (and `?dry_run=true`): deletes every blob,
+  NID entry and `name@version` ref reachable neither from a kept NID nor from any mount on the runtime.
+  A NID something still reaches is never deleted, whichever names pointed at it, and a prune running
+  beside a publish or another prune never leaves a ref pointing at a missing blob: blobs are deleted
+  only after the refs that reached them, and a publish writes its blob before its refs.
+
+A documented request-size limit applies to bundles, and anything that can outlast a request runs as a
+job, as mounts do. Both registry backends, filesystem and S3, are covered. The runtime writes only to a
+registry its operator configures; "nuthatch pulls; it never becomes the registry" still holds for
+everyone else.
+
+### FR16. Mirror and seed a mount through the admin API
+
+A mount's mirror target can be set at `POST /_admin/nests` or once per runtime, and
+`POST /_admin/nests {name, nid, "seed": true}` seeds the dataset from that mirror before indexing, with
+the same checks and refusals as `nuthatch seed` and the progress on the mount job. A refused or
+interrupted seed ends the job `failed` and leaves the dataset where the next attempt resumes it or
+reports why it cannot. This is how a lost runtime is rebuilt without re-indexing every nest over RPC.
 
 ### FR11. `POST /sql`
 
@@ -229,10 +261,11 @@ factory child that is dropped silently today, and an `undecoded` block in `/<nam
 the total and the five largest contract/topic pairs. The `Err` arm logs at `warn`, rate-limited per
 window. This is RFC-0049 §2's proposal, built.
 
-### FR15. Verified S3 registry fetch
+### FR15. Verified S3 registry publish and fetch
 
-A CI job against versitygw with a private bucket: `nest publish`, then a runtime mount by NID through
-the admin API, then a denied credential and a missing NID. Credentials come from object_store's standard
+A CI job against versitygw with a private bucket: publish, then a runtime mount by NID through the
+admin API, then a denied credential and a missing NID, and once FR10's endpoints exist, publish and
+prune through them too. Credentials come from object_store's standard
 AWS chain (env, web identity, container and instance metadata), never `mounts.toml` or the command
 line. A failed mount job gains a structured `code`: `not_found`, `access_denied`, `verification_failed`
 or `other`, alongside the reason text.
@@ -243,9 +276,9 @@ Each slice ends runnable and keeps the ≤2 GB per-cursor CI budget for a defaul
 
 | Slice | Requests | Size |
 |---|---|---|
-| S1 | FR11, FR13, FR14, FR10, FR4 metrics, FR15 | days each |
-| S2 | FR6, FR3 | one to two weeks |
-| S3 | FR2, FR5, FR9 | two to three weeks |
+| S1 | FR11, FR13, FR14, FR10's inspection, FR4 metrics, FR15 | days each |
+| S2 | FR10's endpoints (GraphOps's only deploy path, needed for the private beta), FR6, FR3 | one to two weeks |
+| S3 | FR2, FR5, FR9, FR16 | two to three weeks |
 | S4 | FR8 (gated on the external review) | two to three weeks, then the review |
 | S5 | FR4 cost (needs a Burrmill change) | one week |
 | S6 | FR1, FR7 | the largest: weeks |

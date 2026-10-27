@@ -291,7 +291,7 @@ unconfigured.
 > S0, with nothing in the binary. Do not resume either unasked.
 >
 > **RFC-0073 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
-> [RFC-0073](docs/rfcs/0073-the-shared-runtime.md) (the shared runtime) on 2026-10-27, all fifteen of
+> [RFC-0073](docs/rfcs/0073-the-shared-runtime.md) (the shared runtime) on 2026-10-27, all sixteen of
 > GraphOps's requests: "lets do ALL of it". It is new capability in the default binary for an operator
 > who hosts many organisations' nests in one runtime, and the out-of-scope list below is amended the
 > same day for the three items that crossed it. The order is the RFC's: the small operability items
@@ -375,7 +375,7 @@ Do not start slice N+1 while slice N has failing tests or an unmet budget.
   other terms of the 2026-10-09 amendment still bind: the stock binary, no billing, no accounts,
   nothing in this tree built for it.
   **Amended 2026-10-27 by Chief: the shared runtime ([RFC-0073](docs/rfcs/0073-the-shared-runtime.md)).**
-  GraphOps asked for fifteen things to host every customer's nests in one runtime, and Chief said
+  GraphOps asked for sixteen things to host every customer's nests in one runtime, and Chief said
   "lets do ALL of it". Three of them crossed this list and are now in scope, as operator
   configuration the binary enforces without knowing who anyone is: **per-tenant-label shares and caps
   on query execution** (FR2), **query isolation between mounts hardened for mutually untrusted
