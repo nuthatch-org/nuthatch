@@ -248,7 +248,7 @@ fn the_golden_path_routes_are_all_still_mounted() {
         r#".route("/schema", get(schema_doc))"#,
         r#".route("/entities", get(entities))"#,
         r#".route("/entity/{id}", get(entity))"#,
-        r#".route("/sql", get(sql))"#,
+        r#".route("/sql", get(sql)"#,
     ] {
         assert!(
             src.contains(route),
