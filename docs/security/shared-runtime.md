@@ -131,6 +131,11 @@ charges for that.
   (`analytics_budget::validate_strict_budget`). With the shipped split (2 permits × 512 MB, 1,024 MB
   reserved) nothing changes; a configuration that relied on a single dataset to run two permits at
   768 MB each is refused at boot, because two tenants of that dataset are 2 × 768 MB.
+  A pool is a limit, not an allocation: it reserves only while a statement runs, and only as many
+  statements run at once as there are permits, so a hundred tenants still hold at most permits ×
+  pool size. A pool no session holds is dropped and rebuilt on demand, so tenant labels that come
+  and go do not accumulate
+  (`confinement::a_hundred_tenants_leave_no_pool_reserved_and_no_pool_without_a_session`).
 - **Cached sessions.** Each holds its view catalogue and up to an eighth of the engine limit in
   Parquet footers (64 MB at the default 512 MB). The cache is 16 sessions for the process whatever
   the mode, so `strict` adds no slots: it fills them with more distinct keys, which costs misses and
