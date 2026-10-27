@@ -359,7 +359,7 @@ fn describe(
             .collect(),
         ipfs: IpfsView {
             declarations: egress.ipfs_declarations,
-            gateways: egress.ipfs_gateways,
+            gateways: egress.ipfs_gateways.iter().map(|g| host(g)).collect(),
         },
         offchain: egress
             .offchain
