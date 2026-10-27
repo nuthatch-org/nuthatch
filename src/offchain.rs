@@ -68,10 +68,44 @@ pub fn segment_path(dir: &Path, snapshot: &Snapshot) -> PathBuf {
     dir.join(DIR).join(SEGMENTS).join(&snapshot.file)
 }
 
+/// The manifest is an authored input that ships in a bundle, so a snapshot's `file` is chosen by
+/// whoever wrote the bundle. Only a plain name under `offchain/segments/` is read: an absolute or
+/// `..` path made `/sql` read any Parquet file the process could (RFC-0073 FR8).
+fn checked(c: Catalogue) -> Result<Catalogue> {
+    for table in c.tables.keys().chain(c.refreshes.keys()) {
+        crate::runtime::safe_segment(table, "offchain table")?;
+    }
+    for (table, snapshots) in &c.tables {
+        for s in snapshots {
+            let stem = s.file.strip_suffix(".parquet").unwrap_or("");
+            crate::runtime::safe_segment(stem, "offchain snapshot file")
+                .with_context(|| format!("offchain table {table}: snapshot file {:?}", s.file))?;
+        }
+    }
+    Ok(c)
+}
+
 pub fn load(dir: &Path) -> Result<Catalogue> {
     let path = catalogue_path(dir);
     match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).context("corrupt offchain provenance manifest"),
+        Ok(raw) => {
+            let c = checked(
+                serde_json::from_str(&raw).context("corrupt offchain provenance manifest")?,
+            )?;
+            // A plain name can still be a link placed by someone with write access to the directory.
+            for s in c.tables.values().flatten() {
+                let p = segment_path(dir, s);
+                if p.symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    anyhow::bail!(
+                        "offchain snapshot {} is a symbolic link; it must be a regular file",
+                        p.display()
+                    );
+                }
+            }
+            Ok(c)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Catalogue::default()),
         Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
     }
@@ -594,6 +628,54 @@ fn now_stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manifest_naming(dir: &Path, table: &str, file: &str) {
+        std::fs::create_dir_all(dir.join(DIR)).unwrap();
+        let raw = serde_json::json!({"tables": {table: [{
+            "hash": "h", "file": file, "rows": 1, "columns": ["x"],
+            "source": "s", "ingested_at": "t", "tool_version": "v"
+        }]}});
+        std::fs::write(catalogue_path(dir), raw.to_string()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_file_that_is_a_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("other.parquet");
+        std::fs::write(&target, b"PAR1").unwrap();
+        manifest_naming(dir.path(), "prices", "prices-abc.parquet");
+        let segs = dir.path().join(DIR).join(SEGMENTS);
+        std::fs::create_dir_all(&segs).unwrap();
+        std::os::unix::fs::symlink(&target, segs.join("prices-abc.parquet")).unwrap();
+        let err = load(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+    }
+
+    #[test]
+    fn a_manifest_cannot_name_a_file_outside_offchain_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in [
+            "/etc/other/segments/abc.parquet",
+            "../../data/other/segments/abc.parquet",
+            "sub/abc.parquet",
+            "abc.csv",
+            ".parquet",
+        ] {
+            manifest_naming(dir.path(), "prices", file);
+            assert!(load(dir.path()).is_err(), "{file} was accepted");
+        }
+        manifest_naming(dir.path(), "../prices", "prices-abc.parquet");
+        assert!(
+            load(dir.path()).is_err(),
+            "a table name with a path was accepted"
+        );
+
+        manifest_naming(dir.path(), "prices", "prices-abc123.parquet");
+        let c = load(dir.path()).unwrap();
+        assert_eq!(c.tables["prices"][0].file, "prices-abc123.parquet");
+    }
 
     async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
