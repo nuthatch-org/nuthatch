@@ -160,12 +160,11 @@ them. It is a report, not a price: nuthatch does not meter or bill.
 
 ### FR5. Memory budgets that grow
 
-`PUT /_admin/runtime` raises (or lowers, refusing below current use) `max_rss_mb` live, persisted in
-`mounts.toml`. **This does not change the ≤2 GB budget.** The budget is what nuthatch's own design must
-fit per cursor, gated in CI for a default runtime, and the default ceiling stays 2048 MB. An operator
-can already set `max_rss_mb` above it in `mounts.toml` to pack more nests onto one cursor, and the 507
-refusal says so (`runtime.rs:3257`); FR5 makes that existing operator choice live instead of
-restart-only. The entity-circuit cap becomes a function of the ceiling (32 per 2 GiB, at least 32).
+`PUT /_admin/runtime` raises or lowers `max_rss_mb` live, persisted in `mounts.toml`, refusing a value
+below current use or **above 2048 MB**: the ≤2 GB budget per cursor is the ceiling, not a default, so
+an operator who wants more nests than fit splits them into a second runtime. The `mounts.toml` path
+that accepts more today is a separate defect (#2441) and FR5 does not lean on it. The entity-circuit
+cap becomes a function of the ceiling (32 at 2 GiB, proportionally fewer below).
 Boot stops refusing the whole runtime for an over-budget cursor: it boots the mounts that fit, in
 `mounts.toml` order, and marks the rest refused with the reason. The per-query hot-tip copy is charged
 to the requesting tenant's share (FR2) and bounded by the mount's limits (FR3); replacing the copy
