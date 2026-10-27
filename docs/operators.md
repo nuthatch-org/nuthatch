@@ -1733,6 +1733,17 @@ with the single writer and nothing phones home. The client launches it; you ask 
 data in plain English and it writes the SQL. Tool advertisement is adaptive (RFC-0025): a nest only
 advertises the tools it can actually answer.
 
+A nest behind a gateway that wants a bearer token: put the token in an environment variable and name
+the variable, so the token never appears in `ps` or in the client's config.
+
+```sh
+export NEST_TOKEN=…                  # or set NUTHATCH_MCP_TOKEN, which is read by default
+claude mcp add nuthatch -- nuthatch mcp --url https://nest.example.com --token-env NEST_TOKEN
+```
+
+Every request then carries `Authorization: Bearer <token>`. `--print-config` prints the variable's
+name, never its value, and an error body that echoes the token reaches the agent as `[redacted]`.
+
 ---
 
 ## Stability contract

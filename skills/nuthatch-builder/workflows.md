@@ -150,6 +150,8 @@ nuthatch dev &                        # the index the agent queries
 nuthatch mcp --print-config           # copy-paste MCP client config (Claude Code / any client)
 # or, Claude Code directly:
 claude mcp add nuthatch -- nuthatch mcp --url http://127.0.0.1:8288
+# a remote nest behind a gateway: name the variable holding its bearer token
+claude mcp add nuthatch -- nuthatch mcp --url https://nest.example.com --token-env NEST_TOKEN
 ```
 
 The agent then calls the `schema` tool (per-nest, with footguns + coverage), writes SQL, and gets

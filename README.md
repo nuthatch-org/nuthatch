@@ -424,6 +424,9 @@ Or add it to Claude Code directly:
 claude mcp add nuthatch -- nuthatch mcp --url http://127.0.0.1:8288
 ```
 
+A nest behind a gateway that wants a bearer token: `--token-env NEST_TOKEN` names the variable that
+holds it (`NUTHATCH_MCP_TOKEN` is read by default), so the token never goes on the command line.
+
 Then just ask: *"what are the top USDC holders?"* - the agent writes the SQL and runs it against your
 nest. (Making that correct on the first try is the [semantic-layer work](docs/rfcs/0016-governed-semantic-layer-and-agent-grade-mcp.md).)
 
