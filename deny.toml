@@ -37,6 +37,18 @@ ignore = [
   # does not clear it. Tracked upstream; re-check on the next dbsp bump, same as the quick-xml pair.
   "RUSTSEC-2026-0235", # rkyv: shared-pointer validation ignored pointer metadata
   #
+  # zstd 0.13.3 / zstd-safe 7.2.4 (transitive: arrow-ipc and parquet 59, zip via dbsp, actix-http via
+  # feldera-types). The fixes are zstd 0.14.3 / zstd-safe 8.2.0, which every one of those pins out.
+  #   - actix-http's request decompression never runs: no actix listener is constructed here (see h2
+  #     below), and nuthatch serves HTTP with axum.
+  #   - zstd is decoded in Parquet pages only: segments this binary sealed, or ones `seed` fetched and
+  #     kept only after they hashed to the address the operator's chosen snapshot names (seed.rs).
+  #   - Nothing here uses the seekable format (0398).
+  # Lift these when arrow/parquet move to zstd 0.14. Review by 2026-12-01. (#2411)
+  "RUSTSEC-2026-0391", # zstd: abandoned stream data leaks into the next on a reused context
+  "RUSTSEC-2026-0398", # zstd-safe: seekable decompress sets a Vec length past its capacity
+  "RUSTSEC-2026-0403", # zstd-safe: uninitialised memory when a legacy frame fails mid-stream
+  #
   # h2 0.3.27 (transitive: dbsp → feldera-types → actix-web → actix-http). The 0.4 line is **fixed,
   # not ignored**: h2 0.4.15 → 0.4.16 in the same commit. That is the right action regardless of
   # exposure and needs no justification here; this entry covers only the 0.3 copy, which cannot be
