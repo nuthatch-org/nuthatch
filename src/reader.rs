@@ -427,7 +427,7 @@ impl Follower {
                 let dataset = dataset.0;
                 fresh.insert(dataset.clone());
                 // Read under its cap, so a snapshot over budget arrives holding no rows.
-                if let Some(held) = snapshot.entities.over {
+                if let Some(held) = snapshot.over {
                     let cap = self.cap_for(&dataset).unwrap_or(0);
                     let max = self.lock().max_rss_mb;
                     self.refuse(&dataset, budget_reason(&dataset, held, cap, max));

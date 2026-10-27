@@ -902,6 +902,7 @@ impl Store {
                 if crate::feed::mirrored_meta(k.value()) {
                     snapshot
                         .meta
+                        .map
                         .insert(k.value().to_string(), v.value().to_string());
                 }
             }
@@ -909,11 +910,13 @@ impl Store {
                 let (k, v) = row?;
                 snapshot
                     .blocks
+                    .map
                     .insert(k.value().to_string(), v.value().to_string());
             }
             drop(rtx);
             let sealed = snapshot
                 .meta
+                .map
                 .get("sealed_through")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);

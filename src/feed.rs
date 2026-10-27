@@ -117,10 +117,28 @@ pub struct Snapshot {
     pub epoch: u64,
     pub generation: u64,
     pub entities: Rows,
-    pub meta: BTreeMap<String, String>,
-    pub blocks: BTreeMap<String, String>,
+    pub meta: Rows,
+    pub blocks: Rows,
     /// The catalogue's raw bytes, `None` where the dataset has never sealed.
+    #[serde(default, deserialize_with = "bounded_catalogue")]
     pub catalogue: Option<String>,
+    /// Set by [`read_lines`] when the snapshot came to more than its dataset's cap: the bytes it came
+    /// to. None of it is then kept.
+    #[serde(skip)]
+    pub over: Option<u64>,
+}
+
+impl Snapshot {
+    /// What a follower is charged for holding this snapshot, by [`row_bytes`] and the catalogue's
+    /// length.
+    pub fn bytes(&self) -> u64 {
+        [&self.entities, &self.meta, &self.blocks]
+            .iter()
+            .flat_map(|r| r.map.iter())
+            .map(|(k, v)| row_bytes(k, v))
+            .sum::<u64>()
+            + self.catalogue.as_ref().map_or(0, |c| c.len() as u64)
+    }
 }
 
 /// What a follower charges one stored row beyond its key and value: the map's node and two string
@@ -132,13 +150,12 @@ pub fn row_bytes(key: &str, row: &str) -> u64 {
     (key.len() + row.len()) as u64 + ROW_OVERHEAD
 }
 
-/// A snapshot's hot rows, sent as one JSON object and read into the map directly. Read under the cap
-/// [`read_lines`] sets for its dataset: past it, rows are counted and dropped rather than kept.
+/// One of a snapshot's tables (entity rows, meta, block checkpoints), sent as one JSON object and
+/// read into the map directly. All of a snapshot's tables are read against the one cap
+/// [`read_lines`] sets for its dataset: past it, entries are counted and dropped rather than kept.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rows {
     pub map: BTreeMap<String, String>,
-    /// The bytes the rows came to, set only when they went past the cap and none were kept.
-    pub over: Option<u64>,
 }
 
 impl Serialize for Rows {
@@ -147,47 +164,75 @@ impl Serialize for Rows {
     }
 }
 
+/// The snapshot being read on this thread: its dataset's cap, set by its name ahead of it, and the
+/// bytes its tables and catalogue have come to so far.
+#[derive(Clone, Copy, Default)]
+struct Budget {
+    cap: Option<u64>,
+    seen: u64,
+}
+
+impl Budget {
+    fn over(self) -> bool {
+        self.cap.is_some_and(|cap| self.seen > cap)
+    }
+}
+
 thread_local! {
-    /// The cap for the snapshot being read on this thread, set by its dataset name ahead of it.
-    static ROWS_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static BUDGET: std::cell::Cell<Budget> = const {
+        std::cell::Cell::new(Budget { cap: None, seen: 0 })
+    };
     /// What [`read_lines`] was given to work a dataset's cap out with.
     static CAP_FOR: std::cell::RefCell<Option<CapFor>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The most a dataset's snapshot rows may come to, `None` for no cap.
+/// Count `bytes` against the snapshot being read; whether it is still within its cap.
+fn charge_read(bytes: u64) -> bool {
+    BUDGET.with(|b| {
+        let mut now = b.get();
+        now.seen += bytes;
+        b.set(now);
+        !now.over()
+    })
+}
+
+/// The most a dataset's snapshot may come to, `None` for no cap.
 pub type CapFor = Box<dyn Fn(&str) -> Option<u64>>;
 
 impl<'de> Deserialize<'de> for Rows {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        struct Visit(Option<u64>);
+        struct Visit;
         impl<'de> serde::de::Visitor<'de> for Visit {
             type Value = Rows;
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a map of entity key to stored row")
+                f.write_str("a map of key to stored value")
             }
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
                 mut access: A,
             ) -> std::result::Result<Rows, A::Error> {
                 let mut rows = Rows::default();
-                let mut bytes = 0u64;
                 while let Some((k, v)) = access.next_entry::<String, String>()? {
-                    bytes += row_bytes(&k, &v);
-                    if self.0.is_some_and(|cap| bytes > cap) {
-                        rows.map.clear();
-                        rows.over = Some(bytes);
-                    } else if rows.over.is_none() {
+                    if charge_read(row_bytes(&k, &v)) {
                         rows.map.insert(k, v);
+                    } else {
+                        rows.map.clear();
                     }
-                }
-                if rows.over.is_some() {
-                    rows.over = Some(bytes);
                 }
                 Ok(rows)
             }
         }
-        d.deserialize_map(Visit(ROWS_CAP.with(|c| c.get())))
+        d.deserialize_map(Visit)
     }
+}
+
+/// The catalogue, counted against the snapshot's cap. It is one JSON string, so the parser holds it
+/// whole before it can be counted; past the cap it is dropped at once.
+fn bounded_catalogue<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let raw = Option::<String>::deserialize(d)?;
+    Ok(raw.filter(|r| charge_read(r.len() as u64)))
 }
 
 /// A snapshot's dataset name, whose reading sets the cap its rows, which follow it, are read under.
@@ -199,7 +244,7 @@ impl<'de> Deserialize<'de> for DatasetName {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let name = String::deserialize(d)?;
         let cap = CAP_FOR.with(|f| f.borrow().as_ref().and_then(|f| f(&name)));
-        ROWS_CAP.with(|c| c.set(cap));
+        BUDGET.with(|b| b.set(Budget { cap, seen: 0 }));
         Ok(DatasetName(name))
     }
 }
@@ -213,8 +258,18 @@ pub fn read_lines(
 ) -> Result<()> {
     CAP_FOR.with(|f| *f.borrow_mut() = Some(cap_for));
     for line in serde_json::Deserializer::from_reader(body).into_iter::<Line>() {
-        ROWS_CAP.with(|c| c.set(None));
-        if !each(line.context("an unreadable line on the feed")?) {
+        let budget = BUDGET.with(|b| b.replace(Budget::default()));
+        let mut line = line.context("an unreadable line on the feed")?;
+        if let Line::Snapshot { snapshot, .. } = &mut line {
+            // A table read before the cap was passed kept its rows; none of them is kept now.
+            if budget.over() {
+                *snapshot = Snapshot {
+                    over: Some(budget.seen),
+                    ..Default::default()
+                };
+            }
+        }
+        if !each(line) {
             break;
         }
     }
@@ -491,8 +546,9 @@ struct Mirror {
     blocks: BTreeMap<String, String>,
     epoch: u64,
     generation: u64,
-    /// What the three tables are charged, by [`row_bytes`].
+    /// What the three tables are charged, by [`row_bytes`], and the pinned catalogue's length.
     bytes: u64,
+    catalogue_bytes: u64,
 }
 
 /// Insert into `map`, keeping `bytes` the charge for what it holds.
@@ -572,17 +628,20 @@ impl MemStore {
         let entities = snapshot.entities.map;
         let meta: BTreeMap<String, String> = snapshot
             .meta
+            .map
             .into_iter()
             .filter(|(k, _)| mirrored_meta(k))
             .collect();
-        let blocks = snapshot.blocks;
+        let blocks = snapshot.blocks.map;
+        let catalogue_bytes = snapshot.catalogue.as_ref().map_or(0, |c| c.len() as u64);
         let mirror = Mirror {
-            bytes: charge(&entities) + charge(&meta) + charge(&blocks),
+            bytes: charge(&entities) + charge(&meta) + charge(&blocks) + catalogue_bytes,
             entities,
             meta,
             blocks,
             epoch: snapshot.epoch,
             generation: snapshot.generation,
+            catalogue_bytes,
         };
         crate::seal::pin_catalogue(dir, snapshot.catalogue);
         MemStore {
@@ -630,6 +689,8 @@ impl MemStore {
             m.apply(op);
         }
         if let Some(raw) = &delta.catalogue {
+            m.bytes = m.bytes - m.catalogue_bytes + raw.len() as u64;
+            m.catalogue_bytes = raw.len() as u64;
             crate::seal::pin_catalogue(&self.dir, Some(raw.clone()));
         }
         m.generation = delta.generation;
@@ -665,11 +726,12 @@ impl MirroredTables {
             entities: snapshot.entities.map.clone(),
             meta: snapshot
                 .meta
+                .map
                 .iter()
                 .filter(|(k, _)| mirrored_meta(k))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            blocks: snapshot.blocks.clone(),
+            blocks: snapshot.blocks.map.clone(),
         }
     }
 }
@@ -1181,55 +1243,80 @@ mod tests {
         assert_eq!(tap.generation(), 1);
     }
 
-    /// A mount's lowered guards survive the wire, and a follower never serves wider than its own.
-    /// A snapshot is read under the cap its dataset is given, a line at a time, and one over it keeps
-    /// no rows; the lines either side of it read as they were sent.
+    /// A snapshot is read under the cap its dataset is given, a line at a time, its entity rows, meta,
+    /// checkpoints and catalogue all counted against it. One over it in any of them keeps nothing;
+    /// the lines either side of it read as they were sent.
     #[test]
-    fn snapshot_rows_are_read_under_their_datasets_cap() {
-        let snap = |rows: usize| {
-            let mut s = Snapshot::default();
-            for i in 0..rows {
-                s.entities
-                    .map
-                    .insert(format!("{i:012}-000000"), "x".repeat(100));
+    fn snapshots_are_read_under_their_datasets_cap() {
+        let fill = |rows: &mut Rows, n: usize| {
+            for i in 0..n {
+                rows.map.insert(format!("{i:012}-000000"), "x".repeat(100));
             }
-            s
         };
+        let entry = row_bytes("000000000000-000000", &"x".repeat(100));
+        let cap = entry * 10;
+        let mut cases = Vec::new();
+        let mut s = Snapshot::default();
+        fill(&mut s.entities, 3);
+        fill(&mut s.meta, 2);
+        cases.push(("data/small", s));
+        for big in ["entities", "meta", "blocks"] {
+            let mut s = Snapshot::default();
+            fill(&mut s.entities, 2);
+            let rows = match big {
+                "entities" => &mut s.entities,
+                "meta" => &mut s.meta,
+                _ => &mut s.blocks,
+            };
+            fill(rows, 50);
+            cases.push((big, s));
+        }
+        let mut s = Snapshot::default();
+        fill(&mut s.entities, 2);
+        s.catalogue = Some("c".repeat(cap as usize));
+        cases.push(("catalogue", s));
+        let mut s = Snapshot::default();
+        fill(&mut s.blocks, 50);
+        cases.push(("data/free", s));
+
         let mut wire = Vec::new();
-        for (dataset, rows) in [("data/small", 3), ("data/big", 50), ("data/free", 50)] {
+        for (dataset, snapshot) in &cases {
             serde_json::to_writer(
                 &mut wire,
                 &Line::Snapshot {
-                    dataset: DatasetName(dataset.into()),
-                    snapshot: snap(rows),
+                    dataset: DatasetName(dataset.to_string()),
+                    snapshot: snapshot.clone(),
                 },
             )
             .unwrap();
             wire.push(b'\n');
         }
-        let cap = row_bytes("000000000000-000000", &"x".repeat(100)) * 10;
-        let mut got = Vec::new();
+        let mut got = BTreeMap::new();
         read_lines(
             &wire[..],
             Box::new(move |d: &str| (d != "data/free").then_some(cap)),
             |line| {
                 if let Line::Snapshot { dataset, snapshot } = line {
-                    got.push((
-                        dataset.0,
-                        snapshot.entities.map.len(),
-                        snapshot.entities.over,
-                    ));
+                    got.insert(dataset.0, snapshot);
                 }
                 true
             },
         )
         .unwrap();
-        assert_eq!(got[0], ("data/small".into(), 3, None));
-        assert_eq!(got[1].1, 0);
-        assert_eq!(got[1].2, Some(cap / 10 * 50));
-        assert_eq!(got[2], ("data/free".into(), 50, None));
+        let small = &got["data/small"];
+        assert_eq!(small.over, None);
+        assert_eq!(small.bytes(), entry * 5);
+        for over in ["entities", "meta", "blocks", "catalogue"] {
+            let s = &got[over];
+            assert!(s.over.is_some(), "{over} alone over the cap");
+            assert_eq!(s.bytes(), 0, "{over}: nothing is kept");
+        }
+        assert_eq!(got["entities"].over, Some(entry * 50));
+        assert_eq!(got["data/free"].blocks.map.len(), 50);
+        assert_eq!(got["data/free"].over, None);
     }
 
+    /// A mount's lowered guards survive the wire, and a follower never serves wider than its own.
     #[test]
     fn a_mounts_guards_cross_the_feed_and_stay_within_the_follower() {
         let process = crate::limits::Limits::process();
