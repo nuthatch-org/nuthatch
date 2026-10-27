@@ -65,6 +65,7 @@ pub mod entity_view;
 pub mod exposure;
 pub mod factory;
 pub mod fair_share;
+pub mod feed;
 pub mod flags;
 /// RFC-0059 checkpointed folds, behind the off-by-default `folds` feature.
 #[cfg(feature = "folds")]

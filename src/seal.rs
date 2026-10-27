@@ -732,11 +732,49 @@ fn checked(m: Manifest) -> Result<Manifest> {
     Ok(m)
 }
 
+/// Catalogues a follower (`serve --follow`) pinned per dataset, `None` inside meaning "never sealed".
+type Pins = std::sync::RwLock<HashMap<PathBuf, Option<Arc<str>>>>;
+
+fn pins() -> &'static Pins {
+    static PINS: OnceLock<Pins> = OnceLock::new();
+    PINS.get_or_init(Default::default)
+}
+
+/// Serve `dir`'s catalogue from `raw` rather than the disk (RFC-0073 FR1). A follower's watermark comes
+/// from the writer's feed, and the catalogue on disk may already be a seal ahead of it.
+pub fn pin_catalogue(dir: &Path, raw: Option<String>) {
+    pins()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dir.to_path_buf(), raw.map(Arc::from));
+}
+
+pub fn unpin_catalogue(dir: &Path) {
+    pins()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(dir);
+}
+
+/// The catalogue's bytes: the pinned ones where a follower pinned them, else the file.
+fn read_catalogue(dir: &Path) -> std::io::Result<Vec<u8>> {
+    let pinned = pins()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(dir)
+        .cloned();
+    match pinned {
+        Some(Some(raw)) => Ok(raw.as_bytes().to_vec()),
+        Some(None) => Err(std::io::ErrorKind::NotFound.into()),
+        None => std::fs::read(manifest_path(dir)),
+    }
+}
+
 /// Load the segment catalogue (empty if none yet).
 /// The catalogue, with the sha256 of the exact bytes it was parsed from (RFC-0048 §3). `None` when
 /// nothing has sealed.
 pub fn load_manifest_with_hash(dir: &Path) -> Result<(Manifest, Option<String>)> {
-    match std::fs::read(manifest_path(dir)) {
+    match read_catalogue(dir) {
         Ok(raw) => Ok((
             checked(serde_json::from_slice(&raw).context("corrupt segments manifest")?)?,
             Some(hex::encode(Sha256::digest(&raw))),
@@ -748,7 +786,7 @@ pub fn load_manifest_with_hash(dir: &Path) -> Result<(Manifest, Option<String>)>
 
 /// [`load_manifest_with_hash`]'s hash alone.
 pub fn catalogue_hash(dir: &Path) -> Result<Option<String>> {
-    match std::fs::read(manifest_path(dir)) {
+    match read_catalogue(dir) {
         Ok(raw) => Ok(Some(hex::encode(Sha256::digest(&raw)))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).context("failed to read manifest"),
@@ -756,9 +794,8 @@ pub fn catalogue_hash(dir: &Path) -> Result<Option<String>> {
 }
 
 pub fn load_manifest(dir: &Path) -> Result<Manifest> {
-    let path = manifest_path(dir);
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => checked(serde_json::from_str(&raw).context("corrupt segments manifest")?),
+    match read_catalogue(dir) {
+        Ok(raw) => checked(serde_json::from_slice(&raw).context("corrupt segments manifest")?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::default()),
         Err(e) => Err(e).context("failed to read manifest"),
     }
