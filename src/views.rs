@@ -213,6 +213,18 @@ pub struct BalanceView {
 }
 
 impl BalanceView {
+    /// A view with no circuit, for a process that serves a nest it does not index (RFC-0073 FR1),
+    /// which refuses the routes that read it rather than answer them empty.
+    pub fn inert() -> Self {
+        let (tx, _) = channel::<Msg>();
+        Self {
+            tx,
+            balances: Default::default(),
+            healthy: Arc::new(AtomicBool::new(true)),
+            over_i128: Default::default(),
+        }
+    }
+
     /// Spawn the circuit on its own thread (DBSP drives worker threads; keep it off the async pool).
     pub fn start() -> Result<Self> {
         let (tx, rx) = channel::<Msg>();

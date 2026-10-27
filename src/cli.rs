@@ -1488,6 +1488,17 @@ pub struct ServeArgs {
     /// Objects the mirror uploads at once.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=16))]
     pub publish_parallelism: u64,
+
+    /// Serve every mount of the runtime at this directory, read-only, beside the writer named by
+    /// `--follow` (RFC-0073 FR1). Sealed segments are read from here; redb is never opened.
+    #[arg(long, value_name = "DIR", requires = "follow", conflicts_with_all = ["hot_store", "publish_target", "admin"])]
+    pub runtime: Option<String>,
+
+    /// The writer's address, e.g. `http://127.0.0.1:8288`, whose hot-state feed this process
+    /// follows. Its admin token comes from `NUTHATCH_ADMIN_TOKEN`, or the token file the writer keeps
+    /// in the runtime directory; never from the command line.
+    #[arg(long, value_name = "URL", requires = "runtime")]
+    pub follow: Option<String>,
 }
 
 #[derive(Args)]

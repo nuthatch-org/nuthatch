@@ -2417,6 +2417,12 @@ pub async fn dev(
             admin_enabled,
             admin_token.clone(),
         ))
+        .merge(crate::feed_http::routes(
+            crate::feed_http::runtime_roster(handles.clone()),
+            dir.clone(),
+            admin_enabled,
+            admin_token.clone(),
+        ))
         .merge(bundle_routes(
             handles.clone(),
             jobs.clone(),

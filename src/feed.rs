@@ -126,6 +126,45 @@ pub struct Subscription {
     pub deltas: tokio::sync::broadcast::Receiver<Arc<Delta>>,
 }
 
+/// One line of `GET /_admin/feed`, newline-delimited JSON. A dataset is named by its directory
+/// relative to the runtime (`data/<nid>`), which is where a follower beside the writer finds its
+/// segments; a route is a mount's `/<tenant>/<alias>` key.
+///
+/// Externally tagged (`{"delta": {...}}`) so a large snapshot deserialises without being buffered.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Line {
+    Hello {
+        version: String,
+    },
+    /// A route and the SQL surface the writer serves it with (RFC-0034), which a follower serves too.
+    Mount {
+        route: String,
+        dataset: String,
+        nid: Option<String>,
+        #[serde(default)]
+        sql: crate::allowlist::SqlAccess,
+        #[serde(default)]
+        queries: Vec<crate::allowlist::NamedQuery>,
+    },
+    Unmount {
+        route: String,
+    },
+    Snapshot {
+        dataset: String,
+        snapshot: Snapshot,
+    },
+    Delta {
+        dataset: String,
+        delta: Delta,
+    },
+    /// Each followed dataset's `(epoch, generation)` now, sent every second so a follower can say how
+    /// far behind it is and tell a quiet writer from a gone one.
+    Heartbeat {
+        positions: BTreeMap<String, (u64, u64)>,
+    },
+}
+
 #[derive(Default)]
 struct TapState {
     generation: u64,
