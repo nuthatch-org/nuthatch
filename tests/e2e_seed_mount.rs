@@ -248,3 +248,48 @@ async fn a_seed_with_no_mirror_fails_and_a_seed_cannot_wait() {
     );
     assert!(handles.lock().await.states.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_refused_after_its_seed_keeps_the_seeded_dataset() {
+    let publisher = tempfile::tempdir().unwrap();
+    let mirror = tempfile::tempdir().unwrap();
+    published(publisher.path(), mirror.path()).await;
+
+    let roost = tempfile::tempdir().unwrap();
+    let registry = tempfile::tempdir().unwrap();
+    let (handles, routes, nid) = seeding_runtime(
+        roost.path(),
+        chain(14),
+        Some(mirror.path()),
+        Some(registry.path()),
+    )
+    .await;
+    let ceiling = std::mem::replace(&mut handles.lock().await.mount_ctx.max_rss_mb, 1);
+    let body = serde_json::json!({"name": "usdc", "nid": nid, "seed": true}).to_string();
+    call(&routes, "POST", "/_admin/nests", None, Some(&body)).await;
+    let job = wait_for_phase(&routes, "usdc", "failed").await;
+    assert_eq!(job["phase"], "failed", "{job}");
+    assert_eq!(
+        job["seed_progress"]["done"], 2,
+        "the seed finished first: {job}"
+    );
+    let data = runtime::MountTable::data_dir(roost.path(), &nid);
+    assert!(
+        data.exists(),
+        "a mount refused after its seed must keep the dataset it fetched and seeded"
+    );
+
+    handles.lock().await.mount_ctx.max_rss_mb = ceiling;
+    call(&routes, "POST", "/_admin/nests", None, Some(&body)).await;
+    let job = wait_for_phase(&routes, "usdc", "live").await;
+    assert_eq!(job["phase"], "live", "{job}");
+    assert!(
+        job.get("seed_progress").is_none(),
+        "a dataset already seeded is not seeded again: {job}"
+    );
+    assert_eq!(
+        transfers_through(&data, 8),
+        transfers_through(publisher.path(), 8),
+        "the seeded rows are not the publisher's"
+    );
+}
