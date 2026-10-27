@@ -438,7 +438,7 @@ fn signing_keys(dir: &Path) -> Vec<String> {
 /// Whether a URL looks like it embeds a credential: userinfo, a key-named query parameter, or a path
 /// segment shaped like a token (long, and mixing letters with digits), as provider keys and Slack
 /// hooks are. `/rpc` and `/ext/bc/C/rpc` are not.
-fn url_carries_credential(url: &str) -> bool {
+pub(crate) fn url_carries_credential(url: &str) -> bool {
     let Ok(u) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -562,22 +562,17 @@ fn classify_outbound(dir: &Path) -> Vec<(&'static str, String, bool)> {
     let Ok(config) = crate::config::Config::load(dir) else {
         return Vec::new();
     };
-    let mut out: Vec<(&'static str, String)> = Vec::new();
-    for w in &config.webhooks {
-        out.push(("webhook", w.url.clone()));
+    let egress = crate::inspect::Egress::of(dir, &config);
+    if let Some(e) = &egress.offchain_error {
+        tracing::warn!(
+            "this nest's offchain manifest is unreadable, so its sources are not listed: {e}"
+        );
     }
-    for a in &config.alerts {
-        out.push(("alert sink", a.url.clone()));
-    }
-    for r in &config.nest.rpc_urls {
-        out.push(("rpc", r.clone()));
-    }
-    out.into_iter()
+    egress
+        .urls()
+        .into_iter()
         .filter(|(_, u)| !is_loopback_url(u))
-        .map(|(k, u)| {
-            let ll = is_link_local_url(&u);
-            (k, u, ll)
-        })
+        .map(|(k, u)| (k, u.to_string(), is_link_local_url(u)))
         .collect()
 }
 
@@ -612,7 +607,7 @@ fn warn_outbound_urls(dir: &Path) {
 /// Untar a `.bundle` into `dest`. `tar`'s `unpack` refuses entries that would escape `dest` (its own
 /// zip-slip guard); [`install_verified`] then re-checks every *manifest-declared* file with
 /// [`checked_join`], so extraction and install are both bounded - defence in depth on untrusted input.
-fn extract_bundle(bundle_file: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn extract_bundle(bundle_file: &Path, dest: &Path) -> Result<()> {
     let file = std::fs::File::open(bundle_file)
         .with_context(|| format!("opening bundle {}", bundle_file.display()))?;
     std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
@@ -633,7 +628,53 @@ pub fn install_verified(
     expect: Option<&str>,
 ) -> Result<()> {
     let manifest = load_manifest(blob_dir)?;
+    let hash = verify_blob(blob_dir, &manifest, expect)?;
 
+    let target = match target {
+        Some(t) => t.to_path_buf(),
+        None => {
+            crate::runtime::safe_segment(&manifest.nest_name, "the bundle's nest name")
+                .context("pass --dir to choose where to install it")?;
+            PathBuf::from(&manifest.nest_name)
+        }
+    };
+    install_files(blob_dir, &manifest, &target)?;
+
+    // Audit L6 (defence in depth): a freshly-loaded nest is third-party config, and its `nuthatch.toml`
+    // decides where this process makes *outbound* requests - webhook/alert sinks it POSTs decoded rows
+    // to, and RPC endpoints it fetches from. A hostile or careless bundle can therefore point those at
+    // an internal address the operator never intended (SSRF), or exfiltrate indexed data to a third
+    // party. Warn, don't refuse: external sinks are the normal case and only the operator knows which
+    // are wanted. The point is that they see the list once, at load, rather than discovering it in
+    // outbound traffic later.
+    warn_outbound_urls(&target);
+
+    println!(
+        "loaded nest '{}' → {}",
+        manifest.nest_name,
+        target.display()
+    );
+    println!("  hash:     {hash}");
+    println!(
+        "  registry: {} (reproduced from inputs ✓)",
+        manifest.registry_hash
+    );
+    println!();
+    println!(
+        "tip: it's yours to run - `nuthatch dev --dir {}`. It decodes byte-for-byte as the author",
+        target.display()
+    );
+    println!("     bundled it (every file hashed, registry reproduced from inputs).");
+    Ok(())
+}
+
+/// The format gate, the optional content-address check and every file's integrity, for a blob
+/// directory about to be installed. Returns the blob hash.
+pub(crate) fn verify_blob(
+    blob_dir: &Path,
+    manifest: &Manifest,
+    expect: Option<&str>,
+) -> Result<String> {
     // Format gate - reject a blob authored by a newer nuthatch, exactly as `config.rs` rejects a newer
     // schema_version. A too-new manifest may hash/verify by rules this build doesn't know.
     if manifest.blob_format_version > BLOB_FORMAT_VERSION {
@@ -665,20 +706,17 @@ pub fn install_verified(
             );
         }
     }
+    Ok(hash)
+}
 
-    let target = match target {
-        Some(t) => t.to_path_buf(),
-        None => {
-            crate::runtime::safe_segment(&manifest.nest_name, "the bundle's nest name")
-                .context("pass --dir to choose where to install it")?;
-            PathBuf::from(&manifest.nest_name)
-        }
-    };
-    if target.exists() && std::fs::read_dir(&target)?.next().is_some() {
+/// Copy a verified blob's files into `target` and prove they are the nest the manifest names: the
+/// decode registry reproduces and the installed files compute to its NID.
+pub(crate) fn install_files(blob_dir: &Path, manifest: &Manifest, target: &Path) -> Result<()> {
+    if target.exists() && std::fs::read_dir(target)?.next().is_some() {
         bail!("target {} exists and is not empty", target.display());
     }
     for f in &manifest.files {
-        let dst = checked_join(&target, &f.path)?;
+        let dst = checked_join(target, &f.path)?;
         if let Some(p) = dst.parent() {
             std::fs::create_dir_all(p)?;
         }
@@ -688,42 +726,16 @@ pub fn install_verified(
 
     // The load-bearing check: regenerate the decode registry from the *installed* inputs and assert it
     // matches the manifest. Same inputs + same generator → same decode, verifiably.
-    verify_registry_reproduces(&target, &manifest)?;
+    verify_registry_reproduces(target, manifest)?;
     // The manifest's name, schema version and file order are its own say-so; only the installed
     // files are evidence of which nest this is (#2369).
-    let installed = nest_nid(&target)?;
+    let installed = nest_nid(target)?;
     if installed != manifest.nid() {
         bail!(
             "the bundle's manifest claims nid {}, but its files are nid {installed}",
             manifest.nid()
         );
     }
-
-    // Audit L6 (defence in depth): a freshly-loaded nest is third-party config, and its `nuthatch.toml`
-    // decides where this process makes *outbound* requests - webhook/alert sinks it POSTs decoded rows
-    // to, and RPC endpoints it fetches from. A hostile or careless bundle can therefore point those at
-    // an internal address the operator never intended (SSRF), or exfiltrate indexed data to a third
-    // party. Warn, don't refuse: external sinks are the normal case and only the operator knows which
-    // are wanted. The point is that they see the list once, at load, rather than discovering it in
-    // outbound traffic later.
-    warn_outbound_urls(&target);
-
-    println!(
-        "loaded nest '{}' → {}",
-        manifest.nest_name,
-        target.display()
-    );
-    println!("  hash:     {hash}");
-    println!(
-        "  registry: {} (reproduced from inputs ✓)",
-        manifest.registry_hash
-    );
-    println!();
-    println!(
-        "tip: it's yours to run - `nuthatch dev --dir {}`. It decodes byte-for-byte as the author",
-        target.display()
-    );
-    println!("     bundled it (every file hashed, registry reproduced from inputs).");
     Ok(())
 }
 
@@ -1778,6 +1790,53 @@ url = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
         assert!(
             found.iter().any(|(k, _, ll)| *k == "rpc" && !*ll),
             "a normal rpc endpoint must not be flagged: {found:?}"
+        );
+    }
+
+    /// RFC-0073 FR10: the load warning missed IPFS gateways and offchain sources, which a loaded
+    /// nest reaches as surely as its webhooks.
+    #[test]
+    fn the_load_warning_lists_ipfs_gateways_and_offchain_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::create_dir_all(dir.path().join("offchain")).unwrap();
+        std::fs::write(dir.path().join("abis/t.json"), "[]").unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = []
+
+[[contracts]]
+alias = "t"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+abi = "abis/t.json"
+
+[[ipfs]]
+name = "docs"
+on = "t__x"
+cid_column = "cid"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("offchain/manifest.json"),
+            r#"{"refreshes":{"prices":{"source":"https://feed.example.org/p?[redacted]","attempted_at":"t","succeeded_at":null,"error":null}}}"#,
+        )
+        .unwrap();
+
+        let found = classify_outbound(dir.path());
+        let kinds: Vec<_> = found.iter().map(|(k, _, _)| *k).collect();
+        assert!(kinds.contains(&"ipfs gateway"), "{found:?}");
+        assert!(
+            found
+                .iter()
+                .any(|(k, u, _)| *k == "offchain source"
+                    && u.starts_with("https://feed.example.org")),
+            "{found:?}"
         );
     }
 
