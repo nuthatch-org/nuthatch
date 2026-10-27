@@ -535,7 +535,10 @@ beside `[runtime]`), one isolated cursor per chain, and each nest declares its o
 [runtime]                     # was [roost] before 2.0
 name = "my-runtime"
 max_rss_mb = 2048             # optional per-CURSOR RAM ceiling (default 2048); the runtime's
-                              # total budget is Σ cursors
+                              # total budget is Σ cursors. Also runtime state: `PUT
+                              # /_admin/runtime` sets it live (at most 2048) and writes it
+                              # here. Mounts that do not fit boot quarantined, not the runtime
+                              # refused; the entity cap is 32 at 2048, proportionally fewer below
 default_tenant = "acme"       # optional (default "default"); the tenant a mount without `tenant`
                               # belongs to, served with no tenant segment in the route. Opaque -
                               # nuthatch refcounts a tenant, nothing more.

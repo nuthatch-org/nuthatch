@@ -54,6 +54,8 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 | Unmount | `DELETE /_admin/nests/<name>` | `200`, with `"was_mounted": false` when there was nothing to unmount (a retry is not a failure); `400` for a name no mount could have |
 | Unmount and free the disk | `DELETE /_admin/nests/<name>?reclaim=true` | `200` and the reclaim, for a live or suspended mount; `409`, with nothing unmounted, for a mount with no recorded NID |
 | Free a dataset unmounted earlier | `DELETE /_admin/datasets/<nid>` | `200`, `409` kept, `404` absent |
+| Read the memory ceiling | `GET /_admin/runtime` | `200` and the ceiling, with what each cursor holds |
+| Raise or lower it | `PUT /_admin/runtime` `{"max_rss_mb": 1536}` | `200` and the same; `400` above 2048; `409` below what a cursor holds |
 
 `<name>` is the route the nest serves at, `/<name>/…`: `usdc` for the runtime's default tenant, and
 `acme/usdc` for any other tenant. Each mount's route depends on its own tenant alone, so it never
@@ -112,7 +114,7 @@ of a live mount is `200` there too. Use it from a script; a platform should poll
 | `400` | a malformed NID, a name the runtime would not accept, or a tenant that shares a mount's name (see above) |
 | `404` | the runtime does not hold the NID and was started without `--registry` |
 | `409` | the name is taken, the chain is not declared, the chain's cursor has died (restart the runtime), the nest declares authored entities and the runtime runs `--seal-direct`, or another mount of that name or dataset is still catching up |
-| `507` | the mount would breach the chain cursor's RAM ceiling, the reason carrying projected and ceiling MB, or its authored entities would put the cursor over 32 |
+| `507` | the mount would breach the chain cursor's RAM ceiling, the reason carrying projected and ceiling MB, or its authored entities would put the cursor over its cap (32 at 2048 MB, proportionally fewer below) |
 
 On the job route a refusal ends the job `failed` with the same reason. With `--registry`, a NID the
 registry does not hold is accepted like any mount and ends the job `failed`, its reason naming the NID;
@@ -185,6 +187,27 @@ cursor is running; a dry run dials nothing. `per_block_rpc` lists extraction tha
 beyond the shared `eth_getLogs`, which is what makes a nest expensive to index. `shares` names a mount
 that already indexes this dataset, in which case the mount costs nothing further.
 
+### The memory ceiling
+
+`max_rss_mb` is each chain cursor's RAM ceiling, shared by every mount on that chain. `PUT
+/_admin/runtime` changes it with no restart and writes it to `mounts.toml` before it takes effect, so
+the next boot holds to it; the next mount is admitted against it at once.
+
+```json
+{"max_rss_mb": 1536, "max_rss_mb_limit": 2048, "max_entities_per_cursor": 24,
+ "cursors": [{"chain": "mainnet", "projected_mb": 420, "entities": 3}]}
+```
+
+- **2048 is the most it accepts.** The ≤2 GB budget per cursor is the ceiling, not a default: a
+  chain that needs more nests than fit is split into a second runtime, not given a second cursor.
+- **A value below what a cursor holds is `409`**, naming the chain. What a cursor holds is the
+  admission estimate of its live and joining mounts, `projected_mb` above, not its measured RSS, so a
+  lowered ceiling always admits what is already running. It never unmounts anything.
+- **The entity cap follows it**: 32 authored entities per cursor at 2048 MB, proportionally fewer
+  below, rounded down. A value whose cap is under a cursor's `entities` is `409` too.
+- Boot prices each store at its size then, so a ceiling set to exactly `projected_mb` can refuse the
+  last mount at the next start once stores have grown. Leave headroom.
+
 ### Suspend and resume
 
 A suspended mount leaves its cursor, releases its store and answers `503` with `"suspended": true` in
@@ -237,8 +260,9 @@ the end of the runtime.
 | Any other window error, such as a failed store write | Retryable quarantine with backoff, then re-admitted behind the cursor. | Keep indexing | `quarantined`, retryable; `503` |
 | Ingest panic | Terminal quarantine, `reason` `this nest's ingest panicked: <message>`. Covers its window, its `prepare` and its reorg rollback. | Keep indexing; the cursor carries on | `quarantined`, terminal; `503` |
 | Build failure at boot | Booted quarantined, `reason` `this nest failed to build: <error>`. Every route answers `503` naming it; its record stays in `mounts.toml`. Unmount drops it; a restart builds it again. | Boot and index | `quarantined`, terminal; `503` |
+| Over the ceiling at boot | Booted quarantined, `reason` `refused at boot: <the refusal a mount would answer>`, naming projected and ceiling MB or the entity cap. Mounts are admitted in `mounts.toml` order; one that does not fit takes no room from those after it. Its record stays; unmount drops it, and a restart with room boots it. | Boot and index | `quarantined`, terminal; `503` |
 
-A boot at which every nest fails to build still fails, naming each.
+A boot at which no nest builds or fits still fails, naming each.
 
 **What a panicked nest serves.** A window's rows commit in one hot-store transaction, so a panic
 leaves the store at a window boundary and `/sql` answers the last committed window, frozen, as for

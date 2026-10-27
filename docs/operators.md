@@ -363,9 +363,15 @@ Nests live in their own repositories rather than in-tree; see the
 ## Capacity and sizing
 
 **The budget is per active-chain cursor: 2 GB RAM.** A runtime's total is the sum of its cursors. This
-is a CI-enforced ceiling, not an aspiration, and `dev` **refuses to start** a cursor whose
-projected footprint exceeds `max_rss_mb` (default 2048). It also refuses to start unless the
-analytical split itself fits that ceiling (RFC-0047 C4):
+is a CI-enforced ceiling, not an aspiration. `max_rss_mb` (default 2048) is each cursor's ceiling,
+and a mount projected past it is refused. At boot the mounts on a cursor are admitted in
+`mounts.toml` order, as a live mount would be: those that fit start, and the rest start quarantined
+with the refusal as their reason, in `GET /nests` and `/ready` (RFC-0073 FR5). Each cursor may also
+carry 32 authored entities at 2048 MB, proportionally fewer below. `PUT /_admin/runtime` raises or
+lowers the ceiling live, up to 2048 and never below what a cursor already holds, and records it in
+`mounts.toml` ([admin API](admin-api.md#the-memory-ceiling)). More nests than fit in 2 GB is a second
+runtime, not a larger ceiling. `dev` also refuses to start unless the analytical split itself fits
+that ceiling (RFC-0047 C4):
 
 ```
 (pools × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB
