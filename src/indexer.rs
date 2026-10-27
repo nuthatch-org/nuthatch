@@ -1326,7 +1326,7 @@ fn discover_children(
     children: &ChildRegistry,
     logs: &[crate::rpc::Log],
 ) -> Vec<String> {
-    let (_, found) = decode_window(
+    let (_, found, _) = decode_window(
         registry,
         Some(factory),
         children,
@@ -5271,17 +5271,15 @@ pub async fn backfill_direct(
                 Err(e) => return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}")),
             },
         };
+        let mut undecoded = Vec::new();
         let mut rows: Vec<_> = logs
             .iter()
-            .filter_map(|log| match registry.decode(log) {
-                Ok(Some(r)) => Some(r),
-                Ok(None) => None,
-                Err(e) => {
-                    tracing::debug!("decode skipped: {e:#}");
-                    None
-                }
-            })
+            .filter_map(|log| decode_or_note(registry, log, &mut undecoded))
             .collect();
+        // The final pass is a tail every earlier window already counted.
+        if !final_pass {
+            note_undecoded(None, &undecoded, next, chunk_to);
+        }
         // Seal in canonical (block, log_index) order regardless of how the RPC provider returned the
         // logs. The segment bytes - and therefore its content address - depend on row order; everywhere
         // else in the pipeline sorts defensively (the hot path re-reads redb in key order; the factory
@@ -6071,17 +6069,14 @@ pub async fn backfill_direct_pipelined_with(
         // empty and grow to the ceiling against genuinely dense history, which is the one place an
         // oversized window actually hurts.
         let fetched = logs.len() as u64;
+        let mut undecoded = Vec::new();
         let mut rows: Vec<_> = logs
             .iter()
-            .filter_map(|log| match registry.decode(log) {
-                Ok(Some(r)) => Some(r),
-                Ok(None) => None,
-                Err(e) => {
-                    tracing::debug!("decode skipped: {e:#}");
-                    None
-                }
-            })
+            .filter_map(|log| decode_or_note(registry, log, &mut undecoded))
             .collect();
+        if !final_pass {
+            note_undecoded(extras.metrics, &undecoded, w_from, w_to);
+        }
         let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
         // Include blocks sampled by [[calls]] so their timestamps are available for call rows.
         if state_rpc.is_some() {
@@ -6600,7 +6595,10 @@ pub async fn backfill_direct_factory_with(
         }
 
         // Headers only for kept rows (#765).
-        let (mut rows, found) = decoded;
+        let (mut rows, found, undecoded) = decoded;
+        if !final_pass {
+            note_undecoded(extras.metrics, &undecoded, next, chunk_to);
+        }
         children.extend(found);
         let extra = if state_rpc.is_some() {
             calls
@@ -6897,7 +6895,7 @@ impl NestIngest {
         let mut logs = fetch_discovering(source, &narrow, &self.topic0s, from, to, |logs| {
             let mut seen = wide_logs.clone();
             seen.extend_from_slice(logs);
-            let (_, found) = decode_window(
+            let (_, found, _) = decode_window(
                 &self.registry,
                 Some(&fs),
                 &self.children,
@@ -7623,7 +7621,7 @@ impl NestIngest {
         // returns every matching event on the chain; stamping from the raw log list paid
         // eth_getBlockByNumber for foreign protocols we then discarded.
         let empty_ts = std::collections::HashMap::new();
-        let (mut rows, mut found) = decode_window(
+        let (mut rows, mut found, undecoded) = decode_window(
             &self.registry,
             self.factory.as_deref(),
             &self.children,
@@ -8113,6 +8111,8 @@ impl NestIngest {
         }
         self.metrics.set_last_block(to);
         self.metrics.add_rows_decoded(stored as u64);
+        // Counted once committed, so a refused window asked for again is not counted twice.
+        note_undecoded(Some(&self.metrics), &undecoded, fold_floor, to);
         if stored > 0 {
             // Per-window detail is debug: the live progress line (RFC-0015 slice 3) is the
             // user-facing narrative during catch-up, and this fires once per window - pure spam at
@@ -9292,6 +9292,74 @@ fn rebuild_views(
     Ok(())
 }
 
+/// A log whose topic0 a declared decoder claims and whose body did not decode (RFC-0049 §2).
+#[derive(Debug)]
+pub(crate) struct Undecoded {
+    block: u64,
+    contract: String,
+    topic0: String,
+    error: String,
+}
+
+impl Undecoded {
+    fn new(log: &crate::rpc::Log, contract: Option<&str>, e: &anyhow::Error) -> Self {
+        Undecoded {
+            block: log.block_number,
+            contract: contract.unwrap_or("other").to_string(),
+            topic0: log
+                .topics
+                .first()
+                .map_or_else(String::new, |t| t.to_ascii_lowercase()),
+            error: format!("{e:#}"),
+        }
+    }
+}
+
+/// A contract log that fails to decode is kept as [`Undecoded`] rather than dropped unseen.
+fn decode_or_note(
+    registry: &DecodeRegistry,
+    log: &crate::rpc::Log,
+    undecoded: &mut Vec<Undecoded>,
+) -> Option<crate::registry::DecodedRow> {
+    match registry.decode(log) {
+        Ok(r) => r,
+        Err(e) => {
+            undecoded.push(Undecoded::new(log, registry.alias_of(log), &e));
+            None
+        }
+    }
+}
+
+/// Counts a window's undecoded logs into `metrics` and logs them as one line, not one per log. Only
+/// blocks `from..=to` count: below `from` is a refetched tail the previous window already counted.
+fn note_undecoded(
+    metrics: Option<&crate::metrics::NestMetrics>,
+    undecoded: &[Undecoded],
+    from: u64,
+    to: u64,
+) {
+    let counted: Vec<&Undecoded> = undecoded
+        .iter()
+        .filter(|u| (from..=to).contains(&u.block))
+        .collect();
+    let Some(first) = counted.first() else {
+        return;
+    };
+    if let Some(m) = metrics {
+        for u in &counted {
+            m.add_undecoded(&u.contract, &u.topic0, 1);
+        }
+    }
+    tracing::warn!(
+        "{} log(s) in blocks {from}..={to} matched a declared event and did not decode; the first, \
+         {} {}: {}",
+        counted.len(),
+        first.contract,
+        first.topic0,
+        first.error
+    );
+}
+
 /// Decode a window's logs in chain order (block, log_index), routing each to a contract decoder or -
 /// for a factory nest - a discovered child's template decoder. Timestamps may be empty here: #765
 /// fetches headers only after local filtering, then `apply_row_timestamps` /
@@ -9307,7 +9375,11 @@ fn decode_window(
     children: &ChildRegistry,
     logs: &[crate::rpc::Log],
     timestamps: &std::collections::HashMap<u64, u64>,
-) -> (Vec<crate::registry::DecodedRow>, ChildRegistry) {
+) -> (
+    Vec<crate::registry::DecodedRow>,
+    ChildRegistry,
+    Vec<Undecoded>,
+) {
     let mut ordered: Vec<&crate::rpc::Log> = logs.iter().collect();
     ordered.sort_by(|a, b| {
         a.block_number
@@ -9317,14 +9389,16 @@ fn decode_window(
 
     let mut found = ChildRegistry::new();
     let mut rows = Vec::new();
+    let mut undecoded = Vec::new();
     for block in ordered.chunk_by(|a, b| a.block_number == b.block_number) {
         // Children announced in this block route its logs; a pass that announces a child whose log
-        // it already passed over is run again.
+        // it already passed over is run again, and only the last pass's failures are kept.
         let mut in_block = ChildRegistry::new();
-        let block_rows = loop {
+        let (block_rows, block_undecoded) = loop {
             let mut missed = std::collections::HashSet::new();
             let mut grew = false;
             let mut block_rows = Vec::new();
+            let mut block_undecoded = Vec::new();
             for &log in block {
                 let decoded = match registry.decode(log) {
                     Ok(Some(r)) => Some(r),
@@ -9339,10 +9413,17 @@ fn decode_window(
                         if template.is_none() {
                             missed.insert(addr);
                         }
-                        template.and_then(|t| registry.decode_child(log, &t).ok().flatten())
+                        let t = template?;
+                        match registry.decode_child(log, &t) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                block_undecoded.push(Undecoded::new(log, Some(&t), &e));
+                                None
+                            }
+                        }
                     }),
                     Err(e) => {
-                        tracing::debug!("decode skipped: {e:#}");
+                        block_undecoded.push(Undecoded::new(log, registry.alias_of(log), &e));
                         None
                     }
                 };
@@ -9363,9 +9444,10 @@ fn decode_window(
                 }
             }
             if !grew {
-                break block_rows;
+                break (block_rows, block_undecoded);
             }
         };
+        undecoded.extend(block_undecoded);
         // Registered in the order the stored rows fold, as `rebuild_children` does after a restart.
         if let Some(fs) = factory {
             for child in block_rows.iter().flat_map(|r| fs.discover(r)) {
@@ -9381,7 +9463,7 @@ fn decode_window(
         }
         rows.extend(block_rows);
     }
-    (rows, found)
+    (rows, found, undecoded)
 }
 
 /// Rebuild the discovered-child registry on a warm restart by folding the stored factory events
@@ -12506,7 +12588,7 @@ template = "pool"
         ];
 
         let ts = std::collections::HashMap::from([(100u64, 1_700_000_000u64)]);
-        let (rows, children) = decode_window(&reg, Some(&fs), &ChildRegistry::new(), &logs, &ts);
+        let (rows, children, _) = decode_window(&reg, Some(&fs), &ChildRegistry::new(), &logs, &ts);
 
         assert_eq!(
             rows.len(),
@@ -15188,6 +15270,151 @@ template = "pool"
             }
             Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
         }
+    }
+
+    /// RFC-0073 FR14: a log whose topic0 a decoder claims and whose topics do not fit it is counted,
+    /// once, under its contract alias or template, whether the contract decoder or a factory child's
+    /// template refused it. Block 5 is decoded twice (the child pings before it is announced), and
+    /// the refetched tail of the next window holds it again: neither counts it a second time.
+    #[tokio::test]
+    async fn an_undecoded_log_is_counted_once_per_contract_and_topic0() {
+        let c = "0x0000000000000000000000000000000000000033";
+        let dt = tempfile::tempdir().unwrap();
+        let mut nest = build_factory_test_nest(dt.path()).await;
+        nest.metrics = Arc::new(crate::metrics::NestMetrics::default());
+        let (created_t0, ping_t0) = (
+            nest_topic0(&nest, "fac__child_created"),
+            nest_topic0(&nest, "child__ping"),
+        );
+        let mut logs = factory_history_logs(&nest);
+        // A ping with a topic Ping() does not index, before the child's announcement in its block.
+        logs.push(crate::rpc::Log {
+            address: c.into(),
+            topics: vec![ping_t0.clone(), format!("0x{:064x}", 1)],
+            data: "0x".into(),
+            block_number: 5,
+            block_hash: "0xbh5".into(),
+            tx_hash: "0xt".into(),
+            log_index: 1,
+        });
+        // A ChildCreated missing its indexed `child` topic.
+        logs.push(crate::rpc::Log {
+            address: "0x0000000000000000000000000000000000000022".into(),
+            topics: vec![created_t0.clone()],
+            data: "0x".into(),
+            block_number: 5,
+            block_hash: "0xbh5".into(),
+            tx_hash: "0xt".into(),
+            log_index: 6,
+        });
+        let source = FilteringSource { logs };
+
+        let window = nest.fetch_window(&source, 5, 8).await.unwrap();
+        nest.process_window(&source, &window, 5, 8, 12)
+            .await
+            .unwrap()
+            .expect("the window commits");
+        let tail = nest.fetch_window(&source, 5, 12).await.unwrap();
+        assert!(tail.iter().any(|l| l.block_number == 5 && l.log_index == 6));
+        nest.process_window(&source, &tail, 9, 12, 12)
+            .await
+            .unwrap()
+            .expect("the next window commits");
+
+        assert_eq!(nest.metrics.undecoded_total(), 2);
+        let summary = nest.metrics.undecoded_summary();
+        let mut top: Vec<(String, String, u64)> = summary["top"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["contract"].as_str().unwrap().to_string(),
+                    p["topic0"].as_str().unwrap().to_string(),
+                    p["logs"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        top.sort();
+        assert_eq!(
+            top,
+            vec![
+                ("child".to_string(), ping_t0, 1),
+                ("fac".to_string(), created_t0, 1)
+            ],
+            "{summary}"
+        );
+    }
+
+    /// RFC-0073 FR14: a window's decode failures are one warn line with their count, not one per log.
+    #[test]
+    fn undecoded_logs_are_one_warn_line_per_window() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Lines(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Msg<'a>(&'a mut String);
+                impl tracing::field::Visit for Msg<'_> {
+                    fn record_debug(
+                        &mut self,
+                        _f: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write as _;
+                        let _ = write!(self.0, "{value:?}");
+                    }
+                }
+                let mut line = String::new();
+                event.record(&mut Msg(&mut line));
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), line));
+            }
+        }
+
+        let log = |block: u64| crate::rpc::Log {
+            address: "0x0000000000000000000000000000000000000022".into(),
+            topics: vec![format!("0x{:064x}", 7)],
+            data: "0x".into(),
+            block_number: block,
+            block_hash: String::new(),
+            tx_hash: String::new(),
+            log_index: 0,
+        };
+        let err = anyhow::anyhow!("decode Ping(): topic count");
+        let undecoded: Vec<Undecoded> = [3, 4, 5, 6]
+            .iter()
+            .map(|&b| Undecoded::new(&log(b), Some("fac"), &err))
+            .collect();
+        let metrics = crate::metrics::NestMetrics::default();
+        let lines = Lines::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(lines.clone()),
+        );
+        tracing::dispatcher::with_default(&dispatch, || {
+            note_undecoded(Some(&metrics), &undecoded, 4, 9);
+        });
+        let lines = lines.0.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].0, tracing::Level::WARN);
+        assert!(
+            lines[0].1.starts_with("3 log(s) in blocks 4..=9"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            metrics.undecoded_total(),
+            3,
+            "block 3 is the tail below the window"
+        );
     }
 
     /// #2153: a child announced in a window that is then refused is not registered. The chain the
@@ -20938,7 +21165,7 @@ template="pool"
         foreign.log_index = 1;
         let logs = vec![kept[0].clone(), foreign];
         let empty = std::collections::HashMap::new();
-        let (rows, _) = decode_window(&reg, None, &ChildRegistry::new(), &logs, &empty);
+        let (rows, _, _) = decode_window(&reg, None, &ChildRegistry::new(), &logs, &empty);
         assert_eq!(rows.len(), 1, "only the nest's own address decodes");
         assert_eq!(rows[0].block_number, 10);
         let stamp = blocks_needing_timestamps(&rows, std::iter::empty());

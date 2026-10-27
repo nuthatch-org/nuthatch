@@ -1248,6 +1248,17 @@ impl DecodeRegistry {
         Ok(Some(build_row(dec, log, emitter, self.timestamps)?))
     }
 
+    /// The alias of the contract decoder [`decode`](Self::decode) would match `log` against, if any.
+    pub fn alias_of(&self, log: &Log) -> Option<&str> {
+        let topic0 = parse_b256(log.topics.first()?).ok()?;
+        let emitter = parse_address(&log.address).ok()?;
+        self.by_topic0
+            .get(&topic0)?
+            .iter()
+            .find(|d| d.contract == emitter)
+            .map(|d| d.alias.as_str())
+    }
+
     /// Decode a log emitted by a discovered child under `template` (RFC-0009). The caller has already
     /// confirmed the log's address is in the child registry for this template; here we match the
     /// event by topic0 within that template's decoders. Rows land in the shared `{template}__{event}`

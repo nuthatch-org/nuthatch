@@ -63,6 +63,53 @@ impl SqlRejection {
     }
 }
 
+/// Distinct (contract, topic0) pairs a nest's undecoded tally keeps before folding the rest into
+/// `("other", "other")`, so a label set cannot grow without bound.
+pub const UNDECODED_PAIRS_MAX: usize = 256;
+
+/// Logs whose topic0 a declared decoder claims and whose body did not decode against it (RFC-0049
+/// §2, RFC-0073 FR14), by contract alias or template name and topic0.
+#[derive(Default)]
+pub struct UndecodedTally {
+    pairs: BTreeMap<(String, String), u64>,
+}
+
+impl UndecodedTally {
+    const fn new() -> Self {
+        Self {
+            pairs: BTreeMap::new(),
+        }
+    }
+
+    fn add(&mut self, contract: &str, topic0: &str, n: u64) {
+        let key = (contract.to_string(), topic0.to_string());
+        let key = if self.pairs.contains_key(&key) || self.pairs.len() < UNDECODED_PAIRS_MAX {
+            key
+        } else {
+            ("other".to_string(), "other".to_string())
+        };
+        *self.pairs.entry(key).or_default() += n;
+    }
+
+    pub fn total(&self) -> u64 {
+        self.pairs.values().sum()
+    }
+
+    /// The `undecoded` block `/ready` and `/nest` carry: the total and the five largest pairs.
+    pub fn summary(&self) -> serde_json::Value {
+        let mut top: Vec<_> = self.pairs.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let top: Vec<_> = top
+            .into_iter()
+            .take(5)
+            .map(|((contract, topic0), logs)| {
+                serde_json::json!({ "contract": contract, "topic0": topic0, "logs": logs })
+            })
+            .collect();
+        serde_json::json!({ "total": self.total(), "top": top })
+    }
+}
+
 /// Per-nest counterparts of the nest-scoped signals (SEC-9). In a runtime the process-global gauges and
 /// counters blend every mounted nest into one number; these let an operator see each nest's own
 /// progress under a `{nest="…"}` label. Updating a per-nest value also bumps the matching global
@@ -116,6 +163,7 @@ pub struct NestMetrics {
     /// `indexer.rs:3437`). `last_poll_ok` alone cannot see that; this can.
     last_progress: AtomicU64,
     rows_decoded: AtomicU64,
+    undecoded: Mutex<UndecodedTally>,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
     /// RFC-0069 G2: how many blocks the last reorg rolled back, and when; 0 until one has.
@@ -358,6 +406,16 @@ impl NestMetrics {
     pub fn add_rows_decoded(&self, n: u64) {
         self.rows_decoded.fetch_add(n, Relaxed);
         METRICS.add_rows_decoded(n);
+    }
+    pub fn add_undecoded(&self, contract: &str, topic0: &str, n: u64) {
+        self.undecoded.lock().unwrap().add(contract, topic0, n);
+        METRICS.add_undecoded(contract, topic0, n);
+    }
+    pub fn undecoded_total(&self) -> u64 {
+        self.undecoded.lock().unwrap().total()
+    }
+    pub fn undecoded_summary(&self) -> serde_json::Value {
+        self.undecoded.lock().unwrap().summary()
     }
     pub fn add_rows_sealed(&self, n: u64) {
         self.rows_sealed.fetch_add(n, Relaxed);
@@ -628,6 +686,8 @@ pub struct Metrics {
     /// Global counterpart of [`NestMetrics::last_progress`], read by a solo `dev` (no per-nest health).
     last_progress: AtomicU64,
     rows_decoded: AtomicU64,
+    /// Every nest's undecoded tally together, read by a solo `dev` `/ready`.
+    undecoded: Mutex<UndecodedTally>,
     rows_sealed: AtomicU64,
     reorgs: AtomicU64,
     checkpoints_missed: AtomicU64,
@@ -711,6 +771,7 @@ impl Metrics {
             started_at: AtomicU64::new(0),
             last_progress: AtomicU64::new(0),
             rows_decoded: AtomicU64::new(0),
+            undecoded: Mutex::new(UndecodedTally::new()),
             rows_sealed: AtomicU64::new(0),
             reorgs: AtomicU64::new(0),
             checkpoints_missed: AtomicU64::new(0),
@@ -859,6 +920,12 @@ impl Metrics {
     }
     pub fn add_rows_decoded(&self, n: u64) {
         self.rows_decoded.fetch_add(n, Relaxed);
+    }
+    fn add_undecoded(&self, contract: &str, topic0: &str, n: u64) {
+        self.undecoded.lock().unwrap().add(contract, topic0, n);
+    }
+    pub fn undecoded_summary(&self) -> serde_json::Value {
+        self.undecoded.lock().unwrap().summary()
     }
     pub fn add_rows_sealed(&self, n: u64) {
         self.rows_sealed.fetch_add(n, Relaxed);
@@ -1191,6 +1258,11 @@ impl Metrics {
             "nuthatch_rows_decoded_total",
             "Rows decoded since start.",
             self.rows_decoded.load(Relaxed),
+        ));
+        s.push_str(&counter(
+            "nuthatch_logs_undecoded_total",
+            "Logs a declared event claimed that did not decode against its ABI, since start.",
+            self.undecoded.lock().unwrap().total(),
         ));
         s.push_str(&counter(
             "nuthatch_rows_sealed_total",
@@ -1635,6 +1707,17 @@ impl Metrics {
                 "gauge",
                 &|m| m.fetch_window.load(Relaxed),
             );
+            s.push_str(
+                "# HELP nuthatch_nest_logs_undecoded_total Logs a declared event claimed that did not decode against its ABI, per nest, contract and topic0.\n\
+                 # TYPE nuthatch_nest_logs_undecoded_total counter\n",
+            );
+            for (nest, m) in per.iter() {
+                for ((contract, topic0), n) in &m.undecoded.lock().unwrap().pairs {
+                    s.push_str(&format!(
+                        "nuthatch_nest_logs_undecoded_total{{nest=\"{nest}\",contract=\"{contract}\",topic0=\"{topic0}\"}} {n}\n"
+                    ));
+                }
+            }
             // RFC-0069 G2. Absent until a nest has reorged: a depth of 0 would read as a reorg that
             // rolled nothing back.
             let reorged: Vec<_> = per
@@ -1983,6 +2066,23 @@ mod tests {
         assert!(out.contains("nuthatch_audit_ranges_total 0"));
         assert!(out.contains("nuthatch_audit_mismatches_total 2"));
         assert!(out.contains("nuthatch_audit_errors_total 0"));
+    }
+
+    /// RFC-0073 FR14: past the cap, a new (contract, topic0) pair folds into `other` while a known pair
+    /// keeps counting under its own name, so the label set stops growing and no log goes uncounted.
+    #[test]
+    fn undecoded_pairs_past_the_cap_fold_into_other() {
+        let mut t = UndecodedTally::new();
+        for i in 0..UNDECODED_PAIRS_MAX {
+            t.add("c", &format!("0x{i:02x}"), 1);
+        }
+        t.add("c", "0x00", 1);
+        t.add("late", "0xff", 2);
+        t.add("later", "0xfe", 3);
+        assert_eq!(t.pairs.len(), UNDECODED_PAIRS_MAX + 1);
+        assert_eq!(t.pairs[&("c".to_string(), "0x00".to_string())], 2);
+        assert_eq!(t.pairs[&("other".to_string(), "other".to_string())], 5);
+        assert_eq!(t.total(), UNDECODED_PAIRS_MAX as u64 + 6);
     }
 
     /// #1399: a retried IPFS fetch is a series, globally and per nest, and not only a log line.
