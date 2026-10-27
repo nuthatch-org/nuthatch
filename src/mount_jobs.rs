@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub use crate::distribution::FailureCode;
+
 /// Where unfinished and failed mount jobs are kept, beside `mounts.toml`.
 pub const JOBS_FILE: &str = "mount-jobs.json";
 
@@ -46,6 +48,9 @@ pub struct MountJob {
     pub phase: MountPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Why a failed job failed, in a form a caller can branch on (RFC-0073 FR15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<FailureCode>,
     pub since_unixtime: u64,
     /// A move to `nid` rather than a mount of it, so a restart resumes it as a move (#1549).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -63,6 +68,7 @@ impl MountJob {
             nid: nid.map(str::to_string),
             phase,
             reason: None,
+            code: None,
             since_unixtime: now_unix(),
             is_move: false,
             generation: 0,
@@ -203,6 +209,23 @@ impl MountJobs {
         {
             job.phase = phase;
             job.reason = reason;
+            job.code = None;
+            job.since_unixtime = now_unix();
+            return self.persist(&jobs);
+        }
+        Ok(())
+    }
+
+    /// End an owned job `failed` with `e`'s text and its [`FailureCode`].
+    pub fn fail_if_owned(&self, name: &str, generation: u64, e: &anyhow::Error) -> Result<()> {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(job) = jobs
+            .get_mut(name)
+            .filter(|job| job.generation == generation)
+        {
+            job.phase = MountPhase::Failed;
+            job.reason = Some(format!("{e:#}"));
+            job.code = Some(FailureCode::of(e));
             job.since_unixtime = now_unix();
             return self.persist(&jobs);
         }
@@ -216,6 +239,7 @@ impl MountJobs {
         if let Some(job) = jobs.get_mut(name) {
             job.phase = phase;
             job.reason = reason;
+            job.code = None;
             job.since_unixtime = now_unix();
         }
         self.persist(&jobs)
@@ -333,6 +357,35 @@ mod tests {
 
         again.forget("b").unwrap();
         assert!(MountJobs::load(d.path()).get("b").is_none());
+    }
+
+    /// RFC-0073 FR15: a failure carries its code in the job, through a restart, and a retry clears it.
+    #[test]
+    fn a_failed_job_carries_its_code_and_a_retry_clears_it() {
+        let d = tempfile::tempdir().unwrap();
+        let jobs = MountJobs::load(d.path());
+        let job = jobs
+            .claim(MountJob::new("a", Some("aa"), MountPhase::Accepted))
+            .unwrap();
+        let denied = anyhow::Error::new(crate::distribution::RegistryError::for_test(
+            FailureCode::AccessDenied,
+        ))
+        .context("fetching nid aa from the registry");
+        jobs.fail_if_owned("a", job.generation, &denied).unwrap();
+
+        let again = MountJobs::load(d.path()).get("a").unwrap();
+        assert_eq!(again.code, Some(FailureCode::AccessDenied));
+        assert_eq!(serde_json::json!(again)["code"], "access_denied");
+
+        let untyped = anyhow::anyhow!("the chain's cursor has died");
+        jobs.fail_if_owned("a", job.generation, &untyped).unwrap();
+        assert_eq!(jobs.get("a").unwrap().code, Some(FailureCode::Other));
+
+        jobs.advance_if_owned("a", job.generation, MountPhase::Fetching, None)
+            .unwrap();
+        let retried = jobs.get("a").unwrap();
+        assert_eq!(retried.code, None);
+        assert!(serde_json::json!(retried).get("code").is_none());
     }
 
     #[test]

@@ -616,6 +616,7 @@ jobs:
       AWS_ALLOW_HTTP: "true"
       NUTHATCH_MINIO_ENDPOINT: http://127.0.0.1:9000
       NUTHATCH_MINIO_BUCKET: nuthatch-publish-test
+      NUTHATCH_REGISTRY_BUCKET: nuthatch-registry-test
       # A missing endpoint must fail this job, not skip it quietly - the same reasoning as
       # `NUTHATCH_REQUIRE_PG` above, for the same reason (#1343 exists because a silent skip is
       # exactly how S3 publishing went untested for as long as it did).
@@ -655,10 +656,13 @@ jobs:
       # `object_store`'s default `aws_virtual_hosted_style_request=false` both expect.
       - name: point the AWS CLI at the S3 server (path-style)
         run: aws configure set default.s3.addressing_style path
-      - name: create the test bucket
-        run: aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_MINIO_BUCKET"
-      - name: publish suite against a real S3 server
-        run: cargo test --locked --test it e2e_minio_publish
+      # RFC-0073 FR15: a second bucket, private by default, for the bundle registry.
+      - name: create the test buckets
+        run: |
+          aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_MINIO_BUCKET"
+          aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_REGISTRY_BUCKET"
+      - name: publish and registry suites against a real S3 server
+        run: cargo test --locked --test it -- e2e_minio_publish e2e_s3_registry
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
         uses: ./.github/actions/timeout-or-cancel

@@ -617,6 +617,25 @@ pub(crate) fn extract_bundle(bundle_file: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A bundle whose bytes are not the nest they claim to be: a content address, a file hash, the
+/// decode registry or the NID did not check out. Typed so a mount job can report it as such.
+#[derive(Debug)]
+pub struct Unverified(pub String);
+
+impl std::fmt::Display for Unverified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unverified {}
+
+macro_rules! unverified {
+    ($($arg:tt)*) => {
+        return Err(anyhow::Error::new(Unverified(format!($($arg)*))))
+    };
+}
+
 /// Verify a resolved blob directory and install it as a runnable nest. Verification is three-fold, all
 /// local (RFC-0012 §5): the manifest's format version is understood, every file's bytes hash to what
 /// the manifest claims (integrity), and - after install - the decode registry *regenerated from the
@@ -689,17 +708,17 @@ pub(crate) fn verify_blob(
     let hash = manifest.blob_hash();
     if let Some(want) = expect {
         if hash != want {
-            bail!("blob hash mismatch: expected {want}, got {hash}");
+            unverified!("blob hash mismatch: expected {want}, got {hash}");
         }
     }
 
     // Integrity: every file's bytes hash to the manifest's claim.
     for f in &manifest.files {
         let bytes = std::fs::read(checked_join(blob_dir, &f.path)?)
-            .with_context(|| format!("blob is missing declared file {}", f.path))?;
+            .map_err(|e| Unverified(format!("blob is missing declared file {}: {e}", f.path)))?;
         let got = hex::encode(Sha256::digest(&bytes));
         if got != f.sha256 {
-            bail!(
+            unverified!(
                 "blob file {} is corrupt: manifest {}, actual {got}",
                 f.path,
                 f.sha256
@@ -731,7 +750,7 @@ pub(crate) fn install_files(blob_dir: &Path, manifest: &Manifest, target: &Path)
     // files are evidence of which nest this is (#2369).
     let installed = nest_nid(target)?;
     if installed != manifest.nid() {
-        bail!(
+        unverified!(
             "the bundle's manifest claims nid {}, but its files are nid {installed}",
             manifest.nid()
         );
@@ -745,7 +764,7 @@ pub fn verify_registry_reproduces(dir: &Path, manifest: &Manifest) -> Result<()>
     let config = Config::load(dir)?;
     let regen = hex::encode(crate::registry::from_nest(dir, &config)?.hash());
     if regen != manifest.registry_hash {
-        bail!(
+        unverified!(
             "registry hash mismatch: manifest claims {}, inputs regenerate {} - the blob was authored \
              by a different generator version",
             manifest.registry_hash,
