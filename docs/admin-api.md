@@ -161,6 +161,40 @@ An unmount that fails part-way answers `500` with the `nid`, so the dataset can 
 Inside a running runtime this removes the dataset and the segments only it references. Segments a live
 fold left behind stay for an offline `nuthatch prune`.
 
+## Faults
+
+A chain's cursor carries every nest on that chain, and a fault in one nest takes out that nest alone.
+`GET /nests` gives each mount a `health` of `indexing`, `quarantined` or `suspended`, and a quarantined
+one a `quarantine` object: `kind` (`nest`, or `cursor` when the chain's cursor died), `class`
+(`retryable`, backing off from 5 s to 300 s, or `terminal`, until a restart), `reason`, `attempts` and
+`next_retry_unixtime`. The root `/ready` answers `503` while any mount is quarantined or stalled and
+names each; `/<name>/ready` answers for that mount alone. `--fail-fast` turns every fault below into
+the end of the runtime.
+
+| Fault | The faulted mount | Its co-tenants | `/nests`, `/<name>/ready` |
+|-------|-------------------|----------------|---------------------------|
+| Decode error | The log is skipped, logged at debug. Not a fault. | Unaffected | `indexing`, `200` |
+| Entity over `max_rows` | Terminal quarantine; the entity stops. | Keep indexing | `quarantined`, terminal, the entity named; `503` |
+| Maintained-view build failure | Not quarantined. The view answers from its definition at request time; `nuthatch_maintained_build_failures_total` counts it. | Unaffected | `indexing`, `200` |
+| Query panic | That request answers `500`. Its permit on the cursor's SQL gate is returned. | Keep serving on the same gate | Unchanged |
+| Extraction RPC error | A failed shared `getLogs` is retried for the whole cursor, so a dead pool stalls every nest on the chain. A missing header or timestamp refuses that nest's window, retried without advancing. A block over the provider's cap that an address-filtered refetch cannot fit is a terminal quarantine of the factory nests that forced the wide fetch. | Other chains unaffected; on the same chain they stall with it, as extraction is shared | Stalled: `indexing`, `503` naming `poll_stalled`. Over-cap: `quarantined`, terminal. |
+| A dead IVM circuit, or a reorg below the sealed watermark | Terminal quarantine. | Keep indexing | `quarantined`, terminal; `503` |
+| Any other window error, such as a failed store write | Retryable quarantine with backoff, then re-admitted behind the cursor. | Keep indexing | `quarantined`, retryable; `503` |
+| Ingest panic | Terminal quarantine, `reason` `this nest's ingest panicked: <message>`. Covers its window, its `prepare` and its reorg rollback. | Keep indexing; the cursor carries on | `quarantined`, terminal; `503` |
+| Build failure at boot | Booted quarantined, `reason` `this nest failed to build: <error>`. Every route answers `503` naming it; its record stays in `mounts.toml`. Unmount drops it; a restart builds it again. | Boot and index | `quarantined`, terminal; `503` |
+
+A boot at which every nest fails to build still fails, naming each.
+
+**What a panicked nest serves.** A window's rows commit in one hot-store transaction, so a panic
+leaves the store at a window boundary and `/sql` answers the last committed window, frozen, as for
+any quarantined nest. In-memory state the panic interrupted is not trusted again: the nest indexes
+nothing until a restart rebuilds it from the store.
+
+**A slow nest holds its co-tenants.** The cursor runs each nest's window in turn, so a nest whose
+windows are slow but succeed slows every nest on its chain. There is no per-nest window deadline
+yet: abandoning a window part-way can let its commit land after its derived state was dropped, so a
+deadline needs the window split into a part that can be abandoned and a commit that cannot.
+
 ## What to meter
 
 The runtime serves `/metrics` at its root, before anything is mounted, with per-nest series labelled `{nest="<name>"}`, among them

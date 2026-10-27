@@ -1522,6 +1522,35 @@ fn is_terminal(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<TerminalFault>())
 }
 
+/// One nest's work on the shared cursor, with a panic in it made that nest's terminal fault
+/// (RFC-0073 FR6). Unwound, the cursor task died and took every co-tenant on the chain with it.
+async fn contained<T>(work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    use futures::FutureExt;
+    std::panic::AssertUnwindSafe(work)
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|payload| Err(panicked(payload)))
+}
+
+/// [`contained`] for the synchronous per-nest steps.
+fn contained_sync<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or_else(|payload| Err(panicked(payload)))
+}
+
+fn panicked(payload: Box<dyn std::any::Any + Send>) -> anyhow::Error {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "with a payload that is not a message".to_string());
+    // Terminal: the nest's in-memory state stopped wherever the panic left it, so it must not index again
+    // until a restart rebuilds that state from the store.
+    anyhow::Error::new(TerminalFault(format!(
+        "this nest's ingest panicked: {message}"
+    )))
+}
+
 /// The chain moved under a window while it was being read: the tip loop reads the window again
 /// rather than ending the nest (#2154).
 #[derive(Debug)]
@@ -2005,7 +2034,7 @@ fn check_live_health(
     live: &[usize],
 ) -> Result<()> {
     for &i in live {
-        if let Err(e) = live_ref(nests, i).ensure_views_healthy() {
+        if let Err(e) = contained_sync(|| live_ref(nests, i).ensure_views_healthy()) {
             sup.quarantine(i, &e)?;
         }
     }
@@ -2020,7 +2049,7 @@ fn fan_out_rollback(
     ancestor: u64,
 ) -> Result<()> {
     for &i in live {
-        match live_nest(nests, i).rollback_reorg(ancestor) {
+        match contained_sync(|| live_nest(nests, i).rollback_reorg(ancestor)) {
             Ok(resume) => nexts[i] = nexts[i].min(resume),
             Err(e) => sup.quarantine(i, &e)?,
         }
@@ -2043,23 +2072,28 @@ async fn check_joined_nests(
             continue;
         }
         let nest = live_nest(nests, i);
-        let found = match nexts[i] {
-            0 => Ok(None),
-            next => detect_reorg(source, &nest.store, next - 1).await,
-        };
-        let rolled = match found {
-            Ok(None) => Ok(()),
-            Ok(Some(ancestor)) => {
-                tracing::warn!(
-                    "nest '{}' rejoined behind a reorg to block {ancestor}: rolling it back",
-                    sup.names[i]
-                );
-                source.forget_cached_above(ancestor);
-                nest.rollback_reorg(ancestor)
-                    .map(|resume| nexts[i] = nexts[i].min(resume))
+        let name = &sup.names[i];
+        let next = nexts[i];
+        let rolled = contained(async {
+            let found = match next {
+                0 => None,
+                next => detect_reorg(source, &nest.store, next - 1).await?,
+            };
+            let Some(ancestor) = found else {
+                return Ok(None);
+            };
+            tracing::warn!(
+                "nest '{name}' rejoined behind a reorg to block {ancestor}: rolling it back"
+            );
+            source.forget_cached_above(ancestor);
+            nest.rollback_reorg(ancestor).map(Some)
+        })
+        .await
+        .map(|resume| {
+            if let Some(resume) = resume {
+                nexts[i] = nexts[i].min(resume);
             }
-            Err(e) => Err(e),
-        };
+        });
         match rolled {
             Ok(()) => sup.reorg_checked[i] = true,
             Err(e) => sup.quarantine(i, &e)?,
@@ -2110,8 +2144,7 @@ async fn fan_out_window(
         // An `Err` is this nest's fault alone (decode, store, seal, a dead IVM circuit, a
         // webhook sink): quarantine it and let its co-tenants finish the window. Before
         // RFC-0026 this `?` killed the shared cursor, taking every healthy sibling with it.
-        match live_nest(nests, i)
-            .process_window(source, &nest_logs, nexts[i], to, tip)
+        match contained(live_nest(nests, i).process_window(source, &nest_logs, nexts[i], to, tip))
             .await
         {
             Ok(Some(_)) => {
@@ -2352,8 +2385,7 @@ async fn runtime_index_loop(
         let nest = slot
             .as_mut()
             .expect("no nest can be retired before the cursor begins");
-        match nest
-            .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
+        match contained(nest.prepare(source.as_ref(), backfill, seal_direct, concurrency, window))
             .await
         {
             Ok(next) => {
@@ -2406,9 +2438,15 @@ async fn runtime_index_loop(
         #[allow(clippy::needless_range_loop)]
         for i in 0..nests.len() {
             if matches!(sup.states[i], NestState::Live) && !sup.prepared[i] {
-                match live_nest(&mut nests, i)
-                    .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
-                    .await
+                let nest = live_nest(&mut nests, i);
+                match contained(nest.prepare(
+                    source.as_ref(),
+                    backfill,
+                    seal_direct,
+                    concurrency,
+                    window,
+                ))
+                .await
                 {
                     Ok(next) => {
                         nexts[i] = next;
@@ -2730,6 +2768,68 @@ pub async fn spawn_runtime(
     health: Arc<crate::health::RuntimeHealth>,
     fail_fast: bool,
 ) -> Result<ChainCursor> {
+    spawn_cursor(
+        source,
+        nests,
+        backfill,
+        seal_direct,
+        concurrency,
+        window_override,
+        admin_enabled,
+        admin_token,
+        health,
+        fail_fast,
+        false,
+    )
+    .await
+}
+
+/// [`spawn_runtime`] for a runtime's boot (RFC-0073 FR6): a nest that fails to build is returned in
+/// [`ChainCursor::failed`] instead of failing the cursor, and its co-tenants start without it.
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_runtime_at_boot(
+    source: Arc<dyn Source>,
+    nests: Vec<(String, PathBuf, Config)>,
+    backfill: Option<u64>,
+    seal_direct: bool,
+    concurrency: usize,
+    window_override: Option<u64>,
+    admin_enabled: bool,
+    admin_token: Option<String>,
+    health: Arc<crate::health::RuntimeHealth>,
+    fail_fast: bool,
+) -> Result<ChainCursor> {
+    spawn_cursor(
+        source,
+        nests,
+        backfill,
+        seal_direct,
+        concurrency,
+        window_override,
+        admin_enabled,
+        admin_token,
+        health,
+        fail_fast,
+        !fail_fast,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_cursor(
+    source: Arc<dyn Source>,
+    nests: Vec<(String, PathBuf, Config)>,
+    backfill: Option<u64>,
+    seal_direct: bool,
+    concurrency: usize,
+    window_override: Option<u64>,
+    admin_enabled: bool,
+    admin_token: Option<String>,
+    health: Arc<crate::health::RuntimeHealth>,
+    fail_fast: bool,
+    spare_co_tenants: bool,
+) -> Result<ChainCursor> {
+    let mut failed = Vec::new();
     let mut ingests = Vec::new();
     let mut states = Vec::new();
     let mut alert_workers: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -2756,6 +2856,16 @@ pub async fn spawn_runtime(
         .await
         {
             Ok(built) => built,
+            Err(e) if spare_co_tenants => {
+                tracing::error!(
+                    "nest '{name}' failed to build and is quarantined; its co-tenants start \
+                     without it: {e:#}"
+                );
+                let reason = format!("this nest failed to build: {e:#}");
+                health.quarantine_nest(&name, reason.clone(), 0, None);
+                failed.push((name, reason));
+                continue;
+            }
             Err(e) => return Err(release_unstarted(e, ingests, states, alert_workers).await),
         };
         window.get_or_insert(w);
@@ -2798,6 +2908,7 @@ pub async fn spawn_runtime(
         ingest,
         alert_workers,
         lifecycle: tx,
+        failed,
     })
 }
 
@@ -2813,6 +2924,8 @@ pub struct ChainCursor {
     pub alert_workers: Vec<(String, tokio::task::JoinHandle<()>)>,
     /// Commands to this cursor, applied at window boundaries.
     pub lifecycle: tokio::sync::mpsc::UnboundedSender<CursorCommand>,
+    /// Nests [`spawn_runtime_at_boot`] could not build, with why. None of them is on the cursor.
+    pub failed: Vec<(String, String)>,
 }
 
 impl ChainCursor {
@@ -7617,6 +7730,8 @@ impl NestIngest {
         to: u64,
         tip: u64,
     ) -> Result<Option<usize>> {
+        #[cfg(test)]
+        panic_if_armed(&self.dir);
         // Decode first so factory discovery is inline (a child created at log i is in the
         // registry before its own activity at log j>i - RFC-0009 same-block handling), then
         // buy headers only for blocks that produced a kept row (#765). A topic0-only fetch
@@ -9633,6 +9748,26 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static BEFORE_PRUNE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Every `process_window` of the nest at `dir` panics from now on. Keyed by directory, since the cursor
+/// that runs it may sit on another thread than the test.
+#[cfg(test)]
+pub(crate) fn panic_in_windows_of(dir: &Path) {
+    panicking_nests().lock().unwrap().push(dir.to_path_buf());
+}
+
+#[cfg(test)]
+fn panicking_nests() -> &'static std::sync::Mutex<Vec<PathBuf>> {
+    static DIRS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn panic_if_armed(dir: &Path) {
+    if panicking_nests().lock().unwrap().iter().any(|d| d == dir) {
+        panic!("injected window panic in {}", dir.display());
+    }
 }
 
 /// Run `probe` inside the next tip-path seal, after its segment is written and before its prune.
