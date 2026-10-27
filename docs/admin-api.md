@@ -484,7 +484,9 @@ the disk, which may already be a seal ahead of the generation it applied.
 and the rows a reorg drops (the one drop with no upper bound), but never a seal's prune, which moves
 rows without changing the history. A seal whose catalogue grows by more rows than it pruned from hot,
 as `--seal-direct` writes them, carried rows no delta did, and the follower rebuilds that dataset's
-derived state from the sealed segments.
+derived state from the sealed segments, as it does when feeding fails part-way. While it rebuilds,
+the dataset's derived routes answer `503` `catching_up`. After each window it also brings entities
+that read offchain tables up to the dataset's offchain snapshots, by the code the writer runs.
 
 **A slow follower never slows the writer.** A follower more than 1,024 commits behind on a dataset is
 sent a fresh snapshot of it instead of the commits it missed, and nothing is gathered for the feed

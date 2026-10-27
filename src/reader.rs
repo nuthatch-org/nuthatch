@@ -14,8 +14,9 @@
 //! State the writer derives in memory, the built-in balance, exposure and velocity views and
 //! RFC-0041's entities, the follower derives itself: rebuilt from its snapshot and the sealed
 //! segments as a writer's restart rebuilds it, then fed the rows each window stores or a reorg
-//! drops ([`crate::indexer::FollowerDerived`]). An entity that reads offchain tables is not
-//! maintained here; its routes, and SQL naming it, answer `503` with `reason: "writer_only"`.
+//! drops ([`crate::indexer::FollowerDerived`]), entities reading offchain tables brought up to the
+//! dataset's snapshots after each window as ingest does. Derived state a feed tore part-way, or that
+//! a seal outran, is rebuilt; until it is whole its routes answer `503` with `reason: "catching_up"`.
 
 use crate::feed::{Line, MemStore};
 use crate::serve::{AppState, LiveRuntime, SharedNest};

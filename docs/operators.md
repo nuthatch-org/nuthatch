@@ -269,11 +269,17 @@ the same `as_of`, `sealed_through` and `nid`.
   balances, exposure and velocity views behind `/balances`, `/balance/…`, `/exposure/…` and `/flags`,
   and RFC-0041 entities behind `/derived…`, `/sql` and `/q/<name>`, a follower builds for itself the
   way a writer's restart does, from its snapshot and the sealed segments, and then feeds with the
-  rows each window stores and each reorg drops. The answers are the writer's. It costs a follower
-  what admission charges the writer for those views and entities, and building it makes a snapshot,
-  and a writer restart, slower to apply on a nest with a long history. One exception: an entity that
-  reads offchain tables is not maintained here, and its routes and SQL naming it answer `503` with
-  `"reason": "writer_only"`; send those to the writer.
+  rows each window stores and each reorg drops. An entity joining an offchain table is brought up
+  to the dataset's offchain snapshots after each window, by the same code the writer runs. The
+  answers are the writer's. It costs a follower what admission charges the writer for those views
+  and entities, and building it makes a snapshot, and a writer restart, slower to apply on a nest
+  with a long history.
+- **Derived state is whole or not served.** If feeding it fails part-way, or a seal arrives carrying
+  rows no delta did (`--seal-direct`), the follower rebuilds that nest's derived state from the
+  sealed history. Meanwhile those routes, SQL naming an entity and the nest's `/q/<name>` answer
+  `503` with `"reason": "catching_up"`, and `/<tenant>/<alias>/ready` says why under `derived`; its
+  other routes keep answering. After a writer restart the follower keeps serving the derived state
+  it had, which is whole and matches the hot state it serves, until the new snapshot's is built.
 - **Its own budget.** A follower holds each dataset's hot window in memory, as the writer's `/sql`
   already copies it per query, and charges it to its cursor's `[runtime] max_rss_mb` from the
   runtime's `mounts.toml`, together with what admission charges each nest. A snapshot that would
