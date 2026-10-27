@@ -450,11 +450,11 @@ pub fn router(backing: SharedNest) -> Router {
             .route("/entities", get(entities))
             .route("/ipfs/gave-up", get(ipfs_gave_up))
             .route("/entity/{id}", get(entity))
-            .route("/sql", get(sql))
+            .route("/sql", get(sql).post(sql_post))
             .route("/diff", get(diff_route))
-            .route("/explain", get(explain))
+            .route("/explain", get(explain).post(explain_post))
             .route("/queries", get(queries))
-            .route("/q/{name}", get(named_query))
+            .route("/q/{name}", get(named_query).post(named_query_post))
             .route("/derived", get(derived_index))
             .route("/derived/{entity}", get(derived_all))
             .route("/derived/{entity}/{key}", get(derived_key))
@@ -4001,7 +4001,63 @@ async fn named_query(
     axum::extract::Path(name): axum::extract::Path<String>,
     Query(args): Query<std::collections::HashMap<String, String>>,
     headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    named_query_answer(s, name, args, headers).await
+}
+
+/// `POST /q/{name}` with the arguments as a JSON object (RFC-0073 FR11). A scalar argument becomes
+/// the text the query string would have carried, so both forms render the same statement.
+async fn named_query_post(
+    State(s): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    match named_args_body(&body) {
+        Ok(args) => named_query_answer(s, name, args, headers).await,
+        Err(error) => {
+            crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Invalid);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": error, "query": name })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// A named query's JSON arguments as the string map the query string gives. An empty body is no
+/// arguments.
+fn named_args_body(body: &[u8]) -> Result<std::collections::HashMap<String, String>, String> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Default::default());
+    }
+    let object: serde_json::Map<String, Value> = serde_json::from_slice(body)
+        .map_err(|e| format!("the body must be a JSON object of arguments: {e}"))?;
+    object
+        .into_iter()
+        .map(|(k, v)| {
+            let text = match v {
+                Value::String(s) => s,
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                other => {
+                    return Err(format!(
+                        "argument '{k}' must be a string, number or boolean, not {other}"
+                    ))
+                }
+            };
+            Ok((k, text))
+        })
+        .collect()
+}
+
+async fn named_query_answer(
+    s: AppState,
+    name: String,
+    args: std::collections::HashMap<String, String>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     #[cfg(not(feature = "counter"))]
     let _ = &headers;
     use crate::metrics::METRICS;
@@ -4517,7 +4573,34 @@ fn copy_reachable_entities(
 /// **Bounded surfaces (RFC-0034).** What the guards above cannot express is *which* queries a nest
 /// will answer at all. A mount may set `sql = "deny"` or `sql = "allowlist"`, and this route then
 /// refuses free-form text and points at `/q/{name}` instead.
-async fn sql(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl IntoResponse {
+async fn sql(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> axum::response::Response {
+    sql_answer(s, q).await
+}
+
+/// `POST /sql` with `{"q": "…", "max_rows": n}` (RFC-0073 FR11): the GET form for a statement too
+/// long for a URL, answered by the same code. The body is read as JSON whatever its content type.
+async fn sql_post(State(s): State<AppState>, body: axum::body::Bytes) -> axum::response::Response {
+    match sql_body(&body, false) {
+        Ok(q) => sql_answer(s, q).await,
+        Err(refusal) => *refusal,
+    }
+}
+
+/// A POST body as a [`SqlQuery`], or the `400` refusing it in the route's own error envelope.
+fn sql_body(body: &[u8], explain: bool) -> Result<SqlQuery, Box<axum::response::Response>> {
+    serde_json::from_slice(body).map_err(|e| {
+        crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Invalid);
+        let error = format!("the body must be {{\"q\": \"...\", \"max_rows\": n}}: {e}");
+        let body = if explain {
+            json!({ "valid": false, "error": error })
+        } else {
+            json!({ "error": error })
+        };
+        Box::new((StatusCode::BAD_REQUEST, Json(body)).into_response())
+    })
+}
+
+async fn sql_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
     use crate::metrics::METRICS;
     if !s.surface.free_form_allowed() {
         return refuse_free_form(&s.surface);
@@ -5209,7 +5292,22 @@ fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::respon
 /// unknown tables/columns/type errors, with the same enriched hints as `/sql`) but scan nothing: the
 /// statement is planned and not run. An agent checks a query's shape before spending a
 /// concurrency slot on the real thing. Returns `{valid:true}` or the enriched error.
-async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> impl IntoResponse {
+async fn explain(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> axum::response::Response {
+    explain_answer(s, q).await
+}
+
+/// `POST /explain`, the body form of [`explain`] (RFC-0073 FR11).
+async fn explain_post(
+    State(s): State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    match sql_body(&body, true) {
+        Ok(q) => explain_answer(s, q).await,
+        Err(refusal) => *refusal,
+    }
+}
+
+async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
     use crate::metrics::METRICS;
     // `/explain` gets the same treatment as `/sql`. It plans caller-supplied SQL, so leaving it open
     // on a bounded mount would leak the schema and the cost model of every table. Bounding the
@@ -9470,6 +9568,191 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         let (status, body) = get_json(state, "/sql?q=SELECT%20random()%20AS%20r").await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    fn url_encode(s: &str) -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                    (b as char).to_string()
+                }
+                b => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+
+    /// One request through `router()`, `body` making it a POST, and the raw `(status, body)`.
+    async fn send(state: &AppState, uri: &str, body: Option<String>) -> (StatusCode, Vec<u8>) {
+        use tower::ServiceExt;
+        let req = match body {
+            Some(b) => axum::http::Request::post(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(b)),
+            None => axum::http::Request::get(uri).body(axum::body::Body::empty()),
+        }
+        .unwrap();
+        let resp = router(SharedNest::new(state.clone()))
+            .oneshot(req)
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    /// GET then POST of one statement. The GET runs twice first so both compared answers come from
+    /// the warmed memo and `cached` cannot differ for a reason that is not the route.
+    async fn get_and_post(
+        state: &AppState,
+        route: &str,
+        q: &str,
+        max_rows: Option<usize>,
+    ) -> ((StatusCode, Vec<u8>), (StatusCode, Vec<u8>)) {
+        let mut uri = format!("{route}?q={}", url_encode(q));
+        if let Some(n) = max_rows {
+            uri.push_str(&format!("&max_rows={n}"));
+        }
+        let body = json!({ "q": q, "max_rows": max_rows }).to_string();
+        send(state, &uri, None).await;
+        let got = send(state, &uri, None).await;
+        let posted = send(state, route, Some(body)).await;
+        (got, posted)
+    }
+
+    /// RFC-0073 FR11: `POST /sql` is the GET form with the statement in the body, answer for answer,
+    /// refusals included.
+    #[tokio::test]
+    async fn post_sql_answers_byte_for_byte_as_get() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = table_fixture(tmp.path(), 1..=3, 4..=5);
+        let long = format!("SELECT 1 AS n {}", "-".repeat(SQL_MAX_QUERY_LEN));
+        let cases: &[(&str, Option<usize>, StatusCode)] = &[
+            ("SELECT count(*) AS n FROM t", None, StatusCode::OK),
+            (
+                "SELECT block_number FROM t ORDER BY block_number",
+                Some(1),
+                StatusCode::OK,
+            ),
+            ("DELETE FROM t", None, StatusCode::BAD_REQUEST),
+            ("SELECT nope FROM t", None, StatusCode::BAD_REQUEST),
+            (&long, None, StatusCode::BAD_REQUEST),
+        ];
+        for (q, max_rows, want) in cases {
+            let (got, posted) = get_and_post(&state, "/sql", q, *max_rows).await;
+            assert_eq!(got.0, *want, "{q}: {}", String::from_utf8_lossy(&got.1));
+            assert_eq!(posted.0, got.0, "{q}");
+            assert_eq!(
+                String::from_utf8_lossy(&posted.1),
+                String::from_utf8_lossy(&got.1),
+                "{q}"
+            );
+        }
+    }
+
+    /// The row cap is read from the body, not merely tolerated in it.
+    #[tokio::test]
+    async fn post_sql_obeys_max_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = table_fixture(tmp.path(), 1..=3, 4..=5);
+        let q = "SELECT block_number FROM t ORDER BY block_number";
+        let (status, body) = send(&state, "/sql", Some(json!({ "q": q }).to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        let all: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(all["rows"].as_array().unwrap().len(), 2, "{all}");
+        let (status, body) = send(
+            &state,
+            "/sql",
+            Some(json!({ "q": q, "max_rows": 1 }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let capped: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(capped["rows"].as_array().unwrap().len(), 1, "{capped}");
+        assert_eq!(capped["truncated"], true, "{capped}");
+    }
+
+    #[tokio::test]
+    async fn post_explain_answers_byte_for_byte_as_get() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = table_fixture(tmp.path(), 1..=3, 4..=5);
+        for (q, want) in [
+            ("SELECT count(*) AS n FROM t", StatusCode::OK),
+            ("SELECT nope FROM t", StatusCode::BAD_REQUEST),
+        ] {
+            let (got, posted) = get_and_post(&state, "/explain", q, None).await;
+            assert_eq!(got.0, want, "{q}: {}", String::from_utf8_lossy(&got.1));
+            assert_eq!(posted, got, "{q}");
+        }
+    }
+
+    /// A bounded mount refuses the body form exactly as it refuses the query string.
+    #[tokio::test]
+    async fn post_sql_on_a_bounded_mount_is_refused_as_get() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = table_fixture(tmp.path(), 1..=3, 4..=5);
+        state.surface = named_surface("SELECT 1 AS answer");
+        for route in ["/sql", "/explain"] {
+            let (got, posted) = get_and_post(&state, route, "SELECT 1", None).await;
+            assert_eq!(got.0, StatusCode::FORBIDDEN, "{route}");
+            assert_eq!(posted, got, "{route}");
+        }
+    }
+
+    /// A body that is not the GET form's fields is a `400` in the route's own JSON envelope.
+    #[tokio::test]
+    async fn a_post_body_that_is_not_the_query_is_refused_in_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        for (route, body) in [
+            ("/sql", "SELECT 1"),
+            ("/sql", r#"{"max_rows": 1}"#),
+            ("/explain", r#"{"q": 1}"#),
+        ] {
+            let (status, got) = send(&state, route, Some(body.into())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{route} {body}");
+            let v: Value = serde_json::from_slice(&got).unwrap();
+            assert!(v["error"].as_str().is_some(), "{v}");
+            assert_eq!(v.get("valid").is_some(), route == "/explain", "{v}");
+        }
+    }
+
+    /// `POST /q/{name}` takes its arguments as a JSON object and renders the statement the query
+    /// string renders.
+    #[tokio::test]
+    async fn post_named_query_answers_as_get() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.surface = Arc::new(crate::allowlist::Surface {
+            access: crate::allowlist::SqlAccess::Allowlist,
+            queries: vec![crate::allowlist::NamedQuery {
+                name: "answer".into(),
+                sql: "SELECT {n} AS n".into(),
+                params: [("n".to_string(), crate::allowlist::ParamType::Int)].into(),
+            }],
+        });
+        let got = send(&state, "/q/answer?n=-7", None).await;
+        assert_eq!(got.0, StatusCode::OK, "{}", String::from_utf8_lossy(&got.1));
+        assert!(String::from_utf8_lossy(&got.1).contains("-7"));
+        assert_eq!(
+            send(&state, "/q/answer", Some(r#"{"n": -7}"#.into())).await,
+            got
+        );
+        assert_eq!(
+            send(&state, "/q/answer", Some(r#"{"n": "-7"}"#.into())).await,
+            got
+        );
+        let refused = send(&state, "/q/answer?n=x", None).await;
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            send(&state, "/q/answer", Some(r#"{"n": "x"}"#.into())).await,
+            refused
+        );
+        let (status, _) = send(&state, "/q/answer", Some(r#"{"n": [7]}"#.into())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = send(&state, "/q/answer", Some("".into())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "an empty body is no `n`");
     }
 
     /// A request refused because the queue is full is refused *immediately* - it must not also sit

@@ -915,10 +915,10 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /metrics` | Prometheus text exposition |
 | `GET /tables`, `GET /table/{name}` | schema and recent rows, merged hot and cold; `"degraded": true` and the table in `degraded_tables`, as on `/sql`, when the sealed rows could not be read |
 | `GET /schema` | the full data model |
-| `GET /sql?q=…` | read-only analytical SQL over hot and sealed data; the answer carries `cached`, `degraded`, `tip_unavailable` and a `provenance` block (`as_of`, `sealed_through`, `nid`, `registry_hash`) |
-| `GET /explain` | binds caller-supplied SQL without running it (`valid`, `note`); guarded like `/sql` |
+| `GET /sql?q=…`, `POST /sql` | read-only analytical SQL over hot and sealed data; `POST` takes `{"q": "…", "max_rows": n}` as its body and answers exactly as `GET` does; the answer carries `cached`, `degraded`, `tip_unavailable` and a `provenance` block (`as_of`, `sealed_through`, `nid`, `registry_hash`) |
+| `GET /explain`, `POST /explain` | binds caller-supplied SQL without running it (`valid`, `note`); guarded like `/sql` |
 | `GET /diff` | what happened in a range (`from`, `to`), a `block`, or a `tx` with its `block`: the document `nuthatch diff --format json` prints, or `format=text`/`markdown`; `flow=true` for the token flow. One `/sql` permit per diff, `/sql`'s hot-row ceilings and its 30 s budget; refused on a mount whose `sql` mode is not `open` (RFC-0071). A diff whose read passes 500,000 distinct (token, from, to) edges is refused. An address-history nest under `nuthatch dev` serves the same route over its watched addresses' rows, read from one snapshot of its store, under the same permit count and 30 s budget; a directory of chains serves none |
-| `GET /queries`, `GET /q/{name}` | the mount's `sql` mode (`open`, `allowlist`, `deny`) and its declared queries (RFC-0034), and one of them by name |
+| `GET /queries`, `GET /q/{name}`, `POST /q/{name}` | the mount's `sql` mode (`open`, `allowlist`, `deny`) and its declared queries (RFC-0034), and one of them by name; `POST` takes the arguments as a JSON object |
 | `GET /derived`, `GET /derived/{entity}`, `GET /derived/{entity}/{key}` | authored incremental entities (RFC-0041): the list with its head, one relation, one row |
 | `GET /ipfs/gave-up?limit=100` | the `[[ipfs]]` documents the nest stopped trying to fetch, in block order |
 | `GET /entities`, `GET /entity/{id}` | entity point-reads, transparently across the hot/cold seam |
