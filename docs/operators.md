@@ -124,6 +124,24 @@ regression: the roll says so, naming each statement, and moves the unit back ont
 
 Exit 3 is non-zero on purpose, so a loop over several units stops on it.
 
+#### Upgrading a runtime without an outage
+
+A runtime alone has one: its listener binds only after every mount is built, so for the length of a
+restart nothing answers (see [Followers](#followers-query-capacity-beside-a-runtime-rfc-0073) for the
+time it takes). With followers in front of it, roll in this order, one process at a time, waiting for
+each to report ready before the next:
+
+1. Each follower: stop it, start the new binary, and wait for its `/<tenant>/<alias>/ready` to say
+   `"writer": "connected"` and `"lag_generations": 0`. The other followers answer meanwhile.
+2. The writer last. While it restarts, followers answer from the sealed data and the hot state they
+   last applied, report `"writer": "absent"` with `absent_for_secs`, and stay ready. Once it is back
+   they take fresh snapshots of every dataset and follow the new process.
+
+Writes do not happen while the writer is down, so the answers followers give in that window are as of
+the last block the writer committed, as `as_of` says. `scripts/rolling-upgrade.sh <previous> <current>`
+runs exactly this against the fixture chain with a query every 200 ms and fails if any goes unanswered;
+it is the release gate's rolling-upgrade step.
+
 ### Docker
 
 A container image is published per release:
@@ -220,6 +238,45 @@ behind one cursor; the runtime refuses to.
 
 Multichain is a **capability, not a mandate** - one chain per runtime stays valid and is the simplest
 default.
+
+### Followers: query capacity beside a runtime (RFC-0073)
+
+A runtime's queries run in the process that indexes. To answer more of them, start followers beside
+it on the same box, each serving every mount read-only:
+
+```
+NUTHATCH_ADMIN_TOKEN=<the writer's token> \
+  nuthatch serve --runtime /var/lib/nuthatch/runtime --follow http://127.0.0.1:8288 --listen 127.0.0.1:8289
+```
+
+A follower reads the sealed segments from the runtime directory and never opens a redb file, so it
+runs beside the writer and beside other followers. It takes the hot window, and every mount and
+unmount, from the writer's `GET /_admin/feed` ([admin-api.md](admin-api.md#the-hot-state-feed)),
+which needs the admin token: from `NUTHATCH_ADMIN_TOKEN`, or the `.admin-token` file the writer keeps
+in the runtime directory. Adding one needs no restart of the writer and re-indexes nothing. Put the
+followers, and the writer if you like, behind one load balancer: their answers are the writer's, with
+the same `as_of`, `sealed_through` and `nid`.
+
+- **Until a mount's snapshot arrives** its routes answer `503` with `"reason": "catching_up"`; the root
+  `/ready` is `503` until every mount has one.
+- **`/<tenant>/<alias>/ready`** adds a `follower` object: `writer` (`connected` or `absent`),
+  `applied_generation`, `writer_generation` and `lag_generations`, and `absent_for_secs` while the
+  writer is away. A follower without its writer stays ready and keeps answering; it reports the
+  absence rather than failing.
+- **What it does not serve.** State the writer derives in memory rather than stores: `/balances`,
+  `/balance/…`, `/exposure/…`, `/flags` and `/derived…`, and RFC-0041 entities. Those routes, and SQL
+  that names an entity, answer `503` with `"reason": "writer_only"`. A nest that declares entities has
+  its `/q/<name>` routes refused the same way, since a named query may read one. Send those to the
+  writer.
+- **Its own budget.** A follower holds each dataset's hot window in memory, as the writer's `/sql`
+  already copies it per query, and runs queries under the same per-chain admission and guards. It
+  has no admin surface; mount changes go to the writer.
+- **Beside the writer only, for now.** It reads segments from the runtime directory; following from
+  another host with a segment mirror is RFC-0073's open question 2, not built.
+
+A writer's restart, measured in-process on one cursor at 1, 10, 100 and 500 small mounts
+([docs/bench/rfc-0073-fr7-restart-to-ready.md](bench/rfc-0073-fr7-restart-to-ready.md)), took 9 ms,
+95 ms, 1.0 s and 10.2 s to answer `/ready`. It grows faster than linearly past 100 mounts.
 
 ### Scaled mode: a fleet across machines (RFC-0022)
 
