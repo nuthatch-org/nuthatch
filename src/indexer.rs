@@ -3994,6 +3994,54 @@ fn drain_all_sealable(
 /// size, and a huge list is slower than fetching by topic0 and discarding non-children locally.
 const FACTORY_FLIP_THRESHOLD: usize = 500;
 
+/// The templates a flipped factory nest fetches by topic0 alone, and those topic0s.
+struct WideTemplates {
+    names: std::collections::BTreeSet<String>,
+    topic0s: Vec<String>,
+}
+
+impl WideTemplates {
+    fn covers(&self, template: Option<&str>) -> bool {
+        template.is_some_and(|t| self.names.contains(t))
+    }
+}
+
+/// Past the flip, only a template with more than [`FACTORY_FLIP_THRESHOLD`] children of its own is
+/// fetched without an address. Static contracts never are: one declaring a generic event (ENS's
+/// BaseRegistrar and its ERC-721 `Transfer`) would otherwise ask for every such log on the chain.
+/// Many small templates that together cross the threshold all go wide, as the whole nest used to.
+fn wide_templates(
+    registry: &DecodeRegistry,
+    factory: &FactorySet,
+    children: &ChildRegistry,
+    base: usize,
+    force: bool,
+) -> Option<WideTemplates> {
+    let mut names: std::collections::BTreeSet<String> = factory
+        .templates()
+        .iter()
+        .filter(|t| force || children.addresses_for_template(t).len() > FACTORY_FLIP_THRESHOLD)
+        .cloned()
+        .collect();
+    if names.is_empty() && base + children.len() > FACTORY_FLIP_THRESHOLD {
+        names = factory.templates().iter().cloned().collect();
+    }
+    let mut topic0s: Vec<String> = names
+        .iter()
+        .flat_map(|t| registry.template_topic0s(t))
+        .map(|t| format!("0x{}", hex::encode(t)))
+        .collect();
+    topic0s.sort();
+    topic0s.dedup();
+    (!topic0s.is_empty()).then_some(WideTemplates { names, topic0s })
+}
+
+/// One copy of each log, in chain order. A wide fetch and an address fetch can both return a log.
+fn dedup_logs(logs: &mut Vec<crate::rpc::Log>) {
+    logs.sort_by_key(|l| (l.block_number, l.log_index));
+    logs.dedup_by_key(|l| (l.block_number, l.log_index));
+}
+
 /// Refuse to start when `[nest] block_timestamps` disagrees with what this nest already indexed.
 ///
 /// Flipping the declaration is not a config edit, it is a **breaking schema change** (RFC-0029 §6b-i):
@@ -6381,65 +6429,35 @@ pub async fn backfill_direct_factory_with(
             overlap_from(next, from)
         };
 
-        // Filter flip (RFC-0009 §4): a forced override or a discovered set past the threshold switches
-        // this chunk from the address-list two-pass to a single topic0-only fetch + local filtering.
-        let use_topic0 = !topic0_refused
-            && (force_topic0 || base.len() + children.len() > FACTORY_FLIP_THRESHOLD);
-        if use_topic0 && !flipped_logged {
+        // Filter flip (RFC-0009 §4), per template: see `wide_templates`.
+        let wide = if topic0_refused {
+            None
+        } else {
+            wide_templates(registry, factory, children, base.len(), force_topic0)
+        };
+        if let (Some(w), false) = (&wide, flipped_logged) {
             tracing::info!(
-                "factory backfill filter flipped to topic0-only + local filter ({} children)",
-                children.len()
+                "factory backfill: template(s) {} past {FACTORY_FLIP_THRESHOLD} children fetched by \
+                 topic0 + local filter; contracts and other children by address",
+                w.names.iter().cloned().collect::<Vec<_>>().join(", ")
             );
             flipped_logged = true;
         }
 
         let mut all_logs;
         let decoded;
-        if use_topic0 {
-            // Topic0-only: every matching log (contract + all children) is in hand in one fetch, so
-            // there is no second pass; `decode_window` filters locally by registry membership.
-            // A factory nest with no events declared has nothing to match on either half, and asking
-            // for that asks for every log on the chain (#432). An empty window falls through to the
-            // per-window tail unchanged, as it does in `backfill_direct`: the decode below discovers
-            // nothing from no logs, and the seal/progress bookkeeping still has to run.
-            all_logs = match LogFilter::new(&[], topic0s) {
-                None => Vec::new(),
-                Some(wide) => {
-                    match logs_with_retry(source, &wide, fetch_from, chunk_to, BACKFILL_RETRY_BASE)
-                        .await
-                    {
-                        Ok(l) => {
-                            chunker.observed(l.len() as u64);
-                            l
-                        }
-                        Err(e) if narrowing_can_help(&e, next, chunk_to) => {
-                            if next >= chunk_to {
-                                return Err(e).with_context(|| single_block_over_cap(next));
-                            }
-                            chunker.too_large();
-                            continue;
-                        }
-                        Err(e) if crate::rpc::filter_refused(&e) => {
-                            tracing::warn!(
-                                "the endpoint refuses getLogs without an address list ({e:#}); \
-                                 the factory backfill asks by address from now on"
-                            );
-                            topic0_refused = true;
-                            continue;
-                        }
-                        Err(e) => {
-                            return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}"));
-                        }
-                    }
-                }
-            };
-            decoded = decode_window(registry, Some(factory), children, &all_logs, &empty_ts);
-        } else {
-            // Pass 1: current filter = base contracts + all children discovered so far.
+        {
+            // Pass 1: base contracts + discovered children, less those a wide fetch covers.
             let mut fetched: HashSet<String> =
                 base.iter().map(|s| s.to_ascii_lowercase()).collect();
             let mut current: Vec<String> = base.clone();
             for c in children.addresses() {
+                if wide
+                    .as_ref()
+                    .is_some_and(|w| w.covers(children.template_of(c)))
+                {
+                    continue;
+                }
                 if fetched.insert(c.to_ascii_lowercase()) {
                     current.push(c.to_string());
                 }
@@ -6471,23 +6489,62 @@ pub async fn backfill_direct_factory_with(
                 }
             };
             all_logs = logs1;
+            // A wide template's logs, every emitter: `decode_window` keeps a child's only from its
+            // announcing block, so children found in this window need no second fetch.
+            if let Some(w) = &wide {
+                let f = LogFilter::new(&[], &w.topic0s)
+                    .expect("a wide template decodes at least one event");
+                match logs_with_retry(source, &f, fetch_from, chunk_to, BACKFILL_RETRY_BASE).await {
+                    Ok(l) => {
+                        chunker.observed(l.len() as u64);
+                        all_logs.extend(l);
+                    }
+                    Err(e) if narrowing_can_help(&e, next, chunk_to) => {
+                        if next >= chunk_to {
+                            return Err(e).with_context(|| single_block_over_cap(next));
+                        }
+                        chunker.too_large();
+                        continue;
+                    }
+                    Err(e) if crate::rpc::filter_refused(&e) => {
+                        tracing::warn!(
+                            "the endpoint refuses getLogs without an address list ({e:#}); \
+                             the factory backfill asks by address from now on"
+                        );
+                        topic0_refused = true;
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("getLogs {next}..={chunk_to}"));
+                    }
+                }
+                dedup_logs(&mut all_logs);
+            }
             // Decoded again with every log in hand after each pass, the last decode authoritative.
             let mut pass = decode_window(registry, Some(factory), children, &all_logs, &empty_ts);
 
             // Pass 2+ (fixpoint): re-fetch the chunk for children discovered here but not yet fetched.
             loop {
-                let new: Vec<String> = pass
+                let found: Vec<String> = pass
                     .1
                     .addresses()
                     .iter()
                     .filter(|c| !fetched.contains(&c.to_ascii_lowercase()))
                     .map(|c| c.to_string())
                     .collect();
+                for c in &found {
+                    fetched.insert(c.to_ascii_lowercase());
+                }
+                let new: Vec<String> = found
+                    .into_iter()
+                    .filter(|c| {
+                        !wide
+                            .as_ref()
+                            .is_some_and(|w| w.covers(pass.1.template_of(c)))
+                    })
+                    .collect();
                 if new.is_empty() {
                     break;
-                }
-                for c in &new {
-                    fetched.insert(c.to_ascii_lowercase());
                 }
                 // `new` is non-empty two lines up, so the filter has an address half and cannot be
                 // the every-log-on-the-chain request that `LogFilter` refuses to build.
@@ -6528,6 +6585,9 @@ pub async fn backfill_direct_factory_with(
                     }
                 };
                 all_logs.extend(more);
+                if wide.is_some() {
+                    dedup_logs(&mut all_logs);
+                }
                 pass = decode_window(registry, Some(factory), children, &all_logs, &empty_ts);
             }
             decoded = pass;
@@ -6793,11 +6853,22 @@ impl NestIngest {
             .map(|a| format!("0x{}", hex::encode(a)))
             .chain(self.children.addresses().into_iter().map(str::to_string))
             .collect();
-        let wide = fs.force_topic0() || known.len() > FACTORY_FLIP_THRESHOLD;
-        if wide && !self.topic0_refused {
-            let Some(f) = LogFilter::new(&[], &self.topic0s) else {
-                return Ok(Vec::new());
-            };
+        // Per template, as the backfill does: see `wide_templates`.
+        let mut wide = if self.topic0_refused {
+            None
+        } else {
+            wide_templates(
+                &self.registry,
+                &fs,
+                &self.children,
+                self.registry.addresses().len(),
+                fs.force_topic0(),
+            )
+        };
+        let mut wide_logs = Vec::new();
+        if let Some(w) = &wide {
+            let f = LogFilter::new(&[], &w.topic0s)
+                .expect("a wide template decodes at least one event");
             match source.logs(&f, from, to).await {
                 Err(e) if crate::rpc::filter_refused(&e) => {
                     tracing::warn!(
@@ -6805,14 +6876,42 @@ impl NestIngest {
                          factory and child address from now on"
                     );
                     self.topic0_refused = true;
+                    wide = None;
                 }
-                r => return r,
+                r => wide_logs = r?,
             }
         }
-        fetch_discovering(source, &known, &self.topic0s, from, to, |logs| {
-            discover_children(&self.registry, &fs, &self.children, logs)
+        let covered = |c: &str, reg: &ChildRegistry| {
+            wide.as_ref().is_some_and(|w| w.covers(reg.template_of(c)))
+        };
+        let narrow: Vec<String> = known
+            .into_iter()
+            .filter(|c| !covered(c, &self.children))
+            .collect();
+        let mut logs = fetch_discovering(source, &narrow, &self.topic0s, from, to, |logs| {
+            let mut seen = wide_logs.clone();
+            seen.extend_from_slice(logs);
+            let (_, found) = decode_window(
+                &self.registry,
+                Some(&fs),
+                &self.children,
+                &seen,
+                &std::collections::HashMap::new(),
+            );
+            self.children
+                .addresses()
+                .into_iter()
+                .chain(found.addresses())
+                .filter(|c| !covered(c, &self.children) && !covered(c, &found))
+                .map(str::to_string)
+                .collect()
         })
-        .await
+        .await?;
+        if !wide_logs.is_empty() {
+            logs.extend(wide_logs);
+            dedup_logs(&mut logs);
+        }
+        Ok(logs)
     }
 
     /// The policy a seal-direct pass resolves its documents on.
@@ -14463,6 +14562,109 @@ template = "pool"
             .filter(|(a, _, _)| a.is_empty())
             .count();
         assert_eq!(wide, 1, "refused once, then address-filtered");
+    }
+
+    /// Answers any filter, address-less included, and records what each one asked for.
+    struct OpenSource {
+        logs: Vec<crate::rpc::Log>,
+        calls: std::sync::Mutex<Vec<(Vec<String>, Vec<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for OpenSource {
+        async fn tip(&self) -> Result<u64> {
+            Ok(self.logs.iter().map(|l| l.block_number).max().unwrap_or(0))
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            Ok(Some(format!("0x{n:064x}")))
+        }
+        async fn logs(
+            &self,
+            filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            let addrs: std::collections::HashSet<String> = filter
+                .addresses()
+                .iter()
+                .map(|a| a.to_ascii_lowercase())
+                .collect();
+            let topics = filter.topic0s().to_vec();
+            self.calls
+                .lock()
+                .unwrap()
+                .push((filter.addresses().to_vec(), topics.clone()));
+            Ok(self
+                .logs
+                .iter()
+                .filter(|l| l.block_number >= from && l.block_number <= to)
+                .filter(|l| addrs.is_empty() || addrs.contains(&l.address.to_ascii_lowercase()))
+                .filter(|l| topics.contains(&l.topics[0]))
+                .cloned()
+                .collect())
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
+        }
+    }
+
+    /// Past the flip only the template's own events are asked for without an address. The factory's
+    /// event, declared on a static contract, stays address-filtered: were it a generic event, an
+    /// ERC-721 `Transfer` say, the address-less fetch would be every such log on the chain.
+    #[tokio::test]
+    async fn the_flipped_factory_backfill_never_asks_a_static_event_without_an_address() {
+        let df = tempfile::tempdir().unwrap();
+        let fact = build_factory_test_nest_with(df.path(), "filter = \"topic0\"\n").await;
+        let mut logs = factory_child_logs(&fact);
+        // Someone else's contract emitting the factory's event: never this nest's business.
+        let mut stranger = logs[0].clone();
+        stranger.address = "0x0000000000000000000000000000000000000099".into();
+        stranger.log_index = 2;
+        logs.push(stranger);
+        let source = OpenSource {
+            logs,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let out = tempfile::tempdir().unwrap();
+        let mut children = ChildRegistry::new();
+        let sealed = backfill_direct_factory(
+            &source,
+            &fact.registry,
+            fact.factory.as_deref().unwrap(),
+            &mut children,
+            out.path(),
+            &fact.topic0s,
+            &[],
+            None,
+            0,
+            0,
+            10,
+            64,
+            SPAN_OFF,
+            true,
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sealed, 2,
+            "the factory event and the child's ping, not the stranger's"
+        );
+        let ping = nest_topic0(&fact, "child__ping");
+        let calls = source.calls.lock().unwrap().clone();
+        let wide: Vec<_> = calls.iter().filter(|(a, _)| a.is_empty()).collect();
+        assert!(
+            !wide.is_empty(),
+            "the forced flip must fetch the template by topic0: {calls:?}"
+        );
+        assert!(
+            wide.iter().all(|(_, t)| t == &vec![ping.clone()]),
+            "an address-less fetch may carry only the template's topics: {calls:?}"
+        );
     }
 
     /// The runtime cursor follows the same rule as the solo loop: a factory co-tenant no longer
