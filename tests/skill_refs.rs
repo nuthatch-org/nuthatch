@@ -270,6 +270,8 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     // `queries.toml` (RFC-0034 phase 2, #353): the author's ceiling. `Surface` also lives here but is
     // not `Deserialize` (it's the mount-side runtime type, not something read from a file).
     ("src/allowlist.rs", Some(&["Ceiling", "NamedQuery"])),
+    // RFC-0073 FR3: `[mounts.limits]` under a mount record.
+    ("src/limits.rs", Some(&["MountLimits"])),
     // Nested under `nuthatch.toml` but defined in their own files. Missing here is how a new
     // `[[calls]]` key ships undocumented, the same hole #713 is for `allowlist.rs`.
     ("src/calls.rs", Some(&["CallDecl"])),
