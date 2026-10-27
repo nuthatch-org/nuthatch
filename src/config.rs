@@ -130,6 +130,10 @@ pub struct Config {
     /// nest's name is used. `#[serde(skip)]`: where a nest is mounted is not what it is.
     #[serde(skip)]
     pub route: Option<String>,
+    /// The runtime's declared finality and window for an unregistered chain (RFC-0073 FR9). The
+    /// runtime's setting, not the nest's, so `#[serde(skip)]` like `route`.
+    #[serde(skip)]
+    pub chain_policy: crate::chains::DeclaredPolicy,
     /// RFC-0037: IPFS gateways (or a local node) for resolving declared `[[ipfs]]` documents,
     /// supplied at run time (`--ipfs`), **never** written to `nuthatch.toml`.
     ///
@@ -827,6 +831,7 @@ impl Config {
             freshness: Default::default(),
             ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
             route: None,
+            chain_policy: Default::default(),
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {
@@ -1091,6 +1096,7 @@ mod tests {
             freshness: Default::default(),
             ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
             route: None,
+            chain_policy: Default::default(),
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {

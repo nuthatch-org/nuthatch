@@ -1661,6 +1661,19 @@ impl RpcClient {
         Ok(())
     }
 
+    /// The pool's endpoints, primaries first, as scheme and host only.
+    pub fn redacted_urls(&self) -> Vec<String> {
+        self.urls.iter().map(|u| redact_url(u)).collect()
+    }
+
+    /// After [`Self::verify_chain_ids`], whether each endpoint, in pool order, answered with the chain.
+    pub fn chain_id_answered(&self) -> Vec<bool> {
+        self.unverified
+            .iter()
+            .map(|u| !u.load(Ordering::Relaxed))
+            .collect()
+    }
+
     /// Wait up to `deadline` for any endpoint to answer an HTTP request at all, whatever it says, and
     /// otherwise fail naming every endpoint (#2310). For a one-shot command: `dev` waits forever
     /// instead, because it is serving `/ready` meanwhile (#510).

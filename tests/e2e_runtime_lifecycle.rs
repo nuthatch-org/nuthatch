@@ -141,6 +141,7 @@ async fn two_nest_roost(
             cursors: None,
             registry: None,
             publish: None,
+            chains: Default::default(),
         },
     };
     // The ingest task is deliberately leaked into the handles' lifetime here: the cursor must stay
@@ -762,6 +763,7 @@ async fn route_named_runtime(
             cursors: None,
             registry: None,
             publish: None,
+            chains: Default::default(),
         },
     };
     std::mem::forget(cursor.ingest);
@@ -989,6 +991,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
             cursors: None,
             registry: None,
             publish: None,
+            chains: Default::default(),
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1172,6 +1175,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
             cursors: None,
             registry: None,
             publish: None,
+            chains: Default::default(),
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1559,6 +1563,7 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
             cursors: None,
             registry: None,
             publish: None,
+            chains: Default::default(),
         },
     };
     std::mem::forget(cursor.ingest);
@@ -1711,6 +1716,7 @@ pub(crate) async fn empty_runtime(
             cursors: Some(feed),
             registry: None,
             publish: None,
+            chains: Default::default(),
         },
     };
     (handles, tape, intake)
@@ -1837,6 +1843,8 @@ async fn a_dormant_chain_is_opened_by_its_first_mount() {
                 chain: "arbitrum-one".to_string(),
                 chain_id: 1,
                 rpc_urls: Vec::new(),
+                finality_depth: None,
+                log_window: None,
             },
             rpc_fallback: Vec::new(),
         },
@@ -2889,6 +2897,7 @@ async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it(
             cursors: None,
             registry: None,
             publish: None,
+            chains: Default::default(),
         },
     };
     std::mem::forget(cursor.ingest);

@@ -545,6 +545,25 @@ pub fn header_batch_cap(rpc_urls: &[String]) -> Option<usize> {
 pub const UNREGISTERED_FINALITY: Finality = Finality::Depth(64);
 pub const UNREGISTERED_WINDOW: u64 = 20;
 
+/// An operator's finality depth and `eth_getLogs` window for a chain the registry does not know, as a
+/// runtime declares it (RFC-0073 FR9). Either one left out takes the unregistered default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeclaredPolicy {
+    pub finality_depth: Option<u64>,
+    pub log_window: Option<u64>,
+}
+
+impl DeclaredPolicy {
+    pub fn finality(&self) -> Finality {
+        self.finality_depth
+            .map_or(UNREGISTERED_FINALITY, Finality::Depth)
+    }
+
+    pub fn log_window(&self) -> u64 {
+        self.log_window.unwrap_or(UNREGISTERED_WINDOW)
+    }
+}
+
 /// A resolved chain, ready for `init`/`add` to act on. `Chain` stays a purely `&'static` built-in
 /// registry entry; this is the owned shape a custom (non-built-in) chain needs, since its name and
 /// endpoints come from the command line rather than a `const`.

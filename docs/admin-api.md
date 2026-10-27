@@ -23,8 +23,9 @@ rpc_urls = ["https://…"]
 NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --registry s3://bucket/nests
 ```
 
-- **Chains are declared here, at boot.** A runtime may start with nothing mounted; the first mount onto
-  a chain starts that chain's cursor and dials its RPC only then. Chains cannot be added over the API.
+- **Chains are declared here, at boot, or later over the API** ([Chains](#chains)). A runtime may start
+  with nothing mounted; the first mount onto a chain starts that chain's cursor and dials its RPC only
+  then.
 - **`--registry`** is where a mount fetches a NID the runtime does not hold: a filesystem path or
   `s3://bucket/prefix`. Publish to it with `nuthatch nest publish <bundle> --registry <path>`; a NID is
   what `nuthatch nest nid --dir <dir>` prints. Without `--registry`, only NIDs already under `data/` mount.
@@ -141,7 +142,7 @@ own data, when the dataset has already indexed or another mount already serves i
 |---|---|
 | `400` | a malformed NID, a name the runtime would not accept, or a tenant that shares a mount's name (see above), an invalid `publish`, or `seed` with `wait` |
 | `404` | the runtime does not hold the NID and was started without `--registry` |
-| `409` | the name is taken, the chain is not declared, the chain's cursor has died (restart the runtime), the nest declares authored entities and the runtime runs `--seal-direct`, or another mount of that name or dataset is still catching up |
+| `409` | the name is taken, the chain is not declared (`POST /_admin/chains` declares it), the chain's cursor has died (restart the runtime), the nest declares authored entities and the runtime runs `--seal-direct`, or another mount of that name or dataset is still catching up |
 | `507` | the mount would breach the chain cursor's RAM ceiling, the reason carrying projected and ceiling MB, or its authored entities would put the cursor over its cap (32 at 2048 MB, proportionally fewer below) |
 
 On the job route a refusal ends the job `failed` with the same reason. With `--registry`, a NID the
@@ -267,6 +268,42 @@ An unmount that fails part-way answers `500` with the `nid`, so the dataset can 
 
 Inside a running runtime this removes the dataset and the segments only it references. Segments a live
 fold left behind stay for an offline `nuthatch prune`.
+
+### Chains
+
+Adding a network or rotating an RPC endpoint needs no restart (RFC-0073 FR9).
+
+| Do | Call | Answers |
+|---|---|---|
+| List the chains | `GET /_admin/chains` | `{"chains": [chain, …]}` |
+| Declare a chain | `POST /_admin/chains` `{"chain": "devnet", "chain_id": 31337, "rpc_urls": ["https://…"]}` | `201` and the chain; `200` when the same declaration already stands |
+| Replace a chain's RPC pool | `PUT /_admin/chains/<chain>/rpc` `{"rpc_urls": ["https://…"]}` | `200` and the chain |
+
+```json
+{"chain": "devnet", "chain_id": 31337, "state": "dormant", "rpc_urls": ["https://rpc.example"],
+ "finality_depth": 12, "log_window": 500}
+```
+
+A declared chain is dormant, as one declared at boot is: its cursor starts on the first mount onto it.
+`finality_depth` and `log_window` are optional and only for a chain the built-in registry does not
+know, which otherwise takes a depth of 64 and a window of 20. `state` is `dormant`, `running`, `idle`
+(dialled, with no cursor running) or `stopped` (its cursor died; restart the runtime). **`rpc_urls` are shown as
+scheme and host only**, here and in every error and log line, since a provider's key travels in the
+path, the query or the userinfo. `mounts.toml` keeps them whole, because the next start dials them.
+
+Before either change is made, every endpoint is asked `eth_chainId`: one reporting another chain refuses
+the change, and so does a list in which no endpoint answers at all. A replacement takes effect at the
+next call: calls the cursor already has in flight finish on the old pool, and nothing after them is
+sent there. Both changes are written to `mounts.toml` before they take effect, so what is running is
+what the next start runs; a write that fails answers `500` and changes nothing.
+
+| Status | Why |
+|---|---|
+| `400` | a chain name the runtime would not accept (letters, digits, `_` and `-`, at most 64), no `rpc_urls`, an endpoint that is not `http(s)`, a `log_window` of 0, or `finality_depth` or `log_window` for a registry chain |
+| `404` | `PUT` for a chain the runtime does not declare |
+| `409` | the name is declared with other settings (only the pool can change live; anything else is an edit of `mounts.toml` and a restart), a registry name with another `chain_id`, a registry `chain_id` under another name, a `chain_id` already declared under another name, or a runtime started with `--rpc` or `--rpc-fallback`, which rewrite the pool at every start. Declaring a chain is also refused under `--state-rpc`, because a runtime with an archive endpoint takes one chain; replacing a pool is not, since `--state-rpc` is a separate endpoint the swap leaves alone |
+| `422` | an endpoint reports another chain id, or a body field the API does not take |
+| `502` | no endpoint in `rpc_urls` answered |
 
 ## Tenant shares
 
