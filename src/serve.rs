@@ -92,7 +92,7 @@ pub fn new_sql_gate() -> SqlGate {
 }
 
 pub use crate::fair_share::SqlGate;
-use crate::fair_share::{GatePermit, Refusal};
+use crate::fair_share::{GatePermit, HotShareRefused, Refusal};
 
 /// Memo keys one nest builds at once. Each reads the segment manifest and hashes the authored
 /// files, and a hit re-stats every segment, so a flood of distinct statements queues here, off the
@@ -257,6 +257,11 @@ pub(crate) const SQL_MAX_HOT_ROWS: usize = 2_000_000;
 /// parsed (2026-09-13): 850,879 of them grew the heap 3.36 GB in one request. Past this the request is
 /// refused with `503`, never answered from sealed data alone.
 pub(crate) const SQL_MAX_HOT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Hot-tip source bytes one cursor's queries may hold copied at once (RFC-0073 FR5), divided between
+/// its tenants. What the shipped two permits could already hold under `/sql`, so it adds nothing to
+/// the cursor budget; it stops more permits, or a named query's larger scan, from multiplying it.
+pub const SQL_MAX_HOT_INFLIGHT_BYTES: u64 = SQL_MAX_CONCURRENCY as u64 * SQL_MAX_HOT_BYTES;
 /// Independent source-byte guard for declared queries. This is not a RAM conversion: it bounds
 /// bytes read from immutable segments plus the serialized hot snapshot before the statement runs.
 pub(crate) const SQL_MAX_NAMED_SCAN_BYTES: u64 = 512 * 1024 * 1024;
@@ -3681,6 +3686,55 @@ impl AppState {
     fn tenant_label(&self) -> Option<&str> {
         self.tenant.as_deref().map(crate::fair_share::Seat::tenant)
     }
+
+    /// What [`charged_hot_rows`] needs, to move into a query's blocking task.
+    fn hot_charge(&self) -> HotCharge {
+        HotCharge {
+            gate: self.sql_gate.clone(),
+            seat: self.tenant.clone(),
+        }
+    }
+}
+
+struct HotCharge {
+    gate: SqlGate,
+    seat: Option<Arc<crate::fair_share::Seat>>,
+}
+
+/// One query's hot tip, its source bytes charged to the mount's tenant at its cursor's gate before a
+/// row is parsed (RFC-0073 FR5). The permit is the copy's: hold it until the query is done with it.
+fn charged_hot_rows(
+    store: &dyn crate::store::HotStore,
+    to: &HotCharge,
+    (max_rows, max_bytes): (usize, u64),
+) -> Result<(
+    crate::store::HotRowsSnapshot,
+    Option<crate::fair_share::BytePermit>,
+)> {
+    let mut permit = None;
+    let snapshot = store.hot_rows_charged(max_rows, max_bytes, &mut |bytes| {
+        let total = to.gate.hot_total_bytes();
+        // Larger than the whole budget can never be admitted, so it is the query's size, not a wait.
+        if bytes > total {
+            return Err(crate::store::HotScanBudgetExceeded {
+                source_bytes: bytes,
+                budget: total,
+            }
+            .into());
+        }
+        let tenant = to.seat.as_deref().map(crate::fair_share::Seat::tenant);
+        permit = Some(to.gate.charge_hot(bytes, tenant).map_err(HotShareRefused)?);
+        Ok(())
+    })?;
+    Ok((snapshot, permit))
+}
+
+/// Whether a hot scan's error must reach the caller rather than degrade the query to cold-only.
+fn refuses_the_tip(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
+        || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
+            .is_some()
+        || e.downcast_ref::<HotShareRefused>().is_some()
 }
 
 fn share_message(s: &AppState, what: &str) -> String {
@@ -4288,6 +4342,7 @@ async fn named_scan(
     let cap = s.limits.max_named_scan_bytes;
     let max_hot_rows = s.limits.max_hot_rows;
     let guard = s.query_guard(s.limits.timeout, s.limits.max_rows);
+    let hot_charge = s.hot_charge();
     tokio::task::spawn_blocking(move || -> anyhow::Result<NamedRun> {
         let _permit = permit;
         let started = std::time::Instant::now();
@@ -4318,7 +4373,8 @@ async fn named_scan(
         }
         let budget = cap - reserved.map(|b| b.cold_bytes).unwrap_or(0);
         // No cold-only fallback: an admitted query never answers from an incomplete relation.
-        let snapshot = store.hot_rows_by_table_bounded_with_bytes(max_hot_rows, budget)?;
+        let (snapshot, _hot_permit) =
+            charged_hot_rows(store.as_ref(), &hot_charge, (max_hot_rows, budget))?;
         let mut hot = snapshot.rows;
         let mut hot_rows = snapshot.source_rows;
         let mut hot_bytes = snapshot.source_bytes;
@@ -4904,36 +4960,34 @@ async fn run_sql_query_at(
     let tables = s.tables.clone();
     let declared_entities = s.entities.clone();
     let guard = s.query_guard(sql_timeout, max_rows);
+    let hot_charge = s.hot_charge();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit; // held for the whole blocking query, released on return
-        #[cfg(test)]
-        panic_if_queries_armed(&dir);
-        // Scan the hot tip (redb, blocking) inside the same blocking task, so `/sql` sees the unsealed
-        // rows alongside the sealed segments (RFC-0013). A scan failure degrades to cold-only.
-        // A scan failure degrades to cold-only, *except* an over-budget tip: that must surface, or a
-        // query would quietly answer from sealed data alone and report a different number.
-        let (hot, tip_unavailable, spent) = match store
-            .hot_rows_by_table_bounded_with_bytes(sql_max_hot_rows, sql_max_hot_bytes)
-        {
-            Ok(snapshot) => (
+                              // Scan the hot tip (redb, blocking) inside the same blocking task, so `/sql` sees the unsealed
+                              // rows alongside the sealed segments (RFC-0013). A scan failure degrades to cold-only.
+                              // A scan failure degrades to cold-only, *except* an over-budget tip: that must surface, or a
+                              // query would quietly answer from sealed data alone and report a different number.
+        let (hot, tip_unavailable, spent, _hot_permit) = match charged_hot_rows(
+            store.as_ref(),
+            &hot_charge,
+            (sql_max_hot_rows, sql_max_hot_bytes),
+        ) {
+            Ok((snapshot, held)) => (
                 snapshot.rows,
                 false,
                 (snapshot.source_rows, snapshot.source_bytes),
+                held,
             ),
-            Err(e)
-                if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
-                    || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
-                        .is_some() =>
-            {
-                return Err(e)
-            }
+            Err(e) if refuses_the_tip(&e) => return Err(e),
             // Same level as a segment read failure (#472): a hot store that will not scan is at least
             // as serious, and the fallback below must not be the only trace of it.
             Err(e) => {
                 tracing::error!("hot-tip scan failed - serving cold-only for this query: {e:#}");
-                (Default::default(), true, (0, 0))
+                (Default::default(), true, (0, 0), None)
             }
         };
+        #[cfg(test)]
+        panic_if_queries_armed(&dir);
         // §5.4: the maintained relation is exposed under its declared name, alongside the decoded
         // tables. **This copies every reachable entity row into the connection, per request** - #822 criterion
         // 7's separate term, and it is what this seam is: `hot` is the map `analytics::run` defines
@@ -5157,21 +5211,16 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
     let deadline = std::time::Instant::now() + s.limits.timeout;
     let st = s.clone();
     let gathered = tokio::task::spawn_blocking(move || {
-        let (hot, tip_unavailable, hot_head) = match st
-            .store
-            .hot_rows_by_table_bounded_with_bytes(st.limits.max_hot_rows, st.limits.max_hot_bytes)
-        {
-            Ok(snapshot) => (snapshot.rows, false, Some(snapshot.last_block)),
-            Err(e)
-                if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
-                    || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
-                        .is_some() =>
-            {
-                return Err(e)
-            }
+        let (hot, tip_unavailable, hot_head, hot_permit) = match charged_hot_rows(
+            st.store.as_ref(),
+            &st.hot_charge(),
+            (st.limits.max_hot_rows, st.limits.max_hot_bytes),
+        ) {
+            Ok((snapshot, held)) => (snapshot.rows, false, Some(snapshot.last_block), held),
+            Err(e) if refuses_the_tip(&e) => return Err(e),
             Err(e) => {
                 tracing::error!("hot-tip scan failed - refusing this diff: {e:#}");
-                (Default::default(), true, None)
+                (Default::default(), true, None, None)
             }
         };
         let sealed_through = st.store.sealed_through();
@@ -5205,14 +5254,22 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
             ctx.indexed_head = (head > 0).then_some(head);
         }
         let stories = crate::diff::stories(&st.dir, &st.tables)?;
-        Ok((hot, tip_unavailable, sealed_through, ctx, stories))
+        Ok((
+            hot,
+            hot_permit,
+            tip_unavailable,
+            sealed_through,
+            ctx,
+            stories,
+        ))
     })
     .await;
-    let (hot, tip_unavailable, sealed_through, ctx, (stories, warnings)) = match gathered {
-        Ok(Ok(g)) => g,
-        Ok(Err(e)) => return sql_error_response(&s, e, ""),
-        Err(e) => return error(format!("{e}")),
-    };
+    let (hot, hot_permit, tip_unavailable, sealed_through, ctx, (stories, warnings)) =
+        match gathered {
+            Ok(Ok(g)) => g,
+            Ok(Err(e)) => return sql_error_response(&s, e, ""),
+            Err(e) => return error(format!("{e}")),
+        };
     let src = DiffSource {
         dir: s.dir.clone(),
         hot: Arc::new(hot),
@@ -5230,7 +5287,7 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
         history: None,
     };
     let produced = crate::diff::produce(&src, inputs, &ask).await;
-    drop(permit);
+    drop((permit, src, hot_permit));
     let body = match produced.and_then(|p| p.render(format, ask.top)) {
         Ok(b) => b,
         Err(e) => {
@@ -5256,6 +5313,9 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
 
 fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::response::Response {
     use crate::metrics::METRICS;
+    if let Some(r) = e.downcast_ref::<HotShareRefused>() {
+        return refused(s, r.0, "hot-tip bytes in flight");
+    }
     // The guard's deadline, not a bad query. A 504 so a gateway retries or degrades instead of
     // reporting a client error, and its own rejection reason so a slow nest is visible as one.
     if let Some(cut) = e.downcast_ref::<crate::analytics::QueryBudgetExceeded>() {
@@ -5395,6 +5455,7 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
     let tables = s.tables.clone();
     let guard = s.query_guard(s.limits.timeout, 1);
     let declared_entities = s.entities.clone();
+    let hot_charge = s.hot_charge();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         // Planning materialises no result rows, but the tip is still parsed
@@ -5403,26 +5464,23 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
         // the process past the budget `/sql` refuses to cross (#293). As there, an over-budget tip
         // surfaces rather than degrading to cold-only: answering "valid" off sealed data alone
         // would bind against a narrower schema than the one a subsequent `/sql` would see.
-        let (hot, tip_unavailable, spent) = match store
-            .hot_rows_by_table_bounded_with_bytes(sql_max_hot_rows, sql_max_hot_bytes)
-        {
-            Ok(snapshot) => (
+        let (hot, tip_unavailable, spent, _hot_permit) = match charged_hot_rows(
+            store.as_ref(),
+            &hot_charge,
+            (sql_max_hot_rows, sql_max_hot_bytes),
+        ) {
+            Ok((snapshot, held)) => (
                 snapshot.rows,
                 false,
                 (snapshot.source_rows, snapshot.source_bytes),
+                held,
             ),
-            Err(e)
-                if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
-                    || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
-                        .is_some() =>
-            {
-                return Err(e)
-            }
+            Err(e) if refuses_the_tip(&e) => return Err(e),
             // Same level as a segment read failure (#472): a hot store that will not scan is at
             // least as serious, and the fallback below must not be the only trace of it - #528.
             Err(e) => {
                 tracing::error!("hot-tip scan failed - serving cold-only for this query: {e:#}");
-                (Default::default(), true, (0, 0))
+                (Default::default(), true, (0, 0), None)
             }
         };
         // **The same relations `/sql` would see.** Without this, `/explain` answers a question about a
@@ -5460,6 +5518,9 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
             "tip_unavailable": out.tip_unavailable,
         }))
         .into_response(),
+        Ok(Err(e)) if e.downcast_ref::<HotShareRefused>().is_some() => {
+            sql_error_response(&s, e, &q.q)
+        }
         // Same contract as `/sql`: a `503`, not a `400`. The query may well be valid - the node is
         // refusing to spend the memory to find out, so a caller should retry later, not rewrite
         // their SQL. `valid` is deliberately absent rather than `false`: bindability is unknown
@@ -9774,6 +9835,123 @@ mod tests {
         drop(held);
         let resp = sql_response(state, "SELECT 1 AS n").await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `rows` hot rows of exactly 1,000 stored bytes each.
+    fn kilo_tip(state: &AppState, rows: u64) {
+        let row = |b: u64| {
+            let bare = json!({"table": "t", "block_number": b, "log_index": 0, "pad": ""});
+            let pad = "x".repeat(1000 - bare.to_string().len());
+            json!({"table": "t", "block_number": b, "log_index": 0, "pad": pad}).to_string()
+        };
+        let batch: Vec<_> = (1..=rows)
+            .map(|b| (Store::entity_key(b, 0), row(b)))
+            .collect();
+        assert!(batch.iter().all(|(_, v)| v.len() == 1000));
+        state.store.commit_window(&batch, None, rows).unwrap();
+    }
+
+    /// RFC-0073 FR5: tenant A's in-flight hot copies cannot take the hot-copy memory tenant B's query
+    /// needs. A is refused for its own share before copying; B is answered.
+    #[tokio::test]
+    async fn a_tenants_hot_copies_cannot_take_another_tenants_hot_share() {
+        let (ta, tb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        // 16 KiB of hot copies, half reserved: 4 KiB each. Each tip is 3 KiB.
+        let gate = SqlGate::with_hot_bytes(4, 16 * 1024);
+        let bytes = ResponseBytes::new(SQL_MAX_INFLIGHT_RESPONSE_KIB);
+        let a = seated(ta.path(), &gate, &bytes, "acme");
+        let b = seated(tb.path(), &gate, &bytes, "globex");
+        kilo_tip(&a, 3);
+        kilo_tip(&b, 3);
+
+        // A's hot-heavy queries in flight: every copy its share lets it hold, as a running query holds one.
+        let mut copies = Vec::new();
+        while let Ok(p) = gate.charge_hot(3000, Some("acme")) {
+            copies.push(p);
+        }
+        assert_eq!(copies.len(), 4, "A borrows all but B's reservation");
+        let before = rejections("tenant_share").unwrap_or(0);
+        let resp = sql_response(a.clone(), "SELECT 1 AS n").await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = body_json(resp).await;
+        assert_eq!(body["reason"], "tenant_share", "{body}");
+        assert!(rejections("tenant_share").unwrap() > before);
+        assert_eq!(
+            gate.hot_used().get("acme"),
+            Some(&12),
+            "nothing more charged"
+        );
+
+        let resp = sql_response(b.clone(), "SELECT 2445 AS n").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rows"][0]["n"], 2445);
+        assert_eq!(
+            gate.hot_used().get("globex"),
+            None,
+            "released on completion"
+        );
+
+        drop(copies);
+        let resp = sql_response(a, "SELECT 4 AS n").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "A's own copies freed its share"
+        );
+        assert!(gate.hot_used().is_empty());
+    }
+
+    /// A hot copy is given back however the query ends: a SQL error, or a panic after the copy.
+    #[tokio::test]
+    async fn a_hot_copy_is_released_on_error_and_on_panic() {
+        let (ta, tb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let gate = SqlGate::with_hot_bytes(4, 16 * 1024);
+        let bytes = ResponseBytes::new(SQL_MAX_INFLIGHT_RESPONSE_KIB);
+        let a = seated(ta.path(), &gate, &bytes, "acme");
+        let _b = seated(tb.path(), &gate, &bytes, "globex");
+        kilo_tip(&a, 3);
+        let full = || gate.charge_hot(3000, Some("acme"));
+
+        let resp = sql_response(a.clone(), "SELECT nope FROM nowhere").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(gate.hot_used().is_empty());
+
+        crate::serve::panic_in_queries_of(ta.path());
+        let resp = sql_response(a.clone(), "SELECT 1 AS n").await;
+        assert!(resp.status().is_server_error(), "{}", resp.status());
+        assert!(gate.hot_used().is_empty());
+        let held: Vec<_> = std::iter::from_fn(|| full().ok()).collect();
+        assert_eq!(held.len(), 4, "the panicked query's copy came back");
+    }
+
+    /// A lone nest charges no tenant: a copy is refused only when the gate's whole budget is in use,
+    /// `busy`, or when it could never fit, as an over-budget tip always was.
+    #[tokio::test]
+    async fn an_untenanted_hot_copy_meets_only_the_gates_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), 2);
+        state.sql_gate = SqlGate::with_hot_bytes(2, 4 * 1024);
+        kilo_tip(&state, 3);
+        let resp = sql_response(state.clone(), "SELECT 1 AS n").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let other = state.sql_gate.charge_hot(2048, None).unwrap();
+        let resp = sql_response(state.clone(), "SELECT 2 AS n").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body_json(resp).await,
+            json!({ "error": "server busy: too many hot-tip bytes in flight" })
+        );
+        drop(other);
+
+        kilo_tip(&state, 5);
+        let resp = sql_response(state.clone(), "SELECT 3 AS n").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(resp).await;
+        assert!(
+            body["error"].as_str().unwrap().contains("source bytes"),
+            "{body}"
+        );
     }
 
     /// #2212: a `/sql` body holds its bytes until it has been taken to be sent, and past the budget

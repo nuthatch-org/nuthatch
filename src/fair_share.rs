@@ -10,6 +10,10 @@
 //!
 //! A gate with one tenant, or none, behaves as the plain semaphore it wraps: no reservation is held
 //! for anybody else, and a refusal is `busy` as it always was.
+//!
+//! The hot-tip rows a query copies (RFC-0073 FR5) are a third budget, one per gate, divided the same
+//! way as response bytes. They are a different memory from a response, held while the query runs
+//! rather than while its answer is sent, and both can be in flight for one tenant at once.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -49,7 +53,20 @@ impl Refusal {
 pub struct SqlGate {
     permits: Arc<Semaphore>,
     shares: Arc<GateShares>,
+    hot: Arc<ByteShares>,
 }
+
+/// A query's hot copy refused before a row of it was parsed, for the reason given.
+#[derive(Debug)]
+pub struct HotShareRefused(pub Refusal);
+
+impl std::fmt::Display for HotShareRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no room for this query's hot-tip copy ({:?})", self.0)
+    }
+}
+
+impl std::error::Error for HotShareRefused {}
 
 struct GateShares {
     total: usize,
@@ -222,6 +239,11 @@ impl std::ops::Deref for SqlGate {
 
 impl SqlGate {
     pub fn new(permits: usize) -> Self {
+        Self::with_hot_bytes(permits, crate::serve::SQL_MAX_HOT_INFLIGHT_BYTES)
+    }
+
+    /// A gate whose queries may hold `hot_bytes` of hot-tip copies at once.
+    pub fn with_hot_bytes(permits: usize, hot_bytes: u64) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(permits)),
             shares: Arc::new(GateShares {
@@ -229,6 +251,7 @@ impl SqlGate {
                 ledger: Mutex::default(),
                 changed: Notify::new(),
             }),
+            hot: Arc::new(ByteShares::uncapped((hot_bytes / 1024).max(1) as usize)),
         }
     }
 
@@ -236,8 +259,25 @@ impl SqlGate {
         self.shares.total
     }
 
+    /// The hot-tip bytes this gate's queries may hold copied at once.
+    pub fn hot_total_bytes(&self) -> u64 {
+        self.hot.total as u64 * 1024
+    }
+
+    /// Room for a hot copy of `bytes`, charged to `tenant` until the permit drops.
+    pub fn charge_hot(&self, bytes: u64, tenant: Option<&str>) -> Result<BytePermit, Refusal> {
+        self.hot
+            .reserve(usize::try_from(bytes).unwrap_or(usize::MAX), tenant)
+    }
+
+    /// KiB of hot copies held per tenant right now.
+    pub fn hot_used(&self) -> BTreeMap<String, usize> {
+        self.hot.used()
+    }
+
     /// Set what `tenant` is entitled to on this gate.
     pub fn set_share(&self, tenant: &str, share: TenantShare) {
+        self.hot.set_share(tenant, share);
         let mut l = lock(&self.shares.ledger);
         if share == TenantShare::default() {
             l.shares.remove(tenant);
@@ -265,10 +305,12 @@ impl SqlGate {
             .or_default()
             .seats
             .push(dir.to_path_buf());
+        self.hot.seat(tenant);
         self.shares.changed.notify_waiters();
     }
 
     fn unseat(&self, tenant: &str, dir: &Path) {
+        self.hot.unseat(tenant);
         let mut l = lock(&self.shares.ledger);
         if let Some(t) = l.tenants.get_mut(tenant) {
             if let Some(i) = t.seats.iter().position(|d| d == dir) {
@@ -430,11 +472,14 @@ impl Drop for Ticket<'_> {
     }
 }
 
-/// The process's response bytes in flight, in KiB, divided between tenant labels.
+/// A budget in KiB divided between tenant labels: the process's response bytes in flight, or a gate's
+/// hot-tip copies.
 pub struct ByteShares {
     total: usize,
     permits: Arc<Semaphore>,
     ledger: Mutex<ByteLedger>,
+    /// Whether a tenant's `max_response_mib` caps it; it names response bytes and nothing else.
+    capped: bool,
 }
 
 #[derive(Default)]
@@ -491,7 +536,7 @@ impl ByteLedger {
     }
 }
 
-/// Room for one response body, released when it is dropped.
+/// Room for one response body or hot copy, released when it is dropped.
 pub struct BytePermit {
     permit: Option<OwnedSemaphorePermit>,
     charge: Option<(Arc<ByteShares>, Arc<str>, usize)>,
@@ -516,6 +561,14 @@ impl ByteShares {
             total: kib,
             permits: Arc::new(Semaphore::new(kib)),
             ledger: Mutex::default(),
+            capped: true,
+        }
+    }
+
+    fn uncapped(kib: usize) -> Self {
+        Self {
+            capped: false,
+            ..Self::new(kib)
         }
     }
 
@@ -575,6 +628,7 @@ impl ByteShares {
         let cap = l
             .share(tenant)
             .max_response_mib
+            .filter(|_| self.capped)
             .map(|mib| (mib as usize).saturating_mul(1024));
         if cap.is_some_and(|cap| used + kib > cap) {
             return Err(Refusal::TenantShare);

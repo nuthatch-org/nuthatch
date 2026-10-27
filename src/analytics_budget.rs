@@ -91,6 +91,8 @@ impl AnalyticsConfig {
 /// terms RFC-0047 names in place of the one derived number, and never under
 /// [`RESERVATION_MINIMUM_MB`] (#1899). Unless an operator states both, or raises the wall, **no
 /// accepted split hands Burrmill more RAM than the shipped default the footprint CI job measures.**
+/// The cursor's hot-tip copies, [`crate::serve::SQL_MAX_HOT_INFLIGHT_BYTES`] of source bytes, are
+/// paid from this reservation, as they were before RFC-0073 FR5 bounded them.
 impl AnalyticsConfig {
     pub fn burrmill_limit_mb(&self) -> u64 {
         self.burrmill_memory_limit_mb
@@ -376,6 +378,19 @@ pub(crate) mod tests {
     use super::*;
     use crate::runtime::DEFAULT_MAX_RSS_MB;
     use crate::serve::{SQL_MAX_CONCURRENCY, SQL_MAX_CONCURRENCY_CEILING};
+
+    /// A cursor's hot-tip copies (RFC-0073 FR5) are held outside the pool, so they are paid from the
+    /// reservation; no accepted split leaves a reservation they do not fit in.
+    #[test]
+    fn the_hot_copy_budget_fits_the_smallest_reservation() {
+        let gate = crate::serve::SqlGate::new(SQL_MAX_CONCURRENCY_CEILING);
+        assert_eq!(
+            gate.hot_total_bytes(),
+            crate::serve::SQL_MAX_HOT_INFLIGHT_BYTES,
+            "more permits do not buy more hot copies"
+        );
+        assert!(crate::serve::SQL_MAX_HOT_INFLIGHT_BYTES <= RESERVATION_MINIMUM_MB << 20);
+    }
 
     /// Held by every test that sets or reads the `NUTHATCH_ANALYTICS_*` environment.
     pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {

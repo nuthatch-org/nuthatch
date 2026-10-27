@@ -392,6 +392,18 @@ pub trait HotStore: Send + Sync {
     ) -> Result<HotRowsSnapshot> {
         anyhow::bail!("this hot-store backend cannot report a byte-exact query snapshot")
     }
+    /// As `hot_rows_by_table_bounded_with_bytes`, handing `charge` the snapshot's source bytes before
+    /// a row is parsed (RFC-0073 FR5). This default can only charge once it has copied.
+    fn hot_rows_charged(
+        &self,
+        max_rows: usize,
+        max_bytes: u64,
+        charge: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<HotRowsSnapshot> {
+        let snapshot = self.hot_rows_by_table_bounded_with_bytes(max_rows, max_bytes)?;
+        charge(snapshot.source_bytes)?;
+        Ok(snapshot)
+    }
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>>;
     /// Rows in `[from, to]` in chain order, handed to `visit` as `(block, json)` until it returns
     /// `false`. Choosing a seal cut reads only as far as the cut; this default still loads the range.
@@ -1292,8 +1304,36 @@ impl Store {
         max_rows: usize,
         max_bytes: u64,
     ) -> Result<HotRowsSnapshot> {
+        self.hot_rows_snapshot(max_rows, max_bytes, None)
+    }
+
+    /// With `charge`, the values are first measured without copying and the total charged, inside
+    /// the same read transaction, so the copy that follows is exactly the bytes charged.
+    fn hot_rows_snapshot(
+        &self,
+        max_rows: usize,
+        max_bytes: u64,
+        charge: Option<&mut dyn FnMut(u64) -> Result<()>>,
+    ) -> Result<HotRowsSnapshot> {
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(ENTITIES)?;
+        if let Some(charge) = charge {
+            let mut bytes = 0u64;
+            for row in t.iter()? {
+                let (_k, v) = row?;
+                bytes = bytes
+                    .checked_add(v.value().len() as u64)
+                    .context("hot source byte count overflow")?;
+                if bytes > max_bytes {
+                    return Err(HotScanBudgetExceeded {
+                        source_bytes: bytes,
+                        budget: max_bytes,
+                    }
+                    .into());
+                }
+            }
+            charge(bytes)?;
+        }
         let mut out = HotRowsSnapshot {
             last_block: rtx
                 .open_table(META)?
@@ -1877,6 +1917,14 @@ impl HotStore for Store {
     ) -> Result<HotRowsSnapshot> {
         Store::hot_rows_by_table_bounded_with_bytes(self, max_rows, max_bytes)
     }
+    fn hot_rows_charged(
+        &self,
+        max_rows: usize,
+        max_bytes: u64,
+        charge: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<HotRowsSnapshot> {
+        Store::hot_rows_snapshot(self, max_rows, max_bytes, Some(charge))
+    }
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
         Store::entities_in_range(self, from, to)
     }
@@ -2169,6 +2217,14 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
         max_bytes: u64,
     ) -> Result<HotRowsSnapshot> {
         (**self).hot_rows_by_table_bounded_with_bytes(max_rows, max_bytes)
+    }
+    fn hot_rows_charged(
+        &self,
+        max_rows: usize,
+        max_bytes: u64,
+        charge: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<HotRowsSnapshot> {
+        (**self).hot_rows_charged(max_rows, max_bytes, charge)
     }
     fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
         (**self).entities_in_range(from, to)

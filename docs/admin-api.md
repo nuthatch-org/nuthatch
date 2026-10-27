@@ -278,7 +278,7 @@ FR2). Nuthatch still knows nothing about who a tenant is; the label is the first
 |---|---|---|
 | Set a tenant's share | `PUT /_admin/tenants/<tenant>` `{"weight": 2, "max_permits": 1, "max_response_mib": 32}` | `200`, `{"tenant", "share"}` |
 | Restore the default | `PUT /_admin/tenants/<tenant>` `{}` | `200` |
-| Read every tenant's share and use | `GET /_admin/tenants` | `{"tenants": [{"tenant", "share", "mounts", "permits_held", "response_kib_in_flight"}, …]}` |
+| Read every tenant's share and use | `GET /_admin/tenants` | `{"tenants": [{"tenant", "share", "mounts", "permits_held", "response_kib_in_flight", "hot_kib_in_flight"}, …]}` |
 
 A `PUT` replaces the tenant's whole share, every field optional. It is written to `mounts.toml` under
 `[tenants.<tenant>]` first and then applied to every running mount, with no restart; a share the file
@@ -293,6 +293,12 @@ reservation is admitted within the 250 ms admission wait however busy another te
 behind its own queries, never another's. When several tenants wait, a freed permit goes to the one
 holding the fewest permits per unit of weight. Half the response-bytes budget is reserved the same way,
 split by weight between the tenants mounted; the other half is borrowed first come.
+
+**Hot-tip copies.** A query over the unsealed tip copies those rows for as long as it runs, a memory
+apart from its response. Each gate has 128 MiB of them in flight (RFC-0073 FR5), divided between its
+tenants exactly as response bytes are, and `max_response_mib` does not cap it. The copy is measured
+before a row is parsed and charged to the tenant until the query ends, however it ends, so a tenant
+past its share is refused before it copies anything. `hot_kib_in_flight` is what each tenant holds.
 
 **The trade.** A permit already running is never taken back, so a reservation is held whether or not
 its tenant is busy. A tenant can use every permit only when it is the only tenant on the gate. With as
