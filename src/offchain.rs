@@ -89,7 +89,22 @@ pub fn load(dir: &Path) -> Result<Catalogue> {
     let path = catalogue_path(dir);
     match std::fs::read_to_string(&path) {
         Ok(raw) => {
-            checked(serde_json::from_str(&raw).context("corrupt offchain provenance manifest")?)
+            let c = checked(
+                serde_json::from_str(&raw).context("corrupt offchain provenance manifest")?,
+            )?;
+            // A plain name can still be a link placed by someone with write access to the directory.
+            for s in c.tables.values().flatten() {
+                let p = segment_path(dir, s);
+                if p.symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    anyhow::bail!(
+                        "offchain snapshot {} is a symbolic link; it must be a regular file",
+                        p.display()
+                    );
+                }
+            }
+            Ok(c)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Catalogue::default()),
         Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
@@ -621,6 +636,21 @@ mod tests {
             "source": "s", "ingested_at": "t", "tool_version": "v"
         }]}});
         std::fs::write(catalogue_path(dir), raw.to_string()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_file_that_is_a_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("other.parquet");
+        std::fs::write(&target, b"PAR1").unwrap();
+        manifest_naming(dir.path(), "prices", "prices-abc.parquet");
+        let segs = dir.path().join(DIR).join(SEGMENTS);
+        std::fs::create_dir_all(&segs).unwrap();
+        std::os::unix::fs::symlink(&target, segs.join("prices-abc.parquet")).unwrap();
+        let err = load(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
     }
 
     #[test]
