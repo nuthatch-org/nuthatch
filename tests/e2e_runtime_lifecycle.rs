@@ -413,6 +413,7 @@ async fn a_strict_runtimes_live_mount_queries_in_its_tenants_partition() {
         sql: Default::default(),
         queries: Vec::new(),
         publish: None,
+        limits: Default::default(),
         #[cfg(feature = "counter")]
         counter: None,
     });
