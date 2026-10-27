@@ -741,32 +741,18 @@ async fn a_delta_over_the_budget_is_refused_before_it_is_applied() {
 
 const ENTITY_SQL: &str = "SELECT * FROM received ORDER BY 1";
 
-/// Every route a follower answers from derived state, compared with the writer's answer.
-async fn derived_agree(writer: &Writer, follower: &str, why: &str) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    for path in [
-        "/balances".to_string(),
-        format!("/balance/{}", account(2)),
-        format!("/exposure/{}", account(1)),
-        "/flags".to_string(),
-        "/flags?kind=velocity".to_string(),
-        "/derived".to_string(),
-        "/derived/received".to_string(),
-        "/q/top_received".to_string(),
-    ] {
-        out.push(agree_on(writer, follower, &path, &format!("{why}, {path}")).await);
-    }
-    out.push(agree(writer, follower, ENTITY_SQL, &format!("{why}, entity SQL")).await);
-    out
+/// Drop a one-row `tiers` snapshot giving account 2 `tier`, from a file outside the dataset.
+fn drop_tier(root: &Path, name: &str, tier: &str) {
+    let csv = root.join(format!("{name}.csv"));
+    std::fs::write(&csv, format!("account,tier\n{},{tier}\n", account(2))).unwrap();
+    nuthatch::offchain::drop_file(&root.join("data").join(ROUTE), &csv, "tiers").unwrap();
 }
 
-/// Balances, exposure, velocity and threshold flags, an authored entity by `/derived`, by `/sql` and
-/// through a named query: the follower answers each as the writer does, through a reorg, a seal and
-/// the writer restarting.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_follower_derives_what_the_writer_derives() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join("runtime");
+/// A runtime with one nest carrying every kind of derived state: threshold and velocity flags, a
+/// labelled address for exposure, a chain entity and an entity joining an offchain table, with a
+/// named query over the first. Blocks 1..=8 on the tape, block 2 padded so its range seals.
+fn derived_runtime(tmp: &Path) -> (PathBuf, PathBuf, Arc<TapeSource>) {
+    let root = tmp.join("runtime");
     let dir = root.join("data").join(ROUTE);
     std::fs::create_dir_all(&dir).unwrap();
     scaffold_nest(&dir, ROUTE, USDC);
@@ -787,17 +773,18 @@ async fn a_follower_derives_what_the_writer_derives() {
     .unwrap();
     entity_fixture::write(
         &dir,
-        "[[entities]]\nname = \"received\"\nquery = \"SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to\"\nkey = [\"to\"]\nmax_rows = 50000\n",
+        "[[entities]]\nname = \"received\"\nquery = \"SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to\"\nkey = [\"to\"]\nmax_rows = 50000\n\n\
+         [[entities]]\nname = \"by_tier\"\nquery = \"SELECT t.tier, SUM(x.value) FROM usdc__transfer x JOIN offchain__tiers t ON x.to = t.account GROUP BY t.tier\"\nkey = [\"tier\"]\nmax_rows = 50000\n",
     )
     .unwrap();
+    drop_tier(&root, "first", "gold");
     std::fs::write(
         root.join("named.json"),
         serde_json::json!([{"name": "top_received", "sql": ENTITY_SQL}]).to_string(),
     )
     .unwrap();
-    let via: PathBuf = tmp.path().join("follower-view");
+    let via: PathBuf = tmp.join("follower-view");
     std::os::unix::fs::symlink(&root, &via).unwrap();
-
     let tape = Arc::new(TapeSource::new());
     for b in 1..=8u64 {
         let mut fx = block(b, 0, 100 * b as u128);
@@ -807,6 +794,36 @@ async fn a_follower_derives_what_the_writer_derives() {
         tape.insert_block(b, fx);
     }
     tape.advance_tip_to(8);
+    (root, via, tape)
+}
+
+/// Every route a follower answers from derived state, compared with the writer's answer.
+async fn derived_agree(writer: &Writer, follower: &str, why: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for path in [
+        "/balances".to_string(),
+        format!("/balance/{}", account(2)),
+        format!("/exposure/{}", account(1)),
+        "/flags".to_string(),
+        "/flags?kind=velocity".to_string(),
+        "/derived".to_string(),
+        "/derived/received".to_string(),
+        "/q/top_received".to_string(),
+        "/derived/by_tier".to_string(),
+    ] {
+        out.push(agree_on(writer, follower, &path, &format!("{why}, {path}")).await);
+    }
+    out.push(agree(writer, follower, ENTITY_SQL, &format!("{why}, entity SQL")).await);
+    out
+}
+
+/// Balances, exposure, velocity and threshold flags, an authored entity by `/derived`, by `/sql` and
+/// through a named query: the follower answers each as the writer does, through a reorg, a seal and
+/// the writer restarting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_derives_what_the_writer_derives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, via, tape) = derived_runtime(tmp.path());
     let writer = Writer::start(&root, tape.clone(), 0);
     writer.reaches(8).await;
 
@@ -847,7 +864,10 @@ async fn a_follower_derives_what_the_writer_derives() {
     let reorged = derived_agree(&writer, &fa, "after a reorg").await;
     let total = 100 + 200 + 300 + 400 + 500 + 600 + 7_777 + 8_888 + 9_999;
     assert_eq!(reorged[1]["balance"], total.to_string());
+    assert!(reorged[8].to_string().contains("gold"), "{}", reorged[8]);
 
+    // A second offchain snapshot, dropped while both run, reaches both at the next window.
+    drop_tier(&root, "second", "silver");
     tape.advance_finalized_to(2);
     tape.insert_block(10, block(10, 0, 1_000));
     tape.advance_tip_to(10);
@@ -858,6 +878,7 @@ async fn a_follower_derives_what_the_writer_derives() {
     writer.reaches(10).await;
     let sealed = derived_agree(&writer, &fa, "across a seal").await;
     assert_eq!(sealed[1]["balance"], (total + 1_000).to_string());
+    assert!(sealed[8].to_string().contains("silver"), "{}", sealed[8]);
 
     let port = writer.addr.port();
     writer.stop(&root);
@@ -874,5 +895,71 @@ async fn a_follower_derives_what_the_writer_derives() {
     writer.reaches(11).await;
     let resumed = derived_agree(&writer, &fa, "after the writer restarted").await;
     assert_eq!(resumed[1]["balance"], (total + 2_100).to_string());
+    writer.stop(&root);
+}
+
+/// Derived state a feed tore part-way is not served: its routes answer `catching_up`, and `/ready`
+/// says why, until it is rebuilt from the sealed history, while the nest's hot and sealed routes
+/// keep answering. Once rebuilt it answers as the writer does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn torn_derived_state_is_not_served_until_rebuilt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, via, tape) = derived_runtime(tmp.path());
+    let writer = Writer::start(&root, tape.clone(), 0);
+    writer.reaches(8).await;
+    let (_f, fa) = bind_follower(&via, &writer).await;
+    derived_agree(&writer, &fa, "before the fault").await;
+
+    // The next window's feed fails after the views and before the entities, and the rebuild that
+    // follows waits for `release`.
+    let (release, held) = std::sync::mpsc::channel();
+    nuthatch::indexer::inject_follower_fault(&via.join("data").join(ROUTE), held);
+    tape.insert_block(9, block(9, 0, 900));
+    tape.advance_tip_to(9);
+    writer.reaches(9).await;
+    // The store has the window: the hot route shows block 9.
+    let nine = "SELECT count(*) AS n FROM usdc__transfer WHERE block_number = 9";
+    let mut stored = false;
+    for _ in 0..400 {
+        let (status, body) = sql(&fa, nine).await;
+        if status == 200 && body["rows"][0]["n"] == 1 {
+            stored = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(stored, "the follower applied block 9 to its hot copy");
+    for path in [
+        "/derived/received".to_string(),
+        "/derived/by_tier".to_string(),
+        "/balances".to_string(),
+        format!("/balance/{}", account(2)),
+        "/flags".to_string(),
+        "/q/top_received".to_string(),
+    ] {
+        let (status, body) = get(&fa, &format!("/{ROUTE}{path}")).await;
+        assert_eq!(status, 503, "{path} served torn state: {body}");
+        assert_eq!(body["reason"], "catching_up", "{path}: {body}");
+    }
+    let (status, body) = sql(&fa, ENTITY_SQL).await;
+    assert_eq!((status, &body["reason"]), (503, &"catching_up".into()));
+    let (status, ready) = get(&fa, &format!("/{ROUTE}/ready")).await;
+    assert_eq!(status, 200, "{ready}");
+    assert_eq!(ready["derived"]["state"], "catching_up", "{ready}");
+    assert!(
+        ready["derived"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("part-way")),
+        "{ready}"
+    );
+
+    release.send(()).unwrap();
+    let rebuilt = derived_agree(&writer, &fa, "after the rebuild").await;
+    assert_eq!(
+        rebuilt[1]["balance"],
+        ((100..=800).step_by(100).sum::<u64>() + 900).to_string()
+    );
+    let (_, ready) = get(&fa, &format!("/{ROUTE}/ready")).await;
+    assert_eq!(ready["derived"]["state"], "ready", "{ready}");
     writer.stop(&root);
 }

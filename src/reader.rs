@@ -114,6 +114,8 @@ struct Data {
     store: Arc<MemStore>,
     /// Why there is none, when it could not be built; those routes are then the writer's.
     derived: std::result::Result<Arc<crate::indexer::FollowerDerived>, Refused>,
+    /// Why the derived state is being rebuilt, while it is: it is not served until it is whole.
+    building: Option<String>,
 }
 
 /// Derived state that could not be built, with its own empty entity list so a swap can tell it apart.
@@ -536,7 +538,11 @@ impl Follower {
                 let data = tokio::task::spawn_blocking(move || {
                     let store = Arc::new(MemStore::from_snapshot(&dir, snapshot));
                     let derived = derive(&dir, store.as_ref());
-                    Data { store, derived }
+                    Data {
+                        store,
+                        derived,
+                        building: None,
+                    }
                 })
                 .await
                 .context("building a snapshot's store")?;
@@ -589,27 +595,46 @@ impl Follower {
                     .store
                     .apply(&delta)
                     .with_context(|| format!("{dataset}: resnapshotting"))?;
-                if changes.sealed_unseen {
+                let torn = if changes.sealed_unseen {
                     // Rows sealed straight to segments never crossed the feed: derive again.
-                    let dir = self.root.join(&dataset);
-                    let store = data.store.clone();
-                    let derived = tokio::task::spawn_blocking(move || derive(&dir, store.as_ref()))
-                        .await
-                        .context("rederiving after a seal")?;
-                    if let Some(d) = self.lock().datasets.get_mut(&dataset) {
-                        d.derived = derived;
-                    }
-                    self.realise();
+                    Some("rows were sealed that never passed through hot".to_string())
                 } else if let (Ok(derived), Some(through)) = (&data.derived, changes.through) {
+                    let store = data.store.clone();
                     derived
-                        .apply(&changes.removed, &changes.added, through)
-                        .with_context(|| format!("{dataset}: feeding its derived state"))?;
+                        .apply(store.as_ref(), &changes.removed, &changes.added, through)
+                        .err()
+                        .map(|e| format!("feeding it failed part-way: {e:#}"))
+                } else {
+                    None
+                };
+                if let Some(why) = torn {
+                    self.rederive(&dataset, &data, why).await?;
                 }
             }
             Line::Heartbeat { positions } => {
                 self.lock().positions = positions.into_iter().collect();
             }
         }
+        Ok(())
+    }
+
+    /// Rebuild `dataset`'s derived state from its store and segments, its derived routes answering
+    /// `catching_up` meanwhile. Nothing else is applied until it is done, so it rebuilds a fixed state.
+    async fn rederive(self: &Arc<Self>, dataset: &str, data: &Data, why: String) -> Result<()> {
+        tracing::warn!("{dataset}: rebuilding its derived state: {why}");
+        if let Some(d) = self.lock().datasets.get_mut(dataset) {
+            d.building = Some(format!("{why}; rebuilding it from the sealed history"));
+        }
+        let dir = self.root.join(dataset);
+        let store = data.store.clone();
+        let derived = tokio::task::spawn_blocking(move || derive(&dir, store.as_ref()))
+            .await
+            .context("rebuilding derived state")?;
+        if let Some(d) = self.lock().datasets.get_mut(dataset) {
+            d.derived = derived;
+            d.building = None;
+        }
+        self.realise();
         Ok(())
     }
 
@@ -871,6 +896,11 @@ impl Follower {
                 "as_of": as_of,
                 "sealed_through": store.sealed_through(),
                 "follower": self.lag(&inner, &r.spec.dataset),
+                "derived": inner.datasets.get(&r.spec.dataset).map(|d| match (&d.building, &d.derived) {
+                    (Some(why), _) => serde_json::json!({"state": "catching_up", "reason": why}),
+                    (None, Err(r)) => serde_json::json!({"state": "writer_only", "reason": r.why}),
+                    (None, Ok(_)) => serde_json::json!({"state": "ready"}),
+                }),
             })),
         )
             .into_response()
@@ -941,15 +971,14 @@ fn writer_only(path: &str) -> bool {
             .any(|p| path.starts_with(p))
 }
 
-const OFFCHAIN: &str = "it reads offchain tables, which a follower does not maintain";
-
-fn writer_only_response(what: &str, why: &str) -> Response {
+fn derived_refused(reason: &str, what: &str, why: &str) -> Response {
+    let error = match reason {
+        "catching_up" => format!("{what} waits for this nest's derived state: {why}"),
+        _ => format!("{what} is served by the writer only on this nest: {why}"),
+    };
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "error": format!("{what} is served by the writer only on this nest: {why}"),
-            "reason": "writer_only",
-        })),
+        Json(serde_json::json!({"error": error, "reason": reason})),
     )
         .into_response()
 }
@@ -1002,38 +1031,34 @@ fn guarded(
                 if path == "/ready" {
                     return follower.route_ready(&route);
                 }
-                // What this route's dataset cannot derive: everything, or its offchain entities.
-                let (refusal, entities) = match follower.data(&route).map(|d| d.derived) {
-                    Some(Ok(d)) => (
-                        None,
-                        d.offchain.iter().map(|e| e.to_ascii_lowercase()).collect(),
-                    ),
-                    Some(Err(r)) => (Some(r.why), (*declared).clone()),
-                    None => (None, BTreeSet::new()),
+                // Derived state being rebuilt, or that could not be built, is never served in part.
+                let refusal = match follower.data(&route) {
+                    Some(Data {
+                        building: Some(why),
+                        ..
+                    }) => Some(("catching_up", why)),
+                    Some(Data {
+                        derived: Err(r), ..
+                    }) => Some(("writer_only", r.why)),
+                    _ => None,
                 };
-                if let Some(why) = &refusal {
-                    if writer_only(&path) {
-                        return writer_only_response(&path, why);
-                    }
-                }
-                if path
-                    .strip_prefix("/derived/")
-                    .and_then(|rest| rest.split('/').next())
-                    .is_some_and(|e| entities.contains(&e.to_ascii_lowercase()))
-                {
-                    return writer_only_response(&path, OFFCHAIN);
+                let Some((reason, why)) = refusal else {
+                    return next.run(req).await;
+                };
+                if writer_only(&path) {
+                    return derived_refused(reason, &path, &why);
                 }
                 let reads_sql = matches!(path.as_str(), "/sql" | "/explain" | "/graphql")
                     || path.starts_with("/q/")
                     || path.starts_with("/subgraphs/");
-                if entities.is_empty() || !reads_sql {
+                if declared.is_empty() || !reads_sql {
                     return next.run(req).await;
                 }
-                let why = refusal.as_deref().unwrap_or(OFFCHAIN);
                 // A named query's text is the nest's, not the request's, so it is not read here.
                 if path.starts_with("/q/") {
-                    return writer_only_response("a named query on this nest", why);
+                    return derived_refused(reason, "a named query on this nest", &why);
                 }
+                let entities = &*declared;
                 let (parts, body) = req.into_parts();
                 let Ok(bytes) = axum::body::to_bytes(body, BODY_LIMIT).await else {
                     return StatusCode::PAYLOAD_TOO_LARGE.into_response();
@@ -1043,8 +1068,8 @@ fn guarded(
                     decode_query(parts.uri.query().unwrap_or("")),
                     String::from_utf8_lossy(&bytes)
                 );
-                if names_entity(&text, &entities) {
-                    return writer_only_response("SQL naming this entity", why);
+                if names_entity(&text, entities) {
+                    return derived_refused(reason, "SQL naming an entity", &why);
                 }
                 next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
                     .await

@@ -9185,8 +9185,26 @@ pub struct FollowerDerived {
     pub exposure: ExposureView,
     pub velocity: VelocityView,
     pub entities: Arc<Vec<EntityView>>,
-    /// Entities that read offchain tables, which a follower does not maintain; named when present.
-    pub offchain: Vec<String>,
+    dir: PathBuf,
+}
+
+/// A test seam: the next feed of `dir`'s derived state fails part-way, and the rebuild that follows
+/// waits for the receiver before it finishes, so a test can watch what is served meanwhile.
+#[doc(hidden)]
+pub fn inject_follower_fault(dir: &Path, release: std::sync::mpsc::Receiver<()>) {
+    follower_faults()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dir.to_path_buf(), (true, Some(release)));
+}
+
+type FollowerFaults = std::sync::Mutex<
+    std::collections::HashMap<PathBuf, (bool, Option<std::sync::mpsc::Receiver<()>>)>,
+>;
+
+fn follower_faults() -> &'static FollowerFaults {
+    static FAULTS: std::sync::OnceLock<FollowerFaults> = std::sync::OnceLock::new();
+    FAULTS.get_or_init(Default::default)
 }
 
 impl FollowerDerived {
@@ -9207,14 +9225,6 @@ impl FollowerDerived {
             .get_meta(LAST_BLOCK_KEY)?
             .and_then(|v| v.parse::<u64>().ok());
         let mut entities = start_entities(dir, &registry, through.is_some())?;
-        let offchain: Vec<String> = entities
-            .iter()
-            .filter(|e| !e.offchain_tables().is_empty())
-            .map(|e| e.name().to_string())
-            .collect();
-        if !offchain.is_empty() {
-            entities.clear();
-        }
         if let Some(through) = through {
             if let Err(e) = seed_entities(dir, store, &registry, &mut entities, through) {
                 tracing::error!("entity seeding failed, entities stay unavailable: {e:#}");
@@ -9240,18 +9250,39 @@ impl FollowerDerived {
             exposure,
             velocity,
             entities: Arc::new(entities),
-            offchain,
+            dir: dir.to_path_buf(),
         };
         built.flush();
+        let hold = follower_faults()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(dir)
+            .and_then(|(_, hold)| hold.take());
+        if let Some(hold) = hold {
+            let _ = hold.recv();
+        }
         Ok(built)
     }
 
     /// Feed one applied window or rollback, the only commits ingest feeds its views from: `removed`
     /// the stored rows it dropped or replaced, `added` the rows it stored, `through` its `last_block`.
-    pub fn apply(&self, removed: &[String], added: &[String], through: u64) -> Result<()> {
+    /// Entities reading offchain tables are then brought up to the dataset's snapshots as ingest
+    /// does after each window.
+    pub fn apply(
+        &self,
+        store: &dyn crate::store::HotStore,
+        removed: &[String],
+        added: &[String],
+        through: u64,
+    ) -> Result<()> {
         let schema = self.registry.schema();
         let removed = decode_stored_rows(&schema, removed)?;
         let added = decode_stored_rows(&schema, added)?;
+        let fail = follower_faults()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&self.dir)
+            .is_some_and(|(fail, _)| std::mem::take(fail));
         if !removed.is_empty() {
             for entity in self.entities.iter() {
                 entity.apply_window(&removed, -1, through)?;
@@ -9293,10 +9324,20 @@ impl FollowerDerived {
         }
         self.balances
             .note_over_i128(added.iter().filter(|r| oversized_transfer(r)).count() as u64);
+        if fail {
+            anyhow::bail!("an injected fault, after the views and before the entities");
+        }
         // A rollback alone retracts and stops; a window, even an empty one, advances the watermark.
         if removed.is_empty() || !added.is_empty() {
             for entity in self.entities.iter() {
                 entity.apply_window(&added, 1, through)?;
+            }
+            if self
+                .entities
+                .iter()
+                .any(|e| !e.offchain_tables().is_empty())
+            {
+                refresh_offchain(&self.dir, store, &self.registry, &self.entities, through)?;
             }
         }
         Ok(())
