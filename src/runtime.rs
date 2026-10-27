@@ -7569,6 +7569,28 @@ mod tests {
         );
     }
 
+    /// RFC-0073 FR8: `isolation` is read from `[runtime]`, written back only when strict, and a strict
+    /// route's queries are partitioned by the tenant its key names.
+    #[test]
+    fn strict_isolation_partitions_each_route_by_its_tenant() {
+        use crate::isolation::Isolation;
+        let head = "[runtime]\nname = \"r\"\nchain = \"x\"\nchain_id = 1\n";
+        let shared: MountTable = toml::from_str(head).unwrap();
+        assert_eq!(shared.runtime.isolation, Isolation::Shared);
+        assert!(!toml::to_string(&shared).unwrap().contains("isolation"));
+        let strict: MountTable =
+            toml::from_str(&format!("{head}isolation = \"strict\"\n")).unwrap();
+        assert_eq!(strict.runtime.isolation, Isolation::Strict);
+        let again: MountTable = toml::from_str(&toml::to_string(&strict).unwrap()).unwrap();
+        assert_eq!(again.runtime.isolation, Isolation::Strict);
+        assert!(toml::from_str::<MountTable>(&format!("{head}isolation = \"loose\"\n")).is_err());
+
+        let p = |i, key| query_partition(i, key, "default").map(|t| t.to_string());
+        assert_eq!(p(Isolation::Strict, "usdc"), Some("default".into()));
+        assert_eq!(p(Isolation::Strict, "acme/usdc"), Some("acme".into()));
+        assert_eq!(p(Isolation::Shared, "acme/usdc"), None);
+    }
+
     /// #1565, and the 3.13.0 tyre-kick: a mount's route key depends on its own tenant alone, so it
     /// is the same before and after a restart whatever else is mounted, and a suspended
     /// `tenant/alias` is still found suspended when the table is read back.
@@ -8664,6 +8686,23 @@ mod tests {
         assert_eq!(states[0].1.surface.access, SqlAccess::Deny);
         assert_eq!(states[1].1.surface.access, SqlAccess::Allowlist);
         assert_eq!(states[1].1.surface.queries[0].name, "total");
+        assert!(states.iter().all(|(_, s)| s.isolation.is_none()));
+
+        // RFC-0073 FR8: a strict boot partitions each route by the tenant its key names.
+        states.push(("acme/closed".to_string(), states[0].1.clone()));
+        overlay_boot_records(
+            &mut states,
+            &records,
+            &[],
+            DEFAULT_TENANT,
+            crate::isolation::Isolation::Strict,
+        )
+        .unwrap();
+        let partitions: Vec<_> = states.iter().map(|(_, s)| s.isolation.as_deref()).collect();
+        assert_eq!(
+            partitions,
+            [Some(DEFAULT_TENANT), Some(DEFAULT_TENANT), Some("acme")]
+        );
     }
 
     /// #1647: every write of mounts.toml a suspend makes still holds the mount, so a crash at any
