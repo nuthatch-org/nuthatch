@@ -924,7 +924,7 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /entities`, `GET /entity/{id}` | entity point-reads, transparently across the hot/cold seam |
 | `GET /balances`, `GET /balance/{address}` | the derived IVM balance view |
 | `GET /exposure/{address}`, `GET /flags` | compliance surfaces (RFC-0008) |
-| `GET /nest` | nest identity and registry hash |
+| `GET /nest` | nest identity and registry hash, and the `undecoded` block `/ready` also carries |
 | `GET /shape` | capability probe: what this nest can answer (drives adaptive MCP) |
 | `GET /_admin/`, `/_admin/events`, `/_admin/config`, `/_admin/storage`, `/_admin/requests` | admin UI (eight tabs since 4.2.1), its event stream, the authored files and limits as JSON with every URL cut to scheme and host and every secret withheld, the sealed catalogue per table (`?table=` for one table's segments), and the last 256 requests served (`?since=<seq>` for those after one): route template, the declared query or entity name when the nest knows it, status, milliseconds and bytes, never SQL text, a query string, a path value or a client address, and not the monitoring reads (`/`, `/health`, `/ready`, `/metrics`, `/_admin*`). Token-gated off-localhost; removable with `--no-admin` |
 
@@ -1189,7 +1189,7 @@ per-nest series below.
 |---|---|
 | `nuthatch_tip_height`, `nuthatch_last_block`, `nuthatch_tip_lag_blocks` | is it keeping up |
 | `nuthatch_sealed_through` | cold-layer watermark |
-| `nuthatch_rows_decoded_total`, `nuthatch_rows_sealed_total`, `nuthatch_reorgs_total`, `nuthatch_checkpoints_missed_total` (windows refused because the source gave no hash for the boundary block; indexing is held while it climbs), `nuthatch_ipfs_unreadable_total`, `nuthatch_ipfs_resolved_total`, `nuthatch_ipfs_given_up_total`, `nuthatch_ipfs_unverified_total`, `nuthatch_ipfs_oversize_total`, `nuthatch_ipfs_rows_refused_total`, `nuthatch_ipfs_retries_total` | ingestion |
+| `nuthatch_rows_decoded_total`, `nuthatch_logs_undecoded_total` (logs a declared event claimed that did not decode against its ABI), `nuthatch_rows_sealed_total`, `nuthatch_reorgs_total`, `nuthatch_checkpoints_missed_total` (windows refused because the source gave no hash for the boundary block; indexing is held while it climbs), `nuthatch_ipfs_unreadable_total`, `nuthatch_ipfs_resolved_total`, `nuthatch_ipfs_given_up_total`, `nuthatch_ipfs_unverified_total`, `nuthatch_ipfs_oversize_total`, `nuthatch_ipfs_rows_refused_total`, `nuthatch_ipfs_retries_total` | ingestion |
 | `nuthatch_http_requests_total`, `nuthatch_sql_queries_total`, `nuthatch_sql_rejections_total`, `nuthatch_sql_rejections_total{reason=…}` | serving; the unlabelled rejection total is the aggregate, and the fixed `reason` label classifies its refusals |
 | `nuthatch_sql_memo_hits_total`, `nuthatch_sql_memo_misses_total`, `nuthatch_sql_memo_bytes` | the analytical memo (#1186): how many `/sql` answers were remembered rather than computed, and what it holds |
 | `nuthatch_rpc_requests_total` | outbound HTTP POSTs (one per request or batch envelope, including failover retries) |
@@ -1218,6 +1218,9 @@ dataset; two mounts of one dataset show the same engines),
 `nuthatch_nest_sealed_through`, `nuthatch_nest_last_seal_progress_unixtime` (when that watermark last
 moved), `nuthatch_nest_seal_fault_seconds` (how long every seal attempt has failed, 0 while one
 succeeds; `/ready` names the error), `nuthatch_nest_rows_decoded_total`,
+`nuthatch_nest_logs_undecoded_total{nest,contract,topic0}` (logs whose topic0 a declared event claims
+and whose topics or data did not decode against its ABI, by contract alias or template name; past 256
+pairs a nest counts the rest under `contract="other",topic0="other"`),
 `nuthatch_nest_rows_sealed_total`, `nuthatch_nest_reorgs_total`, `nuthatch_nest_last_reorg_depth_blocks` and
 `nuthatch_nest_last_reorg_unixtime` (the blocks the last reorg rolled back, to the deepest checkpoint
 still canonical, and when; absent until the nest has reorged), `nuthatch_nest_checkpoints_missed_total`,
@@ -1252,6 +1255,7 @@ A nest that mirrors itself (RFC-0052, `--publish-target`) also carries, per nest
 | **Memory near budget** | `nuthatch_rss_bytes` over ~75% of the cursor ceiling | usually the `/sql` hot-scan |
 | **Query rejections spiking** | `rate(nuthatch_sql_rejections_total{reason="busy"}[5m])` | the node is at its analytical concurrency or queue bound; inspect the aggregate too, but do not confuse caller mistakes with saturation |
 | **Queries out of memory** | `increase(nuthatch_sql_rejections_total{reason="out_of_memory"}[2m]) > 0` | a query did not fit the engine's memory budget; a release that regressed memory shows here first, as 4.1.1 would have |
+| **Logs not decoding** | `increase(nuthatch_nest_logs_undecoded_total[1h]) > 0` | a contract's ABI no longer fits what it emits, usually a proxy upgrade; the nest indexes less and stays ready. `/ready`'s `undecoded` names the pair, the warn line the error |
 | **Quarantine flapping** | `increase(nuthatch_nest_quarantine_total[1h]) > 3` | a retryable fault that never settles |
 | **Mirror behind** | `nuthatch_publish_lag_blocks` growing across several intervals, or `nuthatch_publish_dead_letter == 1` | the bucket is unreachable or refusing an object, and consumers of the mirror see stale history |
 | **Sealed history disagrees** | `increase(nuthatch_audit_mismatches_total[1d]) > 0` | a second endpoint served different logs for a sealed range; one of the two providers is wrong (below) |
@@ -1352,6 +1356,12 @@ while sealing succeeds. Once it has lasted 15 minutes (or three poll intervals, 
 `seal_faulted` turns true and the nest answers `503`, whatever `seal_lag_blocks` says (#2262). Hot
 keeps every unsealed row meanwhile, so reads stay complete; the log line at each attempt is the same
 error.
+
+**A log that matches a declared event and does not decode is counted, not dropped unseen.** `undecoded`
+is `{"total", "top"}`, `top` the five largest `{"contract", "topic0", "logs"}` pairs since start, and
+`GET /nest` carries the same block. It is a fact, not a verdict: a nest whose ABI no longer fits keeps
+answering and stays ready. Each window with failures logs one `warn` line with its count and the first
+error (RFC-0073 FR14).
 
 **A seal-direct pass reports the concurrency it runs at.** `seal_direct_concurrency` is
 `{"requested", "effective", "capped_by"}`, and `null` for a nest not started with `--seal-direct`. With a

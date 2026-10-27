@@ -4,7 +4,8 @@
   this is a document to argue with, not work to start. It is **not** a carve-out and it does not
   start, reorder or unblock any slice. Its only operational output is §10's candidate issues, each of
   which must stand on its own under the freeze's bug-fix, security, performance and maintenance
-  allowance.
+  allowance. **§2 is built by RFC-0073 FR14 (#2416), 2026-10-27**: `nuthatch_nest_logs_undecoded_total`,
+  the `undecoded` block in `/ready` and `/nest`, and one `warn` line per window.
 - Author: Jenny
 - Date: 2026-09-02
 - Depends on: RFC-0026 (fault quarantine and partial health), RFC-0025 (adaptive tool
@@ -150,6 +151,9 @@ Two counters, per nest, and the `Err` arm at `warn` with a per-window rate rathe
 `nuthatch_nest_rows_decoded_total` exists; its denominator does not.
 
 **Verdict: open.** The cheapest finding in this document and the one with the worst failure mode.
+
+**Built 2026-10-27 by RFC-0073 FR14 (#2416)**, as one per-nest counter by contract and topic0 rather than
+two: a log `Ok(None)` drops is ordinary and stays uncounted.
 
 ## §3 - Configured-but-empty means off, and the surface still says on
 

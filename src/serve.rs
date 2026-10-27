@@ -1176,7 +1176,20 @@ async fn admin_index(
 
 /// `GET /nest` - static nest metadata for the admin UI's Nest tab (RFC-0010 Part A).
 async fn nest(State(s): State<AppState>) -> impl IntoResponse {
-    Json((*s.nest_info).clone())
+    let mut info = (*s.nest_info).clone();
+    if let Some(obj) = info.as_object_mut() {
+        obj.insert("undecoded".into(), undecoded(&s));
+    }
+    Json(info)
+}
+
+/// Logs a declared event claimed that did not decode, from this nest's counters (RFC-0073 FR14).
+fn undecoded(s: &AppState) -> Value {
+    use crate::metrics::METRICS;
+    match &s.runtime_health {
+        Some((name, _)) => METRICS.nest(name).undecoded_summary(),
+        None => METRICS.undecoded_summary(),
+    }
 }
 
 /// `GET /api` - the Etherscan-shaped account surface over the nest's watched addresses (RFC-0063).
@@ -2204,6 +2217,8 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         body
     };
     let mut body = body;
+    // A fact, not a verdict: a nest whose ABI no longer fits indexes less and is otherwise healthy.
+    body["undecoded"] = undecoded(&s);
     // #2262: the tip seal's error while every attempt fails, absent while it succeeds.
     if let Some((since, reason)) = seal_fault {
         body["seal_fault"] = json!({ "reason": reason, "since_unixtime": since });
@@ -7442,6 +7457,50 @@ mod tests {
         let alias_json: Value = serde_json::from_slice(&alias_body).unwrap();
         assert_eq!(alias_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(alias_json["quarantined"], json!(true));
+    }
+
+    /// RFC-0073 FR14: `/ready` and `/nest` carry this nest's undecoded logs, the total and the largest
+    /// (contract, topic0) pairs, from its own counters rather than the runtime's.
+    #[tokio::test]
+    async fn ready_and_nest_report_the_nests_undecoded_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "undecoded-fr14";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let router = compose_runtime(roster, nests, health);
+
+        let m = crate::metrics::METRICS.nest(name);
+        for (contract, topic0, n) in [
+            ("a", "0x01", 1),
+            ("b", "0x02", 6),
+            ("c", "0x03", 2),
+            ("d", "0x04", 5),
+            ("e", "0x05", 3),
+            ("f", "0x06", 4),
+        ] {
+            m.add_undecoded(contract, topic0, n);
+        }
+        let want = json!({
+            "total": 21,
+            "top": [
+                {"contract": "b", "topic0": "0x02", "logs": 6},
+                {"contract": "d", "topic0": "0x04", "logs": 5},
+                {"contract": "f", "topic0": "0x06", "logs": 4},
+                {"contract": "e", "topic0": "0x05", "logs": 3},
+                {"contract": "c", "topic0": "0x03", "logs": 2},
+            ],
+        });
+        for route in ["ready", "nest"] {
+            let (_, body) = get(router.clone(), &format!("/{name}/{route}")).await;
+            let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+            assert_eq!(json["undecoded"], want, "/{route}: {json}");
+        }
+        let text = crate::metrics::METRICS.render();
+        assert!(text.contains(&format!(
+            "nuthatch_nest_logs_undecoded_total{{nest=\"{name}\",contract=\"b\",topic0=\"0x02\"}} 6"
+        )));
     }
 
     /// #510: a nest whose RPC pool has been dead since before its very first successful poll must
