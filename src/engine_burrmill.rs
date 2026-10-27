@@ -122,7 +122,7 @@ pub(crate) struct BurrmillSession {
     /// its plan gives each, so one with no rows still binds and a count is a number (#1598).
     relations: Mutex<HashMap<String, Vec<(String, &'static str)>>>,
     /// The dataset pool this session draws on, which every session over `dir` shares.
-    pool: Option<burrmill::SharedPool>,
+    pool: Option<Arc<burrmill::SharedPool>>,
 }
 
 impl BurrmillSession {
@@ -260,18 +260,20 @@ impl Drop for BurrmillSession {
 }
 
 // A statement that finds the cached session busy opens another, so the limit has to bound the
-// nest's sessions together (#1792). The pool keeps the size its first session gave it. Under strict
-// isolation each tenant of a dataset has its own (RFC-0073 FR8).
+// nest's sessions together (#1792). The pool keeps the size its first session gave it while any
+// session holds it. Under strict isolation each tenant of a dataset has its own (RFC-0073 FR8).
 type PoolKey = (PathBuf, Option<String>);
-static NEST_POOLS: Mutex<std::collections::BTreeMap<PoolKey, burrmill::SharedPool>> =
+static NEST_POOLS: Mutex<std::collections::BTreeMap<PoolKey, Arc<burrmill::SharedPool>>> =
     Mutex::new(std::collections::BTreeMap::new());
 
-fn nest_pool(dir: &Path, tenant: Option<&str>, memory_bytes: usize) -> burrmill::SharedPool {
-    NEST_POOLS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
+fn nest_pool(dir: &Path, tenant: Option<&str>, memory_bytes: usize) -> Arc<burrmill::SharedPool> {
+    let mut pools = NEST_POOLS.lock().unwrap_or_else(|p| p.into_inner());
+    // A pool no session holds reserves nothing and is rebuilt on demand, so tenant labels that come
+    // and go cannot grow this map past the sessions alive.
+    pools.retain(|_, p| Arc::strong_count(p) > 1 || p.reserved() > 0);
+    pools
         .entry((dir.to_path_buf(), tenant.map(str::to_string)))
-        .or_insert_with(|| burrmill::SharedPool::new(memory_bytes))
+        .or_insert_with(|| Arc::new(burrmill::SharedPool::new(memory_bytes)))
         .clone()
 }
 
@@ -284,6 +286,18 @@ pub(crate) fn pool_tenants(dir: &Path) -> Vec<Option<String>> {
         .keys()
         .filter(|(d, _)| d == dir)
         .map(|(_, t)| t.clone())
+        .collect()
+}
+
+/// What each pool over `dir` holds reserved, by tenant.
+#[cfg(test)]
+pub(crate) fn pool_reservations(dir: &Path) -> Vec<(Option<String>, usize)> {
+    NEST_POOLS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|((d, _), _)| d == dir)
+        .map(|((_, t), p)| (t.clone(), p.reserved()))
         .collect()
 }
 

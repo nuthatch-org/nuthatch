@@ -12207,7 +12207,18 @@ mod tests {
                 first["sealed_bytes"],
                 "{path}, another engine over a copy"
             );
+            // RFC-0073 FR8: a strict tenant's session is metered as the shared one is.
+            let strict = AppState {
+                isolation: Some(Arc::from("acme")),
+                ..a.clone()
+            };
+            assert_eq!(
+                cost_of(&strict, &path).await["sealed_bytes"],
+                first["sealed_bytes"],
+                "{path}, a strict tenant's session"
+            );
         }
+        assert!(crate::analytics::session_opens_in(&a.dir, Some("acme")) >= 1);
     }
 
     /// A remembered answer reads nothing, and a typed route is metered as `/sql` is.

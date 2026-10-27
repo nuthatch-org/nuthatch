@@ -10392,10 +10392,15 @@ mod confinement {
         // At least one each: the cache is process-wide, and another test can evict between queries.
         assert!(opens(Some("a")) >= 1 && opens(Some("b")) >= 1);
         assert_eq!(opens(None), 0);
+        // Held here, since a pool lives only as long as a session on it.
+        let held: Vec<_> = ["a", "b"]
+            .map(|t| engine().open(&f.a, Some(t)).unwrap())
+            .into();
         assert_eq!(
             crate::engine_burrmill::pool_tenants(&f.a),
             vec![Some("a".to_string()), Some("b".to_string())]
         );
+        drop(held);
         query_hot_cold(
             &f.a,
             "SELECT * FROM t__e",
@@ -10406,6 +10411,36 @@ mod confinement {
         )
         .unwrap();
         assert!(opens(None) >= 1, "the shared session is its own");
+    }
+
+    /// A tenant's pool is a limit, not an allocation: once its statement is done it holds nothing,
+    /// and one no session holds is dropped. A hundred tenants of one dataset leave no more pools
+    /// than the session cache keeps sessions, and none of them reserved.
+    #[test]
+    fn a_hundred_tenants_leave_no_pool_reserved_and_no_pool_without_a_session() {
+        let f = two_datasets();
+        for i in 0..100 {
+            let tenant = Some(Arc::from(format!("t{i}")));
+            let out = isolated(tenant.as_ref(), || {
+                query_hot_cold(
+                    &f.a,
+                    "SELECT x, count(*) AS n FROM t__e GROUP BY x ORDER BY x",
+                    guard(),
+                    &HotRows::new(),
+                    10,
+                    &[],
+                )
+            })
+            .unwrap();
+            assert_eq!(out.rows.len(), 1);
+        }
+        let pools = crate::engine_burrmill::pool_reservations(&f.a);
+        assert!(
+            pools.len() <= SESSION_CACHE_CAPACITY + 1,
+            "{} pools for one dataset",
+            pools.len()
+        );
+        assert!(pools.iter().all(|(_, held)| *held == 0), "{pools:?}");
     }
 
     #[test]
