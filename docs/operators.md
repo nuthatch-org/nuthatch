@@ -276,8 +276,10 @@ the same `as_of`, `sealed_through` and `nid`.
   not fit is read without keeping its rows; one whose bytes on the wire run past twice what its
   cursor has left (escaping can inflate a stored row that much) is not read to the end at all, so no
   single value in it is ever held, and the follower reconnects asking the writer to leave that
-  dataset out until `max_rss_mb` changes or the follower restarts. A mount whose deltas grow it past
-  the budget is let go too. Each way its routes and its `/ready` answer `503` with
+  dataset out until `max_rss_mb` changes or the follower restarts. A delta is held to what its
+  dataset has left the same way, on the wire and then by what it would hold at its peak, worked out
+  before any of it is applied; one that would not fit is not applied and its dataset is let go and
+  left out likewise. Each way its routes and its `/ready` answer `503` with
   `"reason": "over_budget"` and the figures, the root `/ready` is `503`, and its co-mounts keep
   serving. The writer still serves it. Each mount's SQL surface, tenant share and `[mounts.limits]` come
   over the feed, so it admits and guards a query as the writer would, with its own per-chain gates
