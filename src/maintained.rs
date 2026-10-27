@@ -598,7 +598,7 @@ pub(crate) struct Job {
 /// The builder of one cursor: one build at a time, each holding one of the cursor's analytical
 /// permits while it runs, so a build is admitted exactly as a query is (RFC-0047 C4).
 struct Cursor {
-    gate: Arc<tokio::sync::Semaphore>,
+    gate: crate::serve::SqlGate,
     state: Mutex<CursorState>,
 }
 
@@ -633,10 +633,10 @@ fn cursors() -> &'static Mutex<Vec<Arc<Cursor>>> {
 
 /// Give `dir`'s builds to the builder of the cursor whose analytical gate is `gate`. Without this a
 /// held nest still serves copies it has, and builds none: what a process with no cursor does.
-pub fn attach(dir: &Path, gate: Arc<tokio::sync::Semaphore>) {
+pub fn attach(dir: &Path, gate: crate::serve::SqlGate) {
     let cursor = {
         let mut all = cursors().lock().unwrap_or_else(|p| p.into_inner());
-        match all.iter().find(|c| Arc::ptr_eq(&c.gate, &gate)) {
+        match all.iter().find(|c| Arc::ptr_eq(&*c.gate, &*gate)) {
             Some(c) => c.clone(),
             None => {
                 let c = Arc::new(Cursor {
@@ -753,12 +753,13 @@ fn drain(cursor: Arc<Cursor>) {
             if superseded() {
                 break None;
             }
-            match cursor.gate.clone().try_acquire_owned() {
-                Ok(p) => break Some(p),
-                Err(tokio::sync::TryAcquireError::Closed) => break None,
-                Err(tokio::sync::TryAcquireError::NoPermits) => {
-                    std::thread::sleep(Duration::from_millis(20))
-                }
+            if cursor.gate.is_closed() {
+                break None;
+            }
+            // Charged to a tenant mounting this dataset, so a build never takes another's reservation.
+            match cursor.gate.try_admit_for(&job.dir) {
+                Some(p) => break Some(p),
+                None => std::thread::sleep(Duration::from_millis(20)),
             }
         };
         if permit.is_some() && !superseded() {

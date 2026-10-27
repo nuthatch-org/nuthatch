@@ -9479,9 +9479,9 @@ FROM bet GROUP BY player;
     const BOTH: &str = "[[view]]\nname = \"bet\"\n\n[[view]]\nname = \"player_total\"\n";
 
     /// Load the declaration and give the nest a builder over a gate of `permits`.
-    fn held(dir: &Path, permits: usize) -> Arc<tokio::sync::Semaphore> {
+    fn held(dir: &Path, permits: usize) -> crate::serve::SqlGate {
         crate::maintained::load(dir).unwrap();
-        let gate = Arc::new(tokio::sync::Semaphore::new(permits));
+        let gate = crate::serve::SqlGate::new(permits);
         crate::maintained::attach(dir, gate.clone());
         gate
     }
@@ -9752,7 +9752,7 @@ FROM bet GROUP BY player;
     fn a_build_waits_for_a_permit() {
         let dir = nest(Some("[[view]]\nname = \"bet\"\n"));
         let gate = held(dir.path(), 1);
-        let held_permit = gate.clone().try_acquire_owned().unwrap();
+        let held_permit = Arc::clone(&gate).try_acquire_owned().unwrap();
         let hot = tip(&[placed(4, "carol", 13, 20)]);
         ask(dir.path(), SHAPES[0], &hot, 10);
         std::thread::sleep(Duration::from_millis(300));
@@ -9793,7 +9793,7 @@ FROM bet GROUP BY player;
     fn a_nest_that_declares_nothing_is_unchanged() {
         let dir = nest(None);
         crate::maintained::load(dir.path()).unwrap();
-        crate::maintained::attach(dir.path(), Arc::new(tokio::sync::Semaphore::new(2)));
+        crate::maintained::attach(dir.path(), crate::serve::SqlGate::new(2));
         let hot = tip(&[placed(4, "carol", 13, 20)]);
         for sql in SHAPES {
             ask(dir.path(), sql, &hot, 10);
@@ -9929,7 +9929,7 @@ FROM bet GROUP BY player;
     fn a_queued_build_of_old_inputs_is_never_run() {
         let dir = nest(Some("[[view]]\nname = \"bet\"\n"));
         let gate = held(dir.path(), 1);
-        let busy = gate.clone().try_acquire_owned().unwrap();
+        let busy = Arc::clone(&gate).try_acquire_owned().unwrap();
         let old = tip(&[placed(4, "carol", 13, 20)]);
         let new = tip(&[placed(4, "carol", 13, 20), resolved(4, 26, 21)]);
         let inputs = fed(dir.path(), old.clone(), 10);
@@ -9958,7 +9958,7 @@ FROM bet GROUP BY player;
     fn a_request_never_queues_the_old_inputs_it_read() {
         let dir = nest(Some("[[view]]\nname = \"bet\"\n"));
         let gate = held(dir.path(), 1);
-        let busy = gate.clone().try_acquire_owned().unwrap();
+        let busy = Arc::clone(&gate).try_acquire_owned().unwrap();
         let old = tip(&[placed(4, "carol", 13, 20)]);
         let new = tip(&[placed(4, "carol", 13, 20), resolved(4, 26, 21)]);
         fed(dir.path(), new.clone(), 10);
@@ -9995,7 +9995,7 @@ FROM bet GROUP BY player;
         );
         assert_eq!(builds, (1, 1));
 
-        let busy = gate.clone().try_acquire_owned().unwrap();
+        let busy = Arc::clone(&gate).try_acquire_owned().unwrap();
         *inputs.lock().unwrap() = (passing, 10);
         crate::maintained::changed(dir.path());
         wait_queued(dir.path(), 2);

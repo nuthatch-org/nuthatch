@@ -1034,6 +1034,7 @@ job:
 | response bytes in flight | 256 MiB per process | `/sql` and `/q` bodies held while slow readers drain them, shared by every nest in the process. Past it a request is refused with `503` and counts as `busy` |
 | max concurrent queries | 2 | the real DoS multiplier: a semaphore. A request over the limit waits up to **250 ms** for a permit and only then returns `503`, so a short burst smooths instead of bouncing (#1319); the wait is charged against the statement timeout, so queuing cannot extend a request's total deadline. The permit count still decides how many queries run at once. `NUTHATCH_SQL_MAX_CONCURRENCY` still overrides it, ceiling 16, and is not an unconstrained config key |
 | max queued queries | 256 per nest | the bound that makes the wait above safe: it caps how *many* requests may be parked waiting, where the 250 ms caps how *long* each one waits. Without it a burst parks arrival-rate × 250 ms requests before any time out. Past the cap a request is refused immediately, as every over-limit request was before the wait existed. A parked request holds only its query string (≤ 16 KiB), so the worst case is roughly 4 MB per nest |
+| tenant share | one permit per tenant on each gate, and half the response bytes split by weight, reserved | in a runtime, each tenant label's part of its chain's gate and of the response bytes (RFC-0073 FR2). A tenant borrows past its reservation only while every other tenant's stays free, so one tenant's burst cannot hold another's query past the 250 ms wait. Past its share a tenant is refused `429` with `"reason": "tenant_share"`; a runtime with one tenant, and a lone nest, are only ever told `busy`. Weights and caps are `[tenants.<tenant>]` in `mounts.toml`, set live by `PUT /_admin/tenants/<tenant>`; see [admin-api.md](admin-api.md#tenant-shares) |
 | engine memory / threads | 512 MB / 2 (threads ceiling 16) | `analytics.memory_limit` / `analytics.threads`. Memory times the pools (the smaller of the permit count and the cursor's datasets) is refused at startup if it plus `ingestion_reservation` exceeds 2 GiB. Threads share the permit ceiling of 16 and are refused above it |
 | max query length | 16 KiB | rejects absurd query strings before the planner |
 | max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially. The same holds past **64 MiB** of stored hot-row JSON, whichever comes first |
@@ -1066,8 +1067,8 @@ and network table functions are refused, and `;`-stacking a second statement is 
 Rejections surface as a `4xx` or `503` and count in the backward-compatible aggregate
 `nuthatch_sql_rejections_total`, and in `nuthatch_sql_rejections_total{reason=…}`. The fixed
 `reason` values distinguish `busy`, `too_large`, `invalid`, `bounded`, declared-query
-`admission`, `timeout`, and `out_of_memory` (the engine ran out of its memory budget, still a `400`
-to the caller); they are the useful series for separating saturation from a caller error. A declared
+`admission`, `timeout`, `out_of_memory` (the engine ran out of its memory budget, still a `400`
+to the caller), and `tenant_share` (a runtime tenant at its own share, answered `429`); they are the useful series for separating saturation from a caller error. A declared
 query refused by its scan bound answers `422` and also counts in
 `nuthatch_named_scan_refusals_total`; the bounds of those admitted are the
 `nuthatch_named_scan_bytes` histogram.

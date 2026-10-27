@@ -313,7 +313,7 @@ async fn nests_on_one_cursor_share_one_gate() {
         before.iter().all(|&n| n == before[0]),
         "handles on one cursor disagree about the permit count before anything is taken: {before:?}"
     );
-    let held = gates[0].clone().try_acquire_owned().unwrap_or_else(|_| {
+    let held = std::sync::Arc::clone(&gates[0]).try_acquire_owned().unwrap_or_else(|_| {
         panic!(
             "no permit was free on a 4-permit cursor ({before:?}), so the observable below cannot be \
              read. This run proves nothing rather than passing."

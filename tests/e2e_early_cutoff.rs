@@ -424,6 +424,7 @@ async fn bring_up_live(
         suspended: Default::default(),
         failed: Default::default(),
         joining: Default::default(),
+        tenant_shares: Default::default(),
         mount_ctx: runtime::MountContext {
             dir: root.to_path_buf(),
             // The whole table, including the record for the nest not yet mounted - which is exactly

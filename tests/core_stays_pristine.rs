@@ -196,11 +196,18 @@ fn the_graph_lane_reads_through_the_same_sql_path() {
     let shared = src.split_once("async fn run_sql_query_at(").unwrap().1;
     let shared = &shared[..shared.find("\n}\n").unwrap()];
     assert!(
-        shared.contains("s.sql_gate"),
+        shared.contains("admit(&s)"),
         "both lanes must retain SQL admission"
     );
+    // Admission is one helper since RFC-0073 FR2 put tenant shares in front of the gate.
+    let admission = src.split_once("async fn gate_admit(").unwrap().1;
+    let admission = &admission[..admission.find("\n}\n").unwrap()];
     assert!(
-        shared.contains("SQL_ADMISSION_WAIT"),
+        admission.contains("s.sql_gate"),
+        "admission must go through the cursor's gate"
+    );
+    assert!(
+        admission.contains("SQL_ADMISSION_WAIT"),
         "admission must remain bounded"
     );
     assert!(

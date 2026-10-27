@@ -798,7 +798,7 @@ exactly like `views/`.
 ### Tenants (RFC-0032)
 
 A mount belongs to a **tenant**: an opaque string nuthatch refcounts and knows nothing else about. No
-authz, no quotas, no metering - identity is the gateway's job. Omit it and the mount belongs to
+authz, no metering - identity is the gateway's job. Omit it and the mount belongs to
 `[runtime] default_tenant`, which is `default` unless set.
 
 ```toml
@@ -824,3 +824,18 @@ other tenant at `/default/usdc/…` (#1933). `GET /nests` reports each mount's `
 
 Both `tenant` and `alias` are path segments, so both are restricted to letters, digits, `_` and `-`.
 Opaque means nuthatch does not interpret it, not that it may contain `..`.
+
+**A tenant's share of query capacity (RFC-0073 FR2).** Each chain's SQL gate and the process's
+response bytes in flight are divided by tenant label. Every tenant with a mount on a gate holds one
+permit in reserve, and half the response-bytes budget is reserved by weight, so one tenant's burst
+cannot hold another's query past the 250 ms admission wait. Past its own share a tenant is answered
+`429` with `"reason": "tenant_share"`; a full gate is still `503` `busy`. A runtime with one tenant
+behaves as before. Shares live under `[tenants.<tenant>]` and are set live, with no restart, by
+`PUT /_admin/tenants/<tenant>`, which writes this section; `{}` restores the default and removes it.
+
+```toml
+[tenants.acme]
+weight = 2               # optional, 1 to 1000 (default 1): orders the queue when tenants wait
+max_permits = 1          # optional: the most SQL permits it holds at once on any one chain's gate
+max_response_mib = 32    # optional: the most response bytes it holds in flight, process-wide
+```
