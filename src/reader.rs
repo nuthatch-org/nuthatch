@@ -106,9 +106,67 @@ struct Link {
     version: Option<String>,
 }
 
+/// One dataset as a follower holds it: the hot copy, and what it derives from the stored rows.
+#[derive(Clone)]
+struct Data {
+    store: Arc<MemStore>,
+    /// Why there is none, when it could not be built; those routes are then the writer's.
+    derived: std::result::Result<Arc<crate::indexer::FollowerDerived>, Refused>,
+}
+
+/// Derived state that could not be built, with its own empty entity list so a swap can tell it apart.
+#[derive(Clone)]
+struct Refused {
+    why: String,
+    entities: Arc<Vec<crate::entity_view::EntityView>>,
+}
+
+/// Build `dir`'s derived state over `store`, or say why not.
+fn derive(
+    dir: &Path,
+    store: &MemStore,
+) -> std::result::Result<Arc<crate::indexer::FollowerDerived>, Refused> {
+    let built = crate::config::Config::load(dir).and_then(|mut config| {
+        config.read_only_role = true;
+        crate::indexer::FollowerDerived::build(dir, &config, store)
+    });
+    built.map(Arc::new).map_err(|e| {
+        tracing::error!("{}: derived state not built: {e:#}", dir.display());
+        Refused {
+            why: format!("its derived state could not be built: {e:#}"),
+            entities: Arc::default(),
+        }
+    })
+}
+
+/// Point `state` at `data`'s derived views, or at inert ones when it has none.
+fn with_derived(state: &mut AppState, data: &Data) {
+    match &data.derived {
+        Ok(d) => {
+            state.balances = d.balances.clone();
+            state.exposure = d.exposure.clone();
+            state.velocity = d.velocity.clone();
+            state.entities = d.entities.clone();
+        }
+        Err(r) => {
+            state.balances = crate::views::BalanceView::inert();
+            state.entities = r.entities.clone();
+        }
+    }
+}
+
+impl Data {
+    fn entities(&self) -> Arc<Vec<crate::entity_view::EntityView>> {
+        match &self.derived {
+            Ok(d) => d.entities.clone(),
+            Err(r) => r.entities.clone(),
+        }
+    }
+}
+
 struct Inner {
     routes: BTreeMap<String, Route>,
-    datasets: HashMap<String, Arc<MemStore>>,
+    datasets: HashMap<String, Data>,
     /// The writer's `(epoch, generation)` per dataset at its last heartbeat.
     positions: HashMap<String, (u64, u64)>,
     link: Link,
@@ -364,7 +422,7 @@ impl Follower {
             .into_iter()
             .filter_map(|d| {
                 let held = inner.datasets.get(d)?;
-                Some(held.bytes() + inner.estimates.get(d).copied().unwrap_or(0))
+                Some(held.store.bytes() + inner.estimates.get(d).copied().unwrap_or(0))
             })
             .sum();
         let own = inner.estimates.get(dataset).copied().unwrap_or(0);
@@ -473,14 +531,16 @@ impl Follower {
                     return Ok(());
                 }
                 let dir = self.root.join(&dataset);
-                let store = tokio::task::spawn_blocking(move || {
-                    Arc::new(MemStore::from_snapshot(&dir, snapshot))
+                let data = tokio::task::spawn_blocking(move || {
+                    let store = Arc::new(MemStore::from_snapshot(&dir, snapshot));
+                    let derived = derive(&dir, store.as_ref());
+                    Data { store, derived }
                 })
                 .await
                 .context("building a snapshot's store")?;
                 let lifted = {
                     let mut inner = self.lock();
-                    inner.datasets.insert(dataset.clone(), store);
+                    inner.datasets.insert(dataset.clone(), data);
                     inner.over_budget.remove(&dataset).is_some()
                 };
                 self.realise();
@@ -490,7 +550,7 @@ impl Follower {
             }
             Line::Delta { dataset, delta } => {
                 let dataset = dataset.0;
-                let (store, refused) = {
+                let (data, refused) = {
                     let inner = self.lock();
                     (
                         inner.datasets.get(&dataset).cloned(),
@@ -500,13 +560,13 @@ impl Follower {
                 if refused {
                     return Ok(());
                 }
-                let store = match (fresh.contains(&dataset), store) {
-                    (true, Some(store)) => store,
+                let data = match (fresh.contains(&dataset), data) {
+                    (true, Some(data)) => data,
                     _ => bail!("{dataset}: a delta before its snapshot; resnapshotting"),
                 };
                 // Charged before it is applied, at its peak, so the copy never holds more than its
                 // budget even part-way through a delta.
-                let peak = store.peak_with(&delta);
+                let peak = data.store.peak_with(&delta);
                 if let Some(cap) = self.cap_for(&dataset).filter(|cap| peak > *cap) {
                     let max = {
                         let mut inner = self.lock();
@@ -523,9 +583,26 @@ impl Follower {
                     return Ok(());
                 }
                 // The old state keeps serving while a new connection takes fresh snapshots.
-                store
+                let changes = data
+                    .store
                     .apply(&delta)
                     .with_context(|| format!("{dataset}: resnapshotting"))?;
+                if changes.sealed_unseen {
+                    // Rows sealed straight to segments never crossed the feed: derive again.
+                    let dir = self.root.join(&dataset);
+                    let store = data.store.clone();
+                    let derived = tokio::task::spawn_blocking(move || derive(&dir, store.as_ref()))
+                        .await
+                        .context("rederiving after a seal")?;
+                    if let Some(d) = self.lock().datasets.get_mut(&dataset) {
+                        d.derived = derived;
+                    }
+                    self.realise();
+                } else if let (Ok(derived), Some(through)) = (&data.derived, changes.through) {
+                    derived
+                        .apply(&changes.removed, &changes.added, through)
+                        .with_context(|| format!("{dataset}: feeding its derived state"))?;
+                }
             }
             Line::Heartbeat { positions } => {
                 self.lock().positions = positions.into_iter().collect();
@@ -543,24 +620,28 @@ impl Follower {
                 routes, datasets, ..
             } = &mut *inner;
             for (route, r) in routes.iter_mut() {
-                let Some(store) = datasets.get(&r.spec.dataset).cloned() else {
+                let Some(data) = datasets.get(&r.spec.dataset).cloned() else {
                     continue;
                 };
-                let store: Arc<dyn HotStore> = store;
                 match &r.served {
                     Some(Ok(shared)) => {
                         let current = shared.current();
-                        if !Arc::ptr_eq(&current.store, &store) {
-                            shared.swap(AppState {
+                        let store: Arc<dyn HotStore> = data.store.clone();
+                        if !Arc::ptr_eq(&current.store, &store)
+                            || !Arc::ptr_eq(&current.entities, &data.entities())
+                        {
+                            let mut next = AppState {
                                 store,
                                 ..(*current).clone()
-                            });
+                            };
+                            with_derived(&mut next, &data);
+                            shared.swap(next);
                         }
                     }
                     Some(Err(_)) => {}
                     None => {
                         r.served = Some(
-                            self.build(route, &r.spec, store)
+                            self.build(route, &r.spec, &data)
                                 .map(SharedNest::new)
                                 .map_err(|e| format!("{e:#}")),
                         );
@@ -588,7 +669,8 @@ impl Follower {
 
     /// A route's serving state over `store`: what `build_nest` assembles for a nest it does not
     /// index, with no circuit, no ingest and no admin surface.
-    fn build(&self, route: &str, r: &Spec, store: Arc<dyn HotStore>) -> Result<AppState> {
+    fn build(&self, route: &str, r: &Spec, data: &Data) -> Result<AppState> {
+        let store: Arc<dyn HotStore> = data.store.clone();
         let dir = self.root.join(&r.dataset);
         let mut config = crate::config::Config::load(&dir)
             .with_context(|| format!("no nest at '{}'", dir.display()))?;
@@ -626,7 +708,7 @@ impl Follower {
             ))
         });
         let process = crate::limits::Limits::process();
-        Ok(AppState {
+        let mut state = AppState {
             freshness: config.freshness,
             store,
             address: config.contracts.first().map(|c| c.address.clone()),
@@ -659,7 +741,9 @@ impl Follower {
             admin_enabled: false,
             admin_token: None,
             nest_info: Arc::new(nest_info),
-        })
+        };
+        with_derived(&mut state, data);
+        Ok(state)
     }
 
     fn recompose(self: &Arc<Self>) {
@@ -724,9 +808,15 @@ impl Follower {
         self.live.swap(app);
     }
 
+    fn data(&self, route: &str) -> Option<Data> {
+        let inner = self.lock();
+        let dataset = &inner.routes.get(route)?.spec.dataset;
+        inner.datasets.get(dataset).cloned()
+    }
+
     /// How far this route's dataset trails the writer, as `/ready` reports it.
     fn lag(&self, inner: &Inner, dataset: &str) -> serde_json::Value {
-        let applied = inner.datasets.get(dataset).map(|s| s.applied());
+        let applied = inner.datasets.get(dataset).map(|d| d.store.applied());
         let writer = inner.positions.get(dataset).copied();
         let lag = match (applied, writer) {
             (Some((ae, ag)), Some((we, wg))) if ae == we => Some(wg.saturating_sub(ag)),
@@ -759,7 +849,7 @@ impl Follower {
             )
                 .into_response();
         }
-        let Some(store) = inner.datasets.get(&r.spec.dataset) else {
+        let Some(store) = inner.datasets.get(&r.spec.dataset).map(|d| &d.store) else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"ready": false, "nest": route, "reason": "catching_up"})),
@@ -841,7 +931,7 @@ fn refusing(reason: &'static str, error: String) -> axum::Router {
     })
 }
 
-/// Routes answered from state the writer derives in memory, which a follower does not have.
+/// Routes answered from derived state, which a follower serves only once it has built its own.
 fn writer_only(path: &str) -> bool {
     matches!(path, "/balances" | "/flags" | "/derived")
         || ["/balance/", "/exposure/", "/derived/"]
@@ -849,11 +939,13 @@ fn writer_only(path: &str) -> bool {
             .any(|p| path.starts_with(p))
 }
 
-fn writer_only_response(what: &str) -> Response {
+const OFFCHAIN: &str = "it reads offchain tables, which a follower does not maintain";
+
+fn writer_only_response(what: &str, why: &str) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({
-            "error": format!("{what} is served by the writer only: a follower holds no derived state"),
+            "error": format!("{what} is served by the writer only on this nest: {why}"),
             "reason": "writer_only",
         })),
     )
@@ -895,21 +987,39 @@ fn names_entity(text: &str, entities: &BTreeSet<String>) -> bool {
 fn guarded(
     follower: Arc<Follower>,
     route: String,
-    entities: Arc<BTreeSet<String>>,
+    declared: Arc<BTreeSet<String>>,
     router: axum::Router,
 ) -> axum::Router {
     router.layer(axum::middleware::from_fn(
         move |req: Request, next: Next| {
             let follower = follower.clone();
             let route = route.clone();
-            let entities = entities.clone();
+            let declared = declared.clone();
             async move {
                 let path = req.uri().path().to_string();
                 if path == "/ready" {
                     return follower.route_ready(&route);
                 }
-                if writer_only(&path) {
-                    return writer_only_response(&path);
+                // What this route's dataset cannot derive: everything, or its offchain entities.
+                let (refusal, entities) = match follower.data(&route).map(|d| d.derived) {
+                    Some(Ok(d)) => (
+                        None,
+                        d.offchain.iter().map(|e| e.to_ascii_lowercase()).collect(),
+                    ),
+                    Some(Err(r)) => (Some(r.why), (*declared).clone()),
+                    None => (None, BTreeSet::new()),
+                };
+                if let Some(why) = &refusal {
+                    if writer_only(&path) {
+                        return writer_only_response(&path, why);
+                    }
+                }
+                if path
+                    .strip_prefix("/derived/")
+                    .and_then(|rest| rest.split('/').next())
+                    .is_some_and(|e| entities.contains(&e.to_ascii_lowercase()))
+                {
+                    return writer_only_response(&path, OFFCHAIN);
                 }
                 let reads_sql = matches!(path.as_str(), "/sql" | "/explain" | "/graphql")
                     || path.starts_with("/q/")
@@ -917,9 +1027,10 @@ fn guarded(
                 if entities.is_empty() || !reads_sql {
                     return next.run(req).await;
                 }
+                let why = refusal.as_deref().unwrap_or(OFFCHAIN);
                 // A named query's text is the nest's, not the request's, so it is not read here.
                 if path.starts_with("/q/") {
-                    return writer_only_response("a named query on a nest with entities");
+                    return writer_only_response("a named query on this nest", why);
                 }
                 let (parts, body) = req.into_parts();
                 let Ok(bytes) = axum::body::to_bytes(body, BODY_LIMIT).await else {
@@ -931,7 +1042,7 @@ fn guarded(
                     String::from_utf8_lossy(&bytes)
                 );
                 if names_entity(&text, &entities) {
-                    return writer_only_response("SQL naming an entity");
+                    return writer_only_response("SQL naming this entity", why);
                 }
                 next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
                     .await

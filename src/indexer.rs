@@ -9173,6 +9173,146 @@ fn velocity_retraction_batch(
         .collect()
 }
 
+/// A follower's derived state (RFC-0073 FR1): the views and entities a writer keeps in memory,
+/// rebuilt the way a writer's restart rebuilds them and then fed the rows each feed delta stores or
+/// rolls back. Every one is a function of the stored rows, through the same conversion and batches
+/// ingest uses, so at any generation it holds what the writer's would after a restart there.
+pub struct FollowerDerived {
+    registry: Arc<DecodeRegistry>,
+    labels: Arc<LabelSet>,
+    velocity_cfg: Option<(i128, u64)>,
+    pub balances: BalanceView,
+    pub exposure: ExposureView,
+    pub velocity: VelocityView,
+    pub entities: Arc<Vec<EntityView>>,
+    /// Entities that read offchain tables, which a follower does not maintain; named when present.
+    pub offchain: Vec<String>,
+}
+
+impl FollowerDerived {
+    /// Build from `store` (a follower's copy) and `dir`'s sealed segments, as `build_nest` does at a
+    /// warm start. Blocking: it folds the sealed history.
+    pub fn build(
+        dir: &Path,
+        config: &Config,
+        store: &dyn crate::store::HotStore,
+    ) -> Result<FollowerDerived> {
+        let registry = Arc::new(crate::registry::from_nest(dir, config)?);
+        let labels = Arc::new(labels::load(dir));
+        let velocity_cfg = config.flags.velocity();
+        let balances = BalanceView::start()?;
+        let exposure = ExposureView::start(!labels.is_empty())?;
+        let velocity = VelocityView::start(velocity_cfg.is_some())?;
+        let through = store
+            .get_meta(LAST_BLOCK_KEY)?
+            .and_then(|v| v.parse::<u64>().ok());
+        let mut entities = start_entities(dir, &registry, through.is_some())?;
+        let offchain: Vec<String> = entities
+            .iter()
+            .filter(|e| !e.offchain_tables().is_empty())
+            .map(|e| e.name().to_string())
+            .collect();
+        if !offchain.is_empty() {
+            entities.clear();
+        }
+        if let Some(through) = through {
+            if let Err(e) = seed_entities(dir, store, &registry, &mut entities, through) {
+                tracing::error!("entity seeding failed, entities stay unavailable: {e:#}");
+            }
+            rebuild_views(
+                dir,
+                store,
+                &registry,
+                &DerivedViews {
+                    labels: &labels,
+                    balances: &balances,
+                    exposure: &exposure,
+                    velocity: &velocity,
+                    velocity_cfg,
+                },
+            )?;
+        }
+        let built = FollowerDerived {
+            registry,
+            labels,
+            velocity_cfg,
+            balances,
+            exposure,
+            velocity,
+            entities: Arc::new(entities),
+            offchain,
+        };
+        built.flush();
+        Ok(built)
+    }
+
+    /// Feed one applied window or rollback, the only commits ingest feeds its views from: `removed`
+    /// the stored rows it dropped or replaced, `added` the rows it stored, `through` its `last_block`.
+    pub fn apply(&self, removed: &[String], added: &[String], through: u64) -> Result<()> {
+        let schema = self.registry.schema();
+        let removed = decode_stored_rows(&schema, removed)?;
+        let added = decode_stored_rows(&schema, added)?;
+        if !removed.is_empty() {
+            for entity in self.entities.iter() {
+                entity.apply_window(&removed, -1, through)?;
+            }
+            self.balances.apply(retraction_batch(&removed));
+            self.balances
+                .retract_over_i128(removed.iter().filter(|r| oversized_transfer(r)).count() as u64);
+            self.exposure
+                .apply(exposure_retraction_batch(&removed, &self.labels));
+            if let Some((_, w)) = self.velocity_cfg {
+                self.velocity.apply(velocity_retraction_batch(&removed, w));
+            }
+        }
+        let transfers: Vec<_> = added
+            .iter()
+            .filter_map(|r| view_transfer(r).map(|t| (r.block_number, t)))
+            .collect();
+        if !transfers.is_empty() {
+            self.balances.apply(
+                transfers
+                    .iter()
+                    .flat_map(|(_, (f, t, v))| views::transfer_deltas(f, t, *v, 1))
+                    .collect(),
+            );
+            self.exposure.apply(
+                transfers
+                    .iter()
+                    .flat_map(|(_, (f, t, v))| exposure::exposure_deltas(f, t, *v, 1, &self.labels))
+                    .collect(),
+            );
+            if let Some((_, w)) = self.velocity_cfg {
+                self.velocity.apply(
+                    transfers
+                        .iter()
+                        .flat_map(|(b, (f, _, v))| velocity::velocity_deltas(f, *b, *v, 1, w))
+                        .collect(),
+                );
+            }
+        }
+        self.balances
+            .note_over_i128(added.iter().filter(|r| oversized_transfer(r)).count() as u64);
+        // A rollback alone retracts and stops; a window, even an empty one, advances the watermark.
+        if removed.is_empty() || !added.is_empty() {
+            for entity in self.entities.iter() {
+                entity.apply_window(&added, 1, through)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Wait until everything fed so far is folded and published.
+    pub fn flush(&self) {
+        self.balances.flush();
+        self.exposure.flush();
+        self.velocity.flush();
+        for e in self.entities.iter() {
+            e.flush();
+        }
+    }
+}
+
 /// The derived IVM views a restart has to reconstruct, and the two things that decide whether each is
 /// fed at all. They travel together because they are always rebuilt together, off one pass over the
 /// same facts - passed singly they made `rebuild_views` an eight-argument function.

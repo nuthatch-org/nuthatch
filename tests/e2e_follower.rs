@@ -7,6 +7,8 @@
 //! in one process the writer must go on reading its own.
 
 mod common;
+#[path = "common/entity_fixture.rs"]
+mod entity_fixture;
 
 use common::tape::*;
 use nuthatch::{feed_http, health::RuntimeHealth, indexer, reader::Follower, serve};
@@ -74,6 +76,17 @@ impl Writer {
                         s.isolation = Some(Arc::from(route.as_str()));
                     }
                 }
+                // Named queries the mount serves, kept outside the dataset so its NID is untouched.
+                if let Ok(raw) = std::fs::read_to_string(root.join("named.json")) {
+                    let queries: Vec<nuthatch::allowlist::NamedQuery> =
+                        serde_json::from_str(&raw).unwrap();
+                    for (_, s) in &mut cursor.states {
+                        s.surface = Arc::new(nuthatch::allowlist::Surface {
+                            access: nuthatch::allowlist::SqlAccess::Open,
+                            queries: queries.clone(),
+                        });
+                    }
+                }
                 let states = cursor.states.clone();
                 let store = states[0].1.store.clone();
                 let roster: feed_http::Roster = Arc::new(move || {
@@ -120,7 +133,10 @@ impl Writer {
                 == Some(block)
         })
         .await;
-        assert!(reached, "the writer indexes to {block}");
+        if !reached {
+            let (_, ready) = get(&format!("http://{}", self.addr), "/ready").await;
+            panic!("the writer never indexed to {block}: {ready}");
+        }
     }
 
     fn generation(&self) -> u64 {
@@ -169,6 +185,7 @@ fn answer(v: &serde_json::Value) -> serde_json::Value {
         "sealed_through": p["sealed_through"],
         "nid": p["nid"],
         "registry_hash": p["registry_hash"],
+        "entities": p["entities"],
     })
 }
 
@@ -191,6 +208,36 @@ async fn agree(writer: &Writer, follower: &str, q: &str, why: &str) -> serde_jso
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("{why}: the follower never agreed with the writer: {last:?}");
+}
+
+/// Wait until `follower` has applied the writer's generation and both answer GET `path` with the
+/// same status and body.
+async fn agree_on(writer: &Writer, follower: &str, path: &str, why: &str) -> serde_json::Value {
+    let base = format!("http://{}", writer.addr);
+    let path = format!("/{ROUTE}{path}");
+    let mut last = (serde_json::Value::Null, serde_json::Value::Null);
+    for _ in 0..600 {
+        let (_, ready) = get(follower, &format!("/{ROUTE}/ready")).await;
+        let applied = ready["follower"]["applied_generation"].as_u64();
+        if applied == Some(writer.generation()) {
+            // Whether the memo answered is the process's business, not the answer's.
+            let uncached = |(s, mut v): (u16, serde_json::Value)| {
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("cached");
+                }
+                (s, v)
+            };
+            let w = uncached(get(&base, &path).await);
+            let f = uncached(get(follower, &path).await);
+            assert_eq!(w.0, 200, "{why}: the writer on {path}: {}", w.1);
+            if w == f && writer.generation() == applied.unwrap() {
+                return f.1;
+            }
+            last = (w.1, f.1);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{why}: {path} never agreed: {last:?}");
 }
 
 async fn bind_follower(root: &Path, writer: &Writer) -> (Arc<Follower>, String) {
@@ -385,8 +432,7 @@ async fn a_route_is_catching_up_until_its_snapshot_and_derived_state_is_the_writ
     assert!(caught, "the route is served once its snapshot is applied");
     for path in ["/balances", "/flags", "/derived"] {
         let (status, body) = get(&fbase, &format!("/{ROUTE}{path}")).await;
-        assert_eq!(status, 503, "{path}");
-        assert_eq!(body["reason"], "writer_only", "{path}");
+        assert_eq!(status, 200, "{path}: {body}");
     }
     let (status, root_ready) = get(&fbase, "/ready").await;
     assert_eq!(status, 200, "{root_ready}");
@@ -691,4 +737,142 @@ async fn a_delta_over_the_budget_is_refused_before_it_is_applied() {
         co_mount_follows(&writer, &tape, &fbase, 2).await;
         writer.stop(&root);
     }
+}
+
+const ENTITY_SQL: &str = "SELECT * FROM received ORDER BY 1";
+
+/// Every route a follower answers from derived state, compared with the writer's answer.
+async fn derived_agree(writer: &Writer, follower: &str, why: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for path in [
+        "/balances".to_string(),
+        format!("/balance/{}", account(2)),
+        format!("/exposure/{}", account(1)),
+        "/flags".to_string(),
+        "/flags?kind=velocity".to_string(),
+        "/derived".to_string(),
+        "/derived/received".to_string(),
+        "/q/top_received".to_string(),
+    ] {
+        out.push(agree_on(writer, follower, &path, &format!("{why}, {path}")).await);
+    }
+    out.push(agree(writer, follower, ENTITY_SQL, &format!("{why}, entity SQL")).await);
+    out
+}
+
+/// Balances, exposure, velocity and threshold flags, an authored entity by `/derived`, by `/sql` and
+/// through a named query: the follower answers each as the writer does, through a reorg, a seal and
+/// the writer restarting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_derives_what_the_writer_derives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("runtime");
+    let dir = root.join("data").join(ROUTE);
+    std::fs::create_dir_all(&dir).unwrap();
+    scaffold_nest(&dir, ROUTE, USDC);
+    let toml = dir.join("nuthatch.toml");
+    let cfg = std::fs::read_to_string(&toml).unwrap();
+    std::fs::write(
+        &toml,
+        format!(
+            "{cfg}\n[flags]\nthreshold = \"150\"\nvelocity_amount = \"300\"\nvelocity_window = 100\n"
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("labels")).unwrap();
+    std::fs::write(
+        dir.join("labels").join("fixture.json"),
+        serde_json::json!([{"address": account(2), "label": "mixer"}]).to_string(),
+    )
+    .unwrap();
+    entity_fixture::write(
+        &dir,
+        "[[entities]]\nname = \"received\"\nquery = \"SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to\"\nkey = [\"to\"]\nmax_rows = 50000\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("named.json"),
+        serde_json::json!([{"name": "top_received", "sql": ENTITY_SQL}]).to_string(),
+    )
+    .unwrap();
+    let via: PathBuf = tmp.path().join("follower-view");
+    std::os::unix::fs::symlink(&root, &via).unwrap();
+
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=8u64 {
+        let mut fx = block(b, 0, 100 * b as u128);
+        if b == 2 {
+            pad_address_to_seal(&mut fx, USDC, 1);
+        }
+        tape.insert_block(b, fx);
+    }
+    tape.advance_tip_to(8);
+    let writer = Writer::start(&root, tape.clone(), 0);
+    writer.reaches(8).await;
+
+    let (_a, fa) = bind_follower(&via, &writer).await;
+    let first = derived_agree(&writer, &fa, "after the snapshot").await;
+    assert!(
+        first[0]["holders"].as_u64().unwrap_or(0) >= 2,
+        "balances are populated: {}",
+        first[0]
+    );
+    assert_eq!(
+        first[1]["balance"],
+        (100..=800).step_by(100).sum::<u64>().to_string()
+    );
+    assert!(
+        first[3]["threshold"]["flags"]
+            .as_array()
+            .is_some_and(|f| !f.is_empty()),
+        "threshold flags: {}",
+        first[3]
+    );
+    assert!(
+        first[4]["flags"].as_array().is_some_and(|f| !f.is_empty()),
+        "velocity flags: {}",
+        first[4]
+    );
+    assert!(
+        first[6].to_string().contains("3600"),
+        "the entity holds account 2's total: {}",
+        first[6]
+    );
+
+    tape.reorg(
+        6,
+        vec![block(7, 1, 7_777), block(8, 1, 8_888), block(9, 1, 9_999)],
+    );
+    writer.reaches(9).await;
+    let reorged = derived_agree(&writer, &fa, "after a reorg").await;
+    let total = 100 + 200 + 300 + 400 + 500 + 600 + 7_777 + 8_888 + 9_999;
+    assert_eq!(reorged[1]["balance"], total.to_string());
+
+    tape.advance_finalized_to(2);
+    tape.insert_block(10, block(10, 0, 1_000));
+    tape.advance_tip_to(10);
+    assert!(
+        wait_until(SEAL_POLL_TIMEOUT, || writer.store.sealed_through() >= 2).await,
+        "the writer seals"
+    );
+    writer.reaches(10).await;
+    let sealed = derived_agree(&writer, &fa, "across a seal").await;
+    assert_eq!(sealed[1]["balance"], (total + 1_000).to_string());
+
+    let port = writer.addr.port();
+    writer.stop(&root);
+    let (status, held) = get(&fa, &format!("/{ROUTE}/balance/{}", account(2))).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        held, sealed[1],
+        "derived state is served while the writer is away"
+    );
+
+    tape.insert_block(11, block(11, 0, 1_100));
+    tape.advance_tip_to(11);
+    let writer = Writer::start(&root, tape.clone(), port);
+    writer.reaches(11).await;
+    let resumed = derived_agree(&writer, &fa, "after the writer restarted").await;
+    assert_eq!(resumed[1]["balance"], (total + 2_100).to_string());
+    writer.stop(&root);
 }
