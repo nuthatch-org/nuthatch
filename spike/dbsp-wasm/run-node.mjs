@@ -28,6 +28,15 @@ if (out !== want) {
   process.exit(1);
 }
 
+// RFC-0075 S1: nuthatch-core's balance view under the inline driver, the shape a tab runs.
+const views = mod.spike_views();
+const wantViews = '[("0xa", 70), ("0xb", 30), ("0xmint", -100)]';
+console.log(`views ${views}`);
+if (views !== wantViews) {
+  console.error(`MISMATCH\n got: ${views}\nwant: ${wantViews}`);
+  process.exit(1);
+}
+
 // The stress: many transactions through a spine, so merging and backpressure run on this thread.
 const [steps, rows] = [Number(process.argv[3] ?? 2000), Number(process.argv[4] ?? 100)];
 const t1 = performance.now();

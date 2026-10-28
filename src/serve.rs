@@ -7255,9 +7255,9 @@ mod tests {
             address: Some("0x0".into()),
             chain: "ethereum".into(),
             dir: dir.to_path_buf(),
-            balances: BalanceView::start().unwrap(),
-            exposure: ExposureView::start(true).unwrap(),
-            velocity: VelocityView::start(true).unwrap(),
+            balances: BalanceView::start(crate::drive::Driver::Threaded).unwrap(),
+            exposure: ExposureView::start(crate::drive::Driver::Threaded, true).unwrap(),
+            velocity: VelocityView::start(crate::drive::Driver::Threaded, true).unwrap(),
             entities: Arc::new(Vec::new()),
             #[cfg(feature = "folds")]
             folds: None,

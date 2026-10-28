@@ -246,8 +246,8 @@ fn record_import(dir: &Path, hash: &str, entries: usize, source: &Path) -> Resul
 
 /// A coarse timestamp for the provenance record. Not on any correctness path - the content address is.
 fn now_rfc3339() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
+    use crate::time::UNIX_EPOCH;
+    let secs = crate::time::system_now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);

@@ -16,13 +16,12 @@
 //! aggregate isn't linear; splitting them keeps both incrementally maintained *and* seedable on
 //! restart from a pre-summed cold aggregate (see `rebuild`).
 
+use crate::drive::{Driver, Lane, Step, ViewDriver};
 use crate::labels::LabelSet;
 use anyhow::{anyhow, Context, Result};
 use dbsp::utils::Tup2;
 use dbsp::{IndexedZSetReader, OrdZSet, OutputHandle, RootCircuit, Runtime};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
 use std::sync::{Arc, RwLock};
 
 /// Field separator inside an encoded exposure key. ASCII Unit Separator (0x1f) - never appears in a
@@ -271,11 +270,6 @@ fn build_circuit(circuit: &mut RootCircuit) -> Result<CircuitHandles, anyhow::Er
     Ok(((amount_h, count_h), (amount_out, count_out)))
 }
 
-enum Msg {
-    Batch(ExposureBatch),
-    Flush(SyncSender<()>),
-}
-
 /// The published view, keyed by address so `/exposure/{address}` is one lookup, not a walk of every
 /// labeled counterparty under the lock the circuit thread publishes through (#2214).
 #[derive(Default)]
@@ -313,85 +307,61 @@ impl Published {
 /// Cheap-to-clone handle to the live exposure view. Mirrors [`crate::views::BalanceView`].
 #[derive(Clone)]
 pub struct ExposureView {
-    tx: Sender<Msg>,
+    /// Unhealthy once the circuit dies on an error, so the ingest loop fails loudly rather than serve
+    /// frozen (and, for compliance, silently wrong) exposure. A disabled view stays healthy.
+    lane: Lane<ExposureBatch>,
     /// Snapshot of the maintained view. Read by the API.
     rows: Arc<RwLock<Published>>,
-    /// Flips false if the circuit thread dies on an error, so the ingest loop can fail loudly rather
-    /// than serve frozen (and, for compliance, silently wrong) exposure. A disabled view stays healthy.
-    healthy: Arc<AtomicBool>,
 }
 
 impl ExposureView {
     /// A view with no circuit, as [`crate::views::BalanceView::inert`].
     pub fn inert() -> Self {
-        let (tx, _) = channel::<Msg>();
         Self {
-            tx,
+            lane: Lane::off(),
             rows: Default::default(),
-            healthy: Arc::new(AtomicBool::new(true)),
         }
     }
 
-    /// Start the exposure view. When `enabled` is false (a nest with no labels) the DBSP circuit and
-    /// its worker thread are *not* spawned - `apply` becomes a silent no-op (its send finds no
-    /// receiver) and `snapshot` stays empty, so an unused view costs nothing (L10).
-    pub fn start(enabled: bool) -> Result<Self> {
-        let (tx, rx) = channel::<Msg>();
+    /// Start the exposure view. When `enabled` is false (a nest with no labels) no DBSP circuit is
+    /// built - `apply` is a silent no-op and `snapshot` stays empty, so an unused view costs nothing
+    /// (L10).
+    pub fn start(driver: Driver, enabled: bool) -> Result<Self> {
         let rows = Arc::new(RwLock::new(Published::default()));
-        let healthy = Arc::new(AtomicBool::new(true));
         if !enabled {
-            drop(rx);
-            return Ok(Self { tx, rows, healthy });
+            return Ok(Self {
+                lane: Lane::off(),
+                rows,
+            });
         }
         let shared = rows.clone();
-        let health = healthy.clone();
-        std::thread::Builder::new()
-            .name("nuthatch-exposure".into())
-            .spawn(move || {
-                let mut circuit = match ExposureCircuit::new() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("exposure circuit failed to start: {e:#}");
-                        health.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                };
-                while let Ok(msg) = rx.recv() {
-                    match msg {
-                        Msg::Batch(batch) => {
-                            if let Err(e) = circuit.step(batch) {
-                                tracing::error!("exposure step failed: {e:#}");
-                                health.store(false, Ordering::SeqCst);
-                                break;
-                            }
-                            // Publish the whole (count, amount) map after each step. The view is small
-                            // (labeled-set counterparties only), so a full swap is cheap and keeps the
-                            // read path lock-free of the circuit internals.
-                            let mut next = Published::default();
-                            for (k, &c) in &circuit.counts {
-                                next.insert(k, c, circuit.amounts.get(k).copied().unwrap_or(0));
-                            }
-                            let old = std::mem::replace(&mut *shared.write().unwrap(), next);
-                            drop(old);
-                        }
-                        Msg::Flush(ack) => {
-                            let _ = ack.send(());
-                        }
-                    }
+        let lane = driver.lane("exposure", "nuthatch-exposure", move || {
+            let mut circuit = ExposureCircuit::new()?;
+            Ok(Box::new(move |batch| {
+                circuit.step(batch).context("exposure step failed")?;
+                // Publish the whole (count, amount) map after each step. The view is small
+                // (labeled-set counterparties only), so a full swap is cheap and keeps the
+                // read path lock-free of the circuit internals.
+                let mut next = Published::default();
+                for (k, &c) in &circuit.counts {
+                    next.insert(k, c, circuit.amounts.get(k).copied().unwrap_or(0));
                 }
-            })
-            .context("failed to spawn exposure thread")?;
-        Ok(Self { tx, rows, healthy })
+                let old = std::mem::replace(&mut *shared.write().unwrap(), next);
+                drop(old);
+                Ok(())
+            }) as Step<ExposureBatch>)
+        })?;
+        Ok(Self { lane, rows })
     }
 
-    /// Whether the circuit thread is alive; `false` means it died on an error and the view is frozen.
+    /// Whether the circuit is alive; `false` means it died on an error and the view is frozen.
     pub fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::SeqCst)
+        self.lane.is_healthy()
     }
 
     pub fn apply(&self, batch: ExposureBatch) {
         if !batch.is_empty() {
-            let _ = self.tx.send(Msg::Batch(batch));
+            self.lane.send(batch);
         }
     }
 
@@ -410,10 +380,7 @@ impl ExposureView {
 
     /// Block until every batch enqueued so far has been folded in (used after a restart rebuild).
     pub fn flush(&self) {
-        let (ack, wait) = sync_channel(0);
-        if self.tx.send(Msg::Flush(ack)).is_ok() {
-            let _ = wait.recv();
-        }
+        self.lane.flush();
     }
 
     /// The exposure rows for `address`, descending by amount.
@@ -595,7 +562,7 @@ mod tests {
     #[test]
     fn view_thread_serves_after_flush() {
         let labels = labelset(&[("0xmixer", "mixer")]);
-        let view = ExposureView::start(true).unwrap();
+        let view = ExposureView::start(Driver::Threaded, true).unwrap();
         view.apply(exposure_deltas("0xalice", "0xmixer", 42, 1, &labels));
         view.flush();
         let rows = view.exposure("0xalice");
@@ -608,7 +575,7 @@ mod tests {
     #[test]
     fn an_address_read_touches_only_that_address() {
         let labels = labelset(&[("0xmixer", "mixer")]);
-        let view = ExposureView::start(true).unwrap();
+        let view = ExposureView::start(Driver::Threaded, true).unwrap();
         let mut batch: ExposureBatch = (0..5_000)
             .flat_map(|i| exposure_deltas("0xmixer", &format!("0x{i:040x}"), 7, 1, &labels))
             .collect();

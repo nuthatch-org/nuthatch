@@ -5,6 +5,13 @@
 //! IVM → serve) rather than fork it. The `nuthatch` binary (`main.rs`) is one such front-end, and
 //! drives the pipeline through the `Source` trait.
 
+// RFC-0075 S1: these live in `nuthatch-core` so a tab compiles the same code; re-exported at their
+// old paths so nothing that names them changed.
+pub use nuthatch_core::{
+    drive, entity_circuit, entity_expr, entity_plan, entity_row, exposure, flags, labels, velocity,
+    views,
+};
+
 pub mod abi;
 pub mod address_discovery;
 pub mod address_history;
@@ -56,19 +63,13 @@ pub(crate) mod engine;
 pub(crate) mod engine_burrmill;
 pub mod entities;
 pub mod entity_bind;
-pub mod entity_circuit;
-pub mod entity_expr;
 pub mod entity_lower;
 pub mod entity_offchain;
-pub mod entity_plan;
-pub mod entity_row;
 pub mod entity_view;
-pub mod exposure;
 pub mod factory;
 pub mod fair_share;
 pub mod feed;
 pub mod feed_http;
-pub mod flags;
 /// RFC-0059 checkpointed folds, behind the off-by-default `folds` feature.
 #[cfg(feature = "folds")]
 pub mod folds;
@@ -92,7 +93,6 @@ pub mod inspect;
 pub mod ipfs;
 pub mod ipfs_resolve;
 pub mod isolation;
-pub mod labels;
 pub mod lifecycle;
 pub mod limits;
 pub mod lists;
@@ -143,8 +143,6 @@ pub mod store;
 pub mod story;
 pub mod subgraph_import;
 pub mod tape;
-pub mod velocity;
-pub mod views;
 #[cfg(feature = "watch")]
 pub mod watch;
 pub mod webhooks;

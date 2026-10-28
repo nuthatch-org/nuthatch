@@ -12,6 +12,14 @@ fn steps() {
 }
 
 #[test]
+fn views_agree_across_drivers() {
+    use nuthatch_core::drive::Driver;
+    let want = r#"[("0xa", 70), ("0xb", 30), ("0xmint", -100)]"#;
+    assert_eq!(dbsp_wasm_spike::run_views(Driver::Threaded).unwrap(), want);
+    assert_eq!(dbsp_wasm_spike::run_views(Driver::Inline).unwrap(), want);
+}
+
+#[test]
 fn stress() {
     let (groups, total) = dbsp_wasm_spike::run_stress(2_000, 100).unwrap();
     eprintln!("native stress: groups={groups} total={total}");

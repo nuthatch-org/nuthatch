@@ -1,0 +1,32 @@
+[package]
+name = "nuthatch-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "A nest's cursor without the operating system: decode to commit to seal, and the circuits, over traits a node and a tab both implement."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow = "1"
+dbsp = "0.320"
+hex = "0.4"
+# `Row` derives `SizeOf` and rkyv archival for `dbsp::DBData`; the versions dbsp itself pins.
+size-of = { package = "feldera-size-of", version = "0.1.7" }
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` as nuthatch-decode has it, so a hash over JSON here is the one the binary computes.
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tracing = "0.1"
+web-time = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_64", "validation"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# rkyv 0.7 archives `usize` as 64-bit only on 64-bit targets; nothing here persists the archive.
+rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_32", "validation"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"

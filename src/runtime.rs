@@ -9444,9 +9444,11 @@ mod tests {
             address: None,
             chain: chain.to_string(),
             dir: dir.to_path_buf(),
-            balances: crate::views::BalanceView::start().unwrap(),
-            exposure: crate::exposure::ExposureView::start(true).unwrap(),
-            velocity: crate::velocity::VelocityView::start(true).unwrap(),
+            balances: crate::views::BalanceView::start(crate::drive::Driver::Threaded).unwrap(),
+            exposure: crate::exposure::ExposureView::start(crate::drive::Driver::Threaded, true)
+                .unwrap(),
+            velocity: crate::velocity::VelocityView::start(crate::drive::Driver::Threaded, true)
+                .unwrap(),
             entities: Arc::new(Vec::new()),
             #[cfg(feature = "folds")]
             folds: None,

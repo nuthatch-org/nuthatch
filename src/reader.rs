@@ -1226,8 +1226,8 @@ impl Follower {
             chain: config.nest.chain.clone(),
             dir,
             balances: crate::views::BalanceView::inert(),
-            exposure: crate::exposure::ExposureView::start(false)?,
-            velocity: crate::velocity::VelocityView::start(false)?,
+            exposure: crate::exposure::ExposureView::start(crate::drive::Driver::Threaded, false)?,
+            velocity: crate::velocity::VelocityView::start(crate::drive::Driver::Threaded, false)?,
             #[cfg(feature = "folds")]
             folds: None,
             entities: Arc::new(Vec::new()),

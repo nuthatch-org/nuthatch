@@ -3250,7 +3250,7 @@ async fn build_nest(
         finish_unpruned_fold(&dir, store.as_ref())?;
     }
 
-    let balances = BalanceView::start()?;
+    let balances = BalanceView::start(crate::drive::Driver::Threaded)?;
     // Labels (RFC-0008 C1) are the annotation substrate the exposure view joins against. Loaded before
     // the exposure view so it only spins up when there's actually something to track.
     let labels = Arc::new(labels::load(&dir));
@@ -3262,7 +3262,7 @@ async fn build_nest(
     }
     // The exposure view joins transfers against the labeled set - with no labels it can only ever be
     // empty, so don't spend a DBSP circuit + dedicated thread on it (deadlock-review finding L10).
-    let exposure = ExposureView::start(!labels.is_empty())?;
+    let exposure = ExposureView::start(crate::drive::Driver::Threaded, !labels.is_empty())?;
 
     // Optional threshold & velocity flags (RFC-0008 C3). Threshold flags are per-transfer stored
     // annotations (block-keyed → roll back with their transfer); velocity is a DBSP windowed view
@@ -3270,7 +3270,7 @@ async fn build_nest(
     let threshold = config.flags.threshold_amount();
     let velocity_cfg = config.flags.velocity();
     // Only fed when a velocity flag is configured - skip its circuit + thread otherwise (L10).
-    let velocity = VelocityView::start(velocity_cfg.is_some())?;
+    let velocity = VelocityView::start(crate::drive::Driver::Threaded, velocity_cfg.is_some())?;
     // Authored incremental entities (RFC-0041). A declaration that will not lower or will not bind
     // stops the nest here rather than at the first block that would have used it - `?`, deliberately.
     // A nest with indexed history behind it starts its entities *unavailable* rather than empty and
@@ -9249,9 +9249,9 @@ impl FollowerDerived {
         let registry = Arc::new(crate::registry::from_nest(dir, config)?);
         let labels = Arc::new(labels::load(dir));
         let velocity_cfg = config.flags.velocity();
-        let balances = BalanceView::start()?;
-        let exposure = ExposureView::start(!labels.is_empty())?;
-        let velocity = VelocityView::start(velocity_cfg.is_some())?;
+        let balances = BalanceView::start(crate::drive::Driver::Threaded)?;
+        let exposure = ExposureView::start(crate::drive::Driver::Threaded, !labels.is_empty())?;
+        let velocity = VelocityView::start(crate::drive::Driver::Threaded, velocity_cfg.is_some())?;
         let through = store
             .get_meta(LAST_BLOCK_KEY)?
             .and_then(|v| v.parse::<u64>().ok());
@@ -27139,7 +27139,7 @@ rpc_urls = ["https://rpc.example"]
                 &transfer_row(10, 0, SENDER, Some(RECIPIENT), &huge),
             )
             .unwrap();
-        let balances = BalanceView::start().unwrap();
+        let balances = BalanceView::start(crate::drive::Driver::Threaded).unwrap();
         rebuild_views(
             dir.path(),
             &store,
@@ -27147,8 +27147,8 @@ rpc_urls = ["https://rpc.example"]
             &DerivedViews {
                 labels: &LabelSet::default(),
                 balances: &balances,
-                exposure: &ExposureView::start(true).unwrap(),
-                velocity: &VelocityView::start(true).unwrap(),
+                exposure: &ExposureView::start(crate::drive::Driver::Threaded, true).unwrap(),
+                velocity: &VelocityView::start(crate::drive::Driver::Threaded, true).unwrap(),
                 velocity_cfg: None,
             },
         )
@@ -27197,9 +27197,9 @@ rpc_urls = ["https://rpc.example"]
         );
 
         // Under test: one pass, all three views.
-        let balances = BalanceView::start().unwrap();
-        let exposure_v = ExposureView::start(true).unwrap();
-        let velocity_v = VelocityView::start(true).unwrap();
+        let balances = BalanceView::start(crate::drive::Driver::Threaded).unwrap();
+        let exposure_v = ExposureView::start(crate::drive::Driver::Threaded, true).unwrap();
+        let velocity_v = VelocityView::start(crate::drive::Driver::Threaded, true).unwrap();
         rebuild_views(
             dir.path(),
             &store,
@@ -27216,9 +27216,9 @@ rpc_urls = ["https://rpc.example"]
 
         // Reference: the same facts, fed one transfer at a time exactly as the live loop feeds them.
         // Nothing is sealed, so there is no cold seed on either side - this is purely the hot tail.
-        let want_balances = BalanceView::start().unwrap();
-        let want_exposure = ExposureView::start(true).unwrap();
-        let want_velocity = VelocityView::start(true).unwrap();
+        let want_balances = BalanceView::start(crate::drive::Driver::Threaded).unwrap();
+        let want_exposure = ExposureView::start(crate::drive::Driver::Threaded, true).unwrap();
+        let want_velocity = VelocityView::start(crate::drive::Driver::Threaded, true).unwrap();
         for (b, _li, from, to, val) in fixture {
             let v: i128 = val.parse().unwrap();
             let to = to.expect("every fixture row has a recipient");
@@ -27283,8 +27283,8 @@ rpc_urls = ["https://rpc.example"]
         store.commit_window(&rows, None, N).unwrap();
         let labels = labelset(&[(MIXER, "mixer")]);
 
-        let balances = BalanceView::start().unwrap();
-        let exposure_v = ExposureView::start(true).unwrap();
+        let balances = BalanceView::start(crate::drive::Driver::Threaded).unwrap();
+        let exposure_v = ExposureView::start(crate::drive::Driver::Threaded, true).unwrap();
         rebuild_views(
             dir.path(),
             &store,
@@ -27293,15 +27293,15 @@ rpc_urls = ["https://rpc.example"]
                 labels: &labels,
                 balances: &balances,
                 exposure: &exposure_v,
-                velocity: &VelocityView::start(false).unwrap(),
+                velocity: &VelocityView::start(crate::drive::Driver::Threaded, false).unwrap(),
                 velocity_cfg: None,
             },
         )
         .unwrap();
 
         // The reference arrives as the tip loop feeds it, in batches well under one DBSP step.
-        let want_balances = BalanceView::start().unwrap();
-        let want_exposure = ExposureView::start(true).unwrap();
+        let want_balances = BalanceView::start(crate::drive::Driver::Threaded).unwrap();
+        let want_exposure = ExposureView::start(crate::drive::Driver::Threaded, true).unwrap();
         for chunk in (1..=N).collect::<Vec<_>>().chunks(100) {
             let mut b = Vec::new();
             let mut e = Vec::new();
@@ -27350,9 +27350,9 @@ rpc_urls = ["https://rpc.example"]
                 &erc20_registry(),
                 &DerivedViews {
                     labels: &LabelSet::default(),
-                    balances: &BalanceView::start().unwrap(),
-                    exposure: &ExposureView::start(false).unwrap(),
-                    velocity: &VelocityView::start(false).unwrap(),
+                    balances: &BalanceView::start(crate::drive::Driver::Threaded).unwrap(),
+                    exposure: &ExposureView::start(crate::drive::Driver::Threaded, false).unwrap(),
+                    velocity: &VelocityView::start(crate::drive::Driver::Threaded, false).unwrap(),
                     velocity_cfg: None,
                 },
             )
@@ -27393,8 +27393,8 @@ rpc_urls = ["https://rpc.example"]
             )
             .unwrap();
 
-        let velocity = VelocityView::start(true).unwrap();
-        let none = BalanceView::start().unwrap();
+        let velocity = VelocityView::start(crate::drive::Driver::Threaded, true).unwrap();
+        let none = BalanceView::start(crate::drive::Driver::Threaded).unwrap();
         rebuild_views(
             dir.path(),
             &store,
@@ -27402,7 +27402,7 @@ rpc_urls = ["https://rpc.example"]
             &DerivedViews {
                 labels: &labelset(&[]),
                 balances: &none,
-                exposure: &ExposureView::start(false).unwrap(),
+                exposure: &ExposureView::start(crate::drive::Driver::Threaded, false).unwrap(),
                 velocity: &velocity,
                 velocity_cfg: Some((100, 100)),
             },
