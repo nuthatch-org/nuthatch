@@ -695,7 +695,7 @@ mod tests {
         }
     }
 
-    /// Reads one line off `rx` as a slow follower would, giving each chunk back as it goes.
+    /// Reads one line off `rx`, giving each chunk back as it goes.
     async fn read_line(rx: &mut mpsc::UnboundedReceiver<Charged>) -> Vec<u8> {
         let mut got = Vec::new();
         while !got.ends_with(b"\n") {
@@ -704,10 +704,21 @@ mod tests {
                 .expect("the line stalled")
                 .expect("the line ended early");
             got.extend_from_slice(&chunk.bytes);
-            drop(chunk);
-            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         got
+    }
+
+    /// Waits for `queued` to settle at `bytes`, with nothing read meanwhile.
+    async fn fills_to(queued: impl Fn() -> u64, bytes: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while queued() != bytes {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} bytes queued, never {bytes}",
+                queued()
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     fn expected(store: &Store, dataset: &str) -> Vec<u8> {
@@ -725,6 +736,12 @@ mod tests {
         let limits = limits(256 * KIB, 1 << 20);
         let (q, mut rx) = Queue::new(Arc::default(), limits);
         let task = tokio::spawn(forward("data/a".into(), store.clone(), q.clone()));
+        // Nothing is read until the queue holds all it may.
+        fills_to(
+            || q.conn.queued.load(Ordering::SeqCst),
+            limits.per_connection,
+        )
+        .await;
         let got = read_line(&mut rx).await;
         assert_eq!(
             got,
@@ -733,11 +750,7 @@ mod tests {
         );
         assert!(got.len() as u64 > 4 * limits.per_connection);
         let peak = q.conn.peak.load(Ordering::SeqCst);
-        assert!(
-            peak > 0 && peak <= limits.per_connection,
-            "{peak} bytes queued against {}",
-            limits.per_connection
-        );
+        assert_eq!(peak, limits.per_connection, "never past its queue's limit");
         task.abort();
     }
 
@@ -759,18 +772,12 @@ mod tests {
                 .put_entity(&format!("{i:012}-000001"), &row.to_string())
                 .unwrap();
         }
-        let mut dropped = false;
-        for _ in 0..200 {
-            if q.conn.is_closed() {
-                dropped = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(dropped, "the stalled follower was dropped");
+        // Dropped before a snapshot's stall would be up, so not by waiting for room.
+        let mut closed = q.conn.closed.subscribe();
+        let dropped = tokio::time::timeout(limits.stall / 2, closed.wait_for(|c| *c)).await;
         assert!(
-            started.elapsed() < limits.stall,
-            "dropped, not waited for: {:?}",
+            dropped.is_ok(),
+            "the stalled follower was dropped, not waited for: {:?}",
             started.elapsed()
         );
         assert!(q.conn.peak.load(Ordering::SeqCst) <= limits.per_connection);
@@ -790,16 +797,28 @@ mod tests {
         let memory = Arc::<FeedMemory>::default();
         let limits = limits(256 * KIB, 512 * KIB);
         let want = expected(&store, "data/a");
+        let (open, gate) = tokio::sync::watch::channel(false);
         let mut followers = Vec::new();
+        let mut queues = Vec::new();
         for _ in 0..4 {
             let (q, mut rx) = Queue::new(memory.clone(), limits);
             let task = tokio::spawn(forward("data/a".into(), store.clone(), q.clone()));
+            let mut gate = gate.clone();
             followers.push(tokio::spawn(async move {
+                gate.wait_for(|open| *open).await.unwrap();
                 let got = read_line(&mut rx).await;
                 task.abort();
                 got
             }));
+            queues.push(q);
         }
+        // Nobody reads until every queue has taken what the budgets allow.
+        let all = limits.total.min(4 * limits.per_connection);
+        fills_to(|| memory.queued(), all).await;
+        for q in &queues {
+            assert!(q.conn.queued.load(Ordering::SeqCst) <= limits.per_connection);
+        }
+        open.send_replace(true);
         for f in followers {
             assert_eq!(
                 f.await.unwrap(),
@@ -807,11 +826,6 @@ mod tests {
                 "every follower had the whole snapshot"
             );
         }
-        let peak = memory.peak();
-        assert!(
-            peak > limits.per_connection && peak <= limits.total,
-            "{peak} bytes queued in all against {}",
-            limits.total
-        );
+        assert_eq!(memory.peak(), all, "never past the total");
     }
 }

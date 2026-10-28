@@ -76,11 +76,15 @@ impl Writer {
                 }
                 let states = cursor.states.clone();
                 let store = states[0].1.store.clone();
+                let marks = root.clone();
+                // A route is unmounted while `unmounted-<route>` exists beside the runtime.
                 let roster: feed_http::Roster = Arc::new(move || {
                     let states = states.clone();
+                    let marks = marks.clone();
                     Box::pin(async move {
                         states
                             .iter()
+                            .filter(|(route, _)| !marks.join(format!("unmounted-{route}")).exists())
                             .map(|(route, s)| feed_http::Served::of(route, s, &Default::default()))
                             .collect()
                     })
@@ -778,4 +782,75 @@ async fn a_resnapshot_is_charged_beside_the_copy_it_replaces() {
         agree(&writer, &fbase, COUNT, "after the restart").await;
         writer.stop(&root);
     }
+}
+
+/// An unmounted copy a request still holds stays charged, so remounting its nest cannot load a new
+/// copy beside it past the budget: 4 MiB held and 4 MiB more do not fit what admission leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unmounted_copy_in_use_is_charged_until_it_drops() {
+    const BUDGET_MB: u64 = 12;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("runtime");
+    let dir = root.join("data").join(ROUTE);
+    std::fs::create_dir_all(&dir).unwrap();
+    scaffold_nest(&dir, ROUTE, USDC);
+    std::fs::write(
+        root.join(nuthatch::runtime::MOUNTS_FILE),
+        format!(
+            "[runtime]\nname = \"r\"\nmax_rss_mb = {BUDGET_MB}\n\n[[chains]]\nchain = \
+             \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n"
+        ),
+    )
+    .unwrap();
+    let via: PathBuf = tmp.path().join("follower-view");
+    std::os::unix::fs::symlink(&root, &via).unwrap();
+    let tape = Arc::new(TapeSource::new());
+    tape.insert_block(1, block(1, 0, 5));
+    tape.advance_tip_to(1);
+    let writer = Writer::start(&root, tape.clone(), 0);
+    writer.reaches(1).await;
+    let row = serde_json::json!({"table": "blob", "block_number": 1, "pad": "x".repeat(4 << 20)});
+    writer
+        .store
+        .put_entity("000000000001-999999", &row.to_string())
+        .unwrap();
+    let (follower, fbase) = bind_follower(&via, &writer).await;
+    agree(&writer, &fbase, COUNT, "before the unmount").await;
+
+    let dataset = format!("data/{ROUTE}");
+    let held = follower
+        .hold(&dataset)
+        .expect("the follower holds its copy");
+    let mark = root.join(format!("unmounted-{ROUTE}"));
+    std::fs::write(&mark, "").unwrap();
+    assert!(
+        wait_until(SEAL_POLL_TIMEOUT, || follower.hold(&dataset).is_none()).await,
+        "the follower let the unmounted copy go"
+    );
+    assert!(
+        follower.retiring() >= 4 << 20,
+        "the copy still held is charged: {}",
+        follower.retiring()
+    );
+
+    std::fs::remove_file(&mark).unwrap();
+    let mut remounted = serde_json::Value::Null;
+    for _ in 0..400 {
+        let (status, body) = route_status(&fbase, ROUTE).await;
+        if status == 503 && body["reason"] != "catching_up" {
+            remounted = body;
+            break;
+        }
+        assert_ne!(status, 200, "a second copy was loaded beside the held one");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(remounted["reason"], "over_budget", "{remounted}");
+    let (peak, _) = follower.charges();
+    assert!(
+        peak <= BUDGET_MB << 20,
+        "charged {peak} bytes against a {BUDGET_MB} MiB budget"
+    );
+    drop(held);
+    assert_eq!(follower.retiring(), 0, "nothing is charged once it drops");
+    writer.stop(&root);
 }

@@ -171,8 +171,13 @@ impl Inner {
 
     /// Hand a copy that is no longer served to the retiring list, charged until it is dropped.
     fn retire(&mut self, dataset: &str, copy: &Arc<MemStore>) {
-        self.retiring.retain(|(_, c)| c.strong_count() > 0);
         let chain = self.chain_of(dataset).unwrap_or_default();
+        self.retire_on(chain, copy);
+    }
+
+    /// [`Inner::retire`] onto `chain`, for a copy whose routes are already gone.
+    fn retire_on(&mut self, chain: Option<String>, copy: &Arc<MemStore>) {
+        self.retiring.retain(|(_, c)| c.strong_count() > 0);
         self.retiring.push((chain, Arc::downgrade(copy)));
     }
 
@@ -481,12 +486,27 @@ impl Follower {
         (inner.peak, inner.reloads)
     }
 
+    /// What copies no longer served but still referenced are charged, in bytes.
+    pub fn retiring(&self) -> u64 {
+        let inner = self.lock();
+        let live = inner.retiring.iter().filter_map(|(_, c)| c.upgrade());
+        live.map(|c| c.bytes()).sum()
+    }
+
+    /// `dataset`'s copy, held as a request in flight would hold it.
+    #[doc(hidden)]
+    pub fn hold(&self, dataset: &str) -> Option<Arc<MemStore>> {
+        self.lock().datasets.get(dataset).cloned()
+    }
+
     /// Stop holding `dataset`, and serve its routes the reason.
     fn refuse(self: &Arc<Self>, dataset: &str, why: String) {
         tracing::warn!("{dataset}: {why}");
         {
             let mut inner = self.lock();
-            inner.datasets.remove(dataset);
+            if let Some(copy) = inner.datasets.remove(dataset) {
+                inner.retire(dataset, &copy);
+            }
             inner.over_budget.insert(dataset.to_string(), why);
         }
         crate::seal::unpin_catalogue(&self.root.join(dataset));
@@ -563,7 +583,9 @@ impl Follower {
                     if let Some(gone) = inner.routes.remove(&route) {
                         let dataset = gone.spec.dataset;
                         if !inner.routes.values().any(|r| r.spec.dataset == dataset) {
-                            inner.datasets.remove(&dataset);
+                            if let Some(copy) = inner.datasets.remove(&dataset) {
+                                inner.retire_on(gone.spec.chain, &copy);
+                            }
                             inner.positions.remove(&dataset);
                             inner.excluded.remove(&dataset);
                             crate::seal::unpin_catalogue(&self.root.join(&dataset));
