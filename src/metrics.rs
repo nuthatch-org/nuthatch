@@ -673,6 +673,30 @@ impl NestMetrics {
     }
 }
 
+impl nuthatch_core::metrics::CursorMetrics for NestMetrics {
+    fn set_last_block(&self, block: u64) {
+        NestMetrics::set_last_block(self, block)
+    }
+    fn add_rows_decoded(&self, n: u64) {
+        NestMetrics::add_rows_decoded(self, n)
+    }
+    fn add_rows_sealed(&self, n: u64) {
+        NestMetrics::add_rows_sealed(self, n)
+    }
+    fn add_undecoded(&self, contract: &str, topic0: &str, n: u64) {
+        NestMetrics::add_undecoded(self, contract, topic0, n)
+    }
+    fn record_reorg(&self, depth: u64) {
+        NestMetrics::record_reorg(self, depth)
+    }
+    fn inc_checkpoints_missed(&self) -> u64 {
+        NestMetrics::inc_checkpoints_missed(self)
+    }
+    fn add_ipfs_unreadable(&self, n: u64) {
+        NestMetrics::add_ipfs_unreadable(self, n)
+    }
+}
+
 pub struct Metrics {
     // Ingestion - the "is it keeping up?" signals an operator alerts on.
     tip_height: AtomicU64,

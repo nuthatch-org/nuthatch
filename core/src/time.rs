@@ -12,3 +12,10 @@ pub fn now() -> Instant {
 pub fn system_now() -> SystemTime {
     SystemTime::now()
 }
+
+/// The cursor's waits: a refused window's back-off and the loop's pacing. The node sleeps on tokio's
+/// timer, a tab on the browser's, so neither runtime is named here.
+pub trait Clock: Send + Sync {
+    fn sleep(&self, d: Duration)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+}

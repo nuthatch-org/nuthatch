@@ -11,6 +11,7 @@ pub mod entity_row;
 pub mod exposure;
 pub mod flags;
 pub mod labels;
+pub mod metrics;
 pub mod seal;
 pub mod source;
 pub mod store;

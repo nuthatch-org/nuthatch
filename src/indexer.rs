@@ -9915,12 +9915,24 @@ fn visit_sealed_columns(
     Ok(())
 }
 
+/// The node's [`nuthatch_core::time::Clock`]: tokio's timer, so paused-time tests still steer it.
+pub struct TokioClock;
+
+impl nuthatch_core::time::Clock for TokioClock {
+    fn sleep(
+        &self,
+        d: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(tokio::time::sleep(d))
+    }
+}
+
 async fn sleep_secs(s: u64) {
-    tokio::time::sleep(std::time::Duration::from_secs(s)).await;
+    sleep_for(std::time::Duration::from_secs(s)).await;
 }
 
 async fn sleep_for(d: std::time::Duration) {
-    tokio::time::sleep(d).await;
+    nuthatch_core::time::Clock::sleep(&TokioClock, d).await;
 }
 
 /// The highest block a cursor may index this iteration (RFC-0040 §3 knob 2). The tip unless the
