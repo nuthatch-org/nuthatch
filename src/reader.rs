@@ -124,7 +124,67 @@ struct Inner {
     /// Datasets whose snapshot ran past its byte limit, which the writer is asked not to send
     /// until `max_rss_mb` changes or the mount goes.
     excluded: BTreeSet<String>,
+    /// Copies replaced or released but possibly still referenced by a request in flight, with the
+    /// chain they are charged to. Each counts against its cursor's budget until its last reference
+    /// drops.
+    retiring: Vec<(Option<String>, std::sync::Weak<MemStore>)>,
+    /// Times a held copy was released so that a new snapshot of it could load under the full budget.
+    reloads: u64,
+    /// The most any cursor here has been charged, in bytes.
+    peak: u64,
 }
+
+impl Inner {
+    fn chain_of(&self, dataset: &str) -> Option<Option<String>> {
+        self.routes
+            .values()
+            .find(|r| r.spec.dataset == dataset)
+            .map(|r| r.spec.chain.clone())
+    }
+
+    /// What `chain`'s cursor is charged now: every held copy, its nest's estimate, and every
+    /// retiring copy still referenced.
+    fn charged(&self, chain: &Option<String>) -> u64 {
+        let held: u64 = self
+            .routes
+            .values()
+            .filter(|r| &r.spec.chain == chain)
+            .map(|r| r.spec.dataset.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|d| {
+                let copy = self.datasets.get(d)?;
+                Some(copy.bytes() + self.estimates.get(d).copied().unwrap_or(0))
+            })
+            .sum();
+        held + self.retiring_on(chain)
+    }
+
+    fn retiring_on(&self, chain: &Option<String>) -> u64 {
+        self.retiring
+            .iter()
+            .filter(|(c, _)| c == chain)
+            .filter_map(|(_, copy)| copy.upgrade())
+            .map(|copy| copy.bytes())
+            .sum()
+    }
+
+    /// Hand a copy that is no longer served to the retiring list, charged until it is dropped.
+    fn retire(&mut self, dataset: &str, copy: &Arc<MemStore>) {
+        self.retiring.retain(|(_, c)| c.strong_count() > 0);
+        let chain = self.chain_of(dataset).unwrap_or_default();
+        self.retiring.push((chain, Arc::downgrade(copy)));
+    }
+
+    fn note_peak(&mut self, dataset: &str) {
+        let chain = self.chain_of(dataset).unwrap_or_default();
+        self.peak = self.peak.max(self.charged(&chain));
+    }
+}
+
+/// How long a released copy is waited for, while requests that started on it finish, before its
+/// replacement is read under whatever budget is then left.
+const RELEASE_WAIT: Duration = Duration::from_secs(10);
 
 const MIB: u64 = 1024 * 1024;
 
@@ -201,6 +261,9 @@ impl Follower {
                 estimates: HashMap::new(),
                 over_budget: HashMap::new(),
                 excluded: BTreeSet::new(),
+                retiring: Vec::new(),
+                reloads: 0,
+                peak: 0,
                 link: Link {
                     connected: false,
                     since: Instant::now(),
@@ -299,11 +362,13 @@ impl Follower {
             let cap_for: crate::feed::CapFor = Box::new(move |dataset, kind| {
                 let f = weak.upgrade()?;
                 let cap = f.cap_for(dataset)?;
+                let held = f.lock().datasets.get(dataset).map(|s| s.bytes());
                 Some(match kind {
-                    crate::feed::Kind::Snapshot => cap,
+                    // A replacement is read beside the copy it replaces, which is served until the
+                    // swap and counted until its last request finishes.
+                    crate::feed::Kind::Snapshot => cap.saturating_sub(held.unwrap_or(0)),
                     // A dataset not held has nothing left to grow into: its deltas are skipped.
-                    crate::feed::Kind::Delta => cap
-                        .saturating_sub(f.lock().datasets.get(dataset).map_or(cap, |s| s.bytes())),
+                    crate::feed::Kind::Delta => cap.saturating_sub(held.unwrap_or(cap)),
                 })
             });
             crate::feed::read_lines(reader, cap_for, |line| line_tx.blocking_send(line).is_ok())
@@ -323,8 +388,14 @@ impl Follower {
         let pumped = pump.await.unwrap_or(Ok(()));
         if let Err(e) = parser.await.context("the feed parser stopped")? {
             if let Some(over) = e.downcast_ref::<crate::feed::LineOverBudget>() {
-                // Not read to the end, so the stream cannot go on: reconnect without it.
                 let dataset = over.dataset.clone();
+                let held = self.lock().datasets.contains_key(&dataset);
+                if over.kind == crate::feed::Kind::Snapshot && held {
+                    // It did not fit beside the copy it replaces: drop that, then ask again.
+                    self.release_for_reload(&dataset).await;
+                    return Err(e);
+                }
+                // Not read to the end, so the stream cannot go on: reconnect without it.
                 let max = {
                     let mut inner = self.lock();
                     inner.excluded.insert(dataset.clone());
@@ -368,7 +439,44 @@ impl Follower {
             })
             .sum();
         let own = inner.estimates.get(dataset).copied().unwrap_or(0);
-        Some((inner.max_rss_mb * MIB).saturating_sub(others + own))
+        let retiring = inner.retiring_on(&chain);
+        Some((inner.max_rss_mb * MIB).saturating_sub(others + own + retiring))
+    }
+
+    /// Stop serving `dataset`'s copy so its replacement can load under the full budget: its routes
+    /// answer `catching_up`, and this waits, bounded, for requests still on the old copy to finish.
+    /// Whatever is still referenced when the wait ends stays charged.
+    async fn release_for_reload(self: &Arc<Self>, dataset: &str) {
+        let released = {
+            let mut inner = self.lock();
+            let Some(old) = inner.datasets.remove(dataset) else {
+                return;
+            };
+            inner.reloads += 1;
+            for r in inner.routes.values_mut() {
+                if r.spec.dataset == dataset {
+                    r.served = None;
+                }
+            }
+            inner.retire(dataset, &old);
+            Arc::downgrade(&old)
+        };
+        tracing::info!(
+            "{dataset}: its new snapshot does not fit beside the copy it replaces; releasing that \
+             copy first, its routes catching up meanwhile"
+        );
+        self.recompose();
+        let deadline = Instant::now() + RELEASE_WAIT;
+        while released.strong_count() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The most any cursor has been charged here, in bytes, and how many copies were released so
+    /// that their replacement could load.
+    pub fn charges(&self) -> (u64, u64) {
+        let inner = self.lock();
+        (inner.peak, inner.reloads)
     }
 
     /// Stop holding `dataset`, and serve its routes the reason.
@@ -467,6 +575,11 @@ impl Follower {
                 fresh.insert(dataset.clone());
                 // Read under its cap, so a snapshot over budget arrives holding no rows.
                 if let Some(held) = snapshot.over {
+                    if self.lock().datasets.contains_key(&dataset) {
+                        // It did not fit beside the copy it replaces: drop that, then ask again.
+                        self.release_for_reload(&dataset).await;
+                        bail!("{dataset}: reloading its snapshot with the old copy released");
+                    }
                     let cap = self.cap_for(&dataset).unwrap_or(0);
                     let max = self.lock().max_rss_mb;
                     self.refuse(&dataset, budget_reason(&dataset, held, cap, max));
@@ -480,7 +593,10 @@ impl Follower {
                 .context("building a snapshot's store")?;
                 let lifted = {
                     let mut inner = self.lock();
-                    inner.datasets.insert(dataset.clone(), store);
+                    if let Some(old) = inner.datasets.insert(dataset.clone(), store) {
+                        inner.retire(&dataset, &old);
+                    }
+                    inner.note_peak(&dataset);
                     inner.over_budget.remove(&dataset).is_some()
                 };
                 self.realise();
@@ -526,6 +642,7 @@ impl Follower {
                 store
                     .apply(&delta)
                     .with_context(|| format!("{dataset}: resnapshotting"))?;
+                self.lock().note_peak(&dataset);
             }
             Line::Heartbeat { positions } => {
                 self.lock().positions = positions.into_iter().collect();

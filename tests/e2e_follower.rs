@@ -692,3 +692,87 @@ async fn a_delta_over_the_budget_is_refused_before_it_is_applied() {
         writer.stop(&root);
     }
 }
+
+/// A writer restart resnapshots every dataset, and the replacement is charged beside the copy it
+/// replaces, which is still served. With room for both, the swap is seamless. Without it, the old
+/// copy is released first, the routes answer `catching_up` while the new one loads, and the cursor
+/// is never charged past its budget either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resnapshot_is_charged_beside_the_copy_it_replaces() {
+    const BUDGET_MB: u64 = 12;
+    // The nest is charged 5 MiB by admission, leaving 7 for its copy: 1 MiB fits twice, 5 MiB once.
+    for (size, reloads) in [(1 << 20, 0), (5 << 20, 1)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("runtime");
+        let dir = root.join("data").join(ROUTE);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_nest(&dir, ROUTE, USDC);
+        std::fs::write(
+            root.join(nuthatch::runtime::MOUNTS_FILE),
+            format!(
+                "[runtime]\nname = \"r\"\nmax_rss_mb = {BUDGET_MB}\n\n[[chains]]\nchain = \
+                 \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n"
+            ),
+        )
+        .unwrap();
+        let via: PathBuf = tmp.path().join("follower-view");
+        std::os::unix::fs::symlink(&root, &via).unwrap();
+        let tape = Arc::new(TapeSource::new());
+        tape.insert_block(1, block(1, 0, 5));
+        tape.advance_tip_to(1);
+        let writer = Writer::start(&root, tape.clone(), 0);
+        writer.reaches(1).await;
+        let row = serde_json::json!({"table": "blob", "block_number": 1, "pad": "x".repeat(size)});
+        writer
+            .store
+            .put_entity("000000000001-999999", &row.to_string())
+            .unwrap();
+        let (follower, fbase) = bind_follower(&via, &writer).await;
+        agree(&writer, &fbase, COUNT, "before the restart").await;
+
+        let port = writer.addr.port();
+        writer.stop(&root);
+        let mut absent = false;
+        for _ in 0..400 {
+            let (_, ready) = get(&fbase, &format!("/{ROUTE}/ready")).await;
+            if ready["follower"]["writer"] == "absent" {
+                absent = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(absent, "the follower saw its writer go");
+        let writer = Writer::start(&root, tape.clone(), port);
+        let (mut caught_up, mut answered) = (false, false);
+        for _ in 0..2000 {
+            let (status, body) = route_status(&fbase, ROUTE).await;
+            match status {
+                200 => answered = true,
+                503 => {
+                    assert_eq!(body["reason"], "catching_up", "{size}: {body}");
+                    caught_up = true;
+                }
+                other => panic!("{size}: {other} {body}"),
+            }
+            let (_, ready) = get(&fbase, &format!("/{ROUTE}/ready")).await;
+            if status == 200 && ready["follower"]["lag_generations"] == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(answered, "{size}: served after the restart");
+        let (peak, released) = follower.charges();
+        assert_eq!(released, reloads, "{size}: copies released to make room");
+        assert_eq!(
+            caught_up,
+            reloads == 1,
+            "{size}: catching up only while the old copy is released"
+        );
+        assert!(
+            peak <= BUDGET_MB << 20,
+            "{size}: charged {peak} bytes against a {BUDGET_MB} MiB budget"
+        );
+        agree(&writer, &fbase, COUNT, "after the restart").await;
+        writer.stop(&root);
+    }
+}
