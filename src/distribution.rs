@@ -189,9 +189,10 @@ pub trait BundleStore: Send + Sync {
     async fn blob_age(&self, hash: &str) -> Result<Option<std::time::Duration>>;
     /// Every blob's content address.
     async fn list_blobs(&self) -> Result<Vec<String>>;
-    /// Every `(name, version, hash)` ref, `latest` included.
+    /// Every `(name, version, hash)` ref, `latest` included. One deleted between the listing and its
+    /// read is left out, as it would be had the delete come first.
     async fn list_refs(&self) -> Result<Vec<(String, String, String)>>;
-    /// Every `(nid, hash)` entry.
+    /// Every `(nid, hash)` entry, leaving out one deleted between the listing and its read.
     async fn list_nid_refs(&self) -> Result<Vec<(String, String)>>;
     /// Remove a blob; an absent one is not an error.
     async fn delete_blob(&self, hash: &str) -> Result<()>;
@@ -328,8 +329,11 @@ impl BundleStore for FsStore {
         let mut out = Vec::new();
         for (name, dir) in self.list_dir(&self.root.join("index"))? {
             for (version, path) in self.list_dir(&dir)? {
-                let hash = Self::read_hash(&path, &format!("nest '{name}@{version}'"))?;
-                out.push((name.clone(), version, hash));
+                match Self::read_hash(&path, &format!("nest '{name}@{version}'")) {
+                    Ok(hash) => out.push((name.clone(), version, hash)),
+                    Err(e) if is_not_found(&e) => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(out)
@@ -338,8 +342,11 @@ impl BundleStore for FsStore {
     async fn list_nid_refs(&self) -> Result<Vec<(String, String)>> {
         let mut out = Vec::new();
         for (nid, path) in self.list_dir(&self.root.join("nids"))? {
-            let hash = Self::read_hash(&path, &format!("nid {nid}"))?;
-            out.push((nid, hash));
+            match Self::read_hash(&path, &format!("nid {nid}")) {
+                Ok(hash) => out.push((nid, hash)),
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(out)
     }
@@ -956,8 +963,11 @@ mod object_store_impl {
             let mut out = Vec::new();
             for parts in self.list_under("index").await? {
                 if let [_, name, version] = parts.as_slice() {
-                    let hash = self.get_ref(name, version).await?;
-                    out.push((name.clone(), version.clone(), hash));
+                    match self.get_ref(name, version).await {
+                        Ok(hash) => out.push((name.clone(), version.clone(), hash)),
+                        Err(e) if is_not_found(&e) => {}
+                        Err(e) => return Err(e),
+                    }
                 }
             }
             Ok(out)
@@ -967,7 +977,11 @@ mod object_store_impl {
             let mut out = Vec::new();
             for parts in self.list_under("nids").await? {
                 if let [_, nid] = parts.as_slice() {
-                    out.push((nid.clone(), self.get_nid_ref(nid).await?));
+                    match self.get_nid_ref(nid).await {
+                        Ok(hash) => out.push((nid.clone(), hash)),
+                        Err(e) if is_not_found(&e) => {}
+                        Err(e) => return Err(e),
+                    }
                 }
             }
             Ok(out)
@@ -1868,6 +1882,34 @@ abi = "abis/c.json"
         assert!(store.fired.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!report.deleted_blobs.contains(&ha), "{report:?}");
         assert_eq!(store.get_ref("late", "1").await.unwrap(), ha);
+        no_ref_dangles(&store).await;
+    }
+
+    /// A ref or NID entry another runtime's prune deletes after this listing saw it and before its
+    /// read is left out, and the prune listing it goes on. A link to nothing is listed and then reads
+    /// as absent, which is that interleaving held still.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_ref_deleted_between_the_listing_and_its_read_is_left_out() {
+        let reg = tempfile::tempdir().unwrap();
+        let store = FsStore::new(reg.path());
+        let dir = tempfile::tempdir().unwrap();
+        let ((ha, na), _) = two_published(&store, dir.path()).await;
+        let gone = reg.path().join("deleted-elsewhere");
+        std::os::unix::fs::symlink(&gone, reg.path().join("index/a/3")).unwrap();
+        std::os::unix::fs::symlink(&gone, reg.path().join("nids").join("ab".repeat(32))).unwrap();
+
+        let refs = store.list_refs().await.unwrap();
+        assert!(!refs.iter().any(|(_, v, _)| v == "3"), "{refs:?}");
+        assert_eq!(refs.len(), 5, "{refs:?}");
+        assert_eq!(store.list_nid_refs().await.unwrap().len(), 2);
+
+        let keep = std::collections::BTreeSet::from([na]);
+        let report = prune(&store, &keep, std::time::Duration::ZERO, false)
+            .await
+            .unwrap();
+        assert_eq!(report.kept_blobs, vec![ha]);
+        assert_eq!(report.deleted_refs, vec!["b@1", "b@latest"]);
         no_ref_dangles(&store).await;
     }
 }
