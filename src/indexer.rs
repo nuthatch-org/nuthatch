@@ -30,6 +30,7 @@ use nuthatch_core::feed::{
     velocity_retraction_batch, view_transfer,
 };
 use nuthatch_core::metrics::CursorMetrics;
+use nuthatch_core::seal::pin_checkpoint;
 pub(crate) use nuthatch_core::window::fetch_window_block_data;
 use nuthatch_core::window::{
     apply_row_timestamps, blocks_needing_timestamps, decode_window, l1_block_rows, note_undecoded,
@@ -8568,52 +8569,7 @@ fn hold_for_documents(
     Ok(Some(finalized_through))
 }
 
-/// `block:hash` of the checkpoint `maybe_seal` last pinned while holding rows (#1495).
-const SEAL_PIN_KEY: &str = "seal_pin";
-
-/// Whether that pin still anchors the reorg walk: at or above the watermark (`from - 1`), at or
-/// below `ceiling`, and still the checkpoint the store holds at its block.
-fn held_pin_covers(store: &dyn crate::store::HotStore, from: u64, ceiling: u64) -> Result<bool> {
-    let Some(pin) = store.get_meta(SEAL_PIN_KEY)? else {
-        return Ok(false);
-    };
-    let Some((block, hash)) = pin
-        .split_once(':')
-        .and_then(|(b, h)| Some((b.parse::<u64>().ok()?, h)))
-    else {
-        return Ok(false);
-    };
-    Ok(block + 1 >= from
-        && block <= ceiling
-        && store.get_block_hash(block)?.as_deref() == Some(hash))
-}
-
-/// Checkpoint `block` with the source's hash before the watermark may move to it (#1665). `false`
-/// when the source could not answer; the watermark then stays where it is until a later poll.
-async fn pin_checkpoint(
-    store: &dyn crate::store::HotStore,
-    source: &dyn Source,
-    block: u64,
-) -> Result<bool> {
-    match source.block_hash(block).await {
-        Ok(Some(hash)) => {
-            store.set_block_hash(block, &hash)?;
-            Ok(true)
-        }
-        Ok(None) | Err(_) => {
-            tracing::debug!("no hash for block {block}; the sealed watermark waits for one");
-            Ok(false)
-        }
-    }
-}
-
-/// Seal finalized rows that have accumulated to [`SEAL_DIRECT_BATCH`], cutting at a block boundary
-/// chosen from the data. Rows short of the threshold stay in the hot store until the next call.
-///
-/// Earlier write-ups called this `seal_finalized`. It sealed `from..=ceiling` with no row threshold,
-/// which is why 80% of a long-running nest's segments were under 20 KB (docs/bench/segment-layout.md).
-///
-/// The outcome goes to `metrics`, so `/ready` sees a seal that fails on every attempt (#2262).
+/// [`nuthatch_core::seal::maybe_seal`] over the nest's files at `dir`.
 async fn maybe_seal(
     dir: &std::path::Path,
     store: &dyn crate::store::HotStore,
@@ -8623,180 +8579,22 @@ async fn maybe_seal(
     metrics: &crate::metrics::NestMetrics,
     seal_span: u64,
 ) -> Result<()> {
-    let sealed = try_seal(
-        dir,
-        store,
+    let faults = NodeFaults {
+        dir: dir.to_path_buf(),
+    };
+    nuthatch_core::seal::maybe_seal(
+        nuthatch_core::seal::TipSeal {
+            sinks: &seal::FsSinks(dir),
+            faults: &faults,
+            store,
+            metrics,
+            seal_span,
+        },
         source,
         finalized_through,
         registry_snapshot,
-        metrics,
-        seal_span,
     )
-    .await;
-    metrics.record_seal(sealed.as_ref().err().map(|e| format!("{e:#}")));
-    sealed
-}
-
-async fn try_seal(
-    dir: &std::path::Path,
-    store: &dyn crate::store::HotStore,
-    source: &dyn Source,
-    finalized_through: u64,
-    registry_snapshot: Option<&str>,
-    metrics: &crate::metrics::NestMetrics,
-    seal_span: u64,
-) -> Result<()> {
-    if finalized_through == 0 {
-        return Ok(());
-    }
-    let last_indexed = match store.get_meta(LAST_BLOCK_KEY)? {
-        Some(v) => v.parse::<u64>().context("corrupt last_block")?,
-        None => return Ok(()),
-    };
-    let ceiling = finalized_through.min(last_indexed);
-
-    let watermark = match store.get_meta(SEALED_THROUGH_KEY)? {
-        Some(v) => Some(v.parse::<u64>().context("corrupt sealed_through")?),
-        None => None,
-    };
-    let mut from = match watermark {
-        Some(w) => w + 1,
-        None => store
-            .get_meta(START_BLOCK_KEY)?
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0),
-    };
-    if ceiling < from {
-        // A watermark with no checkpoint, as a `--seal-direct` backfill can leave, sends a one-block
-        // reorg's walk below it until finality passes it, and that reads as a finality violation (#2175).
-        if let Some(w) = watermark {
-            if store.get_block_hash(w)?.is_none() {
-                pin_checkpoint(store, source, w).await?;
-            }
-        }
-        return Ok(()); // nothing new has finalized
-    }
-
-    loop {
-        if ceiling < from {
-            return Ok(());
-        }
-        // Read only as far as the cut: a finalized range of documents is gigabytes (3.17 GB RSS
-        // measured on 678 QoS payloads, 2026-09-13), and the cut needs a block and a length per row.
-        let mut scan = CutScan::new(ceiling, seal_span);
-        store.scan_entities_in_range(from, ceiling, &mut |block, json| {
-            scan.push_at(json.len(), block)
-        })?;
-        // **Advance across a leading stretch that carries no rows, before deciding anything.**
-        //
-        // Without this the span bound is `first_held_row + seal_span`, not `watermark + seal_span`,
-        // so a nest whose watermark sits at 10,800 and whose next event is at block 100,000 holds
-        // 89,200 finalized blocks and the bound is the event gap plus the span rather than the span.
-        // Found by review on #1200; the row anchor is deliberate (see `seal_cut`) and this is what
-        // makes it coincide with the watermark instead of drifting from it.
-        //
-        // Nothing is sealed here and no segment is written, because there is nothing in the range -
-        // it is the empty-range arm below applied to the empty *prefix* rather than only to a wholly
-        // empty range. `sealed_through` means "every row at or below this block is in cold storage",
-        // which is vacuously true of a range holding no rows. The checkpoint is pinned for the same
-        // reason the empty arm pins one: a later reorg walk must not skip past the watermark to an
-        // older sparse checkpoint and trip the finality guard on a block it never touched (#461).
-        if let Some(first) = scan.first() {
-            if first > from {
-                if !pin_checkpoint(store, source, first - 1).await? {
-                    return Ok(());
-                }
-                store.set_meta(SEALED_THROUGH_KEY, &(first - 1).to_string())?;
-                metrics.set_sealed_through(first - 1);
-                tracing::debug!(
-                    from,
-                    first,
-                    "blocks {from}..={} carried no rows; watermark advanced to the first held row",
-                    first - 1
-                );
-                from = first;
-            }
-        }
-        let cut = match scan.cut() {
-            None if scan.first().is_none() => {
-                // Finalized range with no transfers - just advance the watermark. Pinning a
-                // checkpoint at the new watermark is what stops a later reorg from walking past it
-                // to an older surviving checkpoint and tripping the finality guard on a block the
-                // reorg never touched (#461).
-                if !pin_checkpoint(store, source, ceiling).await? {
-                    return Ok(());
-                }
-                store.set_meta(SEALED_THROUGH_KEY, &ceiling.to_string())?;
-                metrics.set_sealed_through(ceiling);
-                tracing::debug!(
-                    "blocks {from}..={ceiling} finalized with no transfers; watermark advanced"
-                );
-                return Ok(());
-            }
-            None => {
-                // Held, not drained. A cursor-wide "seal because co-tenants are fat"
-                // flush was considered and reverted: it made segment identity depend
-                // on which nests share the cursor. The 2 GB budget is the multinest
-                // RAM job (measured 372 MB for 20 nests × 12,010 rows against 2048).
-                // Still pin the finalized ceiling. Holding rows does not mean the reorg
-                // walker can do without a checkpoint: #461 was a walk that skipped past
-                // sealed_through to an older sparse checkpoint and tripped the finality
-                // guard on a block the reorg never touched. The empty-range arm already
-                // pins; this one must too (#1067).
-                //
-                // One pin serves until the watermark moves (#1495). The walk needs a final
-                // checkpoint at or above the watermark, not a new one per window.
-                if !held_pin_covers(store, from, ceiling)? {
-                    if let Ok(Some(hash)) = source.block_hash(ceiling).await {
-                        store.set_block_hash(ceiling, &hash)?;
-                        store.set_meta(SEAL_PIN_KEY, &format!("{ceiling}:{hash}"))?;
-                    }
-                }
-                tracing::debug!(
-                    rows = scan.rows(),
-                    threshold = SEAL_DIRECT_BATCH,
-                    from,
-                    ceiling,
-                    "tip path holding finalized rows until the batch threshold"
-                );
-                return Ok(());
-            }
-            Some(cut) => cut,
-        };
-
-        if !pin_checkpoint(store, source, cut).await? {
-            return Ok(());
-        }
-
-        let to_seal = store.entities_in_range(from, cut)?;
-        match seal::seal_range_with_snapshot(dir, &to_seal, from, cut, registry_snapshot)? {
-            Some(summary) => {
-                #[cfg(test)]
-                between_seal_and_prune();
-                // After the seal. It fsyncs the bytes and the manifest entry before returning, and
-                // this commit fsyncs the watermark (#1632).
-                let pruned =
-                    store.prune_and_set_meta(from, cut, SEALED_THROUGH_KEY, &cut.to_string())?;
-                metrics.set_sealed_through(cut);
-                metrics.add_rows_sealed(summary.rows as u64);
-                tracing::debug!(
-                    "sealed blocks {from}..={cut}: {} rows across {} table(s); pruned {pruned} from hot",
-                    summary.rows,
-                    summary.tables
-                );
-            }
-            None => {
-                store.set_meta(SEALED_THROUGH_KEY, &cut.to_string())?;
-                metrics.set_sealed_through(cut);
-                tracing::debug!(
-                    "blocks {from}..={cut} finalized with no transfers; watermark advanced"
-                );
-            }
-        }
-        from = cut + 1;
-        // Sealing is synchronous; yielding between segments lets an aborted ingest stop here.
-        tokio::task::yield_now().await;
-    }
+    .await
 }
 
 /// Finish a seal that installed a fold's catalogue and died before its prune (#2169): the prune and

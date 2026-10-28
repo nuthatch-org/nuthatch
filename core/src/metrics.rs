@@ -5,6 +5,9 @@ pub trait CursorMetrics: Send + Sync {
     fn set_last_block(&self, _block: u64) {}
     fn add_rows_decoded(&self, _n: u64) {}
     fn add_rows_sealed(&self, _n: u64) {}
+    fn set_sealed_through(&self, _block: u64) {}
+    /// One tip-path seal attempt's error, or `None` when it did not fail.
+    fn record_seal(&self, _error: Option<String>) {}
     fn add_undecoded(&self, _contract: &str, _topic0: &str, _n: u64) {}
     fn record_reorg(&self, _depth: u64) {}
     /// Returns the running count, which paces the warning a missed checkpoint logs.

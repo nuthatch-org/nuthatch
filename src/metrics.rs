@@ -683,6 +683,12 @@ impl nuthatch_core::metrics::CursorMetrics for NestMetrics {
     fn add_rows_sealed(&self, n: u64) {
         NestMetrics::add_rows_sealed(self, n)
     }
+    fn set_sealed_through(&self, block: u64) {
+        NestMetrics::set_sealed_through(self, block)
+    }
+    fn record_seal(&self, error: Option<String>) {
+        NestMetrics::record_seal(self, error)
+    }
     fn add_undecoded(&self, contract: &str, topic0: &str, n: u64) {
         NestMetrics::add_undecoded(self, contract, topic0, n)
     }

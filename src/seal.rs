@@ -138,6 +138,19 @@ pub fn seal_range_with_snapshot(
     nuthatch_core::seal::seal_range(&mut sink, entity_json, from, to, registry_snapshot)
 }
 
+/// Opens an [`FsSink`] over the nest at `dir` for each seal.
+pub struct FsSinks<'a>(pub &'a Path);
+
+impl nuthatch_core::seal::Sinks for FsSinks<'_> {
+    fn open(&self) -> Box<dyn SegmentSink + '_> {
+        Box::new(FsSink {
+            dir: self.0,
+            publishing: Vec::new(),
+            folded_away: Vec::new(),
+        })
+    }
+}
+
 /// The node's [`SegmentSink`]: segment files beside the nest, or in the runtime's shared store.
 struct FsSink<'a> {
     dir: &'a Path,
