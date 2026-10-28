@@ -480,6 +480,12 @@ streams. A connection whose queue is full when a delta or heartbeat is due, or w
 no room for 30 s, is closed, possibly part-way through a line; the follower reconnects and
 resnapshots.
 
+**What a follower has applied.** `hello` carries `conn`, the writer's number for the connection.
+Every second the follower sends `POST /_admin/feed/applied?conn=<n>` (admin token) with
+`{"<dataset>": [epoch, generation]}` for each copy it holds, and the writer answers `204`. A segment
+a fold replaces is kept from reclaim until every connected follower of its dataset has applied the
+commit whose catalogue stopped naming it and 5 minutes have passed, and for at most an hour.
+
 **The seal handoff.** A seal writes its segment and catalogue, then removes the sealed rows from hot
 and raises `sealed_through` in one commit. That commit's delta carries the removal, the new watermark
 and the catalogue as it stood at the commit, so a follower moves from "rows in hot" to "rows in a

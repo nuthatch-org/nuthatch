@@ -298,6 +298,15 @@ the same `as_of`, `sealed_through` and `nid`.
   follower and 64 MiB across them all, paid from `ingestion_reservation` (the feed queues row of
   the query guards under [Security posture](#security-posture)). A follower too slow to keep its
   queue from filling is dropped and reconnects for fresh snapshots; it never slows a commit.
+- **Segments a follower may still name are kept.** A seal that folds a provisional segment into a
+  new one leaves the old file for `nuthatch prune`. Once a follower has followed that dataset, the
+  writer keeps the old file from any reclaim until every connected follower reports it has applied
+  the commit that stopped naming it and at least 5 minutes have passed (ten statement timeouts, for
+  a request still on an old copy and a follower that dropped for a moment), and never for more than
+  an hour. It costs disk only: one provisional segment per table per fold, held for those minutes.
+  `segments/.retained.json` records what is kept, so a `nuthatch prune` in another process skips it
+  too. A follower that finds a segment its catalogue names missing never answers around it: the
+  request is `503` `catching_up` and the follower takes fresh snapshots.
 - **Beside the writer only, for now.** It reads segments from the runtime directory; following from
   another host with a segment mirror is RFC-0073's open question 2, not built.
 
