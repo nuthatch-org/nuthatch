@@ -340,8 +340,10 @@ impl<R: std::io::Read> std::io::Read for Limited<R> {
     }
 }
 
-/// Start limiting the snapshot whose dataset name has just been read to `cap`, doubled because a
-/// stored row is itself JSON and escaping can inflate it on the wire, plus the framing slack.
+/// Start limiting the line whose dataset name has just been read to `cap` plus the framing slack.
+/// A value never decodes to more bytes than it was read from, escaping only adds to the wire, so
+/// nothing allocated from the line can pass what is left; a heavily escaped line near the budget is
+/// refused a little early instead.
 fn limit_line(dataset: &str, cap: Option<u64>, kind: Kind) {
     WIRE.with(|w| {
         let mut w = w.borrow_mut();
@@ -349,7 +351,7 @@ fn limit_line(dataset: &str, cap: Option<u64>, kind: Kind) {
         w.stop_at = cap.map(|cap| {
             (
                 start,
-                start + cap.saturating_mul(2) + SNAPSHOT_SLACK,
+                start + cap + SNAPSHOT_SLACK,
                 dataset.to_string(),
                 kind,
             )
@@ -1637,7 +1639,7 @@ mod tests {
         .unwrap_err();
         let over = err.downcast_ref::<LineOverBudget>().expect("{err:#}");
         assert_eq!(over.dataset, "data/huge");
-        assert_eq!(over.limit, 2_000 + SNAPSHOT_SLACK);
+        assert_eq!(over.limit, 1_000 + SNAPSHOT_SLACK);
         assert_eq!(seen, vec!["data/small".to_string()]);
         assert!(
             consumed.get() < 200 * 1024,
@@ -1719,7 +1721,7 @@ mod tests {
             (over.dataset.as_str(), over.kind),
             ("data/huge", Kind::Delta)
         );
-        assert_eq!(over.read, 2_000 + SNAPSHOT_SLACK);
+        assert_eq!(over.read, 1_000 + SNAPSHOT_SLACK);
     }
 
     /// A mount's lowered guards survive the wire, and a follower never serves wider than its own.

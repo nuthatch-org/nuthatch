@@ -656,8 +656,8 @@ async fn a_single_value_over_the_budget_is_refused_without_being_read() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delta_over_the_budget_is_refused_before_it_is_applied() {
     for (size, refused_by) in [
-        (3 << 20, "refused before it was applied"),
-        (32 << 20, "delta passed"),
+        ((2 << 20) + (8 << 10), "refused before it was applied"),
+        (3 << 20, "delta passed"),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let (root, via, tape) = two_mounts(tmp.path());
@@ -673,8 +673,9 @@ async fn a_delta_over_the_budget_is_refused_before_it_is_applied() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert_eq!(held, 200, "the mount is held before the delta");
-        // One row of `size` bytes: about 2 MiB is left, so 3 MiB passes the wire limit (twice that) but
-        // not the charge; 32 MiB passes neither.
+        // One row of `size` bytes. A little under 2 MiB is left (12, less 5 charged to each nest and
+        // their few rows), and the wire limit is that plus 64 KiB: 2 MiB and 8 KiB is read and
+        // refused by its charge, 3 MiB is stopped on the wire.
         let row = serde_json::json!({"table": "blob", "block_number": 1, "pad": "x".repeat(size)});
         writer
             .store

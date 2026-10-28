@@ -273,9 +273,11 @@ the same `as_of`, `sealed_through` and `nid`.
 - **Its own budget.** A follower holds each dataset's hot window in memory, as the writer's `/sql`
   already copies it per query, and charges it to its cursor's `[runtime] max_rss_mb` from the
   runtime's `mounts.toml`, together with what admission charges each nest. A snapshot that would
-  not fit is read without keeping its rows; one whose bytes on the wire run past twice what its
-  cursor has left (escaping can inflate a stored row that much) is not read to the end at all, so no
-  single value in it is ever held, and the follower reconnects asking the writer to leave that
+  not fit is read without keeping its rows; one whose bytes on the wire run past what its cursor
+  has left, plus 64 KiB for framing, is not read to the end at all, so nothing is ever allocated
+  past the budget. Escaping only makes the wire larger than the stored rows, so a heavily escaped
+  snapshot near the budget is refused a little early, on the safe side. The follower reconnects
+  asking the writer to leave that
   dataset out until `max_rss_mb` changes or the follower restarts. A delta is held to what its
   dataset has left the same way, on the wire and then by what it would hold at its peak, worked out
   before any of it is applied; one that would not fit is not applied and its dataset is let go and
