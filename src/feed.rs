@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 /// Deltas one subscriber may fall behind by before it is told to resnapshot. Past this the writer
 /// drops what it would have sent rather than wait: a slow reader never holds up a commit.
@@ -695,11 +695,18 @@ impl std::fmt::Display for Gap {
 
 impl std::error::Error for Gap {}
 
-#[derive(Default)]
+/// One mirrored table, chunked so each delta publishes a version that shares what it left alone (#2467).
+type Table = crate::versioned::Chunked<String, String>;
+
+fn table(map: BTreeMap<String, String>) -> Table {
+    Table::from_map(map, |k, v| row_bytes(k, v))
+}
+
+#[derive(Clone)]
 struct Mirror {
-    entities: BTreeMap<String, String>,
-    meta: BTreeMap<String, String>,
-    blocks: BTreeMap<String, String>,
+    entities: Table,
+    meta: Table,
+    blocks: Table,
     epoch: u64,
     generation: u64,
     /// What the three tables are charged, by [`row_bytes`], and the catalogue's length.
@@ -727,6 +734,17 @@ pub struct Changes {
 }
 
 /// Rows a catalogue holds across its segments.
+impl crate::versioned::Footprint for Mirror {
+    fn footprint(&self, out: &mut Vec<(usize, u64)>) {
+        self.entities.footprint(out);
+        self.meta.footprint(out);
+        self.blocks.footprint(out);
+        if let Some(c) = &self.catalogue {
+            out.push((Arc::as_ptr(c) as *const u8 as usize, self.catalogue_bytes));
+        }
+    }
+}
+
 fn catalogue_rows(raw: Option<&str>) -> u64 {
     raw.and_then(|r| serde_json::from_str::<crate::seal::Manifest>(r).ok())
         .map_or(0, |m| {
@@ -736,7 +754,7 @@ fn catalogue_rows(raw: Option<&str>) -> u64 {
 
 /// Insert into `map`, keeping `bytes` the charge for what it holds; the value replaced, if any.
 fn put(
-    map: &mut BTreeMap<String, String>,
+    map: &mut Table,
     bytes: &mut u64,
     key: &str,
     value: &str,
@@ -769,12 +787,12 @@ impl Mirror {
                 let doomed: Vec<String> = match to {
                     Some(to) => self
                         .entities
-                        .range(from.clone()..=to.clone())
+                        .range::<String, _>(from.clone()..=to.clone())
                         .map(|(k, _)| k.clone())
                         .collect(),
                     None => self
                         .entities
-                        .range(from.clone()..)
+                        .range::<String, _>(from.clone()..)
                         .map(|(k, _)| k.clone())
                         .collect(),
                 };
@@ -809,8 +827,8 @@ impl Mirror {
                 }
             }
             Op::UnblockFrom { key } => {
-                let gone = self.blocks.split_off(key);
-                self.bytes -= charge(&gone);
+                let gone = self.blocks.split_off(key.as_str());
+                self.bytes -= gone.iter().map(|(k, v)| row_bytes(k, v)).sum::<u64>();
             }
         }
     }
@@ -826,7 +844,18 @@ fn rows_epoch() -> u64 {
 /// A reader's copy of one dataset's hot window, built from a [`Snapshot`] and kept current by
 /// [`MemStore::apply`]. Every write method of [`HotStore`] refuses: the writer owns the data.
 pub struct MemStore {
-    mirror: RwLock<Mirror>,
+    copy: Arc<MemCopy>,
+    /// Set on a handle from [`HotStore::pinned`]: the version it reads, and the write and rows
+    /// generations it was taken at.
+    at: Option<(Arc<Mirror>, u64, u64)>,
+}
+
+/// What every handle on one copy shares, pinned ones included, so the copy lives and is charged
+/// while any request still reads a version of it.
+pub struct MemCopy {
+    mirror: crate::versioned::Versions<Mirror>,
+    /// Held while a delta is applied, so two applies never fork a version.
+    applying: Mutex<()>,
     writes: AtomicU64,
     rows: AtomicU64,
     /// Its dataset's directory, which [`crate::seal`] never reads the catalogue of while this lives.
@@ -836,13 +865,31 @@ pub struct MemStore {
     missing: std::sync::atomic::AtomicBool,
 }
 
-impl Drop for MemStore {
+impl Drop for MemCopy {
     fn drop(&mut self) {
         crate::seal::unfollow(&self.dir);
     }
 }
 
+impl MemCopy {
+    /// What the copy is charged against its cursor's budget: its latest version by [`row_bytes`],
+    /// and what versions requests still read hold beside it.
+    pub fn bytes(&self) -> u64 {
+        self.mirror.load().bytes + self.mirror.retained()
+    }
+}
+
 impl MemStore {
+    /// The copy this handle reads, for charging it while anything holds it.
+    pub fn copy(&self) -> std::sync::Weak<MemCopy> {
+        Arc::downgrade(&self.copy)
+    }
+
+    /// What versions requests still read hold beside the latest, in bytes.
+    pub fn retained_bytes(&self) -> u64 {
+        self.copy.mirror.retained()
+    }
+
     pub fn from_snapshot(dir: &Path, snapshot: Snapshot) -> MemStore {
         let entities = snapshot.entities.map;
         let meta: BTreeMap<String, String> = snapshot
@@ -855,9 +902,9 @@ impl MemStore {
         let catalogue_bytes = snapshot.catalogue.as_ref().map_or(0, |c| c.len() as u64);
         let mirror = Mirror {
             bytes: charge(&entities) + charge(&meta) + charge(&blocks) + catalogue_bytes,
-            entities,
-            meta,
-            blocks,
+            entities: table(entities),
+            meta: table(meta),
+            blocks: table(blocks),
             epoch: snapshot.epoch,
             generation: snapshot.generation,
             catalogue_bytes,
@@ -866,17 +913,21 @@ impl MemStore {
         };
         crate::seal::follow(dir);
         MemStore {
-            mirror: RwLock::new(mirror),
-            writes: AtomicU64::new(rows_epoch()),
-            rows: AtomicU64::new(rows_epoch()),
-            dir: dir.to_path_buf(),
-            missing: Default::default(),
+            copy: Arc::new(MemCopy {
+                mirror: crate::versioned::Versions::new(mirror),
+                applying: Mutex::new(()),
+                writes: AtomicU64::new(rows_epoch()),
+                rows: AtomicU64::new(rows_epoch()),
+                dir: dir.to_path_buf(),
+                missing: Default::default(),
+            }),
+            at: None,
         }
     }
 
-    /// What this copy is charged against its cursor's budget, by [`row_bytes`].
+    /// What this copy is charged against its cursor's budget: see [`MemCopy::bytes`].
     pub fn bytes(&self) -> u64 {
-        self.read().bytes
+        self.copy.bytes()
     }
 
     /// The most this copy would be charged at any point while `delta` is applied, by the accounting
@@ -884,7 +935,7 @@ impl MemStore {
     pub fn peak_with(&self, delta: &Delta) -> u64 {
         // What each key a delta touches is charged once touched; `None` is removed.
         type Touched = BTreeMap<String, Option<u64>>;
-        fn now(base: &BTreeMap<String, String>, touched: &Touched, key: &str) -> u64 {
+        fn now(base: &Table, touched: &Touched, key: &str) -> u64 {
             touched
                 .get(key)
                 .copied()
@@ -892,7 +943,7 @@ impl MemStore {
                 .unwrap_or(0)
         }
         fn set(
-            base: &BTreeMap<String, String>,
+            base: &Table,
             touched: &mut Touched,
             held: &mut i128,
             key: &str,
@@ -905,7 +956,7 @@ impl MemStore {
             key >= from && to.is_none_or(|t| key <= t.as_str())
         }
         fn drop_range(
-            base: &BTreeMap<String, String>,
+            base: &Table,
             touched: &mut Touched,
             held: &mut i128,
             from: &str,
@@ -913,11 +964,11 @@ impl MemStore {
         ) {
             let mut keys: Vec<String> = match to {
                 Some(to) => base
-                    .range(from.to_string()..=to.clone())
+                    .range::<String, _>(from.to_string()..=to.clone())
                     .map(|(k, _)| k.clone())
                     .collect(),
                 None => base
-                    .range(from.to_string()..)
+                    .range::<String, _>(from.to_string()..)
                     .map(|(k, _)| k.clone())
                     .collect(),
             };
@@ -928,7 +979,8 @@ impl MemStore {
         }
         let m = self.read();
         let (mut entities, mut meta, mut blocks) = (Touched::new(), Touched::new(), Touched::new());
-        let mut held = i128::from(m.bytes);
+        // Versions requests still read are charged beside the latest throughout (#2467).
+        let mut held = i128::from(m.bytes + self.copy.mirror.retained());
         let mut peak = held;
         for op in &delta.ops {
             match op {
@@ -972,7 +1024,7 @@ impl MemStore {
     /// `(epoch, generation)` of the last delta applied.
     /// Whether a request found a segment this copy names missing since this was last asked.
     pub fn take_missing(&self) -> bool {
-        self.missing.swap(false, Ordering::SeqCst)
+        self.copy.missing.swap(false, Ordering::SeqCst)
     }
 
     pub fn applied(&self) -> (u64, u64) {
@@ -980,13 +1032,17 @@ impl MemStore {
         (m.epoch, m.generation)
     }
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, Mirror> {
-        self.mirror.read().unwrap_or_else(|e| e.into_inner())
+    fn read(&self) -> Arc<Mirror> {
+        match &self.at {
+            Some((m, _, _)) => m.clone(),
+            None => self.copy.mirror.load(),
+        }
     }
 
     /// Apply the next delta, or refuse it as a [`Gap`] and change nothing.
     pub fn apply(&self, delta: &Delta) -> Result<Changes, Gap> {
-        let mut m = self.mirror.write().unwrap_or_else(|e| e.into_inner());
+        let _applying = self.copy.applying.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m = Mirror::clone(&self.copy.mirror.load());
         if delta.resync || delta.epoch != m.epoch || delta.generation != m.generation + 1 {
             return Err(Gap {
                 applied: (m.epoch, m.generation),
@@ -994,13 +1050,13 @@ impl MemStore {
             });
         }
         // Bracketed odd while the change lands, as `Store::commit` is, so the memo's fence holds.
-        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.copy.writes.fetch_add(1, Ordering::SeqCst);
         let changes_rows = delta
             .ops
             .iter()
             .any(|op| matches!(op, Op::Put { .. } | Op::Drop { .. }));
         if changes_rows {
-            self.rows.fetch_add(1, Ordering::SeqCst);
+            self.copy.rows.fetch_add(1, Ordering::SeqCst);
         }
         let mut changes = Changes::default();
         for op in &delta.ops {
@@ -1015,10 +1071,11 @@ impl MemStore {
             m.catalogue_rows = rows;
         }
         m.generation = delta.generation;
+        self.copy.mirror.publish(m);
         if changes_rows {
-            self.rows.fetch_add(1, Ordering::SeqCst);
+            self.copy.rows.fetch_add(1, Ordering::SeqCst);
         }
-        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.copy.writes.fetch_add(1, Ordering::SeqCst);
         Ok(changes)
     }
 
@@ -1102,10 +1159,11 @@ impl MemStore {
     /// Every mirrored table, for comparing a copy against the store it follows.
     pub fn tables(&self) -> MirroredTables {
         let m = self.read();
+        let all = |t: &Table| t.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         MirroredTables {
-            entities: m.entities.clone(),
-            meta: m.meta.clone(),
-            blocks: m.blocks.clone(),
+            entities: all(&m.entities),
+            meta: all(&m.meta),
+            blocks: all(&m.blocks),
         }
     }
 }
@@ -1146,13 +1204,32 @@ fn block_of(key: &str) -> Result<u64> {
 
 #[async_trait::async_trait]
 impl HotStore for MemStore {
+    fn pinned(&self) -> Result<Option<Arc<dyn HotStore>>> {
+        let _applying = self.copy.applying.lock().unwrap_or_else(|e| e.into_inner());
+        let at = (
+            self.copy.mirror.load(),
+            self.copy.writes.load(Ordering::SeqCst),
+            self.copy.rows.load(Ordering::SeqCst),
+        );
+        Ok(Some(Arc::new(MemStore {
+            copy: self.copy.clone(),
+            at: Some(at),
+        })))
+    }
+
     fn write_generation(&self) -> Option<u64> {
-        let g = self.writes.load(Ordering::SeqCst);
+        let g = match &self.at {
+            Some((_, w, _)) => *w,
+            None => self.copy.writes.load(Ordering::SeqCst),
+        };
         g.is_multiple_of(2).then_some(g)
     }
 
     fn rows_generation(&self) -> Option<u64> {
-        let g = self.rows.load(Ordering::SeqCst);
+        let g = match &self.at {
+            Some((_, _, r)) => *r,
+            None => self.copy.rows.load(Ordering::SeqCst),
+        };
         g.is_multiple_of(2).then_some(g)
     }
 
@@ -1161,7 +1238,7 @@ impl HotStore for MemStore {
     }
 
     fn segment_missing(&self) {
-        self.missing.store(true, Ordering::SeqCst);
+        self.copy.missing.store(true, Ordering::SeqCst);
     }
 
     fn put_entity(&self, _key: &str, _json: &str) -> Result<()> {
@@ -1249,7 +1326,7 @@ impl HotStore for MemStore {
         Ok(self
             .read()
             .entities
-            .range(lo..=hi)
+            .range::<String, _>(lo..=hi)
             .map(|(_, v)| v.clone())
             .collect())
     }
@@ -1262,7 +1339,7 @@ impl HotStore for MemStore {
         let lo = format!("{from:012}-000000");
         let hi = format!("{to:012}-999999");
         let m = self.read();
-        for (k, v) in m.entities.range(lo..=hi) {
+        for (k, v) in m.entities.range::<String, _>(lo..=hi) {
             if !visit(block_of(k)?, v) {
                 break;
             }
@@ -1283,7 +1360,7 @@ impl HotStore for MemStore {
         Ok(self
             .read()
             .meta
-            .range(prefix.to_string()..)
+            .range::<String, _>(prefix.to_string()..)
             .take_while(|(k, _)| k.starts_with(prefix))
             .take(limit)
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -1293,7 +1370,7 @@ impl HotStore for MemStore {
         Ok(self
             .read()
             .meta
-            .range(prefix.to_string()..)
+            .range::<String, _>(prefix.to_string()..)
             .take_while(|(k, _)| k.starts_with(prefix))
             .count() as u64)
     }

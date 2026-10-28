@@ -9471,6 +9471,7 @@ mod tests {
             nid: None,
             runtime_health: None,
             address_history: None,
+            snapshots: None,
             isolation: None,
         }
     }

@@ -144,6 +144,7 @@ pub mod story;
 pub mod subgraph_import;
 pub mod tape;
 pub mod velocity;
+pub mod versioned;
 pub mod views;
 #[cfg(feature = "watch")]
 pub mod watch;

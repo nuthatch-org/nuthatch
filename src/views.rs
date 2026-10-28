@@ -29,7 +29,16 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use crate::versioned::{Chunked, Sink, Versions};
+
+/// The published balances: address to net balance.
+pub type Balances = Chunked<String, i128>;
+
+fn new_balances() -> Balances {
+    Chunked::new(|k, _| k.len() as u64 + 40)
+}
 
 /// A balance delta fed to the circuit: (address, signed_value). Insert carries weight +1, a reorg
 /// retraction carries weight −1.
@@ -89,7 +98,7 @@ impl BalanceCircuit {
     fn step(
         &mut self,
         mut batch: WeightedBatch,
-        balances: &mut HashMap<String, i128>,
+        balances: &mut impl Sink<String, i128>,
     ) -> Result<()> {
         self.input.append(&mut batch);
         let output = &self.output;
@@ -139,7 +148,7 @@ pub(crate) fn step_to_commit(
 
 fn fold_balances(
     output: &OutputHandle<OrdZSet<Tup2<String, i128>>>,
-    balances: &mut HashMap<String, i128>,
+    balances: &mut impl Sink<String, i128>,
 ) {
     // The aggregate emits a change stream: a key whose balance moves from old→new appears as
     // (key,old,−1) and (key,new,+1); a key falling to zero appears only as (key,old,−1).
@@ -156,11 +165,11 @@ fn fold_balances(
             }
         });
     for (k, v) in set.iter() {
-        balances.insert(k.clone(), *v);
+        balances.put(k.clone(), *v);
     }
     for k in cleared {
         if !set.contains_key(&k) {
-            balances.remove(&k); // balance returned to zero → drop the key
+            balances.take(&k); // balance returned to zero → drop the key
         }
     }
 }
@@ -188,7 +197,9 @@ enum Msg {
 #[derive(Clone)]
 pub struct BalanceView {
     tx: Sender<Msg>,
-    balances: Arc<RwLock<HashMap<String, i128>>>,
+    balances: Arc<Versions<Balances>>,
+    /// The version a request was handed (#2467), read instead of the latest.
+    pinned: Option<Arc<Balances>>,
     /// Flips to `false` (permanently) if the circuit thread dies on an error - so the ingest loop can
     /// surface a dead derived-view thread and fail loudly, instead of silently serving frozen balances
     /// as if healthy (a dead task must surface, never be served over).
@@ -219,7 +230,8 @@ impl BalanceView {
         let (tx, _) = channel::<Msg>();
         Self {
             tx,
-            balances: Default::default(),
+            balances: Arc::new(Versions::new(new_balances())),
+            pinned: None,
             healthy: Arc::new(AtomicBool::new(true)),
             over_i128: Default::default(),
         }
@@ -228,7 +240,7 @@ impl BalanceView {
     /// Spawn the circuit on its own thread (DBSP drives worker threads; keep it off the async pool).
     pub fn start() -> Result<Self> {
         let (tx, rx) = channel::<Msg>();
-        let balances = Arc::new(RwLock::new(HashMap::new()));
+        let balances = Arc::new(Versions::new(new_balances()));
         let shared = balances.clone();
         let healthy = Arc::new(AtomicBool::new(true));
         let health = healthy.clone();
@@ -243,15 +255,16 @@ impl BalanceView {
                         return;
                     }
                 };
+                let mut map = new_balances();
                 while let Ok(msg) = rx.recv() {
                     match msg {
                         Msg::Batch(batch) => {
-                            let mut map = shared.write().unwrap();
                             if let Err(e) = circuit.step(batch, &mut map) {
                                 tracing::error!("IVM step failed: {e:#}");
                                 health.store(false, Ordering::SeqCst);
                                 break;
                             }
+                            shared.publish(map.clone());
                         }
                         // Messages are processed in order, so by the time we see the barrier every
                         // prior batch is applied - ack unblocks the waiter.
@@ -265,6 +278,7 @@ impl BalanceView {
         Ok(Self {
             tx,
             balances,
+            pinned: None,
             healthy,
             over_i128: Arc::new(AtomicU64::new(0)),
         })
@@ -305,15 +319,29 @@ impl BalanceView {
     }
 
     pub fn balance(&self, address: &str) -> Option<i128> {
-        self.balances.read().ok()?.get(address).copied()
+        self.map().get(address).copied()
+    }
+
+    fn map(&self) -> Arc<Balances> {
+        self.pinned.clone().unwrap_or_else(|| self.balances.load())
+    }
+
+    /// This view held at what it has published now, which later batches leave alone (#2467).
+    pub fn pinned(&self) -> Self {
+        Self {
+            pinned: Some(self.balances.load()),
+            ..self.clone()
+        }
+    }
+
+    /// What published versions still referenced hold that the latest does not, in bytes.
+    pub fn retained_bytes(&self) -> u64 {
+        self.balances.retained()
     }
 
     /// Top `n` addresses by balance, descending, ties by address.
     pub fn top(&self, n: usize) -> Vec<(String, i128)> {
-        let map = match self.balances.read() {
-            Ok(m) => m,
-            Err(_) => return Vec::new(),
-        };
+        let map = self.map();
         top_k(map.iter().map(|(k, v)| (*v, Reverse(k.as_str()))), n)
             .into_iter()
             .map(|(v, Reverse(k))| (k.to_string(), v))
@@ -321,7 +349,7 @@ impl BalanceView {
     }
 
     pub fn holders(&self) -> usize {
-        self.balances.read().map(|m| m.len()).unwrap_or(0)
+        self.map().len()
     }
 
     /// Record `n` transfers dropped for exceeding 38 digits (COR-8, #814).
@@ -527,12 +555,11 @@ mod tests {
     #[test]
     fn top_breaks_ties_by_address_and_takes_at_most_n() {
         let view = BalanceView::start().unwrap();
-        view.balances.write().unwrap().extend([
-            ("0xc".to_string(), 5),
-            ("0xa".to_string(), 5),
-            ("0xb".to_string(), 9),
-            ("0xd".to_string(), -1),
-        ]);
+        let mut map = new_balances();
+        for (k, v) in [("0xc", 5), ("0xa", 5), ("0xb", 9), ("0xd", -1)] {
+            map.insert(k.to_string(), v);
+        }
+        view.balances.publish(map);
         assert_eq!(
             view.top(3),
             vec![

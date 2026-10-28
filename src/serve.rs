@@ -384,6 +384,60 @@ pub struct AppState {
     /// RFC-0063: the watched-address history `/api` serves. `None` on a nest without
     /// `[address_history]`, which answers every `/api` request unsupported.
     pub address_history: Option<crate::address_history::AddressHistory>,
+    /// Where the nest publishes each window's [`Snapshot`], which a request reads in place of the
+    /// live store and views (#2467). `None` reads them live.
+    pub snapshots: Option<Snapshots>,
+}
+
+/// One window's rows and derived state, published together once every part has it (#2467). A
+/// request loads the latest once and answers every part from it, so it never sees a window in part
+/// and never waits on one: a long query only keeps an old version alive.
+pub struct Snapshot {
+    pub store: Arc<dyn crate::store::HotStore>,
+    pub balances: crate::views::BalanceView,
+    pub exposure: crate::exposure::ExposureView,
+    pub velocity: crate::velocity::VelocityView,
+    pub entities: Arc<Vec<crate::entity_view::EntityView>>,
+}
+
+/// Where a nest's latest [`Snapshot`] is published.
+pub type Snapshots = Arc<arc_swap::ArcSwapOption<Snapshot>>;
+
+impl Snapshot {
+    /// What `store` and the views hold now. The caller has flushed every view, and nothing feeds
+    /// them until this returns. `None` from a store that cannot pin.
+    pub fn take(
+        store: &Arc<dyn crate::store::HotStore>,
+        balances: &crate::views::BalanceView,
+        exposure: &crate::exposure::ExposureView,
+        velocity: &crate::velocity::VelocityView,
+        entities: &[crate::entity_view::EntityView],
+    ) -> Result<Option<Snapshot>> {
+        let Some(store) = store.pinned()? else {
+            return Ok(None);
+        };
+        Ok(Some(Snapshot {
+            store,
+            balances: balances.pinned(),
+            exposure: exposure.pinned(),
+            velocity: velocity.pinned(),
+            entities: Arc::new(entities.iter().map(|e| e.pinned()).collect()),
+        }))
+    }
+}
+
+/// `state` reading its nest's latest snapshot, or itself before one is published.
+fn pin_snapshot(state: Arc<AppState>) -> Arc<AppState> {
+    let Some(snap) = state.snapshots.as_ref().and_then(|s| s.load_full()) else {
+        return state;
+    };
+    let mut pinned = AppState::clone(&state);
+    pinned.store = snap.store.clone();
+    pinned.balances = snap.balances.clone();
+    pinned.exposure = snap.exposure.clone();
+    pinned.velocity = snap.velocity.clone();
+    pinned.entities = snap.entities.clone();
+    Arc::new(pinned)
 }
 
 impl AppState {
@@ -570,7 +624,7 @@ async fn pin_request(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let state = backing.current();
+    let state = pin_snapshot(backing.current());
     #[cfg(test)]
     {
         let hook = pin_hooks().lock().unwrap().remove(&state.dir);
@@ -7282,6 +7336,7 @@ mod tests {
             nest_info: Arc::new(json!({ "name": "t" })),
             runtime_health: None,
             address_history: None,
+            snapshots: None,
             isolation: None,
         }
     }
