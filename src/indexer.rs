@@ -9202,6 +9202,33 @@ pub fn inject_follower_fault(dir: &Path, release: std::sync::mpsc::Receiver<()>)
         .insert(dir.to_path_buf(), (true, Some(release)));
 }
 
+/// A test seam: every feed of `dir`'s derived state waits `delay` before it starts, after the delta's
+/// rows are in the copy, so a test can read inside that window.
+#[doc(hidden)]
+pub fn slow_follower_feed(dir: &Path, delay: std::time::Duration) {
+    follower_delays()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dir.to_path_buf(), delay);
+}
+
+/// What [`slow_follower_feed`] set for `dir`.
+pub(crate) fn follower_feed_delay(dir: &Path) -> Option<std::time::Duration> {
+    follower_delays()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(dir)
+        .copied()
+}
+
+fn follower_delays(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Duration>> {
+    static DELAYS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Duration>>,
+    > = std::sync::OnceLock::new();
+    DELAYS.get_or_init(Default::default)
+}
+
 type FollowerFaults = std::sync::Mutex<
     std::collections::HashMap<PathBuf, (bool, Option<std::sync::mpsc::Receiver<()>>)>,
 >;
