@@ -40,7 +40,8 @@ pub enum Op {
         key: String,
         row: String,
     },
-    /// Entity keys in `from..=to`, or from `from` to the end when `to` is absent.
+    /// Entity keys in `from..=to`: a seal's prune. Absent `to`, from `from` to the end: a reorg's
+    /// rollback, the only open-ended drop the store makes, which a follower's derived state retracts.
     Drop {
         from: String,
         to: Option<String>,
@@ -706,14 +707,46 @@ struct Mirror {
     catalogue_bytes: u64,
     /// The catalogue this copy's watermark pairs with, `None` where its dataset never sealed.
     catalogue: Option<Arc<str>>,
+    catalogue_rows: u64,
 }
 
-/// Insert into `map`, keeping `bytes` the charge for what it holds.
-fn put(map: &mut BTreeMap<String, String>, bytes: &mut u64, key: &str, value: &str) {
+/// What one applied delta did to the stored rows, for whatever a follower derives from them.
+#[derive(Debug, Default)]
+pub struct Changes {
+    /// Rows a rollback dropped, and the old value of a row a put replaced.
+    pub removed: Vec<String>,
+    /// Rows a put stored that were not already there as they are.
+    pub added: Vec<String>,
+    /// Rows a seal's prune moved out of hot, which leave the history unchanged.
+    pub pruned: u64,
+    /// The `last_block` the delta committed, set by a window or a rollback and nothing else.
+    pub through: Option<u64>,
+    /// The catalogue grew by rows that never passed through hot, as `--seal-direct` writes them:
+    /// nothing derived from the deltas has seen them.
+    pub sealed_unseen: bool,
+}
+
+/// Rows a catalogue holds across its segments.
+fn catalogue_rows(raw: Option<&str>) -> u64 {
+    raw.and_then(|r| serde_json::from_str::<crate::seal::Manifest>(r).ok())
+        .map_or(0, |m| {
+            m.tables.values().flatten().map(|s| s.rows as u64).sum()
+        })
+}
+
+/// Insert into `map`, keeping `bytes` the charge for what it holds; the value replaced, if any.
+fn put(
+    map: &mut BTreeMap<String, String>,
+    bytes: &mut u64,
+    key: &str,
+    value: &str,
+) -> Option<String> {
     *bytes += row_bytes(key, value);
-    if let Some(old) = map.insert(key.to_string(), value.to_string()) {
-        *bytes -= row_bytes(key, &old);
+    let old = map.insert(key.to_string(), value.to_string());
+    if let Some(old) = &old {
+        *bytes -= row_bytes(key, old);
     }
+    old
 }
 
 fn charge(map: &BTreeMap<String, String>) -> u64 {
@@ -721,9 +754,17 @@ fn charge(map: &BTreeMap<String, String>) -> u64 {
 }
 
 impl Mirror {
-    fn apply(&mut self, op: &Op) {
+    fn apply(&mut self, op: &Op, changes: &mut Changes) {
         match op {
-            Op::Put { key, row } => put(&mut self.entities, &mut self.bytes, key, row),
+            Op::Put { key, row } => match put(&mut self.entities, &mut self.bytes, key, row) {
+                Some(old) if &old == row => {}
+                Some(old) => {
+                    changes.removed.push(old);
+                    changes.added.push(row.clone());
+                }
+                None => changes.added.push(row.clone()),
+            },
+            // A rollback is the only open-ended drop; a seal's prune is always a bounded one.
             Op::Drop { from, to } => {
                 let doomed: Vec<String> = match to {
                     Some(to) => self
@@ -738,18 +779,30 @@ impl Mirror {
                         .collect(),
                 };
                 for k in &doomed {
-                    if let Some(v) = self.entities.remove(k) {
-                        self.bytes -= row_bytes(k, &v);
+                    if let Some(row) = self.entities.remove(k) {
+                        self.bytes -= row_bytes(k, &row);
+                        if to.is_some() {
+                            changes.pruned += 1;
+                        } else {
+                            changes.removed.push(row);
+                        }
                     }
                 }
             }
-            Op::Meta { key, value } => put(&mut self.meta, &mut self.bytes, key, value),
+            Op::Meta { key, value } => {
+                if key == "last_block" {
+                    changes.through = value.parse().ok();
+                }
+                put(&mut self.meta, &mut self.bytes, key, value);
+            }
             Op::Unmeta { key } => {
                 if let Some(v) = self.meta.remove(key) {
                     self.bytes -= row_bytes(key, &v);
                 }
             }
-            Op::Block { key, record } => put(&mut self.blocks, &mut self.bytes, key, record),
+            Op::Block { key, record } => {
+                put(&mut self.blocks, &mut self.bytes, key, record);
+            }
             Op::Unblock { key } => {
                 if let Some(v) = self.blocks.remove(key) {
                     self.bytes -= row_bytes(key, &v);
@@ -808,6 +861,7 @@ impl MemStore {
             epoch: snapshot.epoch,
             generation: snapshot.generation,
             catalogue_bytes,
+            catalogue_rows: catalogue_rows(snapshot.catalogue.as_deref()),
             catalogue: snapshot.catalogue.map(Arc::from),
         };
         crate::seal::follow(dir);
@@ -931,7 +985,7 @@ impl MemStore {
     }
 
     /// Apply the next delta, or refuse it as a [`Gap`] and change nothing.
-    pub fn apply(&self, delta: &Delta) -> Result<(), Gap> {
+    pub fn apply(&self, delta: &Delta) -> Result<Changes, Gap> {
         let mut m = self.mirror.write().unwrap_or_else(|e| e.into_inner());
         if delta.resync || delta.epoch != m.epoch || delta.generation != m.generation + 1 {
             return Err(Gap {
@@ -948,20 +1002,24 @@ impl MemStore {
         if changes_rows {
             self.rows.fetch_add(1, Ordering::SeqCst);
         }
+        let mut changes = Changes::default();
         for op in &delta.ops {
-            m.apply(op);
+            m.apply(op, &mut changes);
         }
         if let Some(raw) = &delta.catalogue {
             m.bytes = m.bytes - m.catalogue_bytes + raw.len() as u64;
             m.catalogue_bytes = raw.len() as u64;
             m.catalogue = Some(Arc::from(raw.as_str()));
+            let rows = catalogue_rows(Some(raw));
+            changes.sealed_unseen = rows.saturating_sub(m.catalogue_rows) != changes.pruned;
+            m.catalogue_rows = rows;
         }
         m.generation = delta.generation;
         if changes_rows {
             self.rows.fetch_add(1, Ordering::SeqCst);
         }
         self.writes.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        Ok(changes)
     }
 
     /// `Store::hot_rows_snapshot` over the copy: with `charge`, the rows the copy will take are
@@ -1609,6 +1667,62 @@ mod tests {
         rec.push(|| panic!("an unfollowed commit must not build its ops"));
         tap.commit(rec, || Ok(())).unwrap();
         assert_eq!(tap.generation(), 1);
+    }
+
+    /// What a delta tells a follower's derived state: a window's new rows, a reorg's dropped ones,
+    /// a seal's prune as no change at all, and rows sealed without passing through hot as unseen.
+    #[test]
+    fn a_delta_says_which_stored_rows_it_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
+        let mut sub = store.feed_subscribe().unwrap();
+        let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot.clone());
+        let mut next = || copy.apply(&sub.deltas.try_recv().unwrap()).unwrap();
+
+        store
+            .commit_window(&[row(1, 0, "t"), row(2, 0, "t")], None, 2)
+            .unwrap();
+        let window = next();
+        assert_eq!(window.added.len(), 2);
+        assert!(window.removed.is_empty());
+        assert_eq!(window.through, Some(2));
+
+        // A refetched row already held as it is changes nothing.
+        store.commit_window(&[row(2, 0, "t")], None, 2).unwrap();
+        let again = next();
+        assert!(again.added.is_empty() && again.removed.is_empty());
+
+        write_catalogue(tmp.path(), 1);
+        store
+            .prune_and_set_meta(1, 1, "sealed_through", "1")
+            .unwrap();
+        let seal = next();
+        assert!(seal.added.is_empty() && seal.removed.is_empty());
+        assert_eq!(
+            (seal.pruned, seal.through, seal.sealed_unseen),
+            (1, None, false)
+        );
+
+        store
+            .rollback_to_and_set_meta(1, "last_block", "1", &[])
+            .unwrap();
+        let reorg = next();
+        assert_eq!(reorg.removed, vec![row(2, 0, "t").1]);
+        assert_eq!(reorg.through, Some(1));
+
+        // Sealed straight to a segment: the catalogue grows and nothing left hot.
+        std::fs::write(
+            tmp.path()
+                .join(crate::seal::SEGMENTS_DIR)
+                .join(crate::seal::MANIFEST_FILE),
+            serde_json::json!({"tables": {"t": [
+                {"hash": "h1", "from_block": 1, "to_block": 1, "rows": 1, "file": "t-h1.parquet"},
+                {"hash": "h9", "from_block": 2, "to_block": 9, "rows": 40, "file": "t-h9.parquet"}]}})
+            .to_string(),
+        )
+        .unwrap();
+        store.set_meta("sealed_through", "9").unwrap();
+        assert!(next().sealed_unseen);
     }
 
     /// A snapshot is read under the cap its dataset is given, a line at a time, its entity rows, meta,

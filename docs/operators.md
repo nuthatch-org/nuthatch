@@ -265,11 +265,21 @@ the same `as_of`, `sealed_through` and `nid`.
   `applied_generation`, `writer_generation` and `lag_generations`, and `absent_for_secs` while the
   writer is away. A follower without its writer stays ready and keeps answering; it reports the
   absence rather than failing.
-- **What it does not serve.** State the writer derives in memory rather than stores: `/balances`,
-  `/balance/…`, `/exposure/…`, `/flags` and `/derived…`, and RFC-0041 entities. Those routes, and SQL
-  that names an entity, answer `503` with `"reason": "writer_only"`. A nest that declares entities has
-  its `/q/<name>` routes refused the same way, since a named query may read one. Send those to the
-  writer.
+- **Derived state, derived again.** What the writer keeps in memory rather than stores, the
+  balances, exposure and velocity views behind `/balances`, `/balance/…`, `/exposure/…` and `/flags`,
+  and RFC-0041 entities behind `/derived…`, `/sql` and `/q/<name>`, a follower builds for itself the
+  way a writer's restart does, from its snapshot and the sealed segments, and then feeds with the
+  rows each window stores and each reorg drops. An entity joining an offchain table is brought up
+  to the dataset's offchain snapshots after each window, by the same code the writer runs. The
+  answers are the writer's. It costs a follower what admission charges the writer for those views
+  and entities, and building it makes a snapshot, and a writer restart, slower to apply on a nest
+  with a long history.
+- **Derived state is whole or not served.** If feeding it fails part-way, or a seal arrives carrying
+  rows no delta did (`--seal-direct`), the follower rebuilds that nest's derived state from the
+  sealed history, releasing the torn state first. Meanwhile those routes, SQL naming an entity and
+  the nest's `/q/<name>` answer `503` with `"reason": "catching_up"`, and `/<tenant>/<alias>/ready` says why under `derived`; its
+  other routes keep answering. After a writer restart the follower keeps serving the derived state
+  it had, which is whole and matches the hot state it serves, until the new snapshot's is built.
 - **Its own budget.** A follower holds each dataset's hot window in memory, as the writer's `/sql`
   already copies it per query, and charges it to its cursor's `[runtime] max_rss_mb` from the
   runtime's `mounts.toml`, together with what admission charges each nest. A snapshot that would
@@ -284,12 +294,13 @@ the same `as_of`, `sealed_through` and `nid`.
   left out likewise. Each way its routes and its `/ready` answer `503` with
   `"reason": "over_budget"` and the figures, the root `/ready` is `503`, and its co-mounts keep
   serving. The writer still serves it. A new snapshot of a dataset already held, as every writer
-  restart sends, is charged beside the copy it replaces, which goes on serving until the swap and
-  stays charged until the last request on it finishes. If both do not fit, the old copy is released
-  first: its routes answer `503` `catching_up` while the new one loads under the full budget. An
-  unmounted copy still in use is charged the same way. A dataset refused only because such copies
-  held part of the budget is asked for again, by reconnecting, once they go; one over the budget on
-  its own stays refused as above. Each mount's SQL surface, tenant share and `[mounts.limits]` come
+  restart sends, is charged with its derived state beside the copy and derived state it replaces,
+  which go on serving until the swap and stay charged until the last request on them finishes. If
+  both do not fit, the old ones are released first: its routes answer `503` `catching_up` while the
+  new ones load under the full budget. An unmounted or refused copy still in use, and its derived
+  state, are charged the same way. A dataset refused only because such copies held part of the
+  budget is asked for again, by reconnecting, once they go; one over the budget on its own stays
+  refused as above. Each mount's SQL surface, tenant share and `[mounts.limits]` come
   over the feed, so it admits and guards a query as the writer would, with its own per-chain gates
   and never wider than its own process values. It has no admin surface; mount changes, limits and
   shares go to the writer.
