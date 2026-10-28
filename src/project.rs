@@ -738,6 +738,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
         route: None,
         chain_policy: Default::default(),
+        cursor_max_rss_mb: None,
         ipfs_gateways: Vec::new(),
         ipfs: Vec::new(),
         nest: Nest {

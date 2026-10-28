@@ -18,6 +18,7 @@ non-negotiables below, stop and flag it instead of proceeding.
    is per-cursor and shared across the nests on that cursor - density is RAM-bounded, not free.
    Treat this as a CI-enforced budget (per cursor), not an aspiration. If a design decision
    threatens it, surface the tradeoff before implementing.
+   *(Amended 2026-10-28 by Chief: the 2 GB figure is the budget nuthatch's own design must fit per cursor at the default ceiling, gated in CI. An operator may give a cursor a higher `max_rss_mb` by choice, live or in `mounts.toml`; nothing in nuthatch requires it, and the default stays 2048.)*
 3. **No phone-home.** The binary makes no network call about the operator that the operator did
    not explicitly turn on. No telemetry by default and none required; no mandatory API tokens; no
    gated data services. The one permitted exception is the opt-in head count of RFC-0054, which is

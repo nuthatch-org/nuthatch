@@ -57,7 +57,7 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 | Unmount and free the disk | `DELETE /_admin/nests/<name>?reclaim=true` | `200` and the reclaim, for a live or suspended mount; `409`, with nothing unmounted, for a mount with no recorded NID |
 | Free a dataset unmounted earlier | `DELETE /_admin/datasets/<nid>` | `200`, `409` kept, `404` absent |
 | Read the memory ceiling | `GET /_admin/runtime` | `200` and the ceiling, with what each cursor holds |
-| Raise or lower it | `PUT /_admin/runtime` `{"max_rss_mb": 1536}` | `200` and the same; `400` above 2048; `409` below what a cursor holds |
+| Raise or lower it | `PUT /_admin/runtime` `{"max_rss_mb": 1536}` | `200` and the same; `409` below what a cursor holds |
 
 `<name>` is the route the nest serves at, `/<name>/…`: `usdc` for the runtime's default tenant, and
 `acme/usdc` for any other tenant. Each mount's route depends on its own tenant alone, so it never
@@ -143,7 +143,7 @@ own data, when the dataset has already indexed or another mount already serves i
 | `400` | a malformed NID, a name the runtime would not accept, or a tenant that shares a mount's name (see above), an invalid `publish`, or `seed` with `wait` |
 | `404` | the runtime does not hold the NID and was started without `--registry` |
 | `409` | the name is taken, the chain is not declared (`POST /_admin/chains` declares it), the chain's cursor has died (restart the runtime), the nest declares authored entities and the runtime runs `--seal-direct`, or another mount of that name or dataset is still catching up |
-| `507` | the mount would breach the chain cursor's RAM ceiling, the reason carrying projected and ceiling MB, or its authored entities would put the cursor over its cap (32 at 2048 MB, proportionally fewer below) |
+| `507` | the mount would breach the chain cursor's RAM ceiling, the reason carrying projected and ceiling MB, or its authored entities would put the cursor over its cap (32 per 2048 MB of ceiling, rounded down) |
 
 On the job route a refusal ends the job `failed` with the same reason. With `--registry`, a NID the
 registry does not hold is accepted like any mount and ends the job `failed`, its reason naming the NID;
@@ -224,17 +224,24 @@ that already indexes this dataset, in which case the mount costs nothing further
 the next boot holds to it; the next mount is admitted against it at once.
 
 ```json
-{"max_rss_mb": 1536, "max_rss_mb_limit": 2048, "max_entities_per_cursor": 24,
+{"max_rss_mb": 1536, "max_rss_mb_default": 2048, "above_default": false,
+ "max_entities_per_cursor": 24,
  "cursors": [{"chain": "mainnet", "projected_mb": 420, "entities": 3}]}
 ```
 
-- **2048 is the most it accepts.** The ≤2 GB budget per cursor is the ceiling, not a default: a
-  chain that needs more nests than fit is split into a second runtime, not given a second cursor.
+- **2048 is the default, and the budget nuthatch is designed and gated for.** CI holds a cursor to
+  2 GB at that ceiling. An operator whose machine has more may raise it, here or in `mounts.toml`;
+  nothing in nuthatch requires it. Above the default, the answer carries `"above_default": true` and
+  a `note` saying so, and boot logs it once. A value past 1048576 (1 TiB) is `400`: it is in MB, and
+  a figure that large was typed in bytes or KiB.
 - **A value below what a cursor holds is `409`**, naming the chain. What a cursor holds is the
   admission estimate of its live and joining mounts, `projected_mb` above, not its measured RSS, so a
   lowered ceiling always admits what is already running. It never unmounts anything.
-- **The entity cap follows it**: 32 authored entities per cursor at 2048 MB, proportionally fewer
-  below, rounded down. A value whose cap is under a cursor's `entities` is `409` too.
+- **The entity cap follows it**: 32 authored entities per cursor for each 2048 MB, rounded down, so
+  24 at 1536 and 64 at 4096. A value whose cap is under a cursor's `entities` is `409` too.
+- **The analytics split follows it upward.** Above 2048, `(pools × analytics.memory_limit) +
+  ingestion_reservation` is checked against the raised ceiling at startup, as `NUTHATCH_MAX_RSS`
+  would raise it. Below 2048 the split is still held to the default.
 - Boot prices each store at its size then, so a ceiling set to exactly `projected_mb` can refuse the
   last mount at the next start once stores have grown. Leave headroom.
 
