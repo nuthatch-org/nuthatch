@@ -19,6 +19,24 @@ fn views_agree_across_drivers() {
     assert_eq!(dbsp_wasm_spike::run_views(Driver::Inline).unwrap(), want);
 }
 
+/// `run-node.mjs` holds the wasm32 run to this same string.
+const WINDOW: &str = concat!(
+    "committed=2 rows_sha256=8b6b04dba6c9e66507c3a23852d42c97a102850215b6e22b2b3c36e19eb3f491 ",
+    r#"balances=[("0x1111111111111111111111111111111111111111", 60), "#,
+    r#"("0x2222222222222222222222222222222222222222", 40), "#,
+    r#"("0x0000000000000000000000000000000000000000", -100)] "#,
+    r#"last=Some("12") sealed_through=12 hot=0 segments=["#,
+    r#""tok__transfer 10..=10 rows=1 4c63483c430d40b3e42a93728158d6fbc52a9ca2f258e52269563612b722c2e7", "#,
+    r#""tok__transfer 12..=12 rows=1 43ec70ec6f116bb227890db1d079a646eaa677d0ef208fb56c6e5f44e6d34a1f"]"#,
+);
+
+#[test]
+fn a_window_through_core() {
+    let got = dbsp_wasm_spike::window::run_window().unwrap();
+    eprintln!("native window: {got}");
+    assert_eq!(got, WINDOW);
+}
+
 #[test]
 fn stress() {
     let (groups, total) = dbsp_wasm_spike::run_stress(2_000, 100).unwrap();

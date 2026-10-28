@@ -1425,13 +1425,17 @@ name = "dbsp-wasm-spike"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dbsp",
  "feldera-size-of",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "js-sys",
  "nuthatch-core",
+ "nuthatch-decode",
+ "nuthatch-seal",
  "rkyv",
+ "serde_json",
  "uuid",
  "wasm-bindgen",
 ]

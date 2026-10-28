@@ -8,6 +8,7 @@ use dbsp::{IndexedZSetReader, OrdZSet, Runtime, ZWeight};
 // is the one a nest lowers, not a copy of it.
 pub use nuthatch_core::{entity_circuit, entity_expr, entity_plan, entity_row};
 pub mod entity;
+pub mod window;
 
 /// Builds a one-worker circuit, feeds it three batches with a retraction in the middle, and
 /// answers the running sum of `doubled` after each step, plus the final `count_by_parity` relation.
@@ -43,10 +44,7 @@ pub fn run_steps() -> Result<(Vec<Vec<(u64, ZWeight)>>, Vec<((u64, i64), ZWeight
         steps.push(out.iter().map(|(k, (), w)| (k, w)).collect());
     }
     let parity = parity_out.consolidate();
-    let parity: Vec<((u64, i64), ZWeight)> = parity
-        .iter()
-        .map(|(k, v, w)| ((k, v), w))
-        .collect();
+    let parity: Vec<((u64, i64), ZWeight)> = parity.iter().map(|(k, v, w)| ((k, v), w)).collect();
     circuit.kill().map_err(|_| "kill".to_string())?;
     Ok((steps, parity))
 }
@@ -151,6 +149,12 @@ mod wasm {
     }
 
     #[wasm_bindgen]
+    pub fn spike_window() -> Result<String, JsError> {
+        std::panic::set_hook(Box::new(|info| error(&format!("panic: {info}"))));
+        super::window::run_window().map_err(|e| JsError::new(&e))
+    }
+
+    #[wasm_bindgen]
     pub fn spike_stress(steps: u32, rows: u32) -> Result<String, JsError> {
         let (groups, total) =
             super::run_stress(steps as u64, rows as u64).map_err(|e| JsError::new(&e))?;
@@ -191,4 +195,3 @@ mod wasm {
         (core::arch::wasm32::memory_size(0) * 65536) as f64
     }
 }
-

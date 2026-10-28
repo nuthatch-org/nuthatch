@@ -14,7 +14,11 @@ doctest = false
 dbsp = "=0.320.0"
 # RFC-0075 S1: the crate this build exists to hold to wasm32; the patch below is applied only here.
 nuthatch-core = { path = "../../core" }
+nuthatch-decode = { path = "../../decode" }
+nuthatch-seal = { path = "../../seal" }
 anyhow = "1"
+async-trait = "0.1"
+serde_json = { version = "1", features = ["preserve_order"] }
 # As the binary pins them (`Cargo.toml` of nuthatch): `Row` derives `SizeOf` and rkyv archival.
 size-of = { package = "feldera-size-of", version = "0.1.7" }
 
