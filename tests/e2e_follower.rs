@@ -1191,6 +1191,81 @@ fn derived_runtime(tmp: &Path) -> (PathBuf, PathBuf, Arc<TapeSource>) {
     (root, via, tape)
 }
 
+/// `/flags` reads a block's threshold flags from its hot rows and its velocity from a view fed after
+/// them. Every transfer here is 1,000 from one account, so a whole state always has a velocity
+/// volume of 1,000 per threshold flag: a reader that caught a delta between its rows and its views
+/// would see more flags than volume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_sees_each_delta_wholly_or_not_at_all() {
+    const LAST: u64 = 24;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("runtime");
+    let dir = root.join("data").join(ROUTE);
+    std::fs::create_dir_all(&dir).unwrap();
+    scaffold_nest(&dir, ROUTE, USDC);
+    let toml = dir.join("nuthatch.toml");
+    let cfg = std::fs::read_to_string(&toml).unwrap();
+    std::fs::write(
+        &toml,
+        format!(
+            "{cfg}\n[flags]\nthreshold = \"150\"\nvelocity_amount = \"300\"\nvelocity_window = 100\n"
+        ),
+    )
+    .unwrap();
+    let via: PathBuf = tmp.path().join("follower-view");
+    std::os::unix::fs::symlink(&root, &via).unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=3 {
+        tape.insert_block(b, block(b, 0, 1_000));
+    }
+    tape.advance_tip_to(3);
+    let writer = Writer::start(&root, tape.clone(), 0);
+    writer.reaches(3).await;
+    let (_f, fa) = bind_follower(&via, &writer).await;
+    agree_on(&writer, &fa, "/flags", "before the stream").await;
+    // Each delta's views are fed 50 ms after its rows land in the copy: a reader let in between
+    // would see the flags without the volume.
+    nuthatch::indexer::slow_follower_feed(&via.join("data").join(ROUTE), Duration::from_millis(50));
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let (stop, fa) = (stop.clone(), fa.clone());
+        tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let (status, body) = get(&fa, &format!("/{ROUTE}/flags")).await;
+                if status != 200 {
+                    continue;
+                }
+                let flags = body["threshold"]["flags"].as_array().map_or(0, Vec::len) as u64;
+                let volume: u64 = body["velocity"]["flags"][0]["volume"]
+                    .as_str()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                seen.push((flags, volume));
+            }
+            seen
+        })
+    };
+    // One block at a time, so each is a delta of its own.
+    for b in 4..=LAST {
+        tape.insert_block(b, block(b, 0, 1_000));
+        tape.advance_tip_to(b);
+        writer.reaches(b).await;
+    }
+    agree_on(&writer, &fa, "/flags", "after the stream").await;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let seen = reader.await.unwrap();
+    let torn: Vec<_> = seen.iter().filter(|(n, v)| *v != 1_000 * n).collect();
+    assert!(torn.is_empty(), "read part-way through a delta: {torn:?}");
+    let states: std::collections::BTreeSet<u64> = seen.iter().map(|(n, _)| *n).collect();
+    assert!(
+        states.len() > 10,
+        "the reader saw the stream move: {states:?}"
+    );
+    writer.stop(&root);
+}
+
 /// Every route a follower answers from derived state, compared with the writer's answer.
 async fn derived_agree(writer: &Writer, follower: &str, why: &str) -> Vec<serde_json::Value> {
     let mut out = Vec::new();

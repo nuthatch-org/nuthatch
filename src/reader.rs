@@ -265,6 +265,9 @@ struct Inner {
     /// Datasets refused while retiring copies held part of their cursor's budget, with that chain
     /// and what those copies came to. Each is asked for again once that falls.
     awaiting_room: HashMap<String, (Option<String>, u64)>,
+    /// Per dataset, held for writing while a delta's rows and derived state are applied and for
+    /// reading by every request, which so sees each delta wholly or not at all.
+    applying: HashMap<String, Arc<tokio::sync::RwLock<()>>>,
     /// Times a held copy was released so that a new snapshot of it could load under the full budget.
     reloads: u64,
     /// Copies and derived states ever handed to `retiring`.
@@ -479,6 +482,7 @@ impl Follower {
                 excluded: BTreeSet::new(),
                 retiring: Vec::new(),
                 awaiting_room: HashMap::new(),
+                applying: HashMap::new(),
                 reloads: 0,
                 retired: 0,
                 peak: 0,
@@ -977,26 +981,57 @@ impl Follower {
                     );
                     return Ok(());
                 }
+                let gate = self
+                    .lock()
+                    .applying
+                    .entry(dataset.clone())
+                    .or_default()
+                    .clone();
+                let whole = gate.write().await;
                 // The old state keeps serving while a new connection takes fresh snapshots.
                 let changes = data
                     .store
                     .apply(&delta)
                     .with_context(|| format!("{dataset}: resnapshotting"))?;
                 self.lock().note_peak(&dataset);
+                if let Some(delay) = crate::indexer::follower_feed_delay(&self.root.join(&dataset))
+                {
+                    tokio::time::sleep(delay).await;
+                }
                 let torn = if changes.sealed_unseen {
                     // Rows sealed straight to segments never crossed the feed: derive again.
                     Some("rows were sealed that never passed through hot".to_string())
                 } else if let (Ok(derived), Some(through)) = (&data.derived, changes.through) {
-                    let store = data.store.clone();
+                    let (derived, store) = (derived.clone(), data.store.clone());
                     let dir = self.root.join(&dataset);
-                    crate::seal::within(&dir, store.clone(), || {
-                        derived.apply(store.as_ref(), &changes.removed, &changes.added, through)
+                    // Fed and then flushed, so every view has published the delta before a reader
+                    // is let back in.
+                    tokio::task::spawn_blocking(move || {
+                        crate::seal::within(&dir, store.clone(), || {
+                            derived.apply(
+                                store.as_ref(),
+                                &changes.removed,
+                                &changes.added,
+                                through,
+                            )?;
+                            derived.flush();
+                            Ok::<_, anyhow::Error>(())
+                        })
                     })
+                    .await
+                    .context("feeding derived state")?
                     .err()
                     .map(|e| format!("feeding it failed part-way: {e:#}"))
                 } else {
                     None
                 };
+                if let Some(why) = &torn {
+                    // Marked before readers are let back in, so none reads the torn state.
+                    if let Some(d) = self.lock().datasets.get_mut(&dataset) {
+                        d.building = Some(why.clone());
+                    }
+                }
+                drop(whole);
                 if let Some(why) = torn {
                     let store = data.store.clone();
                     drop(data);
@@ -1284,6 +1319,13 @@ impl Follower {
         self.live.swap(app);
     }
 
+    /// The gate a delta to `route`'s dataset holds the write side of while it is applied.
+    fn route_gate(&self, route: &str) -> Option<Arc<tokio::sync::RwLock<()>>> {
+        let mut inner = self.lock();
+        let dataset = inner.routes.get(route)?.spec.dataset.clone();
+        Some(inner.applying.entry(dataset).or_default().clone())
+    }
+
     fn data(&self, route: &str) -> Option<Data> {
         let inner = self.lock();
         let dataset = &inner.routes.get(route)?.spec.dataset;
@@ -1480,6 +1522,13 @@ fn guarded(
                 if path == "/ready" {
                     return follower.route_ready(&route);
                 }
+                // Held for the whole request, so it reads a delta's rows and derived state wholly or
+                // not at all.
+                let gate = follower.route_gate(&route);
+                let _whole = match &gate {
+                    Some(g) => Some(g.read().await),
+                    None => None,
+                };
                 // Derived state being rebuilt, or that could not be built, is never served in part.
                 let refusal = match follower.data(&route) {
                     Some(Data {
