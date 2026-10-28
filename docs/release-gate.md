@@ -23,6 +23,7 @@ budget). Every CI gate had passed: the footprint jobs index synthetic data and r
 | `scripts/gate/common.sh` | Production's budget, how a set is read and the canonical answer form. |
 | `scripts/gate/baseline-4.2.0.tsv` | The proof run's baseline: 4.2.0 on the 2026-10-03 copy, on a MacBook. |
 | `scripts/release-gate-run.sh` | The ThinkPad's job: fetch the candidate, gate it, post the status. |
+| `scripts/rolling-upgrade.sh` | The rolling upgrade: previous release to the candidate, a query answered at every step. |
 
 ## The query set
 
@@ -164,17 +165,48 @@ statement's new answer with the same row count.
 
 ## The rolling upgrade (RFC-0073 FR7)
 
-`scripts/rolling-upgrade.sh --previous <tag> <candidate>` downloads the previous release's binary and
-runs a one-nest runtime over the fixture chain with it as the writer and two followers, then replaces
-follower one, follower two and the writer with the candidate, in that order. A prober asks both
-followers the same count every 200 ms throughout, and the run fails if any probe goes unanswered by
-both, or if a replaced process never reports ready and caught up. `<previous> <candidate>` takes two
-local binaries instead.
+`scripts/rolling-upgrade.sh <candidate>` finds the previous release itself, downloads its binary and
+checks it against its `.sha256`, then runs a one-nest runtime over the fixture chain with it as the
+writer and two followers, and replaces follower one, follower two and the writer with the candidate,
+in that order. A prober asks both followers the same count every 200 ms throughout, and the run fails
+if any probe goes unanswered by both, or if a replaced process never reports ready and caught up.
 
-Followers first ship in the release after 5.12.0, so there is no previous release that can run step
-one yet: until there is, the script refuses with exit 2 and names why, and `ROLLING_SAME=1` runs the
-procedure with the candidate in both roles. Measured 2026-10-27 that way on a debug build: 44 probes
-across the three replacements, none unanswered.
+**The previous release** is the latest full release of `GATE_REPO` older than the version the
+candidate reports: drafts and prerelease tags are skipped, and so is the candidate's own tag, so
+v5.14.0 and v5.14.0-rc.1 are both tested against v5.13.x. Followers first ship in 5.13.0, so until
+the previous release is 5.13.0 or later it cannot run step one, and the script falls back to running
+the candidate in both roles, which proves the procedure and not the upgrade. It never does that
+quietly. Every run prints one `MODE` line, which the gate's status repeats:
+
+    rolling-upgrade: MODE cross-release v5.13.0 to 5.14.0
+    rolling-upgrade: MODE same-binary 5.13.0: v5.12.1 cannot follow (followers are RFC-0073 FR1)
+
+and a fallback adds `NOT A CROSS-RELEASE TEST`. With no older release at all it falls back the same
+way and says so. Nothing needs editing when 5.13.0 ships: 5.14.0's run resolves 5.13.0, which can
+follow, and is a real upgrade. `--plan` stops after the `MODE` line, before the fixture chain.
+
+A previous release named by hand, `--previous <tag> <candidate>` or `<previous> <candidate>` as two
+local binaries, is what was asked for: one that cannot follow is a setup fault (exit 2), unless
+`ROLLING_SAME=1` asks for the fallback. A previous binary that does not run on this machine at all
+(the default `GATE_TARGET` is x86_64 Linux) is a setup fault too, never a fallback. Measured
+2026-10-27 with the candidate in both roles on a debug build: 44 probes across the three
+replacements, none unanswered.
+
+**In the gate.** `release-gate-run.sh` runs it after the nests, once per candidate rather than once
+per nest, and posts `release-gate/rolling-upgrade` on the candidate's commit: `success` reads
+`passed, <mode>`, `failure` names the mode and the step or probe that failed, and `error` is a run
+that could not start. A `--poll` runs it for the newest release only, and only if that has no
+`release-gate/rolling-upgrade` status yet; older releases predate the step and are not walked back
+through. Like the nests' contexts it does not block the tag and is not a required check. The run's
+exit is the worse of the nests' and the rolling upgrade's. `GATE_ROLLING=0` gates the nests alone,
+`GATE_ROLLING=only` the rolling upgrade alone. It needs a `fixture-rpc`: `FIXTURE_RPC`, or cargo on
+the box to build one from the checkout (`scripts/fixture-rpc.sh`), which the ThinkPad's
+`~/nuthatch-ops` is.
+
+It lives here and not in `release.yml` because this is where a candidate is gated: the tag workflow
+publishes, and only the ThinkPad's statuses say whether a release is fit to roll. CI's
+`rolling-upgrade` job runs the same script against every PR and push to `main`, with the build as the
+candidate, so a change that breaks the procedure is caught before it is tagged.
 
 ## What it does not catch
 
