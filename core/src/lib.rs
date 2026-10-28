@@ -25,3 +25,4 @@ pub mod store;
 pub mod time;
 pub mod velocity;
 pub mod views;
+pub mod window;
