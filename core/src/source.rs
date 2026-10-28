@@ -192,6 +192,12 @@ pub trait Source: Send + Sync {
     /// Takes a [`LogFilter`] rather than two slices so that "match everything" is not expressible
     /// here: a caller with nothing to ask for cannot construct one, and so cannot ask (#432).
     async fn logs(&self, filter: &LogFilter, from: u64, to: u64) -> Result<Vec<Log>>;
+
+    /// Was `err`, from [`Source::logs`], a refusal of a getLogs with no address list (#1941)? A
+    /// factory nest then asks by address from then on.
+    fn refuses_topic0_only(&self, _err: &anyhow::Error) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

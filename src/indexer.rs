@@ -33,8 +33,9 @@ use nuthatch_core::metrics::CursorMetrics;
 use nuthatch_core::seal::pin_checkpoint;
 pub(crate) use nuthatch_core::window::fetch_window_block_data;
 use nuthatch_core::window::{
-    apply_row_timestamps, blocks_needing_timestamps, decode_window, l1_block_rows, note_undecoded,
-    seal_ceiling, Undecoded, WindowForked,
+    apply_row_timestamps, blocks_needing_timestamps, decode_window, dedup_logs, fetch_discovering,
+    l1_block_rows, note_undecoded, seal_ceiling, wide_templates, Undecoded, WindowForked,
+    FACTORY_FLIP_THRESHOLD,
 };
 use nuthatch_seal::cut::CutScan;
 pub use nuthatch_seal::cut::{SEAL_DIRECT_BATCH, SEAL_DIRECT_BYTES};
@@ -1318,42 +1319,6 @@ fn discover_children(
         .chain(found.addresses())
         .map(str::to_string)
         .collect()
-}
-
-/// `from..=to` address-filtered, then refetched for the children each round discovers until a round
-/// finds none: the backfill's pass 1 and pass 2 fixpoint, for the tip loops.
-///
-/// `discover` decodes everything fetched so far and returns every child it knows of. A child
-/// created in the range announces itself from its factory's address, which round 1 fetched, so its
-/// own logs in the same range arrive in round 2.
-async fn fetch_discovering(
-    source: &dyn Source,
-    addresses: &[String],
-    topics: &[String],
-    from: u64,
-    to: u64,
-    mut discover: impl FnMut(&[crate::rpc::Log]) -> Vec<String>,
-) -> Result<Vec<crate::rpc::Log>> {
-    use std::collections::HashSet;
-    let mut fetched: HashSet<String> = addresses.iter().map(|a| a.to_ascii_lowercase()).collect();
-    let Some(filter) = LogFilter::new(addresses, topics) else {
-        return Ok(Vec::new());
-    };
-    let mut all = source.logs(&filter, from, to).await?;
-    loop {
-        let new: Vec<String> = discover(&all)
-            .into_iter()
-            .filter(|c| fetched.insert(c.to_ascii_lowercase()))
-            .collect();
-        // An empty `new` would make the filter below address-less, so it returns first.
-        if new.is_empty() {
-            return Ok(all);
-        }
-        let Some(child_filter) = LogFilter::new(&new, topics) else {
-            return Ok(all);
-        };
-        all.extend(source.logs(&child_filter, from, to).await?);
-    }
 }
 
 /// COR-5: a single block whose topic0-only union fetch broke the provider's `getLogs` cap. Recover it
@@ -4061,65 +4026,6 @@ fn drain_all_sealable(
     Ok(())
 }
 
-/// Above this many discovered children, the factory backfill flips from an address-list filter to a
-/// topic0-only fetch with local registry-lookup filtering (RFC-0009 §4) - providers cap address-list
-/// size, and a huge list is slower than fetching by topic0 and discarding non-children locally.
-const FACTORY_FLIP_THRESHOLD: usize = 500;
-
-/// The templates a flipped factory nest fetches by topic0 alone, and those topic0s.
-struct WideTemplates {
-    names: std::collections::BTreeSet<String>,
-    topic0s: Vec<String>,
-}
-
-impl WideTemplates {
-    fn covers(&self, template: Option<&str>) -> bool {
-        template.is_some_and(|t| self.names.contains(t))
-    }
-}
-
-/// Past the flip, only a template with more than [`FACTORY_FLIP_THRESHOLD`] children of its own is
-/// fetched without an address. Static contracts never are: one declaring a generic event (ENS's
-/// BaseRegistrar and its ERC-721 `Transfer`) would otherwise ask for every such log on the chain.
-/// Small templates that together cross the threshold go wide, but only those with a child: a
-/// template with none has nothing to cover, and its events may be as generic as ERC-1155 transfers.
-fn wide_templates(
-    registry: &DecodeRegistry,
-    factory: &FactorySet,
-    children: &ChildRegistry,
-    base: usize,
-    force: bool,
-) -> Option<WideTemplates> {
-    let mut names: std::collections::BTreeSet<String> = factory
-        .templates()
-        .iter()
-        .filter(|t| force || children.addresses_for_template(t).len() > FACTORY_FLIP_THRESHOLD)
-        .cloned()
-        .collect();
-    if names.is_empty() && base + children.len() > FACTORY_FLIP_THRESHOLD {
-        names = factory
-            .templates()
-            .iter()
-            .filter(|t| !children.addresses_for_template(t).is_empty())
-            .cloned()
-            .collect();
-    }
-    let mut topic0s: Vec<String> = names
-        .iter()
-        .flat_map(|t| registry.template_topic0s(t))
-        .map(|t| format!("0x{}", hex::encode(t)))
-        .collect();
-    topic0s.sort();
-    topic0s.dedup();
-    (!topic0s.is_empty()).then_some(WideTemplates { names, topic0s })
-}
-
-/// One copy of each log, in chain order. A wide fetch and an address fetch can both return a log.
-fn dedup_logs(logs: &mut Vec<crate::rpc::Log>) {
-    logs.sort_by_key(|l| (l.block_number, l.log_index));
-    logs.dedup_by_key(|l| (l.block_number, l.log_index));
-}
-
 /// Refuse to start when `[nest] block_timestamps` disagrees with what this nest already indexed.
 ///
 /// Flipping the declaration is not a config edit, it is a **breaking schema change** (RFC-0029 §6b-i):
@@ -6797,86 +6703,22 @@ impl NestIngest {
         })
     }
 
-    /// This window's logs. A factory nest is asked by `base ∪ children` until it has more than
-    /// [`FACTORY_FLIP_THRESHOLD`] children, the rule the seal-direct factory backfill follows (#1941).
+    /// This window's logs; see [`nuthatch_core::window::fetch_window`].
     async fn fetch_window(
         &mut self,
         source: &dyn Source,
         from: u64,
         to: u64,
     ) -> Result<Vec<crate::rpc::Log>> {
-        let Some(fs) = self.factory.clone() else {
-            return match LogFilter::new(&self.addresses, &self.topic0s) {
-                Some(f) => source.logs(&f, from, to).await,
-                None => Ok(Vec::new()),
-            };
+        let wanted = nuthatch_core::window::Wanted {
+            registry: &self.registry,
+            factory: self.factory.as_deref(),
+            children: &self.children,
+            addresses: &self.addresses,
+            topic0s: &self.topic0s,
+            topic0_refused: &mut self.topic0_refused,
         };
-        let known: Vec<String> = self
-            .registry
-            .addresses()
-            .iter()
-            .map(|a| format!("0x{}", hex::encode(a)))
-            .chain(self.children.addresses().into_iter().map(str::to_string))
-            .collect();
-        // Per template, as the backfill does: see `wide_templates`.
-        let mut wide = if self.topic0_refused {
-            None
-        } else {
-            wide_templates(
-                &self.registry,
-                &fs,
-                &self.children,
-                self.registry.addresses().len(),
-                fs.force_topic0(),
-            )
-        };
-        let mut wide_logs = Vec::new();
-        if let Some(w) = &wide {
-            let f = LogFilter::new(&[], &w.topic0s)
-                .expect("a wide template decodes at least one event");
-            match source.logs(&f, from, to).await {
-                Err(e) if crate::rpc::filter_refused(&e) => {
-                    tracing::warn!(
-                        "the endpoint refuses getLogs without an address list ({e:#}); asking by \
-                         factory and child address from now on"
-                    );
-                    self.topic0_refused = true;
-                    wide = None;
-                }
-                r => wide_logs = r?,
-            }
-        }
-        let covered = |c: &str, reg: &ChildRegistry| {
-            wide.as_ref().is_some_and(|w| w.covers(reg.template_of(c)))
-        };
-        let narrow: Vec<String> = known
-            .into_iter()
-            .filter(|c| !covered(c, &self.children))
-            .collect();
-        let mut logs = fetch_discovering(source, &narrow, &self.topic0s, from, to, |logs| {
-            let mut seen = wide_logs.clone();
-            seen.extend_from_slice(logs);
-            let (_, found, _) = decode_window(
-                &self.registry,
-                Some(&fs),
-                &self.children,
-                &seen,
-                &std::collections::HashMap::new(),
-            );
-            self.children
-                .addresses()
-                .into_iter()
-                .chain(found.addresses())
-                .filter(|c| !covered(c, &self.children) && !covered(c, &found))
-                .map(str::to_string)
-                .collect()
-        })
-        .await?;
-        if !wide_logs.is_empty() {
-            logs.extend(wide_logs);
-            dedup_logs(&mut logs);
-        }
-        Ok(logs)
+        nuthatch_core::window::fetch_window(wanted, source, from, to).await
     }
 
     /// The policy a seal-direct pass resolves its documents on.
@@ -13722,6 +13564,9 @@ template = "pool"
                 .filter(|l| allow.contains(&l.address.to_ascii_lowercase()))
                 .cloned()
                 .collect())
+        }
+        fn refuses_topic0_only(&self, err: &anyhow::Error) -> bool {
+            crate::rpc::filter_refused(err)
         }
         async fn block_timestamps(
             &self,

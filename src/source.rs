@@ -13,6 +13,10 @@ impl Source for RpcClient {
         self.forget_timestamps_above(block);
     }
 
+    fn refuses_topic0_only(&self, err: &anyhow::Error) -> bool {
+        crate::rpc::filter_refused(err)
+    }
+
     async fn tip(&self) -> Result<u64> {
         self.block_number().await
     }
@@ -92,6 +96,10 @@ impl LivePool {
 impl Source for LivePool {
     fn forget_cached_above(&self, block: u64) {
         Source::forget_cached_above(&*self.current(), block);
+    }
+
+    fn refuses_topic0_only(&self, err: &anyhow::Error) -> bool {
+        crate::rpc::filter_refused(err)
     }
 
     async fn tip(&self) -> Result<u64> {
