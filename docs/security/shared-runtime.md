@@ -68,7 +68,13 @@ service.
 | B's hot rows through a reused session | Sessions are cached per dataset, and per tenant under `strict` | `confinement::a_mount_cannot_reach…` (B's session holds B's hot rows first) |
 | An authored path that leaves the nest: `offchain/manifest.json` naming `/…` or `../…` | Fixed in 5.12.1, see below | `confinement::an_offchain_catalogue_cannot_name_a_file_outside_its_nest` |
 | Another tenant of the same dataset, through its session, pool or memo | `strict` partitions all three by tenant | `confinement::two_tenants_of_one_dataset_get_separate_sessions_and_pools`, `serve::tests::a_strict_mount_queries_in_its_tenants_session_on_every_sql_route`, `sqlmemo::tests::every_input_changes_the_key`, `e2e_runtime_lifecycle::a_strict_runtimes_live_mount_queries_in_its_tenants_partition` |
-| Any write, any read of B's secret, by statements no one listed | The SQL fuzz target, below | `fuzz/sql`, CI job `fuzz-sql` |
+| A bundle entry that is a link, a sparse file or a device, or a blob file reached through a link | Extraction admits only regular files and directories; the integrity check refuses a link anywhere on a file's path. See the findings below | `blob::tests::a_bundle_holds_only_regular_files_and_directories` |
+| A manifest path with a backslash, a second separator on Windows | Refused at the integrity check | `blob::tests::a_manifest_path_with_a_backslash_is_refused` |
+| A statement or view that builds a value larger than its pool | Burrmill refuses a value past 16 MiB and charges outputs from 256 KiB to the pool | `confinement::a_statement_cannot_allocate_far_past_its_pool` |
+| A bundle file named like derived state in another case (`Segments/manifest.json`) | Refused at the integrity check, case-insensitively | `blob::tests::a_bundle_cannot_carry_derived_state_in_another_case` |
+| An authored view naming a path, a file function, a registration's parts, the catalogue or B's view | Burrmill's planner, the same one a statement meets: view bodies do not pass `/sql`'s text guards | `confinement::an_authored_view_reaches_no_more_than_a_statement` |
+| A failed statement's error explanation | Served from what defining the views recorded; no engine is opened outside the request | `confinement::a_served_error_is_explained_without_opening_an_engine` |
+| Any write, any read of B's secret, by statements or authored views no one listed | The SQL fuzz target, below | `fuzz/sql`, CI job `fuzz-sql` |
 
 Most of these are older than `strict` and hold under `shared` too; the confinement tests run every
 attack in both modes.
@@ -90,6 +96,71 @@ either, so neither `/sql` nor an entity reading an offchain table can follow one
 Reading another dataset's segment this way needed its path, and so its content hash; any other
 Parquet file on the host needed only its path. That bounds it, it does not excuse it.
 
+## Findings from the FR8 pre-review
+
+An internal adversarial pass on 2026-10-28, before the independent review, found these.
+
+**A bundle could copy any file the process can read into the tenant's nest.** Fixed in 5.12.2
+(#2463), advisory
+[GHSA-mqw2-cc6q-mpw6](https://github.com/nuthatch-org/nuthatch/security/advisories/GHSA-mqw2-cc6q-mpw6).
+Bundle extraction used `tar`'s `unpack`, which creates symbolic links with any target; its guard
+checks only where the link itself is placed. The integrity check then read each manifest file
+through the link. A first bundle with a wrong hash was refused with `blob file … is corrupt:
+manifest …, actual <sha256>`, which is the sha256 of any host file, and a missing-file error told
+whether a path existed. A second bundle carrying that sha256 passed, and install copied the
+target's bytes into the nest as a regular file. A sealed segment's sha256 is its file name, so
+another dataset's segment needed no first step: linked into `offchain/segments/` it served that
+dataset's rows through `offchain__…`. The same link to `/dev/zero` made the check read until the
+process died, and a GNU sparse entry unpacked far more than the bundle held. It was reached by any
+install: a mount from the registry, `POST /_admin/bundles` (dry run included) and `nest load`.
+Extraction now admits only regular files and directories, the integrity check refuses a link on
+any file's path, and a manifest path holding a backslash is refused.
+
+**On a case-insensitive filesystem a bundle could write its dataset's sealed catalogue.** Fixed in
+5.12.2, same advisory. `Segments/manifest.json` is not the excluded name `segments`, so it counted
+in the identity and installed; macOS's default filesystem then served it as
+`segments/manifest.json`, binding any segment in the shared store by its hash. Linux filesystems
+are case-sensitive and were not affected. A manifest path naming derived state is now refused,
+case-insensitively.
+
+**Explaining a failed query opened an engine outside the request.** Fixed in 5.13.0. When an error
+named an authored view, `/sql`, `/explain`, `/q/…`, `/diff` and GraphQL replayed every authored
+statement in a fresh engine to find out why: on the async thread, after the SQL permit was
+released, with its own memory budget, without the tenant's isolation, and running `CREATE TABLE …
+AS`, which strict refuses. An error text that merely quoted `Table with name <view>` asked for it.
+It reached nothing of another tenant's, but it was unbounded work outside every limit on this page.
+A served error is now explained from what defining the views recorded.
+
+**A scalar function's result was not charged to the engine pool.** Bounded by burrmill#122, pinned
+in #2469. One value was as large as its arguments asked for: `repeat('a', 1500000000)` grew peak
+RSS by 5.7 GB under a 512 MB pool, `lpad('a', 1000000000)` by 3.8 GB, `array_repeat(1, 100000000)`
+by 1.6 GB and `range(100000000)` by 0.8 GB, and nested `replace` grows exponentially with no size
+argument at all. Burrmill now holds three bounds. No value that a function, `||` or a literal
+repeated per row builds may pass 16 MiB; where an argument chooses the size it is refused from the
+arguments before anything is allocated, elsewhere once built, so nesting cannot compound. Every
+output of 256 KiB or more is charged to the statement's pool while its bytes live, as are `range`
+and `generate_series` in a FROM clause. What remains is the floor: an output under 256 KiB is not
+charged, so a statement can hold that much per call above its pool, beside the one value under
+16 MiB a function may build before its result is checked. Burrmill's own test allows a statement
+24 MiB past its pool for this, and `confinement::a_statement_cannot_allocate_far_past_its_pool`
+holds each statement above, and a recursive CTE doubling a string, to the pool plus that slack.
+
+**An authored view's first bytes could panic its definition.** Fixed in 5.13.0, found by
+`fuzz/sql`. A multibyte character across byte six panicked the `CREATE` check on every query that
+defined the view. It was confined to the request, and to the nest that shipped the file.
+
+### Plausible, not tested
+
+- Strict's allow-list reads `Expr::Function` only. A function reached through method-call or another
+  special syntax, if Burrmill's parser accepts one, would not be seen. Only `version`,
+  `arrow_metadata` and `arrow_field` are withheld, so little is behind it.
+- Process state that grows without a request-side bound: the engine registry in
+  `engine_burrmill` gains an entry per session opened and is pruned only when `/metrics` is
+  scraped, and `SESSION_OPENS` is never evicted. The held-relation, view-failure and peak maps are
+  bounded by mount churn, which the operator drives.
+- A hand-laid `data/<nid>/maintained` that is a link is followed when undeclared copies are retired.
+  A bundle cannot produce one; an operator can.
+
 ## What is not defended
 
 Said plainly, because a shared runtime is a shared machine.
@@ -108,6 +179,7 @@ Said plainly, because a shared runtime is a shared machine.
 - **The shared segment store.** Sealed segments of every dataset live once, by content hash, in
   `segments/`. A dataset only ever reads the hashes its own catalogue lists, and a seeded catalogue's
   files are verified against their hashes, so reading another's segment needs its bytes already.
+  Two findings above broke that premise, each needing only a hash; both are fixed in 5.12.2.
 - **Layout disclosure.** An error can name the tenant's own segment paths, which show the runtime's
   directory. It names nothing of another tenant's that the statement did not spell out.
 - **Everything outside SQL.** A nest's webhooks, offchain pulls, IPFS gateways and RPC endpoints are
@@ -136,6 +208,9 @@ charges for that.
   pool size. A pool no session holds is dropped and rebuilt on demand, so tenant labels that come
   and go do not accumulate
   (`confinement::a_hundred_tenants_leave_no_pool_reserved_and_no_pool_without_a_session`).
+  Since burrmill#122 the values a statement builds are charged too, from 256 KiB per output, and no
+  one value passes 16 MiB, so a statement holds at most its pool plus that slack (Burrmill tests 24
+  MiB). Before it, one `repeat` call could grow the process by gigabytes; see the findings above.
 - **Cached sessions.** Each holds its view catalogue and up to an eighth of the engine limit in
   Parquet footers (64 MB at the default 512 MB). The cache is 16 sessions for the process whatever
   the mode, so `strict` adds no slots: it fills them with more distinct keys, which costs misses and
@@ -154,7 +229,8 @@ sealed rows, hot rows, config and view text, and runs fuzzed statements on A, sh
 fails on an answer or error carrying B's secret that the statement did not spell out, and on any
 file under the runtime directory created, removed or changed. Statements are assembled from fragments
 of every attack above, appended to statements that already answer, so the fuzzer recombines escapes
-rather than discovering `SELECT`. A panic is an outcome rather than a finding, as `/sql` confines one
+rather than discovering `SELECT`. An input may also carry A's `views/zz.sql`, from the same
+fragments, since a bundle is the tenant's too. A panic is an outcome rather than a finding, as `/sql` confines one
 to its request. Planting the secret in A's own rows makes it fail within seconds, which is the check
 that it can see a leak at all.
 
