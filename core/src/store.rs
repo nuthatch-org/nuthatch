@@ -297,6 +297,12 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     fn released(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         (**self).released()
     }
+    fn write_generation(&self) -> Option<u64> {
+        (**self).write_generation()
+    }
+    fn rows_generation(&self) -> Option<u64> {
+        (**self).rows_generation()
+    }
     fn served_catalogue(&self) -> Option<Option<Arc<str>>> {
         (**self).served_catalogue()
     }

@@ -2425,6 +2425,19 @@ mod tests {
         assert_eq!(store.write_generation(), Some(g1 + 2));
     }
 
+    /// Through an `Arc` with the core trait in scope, the shared handle's own impl answers, and it
+    /// must forward rather than fall back to the default `None`.
+    #[test]
+    fn a_shared_handle_reports_the_stores_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let (w, r) = (store.write_generation(), store.rows_generation());
+        assert!(w.is_some() && r.is_some());
+        let shared: Arc<dyn HotStore> = Arc::new(store);
+        assert_eq!(nuthatch_core::store::HotStore::write_generation(&shared), w);
+        assert_eq!(nuthatch_core::store::HotStore::rows_generation(&shared), r);
+    }
+
     /// #2204: the memo outlives a handle, so a reopen of the same store - a resume - must not
     /// reuse a generation the previous handle already named a different row set by.
     #[test]
