@@ -10601,7 +10601,7 @@ mod confinement {
         text.push_str(&format!("CREATE VIEW q2 AS SELECT * FROM \"{b}\".t__e;\n"));
         std::fs::write(f.a.join("views").join("zz.sql"), text).unwrap();
         for tenant in [None, Some(Arc::<str>::from("a"))] {
-            for i in 0..bodies.len() {
+            for (i, body) in bodies.iter().enumerate() {
                 let got = isolated(tenant.as_ref(), || {
                     query_hot_cold(
                         &f.a,
@@ -10612,7 +10612,7 @@ mod confinement {
                         &[],
                     )
                 });
-                assert!(got.is_err(), "{tenant:?}: view {} answered", bodies[i]);
+                assert!(got.is_err(), "{tenant:?}: view {body} answered");
             }
             for name in ["q0", "q1", "q2"] {
                 if let Ok(out) = isolated(tenant.as_ref(), || {
@@ -10642,7 +10642,10 @@ mod confinement {
         let f = two_datasets();
         let peak = || {
             let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-            assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) }, 0);
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                0
+            );
             let rss = unsafe { usage.assume_init().ru_maxrss } as u64;
             if cfg!(target_os = "macos") {
                 rss

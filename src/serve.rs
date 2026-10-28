@@ -5670,10 +5670,11 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
         Ok(Err(e)) => {
             METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Invalid);
             let raw = sanitize_sql_error(&format!("{e:#}"), &s.dir);
-            let msg = match crate::analytics::enrich_served_query_error(&s.dir, &raw, &q.q, &s.tables) {
-                Some(hint) => format!("{raw}\n\nhint: {hint}"),
-                None => raw,
-            };
+            let msg =
+                match crate::analytics::enrich_served_query_error(&s.dir, &raw, &q.q, &s.tables) {
+                    Some(hint) => format!("{raw}\n\nhint: {hint}"),
+                    None => raw,
+                };
             (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "valid": false, "error": msg })),
