@@ -7397,15 +7397,25 @@ template="pool"
     fn a_wide_batch_stays_under_the_cursor() {
         if std::env::var_os("NUTHATCH_WIDE_RSS").is_none() {
             let exe = std::env::current_exe().unwrap();
-            let child = std::process::Command::new(exe)
-                .args([
-                    "analytics::tests::a_wide_batch_stays_under_the_cursor",
-                    "--exact",
-                    "--nocapture",
-                ])
-                .env("NUTHATCH_WIDE_RSS", "1")
-                .output()
-                .unwrap();
+            // Spawned under the env lock: a test that sets a 64 MB engine limit for its own sessions
+            // would otherwise hand it to the child, whose built values are now charged to the pool.
+            let spawned = {
+                let _env = crate::analytics_budget::tests::env_lock()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                std::process::Command::new(exe)
+                    .args([
+                        "analytics::tests::a_wide_batch_stays_under_the_cursor",
+                        "--exact",
+                        "--nocapture",
+                    ])
+                    .env("NUTHATCH_WIDE_RSS", "1")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            };
+            let child = spawned.wait_with_output().unwrap();
             let stdout = String::from_utf8_lossy(&child.stdout);
             let stderr = String::from_utf8_lossy(&child.stderr);
             eprint!("{stdout}{stderr}");
