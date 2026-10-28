@@ -1035,14 +1035,14 @@ jobs:
           name: nuthatch-release
           path: bin
       - name: replace followers, then the writer, with a query answered at every step
-        # RFC-0073 FR7. No release before this one can follow, so the candidate plays both roles
-        # until one can; then this becomes `--previous <tag>` (docs/release-gate.md).
+        # RFC-0073 FR7. The previous binary is the latest release older than this build; while that
+        # release cannot follow, the build plays both roles and the MODE line says so.
         env:
           FIXTURE_RPC: bin/fixture-rpc
-          ROLLING_SAME: "1"
+          GH_TOKEN: ${{ github.token }}
         run: |
           chmod +x bin/nuthatch bin/fixture-rpc
-          bash scripts/rolling-upgrade.sh bin/nuthatch bin/nuthatch
+          bash scripts/rolling-upgrade.sh bin/nuthatch
 
   point-read:
     name: point-read latency

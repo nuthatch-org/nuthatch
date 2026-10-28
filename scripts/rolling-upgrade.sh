@@ -2,8 +2,14 @@
 # rolling-upgrade.sh - RFC-0073 FR7's release-gate step: take a runtime from one release to the next
 # with a query answered at every step.
 #
-#   scripts/rolling-upgrade.sh <previous-binary> <current-binary>
-#   scripts/rolling-upgrade.sh --previous <tag> <current-binary>
+#   scripts/rolling-upgrade.sh [--plan] <current-binary>
+#   scripts/rolling-upgrade.sh [--plan] --previous <tag> <current-binary>
+#   scripts/rolling-upgrade.sh [--plan] <previous-binary> <current-binary>
+#
+# With the current binary alone, the previous is the latest full release (no draft, no prerelease)
+# older than the version the current binary reports. If that release cannot follow, or there is
+# none, the current binary plays both roles; the MODE line says which ran and why. --plan stops
+# after that line, before the fixture chain starts.
 #
 # A runtime with one nest over the fixture chain (scripts/fixture-rpc.sh) runs the previous binary as
 # its writer (`dev`) and two followers (`serve --runtime --follow`). Then, in order: follower one is
@@ -12,10 +18,9 @@
 # correctly by at least one of them. After each step the gate also waits for the followers to report
 # the writer connected and no generations behind.
 #
-# --previous TAG downloads that release's asset for GATE_TARGET (default x86_64-unknown-linux-gnu)
-# with gh and checks it against its .sha256. A previous release that predates followers cannot run
-# the first step; the gate says so and exits 2 (a setup fault), unless ROLLING_SAME=1, which runs the
-# current binary in both roles to prove the procedure until a release that can follow exists.
+# A release, named or resolved, is downloaded for GATE_TARGET (default x86_64-unknown-linux-gnu) with
+# gh and checked against its .sha256. A previous binary named by --previous or by path that predates
+# followers exits 2 (a setup fault), unless ROLLING_SAME=1 runs the current binary in both roles.
 #
 # Exit 0 PASS; 1 FAIL (a probe nobody answered, or a step that never became ready); 2 setup fault.
 # The run's logs stay in ROLLING_OUT (default: a temp dir, printed).
@@ -31,21 +36,49 @@ die() { echo "rolling-upgrade: $*" >&2; exit 2; }
 fail() { echo "rolling-upgrade: FAIL: $*" >&2; exit 1; }
 say() { echo "rolling-upgrade: $*" >&2; }
 
-previous_tag=""
+# shellcheck source=gate/semver.sh
+. "$(dirname "$0")/gate/semver.sh"
+
+plan=0
+if [ "${1:-}" = "--plan" ]; then
+  plan=1
+  shift
+fi
+previous_tag="" previous="" auto=0
 if [ "${1:-}" = "--previous" ]; then
   [ $# -ge 2 ] || die "--previous needs a tag"
   previous_tag=$2
   shift 2
-fi
-if [ -n "$previous_tag" ]; then
   [ $# -eq 1 ] || die "usage: $0 --previous <tag> <current-binary>"
   current=$1
+elif [ $# -eq 1 ]; then
+  auto=1
+  current=$1
 else
-  [ $# -eq 2 ] || die "usage: $0 <previous-binary> <current-binary>"
+  [ $# -eq 2 ] || die "usage: $0 [--plan] [<previous-binary> | --previous <tag>] <current-binary>"
   previous=$1
   current=$2
 fi
 [ -x "$current" ] || die "no binary at $current"
+
+version_of() { "$1" --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?' | head -n 1 || true; }
+current_version=$(version_of "$current")
+[ -n "$current_version" ] || die "$current reports no version"
+
+same_why=""
+if [ "$auto" -eq 1 ]; then
+  listed=$(gh release list -R "$repo" -L 100 --exclude-pre-releases --json tagName,isDraft \
+    --jq '.[] | select(.isDraft | not) | .tagName') || die "could not list the releases of $repo"
+  for t in $listed; do
+    semver_gt "$current_version" "$t" || continue
+    if [ -z "$previous_tag" ] || semver_gt "$t" "$previous_tag"; then previous_tag=$t; fi
+  done
+  if [ -n "$previous_tag" ]; then
+    say "previous: $previous_tag, the latest release of $repo older than $current_version"
+  else
+    same_why="no release of $repo is older than $current_version"
+  fi
+fi
 
 out=${ROLLING_OUT:-$(mktemp -d)}
 mkdir -p "$out"
@@ -58,7 +91,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ -n "$previous_tag" ]; then
+if [ -n "$same_why" ]; then
+  previous=$current
+elif [ -n "$previous_tag" ]; then
   asset=nuthatch-$target.tar.gz
   mkdir -p "$out/previous"
   gh release download "$previous_tag" -R "$repo" -p "$asset" -p "$asset.sha256" -D "$out/previous" \
@@ -75,15 +110,31 @@ if [ -n "$previous_tag" ]; then
 fi
 [ -x "$previous" ] || die "no binary at $previous"
 
-if ! "$previous" serve --help 2>/dev/null | grep -q -- '--follow'; then
-  if [ "${ROLLING_SAME:-}" = 1 ]; then
-    say "the previous binary cannot follow; ROLLING_SAME=1, so the current binary plays both roles"
-    previous=$current
-  else
-    die "the previous binary ($("$previous" --version 2>/dev/null)) predates followers (RFC-0073 FR1); \
+if [ -z "$same_why" ]; then
+  previous_version=$(version_of "$previous")
+  # A binary that cannot run here would otherwise read as one that cannot follow.
+  [ -n "$previous_version" ] || die "the previous binary $previous does not run here (GATE_TARGET is $target)"
+  if ! "$previous" serve --help 2>/dev/null | grep -q -- '--follow'; then
+    if [ "$auto" -eq 1 ]; then
+      same_why="$previous_tag cannot follow (followers are RFC-0073 FR1)"
+    elif [ "${ROLLING_SAME:-}" = 1 ]; then
+      same_why="${previous_tag:-$previous_version} cannot follow; ROLLING_SAME=1"
+    else
+      die "the previous binary ($previous_version) predates followers (RFC-0073 FR1); \
 there is nothing to upgrade without an outage yet. ROLLING_SAME=1 runs the procedure on one binary"
+    fi
+    previous=$current
   fi
 fi
+if [ -n "$same_why" ]; then
+  mode="same-binary $current_version: $same_why"
+  say "MODE $mode"
+  say "NOT A CROSS-RELEASE TEST: the current binary plays both roles, which proves the procedure, not the upgrade"
+else
+  mode="cross-release ${previous_tag:-$(version_of "$previous")} to $current_version"
+  say "MODE $mode"
+fi
+[ "$plan" -eq 0 ] || exit 0
 
 free_port() {
   local p
@@ -234,4 +285,4 @@ if [ "$failed" -gt 0 ]; then
   grep '^FAIL' "$probe_log" | head -n 5 >&2
   fail "$failed of $probes probes went unanswered"
 fi
-say "PASS: $probes probes across three replacements, every one answered"
+say "PASS ($mode): $probes probes across three replacements, every one answered"

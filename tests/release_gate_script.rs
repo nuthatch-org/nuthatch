@@ -997,6 +997,7 @@ impl Releases {
             .env("GATE_SET", set)
             .env("GATE_PASSES", "1")
             .env("GATE_REPO", "test/nuthatch")
+            .env("GATE_ROLLING", "0")
             .env_remove("GATE_LOCK_HELD");
         for (k, v) in env {
             cmd.env(k, v);
@@ -1656,6 +1657,7 @@ fn an_unset_gate_set_is_a_setup_fault_that_names_it() {
         )
         .env("FAKE_GH_DIR", dir.path())
         .env("GATE_STATE", dir.path().join("state"))
+        .env("GATE_ROLLING", "0")
         .env_remove("GATE_SET")
         .env_remove("GATE_LOCK_HELD");
     let child = run_bounded(cmd, dir.path(), "runner");
@@ -1899,4 +1901,357 @@ fn the_defaults_catch_the_incident_on_a_32_core_box_both_ways() {
     );
     assert_eq!(out.status.code(), Some(2), "26 mid-run:\n{text}");
     assert!(text.contains("RESULT: SETUP FAULT"), "{text}");
+}
+
+/// A stand-in nuthatch for the rolling upgrade's choice of previous release: it reports `version`,
+/// and lists `--follow` under `serve --help` only when it `follows`.
+fn fake_nuthatch(path: &Path, version: &str, follows: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let serve = if follows {
+        "echo '      --follow <URL>'"
+    } else {
+        "echo '      --runtime <DIR>'"
+    };
+    std::fs::write(
+        path,
+        format!(
+            "#!/usr/bin/env bash\ncase \"${{1:-}}\" in\n  --version) echo 'nuthatch {version}' ;;\n  serve) {serve} ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// FAKE_GH's directory with `(tag, full|pre|draft, follows)` releases, listed in the order given.
+fn fake_gh(dir: &Path, list: &[(&str, &str, bool)]) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let gh = dir.join("gh");
+    std::fs::create_dir_all(gh.join("fakes")).unwrap();
+    std::fs::write(gh.join("fakes/gh"), FAKE_GH).unwrap();
+    std::fs::set_permissions(gh.join("fakes/gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut listing = String::new();
+    for (tag, kind, follows) in list {
+        listing.push_str(&format!("{tag} {kind}\n"));
+        fake_nuthatch(
+            &gh.join(format!("bin-{tag}/nuthatch")),
+            tag.trim_start_matches('v'),
+            *follows,
+        );
+    }
+    std::fs::write(gh.join("releases"), listing).unwrap();
+    gh
+}
+
+fn with_fake_gh(cmd: &mut Command, gh: &Path) {
+    cmd.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            gh.join("fakes").display(),
+            std::env::var("PATH").unwrap()
+        ),
+    )
+    .env("FAKE_GH_DIR", gh)
+    .env("GATE_REPO", "test/nuthatch")
+    .env_remove("GATE_TARGET")
+    .env_remove("ROLLING_SAME");
+}
+
+fn output_of(mut cmd: Command) -> (Option<i32>, String) {
+    let out = cmd.output().expect("run a gate script");
+    (
+        out.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// `rolling-upgrade.sh --plan`: resolves the previous release and names the mode, then stops.
+fn rolling_plan(gh: &Path, args: &[&str], env: &[(&str, &str)]) -> (Option<i32>, String) {
+    let mut cmd = Command::new(root().join("scripts/rolling-upgrade.sh"));
+    with_fake_gh(&mut cmd, gh);
+    cmd.arg("--plan")
+        .args(args)
+        .env("ROLLING_OUT", gh.join("out"));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    output_of(cmd)
+}
+
+fn read_in(dir: &Path, name: &str) -> String {
+    std::fs::read_to_string(dir.join(name)).unwrap_or_default()
+}
+
+/// The rolling upgrade's statuses, without their context.
+fn rolling_posts(posted_ctx: &str) -> Vec<String> {
+    posted_for(posted_ctx, "release-gate/rolling-upgrade")
+        .into_iter()
+        .map(|l| {
+            l.trim_start_matches("release-gate/rolling-upgrade ")
+                .to_string()
+        })
+        .collect()
+}
+
+/// RFC-0073 FR7: once a release can follow, every later candidate is tested against it with no
+/// edit. The previous is the newest full release older than the candidate, by number: not a draft,
+/// not a prerelease, not the candidate's own tag, and v5.10 above v5.9.
+#[test]
+fn the_previous_release_is_the_latest_full_release_older_than_the_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh(
+        dir.path(),
+        &[
+            ("v5.14.0", "full", true),
+            ("v5.14.0-rc.1", "pre", true),
+            ("v5.13.2", "draft", true),
+            ("v5.9.0", "full", true),
+            ("v5.13.1", "full", true),
+            ("v5.10.0", "full", true),
+            ("v5.13.0", "full", true),
+        ],
+    );
+    let current = dir.path().join("current/nuthatch");
+    fake_nuthatch(&current, "5.14.0", true);
+    let (code, text) = rolling_plan(&gh, &[current.to_str().unwrap()], &[]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(read_in(&gh, "downloaded"), "v5.13.1\n", "{text}");
+    assert!(
+        text.contains("rolling-upgrade: MODE cross-release v5.13.1 to 5.14.0"),
+        "{text}"
+    );
+    assert!(!text.contains("same-binary"), "{text}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh(
+        dir.path(),
+        &[("v5.9.0", "full", true), ("v5.10.0", "full", true)],
+    );
+    let current = dir.path().join("current/nuthatch");
+    fake_nuthatch(&current, "5.10.1", true);
+    let (code, text) = rolling_plan(&gh, &[current.to_str().unwrap()], &[]);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("MODE cross-release v5.10.0 to 5.10.1"),
+        "{text}"
+    );
+}
+
+/// No release before 5.13.0 can follow, so until one is the previous, the candidate plays both
+/// roles, and the output says so where nobody can read it as a cross-release pass.
+#[test]
+fn a_previous_release_that_cannot_follow_falls_back_to_the_candidate_alone_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh(
+        dir.path(),
+        &[("v5.12.1", "full", false), ("v5.12.0", "full", false)],
+    );
+    let current = dir.path().join("current/nuthatch");
+    fake_nuthatch(&current, "5.13.0", true);
+    let (code, text) = rolling_plan(&gh, &[current.to_str().unwrap()], &[]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(read_in(&gh, "downloaded"), "v5.12.1\n", "{text}");
+    assert!(
+        text.contains("rolling-upgrade: MODE same-binary 5.13.0: v5.12.1 cannot follow"),
+        "{text}"
+    );
+    assert!(text.contains("NOT A CROSS-RELEASE TEST"), "{text}");
+}
+
+#[test]
+fn with_no_older_release_the_candidate_runs_alone_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh(
+        dir.path(),
+        &[("v5.13.0", "full", true), ("v5.13.0-rc.1", "pre", true)],
+    );
+    let current = dir.path().join("current/nuthatch");
+    fake_nuthatch(&current, "5.13.0", true);
+    let (code, text) = rolling_plan(&gh, &[current.to_str().unwrap()], &[]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(read_in(&gh, "downloaded"), "", "{text}");
+    assert!(
+        text.contains("MODE same-binary 5.13.0: no release of test/nuthatch is older than 5.13.0"),
+        "{text}"
+    );
+}
+
+/// A previous release named by hand is what was asked for: one that cannot follow is a setup fault,
+/// not a silent fallback, unless ROLLING_SAME=1 asks for one.
+#[test]
+fn a_named_previous_that_cannot_follow_is_a_setup_fault_unless_asked_to_fall_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh(dir.path(), &[("v5.12.1", "full", false)]);
+    let current = dir.path().join("current/nuthatch");
+    fake_nuthatch(&current, "5.13.0", true);
+    let args = ["--previous", "v5.12.1", current.to_str().unwrap()];
+    let (code, text) = rolling_plan(&gh, &args, &[]);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("predates followers"), "{text}");
+    assert!(!text.contains("MODE"), "{text}");
+    let (code, text) = rolling_plan(&gh, &args, &[("ROLLING_SAME", "1")]);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("MODE same-binary 5.13.0: v5.12.1 cannot follow; ROLLING_SAME=1"),
+        "{text}"
+    );
+}
+
+/// A rolling-upgrade.sh that records the arguments it was given, prints `lines` and exits `code`.
+fn fake_rolling(gh: &Path, code: i32, lines: &[&str]) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = gh.join("fakes/rolling-upgrade.sh");
+    let mut body = String::from("#!/usr/bin/env bash\necho \"$*\" >>\"$FAKE_GH_DIR/rolled\"\n");
+    for l in lines {
+        body.push_str(&format!("echo '{l}' >&2\n"));
+    }
+    body.push_str(&format!("exit {code}\n"));
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn rolling_runner(gh: &Path, script: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let mut cmd = Command::new(root().join("scripts/release-gate-run.sh"));
+    with_fake_gh(&mut cmd, gh);
+    cmd.args(args)
+        .env("GATE_STATE", gh.join("state"))
+        .env("GATE_ROLLING", "only")
+        .env("GATE_ROLLING_SCRIPT", script);
+    output_of(cmd)
+}
+
+/// The candidate's gate result carries the rolling upgrade under its own context, with the mode in
+/// the status, so a fallback never reads as a cross-release pass.
+#[test]
+fn the_gate_posts_the_rolling_upgrade_with_the_mode_it_ran() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh(
+        dir.path(),
+        &[("v5.13.0", "full", true), ("v5.12.1", "full", false)],
+    );
+    let script = fake_rolling(
+        &gh,
+        0,
+        &["rolling-upgrade: MODE same-binary 5.13.0: v5.12.1 cannot follow (followers are RFC-0073 FR1)"],
+    );
+    let (code, text) = rolling_runner(&gh, &script, &["v5.13.0"]);
+    assert_eq!(code, Some(0), "{text}");
+    let rolled = read_in(&gh, "rolled");
+    assert!(
+        rolled.trim_end().ends_with("bins/v5.13.0/nuthatch"),
+        "{rolled}"
+    );
+    let posted = rolling_posts(&read_in(&gh, "posted-ctx"));
+    assert_eq!(posted.len(), 2, "{posted:?}\n{text}");
+    assert!(posted[0].starts_with("sha-v5.13.0 pending "), "{posted:?}");
+    assert_eq!(
+        posted[1],
+        "sha-v5.13.0 success passed, same-binary 5.13.0: v5.12.1 cannot follow (followers are RFC-0073 FR1)"
+    );
+
+    let script = fake_rolling(
+        &gh,
+        1,
+        &[
+            "rolling-upgrade: MODE cross-release v5.12.1 to 5.13.0",
+            "rolling-upgrade: FAIL: 3 of 90 probes went unanswered",
+        ],
+    );
+    let (code, text) = rolling_runner(&gh, &script, &["v5.13.0"]);
+    assert_eq!(code, Some(1), "{text}");
+    let posted = rolling_posts(&read_in(&gh, "posted-ctx"));
+    assert_eq!(
+        posted.last().unwrap(),
+        "sha-v5.13.0 failure cross-release v5.12.1 to 5.13.0: 3 of 90 probes went unanswered"
+    );
+}
+
+/// A poll runs the rolling upgrade for the newest release alone: older releases predate the step,
+/// and walking back through them is what the nests' poll did on 2026-10-03.
+#[test]
+fn poll_runs_the_rolling_upgrade_for_the_newest_release_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh(
+        dir.path(),
+        &[
+            ("v5.14.0-rc.1", "draft", true),
+            ("v5.13.0", "full", true),
+            ("v5.12.1", "full", false),
+        ],
+    );
+    let script = fake_rolling(
+        &gh,
+        0,
+        &["rolling-upgrade: MODE cross-release v5.12.1 to 5.13.0"],
+    );
+    let (code, text) = rolling_runner(&gh, &script, &["--poll"]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(read_in(&gh, "downloaded"), "v5.13.0\n", "{text}");
+
+    std::fs::write(
+        gh.join("status-sha-v5.13.0-release-gate_rolling-upgrade"),
+        "success\n",
+    )
+    .unwrap();
+    std::fs::remove_file(gh.join("rolled")).unwrap();
+    let (code, text) = rolling_runner(&gh, &script, &["--poll"]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(text, "", "nothing to gate is quiet");
+    assert_eq!(
+        read_in(&gh, "rolled"),
+        "",
+        "v5.12.1 is never walked back to"
+    );
+}
+
+/// By default the runner gates the nests and then the rolling upgrade, once, and exits with the
+/// worse of the two.
+#[test]
+fn the_runner_gates_the_nests_then_the_rolling_upgrade_and_exits_with_the_worse() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let r = releases(&c, &[("v4.3.0-rc1", "pre", 0), ("v4.2.0", "full", 0)], &[]);
+    let script = fake_rolling(
+        &r.dir,
+        1,
+        &[
+            "rolling-upgrade: MODE cross-release v4.2.0 to 4.3.0-rc1",
+            "rolling-upgrade: FAIL: the upgraded writer answers 8 transfers was not reached in 120s",
+        ],
+    );
+    let (code, text) = r.runner(
+        &c,
+        &set,
+        &["v4.3.0-rc1"],
+        &[
+            ("GATE_ROLLING", "1"),
+            ("GATE_ROLLING_SCRIPT", script.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(code, Some(1), "{text}");
+    let ctx = r.read("posted-ctx");
+    let nest = posted_for(&ctx, "release-gate/alloc-nest");
+    assert!(
+        nest.last()
+            .unwrap()
+            .starts_with("release-gate/alloc-nest sha-v4.3.0-rc1 success "),
+        "{ctx}\n{text}"
+    );
+    let rolling = rolling_posts(&ctx);
+    assert_eq!(rolling.len(), 2, "{ctx}");
+    assert!(
+        rolling[1].starts_with("sha-v4.3.0-rc1 failure cross-release v4.2.0 to 4.3.0-rc1: "),
+        "{ctx}"
+    );
+    assert_eq!(
+        r.read("rolled").lines().count(),
+        1,
+        "once, not once per nest"
+    );
 }
