@@ -519,6 +519,16 @@ async fn a_snapshot_over_the_cursor_budget_is_refused_and_its_co_mount_serves() 
         body["error"].as_str().unwrap().contains("max_rss_mb 12"),
         "{body}"
     );
+    // Over the whole budget, not short of room a retiring copy held: it is not asked for again.
+    for _ in 0..100 {
+        let (status, body) = route_status(&fbase, ROUTE).await;
+        assert_eq!(
+            (status, &body["reason"]),
+            (503, &"over_budget".into()),
+            "{body}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let (status, ready) = get(&fbase, &format!("/{ROUTE}/ready")).await;
     assert_eq!((status, &ready["reason"]), (503, &"over_budget".into()));
     let (status, root_ready) = get(&fbase, "/ready").await;
@@ -852,5 +862,25 @@ async fn an_unmounted_copy_in_use_is_charged_until_it_drops() {
     );
     drop(held);
     assert_eq!(follower.retiring(), 0, "nothing is charged once it drops");
+    // Refused only for want of the room the held copy took, it comes back on its own.
+    let mut back = (0, serde_json::Value::Null);
+    for _ in 0..400 {
+        back = route_status(&fbase, ROUTE).await;
+        if back.0 == 200 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        back.0, 200,
+        "the remount came back once there was room: {}",
+        back.1
+    );
+    agree(&writer, &fbase, COUNT, "after the remount").await;
+    let (peak, _) = follower.charges();
+    assert!(
+        peak <= BUDGET_MB << 20,
+        "charged {peak} bytes against a {BUDGET_MB} MiB budget"
+    );
     writer.stop(&root);
 }

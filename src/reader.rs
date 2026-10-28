@@ -128,6 +128,9 @@ struct Inner {
     /// chain they are charged to. Each counts against its cursor's budget until its last reference
     /// drops.
     retiring: Vec<(Option<String>, std::sync::Weak<MemStore>)>,
+    /// Datasets refused while retiring copies held part of their cursor's budget, with that chain
+    /// and what those copies came to. Each is asked for again once that falls.
+    awaiting_room: HashMap<String, (Option<String>, u64)>,
     /// Times a held copy was released so that a new snapshot of it could load under the full budget.
     reloads: u64,
     /// The most any cursor here has been charged, in bytes.
@@ -267,6 +270,7 @@ impl Follower {
                 over_budget: HashMap::new(),
                 excluded: BTreeSet::new(),
                 retiring: Vec::new(),
+                awaiting_room: HashMap::new(),
                 reloads: 0,
                 peak: 0,
                 link: Link {
@@ -504,6 +508,16 @@ impl Follower {
         tracing::warn!("{dataset}: {why}");
         {
             let mut inner = self.lock();
+            // Refused while retiring copies held part of the budget: asked for again once they go.
+            let chain = inner.chain_of(dataset).unwrap_or_default();
+            let retiring = inner.retiring_on(&chain);
+            if retiring > 0 {
+                inner
+                    .awaiting_room
+                    .insert(dataset.to_string(), (chain, retiring));
+            } else {
+                inner.awaiting_room.remove(dataset);
+            }
             if let Some(copy) = inner.datasets.remove(dataset) {
                 inner.retire(dataset, &copy);
             }
@@ -588,6 +602,7 @@ impl Follower {
                             }
                             inner.positions.remove(&dataset);
                             inner.excluded.remove(&dataset);
+                            inner.awaiting_room.remove(&dataset);
                             crate::seal::unpin_catalogue(&self.root.join(&dataset));
                         }
                     }
@@ -621,6 +636,7 @@ impl Follower {
                         inner.retire(&dataset, &old);
                     }
                     inner.note_peak(&dataset);
+                    inner.awaiting_room.remove(&dataset);
                     inner.over_budget.remove(&dataset).is_some()
                 };
                 self.realise();
@@ -669,7 +685,30 @@ impl Follower {
                 self.lock().note_peak(&dataset);
             }
             Line::Heartbeat { positions } => {
-                self.lock().positions = positions.into_iter().collect();
+                let roomier = {
+                    let mut inner = self.lock();
+                    inner.positions = positions.into_iter().collect();
+                    let roomier: Vec<String> = inner
+                        .awaiting_room
+                        .iter()
+                        .filter(|(_, (chain, was))| inner.retiring_on(chain) < *was)
+                        .map(|(d, _)| d.clone())
+                        .collect();
+                    for d in &roomier {
+                        inner.awaiting_room.remove(d);
+                        inner.excluded.remove(d);
+                        inner.over_budget.remove(d);
+                    }
+                    roomier
+                };
+                if !roomier.is_empty() {
+                    self.recompose();
+                    // The feed sends a snapshot only on connecting, so ask again by reconnecting.
+                    bail!(
+                        "room came back for {}; asking for it again",
+                        roomier.join(", ")
+                    );
+                }
             }
         }
         Ok(())
