@@ -613,6 +613,10 @@ impl std::ops::Deref for OpenDb {
 
 #[derive(Clone)]
 pub struct Store {
+    /// The read transaction every read on this handle uses, set on a handle taken by
+    /// [`HotStore::pinned`] (#2467). `None` reads at the latest commit. Declared before `db` so it
+    /// drops first: redb keeps its file locked while a transaction lives, past `released`.
+    pinned: Option<Arc<Pin>>,
     db: Arc<OpenDb>,
     released: tokio::sync::watch::Receiver<()>,
     /// Fence this handle holds, shared across clones so every clone of one nest's handle speaks for
@@ -627,9 +631,6 @@ pub struct Store {
     commit_gate: Arc<tokio::sync::Mutex<()>>,
     /// The hot-state feed's writer half (RFC-0073 FR1), shared across clones.
     tap: Arc<crate::feed::Tap>,
-    /// The read transaction every read on this handle uses, set on a handle taken by
-    /// [`HotStore::pinned`] (#2467). `None` reads at the latest commit.
-    pinned: Option<Arc<Pin>>,
     /// Bytes of the largest `entities_in_range` answer, so a test can hold sealing to reading a cut.
     #[cfg(test)]
     pub(crate) largest_range_read: Arc<std::sync::atomic::AtomicUsize>,

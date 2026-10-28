@@ -934,6 +934,17 @@ async fn a_corrupted_segment_reduces_the_table_over_http(corrupt: impl FnOnce(&s
         wait_until(SEAL_POLL_TIMEOUT, || store.sealed_through() >= 6).await,
         "range [4,6] did not seal in time"
     );
+    // Requests read the published snapshot (#2467), which follows the seal by a moment.
+    let snapshots = rt.state.snapshots.clone().expect("a writer publishes snapshots");
+    assert!(
+        wait_until(SEAL_POLL_TIMEOUT, || {
+            snapshots
+                .load_full()
+                .is_some_and(|s| s.store.sealed_through() >= 6)
+        })
+        .await,
+        "the seal was not published in time"
+    );
 
     let table = transfer_table("usdc");
     let segs = seal::load_manifest(dir.path())
@@ -1385,6 +1396,8 @@ async fn a_hot_scan_failure_does_not_claim_completeness_over_http() {
     }
     let mut state = rt.state.clone();
     state.store = Arc::new(HotScanFails(state.store.clone()));
+    // Served from that store, not the nest's published snapshot (#2467).
+    state.snapshots = None;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1483,6 +1496,8 @@ async fn a_hot_scan_failure_does_not_claim_bindable_completeness_over_http() {
     }
     let mut state = rt.state.clone();
     state.store = Arc::new(HotScanFails(state.store.clone()));
+    // Served from that store, not the nest's published snapshot (#2467).
+    state.snapshots = None;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1633,6 +1648,8 @@ async fn a_hot_scan_failure_and_a_cold_corruption_are_told_apart_on_the_healthy_
     std::fs::write(&usdc_path, b"not parquet, not even close").unwrap();
     let mut state = rt.state.clone();
     state.store = Arc::new(HotScanFails(state.store.clone()));
+    // Served from that store, not the nest's published snapshot (#2467).
+    state.snapshots = None;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

@@ -8320,11 +8320,11 @@ impl NestIngest {
         }
         // Catching up, a snapshot per window would make every window wait on its views, so requests
         // read one about a second old instead.
-        if to >= tip
+        let publish = to >= tip
             || self
                 .published_at
-                .is_none_or(|at| at.elapsed() >= PUBLISH_WHILE_CATCHING_UP)
-        {
+                .is_none_or(|at| at.elapsed() >= PUBLISH_WHILE_CATCHING_UP);
+        if publish {
             self.publish_snapshot().await?;
         }
         // RFC-0062 S2, once the window is published. Not while catching up: a build per backfill
@@ -8401,6 +8401,10 @@ impl NestIngest {
         #[cfg(feature = "folds")]
         if let Some(w) = &self.folds {
             w.sealed_through_advanced(self.store.sealed_through());
+        }
+        // A seal moves rows from hot to a segment; requests read past it once this is published.
+        if publish {
+            self.republish_if_moved().await?;
         }
         Ok(Some(stored))
     }
