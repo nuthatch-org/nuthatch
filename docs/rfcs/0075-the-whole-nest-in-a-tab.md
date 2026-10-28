@@ -1,0 +1,252 @@
+# RFC-0075: The whole nest in a tab - ingest, hot store, reorgs, entities and the API in a browser
+
+- Status: **Accepted 2026-10-28 (Chief): "i wanna do it".** S0's kill question was measured the same
+  day and did not kill it (§3). The rest of S0 and S1 to S6 are authorised in order, each on its own
+  gate (§9).
+- Author: Pete (cargopete)
+- Date: 2026-10-28
+- Depends on: RFC-0065 (the nest in a tab: decode, sealing and Burrmill already in a browser worker),
+  RFC-0066 (the nest builder and its in-tab backfill), RFC-0074 (redb on `wasm32-unknown-unknown`
+  over a byte buffer; on branch `pete/rotki-embedded-s0`, parked), RFC-0041 (authored incremental
+  entities), RFC-0021 (one cursor per chain).
+- Blocks: nothing.
+- Nature: a separate artefact plus a refactor of the binary's crates that changes none of its
+  behaviour. §8 says why it needs no RFC-0044 §8 record.
+
+## 1. Where this comes from
+
+Chris at GraphOps said on 2026-10-27 that one of nuthatch's interesting properties is that it is pure
+Rust and could be embedded as a wasm blob. RFC-0074 tested that for one consumer, rotki's address
+history, and it held. This RFC asks the general question: can the whole nest run in a browser, with no
+server process anywhere?
+
+RFC-0065 got most of the way. A worker at `/play` follows a chain from an RPC, decodes, seals Parquet
+segments byte-identical to the binary's and answers SQL through Burrmill over hot ∪ sealed. What it
+left out, by its own §3, is everything stateful between decode and seal: the redb hot store, the reorg
+path, the DBSP circuits (built-in `balances`, `exposure`, `velocity` and `entities.toml`) and the HTTP
+surface. The tab today keeps its unsealed tail as a list of rows and has no rollback, so it seals only
+what two RPCs agree is final.
+
+This RFC closes that gap. The result is a tab that is a nest: the same cursor, the same store, the same
+circuits and the same answers as `nuthatch dev`, with the browser in place of the operating system.
+
+## 2. What builds for wasm today
+
+| Piece | State | Evidence |
+|---|---|---|
+| `nuthatch-decode`, `nuthatch-seal`, `nuthatch-scaffold`, `nuthatch-identity` | build for wasm32, CI-checked | RFC-0065, RFC-0066 |
+| Burrmill | builds for wasm32; burrmill-wasm is 35.3 MB raw, 5.6 MB brotli | burrmill-wasm |
+| redb 2.6.3 | builds for `wasm32-unknown-unknown` behind a custom `StorageBackend`; WASI does not (a nightly feature under `target_os = "wasi"`) | RFC-0074 S0, measured |
+| dbsp 0.320.0 | **does not build as published**; builds and runs with a 459-line patch | §3, measured 2026-10-28 |
+| `src/rpc.rs` | reqwest and tokio; the decision logic is transport-free | §5 |
+| `src/indexer.rs` | 27,826 lines, 340 `tokio::` mentions, 52 clock or sleep calls | §6 |
+| `src/serve.rs` | 15k lines of axum handlers over `AppState` | §7 |
+
+## 3. DBSP on wasm32: the kill question
+
+This was the unknown that could stop the programme, so it went first.
+
+**As published, dbsp does not build.** `feldera-types` depends on actix-web unconditionally, which
+brings mio, socket2 and zstd; dbsp links mimalloc's C build, `nix`, `core_affinity`, asks tokio for
+`rt-multi-thread` (a `compile_error!` on wasm) and rkyv's `size_64` (only implemented for 64-bit
+pointers); two literals overflow a 32-bit `usize`; the multihost exchange names `TcpStream`. At run time
+it would fail further on: `Runtime::run` spawns a thread per worker, a multi-thread tokio runtime for
+merges and an RSS monitor thread; the client and worker handshake parks on a `Condvar`; and
+`Instant::now()` panics on this target.
+
+**A patch makes it build, run and answer correctly.** 459 lines added and 89 removed across six
+feldera crates, every change a target cfg, so the native build compiles the published code. Two parts
+are design rather than plumbing:
+
+1. **Workers are closures on the calling thread.** On wasm32 `Runtime::run` builds the circuit inline
+   and registers a `serve_one` closure; `broadcast_command` sends as before and then drives every
+   worker until its queue is empty, so the reply is waiting when the client looks for it.
+2. **Merges are synchronous.** The merger runs `merge_step` until there is no work, and
+   `backpressure_wait` drains first, so the `Notify` it would await is never needed.
+
+Measured in Node 26, release build at `opt-level = "s"`: a map plus an integrated aggregate answers
+correctly in 13 ms; 20,000 transactions of 100 rows, every fourth one retracting 100 earlier rows, go
+through a spine in 4.3 s, and the native build of the same patched crate gives the identical relation.
+The dbsp module with two small circuits is 3.57 MB raw and 679 KB brotli, about an eighth more than
+the tab already downloads. Licences are MIT OR Apache-2.0 throughout.
+
+nuthatch already runs every circuit with one worker (`init_circuit(1, ..)` in `views.rs`,
+`exposure.rs`, `velocity.rs`, `entity_circuit.rs`), so single-threaded dbsp loses only the overlap
+between merging and folding.
+
+The spike is in `spike/dbsp-wasm/`; `vendor.sh` rebuilds the patched crates from the registry and the
+patch file, which is the full diff.
+
+**Not yet reached**: an entity-shaped circuit (a join over `entity_row.rs`'s `Row`),
+`sharded_accumulator`'s backpressure waiter (`operator/dynamic/sharded_accumulator.rs:288`), which
+awaits a `Notify` only a merger task signals, `complete_merges` and `retain_keys`. The rest of S0
+covers them.
+
+## 4. The design
+
+**One dedicated worker runs the whole nest**: ingest, hot store, folds, sealing and queries. The page
+talks to it over `postMessage`. It is single-threaded by necessity, not preference: Rust's wasm threads
+need `-Zbuild-std` on nightly, the project pins 1.95 stable, and `SharedArrayBuffer` needs
+cross-origin isolation, which would break every cross-origin RPC and the R2 mirror unless each sends
+CORP headers. Burrmill in the tab is single-threaded already. The cost is that a long query holds up
+the cursor and the other way round; the tab already runs statements one at a time.
+
+**The hot store is redb over OPFS.** An `OpfsBackend` implements redb's five synchronous
+`StorageBackend` methods over one `FileSystemSyncAccessHandle` (read and write at an offset, truncate,
+flush, size), which matches exactly and is available only in a worker. RFC-0074's `Vec<u8>` backend is
+the fallback where sync handles are missing. Both are backends behind a trait, as `CLAUDE.md` asks;
+`Store::from_db` is the only constructor that changes. A nest's data is one OPFS directory per NID:
+`nuthatch.redb`, `segments/<hash>.parquet` (where `/play` keeps segments now) and `manifest.json`.
+
+The browser enforces single-writer for us: a second tab's `createSyncAccessHandle` on the same file
+throws `NoModificationAllowedError`, which is a firmer lock than the flock the binary relies on.
+`wireapp/redb-opfs` does this bridge but is GPL-3.0, so it is read for ideas only; ours is about 60
+lines.
+
+**Reorgs are the binary's.** `rollback_reorg` (`src/indexer.rs:7589`) is synchronous and touches only
+the store and the views: read the meta keys, retract the entities in range through the circuits, roll
+back factory children, commit one transaction. It ports unchanged once the views are driven inline. A
+reorg below `sealed_through` stays a terminal fault, the same rule the tab follows for sealing now.
+The tab gains what it lacks today: it can follow the tip, roll back what a fork took away, and seal
+past finality as the binary does.
+
+**The views are driven inline.** `BalanceView::start` and `EntityView::start_bound` spawn a thread and
+a channel to keep circuits off the tokio pool. A `ViewDriver` trait with two implementations, the
+threaded one the binary uses today and an inline one that steps the circuit on `apply`, is chosen by
+the runtime and not by cfg. `flush()` is a no-op inline.
+
+## 5. RPC and async
+
+The tab fetches in JavaScript today and hands JSON to wasm. RFC-0074 went the other way, with Rust
+owning the loop and a synchronous host import, which a browser cannot offer without `Atomics.wait`.
+This RFC takes a third shape: **Rust owns the loop and awaits `fetch`**, polled by the browser's event
+loop through wasm-bindgen-futures, which burrmill-wasm already uses.
+
+`rpc.rs` splits into decisions and transport. The decision logic is free functions and per-endpoint
+atomics with no I/O: `select_rpcs`, `classify_status`, `classify_rpc_error`, `looks_like_cap`,
+`suggested_range`, `parse_retry_hint` and the pool's health, rests and heads. It moves unchanged. The
+transport becomes `trait Transport { async fn post(url, body) -> (u16, Bytes) }` with reqwest in the
+binary and `fetch` in the tab, and `RpcClient<T: Transport>` over it; timeouts go behind the same
+trait.
+
+`Source` is `#[async_trait]` on `Send + Sync`, and a `JsFuture` is not `Send`. The answer is
+`send_wrapper`, as `burrmill-wasm/src/js_store.rs` already does, which is sound because the tab has one
+thread (§4) and only because of that. Making the trait `?Send` under a cfg would fork business logic.
+
+## 6. The crate boundary
+
+The refactor is a crate, not cfg forks. **`nuthatch-core`** takes `NestIngest`'s window path
+(`fetch_window`, then `process_window`: decode, `balances`, `exposure`, `velocity`, entities, commit,
+seal) and `rollback_reorg`, over four traits:
+
+- `Source`, which exists.
+- `HotStore`, which exists; its two `spawn_blocking` commit wrappers become the synchronous calls,
+  with the binary keeping its blocking-pool version.
+- `SegmentSink`, for `seal_range`'s writes: bytes under `segments/<hash>`, then the manifest. The pure
+  half is `nuthatch-seal` already.
+- `Clock`, for the 52 clock and sleep sites, most of which are in the solo loop and pacing rather than
+  the window path. A missed `Instant::now()` is a panic at run time on wasm, not a compile error, so
+  each crate takes its time through one shim module and CI forbids `std::time::Instant` elsewhere.
+
+Already pure and moving with it: `chains`, `chunker`, `factory`, `labels`, `alerts`, `freshness`,
+`registry`, the `entity_*` modules, `views`, `exposure`, `velocity`, `source`. Staying in the binary
+only: mounts, graft, migrate, publish, folds, graph, `watch`, the admin cockpit, the address-history
+cursor and the process-global metrics, for which the tab gets a no-op `NestMetrics`.
+
+rkyv needs `size_32` on wasm32, which changes dbsp's internal archive layout. Nothing in nuthatch
+hashes or persists rkyv bytes and checkpoints are unused, so it is invisible; a native checkpoint
+could never be loaded in a tab, which nobody wants.
+
+## 7. The query surface
+
+What `serve.rs` serves is axum handlers over `AppState`. The refactor is to pull each route body into
+an axum-free `answer(request) -> response` over the nest state, as `sql_answer` already is. The binary
+keeps its router and calls the same functions. The tab links the functions and offers them two ways:
+
+1. **A JS API from the worker** (`nest.sql(q)`, `nest.entity(id)`, `nest.derived(name, key)`),
+   returning the same JSON text the routes return. This is what `/play` consumes.
+2. **A Service Worker** that answers the HTTP shapes for a path prefix on the page's origin and
+   relays to the nest worker. Every existing client then works unchanged inside the page: the
+   scaffolded skill's `fetch` calls, `llms.txt`'s examples, a dashboard. It is the HTTP API inside the
+   page, not a server; nothing outside the browser can reach it.
+
+MCP over stdio has no meaning in a tab. MCP over HTTP through the Service Worker is the same `answer()`
+in another envelope, and is left for a user who asks.
+
+## 8. Against the non-negotiables
+
+1. **Single static binary.** Unchanged. The binary is built from the same crates and S1's gate is
+   that it behaves identically; the tab is a separate artefact, as RFC-0065's is.
+2. **Footprint.** A tab nest sits inside the per-cursor 2 GiB budget and under wasm32's 4 GiB space;
+   the engine already refuses statements over 2 GiB, and 600 MiB on phones. S6 enforces both with a
+   cursor running. Memory64 is not used: Safari does not ship it.
+3. **No phone-home.** The tab talks to the RPCs the visitor chose and the mirror it reads, as `/play`
+   does now. Nothing is sent about anyone.
+4. **Determinism.** The same decode, the same circuits and the same sealer. The gates are byte-identical
+   segments, row-identical entity state and the reorg property test converging under wasm (§9).
+5. **Licence.** dbsp, the feldera crates, `web-time` and `send_wrapper` are MIT OR Apache-2.0.
+   `redb-opfs` is GPL and is not used.
+
+No RFC-0044 §8 record is needed: nothing new enters the default binary, which S1's gate holds to its
+current behaviour, and the tab is a separate artefact as RFC-0065 is.
+
+## 9. Slices and their gates
+
+Each ends runnable, and each gate can fail. Sizes are days of focused work.
+
+- **S0, dbsp on wasm32.** The kill question is answered (§3). What remains: lift
+  `entity_circuit.rs`'s `lower()` plan, with its join over `Row`, into the spike and step 1,000
+  windows. **Gate**: the relation equals the native build's, with no panic and no deadlock, wall time
+  and peak wasm memory recorded. A path that blocks names the next patch. Also: open the upstream
+  conversation with feldera (actix-web optional, the zip and object_store trims, the inline runtime
+  behind a `single-thread` feature). About 1 day.
+- **S1, `nuthatch-core`.** The window path and `rollback_reorg` behind `Source`, `HotStore`,
+  `SegmentSink` and `Clock`, with the `ViewDriver` trait; the binary uses the crate through its
+  threaded driver; the patched dbsp carried as a `[patch]` with a CI job that builds it for wasm32 and
+  runs the step test. **Gate**: native sealing of a pinned range gives the same segment hashes before
+  and after; `tests/e2e_reorg.rs` and `tests/e2e_entity_reorg.rs` are green;
+  `cargo check --target wasm32-unknown-unknown -p nuthatch-core` runs in CI. 5 to 8 days, and the
+  largest slice.
+- **S2, the hot store in the tab.** `OpfsBackend` and the `Vec<u8>` backend behind `Store::from_db`;
+  `nuthatch-core` driven from the `/play` worker over a `TapeSource` played from a recorded chain.
+  **Gate**: the reorg property test runs under Node against the wasm build and converges for every
+  depth band; a second tab opening the same store is refused. About 3 days.
+- **S3, the live cursor.** `Source` over `fetch` through the `Transport` trait, following a young
+  contract from its deploy block as RFC-0066 S2 does, now through `nuthatch-core`: hot store, the three
+  built-in views, sealing from the store and pruning sealed rows. **Gate**: for the same contract and
+  range, every segment hash equals the node's and `/balances` is row-identical; peak memory and bytes
+  recorded in Chrome and Safari. About 4 days.
+- **S4, entities and views.** `entities.toml` circuits built from the scaffolded nest and folded
+  inline; `views/*.sql` answered over hot ∪ sealed through the ported `bind_relation`. **Gate**:
+  `/derived/{entity}` and every authored view row-identical to native at the same watermark, including
+  after a scripted reorg. About 4 days.
+- **S5, the query surface.** Route bodies as `answer()`; the JS API, then the Service Worker.
+  **Gate**: the scaffolded skill's `fetch` examples and `llms.txt` run unchanged against the page;
+  `/sql`, `/entity`, `/derived`, `/balances`, `/explain` and `/ready` byte-identical to native for a
+  fixed nest. About 3 days.
+- **S6, size and memory.** `opt-level`, `wasm-opt`, and what dbsp drags in that a tab never calls
+  (clap, the profiler, LIR); the 2 GiB and 600 MiB budgets enforced with a cursor and a query running
+  together. **Gate**: module size published beside burrmill-wasm's 5.6 MB brotli; the Lodestar-class
+  refusal still holds with a cursor running. About 2 days.
+
+## 10. Risks
+
+1. **The dbsp patch is ours to carry.** feldera releases about weekly (0.349.0 against our 0.320.0
+   pin on 2026-10-28). The CI job in S1 catches a bump that breaks it; an upstream PR shrinks it. The
+   inline runtime is the part that can rot.
+2. **A dbsp path S0 did not reach.** The sharded accumulator's waiter is the likeliest; S0's second
+   half exists to find it.
+3. **Clocks.** A missed `Instant::now()` panics at run time. The shim-plus-lint rule in §6 is the
+   guard.
+4. **Quota and eviction.** Safari evicts an origin unused for seven days unless
+   `navigator.storage.persist()` is granted; Chromium allows up to 60 % of disk, Firefox the lesser of
+   10 % and 10 GiB. A tab nest is a cache of something re-derivable, and the page says so.
+5. **Phones.** A backfill's unsealed tail and a heavy view share one 600 MiB space. S3 measures it.
+6. **Public RPCs cap history.** A contract older than about eight days needs a full-history RPC, as
+   RFC-0065 §5 and RFC-0066 §12 found. Unchanged here.
+
+## 11. Non-goals
+
+Threads (nightly only). Memory64 (not in Safari). Publishing what a tab seals (RFC-0065 §7). Anything
+hosted or any account. Folds and the `graph` feature. Address history, which has RFC-0074's module.
+MCP over stdio.
