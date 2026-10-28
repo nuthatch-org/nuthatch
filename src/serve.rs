@@ -9413,8 +9413,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let writer = table_fixture(tmp.path(), 1..=3, 4..=5);
         writer.store.set_meta("sealed_through", "3").unwrap();
-        // Final, so the next seal adds a segment rather than folding this one into it.
-        crate::seal::finalise_provisional(&writer.dir).unwrap();
+        let first = crate::seal::load_manifest(&writer.dir).unwrap().tables["t"][0].clone();
+        let first_path = crate::seal::segment_path(&writer.dir, &first.file, &first.hash);
+        let first_bytes = std::fs::read(&first_path).unwrap();
         let copy = |store: &Arc<dyn crate::store::HotStore>| -> Arc<dyn crate::store::HotStore> {
             let sub = store
                 .feed_subscribe()
@@ -9464,6 +9465,9 @@ mod tests {
             .store
             .prune_and_set_meta(4, 5, "sealed_through", "5")
             .unwrap();
+        // The seal folds blocks 1 to 3's segment into one of 1 to 5. Its old file is put back, as
+        // retention for a follower would keep it, so only the catalogue decides the answer.
+        std::fs::write(&first_path, &first_bytes).unwrap();
         let new = copy(&writer.store);
         shared.swap(AppState {
             store: new,
