@@ -259,3 +259,39 @@ async fn remounting_costs_nothing_until_you_prune() {
         "the rebuilt dataset should be back under its identity"
     );
 }
+
+/// RFC-0075 S1: the bytes the tip path seals for a pinned range, end to end: fetch, decode, commit and
+/// seal through the runtime cursor. Captured before the window path moved into `nuthatch-core`; a
+/// change here is a re-seal, not a refactor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_window_path_seals_the_pinned_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    write_roost(root, "\"usdc\"");
+    let nest = root.join("nests").join("usdc");
+    std::fs::create_dir_all(&nest).unwrap();
+    scaffold_nest(&nest, "usdc", USDC);
+    migrate::run(root, false, false).expect("migrate");
+
+    let (_, data_dir, watermark) = index_once(root).await;
+    let got: Vec<String> = seal::load_manifest(&data_dir)
+        .unwrap()
+        .tables
+        .iter()
+        .flat_map(|(t, segs)| {
+            segs.iter().map(move |s| {
+                format!(
+                    "{t} {}..={} {} {}",
+                    s.from_block, s.to_block, s.rows, s.hash
+                )
+            })
+        })
+        .collect();
+    assert_eq!(watermark, PINNED_THROUGH);
+    assert_eq!(got, PINNED_SEGMENTS, "{got:#?}");
+}
+
+const PINNED_THROUGH: u64 = 10;
+const PINNED_SEGMENTS: &[&str] = &[
+    "usdc__transfer 1..=10 20000 2a7275302ce29f4af8317d6003bb5bfb3a087f3a49e4ff0298333f42a9085fd7",
+];
