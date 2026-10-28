@@ -3533,12 +3533,14 @@ fn offchain_status_ddl(view: &str, table: &str, refresh: &crate::offchain::Refre
 /// Make a nest-authored `CREATE VIEW` re-runnable on a cached connection (#295).
 fn with_or_replace_view(stmt: &str) -> String {
     let s = stmt.trim_start();
-    if s.len() < 11 || !s[..6].eq_ignore_ascii_case("create") {
+    // `get`, not slicing: an authored file's first bytes need not end on a character boundary.
+    if s.len() < 11 || !s.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("create")) {
         return stmt.to_string();
     }
     let rest = s[6..].trim_start();
-    if rest.len() >= 4
-        && rest[..4].eq_ignore_ascii_case("view")
+    if rest
+        .get(..4)
+        .is_some_and(|w| w.eq_ignore_ascii_case("view"))
         && rest
             .get(4..)
             .and_then(|r| r.chars().next())
@@ -10632,9 +10634,23 @@ mod confinement {
         }
     }
 
+    /// Found by `fuzz/sql` on an authored view: a multibyte character across byte six panicked the
+    /// `CREATE` check on every query that defined it.
+    #[test]
+    fn an_authored_view_file_need_not_start_on_ascii() {
+        let f = two_datasets();
+        std::fs::write(f.a.join("views").join("zz.sql"), "x^ɵ-ɹ (  z)(").unwrap();
+        for tenant in [None, Some(Arc::<str>::from("a"))] {
+            isolated(tenant.as_ref(), || {
+                query_hot_cold(&f.a, "SELECT * FROM v", guard(), &HotRows::new(), 10, &[])
+            })
+            .unwrap();
+        }
+    }
+
     /// FR8 review, open: a scalar function's output is not charged to the engine pool, so one value
     /// can be as large as its arguments say. `repeat('a', 1e9)` peaked at 4 GB of RSS under a 512 MB
-    /// pool; `range`, `lpad`, `array_repeat` and nested `replace` do the same. Ignored until the
+    /// pool; `range`, `lpad` and `array_repeat` do the same. Ignored until the
     /// engine bounds it, because running it is the attack.
     #[test]
     #[ignore = "open finding: scalar results are not charged to the pool"]
