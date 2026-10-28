@@ -283,7 +283,11 @@ the same `as_of`, `sealed_through` and `nid`.
   before any of it is applied; one that would not fit is not applied and its dataset is let go and
   left out likewise. Each way its routes and its `/ready` answer `503` with
   `"reason": "over_budget"` and the figures, the root `/ready` is `503`, and its co-mounts keep
-  serving. The writer still serves it. Each mount's SQL surface, tenant share and `[mounts.limits]` come
+  serving. The writer still serves it. A new snapshot of a dataset already held, as every writer
+  restart sends, is charged beside the copy it replaces, which goes on serving until the swap and
+  stays charged until the last request on it finishes. If both do not fit, the old copy is released
+  first: its routes answer `503` `catching_up` while the new one loads under the full budget. Each
+  mount's SQL surface, tenant share and `[mounts.limits]` come
   over the feed, so it admits and guards a query as the writer would, with its own per-chain gates
   and never wider than its own process values. It has no admin surface; mount changes, limits and
   shares go to the writer.
