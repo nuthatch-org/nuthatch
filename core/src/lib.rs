@@ -13,6 +13,7 @@ pub mod entity_view;
 pub mod exposure;
 pub mod factory;
 pub mod flags;
+pub mod hooks;
 pub mod labels;
 pub mod metrics;
 pub mod seal;

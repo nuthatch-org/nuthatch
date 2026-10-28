@@ -3603,6 +3603,7 @@ async fn build_nest(
         calls: config.calls.clone(),
         state_rpc,
         rewound: None,
+        hooks: Arc::new(nuthatch_core::hooks::NoHooks),
     };
     // Stamps this nest's readiness clock (#510): `/ready`'s never-polled grace period is bounded from
     // here, not permanent - see `serve::poll_stalled`.
@@ -3619,6 +3620,11 @@ async fn build_nest(
             nest.metrics.clone(),
         )?
         .map(Arc::new),
+        ..nest
+    };
+    // Last, so they hold the fold writer.
+    let nest = NestIngest {
+        hooks: nest.node_hooks(),
         ..nest
     };
 
@@ -6951,9 +6957,23 @@ pub struct NestIngest {
     ipfs_window_deadline: std::time::Duration,
     /// Where a refused window rolled this nest back to, for the loop to resume from (#2146).
     rewound: Option<u64>,
+    /// What runs around a committed window that is the node's and not the window path's.
+    hooks: Arc<dyn nuthatch_core::hooks::WindowHooks>,
 }
 
 impl NestIngest {
+    fn node_hooks(&self) -> Arc<dyn nuthatch_core::hooks::WindowHooks> {
+        Arc::new(NodeHooks {
+            dir: self.dir.clone(),
+            store: self.store.clone(),
+            registry: self.registry.clone(),
+            entities: self.entities.clone(),
+            webhooks: self.webhooks.clone(),
+            #[cfg(feature = "folds")]
+            folds: self.folds.clone(),
+        })
+    }
+
     /// This window's logs. A factory nest is asked by `base ∪ children` until it has more than
     /// [`FACTORY_FLIP_THRESHOLD`] children, the rule the seal-direct factory backfill follows (#1941).
     async fn fetch_window(
@@ -8202,33 +8222,7 @@ impl NestIngest {
                 entity.apply(batch, to);
             }
         }
-        // RFC-0062 S2. Not while catching up: a build per backfill window is history-sized work
-        // that the next window makes nobody's.
-        if to >= tip {
-            crate::maintained::changed(&self.dir);
-        }
-        #[cfg(test)]
-        take_after_commit_failure()?;
-        // After the commit, so a rebuild reads exactly the history the entities have folded. Off the
-        // runtime: it reads the manifest and snapshots, and a rebuild reads the sealed corpus.
-        if self
-            .entities
-            .iter()
-            .any(|e| !e.offchain_tables().is_empty())
-        {
-            let (dir, store, registry, entities) = (
-                self.dir.clone(),
-                self.store.clone(),
-                self.registry.clone(),
-                self.entities.clone(),
-            );
-            let refreshed = tokio::task::spawn_blocking(move || {
-                refresh_offchain(&dir, store.as_ref(), &registry, &entities, to)
-            })
-            .await
-            .context("the offchain refresh task did not complete")?;
-            refreshed?;
-        }
+        self.hooks.committed(to, tip).await?;
         self.metrics.set_last_block(to);
         self.metrics.add_rows_decoded(stored as u64);
         // Counted once committed, so a refused window asked for again is not counted twice.
@@ -8274,7 +8268,64 @@ impl NestIngest {
         {
             tracing::warn!("sealing failed: {e:#}");
         }
+        if let Some((threshold, window)) = self.velocity_cfg {
+            self.velocity
+                .settle(self.store.sealed_through(), threshold, window);
+        }
+        self.hooks
+            .sealed(finalized_through, self.store.sealed_through(), to >= tip);
+        Ok(Some(stored))
+    }
+}
+
+/// The node's side of a window: maintained views, offchain entity inputs, webhooks and the fold
+/// writer, none of which a tab has.
+struct NodeHooks {
+    dir: PathBuf,
+    store: Arc<dyn crate::store::HotStore>,
+    registry: Arc<DecodeRegistry>,
+    entities: Arc<Vec<EntityView>>,
+    webhooks: Arc<Vec<crate::config::Webhook>>,
+    #[cfg(feature = "folds")]
+    folds: Option<Arc<crate::folds::Writer>>,
+}
+
+#[async_trait::async_trait]
+impl nuthatch_core::hooks::WindowHooks for NodeHooks {
+    async fn committed(&self, to: u64, tip: u64) -> Result<()> {
+        // RFC-0062 S2. Not while catching up: a build per backfill window is history-sized work
+        // that the next window makes nobody's.
         if to >= tip {
+            crate::maintained::changed(&self.dir);
+        }
+        #[cfg(test)]
+        take_after_commit_failure()?;
+        // After the commit, so a rebuild reads exactly the history the entities have folded. Off the
+        // runtime: it reads the manifest and snapshots, and a rebuild reads the sealed corpus.
+        if self
+            .entities
+            .iter()
+            .any(|e| !e.offchain_tables().is_empty())
+        {
+            let (dir, store, registry, entities) = (
+                self.dir.clone(),
+                self.store.clone(),
+                self.registry.clone(),
+                self.entities.clone(),
+            );
+            let refreshed = tokio::task::spawn_blocking(move || {
+                refresh_offchain(&dir, store.as_ref(), &registry, &entities, to)
+            })
+            .await
+            .context("the offchain refresh task did not complete")?;
+            refreshed?;
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "folds"), allow(unused_variables))]
+    fn sealed(&self, finalized_through: u64, sealed_through: u64, at_tip: bool) {
+        if at_tip {
             crate::maintained::changed(&self.dir);
         }
         // Deliver user webhooks for whatever just sealed (RFC-0010 Part B) - enqueue only,
@@ -8289,17 +8340,12 @@ impl NestIngest {
                 tracing::warn!("webhook delivery failed: {e:#}");
             }
         }
-        if let Some((threshold, window)) = self.velocity_cfg {
-            self.velocity
-                .settle(self.store.sealed_through(), threshold, window);
-        }
         // Whatever advanced the watermark, the fold writer hears of it here; an unchanged one costs an
         // atomic compare.
         #[cfg(feature = "folds")]
         if let Some(w) = &self.folds {
-            w.sealed_through_advanced(self.store.sealed_through());
+            w.sealed_through_advanced(sealed_through);
         }
-        Ok(Some(stored))
     }
 }
 
