@@ -217,6 +217,9 @@ impl HttpMirror {
             reqwest::StatusCode::NOT_FOUND => Ok(None),
             // A bucket that forbids listing answers 403 for an absent key, so 403 cannot be read
             // as "not there".
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => Err(
+                crate::distribution::access_denied_err(&format!("the mirror's {key}")),
+            ),
             s => bail!("fetching {key}: the mirror answered {s}"),
         }
     }

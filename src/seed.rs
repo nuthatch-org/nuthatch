@@ -463,6 +463,40 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn an_http_mirror_codes_a_refusal_and_an_absence() {
+        use crate::distribution::FailureCode;
+        use axum::http::StatusCode;
+        let app = axum::Router::new()
+            .route(
+                "/unauthorized/{*key}",
+                axum::routing::any(|| async { StatusCode::UNAUTHORIZED }),
+            )
+            .route(
+                "/forbidden/{*key}",
+                axum::routing::any(|| async { StatusCode::FORBIDDEN }),
+            )
+            .route(
+                "/broken/{*key}",
+                axum::routing::any(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for (path, want) in [
+            ("unauthorized", FailureCode::AccessDenied),
+            ("forbidden", FailureCode::AccessDenied),
+            ("absent", FailureCode::NotFound),
+            ("broken", FailureCode::Other),
+        ] {
+            let mirror = publish::open_mirror(&format!("{base}/{path}")).unwrap();
+            let err = read_snapshot(mirror.as_ref(), "d").await.unwrap_err();
+            assert_eq!(FailureCode::of(&err), want, "{path}: {err:#}");
+        }
+        server.abort();
+    }
+
     #[test]
     fn a_catalogue_listing_rows_twice_is_refused() {
         let (a, b) = ("ab".repeat(32), "cd".repeat(32));
