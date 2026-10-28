@@ -162,6 +162,20 @@ edited between the runs) fails with the first differing row, and so does a float
 reordered under no top-level `ORDER BY` (none at all, or one in a subquery) pass, as does a volatile
 statement's new answer with the same row count.
 
+## The rolling upgrade (RFC-0073 FR7)
+
+`scripts/rolling-upgrade.sh --previous <tag> <candidate>` downloads the previous release's binary and
+runs a one-nest runtime over the fixture chain with it as the writer and two followers, then replaces
+follower one, follower two and the writer with the candidate, in that order. A prober asks both
+followers the same count every 200 ms throughout, and the run fails if any probe goes unanswered by
+both, or if a replaced process never reports ready and caught up. `<previous> <candidate>` takes two
+local binaries instead.
+
+Followers first ship in the release after 5.12.0, so there is no previous release that can run step
+one yet: until there is, the script refuses with exit 2 and names why, and `ROLLING_SAME=1` runs the
+procedure with the candidate in both roles. Measured 2026-10-27 that way on a debug build: 44 probes
+across the three replacements, none unanswered.
+
 ## What it does not catch
 
 The comparison is with the release production runs, so a wrong answer both releases share passes

@@ -398,6 +398,19 @@ pub(crate) mod tests {
         const { assert!(crate::serve::SQL_MAX_HOT_INFLIGHT_BYTES <= RESERVATION_MINIMUM_MB << 20) };
     }
 
+    /// The writer's queued feed bytes (RFC-0073 FR1) are paid from the reservation beside the
+    /// hot-tip copies, and fit the smallest one with them.
+    #[test]
+    fn the_feed_queues_fit_the_smallest_reservation_beside_the_hot_copies() {
+        const {
+            assert!(
+                crate::serve::SQL_MAX_HOT_INFLIGHT_BYTES + crate::feed_http::FEED_QUEUE_TOTAL_BYTES
+                    <= RESERVATION_MINIMUM_MB << 20
+            )
+        };
+        const { assert!(crate::feed_http::FEED_QUEUE_BYTES <= crate::feed_http::FEED_QUEUE_TOTAL_BYTES) };
+    }
+
     /// Held by every test that sets or reads the `NUTHATCH_ANALYTICS_*` environment.
     pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
         static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();

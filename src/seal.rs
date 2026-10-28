@@ -34,7 +34,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-#[cfg(test)]
 use std::time::Duration;
 use std::time::Instant;
 
@@ -261,7 +260,11 @@ pub fn seal_range_with_snapshot(
                 before_manifest();
                 // The folded file is left for `nuthatch prune`, which reclaims what no manifest
                 // references: another dataset in the store may hold the same bytes under the same
-                // hash, and this nest cannot know.
+                // hash, and this nest cannot know. A follower's copy may still name it.
+                if let Some(prev) = &replaced {
+                    let old = store.join(format!("{}.parquet", prev.hash));
+                    retain_for_followers(dir, &old, &prev.hash);
+                }
             }
             None => {
                 publish_durable(&seg_dir, &file, &bytes)?;
@@ -398,18 +401,19 @@ impl Drop for SegmentHold {
     }
 }
 
-/// Whether a live seal is about to name `path` and has not installed that manifest yet.
+/// Whether a live seal is about to name `path` and has not installed that manifest yet, or a
+/// follower may still name it.
 pub fn segment_held(path: &Path) -> bool {
-    publishing()
-        .lock()
-        .unwrap()
-        .contains_key(&segment_key(path))
+    let key = segment_key(path);
+    publishing().lock().unwrap().contains_key(&key) || retained(&key)
 }
 
-/// Delete `path` unless a live seal holds it. The check and the unlink share the publishing lock.
+/// Delete `path` unless a live seal holds it or a follower may still name it. The check and the
+/// unlink share the publishing lock.
 pub fn remove_segment_if_unheld(path: &Path) -> Result<bool> {
     let held = publishing().lock().unwrap();
-    if held.contains_key(&segment_key(path)) {
+    let key = segment_key(path);
+    if held.contains_key(&key) || retained(&key) {
         return Ok(false);
     }
     match std::fs::remove_file(path) {
@@ -417,6 +421,223 @@ pub fn remove_segment_if_unheld(path: &Path) -> Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).context(format!("removing {}", path.display())),
     }
+}
+
+/// How long a shared segment a fold replaced is kept from reclaim, at least, once a follower has
+/// followed its dataset (RFC-0073 FR1): ten times the 30 s statement timeout, so a request still on a
+/// follower's old copy finishes and a follower that dropped for a moment reconnects and resnapshots.
+pub const FOLLOWER_GRACE: Duration = Duration::from_secs(300);
+/// The most it is kept, whatever followers report: one that never reports, or has stalled, cannot
+/// keep disk for ever. Past it a follower still naming the file finds it gone and resnapshots.
+pub const FOLLOWER_RETAIN_MAX: Duration = Duration::from_secs(3600);
+/// Beside the shared segments: the hashes kept for followers, with when each may go, for a
+/// `nuthatch prune` run in another process.
+pub const RETAINED_FILE: &str = ".retained.json";
+
+struct Retained {
+    key: PathBuf,
+    hash: String,
+    dataset: PathBuf,
+    at: Instant,
+    /// The writer's `(epoch, generation)` at the commit whose catalogue stopped naming it.
+    stopped: Option<(u64, u64)>,
+}
+
+#[derive(Default)]
+struct Retention {
+    /// Per dataset, each connected follower's last applied `(epoch, generation)`.
+    followers: HashMap<PathBuf, HashMap<u64, Option<(u64, u64)>>>,
+    /// Datasets a follower has followed in this process, whose replaced segments are retained.
+    followed: BTreeSet<PathBuf>,
+    files: Vec<Retained>,
+    /// Grace and most, where a test has set them for a dataset.
+    windows: HashMap<PathBuf, (Duration, Duration)>,
+}
+
+fn retention() -> &'static Mutex<Retention> {
+    static R: OnceLock<Mutex<Retention>> = OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// Test knob: the grace and most for `dir`'s retained segments, keyed by dataset so no test's
+/// setting reaches another's.
+#[doc(hidden)]
+pub fn set_follower_retention(dir: &Path, grace: Duration, most: Duration) {
+    let mut r = retention().lock().unwrap();
+    r.windows.insert(lease_key(dir), (grace, most));
+}
+
+/// Follower connection `conn` now follows `dir`; until it reports, it is taken to name everything.
+pub fn follower_connected(dir: &Path, conn: u64) {
+    let key = lease_key(dir);
+    let mut r = retention().lock().unwrap();
+    r.followed.insert(key.clone());
+    r.followers.entry(key).or_default().insert(conn, None);
+}
+
+pub fn follower_gone(dir: &Path, conn: u64) {
+    let key = lease_key(dir);
+    let mut r = retention().lock().unwrap();
+    if let Some(conns) = r.followers.get_mut(&key) {
+        conns.remove(&conn);
+    }
+}
+
+/// What follower connection `conn` has applied of `dir`.
+pub fn follower_applied(dir: &Path, conn: u64, applied: (u64, u64)) {
+    let key = lease_key(dir);
+    let mut r = retention().lock().unwrap();
+    if let Some(slot) = r.followers.get_mut(&key).and_then(|c| c.get_mut(&conn)) {
+        *slot = Some(applied);
+    }
+}
+
+/// A fold replaced `path` in `dir`'s catalogue: keep it from reclaim while a follower may name it.
+fn retain_for_followers(dir: &Path, path: &Path, hash: &str) {
+    let dataset = lease_key(dir);
+    let mut r = retention().lock().unwrap();
+    if !r.followed.contains(&dataset) {
+        return;
+    }
+    r.files.push(Retained {
+        key: segment_key(path),
+        hash: hash.to_string(),
+        dataset,
+        at: Instant::now(),
+        stopped: None,
+    });
+    write_ledgers(&r);
+}
+
+/// `dir`'s writer committed the catalogue that stops naming what was retained before it.
+pub(crate) fn catalogue_moved(dir: &Path, at: (u64, u64)) {
+    let dataset = lease_key(dir);
+    let mut r = retention().lock().unwrap();
+    for f in r.files.iter_mut().filter(|f| f.dataset == dataset) {
+        f.stopped.get_or_insert(at);
+    }
+}
+
+impl Retention {
+    fn window(&self, dataset: &Path) -> (Duration, Duration) {
+        self.windows
+            .get(dataset)
+            .copied()
+            .unwrap_or((FOLLOWER_GRACE, FOLLOWER_RETAIN_MAX))
+    }
+
+    /// Whether `f` may go: past the most, or past the grace with every connected follower of its
+    /// dataset having applied the commit that stopped naming it.
+    fn releasable(&self, f: &Retained) -> bool {
+        let (grace, most) = self.window(&f.dataset);
+        let age = f.at.elapsed();
+        if age >= most {
+            return true;
+        }
+        let Some((epoch, generation)) = f.stopped else {
+            return false;
+        };
+        age >= grace
+            && self.followers.get(&f.dataset).is_none_or(|conns| {
+                conns
+                    .values()
+                    .all(|p| p.is_some_and(|(e, g)| e == epoch && g >= generation))
+            })
+    }
+
+    /// Let go of what may go, keeping the ledgers current. Whether anything went.
+    fn release(&mut self) -> bool {
+        let before = self.files.len();
+        let files = std::mem::take(&mut self.files);
+        self.files = files.into_iter().filter(|f| !self.releasable(f)).collect();
+        let changed = self.files.len() != before;
+        if changed {
+            write_ledgers(self);
+        }
+        changed
+    }
+}
+
+/// Whether a follower may still name the segment at `key`.
+fn retained(key: &Path) -> bool {
+    let mut r = retention().lock().unwrap();
+    r.release();
+    r.files.iter().any(|f| f.key == key)
+}
+
+/// Let go of every retained segment that may go. Called as followers report.
+pub fn release_retained() {
+    retention().lock().unwrap().release();
+}
+
+/// Each shared store's ledger of what is retained and until when, rewritten whole.
+fn write_ledgers(r: &Retention) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut stores: BTreeMap<PathBuf, BTreeMap<String, u64>> = BTreeMap::new();
+    for f in &r.files {
+        let Some(store) = f.key.parent() else {
+            continue;
+        };
+        let left = r.window(&f.dataset).1.saturating_sub(f.at.elapsed());
+        stores
+            .entry(store.to_path_buf())
+            .or_default()
+            .insert(f.hash.clone(), now + left.as_secs() + 1);
+    }
+    for gone in r
+        .followed
+        .iter()
+        .filter_map(|d| shared_store(d))
+        .collect::<BTreeSet<_>>()
+    {
+        let gone = std::fs::canonicalize(&gone).unwrap_or(gone);
+        stores.entry(gone).or_default();
+    }
+    for (store, hashes) in stores {
+        let path = store.join(RETAINED_FILE);
+        let written = if hashes.is_empty() {
+            std::fs::remove_file(&path).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+        } else {
+            serde_json::to_vec(&hashes)
+                .map_err(std::io::Error::other)
+                .and_then(|b| write_atomic(&path, &b))
+        };
+        if let Err(e) = written {
+            tracing::warn!("{}: not written: {e}", path.display());
+        }
+    }
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// The hashes `store`'s ledger keeps from reclaim now, for a reclaim in a process that does not
+/// hold the retention itself.
+pub fn ledger_retained(store: &Path) -> BTreeSet<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    std::fs::read(store.join(RETAINED_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<BTreeMap<String, u64>>(&b).ok())
+        .map(|m| {
+            m.into_iter()
+                .filter(|(_, until)| *until > now)
+                .map(|(h, _)| h)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn leases() -> &'static Mutex<HashMap<PathBuf, Leases>> {
@@ -732,11 +953,175 @@ fn checked(m: Manifest) -> Result<Manifest> {
     Ok(m)
 }
 
+/// The nest a request is served from: its directory and the hot store it reads. A follower's copy
+/// carries the catalogue its watermark pairs with (RFC-0073 FR1), and every catalogue read for that
+/// directory while the request runs is answered from it, whichever copy is newest by then.
+#[derive(Clone)]
+pub struct Serving {
+    dir: PathBuf,
+    store: Arc<dyn crate::store::HotStore>,
+    /// Set when a segment the copy's catalogue names was missing on disk.
+    missing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A segment a follower's catalogue names is missing on disk: the answer would be short, so there
+/// is none, and the follower takes a fresh snapshot.
+#[derive(Debug)]
+pub struct SegmentGone(pub PathBuf);
+
+impl std::fmt::Display for SegmentGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "segment {} is named by this follower's catalogue and gone from disk; taking a fresh \
+             snapshot",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for SegmentGone {}
+
+/// Whether `dir`'s request is served from a follower's copy, in which case `segment`'s being
+/// missing is noted for the request and on the copy, whose follower resnapshots, and must fail the
+/// read rather than shorten it.
+pub fn follower_missing(dir: &Path, segment: &Path) -> bool {
+    let Some(s) = current_serving().filter(|s| s.dir == dir) else {
+        return false;
+    };
+    if s.store.served_catalogue().is_none() {
+        return false;
+    }
+    tracing::warn!(
+        "{}: segment {} named by this copy is missing",
+        dir.display(),
+        segment.display()
+    );
+    s.missing.store(true, std::sync::atomic::Ordering::SeqCst);
+    s.store.segment_missing();
+    true
+}
+
+tokio::task_local! {
+    static SERVING: Serving;
+}
+
+thread_local! {
+    static SERVING_ON_THREAD: std::cell::RefCell<Option<Serving>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `fut` as a request served from `store` over `dir`, and say whether it found a segment its
+/// copy names missing.
+pub async fn serving<F: std::future::Future>(
+    dir: PathBuf,
+    store: Arc<dyn crate::store::HotStore>,
+    fut: F,
+) -> (F::Output, bool) {
+    let missing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let serving = Serving {
+        dir,
+        store,
+        missing: missing.clone(),
+    };
+    let out = SERVING.scope(serving, fut).await;
+    (out, missing.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+fn current_serving() -> Option<Serving> {
+    SERVING
+        .try_with(Clone::clone)
+        .ok()
+        .or_else(|| SERVING_ON_THREAD.with(|s| s.borrow().clone()))
+}
+
+fn on_thread<R>(serving: Option<Serving>, f: impl FnOnce() -> R) -> R {
+    // Restored on drop, so a panic does not leave a copy on a pooled thread.
+    struct Restore(Option<Serving>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SERVING_ON_THREAD.with(|s| *s.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(SERVING_ON_THREAD.with(|s| s.replace(serving)));
+    f()
+}
+
+/// [`serving`] for work on this thread, outside any request.
+pub fn within<R>(dir: &Path, store: Arc<dyn crate::store::HotStore>, f: impl FnOnce() -> R) -> R {
+    let serving = Serving {
+        dir: dir.to_path_buf(),
+        store,
+        missing: Default::default(),
+    };
+    on_thread(Some(serving), f)
+}
+
+/// `f`, to run on another thread as part of the request this one serves.
+pub fn carry<R>(f: impl FnOnce() -> R) -> impl FnOnce() -> R {
+    let serving = current_serving();
+    move || on_thread(serving, f)
+}
+
+/// `tokio::task::spawn_blocking`, carrying the request's copy onto the blocking thread.
+pub fn spawn_blocking<R: Send + 'static>(
+    f: impl FnOnce() -> R + Send + 'static,
+) -> tokio::task::JoinHandle<R> {
+    tokio::task::spawn_blocking(carry(f))
+}
+
+/// Directories a follower holds copies of, by how many: their catalogue on disk may be a seal ahead
+/// of a copy's watermark, so it is never read for them.
+fn followed() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static FOLLOWED: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    FOLLOWED.get_or_init(Default::default)
+}
+
+/// A follower's copy of `dir` now exists; paired with [`unfollow`] when it goes.
+pub fn follow(dir: &Path) {
+    let mut all = followed().lock().unwrap_or_else(|e| e.into_inner());
+    *all.entry(dir.to_path_buf()).or_default() += 1;
+}
+
+pub fn unfollow(dir: &Path) {
+    let mut all = followed().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(n) = all.get_mut(dir) {
+        *n -= 1;
+        if *n == 0 {
+            all.remove(dir);
+        }
+    }
+}
+
+/// The catalogue's bytes: the serving copy's where it carries one, else the file, which is never
+/// read for a directory a follower holds.
+fn read_catalogue(dir: &Path) -> std::io::Result<Vec<u8>> {
+    if let Some(s) = current_serving().filter(|s| s.dir == dir) {
+        return match s.store.served_catalogue() {
+            Some(Some(raw)) => Ok(raw.as_bytes().to_vec()),
+            Some(None) => Err(std::io::ErrorKind::NotFound.into()),
+            // The writer's own store: its catalogue is the file.
+            None => std::fs::read(manifest_path(dir)),
+        };
+    }
+    let held = followed()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(dir);
+    if held {
+        return Err(std::io::Error::other(format!(
+            "{}: a follower reads its catalogue only from the copy a request is served from",
+            dir.display()
+        )));
+    }
+    std::fs::read(manifest_path(dir))
+}
+
 /// Load the segment catalogue (empty if none yet).
 /// The catalogue, with the sha256 of the exact bytes it was parsed from (RFC-0048 §3). `None` when
 /// nothing has sealed.
 pub fn load_manifest_with_hash(dir: &Path) -> Result<(Manifest, Option<String>)> {
-    match std::fs::read(manifest_path(dir)) {
+    match read_catalogue(dir) {
         Ok(raw) => Ok((
             checked(serde_json::from_slice(&raw).context("corrupt segments manifest")?)?,
             Some(hex::encode(Sha256::digest(&raw))),
@@ -748,7 +1133,7 @@ pub fn load_manifest_with_hash(dir: &Path) -> Result<(Manifest, Option<String>)>
 
 /// [`load_manifest_with_hash`]'s hash alone.
 pub fn catalogue_hash(dir: &Path) -> Result<Option<String>> {
-    match std::fs::read(manifest_path(dir)) {
+    match read_catalogue(dir) {
         Ok(raw) => Ok(Some(hex::encode(Sha256::digest(&raw)))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).context("failed to read manifest"),
@@ -756,9 +1141,8 @@ pub fn catalogue_hash(dir: &Path) -> Result<Option<String>> {
 }
 
 pub fn load_manifest(dir: &Path) -> Result<Manifest> {
-    let path = manifest_path(dir);
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => checked(serde_json::from_str(&raw).context("corrupt segments manifest")?),
+    match read_catalogue(dir) {
+        Ok(raw) => checked(serde_json::from_slice(&raw).context("corrupt segments manifest")?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::default()),
         Err(e) => Err(e).context("failed to read manifest"),
     }

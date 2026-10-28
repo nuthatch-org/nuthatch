@@ -52,6 +52,11 @@ path = "tests/sql_concurrency_is_measurable.rs"
 name = "e2e_warm_restart"
 path = "tests/e2e_warm_restart.rs"
 
+# RFC-0073 FR7's restart-time benchmark: an RSS reading, so its own process.
+[[test]]
+name = "bench_restart_mounts"
+path = "tests/bench_restart_mounts.rs"
+
 [[test]]
 name = "e2e_maintained_reorg"
 path = "tests/e2e_maintained_reorg.rs"

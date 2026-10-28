@@ -116,6 +116,21 @@ fn builder() -> Builder {
     b
 }
 
+/// Every commit after a feed snapshot.
+pub type FeedDeltas = tokio::sync::broadcast::Receiver<Arc<crate::feed::Delta>>;
+
+/// The tables a feed snapshot carries, in its field order, and which of their keys it keeps.
+type FeedTable = (
+    &'static str,
+    TableDefinition<'static, &'static str, &'static str>,
+    fn(&str) -> bool,
+);
+const FEED_TABLES: [FeedTable; 3] = [
+    ("entities", ENTITIES, |_| true),
+    ("meta", META, crate::feed::mirrored_meta),
+    ("blocks", BLOCKS, |_| true),
+];
+
 const ENTITIES: TableDefinition<&str, &str> = TableDefinition::new("entities");
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 /// Block-hash checkpoints (block -> canonical hash we indexed against), for reorg detection.
@@ -340,6 +355,31 @@ pub trait HotStore: Send + Sync {
     /// view can be computed, so nothing was ever remembered (#1951). A backend that returns `None`
     /// simply has no memo.
     fn rows_generation(&self) -> Option<u64> {
+        None
+    }
+
+    /// RFC-0073 FR1: a snapshot of the mirrored tables and a receiver for every commit after it, or
+    /// `None` from a backend with no feed.
+    fn feed_subscribe(&self) -> Result<Option<crate::feed::Subscription>> {
+        Ok(None)
+    }
+
+    /// The catalogue this store's watermark pairs with, where it carries one rather than the disk
+    /// (RFC-0073 FR1): `Some(None)` when its dataset has never sealed.
+    fn served_catalogue(&self) -> Option<Option<Arc<str>>> {
+        None
+    }
+
+    /// A request served from this store found a segment its catalogue names missing on disk.
+    fn segment_missing(&self) {}
+
+    /// [`HotStore::feed_subscribe`] with the snapshot written to `out` as JSON as it is read.
+    fn feed_stream(&self, _out: &mut dyn std::io::Write) -> Result<Option<FeedDeltas>> {
+        Ok(None)
+    }
+
+    /// `(epoch, generation)` of the feed's last commit, `None` from a backend with no feed.
+    fn feed_position(&self) -> Option<(u64, u64)> {
         None
     }
 
@@ -572,6 +612,8 @@ pub struct Store {
     /// Held for the whole of a blocking-pool commit, which outlives an abort of the task that
     /// started it (#1767). [`HotStore::settle_commits`] waits on it.
     commit_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The hot-state feed's writer half (RFC-0073 FR1), shared across clones.
+    tap: Arc<crate::feed::Tap>,
     /// Bytes of the largest `entities_in_range` answer, so a test can hold sealing to reading a cut.
     #[cfg(test)]
     pub(crate) largest_range_read: Arc<std::sync::atomic::AtomicUsize>,
@@ -698,7 +740,7 @@ impl Store {
         let db = builder()
             .create(path)
             .with_context(|| format!("failed to open redb at {}", path.display()))?;
-        let store = Store::from_db(db)?;
+        let store = Store::from_db(db, path.parent())?;
         #[cfg(test)]
         let store = Store {
             path: Arc::new(path.to_path_buf()),
@@ -715,7 +757,7 @@ impl Store {
         let db = b
             .create(path)
             .with_context(|| format!("failed to open redb at {}", path.display()))?;
-        Store::from_db(db)
+        Store::from_db(db, path.parent())
     }
 
     /// Open a store that **already exists**, and fail rather than bring one into being.
@@ -770,6 +812,7 @@ impl Store {
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rows: Arc::new(std::sync::atomic::AtomicU64::new(rows_epoch())),
             commit_gate: Arc::default(),
+            tap: Arc::new(crate::feed::Tap::new(path.parent().map(Path::to_path_buf))),
             #[cfg(test)]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -818,7 +861,7 @@ impl Store {
         Ok(())
     }
 
-    fn from_db(db: Database) -> Result<Store> {
+    fn from_db(db: Database, dir: Option<&Path>) -> Result<Store> {
         // Materialise all four tables up front so read txns never hit a missing one. Only `open`
         // (the creating path) goes through this - `open_existing` takes no write txn, see #471.
         let wtx = db.begin_write()?;
@@ -851,6 +894,7 @@ impl Store {
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rows: Arc::new(std::sync::atomic::AtomicU64::new(rows_epoch())),
             commit_gate: Arc::default(),
+            tap: Arc::new(crate::feed::Tap::new(dir.map(Path::to_path_buf))),
             #[cfg(test)]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -860,6 +904,100 @@ impl Store {
             #[cfg(test)]
             path: Arc::default(),
         })
+    }
+
+    /// [`Store::commit_rows`] for a commit that changes a mirrored table: numbered by the feed, and
+    /// published with `rec`'s ops to anything following this store (RFC-0073 FR1).
+    fn commit_fed(
+        &self,
+        wtx: redb::WriteTransaction,
+        changed: bool,
+        rec: crate::feed::Recorder,
+    ) -> Result<()> {
+        self.tap.commit(rec, || self.commit_rows(wtx, changed))
+    }
+
+    /// The feed's snapshot of the mirrored tables and a receiver for every commit after it.
+    pub fn feed_subscribe(&self) -> Result<crate::feed::Subscription> {
+        let (deltas, rtx, mut snapshot) = self.feed_begin()?;
+        let [entities, meta, blocks] = FEED_TABLES;
+        let tables = [
+            (entities, &mut snapshot.entities),
+            (meta, &mut snapshot.meta),
+            (blocks, &mut snapshot.blocks),
+        ];
+        for ((_, table, keep), rows) in tables {
+            for row in rtx.open_table(table)?.iter()? {
+                let (k, v) = row?;
+                if keep(k.value()) {
+                    rows.map
+                        .insert(k.value().to_string(), v.value().to_string());
+                }
+            }
+        }
+        Ok(crate::feed::Subscription { snapshot, deltas })
+    }
+
+    /// [`Store::feed_subscribe`] writing the snapshot to `out` as JSON while its read transaction
+    /// iterates, so no copy of it, decoded or encoded, is ever whole. The same bytes as serialising
+    /// [`Store::feed_subscribe`]'s snapshot.
+    pub fn feed_stream(&self, out: &mut dyn std::io::Write) -> Result<FeedDeltas> {
+        let (deltas, rtx, head) = self.feed_begin()?;
+        write!(
+            out,
+            "{{\"epoch\":{},\"generation\":{}",
+            head.epoch, head.generation
+        )?;
+        for (name, table, keep) in FEED_TABLES {
+            write!(out, ",\"{name}\":{{")?;
+            let mut first = true;
+            for row in rtx.open_table(table)?.iter()? {
+                let (k, v) = row?;
+                if !keep(k.value()) {
+                    continue;
+                }
+                if !std::mem::take(&mut first) {
+                    out.write_all(b",")?;
+                }
+                serde_json::to_writer(&mut *out, k.value())?;
+                out.write_all(b":")?;
+                serde_json::to_writer(&mut *out, v.value())?;
+            }
+            out.write_all(b"}")?;
+        }
+        out.write_all(b",\"catalogue\":")?;
+        serde_json::to_writer(&mut *out, &head.catalogue)?;
+        out.write_all(b"}")?;
+        Ok(deltas)
+    }
+
+    /// Subscribe, and open the read transaction a snapshot is taken in: its position and catalogue,
+    /// and no rows.
+    fn feed_begin(&self) -> Result<(FeedDeltas, redb::ReadTransaction, crate::feed::Snapshot)> {
+        let mut attempts = 0;
+        loop {
+            let (deltas, generation, rtx) = self.tap.subscribe(|| Ok(self.db.begin_read()?))?;
+            let sealed = rtx
+                .open_table(META)?
+                .get("sealed_through")?
+                .and_then(|v| v.value().parse().ok())
+                .unwrap_or(0);
+            let catalogue = self.tap.catalogue();
+            // A seal between its catalogue and its commit: take the snapshot again after the commit.
+            if crate::feed::catalogue_ahead(catalogue.as_deref(), sealed) && attempts < 400 {
+                attempts += 1;
+                drop(rtx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            let snapshot = crate::feed::Snapshot {
+                epoch: self.tap.epoch(),
+                generation,
+                catalogue,
+                ..Default::default()
+            };
+            return Ok((deltas, rtx, snapshot));
+        }
     }
 
     /// Push a pending alert delivery onto the durable outbox; returns its sequence number. A fast
@@ -981,11 +1119,16 @@ impl Store {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
         self.guard_fence(&wtx)?;
+        let mut rec = self.tap.recorder();
         {
             let mut t = wtx.open_table(ENTITIES)?;
             t.insert(key, json)?;
+            rec.push(|| crate::feed::Op::Put {
+                key: key.to_string(),
+                row: json.to_string(),
+            });
         }
-        self.commit_rows(wtx, true)?;
+        self.commit_fed(wtx, true, rec)?;
         Ok(())
     }
 
@@ -1013,6 +1156,7 @@ impl Store {
     ) -> Result<bool> {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
+        let mut rec = self.tap.recorder();
         let named = {
             let mut t = wtx.open_table(ENTITIES)?;
             let named = t
@@ -1021,12 +1165,16 @@ impl Store {
             if named {
                 for (key, json) in entries {
                     t.insert(key.as_str(), json.as_str())?;
+                    rec.push(|| crate::feed::Op::Put {
+                        key: key.clone(),
+                        row: json.clone(),
+                    });
                 }
             }
             named
         };
         if named {
-            self.commit_rows(wtx, !entries.is_empty())?;
+            self.commit_fed(wtx, !entries.is_empty(), rec)?;
         } else {
             wtx.abort()?;
         }
@@ -1061,10 +1209,15 @@ impl Store {
         if !outbox.is_empty() {
             Self::outbox_push_in(&wtx, outbox)?;
         }
+        let mut rec = self.tap.recorder();
         {
             let mut t = wtx.open_table(ENTITIES)?;
             for (k, v) in entities {
                 t.insert(k.as_str(), v.as_str())?;
+                rec.push(|| crate::feed::Op::Put {
+                    key: k.clone(),
+                    row: v.clone(),
+                });
             }
             if let Some((block, hash)) = checkpoint {
                 let mut b = wtx.open_table(BLOCKS)?;
@@ -1085,6 +1238,10 @@ impl Store {
                     }
                 }
                 b.insert(key.as_str(), packed.as_str())?;
+                rec.push(|| crate::feed::Op::Block {
+                    key: key.clone(),
+                    record: packed.clone(),
+                });
             }
             let mut m = wtx.open_table(META)?;
             // A reorg walk stops at the newest checkpoint at or below the sealed watermark; nothing
@@ -1113,12 +1270,17 @@ impl Store {
                         .collect();
                     for k in doomed {
                         b.remove(k.as_str())?;
+                        rec.push(|| crate::feed::Op::Unblock { key: k.clone() });
                     }
                 }
             }
             m.insert("last_block", last_block.to_string().as_str())?;
         }
-        self.commit_rows(wtx, !entities.is_empty())?;
+        rec.push(|| crate::feed::Op::Meta {
+            key: "last_block".into(),
+            value: last_block.to_string(),
+        });
+        self.commit_fed(wtx, !entities.is_empty(), rec)?;
         Ok(())
     }
 
@@ -1452,11 +1614,13 @@ impl Store {
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
+        let mut rec = self.tap.recorder();
         {
             let mut t = wtx.open_table(META)?;
             t.insert(key, value)?;
+            rec.meta(key, value);
         }
-        self.commit(wtx)?;
+        self.commit_fed(wtx, false, rec)?;
         Ok(())
     }
 
@@ -1464,16 +1628,19 @@ impl Store {
     pub fn set_metas(&self, set: &[(&str, &str)], remove: &[&str]) -> Result<()> {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
+        let mut rec = self.tap.recorder();
         {
             let mut t = wtx.open_table(META)?;
             for (k, v) in set {
                 t.insert(*k, *v)?;
+                rec.meta(k, v);
             }
             for k in remove {
                 t.remove(*k)?;
+                rec.push(|| crate::feed::Op::Unmeta { key: k.to_string() });
             }
         }
-        self.commit(wtx)?;
+        self.commit_fed(wtx, false, rec)?;
         Ok(())
     }
 
@@ -1540,6 +1707,7 @@ impl Store {
     ) -> Result<()> {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
+        let mut rec = self.tap.recorder();
         {
             let mut t = wtx.open_table(BLOCKS)?;
             let key = Self::block_key(block);
@@ -1558,8 +1726,12 @@ impl Store {
                 }
             }
             t.insert(key.as_str(), packed.as_str())?;
+            rec.push(|| crate::feed::Op::Block {
+                key: key.clone(),
+                record: packed.clone(),
+            });
         }
-        self.commit(wtx)?;
+        self.commit_fed(wtx, false, rec)?;
         Ok(())
     }
 
@@ -1641,8 +1813,37 @@ impl Store {
                 }
             }
         }
-        self.commit_rows(wtx, removed > 0)?;
+        self.commit_fed(wtx, removed > 0, self.rollback_ops(block, None))?;
         Ok(removed)
+    }
+
+    /// What a rollback to `block` did, for the feed: the same ranges, so a follower drops the same rows.
+    fn rollback_ops(&self, block: u64, meta: Option<(&str, &str)>) -> crate::feed::Recorder {
+        let mut rec = self.tap.recorder();
+        rec.push(|| crate::feed::Op::Drop {
+            from: format!("{:012}-", block.saturating_add(1)),
+            to: None,
+        });
+        rec.push(|| crate::feed::Op::UnblockFrom {
+            key: Self::block_key(block.saturating_add(1)),
+        });
+        if let Some((key, value)) = meta {
+            rec.meta(key, value);
+        }
+        rec
+    }
+
+    /// What pruning `[from, to]` did, for the feed.
+    fn prune_ops(&self, from: u64, to: u64, meta: Option<(&str, &str)>) -> crate::feed::Recorder {
+        let mut rec = self.tap.recorder();
+        rec.push(|| crate::feed::Op::Drop {
+            from: format!("{from:012}-000000"),
+            to: Some(format!("{to:012}-999999")),
+        });
+        if let Some((key, value)) = meta {
+            rec.meta(key, value);
+        }
+        rec
     }
 
     /// Reorg rollback **and** watermark reset in ONE write transaction (hardening the reorg path, the
@@ -1702,7 +1903,8 @@ impl Store {
             let mut m = wtx.open_table(META)?;
             m.insert(meta_key, meta_val)?;
         }
-        self.commit_rows(wtx, removed > 0)?;
+        let rec = self.rollback_ops(block, Some((meta_key, meta_val)));
+        self.commit_fed(wtx, removed > 0, rec)?;
         Ok(removed)
     }
 
@@ -1728,7 +1930,7 @@ impl Store {
                 removed += 1;
             }
         }
-        self.commit_rows(wtx, removed > 0)?;
+        self.commit_fed(wtx, removed > 0, self.prune_ops(from, to, None))?;
         Ok(removed)
     }
 
@@ -1764,7 +1966,8 @@ impl Store {
             let mut m = wtx.open_table(META)?;
             m.insert(meta_key, meta_val)?;
         }
-        self.commit_rows(wtx, removed > 0)?;
+        let rec = self.prune_ops(from, to, Some((meta_key, meta_val)));
+        self.commit_fed(wtx, removed > 0, rec)?;
         Ok(removed)
     }
 
@@ -1878,6 +2081,18 @@ impl HotStore for Store {
     fn rows_generation(&self) -> Option<u64> {
         let g = self.rows.load(std::sync::atomic::Ordering::SeqCst);
         g.is_multiple_of(2).then_some(g)
+    }
+
+    fn feed_subscribe(&self) -> Result<Option<crate::feed::Subscription>> {
+        Store::feed_subscribe(self).map(Some)
+    }
+
+    fn feed_stream(&self, out: &mut dyn std::io::Write) -> Result<Option<FeedDeltas>> {
+        Store::feed_stream(self, out).map(Some)
+    }
+
+    fn feed_position(&self) -> Option<(u64, u64)> {
+        Some((self.tap.epoch(), self.tap.generation()))
     }
 
     fn put_entity(&self, key: &str, json: &str) -> Result<()> {
@@ -2181,6 +2396,21 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     fn released(&self) -> futures::future::BoxFuture<'static, ()> {
         (**self).released()
     }
+    fn feed_subscribe(&self) -> Result<Option<crate::feed::Subscription>> {
+        (**self).feed_subscribe()
+    }
+    fn feed_stream(&self, out: &mut dyn std::io::Write) -> Result<Option<FeedDeltas>> {
+        (**self).feed_stream(out)
+    }
+    fn served_catalogue(&self) -> Option<Option<Arc<str>>> {
+        (**self).served_catalogue()
+    }
+    fn segment_missing(&self) {
+        (**self).segment_missing()
+    }
+    fn feed_position(&self) -> Option<(u64, u64)> {
+        (**self).feed_position()
+    }
     fn put_entity(&self, key: &str, json: &str) -> Result<()> {
         (**self).put_entity(key, json)
     }
@@ -2449,7 +2679,7 @@ mod tests {
                 let countdown = backend.countdown.clone();
                 let mut b = redb::Builder::new();
                 b.set_cache_size(0);
-                let store = Store::from_db(b.create_with_backend(backend).unwrap()).unwrap();
+                let store = Store::from_db(b.create_with_backend(backend).unwrap(), None).unwrap();
                 let pad = "x".repeat(600);
                 let rows: Vec<(String, String)> = (1..=24)
                     .map(|n| {
@@ -2468,9 +2698,11 @@ mod tests {
                     inner: memory,
                     countdown: Arc::default(),
                 };
-                let store =
-                    Store::from_db(redb::Builder::new().create_with_backend(reopened).unwrap())
-                        .unwrap();
+                let store = Store::from_db(
+                    redb::Builder::new().create_with_backend(reopened).unwrap(),
+                    None,
+                )
+                .unwrap();
                 let left = store.entities_in_range(0, 24).unwrap().len();
                 match outcome {
                     Ok(_) => assert_eq!(

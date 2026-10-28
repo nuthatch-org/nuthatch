@@ -429,7 +429,14 @@ impl SharedNest {
 // swappable `SharedNest` per request, always seeing the current version.
 impl axum::extract::FromRef<SharedNest> for AppState {
     fn from_ref(shared: &SharedNest) -> AppState {
-        (*shared.0.load_full()).clone()
+        let pinned = PINNED
+            .try_with(|(b, s)| Arc::ptr_eq(&b.0, &shared.0).then(|| s.clone()))
+            .ok()
+            .flatten();
+        match pinned {
+            Some(state) => (*state).clone(),
+            None => (*shared.0.load_full()).clone(),
+        }
     }
 }
 
@@ -528,7 +535,65 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
             )
         }
     }))
+    .layer(axum::middleware::from_fn({
+        let backing = backing.clone();
+        move |req, next| pin_request(backing.clone(), req, next)
+    }))
     .with_state(backing)
+}
+
+tokio::task_local! {
+    static PINNED: (SharedNest, Arc<AppState>);
+}
+
+/// A request to `dir` that, once it has taken its state, says so and waits to be let go.
+#[cfg(test)]
+type PinHook = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+fn pin_hooks() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, PinHook>>
+{
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, PinHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
+/// Serve one request from one version of its nest: every extraction of its state, and every
+/// catalogue read on any thread working for it, sees the backing current when it arrived. A
+/// follower's resnapshot swaps the backing mid-request, and the catalogue pairs with one copy.
+async fn pin_request(
+    backing: SharedNest,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let state = backing.current();
+    #[cfg(test)]
+    {
+        let hook = pin_hooks().lock().unwrap().remove(&state.dir);
+        if let Some((pinned, release)) = hook {
+            let _ = pinned.send(());
+            let _ = release.await;
+        }
+    }
+    let (dir, store) = (state.dir.clone(), state.store.clone());
+    let served = crate::seal::serving(dir, store, next.run(req));
+    let (resp, missing) = PINNED.scope((backing, state), served).await;
+    if missing {
+        // Whatever the route made of it, an answer missing a segment's rows is not one.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "a sealed segment this copy names is gone from disk; taking a fresh snapshot",
+                "reason": "catching_up",
+            })),
+        )
+            .into_response();
+    }
+    resp
 }
 
 pub async fn run(
@@ -1252,7 +1317,7 @@ async fn etherscan_api(
     State(s): State<AppState>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
-    let answer = tokio::task::spawn_blocking(move || {
+    let answer = crate::seal::spawn_blocking(move || {
         crate::address_history::respond(s.address_history.as_ref(), &q)
     })
     .await
@@ -2509,7 +2574,7 @@ async fn admin_config(
         return (StatusCode::UNAUTHORIZED, "admin token required").into_response();
     }
     let dir = s.dir.clone();
-    let files = tokio::task::spawn_blocking(move || {
+    let files = crate::seal::spawn_blocking(move || {
         let mut names: Vec<String> = ADMIN_CONFIG_FILES.iter().map(|f| f.to_string()).collect();
         if let Ok(entries) = std::fs::read_dir(dir.join("views")) {
             let mut views: Vec<String> = entries
@@ -2575,7 +2640,7 @@ async fn admin_storage(
     }
     let dir = s.dir.clone();
     let wanted = q.table;
-    let built = tokio::task::spawn_blocking(move || -> Result<Value> {
+    let built = crate::seal::spawn_blocking(move || -> Result<Value> {
         let manifest = crate::seal::load_manifest(&dir)?;
         let size = |seg: &crate::seal::Segment| {
             std::fs::metadata(crate::seal::segment_path(&dir, &seg.file, &seg.hash))
@@ -3819,7 +3884,7 @@ async fn bounded_hot_read<T: Send + 'static>(
     }
     let permit = admit(s).await?;
     let cap = s.limits.max_hot_rows;
-    match tokio::task::spawn_blocking(move || read(cap)).await {
+    match crate::seal::spawn_blocking(move || read(cap)).await {
         Ok(Ok(Some(rows))) => Ok((rows, Some(permit))),
         Ok(Ok(None)) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4919,7 +4984,7 @@ async fn run_sql_query_at(
         };
         let (st, sql) = (s.clone(), q.q.clone());
         let scope = crate::metrics::serving_scope();
-        match tokio::task::spawn_blocking(move || {
+        match crate::seal::spawn_blocking(move || {
             let _slot = slot;
             crate::metrics::within_serving_scope(scope, || remembered(&st, &sql, max_rows))
         })
@@ -5220,7 +5285,7 @@ impl crate::diff::Source for DiffSource {
             sql.to_string(),
         );
         let sealed_through = self.sealed_through;
-        let mut out = tokio::task::spawn_blocking(move || {
+        let mut out = crate::seal::spawn_blocking(move || {
             analytics::isolated(tenant.as_ref(), || {
                 analytics::query_hot_cold(&dir, &sql, guard, &hot, sealed_through, &tables)
             })
@@ -5253,7 +5318,7 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
     METRICS.inc_sql();
     let deadline = std::time::Instant::now() + s.limits.timeout;
     let st = s.clone();
-    let gathered = tokio::task::spawn_blocking(move || {
+    let gathered = crate::seal::spawn_blocking(move || {
         let (hot, tip_unavailable, hot_head, hot_permit) = match charged_hot_rows(
             st.store.as_ref(),
             &st.hot_charge(),
@@ -5501,7 +5566,7 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
     let declared_entities = s.entities.clone();
     let hot_charge = s.hot_charge();
     let tenant = s.isolation.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = crate::seal::spawn_blocking(move || {
         let _permit = permit;
         // Planning materialises no result rows, but the tip is still parsed
         // into temp tables first - so `/explain` carries the full scan cost. Without the same
@@ -9294,6 +9359,142 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "shared: {body}");
     }
 
+    /// RFC-0073 FR1 with FR8: the test above served from a follower's copy of the store. The
+    /// writer's partition reaches it on the feed's mount line, and its queries run in their
+    /// tenant's session on every SQL route, with the allow-list held there too.
+    #[tokio::test]
+    async fn a_strict_follower_queries_in_its_tenants_session_on_every_sql_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = table_fixture(tmp.path(), 1..=3, 4..=5);
+        let sub = writer
+            .store
+            .feed_subscribe()
+            .unwrap()
+            .expect("a redb store has a feed");
+        let shared = AppState {
+            store: Arc::new(crate::feed::MemStore::from_snapshot(
+                &writer.dir,
+                sub.snapshot,
+            )),
+            ..writer.clone()
+        };
+        let tenant = |t: &str| {
+            let strict = AppState {
+                isolation: Some(Arc::from(t)),
+                ..writer.clone()
+            };
+            let served = crate::feed_http::Served::of("r", &strict, &Default::default());
+            AppState {
+                isolation: served.isolation.as_deref().map(Arc::from),
+                ..shared.clone()
+            }
+        };
+        for t in ["a", "b"] {
+            assert_eq!(tenant(t).isolation.as_deref(), Some(t));
+            for uri in [
+                "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20t",
+                "/explain?q=SELECT%20count(*)%20AS%20n%20FROM%20t",
+                "/table/t?limit=10",
+                "/entity/000000000004-000000",
+            ] {
+                let (status, body) = get_json(tenant(t), uri).await;
+                assert_eq!(status, StatusCode::OK, "{t} {uri}: {body}");
+            }
+            let count = "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20t";
+            let (status, body) = get_json(tenant(t), count).await;
+            assert_eq!(status, StatusCode::OK);
+            let strict_writer = AppState {
+                isolation: Some(Arc::from(t)),
+                ..writer.clone()
+            };
+            let (_, theirs) = get_json(strict_writer, count).await;
+            assert_eq!(body["rows"], theirs["rows"], "{t}: the writer's answer");
+            let (status, body) = get_json(tenant(t), "/sql?q=SELECT%20version()").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{t}: {body}");
+        }
+        let opens = |t| crate::analytics::session_opens_in(tmp.path(), t);
+        assert!(opens(Some("a")) >= 1 && opens(Some("b")) >= 1);
+        assert_eq!(opens(None), 0, "a strict route used the shared session");
+    }
+
+    /// RFC-0073 FR1: a request that took the old copy before a resnapshot swapped in one whose seal
+    /// moved rows from hot to a segment answers from the old copy's catalogue throughout, counting
+    /// each row once, and the next request answers from the new copy's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_in_flight_across_a_resnapshot_reads_its_own_copys_catalogue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = table_fixture(tmp.path(), 1..=3, 4..=5);
+        writer.store.set_meta("sealed_through", "3").unwrap();
+        let first = crate::seal::load_manifest(&writer.dir).unwrap().tables["t"][0].clone();
+        let first_path = crate::seal::segment_path(&writer.dir, &first.file, &first.hash);
+        let first_bytes = std::fs::read(&first_path).unwrap();
+        let copy = |store: &Arc<dyn crate::store::HotStore>| -> Arc<dyn crate::store::HotStore> {
+            let sub = store
+                .feed_subscribe()
+                .unwrap()
+                .expect("a redb store has a feed");
+            Arc::new(crate::feed::MemStore::from_snapshot(
+                &writer.dir,
+                sub.snapshot,
+            ))
+        };
+        let old = copy(&writer.store);
+        let shared = SharedNest::new(AppState {
+            store: old.clone(),
+            ..writer.clone()
+        });
+        let count = "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20t";
+        let ask = |shared: SharedNest| async move {
+            use tower::ServiceExt;
+            let req = axum::http::Request::builder()
+                .uri(count)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = router(shared).oneshot(req).await.unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&body).unwrap()["rows"][0]["n"].clone()
+        };
+        assert_eq!(ask(shared.clone()).await, 5, "the old generation");
+
+        let (pinned_tx, pinned) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        pin_hooks()
+            .lock()
+            .unwrap()
+            .insert(writer.dir.clone(), (pinned_tx, release_rx));
+        let held = tokio::spawn(ask(shared.clone()));
+        pinned.await.unwrap();
+        // The seal: blocks 4 and 5 go to a segment and leave hot, and a resnapshot is swapped in.
+        let row = |b: u64| json!({"table":"t","block_number":b,"log_index":0,"v":"x"}).to_string();
+        // As the writer: its copies share this process and this directory only in this test.
+        crate::seal::within(&writer.dir, writer.store.clone(), || {
+            crate::seal::seal_range(&writer.dir, &[row(4), row(5)], 4, 5)
+        })
+        .unwrap();
+        writer
+            .store
+            .prune_and_set_meta(4, 5, "sealed_through", "5")
+            .unwrap();
+        // The seal folds blocks 1 to 3's segment into one of 1 to 5. Its old file is put back, as
+        // retention for a follower would keep it, so only the catalogue decides the answer.
+        std::fs::write(&first_path, &first_bytes).unwrap();
+        let new = copy(&writer.store);
+        shared.swap(AppState {
+            store: new,
+            ..writer.clone()
+        });
+        release.send(()).unwrap();
+        assert_eq!(
+            held.await.unwrap(),
+            5,
+            "the held request counts each row once"
+        );
+        assert_eq!(ask(shared.clone()).await, 5, "the new generation");
+        drop(old);
+    }
+
     async fn get_json(state: AppState, uri: &str) -> (StatusCode, Value) {
         use tower::ServiceExt;
         let req = axum::http::Request::builder()
@@ -10010,6 +10211,65 @@ mod tests {
             StatusCode::OK,
             "A's own copies freed its share"
         );
+        assert!(gate.hot_used().is_empty());
+    }
+
+    /// RFC-0073 FR1 with FR5: a follower's hot copy is charged and refused as the writer's is. The
+    /// test above, with each tenant served from a follower's in-memory copy of its store.
+    #[tokio::test]
+    async fn a_followers_hot_copies_are_charged_as_the_writers_are() {
+        let (ta, tb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let gate = SqlGate::with_hot_bytes(4, 16 * 1024);
+        let bytes = ResponseBytes::new(SQL_MAX_INFLIGHT_RESPONSE_KIB);
+        let followed = |state: AppState| {
+            let sub = state
+                .store
+                .feed_subscribe()
+                .unwrap()
+                .expect("a redb store has a feed");
+            AppState {
+                store: Arc::new(crate::feed::MemStore::from_snapshot(
+                    &state.dir,
+                    sub.snapshot,
+                )),
+                ..state
+            }
+        };
+        let a = seated(ta.path(), &gate, &bytes, "acme");
+        let b = seated(tb.path(), &gate, &bytes, "globex");
+        kilo_tip(&a, 3);
+        kilo_tip(&b, 3);
+        let (a, b) = (followed(a), followed(b));
+
+        let mut copies = Vec::new();
+        while let Ok(p) = gate.charge_hot(3000, Some("acme")) {
+            copies.push(p);
+        }
+        assert_eq!(copies.len(), 4);
+        let resp = sql_response(a.clone(), "SELECT 1 AS n").await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body_json(resp).await["reason"], "tenant_share");
+        assert_eq!(
+            gate.hot_used().get("acme"),
+            Some(&12),
+            "nothing more charged"
+        );
+
+        let resp = sql_response(b.clone(), "SELECT 2445 AS n").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rows"][0]["n"], 2445);
+        let seen = hot_held_while_running().lock().unwrap().clone();
+        let during = seen.iter().rev().find(|(d, _)| d == tb.path());
+        assert_eq!(
+            during.and_then(|(_, held)| held.get("globex")),
+            Some(&3),
+            "the follower's 3 KiB tip, held for the life of the query"
+        );
+        assert_eq!(gate.hot_used().get("globex"), None);
+
+        drop(copies);
+        let resp = sql_response(a, "SELECT 4 AS n").await;
+        assert_eq!(resp.status(), StatusCode::OK);
         assert!(gate.hot_used().is_empty());
     }
 

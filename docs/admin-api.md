@@ -448,6 +448,54 @@ re-pointed in the same instant may be deleted rather than kept; it never dangles
 Publish and prune answer synchronously. Neither dials an RPC, a bundle is bounded by the size limit,
 and both are safe to repeat, so a caller whose request timed out sends it again.
 
+## The hot-state feed
+
+`GET /_admin/feed` is what a follower (`nuthatch serve --runtime <dir> --follow <writer-url>`,
+RFC-0073 FR1) keeps its copy of the hot window from. It is behind the admin token like the rest of
+this surface, absent when the admin API is off, and answers `401` without the token. Nothing in it is
+meant for a person; it is documented so an operator knows what is on the wire. `?exclude=` names
+datasets, comma-separated, whose snapshots and deltas are not sent: a follower asks it for a
+dataset whose snapshot ran past what it can hold.
+
+The answer is a stream of newline-delimited JSON, one connection for every mount:
+
+| Line | When | Carries |
+|---|---|---|
+| `{"hello": …}` | first | the writer's version and `feed`, the format's version; a follower refuses a writer speaking another |
+| `{"mount": …}` | per route, then on any change | `route`, `dataset` (`data/<nid>`, relative to the runtime), `nid`, `chain`, and the SQL surface, tenant share and limits the writer serves it with |
+| `"mounted"` | once, after the first `mount`s | every route mounted when the connection opened has been sent |
+| `{"unmount": …}` | a route goes | `route` |
+| `{"snapshot": …}` | per dataset, after its mounts | `dataset` first, then the hot window as of one generation: entity rows, meta and block checkpoints as JSON objects keyed by key, and the segment catalogue, read in one hot-store transaction |
+| `{"delta": …}` | every hot-store commit after it | `epoch`, `generation`, the commit's changes, and the catalogue when the commit raised `sealed_through` |
+| `{"heartbeat": …}` | every second | each dataset's `[epoch, generation]` now |
+
+**Generations.** Each dataset's commits are numbered from its writer's start: generation G+1 follows G
+within one `epoch`, and a restarted writer is a new epoch. A follower that receives anything other
+than the next generation of the epoch it applied has a gap, drops the connection and takes fresh
+snapshots on the next one, serving what it had until each is complete.
+
+**Slow followers.** A snapshot is written in 64 KiB chunks as it is read, and a connection holds at
+most 8 MiB queued, 64 MiB across every connection. A heartbeat may be skipped while a snapshot
+streams. A connection whose queue is full when a delta or heartbeat is due, or whose snapshot finds
+no room for 30 s, is closed, possibly part-way through a line; the follower reconnects and
+resnapshots.
+
+**What a follower has applied.** `hello` carries `conn`, the writer's number for the connection.
+Every second the follower sends `POST /_admin/feed/applied?conn=<n>` (admin token) with
+`{"<dataset>": [epoch, generation]}` for each copy it holds, and the writer answers `204`. A segment
+a fold replaces is kept from reclaim until every connected follower of its dataset has applied the
+commit whose catalogue stopped naming it and 5 minutes have passed, and for at most an hour.
+
+**The seal handoff.** A seal writes its segment and catalogue, then removes the sealed rows from hot
+and raises `sealed_through` in one commit. That commit's delta carries the removal, the new watermark
+and the catalogue as it stood at the commit, so a follower moves from "rows in hot" to "rows in a
+segment under the watermark" in one step. A follower reads the catalogue from the feed, never from
+the disk, which may already be a seal ahead of the generation it applied.
+
+**A slow follower never slows the writer.** A follower more than 1,024 commits behind on a dataset is
+sent a fresh snapshot of it instead of the commits it missed, and nothing is gathered for the feed
+while nothing is following. The writer's own tip path is unchanged in either case.
+
 ## What to meter
 
 The runtime serves `/metrics` at its root, before anything is mounted, with per-nest series labelled `{nest="<name>"}`, among them

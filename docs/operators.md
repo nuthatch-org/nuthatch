@@ -124,6 +124,24 @@ regression: the roll says so, naming each statement, and moves the unit back ont
 
 Exit 3 is non-zero on purpose, so a loop over several units stops on it.
 
+#### Upgrading a runtime without an outage
+
+A runtime alone has one: its listener binds only after every mount is built, so for the length of a
+restart nothing answers (see [Followers](#followers-query-capacity-beside-a-runtime-rfc-0073) for the
+time it takes). With followers in front of it, roll in this order, one process at a time, waiting for
+each to report ready before the next:
+
+1. Each follower: stop it, start the new binary, and wait for its `/<tenant>/<alias>/ready` to say
+   `"writer": "connected"` and `"lag_generations": 0`. The other followers answer meanwhile.
+2. The writer last. While it restarts, followers answer from the sealed data and the hot state they
+   last applied, report `"writer": "absent"` with `absent_for_secs`, and stay ready. Once it is back
+   they take fresh snapshots of every dataset and follow the new process.
+
+Writes do not happen while the writer is down, so the answers followers give in that window are as of
+the last block the writer committed, as `as_of` says. `scripts/rolling-upgrade.sh <previous> <current>`
+runs exactly this against the fixture chain with a query every 200 ms and fails if any goes unanswered;
+it is the release gate's rolling-upgrade step.
+
 ### Docker
 
 A container image is published per release:
@@ -220,6 +238,81 @@ behind one cursor; the runtime refuses to.
 
 Multichain is a **capability, not a mandate** - one chain per runtime stays valid and is the simplest
 default.
+
+### Followers: query capacity beside a runtime (RFC-0073)
+
+A runtime's queries run in the process that indexes. To answer more of them, start followers beside
+it on the same box, each serving every mount read-only:
+
+```
+NUTHATCH_ADMIN_TOKEN=<the writer's token> \
+  nuthatch serve --runtime /var/lib/nuthatch/runtime --follow http://127.0.0.1:8288 --listen 127.0.0.1:8289
+```
+
+A follower reads the sealed segments from the runtime directory and never opens a redb file, so it
+runs beside the writer and beside other followers. It takes the hot window, and every mount and
+unmount, from the writer's `GET /_admin/feed` ([admin-api.md](admin-api.md#the-hot-state-feed)),
+which needs the admin token: from `NUTHATCH_ADMIN_TOKEN`, or the `.admin-token` file the writer keeps
+in the runtime directory. Adding one needs no restart of the writer and re-indexes nothing. Put the
+followers, and the writer if you like, behind one load balancer: their answers are the writer's, with
+the same `as_of`, `sealed_through` and `nid`.
+
+- **Until a mount's snapshot arrives** its routes answer `503` with `"reason": "catching_up"`; the root
+  `/ready` is `503` until every mount has one. Before a follower has heard the writer's mount set at
+  all, every path answers that way, since it cannot yet tell a route that is coming from one that
+  does not exist.
+- **`/<tenant>/<alias>/ready`** adds a `follower` object: `writer` (`connected` or `absent`),
+  `applied_generation`, `writer_generation` and `lag_generations`, and `absent_for_secs` while the
+  writer is away. A follower without its writer stays ready and keeps answering; it reports the
+  absence rather than failing.
+- **What it does not serve.** State the writer derives in memory rather than stores: `/balances`,
+  `/balance/…`, `/exposure/…`, `/flags` and `/derived…`, and RFC-0041 entities. Those routes, and SQL
+  that names an entity, answer `503` with `"reason": "writer_only"`. A nest that declares entities has
+  its `/q/<name>` routes refused the same way, since a named query may read one. Send those to the
+  writer.
+- **Its own budget.** A follower holds each dataset's hot window in memory, as the writer's `/sql`
+  already copies it per query, and charges it to its cursor's `[runtime] max_rss_mb` from the
+  runtime's `mounts.toml`, together with what admission charges each nest. A snapshot that would
+  not fit is read without keeping its rows; one whose bytes on the wire run past what its cursor
+  has left, plus 64 KiB for framing, is not read to the end at all, so nothing is ever allocated
+  past the budget. Escaping only makes the wire larger than the stored rows, so a heavily escaped
+  snapshot near the budget is refused a little early, on the safe side. The follower reconnects
+  asking the writer to leave that
+  dataset out until `max_rss_mb` changes or the follower restarts. A delta is held to what its
+  dataset has left the same way, on the wire and then by what it would hold at its peak, worked out
+  before any of it is applied; one that would not fit is not applied and its dataset is let go and
+  left out likewise. Each way its routes and its `/ready` answer `503` with
+  `"reason": "over_budget"` and the figures, the root `/ready` is `503`, and its co-mounts keep
+  serving. The writer still serves it. A new snapshot of a dataset already held, as every writer
+  restart sends, is charged beside the copy it replaces, which goes on serving until the swap and
+  stays charged until the last request on it finishes. If both do not fit, the old copy is released
+  first: its routes answer `503` `catching_up` while the new one loads under the full budget. An
+  unmounted copy still in use is charged the same way. A dataset refused only because such copies
+  held part of the budget is asked for again, by reconnecting, once they go; one over the budget on
+  its own stays refused as above. Each mount's SQL surface, tenant share and `[mounts.limits]` come
+  over the feed, so it admits and guards a query as the writer would, with its own per-chain gates
+  and never wider than its own process values. It has no admin surface; mount changes, limits and
+  shares go to the writer.
+- **What it costs the writer.** The writer streams each snapshot in 64 KiB chunks straight from its
+  read transaction, so it never holds an encoded copy of one, and holds at most 8 MiB queued per
+  follower and 64 MiB across them all, paid from `ingestion_reservation` (the feed queues row of
+  the query guards under [Security posture](#security-posture)). A follower too slow to keep its
+  queue from filling is dropped and reconnects for fresh snapshots; it never slows a commit.
+- **Segments a follower may still name are kept.** A seal that folds a provisional segment into a
+  new one leaves the old file for `nuthatch prune`. Once a follower has followed that dataset, the
+  writer keeps the old file from any reclaim until every connected follower reports it has applied
+  the commit that stopped naming it and at least 5 minutes have passed (ten statement timeouts, for
+  a request still on an old copy and a follower that dropped for a moment), and never for more than
+  an hour. It costs disk only: one provisional segment per table per fold, held for those minutes.
+  `segments/.retained.json` records what is kept, so a `nuthatch prune` in another process skips it
+  too. A follower that finds a segment its catalogue names missing never answers around it: the
+  request is `503` `catching_up` and the follower takes fresh snapshots.
+- **Beside the writer only, for now.** It reads segments from the runtime directory; following from
+  another host with a segment mirror is RFC-0073's open question 2, not built.
+
+A writer's restart, measured in-process on one cursor at 1, 10, 100 and 500 small mounts
+([docs/bench/rfc-0073-fr7-restart-to-ready.md](bench/rfc-0073-fr7-restart-to-ready.md)), took 9 ms,
+95 ms, 1.0 s and 10.2 s to answer `/ready`. It grows faster than linearly past 100 mounts.
 
 ### Scaled mode: a fleet across machines (RFC-0022)
 
@@ -1043,6 +1136,7 @@ job:
 | max query length | 16 KiB | rejects absurd query strings before the planner |
 | max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially. The same holds past **64 MiB** of stored hot-row JSON, whichever comes first |
 | hot-tip copies in flight | 128 MiB per chain gate | the stored hot-row JSON every query on one chain's gate holds copied at once, `/sql`, `/explain`, `/diff`, `/q` and GraphQL alike, measured before a row is parsed and given back when the query ends (RFC-0073 FR5). It is what the two default permits could already hold, so it adds nothing to the 2 GiB budget, and raising the permit count no longer multiplies it. A copy that does not fit now is refused `503` `busy`; one larger than the whole budget is refused as an over-budget tip. In a runtime it is divided between tenants like response bytes, and a tenant past its share is refused `429` `tenant_share` before copying |
+| feed queues | 8 MiB per follower, 64 MiB per process | encoded feed bytes a writer holds queued for its followers (RFC-0073 FR1), paid from `ingestion_reservation` beside the hot-tip copies; the two together fit its 256MB floor. A snapshot is encoded in 64 KiB chunks as its read transaction iterates and waits for room, so no whole encoded copy of it exists. A follower whose queue is full when a delta, heartbeat or mount line arrives is dropped, not waited for, and reconnects for fresh snapshots; one that leaves a snapshot without room for 30 s is dropped too, which also ends that snapshot's read transaction |
 | declared-query scan bound | 512 MiB | named queries (`/q/{name}`) only: source bytes the plan may read, each Parquet scan charged the widest table it can reach, plus the hot and maintained rows copied for it. Checked on the connection that runs the statement, before it is evaluated. Over the cap, or a plan that can rescan (nested-loop or delim join, recursive CTE), answers `422` |
 
 **Lowering the guards.** The statement timeout, row, result-byte, unsealed-row, unsealed-byte,
