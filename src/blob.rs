@@ -672,6 +672,12 @@ pub fn install_verified(
     // Integrity: every file's bytes hash to the manifest's claim.
     for f in &manifest.files {
         let path = checked_join(blob_dir, &f.path)?;
+        if names_derived_state(&f.path) {
+            bail!(
+                "blob file {} is named like derived state, which a nest's inputs never hold",
+                f.path
+            );
+        }
         if !no_links_below(blob_dir, &path) {
             bail!("blob file {} is not a regular file under the blob", f.path);
         }
@@ -746,6 +752,17 @@ pub fn install_verified(
     );
     println!("     bundled it (every file hashed, registry reproduced from inputs).");
     Ok(())
+}
+
+/// Whether a manifest path names, in any case, what [`collect_files`] leaves out. On a
+/// case-insensitive filesystem a differently cased name would install and then be read as derived state.
+fn names_derived_state(rel: &str) -> bool {
+    let first = rel.split('/').next().unwrap_or_default();
+    let root_only = [crate::maintained::COPIES_DIR, crate::seal::QUARANTINE_DIR];
+    root_only.iter().any(|d| first.eq_ignore_ascii_case(d))
+        || rel
+            .split('/')
+            .any(|part| EXCLUDE.iter().any(|x| part.eq_ignore_ascii_case(x)))
 }
 
 /// Whether `path`, below `base`, is reached through no link and is no device or directory. A missing
@@ -1680,6 +1697,38 @@ abi = "abis/c.json"
         let t = tempfile::tempdir().unwrap();
         let err = install_verified(blob.path(), Some(&t.path().join("n")), None).unwrap_err();
         assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+    }
+
+    #[test]
+    fn a_bundle_cannot_carry_derived_state_in_another_case() {
+        for planted in [
+            "Segments/manifest.json",
+            "Maintained/x.parquet",
+            "NUTHATCH.REDB",
+        ] {
+            let src = tempfile::tempdir().unwrap();
+            write_nest(src.path());
+            let at = src.path().join(planted);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(&at, r#"{"tables":{}}"#).unwrap();
+            let manifest = build_manifest(src.path(), None).unwrap();
+            if !manifest.files.iter().any(|f| f.path == planted) {
+                continue;
+            }
+            let out = tempfile::tempdir().unwrap();
+            let file = out.path().join("t.bundle");
+            write_bundle(src.path(), &manifest, &file).unwrap();
+            let blob = out.path().join("blob");
+            extract_bundle(&file, &blob).unwrap();
+            let e = install_verified(&blob, Some(&out.path().join("n")), None).unwrap_err();
+            assert!(
+                format!("{e:#}").contains("derived state"),
+                "{planted}: {e:#}"
+            );
+        }
+        assert!(!names_derived_state("views/maintained.sql"));
+        assert!(!names_derived_state("views/quarantine/x.sql"));
+        assert!(names_derived_state("abis/Segments/x.json"));
     }
 
     #[test]
