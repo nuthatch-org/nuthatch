@@ -41,10 +41,43 @@ pub fn check_engine_choice(value: Option<&str>) -> Result<()> {
     }
 }
 
+thread_local! {
+    static TENANT: std::cell::RefCell<Option<Arc<str>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the queries it makes on this thread isolated to `tenant` (RFC-0073 FR8): their own
+/// cached session and memory pool, and the strict function allow-list. `None` is the shared default.
+pub fn isolated<R>(tenant: Option<&Arc<str>>, f: impl FnOnce() -> R) -> R {
+    let previous = TENANT.with(|t| t.replace(tenant.cloned()));
+    struct Restore(Option<Arc<str>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TENANT.with(|t| *t.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(previous);
+    f()
+}
+
+fn current_tenant() -> Option<Arc<str>> {
+    TENANT.with(|t| t.borrow().clone())
+}
+
 /// A session bounded and locked to `dir`, counted so a test can see the cache reuse one.
-fn open_session(dir: &Path) -> Result<Box<dyn Session>> {
-    note_session_open(dir);
-    engine().open(dir)
+fn open_session(dir: &Path, tenant: Option<&Arc<str>>) -> Result<Box<dyn Session>> {
+    note_session_open(dir, tenant);
+    let session = engine().open(dir, tenant.map(|t| &**t))?;
+    if tenant.is_some() {
+        let unlisted = crate::isolation::unlisted(&session.function_names());
+        if !unlisted.is_empty() {
+            bail!(
+                "the engine registers functions strict isolation has not reviewed ({}); this build \
+                 cannot serve a strict runtime until src/isolation.rs names them",
+                unlisted.join(", ")
+            );
+        }
+    }
+    Ok(session)
 }
 
 /// One cached read-only session (#295). A fresh in-memory instance per query was the rebuild the
@@ -67,6 +100,7 @@ fn open_session(dir: &Path) -> Result<Box<dyn Session>> {
 /// An interrupt drops the slot rather than leaving the engine half-cancelled for the next caller.
 struct SessionCache {
     dir: PathBuf,
+    tenant: Option<Arc<str>>,
     sealed_through: u64,
     as_of: Option<u64>,
     excluded: std::collections::BTreeSet<String>,
@@ -97,32 +131,35 @@ fn content_stamp(path: &Path) -> Option<InputStamp> {
     Some(hex::encode(Sha256::digest(&bytes)))
 }
 
-static SESSION_CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, SessionCache>>> =
+/// A dataset, and the tenant its session is isolated to under strict isolation.
+type SessionKey = (PathBuf, Option<Arc<str>>);
+
+static SESSION_CACHE: OnceLock<Mutex<std::collections::HashMap<SessionKey, SessionCache>>> =
     OnceLock::new();
-static SESSION_OPENS: OnceLock<Mutex<std::collections::HashMap<PathBuf, u64>>> = OnceLock::new();
+static SESSION_OPENS: OnceLock<Mutex<std::collections::HashMap<SessionKey, u64>>> = OnceLock::new();
 static SESSION_USE: AtomicU64 = AtomicU64::new(0);
 const SESSION_CACHE_CAPACITY: usize = 16;
 
 fn session_cache_lock(
-) -> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, SessionCache>> {
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<SessionKey, SessionCache>> {
     SESSION_CACHE
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
         .lock()
         .unwrap_or_else(|p| p.into_inner())
 }
 
-fn note_session_open(dir: &Path) {
+fn note_session_open(dir: &Path, tenant: Option<&Arc<str>>) {
     *SESSION_OPENS
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .entry(dir.to_path_buf())
+        .entry((dir.to_path_buf(), tenant.cloned()))
         .or_default() += 1;
 }
 
-/// Drop a nest's analytical connection when its runtime ownership ends (#824).
+/// Drop a nest's analytical connections when its runtime ownership ends (#824), every tenant's.
 pub fn invalidate_session_cache(dir: &Path) {
-    session_cache_lock().remove(dir);
+    session_cache_lock().retain(|(d, _), _| d != dir);
 }
 
 pub(crate) fn cache_inputs(dir: &Path) -> std::collections::BTreeMap<PathBuf, InputStamp> {
@@ -154,15 +191,15 @@ pub(crate) fn cache_inputs(dir: &Path) -> std::collections::BTreeMap<PathBuf, In
 }
 
 fn retain_session_cache(
-    mut cache: std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, SessionCache>>,
+    mut cache: std::sync::MutexGuard<'static, std::collections::HashMap<SessionKey, SessionCache>>,
     slot: SessionCache,
 ) {
-    cache.insert(slot.dir.clone(), slot);
+    cache.insert((slot.dir.clone(), slot.tenant.clone()), slot);
     while cache.len() > SESSION_CACHE_CAPACITY {
         let Some(victim) = cache
             .iter()
             .min_by_key(|(_, entry)| entry.last_used)
-            .map(|(dir, _)| dir.clone())
+            .map(|(key, _)| key.clone())
         else {
             break;
         };
@@ -174,7 +211,30 @@ fn retain_session_cache(
 fn session_opens_for(dir: &Path) -> u64 {
     SESSION_OPENS
         .get()
-        .and_then(|m| m.lock().ok().map(|g| g.get(dir).copied().unwrap_or(0)))
+        .and_then(|m| {
+            m.lock().ok().map(|g| {
+                g.iter()
+                    .filter(|((d, _), _)| d == dir)
+                    .map(|(_, n)| n)
+                    .sum()
+            })
+        })
+        .unwrap_or(0)
+}
+
+/// Sessions opened over `dir` for `tenant` (`None`: the shared session), for the FR8 tests.
+#[cfg(test)]
+pub(crate) fn session_opens_in(dir: &Path, tenant: Option<&str>) -> u64 {
+    SESSION_OPENS
+        .get()
+        .and_then(|m| {
+            m.lock().ok().map(|g| {
+                g.iter()
+                    .filter(|((d, t), _)| d == dir && t.as_deref() == tenant)
+                    .map(|(_, n)| n)
+                    .sum()
+            })
+        })
         .unwrap_or(0)
 }
 
@@ -596,7 +656,8 @@ pub fn degraded_tables(
     dir: &Path,
     declared: &[crate::registry::TableSchema],
 ) -> Result<std::collections::BTreeSet<String>> {
-    let session = open_session(dir).context("failed to open a session for the segment sweep")?;
+    let session =
+        open_session(dir, None).context("failed to open a session for the segment sweep")?;
     define_views(
         &*session,
         dir,
@@ -1419,6 +1480,10 @@ fn attempt(
     reject_statement_stacking(sql)?;
     reject_file_access(sql)?;
     reject_replacement_scan(sql)?;
+    let tenant = current_tenant();
+    if tenant.is_some() {
+        crate::isolation::refuse_unlisted_functions(sql)?;
+    }
 
     // **The allowlist, and the control that is meant to outlive the others** (audit finding 5).
     //
@@ -1440,7 +1505,7 @@ fn attempt(
     // Taken out of the slot for the query so an interrupt can drop it without fighting the mutex
     // borrow; put back only if the statement was not cancelled underneath us.
     let inputs = cache_inputs(dir);
-    let mut slot = session_cache_lock().remove(dir);
+    let mut slot = session_cache_lock().remove(&(dir.to_path_buf(), tenant.clone()));
     let reusable = slot.as_ref().is_some_and(|c| {
         c.sealed_through == sealed_through
             && c.as_of == as_of
@@ -1448,9 +1513,11 @@ fn attempt(
             && c.inputs == inputs
     });
     if !reusable {
-        let session = open_session(dir).context("failed to open an analytics session")?;
+        let session =
+            open_session(dir, tenant.as_ref()).context("failed to open an analytics session")?;
         slot = Some(SessionCache {
             dir: dir.to_path_buf(),
+            tenant: tenant.clone(),
             sealed_through,
             as_of,
             excluded: excluded.clone(),
@@ -1472,6 +1539,9 @@ fn attempt(
         // it" on both counts.
         let surveys = walked.as_ref().map(|(_, sv)| *sv).unwrap_or(true);
         let referenced = walked.map(|(r, _)| r);
+        if tenant.is_some() {
+            refuse_unlisted_in_views(session, dir, referenced.as_ref())?;
+        }
         let (copies, leaves) = bind_maintained_copies(
             session,
             dir,
@@ -3256,11 +3326,29 @@ fn declared_relations(dir: &Path) -> std::collections::BTreeSet<String> {
 /// `reachable_tables` already carries the intermediate view names in its closure, so a view a
 /// statement reaches through another view is still defined, in file order, before the one that
 /// reads it.
+/// Strict isolation's allow-list over the authored views a statement can reach, every one when what
+/// it reaches is not known: a view body is the tenant's SQL as much as the statement is.
+fn refuse_unlisted_in_views(
+    session: &dyn Session,
+    dir: &Path,
+    referenced: Option<&std::collections::BTreeSet<String>>,
+) -> Result<()> {
+    let reach = referenced.and_then(|r| reachable_tables(session, dir, r));
+    for (name, body) in nest_view_bodies(dir) {
+        if reach.as_ref().is_none_or(|r| r.contains(&name)) {
+            crate::isolation::refuse_unlisted_functions(body.trim().trim_end_matches(';'))
+                .with_context(|| format!("view `{name}`"))?;
+        }
+    }
+    Ok(())
+}
+
 fn define_nest_views(
     session: &dyn Session,
     dir: &Path,
     wanted: Option<&std::collections::BTreeSet<String>>,
 ) {
+    let strict = current_tenant().is_some();
     for v in nest_view_files(dir) {
         // **Per statement, not per file** (issue #241 item 4). `execute_batch` runs the whole file as
         // one unit, so a single view referencing a table that has never fired - `TaskCancelled`, a
@@ -3277,10 +3365,15 @@ fn define_nest_views(
                 }
             }
             let name = view_name(&stmt).unwrap_or_default();
-            let failed = session
-                .execute(&with_or_replace_view(&stmt))
-                .err()
-                .map(|e| e.to_string());
+            // `CREATE TABLE … AS` materialises outside the memory pool, which a tenant must not.
+            let failed = if strict && (view_name(&stmt).is_none() || view_body(&stmt).is_none()) {
+                Some("strict isolation runs only CREATE VIEW from views/*.sql".to_string())
+            } else {
+                session
+                    .execute(&with_or_replace_view(&stmt))
+                    .err()
+                    .map(|e| e.to_string())
+            };
             let new = note_view_failure(dir, &v.file, &name, failed.clone());
             // Warned once per fault, since every statement reaching the view defines it again.
             match failed {
@@ -3883,7 +3976,7 @@ impl FoldBinder {
     /// Bounded and locked down like `/sql`'s connection: the same memory, thread and spill limits.
     pub(crate) fn open(dir: &Path) -> Result<Self> {
         Ok(Self {
-            session: open_session(dir)?,
+            session: open_session(dir, None)?,
             parser: crate::graft::Parser::new()?,
         })
     }
@@ -4119,7 +4212,7 @@ impl FoldEvaluator {
             std::fs::create_dir_all(shared)?;
         }
         Ok(Self {
-            session: open_session(dir)?,
+            session: open_session(dir, None)?,
             dir: dir.to_path_buf(),
             schema: schema.to_vec(),
             views_defined: false,
@@ -10039,5 +10132,337 @@ FROM bet GROUP BY player;
         std::fs::remove_file(dir.path().join(crate::maintained::DECLARATION_FILE)).unwrap();
         crate::maintained::load(dir.path()).unwrap();
         assert!(!root.exists(), "nothing declared, nothing kept");
+    }
+}
+
+/// RFC-0073 FR8: a query on mount A attacks every known path to B's files, segments, hot rows and
+/// catalogue. Each attack runs as a shared runtime and as a strict one runs it.
+#[cfg(test)]
+mod confinement {
+    use super::*;
+    use serde_json::json;
+
+    const SECRET: &str = "SECRET_OF_B";
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        a: PathBuf,
+        b: PathBuf,
+        /// B's sealed segment, wherever the shared store put it.
+        b_segment: PathBuf,
+    }
+
+    fn guard() -> QueryGuard {
+        QueryGuard {
+            timeout: Duration::from_secs(10),
+            max_rows: 1000,
+            ..Default::default()
+        }
+    }
+
+    /// Two datasets of one runtime, `data/a…` and `data/b…`, with B's secret in its sealed rows, its
+    /// config, the text of one of its views and an offchain snapshot.
+    fn two_datasets() -> Fixture {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join(crate::runtime::DATA_DIR).join("aaaa");
+        let b = root.path().join(crate::runtime::DATA_DIR).join("bbbb");
+        for (dir, x) in [(&a, "mine"), (&b, SECRET)] {
+            std::fs::create_dir_all(dir.join("views")).unwrap();
+            let row = json!({"table": "t__e", "block_number": 10, "log_index": 0, "x": x});
+            crate::seal::seal_range(dir, &[row.to_string()], 10, 10).unwrap();
+        }
+        std::fs::write(b.join(crate::config::CONFIG_FILE), SECRET).unwrap();
+        std::fs::write(
+            b.join("views").join("b_only.sql"),
+            format!("CREATE VIEW b_only AS SELECT '{SECRET}' AS x FROM t__e;\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            a.join("views").join("v.sql"),
+            "CREATE VIEW v AS SELECT x FROM t__e;\n",
+        )
+        .unwrap();
+        let manifest = crate::seal::load_manifest(&b).unwrap();
+        let seg = &manifest.tables["t__e"][0];
+        let b_segment = crate::seal::segment_path(&b, &seg.file, &seg.hash);
+        assert!(b_segment.exists(), "{}", b_segment.display());
+        Fixture {
+            _root: root,
+            a,
+            b,
+            b_segment,
+        }
+    }
+
+    fn leaked(f: &Fixture, text: &str) -> bool {
+        text.contains(SECRET)
+            || text.contains("SECRET_HOT")
+            || text.contains("b_only")
+            || text.contains(&*f.b.to_string_lossy())
+            || text.contains(&*f.b_segment.to_string_lossy())
+    }
+
+    /// Every statement here must fail, in both modes.
+    fn refused(f: &Fixture) -> Vec<String> {
+        let seg = f.b_segment.display();
+        let b = f.b.display();
+        vec![
+            // Quoted, split and qualified function names (v0.9.3's escape was the quoted one).
+            format!("SELECT * FROM read_parquet('{seg}')"),
+            format!("SELECT * FROM \"read_parquet\"('{seg}')"),
+            format!("SELECT * FROM \"READ_PARQUET\"('{seg}')"),
+            format!("SELECT * FROM read\"_\"parquet('{seg}')"),
+            format!("SELECT * FROM main.read_parquet('{seg}')"),
+            format!("SELECT * FROM read_parquet/**/('{seg}')"),
+            format!("SELECT * FROM read_text('{b}/nuthatch.toml')"),
+            format!("SELECT * FROM read_csv('{b}/nuthatch.toml')"),
+            format!("SELECT * FROM \"read_csv\"('{b}/nuthatch.toml')"),
+            format!("SELECT * FROM glob('{b}/*')"),
+            format!("SELECT * FROM read_some_future_format('{seg}')"),
+            "SELECT input_file_name() FROM t__e".to_string(),
+            "SELECT file_row_index() FROM t__e".to_string(),
+            // Replacement scans and file URLs in table position.
+            format!("SELECT * FROM '{seg}'"),
+            format!("SELECT * FROM t__e JOIN '{seg}' ON true"),
+            format!("SELECT * FROM \"{seg}\""),
+            format!("SELECT * FROM \"file://{seg}\""),
+            format!("SELECT * FROM 'file://{seg}'"),
+            // The parts a registration is built from.
+            "SELECT * FROM t__e__raw".to_string(),
+            "SELECT * FROM t__e__hot".to_string(),
+            "SELECT * FROM \"T__E__UNION\"".to_string(),
+            // The catalogue beyond the two tables Burrmill builds.
+            "SELECT * FROM information_schema.views".to_string(),
+            "SELECT * FROM information_schema.df_settings".to_string(),
+            "SELECT * FROM information_schema.schemata".to_string(),
+            "SELECT * FROM pg_catalog.pg_tables".to_string(),
+            "SHOW TABLES".to_string(),
+            "EXPLAIN SELECT * FROM t__e".to_string(),
+            // B's view by name: views are per dataset.
+            "SELECT * FROM b_only".to_string(),
+            // Stacked statements (v0.6.2's escape was a stacked COPY … TO).
+            "SELECT 1; SELECT * FROM t__e".to_string(),
+            format!("SELECT 1; COPY (SELECT 1) TO '{b}/written'"),
+            format!("SELECT 1;\nATTACH '{b}/nest.redb' AS b"),
+            format!("WITH c AS (SELECT 1) COPY (SELECT 1) TO '{b}/written'"),
+            format!("COPY (SELECT 1) TO '{b}/written'"),
+            format!("CREATE EXTERNAL TABLE x STORED AS PARQUET LOCATION '{seg}'"),
+            format!("CREATE VIEW x AS SELECT * FROM read_parquet('{seg}')"),
+            format!("INSERT INTO t__e SELECT * FROM '{seg}'"),
+            "SET datafusion.execution.batch_size = 1".to_string(),
+        ]
+    }
+
+    /// Answered, from A's own data, and must name nothing of B's.
+    fn answered(f: &Fixture) -> Vec<String> {
+        let b = f.b.display();
+        vec![
+            "SELECT * FROM t__e".to_string(),
+            "SELECT * FROM v".to_string(),
+            "SELECT * FROM information_schema.tables".to_string(),
+            "SELECT * FROM information_schema.columns".to_string(),
+            "SELECT * FROM datafusion.information_schema.tables".to_string(),
+            // A schema qualifier never reaches another dataset: every name resolves in A's session.
+            "SELECT * FROM bbbb.t__e".to_string(),
+            format!("SELECT * FROM \"{b}\".t__e"),
+            "SELECT * FROM datafusion.public.t__e".to_string(),
+            "SELECT x FROM t__e UNION ALL SELECT table_name FROM information_schema.tables"
+                .to_string(),
+        ]
+    }
+
+    fn attack(f: &Fixture, tenant: Option<&str>) {
+        let tenant: Option<Arc<str>> = tenant.map(Arc::from);
+        // B's session holds its hot rows first, so a cached session that crossed datasets would show.
+        let mut hot = HotRows::new();
+        hot.insert(
+            "t__e".into(),
+            vec![json!({"table": "t__e", "block_number": 11, "log_index": 0, "x": "SECRET_HOT"})],
+        );
+        isolated(tenant.as_ref(), || {
+            query_hot_cold(&f.b, "SELECT * FROM t__e", guard(), &hot, 10, &[]).unwrap()
+        });
+        for sql in refused(f) {
+            let got = isolated(tenant.as_ref(), || {
+                query_hot_cold(&f.a, &sql, guard(), &HotRows::new(), 10, &[])
+            });
+            match got {
+                Ok(out) => panic!("{tenant:?} answered {sql}: {:?}", out.rows),
+                Err(e) => assert!(
+                    !error_leaks(&sql, &format!("{e:#}")),
+                    "{tenant:?}: the refusal of {sql} names B: {e:#}"
+                ),
+            }
+        }
+        for sql in answered(f) {
+            let out = isolated(tenant.as_ref(), || {
+                query_hot_cold(&f.a, &sql, guard(), &HotRows::new(), 10, &[])
+            })
+            .unwrap_or_else(|e| panic!("{tenant:?}: {sql}: {e:#}"));
+            let text = serde_json::to_string(&out.rows).unwrap();
+            assert!(!leaked(f, &text), "{tenant:?}: {sql} reached B: {text}");
+            assert!(!out.rows.is_empty(), "{tenant:?}: {sql} answered nothing");
+        }
+    }
+
+    /// An error may echo what the statement said, B's paths included; anything else of B's is a leak.
+    fn error_leaks(sql: &str, error: &str) -> bool {
+        error.contains(SECRET)
+            || error.contains("SECRET_HOT")
+            || (error.contains("b_only") && !sql.contains("b_only"))
+    }
+
+    #[test]
+    fn a_mount_cannot_reach_another_datasets_files_rows_or_catalogue() {
+        let f = two_datasets();
+        attack(&f, None);
+        attack(&f, Some("a"));
+    }
+
+    /// The escape this work found: `offchain/manifest.json` is an authored input that ships in a
+    /// bundle, and a snapshot's `file` was joined to `offchain/segments/` unchecked. An absolute path
+    /// bound any Parquet file the process could read as `offchain__<table>`.
+    #[test]
+    fn an_offchain_catalogue_cannot_name_a_file_outside_its_nest() {
+        let f = two_datasets();
+        std::fs::create_dir_all(f.a.join("offchain").join("segments")).unwrap();
+        let name = f
+            .b_segment
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let relative = format!("../../../../segments/{name}");
+        assert!(
+            f.a.join("offchain")
+                .join("segments")
+                .join(&relative)
+                .exists(),
+            "the relative probe must resolve to B's segment"
+        );
+        for file in [f.b_segment.display().to_string(), relative] {
+            let snapshot = json!({
+                "hash": "h", "file": file, "rows": 1, "columns": ["x"], "source": "s",
+                "ingested_at": "t", "tool_version": "v",
+            });
+            std::fs::write(
+                f.a.join("offchain").join("manifest.json"),
+                json!({"tables": {"stolen": [snapshot]}}).to_string(),
+            )
+            .unwrap();
+            for tenant in [None, Some(Arc::from("a"))] {
+                let got = isolated(tenant.as_ref(), || {
+                    query_hot_cold(
+                        &f.a,
+                        "SELECT * FROM offchain__stolen",
+                        guard(),
+                        &HotRows::new(),
+                        10,
+                        &[],
+                    )
+                });
+                assert!(got.is_err(), "{file} was bound: {:?}", got.map(|o| o.rows));
+            }
+            assert!(crate::offchain::load(&f.a).is_err(), "{file}");
+        }
+    }
+
+    /// FR8: two tenants mounting one dataset get separate sessions and memory pools, and neither
+    /// is the shared one.
+    #[test]
+    fn two_tenants_of_one_dataset_get_separate_sessions_and_pools() {
+        let f = two_datasets();
+        let opens = |t: Option<&str>| session_opens_in(&f.a, t);
+        for t in ["a", "b"] {
+            let tenant = Some(Arc::from(t));
+            for _ in 0..2 {
+                isolated(tenant.as_ref(), || {
+                    query_hot_cold(
+                        &f.a,
+                        "SELECT * FROM t__e",
+                        guard(),
+                        &HotRows::new(),
+                        10,
+                        &[],
+                    )
+                })
+                .unwrap();
+            }
+        }
+        // At least one each: the cache is process-wide, and another test can evict between queries.
+        assert!(opens(Some("a")) >= 1 && opens(Some("b")) >= 1);
+        assert_eq!(opens(None), 0);
+        // Held here, since a pool lives only as long as a session on it.
+        let held: Vec<_> = ["a", "b"]
+            .map(|t| engine().open(&f.a, Some(t)).unwrap())
+            .into();
+        assert_eq!(
+            crate::engine_burrmill::pool_tenants(&f.a),
+            vec![Some("a".to_string()), Some("b".to_string())]
+        );
+        drop(held);
+        query_hot_cold(
+            &f.a,
+            "SELECT * FROM t__e",
+            guard(),
+            &HotRows::new(),
+            10,
+            &[],
+        )
+        .unwrap();
+        assert!(opens(None) >= 1, "the shared session is its own");
+    }
+
+    /// A tenant's pool is a limit, not an allocation: once its statement is done it holds nothing,
+    /// and one no session holds is dropped. A hundred tenants of one dataset leave no more pools
+    /// than the session cache keeps sessions, and none of them reserved.
+    #[test]
+    fn a_hundred_tenants_leave_no_pool_reserved_and_no_pool_without_a_session() {
+        let f = two_datasets();
+        for i in 0..100 {
+            let tenant = Some(Arc::from(format!("t{i}")));
+            let out = isolated(tenant.as_ref(), || {
+                query_hot_cold(
+                    &f.a,
+                    "SELECT x, count(*) AS n FROM t__e GROUP BY x ORDER BY x",
+                    guard(),
+                    &HotRows::new(),
+                    10,
+                    &[],
+                )
+            })
+            .unwrap();
+            assert_eq!(out.rows.len(), 1);
+        }
+        let pools = crate::engine_burrmill::pool_reservations(&f.a);
+        assert!(
+            pools.len() <= SESSION_CACHE_CAPACITY + 1,
+            "{} pools for one dataset",
+            pools.len()
+        );
+        assert!(pools.iter().all(|(_, held)| *held == 0), "{pools:?}");
+    }
+
+    #[test]
+    fn strict_refuses_off_list_functions_in_statements_and_the_views_they_reach() {
+        let f = two_datasets();
+        std::fs::write(
+            f.a.join("views").join("w.sql"),
+            "CREATE VIEW w AS SELECT version() AS x FROM t__e;\n\
+             CREATE TABLE big AS SELECT * FROM range(3);\n",
+        )
+        .unwrap();
+        let run = |tenant: Option<&str>, sql: &str| {
+            let tenant: Option<Arc<str>> = tenant.map(Arc::from);
+            isolated(tenant.as_ref(), || {
+                query_hot_cold(&f.a, sql, guard(), &HotRows::new(), 10, &[])
+            })
+        };
+        for sql in ["SELECT version()", "SELECT * FROM w", "SELECT * FROM big"] {
+            run(None, sql).unwrap_or_else(|e| panic!("shared: {sql}: {e:#}"));
+            assert!(run(Some("a"), sql).is_err(), "strict ran {sql}");
+        }
+        // A view that calls nothing off the list still answers, beside one that does.
+        run(Some("a"), "SELECT * FROM v").unwrap();
     }
 }

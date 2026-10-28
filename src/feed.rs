@@ -495,6 +495,10 @@ pub enum Line {
         /// The chain whose cursor the mount is on, which a follower charges its memory to.
         #[serde(default)]
         chain: Option<String>,
+        /// The tenant this mount's queries are isolated to under `[runtime] isolation = "strict"`
+        /// (RFC-0073 FR8), which a follower isolates them to as well.
+        #[serde(default)]
+        isolation: Option<String>,
     },
     /// Every route mounted when the connection opened has been sent: a route not named by now does
     /// not exist, rather than not having arrived yet.

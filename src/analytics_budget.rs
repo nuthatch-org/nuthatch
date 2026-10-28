@@ -137,6 +137,12 @@ pub fn validate_cursor_budget(datasets: usize) -> Result<()> {
     validate_on_cursor(&from_env(), crate::serve::sql_max_concurrency(), datasets)
 }
 
+/// Under `isolation = "strict"` each tenant of a dataset has a pool of its own (RFC-0073 FR8), so a
+/// cursor's datasets no longer bound its pools and every permit is charged one.
+pub fn validate_strict_budget() -> Result<()> {
+    validate_cursor_budget(usize::MAX)
+}
+
 /// A dataset's sessions share one pool (#1792), so no more pools reserve at once than the cursor
 /// has datasets, nor more than it has permits.
 pub fn validate_on_cursor(cfg: &AnalyticsConfig, permits: usize, datasets: usize) -> Result<()> {
@@ -543,6 +549,13 @@ pub(crate) mod tests {
             1,
         )
         .expect("768 + 1024 is under 2048");
+        // RFC-0073 FR8: two tenants of that one dataset are two pools under strict isolation.
+        let strict = AnalyticsConfig {
+            burrmill_memory_limit_mb: Some(768),
+            threads: 8,
+            ..AnalyticsConfig::default()
+        };
+        assert!(validate_on_cursor(&strict, 2, usize::MAX).is_err());
     }
 
     /// #1899: the derived 1024 MB stands in for two terms RFC-0047 names, ingest and the memory a

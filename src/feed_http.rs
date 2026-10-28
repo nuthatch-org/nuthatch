@@ -34,6 +34,7 @@ pub struct Served {
     pub share: Option<crate::runtime::TenantShare>,
     pub limits: crate::limits::Limits,
     pub chain: String,
+    pub isolation: Option<String>,
     pub store: Arc<dyn HotStore>,
 }
 
@@ -54,6 +55,7 @@ impl Served {
             tenant,
             limits: state.limits,
             chain: state.chain.clone(),
+            isolation: state.isolation.as_deref().map(str::to_string),
             store: state.store.clone(),
         }
     }
@@ -211,6 +213,7 @@ async fn serve_connection(
                         share: m.share,
                         limits: Some((&m.limits).into()),
                         chain: Some(m.chain.clone()),
+                        isolation: m.isolation.clone(),
                     });
                     if routes.get(route).is_some_and(|sent| sent[..] == mount[..]) {
                         continue;

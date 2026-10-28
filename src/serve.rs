@@ -374,6 +374,9 @@ pub struct AppState {
     /// dataset identity; a solo `dev` nest carries the NID it computed from its manifest. `None`
     /// only when that manifest could not be built.
     pub nid: Option<Arc<str>>,
+    /// The tenant this mount's queries are isolated to under `[runtime] isolation = "strict"`
+    /// (RFC-0073 FR8); `None` shares the dataset's session, pool and memo with every mount of it.
+    pub isolation: Option<Arc<str>>,
     /// This nest's name and the runtime health surface it should answer `/ready` from (RFC-0026 §5).
     /// `None` for a solo `dev` nest, which has no mounts around it and falls back to the global
     /// poll-freshness check.
@@ -3892,12 +3895,15 @@ async fn table(
                 );
                 let dir = s.dir.clone();
                 let declared = Arc::clone(&s.tables);
+                let tenant = s.isolation.clone();
                 let guard = s.query_guard(s.limits.timeout, need);
                 match crate::cost::spawn_blocking(move || {
                     let _permit = permit; // held for the whole blocking query
                                           // Declared, so a table nothing has been sealed for yet reads empty, not failed.
                     let hot = analytics::HotRows::new();
-                    analytics::query_hot_cold(&dir, &sql, guard, &hot, u64::MAX, &declared)
+                    analytics::isolated(tenant.as_ref(), || {
+                        analytics::query_hot_cold(&dir, &sql, guard, &hot, u64::MAX, &declared)
+                    })
                 })
                 .await
                 {
@@ -4052,9 +4058,12 @@ async fn entity(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoR
             crate::cost::queued(admission.elapsed());
             let guard = s.query_guard(s.limits.timeout.saturating_sub(admission.elapsed()), 1);
             let dir = s.dir.clone();
+            let tenant = s.isolation.clone();
             let sealed = crate::cost::spawn_blocking(move || {
                 let _permit = permit;
-                analytics::get_row_guarded(&dir, block, log_index, guard)
+                analytics::isolated(tenant.as_ref(), || {
+                    analytics::get_row_guarded(&dir, block, log_index, guard)
+                })
             })
             .await;
             match sealed {
@@ -4353,6 +4362,7 @@ async fn named_scan(
     let max_hot_rows = s.limits.max_hot_rows;
     let guard = s.query_guard(s.limits.timeout, s.limits.max_rows);
     let hot_charge = s.hot_charge();
+    let tenant = s.isolation.clone();
     crate::cost::spawn_blocking(move || -> anyhow::Result<NamedRun> {
         let _permit = permit;
         let started = std::time::Instant::now();
@@ -4435,15 +4445,17 @@ async fn named_scan(
             pinned_catalogue: pin.map(|(catalogue, _)| catalogue),
             execute,
         };
-        let out = crate::analytics::query_named(
-            &dir,
-            &sql,
-            QueryGuard { timeout, ..guard },
-            &hot,
-            sealed_through,
-            &tables,
-            &admission,
-        )?;
+        let out = crate::analytics::isolated(tenant.as_ref(), || {
+            crate::analytics::query_named(
+                &dir,
+                &sql,
+                QueryGuard { timeout, ..guard },
+                &hot,
+                sealed_through,
+                &tables,
+                &admission,
+            )
+        })?;
         let as_of = store
             .get_meta("last_block")
             .ok()
@@ -4781,6 +4793,7 @@ fn memo_identity(
     let files = crate::analytics::cache_inputs(&s.dir);
     let key = crate::sqlmemo::Inputs {
         dir: &s.dir,
+        tenant: s.isolation.as_deref(),
         sql,
         max_rows,
         sealed: &sealed,
@@ -4973,6 +4986,7 @@ async fn run_sql_query_at(
     let declared_entities = s.entities.clone();
     let guard = s.query_guard(sql_timeout, max_rows);
     let hot_charge = s.hot_charge();
+    let tenant = s.isolation.clone();
     let result = crate::cost::spawn_blocking(move || {
         let _permit = permit; // held for the whole blocking query, released on return
                               // Scan the hot tip (redb, blocking) inside the same blocking task, so `/sql` sees the unsealed
@@ -5036,11 +5050,18 @@ async fn run_sql_query_at(
             )?
         };
         let sealed_through = store.sealed_through();
-        let mut out = if let Some(block) = historical_block {
-            analytics::query_hot_cold_at(&dir, &sql, guard, &hot, sealed_through, &tables, block)?
-        } else {
-            analytics::query_hot_cold(&dir, &sql, guard, &hot, sealed_through, &tables)?
-        };
+        let mut out = analytics::isolated(tenant.as_ref(), || match historical_block {
+            Some(block) => analytics::query_hot_cold_at(
+                &dir,
+                &sql,
+                guard,
+                &hot,
+                sealed_through,
+                &tables,
+                block,
+            ),
+            None => analytics::query_hot_cold(&dir, &sql, guard, &hot, sealed_through, &tables),
+        })?;
         out.tip_unavailable = tip_unavailable;
         // The state after the query, for the memo: an answer is remembered only if nothing it reads
         // moved while it ran, so a remembered answer always describes exactly the state its key names.
@@ -5166,6 +5187,7 @@ impl DiffQuery {
 /// under the deadline `/sql` gives one query.
 struct DiffSource {
     dir: PathBuf,
+    tenant: Option<Arc<str>>,
     hot: Arc<crate::analytics::HotRows>,
     tip_unavailable: bool,
     sealed_through: u64,
@@ -5190,6 +5212,7 @@ impl crate::diff::Source for DiffSource {
             timeout: left,
             ..self.guard
         };
+        let tenant = self.tenant.clone();
         let (dir, hot, tables, sql) = (
             self.dir.clone(),
             self.hot.clone(),
@@ -5198,7 +5221,9 @@ impl crate::diff::Source for DiffSource {
         );
         let sealed_through = self.sealed_through;
         let mut out = tokio::task::spawn_blocking(move || {
-            analytics::query_hot_cold(&dir, &sql, guard, &hot, sealed_through, &tables)
+            analytics::isolated(tenant.as_ref(), || {
+                analytics::query_hot_cold(&dir, &sql, guard, &hot, sealed_through, &tables)
+            })
         })
         .await??;
         out.tip_unavailable = self.tip_unavailable;
@@ -5290,6 +5315,7 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
         };
     let src = DiffSource {
         dir: s.dir.clone(),
+        tenant: s.isolation.clone(),
         hot: Arc::new(hot),
         tip_unavailable,
         sealed_through,
@@ -5474,6 +5500,7 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
     let guard = s.query_guard(s.limits.timeout, 1);
     let declared_entities = s.entities.clone();
     let hot_charge = s.hot_charge();
+    let tenant = s.isolation.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         // Planning materialises no result rows, but the tip is still parsed
@@ -5522,7 +5549,9 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
             (sql_max_hot_rows, sql_max_named_scan_bytes),
         )?;
         let sealed_through = store.sealed_through();
-        let mut out = analytics::plan_hot_cold(&dir, &query, guard, &hot, sealed_through, &tables)?;
+        let mut out = analytics::isolated(tenant.as_ref(), || {
+            analytics::plan_hot_cold(&dir, &query, guard, &hot, sealed_through, &tables)
+        })?;
         out.tip_unavailable = tip_unavailable;
         Ok(out)
     })
@@ -7187,6 +7216,7 @@ mod tests {
             nest_info: Arc::new(json!({ "name": "t" })),
             runtime_health: None,
             address_history: None,
+            isolation: None,
         }
     }
 
@@ -9232,6 +9262,95 @@ mod tests {
             columns: crate::registry::implicit_columns(false),
         }]);
         state
+    }
+
+    /// RFC-0073 FR8: a strict mount's queries run in its tenant's session on every SQL route, never
+    /// in the one its dataset's other mounts share, and the allow-list holds on the route.
+    #[tokio::test]
+    async fn a_strict_mount_queries_in_its_tenants_session_on_every_sql_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = table_fixture(tmp.path(), 1..=3, 4..=5);
+        let tenant = |t: &str| AppState {
+            isolation: Some(Arc::from(t)),
+            ..shared.clone()
+        };
+        for t in ["a", "b"] {
+            for uri in [
+                "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20t",
+                "/explain?q=SELECT%20count(*)%20AS%20n%20FROM%20t",
+                "/table/t?limit=10",
+                "/entity/000000000001-000000",
+            ] {
+                let (status, body) = get_json(tenant(t), uri).await;
+                assert_eq!(status, StatusCode::OK, "{t} {uri}: {body}");
+            }
+            let (status, body) = get_json(tenant(t), "/sql?q=SELECT%20version()").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{t}: {body}");
+        }
+        let opens = |t| crate::analytics::session_opens_in(tmp.path(), t);
+        assert!(opens(Some("a")) >= 1 && opens(Some("b")) >= 1);
+        assert_eq!(opens(None), 0, "a strict route used the shared session");
+        let (status, body) = get_json(shared, "/sql?q=SELECT%20version()").await;
+        assert_eq!(status, StatusCode::OK, "shared: {body}");
+    }
+
+    /// RFC-0073 FR1 with FR8: the test above served from a follower's copy of the store. The
+    /// writer's partition reaches it on the feed's mount line, and its queries run in their
+    /// tenant's session on every SQL route, with the allow-list held there too.
+    #[tokio::test]
+    async fn a_strict_follower_queries_in_its_tenants_session_on_every_sql_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = table_fixture(tmp.path(), 1..=3, 4..=5);
+        let sub = writer
+            .store
+            .feed_subscribe()
+            .unwrap()
+            .expect("a redb store has a feed");
+        let shared = AppState {
+            store: Arc::new(crate::feed::MemStore::from_snapshot(
+                &writer.dir,
+                sub.snapshot,
+            )),
+            ..writer.clone()
+        };
+        let tenant = |t: &str| {
+            let strict = AppState {
+                isolation: Some(Arc::from(t)),
+                ..writer.clone()
+            };
+            let served = crate::feed_http::Served::of("r", &strict, &Default::default());
+            AppState {
+                isolation: served.isolation.as_deref().map(Arc::from),
+                ..shared.clone()
+            }
+        };
+        for t in ["a", "b"] {
+            assert_eq!(tenant(t).isolation.as_deref(), Some(t));
+            for uri in [
+                "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20t",
+                "/explain?q=SELECT%20count(*)%20AS%20n%20FROM%20t",
+                "/table/t?limit=10",
+                "/entity/000000000004-000000",
+            ] {
+                let (status, body) = get_json(tenant(t), uri).await;
+                assert_eq!(status, StatusCode::OK, "{t} {uri}: {body}");
+            }
+            let count = "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20t";
+            let (status, body) = get_json(tenant(t), count).await;
+            assert_eq!(status, StatusCode::OK);
+            let strict_writer = AppState {
+                isolation: Some(Arc::from(t)),
+                ..writer.clone()
+            };
+            let (_, theirs) = get_json(strict_writer, count).await;
+            assert_eq!(body["rows"], theirs["rows"], "{t}: the writer's answer");
+            let (status, body) = get_json(tenant(t), "/sql?q=SELECT%20version()").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{t}: {body}");
+        }
+        let opens = |t| crate::analytics::session_opens_in(tmp.path(), t);
+        assert!(opens(Some("a")) >= 1 && opens(Some("b")) >= 1);
+        assert_eq!(opens(None), 0, "a strict route used the shared session");
+        crate::seal::unpin_catalogue(tmp.path());
     }
 
     async fn get_json(state: AppState, uri: &str) -> (StatusCode, Value) {
@@ -12208,7 +12327,18 @@ mod tests {
                 first["sealed_bytes"],
                 "{path}, another engine over a copy"
             );
+            // RFC-0073 FR8: a strict tenant's session is metered as the shared one is.
+            let strict = AppState {
+                isolation: Some(Arc::from("acme")),
+                ..a.clone()
+            };
+            assert_eq!(
+                cost_of(&strict, &path).await["sealed_bytes"],
+                first["sealed_bytes"],
+                "{path}, a strict tenant's session"
+            );
         }
+        assert!(crate::analytics::session_opens_in(&a.dir, Some("acme")) >= 1);
     }
 
     /// A remembered answer reads nothing, and a typed route is metered as `/sql` is.

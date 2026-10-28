@@ -316,6 +316,10 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
     ("src/tape.rs", "RFC-0039 tape bytes, not nest config"),
     ("src/feed.rs", "the hot-state feed's wire format (RFC-0073 FR1), not nest config"),
     ("src/feed_http.rs", "the feed route's token query, not nest config"),
+    (
+        "src/isolation.rs",
+        "the value of `[runtime] isolation`, which RuntimeMeta carries; it has no keys of its own",
+    ),
     ("src/store.rs", "the table tag of a hot row, not nest config"),
     (
         "src/mount_jobs.rs",

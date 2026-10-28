@@ -92,6 +92,7 @@ struct Spec {
     share: Option<crate::runtime::TenantShare>,
     limits: Option<crate::feed::WireLimits>,
     chain: Option<String>,
+    isolation: Option<String>,
 }
 
 struct Route {
@@ -405,6 +406,7 @@ impl Follower {
                 share,
                 limits,
                 chain,
+                isolation,
             } => {
                 let estimate = nest_estimate(&self.root.join(&dataset));
                 let spec = Spec {
@@ -418,6 +420,7 @@ impl Follower {
                     share,
                     limits,
                     chain,
+                    isolation,
                 };
                 {
                     let mut inner = self.lock();
@@ -650,6 +653,7 @@ impl Follower {
             #[cfg(feature = "counter")]
             counter: None,
             nid: r.nid.as_deref().map(Arc::from),
+            isolation: r.isolation.as_deref().map(Arc::from),
             runtime_health: Some((route.to_string(), health)),
             address_history: None,
             admin_enabled: false,

@@ -1,0 +1,32 @@
+[package]
+name = "nuthatch-fuzz-sql"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace, apart from `fuzz/`: this one links the whole engine, dbsp included, and the
+# decode targets must not (fuzz/README.md, nuthatch#581).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+[dependencies.nuthatch]
+path = "../.."
+default-features = false
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "sql_confinement"
+path = "fuzz_targets/sql_confinement.rs"
+test = false
+doc = false
+bench = false

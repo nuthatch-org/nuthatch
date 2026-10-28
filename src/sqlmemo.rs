@@ -208,6 +208,8 @@ pub fn sealed_segments(dir: &Path, sealed_through: u64) -> Option<String> {
 
 pub struct Inputs<'a> {
     pub dir: &'a Path,
+    /// The tenant a strict runtime isolates this answer to (RFC-0073 FR8).
+    pub tenant: Option<&'a str>,
     pub sql: &'a str,
     pub max_rows: usize,
     /// [`sealed_segments`] at the served watermark, not the watermark: on a chain that finalises
@@ -228,6 +230,7 @@ impl Inputs<'_> {
             h.update(bytes);
         };
         field(self.dir.to_string_lossy().as_bytes());
+        field(self.tenant.unwrap_or_default().as_bytes());
         field(self.sql.as_bytes());
         field(&(self.max_rows as u64).to_le_bytes());
         field(self.sealed.as_bytes());
@@ -517,6 +520,7 @@ mod tests {
     ) -> Inputs<'a> {
         Inputs {
             dir,
+            tenant: None,
             sql,
             max_rows: 100,
             sealed: "s10",
@@ -589,6 +593,12 @@ mod tests {
         let mut i = inputs(&d, "SELECT 1", 3, &wm, &files);
         i.max_rows = 101;
         assert_ne!(base, i.key(), "row cap");
+        // RFC-0073 FR8: a strict runtime's tenants of one dataset never share an entry.
+        let mut a = inputs(&d, "SELECT 1", 3, &wm, &files);
+        a.tenant = Some("a");
+        let mut b = inputs(&d, "SELECT 1", 3, &wm, &files);
+        b.tenant = Some("b");
+        assert!(base != a.key() && a.key() != b.key(), "tenant");
         let wm2 = at(6, &[]);
         assert_ne!(
             base,

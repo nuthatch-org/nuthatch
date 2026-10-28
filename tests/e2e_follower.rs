@@ -67,6 +67,13 @@ impl Writer {
                 )
                 .await
                 .expect("spawn_runtime");
+                let mut cursor = cursor;
+                // `[runtime] isolation = "strict"` as the runtime stamps it: each route its own tenant.
+                if root.join("strict").exists() {
+                    for (route, s) in &mut cursor.states {
+                        s.isolation = Some(Arc::from(route.as_str()));
+                    }
+                }
                 let states = cursor.states.clone();
                 let store = states[0].1.store.clone();
                 let roster: feed_http::Roster = Arc::new(move || {
@@ -384,6 +391,41 @@ async fn a_route_is_catching_up_until_its_snapshot_and_derived_state_is_the_writ
     let (status, root_ready) = get(&fbase, "/ready").await;
     assert_eq!(status, 200, "{root_ready}");
     assert_eq!(root_ready["nests"][ROUTE]["ready"], true);
+    writer.stop(&root);
+}
+
+/// A strict runtime's writer isolates each mount's queries to its tenant, and the follower takes
+/// the partition from the feed and does the same: an off-list function is refused on both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_strict_writers_followers_isolate_as_it_does() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("runtime");
+    let dir = root.join("data").join(ROUTE);
+    std::fs::create_dir_all(&dir).unwrap();
+    scaffold_nest(&dir, ROUTE, USDC);
+    std::fs::write(root.join("strict"), "").unwrap();
+    let via: PathBuf = tmp.path().join("follower-view");
+    std::os::unix::fs::symlink(&root, &via).unwrap();
+    let tape = Arc::new(TapeSource::new());
+    tape.insert_block(1, block(1, 0, 5));
+    tape.advance_tip_to(1);
+    let writer = Writer::start(&root, tape.clone(), 0);
+    writer.reaches(1).await;
+    let (_f, fbase) = bind_follower(&via, &writer).await;
+    agree(
+        &writer,
+        &fbase,
+        COUNT,
+        "a strict follower counts as its writer",
+    )
+    .await;
+    for base in [format!("http://{}", writer.addr), fbase.clone()] {
+        let (status, body) = sql(&base, "SELECT version()").await;
+        assert_eq!(
+            status, 400,
+            "{base}: an off-list function under strict: {body}"
+        );
+    }
     writer.stop(&root);
 }
 
