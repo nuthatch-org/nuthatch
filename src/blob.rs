@@ -1770,7 +1770,11 @@ abi = "abis/c.json"
     /// by name and the dataset's sealed catalogue by path.
     #[test]
     fn a_bundle_cannot_carry_derived_state_in_another_case() {
-        for planted in ["Segments/manifest.json", "Maintained/x.parquet", "NUTHATCH.REDB"] {
+        for planted in [
+            "Segments/manifest.json",
+            "Maintained/x.parquet",
+            "NUTHATCH.REDB",
+        ] {
             let src = tempfile::tempdir().unwrap();
             write_nest(src.path());
             let at = src.path().join(planted);
@@ -1785,7 +1789,10 @@ abi = "abis/c.json"
             write_bundle(src.path(), &manifest, &file).unwrap();
             let got = CheckedBundle::from_bytes(&std::fs::read(&file).unwrap(), None);
             let e = got.map(|_| ()).unwrap_err();
-            assert!(format!("{e:#}").contains("derived state"), "{planted}: {e:#}");
+            assert!(
+                format!("{e:#}").contains("derived state"),
+                "{planted}: {e:#}"
+            );
         }
         assert!(!names_derived_state("views/maintained.sql"));
         assert!(!names_derived_state("views/quarantine/x.sql"));
