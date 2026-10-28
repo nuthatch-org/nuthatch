@@ -672,6 +672,13 @@ pub fn install_verified(
     // Integrity: every file's bytes hash to the manifest's claim.
     for f in &manifest.files {
         let path = checked_join(blob_dir, &f.path)?;
+        // Manifests always use `/`. A backslash is a second separator on Windows the name checks miss.
+        if f.path.contains('\\') {
+            bail!(
+                "blob file {} uses a backslash, which a manifest path never holds",
+                f.path
+            );
+        }
         if names_derived_state(&f.path) {
             bail!(
                 "blob file {} is named like derived state, which a nest's inputs never hold",
@@ -1697,6 +1704,31 @@ abi = "abis/c.json"
         let t = tempfile::tempdir().unwrap();
         let err = install_verified(blob.path(), Some(&t.path().join("n")), None).unwrap_err();
         assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+    }
+
+    #[test]
+    fn a_manifest_path_with_a_backslash_is_refused() {
+        let src = tempfile::tempdir().unwrap();
+        write_nest(src.path());
+        let mut manifest = build_manifest(src.path(), None).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let blob = out.path().join("blob");
+        write_bundle_dir(src.path(), &blob, &manifest).unwrap();
+        let f = manifest
+            .files
+            .iter_mut()
+            .find(|f| f.path.contains('/'))
+            .unwrap();
+        let crafted = f.path.replacen('/', "\\", 1);
+        std::fs::rename(blob.join(&f.path), blob.join(&crafted)).unwrap();
+        f.path = crafted;
+        std::fs::write(
+            blob.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let err = install_verified(&blob, Some(&out.path().join("n")), None).unwrap_err();
+        assert!(format!("{err:#}").contains("backslash"), "{err:#}");
     }
 
     #[test]
