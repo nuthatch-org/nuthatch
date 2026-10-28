@@ -694,11 +694,13 @@ mod tests {
         store
     }
 
+    /// A stall well past [`read_line`]'s wait, so a snapshot that moves only when its stall ends,
+    /// rather than when a reader gives room back, fails the read.
     fn limits(per_connection: u64, total: u64) -> QueueLimits {
         QueueLimits {
             per_connection,
             total,
-            stall: Duration::from_secs(10),
+            stall: Duration::from_secs(60),
         }
     }
 
