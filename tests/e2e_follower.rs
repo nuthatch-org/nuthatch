@@ -761,7 +761,9 @@ async fn a_delta_over_the_budget_is_refused_before_it_is_applied() {
 async fn a_resnapshot_is_charged_beside_the_copy_it_replaces() {
     const BUDGET_MB: u64 = 14;
     // The nest's derived state is charged 5 MiB by admission: two of it and two 1 MiB copies fit,
-    // two of it and two 3 MiB copies do not, and one of it and a 5 MiB copy does.
+    // two of it and two 3 MiB copies do not, and one of it and a 5 MiB copy does. At 3 MiB the old
+    // 3 + 5 and a replacement of 3 leave no room for the replacement's own 5 while it builds, so the
+    // old ones go first.
     for (size, reloads) in [(1 << 20, 0), (3 << 20, 1), (5 << 20, 1)] {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("runtime");

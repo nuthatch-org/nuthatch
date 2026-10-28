@@ -576,7 +576,8 @@ impl Follower {
                 Some(match kind {
                     // A replacement and its derived state are built beside the copy and derived
                     // state they replace, which are served until the swap and counted until their
-                    // last request finishes.
+                    // last request finishes. `cap_for` has already reserved the replacement's own
+                    // derived estimate, so all four must fit or the old ones are released first.
                     crate::feed::Kind::Snapshot => {
                         cap.saturating_sub(inner.held(dataset).unwrap_or(0))
                     }
