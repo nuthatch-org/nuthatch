@@ -1316,9 +1316,9 @@ async fn a_writer_request_sees_each_window_wholly_or_not_at_all() {
     let writer = Writer::start(&root, tape.clone(), 0);
     writer.reaches(3).await;
     let base = format!("http://{}", writer.addr);
-    // Each window waits 50 ms after its views are fed and again after its commit, and the entity 30 ms
-    // before it folds: a request let in at any of those points sees one part of the window without
-    // another.
+    // Each window waits 50 ms after its views are fed, after its commit and after its entity folds, and
+    // the entity 30 ms before it folds: a request reading live state at any of those points sees one
+    // part of the window without another.
     nuthatch::indexer::slow_writer_commit(&dir, Duration::from_millis(50));
     nuthatch::entity_view::slow_entity_fold("received_whole", Duration::from_millis(30));
 

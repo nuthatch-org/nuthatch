@@ -7738,6 +7738,9 @@ impl NestIngest {
     /// snapshot requests read (#2467).
     async fn publish_snapshot(&mut self) -> Result<()> {
         self.flush_derived().await?;
+        if let Some(delay) = feed_delay(&self.dir) {
+            tokio::time::sleep(delay).await;
+        }
         let snapshot = serve::Snapshot::take(
             &self.store,
             &self.balances,
@@ -9280,8 +9283,8 @@ pub fn slow_follower_feed(dir: &Path, delay: std::time::Duration) {
         .insert(dir.to_path_buf(), delay);
 }
 
-/// The same seam on the writer: each window of `dir` waits `delay` after its views are fed and again
-/// after its commit, before its entities are.
+/// The same seam on the writer: each window of `dir` waits `delay` after its views are fed, after its
+/// commit, and after its entities have folded, before it is published.
 #[doc(hidden)]
 pub fn slow_writer_commit(dir: &Path, delay: std::time::Duration) {
     slow_follower_feed(dir, delay);
