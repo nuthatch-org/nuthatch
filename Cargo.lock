@@ -4936,6 +4936,7 @@ dependencies = [
  "feldera-size-of",
  "hex",
  "nuthatch-decode",
+ "nuthatch-seal",
  "rkyv",
  "serde",
  "serde_json",

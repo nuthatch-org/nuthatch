@@ -534,6 +534,17 @@ jobs:
           cargo test --locked --manifest-path core/Cargo.toml
       - name: vendor the patched dbsp
         run: spike/dbsp-wasm/vendor.sh
+      # zstd-sys (via nuthatch-seal) compiles C for the target: the runner's LLVM clang, with an empty
+      # sysroot, as the decode and seal wasm step does.
+      - name: C toolchain for wasm32
+        run: |
+          ar=$(command -v llvm-ar || ls /usr/bin/llvm-ar-* | sort -V | tail -1)
+          mkdir -p "$RUNNER_TEMP/no-sysroot"
+          {
+            echo "CC_wasm32_unknown_unknown=clang"
+            echo "AR_wasm32_unknown_unknown=$ar"
+            echo "CFLAGS_wasm32_unknown_unknown=--sysroot=$RUNNER_TEMP/no-sysroot"
+          } >> "$GITHUB_ENV"
       - name: wasm check (core)
         working-directory: spike/dbsp-wasm
         run: cargo check --locked --target wasm32-unknown-unknown -p nuthatch-core

@@ -12,6 +12,7 @@ anyhow = "1"
 async-trait = "0.1"
 dbsp = "0.320"
 nuthatch-decode = { path = "../decode" }
+nuthatch-seal = { path = "../seal" }
 hex = "0.4"
 # `Row` derives `SizeOf` and rkyv archival for `dbsp::DBData`; the versions dbsp itself pins.
 size-of = { package = "feldera-size-of", version = "0.1.7" }
