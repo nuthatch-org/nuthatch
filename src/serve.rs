@@ -12389,7 +12389,8 @@ mod tests {
                 "peak_mem_bytes",
                 "queue_us",
                 "result_bytes",
-                "sealed_bytes_read"
+                "sealed_bytes_read",
+                "scan_cpu_us"
             ],
             "{header}"
         );
@@ -12455,6 +12456,7 @@ mod tests {
         ] {
             let first = cost_of(&a, &path).await;
             assert!(first["sealed_bytes"] > 0, "{path}: {first:?}");
+            assert!(first["scan_cpu_us"] > 0, "the scans ran: {first:?}");
             for _ in 0..10 {
                 assert_eq!(
                     cost_of(&a, &path).await["sealed_bytes"],

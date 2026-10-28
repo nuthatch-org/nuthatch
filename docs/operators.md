@@ -1399,7 +1399,7 @@ GET /sql?q=… HTTP/1.1
 Nuthatch-Cost: 1
 
 HTTP/1.1 200 OK
-Nuthatch-Cost: sealed_bytes=1409; hot_rows=12; engine_us=3793; peak_mem_bytes=0; queue_us=0; result_bytes=219712; sealed_bytes_read=1409
+Nuthatch-Cost: sealed_bytes=1409; hot_rows=12; engine_us=3793; peak_mem_bytes=0; queue_us=0; result_bytes=219712; sealed_bytes_read=1409; scan_cpu_us=2140
 ```
 
 It is a report, not a price. Nuthatch meters and bills nothing; a gateway that wants to charge, cap
@@ -1416,6 +1416,7 @@ reads by name, or by position for the fields it knows, keeps working:
 | `queue_us` | time spent waiting for a `/sql` permit |
 | `result_bytes` | the serialized body |
 | `sealed_bytes_read` | Parquet data bytes the statements actually fetched, footers excluded |
+| `scan_cpu_us` | thread CPU the segment scans spent decoding and filtering, read by the thread clock around each scan poll; not the operators above the scans, and not an owned fold |
 
 `sealed_bytes` is the figure to build on. Segments are immutable and the selection is made from
 their footers before anything runs, so the same statement over the same sealed segments reports the
@@ -1430,11 +1431,18 @@ up to half as much again from one run to the next in Burrmill's own test. Nor is
 `sealed_bytes`: a filtered statement in those tests read 19,289 bytes against 17,714 selected.
 
 A remembered answer (the [analytical memo](#the-analytical-memo)) runs nothing and reports `0` for
-both. The other fields move with the machine and its load. There is no CPU-time field: a scan
-registers each segment's compute time into its DataFusion metrics as it opens the segment, so reading
-it at the end means holding those metrics through the scan, which Burrmill's scan-memory gate
-measured at 7 KiB a segment outside the memory pool against 1 KiB without (burrmill#86). `engine_us`
-is wall time instead. A route that reads only maintained state, `/balances` or `/derived` for
+both. The other fields move with the machine and its load.
+
+`scan_cpu_us` is the scans' CPU, not the whole statement's. Each segment scan's polls are timed by
+the thread's own CPU clock, which is where Parquet is decoded and pushed-down filters run. In
+Burrmill's own test of a filtered scan it came to 54% of the process CPU in a release build and 70%
+in a debug one; planning, the footer pass behind `sealed_bytes` and the operators above the scans
+make up the rest. Joins, aggregates and sorts are not in it: DataFusion keeps their compute time in
+metrics that can only be read from a plan held to the end, and holding a scan's keeps every
+segment's alive (7 KiB a segment outside the memory pool against 1 KiB without, burrmill#86). It
+reads 0 on a platform without a per-thread CPU clock. `engine_us` stays wall time.
+
+A route that reads only maintained state, `/balances` or `/derived` for
 instance, reads no sealed bytes and no hot rows.
 
 A nest that mirrors itself (RFC-0052, `--publish-target`) also carries, per nest and only then:

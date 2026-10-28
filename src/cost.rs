@@ -38,6 +38,7 @@ const METERED: &[&str] = &[
 struct Tally {
     sealed_bytes: AtomicU64,
     sealed_bytes_read: AtomicU64,
+    scan_cpu_nanos: AtomicU64,
     hot_rows: AtomicU64,
     engine_nanos: AtomicU64,
     peak_memory: AtomicU64,
@@ -97,6 +98,7 @@ pub fn engine(m: &burrmill::QueryMetrics) {
     with(|t| {
         t.sealed_bytes.fetch_add(m.sealed_bytes_scanned, Relaxed);
         t.sealed_bytes_read.fetch_add(m.sealed_bytes_read, Relaxed);
+        t.scan_cpu_nanos.fetch_add(m.scan_cpu_nanos, Relaxed);
         t.engine_nanos.fetch_add(m.exec_nanos, Relaxed);
         t.peak_memory.fetch_max(m.peak_memory_bytes, Relaxed);
     });
@@ -122,7 +124,7 @@ impl Meter {
     pub fn header(&self, result_bytes: u64) -> String {
         let t = &self.0;
         format!(
-            "sealed_bytes={}; hot_rows={}; engine_us={}; peak_mem_bytes={}; queue_us={}; result_bytes={}; sealed_bytes_read={}",
+            "sealed_bytes={}; hot_rows={}; engine_us={}; peak_mem_bytes={}; queue_us={}; result_bytes={}; sealed_bytes_read={}; scan_cpu_us={}",
             t.sealed_bytes.load(Relaxed),
             t.hot_rows.load(Relaxed),
             t.engine_nanos.load(Relaxed) / 1_000,
@@ -130,6 +132,7 @@ impl Meter {
             t.queue_nanos.load(Relaxed) / 1_000,
             result_bytes,
             t.sealed_bytes_read.load(Relaxed),
+            t.scan_cpu_nanos.load(Relaxed) / 1_000,
         )
     }
 }
@@ -183,6 +186,7 @@ mod tests {
                 output_rows: 3,
                 exec_nanos: 2_500_000,
                 peak_memory_bytes: 1 << 20,
+                scan_cpu_nanos: 1_500_000,
             });
             engine(&burrmill::QueryMetrics {
                 sealed_bytes_scanned: 1,
@@ -194,7 +198,7 @@ mod tests {
         });
         assert_eq!(
             m.header(12),
-            "sealed_bytes=4097; hot_rows=7; engine_us=2500; peak_mem_bytes=1048576; queue_us=250; result_bytes=12; sealed_bytes_read=3000"
+            "sealed_bytes=4097; hot_rows=7; engine_us=2500; peak_mem_bytes=1048576; queue_us=250; result_bytes=12; sealed_bytes_read=3000; scan_cpu_us=1500"
         );
     }
 
