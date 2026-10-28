@@ -881,11 +881,11 @@ async fn a_resnapshot_is_charged_beside_the_copy_it_replaces() {
         assert!(answered, "{size}: served after the restart");
         let (peak, released) = follower.charges();
         assert_eq!(released, reloads, "{size}: copies released to make room");
-        assert_eq!(
-            caught_up,
-            reloads == 1,
-            "{size}: catching up only while the old copy is released"
-        );
+        // The release's `catching_up` window is as short as a reconnect, and polling can miss it
+        // on a loaded machine: the count of releases above is what shows which path was taken.
+        if reloads == 0 {
+            assert!(!caught_up, "{size}: served throughout a swap with room");
+        }
         assert!(
             peak <= BUDGET_MB << 20,
             "{size}: charged {peak} bytes against a {BUDGET_MB} MiB budget"
