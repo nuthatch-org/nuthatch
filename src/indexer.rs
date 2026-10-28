@@ -2038,6 +2038,23 @@ fn check_live_health(
     Ok(())
 }
 
+/// Publish again for each live nest whose store moved outside a window (#2467).
+async fn republish_idle(
+    nests: &mut [Option<NestIngest>],
+    sup: &mut Supervisor,
+    live: &[usize],
+) -> Result<()> {
+    for &i in live {
+        let Some(nest) = nests[i].as_mut() else {
+            continue;
+        };
+        if let Err(e) = contained(nest.republish_if_moved()).await {
+            sup.quarantine(i, &e)?;
+        }
+    }
+    Ok(())
+}
+
 async fn fan_out_rollback(
     nests: &mut [Option<NestIngest>],
     nexts: &mut [u64],
@@ -2556,6 +2573,7 @@ async fn runtime_index_loop(
         heartbeat.maybe_log(global_next, tip);
         if global_next > ceiling {
             check_live_health(&nests, &mut sup, &live)?;
+            republish_idle(&mut nests, &mut sup, &live).await?;
             sleep_for(freshness.poll_interval).await;
             continue;
         }
@@ -3605,6 +3623,7 @@ async fn build_nest(
         rewound: None,
         snapshots: Default::default(),
         published_at: None,
+        published_generation: None,
     };
     // Stamps this nest's readiness clock (#510): `/ready`'s never-polled grace period is bounded from
     // here, not permanent - see `serve::poll_stalled`.
@@ -6958,6 +6977,8 @@ pub struct NestIngest {
     snapshots: serve::Snapshots,
     /// When the last snapshot was published, which catching up throttles on.
     published_at: Option<std::time::Instant>,
+    /// The store's write generation the last snapshot was taken at.
+    published_generation: Option<u64>,
 }
 
 impl NestIngest {
@@ -7741,6 +7762,8 @@ impl NestIngest {
         if let Some(delay) = feed_delay(&self.dir) {
             tokio::time::sleep(delay).await;
         }
+        // Read before the store is pinned, so a write between the two is published again rather than missed.
+        self.published_generation = self.store.write_generation();
         let snapshot = serve::Snapshot::take(
             &self.store,
             &self.balances,
@@ -7751,6 +7774,18 @@ impl NestIngest {
         self.snapshots.store(snapshot.map(Arc::new));
         self.published_at = Some(std::time::Instant::now());
         Ok(())
+    }
+
+    /// Publish again when the store moved outside a window, as documents resolved out of band move it,
+    /// so a nest idle at its tip does not serve them late. Nothing feeds the views between windows.
+    async fn republish_if_moved(&mut self) -> Result<()> {
+        let generation = self.store.write_generation();
+        if self.published_at.is_some()
+            && (generation.is_none() || generation == self.published_generation)
+        {
+            return Ok(());
+        }
+        self.publish_snapshot().await
     }
 
     /// [`Self::rollback_reorg`], published before a request reads past it.
@@ -8525,6 +8560,7 @@ async fn index_loop(
             // As in the runtime loop: an entity fault recorded after its window was checked surfaces
             // here rather than waiting for a block.
             nest.ensure_views_healthy()?;
+            nest.republish_if_moved().await?;
             // Poll for new blocks. The wait is RFC-0040 §3 knob 1: every poll costs a tip call and,
             // when the tip has moved, a reorg check, a checkpoint header and a `finalized` probe -
             // whether or not any block carried an event. At two seconds that is the whole bill of a
