@@ -476,6 +476,11 @@ mod tests {
                 "/forbidden/{*key}",
                 axum::routing::any(|| async { StatusCode::FORBIDDEN }),
             )
+            // No snapshot, so the seed asks for `publish.json` by HEAD, and only that is refused.
+            .route(
+                "/head-refused/d/publish.json",
+                axum::routing::head(|| async { StatusCode::FORBIDDEN }),
+            )
             .route(
                 "/broken/{*key}",
                 axum::routing::any(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
@@ -488,11 +493,15 @@ mod tests {
             ("unauthorized", FailureCode::AccessDenied),
             ("forbidden", FailureCode::AccessDenied),
             ("absent", FailureCode::NotFound),
+            ("head-refused", FailureCode::AccessDenied),
             ("broken", FailureCode::Other),
         ] {
             let mirror = publish::open_mirror(&format!("{base}/{path}")).unwrap();
             let err = read_snapshot(mirror.as_ref(), "d").await.unwrap_err();
             assert_eq!(FailureCode::of(&err), want, "{path}: {err:#}");
+            if path == "head-refused" {
+                assert!(format!("{err:#}").contains("publish.json"), "{err:#}");
+            }
         }
         server.abort();
     }
