@@ -323,7 +323,7 @@ impl Mirror for ObjMirror {
         match self.inner.get(&self.key(key)).await {
             Ok(g) => Ok(Some(g.bytes().await.context("reading object")?.to_vec())),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(anyhow::Error::new(e).context(key.to_string())),
+            Err(e) => Err(obj_read_err(e, key)),
         }
     }
 
@@ -457,8 +457,20 @@ impl Mirror for ObjMirror {
                     .map(|t| t.trim_start_matches("W/").trim_matches('"').to_string()),
             })),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(anyhow::Error::new(e).context(key.to_string())),
+            Err(e) => Err(obj_read_err(e, key)),
         }
+    }
+}
+
+/// A refused read carries `access_denied`, so a seeding mount's job says why it failed (RFC-0073 FR16).
+#[cfg(feature = "object-store")]
+fn obj_read_err(e: object_store::Error, key: &str) -> anyhow::Error {
+    match e {
+        object_store::Error::PermissionDenied { .. }
+        | object_store::Error::Unauthenticated { .. } => {
+            crate::distribution::access_denied_err(&format!("the mirror's {key}"))
+        }
+        other => anyhow::Error::new(other).context(key.to_string()),
     }
 }
 

@@ -87,6 +87,14 @@ async fn run_to(dir: &Path, tape: Arc<TapeSource>, name: &str, block: u64) -> Ve
 /// A stopped publisher holding a full segment `1..=5`, a provisional tail `6..=8`, and blocks
 /// `9..=12` unsealed, mirrored to `mirror`.
 pub(crate) async fn published(dir: &Path, mirror: &Path) -> nuthatch::publish::SyncReport {
+    stopped_publisher(dir).await;
+    nuthatch::publish::sync(dir, mirror.to_str().unwrap(), false)
+        .await
+        .expect("publish sync")
+}
+
+/// [`published`] before its mirror is written.
+pub(crate) async fn stopped_publisher(dir: &Path) {
     let tape = chain(11);
     let rt = spawn(dir, tape.clone(), PUBLISHER).await;
     let store = rt.state.store.clone();
@@ -114,9 +122,6 @@ pub(crate) async fn published(dir: &Path, mirror: &Path) -> nuthatch::publish::S
     drop(store);
     rt.shutdown().await.expect("the publisher stops");
     force_seal_through(dir, 8);
-    nuthatch::publish::sync(dir, mirror.to_str().unwrap(), false)
-        .await
-        .expect("publish sync")
 }
 
 fn recipient_balance(balances: &[(String, i128)]) -> i128 {

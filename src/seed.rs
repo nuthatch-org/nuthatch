@@ -77,9 +77,11 @@ pub async fn seed_dataset(
     let db = dir.join(crate::config::DB_FILE);
     refuse_an_indexed_nest(&db)?;
     // `schema.json` is part of the data identity, and `dev` writes a missing one at its first start,
-    // so the publisher's identity includes it. Only a missing one: regenerating a present file with
+    // so a nest directory's publisher has one. Only a missing one: regenerating a present file with
     // this binary would move the identity away from a publisher whose release wrote it differently.
-    if !dir.join("schema.json").exists() {
+    // Never in a runtime's `data/<nid>`: the runtime does not write it there, so that dataset's
+    // publisher has none, and writing it would move the dataset off the NID its mount claims.
+    if !dir.join("schema.json").exists() && !crate::runtime::MountTable::is_identity_keyed(dir) {
         crate::project::refresh_stale_artifacts(dir, &config)?;
     }
 
