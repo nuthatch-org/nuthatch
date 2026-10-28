@@ -9389,7 +9389,9 @@ mod tests {
             ));
             let cost = cost_of(state, &q).await;
             assert!(cost["sealed_bytes"] > 0, "{who}: {cost:?}");
-            assert!(cost["scan_cpu_us"] > 0, "{who}: {cost:?}");
+            // 0 where there is no per-thread CPU clock; every unix target has one.
+            assert!(cost.contains_key("scan_cpu_us"), "{who}: {cost:?}");
+            assert!(!cfg!(unix) || cost["scan_cpu_us"] > 0, "{who}: {cost:?}");
             assert_eq!(cost["hot_rows"], 2, "{who}: {cost:?}");
         }
         let opens = |t| crate::analytics::session_opens_in(tmp.path(), t);
@@ -12498,7 +12500,10 @@ mod tests {
         ] {
             let first = cost_of(&a, &path).await;
             assert!(first["sealed_bytes"] > 0, "{path}: {first:?}");
-            assert!(first["scan_cpu_us"] > 0, "the scans ran: {first:?}");
+            assert!(
+                !cfg!(unix) || first["scan_cpu_us"] > 0,
+                "the scans ran: {first:?}"
+            );
             for _ in 0..10 {
                 assert_eq!(
                     cost_of(&a, &path).await["sealed_bytes"],
