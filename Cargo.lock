@@ -4931,9 +4931,11 @@ name = "nuthatch-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dbsp",
  "feldera-size-of",
  "hex",
+ "nuthatch-decode",
  "rkyv",
  "serde",
  "serde_json",

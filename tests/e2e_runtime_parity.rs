@@ -8,7 +8,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use nuthatch::store::HotStore;
+use nuthatch::store::{CoreHotStore as _, HotStore};
 use nuthatch::{analytics, indexer, seal};
 
 use common::tape::*;

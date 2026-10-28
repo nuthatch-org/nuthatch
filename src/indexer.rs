@@ -18425,7 +18425,7 @@ template = "pool"
     /// prove, and otherwise starts without writing, even over a store no build has recorded.
     #[test]
     fn a_reader_compares_what_a_store_was_indexed_under_but_never_records_it() {
-        use crate::store::HotStore as _;
+        use crate::store::CoreHotStore as _;
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
         store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
@@ -18459,7 +18459,7 @@ template = "pool"
     /// already matches on a later start.
     #[test]
     fn an_owner_records_coverage_once_and_leaves_a_matching_store_alone() {
-        use crate::store::HotStore as _;
+        use crate::store::CoreHotStore as _;
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
         let config = covering("n", "http://a", ADDRESS, 100);

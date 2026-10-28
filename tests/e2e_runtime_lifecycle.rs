@@ -1501,7 +1501,7 @@ async fn the_lifecycle_routes_demand_the_admin_token_before_they_act() {
 /// store, as boot does, and unmounting the mount that indexes it leaves the other one indexing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unmount() {
-    use nuthatch::store::HotStore;
+    use nuthatch::store::CoreHotStore as _;
 
     let roost_dir = tempfile::tempdir().unwrap();
     let nid = "dd44".repeat(16);

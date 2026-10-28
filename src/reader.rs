@@ -20,7 +20,7 @@
 
 use crate::feed::{Line, MemStore};
 use crate::serve::{AppState, LiveRuntime, SharedNest};
-use crate::store::HotStore;
+use crate::store::{CoreHotStore as _, HotStore};
 use anyhow::{bail, Context, Result};
 use axum::extract::Request;
 use axum::http::StatusCode;
