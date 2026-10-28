@@ -575,6 +575,20 @@ pub(crate) mod tests {
         .expect("a lowered cursor still starts the shipped split");
     }
 
+    /// What `spawn_cursor` and `build_nest` call: the cursor's ceiling reaches the env-read config.
+    #[test]
+    fn the_startup_check_takes_the_cursor_ceiling() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _v = EnvVars::set(&[(ENV_BURRMILL_MEMORY_LIMIT, "2048MB")]);
+        assert!(validate_cursor_budget(1, None).is_err());
+        assert!(validate_cursor_budget(1, Some(DEFAULT_MAX_RSS_MB)).is_err());
+        validate_cursor_budget(1, Some(4096)).expect("3,072 MB under the cursor's 4,096");
+        assert!(
+            validate_strict_budget(Some(4096)).is_err(),
+            "two pools of 2,048"
+        );
+    }
+
     /// #1899: the QoS nest's settings under the 2 GiB wall. Burrmill's limit is what counted, so the
     /// refusal names it and what would fit, not analytics.memory_limit, which it overrides.
     #[test]
