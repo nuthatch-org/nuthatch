@@ -365,6 +365,12 @@ pub trait HotStore: Send + Sync {
         Ok(None)
     }
 
+    /// What versions taken by [`HotStore::pinned`] and still read hold beside the latest, in bytes.
+    /// Zero where nothing is kept in memory per version.
+    fn retained_bytes(&self) -> u64 {
+        0
+    }
+
     /// RFC-0073 FR1: a snapshot of the mirrored tables and a receiver for every commit after it, or
     /// `None` from a backend with no feed.
     fn feed_subscribe(&self) -> Result<Option<crate::feed::Subscription>> {
@@ -2471,6 +2477,9 @@ fn unix_now() -> i64 {
 impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     fn pinned(&self) -> Result<Option<Arc<dyn HotStore>>> {
         (**self).pinned()
+    }
+    fn retained_bytes(&self) -> u64 {
+        (**self).retained_bytes()
     }
     fn released(&self) -> futures::future::BoxFuture<'static, ()> {
         (**self).released()

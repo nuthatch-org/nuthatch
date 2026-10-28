@@ -1513,6 +1513,7 @@ fn runtime_metrics(
     body.push_str(&health.render_metrics());
     for (_, nest) in nests {
         body.push_str(&entity_metrics(&nest.current()));
+        body.push_str(&snapshot_metrics(&nest.current()));
     }
     (
         [(
@@ -1532,6 +1533,7 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
         body.push_str(&health.render_metrics());
     }
     body.push_str(&entity_metrics(&s));
+    body.push_str(&snapshot_metrics(&s));
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1588,6 +1590,21 @@ pub const ENTITY_SERIES: &[(&str, &str)] = &[
         "Bytes the entity's DBSP circuit held at its last sample.",
     ),
 ];
+
+/// What versions of the hot copy and derived state requests still read hold beside the latest (#2467).
+fn snapshot_metrics(s: &AppState) -> String {
+    let nest = s.nest_info.get("name").and_then(Value::as_str).unwrap_or("");
+    let bytes = s.balances.retained_bytes()
+        + s.exposure.retained_bytes()
+        + s.velocity.retained_bytes()
+        + s.entities.iter().map(|e| e.retained_bytes()).sum::<u64>()
+        + s.store.retained_bytes();
+    format!(
+        "# HELP nuthatch_snapshot_retained_bytes Bytes that versions still being read hold beside the latest.\n\
+         # TYPE nuthatch_snapshot_retained_bytes gauge\n\
+         nuthatch_snapshot_retained_bytes{{nest=\"{nest}\"}} {bytes}\n"
+    )
+}
 
 fn entity_metrics(s: &AppState) -> String {
     if s.entities.is_empty() {

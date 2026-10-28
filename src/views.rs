@@ -507,6 +507,30 @@ mod tests {
         assert_eq!(bal.get("0xwhale"), Some(&(2 * big)));
     }
 
+    /// #2467: a pinned view answers from its version while the view moves on, and the version is
+    /// charged only while it is held.
+    #[test]
+    fn a_pinned_view_keeps_its_version_and_is_charged_while_held() {
+        let view = BalanceView::start().unwrap();
+        let batch: WeightedBatch = (0..1_000)
+            .flat_map(|i| transfer_deltas("0xminter", &format!("0x{i:040x}"), 1, 1))
+            .collect();
+        view.apply(batch);
+        view.flush();
+        let pinned = view.pinned();
+        assert_eq!(view.retained_bytes(), 0);
+        view.apply(transfer_deltas("0xminter", "0xnew", 7, 1));
+        view.flush();
+        assert_eq!(pinned.balance("0xnew"), None);
+        assert_eq!(pinned.holders(), 1_001);
+        assert_eq!(view.balance("0xnew"), Some(7));
+        let retained = view.retained_bytes();
+        assert!(retained > 0, "the pinned version keeps the chunks the batch replaced");
+        assert!(retained < 1_000 * 50, "and only those: {retained}");
+        drop(pinned);
+        assert_eq!(view.retained_bytes(), 0);
+    }
+
     /// A flush barrier returns only once queued work is drained - the property `rebuild` relies on.
     #[test]
     fn flush_waits_for_enqueued_work() {

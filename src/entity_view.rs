@@ -1491,6 +1491,43 @@ mod tests {
         assert!(!why.contains("max_rows exceeded"), "400 rows fit: {why}");
     }
 
+    /// #2467: versions requests still read are charged to the entity's allowance with its state.
+    #[test]
+    fn versions_still_read_count_against_the_allowance() {
+        assert_eq!(over_allowance(600, 0, 1_000), None);
+        let why = over_allowance(600, 500, 1_000).expect("600 + 500 is past 1,000");
+        assert!(why.contains("versions still being read hold 500"), "{why}");
+    }
+
+    /// #2467: a pinned entity answers from its version while the entity folds on, and that version is
+    /// charged only while it is held.
+    #[test]
+    fn a_pinned_entity_keeps_its_version_and_is_charged_while_held() {
+        let reg = registry();
+        let v = EntityView::start("received", &received(), &cols(), &reg, 10_000, false).unwrap();
+        let logs: Vec<_> = (0..500u64)
+            .map(|i| {
+                let to = format!("0x{:040x}", i + 1);
+                log(TRANSFER_TOPIC0, ALICE, &to, "1", 100, i)
+            })
+            .collect();
+        v.apply_window(&decode(&reg, &logs), 1, 100).unwrap();
+        v.flush();
+        let pinned = v.pinned();
+        v.apply_window(
+            &decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "7", 101, 0)]),
+            1,
+            101,
+        )
+        .unwrap();
+        v.flush();
+        assert_eq!((pinned.len(), pinned.applied_through()), (500, 100));
+        assert_eq!((v.len(), v.applied_through()), (501, 101));
+        assert!(v.retained_bytes() > 0);
+        drop(pinned);
+        assert_eq!(v.retained_bytes(), 0);
+    }
+
     #[test]
     fn crossing_max_rows_faults_the_circuit_rather_than_warning() {
         // Criterion 10: neither warns-and-continues nor OOMs the cursor.

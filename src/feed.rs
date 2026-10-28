@@ -885,10 +885,6 @@ impl MemStore {
         Arc::downgrade(&self.copy)
     }
 
-    /// What versions requests still read hold beside the latest, in bytes.
-    pub fn retained_bytes(&self) -> u64 {
-        self.copy.mirror.retained()
-    }
 
     pub fn from_snapshot(dir: &Path, snapshot: Snapshot) -> MemStore {
         let entities = snapshot.entities.map;
@@ -1204,6 +1200,10 @@ fn block_of(key: &str) -> Result<u64> {
 
 #[async_trait::async_trait]
 impl HotStore for MemStore {
+    fn retained_bytes(&self) -> u64 {
+        self.copy.mirror.retained()
+    }
+
     fn pinned(&self) -> Result<Option<Arc<dyn HotStore>>> {
         let _applying = self.copy.applying.lock().unwrap_or_else(|e| e.into_inner());
         let at = (
@@ -1596,6 +1596,41 @@ mod tests {
             HotStore::recent_by_table(&copy, "c", 10).unwrap(),
             store.recent_by_table("c", 10).unwrap()
         );
+    }
+
+    /// #2467: a version a request still reads is charged beside the copy, only for what it holds
+    /// alone, and only until the request lets it go.
+    #[test]
+    fn a_version_a_request_reads_is_charged_until_it_is_released() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
+        let rows: Vec<_> = (1..=400).map(|b| row(b, 0, "t")).collect();
+        store.commit_window(&rows, None, 400).unwrap();
+        let mut sub = store.feed_subscribe().unwrap();
+        let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot.clone());
+        let alone = copy.bytes();
+        let held = HotStore::pinned(&copy).unwrap().unwrap();
+        assert_eq!(copy.bytes(), alone, "the latest version is not charged twice");
+
+        store.commit_window(&[row(5, 1, "t")], None, 401).unwrap();
+        let delta = sub.deltas.try_recv().unwrap();
+        // Charged before the delta lands, so a cap sees what the held version keeps.
+        assert!(copy.peak_with(&delta) > alone);
+        copy.apply(&delta).unwrap();
+        let retained = copy.retained_bytes();
+        assert!(retained > 0, "the held version keeps the chunk the delta replaced");
+        assert!(
+            retained < alone / 4,
+            "only the chunks the delta touched: {retained} of {alone}"
+        );
+        let latest = copy.copy.mirror.load().bytes;
+        assert_eq!(copy.bytes(), latest + retained);
+        assert_eq!(HotStore::count(&*held).unwrap(), 400, "the held version");
+        assert_eq!(HotStore::count(&copy).unwrap(), 401, "the latest");
+
+        drop(held);
+        assert_eq!(copy.retained_bytes(), 0);
+        assert_eq!(copy.bytes(), latest);
     }
 
     /// The seal's prune, its watermark and its catalogue arrive in one delta.
