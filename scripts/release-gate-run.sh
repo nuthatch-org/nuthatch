@@ -24,6 +24,11 @@
 # release-gate/<name>. The exit is the worst of theirs. See deploy/release-gate/nests.conf.example.
 #   <name> <copy> <query set> <env file> <refresh: helsinki | local | none>
 #
+# The rolling upgrade (RFC-0073 FR7): after the nests, the candidate is run through
+# scripts/rolling-upgrade.sh once, against the latest release older than it, and posts
+# release-gate/rolling-upgrade, naming whether it ran across releases or fell back to one binary.
+# A poll runs it only for the newest release, and only if that has no such status yet.
+#
 # Environment:
 #   GATE_NESTS    the nests' config file; unset means the one nest the variables below describe
 #   GATE_STATE    working directory: binaries and run logs             (default ~/release-gate)
@@ -42,6 +47,8 @@
 #   GATE_PASSES   passes per binary            (default 3)
 #   GATE_CONCURRENCY  statements in flight at once (default 2, as 8107's SQL_MAX_CONCURRENCY); a
 #                     GATE_ENV that sets NUTHATCH_SQL_MAX_CONCURRENCY decides it instead
+#   GATE_ROLLING  1 gates the nests then the rolling upgrade (default), 0 the nests only, only the
+#                 rolling upgrade only. It needs a fixture-rpc: FIXTURE_RPC, or cargo to build one
 set -euo pipefail
 
 name=${GATE_NAME:-alloc-nest}
@@ -68,7 +75,7 @@ while [ $# -gt 0 ]; do
     --sha) [ $# -ge 2 ] || die "--sha needs a commit"; sha=$2; shift 2 ;;
     --production) [ $# -ge 2 ] || die "--production needs a tag"; production_flag=$2; shift 2 ;;
     --no-status) post=0; shift ;;
-    -h|--help) sed -n '2,47p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,51p' "$0"; exit 0 ;;
     --*) die "unknown option $1" ;;
     *) [ -z "$tag" ] || die "one tag at a time"; tag=$1; shift ;;
   esac
@@ -77,6 +84,119 @@ modes=$(( poll + (${#tag} > 0 ? 1 : 0) + (${#local_bin} > 0 ? 1 : 0) ))
 [ "$modes" -eq 1 ] || die "give exactly one of <tag>, --poll, --binary PATH --sha SHA"
 [ -z "$local_bin" ] || [ -n "$sha" ] || die "--binary needs --sha: the status has to land on a commit"
 command -v gh >/dev/null || die "gh is not on PATH"
+rolling=${GATE_ROLLING:-1}
+case "$rolling" in 0 | 1 | only) ;; *) die "GATE_ROLLING is 0, 1 or only, not $rolling" ;; esac
+
+# shellcheck source=gate/semver.sh
+. "$here/gate/semver.sh"
+
+status_posted=0
+post_status() {
+  local st=$1 desc=$2 ctx=$CONTEXT
+  desc=${desc:0:140}
+  if [ "$post" -eq 0 ]; then
+    log "status (not posted): $ctx $st - $desc"
+    return 0
+  fi
+  gh api -X POST "repos/$repo/statuses/$sha" -f state="$st" -f context="$ctx" \
+    -f description="$desc" >/dev/null
+  # A pending status left behind by a dying run would read as "still running" for ever.
+  [ "$st" = pending ] || [ "$ctx" != "$CONTEXT" ] || status_posted=1
+  log "posted $ctx $st on $sha: $desc"
+}
+
+sha256_check() {
+  local dir=$1 file=$2
+  if command -v sha256sum >/dev/null; then
+    (cd "$dir" && sha256sum -c "$file.sha256" >/dev/null)
+  else
+    (cd "$dir" && shasum -a 256 -c "$file.sha256" >/dev/null)
+  fi
+}
+
+# Download and verify one release's binary; prints its path.
+fetch() {
+  local t=$1 dir=$state/bins/$1 asset=nuthatch-$target.tar.gz
+  if [ ! -x "$dir/nuthatch" ]; then
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    gh release download "$t" -R "$repo" -p "$asset" -p "$asset.sha256" -D "$dir" >&2 \
+      || die "could not download $asset from $t"
+    sha256_check "$dir" "$asset" || die "$asset from $t fails its checksum"
+    tar -xzf "$dir/$asset" -C "$dir"
+    local found
+    found=$(find "$dir" -type f -name nuthatch | head -n 1)
+    [ -n "$found" ] || die "no nuthatch binary inside $asset from $t"
+    [ "$found" = "$dir/nuthatch" ] || mv "$found" "$dir/nuthatch"
+    chmod +x "$dir/nuthatch"
+  fi
+  printf '%s\n' "$dir/nuthatch"
+}
+
+commit_of() { gh api "repos/$repo/commits/$1" --jq .sha; }
+
+# The newest status for the context decides. A pending one older than GATE_STALE_SECS is a run that
+# died before posting its verdict, so the release is gated again rather than left pending forever.
+has_status() {
+  gh api "repos/$repo/commits/$1/statuses" --jq "[.[] | select(.context == \"$CONTEXT\")] | first
+    | if . == null then \"none\"
+      elif .state == \"pending\" and (now - (.updated_at | fromdate)) > ${GATE_STALE_SECS:-7200} then \"stale\"
+      else .state end" | grep -qvE '^(none|stale)$'
+}
+
+# The rolling upgrade belongs to the candidate, not to a nest, so it runs once, after the nests.
+if [ "$rolling" = 1 ]; then
+  rc_nests=0 rc_rolling=0
+  GATE_ROLLING=0 "$0" ${args[@]+"${args[@]}"} || rc_nests=$?
+  GATE_ROLLING=only "$0" ${args[@]+"${args[@]}"} || rc_rolling=$?
+  if [ "$rc_nests" -gt 1 ] || [ "$rc_rolling" -gt 1 ]; then exit 2; fi
+  if [ "$rc_nests" -eq 1 ] || [ "$rc_rolling" -eq 1 ]; then exit 1; fi
+  exit 0
+fi
+
+if [ "$rolling" = only ]; then
+  CONTEXT=release-gate/rolling-upgrade
+  mkdir -p "$state/bins" "$state/runs"
+  trap 'rc=$?; if [ "$rc" -gt 1 ] && [ "$status_posted" -eq 0 ] && [ -n "$sha" ]; then
+    post_status error "the rolling upgrade could not run (exit $rc); see $state/runs on the gate box" || true; fi' EXIT
+  if [ "$poll" -eq 1 ]; then
+    # Only the newest release: every older one predates this step, and walking back through them
+    # is what --poll did to the nests on 2026-10-03.
+    listed=$(gh release list -R "$repo" -L 20 --json tagName,isDraft \
+      --jq '.[] | select(.isDraft | not) | .tagName') || die "could not list the releases of $repo"
+    newest=$(printf '%s\n' "$listed" | head -n 1)
+    [ -n "$newest" ] || exit 0
+    c=$(commit_of "$newest")
+    ! has_status "$c" || exit 0
+    tag=$newest
+    log "gating the rolling upgrade to $tag, the newest release, which has no $CONTEXT status"
+  fi
+  if [ -n "$tag" ]; then
+    sha=$(commit_of "$tag")
+    label=$tag
+    cand_bin=$(fetch "$tag")
+  else
+    [ -x "$local_bin" ] || die "not an executable: $local_bin"
+    label="local build of ${sha:0:12}"
+    cand_bin=$local_bin
+  fi
+  run=$state/runs/$(date -u +%Y%m%dT%H%M%SZ)-rolling-upgrade-${tag:-${sha:0:12}}
+  mkdir -p "$run"
+  post_status pending "replacing followers, then the writer, from the previous release to $label"
+  log "rolling upgrade to $label"
+  rc=0
+  ROLLING_OUT=$run/out GATE_REPO=$repo GATE_TARGET=$target \
+    "${GATE_ROLLING_SCRIPT:-$here/rolling-upgrade.sh}" "$cand_bin" >"$run/rolling.txt" 2>&1 || rc=$?
+  cat "$run/rolling.txt"
+  mode=$(sed -n 's/^rolling-upgrade: MODE //p' "$run/rolling.txt" | head -n 1)
+  why=$(grep -E '^rolling-upgrade: FAIL: ' "$run/rolling.txt" | tail -n 1 | sed 's/^rolling-upgrade: FAIL: //' || true)
+  case "$rc" in
+    0) post_status success "passed, ${mode:-mode not reported}" ;;
+    1) post_status failure "${mode:-mode not reported}: ${why:-failed}" ;;
+    *) post_status error "could not run (exit $rc)${mode:+, $mode}; see $run" ; exit 2 ;;
+  esac
+  exit "$rc"
+fi
 
 # A config path as written, ~ for $HOME, else relative to the config file's directory.
 conf_path() {
@@ -149,7 +269,6 @@ mkdir -p "$state/bins" "$state/runs" "$(dirname "$nest")"
 # same lock, so a run by hand waits for this one, and the children here ride on it.
 # shellcheck source=gate/lock.sh
 . "$here/gate/lock.sh"
-status_posted=0
 cleanup() {
   rc=$?
   gate_unlock
@@ -159,59 +278,6 @@ cleanup() {
 }
 trap cleanup EXIT
 gate_lock "$nest" || die "could not take the lock on $nest"
-
-post_status() {
-  local st=$1 desc=$2 ctx=$CONTEXT
-  desc=${desc:0:140}
-  if [ "$post" -eq 0 ]; then
-    log "status (not posted): $ctx $st - $desc"
-    return 0
-  fi
-  gh api -X POST "repos/$repo/statuses/$sha" -f state="$st" -f context="$ctx" \
-    -f description="$desc" >/dev/null
-  # A pending status left behind by a dying run would read as "still running" for ever.
-  [ "$st" = pending ] || [ "$ctx" != "$CONTEXT" ] || status_posted=1
-  log "posted $ctx $st on $sha: $desc"
-}
-
-sha256_check() {
-  local dir=$1 file=$2
-  if command -v sha256sum >/dev/null; then
-    (cd "$dir" && sha256sum -c "$file.sha256" >/dev/null)
-  else
-    (cd "$dir" && shasum -a 256 -c "$file.sha256" >/dev/null)
-  fi
-}
-
-# Download and verify one release's binary; prints its path.
-fetch() {
-  local t=$1 dir=$state/bins/$1 asset=nuthatch-$target.tar.gz
-  if [ ! -x "$dir/nuthatch" ]; then
-    rm -rf "$dir"
-    mkdir -p "$dir"
-    gh release download "$t" -R "$repo" -p "$asset" -p "$asset.sha256" -D "$dir" >&2 \
-      || die "could not download $asset from $t"
-    sha256_check "$dir" "$asset" || die "$asset from $t fails its checksum"
-    tar -xzf "$dir/$asset" -C "$dir"
-    local found
-    found=$(find "$dir" -type f -name nuthatch | head -n 1)
-    [ -n "$found" ] || die "no nuthatch binary inside $asset from $t"
-    [ "$found" = "$dir/nuthatch" ] || mv "$found" "$dir/nuthatch"
-    chmod +x "$dir/nuthatch"
-  fi
-  printf '%s\n' "$dir/nuthatch"
-}
-
-commit_of() { gh api "repos/$repo/commits/$1" --jq .sha; }
-
-# The newest status for the context decides. A pending one older than GATE_STALE_SECS is a run that
-# died before posting its verdict, so the release is gated again rather than left pending forever.
-has_status() {
-  gh api "repos/$repo/commits/$1/statuses" --jq "[.[] | select(.context == \"$CONTEXT\")] | first
-    | if . == null then \"none\"
-      elif .state == \"pending\" and (now - (.updated_at | fromdate)) > ${GATE_STALE_SECS:-7200} then \"stale\"
-      else .state end" | grep -qvE '^(none|stale)$'
-}
 
 full_releases="" listed_full=0
 # Sets production and production_from for candidate $1: --production; else the version the copy's
@@ -241,43 +307,6 @@ resolve_production() {
     production_from=latest
   fi
   [ -n "$production" ] || die "no full release to measure as production; pass --production"
-}
-
-is_num() { case "$1" in '' | *[!0-9]*) return 1 ;; esac; }
-
-# semver_gt A B: tag A is a newer version than tag B. A leading v and any +build are ignored, a
-# prerelease sorts before its release, and prerelease identifiers compare as numbers where both are.
-# A tag that is not a version is never newer.
-semver_gt() {
-  local a=${1#v} b=${2#v} ac bc ap bp a1 a2 a3 b1 b2 b3 rest x y
-  a=${a%%+*} b=${b%%+*}
-  ac=${a%%-*} bc=${b%%-*}
-  ap=${a#"$ac"} bp=${b#"$bc"}
-  ap=${ap#-} bp=${bp#-}
-  IFS=. read -r a1 a2 a3 rest <<<"$ac"
-  IFS=. read -r b1 b2 b3 rest <<<"$bc"
-  for x in "$a1" "$a2" "$a3" "$b1" "$b2" "$b3"; do is_num "${x:-0}" || return 1; done
-  a1=${a1:-0} a2=${a2:-0} a3=${a3:-0} b1=${b1:-0} b2=${b2:-0} b3=${b3:-0}
-  if [ "$a1" -ne "$b1" ]; then [ "$a1" -gt "$b1" ]; return; fi
-  if [ "$a2" -ne "$b2" ]; then [ "$a2" -gt "$b2" ]; return; fi
-  if [ "$a3" -ne "$b3" ]; then [ "$a3" -gt "$b3" ]; return; fi
-  [ "$ap" != "$bp" ] || return 1
-  [ -n "$ap" ] || return 0
-  [ -n "$bp" ] || return 1
-  while :; do
-    x=${ap%%.*} y=${bp%%.*}
-    if [ "$x" != "$y" ]; then
-      if is_num "$x" && is_num "$y"; then [ "$x" -gt "$y" ]; return; fi
-      if is_num "$x"; then return 1; fi
-      if is_num "$y"; then return 0; fi
-      [ "$x" \> "$y" ]
-      return
-    fi
-    # Equal so far: the one with fewer identifiers is the older.
-    [ "$ap" != "$x" ] || return 1
-    [ "$bp" != "$y" ] || return 0
-    ap=${ap#*.} bp=${bp#*.}
-  done
 }
 
 if [ "$poll" -eq 1 ]; then
