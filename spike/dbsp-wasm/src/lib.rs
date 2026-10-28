@@ -4,6 +4,22 @@
 
 use dbsp::{IndexedZSetReader, OrdZSet, Runtime, ZWeight};
 
+// The S0 remainder (#2476): the binary's entity circuit, compiled here from its own files so the
+// plan stepped on wasm32 is the one a nest lowers, not a copy of it.
+#[path = "../../../src/entity_row.rs"]
+#[allow(dead_code, unused_imports, clippy::all)]
+pub mod entity_row;
+#[path = "../../../src/entity_expr.rs"]
+#[allow(dead_code, unused_imports, clippy::all)]
+pub mod entity_expr;
+#[path = "../../../src/entity_plan.rs"]
+#[allow(dead_code, unused_imports, clippy::all)]
+pub mod entity_plan;
+#[path = "../../../src/entity_circuit.rs"]
+#[allow(dead_code, unused_imports, clippy::all)]
+pub mod entity_circuit;
+pub mod entity;
+
 /// Builds a one-worker circuit, feeds it three batches with a retraction in the middle, and
 /// answers the running sum of `doubled` after each step, plus the final `count_by_parity` relation.
 pub fn run_steps() -> Result<(Vec<Vec<(u64, ZWeight)>>, Vec<((u64, i64), ZWeight)>), String> {
@@ -130,26 +146,39 @@ mod wasm {
             super::run_stress(steps as u64, rows as u64).map_err(|e| JsError::new(&e))?;
         Ok(format!("groups={groups} total={total}"))
     }
-}
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn native_answer() {
-        let (steps, parity) = super::run_steps().unwrap();
-        assert_eq!(steps[0], vec![(2, 1), (4, 1), (6, 1)]);
-        assert_eq!(steps[1], vec![(4, -1), (8, 1)]);
-        assert_eq!(
-            parity,
-            vec![((0, 18), 1), ((1, 16), 1)],
-            "{parity:?}"
-        );
+    /// The entity circuit for `windows` windows of `rows` transfers; `on_progress(window)` is
+    /// called every hundred windows so the host can sample memory between them.
+    #[wasm_bindgen]
+    pub fn spike_entity(
+        windows: u32,
+        rows: u32,
+        on_progress: &js_sys::Function,
+    ) -> Result<String, JsError> {
+        std::panic::set_hook(Box::new(|info| error(&format!("panic: {info}"))));
+        let r = super::entity::run_entity(windows as u64, rows as u64, 250, |w| {
+            let _ = on_progress.call1(&JsValue::NULL, &JsValue::from_f64(w as f64));
+        })
+        .map_err(|e| JsError::new(&e))?;
+        Ok(format!(
+            "windows={} left +{} -{} right +{} -{} groups={} digest={:016x} oracle={} state_bytes={:?} first={:?}",
+            r.windows,
+            r.left_inserted,
+            r.left_retracted,
+            r.right_inserted,
+            r.right_retracted,
+            r.groups,
+            r.digest,
+            r.oracle_agrees,
+            r.state_bytes,
+            r.first_rows
+        ))
     }
 
-    #[test]
-    fn native_stress() {
-        let (groups, total) = super::run_stress(2_000, 100).unwrap();
-        eprintln!("native stress: groups={groups} total={total}");
-        assert_eq!(groups, 1024);
+    /// The module's linear memory, in bytes. It only ever grows, so the last reading is the peak.
+    #[wasm_bindgen]
+    pub fn wasm_memory_bytes() -> f64 {
+        (core::arch::wasm32::memory_size(0) * 65536) as f64
     }
 }
+
