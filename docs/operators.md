@@ -466,20 +466,28 @@ Nests live in their own repositories rather than in-tree; see the
 
 ## Capacity and sizing
 
-**The budget is per active-chain cursor: 2 GB RAM.** A runtime's total is the sum of its cursors. This
-is a CI-enforced ceiling, not an aspiration. `max_rss_mb` (default 2048) is each cursor's ceiling,
-and a mount projected past it is refused. At boot the mounts on a cursor are admitted in
-`mounts.toml` order, as a live mount would be: those that fit start, and the rest start quarantined
-with the refusal as their reason, in `GET /nests` and `/ready` (RFC-0073 FR5). Each cursor may also
-carry 32 authored entities at 2048 MB, proportionally fewer below. `PUT /_admin/runtime` raises or
-lowers the ceiling live, up to 2048 and never below what a cursor already holds, and records it in
-`mounts.toml` ([admin API](admin-api.md#the-memory-ceiling)). More nests than fit in 2 GB is a second
-runtime, not a larger ceiling. `dev` also refuses to start unless the analytical split itself fits
-that ceiling (RFC-0047 C4):
+**The budget is per active-chain cursor: 2 GB RAM.** A runtime's total is the sum of its cursors. It
+is the budget nuthatch is designed and gated for: CI fails a build that takes a cursor past it at the
+default ceiling. `max_rss_mb` (default 2048) is each cursor's ceiling, and a mount projected past it
+is refused. At boot the mounts on a cursor are admitted in `mounts.toml` order, as a live mount would
+be: those that fit start, and the rest start quarantined with the refusal as their reason, in `GET
+/nests` and `/ready` (RFC-0073 FR5). Each cursor may also carry 32 authored entities for each 2048 MB
+of ceiling, rounded down. `PUT /_admin/runtime` raises or lowers the ceiling live, never below what a
+cursor already holds, and records it in `mounts.toml` ([admin API](admin-api.md#the-memory-ceiling)).
+
+**An operator may raise it.** On a machine with more RAM, a `max_rss_mb` above 2048 is your choice
+and nothing in nuthatch needs it (#2441). Boot logs once that the ceiling is above the default, and
+`GET /_admin/runtime` says `"above_default": true`. Nothing measures a cursor above 2 GB for you, so
+size it from `rss_bytes` in `GET /nests` on your own workload. A second runtime remains the other way
+to hold more nests. `dev` also refuses to start unless the analytical split itself fits that
+ceiling (RFC-0047 C4):
 
 ```
-(pools × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB
+(pools × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ wall
 ```
+
+The wall is 2 GiB, raised by `NUTHATCH_MAX_RSS` or by a `max_rss_mb` above 2048, whichever is
+higher. A `max_rss_mb` below 2048 does not lower it.
 
 `pools` is the smaller of `sql_permits` and the number of nest datasets on the cursor, since a
 dataset's sessions share one pool however many permits it has (#1825). `sql_permits` is
@@ -507,7 +515,7 @@ and is refused at startup.
 `ingestion_reservation` alone may be raised and not lowered, which is what makes the inequality worth
 having. The consequence is the property to hold onto: **no configuration this gate accepts gives
 analytics more RAM than the shipped default that the footprint CI job measures**, unless the operator
-has raised the wall with `NUTHATCH_MAX_RSS`, or measured both terms below, and so said what the process holds. The gate is
+has raised the wall with `NUTHATCH_MAX_RSS` or `max_rss_mb`, or measured both terms below, and so said what the process holds. The gate is
 arithmetic over the walls, not an enforcement of ingest RSS; ingest, DBSP, redb and result
 materialisation are still bounded by the `max_rss_mb` wall and the footprint job, not by this sum.
 

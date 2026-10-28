@@ -374,8 +374,14 @@ impl App {
         Some(chains.len())
     }
 
+    /// The roster's `max_rss_mb_per_cursor` per cursor, which an operator may set above the default.
     pub fn budget_bytes(&self) -> Option<f64> {
-        self.cursors().map(|c| CURSOR_BUDGET_BYTES * c as f64)
+        let per_cursor = self
+            .nests
+            .value()
+            .and_then(|b| b.get("max_rss_mb_per_cursor")?.as_f64())
+            .map_or(CURSOR_BUDGET_BYTES, |mb| mb * 1024.0 * 1024.0);
+        self.cursors().map(|c| per_cursor * c as f64)
     }
 
     pub fn metric(&self, name: &str, labels: &[(&str, &str)]) -> Option<f64> {

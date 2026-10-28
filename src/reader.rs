@@ -719,7 +719,12 @@ impl Follower {
             .sum();
         let own = inner.estimates.get(dataset).copied().unwrap_or(0);
         let retiring = inner.retiring_on(&chain);
-        Some((inner.max_rss_mb * MIB).saturating_sub(others + own + retiring))
+        Some(
+            inner
+                .max_rss_mb
+                .saturating_mul(MIB)
+                .saturating_sub(others + own + retiring),
+        )
     }
 
     /// Stop serving `dataset`'s copy so its replacement can load under the full budget: its routes

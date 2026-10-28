@@ -180,7 +180,7 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
                 "this query exceeded analytics.max_temp_size (NUTHATCH_ANALYTICS_MAX_TEMP_SIZE). \
                  It cannot run in its disk budget; block processing is not degraded. Raise \
                  analytics.max_temp_size or reduce the query. That cap is disk, not RAM, and does \
-                 not change the 2 GiB cursor equation."
+                 not change the cursor's RAM equation."
                     .into(),
             );
         }
@@ -189,7 +189,7 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
              is set, otherwise analytics.memory_limit (NUTHATCH_ANALYTICS_MEMORY_LIMIT, default \
              512MB). It cannot run in its budget; block processing is not degraded. Lower the \
              query, or raise the limit in effect only if (sql_permits × that limit) + \
-             ingestion_reservation still fits the 2 GiB per-cursor ceiling."
+             ingestion_reservation still fits the per-cursor ceiling, 2 GiB unless raised."
                 .into(),
         );
     }

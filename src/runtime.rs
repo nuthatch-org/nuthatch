@@ -579,8 +579,13 @@ fn refuse_route_collisions<'a>(routes: impl IntoIterator<Item = &'a str>) -> Res
 }
 
 /// The default per-cursor RSS ceiling: the CLAUDE.md ≤2 GB budget (RFC-0021 - now per active-chain
-/// cursor, not per whole runtime).
+/// cursor, not per whole runtime). It is what nuthatch's own design must fit and CI gates; an
+/// operator may give a cursor more by choice (#2441).
 pub const DEFAULT_MAX_RSS_MB: u64 = 2048;
+
+/// The most `PUT /_admin/runtime` accepts, 1 TiB. Far past any one cursor, and it refuses a figure
+/// typed in bytes or KiB before anything multiplies it into bytes.
+pub const MAX_RSS_MB_CEILING: u64 = 1 << 20;
 
 // A deliberately rough, *honest* per-runtime footprint model (RFC-0012 §3). These are order-of-
 // magnitude estimates for the pre-mount projection, not measurements - the roster reports the real
@@ -679,12 +684,13 @@ pub(crate) fn entity_allowance_bytes(max_rows: u64, reads_offchain: bool) -> u64
 /// generous rather than fitted, since the MB budget is what should bind first on any realistic nest.
 const MAX_ENTITIES_PER_CURSOR: usize = 32;
 
-/// The entity ceiling of a cursor held to `ceiling_mb` (RFC-0073 FR5): [`MAX_ENTITIES_PER_CURSOR`] at
-/// the 2 GiB budget, proportionally fewer below it, and never more above it, so a `mounts.toml` past
-/// 2048 (#2441) buys no threads.
+/// The entity ceiling of a cursor held to `ceiling_mb` (RFC-0073 FR5): [`MAX_ENTITIES_PER_CURSOR`] for
+/// each 2 GiB of ceiling, rounded down, so it scales with the budget above the default as below it.
 pub fn max_entities_per_cursor(ceiling_mb: u64) -> usize {
-    (MAX_ENTITIES_PER_CURSOR as u64 * ceiling_mb.min(DEFAULT_MAX_RSS_MB) / DEFAULT_MAX_RSS_MB)
-        as usize
+    usize::try_from(
+        (MAX_ENTITIES_PER_CURSOR as u64).saturating_mul(ceiling_mb) / DEFAULT_MAX_RSS_MB,
+    )
+    .unwrap_or(usize::MAX)
 }
 
 /// RFC-0041 §7 criterion 11: the explicit per-cursor ceiling on authored entities.
@@ -2086,6 +2092,14 @@ pub async fn dev(
     }
     let meta = &mounts.runtime;
     let endpoints = mounts.chain_endpoints()?;
+    // The RSS budget is now **per active-chain cursor** (RFC-0021), not per whole runtime.
+    let max_rss = meta.max_rss_mb.unwrap_or(DEFAULT_MAX_RSS_MB);
+    if max_rss > DEFAULT_MAX_RSS_MB {
+        tracing::info!(
+            "max_rss_mb is {max_rss} MB per cursor, raised by the operator above the \
+             {DEFAULT_MAX_RSS_MB} MB default nuthatch is designed and gated for"
+        );
+    }
 
     // Load every mounted **dataset** - not every alias (RFC-0032 §4). Aliases sharing one nest
     // identity share one store and one place in the cursor; only the canonical one indexes, and the
@@ -2121,10 +2135,11 @@ pub async fn dev(
             &ipfs_gateways,
             &state_rpc,
         );
+        config.cursor_max_rss_mb = Some(max_rss);
     }
     let groups = group_by_chain(&endpoints, mounted)?;
     if meta.isolation == crate::isolation::Isolation::Strict {
-        crate::analytics_budget::validate_strict_budget()?;
+        crate::analytics_budget::validate_strict_budget(Some(max_rss))?;
     }
 
     // A mount may narrow its author's ceiling, never widen it (RFC-0034 §3). Checked before any
@@ -2192,8 +2207,6 @@ pub async fn dev(
             format!("/{}/_admin/", m.route_key(&mounts.tenant_default()))
         });
     let admin_token = indexer::admin_required_token(admin_enabled, &dir, &listen, &ui)?;
-    // The RSS budget is now **per active-chain cursor** (RFC-0021), not per whole runtime.
-    let max_rss = meta.max_rss_mb.unwrap_or(DEFAULT_MAX_RSS_MB);
 
     // Bring up one cursor per chain group: its own source + `spawn_runtime`, isolated tip/finality/reorg,
     // and held to the per-cursor RSS budget. A cursor's failure quarantines that cursor alone (RFC-0026).
@@ -4731,8 +4744,8 @@ struct CursorUse {
 /// Why `PUT /_admin/runtime` refused a ceiling (RFC-0073 FR5).
 #[derive(Debug)]
 pub enum CeilingRefusal {
-    /// The ≤2 GB budget per cursor is the ceiling: more nests than fit is a second runtime.
-    AboveBudget { requested: u64 },
+    /// Above [`MAX_RSS_MB_CEILING`].
+    AboveLimit { requested: u64 },
     /// A cursor already projects more than the value asked for. `chain` is `None` for the
     /// runtime's own base, which every cursor pays.
     BelowUse {
@@ -4752,10 +4765,10 @@ pub enum CeilingRefusal {
 impl std::fmt::Display for CeilingRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CeilingRefusal::AboveBudget { requested } => write!(
+            CeilingRefusal::AboveLimit { requested } => write!(
                 f,
-                "max_rss_mb {requested} is above the {DEFAULT_MAX_RSS_MB} MB budget per cursor; a \
-                 runtime that needs more nests than fit is split into a second runtime"
+                "max_rss_mb {requested} is above the {MAX_RSS_MB_CEILING} MB this accepts; it is \
+                 in MB, not bytes"
             ),
             CeilingRefusal::BelowUse {
                 requested,
@@ -4794,7 +4807,7 @@ impl std::error::Error for CeilingRefusal {}
 impl CeilingRefusal {
     pub fn status(&self) -> u16 {
         match self {
-            CeilingRefusal::AboveBudget { .. } => 400,
+            CeilingRefusal::AboveLimit { .. } => 400,
             CeilingRefusal::BelowUse { .. } | CeilingRefusal::BelowEntities { .. } => 409,
         }
     }
@@ -5910,20 +5923,28 @@ impl RuntimeHandles {
                 })
             })
             .collect();
-        serde_json::json!({
+        let mut report = serde_json::json!({
             "max_rss_mb": ceiling,
-            "max_rss_mb_limit": DEFAULT_MAX_RSS_MB,
+            "max_rss_mb_default": DEFAULT_MAX_RSS_MB,
+            "above_default": ceiling > DEFAULT_MAX_RSS_MB,
             "max_entities_per_cursor": max_entities_per_cursor(ceiling),
             "cursors": cursors,
-        })
+        });
+        if ceiling > DEFAULT_MAX_RSS_MB {
+            report["note"] = serde_json::json!(format!(
+                "the operator raised each cursor's ceiling above the {DEFAULT_MAX_RSS_MB} MB default \
+                 nuthatch is designed and gated for"
+            ));
+        }
+        report
     }
 
-    /// Raise or lower the per-cursor ceiling live (RFC-0073 FR5), refusing a value above the 2 GiB
-    /// budget or below what a cursor already holds. Persisted before it applies, so a ceiling a
-    /// restart would not keep is never in force.
+    /// Raise or lower the per-cursor ceiling live (RFC-0073 FR5), refusing a value below what a
+    /// cursor already holds. Above the 2 GiB default is the operator's choice (#2441). Persisted
+    /// before it applies, so a ceiling a restart would not keep is never in force.
     pub fn set_max_rss_mb(&mut self, max_rss_mb: u64) -> Result<()> {
-        if max_rss_mb > DEFAULT_MAX_RSS_MB {
-            return Err(CeilingRefusal::AboveBudget {
+        if max_rss_mb > MAX_RSS_MB_CEILING {
+            return Err(CeilingRefusal::AboveLimit {
                 requested: max_rss_mb,
             }
             .into());
@@ -6194,6 +6215,7 @@ impl RuntimeHandles {
                     &self.mount_ctx.ipfs_gateways,
                     &self.mount_ctx.state_rpc,
                 );
+                config.cursor_max_rss_mb = Some(self.mount_ctx.max_rss_mb);
                 if let Some(e) = self
                     .mount_ctx
                     .chains
@@ -9130,17 +9152,21 @@ mod tests {
         assert!(err.contains("over the ceiling of 26"), "{err}");
     }
 
-    /// RFC-0073 FR5: 32 entity circuits at 2 GiB, proportionally fewer below, and no more above.
+    /// RFC-0073 FR5: 32 entity circuits per 2 GiB of ceiling, below the default and above it (#2441).
     #[test]
     fn the_entity_cap_is_a_function_of_the_ceiling() {
         assert_eq!(max_entities_per_cursor(DEFAULT_MAX_RSS_MB), 32);
         assert_eq!(max_entities_per_cursor(1024), 16);
         assert_eq!(max_entities_per_cursor(1536), 24);
         assert_eq!(max_entities_per_cursor(1663), 25, "rounded down, never up");
+        assert_eq!(max_entities_per_cursor(2049), 32, "rounded down, never up");
+        assert_eq!(max_entities_per_cursor(3072), 48);
+        assert_eq!(max_entities_per_cursor(4096), 64);
+        assert_eq!(max_entities_per_cursor(MAX_RSS_MB_CEILING), 16_384);
+        // A mounts.toml is not bounded as the PUT is; this must not overflow.
         assert_eq!(
-            max_entities_per_cursor(4096),
-            32,
-            "a mounts.toml past 2048 buys no threads"
+            max_entities_per_cursor(u64::MAX),
+            (u64::MAX / DEFAULT_MAX_RSS_MB) as usize
         );
     }
 
@@ -11256,7 +11282,8 @@ mod fr5_tests {
 
     /// RFC-0073 FR5: `PUT /_admin/runtime` lowers and raises the per-cursor ceiling with no restart,
     /// a mount's admission follows it at once, `mounts.toml` keeps it, and the next boot is held to
-    /// it. Above 2048, or below what the cursor projects, is refused and nothing is written.
+    /// it. Above 2048 is accepted and flagged (#2441); below what the cursor projects is refused and
+    /// nothing is written.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_ceiling_moves_live_and_a_restart_keeps_it() {
         let root = tempfile::tempdir().unwrap();
@@ -11289,23 +11316,50 @@ mod fr5_tests {
         assert_eq!(body["max_entities_per_cursor"], 32);
         assert_eq!(body["cursors"][0]["projected_mb"], used, "{body}");
 
+        assert_eq!(body["above_default"], false, "{body}");
+        assert!(body.get("note").is_none(), "{body}");
+
         let put = |mb: u64| Some(serde_json::json!({ "max_rss_mb": mb }));
-        for over in [2049, 4096] {
+        // #2441: above the default is the operator's choice, and says so.
+        for (over, cap) in [(2049, 32), (4096, 64)] {
             let (status, body) = call(&routes, "PUT", "/_admin/runtime", put(over)).await;
-            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
-            assert!(body["error"].as_str().unwrap().contains("2048"), "{body}");
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            assert_eq!(body["max_rss_mb"], over);
+            assert_eq!(body["max_entities_per_cursor"], cap);
+            assert_eq!(body["above_default"], true, "{body}");
+            assert!(body["note"].as_str().unwrap().contains("2048"), "{body}");
+            assert_eq!(persisted(root.path()), Some(over));
+            assert_eq!(handles.lock().await.mount_ctx.max_rss_mb, over);
         }
+        let (status, body) = call(&routes, "GET", "/_admin/runtime", None).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(body["max_rss_mb"], 4096);
+        assert_eq!(body["above_default"], true, "{body}");
+        let (status, body) = call(
+            &routes,
+            "PUT",
+            "/_admin/runtime",
+            put(MAX_RSS_MB_CEILING + 1),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            persisted(root.path()),
+            Some(4096),
+            "a refusal wrote mounts.toml"
+        );
         let (status, body) = call(&routes, "PUT", "/_admin/runtime", put(used - 1)).await;
         assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
         assert!(
             body["error"].as_str().unwrap().contains("ethereum"),
             "{body}"
         );
-        assert_eq!(persisted(root.path()), None, "a refusal wrote mounts.toml");
         assert_eq!(
-            handles.lock().await.mount_ctx.max_rss_mb,
-            DEFAULT_MAX_RSS_MB
+            persisted(root.path()),
+            Some(4096),
+            "a refusal wrote mounts.toml"
         );
+        assert_eq!(handles.lock().await.mount_ctx.max_rss_mb, 4096);
 
         // Lowered to exactly what the cursor holds: a third mount no longer fits.
         let (status, body) = call(&routes, "PUT", "/_admin/runtime", put(used)).await;
