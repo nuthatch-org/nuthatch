@@ -148,3 +148,109 @@ async fn writer_restart_to_ready_by_mount_count() {
         );
     }
 }
+
+/// RFC-0073 FR1: what a follower pays to take a snapshot of a nest with a long sealed history and
+/// build its derived state (balances and a chain entity) from it, as it does on joining and after
+/// every writer restart. `NUTHATCH_BENCH_BLOCKS` blocks of 100 transfers, sealed every 5 blocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a benchmark: run explicitly with --ignored --nocapture"]
+async fn follower_snapshot_and_derive_over_a_long_sealed_history() {
+    let blocks: u64 = std::env::var("NUTHATCH_BENCH_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data").join("m0");
+    std::fs::create_dir_all(&dir).unwrap();
+    scaffold_nest(&dir, "m0", USDC);
+    std::fs::create_dir_all(dir.join("entities")).unwrap();
+    std::fs::write(
+        dir.join("entities").join("received.sql"),
+        "SELECT t.to, SUM(t.value) FROM m0__transfer t GROUP BY t.to",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("entities.toml"),
+        "[[entities]]\nname = \"received\"\nsql = \"entities/received.sql\"\nkey = [\"to\"]\nmax_rows = 10000000\n",
+    )
+    .unwrap();
+    let tape = Arc::new(TapeSource::new());
+    let accounts: Vec<String> = (0..200).map(account).collect();
+    for b in 1..=blocks {
+        let transfers: Vec<(&str, &str, u128)> = (0..100u64)
+            .map(|i| {
+                let from = &accounts[((b * 7 + i) % 200) as usize];
+                let to = &accounts[((b * 13 + i * 3) % 200) as usize];
+                (from.as_str(), to.as_str(), (b * 100 + i) as u128)
+            })
+            .collect();
+        tape.insert_block(
+            b,
+            transfers_block(b, 0, 1_700_000_000 + b, USDC, &transfers),
+        );
+    }
+    tape.advance_tip_to(blocks);
+
+    let t = Instant::now();
+    let (cursor, _) = spawn(tmp.path(), 1, tape.clone()).await;
+    assert!(
+        wait_until(Duration::from_secs(600), || at(&cursor, blocks)).await,
+        "indexes cold"
+    );
+    cursor.shutdown().await.unwrap();
+    let indexed = t.elapsed();
+    let t = Instant::now();
+    let mut through = 0;
+    while through + 5 < blocks {
+        through += 5;
+        force_seal_through(&dir, through);
+    }
+    let sealed = t.elapsed();
+    let segments = nuthatch::seal::load_manifest(&dir)
+        .unwrap()
+        .tables
+        .values()
+        .map(Vec::len)
+        .sum::<usize>();
+
+    let config = nuthatch::config::Config::load(&dir).unwrap();
+    let t = Instant::now();
+    let store = nuthatch::store::Store::open(&dir.join("nuthatch.redb")).unwrap();
+    let sub = store.feed_subscribe().unwrap();
+    let wire = serde_json::to_vec(&nuthatch::feed::Line::Snapshot {
+        dataset: nuthatch::feed::DatasetName("data/m0".into()),
+        snapshot: sub.snapshot,
+    })
+    .unwrap();
+    let mut snapshot = None;
+    nuthatch::feed::read_lines(&wire[..], Box::new(|_, _| None), |line| {
+        if let nuthatch::feed::Line::Snapshot { snapshot: s, .. } = line {
+            snapshot = Some(s);
+        }
+        false
+    })
+    .unwrap();
+    let copy = std::sync::Arc::new(nuthatch::feed::MemStore::from_snapshot(
+        &dir,
+        snapshot.unwrap(),
+    ));
+    let taken = t.elapsed();
+    let t = Instant::now();
+    let derived = nuthatch::seal::within(&dir, copy.clone(), || {
+        indexer::FollowerDerived::build(&dir, &config, &copy)
+    })
+    .unwrap();
+    let built = t.elapsed();
+    assert!(!derived.entities[0].is_empty());
+    assert!(derived.balances.holders() > 0);
+    println!(
+        "{blocks} blocks, {} rows, {segments} segments (indexed {:.1} s, sealed {:.1} s): \
+         snapshot taken, sent and applied {:.0} ms ({} wire bytes), derived state built {:.0} ms",
+        blocks * 100,
+        indexed.as_secs_f64(),
+        sealed.as_secs_f64(),
+        taken.as_secs_f64() * 1e3,
+        wire.len(),
+        built.as_secs_f64() * 1e3,
+    );
+}

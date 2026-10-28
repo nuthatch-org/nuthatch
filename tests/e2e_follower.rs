@@ -7,6 +7,8 @@
 //! in one process the writer must go on reading its own.
 
 mod common;
+#[path = "common/entity_fixture.rs"]
+mod entity_fixture;
 
 use common::tape::*;
 use nuthatch::{feed_http, health::RuntimeHealth, indexer, reader::Follower, serve};
@@ -74,6 +76,17 @@ impl Writer {
                         s.isolation = Some(Arc::from(route.as_str()));
                     }
                 }
+                // Named queries the mount serves, kept outside the dataset so its NID is untouched.
+                if let Ok(raw) = std::fs::read_to_string(root.join("named.json")) {
+                    let queries: Vec<nuthatch::allowlist::NamedQuery> =
+                        serde_json::from_str(&raw).unwrap();
+                    for (_, s) in &mut cursor.states {
+                        s.surface = Arc::new(nuthatch::allowlist::Surface {
+                            access: nuthatch::allowlist::SqlAccess::Open,
+                            queries: queries.clone(),
+                        });
+                    }
+                }
                 let states = cursor.states.clone();
                 let store = states[0].1.store.clone();
                 let marks = root.clone();
@@ -124,7 +137,10 @@ impl Writer {
                 == Some(block)
         })
         .await;
-        assert!(reached, "the writer indexes to {block}");
+        if !reached {
+            let (_, ready) = get(&format!("http://{}", self.addr), "/ready").await;
+            panic!("the writer never indexed to {block}: {ready}");
+        }
     }
 
     fn generation(&self) -> u64 {
@@ -173,6 +189,7 @@ fn answer(v: &serde_json::Value) -> serde_json::Value {
         "sealed_through": p["sealed_through"],
         "nid": p["nid"],
         "registry_hash": p["registry_hash"],
+        "entities": p["entities"],
     })
 }
 
@@ -195,6 +212,36 @@ async fn agree(writer: &Writer, follower: &str, q: &str, why: &str) -> serde_jso
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("{why}: the follower never agreed with the writer: {last:?}");
+}
+
+/// Wait until `follower` has applied the writer's generation and both answer GET `path` with the
+/// same status and body.
+async fn agree_on(writer: &Writer, follower: &str, path: &str, why: &str) -> serde_json::Value {
+    let base = format!("http://{}", writer.addr);
+    let path = format!("/{ROUTE}{path}");
+    let mut last = (serde_json::Value::Null, serde_json::Value::Null);
+    for _ in 0..600 {
+        let (_, ready) = get(follower, &format!("/{ROUTE}/ready")).await;
+        let applied = ready["follower"]["applied_generation"].as_u64();
+        if applied == Some(writer.generation()) {
+            // Whether the memo answered is the process's business, not the answer's.
+            let uncached = |(s, mut v): (u16, serde_json::Value)| {
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("cached");
+                }
+                (s, v)
+            };
+            let w = uncached(get(&base, &path).await);
+            let f = uncached(get(follower, &path).await);
+            assert_eq!(w.0, 200, "{why}: the writer on {path}: {}", w.1);
+            if w == f && writer.generation() == applied.unwrap() {
+                return f.1;
+            }
+            last = (w.1, f.1);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{why}: {path} never agreed: {last:?}");
 }
 
 async fn bind_follower(root: &Path, writer: &Writer) -> (Arc<Follower>, String) {
@@ -389,8 +436,7 @@ async fn a_route_is_catching_up_until_its_snapshot_and_derived_state_is_the_writ
     assert!(caught, "the route is served once its snapshot is applied");
     for path in ["/balances", "/flags", "/derived"] {
         let (status, body) = get(&fbase, &format!("/{ROUTE}{path}")).await;
-        assert_eq!(status, 503, "{path}");
-        assert_eq!(body["reason"], "writer_only", "{path}");
+        assert_eq!(status, 200, "{path}: {body}");
     }
     let (status, root_ready) = get(&fbase, "/ready").await;
     assert_eq!(status, 200, "{root_ready}");
@@ -707,15 +753,16 @@ async fn a_delta_over_the_budget_is_refused_before_it_is_applied() {
     }
 }
 
-/// A writer restart resnapshots every dataset, and the replacement is charged beside the copy it
-/// replaces, which is still served. With room for both, the swap is seamless. Without it, the old
-/// copy is released first, the routes answer `catching_up` while the new one loads, and the cursor
-/// is never charged past its budget either way.
+/// A writer restart resnapshots every dataset, and the replacement and its derived state are charged
+/// beside the copy and derived state they replace, which are still served. With room for both, the
+/// swap is seamless. Without it, the old ones are released first, the routes answer `catching_up`
+/// while the new ones load, and the cursor is never charged past its budget either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resnapshot_is_charged_beside_the_copy_it_replaces() {
-    const BUDGET_MB: u64 = 12;
-    // The nest is charged 5 MiB by admission, leaving 7 for its copy: 1 MiB fits twice, 5 MiB once.
-    for (size, reloads) in [(1 << 20, 0), (5 << 20, 1)] {
+    const BUDGET_MB: u64 = 14;
+    // The nest's derived state is charged 5 MiB by admission: two of it and two 1 MiB copies fit,
+    // two of it and two 3 MiB copies do not, and one of it and a 5 MiB copy does.
+    for (size, reloads) in [(1 << 20, 0), (3 << 20, 1), (5 << 20, 1)] {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("runtime");
         let dir = root.join("data").join(ROUTE);
@@ -838,9 +885,9 @@ async fn an_unmounted_copy_in_use_is_charged_until_it_drops() {
         "the follower let the unmounted copy go"
     );
     assert!(
-        follower.retiring() >= 4 << 20,
+        follower.retiring().1 >= 4 << 20,
         "the copy still held is charged: {}",
-        follower.retiring()
+        follower.retiring().1
     );
 
     std::fs::remove_file(&mark).unwrap();
@@ -861,7 +908,7 @@ async fn an_unmounted_copy_in_use_is_charged_until_it_drops() {
         "charged {peak} bytes against a {BUDGET_MB} MiB budget"
     );
     drop(held);
-    assert_eq!(follower.retiring(), 0, "nothing is charged once it drops");
+    assert_eq!(follower.retiring().1, 0, "nothing is charged once it drops");
     // Refused only for want of the room the held copy took, it comes back on its own.
     let mut back = (0, serde_json::Value::Null);
     for _ in 0..400 {
@@ -1029,5 +1076,303 @@ async fn a_folded_segment_is_kept_until_its_followers_have_moved_on() {
     assert!(released, "reclaimed once the follower moved on");
     assert!(!path.exists());
     assert!(!nuthatch::seal::ledger_retained(&store).contains(&hash));
+    writer.stop(&root);
+}
+
+const ENTITY_SQL: &str = "SELECT * FROM received ORDER BY 1";
+
+/// Drop a one-row `tiers` snapshot giving account 2 `tier`, from a file outside the dataset.
+fn drop_tier(root: &Path, name: &str, tier: &str) {
+    let csv = root.join(format!("{name}.csv"));
+    std::fs::write(&csv, format!("account,tier\n{},{tier}\n", account(2))).unwrap();
+    nuthatch::offchain::drop_file(&root.join("data").join(ROUTE), &csv, "tiers").unwrap();
+}
+
+/// A runtime with one nest carrying every kind of derived state: threshold and velocity flags, a
+/// labelled address for exposure, a chain entity and an entity joining an offchain table, with a
+/// named query over the first. Blocks 1..=8 on the tape, block 2 padded so its range seals.
+fn derived_runtime(tmp: &Path) -> (PathBuf, PathBuf, Arc<TapeSource>) {
+    let root = tmp.join("runtime");
+    let dir = root.join("data").join(ROUTE);
+    std::fs::create_dir_all(&dir).unwrap();
+    scaffold_nest(&dir, ROUTE, USDC);
+    let toml = dir.join("nuthatch.toml");
+    let cfg = std::fs::read_to_string(&toml).unwrap();
+    std::fs::write(
+        &toml,
+        format!(
+            "{cfg}\n[flags]\nthreshold = \"150\"\nvelocity_amount = \"300\"\nvelocity_window = 100\n"
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("labels")).unwrap();
+    std::fs::write(
+        dir.join("labels").join("fixture.json"),
+        serde_json::json!([{"address": account(2), "label": "mixer"}]).to_string(),
+    )
+    .unwrap();
+    entity_fixture::write(
+        &dir,
+        "[[entities]]\nname = \"received\"\nquery = \"SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to\"\nkey = [\"to\"]\nmax_rows = 50000\n\n\
+         [[entities]]\nname = \"by_tier\"\nquery = \"SELECT t.tier, SUM(x.value) FROM usdc__transfer x JOIN offchain__tiers t ON x.to = t.account GROUP BY t.tier\"\nkey = [\"tier\"]\nmax_rows = 50000\n",
+    )
+    .unwrap();
+    drop_tier(&root, "first", "gold");
+    std::fs::write(
+        root.join("named.json"),
+        serde_json::json!([{"name": "top_received", "sql": ENTITY_SQL}]).to_string(),
+    )
+    .unwrap();
+    let via: PathBuf = tmp.join("follower-view");
+    std::os::unix::fs::symlink(&root, &via).unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=8u64 {
+        let mut fx = block(b, 0, 100 * b as u128);
+        if b == 2 {
+            pad_address_to_seal(&mut fx, USDC, 1);
+        }
+        tape.insert_block(b, fx);
+    }
+    tape.advance_tip_to(8);
+    (root, via, tape)
+}
+
+/// Every route a follower answers from derived state, compared with the writer's answer.
+async fn derived_agree(writer: &Writer, follower: &str, why: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for path in [
+        "/balances".to_string(),
+        format!("/balance/{}", account(2)),
+        format!("/exposure/{}", account(1)),
+        "/flags".to_string(),
+        "/flags?kind=velocity".to_string(),
+        "/derived".to_string(),
+        "/derived/received".to_string(),
+        "/q/top_received".to_string(),
+        "/derived/by_tier".to_string(),
+    ] {
+        out.push(agree_on(writer, follower, &path, &format!("{why}, {path}")).await);
+    }
+    out.push(agree(writer, follower, ENTITY_SQL, &format!("{why}, entity SQL")).await);
+    out
+}
+
+/// Balances, exposure, velocity and threshold flags, an authored entity by `/derived`, by `/sql` and
+/// through a named query: the follower answers each as the writer does, through a reorg, a seal and
+/// the writer restarting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_derives_what_the_writer_derives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, via, tape) = derived_runtime(tmp.path());
+    let writer = Writer::start(&root, tape.clone(), 0);
+    writer.reaches(8).await;
+
+    let (_a, fa) = bind_follower(&via, &writer).await;
+    let first = derived_agree(&writer, &fa, "after the snapshot").await;
+    assert!(
+        first[0]["holders"].as_u64().unwrap_or(0) >= 2,
+        "balances are populated: {}",
+        first[0]
+    );
+    assert_eq!(
+        first[1]["balance"],
+        (100..=800).step_by(100).sum::<u64>().to_string()
+    );
+    assert!(
+        first[3]["threshold"]["flags"]
+            .as_array()
+            .is_some_and(|f| !f.is_empty()),
+        "threshold flags: {}",
+        first[3]
+    );
+    assert!(
+        first[4]["flags"].as_array().is_some_and(|f| !f.is_empty()),
+        "velocity flags: {}",
+        first[4]
+    );
+    assert!(
+        first[6].to_string().contains("3600"),
+        "the entity holds account 2's total: {}",
+        first[6]
+    );
+
+    tape.reorg(
+        6,
+        vec![block(7, 1, 7_777), block(8, 1, 8_888), block(9, 1, 9_999)],
+    );
+    writer.reaches(9).await;
+    let reorged = derived_agree(&writer, &fa, "after a reorg").await;
+    let total = 100 + 200 + 300 + 400 + 500 + 600 + 7_777 + 8_888 + 9_999;
+    assert_eq!(reorged[1]["balance"], total.to_string());
+    assert!(reorged[8].to_string().contains("gold"), "{}", reorged[8]);
+
+    // A second offchain snapshot, dropped while both run, reaches both at the next window.
+    drop_tier(&root, "second", "silver");
+    tape.advance_finalized_to(2);
+    tape.insert_block(10, block(10, 0, 1_000));
+    tape.advance_tip_to(10);
+    assert!(
+        wait_until(SEAL_POLL_TIMEOUT, || writer.store.sealed_through() >= 2).await,
+        "the writer seals"
+    );
+    writer.reaches(10).await;
+    let sealed = derived_agree(&writer, &fa, "across a seal").await;
+    assert_eq!(sealed[1]["balance"], (total + 1_000).to_string());
+    assert!(sealed[8].to_string().contains("silver"), "{}", sealed[8]);
+
+    let port = writer.addr.port();
+    writer.stop(&root);
+    let (status, held) = get(&fa, &format!("/{ROUTE}/balance/{}", account(2))).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        held, sealed[1],
+        "derived state is served while the writer is away"
+    );
+
+    tape.insert_block(11, block(11, 0, 1_100));
+    tape.advance_tip_to(11);
+    let writer = Writer::start(&root, tape.clone(), port);
+    writer.reaches(11).await;
+    let resumed = derived_agree(&writer, &fa, "after the writer restarted").await;
+    assert_eq!(resumed[1]["balance"], (total + 2_100).to_string());
+    writer.stop(&root);
+}
+
+/// The file of the transfer table's first sealed segment.
+fn transfer_segment(root: &Path) -> PathBuf {
+    let dir = root.join("data").join(ROUTE);
+    let manifest = nuthatch::seal::load_manifest(&dir).unwrap();
+    let s = manifest.tables["usdc__transfer"][0].clone();
+    nuthatch::seal::segment_path(&dir, &s.file, &s.hash)
+}
+
+/// Derived state built from sealed history its copy's catalogue names, with a segment of it gone, is
+/// not built from what remains: its routes answer `catching_up`, never a short balance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn derived_state_is_never_built_from_a_short_sealed_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, via, tape) = derived_runtime(tmp.path());
+    let writer = Writer::start(&root, tape.clone(), 0);
+    writer.reaches(8).await;
+    tape.advance_finalized_to(2);
+    tape.insert_block(9, block(9, 0, 900));
+    tape.advance_tip_to(9);
+    assert!(
+        wait_until(SEAL_POLL_TIMEOUT, || writer.store.sealed_through() >= 2).await,
+        "the writer seals"
+    );
+    writer.reaches(9).await;
+    let (follower, fa) = bind_follower(&via, &writer).await;
+    let whole = derived_agree(&writer, &fa, "before the segment goes").await;
+
+    let path = transfer_segment(&root);
+    std::fs::remove_file(&path).unwrap();
+    let before = follower.connects();
+    let (status, body) = sql(&fa, COUNT).await;
+    assert_eq!((status, &body["reason"]), (503, &"catching_up".into()));
+    assert!(
+        wait_until(Duration::from_secs(10), || follower.connects() > before).await,
+        "the follower takes a fresh snapshot"
+    );
+    let mut rebuilding = false;
+    for _ in 0..200 {
+        let (status, body) = get(&fa, &format!("/{ROUTE}/balances")).await;
+        match status {
+            200 => assert_eq!(body, whole[0], "a balance from a short history"),
+            503 => {
+                assert_eq!(body["reason"], "catching_up", "{body}");
+                rebuilding = true;
+                break;
+            }
+            other => panic!("{other}: {body}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        rebuilding,
+        "the rebuild over a missing segment is catching up"
+    );
+    let (_, ready) = get(&fa, &format!("/{ROUTE}/ready")).await;
+    assert_eq!(ready["derived"]["state"], "catching_up", "{ready}");
+    writer.stop(&root);
+}
+
+/// Derived state a feed tore part-way is not served: its routes answer `catching_up`, and `/ready`
+/// says why, until it is rebuilt from the sealed history, while the nest's hot and sealed routes
+/// keep answering. Once rebuilt it answers as the writer does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn torn_derived_state_is_not_served_until_rebuilt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, via, tape) = derived_runtime(tmp.path());
+    let writer = Writer::start(&root, tape.clone(), 0);
+    writer.reaches(8).await;
+    let (follower, fa) = bind_follower(&via, &writer).await;
+    derived_agree(&writer, &fa, "before the fault").await;
+
+    // The next window's feed fails after the views and before the entities, and the rebuild that
+    // follows waits for `release`.
+    let (release, held) = std::sync::mpsc::channel();
+    nuthatch::indexer::inject_follower_fault(&via.join("data").join(ROUTE), held);
+    tape.insert_block(9, block(9, 0, 900));
+    tape.advance_tip_to(9);
+    writer.reaches(9).await;
+    // The store has the window: the hot route shows block 9.
+    let nine = "SELECT count(*) AS n FROM usdc__transfer WHERE block_number = 9";
+    let mut stored = false;
+    for _ in 0..400 {
+        let (status, body) = sql(&fa, nine).await;
+        if status == 200 && body["rows"][0]["n"] == 1 {
+            stored = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(stored, "the follower applied block 9 to its hot copy");
+    for path in [
+        "/derived/received".to_string(),
+        "/derived/by_tier".to_string(),
+        "/balances".to_string(),
+        format!("/balance/{}", account(2)),
+        "/flags".to_string(),
+        "/q/top_received".to_string(),
+    ] {
+        let (status, body) = get(&fa, &format!("/{ROUTE}{path}")).await;
+        assert_eq!(status, 503, "{path} served torn state: {body}");
+        assert_eq!(body["reason"], "catching_up", "{path}: {body}");
+    }
+    let (status, body) = sql(&fa, ENTITY_SQL).await;
+    assert_eq!((status, &body["reason"]), (503, &"catching_up".into()));
+    let (status, ready) = get(&fa, &format!("/{ROUTE}/ready")).await;
+    assert_eq!(status, 200, "{ready}");
+    assert_eq!(ready["derived"]["state"], "catching_up", "{ready}");
+    assert!(
+        ready["derived"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("part-way")),
+        "{ready}"
+    );
+    // The torn state was released, not kept beside the rebuild, before the rebuild began.
+    let mut released = false;
+    for _ in 0..200 {
+        if follower.retiring() == (1, 0) {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (retired, held) = follower.retiring();
+    assert!(
+        released,
+        "{retired} states retired, {held} bytes of them still held during the rebuild"
+    );
+
+    release.send(()).unwrap();
+    let rebuilt = derived_agree(&writer, &fa, "after the rebuild").await;
+    assert_eq!(
+        rebuilt[1]["balance"],
+        ((100..=800).step_by(100).sum::<u64>() + 900).to_string()
+    );
+    let (_, ready) = get(&fa, &format!("/{ROUTE}/ready")).await;
+    assert_eq!(ready["derived"]["state"], "ready", "{ready}");
     writer.stop(&root);
 }

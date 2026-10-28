@@ -11,9 +11,12 @@
 //! applied, reports how long the writer has been absent, and reconnects. A restarted writer is a new
 //! epoch, so the follower takes fresh snapshots, swapping each in only once it is complete.
 //!
-//! What a follower does not serve: state the writer derives in memory rather than stores, which is
-//! the built-in balance, exposure and velocity views and RFC-0041's entities. Those routes, and SQL
-//! that names an entity, answer `503` with `reason: "writer_only"` rather than an empty answer.
+//! State the writer derives in memory, the built-in balance, exposure and velocity views and
+//! RFC-0041's entities, the follower derives itself: rebuilt from its snapshot and the sealed
+//! segments as a writer's restart rebuilds it, then fed the rows each window stores or a reorg
+//! drops ([`crate::indexer::FollowerDerived`]), entities reading offchain tables brought up to the
+//! dataset's snapshots after each window as ingest does. Derived state a feed tore part-way, or that
+//! a seal outran, is rebuilt; until it is whole its routes answer `503` with `reason: "catching_up"`.
 
 use crate::feed::{Line, MemStore};
 use crate::serve::{AppState, LiveRuntime, SharedNest};
@@ -118,9 +121,90 @@ struct Link {
     conn: Option<u64>,
 }
 
+/// One dataset as a follower holds it: the hot copy, and what it derives from the stored rows.
+#[derive(Clone)]
+struct Data {
+    store: Arc<MemStore>,
+    /// Why there is none, when it could not be built; those routes are then the writer's.
+    derived: std::result::Result<Arc<crate::indexer::FollowerDerived>, Refused>,
+    /// Why the derived state is being rebuilt, while it is: it is not served until it is whole.
+    building: Option<String>,
+}
+
+/// Derived state that could not be built, with its own empty entity list so a swap can tell it apart.
+#[derive(Clone)]
+struct Refused {
+    why: String,
+    entities: Arc<Vec<crate::entity_view::EntityView>>,
+    /// A segment the copy names was missing: not the writer's to answer, but this follower's to
+    /// rebuild once it has a fresh snapshot.
+    gone: bool,
+}
+
+/// Build `dir`'s derived state over `store`, reading sealed history through `store`'s catalogue,
+/// or say why not.
+fn derive(
+    dir: &Path,
+    store: &Arc<MemStore>,
+) -> std::result::Result<Arc<crate::indexer::FollowerDerived>, Refused> {
+    let built = crate::seal::within(dir, store.clone(), || {
+        crate::config::Config::load(dir).and_then(|mut config| {
+            config.read_only_role = true;
+            crate::indexer::FollowerDerived::build(dir, &config, store)
+        })
+    });
+    built.map(Arc::new).map_err(|e| {
+        let gone = e.chain().any(|c| c.is::<crate::seal::SegmentGone>());
+        tracing::error!("{}: derived state not built: {e:#}", dir.display());
+        Refused {
+            why: format!("its derived state could not be built: {e:#}"),
+            entities: Arc::default(),
+            gone,
+        }
+    })
+}
+
+/// Why derived state is not served while this follower takes a fresh snapshot, if that is why.
+fn rebuilding(
+    derived: &std::result::Result<Arc<crate::indexer::FollowerDerived>, Refused>,
+) -> Option<String> {
+    derived
+        .as_ref()
+        .err()
+        .filter(|r| r.gone)
+        .map(|r| r.why.clone())
+}
+
+/// Point `state` at `data`'s derived views, or at inert ones when it has none.
+fn with_derived(state: &mut AppState, data: &Data) {
+    match &data.derived {
+        Ok(d) => {
+            state.balances = d.balances.clone();
+            state.exposure = d.exposure.clone();
+            state.velocity = d.velocity.clone();
+            state.entities = d.entities.clone();
+        }
+        Err(r) => {
+            state.balances = crate::views::BalanceView::inert();
+            state.exposure = crate::exposure::ExposureView::inert();
+            state.velocity = crate::velocity::VelocityView::inert();
+            state.entities = r.entities.clone();
+        }
+    }
+}
+
+impl Data {
+    fn entities(&self) -> Arc<Vec<crate::entity_view::EntityView>> {
+        match &self.derived {
+            Ok(d) => d.entities.clone(),
+            Err(r) => r.entities.clone(),
+        }
+    }
+}
+
 struct Inner {
     routes: BTreeMap<String, Route>,
-    datasets: HashMap<String, Arc<MemStore>>,
+    datasets: HashMap<String, Data>,
     /// The writer's `(epoch, generation)` per dataset at its last heartbeat.
     positions: HashMap<String, (u64, u64)>,
     link: Link,
@@ -136,15 +220,16 @@ struct Inner {
     /// Datasets whose snapshot ran past its byte limit, which the writer is asked not to send
     /// until `max_rss_mb` changes or the mount goes.
     excluded: BTreeSet<String>,
-    /// Copies replaced or released but possibly still referenced by a request in flight, with the
-    /// chain they are charged to. Each counts against its cursor's budget until its last reference
-    /// drops.
-    retiring: Vec<(Option<String>, std::sync::Weak<MemStore>)>,
+    /// Copies and derived state replaced or released but possibly still referenced by a request in
+    /// flight. Each counts against its cursor's budget until its last reference drops.
+    retiring: Vec<Retiring>,
     /// Datasets refused while retiring copies held part of their cursor's budget, with that chain
     /// and what those copies came to. Each is asked for again once that falls.
     awaiting_room: HashMap<String, (Option<String>, u64)>,
     /// Times a held copy was released so that a new snapshot of it could load under the full budget.
     reloads: u64,
+    /// Copies and derived states ever handed to `retiring`.
+    retired: u64,
     /// The most any cursor here has been charged, in bytes.
     peak: u64,
 }
@@ -167,10 +252,7 @@ impl Inner {
             .map(|r| r.spec.dataset.as_str())
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .filter_map(|d| {
-                let copy = self.datasets.get(d)?;
-                Some(copy.bytes() + self.estimates.get(d).copied().unwrap_or(0))
-            })
+            .filter_map(|d| self.held(d))
             .sum();
         held + self.retiring_on(chain)
     }
@@ -178,27 +260,88 @@ impl Inner {
     fn retiring_on(&self, chain: &Option<String>) -> u64 {
         self.retiring
             .iter()
-            .filter(|(c, _)| c == chain)
-            .filter_map(|(_, copy)| copy.upgrade())
-            .map(|copy| copy.bytes())
+            .filter(|r| &r.chain == chain)
+            .map(Retiring::bytes)
             .sum()
     }
 
-    /// Hand a copy that is no longer served to the retiring list, charged until it is dropped.
-    fn retire(&mut self, dataset: &str, copy: &Arc<MemStore>) {
-        let chain = self.chain_of(dataset).unwrap_or_default();
-        self.retire_on(chain, copy);
+    /// What `dataset`'s held copy and derived state are charged, which a replacement is read beside.
+    fn held(&self, dataset: &str) -> Option<u64> {
+        let data = self.datasets.get(dataset)?;
+        Some(data.store.bytes() + self.estimates.get(dataset).copied().unwrap_or(0))
     }
 
-    /// [`Inner::retire`] onto `chain`, for a copy whose routes are already gone.
-    fn retire_on(&mut self, chain: Option<String>, copy: &Arc<MemStore>) {
-        self.retiring.retain(|(_, c)| c.strong_count() > 0);
-        self.retiring.push((chain, Arc::downgrade(copy)));
+    /// Hand a copy, its derived state, or both, no longer served to the retiring list, each charged
+    /// until it is dropped. Returns it, to wait on.
+    fn retire(
+        &mut self,
+        dataset: &str,
+        store: Option<&Arc<MemStore>>,
+        derived: Option<&Derived>,
+    ) -> Retiring {
+        let chain = self.chain_of(dataset).unwrap_or_default();
+        self.retire_on(chain, dataset, store, derived)
+    }
+
+    /// [`Inner::retire`] onto `chain`, for a dataset whose routes are already gone.
+    fn retire_on(
+        &mut self,
+        chain: Option<String>,
+        dataset: &str,
+        store: Option<&Arc<MemStore>>,
+        derived: Option<&Derived>,
+    ) -> Retiring {
+        self.retiring.retain(Retiring::live);
+        let retiring = Retiring {
+            chain,
+            store: store.map(Arc::downgrade),
+            derived: derived.map(|d| Arc::downgrade(&d.entities)),
+            estimate: self.estimates.get(dataset).copied().unwrap_or(0),
+        };
+        self.retiring.push(retiring.clone());
+        self.retired += 1;
+        retiring
     }
 
     fn note_peak(&mut self, dataset: &str) {
         let chain = self.chain_of(dataset).unwrap_or_default();
         self.peak = self.peak.max(self.charged(&chain));
+    }
+}
+
+type Derived = Arc<crate::indexer::FollowerDerived>;
+
+/// A copy or derived state that is no longer served, charged to `chain` while referenced.
+#[derive(Clone)]
+struct Retiring {
+    chain: Option<String>,
+    store: Option<std::sync::Weak<MemStore>>,
+    /// Every serving state built from derived views shares their entity list, so this lives exactly
+    /// as long as the views do.
+    derived: Option<std::sync::Weak<Vec<crate::entity_view::EntityView>>>,
+    /// The derived state's charge: its nest's admission estimate.
+    estimate: u64,
+}
+
+impl Retiring {
+    fn bytes(&self) -> u64 {
+        let store = self.store.as_ref().and_then(|s| s.upgrade());
+        let derived = self.derived.as_ref().is_some_and(|d| d.strong_count() > 0);
+        store.map_or(0, |s| s.bytes()) + if derived { self.estimate } else { 0 }
+    }
+
+    fn live(&self) -> bool {
+        self.store.as_ref().is_some_and(|s| s.strong_count() > 0)
+            || self.derived.as_ref().is_some_and(|d| d.strong_count() > 0)
+    }
+
+    /// Wait, at most `RELEASE_WAIT`, for requests still on it to finish. Whatever is still
+    /// referenced when the wait ends stays charged.
+    async fn released(&self) {
+        let deadline = Instant::now() + RELEASE_WAIT;
+        while self.live() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -288,6 +431,7 @@ impl Follower {
                 retiring: Vec::new(),
                 awaiting_room: HashMap::new(),
                 reloads: 0,
+                retired: 0,
                 peak: 0,
                 link: Link {
                     connected: false,
@@ -354,7 +498,7 @@ impl Follower {
                 let applied: BTreeMap<String, (u64, u64)> = inner
                     .datasets
                     .iter()
-                    .map(|(d, copy)| (d.clone(), copy.applied()))
+                    .map(|(d, copy)| (d.clone(), copy.store.applied()))
                     .collect();
                 (inner.link.conn, applied)
             };
@@ -428,13 +572,18 @@ impl Follower {
             let cap_for: crate::feed::CapFor = Box::new(move |dataset, kind| {
                 let f = weak.upgrade()?;
                 let cap = f.cap_for(dataset)?;
-                let held = f.lock().datasets.get(dataset).map(|s| s.bytes());
+                let inner = f.lock();
                 Some(match kind {
-                    // A replacement is read beside the copy it replaces, which is served until the
-                    // swap and counted until its last request finishes.
-                    crate::feed::Kind::Snapshot => cap.saturating_sub(held.unwrap_or(0)),
+                    // A replacement and its derived state are built beside the copy and derived
+                    // state they replace, which are served until the swap and counted until their
+                    // last request finishes.
+                    crate::feed::Kind::Snapshot => {
+                        cap.saturating_sub(inner.held(dataset).unwrap_or(0))
+                    }
                     // A dataset not held has nothing left to grow into: its deltas are skipped.
-                    crate::feed::Kind::Delta => cap.saturating_sub(held.unwrap_or(cap)),
+                    crate::feed::Kind::Delta => cap.saturating_sub(
+                        inner.datasets.get(dataset).map_or(cap, |s| s.store.bytes()),
+                    ),
                 })
             });
             crate::feed::read_lines(reader, cap_for, |line| line_tx.blocking_send(line).is_ok())
@@ -503,7 +652,7 @@ impl Follower {
             .into_iter()
             .filter_map(|d| {
                 let held = inner.datasets.get(d)?;
-                Some(held.bytes() + inner.estimates.get(d).copied().unwrap_or(0))
+                Some(held.store.bytes() + inner.estimates.get(d).copied().unwrap_or(0))
             })
             .sum();
         let own = inner.estimates.get(dataset).copied().unwrap_or(0);
@@ -526,18 +675,14 @@ impl Follower {
                     r.served = None;
                 }
             }
-            inner.retire(dataset, &old);
-            Arc::downgrade(&old)
+            inner.retire(dataset, Some(&old.store), old.derived.as_ref().ok())
         };
         tracing::info!(
             "{dataset}: its new snapshot does not fit beside the copy it replaces; releasing that \
              copy first, its routes catching up meanwhile"
         );
         self.recompose();
-        let deadline = Instant::now() + RELEASE_WAIT;
-        while released.strong_count() > 0 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        released.released().await;
     }
 
     /// The most any cursor has been charged here, in bytes, and how many copies were released so
@@ -547,11 +692,12 @@ impl Follower {
         (inner.peak, inner.reloads)
     }
 
-    /// What copies no longer served but still referenced are charged, in bytes.
-    pub fn retiring(&self) -> u64 {
+    /// How many copies and derived states have stopped being served, and what those still referenced
+    /// are charged, in bytes.
+    pub fn retiring(&self) -> (u64, u64) {
         let inner = self.lock();
-        let live = inner.retiring.iter().filter_map(|(_, c)| c.upgrade());
-        live.map(|c| c.bytes()).sum()
+        let bytes = inner.retiring.iter().map(Retiring::bytes).sum();
+        (inner.retired, bytes)
     }
 
     /// How many feed connections this follower has made, each taking fresh snapshots.
@@ -569,7 +715,7 @@ impl Follower {
     /// `dataset`'s copy, held as a request in flight would hold it.
     #[doc(hidden)]
     pub fn hold(&self, dataset: &str) -> Option<Arc<MemStore>> {
-        self.lock().datasets.get(dataset).cloned()
+        self.lock().datasets.get(dataset).map(|d| d.store.clone())
     }
 
     /// Stop holding `dataset`, and serve its routes the reason.
@@ -587,8 +733,8 @@ impl Follower {
             } else {
                 inner.awaiting_room.remove(dataset);
             }
-            if let Some(copy) = inner.datasets.remove(dataset) {
-                inner.retire(dataset, &copy);
+            if let Some(old) = inner.datasets.remove(dataset) {
+                inner.retire(dataset, Some(&old.store), old.derived.as_ref().ok());
             }
             inner.over_budget.insert(dataset.to_string(), why);
         }
@@ -671,8 +817,14 @@ impl Follower {
                     if let Some(gone) = inner.routes.remove(&route) {
                         let dataset = gone.spec.dataset;
                         if !inner.routes.values().any(|r| r.spec.dataset == dataset) {
-                            if let Some(copy) = inner.datasets.remove(&dataset) {
-                                inner.retire_on(gone.spec.chain, &copy);
+                            if let Some(old) = inner.datasets.remove(&dataset) {
+                                let derived = old.derived.as_ref().ok();
+                                inner.retire_on(
+                                    gone.spec.chain,
+                                    &dataset,
+                                    Some(&old.store),
+                                    derived,
+                                );
                             }
                             inner.positions.remove(&dataset);
                             inner.excluded.remove(&dataset);
@@ -698,15 +850,21 @@ impl Follower {
                     return Ok(());
                 }
                 let dir = self.root.join(&dataset);
-                let store = tokio::task::spawn_blocking(move || {
-                    Arc::new(MemStore::from_snapshot(&dir, snapshot))
+                let data = tokio::task::spawn_blocking(move || {
+                    let store = Arc::new(MemStore::from_snapshot(&dir, snapshot));
+                    let derived = derive(&dir, &store);
+                    Data {
+                        building: rebuilding(&derived),
+                        store,
+                        derived,
+                    }
                 })
                 .await
                 .context("building a snapshot's store")?;
                 let lifted = {
                     let mut inner = self.lock();
-                    if let Some(old) = inner.datasets.insert(dataset.clone(), store) {
-                        inner.retire(&dataset, &old);
+                    if let Some(old) = inner.datasets.insert(dataset.clone(), data) {
+                        inner.retire(&dataset, Some(&old.store), old.derived.as_ref().ok());
                     }
                     inner.note_peak(&dataset);
                     inner.awaiting_room.remove(&dataset);
@@ -720,7 +878,7 @@ impl Follower {
             Line::Delta { dataset, delta } => {
                 let _ = self.paused.subscribe().wait_for(|p| !*p).await;
                 let dataset = dataset.0;
-                let (store, refused) = {
+                let (data, refused) = {
                     let inner = self.lock();
                     (
                         inner.datasets.get(&dataset).cloned(),
@@ -730,13 +888,13 @@ impl Follower {
                 if refused {
                     return Ok(());
                 }
-                let store = match (fresh.contains(&dataset), store) {
-                    (true, Some(store)) => store,
+                let data = match (fresh.contains(&dataset), data) {
+                    (true, Some(data)) => data,
                     _ => bail!("{dataset}: a delta before its snapshot; resnapshotting"),
                 };
                 // Charged before it is applied, at its peak, so the copy never holds more than its
                 // budget even part-way through a delta.
-                let peak = store.peak_with(&delta);
+                let peak = data.store.peak_with(&delta);
                 if let Some(cap) = self.cap_for(&dataset).filter(|cap| peak > *cap) {
                     let max = {
                         let mut inner = self.lock();
@@ -753,10 +911,30 @@ impl Follower {
                     return Ok(());
                 }
                 // The old state keeps serving while a new connection takes fresh snapshots.
-                store
+                let changes = data
+                    .store
                     .apply(&delta)
                     .with_context(|| format!("{dataset}: resnapshotting"))?;
                 self.lock().note_peak(&dataset);
+                let torn = if changes.sealed_unseen {
+                    // Rows sealed straight to segments never crossed the feed: derive again.
+                    Some("rows were sealed that never passed through hot".to_string())
+                } else if let (Ok(derived), Some(through)) = (&data.derived, changes.through) {
+                    let store = data.store.clone();
+                    let dir = self.root.join(&dataset);
+                    crate::seal::within(&dir, store.clone(), || {
+                        derived.apply(store.as_ref(), &changes.removed, &changes.added, through)
+                    })
+                    .err()
+                    .map(|e| format!("feeding it failed part-way: {e:#}"))
+                } else {
+                    None
+                };
+                if let Some(why) = torn {
+                    let store = data.store.clone();
+                    drop(data);
+                    self.rederive(&dataset, store, why).await?;
+                }
             }
             Line::Heartbeat { positions } => {
                 let roomier = {
@@ -787,7 +965,7 @@ impl Follower {
                     .lock()
                     .datasets
                     .iter()
-                    .filter(|(_, copy)| copy.take_missing())
+                    .filter(|(_, copy)| copy.store.take_missing())
                     .map(|(d, _)| d.clone())
                     .collect();
                 if !gone.is_empty() {
@@ -801,6 +979,47 @@ impl Follower {
         Ok(())
     }
 
+    /// Rebuild `dataset`'s derived state from its store and segments, its derived routes answering
+    /// `catching_up` meanwhile. Nothing else is applied until it is done, so it rebuilds a fixed state.
+    /// The torn state is never served again, so it is released before its replacement is built.
+    async fn rederive(
+        self: &Arc<Self>,
+        dataset: &str,
+        store: Arc<MemStore>,
+        why: String,
+    ) -> Result<()> {
+        tracing::warn!("{dataset}: rebuilding its derived state: {why}");
+        let released = {
+            let mut inner = self.lock();
+            let Some(d) = inner.datasets.get_mut(dataset) else {
+                return Ok(());
+            };
+            let why = format!("{why}; rebuilding it from the sealed history");
+            d.building = Some(why.clone());
+            let old = std::mem::replace(
+                &mut d.derived,
+                Err(Refused {
+                    why,
+                    entities: Arc::default(),
+                    gone: false,
+                }),
+            );
+            inner.retire(dataset, None, old.as_ref().ok())
+        };
+        self.realise();
+        released.released().await;
+        let dir = self.root.join(dataset);
+        let derived = tokio::task::spawn_blocking(move || derive(&dir, &store))
+            .await
+            .context("rebuilding derived state")?;
+        if let Some(d) = self.lock().datasets.get_mut(dataset) {
+            d.building = rebuilding(&derived);
+            d.derived = derived;
+        }
+        self.realise();
+        Ok(())
+    }
+
     /// Serve every route whose dataset has a snapshot, and point existing ones at the current store.
     fn realise(self: &Arc<Self>) {
         let mut changed = false;
@@ -810,24 +1029,28 @@ impl Follower {
                 routes, datasets, ..
             } = &mut *inner;
             for (route, r) in routes.iter_mut() {
-                let Some(store) = datasets.get(&r.spec.dataset).cloned() else {
+                let Some(data) = datasets.get(&r.spec.dataset).cloned() else {
                     continue;
                 };
-                let store: Arc<dyn HotStore> = store;
                 match &r.served {
                     Some(Ok(shared)) => {
                         let current = shared.current();
-                        if !Arc::ptr_eq(&current.store, &store) {
-                            shared.swap(AppState {
+                        let store: Arc<dyn HotStore> = data.store.clone();
+                        if !Arc::ptr_eq(&current.store, &store)
+                            || !Arc::ptr_eq(&current.entities, &data.entities())
+                        {
+                            let mut next = AppState {
                                 store,
                                 ..(*current).clone()
-                            });
+                            };
+                            with_derived(&mut next, &data);
+                            shared.swap(next);
                         }
                     }
                     Some(Err(_)) => {}
                     None => {
                         r.served = Some(
-                            self.build(route, &r.spec, store)
+                            self.build(route, &r.spec, &data)
                                 .map(SharedNest::new)
                                 .map_err(|e| format!("{e:#}")),
                         );
@@ -855,7 +1078,8 @@ impl Follower {
 
     /// A route's serving state over `store`: what `build_nest` assembles for a nest it does not
     /// index, with no circuit, no ingest and no admin surface.
-    fn build(&self, route: &str, r: &Spec, store: Arc<dyn HotStore>) -> Result<AppState> {
+    fn build(&self, route: &str, r: &Spec, data: &Data) -> Result<AppState> {
+        let store: Arc<dyn HotStore> = data.store.clone();
         let dir = self.root.join(&r.dataset);
         let mut config = crate::config::Config::load(&dir)
             .with_context(|| format!("no nest at '{}'", dir.display()))?;
@@ -893,7 +1117,7 @@ impl Follower {
             ))
         });
         let process = crate::limits::Limits::process();
-        Ok(AppState {
+        let mut state = AppState {
             freshness: config.freshness,
             store,
             address: config.contracts.first().map(|c| c.address.clone()),
@@ -926,7 +1150,9 @@ impl Follower {
             admin_enabled: false,
             admin_token: None,
             nest_info: Arc::new(nest_info),
-        })
+        };
+        with_derived(&mut state, data);
+        Ok(state)
     }
 
     fn recompose(self: &Arc<Self>) {
@@ -991,9 +1217,15 @@ impl Follower {
         self.live.swap(app);
     }
 
+    fn data(&self, route: &str) -> Option<Data> {
+        let inner = self.lock();
+        let dataset = &inner.routes.get(route)?.spec.dataset;
+        inner.datasets.get(dataset).cloned()
+    }
+
     /// How far this route's dataset trails the writer, as `/ready` reports it.
     fn lag(&self, inner: &Inner, dataset: &str) -> serde_json::Value {
-        let applied = inner.datasets.get(dataset).map(|s| s.applied());
+        let applied = inner.datasets.get(dataset).map(|d| d.store.applied());
         let writer = inner.positions.get(dataset).copied();
         let lag = match (applied, writer) {
             (Some((ae, ag)), Some((we, wg))) if ae == we => Some(wg.saturating_sub(ag)),
@@ -1026,7 +1258,7 @@ impl Follower {
             )
                 .into_response();
         }
-        let Some(store) = inner.datasets.get(&r.spec.dataset) else {
+        let Some(store) = inner.datasets.get(&r.spec.dataset).map(|d| &d.store) else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"ready": false, "nest": route, "reason": "catching_up"})),
@@ -1046,6 +1278,11 @@ impl Follower {
                 "as_of": as_of,
                 "sealed_through": store.sealed_through(),
                 "follower": self.lag(&inner, &r.spec.dataset),
+                "derived": inner.datasets.get(&r.spec.dataset).map(|d| match (&d.building, &d.derived) {
+                    (Some(why), _) => serde_json::json!({"state": "catching_up", "reason": why}),
+                    (None, Err(r)) => serde_json::json!({"state": "writer_only", "reason": r.why}),
+                    (None, Ok(_)) => serde_json::json!({"state": "ready"}),
+                }),
             })),
         )
             .into_response()
@@ -1108,7 +1345,7 @@ fn refusing(reason: &'static str, error: String) -> axum::Router {
     })
 }
 
-/// Routes answered from state the writer derives in memory, which a follower does not have.
+/// Routes answered from derived state, which a follower serves only once it has built its own.
 fn writer_only(path: &str) -> bool {
     matches!(path, "/balances" | "/flags" | "/derived")
         || ["/balance/", "/exposure/", "/derived/"]
@@ -1116,13 +1353,14 @@ fn writer_only(path: &str) -> bool {
             .any(|p| path.starts_with(p))
 }
 
-fn writer_only_response(what: &str) -> Response {
+fn derived_refused(reason: &str, what: &str, why: &str) -> Response {
+    let error = match reason {
+        "catching_up" => format!("{what} waits for this nest's derived state: {why}"),
+        _ => format!("{what} is served by the writer only on this nest: {why}"),
+    };
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "error": format!("{what} is served by the writer only: a follower holds no derived state"),
-            "reason": "writer_only",
-        })),
+        Json(serde_json::json!({"error": error, "reason": reason})),
     )
         .into_response()
 }
@@ -1162,32 +1400,47 @@ fn names_entity(text: &str, entities: &BTreeSet<String>) -> bool {
 fn guarded(
     follower: Arc<Follower>,
     route: String,
-    entities: Arc<BTreeSet<String>>,
+    declared: Arc<BTreeSet<String>>,
     router: axum::Router,
 ) -> axum::Router {
     router.layer(axum::middleware::from_fn(
         move |req: Request, next: Next| {
             let follower = follower.clone();
             let route = route.clone();
-            let entities = entities.clone();
+            let declared = declared.clone();
             async move {
                 let path = req.uri().path().to_string();
                 if path == "/ready" {
                     return follower.route_ready(&route);
                 }
+                // Derived state being rebuilt, or that could not be built, is never served in part.
+                let refusal = match follower.data(&route) {
+                    Some(Data {
+                        building: Some(why),
+                        ..
+                    }) => Some(("catching_up", why)),
+                    Some(Data {
+                        derived: Err(r), ..
+                    }) => Some(("writer_only", r.why)),
+                    _ => None,
+                };
+                let Some((reason, why)) = refusal else {
+                    return next.run(req).await;
+                };
                 if writer_only(&path) {
-                    return writer_only_response(&path);
+                    return derived_refused(reason, &path, &why);
                 }
                 let reads_sql = matches!(path.as_str(), "/sql" | "/explain" | "/graphql")
                     || path.starts_with("/q/")
                     || path.starts_with("/subgraphs/");
-                if entities.is_empty() || !reads_sql {
+                if declared.is_empty() || !reads_sql {
                     return next.run(req).await;
                 }
                 // A named query's text is the nest's, not the request's, so it is not read here.
                 if path.starts_with("/q/") {
-                    return writer_only_response("a named query on a nest with entities");
+                    return derived_refused(reason, "a named query on this nest", &why);
                 }
+                let entities = &*declared;
                 let (parts, body) = req.into_parts();
                 let Ok(bytes) = axum::body::to_bytes(body, BODY_LIMIT).await else {
                     return StatusCode::PAYLOAD_TOO_LARGE.into_response();
@@ -1197,8 +1450,8 @@ fn guarded(
                     decode_query(parts.uri.query().unwrap_or("")),
                     String::from_utf8_lossy(&bytes)
                 );
-                if names_entity(&text, &entities) {
-                    return writer_only_response("SQL naming an entity");
+                if names_entity(&text, entities) {
+                    return derived_refused(reason, "SQL naming an entity", &why);
                 }
                 next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
                     .await
