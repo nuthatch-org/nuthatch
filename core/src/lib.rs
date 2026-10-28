@@ -8,6 +8,7 @@ pub mod entity_circuit;
 pub mod entity_expr;
 pub mod entity_plan;
 pub mod entity_row;
+pub mod entity_view;
 pub mod exposure;
 pub mod flags;
 pub mod labels;

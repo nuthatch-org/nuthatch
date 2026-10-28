@@ -2,20 +2,41 @@
 //! on the caller's thread as each batch is applied, which is the only shape a tab's one worker allows.
 //! The choice is a runtime value, so both shapes run the same circuit code.
 
+use crate::time::{self, Instant};
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 
 /// What a lane does with each message. An error stops the lane for good and marks it unhealthy.
 pub type Step<M> = Box<dyn FnMut(M) -> Result<()> + Send>;
 
+/// A step that also asks to be woken: it answers with a deadline, and is called with `None` if no
+/// message arrives before it. Only a threaded lane can wake; inline, the next message is the wake.
+pub type TimedStep<M> = Box<dyn FnMut(Option<M>) -> Result<Option<Instant>> + Send>;
+
 /// Starts lanes. `build` makes the circuit and the step that feeds it; where it runs is the driver's.
 pub trait ViewDriver {
+    fn lane_timed<M, B>(&self, name: &'static str, thread: &str, build: B) -> Result<Lane<M>>
+    where
+        M: Send + 'static,
+        B: FnOnce() -> Result<TimedStep<M>> + Send + 'static;
+
     fn lane<M, B>(&self, name: &'static str, thread: &str, build: B) -> Result<Lane<M>>
     where
         M: Send + 'static,
-        B: FnOnce() -> Result<Step<M>> + Send + 'static;
+        B: FnOnce() -> Result<Step<M>> + Send + 'static,
+    {
+        self.lane_timed(name, thread, move || {
+            let mut step = build()?;
+            Ok(Box::new(move |m: Option<M>| {
+                if let Some(m) = m {
+                    step(m)?;
+                }
+                Ok(None)
+            }) as TimedStep<M>)
+        })
+    }
 }
 
 /// One thread per circuit, fed through a channel: the node's shape, which keeps dbsp off the async pool.
@@ -35,14 +56,14 @@ pub enum Driver {
 }
 
 impl ViewDriver for Driver {
-    fn lane<M, B>(&self, name: &'static str, thread: &str, build: B) -> Result<Lane<M>>
+    fn lane_timed<M, B>(&self, name: &'static str, thread: &str, build: B) -> Result<Lane<M>>
     where
         M: Send + 'static,
-        B: FnOnce() -> Result<Step<M>> + Send + 'static,
+        B: FnOnce() -> Result<TimedStep<M>> + Send + 'static,
     {
         match self {
-            Driver::Threaded => Threaded.lane(name, thread, build),
-            Driver::Inline => Inline.lane(name, thread, build),
+            Driver::Threaded => Threaded.lane_timed(name, thread, build),
+            Driver::Inline => Inline.lane_timed(name, thread, build),
         }
     }
 }
@@ -55,7 +76,7 @@ enum Envelope<M> {
 enum Kind<M> {
     Off,
     Threaded(Sender<Envelope<M>>),
-    Inline(Arc<Mutex<Option<Step<M>>>>),
+    Inline(Arc<Mutex<Option<TimedStep<M>>>>),
 }
 
 /// A handle on a running circuit. Cheap to clone; every clone feeds the same circuit.
@@ -79,10 +100,10 @@ impl<M> Clone for Lane<M> {
 }
 
 impl ViewDriver for Threaded {
-    fn lane<M, B>(&self, name: &'static str, thread: &str, build: B) -> Result<Lane<M>>
+    fn lane_timed<M, B>(&self, name: &'static str, thread: &str, build: B) -> Result<Lane<M>>
     where
         M: Send + 'static,
-        B: FnOnce() -> Result<Step<M>> + Send + 'static,
+        B: FnOnce() -> Result<TimedStep<M>> + Send + 'static,
     {
         let (tx, rx) = channel::<Envelope<M>>();
         let healthy = Arc::new(AtomicBool::new(true));
@@ -98,18 +119,36 @@ impl ViewDriver for Threaded {
                         return;
                     }
                 };
-                while let Ok(env) = rx.recv() {
-                    match env {
-                        Envelope::Msg(m) => {
-                            if let Err(e) = step(m) {
-                                tracing::error!("{e:#}");
-                                health.store(false, Ordering::SeqCst);
-                                break;
+                let mut wake: Option<Instant> = None;
+                loop {
+                    let env = match wake {
+                        Some(at) => {
+                            match rx.recv_timeout(at.saturating_duration_since(time::now())) {
+                                Ok(env) => Some(env),
+                                Err(RecvTimeoutError::Timeout) => None,
+                                Err(RecvTimeoutError::Disconnected) => break,
                             }
                         }
+                        None => match rx.recv() {
+                            Ok(env) => Some(env),
+                            Err(_) => break,
+                        },
+                    };
+                    let msg = match env {
                         // In order, so every earlier message is folded by the time this is seen.
-                        Envelope::Flush(ack) => {
+                        Some(Envelope::Flush(ack)) => {
                             let _ = ack.send(());
+                            continue;
+                        }
+                        Some(Envelope::Msg(m)) => Some(m),
+                        None => None,
+                    };
+                    match step(msg) {
+                        Ok(next) => wake = next,
+                        Err(e) => {
+                            tracing::error!("{e:#}");
+                            health.store(false, Ordering::SeqCst);
+                            break;
                         }
                     }
                 }
@@ -123,10 +162,10 @@ impl ViewDriver for Threaded {
 }
 
 impl ViewDriver for Inline {
-    fn lane<M, B>(&self, name: &'static str, _thread: &str, build: B) -> Result<Lane<M>>
+    fn lane_timed<M, B>(&self, name: &'static str, _thread: &str, build: B) -> Result<Lane<M>>
     where
         M: Send + 'static,
-        B: FnOnce() -> Result<Step<M>> + Send + 'static,
+        B: FnOnce() -> Result<TimedStep<M>> + Send + 'static,
     {
         let healthy = Arc::new(AtomicBool::new(true));
         let step = match build() {
@@ -168,7 +207,7 @@ impl<M> Lane<M> {
             Kind::Inline(step) => {
                 let mut guard = step.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(s) = guard.as_mut() {
-                    if let Err(e) = s(msg) {
+                    if let Err(e) = s(Some(msg)) {
                         tracing::error!("{e:#}");
                         self.healthy.store(false, Ordering::SeqCst);
                         *guard = None;
@@ -225,6 +264,35 @@ mod tests {
                 5,
                 "{driver:?}: a dead lane folds nothing"
             );
+        }
+    }
+
+    #[test]
+    fn a_threaded_lane_wakes_at_the_deadline_and_inline_waits_for_a_message() {
+        for driver in [Driver::Threaded, Driver::Inline] {
+            let wakes = Arc::new(AtomicU64::new(0));
+            let seen = wakes.clone();
+            let lane: Lane<()> = driver
+                .lane_timed("wake", "wake", move || {
+                    Ok(Box::new(move |m: Option<()>| {
+                        if m.is_none() {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            return Ok(None);
+                        }
+                        Ok(Some(time::now()))
+                    }) as TimedStep<()>)
+                })
+                .unwrap();
+            lane.send(());
+            let until = time::now() + time::Duration::from_secs(5);
+            while wakes.load(Ordering::SeqCst) == 0
+                && time::now() < until
+                && driver == Driver::Threaded
+            {
+                std::thread::yield_now();
+            }
+            let want = u64::from(driver == Driver::Threaded);
+            assert_eq!(wakes.load(Ordering::SeqCst), want, "{driver:?}");
         }
     }
 

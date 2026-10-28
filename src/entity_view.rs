@@ -20,62 +20,22 @@
 //! circuit and latches unhealthy, which the ingest loop already treats as terminal. §7 wants the
 //! bound enforced while running, not merely validated at load, and a bound that logs and continues
 //! is the shape this project keeps finding in its own instruments.
+//!
+//! The circuit, its lane and its published relation are `nuthatch_core::entity_view::EntityLane`
+//! (RFC-0075 §4); this module binds decoded rows to it and admits offchain input.
 
 use anyhow::{anyhow, Context, Result};
-use std::sync::mpsc::{channel, sync_channel, RecvTimeoutError, Sender, SyncSender};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::entity_bind::Binding;
-use crate::entity_circuit::EntityCircuit;
 use crate::entity_offchain::Snapshot;
 use crate::entity_plan::{Plan, Relation};
 use crate::entity_row::Row;
 use crate::registry::{DecodeRegistry, DecodedRow};
 use dbsp::ZWeight;
+use nuthatch_core::entity_view::{EntityLane, Limits};
 
-/// One window's facts, already bound to the plan's input relations and weighted.
-///
-/// Binding happens on the caller's thread rather than the circuit's, so a window that cannot be
-/// converted - a `uint256` too wide to be exact, say - is an error the ingest path sees at the
-/// point it fed the window, not a circuit that dies later for reasons it can no longer explain.
-pub struct Batch {
-    pub left: Vec<(Row, ZWeight)>,
-    pub right: Vec<(Row, ZWeight)>,
-}
-
-impl Batch {
-    fn weight(&self) -> i64 {
-        self.left
-            .iter()
-            .chain(self.right.iter())
-            .map(|(_, w)| *w)
-            .sum()
-    }
-}
-
-enum Msg {
-    /// A weighted batch, the block it carries the entity through once folded, and whether to
-    /// publish the relation after folding it.
-    ///
-    /// A seed sets `publish: false`. Publishing copies the whole relation, so doing it per chunk
-    /// makes a chunked seed quadratic in the number of chunks - and a half-seeded relation is not
-    /// something any reader should see anyway. `Flush` publishes what a deferred batch left
-    /// pending, which is what `EntityView::seed_end` waits on.
-    Batch(Box<Batch>, u64, bool),
-    /// Rows of appended offchain snapshots (#1437), and the version `table` reaches once they fold.
-    /// The block watermark does not move: a snapshot carries no block.
-    Offchain(Box<Batch>, String, OffchainMark),
-    /// A rebuild, folded into a pending circuit and relation beside the live ones so readers keep
-    /// the old, correctly labelled state until `Rebuild::Commit` swaps the new one in under one lock.
-    Rebuild(Rebuild),
-    /// A bound refused on the caller's side: the fault is already recorded, and the circuit stops
-    /// so its state is released.
-    Stop,
-    Flush(SyncSender<()>),
-    /// Sample the state size now and answer with it and what it cost (#1834).
-    SampleState(SyncSender<Result<(u64, Duration)>>),
-}
+pub use nuthatch_core::entity_view::{Applied, Batch, OffchainMark, Watermarks};
 
 /// How often an entity's state size may be sampled: `NUTHATCH_ENTITY_STATE_SAMPLE_SECS`, default 60,
 /// `0` for never. A sample walks every trace (#1834), so it is rationed rather than taken per scrape.
@@ -95,121 +55,6 @@ fn state_sample_interval() -> Option<Duration> {
     })
 }
 
-fn sample_state(circuit: &mut EntityCircuit, into: &Mutex<Option<u64>>) -> Result<(u64, Duration)> {
-    let started = Instant::now();
-    let bytes = circuit.state_bytes()?;
-    *into.lock().unwrap() = Some(bytes);
-    Ok((bytes, started.elapsed()))
-}
-
-/// Why a sampled state of `bytes` stops the entity, or `None` inside `allowance` (#2167). `max_rows`
-/// bounds input rows; a join's output, and the values a MIN or MAX keeps from it, can outgrow them.
-fn over_allowance(bytes: u64, allowance: u64) -> Option<String> {
-    (bytes > allowance).then(|| {
-        format!(
-            "the circuit holds {bytes} bytes of state, past the allowance of {allowance} bytes \
-             admission charged for this entity. Raise its max_rows, which admission charges for"
-        )
-    })
-}
-
-const REBUILD_ORDER: &str =
-    "a rebuild message arrived with no rebuild in progress; the ingest path fed it out of order";
-
-enum Rebuild {
-    Begin,
-    Batch(Box<Batch>),
-    Offchain(Box<Batch>, String, OffchainMark),
-    Commit(u64),
-}
-
-/// How far an entity has applied one offchain table (#1437): how many snapshots, the latest, and a
-/// digest of the whole ordered list, which is what tells a replaced snapshot from an unchanged one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OffchainMark {
-    pub snapshots: usize,
-    pub latest: String,
-    pub digest: String,
-}
-
-impl OffchainMark {
-    pub fn of(version: &[String]) -> Self {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        for hash in version {
-            h.update((hash.len() as u64).to_le_bytes());
-            h.update(hash.as_bytes());
-        }
-        Self {
-            snapshots: version.len(),
-            latest: version.last().cloned().unwrap_or_default(),
-            digest: hex::encode(h.finalize()),
-        }
-    }
-}
-
-/// What an entity's rows account for, read with them under one lock (#932): the block it has folded
-/// through and, per offchain table it reads, the snapshots it has folded.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Applied {
-    pub through: u64,
-    pub offchain: std::collections::BTreeMap<String, OffchainMark>,
-}
-
-/// Per entity, what the rows it contributed to an answer account for.
-pub type Watermarks = std::collections::BTreeMap<String, Applied>;
-
-impl Applied {
-    /// The offchain half as a response label, or `None` for an entity that reads no offchain table.
-    pub fn offchain_json(&self) -> Option<serde_json::Value> {
-        (!self.offchain.is_empty()).then(|| {
-            self.offchain
-                .iter()
-                .map(|(table, m)| {
-                    (
-                        format!("{}{table}", crate::entity_offchain::OFFCHAIN_NAMESPACE),
-                        serde_json::json!({ "snapshots": m.snapshots, "latest": m.latest }),
-                    )
-                })
-                .collect::<serde_json::Map<_, _>>()
-                .into()
-        })
-    }
-}
-
-/// What the entity currently answers with, published as one value.
-///
-/// The relation and the watermark used to be a lock and an atomic, updated in that order with a
-/// comment explaining why the order mattered. It is not a comment's job to hold an invariant: a
-/// reader between the two stores sees a head whose rows are not published yet, and no test can catch
-/// that reliably. One lock, one publication, and the ordering has nowhere to go wrong.
-#[derive(Default)]
-struct Published {
-    relation: Relation,
-    /// The dataset head this entity has **actually folded**, which is not the nest's head while it
-    /// is catching up. Advanced only after the batch carrying it has been applied.
-    through: u64,
-    /// When `through` last actually moved, in unix seconds.
-    ///
-    /// **Progress, not duration** - the lesson #846 paid for one layer down, where `/ready`
-    /// suppressed every stall term during a bulk seal and put nothing in its place, so a pass frozen
-    /// for ten hours answered `200 {"ready":true}`. An entity catching up is the same shape:
-    /// legitimately behind, indefinitely, and indistinguishable from dead unless something watches
-    /// it advance. Zero until the first batch lands, which is "no progress yet" rather than 1970.
-    progress_at: u64,
-    /// Per offchain table, the snapshots folded into `relation` (#1437).
-    offchain: std::collections::BTreeMap<String, OffchainMark>,
-}
-
-impl Published {
-    fn applied(&self) -> Applied {
-        Applied {
-            through: self.through,
-            offchain: self.offchain.clone(),
-        }
-    }
-}
-
 /// One maintained authored entity: its circuit, its state, and how far it has been applied.
 pub struct EntityView {
     name: String,
@@ -218,23 +63,14 @@ pub struct EntityView {
     /// Carried here rather than on [`Plan`] because a circuit and a batch evaluator are positional
     /// and have no use for a name; only the serving surface does (#822).
     columns: Vec<String>,
-    tx: Sender<Msg>,
+    lane: EntityLane,
     binding: Binding,
-    state: Arc<RwLock<Published>>,
     /// Why this entity holds no answer despite the nest being fine - today, only a warm restart.
     ///
-    /// Kept apart from `fault` on purpose. A faulted entity had a circuit that died; an unavailable
-    /// one never had state to lose. Reporting them as the same thing would make #866's fault
-    /// reporting say something untrue about a nest that is working.
+    /// Kept apart from the lane's fault on purpose. A faulted entity had a circuit that died; an
+    /// unavailable one never had state to lose. Reporting them as the same thing would make #866's
+    /// fault reporting say something untrue about a nest that is working.
     unavailable: Option<String>,
-    /// Why the circuit thread stopped, if it has - on start, on a step, or on the declared bound.
-    /// §5.2: "Serving frozen derived state as healthy is not graceful degradation; it is a lie with
-    /// a pleasant HTTP status."
-    ///
-    /// The reason and not merely the fact, because #866 asks for an entity that is *visibly* dead,
-    /// and "unhealthy" without a cause sends whoever is on call to the logs of a process that may
-    /// since have restarted.
-    fault: Arc<RwLock<Option<String>>>,
     /// Per offchain table, the snapshots sent to the circuit (#1437). Sent, not folded: the next
     /// refresh compares the manifest against this, so no snapshot is ever fed twice.
     fed: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>,
@@ -242,8 +78,6 @@ pub struct EntityView {
     /// [`Self::admit_offchain`].
     held: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
     max_rows: u64,
-    /// The circuit's state size at its last sample, `None` until the first (#1834).
-    state_bytes: Arc<Mutex<Option<u64>>>,
 }
 
 impl EntityView {
@@ -301,253 +135,25 @@ impl EntityView {
                  not implemented. Re-index this nest from its start block to repopulate it."
             )
         });
-
-        let (tx, rx) = channel::<Msg>();
-        let state = Arc::new(RwLock::new(Published::default()));
-        let shared = state.clone();
-        let fault = Arc::new(RwLock::new(None::<String>));
-        let stopped = fault.clone();
-        let plan = plan.clone();
-        let label = name.to_string();
-        let thread_label = label.clone();
-        let state_bytes = Arc::new(Mutex::new(None::<u64>));
-        let sampled = state_bytes.clone();
-        let allowance = crate::runtime::entity_allowance_bytes(
-            max_rows as u64,
-            !binding.offchain_tables().is_empty(),
-        );
-
-        std::thread::Builder::new()
-            .name(format!("nuthatch-entity-{name}"))
-            .spawn(move || {
-                let mut circuit = match EntityCircuit::build(plan.clone()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("entity `{thread_label}` circuit failed to start: {e:#}");
-                        *stopped.write().unwrap() = Some(format!("{e:#}"));
-                        return;
-                    }
-                };
-                // The live input cardinality, as a running total rather than a copy of the input.
-                //
-                // The spike kept a map of every fact and its weight in order to count them, which is
-                // an entire second copy of the input inside a budget measured in gigabytes (§7).
-                // Weights sum, so a signed running total is exact for a multiset and costs eight
-                // bytes - and it counts **both** input relations, which is #838: the spike's bound
-                // watched the delegations and admitted fifty thousand indexer facts at a declared
-                // bound of one.
-                let mut live: i64 = 0;
-                // The watermark of a folded-but-unpublished batch, i.e. a seed in progress.
-                let mut pending: Option<u64> = None;
-                // A rebuild in progress (#1437): circuit, relation, live count and offchain marks.
-                let mut rebuilding: Option<(
-                    EntityCircuit,
-                    Relation,
-                    i64,
-                    std::collections::BTreeMap<String, OffchainMark>,
-                )> = None;
-                // Stamp the watermark onto the already-updated relation. **The relation is not
-                // copied here.** `circuit.apply` folds its deltas straight into `published.relation`
-                // under this same lock, so a batch costs what the batch changed rather than what the
-                // relation holds - see `EntityCircuit::apply` and #897. One lock still, and the rows
-                // and the head they account for still become visible together, which is the whole
-                // reason `Published` is one value.
-                let stamp = |through: u64, published: &mut Published| {
-                    let moved = through > published.through;
-                    published.through = through;
-                    // Stamped only when the watermark actually moves. A window that carries the
-                    // entity no further is not progress, and counting it as such is how a wedged
-                    // entity looks busy.
-                    if moved {
-                        published.progress_at = crate::metrics::now_unix();
-                    }
-                };
-                // State size (#1834): sampled after the circuit changes, at most once per interval, and
-                // never while it sits idle, since an idle circuit's size has not moved.
-                let interval = state_sample_interval();
-                let mut changed = false;
-                let mut due = Instant::now();
-                loop {
-                    if let Some(every) = interval.filter(|_| changed && Instant::now() >= due) {
-                        match sample_state(&mut circuit, &sampled) {
-                            Ok((bytes, took)) => {
-                                tracing::debug!(
-                                    "entity `{thread_label}` state sampled in {took:?}"
-                                );
-                                if let Some(why) = over_allowance(bytes, allowance) {
-                                    tracing::error!("entity `{thread_label}`: {why}");
-                                    *stopped.write().unwrap() = Some(why);
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "entity `{thread_label}` state size not sampled: {e:#}"
-                                )
-                            }
-                        }
-                        changed = false;
-                        due = Instant::now() + every;
-                    }
-                    let msg = match interval {
-                        Some(_) if changed => {
-                            match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
-                                Ok(msg) => msg,
-                                Err(RecvTimeoutError::Timeout) => continue,
-                                Err(RecvTimeoutError::Disconnected) => break,
-                            }
-                        }
-                        _ => match rx.recv() {
-                            Ok(msg) => msg,
-                            Err(_) => break,
-                        },
-                    };
-                    changed |= !matches!(msg, Msg::Flush(_) | Msg::SampleState(_));
-                    match msg {
-                        Msg::Batch(batch, through, should_publish) => {
-                            // The write lock is held across the fold, so no reader ever sees the
-                            // relation mid-transaction. A fold is microseconds; the clone it
-                            // replaces was tens of milliseconds (#897).
-                            let mut published = shared.write().unwrap();
-                            match step(
-                                &mut circuit,
-                                &batch,
-                                &mut live,
-                                max_rows,
-                                &mut published.relation,
-                            ) {
-                                Err(e) => {
-                                    // Includes crossing the declared `max_rows`, which is a fault
-                                    // and not a warning (criterion 10). The watermark deliberately
-                                    // does not advance: whatever this batch carried, the entity did
-                                    // not fold it.
-                                    tracing::error!("entity `{thread_label}` step failed: {e:#}");
-                                    *stopped.write().unwrap() = Some(format!("{e:#}"));
-                                    break;
-                                }
-                                Ok(()) => {
-                                    if should_publish {
-                                        pending = None;
-                                        stamp(through, &mut published);
-                                    } else {
-                                        pending = Some(through);
-                                    }
-                                }
-                            }
-                        }
-                        Msg::Offchain(batch, table, mark) => {
-                            let mut published = shared.write().unwrap();
-                            if let Err(e) = step(
-                                &mut circuit,
-                                &batch,
-                                &mut live,
-                                max_rows,
-                                &mut published.relation,
-                            ) {
-                                tracing::error!("entity `{thread_label}` step failed: {e:#}");
-                                *stopped.write().unwrap() = Some(format!("{e:#}"));
-                                break;
-                            }
-                            published.offchain.insert(table, mark);
-                        }
-                        Msg::Rebuild(Rebuild::Begin) => match EntityCircuit::build(plan.clone()) {
-                            Ok(c) => rebuilding = Some((c, Relation::new(), 0, Default::default())),
-                            Err(e) => {
-                                *stopped.write().unwrap() = Some(format!("{e:#}"));
-                                break;
-                            }
-                        },
-                        Msg::Rebuild(Rebuild::Batch(batch)) => {
-                            let Some((c, relation, count, _)) = rebuilding.as_mut() else {
-                                *stopped.write().unwrap() = Some(REBUILD_ORDER.into());
-                                break;
-                            };
-                            if let Err(e) = step(c, &batch, count, max_rows, relation) {
-                                tracing::error!("entity `{thread_label}` rebuild failed: {e:#}");
-                                *stopped.write().unwrap() = Some(format!("{e:#}"));
-                                break;
-                            }
-                        }
-                        Msg::Rebuild(Rebuild::Offchain(batch, table, mark)) => {
-                            let Some((c, relation, count, marks)) = rebuilding.as_mut() else {
-                                *stopped.write().unwrap() = Some(REBUILD_ORDER.into());
-                                break;
-                            };
-                            if let Err(e) = step(c, &batch, count, max_rows, relation) {
-                                tracing::error!("entity `{thread_label}` rebuild failed: {e:#}");
-                                *stopped.write().unwrap() = Some(format!("{e:#}"));
-                                break;
-                            }
-                            marks.insert(table, mark);
-                        }
-                        Msg::Rebuild(Rebuild::Commit(through)) => {
-                            let Some((c, relation, count, marks)) = rebuilding.take() else {
-                                *stopped.write().unwrap() = Some(REBUILD_ORDER.into());
-                                break;
-                            };
-                            let mut published = shared.write().unwrap();
-                            circuit = c;
-                            live = count;
-                            published.relation = relation;
-                            published.offchain = marks;
-                            pending = None;
-                            stamp(through, &mut published);
-                        }
-                        // Messages are processed in order, so by the time the barrier is seen every
-                        // prior batch is folded - the ack unblocks the waiter.
-                        Msg::Stop => break,
-                        Msg::Flush(ack) => {
-                            // A seed is the whole history arriving at once, so its end is sampled
-                            // even when no sample is due.
-                            let why = interval.and(pending).and_then(|_| {
-                                let (bytes, _) = sample_state(&mut circuit, &sampled).ok()?;
-                                over_allowance(bytes, allowance)
-                            });
-                            if let Some(why) = why {
-                                tracing::error!("entity `{thread_label}`: {why}");
-                                *stopped.write().unwrap() = Some(why);
-                                let _ = ack.send(());
-                                break;
-                            }
-                            if let Some(through) = pending.take() {
-                                stamp(through, &mut shared.write().unwrap());
-                            }
-                            let _ = ack.send(());
-                        }
-                        Msg::SampleState(ack) => {
-                            let sample = sample_state(&mut circuit, &sampled);
-                            let why = sample
-                                .as_ref()
-                                .ok()
-                                .and_then(|(bytes, _)| over_allowance(*bytes, allowance));
-                            // The fault is published before the ack, so a caller that sees this
-                            // sample also sees the entity stopped.
-                            if let Some(why) = &why {
-                                tracing::error!("entity `{thread_label}`: {why}");
-                                *stopped.write().unwrap() = Some(why.clone());
-                            }
-                            let _ = ack.send(sample);
-                            if why.is_some() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            })
+        let limits = Limits {
+            max_rows,
+            allowance_bytes: crate::runtime::entity_allowance_bytes(
+                max_rows as u64,
+                !binding.offchain_tables().is_empty(),
+            ),
+            sample_every: state_sample_interval(),
+        };
+        let lane = EntityLane::start(nuthatch_core::drive::Driver::Threaded, name, plan, limits)
             .with_context(|| format!("failed to spawn the circuit thread for entity `{name}`"))?;
-
         Ok(Self {
-            name: label,
+            name: name.to_string(),
             columns: columns.to_vec(),
-            tx,
+            lane,
             binding,
-            state,
             unavailable,
-            fault,
             fed: Default::default(),
             held: Default::default(),
             max_rows: max_rows as u64,
-            state_bytes,
         })
     }
 
@@ -557,7 +163,7 @@ impl EntityView {
 
     /// Bytes the circuit held at its last sample; `None` before the first or with sampling off.
     pub fn state_bytes(&self) -> Option<u64> {
-        *self.state_bytes.lock().unwrap()
+        self.lane.state_bytes()
     }
 
     /// The output columns' names - key columns first, then aggregates.
@@ -582,39 +188,15 @@ impl EntityView {
     /// built the response, whose `provenance.entities[].applied_through` called `applied_through()`
     /// afresh - so a batch landing in between produced an answer whose rows were from block N while
     /// its label said N+8.
-    ///
-    /// The relation was never wrong and the mismatch always self-corrected on the next read. The
-    /// *label* was wrong, and the label is the product claim: an agent citing `applied_through` is
-    /// citing how current the answer is. A citation that overstates its own currency is the one thing
-    /// this block must not do.
-    ///
-    /// The circuit thread was never the problem - `step` and `stamp` already share one write lock, so
-    /// no reader sees the relation mid-transaction. The gap was entirely on the reading side.
     pub fn rows_as_json_with_watermark(&self) -> (Vec<serde_json::Value>, Applied) {
-        let state = match self.state.read() {
-            Ok(s) => s,
-            Err(_) => return (Vec::new(), Applied::default()),
-        };
-        let applied = state.applied();
-        let rows = state
-            .relation
-            .iter()
-            .map(|(k, v)| {
-                let mut obj = serde_json::Map::new();
-                for (name, cell) in self.columns.iter().zip(k.0.iter().chain(v.0.iter())) {
-                    obj.insert(name.clone(), sql_cell(cell));
-                }
-                serde_json::Value::Object(obj)
-            })
-            .collect();
-        (rows, applied)
+        self.lane.rows_as_json_with_watermark(&self.columns)
     }
 
-    /// Whether the circuit thread is alive and folding. `false` means it died - on start, on a step,
-    /// or on the declared bound - and the ingest loop treats that as terminal rather than serving a
-    /// frozen relation. A clean shutdown drops the sender and exits without flipping this.
+    /// Whether the circuit is alive and folding. `false` means it died - on start, on a step, or on
+    /// the declared bound - and the ingest loop treats that as terminal rather than serving a frozen
+    /// relation. A clean shutdown drops the lane and exits without flipping this.
     pub fn is_healthy(&self) -> bool {
-        self.fault.read().map(|f| f.is_none()).unwrap_or(false)
+        self.lane.is_healthy()
     }
 
     /// Why this entity holds no answer, if it does not. `None` means it is maintaining normally.
@@ -715,11 +297,8 @@ impl EntityView {
             return Ok(());
         };
         let batch = self.offchain_batch(table, snapshots)?;
-        let _ = self.tx.send(Msg::Offchain(
-            Box::new(batch),
-            table.to_string(),
-            OffchainMark::of(version),
-        ));
+        self.lane
+            .apply_offchain(batch, table.to_string(), OffchainMark::of(version));
         self.fed
             .lock()
             .unwrap()
@@ -755,13 +334,12 @@ impl EntityView {
         if rows <= self.max_rows && bytes <= max_bytes {
             return Some(after);
         }
-        *self.fault.write().unwrap() = Some(format!(
+        self.lane.stop(format!(
             "offchain__{table} would bring entity `{}`'s offchain input to {rows} rows and {bytes} \
              bytes, over its allowance of {} rows and {max_bytes} bytes. Raise its max_rows, which \
              admission charges for",
             self.name, self.max_rows
         ));
-        let _ = self.tx.send(Msg::Stop);
         None
     }
 
@@ -770,7 +348,7 @@ impl EntityView {
     pub fn rebuild_begin(&self) {
         self.fed.lock().unwrap().clear();
         self.held.lock().unwrap().clear();
-        let _ = self.tx.send(Msg::Rebuild(Rebuild::Begin));
+        self.lane.rebuild_begin();
     }
 
     /// Feed stored chain history to the rebuild at `+1`.
@@ -783,7 +361,7 @@ impl EntityView {
             left: left.into_iter().map(|r| (r, 1)).collect(),
             right: right.into_iter().map(|r| (r, 1)).collect(),
         };
-        let _ = self.tx.send(Msg::Rebuild(Rebuild::Batch(Box::new(batch))));
+        self.lane.rebuild_batch(batch);
         Ok(())
     }
 
@@ -798,11 +376,8 @@ impl EntityView {
             return Ok(());
         };
         let batch = self.offchain_batch(table, snapshots)?;
-        let _ = self.tx.send(Msg::Rebuild(Rebuild::Offchain(
-            Box::new(batch),
-            table.to_string(),
-            OffchainMark::of(version),
-        )));
+        self.lane
+            .rebuild_offchain(batch, table.to_string(), OffchainMark::of(version));
         self.fed
             .lock()
             .unwrap()
@@ -813,8 +388,7 @@ impl EntityView {
 
     /// Swap the rebuilt relation in, labelled `through`, and wait until it is visible.
     pub fn rebuild_commit(&self, through: u64) -> Result<()> {
-        let _ = self.tx.send(Msg::Rebuild(Rebuild::Commit(through)));
-        self.flush();
+        self.lane.rebuild_commit(through);
         match self.fault() {
             Some(why) => Err(anyhow!("rebuilding entity `{}` faulted: {why}", self.name)),
             None => Ok(()),
@@ -839,7 +413,7 @@ impl EntityView {
 
     /// Why this entity stopped, if it has. `None` is a live entity.
     pub fn fault(&self) -> Option<String> {
-        self.fault.read().ok().and_then(|f| f.clone())
+        self.lane.fault()
     }
 
     /// **§5.1 and §5.2 in one call.** Convert a decoded window to this entity's input relations and
@@ -892,45 +466,33 @@ impl EntityView {
         }
         Ok(())
     }
-
-    /// Enqueue an already-bound batch. Non-blocking, and drops silently if the thread has died -
+    /// Enqueue an already-bound batch. Non-blocking, and drops silently if the circuit has died -
     /// which `is_healthy` is what reports, not this.
     pub fn apply(&self, batch: Batch, through: u64) {
-        let _ = self.tx.send(Msg::Batch(Box::new(batch), through, true));
+        self.lane.apply(batch, through);
     }
 
-    /// Enqueue a batch **without** publishing the relation afterwards. See [`Msg::Batch`]; the next
-    /// [`Self::flush`] publishes it.
+    /// Enqueue a batch **without** publishing the relation afterwards; the next [`Self::flush`]
+    /// publishes it.
     fn apply_deferred(&self, batch: Batch, through: u64) {
-        let _ = self.tx.send(Msg::Batch(Box::new(batch), through, false));
+        self.lane.apply_deferred(batch, through);
     }
 
     /// Block until every batch enqueued so far has been folded. Used after a restart rebuild so the
     /// first request sees a complete relation, and as the consistency boundary at a commit.
     pub fn flush(&self) {
-        let (ack, wait) = sync_channel(0);
-        if self.tx.send(Msg::Flush(ack)).is_ok() {
-            let _ = wait.recv();
-        }
+        self.lane.flush();
     }
 
     /// Sample the state size now, on the circuit's thread, after every batch sent before it; returns
     /// the bytes and what the sample cost. The periodic sample runs the same walk.
     pub fn sample_state(&self) -> Result<(u64, Duration)> {
-        let (ack, wait) = sync_channel(0);
-        self.tx
-            .send(Msg::SampleState(ack))
-            .map_err(|_| anyhow!("entity `{}` has stopped", self.name))?;
-        wait.recv()
-            .map_err(|_| anyhow!("entity `{}` stopped before sampling", self.name))?
+        self.lane.sample_state()
     }
 
     /// The maintained relation as of the last folded batch.
     pub fn relation(&self) -> Relation {
-        self.state
-            .read()
-            .map(|s| s.relation.clone())
-            .unwrap_or_default()
+        self.lane.relation()
     }
 
     /// One key's row, read under the lock.
@@ -939,12 +501,9 @@ impl EntityView {
     /// real nest is 49 ms for 309,548 groups (#897) - on the very route whose claim is that a keyed
     /// read is a map lookup and not a scan.
     pub fn get(&self, key: &Row) -> Option<Row> {
-        self.state.read().ok()?.relation.get(key).cloned()
+        self.lane.get(key)
     }
 
-    /// The first `limit` rows and the total count, read under the lock. Same reason as
-    /// [`Self::get`]: the listing route returns at most a hundred rows and was copying every one
-    /// the entity holds to do it.
     /// A keyed read **with** the watermark describing it, in **one** acquisition (#932).
     ///
     /// Serving a row and then reading `applied_through()` separately is the race this fixes; doing it
@@ -956,87 +515,36 @@ impl EntityView {
         &self,
         readings: &[Vec<crate::entity_row::Scalar>],
     ) -> (Option<Row>, Applied) {
-        let Ok(s) = self.state.read() else {
-            return (None, Applied::default());
-        };
-        let width = s.relation.keys().next().map_or(0, |k| k.0.len());
-        if width == 0 || width != readings.len() || readings.iter().any(Vec::is_empty) {
-            return (None, s.applied());
-        }
-        let mut at = vec![0usize; width];
-        loop {
-            let key = Row(at
-                .iter()
-                .zip(readings)
-                .map(|(&i, r)| r[i].clone())
-                .collect());
-            if let Some(row) = s.relation.get(&key) {
-                return (Some(row.clone()), s.applied());
-            }
-            let mut i = 0;
-            loop {
-                if i == width {
-                    return (None, s.applied());
-                }
-                at[i] += 1;
-                if at[i] < readings[i].len() {
-                    break;
-                }
-                at[i] = 0;
-                i += 1;
-            }
-        }
+        self.lane.get_with_watermark(readings)
     }
 
     /// [`Self::head_rows`] **with** the watermark describing those rows, one acquisition (#932).
     pub fn head_rows_with_watermark(&self, limit: usize) -> (usize, Vec<(Row, Row)>, Applied) {
-        match self.state.read() {
-            Ok(s) => (
-                s.relation.len(),
-                s.relation
-                    .iter()
-                    .take(limit)
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                s.applied(),
-            ),
-            Err(_) => (0, Vec::new(), Applied::default()),
-        }
+        self.lane.head_rows_with_watermark(limit)
     }
 
+    /// The first `limit` rows and the total count, read under the lock. Same reason as
+    /// [`Self::get`]: the listing route returns at most a hundred rows and was copying every one
+    /// the entity holds to do it.
     pub fn head_rows(&self, limit: usize) -> (usize, Vec<(Row, Row)>) {
-        match self.state.read() {
-            Ok(s) => (
-                s.relation.len(),
-                s.relation
-                    .iter()
-                    .take(limit)
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            ),
-            Err(_) => (0, Vec::new()),
-        }
+        let (len, rows, _) = self.lane.head_rows_with_watermark(limit);
+        (len, rows)
     }
 
     pub fn len(&self) -> usize {
-        self.state.read().map(|s| s.relation.len()).unwrap_or(0)
+        self.lane.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.lane.is_empty()
     }
 
     /// Row count **and** watermark under one lock (#932).
     ///
     /// Every surface reporting both - `/derived`, `/ready`, the semantic doc - was reading them
     /// separately, so a batch landing between the two produced a count from block N labelled N+k.
-    /// Less consequential than the `/sql` case (nobody reconciles against a row count) but the same
-    /// defect, and cheaper to fix once than to explain twice.
     pub fn len_and_watermark(&self) -> (usize, Applied) {
-        self.state
-            .read()
-            .map(|s| (s.relation.len(), s.applied()))
-            .unwrap_or_default()
+        self.lane.len_and_watermark()
     }
 
     /// The block this entity has folded through (criterion 2).
@@ -1045,7 +553,7 @@ impl EntityView {
     /// during backfill and after a definition change; answering for the nest's head while holding
     /// this one's rows is how a partial relation gets stamped current.
     pub fn applied_through(&self) -> u64 {
-        self.state.read().map(|s| s.through).unwrap_or(0)
+        self.lane.applied_through()
     }
 
     /// The applied-through watermark **for a fence, never for a label** (#1186).
@@ -1064,65 +572,17 @@ impl EntityView {
     /// name that says so. If you find yourself putting this into a response body, you want
     /// `rows_as_json_with_watermark`, and you are about to reintroduce #932.
     pub fn fence_watermark(&self) -> Applied {
-        self.state.read().map(|s| s.applied()).unwrap_or_default()
+        self.lane.fence_watermark()
     }
 
     /// When the applied-through watermark last moved, in unix seconds; `0` before the first batch.
     pub fn last_progress(&self) -> u64 {
-        self.state.read().map(|s| s.progress_at).unwrap_or(0)
+        self.lane.last_progress()
     }
 
     /// Is this entity current for a dataset advertising `head`?
     pub fn is_current(&self, head: u64) -> bool {
         self.applied_through() >= head
-    }
-}
-
-/// Fold one batch, bound first.
-///
-/// The bound is checked **before** the batch reaches the circuit, not after. Checking afterwards
-/// means the memory has already been allocated, which is the difference between a bound that
-/// prevents an over-budget cursor and one that reports it. Worth saying plainly that the tests below
-/// cannot tell the two orders apart - they prove the fault, not the allocation - so this ordering is
-/// a design choice held by this comment and not by a red test.
-fn step(
-    circuit: &mut EntityCircuit,
-    batch: &Batch,
-    live: &mut i64,
-    max_rows: usize,
-    into: &mut Relation,
-) -> Result<()> {
-    let next = live
-        .checked_add(batch.weight())
-        .ok_or_else(|| anyhow!("the entity's live input row count overflowed i64"))?;
-    if next < 0 {
-        return Err(anyhow!(
-            "this batch retracts {} more rows than the entity holds. A reorg feeds back rows that \
-             were applied; retracting rows that were not is a bookkeeping fault, not a small one",
-            -next
-        ));
-    }
-    if next as usize > max_rows {
-        return Err(anyhow!(
-            "RFC-0041 max_rows exceeded: {next} live input rows across both relations, declared \
-             bound {max_rows}"
-        ));
-    }
-    circuit.apply(&batch.left, &batch.right, into)?;
-    *live = next;
-    Ok(())
-}
-
-/// A cell as the SQL loader takes it: typed, so an integer stays numeric and a NULL is not the text
-/// `"NULL"`. `arbitrary_precision` carries every `i128` exactly.
-fn sql_cell(cell: &crate::entity_row::Scalar) -> serde_json::Value {
-    use crate::entity_row::Scalar;
-    match cell {
-        Scalar::Null => serde_json::Value::Null,
-        Scalar::Bool(b) => serde_json::Value::Bool(*b),
-        Scalar::Int(i) => serde_json::Number::from_i128(*i)
-            .map_or_else(|| serde_json::Value::String(i.to_string()), Into::into),
-        Scalar::Str(s) => serde_json::Value::String(s.clone()),
     }
 }
 
