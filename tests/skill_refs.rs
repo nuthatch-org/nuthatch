@@ -297,6 +297,8 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     ("src/folds.rs", Some(&["FoldsToml", "FoldDecl"])),
     // RFC-0063: `[address_history]` in `nuthatch.toml`.
     ("src/address_history.rs", Some(&["AddressHistoryConfig"])),
+    // `[[alerts]] format`'s values, in nuthatch-core since RFC-0075 S1.
+    ("core/src/alerts.rs", Some(&["AlertFormat"])),
 ];
 
 /// `src/*.rs` files that derive `Deserialize` for wire formats, snapshots, or HTTP bodies - not

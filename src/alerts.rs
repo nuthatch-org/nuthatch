@@ -15,11 +15,12 @@
 //! `wasi:http`-sandboxed egress (the C4 grant model) is available for an untrusted enricher, but a
 //! webhook sink is operator-configured and delivery-guaranteed, so the host owns it.
 
-use crate::config::Alert;
 use crate::store::HotStore;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::time::Duration;
+
+pub use nuthatch_core::alerts::{payloads, trim, AlertRouter, OUTBOX_MAX};
 
 /// One readable line for a chat sink.
 ///
@@ -57,9 +58,6 @@ pub fn discord_line(payload: &Value) -> String {
     line
 }
 
-/// Bound on the durable outbox. A dead webhook can't grow it without limit; past this the oldest
-/// undelivered alerts are shed (loudly). Generous - a transient outage of minutes is absorbed.
-pub const OUTBOX_MAX: u64 = 10_000;
 /// How many pending deliveries a single drain attempts.
 const DELIVERY_BATCH: usize = 100;
 /// Poll interval between outbox drains - also the (constant) retry backoff for a failed delivery.
@@ -69,36 +67,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How many webhook POSTs are in flight at once during a drain (SEC-8): one slow/dead sink must not
 /// throttle the others - the drain is bounded by the slowest single request, not the sum.
 const DELIVERY_CONCURRENCY: usize = 8;
-
-/// Routes annotation kinds to the webhook sinks that want them. Built once from `[[alerts]]`.
-#[derive(Clone, Default)]
-pub struct AlertRouter {
-    sinks: Vec<Alert>,
-}
-
-impl AlertRouter {
-    pub fn new(sinks: Vec<Alert>) -> Self {
-        Self { sinks }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.sinks.is_empty()
-    }
-
-    /// The URLs that want annotations of `kind`.
-    fn urls_for(&self, kind: &str) -> Vec<(&str, crate::config::AlertFormat)> {
-        self.sinks
-            .iter()
-            .filter(|s| s.kinds.iter().any(|k| k == kind))
-            .map(|s| (s.url.as_str(), s.format))
-            .collect()
-    }
-
-    /// Whether any sink watches `kind` - a cheap pre-check before building a retraction payload.
-    pub fn watches(&self, kind: &str) -> bool {
-        self.sinks.iter().any(|s| s.kinds.iter().any(|k| k == kind))
-    }
-}
 
 /// Enqueue an alert for every sink that watches `kind`. `event` is `"flag"` or `"flag_retracted"`.
 /// A no-op when nothing is configured or nothing matches. Bounds the outbox after pushing.
@@ -115,39 +83,6 @@ pub fn enqueue(
     }
     if !queued.is_empty() {
         trim(store)?;
-    }
-    Ok(())
-}
-
-/// The outbox entries [`enqueue`] would push, for a caller that writes them in its own transaction.
-pub fn payloads(router: &AlertRouter, event: &str, kind: &str, annotation: &Value) -> Vec<String> {
-    router
-        .urls_for(kind)
-        .into_iter()
-        .map(|(url, format)| {
-            // The format rides in the payload rather than being looked up at delivery: the outbox is
-            // durable, so an entry may outlive an edit to `[[alerts]]`, and a queued alert should be
-            // delivered the way it was queued.
-            json!({
-                "event": event,
-                "kind": kind,
-                "url": url,
-                "format": format,
-                "annotation": annotation,
-            })
-            .to_string()
-        })
-        .collect()
-}
-
-/// Bound the outbox at [`OUTBOX_MAX`], dropping the oldest undelivered entries.
-pub fn trim(store: &dyn HotStore) -> Result<()> {
-    let dropped = store.outbox_trim(OUTBOX_MAX)?;
-    if dropped > 0 {
-        tracing::warn!(
-            "alert outbox full ({OUTBOX_MAX}): dropped {dropped} oldest undelivered alert(s) - \
-             a webhook is down or too slow"
-        );
     }
     Ok(())
 }
@@ -332,6 +267,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::config::Alert;
     use crate::store::Store;
 
     #[test]

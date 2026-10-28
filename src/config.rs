@@ -240,26 +240,16 @@ pub struct Alert {
     pub format: AlertFormat,
 }
 
-/// The body a sink expects.
-///
-/// **Discord will not take our payload.** Posting the outbox's own JSON to a Discord webhook is
-/// answered `400 {"message": "Cannot send an empty message", "code": 50006}` - measured against a
-/// real webhook, not inferred - while `{"content": "…"}` is answered `204`. Since the delivery
-/// worker retries a non-success forever, wiring Discord up without this would give an outbox that
-/// never drains and alerts that never arrive: an alerting system that fails silently, which is worse
-/// than none.
-///
-/// An unrecognised value is a **load error**, not a fallback to `Raw`. Falling back would put the
-/// nest straight into that silent-failure state for a typo.
-#[derive(Debug, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum AlertFormat {
-    /// The outbox payload verbatim: `{event, kind, url, annotation}`. What every existing sink gets,
-    /// and what an HMAC signature is computed over.
-    #[default]
-    Raw,
-    /// `{"content": "…"}` - Discord, and anything else that speaks the same shape.
-    Discord,
+pub use nuthatch_core::alerts::AlertFormat;
+
+impl From<Alert> for nuthatch_core::alerts::AlertSink {
+    fn from(a: Alert) -> Self {
+        Self {
+            kinds: a.kinds,
+            url: a.url,
+            format: a.format,
+        }
+    }
 }
 
 /// A child-contract template (RFC-0009): a name + a vendored ABI, applied to every contract a
