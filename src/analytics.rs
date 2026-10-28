@@ -8211,7 +8211,9 @@ template="pool"
             ]);
             query_hot_cold(
                 dir.path(),
-                "SELECT a.i FROM range(5000000) a(i), range(120) b(j) \
+                // Each series small enough to fit the pool, since series rows are charged to it before
+                // they are built; the cross join is what makes the sort spill.
+                "SELECT a.i FROM range(50000) a(i), range(12000) b(j) \
                  ORDER BY (a.i * 2654435761) % 1000003, b.j",
                 guard,
                 &HotRows::new(),
