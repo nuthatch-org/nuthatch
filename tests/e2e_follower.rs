@@ -600,7 +600,20 @@ async fn a_snapshot_over_the_cursor_budget_is_refused_and_its_co_mount_serves() 
             .unwrap()["rows"]
             .clone()
     };
-    assert_eq!(resp(fbase.clone()).await, resp(wbase).await);
+    // The co-mount's own store, not the one `reaches` watches, has to have block 1 on both sides.
+    let mut counts = (serde_json::Value::Null, serde_json::Value::Null);
+    for _ in 0..400 {
+        counts = (resp(wbase.clone()).await, resp(fbase.clone()).await);
+        if counts.0[0]["n"] == 1 && counts.0 == counts.1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(counts.0[0]["n"], 1, "the writer's co-mount has block 1");
+    assert_eq!(
+        counts.1, counts.0,
+        "the co-mount answers as the writer does"
+    );
 
     let mut big = route_status(&fbase, ROUTE).await;
     for _ in 0..400 {
@@ -1375,13 +1388,19 @@ async fn torn_derived_state_is_not_served_until_rebuilt() {
     let mut stored = false;
     for _ in 0..400 {
         let (status, body) = sql(&fa, nine).await;
-        if status == 200 && body["rows"][0]["n"] == 1 {
+        let (_, ready) = get(&fa, &format!("/{ROUTE}/ready")).await;
+        // Both, so the window is past being applied and the feed has been found torn.
+        if status == 200 && body["rows"][0]["n"] == 1 && ready["derived"]["state"] == "catching_up"
+        {
             stored = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(stored, "the follower applied block 9 to its hot copy");
+    assert!(
+        stored,
+        "the follower applied block 9 to its hot copy and found the feed torn"
+    );
     for path in [
         "/derived/received".to_string(),
         "/derived/by_tier".to_string(),
