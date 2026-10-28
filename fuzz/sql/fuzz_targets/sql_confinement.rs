@@ -9,6 +9,9 @@
 //! - an answer or an error carrying B's secret, when the statement did not spell it out itself;
 //! - any file under the runtime directory created, removed or changed by a statement.
 //!
+//! A bundle is the tenant's too, so an input may also carry A's `views/zz.sql`, built from the same
+//! fragments, which the statement can then name as `z`.
+//!
 //! An `Err` is always an acceptable outcome. Statements are built from fragments of every escape
 //! this surface has had or been audited for (quoted names, replacement scans, file URLs, stacked
 //! statements, the catalogue), so libFuzzer spends its time recombining them rather than finding
@@ -141,6 +144,8 @@ const WORDS: &[&str] = &[
     "CREATE EXTERNAL TABLE",
     "STORED AS PARQUET LOCATION",
     "DROP VIEW",
+    "DROP TABLE",
+    "CREATE TABLE z AS",
     "SET",
     "PRAGMA",
     "EXPLAIN",
@@ -148,6 +153,7 @@ const WORDS: &[&str] = &[
     "LATERAL",
     "t__e",
     "v",
+    "z",
     "b_only",
     "t__e__raw",
     "t__e__hot",
@@ -216,7 +222,11 @@ struct Input {
     strict: bool,
     base: u8,
     pieces: Vec<Piece>,
+    /// The body of an authored `CREATE VIEW z AS …`, or its whole file when `raw`.
+    view: Option<(bool, Vec<Piece>)>,
 }
+
+const VIEW_FILE: &str = "zz.sql";
 
 /// Statements that already answer, so the fuzzer spends its time on what follows them rather than on
 /// assembling a first `SELECT`. The empty one leaves the pieces on their own.
@@ -230,8 +240,12 @@ const BASES: &[&str] = &[
 ];
 
 fn render(f: &Fixture, input: &Input) -> String {
-    let mut sql = format!("{} ", BASES[input.base as usize % BASES.len()]);
-    for piece in &input.pieces {
+    let sql = format!("{} ", BASES[input.base as usize % BASES.len()]);
+    render_pieces(f, sql, &input.pieces)
+}
+
+fn render_pieces(f: &Fixture, mut sql: String, pieces: &[Piece]) -> String {
+    for piece in pieces {
         match piece {
             Piece::Word(i) => sql.push_str(WORDS[*i as usize % WORDS.len()]),
             Piece::Punct(i) => sql.push_str(PUNCT[*i as usize % PUNCT.len()]),
@@ -253,8 +267,19 @@ fn render(f: &Fixture, input: &Input) -> String {
 fuzz_target!(|input: Input| {
     let f = fixture();
     let sql = render(f, &input);
-    if sql.len() > 16 * 1024 {
+    let view = input.view.as_ref().map(|(raw, pieces)| {
+        let head = if *raw { "" } else { "CREATE VIEW z AS " };
+        render_pieces(f, head.to_string(), pieces)
+    });
+    if sql.len() + view.as_ref().map_or(0, String::len) > 16 * 1024 {
         return;
+    }
+    let view_file = f.a.join("views").join(VIEW_FILE);
+    match &view {
+        Some(text) => std::fs::write(&view_file, text).unwrap(),
+        None => {
+            let _ = std::fs::remove_file(&view_file);
+        }
     }
     let tenant = input.strict.then(|| Arc::<str>::from("a"));
     // `/sql` confines a panic to its request, so one is an outcome here, not a finding; the checks
@@ -269,17 +294,21 @@ fuzz_target!(|input: Input| {
         Ok(Err(e)) => format!("{e:#}"),
         Err(_) => String::new(),
     };
-    if !sql.contains(&f.secret) {
+    let spelled = sql.contains(&f.secret) || view.as_ref().is_some_and(|v| v.contains(&f.secret));
+    if !spelled {
         assert!(
             !text.contains(&f.secret),
-            "B's secret reached A ({}): {sql}\n{text}",
+            "B's secret reached A ({}): {sql}\nview: {view:?}\n{text}",
             if input.strict { "strict" } else { "shared" }
         );
     }
-    let now = files_under(&f.root);
+    let now: Vec<_> = files_under(&f.root)
+        .into_iter()
+        .filter(|(p, _, _)| *p != view_file)
+        .collect();
     assert!(
         now == f.files,
-        "a statement changed the runtime directory: {sql}\nbefore {:?}\nafter {:?}",
+        "a statement changed the runtime directory: {sql}\nview: {view:?}\nbefore {:?}\nafter {:?}",
         f.files,
         now
     );
