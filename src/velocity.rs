@@ -291,6 +291,16 @@ pub struct VelocityView {
 }
 
 impl VelocityView {
+    /// A view with no circuit, as [`crate::views::BalanceView::inert`].
+    pub fn inert() -> Self {
+        let (tx, _) = channel::<Msg>();
+        Self {
+            tx,
+            rows: Default::default(),
+            healthy: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
     /// Start the velocity view. When `enabled` is false (no velocity flag configured) the DBSP circuit
     /// and its worker thread are not spawned - `apply` no-ops and `snapshot` stays empty (L10).
     pub fn start(enabled: bool) -> Result<Self> {
