@@ -383,6 +383,10 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "src/seal.rs",
         "sealed-segment catalogue, written by the indexer",
     ),
+    (
+        "core/src/seal.rs",
+        "sealed-segment catalogue, written by the indexer",
+    ),
     ("src/pack.rs", "compliance-pack manifest, not nest config"),
     ("core/src/labels.rs", "imported label snapshots, not nest toml"),
     ("src/lists.rs", "fetched list snapshots, not nest toml"),
