@@ -10648,12 +10648,12 @@ mod confinement {
         }
     }
 
-    /// FR8 review, open: a scalar function's output is not charged to the engine pool, so one value
-    /// can be as large as its arguments say. `repeat('a', 1e9)` peaked at 4 GB of RSS under a 512 MB
-    /// pool; `range`, `lpad` and `array_repeat` do the same. Ignored until the
-    /// engine bounds it, because running it is the attack.
+    /// FR8 review: a scalar function's result was not charged to the engine pool, and
+    /// `repeat('a', 1500000000)` grew peak RSS by 5.7 GB under a 512 MB pool. Burrmill now refuses a
+    /// value past 16 MiB from its arguments or once built, and charges outputs from 256 KiB to the
+    /// pool, so each of these is refused within the pool and its slack (24 MiB in Burrmill's
+    /// `df_valuebound`).
     #[test]
-    #[ignore = "open finding: scalar results are not charged to the pool"]
     fn a_statement_cannot_allocate_far_past_its_pool() {
         let f = two_datasets();
         let peak = || {
@@ -10669,24 +10669,34 @@ mod confinement {
                 rss * 1024
             }
         };
-        let before = peak();
         let tenant = Some(Arc::<str>::from("a"));
-        let got = isolated(tenant.as_ref(), || {
-            query_hot_cold(
-                &f.a,
-                "SELECT length(repeat('a', 1500000000)) AS n",
-                guard(),
-                &HotRows::new(),
-                10,
-                &[],
-            )
-        });
-        let grew = peak().saturating_sub(before);
-        assert!(
-            got.is_err() && grew < 1 << 30,
-            "answered {:?} after growing {} MB",
-            got.map(|o| o.rows),
-            grew >> 20
-        );
+        let run = |sql: &str| {
+            isolated(tenant.as_ref(), || {
+                query_hot_cold(&f.a, sql, guard(), &HotRows::new(), 10, &[])
+            })
+        };
+        run("SELECT 1 AS warm").unwrap();
+        let replace = (0..40).fold("'a'".to_string(), |s, _| format!("replace({s}, 'a', 'aa')"));
+        let bound = (crate::analytics_budget::DEFAULT_MEMORY_LIMIT_MB << 20) + (24 << 20);
+        for sql in [
+            "SELECT length(repeat('a', 1500000000)) AS n".to_string(),
+            "SELECT length(lpad('a', 1000000000)) AS n".into(),
+            "SELECT cardinality(array_repeat(1, 100000000)) AS n".into(),
+            "SELECT cardinality(range(100000000)) AS n".into(),
+            format!("SELECT length({replace}) AS n"),
+            "WITH RECURSIVE r(s, i) AS (SELECT 'aaaaaaaa', 0 UNION ALL \
+             SELECT s || s, i + 1 FROM r WHERE i < 27) SELECT max(length(s)) AS n FROM r"
+                .into(),
+        ] {
+            let before = peak();
+            let got = run(&sql);
+            let grew = peak().saturating_sub(before);
+            assert!(
+                got.is_err() && grew < bound,
+                "{sql}: answered {:?} after growing {} MB",
+                got.map(|o| o.rows),
+                grew >> 20
+            );
+        }
     }
 }
