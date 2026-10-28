@@ -429,7 +429,14 @@ impl SharedNest {
 // swappable `SharedNest` per request, always seeing the current version.
 impl axum::extract::FromRef<SharedNest> for AppState {
     fn from_ref(shared: &SharedNest) -> AppState {
-        (*shared.0.load_full()).clone()
+        let pinned = PINNED
+            .try_with(|(b, s)| Arc::ptr_eq(&b.0, &shared.0).then(|| s.clone()))
+            .ok()
+            .flatten();
+        match pinned {
+            Some(state) => (*state).clone(),
+            None => (*shared.0.load_full()).clone(),
+        }
     }
 }
 
@@ -528,7 +535,53 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
             )
         }
     }))
+    .layer(axum::middleware::from_fn({
+        let backing = backing.clone();
+        move |req, next| pin_request(backing.clone(), req, next)
+    }))
     .with_state(backing)
+}
+
+tokio::task_local! {
+    static PINNED: (SharedNest, Arc<AppState>);
+}
+
+/// A request to `dir` that, once it has taken its state, says so and waits to be let go.
+#[cfg(test)]
+type PinHook = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+fn pin_hooks() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, PinHook>>
+{
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, PinHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
+/// Serve one request from one version of its nest: every extraction of its state, and every
+/// catalogue read on any thread working for it, sees the backing current when it arrived. A
+/// follower's resnapshot swaps the backing mid-request, and the catalogue pairs with one copy.
+async fn pin_request(
+    backing: SharedNest,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let state = backing.current();
+    #[cfg(test)]
+    {
+        let hook = pin_hooks().lock().unwrap().remove(&state.dir);
+        if let Some((pinned, release)) = hook {
+            let _ = pinned.send(());
+            let _ = release.await;
+        }
+    }
+    let (dir, store) = (state.dir.clone(), state.store.clone());
+    let served = crate::seal::serving(dir, store, next.run(req));
+    PINNED.scope((backing, state), served).await
 }
 
 pub async fn run(
@@ -1252,7 +1305,7 @@ async fn etherscan_api(
     State(s): State<AppState>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
-    let answer = tokio::task::spawn_blocking(move || {
+    let answer = crate::seal::spawn_blocking(move || {
         crate::address_history::respond(s.address_history.as_ref(), &q)
     })
     .await
@@ -2509,7 +2562,7 @@ async fn admin_config(
         return (StatusCode::UNAUTHORIZED, "admin token required").into_response();
     }
     let dir = s.dir.clone();
-    let files = tokio::task::spawn_blocking(move || {
+    let files = crate::seal::spawn_blocking(move || {
         let mut names: Vec<String> = ADMIN_CONFIG_FILES.iter().map(|f| f.to_string()).collect();
         if let Ok(entries) = std::fs::read_dir(dir.join("views")) {
             let mut views: Vec<String> = entries
@@ -2575,7 +2628,7 @@ async fn admin_storage(
     }
     let dir = s.dir.clone();
     let wanted = q.table;
-    let built = tokio::task::spawn_blocking(move || -> Result<Value> {
+    let built = crate::seal::spawn_blocking(move || -> Result<Value> {
         let manifest = crate::seal::load_manifest(&dir)?;
         let size = |seg: &crate::seal::Segment| {
             std::fs::metadata(crate::seal::segment_path(&dir, &seg.file, &seg.hash))
@@ -3819,7 +3872,7 @@ async fn bounded_hot_read<T: Send + 'static>(
     }
     let permit = admit(s).await?;
     let cap = s.limits.max_hot_rows;
-    match tokio::task::spawn_blocking(move || read(cap)).await {
+    match crate::seal::spawn_blocking(move || read(cap)).await {
         Ok(Ok(Some(rows))) => Ok((rows, Some(permit))),
         Ok(Ok(None)) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4919,7 +4972,7 @@ async fn run_sql_query_at(
         };
         let (st, sql) = (s.clone(), q.q.clone());
         let scope = crate::metrics::serving_scope();
-        match tokio::task::spawn_blocking(move || {
+        match crate::seal::spawn_blocking(move || {
             let _slot = slot;
             crate::metrics::within_serving_scope(scope, || remembered(&st, &sql, max_rows))
         })
@@ -5220,7 +5273,7 @@ impl crate::diff::Source for DiffSource {
             sql.to_string(),
         );
         let sealed_through = self.sealed_through;
-        let mut out = tokio::task::spawn_blocking(move || {
+        let mut out = crate::seal::spawn_blocking(move || {
             analytics::isolated(tenant.as_ref(), || {
                 analytics::query_hot_cold(&dir, &sql, guard, &hot, sealed_through, &tables)
             })
@@ -5253,7 +5306,7 @@ async fn diff_route(State(s): State<AppState>, Query(q): Query<DiffQuery>) -> im
     METRICS.inc_sql();
     let deadline = std::time::Instant::now() + s.limits.timeout;
     let st = s.clone();
-    let gathered = tokio::task::spawn_blocking(move || {
+    let gathered = crate::seal::spawn_blocking(move || {
         let (hot, tip_unavailable, hot_head, hot_permit) = match charged_hot_rows(
             st.store.as_ref(),
             &st.hot_charge(),
@@ -5501,7 +5554,7 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
     let declared_entities = s.entities.clone();
     let hot_charge = s.hot_charge();
     let tenant = s.isolation.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = crate::seal::spawn_blocking(move || {
         let _permit = permit;
         // Planning materialises no result rows, but the tip is still parsed
         // into temp tables first - so `/explain` carries the full scan cost. Without the same
@@ -9350,7 +9403,80 @@ mod tests {
         let opens = |t| crate::analytics::session_opens_in(tmp.path(), t);
         assert!(opens(Some("a")) >= 1 && opens(Some("b")) >= 1);
         assert_eq!(opens(None), 0, "a strict route used the shared session");
-        crate::seal::unpin_catalogue(tmp.path());
+    }
+
+    /// RFC-0073 FR1: a request that took the old copy before a resnapshot swapped in one whose seal
+    /// moved rows from hot to a segment answers from the old copy's catalogue throughout, counting
+    /// each row once, and the next request answers from the new copy's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_in_flight_across_a_resnapshot_reads_its_own_copys_catalogue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = table_fixture(tmp.path(), 1..=3, 4..=5);
+        writer.store.set_meta("sealed_through", "3").unwrap();
+        // Final, so the next seal adds a segment rather than folding this one into it.
+        crate::seal::finalise_provisional(&writer.dir).unwrap();
+        let copy = |store: &Arc<dyn crate::store::HotStore>| -> Arc<dyn crate::store::HotStore> {
+            let sub = store
+                .feed_subscribe()
+                .unwrap()
+                .expect("a redb store has a feed");
+            Arc::new(crate::feed::MemStore::from_snapshot(
+                &writer.dir,
+                sub.snapshot,
+            ))
+        };
+        let old = copy(&writer.store);
+        let shared = SharedNest::new(AppState {
+            store: old.clone(),
+            ..writer.clone()
+        });
+        let count = "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20t";
+        let ask = |shared: SharedNest| async move {
+            use tower::ServiceExt;
+            let req = axum::http::Request::builder()
+                .uri(count)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = router(shared).oneshot(req).await.unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&body).unwrap()["rows"][0]["n"].clone()
+        };
+        assert_eq!(ask(shared.clone()).await, 5, "the old generation");
+
+        let (pinned_tx, pinned) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        pin_hooks()
+            .lock()
+            .unwrap()
+            .insert(writer.dir.clone(), (pinned_tx, release_rx));
+        let held = tokio::spawn(ask(shared.clone()));
+        pinned.await.unwrap();
+        // The seal: blocks 4 and 5 go to a segment and leave hot, and a resnapshot is swapped in.
+        let row = |b: u64| json!({"table":"t","block_number":b,"log_index":0,"v":"x"}).to_string();
+        // As the writer: its copies share this process and this directory only in this test.
+        crate::seal::within(&writer.dir, writer.store.clone(), || {
+            crate::seal::seal_range(&writer.dir, &[row(4), row(5)], 4, 5)
+        })
+        .unwrap();
+        writer
+            .store
+            .prune_and_set_meta(4, 5, "sealed_through", "5")
+            .unwrap();
+        let new = copy(&writer.store);
+        shared.swap(AppState {
+            store: new,
+            ..writer.clone()
+        });
+        release.send(()).unwrap();
+        assert_eq!(
+            held.await.unwrap(),
+            5,
+            "the held request counts each row once"
+        );
+        assert_eq!(ask(shared.clone()).await, 5, "the new generation");
+        drop(old);
     }
 
     async fn get_json(state: AppState, uri: &str) -> (StatusCode, Value) {
@@ -10129,8 +10255,6 @@ mod tests {
         let resp = sql_response(a, "SELECT 4 AS n").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(gate.hot_used().is_empty());
-        crate::seal::unpin_catalogue(ta.path());
-        crate::seal::unpin_catalogue(tb.path());
     }
 
     /// A hot copy is given back however the query ends: a SQL error, or a panic after the copy.

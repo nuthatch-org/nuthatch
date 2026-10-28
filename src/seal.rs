@@ -732,42 +732,119 @@ fn checked(m: Manifest) -> Result<Manifest> {
     Ok(m)
 }
 
-/// Catalogues a follower (`serve --follow`) pinned per dataset, `None` inside meaning "never sealed".
-type Pins = std::sync::RwLock<HashMap<PathBuf, Option<Arc<str>>>>;
-
-fn pins() -> &'static Pins {
-    static PINS: OnceLock<Pins> = OnceLock::new();
-    PINS.get_or_init(Default::default)
+/// The nest a request is served from: its directory and the hot store it reads. A follower's copy
+/// carries the catalogue its watermark pairs with (RFC-0073 FR1), and every catalogue read for that
+/// directory while the request runs is answered from it, whichever copy is newest by then.
+#[derive(Clone)]
+pub struct Serving {
+    dir: PathBuf,
+    store: Arc<dyn crate::store::HotStore>,
 }
 
-/// Serve `dir`'s catalogue from `raw` rather than the disk (RFC-0073 FR1). A follower's watermark comes
-/// from the writer's feed, and the catalogue on disk may already be a seal ahead of it.
-pub fn pin_catalogue(dir: &Path, raw: Option<String>) {
-    pins()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(dir.to_path_buf(), raw.map(Arc::from));
+tokio::task_local! {
+    static SERVING: Serving;
 }
 
-pub fn unpin_catalogue(dir: &Path) {
-    pins()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(dir);
+thread_local! {
+    static SERVING_ON_THREAD: std::cell::RefCell<Option<Serving>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// The catalogue's bytes: the pinned ones where a follower pinned them, else the file.
-fn read_catalogue(dir: &Path) -> std::io::Result<Vec<u8>> {
-    let pinned = pins()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(dir)
-        .cloned();
-    match pinned {
-        Some(Some(raw)) => Ok(raw.as_bytes().to_vec()),
-        Some(None) => Err(std::io::ErrorKind::NotFound.into()),
-        None => std::fs::read(manifest_path(dir)),
+/// Run `fut` as a request served from `store` over `dir`.
+pub async fn serving<F: std::future::Future>(
+    dir: PathBuf,
+    store: Arc<dyn crate::store::HotStore>,
+    fut: F,
+) -> F::Output {
+    SERVING.scope(Serving { dir, store }, fut).await
+}
+
+fn current_serving() -> Option<Serving> {
+    SERVING
+        .try_with(Clone::clone)
+        .ok()
+        .or_else(|| SERVING_ON_THREAD.with(|s| s.borrow().clone()))
+}
+
+fn on_thread<R>(serving: Option<Serving>, f: impl FnOnce() -> R) -> R {
+    // Restored on drop, so a panic does not leave a copy on a pooled thread.
+    struct Restore(Option<Serving>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SERVING_ON_THREAD.with(|s| *s.borrow_mut() = self.0.take());
+        }
     }
+    let _restore = Restore(SERVING_ON_THREAD.with(|s| s.replace(serving)));
+    f()
+}
+
+/// [`serving`] for work on this thread, outside any request.
+pub fn within<R>(dir: &Path, store: Arc<dyn crate::store::HotStore>, f: impl FnOnce() -> R) -> R {
+    let serving = Serving {
+        dir: dir.to_path_buf(),
+        store,
+    };
+    on_thread(Some(serving), f)
+}
+
+/// `f`, to run on another thread as part of the request this one serves.
+pub fn carry<R>(f: impl FnOnce() -> R) -> impl FnOnce() -> R {
+    let serving = current_serving();
+    move || on_thread(serving, f)
+}
+
+/// `tokio::task::spawn_blocking`, carrying the request's copy onto the blocking thread.
+pub fn spawn_blocking<R: Send + 'static>(
+    f: impl FnOnce() -> R + Send + 'static,
+) -> tokio::task::JoinHandle<R> {
+    tokio::task::spawn_blocking(carry(f))
+}
+
+/// Directories a follower holds copies of, by how many: their catalogue on disk may be a seal ahead
+/// of a copy's watermark, so it is never read for them.
+fn followed() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static FOLLOWED: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    FOLLOWED.get_or_init(Default::default)
+}
+
+/// A follower's copy of `dir` now exists; paired with [`unfollow`] when it goes.
+pub fn follow(dir: &Path) {
+    let mut all = followed().lock().unwrap_or_else(|e| e.into_inner());
+    *all.entry(dir.to_path_buf()).or_default() += 1;
+}
+
+pub fn unfollow(dir: &Path) {
+    let mut all = followed().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(n) = all.get_mut(dir) {
+        *n -= 1;
+        if *n == 0 {
+            all.remove(dir);
+        }
+    }
+}
+
+/// The catalogue's bytes: the serving copy's where it carries one, else the file, which is never
+/// read for a directory a follower holds.
+fn read_catalogue(dir: &Path) -> std::io::Result<Vec<u8>> {
+    if let Some(s) = current_serving().filter(|s| s.dir == dir) {
+        return match s.store.served_catalogue() {
+            Some(Some(raw)) => Ok(raw.as_bytes().to_vec()),
+            Some(None) => Err(std::io::ErrorKind::NotFound.into()),
+            // The writer's own store: its catalogue is the file.
+            None => std::fs::read(manifest_path(dir)),
+        };
+    }
+    let held = followed()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(dir);
+    if held {
+        return Err(std::io::Error::other(format!(
+            "{}: a follower reads its catalogue only from the copy a request is served from",
+            dir.display()
+        )));
+    }
+    std::fs::read(manifest_path(dir))
 }
 
 /// Load the segment catalogue (empty if none yet).

@@ -69,7 +69,7 @@ fn with(f: impl FnOnce(&Tally)) {
     }
 }
 
-/// `tokio::task::spawn_blocking`, with the request's meter on the blocking thread.
+/// `tokio::task::spawn_blocking`, with the request's meter, and the copy it is served from, on the thread.
 pub fn spawn_blocking<R: Send + 'static>(
     f: impl FnOnce() -> R + Send + 'static,
 ) -> tokio::task::JoinHandle<R> {
@@ -81,7 +81,7 @@ pub fn spawn_blocking<R: Send + 'static>(
         }
     }
     let meter = current();
-    tokio::task::spawn_blocking(move || {
+    crate::seal::spawn_blocking(move || {
         let _restore = Restore(ON_THREAD.with(|m| m.replace(meter)));
         f()
     })

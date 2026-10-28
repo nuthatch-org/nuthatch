@@ -523,7 +523,6 @@ impl Follower {
             }
             inner.over_budget.insert(dataset.to_string(), why);
         }
-        crate::seal::unpin_catalogue(&self.root.join(dataset));
         self.recompose();
     }
 
@@ -603,7 +602,6 @@ impl Follower {
                             inner.positions.remove(&dataset);
                             inner.excluded.remove(&dataset);
                             inner.awaiting_room.remove(&dataset);
-                            crate::seal::unpin_catalogue(&self.root.join(&dataset));
                         }
                     }
                 }

@@ -13,8 +13,9 @@
 //! **The seal handoff.** A seal writes its segment and catalogue, then prunes the sealed rows from
 //! hot and raises `sealed_through` in one commit. The delta for that commit carries the prune, the new
 //! watermark and the catalogue as it stood at the commit, so a reader moves from "rows in hot" to
-//! "rows in a segment under its watermark" in one apply. Its catalogue comes from the feed, pinned
-//! with [`crate::seal::pin_catalogue`], never from the disk, which may already be a seal ahead.
+//! "rows in a segment under its watermark" in one apply. Its catalogue comes from the feed and is
+//! held by the copy, never read from the disk, which may already be a seal ahead: a request reads the
+//! catalogue of the copy it is served from ([`crate::seal::serving`]).
 
 use crate::store::{HotRowsSnapshot, HotScanBudgetExceeded, HotScanTooLarge, HotStore, Lease};
 use anyhow::{bail, Context, Result};
@@ -679,9 +680,11 @@ struct Mirror {
     blocks: BTreeMap<String, String>,
     epoch: u64,
     generation: u64,
-    /// What the three tables are charged, by [`row_bytes`], and the pinned catalogue's length.
+    /// What the three tables are charged, by [`row_bytes`], and the catalogue's length.
     bytes: u64,
     catalogue_bytes: u64,
+    /// The catalogue this copy's watermark pairs with, `None` where its dataset never sealed.
+    catalogue: Option<Arc<str>>,
 }
 
 /// Insert into `map`, keeping `bytes` the charge for what it holds.
@@ -752,8 +755,14 @@ pub struct MemStore {
     mirror: RwLock<Mirror>,
     writes: AtomicU64,
     rows: AtomicU64,
-    /// The catalogue this store's watermark pairs with, pinned for its dataset directory.
+    /// Its dataset's directory, which [`crate::seal`] never reads the catalogue of while this lives.
     dir: PathBuf,
+}
+
+impl Drop for MemStore {
+    fn drop(&mut self) {
+        crate::seal::unfollow(&self.dir);
+    }
 }
 
 impl MemStore {
@@ -775,8 +784,9 @@ impl MemStore {
             epoch: snapshot.epoch,
             generation: snapshot.generation,
             catalogue_bytes,
+            catalogue: snapshot.catalogue.map(Arc::from),
         };
-        crate::seal::pin_catalogue(dir, snapshot.catalogue);
+        crate::seal::follow(dir);
         MemStore {
             mirror: RwLock::new(mirror),
             writes: AtomicU64::new(rows_epoch()),
@@ -914,7 +924,7 @@ impl MemStore {
         if let Some(raw) = &delta.catalogue {
             m.bytes = m.bytes - m.catalogue_bytes + raw.len() as u64;
             m.catalogue_bytes = raw.len() as u64;
-            crate::seal::pin_catalogue(&self.dir, Some(raw.clone()));
+            m.catalogue = Some(Arc::from(raw.as_str()));
         }
         m.generation = delta.generation;
         if changes_rows {
@@ -1056,6 +1066,10 @@ impl HotStore for MemStore {
     fn rows_generation(&self) -> Option<u64> {
         let g = self.rows.load(Ordering::SeqCst);
         g.is_multiple_of(2).then_some(g)
+    }
+
+    fn served_catalogue(&self) -> Option<Option<Arc<str>>> {
+        Some(self.read().catalogue.clone())
     }
 
     fn put_entity(&self, _key: &str, _json: &str) -> Result<()> {
@@ -1413,7 +1427,6 @@ mod tests {
             HotStore::recent_by_table(&copy, "c", 10).unwrap(),
             store.recent_by_table("c", 10).unwrap()
         );
-        crate::seal::unpin_catalogue(tmp.path());
     }
 
     /// The seal's prune, its watermark and its catalogue arrive in one delta.
@@ -1426,7 +1439,7 @@ mod tests {
             .unwrap();
         let mut sub = store.feed_subscribe().unwrap();
         assert_eq!(sub.snapshot.catalogue, None);
-        let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot.clone());
+        let copy = Arc::new(MemStore::from_snapshot(tmp.path(), sub.snapshot.clone()));
         write_catalogue(tmp.path(), 1);
         store
             .prune_and_set_meta(1, 1, "sealed_through", "1")
@@ -1440,10 +1453,53 @@ mod tests {
         copy.apply(&delta).unwrap();
         // The disk moves on; the follower's catalogue stays the one its watermark pairs with.
         write_catalogue(tmp.path(), 9);
-        let (pinned, _) = crate::seal::load_manifest_with_hash(tmp.path()).unwrap();
+        let (pinned, _) = crate::seal::within(tmp.path(), copy.clone(), || {
+            crate::seal::load_manifest_with_hash(tmp.path())
+        })
+        .unwrap();
         assert_eq!(pinned.tables["t"][0].to_block, 1);
-        assert_eq!(HotStore::count(&copy).unwrap(), 1);
-        crate::seal::unpin_catalogue(tmp.path());
+        assert_eq!(HotStore::count(&*copy).unwrap(), 1);
+        assert!(
+            crate::seal::load_manifest(tmp.path()).is_err(),
+            "outside a request on a copy, the disk is not read for a followed dataset"
+        );
+    }
+
+    /// Each copy of one dataset answers with its own catalogue, whichever is newer, and one going
+    /// leaves the other's alone.
+    #[test]
+    fn each_copy_of_a_dataset_reads_its_own_catalogue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
+        store
+            .commit_window(&[row(1, 0, "t"), row(2, 0, "t")], None, 2)
+            .unwrap();
+        let old = Arc::new(MemStore::from_snapshot(
+            tmp.path(),
+            store.feed_subscribe().unwrap().snapshot,
+        ));
+        write_catalogue(tmp.path(), 1);
+        store
+            .prune_and_set_meta(1, 1, "sealed_through", "1")
+            .unwrap();
+        let new = Arc::new(MemStore::from_snapshot(
+            tmp.path(),
+            store.feed_subscribe().unwrap().snapshot,
+        ));
+        let sealed = |copy: &Arc<MemStore>| {
+            crate::seal::within(tmp.path(), copy.clone(), || {
+                crate::seal::load_manifest(tmp.path()).unwrap().tables.len()
+            })
+        };
+        assert_eq!((sealed(&old), sealed(&new)), (0, 1));
+        drop(old);
+        assert_eq!(sealed(&new), 1, "the other copy's going leaves this one's");
+        assert!(crate::seal::load_manifest(tmp.path()).is_err());
+        drop(new);
+        assert_eq!(
+            crate::seal::load_manifest(tmp.path()).unwrap().tables.len(),
+            1
+        );
     }
 
     /// A snapshot taken between a seal's catalogue and its commit waits for the commit.
@@ -1496,7 +1552,6 @@ mod tests {
             resync: false,
         };
         assert!(copy.apply(&other_epoch).is_err(), "a restarted writer");
-        crate::seal::unpin_catalogue(tmp.path());
     }
 
     /// A commit whose ops were not gathered because nobody was subscribed when it began is published
@@ -1688,7 +1743,6 @@ mod tests {
             before,
             "the put taken back, the meta rewritten as it was"
         );
-        crate::seal::unpin_catalogue(tmp.path());
     }
 
     /// A delta's bytes are limited by what its dataset has left, as a snapshot's are by its budget.
