@@ -3662,6 +3662,62 @@ pub fn enrich_query_error(
     crate::sql_errors::enrich(raw, query, schema)
 }
 
+/// [`enrich_query_error`] for a served request: explains a failed view from what defining it
+/// recorded, and never opens an engine. The replay opened one outside the request's permit and
+/// isolation, on the async thread, ran every authored statement including `CREATE TABLE … AS`, and
+/// any statement whose error text named an authored view could ask for it.
+pub fn enrich_served_query_error(
+    dir: &Path,
+    raw: &str,
+    query: &str,
+    schema: &[crate::registry::TableSchema],
+) -> Option<String> {
+    if let Some(name) = missing_table_of(raw) {
+        if let Some(issue) = recorded_view_failure(dir, schema, &name, 8) {
+            let extra = issue.hint.map(|h| format!("\n{h}")).unwrap_or_default();
+            return Some(format!(
+                "view `{name}` failed to build (in `{}`): {}{extra}",
+                issue.file, issue.error
+            ));
+        }
+    }
+    crate::sql_errors::enrich(raw, query, schema)
+}
+
+fn recorded_view_failure(
+    dir: &Path,
+    schema: &[crate::registry::TableSchema],
+    missing: &str,
+    hops_left: u8,
+) -> Option<ViewIssue> {
+    let target = missing.trim_matches('"').to_ascii_lowercase();
+    let (file, _, error) = view_failures(dir)
+        .into_iter()
+        .find(|(_, view, _)| view.to_ascii_lowercase() == target)?;
+    if hops_left > 0 {
+        if let Some(dep) = missing_table_of(&error).filter(|d| d.to_ascii_lowercase() != target) {
+            if let Some(root) = recorded_view_failure(dir, schema, &dep, hops_left - 1) {
+                return Some(ViewIssue {
+                    file,
+                    error: format!(
+                        "depends on view `{dep}` (in `{}`), which failed to build: {}",
+                        root.file, root.error
+                    ),
+                    hint: root.hint,
+                });
+            }
+        }
+    }
+    let stmt = nest_view_files(dir)
+        .into_iter()
+        .filter(|v| v.file == file)
+        .flat_map(|v| split_sql_statements(&v.sql))
+        .find(|s| view_target_name(s).is_some_and(|n| n.to_ascii_lowercase() == target))
+        .unwrap_or_default();
+    let hint = crate::sql_errors::enrich(&error, &stmt, schema);
+    Some(ViewIssue { file, error, hint })
+}
+
 /// If `missing` is the name of a nest-authored view (`views/*.sql`) that failed to build, the error
 /// from that specific `CREATE VIEW` statement - the real fault a query against it hit, rather than
 /// the "does not exist" the engine reports for a name that was simply never created. `None` if `missing`
@@ -10475,5 +10531,143 @@ mod confinement {
         }
         // A view that calls nothing off the list still answers, beside one that does.
         run(Some("a"), "SELECT * FROM v").unwrap();
+    }
+
+    /// FR8 review: explaining a missing view replayed every authored statement in a fresh engine,
+    /// outside the request's permit and isolation, `CREATE TABLE … AS` included, and an error that
+    /// merely quoted an authored view's name was enough to ask for it. A served request is explained
+    /// from what defining its views recorded.
+    #[test]
+    fn a_served_error_is_explained_without_opening_an_engine() {
+        let f = two_datasets();
+        std::fs::write(
+            f.a.join("views").join("w.sql"),
+            "CREATE VIEW broken AS SELECT CAST('x' AS INT) AS n FROM nosuch;\n\
+             CREATE VIEW on_broken AS SELECT n FROM broken;\n\
+             CREATE TABLE big AS SELECT * FROM range(3);\n",
+        )
+        .unwrap();
+        for tenant in [None, Some(Arc::<str>::from("a"))] {
+            let sql = "SELECT * FROM on_broken";
+            let raw = isolated(tenant.as_ref(), || {
+                query_hot_cold(&f.a, sql, guard(), &HotRows::new(), 10, &[])
+            })
+            .map(|_| ())
+            .unwrap_err();
+            let raw = format!("{raw:#}");
+            let before = view_build_opens();
+            let msg = enrich_served_query_error(&f.a, &raw, sql, &[]).unwrap();
+            assert!(
+                msg.contains("on_broken")
+                    && msg.contains("depends on view `broken`")
+                    && msg.contains("w.sql"),
+                "{tenant:?}: {msg}"
+            );
+            for raw in [
+                raw.as_str(),
+                "Invalid input: Table with name v whatever",
+                "Table with name broken does not exist",
+            ] {
+                let _ = enrich_served_query_error(&f.a, raw, sql, &[]);
+            }
+            assert_eq!(view_build_opens(), before, "{tenant:?}");
+        }
+    }
+
+    /// An authored view is the tenant's SQL with none of `/sql`'s text guards in front of it, only
+    /// Burrmill's planner: a path, a file function, a registration's parts, the catalogue and B's
+    /// view by name each fail to build, in both modes.
+    #[test]
+    fn an_authored_view_reaches_no_more_than_a_statement() {
+        let f = two_datasets();
+        let seg = f.b_segment.display().to_string();
+        let b = f.b.display().to_string();
+        let bodies = [
+            format!("SELECT * FROM read_parquet('{seg}')"),
+            format!("SELECT * FROM '{seg}'"),
+            format!("SELECT * FROM \"{seg}\""),
+            format!("SELECT * FROM \"file://{seg}\""),
+            "SELECT * FROM t__e__raw".to_string(),
+            "SELECT * FROM t__e__hot".to_string(),
+            "SELECT * FROM information_schema.views".to_string(),
+            "SELECT * FROM b_only".to_string(),
+        ];
+        let mut text = String::new();
+        for (i, body) in bodies.iter().enumerate() {
+            text.push_str(&format!("CREATE VIEW p{i} AS {body};\n"));
+        }
+        text.push_str(&format!("CREATE TABLE q0 AS SELECT * FROM '{seg}';\n"));
+        text.push_str("CREATE TABLE q1 AS SELECT * FROM t__e__raw;\n");
+        text.push_str(&format!("CREATE VIEW q2 AS SELECT * FROM \"{b}\".t__e;\n"));
+        std::fs::write(f.a.join("views").join("zz.sql"), text).unwrap();
+        for tenant in [None, Some(Arc::<str>::from("a"))] {
+            for i in 0..bodies.len() {
+                let got = isolated(tenant.as_ref(), || {
+                    query_hot_cold(
+                        &f.a,
+                        &format!("SELECT * FROM p{i}"),
+                        guard(),
+                        &HotRows::new(),
+                        10,
+                        &[],
+                    )
+                });
+                assert!(got.is_err(), "{tenant:?}: view {} answered", bodies[i]);
+            }
+            for name in ["q0", "q1", "q2"] {
+                if let Ok(out) = isolated(tenant.as_ref(), || {
+                    query_hot_cold(
+                        &f.a,
+                        &format!("SELECT * FROM {name}"),
+                        guard(),
+                        &HotRows::new(),
+                        10,
+                        &[],
+                    )
+                }) {
+                    let text = serde_json::to_string(&out.rows).unwrap();
+                    assert!(!leaked(&f, &text), "{tenant:?}: {name} reached B: {text}");
+                }
+            }
+        }
+    }
+
+    /// FR8 review, open: a scalar function's output is not charged to the engine pool, so one value
+    /// can be as large as its arguments say. `repeat('a', 1e9)` peaked at 4 GB of RSS under a 512 MB
+    /// pool; `range`, `lpad`, `array_repeat` and nested `replace` do the same. Ignored until the
+    /// engine bounds it, because running it is the attack.
+    #[test]
+    #[ignore = "open finding: scalar results are not charged to the pool"]
+    fn a_statement_cannot_allocate_far_past_its_pool() {
+        let f = two_datasets();
+        let peak = || {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) }, 0);
+            let rss = unsafe { usage.assume_init().ru_maxrss } as u64;
+            if cfg!(target_os = "macos") {
+                rss
+            } else {
+                rss * 1024
+            }
+        };
+        let before = peak();
+        let tenant = Some(Arc::<str>::from("a"));
+        let got = isolated(tenant.as_ref(), || {
+            query_hot_cold(
+                &f.a,
+                "SELECT length(repeat('a', 1500000000)) AS n",
+                guard(),
+                &HotRows::new(),
+                10,
+                &[],
+            )
+        });
+        let grew = peak().saturating_sub(before);
+        assert!(
+            got.is_err() && grew < 1 << 30,
+            "answered {:?} after growing {} MB",
+            got.map(|o| o.rows),
+            grew >> 20
+        );
     }
 }

@@ -5493,7 +5493,7 @@ fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::respon
     // engine message is preserved but path-scrubbed (SEC review) - the engine embeds absolute
     // segment paths, which would leak the on-disk layout; the useful table/column detail stays.
     let raw = sanitize_sql_error(&format!("{e:#}"), &s.dir);
-    let msg = match crate::analytics::enrich_query_error(&s.dir, &raw, sql, &s.tables) {
+    let msg = match crate::analytics::enrich_served_query_error(&s.dir, &raw, sql, &s.tables) {
         Some(hint) => format!("{raw}\n\nhint: {hint}"),
         None => raw,
     };
@@ -5670,7 +5670,7 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
         Ok(Err(e)) => {
             METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Invalid);
             let raw = sanitize_sql_error(&format!("{e:#}"), &s.dir);
-            let msg = match crate::analytics::enrich_query_error(&s.dir, &raw, &q.q, &s.tables) {
+            let msg = match crate::analytics::enrich_served_query_error(&s.dir, &raw, &q.q, &s.tables) {
                 Some(hint) => format!("{raw}\n\nhint: {hint}"),
                 None => raw,
             };
