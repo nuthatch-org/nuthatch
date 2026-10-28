@@ -953,6 +953,39 @@ async fn a_named_segment_gone_from_disk_is_catching_up_never_a_short_answer() {
     writer.stop(&root);
 }
 
+/// Each follower resnapshots on what its own requests found: one follower's finding a named segment
+/// missing is not taken, or lost, by another follower of the same dataset in the process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_segment_resnapshots_the_follower_that_found_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, writer, a, abase) = sealing_by_hand(tmp.path()).await;
+    let (b, bbase) = bind_follower(&tmp.path().join("follower-view"), &writer).await;
+    seal(&root, &writer, 1, 2);
+    agree(&writer, &abase, COUNT, "a, across the seal").await;
+    agree(&writer, &bbase, COUNT, "b, across the seal").await;
+    let (_, path) = first_segment(&root);
+    std::fs::remove_file(&path).unwrap();
+    let (a0, b0) = (a.connects(), b.connects());
+
+    let (status, body) = sql(&abase, COUNT).await;
+    assert_eq!((status, &body["reason"]), (503, &"catching_up".into()));
+    assert!(
+        wait_until(Duration::from_secs(5), || a.connects() > a0).await,
+        "the follower that found it resnapshots"
+    );
+    // Two of b's heartbeats: neither takes a's finding, and b has found nothing of its own.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(b.connects(), b0, "b resnapshots only on its own finding");
+
+    let (status, body) = sql(&bbase, COUNT).await;
+    assert_eq!((status, &body["reason"]), (503, &"catching_up".into()));
+    assert!(
+        wait_until(Duration::from_secs(5), || b.connects() > b0).await,
+        "b resnapshots on its own finding"
+    );
+    writer.stop(&root);
+}
+
 /// A segment a fold replaces is kept from reclaim while a follower's copy may still name it: the
 /// follower, held at the old generation, answers it exactly, and the file goes only once that
 /// follower has applied the commit that stopped naming it and the grace has run.

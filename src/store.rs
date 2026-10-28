@@ -370,6 +370,9 @@ pub trait HotStore: Send + Sync {
         None
     }
 
+    /// A request served from this store found a segment its catalogue names missing on disk.
+    fn segment_missing(&self) {}
+
     /// [`HotStore::feed_subscribe`] with the snapshot written to `out` as JSON as it is read.
     fn feed_stream(&self, _out: &mut dyn std::io::Write) -> Result<Option<FeedDeltas>> {
         Ok(None)
@@ -2401,6 +2404,9 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     }
     fn served_catalogue(&self) -> Option<Option<Arc<str>>> {
         (**self).served_catalogue()
+    }
+    fn segment_missing(&self) {
+        (**self).segment_missing()
     }
     fn feed_position(&self) -> Option<(u64, u64)> {
         (**self).feed_position()

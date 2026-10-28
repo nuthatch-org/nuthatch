@@ -982,14 +982,9 @@ impl std::fmt::Display for SegmentGone {
 
 impl std::error::Error for SegmentGone {}
 
-/// Datasets whose copies found a named segment missing, for the follower to resnapshot.
-fn gone() -> &'static Mutex<BTreeSet<PathBuf>> {
-    static GONE: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
-    GONE.get_or_init(Default::default)
-}
-
 /// Whether `dir`'s request is served from a follower's copy, in which case `segment`'s being
-/// missing is noted for the request and the follower, and must fail the read rather than shorten it.
+/// missing is noted for the request and on the copy, whose follower resnapshots, and must fail the
+/// read rather than shorten it.
 pub fn follower_missing(dir: &Path, segment: &Path) -> bool {
     let Some(s) = current_serving().filter(|s| s.dir == dir) else {
         return false;
@@ -1003,13 +998,8 @@ pub fn follower_missing(dir: &Path, segment: &Path) -> bool {
         segment.display()
     );
     s.missing.store(true, std::sync::atomic::Ordering::SeqCst);
-    gone().lock().unwrap().insert(dir.to_path_buf());
+    s.store.segment_missing();
     true
-}
-
-/// Whether a copy of `dir` found a named segment missing since this was last asked.
-pub fn take_missing(dir: &Path) -> bool {
-    gone().lock().unwrap().remove(dir)
 }
 
 tokio::task_local! {

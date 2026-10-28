@@ -265,6 +265,8 @@ pub struct Follower {
     gates: Mutex<HashMap<String, crate::serve::SqlGate>>,
     /// A test's hold on applying deltas, so a copy stays at a generation while the writer moves on.
     paused: tokio::sync::watch::Sender<bool>,
+    /// Feed connections made, each of which takes fresh snapshots.
+    connects: std::sync::atomic::AtomicU64,
 }
 
 impl Follower {
@@ -297,6 +299,7 @@ impl Follower {
             root,
             gates: Mutex::default(),
             paused: tokio::sync::watch::Sender::new(false),
+            connects: Default::default(),
         });
         follower.recompose();
         tokio::spawn(follower.clone().run());
@@ -397,6 +400,8 @@ impl Follower {
             inner.link.connected = true;
             inner.link.since = Instant::now();
         }
+        self.connects
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
         let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<Line>(16);
         let mut body = resp.bytes_stream();
@@ -547,6 +552,12 @@ impl Follower {
         let inner = self.lock();
         let live = inner.retiring.iter().filter_map(|(_, c)| c.upgrade());
         live.map(|c| c.bytes()).sum()
+    }
+
+    /// How many feed connections this follower has made, each taking fresh snapshots.
+    #[doc(hidden)]
+    pub fn connects(&self) -> u64 {
+        self.connects.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Stop applying deltas, or go on, as a follower that has fallen behind would.
@@ -772,10 +783,12 @@ impl Follower {
                         roomier.join(", ")
                     );
                 }
-                let held: Vec<String> = self.lock().datasets.keys().cloned().collect();
-                let gone: Vec<String> = held
-                    .into_iter()
-                    .filter(|d| crate::seal::take_missing(&self.root.join(d)))
+                let gone: Vec<String> = self
+                    .lock()
+                    .datasets
+                    .iter()
+                    .filter(|(_, copy)| copy.take_missing())
+                    .map(|(d, _)| d.clone())
                     .collect();
                 if !gone.is_empty() {
                     bail!(

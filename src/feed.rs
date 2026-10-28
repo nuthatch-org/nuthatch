@@ -778,6 +778,9 @@ pub struct MemStore {
     rows: AtomicU64,
     /// Its dataset's directory, which [`crate::seal`] never reads the catalogue of while this lives.
     dir: PathBuf,
+    /// Set when a request served from this copy found a segment it names missing: its follower,
+    /// and no other, takes a fresh snapshot.
+    missing: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for MemStore {
@@ -813,6 +816,7 @@ impl MemStore {
             writes: AtomicU64::new(rows_epoch()),
             rows: AtomicU64::new(rows_epoch()),
             dir: dir.to_path_buf(),
+            missing: Default::default(),
         }
     }
 
@@ -912,6 +916,11 @@ impl MemStore {
     }
 
     /// `(epoch, generation)` of the last delta applied.
+    /// Whether a request found a segment this copy names missing since this was last asked.
+    pub fn take_missing(&self) -> bool {
+        self.missing.swap(false, Ordering::SeqCst)
+    }
+
     pub fn applied(&self) -> (u64, u64) {
         let m = self.read();
         (m.epoch, m.generation)
@@ -1091,6 +1100,10 @@ impl HotStore for MemStore {
 
     fn served_catalogue(&self) -> Option<Option<Arc<str>>> {
         Some(self.read().catalogue.clone())
+    }
+
+    fn segment_missing(&self) {
+        self.missing.store(true, Ordering::SeqCst);
     }
 
     fn put_entity(&self, _key: &str, _json: &str) -> Result<()> {
