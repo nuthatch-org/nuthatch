@@ -1615,10 +1615,7 @@ impl Store {
         {
             let mut t = wtx.open_table(META)?;
             t.insert(key, value)?;
-            rec.push(|| crate::feed::Op::Meta {
-                key: key.to_string(),
-                value: value.to_string(),
-            });
+            rec.meta(key, value);
         }
         self.commit_fed(wtx, false, rec)?;
         Ok(())
@@ -1633,10 +1630,7 @@ impl Store {
             let mut t = wtx.open_table(META)?;
             for (k, v) in set {
                 t.insert(*k, *v)?;
-                rec.push(|| crate::feed::Op::Meta {
-                    key: k.to_string(),
-                    value: v.to_string(),
-                });
+                rec.meta(k, v);
             }
             for k in remove {
                 t.remove(*k)?;
@@ -1831,10 +1825,7 @@ impl Store {
             key: Self::block_key(block.saturating_add(1)),
         });
         if let Some((key, value)) = meta {
-            rec.push(|| crate::feed::Op::Meta {
-                key: key.to_string(),
-                value: value.to_string(),
-            });
+            rec.meta(key, value);
         }
         rec
     }
@@ -1847,10 +1838,7 @@ impl Store {
             to: Some(format!("{to:012}-999999")),
         });
         if let Some((key, value)) = meta {
-            rec.push(|| crate::feed::Op::Meta {
-                key: key.to_string(),
-                value: value.to_string(),
-            });
+            rec.meta(key, value);
         }
         rec
     }

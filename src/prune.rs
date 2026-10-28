@@ -185,7 +185,10 @@ fn store_is_held(dataset: &Path) -> bool {
 fn orphan_segments(dir: &Path) -> Result<Vec<(PathBuf, u64)>> {
     let surviving: Vec<PathBuf> = dataset_dirs(dir)?.into_iter().map(|(_, p)| p).collect();
     let referenced = referenced_segments(&surviving)?;
-    let Ok(entries) = std::fs::read_dir(dir.join(crate::seal::SEGMENTS_DIR)) else {
+    let store = dir.join(crate::seal::SEGMENTS_DIR);
+    // Replaced, but kept while a follower of a running writer may still name it (RFC-0073 FR1).
+    let retained = crate::seal::ledger_retained(&store);
+    let Ok(entries) = std::fs::read_dir(&store) else {
         return Ok(Vec::new());
     };
     Ok(entries
@@ -193,7 +196,7 @@ fn orphan_segments(dir: &Path) -> Result<Vec<(PathBuf, u64)>> {
         .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
         .filter_map(|e| {
             let hash = e.path().file_stem()?.to_string_lossy().to_string();
-            if referenced.contains(&hash) {
+            if referenced.contains(&hash) || retained.contains(&hash) {
                 return None;
             }
             Some((e.path(), e.metadata().ok()?.len()))

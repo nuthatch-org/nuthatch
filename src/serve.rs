@@ -581,7 +581,19 @@ async fn pin_request(
     }
     let (dir, store) = (state.dir.clone(), state.store.clone());
     let served = crate::seal::serving(dir, store, next.run(req));
-    PINNED.scope((backing, state), served).await
+    let (resp, missing) = PINNED.scope((backing, state), served).await;
+    if missing {
+        // Whatever the route made of it, an answer missing a segment's rows is not one.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "a sealed segment this copy names is gone from disk; taking a fresh snapshot",
+                "reason": "catching_up",
+            })),
+        )
+            .into_response();
+    }
+    resp
 }
 
 pub async fn run(

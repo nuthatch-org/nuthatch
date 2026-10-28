@@ -408,6 +408,7 @@ pub fn routes(
     }
     axum::Router::new()
         .route("/_admin/feed", axum::routing::get(feed))
+        .route("/_admin/feed/applied", axum::routing::post(applied))
         .with_state(FeedState {
             roster,
             root,
@@ -474,6 +475,34 @@ async fn feed(
         .into_response()
 }
 
+#[derive(serde::Deserialize)]
+struct AppliedQuery {
+    token: Option<String>,
+    conn: u64,
+}
+
+/// `POST /_admin/feed/applied?conn=<n>`: what a follower has applied, per dataset, as
+/// `{"<dataset>": [epoch, generation]}`, so a segment it may still name is kept until it has moved on.
+async fn applied(
+    State(s): State<FeedState>,
+    Query(q): Query<AppliedQuery>,
+    headers: HeaderMap,
+    axum::Json(positions): axum::Json<BTreeMap<String, (u64, u64)>>,
+) -> Response {
+    if !crate::serve::token_ok(s.token.as_deref(), q.token.as_deref(), &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({"error": "admin token required"})),
+        )
+            .into_response();
+    }
+    for (dataset, at) in positions {
+        crate::seal::follower_applied(&s.root.join(dataset), q.conn, at);
+    }
+    crate::seal::release_retained();
+    StatusCode::NO_CONTENT.into_response()
+}
+
 /// Aborts the forwarders when the connection ends, however it ends.
 struct Forwarders(HashMap<String, tokio::task::JoinHandle<()>>);
 
@@ -485,14 +514,48 @@ impl Drop for Forwarders {
     }
 }
 
+/// The datasets one connection's follower follows, for the segments kept for it; it stops counting
+/// when the connection ends.
+struct Following {
+    conn: u64,
+    dirs: std::collections::BTreeSet<PathBuf>,
+}
+
+impl Following {
+    fn follow(&mut self, dir: PathBuf) {
+        crate::seal::follower_connected(&dir, self.conn);
+        self.dirs.insert(dir);
+    }
+
+    fn unfollow(&mut self, dir: &Path) {
+        crate::seal::follower_gone(dir, self.conn);
+        self.dirs.remove(dir);
+    }
+}
+
+impl Drop for Following {
+    fn drop(&mut self) {
+        for dir in &self.dirs {
+            crate::seal::follower_gone(dir, self.conn);
+        }
+    }
+}
+
 async fn serve_connection(s: FeedState, tx: Queue, excluded: std::collections::BTreeSet<String>) {
+    static CONNS: AtomicU64 = AtomicU64::new(1);
+    let conn = CONNS.fetch_add(1, Ordering::Relaxed);
     let hello = Line::Hello {
         version: env!("CARGO_PKG_VERSION").to_string(),
         feed: crate::feed::FEED_VERSION,
+        conn: Some(conn),
     };
     if !tx.line(line(&hello)).await {
         return;
     }
+    let mut following = Following {
+        conn,
+        dirs: Default::default(),
+    };
     let mut routes: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut announced = false;
     let mut forwarders = Forwarders(HashMap::new());
@@ -549,6 +612,7 @@ async fn serve_connection(s: FeedState, tx: Queue, excluded: std::collections::B
                         if let Some(h) = forwarders.0.remove(dataset) {
                             h.abort();
                         }
+                        following.follow(s.root.join(dataset));
                         let task = tokio::spawn(forward(dataset.clone(), store.clone(), tx.clone()));
                         forwarders.0.insert(dataset.clone(), task);
                     }
@@ -557,10 +621,12 @@ async fn serve_connection(s: FeedState, tx: Queue, excluded: std::collections::B
                     if let Some(h) = forwarders.0.remove(&gone) {
                         h.abort();
                     }
+                    following.unfollow(&s.root.join(&gone));
                 }
                 stores = live;
             }
             _ = heartbeat.tick() => {
+                crate::seal::release_retained();
                 let positions = stores
                     .iter()
                     .filter_map(|(d, st)| Some((d.clone(), st.feed_position()?)))

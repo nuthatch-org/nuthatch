@@ -884,3 +884,117 @@ async fn an_unmounted_copy_in_use_is_charged_until_it_drops() {
     );
     writer.stop(&root);
 }
+
+/// A writer at blocks 1 to 6, with no seal of its own (nothing finalises), and a follower.
+async fn sealing_by_hand(tmp: &Path) -> (PathBuf, Writer, Arc<Follower>, String) {
+    let root = tmp.join("runtime");
+    let dir = root.join("data").join(ROUTE);
+    std::fs::create_dir_all(&dir).unwrap();
+    scaffold_nest(&dir, ROUTE, USDC);
+    let via: PathBuf = tmp.join("follower-view");
+    std::os::unix::fs::symlink(&root, &via).unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=6u64 {
+        tape.insert_block(b, block(b, 0, 100 * b as u128));
+    }
+    tape.advance_tip_to(6);
+    let writer = Writer::start(&root, tape, 0);
+    writer.reaches(6).await;
+    let (follower, fbase) = bind_follower(&via, &writer).await;
+    agree(&writer, &fbase, COUNT, "before any seal").await;
+    (root, writer, follower, fbase)
+}
+
+/// Seal `from..=to` as the writer's seal does: segment and catalogue, then the commit that prunes
+/// hot and raises the watermark.
+fn seal(root: &Path, writer: &Writer, from: u64, to: u64) {
+    let dir = root.join("data").join(ROUTE);
+    let rows = writer.store.entities_in_range(from, to).unwrap();
+    nuthatch::seal::seal_range(&dir, &rows, from, to).unwrap();
+    writer
+        .store
+        .prune_and_set_meta(from, to, "sealed_through", &to.to_string())
+        .unwrap();
+}
+
+/// The segment the catalogue names first, and its file.
+fn first_segment(root: &Path) -> (String, PathBuf) {
+    let dir = root.join("data").join(ROUTE);
+    let manifest = nuthatch::seal::load_manifest(&dir).unwrap();
+    let s = manifest.tables.values().next().unwrap()[0].clone();
+    let path = nuthatch::seal::segment_path(&dir, &s.file, &s.hash);
+    (s.hash, path)
+}
+
+/// A segment a follower's catalogue names, gone from disk, is never answered around: its queries
+/// are `503 catching_up` until it has a catalogue that does not name it, never a short count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_named_segment_gone_from_disk_is_catching_up_never_a_short_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, writer, _follower, fbase) = sealing_by_hand(tmp.path()).await;
+    seal(&root, &writer, 1, 2);
+    agree(&writer, &fbase, COUNT, "across the seal").await;
+    let (_, path) = first_segment(&root);
+    std::fs::remove_file(&path).unwrap();
+    let mut refused = 0;
+    for _ in 0..40 {
+        let (status, body) = sql(&fbase, COUNT).await;
+        match status {
+            503 => {
+                assert_eq!(body["reason"], "catching_up", "{body}");
+                refused += 1;
+            }
+            200 => assert_eq!(body["rows"][0]["n"], 6, "a short answer: {body}"),
+            other => panic!("{other}: {body}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(refused > 0, "the missing segment was noticed");
+    writer.stop(&root);
+}
+
+/// A segment a fold replaces is kept from reclaim while a follower's copy may still name it: the
+/// follower, held at the old generation, answers it exactly, and the file goes only once that
+/// follower has applied the commit that stopped naming it and the grace has run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folded_segment_is_kept_until_its_followers_have_moved_on() {
+    const GRACE: Duration = Duration::from_millis(300);
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, writer, follower, fbase) = sealing_by_hand(tmp.path()).await;
+    let dir = root.join("data").join(ROUTE);
+    nuthatch::seal::set_follower_retention(&dir, GRACE, Duration::from_secs(60));
+    seal(&root, &writer, 1, 2);
+    let old = agree(&writer, &fbase, COUNT, "across the first seal").await;
+    let (hash, path) = first_segment(&root);
+    let store = root.join(nuthatch::seal::SEGMENTS_DIR);
+
+    follower.pause(true);
+    // The next seal folds blocks 1 and 2's provisional segment into one of 1 to 4.
+    seal(&root, &writer, 3, 4);
+    assert_ne!(first_segment(&root).0, hash, "the fold replaced it");
+    let kept = || {
+        !nuthatch::seal::remove_segment_if_unheld(&path).unwrap()
+            && path.exists()
+            && nuthatch::seal::ledger_retained(&store).contains(&hash)
+    };
+    assert!(kept(), "kept from reclaim while the follower may name it");
+    let (status, held) = sql(&fbase, COUNT).await;
+    assert_eq!(status, 200, "{held}");
+    assert_eq!(held["rows"], old["rows"], "the old generation, exactly");
+    tokio::time::sleep(GRACE * 3).await;
+    assert!(
+        kept(),
+        "past the grace, still kept: the follower has not moved on"
+    );
+
+    follower.pause(false);
+    agree(&writer, &fbase, COUNT, "after the follower moved on").await;
+    let released = wait_until(Duration::from_secs(10), || {
+        nuthatch::seal::remove_segment_if_unheld(&path).unwrap()
+    })
+    .await;
+    assert!(released, "reclaimed once the follower moved on");
+    assert!(!path.exists());
+    assert!(!nuthatch::seal::ledger_retained(&store).contains(&hash));
+    writer.stop(&root);
+}

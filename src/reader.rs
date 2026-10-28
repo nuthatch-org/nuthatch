@@ -31,6 +31,16 @@ use std::time::{Duration, Instant};
 
 /// A connection that has carried nothing for this long, heartbeats included, is treated as gone.
 const SILENCE: Duration = Duration::from_secs(5);
+/// How often a follower tells the writer what it has applied.
+const REPORT_EVERY: Duration = Duration::from_secs(1);
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 const BACKOFF_FIRST: Duration = Duration::from_millis(200);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// The most a request body is read to look for an entity name.
@@ -104,6 +114,8 @@ struct Link {
     connected: bool,
     since: Instant,
     version: Option<String>,
+    /// The writer's name for this connection, under which what is applied is reported.
+    conn: Option<u64>,
 }
 
 struct Inner {
@@ -251,6 +263,8 @@ pub struct Follower {
     inner: Mutex<Inner>,
     /// One analytical gate per chain, as the writer has one per cursor.
     gates: Mutex<HashMap<String, crate::serve::SqlGate>>,
+    /// A test's hold on applying deltas, so a copy stays at a generation while the writer moves on.
+    paused: tokio::sync::watch::Sender<bool>,
 }
 
 impl Follower {
@@ -277,10 +291,12 @@ impl Follower {
                     connected: false,
                     since: Instant::now(),
                     version: None,
+                    conn: None,
                 },
             }),
             root,
             gates: Mutex::default(),
+            paused: tokio::sync::watch::Sender::new(false),
         });
         follower.recompose();
         tokio::spawn(follower.clone().run());
@@ -316,9 +332,43 @@ impl Follower {
                 }
                 // The gone writer's positions say nothing about the next one: no lag until it reports.
                 inner.positions.clear();
+                inner.link.conn = None;
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(BACKOFF_MAX);
+        }
+    }
+
+    /// Tell the writer, every [`REPORT_EVERY`], what each copy has applied, so it keeps the
+    /// segments a copy may still name until it has moved on. Best effort: unreported, the writer
+    /// keeps them until its grace and most run out, never less.
+    async fn report_applied(self: Arc<Self>, client: reqwest::Client) {
+        let mut every = tokio::time::interval(REPORT_EVERY);
+        loop {
+            every.tick().await;
+            let (conn, applied) = {
+                let inner = self.lock();
+                let applied: BTreeMap<String, (u64, u64)> = inner
+                    .datasets
+                    .iter()
+                    .map(|(d, copy)| (d.clone(), copy.applied()))
+                    .collect();
+                (inner.link.conn, applied)
+            };
+            let Some(conn) = conn else {
+                continue;
+            };
+            let sent = client
+                .post(format!("{}/_admin/feed/applied", self.writer))
+                .query(&[("conn", conn)])
+                .bearer_auth(&self.token)
+                .timeout(REPORT_EVERY)
+                .json(&applied)
+                .send()
+                .await;
+            if let Err(e) = sent {
+                tracing::debug!("reporting what is applied: {}", e.without_url());
+            }
         }
     }
 
@@ -384,6 +434,8 @@ impl Follower {
             });
             crate::feed::read_lines(reader, cap_for, |line| line_tx.blocking_send(line).is_ok())
         });
+        let reporter = tokio::spawn(self.clone().report_applied(client.clone()));
+        let _reporter = AbortOnDrop(reporter);
         // Datasets snapshotted on this connection: a delta for any other is a gap.
         let mut fresh: BTreeSet<String> = BTreeSet::new();
         let handled = async {
@@ -497,6 +549,12 @@ impl Follower {
         live.map(|c| c.bytes()).sum()
     }
 
+    /// Stop applying deltas, or go on, as a follower that has fallen behind would.
+    #[doc(hidden)]
+    pub fn pause(&self, paused: bool) {
+        self.paused.send_replace(paused);
+    }
+
     /// `dataset`'s copy, held as a request in flight would hold it.
     #[doc(hidden)]
     pub fn hold(&self, dataset: &str) -> Option<Arc<MemStore>> {
@@ -528,7 +586,11 @@ impl Follower {
 
     async fn handle(self: &Arc<Self>, line: Line, fresh: &mut BTreeSet<String>) -> Result<()> {
         match line {
-            Line::Hello { version, feed } => {
+            Line::Hello {
+                version,
+                feed,
+                conn,
+            } => {
                 if feed != crate::feed::FEED_VERSION {
                     bail!(
                         "the writer ({version}) speaks feed version {feed} and this follower ({}) \
@@ -537,7 +599,9 @@ impl Follower {
                         crate::feed::FEED_VERSION
                     );
                 }
-                self.lock().link.version = Some(version);
+                let mut inner = self.lock();
+                inner.link.version = Some(version);
+                inner.link.conn = conn;
             }
             Line::Mount {
                 route,
@@ -643,6 +707,7 @@ impl Follower {
                 }
             }
             Line::Delta { dataset, delta } => {
+                let _ = self.paused.subscribe().wait_for(|p| !*p).await;
                 let dataset = dataset.0;
                 let (store, refused) = {
                     let inner = self.lock();
@@ -705,6 +770,17 @@ impl Follower {
                     bail!(
                         "room came back for {}; asking for it again",
                         roomier.join(", ")
+                    );
+                }
+                let held: Vec<String> = self.lock().datasets.keys().cloned().collect();
+                let gone: Vec<String> = held
+                    .into_iter()
+                    .filter(|d| crate::seal::take_missing(&self.root.join(d)))
+                    .collect();
+                if !gone.is_empty() {
+                    bail!(
+                        "{}: a segment the copy names is gone; taking fresh snapshots",
+                        gone.join(", ")
                     );
                 }
             }

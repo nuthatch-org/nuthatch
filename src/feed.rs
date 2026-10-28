@@ -80,9 +80,23 @@ pub fn mirrored_meta(key: &str) -> bool {
 
 /// Ops gathered inside one write transaction, or `None` when nothing is subscribed and gathering
 /// them would only copy rows nobody reads.
-pub struct Recorder(Option<Vec<Op>>);
+pub struct Recorder(Option<Vec<Op>>, bool);
 
 impl Recorder {
+    /// A meta write. One to `sealed_through` is noted whether or not anyone is subscribed, since
+    /// segments kept for followers wait on the commit that carries it.
+    pub fn meta(&mut self, key: &str, value: &str) {
+        self.1 |= key == "sealed_through";
+        self.push(|| Op::Meta {
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+    }
+
+    fn seals(&self) -> bool {
+        self.1
+    }
+
     pub fn push(&mut self, op: impl FnOnce() -> Op) {
         if let Some(ops) = &mut self.0 {
             let op = op();
@@ -478,6 +492,10 @@ pub enum Line {
         version: String,
         #[serde(default)]
         feed: u32,
+        /// This connection, which the follower names when it reports what it has applied
+        /// (`POST /_admin/feed/applied`), so segments it may still name are kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conn: Option<u64>,
     },
     /// A route and what the writer serves it under: its SQL surface (RFC-0034), its tenant label and
     /// share (RFC-0073 FR2) and its guards (FR3). A follower serves it under the same.
@@ -581,7 +599,7 @@ impl Tap {
     }
 
     pub fn recorder(&self) -> Recorder {
-        Recorder((self.tx.receiver_count() > 0).then(Vec::new))
+        Recorder((self.tx.receiver_count() > 0).then(Vec::new), false)
     }
 
     /// Run `commit` and number it, publishing its ops to any subscriber. Holding the lock across the
@@ -590,6 +608,9 @@ impl Tap {
         let mut state = self.lock();
         commit()?;
         state.generation += 1;
+        if let (Some(dir), true) = (&self.dir, rec.seals()) {
+            crate::seal::catalogue_moved(dir, (self.epoch, state.generation));
+        }
         if self.tx.receiver_count() == 0 {
             return Ok(());
         }

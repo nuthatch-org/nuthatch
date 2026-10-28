@@ -2925,6 +2925,7 @@ fn define_views_bound(
     let mut bound: std::collections::BTreeMap<String, TableScan> = Default::default();
     let (manifest, catalogue_hash) = crate::seal::load_manifest_with_hash(dir)?;
     let mut overtaken = false;
+    let mut gone_on_follower: Option<PathBuf> = None;
     #[cfg(test)]
     if let Some(f) = test_after_manifest_read().lock().unwrap().remove(dir) {
         f();
@@ -3047,6 +3048,11 @@ fn define_views_bound(
                         // table's cold data is reduced, loudly, and queries keep working.
                         if let Ok(meta) = std::fs::metadata(&p) {
                             Some((p, meta.len()))
+                        } else if crate::seal::follower_missing(dir, &p) {
+                            // A follower's copy names it and its writer has let it go: a short
+                            // answer would be a wrong one, so there is none.
+                            gone_on_follower.get_or_insert(p);
+                            None
                         } else if crate::seal::catalogue_hash(dir).ok().flatten() != catalogue_hash {
                             // Gone because the catalogue moved under this plan, not because it was
                             // quarantined: reducing would answer short, so the plan is redone.
@@ -3189,6 +3195,9 @@ fn define_views_bound(
             }
             Ok(false) => {}
         }
+    }
+    if let Some(p) = gone_on_follower {
+        return Err(crate::seal::SegmentGone(p).into());
     }
     if overtaken {
         return Err(SegmentSetChanged.into());
