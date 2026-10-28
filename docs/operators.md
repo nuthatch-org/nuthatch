@@ -291,6 +291,11 @@ the same `as_of`, `sealed_through` and `nid`.
   over the feed, so it admits and guards a query as the writer would, with its own per-chain gates
   and never wider than its own process values. It has no admin surface; mount changes, limits and
   shares go to the writer.
+- **What it costs the writer.** The writer streams each snapshot in 64 KiB chunks straight from its
+  read transaction, so it never holds an encoded copy of one, and holds at most 8 MiB queued per
+  follower and 64 MiB across them all, paid from `ingestion_reservation` (the feed queues row of
+  the query guards under [Security posture](#security-posture)). A follower too slow to keep its
+  queue from filling is dropped and reconnects for fresh snapshots; it never slows a commit.
 - **Beside the writer only, for now.** It reads segments from the runtime directory; following from
   another host with a segment mirror is RFC-0073's open question 2, not built.
 
@@ -1120,6 +1125,7 @@ job:
 | max query length | 16 KiB | rejects absurd query strings before the planner |
 | max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially. The same holds past **64 MiB** of stored hot-row JSON, whichever comes first |
 | hot-tip copies in flight | 128 MiB per chain gate | the stored hot-row JSON every query on one chain's gate holds copied at once, `/sql`, `/explain`, `/diff`, `/q` and GraphQL alike, measured before a row is parsed and given back when the query ends (RFC-0073 FR5). It is what the two default permits could already hold, so it adds nothing to the 2 GiB budget, and raising the permit count no longer multiplies it. A copy that does not fit now is refused `503` `busy`; one larger than the whole budget is refused as an over-budget tip. In a runtime it is divided between tenants like response bytes, and a tenant past its share is refused `429` `tenant_share` before copying |
+| feed queues | 8 MiB per follower, 64 MiB per process | encoded feed bytes a writer holds queued for its followers (RFC-0073 FR1), paid from `ingestion_reservation` beside the hot-tip copies; the two together fit its 256MB floor. A snapshot is encoded in 64 KiB chunks as its read transaction iterates and waits for room, so no whole encoded copy of it exists. A follower whose queue is full when a delta, heartbeat or mount line arrives is dropped, not waited for, and reconnects for fresh snapshots; one that leaves a snapshot without room for 30 s is dropped too, which also ends that snapshot's read transaction |
 | declared-query scan bound | 512 MiB | named queries (`/q/{name}`) only: source bytes the plan may read, each Parquet scan charged the widest table it can reach, plus the hot and maintained rows copied for it. Checked on the connection that runs the statement, before it is evaluated. Over the cap, or a plan that can rescan (nested-loop or delim join, recursive CTE), answers `422` |
 
 **Lowering the guards.** The statement timeout, row, result-byte, unsealed-row, unsealed-byte,

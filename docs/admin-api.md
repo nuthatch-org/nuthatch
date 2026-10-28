@@ -474,6 +474,12 @@ within one `epoch`, and a restarted writer is a new epoch. A follower that recei
 than the next generation of the epoch it applied has a gap, drops the connection and takes fresh
 snapshots on the next one, serving what it had until each is complete.
 
+**Slow followers.** A snapshot is written in 64 KiB chunks as it is read, and a connection holds at
+most 8 MiB queued, 64 MiB across every connection. A heartbeat may be skipped while a snapshot
+streams. A connection whose queue is full when a delta or heartbeat is due, or whose snapshot finds
+no room for 30 s, is closed, possibly part-way through a line; the follower reconnects and
+resnapshots.
+
 **The seal handoff.** A seal writes its segment and catalogue, then removes the sealed rows from hot
 and raises `sealed_through` in one commit. That commit's delta carries the removal, the new watermark
 and the catalogue as it stood at the commit, so a follower moves from "rows in hot" to "rows in a

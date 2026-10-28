@@ -116,6 +116,21 @@ fn builder() -> Builder {
     b
 }
 
+/// Every commit after a feed snapshot.
+pub type FeedDeltas = tokio::sync::broadcast::Receiver<Arc<crate::feed::Delta>>;
+
+/// The tables a feed snapshot carries, in its field order, and which of their keys it keeps.
+type FeedTable = (
+    &'static str,
+    TableDefinition<'static, &'static str, &'static str>,
+    fn(&str) -> bool,
+);
+const FEED_TABLES: [FeedTable; 3] = [
+    ("entities", ENTITIES, |_| true),
+    ("meta", META, crate::feed::mirrored_meta),
+    ("blocks", BLOCKS, |_| true),
+];
+
 const ENTITIES: TableDefinition<&str, &str> = TableDefinition::new("entities");
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 /// Block-hash checkpoints (block -> canonical hash we indexed against), for reorg detection.
@@ -346,6 +361,11 @@ pub trait HotStore: Send + Sync {
     /// RFC-0073 FR1: a snapshot of the mirrored tables and a receiver for every commit after it, or
     /// `None` from a backend with no feed.
     fn feed_subscribe(&self) -> Result<Option<crate::feed::Subscription>> {
+        Ok(None)
+    }
+
+    /// [`HotStore::feed_subscribe`] with the snapshot written to `out` as JSON as it is read.
+    fn feed_stream(&self, _out: &mut dyn std::io::Write) -> Result<Option<FeedDeltas>> {
         Ok(None)
     }
 
@@ -890,53 +910,84 @@ impl Store {
 
     /// The feed's snapshot of the mirrored tables and a receiver for every commit after it.
     pub fn feed_subscribe(&self) -> Result<crate::feed::Subscription> {
-        let mut attempts = 0;
-        loop {
-            let (deltas, generation, rtx) = self.tap.subscribe(|| Ok(self.db.begin_read()?))?;
-            let mut snapshot = crate::feed::Snapshot {
-                epoch: self.tap.epoch(),
-                generation,
-                ..Default::default()
-            };
-            for row in rtx.open_table(ENTITIES)?.iter()? {
+        let (deltas, rtx, mut snapshot) = self.feed_begin()?;
+        let [entities, meta, blocks] = FEED_TABLES;
+        let tables = [
+            (entities, &mut snapshot.entities),
+            (meta, &mut snapshot.meta),
+            (blocks, &mut snapshot.blocks),
+        ];
+        for ((_, table, keep), rows) in tables {
+            for row in rtx.open_table(table)?.iter()? {
                 let (k, v) = row?;
-                snapshot
-                    .entities
-                    .map
-                    .insert(k.value().to_string(), v.value().to_string());
-            }
-            for row in rtx.open_table(META)?.iter()? {
-                let (k, v) = row?;
-                if crate::feed::mirrored_meta(k.value()) {
-                    snapshot
-                        .meta
-                        .map
+                if keep(k.value()) {
+                    rows.map
                         .insert(k.value().to_string(), v.value().to_string());
                 }
             }
-            for row in rtx.open_table(BLOCKS)?.iter()? {
+        }
+        Ok(crate::feed::Subscription { snapshot, deltas })
+    }
+
+    /// [`Store::feed_subscribe`] writing the snapshot to `out` as JSON while its read transaction
+    /// iterates, so no copy of it, decoded or encoded, is ever whole. The same bytes as serialising
+    /// [`Store::feed_subscribe`]'s snapshot.
+    pub fn feed_stream(&self, out: &mut dyn std::io::Write) -> Result<FeedDeltas> {
+        let (deltas, rtx, head) = self.feed_begin()?;
+        write!(
+            out,
+            "{{\"epoch\":{},\"generation\":{}",
+            head.epoch, head.generation
+        )?;
+        for (name, table, keep) in FEED_TABLES {
+            write!(out, ",\"{name}\":{{")?;
+            let mut first = true;
+            for row in rtx.open_table(table)?.iter()? {
                 let (k, v) = row?;
-                snapshot
-                    .blocks
-                    .map
-                    .insert(k.value().to_string(), v.value().to_string());
+                if !keep(k.value()) {
+                    continue;
+                }
+                if !std::mem::take(&mut first) {
+                    out.write_all(b",")?;
+                }
+                serde_json::to_writer(&mut *out, k.value())?;
+                out.write_all(b":")?;
+                serde_json::to_writer(&mut *out, v.value())?;
             }
-            drop(rtx);
-            let sealed = snapshot
-                .meta
-                .map
-                .get("sealed_through")
-                .and_then(|v| v.parse().ok())
+            out.write_all(b"}")?;
+        }
+        out.write_all(b",\"catalogue\":")?;
+        serde_json::to_writer(&mut *out, &head.catalogue)?;
+        out.write_all(b"}")?;
+        Ok(deltas)
+    }
+
+    /// Subscribe, and open the read transaction a snapshot is taken in: its position and catalogue,
+    /// and no rows.
+    fn feed_begin(&self) -> Result<(FeedDeltas, redb::ReadTransaction, crate::feed::Snapshot)> {
+        let mut attempts = 0;
+        loop {
+            let (deltas, generation, rtx) = self.tap.subscribe(|| Ok(self.db.begin_read()?))?;
+            let sealed = rtx
+                .open_table(META)?
+                .get("sealed_through")?
+                .and_then(|v| v.value().parse().ok())
                 .unwrap_or(0);
-            snapshot.catalogue = self.tap.catalogue();
+            let catalogue = self.tap.catalogue();
             // A seal between its catalogue and its commit: take the snapshot again after the commit.
-            if crate::feed::catalogue_ahead(snapshot.catalogue.as_deref(), sealed) && attempts < 400
-            {
+            if crate::feed::catalogue_ahead(catalogue.as_deref(), sealed) && attempts < 400 {
                 attempts += 1;
+                drop(rtx);
                 std::thread::sleep(std::time::Duration::from_millis(5));
                 continue;
             }
-            return Ok(crate::feed::Subscription { snapshot, deltas });
+            let snapshot = crate::feed::Snapshot {
+                epoch: self.tap.epoch(),
+                generation,
+                catalogue,
+                ..Default::default()
+            };
+            return Ok((deltas, rtx, snapshot));
         }
     }
 
@@ -2039,6 +2090,10 @@ impl HotStore for Store {
         Store::feed_subscribe(self).map(Some)
     }
 
+    fn feed_stream(&self, out: &mut dyn std::io::Write) -> Result<Option<FeedDeltas>> {
+        Store::feed_stream(self, out).map(Some)
+    }
+
     fn feed_position(&self) -> Option<(u64, u64)> {
         Some((self.tap.epoch(), self.tap.generation()))
     }
@@ -2346,6 +2401,9 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     }
     fn feed_subscribe(&self) -> Result<Option<crate::feed::Subscription>> {
         (**self).feed_subscribe()
+    }
+    fn feed_stream(&self, out: &mut dyn std::io::Write) -> Result<Option<FeedDeltas>> {
+        (**self).feed_stream(out)
     }
     fn feed_position(&self) -> Option<(u64, u64)> {
         (**self).feed_position()
