@@ -17,7 +17,7 @@ keywords = ["blockchain", "indexer", "ethereum", "self-hosted", "mcp"]
 categories = ["command-line-utilities", "database", "cryptography::cryptocurrencies"]
 # Keep the published crate lean: the scratch/docs aren't needed to build the host, and
 # fuzz/ is dev-only tooling (its own package, nightly-only, never in the data path per CLAUDE.md §4).
-exclude = ["/scratchpad", "/fuzz", "/decode", "/seal", "/tools", "/count"]
+exclude = ["/scratchpad", "/fuzz", "/decode", "/seal", "/tools", "/count", "/embed"]
 
 [[bin]]
 name = "nuthatch"

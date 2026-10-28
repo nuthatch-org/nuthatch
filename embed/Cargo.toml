@@ -1,0 +1,35 @@
+[package]
+name = "nuthatch-embed"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "RFC-0074 S0: nuthatch's address history as a WebAssembly module a host drives over RPC it supplies."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+# The included source files carry the binary's own unit tests, which need the binary; tests/ holds ours.
+test = false
+doctest = false
+
+[dependencies]
+alloy-consensus = { version = "2.5", default-features = false, features = ["std", "serde"] }
+alloy-primitives = "1.6"
+alloy-rpc-types-eth = { version = "2.5", default-features = false, features = ["std", "serde"] }
+anyhow = "1"
+futures = "0.3"
+hex = "0.4"
+redb = "=2.6.3"
+serde = { version = "1", features = ["derive"] }
+# preserve_order as the binary has it through nuthatch-decode, so a stored record keeps its key order.
+serde_json = { version = "1", features = ["raw_value", "preserve_order"] }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+tracing = "0.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
