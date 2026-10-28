@@ -613,6 +613,23 @@ fn warn_outbound_urls(dir: &Path) {
 /// zip-slip guard); [`install_verified`] then re-checks every *manifest-declared* file with
 /// [`checked_join`], so extraction and install are both bounded - defence in depth on untrusted input.
 fn extract_bundle(bundle_file: &Path, dest: &Path) -> Result<()> {
+    // A link entry let the integrity check read any host file and report its sha256, or read
+    // `/dev/zero` until the process died; a sparse one unpacks gigabytes from a few bytes.
+    let file = std::fs::File::open(bundle_file)
+        .with_context(|| format!("opening bundle {}", bundle_file.display()))?;
+    for entry in tar::Archive::new(file)
+        .entries()
+        .with_context(|| format!("reading bundle {}", bundle_file.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading bundle {}", bundle_file.display()))?;
+        let kind = entry.header().entry_type();
+        if !(kind.is_file() || kind.is_dir()) {
+            bail!(
+                "bundle entry {} is a {kind:?}; a bundle may hold only regular files and directories",
+                String::from_utf8_lossy(&entry.path_bytes())
+            );
+        }
+    }
     let file = std::fs::File::open(bundle_file)
         .with_context(|| format!("opening bundle {}", bundle_file.display()))?;
     std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
@@ -654,7 +671,24 @@ pub fn install_verified(
 
     // Integrity: every file's bytes hash to the manifest's claim.
     for f in &manifest.files {
-        let bytes = std::fs::read(checked_join(blob_dir, &f.path)?)
+        let path = checked_join(blob_dir, &f.path)?;
+        // Manifests always use `/`. A backslash is a second separator on Windows the name checks miss.
+        if f.path.contains('\\') {
+            bail!(
+                "blob file {} uses a backslash, which a manifest path never holds",
+                f.path
+            );
+        }
+        if names_derived_state(&f.path) {
+            bail!(
+                "blob file {} is named like derived state, which a nest's inputs never hold",
+                f.path
+            );
+        }
+        if !no_links_below(blob_dir, &path) {
+            bail!("blob file {} is not a regular file under the blob", f.path);
+        }
+        let bytes = std::fs::read(&path)
             .with_context(|| format!("blob is missing declared file {}", f.path))?;
         let got = hex::encode(Sha256::digest(&bytes));
         if got != f.sha256 {
@@ -725,6 +759,35 @@ pub fn install_verified(
     );
     println!("     bundled it (every file hashed, registry reproduced from inputs).");
     Ok(())
+}
+
+/// Whether a manifest path names, in any case, what [`collect_files`] leaves out. On a
+/// case-insensitive filesystem a differently cased name would install and then be read as derived state.
+fn names_derived_state(rel: &str) -> bool {
+    let first = rel.split('/').next().unwrap_or_default();
+    let root_only = [crate::maintained::COPIES_DIR, crate::seal::QUARANTINE_DIR];
+    root_only.iter().any(|d| first.eq_ignore_ascii_case(d))
+        || rel
+            .split('/')
+            .any(|part| EXCLUDE.iter().any(|x| part.eq_ignore_ascii_case(x)))
+}
+
+/// Whether `path`, below `base`, is reached through no link and is no device or directory. A missing
+/// file passes, for the read to report. A blob directory need not have come from [`extract_bundle`].
+fn no_links_below(base: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(base) else {
+        return false;
+    };
+    let mut at = base.to_path_buf();
+    for comp in rel.components() {
+        at.push(comp);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => return false,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
 }
 
 /// Verify that a nest dir's inputs reproduce the `registry_hash` a manifest claims - the check `load`
@@ -1566,6 +1629,138 @@ abi = "abis/c.json"
         )
         .await
         .is_err());
+    }
+
+    /// FR8 review: a bundle's link entry made the integrity check read a host file, report its
+    /// sha256 in the refusal, and once the manifest carried that hash, install the file's bytes
+    /// into the nest. A sparse entry unpacks far more than the bundle holds.
+    #[test]
+    fn a_bundle_holds_only_regular_files_and_directories() {
+        let src = tempfile::tempdir().unwrap();
+        write_nest(src.path());
+        std::fs::create_dir_all(src.path().join("views")).unwrap();
+        let secret = b"rpc_key = \"SECRET_OF_THE_HOST\"\n";
+        std::fs::write(src.path().join("views/a.sql"), secret).unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let host_file = host.path().join("nuthatch.toml");
+        std::fs::write(&host_file, secret).unwrap();
+        let manifest = build_manifest(src.path(), None).unwrap();
+        assert!(manifest.files.iter().any(|f| f.path == "views/a.sql"));
+
+        let tar_with = |special: &dyn Fn(&mut tar::Builder<Vec<u8>>)| {
+            let mut ar = tar::Builder::new(Vec::new());
+            let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+            let mut h = tar::Header::new_gnu();
+            h.set_size(bytes.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            ar.append_data(&mut h, "manifest.json", &bytes[..]).unwrap();
+            for f in manifest.files.iter().filter(|f| f.path != "views/a.sql") {
+                ar.append_path_with_name(src.path().join(&f.path), &f.path)
+                    .unwrap();
+            }
+            special(&mut ar);
+            ar.into_inner().unwrap()
+        };
+        let link = tar_with(&|ar| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            h.set_cksum();
+            ar.append_link(&mut h, "views/a.sql", &host_file).unwrap();
+        });
+        let sparse = tar_with(&|ar| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::GNUSparse);
+            h.set_size(1);
+            let gnu = h.as_gnu_mut().unwrap();
+            gnu.set_real_size(1 << 40);
+            gnu.sparse[0].set_offset((1 << 40) - 1);
+            gnu.sparse[0].set_length(1);
+            h.set_mode(0o644);
+            h.set_cksum();
+            ar.append_data(&mut h, "views/a.sql", &b"x"[..]).unwrap();
+        });
+        let refusal = |bytes: &[u8]| {
+            let t = tempfile::tempdir().unwrap();
+            let file = t.path().join("n.bundle");
+            std::fs::write(&file, bytes).unwrap();
+            match extract_bundle(&file, &t.path().join("blob")) {
+                Ok(()) => panic!("a special entry was extracted"),
+                Err(e) => format!("{e:#}"),
+            }
+        };
+        let e = refusal(&link);
+        assert!(e.contains("only regular files and directories"), "{e}");
+        let e = refusal(&sparse);
+        assert!(e.contains("only regular files and directories"), "{e}");
+
+        // A blob directory that did not come from a bundle is held to the same rule.
+        let blob = tempfile::tempdir().unwrap();
+        bundle(src.path(), Some(blob.path()), true, false).unwrap();
+        std::fs::remove_file(blob.path().join("views/a.sql")).unwrap();
+        std::os::unix::fs::symlink(&host_file, blob.path().join("views/a.sql")).unwrap();
+        let t = tempfile::tempdir().unwrap();
+        let err = install_verified(blob.path(), Some(&t.path().join("n")), None).unwrap_err();
+        assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+    }
+
+    #[test]
+    fn a_manifest_path_with_a_backslash_is_refused() {
+        let src = tempfile::tempdir().unwrap();
+        write_nest(src.path());
+        let mut manifest = build_manifest(src.path(), None).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let blob = out.path().join("blob");
+        write_bundle_dir(src.path(), &blob, &manifest).unwrap();
+        let f = manifest
+            .files
+            .iter_mut()
+            .find(|f| f.path.contains('/'))
+            .unwrap();
+        let crafted = f.path.replacen('/', "\\", 1);
+        std::fs::rename(blob.join(&f.path), blob.join(&crafted)).unwrap();
+        f.path = crafted;
+        std::fs::write(
+            blob.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let err = install_verified(&blob, Some(&out.path().join("n")), None).unwrap_err();
+        assert!(format!("{err:#}").contains("backslash"), "{err:#}");
+    }
+
+    #[test]
+    fn a_bundle_cannot_carry_derived_state_in_another_case() {
+        for planted in [
+            "Segments/manifest.json",
+            "Maintained/x.parquet",
+            "NUTHATCH.REDB",
+        ] {
+            let src = tempfile::tempdir().unwrap();
+            write_nest(src.path());
+            let at = src.path().join(planted);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(&at, r#"{"tables":{}}"#).unwrap();
+            let manifest = build_manifest(src.path(), None).unwrap();
+            if !manifest.files.iter().any(|f| f.path == planted) {
+                continue;
+            }
+            let out = tempfile::tempdir().unwrap();
+            let file = out.path().join("t.bundle");
+            write_bundle(src.path(), &manifest, &file).unwrap();
+            let blob = out.path().join("blob");
+            extract_bundle(&file, &blob).unwrap();
+            let e = install_verified(&blob, Some(&out.path().join("n")), None).unwrap_err();
+            assert!(
+                format!("{e:#}").contains("derived state"),
+                "{planted}: {e:#}"
+            );
+        }
+        assert!(!names_derived_state("views/maintained.sql"));
+        assert!(!names_derived_state("views/quarantine/x.sql"));
+        assert!(names_derived_state("abis/Segments/x.json"));
     }
 
     #[test]
