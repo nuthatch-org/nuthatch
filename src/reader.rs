@@ -1626,6 +1626,90 @@ mod tests {
         assert_eq!(decode_query("a%2"), "a%2");
     }
 
+    /// #2467: what versions of a dataset's derived state still being read hold is charged to its
+    /// cursor, both in what the dataset holds and in the room left for its next delta.
+    #[tokio::test]
+    async fn derived_versions_still_read_are_charged_to_the_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ds");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"ds\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"t\"\naddress = \"0x0000000000000000000000000000000000000001\"\n\
+             abi = \"abi.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("abi.json"), "[]").unwrap();
+        let writer = crate::store::Store::open(&dir.join(crate::config::DB_FILE)).unwrap();
+        let store = Arc::new(MemStore::from_snapshot(
+            &dir,
+            writer.feed_subscribe().unwrap().snapshot,
+        ));
+        let config = crate::config::Config::load(&dir).unwrap();
+        let derived = Arc::new(
+            crate::indexer::FollowerDerived::build(&dir, &config, store.as_ref()).unwrap(),
+        );
+        derived.balances.apply(
+            (0..2_000)
+                .flat_map(|i| crate::views::transfer_deltas("0xm", &format!("0x{i:040x}"), 1, 1))
+                .collect(),
+        );
+        derived.balances.flush();
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        {
+            let mut inner = follower.lock();
+            inner.routes.insert(
+                "ds".into(),
+                Route {
+                    spec: Spec {
+                        dataset: "ds".into(),
+                        nid: None,
+                        surface: Default::default(),
+                        tenant: None,
+                        share: None,
+                        limits: None,
+                        chain: Some("mainnet".into()),
+                        isolation: None,
+                    },
+                    served: None,
+                },
+            );
+            inner.datasets.insert(
+                "ds".into(),
+                Data {
+                    store,
+                    snapshots: Default::default(),
+                    derived: Ok(derived.clone()),
+                    building: None,
+                },
+            );
+        }
+        let held = || follower.lock().held("ds").unwrap();
+        let room = || follower.cap_for("ds").unwrap();
+        let (held_before, room_before) = (held(), room());
+
+        let pinned = derived.balances.pinned();
+        derived
+            .balances
+            .apply(crate::views::transfer_deltas("0xm", "0xnew", 1, 1));
+        derived.balances.flush();
+        let retained = derived.balances.retained_bytes();
+        assert!(
+            retained > 0,
+            "the pinned version keeps what the batch replaced"
+        );
+        assert_eq!(held(), held_before + retained);
+        assert_eq!(room(), room_before - retained);
+
+        drop(pinned);
+        assert_eq!((held(), room()), (held_before, room_before));
+    }
+
     #[test]
     fn derived_routes_are_the_writers() {
         for p in [
