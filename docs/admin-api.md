@@ -371,7 +371,7 @@ the end of the runtime.
 
 | Fault | The faulted mount | Its co-tenants | `/nests`, `/<name>/ready` |
 |-------|-------------------|----------------|---------------------------|
-| Decode error | The log is skipped, logged at debug. Not a fault. | Unaffected | `indexing`, `200` |
+| Decode error | The log is skipped, counted in `nuthatch_nest_logs_undecoded_total` and `/ready`'s `undecoded`, and logged at warn once per window. Not a fault. | Unaffected | `indexing`, `200` |
 | Entity over `max_rows` | Terminal quarantine; the entity stops. | Keep indexing | `quarantined`, terminal, the entity named; `503` |
 | Maintained-view build failure | Not quarantined. The view answers from its definition at request time; `nuthatch_maintained_build_failures_total` counts it. | Unaffected | `indexing`, `200` |
 | Query panic | That request answers `500`. Its permit on the cursor's SQL gate is returned. | Keep serving on the same gate | Unchanged |
