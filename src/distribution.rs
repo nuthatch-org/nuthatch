@@ -151,7 +151,7 @@ fn not_found_err(subject: &str) -> anyhow::Error {
     })
 }
 
-fn access_denied_err(subject: &str) -> anyhow::Error {
+pub(crate) fn access_denied_err(subject: &str) -> anyhow::Error {
     anyhow::Error::new(RegistryError {
         code: FailureCode::AccessDenied,
         message: access_denied(subject),

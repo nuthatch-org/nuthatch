@@ -12,12 +12,24 @@ use std::sync::Arc;
 use nuthatch::{indexer, runtime};
 
 use crate::e2e_runtime_lifecycle::{call, empty_runtime, wait_for_phase, OPEN};
-use crate::e2e_seed_from_mirror::{chain, published, PUBLISHER};
+use crate::e2e_seed_from_mirror::{chain, published, stopped_publisher, PUBLISHER};
 use common::tape::*;
+
+/// The publisher's nest as `init` leaves it, derived artifacts included: they are in the identity, a
+/// nest directory's `dev` writes them, and a runtime's `data/<nid>` never does.
+pub(crate) fn publisher_inputs(dir: &Path) {
+    let config = scaffold_nest(dir, PUBLISHER, USDC);
+    nuthatch::project::refresh_stale_artifacts(dir, &config).unwrap();
+}
+
+/// The publisher's nest with a hand-written `nuthatch.toml` and no derived artifacts.
+pub(crate) fn bare_inputs(dir: &Path) {
+    scaffold_nest(dir, PUBLISHER, USDC);
+}
 
 /// An empty runtime following `tape` whose dataset is the publisher's nest: already on disk, or
 /// fetched from `registry` by the mount, as a rebuilt runtime holds nothing.
-async fn seeding_runtime(
+pub(crate) async fn seeding_runtime(
     roost: &Path,
     tape: Arc<dyn nuthatch::source::Source>,
     default_mirror: Option<&Path>,
@@ -27,8 +39,23 @@ async fn seeding_runtime(
     axum::Router,
     String,
 ) {
+    seeding_runtime_of(roost, tape, default_mirror, registry, publisher_inputs).await
+}
+
+/// [`seeding_runtime`] whose nest is what `inputs` writes.
+pub(crate) async fn seeding_runtime_of(
+    roost: &Path,
+    tape: Arc<dyn nuthatch::source::Source>,
+    default_mirror: Option<&Path>,
+    registry: Option<&Path>,
+    inputs: fn(&Path),
+) -> (
+    Arc<tokio::sync::Mutex<runtime::RuntimeHandles>>,
+    axum::Router,
+    String,
+) {
     let src = tempfile::tempdir().unwrap();
-    scaffold_nest(src.path(), PUBLISHER, USDC);
+    inputs(src.path());
     let nid = nuthatch::blob::nest_nid(src.path()).unwrap();
     let (mut handles, _tape, intake) = empty_runtime(roost, &nid).await;
     std::mem::forget(intake);
@@ -46,7 +73,7 @@ async fn seeding_runtime(
         }
         None => {
             std::fs::create_dir_all(&data).unwrap();
-            scaffold_nest(&data, PUBLISHER, USDC);
+            inputs(&data);
         }
     }
     handles
@@ -66,12 +93,12 @@ async fn seeding_runtime(
     (handles, routes, nid)
 }
 
-fn last_block(dir: &Path, handles: &runtime::RuntimeHandles) -> Option<String> {
+pub(crate) fn last_block(dir: &Path, handles: &runtime::RuntimeHandles) -> Option<String> {
     let (_, state) = handles.states.iter().find(|(_, s)| s.dir == dir)?;
     state.store.get_meta("last_block").ok().flatten()
 }
 
-fn transfers_through(dir: &Path, block: u64) -> serde_json::Value {
+pub(crate) fn transfers_through(dir: &Path, block: u64) -> serde_json::Value {
     let sql = format!(
         "SELECT block_number, log_index FROM {} WHERE block_number <= {block} \
          ORDER BY block_number, log_index",
@@ -290,6 +317,49 @@ async fn a_mount_refused_after_its_seed_keeps_the_seeded_dataset() {
     assert_eq!(
         transfers_through(&data, 8),
         transfers_through(publisher.path(), 8),
+        "the seeded rows are not the publisher's"
+    );
+}
+
+/// One runtime's mount seeds another's: the publisher is a `data/<nid>` the runtime never writes
+/// derived artifacts into, so the seed must not write them either, or it misses the publisher's
+/// dataset and leaves its own off the NID its mount claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_seeds_from_another_runtimes_mount_and_keeps_its_nid() {
+    let src = tempfile::tempdir().unwrap();
+    bare_inputs(src.path());
+    let nid = nuthatch::blob::nest_nid(src.path()).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let publisher = runtime::MountTable::data_dir(other.path(), &nid);
+    std::fs::create_dir_all(&publisher).unwrap();
+    bare_inputs(&publisher);
+    stopped_publisher(&publisher).await;
+    let mirror = tempfile::tempdir().unwrap();
+    nuthatch::publish::sync(&publisher, mirror.path().to_str().unwrap(), false)
+        .await
+        .unwrap();
+
+    let roost = tempfile::tempdir().unwrap();
+    let (_handles, routes, seeded) =
+        seeding_runtime_of(roost.path(), chain(14), None, None, bare_inputs).await;
+    assert_eq!(seeded, nid);
+    let body = serde_json::json!({
+        "name": "usdc", "nid": nid, "seed": true,
+        "publish": {"target": mirror.path().to_str().unwrap()},
+    })
+    .to_string();
+    call(&routes, "POST", "/_admin/nests", None, Some(&body)).await;
+    let job = wait_for_phase(&routes, "usdc", "live").await;
+    assert_eq!(job["phase"], "live", "{job}");
+    let data = runtime::MountTable::data_dir(roost.path(), &nid);
+    assert_eq!(
+        nuthatch::blob::nest_nid(&data).unwrap(),
+        nid,
+        "seeding moved the dataset off its NID"
+    );
+    assert_eq!(
+        transfers_through(&data, 8),
+        transfers_through(&publisher, 8),
         "the seeded rows are not the publisher's"
     );
 }

@@ -9359,6 +9359,50 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "shared: {body}");
     }
 
+    /// RFC-0073 FR4 with FR1 and FR8: a metered statement on a strict writer and on a strict follower
+    /// reports its scans' CPU, and still runs in its tenant's session.
+    #[tokio::test]
+    async fn a_strict_writer_and_follower_report_the_cost_of_a_statement_run_in_their_tenant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = table_fixture(tmp.path(), 1..=3, 4..=5);
+        writer.store.set_meta("sealed_through", "3").unwrap();
+        let sub = writer
+            .store
+            .feed_subscribe()
+            .unwrap()
+            .expect("a redb store has a feed");
+        let follower = AppState {
+            store: Arc::new(crate::feed::MemStore::from_snapshot(
+                &writer.dir,
+                sub.snapshot,
+            )),
+            isolation: Some(Arc::from("f")),
+            ..writer.clone()
+        };
+        let writer = AppState {
+            isolation: Some(Arc::from("w")),
+            ..writer
+        };
+        for (who, state, floor) in [("writer", &writer, 1), ("follower", &follower, 2)] {
+            let q = sql_path(&format!(
+                "SELECT count(*) AS n FROM t WHERE block_number >= {floor}"
+            ));
+            let cost = cost_of(state, &q).await;
+            assert!(cost["sealed_bytes"] > 0, "{who}: {cost:?}");
+            // 0 where there is no per-thread CPU clock; every unix target has one.
+            assert!(cost.contains_key("scan_cpu_us"), "{who}: {cost:?}");
+            assert!(!cfg!(unix) || cost["scan_cpu_us"] > 0, "{who}: {cost:?}");
+            assert_eq!(cost["hot_rows"], 2, "{who}: {cost:?}");
+        }
+        let opens = |t| crate::analytics::session_opens_in(tmp.path(), t);
+        assert!(opens(Some("w")) >= 1 && opens(Some("f")) >= 1);
+        assert_eq!(
+            opens(None),
+            0,
+            "a metered strict statement used the shared session"
+        );
+    }
+
     /// RFC-0073 FR1 with FR8: the test above served from a follower's copy of the store. The
     /// writer's partition reaches it on the feed's mount line, and its queries run in their
     /// tenant's session on every SQL route, with the allow-list held there too.
@@ -12389,7 +12433,8 @@ mod tests {
                 "peak_mem_bytes",
                 "queue_us",
                 "result_bytes",
-                "sealed_bytes_read"
+                "sealed_bytes_read",
+                "scan_cpu_us"
             ],
             "{header}"
         );
@@ -12455,6 +12500,10 @@ mod tests {
         ] {
             let first = cost_of(&a, &path).await;
             assert!(first["sealed_bytes"] > 0, "{path}: {first:?}");
+            assert!(
+                !cfg!(unix) || first["scan_cpu_us"] > 0,
+                "the scans ran: {first:?}"
+            );
             for _ in 0..10 {
                 assert_eq!(
                     cost_of(&a, &path).await["sealed_bytes"],

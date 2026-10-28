@@ -1582,7 +1582,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "burrmill"
 version = "0.0.1"
-source = "git+https://github.com/nuthatch-org/burrmill?rev=242d73eb2308744ead95e69aebf436b739bb3a43#242d73eb2308744ead95e69aebf436b739bb3a43"
+source = "git+https://github.com/nuthatch-org/burrmill?rev=203807c9968f5b024dbd81396fe34c4d221bc6ae#203807c9968f5b024dbd81396fe34c4d221bc6ae"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.0",
@@ -1611,6 +1611,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "indexmap 2.14.0",
  "itertools 0.14.0",
+ "libc",
  "log",
  "object_store 0.13.2",
  "parquet",

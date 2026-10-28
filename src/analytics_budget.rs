@@ -54,6 +54,9 @@ pub struct AnalyticsConfig {
     pub max_rss_mb: Option<u64>,
     /// Measured `runtime_headroom`. `None` → [`RUNTIME_HEADROOM_MB`], which the derived reservation covers.
     pub runtime_headroom_mb: Option<u64>,
+    /// The runtime's `max_rss_mb` for the cursor. Above the default, it raises the wall as
+    /// [`ENV_MAX_RSS`] does (#2441); below it, the split is still held to the default.
+    pub cursor_max_rss_mb: Option<u64>,
 }
 
 impl Default for AnalyticsConfig {
@@ -67,6 +70,7 @@ impl Default for AnalyticsConfig {
             burrmill_memory_limit_mb: None,
             max_rss_mb: None,
             runtime_headroom_mb: None,
+            cursor_max_rss_mb: None,
         }
     }
 }
@@ -102,6 +106,7 @@ impl AnalyticsConfig {
     pub fn max_rss(&self) -> u64 {
         self.max_rss_mb
             .unwrap_or(crate::runtime::DEFAULT_MAX_RSS_MB)
+            .max(self.cursor_max_rss_mb.unwrap_or(0))
     }
 }
 
@@ -124,23 +129,28 @@ pub fn from_env() -> AnalyticsConfig {
         burrmill_memory_limit_mb: env_optional_memory(ENV_BURRMILL_MEMORY_LIMIT),
         max_rss_mb: env_optional_memory(ENV_MAX_RSS),
         runtime_headroom_mb: env_optional_memory(ENV_RUNTIME_HEADROOM),
+        cursor_max_rss_mb: None,
     }
 }
 
 /// Refuses a split that breaches
-/// `(pools × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB`,
+/// `(pools × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ wall`,
 /// an `ingestion_reservation` below [`derived_ingestion_reservation_mb`], and a thread count above
 /// [`THREADS_CEILING`]. Does not cap ingest, DBSP, redb, or result materialisation - which is
-/// exactly why the reservation may only be raised. 2 GiB is the footprint CI job / process RSS
-/// wall; this is the arithmetic that keeps a config from being allowed to breach it quietly.
-pub fn validate_cursor_budget(datasets: usize) -> Result<()> {
-    validate_on_cursor(&from_env(), crate::serve::sql_max_concurrency(), datasets)
+/// exactly why the reservation may only be raised. The wall is 2 GiB, what the footprint CI job
+/// measures, unless [`ENV_MAX_RSS`] or the cursor's `max_rss_mb` raises it.
+pub fn validate_cursor_budget(datasets: usize, cursor_max_rss_mb: Option<u64>) -> Result<()> {
+    let cfg = AnalyticsConfig {
+        cursor_max_rss_mb,
+        ..from_env()
+    };
+    validate_on_cursor(&cfg, crate::serve::sql_max_concurrency(), datasets)
 }
 
 /// Under `isolation = "strict"` each tenant of a dataset has a pool of its own (RFC-0073 FR8), so a
 /// cursor's datasets no longer bound its pools and every permit is charged one.
-pub fn validate_strict_budget() -> Result<()> {
-    validate_cursor_budget(usize::MAX)
+pub fn validate_strict_budget(cursor_max_rss_mb: Option<u64>) -> Result<()> {
+    validate_cursor_budget(usize::MAX, cursor_max_rss_mb)
 }
 
 /// A dataset's sessions share one pool (#1792), so no more pools reserve at once than the cursor
@@ -175,14 +185,17 @@ pub fn validate_against(cfg: &AnalyticsConfig, pools: usize) -> Result<()> {
     if cfg.burrmill_memory_limit_mb == Some(0) {
         bail!("{ENV_BURRMILL_MEMORY_LIMIT} must be greater than zero");
     }
-    let ceiling = cfg.max_rss();
-    if ceiling < crate::runtime::DEFAULT_MAX_RSS_MB {
+    if let Some(env) = cfg
+        .max_rss_mb
+        .filter(|&mb| mb < crate::runtime::DEFAULT_MAX_RSS_MB)
+    {
         bail!(
-            "{ENV_MAX_RSS} is {ceiling} MB, below the shipped {} MB. It is the wall the operator \
+            "{ENV_MAX_RSS} is {env} MB, below the shipped {} MB. It is the wall the operator \
              has given the process, and it may only be raised: the split is not what bounds ingest.",
             crate::runtime::DEFAULT_MAX_RSS_MB
         );
     }
+    let ceiling = cfg.max_rss();
     let duck = pools.saturating_mul(cfg.burrmill_limit_mb());
     let reservation = cfg.reservation_mb();
     let floor = derived_ingestion_reservation_mb();
@@ -215,7 +228,11 @@ pub fn validate_against(cfg: &AnalyticsConfig, pools: usize) -> Result<()> {
         } else {
             format!("analytics.memory_limit ({ENV_MEMORY_LIMIT})")
         };
-        let wall = if cfg.max_rss_mb.is_some() {
+        let wall = if cfg.cursor_max_rss_mb.is_some_and(|mb| {
+            mb == ceiling && mb > cfg.max_rss_mb.unwrap_or(crate::runtime::DEFAULT_MAX_RSS_MB)
+        }) {
+            format!("the {ceiling} MB wall the runtime's max_rss_mb sets for this cursor")
+        } else if cfg.max_rss_mb.is_some() {
             format!("the {ceiling} MB wall {ENV_MAX_RSS} sets")
         } else {
             format!("the {ceiling} MB wall (the per-cursor default; {ENV_MAX_RSS} is unset)")
@@ -243,9 +260,10 @@ pub fn validate_against(cfg: &AnalyticsConfig, pools: usize) -> Result<()> {
              since a dataset's sessions share one pool. {remedy}{permits}{raised}. \
              ingestion_reservation ({ENV_INGESTION_RESERVATION}) goes below its derived floor only beside a \
              measured runtime_headroom ({ENV_RUNTIME_HEADROOM}). \
-             {ENV_MAX_RSS} raises the wall only where the process has been given more than the 2 GiB \
-             per-cursor budget. This gate refuses that split; it does not cap ingest, DBSP, redb, or \
-             result materialisation. analytics.max_temp_size is disk and does not buy RAM. A query \
+             {ENV_MAX_RSS}, or a runtime's max_rss_mb above 2048, raises the wall only where the \
+             process has been given more than the 2 GiB per-cursor default. This gate refuses that \
+             split; it does not cap ingest, DBSP, redb, or result materialisation. \
+             analytics.max_temp_size is disk and does not buy RAM. A query \
              that cannot run in its budget fails; it never degrades block processing."
         );
     }
@@ -520,6 +538,55 @@ pub(crate) mod tests {
         };
         let err = validate_against(&lowered, 1).unwrap_err().to_string();
         assert!(err.contains("may only be raised"), "{err}");
+        let lowered_beside_a_cursor = AnalyticsConfig {
+            cursor_max_rss_mb: Some(4096),
+            ..lowered
+        };
+        assert!(validate_against(&lowered_beside_a_cursor, 1).is_err());
+    }
+
+    /// #2441: a runtime's `max_rss_mb` above 2048 is the cursor's wall, as `NUTHATCH_MAX_RSS` is;
+    /// below 2048 it leaves the split held to the default it was always held to.
+    #[test]
+    fn the_cursor_ceiling_raises_the_wall() {
+        let cfg = AnalyticsConfig {
+            burrmill_memory_limit_mb: Some(2048),
+            ..AnalyticsConfig::default()
+        };
+        assert!(validate_against(&cfg, 1).is_err(), "3,072 MB over 2,048");
+        let cursor = |mb| AnalyticsConfig {
+            cursor_max_rss_mb: Some(mb),
+            ..cfg.clone()
+        };
+        validate_against(&cursor(3072), 1).expect("3,072 MB under the cursor's 3,072");
+        let err = validate_against(&cursor(3071), 1).unwrap_err().to_string();
+        assert!(
+            err.contains("3071 MB wall the runtime's max_rss_mb sets"),
+            "{err}"
+        );
+        assert!(validate_against(&cursor(1024), 1).is_err());
+        validate_against(
+            &AnalyticsConfig {
+                cursor_max_rss_mb: Some(1024),
+                ..AnalyticsConfig::default()
+            },
+            SQL_MAX_CONCURRENCY,
+        )
+        .expect("a lowered cursor still starts the shipped split");
+    }
+
+    /// What `spawn_cursor` and `build_nest` call: the cursor's ceiling reaches the env-read config.
+    #[test]
+    fn the_startup_check_takes_the_cursor_ceiling() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _v = EnvVars::set(&[(ENV_BURRMILL_MEMORY_LIMIT, "2048MB")]);
+        assert!(validate_cursor_budget(1, None).is_err());
+        assert!(validate_cursor_budget(1, Some(DEFAULT_MAX_RSS_MB)).is_err());
+        validate_cursor_budget(1, Some(4096)).expect("3,072 MB under the cursor's 4,096");
+        assert!(
+            validate_strict_budget(Some(4096)).is_err(),
+            "two pools of 2,048"
+        );
     }
 
     /// #1899: the QoS nest's settings under the 2 GiB wall. Burrmill's limit is what counted, so the

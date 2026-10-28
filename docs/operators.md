@@ -466,20 +466,28 @@ Nests live in their own repositories rather than in-tree; see the
 
 ## Capacity and sizing
 
-**The budget is per active-chain cursor: 2 GB RAM.** A runtime's total is the sum of its cursors. This
-is a CI-enforced ceiling, not an aspiration. `max_rss_mb` (default 2048) is each cursor's ceiling,
-and a mount projected past it is refused. At boot the mounts on a cursor are admitted in
-`mounts.toml` order, as a live mount would be: those that fit start, and the rest start quarantined
-with the refusal as their reason, in `GET /nests` and `/ready` (RFC-0073 FR5). Each cursor may also
-carry 32 authored entities at 2048 MB, proportionally fewer below. `PUT /_admin/runtime` raises or
-lowers the ceiling live, up to 2048 and never below what a cursor already holds, and records it in
-`mounts.toml` ([admin API](admin-api.md#the-memory-ceiling)). More nests than fit in 2 GB is a second
-runtime, not a larger ceiling. `dev` also refuses to start unless the analytical split itself fits
-that ceiling (RFC-0047 C4):
+**The budget is per active-chain cursor: 2 GB RAM.** A runtime's total is the sum of its cursors. It
+is the budget nuthatch is designed and gated for: CI fails a build that takes a cursor past it at the
+default ceiling. `max_rss_mb` (default 2048) is each cursor's ceiling, and a mount projected past it
+is refused. At boot the mounts on a cursor are admitted in `mounts.toml` order, as a live mount would
+be: those that fit start, and the rest start quarantined with the refusal as their reason, in `GET
+/nests` and `/ready` (RFC-0073 FR5). Each cursor may also carry 32 authored entities for each 2048 MB
+of ceiling, rounded down. `PUT /_admin/runtime` raises or lowers the ceiling live, never below what a
+cursor already holds, and records it in `mounts.toml` ([admin API](admin-api.md#the-memory-ceiling)).
+
+**An operator may raise it.** On a machine with more RAM, a `max_rss_mb` above 2048 is your choice
+and nothing in nuthatch needs it (#2441). Boot logs once that the ceiling is above the default, and
+`GET /_admin/runtime` says `"above_default": true`. Nothing measures a cursor above 2 GB for you, so
+size it from `rss_bytes` in `GET /nests` on your own workload. A second runtime remains the other way
+to hold more nests. `dev` also refuses to start unless the analytical split itself fits that
+ceiling (RFC-0047 C4):
 
 ```
-(pools × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ 2 GiB
+(pools × analytics.memory_limit) + ingestion_reservation + runtime_headroom ≤ wall
 ```
+
+The wall is 2 GiB, raised by `NUTHATCH_MAX_RSS` or by a `max_rss_mb` above 2048, whichever is
+higher. A `max_rss_mb` below 2048 does not lower it.
 
 `pools` is the smaller of `sql_permits` and the number of nest datasets on the cursor, since a
 dataset's sessions share one pool however many permits it has (#1825). `sql_permits` is
@@ -507,7 +515,7 @@ and is refused at startup.
 `ingestion_reservation` alone may be raised and not lowered, which is what makes the inequality worth
 having. The consequence is the property to hold onto: **no configuration this gate accepts gives
 analytics more RAM than the shipped default that the footprint CI job measures**, unless the operator
-has raised the wall with `NUTHATCH_MAX_RSS`, or measured both terms below, and so said what the process holds. The gate is
+has raised the wall with `NUTHATCH_MAX_RSS` or `max_rss_mb`, or measured both terms below, and so said what the process holds. The gate is
 arithmetic over the walls, not an enforcement of ingest RSS; ingest, DBSP, redb and result
 materialisation are still bounded by the `max_rss_mb` wall and the footprint job, not by this sum.
 
@@ -1410,7 +1418,7 @@ GET /sql?q=… HTTP/1.1
 Nuthatch-Cost: 1
 
 HTTP/1.1 200 OK
-Nuthatch-Cost: sealed_bytes=1409; hot_rows=12; engine_us=3793; peak_mem_bytes=0; queue_us=0; result_bytes=219712; sealed_bytes_read=1409
+Nuthatch-Cost: sealed_bytes=1409; hot_rows=12; engine_us=3793; peak_mem_bytes=0; queue_us=0; result_bytes=219712; sealed_bytes_read=1409; scan_cpu_us=2140
 ```
 
 It is a report, not a price. Nuthatch meters and bills nothing; a gateway that wants to charge, cap
@@ -1427,6 +1435,7 @@ reads by name, or by position for the fields it knows, keeps working:
 | `queue_us` | time spent waiting for a `/sql` permit |
 | `result_bytes` | the serialized body |
 | `sealed_bytes_read` | Parquet data bytes the statements actually fetched, footers excluded |
+| `scan_cpu_us` | thread CPU the segment scans spent decoding and filtering, read by the thread clock around each scan poll; not the operators above the scans, and not an owned fold |
 
 `sealed_bytes` is the figure to build on. Segments are immutable and the selection is made from
 their footers before anything runs, so the same statement over the same sealed segments reports the
@@ -1441,11 +1450,18 @@ up to half as much again from one run to the next in Burrmill's own test. Nor is
 `sealed_bytes`: a filtered statement in those tests read 19,289 bytes against 17,714 selected.
 
 A remembered answer (the [analytical memo](#the-analytical-memo)) runs nothing and reports `0` for
-both. The other fields move with the machine and its load. There is no CPU-time field: a scan
-registers each segment's compute time into its DataFusion metrics as it opens the segment, so reading
-it at the end means holding those metrics through the scan, which Burrmill's scan-memory gate
-measured at 7 KiB a segment outside the memory pool against 1 KiB without (burrmill#86). `engine_us`
-is wall time instead. A route that reads only maintained state, `/balances` or `/derived` for
+both. The other fields move with the machine and its load.
+
+`scan_cpu_us` is the scans' CPU, not the whole statement's. Each segment scan's polls are timed by
+the thread's own CPU clock, which is where Parquet is decoded and pushed-down filters run. In
+Burrmill's own test of a filtered scan it came to 54% of the process CPU in a release build and 70%
+in a debug one; planning, the footer pass behind `sealed_bytes` and the operators above the scans
+make up the rest. Joins, aggregates and sorts are not in it: DataFusion keeps their compute time in
+metrics that can only be read from a plan held to the end, and holding a scan's keeps every
+segment's alive (7 KiB a segment outside the memory pool against 1 KiB without, burrmill#86). It
+reads 0 on a platform without a per-thread CPU clock. `engine_us` stays wall time.
+
+A route that reads only maintained state, `/balances` or `/derived` for
 instance, reads no sealed bytes and no hot rows.
 
 A nest that mirrors itself (RFC-0052, `--publish-target`) also carries, per nest and only then:

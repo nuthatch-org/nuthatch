@@ -652,3 +652,16 @@ fn the_first_block_indexed_is_not_an_arrival() {
     app.apply(&read(3_000, "/ready", 200, &ready(26_000_001, 124)));
     assert_eq!(app.tracks[""].arrivals, [1]);
 }
+
+/// #2441: the boiler's budget is the roster's ceiling per cursor, which an operator may raise.
+#[test]
+fn the_budget_follows_the_runtimes_ceiling() {
+    let (mut app, now) = replayed("runtime.jsonl");
+    let cursors = app.cursors().unwrap() as f64;
+    let gib = 1024.0 * 1024.0 * 1024.0;
+    assert_eq!(app.budget_bytes(), Some(2.0 * gib * cursors));
+    let mut nests: serde_json::Value = app.nests.value().unwrap().clone();
+    nests["max_rss_mb_per_cursor"] = 4096.into();
+    app.apply(&read(now - 20, "/nests", 200, &nests.to_string()));
+    assert_eq!(app.budget_bytes(), Some(4.0 * gib * cursors));
+}

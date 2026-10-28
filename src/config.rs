@@ -134,6 +134,10 @@ pub struct Config {
     /// runtime's setting, not the nest's, so `#[serde(skip)]` like `route`.
     #[serde(skip)]
     pub chain_policy: crate::chains::DeclaredPolicy,
+    /// The runtime's `max_rss_mb` for this nest's cursor, which the analytics split must fit. `None`
+    /// outside a runtime, where the default holds. `#[serde(skip)]` like `chain_policy`.
+    #[serde(skip)]
+    pub cursor_max_rss_mb: Option<u64>,
     /// RFC-0037: IPFS gateways (or a local node) for resolving declared `[[ipfs]]` documents,
     /// supplied at run time (`--ipfs`), **never** written to `nuthatch.toml`.
     ///
@@ -832,6 +836,7 @@ impl Config {
             ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
             route: None,
             chain_policy: Default::default(),
+            cursor_max_rss_mb: None,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {
@@ -1097,6 +1102,7 @@ mod tests {
             ipfs_window_deadline: crate::ipfs_resolve::WINDOW_DEADLINE,
             route: None,
             chain_policy: Default::default(),
+            cursor_max_rss_mb: None,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {
