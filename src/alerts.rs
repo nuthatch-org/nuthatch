@@ -16,11 +16,11 @@
 //! webhook sink is operator-configured and delivery-guaranteed, so the host owns it.
 
 use crate::store::HotStore;
-use anyhow::Result;
+
 use serde_json::{json, Value};
 use std::time::Duration;
 
-pub use nuthatch_core::alerts::{payloads, trim, AlertRouter, OUTBOX_MAX};
+pub use nuthatch_core::alerts::{enqueue, payloads, trim, AlertRouter, OUTBOX_MAX};
 
 /// One readable line for a chat sink.
 ///
@@ -67,25 +67,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How many webhook POSTs are in flight at once during a drain (SEC-8): one slow/dead sink must not
 /// throttle the others - the drain is bounded by the slowest single request, not the sum.
 const DELIVERY_CONCURRENCY: usize = 8;
-
-/// Enqueue an alert for every sink that watches `kind`. `event` is `"flag"` or `"flag_retracted"`.
-/// A no-op when nothing is configured or nothing matches. Bounds the outbox after pushing.
-pub fn enqueue(
-    store: &dyn HotStore,
-    router: &AlertRouter,
-    event: &str,
-    kind: &str,
-    annotation: &Value,
-) -> Result<()> {
-    let queued = payloads(router, event, kind, annotation);
-    for payload in &queued {
-        store.outbox_push(payload)?;
-    }
-    if !queued.is_empty() {
-        trim(store)?;
-    }
-    Ok(())
-}
 
 /// Drain up to [`DELIVERY_BATCH`] pending deliveries once, POSTing the exact stored payload bytes to
 /// its URL (so an HMAC signature covers what's actually sent). A payload whose `webhook` names a

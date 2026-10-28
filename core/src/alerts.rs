@@ -94,6 +94,25 @@ pub fn payloads(router: &AlertRouter, event: &str, kind: &str, annotation: &Valu
         .collect()
 }
 
+/// Enqueue an alert for every sink that watches `kind`. `event` is `"flag"` or `"flag_retracted"`.
+/// A no-op when nothing is configured or nothing matches. Bounds the outbox after pushing.
+pub fn enqueue(
+    store: &dyn HotStore,
+    router: &AlertRouter,
+    event: &str,
+    kind: &str,
+    annotation: &Value,
+) -> Result<()> {
+    let queued = payloads(router, event, kind, annotation);
+    for payload in &queued {
+        store.outbox_push(payload)?;
+    }
+    if !queued.is_empty() {
+        trim(store)?;
+    }
+    Ok(())
+}
+
 /// Bound the outbox at [`OUTBOX_MAX`], dropping the oldest undelivered entries.
 pub fn trim(store: &dyn HotStore) -> Result<()> {
     let dropped = store.outbox_trim(OUTBOX_MAX)?;

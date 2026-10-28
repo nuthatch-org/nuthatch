@@ -12,6 +12,7 @@ pub mod entity_plan;
 pub mod entity_row;
 pub mod entity_view;
 pub mod exposure;
+pub mod extra;
 pub mod factory;
 pub mod fault;
 pub mod feed;

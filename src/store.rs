@@ -153,20 +153,7 @@ pub(crate) fn row_block_hash(json: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// A tab cannot appear in a block hash, so a hash-only value from before #1289 still round-trips.
-pub(crate) fn encode_block_record(hash: &str, timestamp: Option<u64>) -> String {
-    match timestamp {
-        Some(ts) => format!("{hash}\t{ts}"),
-        None => hash.to_string(),
-    }
-}
-
-pub(crate) fn decode_block_record(value: &str) -> (String, Option<u64>) {
-    match value.split_once('\t') {
-        Some((h, t)) => (h.to_string(), t.parse().ok()),
-        None => (value.to_string(), None),
-    }
-}
+pub(crate) use nuthatch_core::store::{decode_block_record, encode_block_record};
 
 /// Durable alert-delivery outbox (RFC-0008 C5): monotonic seq -> pending-delivery JSON. Survives
 /// restart, so at-least-once delivery holds across a process bounce.
@@ -825,14 +812,7 @@ impl Store {
 
     /// Key entities as `{block:012}-{log_index:06}` so iteration is chain-ordered.
     pub fn entity_key(block: u64, log_index: u64) -> String {
-        // The 6-digit zero-pad holds log_index up to 999,999; a 7-digit index would break the
-        // zero-padded lexicographic ordering the range scans and prune bounds rely on. Unreachable at
-        // real block gas limits (~80k logs); catch it in tests/CI rather than silently mis-order.
-        debug_assert!(
-            log_index < 1_000_000,
-            "log_index {log_index} exceeds the 6-digit entity-key width"
-        );
-        format!("{block:012}-{log_index:06}")
+        nuthatch_core::store::entity_key(block, log_index)
     }
 
     fn block_key(block: u64) -> String {
