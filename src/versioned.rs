@@ -50,7 +50,8 @@ impl<K, V> Clone for Chunked<K, V> {
 }
 
 impl<K: Ord + Clone + std::fmt::Debug, V: Clone + std::fmt::Debug> std::fmt::Debug
-    for Chunked<K, V> {
+    for Chunked<K, V>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
@@ -107,7 +108,11 @@ impl<K: Ord + Clone, V: Clone> Chunked<K, V> {
         K: Borrow<Q>,
     {
         self.chunks
-            .partition_point(|c| c.map.first_key_value().is_some_and(|(f, _)| f.borrow() <= k))
+            .partition_point(|c| {
+                c.map
+                    .first_key_value()
+                    .is_some_and(|(f, _)| f.borrow() <= k)
+            })
             .saturating_sub(1)
     }
 
@@ -151,7 +156,12 @@ impl<K: Ord + Clone, V: Clone> Chunked<K, V> {
         chunk.bytes = chunk.bytes + added - removed;
         self.bytes = self.bytes + added - removed;
         if chunk.map.len() > 2 * CHUNK {
-            let mid = chunk.map.keys().nth(chunk.map.len() / 2).cloned().expect("non-empty");
+            let mid = chunk
+                .map
+                .keys()
+                .nth(chunk.map.len() / 2)
+                .cloned()
+                .expect("non-empty");
             let upper = chunk.map.split_off(&mid);
             let moved: u64 = upper.iter().map(|(k, v)| weigh(k, v)).sum();
             chunk.bytes -= moved;
@@ -392,12 +402,10 @@ impl<T: Footprint> Versions<T> {
 mod tests {
     use super::*;
 
-    fn w(_: &u64, v: &String) -> u64 {
-        8 + v.len() as u64
-    }
+    const W: Weigh<u64, String> = |_, v| 8 + v.len() as u64;
 
     fn filled(n: u64) -> Chunked<u64, String> {
-        let mut c = Chunked::new(w);
+        let mut c = Chunked::new(W);
         for i in 0..n {
             c.insert(i * 2, format!("v{i}"));
         }
@@ -419,17 +427,17 @@ mod tests {
         assert!(c.range(1990..).eq(m.range(1990..)));
         assert!(c.range(5000..).eq(m.range(5000..)));
         assert_eq!(c.get(&8), m.get(&8));
-        let want: u64 = m.iter().map(|(k, v)| w(k, v)).sum();
+        let want: u64 = m.iter().map(|(k, v)| W(k, v)).sum();
         assert_eq!(c.bytes(), want);
         let tail = c.split_off(&1500);
         let mtail = m.split_off(&1500);
         assert!(tail.iter().map(|(k, v)| (k, v)).eq(mtail.iter()));
         assert!(c.iter().eq(m.iter()));
-        assert_eq!(c.bytes(), m.iter().map(|(k, v)| w(k, v)).sum::<u64>());
+        assert_eq!(c.bytes(), m.iter().map(|(k, v)| W(k, v)).sum::<u64>());
         c.retain(|k, _| k % 3 == 0);
         m.retain(|k, _| k % 3 == 0);
         assert!(c.iter().eq(m.iter()));
-        assert_eq!(c.bytes(), m.iter().map(|(k, v)| w(k, v)).sum::<u64>());
+        assert_eq!(c.bytes(), m.iter().map(|(k, v)| W(k, v)).sum::<u64>());
     }
 
     #[test]

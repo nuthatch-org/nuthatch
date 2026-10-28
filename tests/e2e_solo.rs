@@ -935,7 +935,11 @@ async fn a_corrupted_segment_reduces_the_table_over_http(corrupt: impl FnOnce(&s
         "range [4,6] did not seal in time"
     );
     // Requests read the published snapshot (#2467), which follows the seal by a moment.
-    let snapshots = rt.state.snapshots.clone().expect("a writer publishes snapshots");
+    let snapshots = rt
+        .state
+        .snapshots
+        .clone()
+        .expect("a writer publishes snapshots");
     assert!(
         wait_until(SEAL_POLL_TIMEOUT, || {
             snapshots

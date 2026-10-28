@@ -753,12 +753,7 @@ fn catalogue_rows(raw: Option<&str>) -> u64 {
 }
 
 /// Insert into `map`, keeping `bytes` the charge for what it holds; the value replaced, if any.
-fn put(
-    map: &mut Table,
-    bytes: &mut u64,
-    key: &str,
-    value: &str,
-) -> Option<String> {
+fn put(map: &mut Table, bytes: &mut u64, key: &str, value: &str) -> Option<String> {
     *bytes += row_bytes(key, value);
     let old = map.insert(key.to_string(), value.to_string());
     if let Some(old) = &old {
@@ -885,7 +880,6 @@ impl MemStore {
         Arc::downgrade(&self.copy)
     }
 
-
     pub fn from_snapshot(dir: &Path, snapshot: Snapshot) -> MemStore {
         let entities = snapshot.entities.map;
         let meta: BTreeMap<String, String> = snapshot
@@ -938,13 +932,7 @@ impl MemStore {
                 .unwrap_or_else(|| base.get(key).map(|v| row_bytes(key, v)))
                 .unwrap_or(0)
         }
-        fn set(
-            base: &Table,
-            touched: &mut Touched,
-            held: &mut i128,
-            key: &str,
-            to: Option<u64>,
-        ) {
+        fn set(base: &Table, touched: &mut Touched, held: &mut i128, key: &str, to: Option<u64>) {
             *held += i128::from(to.unwrap_or(0)) - i128::from(now(base, touched, key));
             touched.insert(key.to_string(), to);
         }
@@ -1610,7 +1598,11 @@ mod tests {
         let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot.clone());
         let alone = copy.bytes();
         let held = HotStore::pinned(&copy).unwrap().unwrap();
-        assert_eq!(copy.bytes(), alone, "the latest version is not charged twice");
+        assert_eq!(
+            copy.bytes(),
+            alone,
+            "the latest version is not charged twice"
+        );
 
         store.commit_window(&[row(5, 1, "t")], None, 401).unwrap();
         let delta = sub.deltas.try_recv().unwrap();
@@ -1618,7 +1610,10 @@ mod tests {
         assert!(copy.peak_with(&delta) > alone);
         copy.apply(&delta).unwrap();
         let retained = copy.retained_bytes();
-        assert!(retained > 0, "the held version keeps the chunk the delta replaced");
+        assert!(
+            retained > 0,
+            "the held version keeps the chunk the delta replaced"
+        );
         assert!(
             retained < alone / 4,
             "only the chunks the delta touched: {retained} of {alone}"

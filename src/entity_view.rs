@@ -438,7 +438,9 @@ impl EntityView {
                                 tracing::debug!(
                                     "entity `{thread_label}` state sampled in {took:?}"
                                 );
-                                if let Some(why) = over_allowance(bytes, shared.retained(), allowance) {
+                                if let Some(why) =
+                                    over_allowance(bytes, shared.retained(), allowance)
+                                {
                                     tracing::error!("entity `{thread_label}`: {why}");
                                     *stopped.write().unwrap() = Some(why);
                                     break;
@@ -583,10 +585,9 @@ impl EntityView {
                         }
                         Msg::SampleState(ack) => {
                             let sample = sample_state(&mut circuit, &sampled);
-                            let why = sample
-                                .as_ref()
-                                .ok()
-                                .and_then(|(bytes, _)| over_allowance(*bytes, shared.retained(), allowance));
+                            let why = sample.as_ref().ok().and_then(|(bytes, _)| {
+                                over_allowance(*bytes, shared.retained(), allowance)
+                            });
                             // The fault is published before the ack, so a caller that sees this
                             // sample also sees the entity stopped.
                             if let Some(why) = &why {

@@ -525,7 +525,10 @@ mod tests {
         assert_eq!(pinned.holders(), 1_001);
         assert_eq!(view.balance("0xnew"), Some(7));
         let retained = view.retained_bytes();
-        assert!(retained > 0, "the pinned version keeps the chunks the batch replaced");
+        assert!(
+            retained > 0,
+            "the pinned version keeps the chunks the batch replaced"
+        );
         assert!(retained < 1_000 * 50, "and only those: {retained}");
         drop(pinned);
         assert_eq!(view.retained_bytes(), 0);

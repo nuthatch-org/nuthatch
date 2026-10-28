@@ -1593,7 +1593,11 @@ pub const ENTITY_SERIES: &[(&str, &str)] = &[
 
 /// What versions of the hot copy and derived state requests still read hold beside the latest (#2467).
 fn snapshot_metrics(s: &AppState) -> String {
-    let nest = s.nest_info.get("name").and_then(Value::as_str).unwrap_or("");
+    let nest = s
+        .nest_info
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let bytes = s.balances.retained_bytes()
         + s.exposure.retained_bytes()
         + s.velocity.retained_bytes()
