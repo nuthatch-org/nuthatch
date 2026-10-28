@@ -28,6 +28,7 @@ struct Nest {
     history: AddressHistory,
     bytes: Bytes,
     discoverer: HostDiscoverer,
+    cover_windows: u64,
 }
 
 thread_local! {
@@ -97,10 +98,17 @@ struct OpenConfig {
     /// redb's page cache, bytes. The store itself is in guest memory already, so this stays small.
     #[serde(default = "default_cache")]
     cache_bytes: usize,
+    /// Windows an `nh_query` may sync before it answers incomplete; the rest is left to `nh_sync`.
+    #[serde(default = "default_cover")]
+    cover_windows: u64,
 }
 
 fn default_cache() -> usize {
     4 << 20
+}
+
+fn default_cover() -> u64 {
+    4
 }
 
 /// Open the store: from `state` (bytes an earlier `nh_export` gave), or empty when `state_len` is 0.
@@ -124,6 +132,7 @@ pub unsafe extern "C" fn nh_open(
                 history,
                 bytes,
                 discoverer: driver::discoverer(c.chain_id),
+                cover_windows: c.cover_windows,
             })
         });
         Ok(serde_json::to_vec(&json!({ "watched": watched }))?)
@@ -132,6 +141,7 @@ pub unsafe extern "C" fn nh_open(
 
 #[derive(Deserialize)]
 struct SyncArgs {
+    addresses: Option<Vec<String>>,
     #[serde(default)]
     from: u64,
     to: Option<u64>,
@@ -150,7 +160,14 @@ pub unsafe extern "C" fn nh_sync(ptr: *const u8, len: usize) -> i64 {
     finish(with_nest(|nest| {
         let a: SyncArgs = serde_json::from_slice(args)?;
         let report = crate::host::block_on(
-            driver::sync(&nest.discoverer, &nest.history, a.from, a.to, a.max_windows),
+            driver::sync(
+                &nest.discoverer,
+                &nest.history,
+                a.addresses,
+                a.from,
+                a.to,
+                a.max_windows,
+            ),
             &mut transport,
         )??;
         Ok(serde_json::to_vec(&report)?)
@@ -197,23 +214,10 @@ pub unsafe extern "C" fn nh_query(ptr: *const u8, len: usize) -> i64 {
                 (k, s)
             })
             .collect();
-        let mut answer = crate::address_history::respond(Some(&nest.history), &params);
-        let get = |k: &str| params.get(k).map(String::as_str);
-        if get("module") == Some("block") && get("action") == Some("getblocknobytime") {
-            if let Some(t) = get("timestamp").and_then(|t| t.parse::<u64>().ok()) {
-                let after = get("closest") == Some("after");
-                answer = crate::host::block_on(
-                    crate::blocktime::block_by_time(
-                        &nest.discoverer.main,
-                        &nest.history,
-                        answer,
-                        t,
-                        after,
-                    ),
-                    &mut transport,
-                )?;
-            }
-        }
+        let answer = crate::host::block_on(
+            driver::answer(&nest.discoverer, &nest.history, &params, nest.cover_windows),
+            &mut transport,
+        )?;
         Ok(serde_json::to_vec(&answer)?)
     }))
 }
