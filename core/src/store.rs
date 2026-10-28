@@ -5,6 +5,10 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub const LAST_BLOCK_KEY: &str = "last_block";
+pub const SEALED_THROUGH_KEY: &str = "sealed_through";
+pub const START_BLOCK_KEY: &str = "start_block";
+
 /// A held lease on a cursor (RFC-0022 slice 4b).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lease {

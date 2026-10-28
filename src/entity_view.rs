@@ -586,6 +586,30 @@ impl EntityView {
     }
 }
 
+impl nuthatch_core::entity_view::WindowEntity for EntityView {
+    fn name(&self) -> &str {
+        EntityView::name(self)
+    }
+    fn bind_window(&self, rows: &[DecodedRow], weight: ZWeight) -> Result<Option<Batch>> {
+        EntityView::bind_window(self, rows, weight)
+    }
+    fn apply(&self, batch: Batch, through: u64) {
+        EntityView::apply(self, batch, through)
+    }
+    fn apply_window(&self, rows: &[DecodedRow], weight: ZWeight, through: u64) -> Result<()> {
+        EntityView::apply_window(self, rows, weight, through)
+    }
+    fn fault(&self) -> Option<String> {
+        EntityView::fault(self)
+    }
+    fn applied_through(&self) -> u64 {
+        EntityView::applied_through(self)
+    }
+    fn flush(&self) {
+        EntityView::flush(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

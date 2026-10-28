@@ -23,10 +23,16 @@ use crate::source::{LogFilter, Source};
 use crate::store::Store;
 use crate::velocity::{self, VelocityView};
 use crate::views::{self, BalanceView};
+pub use nuthatch_core::fault::TerminalFault;
+use nuthatch_core::fault::{is_terminal, FaultPoints};
+use nuthatch_core::feed::{
+    decode_stored_rows, exposure_retraction_batch, oversized_transfer, retraction_batch,
+    velocity_retraction_batch, view_transfer,
+};
 use nuthatch_seal::cut::CutScan;
 pub use nuthatch_seal::cut::{SEAL_DIRECT_BATCH, SEAL_DIRECT_BYTES};
 
-pub(crate) const LAST_BLOCK_KEY: &str = "last_block";
+pub(crate) use nuthatch_core::store::{LAST_BLOCK_KEY, SEALED_THROUGH_KEY, START_BLOCK_KEY};
 /// What this nest's stored data was indexed *with*: `"1"` if rows carry `block_timestamp`, `"0"` if
 /// not (RFC-0029 §6b). Written on first index and compared on every start.
 ///
@@ -39,8 +45,6 @@ const TIMESTAMPS_KEY: &str = "block_timestamps";
 /// [`TIMESTAMPS_KEY`]: that one guards a column, this one guards the *identity* of the whole decode
 /// configuration, which is what a nest's content address is a statement about.
 use crate::store::{IDENTITY_FORMULA, IDENTITY_FORMULA_KEY, REGISTRY_KEY};
-pub(crate) const SEALED_THROUGH_KEY: &str = "sealed_through";
-pub(crate) const START_BLOCK_KEY: &str = "start_block";
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
 const DEFAULT_BACKFILL: u64 = 5_000;
 
@@ -1017,35 +1021,6 @@ fn seed_entities(
     Ok(())
 }
 
-/// Stored JSON rows to decoded rows, against a nest's table schemas.
-///
-/// One conversion, and every caller uses it - the reorg path, the restart seed, and whatever needs it
-/// next. A second one written separately is how a retraction stops cancelling its insertion (#864).
-///
-/// A row of a table the registry does not decode (a threshold flag, a `[[calls]]` or `[[ipfs]]` row)
-/// is skipped: ingest never feeds one to an entity or a view, so nothing seeds or retracts it.
-fn decode_stored_rows(
-    schema: &[crate::registry::TableSchema],
-    stored: &[String],
-) -> Result<Vec<crate::registry::DecodedRow>> {
-    let mut rows = Vec::with_capacity(stored.len());
-    for raw in stored {
-        let value: serde_json::Value =
-            serde_json::from_str(raw).context("an unparseable row in the hot store")?;
-        let Some(table) = value.get("table").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
-            continue;
-        };
-        rows.push(crate::registry::DecodedRow::from_stored(
-            &value,
-            table_schema,
-        )?);
-    }
-    Ok(rows)
-}
-
 /// #866 criterion 13: `--seal-direct` either rebuilds entities from the finished sealed corpus before
 /// serving, or refuses the combination clearly. It refuses, **before anything is spawned**.
 ///
@@ -1495,28 +1470,6 @@ async fn recover_over_cap_static(
     logs.sort_by_key(|l| (l.block_number, l.log_index));
     logs.dedup_by_key(|l| (l.block_number, l.log_index));
     fan_out_window(source, nests, nexts, sup, &served, &logs, block, tip).await
-}
-
-/// A fault that will re-fail identically on retry (RFC-0026 §3), so the unit it kills is quarantined
-/// **until restart** rather than backed off and re-admitted: a reorg below the sealed watermark bails
-/// again on the next attempt by construction, and a dead IVM circuit thread cannot be revived
-/// in-process. Retrying either is a busy-loop that spams the log and hides the operator's real job.
-/// Carried through `anyhow` and recognised by downcast, so the bail sites stay one-liners.
-#[derive(Debug)]
-pub struct TerminalFault(pub String);
-
-impl std::fmt::Display for TerminalFault {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for TerminalFault {}
-
-/// Whether any link in the error chain is a [`TerminalFault`] - i.e. a retry is pointless. Everything
-/// else is assumed retryable: a transient store/RPC/webhook error that a later window may well survive.
-fn is_terminal(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.is::<TerminalFault>())
 }
 
 /// One nest's work on the shared cursor, with a panic in it made that nest's terminal fault
@@ -3525,6 +3478,7 @@ async fn build_nest(
         freshness: config.freshness,
         name: key.clone(),
         dir: dir.clone(),
+        faults: Arc::new(NodeFaults { dir: dir.clone() }),
         store: shared_store.clone(),
         registry: registry.clone(),
         balances: balances.clone(),
@@ -6909,6 +6863,8 @@ pub struct NestIngest {
     /// Per-nest metrics handle (SEC-9): nest-scoped updates go here, which also feed the process-global
     /// aggregates. In a runtime each nest gets its own, keyed by name.
     metrics: Arc<crate::metrics::NestMetrics>,
+    /// Where the node's tests make a window fail; inert outside them.
+    faults: Arc<dyn FaultPoints>,
     /// RFC-0059 §5: the seal loop's checkpoint writer, when the nest ships `folds/`.
     #[cfg(feature = "folds")]
     folds: Option<Arc<crate::folds::Writer>>,
@@ -7528,12 +7484,6 @@ impl NestIngest {
         }
     }
 
-    /// Roll this nest's mutable hot store + IVM views back to `ancestor` (the deepest reorg-survivor
-    /// block). Detection is the *caller's* job: a solo nest detects on its own cursor (`handle_reorg`);
-    /// a runtime detects **once** at the shared boundary and fans this out to every nest (slice 3). A
-    /// nest already at or below `ancestor` (e.g. a still-backfilling nest in a runtime while the tip
-    /// reorgs) is a no-op - nothing above `ancestor` to undo, and its cursor must NOT be bumped up to
-    /// `ancestor` (that would claim blocks it never indexed). Propagates the finality-violation bail.
     /// Fail loudly if any derived-view circuit thread has died. A dead IVM thread silently freezes the
     /// balance/exposure/velocity views while ingest keeps committing and serving - so a dead thread must
     /// surface as a fatal ingest error, never be served over (audit: correctness M1). A disabled view
@@ -7590,141 +7540,25 @@ impl NestIngest {
         Ok(())
     }
 
-    /// Feed rolled-back rows to every authored entity at weight `-1`.
-    fn retract_entities(&self, rows: &[crate::registry::DecodedRow], ancestor: u64) -> Result<()> {
-        if self.entities.is_empty() || rows.is_empty() {
-            return Ok(());
-        }
-        for entity in self.entities.iter() {
-            entity.apply_window(rows, -1, ancestor).with_context(|| {
-                format!(
-                    "retracting rolled-back rows from entity `{}`",
-                    entity.name()
-                )
-            })?;
-        }
-        Ok(())
-    }
-
+    /// Roll this nest back to `ancestor`; see [`nuthatch_core::cursor::rollback_reorg`].
     fn rollback_reorg(&mut self, ancestor: u64) -> Result<u64> {
-        // Nothing below this nest's origin was indexed, so no rollback goes below it, and a fork
-        // deeper than every checkpoint resumes there rather than at block 1 (#2174).
-        let deepest = ancestor == 0;
-        let ancestor = ancestor.max(
-            self.store
-                .get_meta(START_BLOCK_KEY)?
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0)
-                .saturating_sub(1),
-        );
-        // Retract the rolled-back transfers from the IVM view *before* dropping them from the hot
-        // store - a reorg is just the same facts re-fed with weight −1.
-        let last_indexed = self
-            .store
-            .get_meta(LAST_BLOCK_KEY)?
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(ancestor);
-        // This nest hasn't reached past the fork: nothing to undo, and don't advance its cursor.
-        if last_indexed <= ancestor {
-            return Ok(ancestor + 1);
-        }
-        // A reorg below the sealed watermark is a finality violation this model can't repair: the
-        // doomed blocks are already in immutable sealed segments (and pruned from hot), so the
-        // retraction below would be silently incomplete and the sealed layer would permanently disagree
-        // with the canonical chain. Halt loudly instead (deadlock-review finding M6). The `--seal-direct`
-        // finality depth / `finalized` tag is the contract; if it's being violated, it needs raising.
-        let sealed_through = self
-            .store
-            .get_meta(SEALED_THROUGH_KEY)?
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        if ancestor < sealed_through {
-            // Terminal (RFC-0026 §3): the next attempt re-derives the same watermark and bails
-            // identically, so this nest is quarantined until an operator raises the finality depth.
-            // `detect_reorg` answers 0 when no checkpoint it holds is canonical, which is not a fork
-            // at genesis and must not read as one.
-            let fork = if deepest {
-                "a fork deeper than every checkpoint this nest holds".to_string()
-            } else {
-                format!("a reorg to block {ancestor}")
-            };
-            anyhow::bail!(TerminalFault(format!(
-                "{fork} is below the sealed/finalized watermark {sealed_through} - a finality \
-                 violation this indexer cannot repair; halting. Raise the chain's finality depth."
-            )));
-        }
-        let doomed = self.store.entities_in_range(ancestor + 1, last_indexed)?;
-        // A retry reads the same rows and fails the same way.
-        let rows = decode_stored_rows(&self.registry.schema(), &doomed).map_err(|e| {
-            anyhow::Error::new(TerminalFault(format!(
-                "the rows a reorg to block {ancestor} rolls back do not decode: {e:#}"
-            )))
-        })?;
-        // From here the views are being retracted: a failure leaves them out of step with the store
-        // and a retry would retract them twice, so only a restart, which rebuilds them, recovers.
-        let torn = move |e: anyhow::Error| {
-            anyhow::Error::new(TerminalFault(format!(
-                "rolling back to block {ancestor} failed part-way, leaving the derived views out of \
-                 step with the hot store; restart to rebuild them: {e:#}"
-            )))
-        };
-        // §5.2, for the authored entities: the same rows, at weight -1, *before* they are dropped
-        // from the hot store. There is no rollback interface because there is nothing to roll back.
-        //
-        // These are reconstructed through `DecodedRow::from_stored` rather than parsed here, and
-        // that is the whole point: DBSP cancels by key, so a retraction built by a different
-        // converter than the insertion does not cancel it - it lands beside it and stays forever.
-        // One conversion, both directions, and the views read the decoded rows as ingest does.
-        self.retract_entities(&rows, ancestor).map_err(torn)?;
-        self.balances.apply(retraction_batch(&rows));
-        self.balances
-            .retract_over_i128(rows.iter().filter(|r| oversized_transfer(r)).count() as u64);
-        self.exposure
-            .apply(exposure_retraction_batch(&rows, &self.labels));
-        if let Some((_, w)) = self.velocity_cfg {
-            self.velocity.apply(velocity_retraction_batch(&rows, w));
-        }
-        // Drop children whose announcing factory event was rolled back (RFC-0009): the registry state
-        // at B is a pure fold over factory events ≤ B.
-        if self.factory.is_some() {
-            let dropped = self.children.rollback_to(ancestor);
-            if dropped > 0 {
-                tracing::warn!("reorg: dropped {dropped} discovered child contract(s)");
-            }
-        }
-        // Fire a `flag_retracted` alert for every rolled-back annotation a sink watches - a consumer
-        // that acted on a flag learns the chain took it back (RFC-0008 C5). Queued by the rollback's
-        // own transaction, so a rollback that fails retracts nothing (#2177).
-        let mut outbox = Vec::new();
-        if !self.router.is_empty() {
-            for j in &doomed {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(j) {
-                    if let Some(kind) = v.get("kind").and_then(|k| k.as_str()) {
-                        outbox.extend(alerts::payloads(&self.router, "flag_retracted", kind, &v));
-                    }
-                }
-            }
-        }
-
-        // Roll the hot store back to the ancestor AND reset the `last_block` watermark in ONE txn: a
-        // crash between a separate delete and watermark reset would leave `last_block` past the fork and
-        // the rolled-back range permanently un-reindexed (a silent gap).
-        let removed = self
-            .store
-            .rollback_to_and_set_meta(ancestor, LAST_BLOCK_KEY, &ancestor.to_string(), &outbox)
-            .map_err(torn)?;
-        if !outbox.is_empty() {
-            if let Err(e) = alerts::trim(self.store.as_ref()) {
-                tracing::warn!("could not bound the alert outbox: {e:#}");
-            }
-        }
-
-        self.metrics.record_reorg(last_indexed - ancestor);
-        self.metrics.set_last_block(ancestor);
-        tracing::warn!(
-            "reorg detected: rolled back to block {ancestor} (removed {removed} entities)"
-        );
-        Ok(ancestor + 1)
+        let schema = self.registry.schema();
+        nuthatch_core::cursor::rollback_reorg(
+            nuthatch_core::cursor::Nest {
+                store: self.store.as_ref(),
+                schema: &schema,
+                balances: &self.balances,
+                exposure: &self.exposure,
+                velocity: &self.velocity,
+                labels: &self.labels,
+                velocity_window: self.velocity_cfg.map(|(_, w)| w),
+                entities: self.entities.as_slice(),
+                children: self.factory.is_some().then_some(&mut self.children),
+                router: &self.router,
+                metrics: self.metrics.as_ref(),
+            },
+            ancestor,
+        )
     }
 
     /// Undo the views this attempt just fed. The commit did not land, so a retry starts from here.
@@ -7753,8 +7587,7 @@ impl NestIngest {
         to: u64,
         tip: u64,
     ) -> Result<Option<usize>> {
-        #[cfg(test)]
-        panic_if_armed(&self.dir);
+        self.faults.window_started();
         // Decode first so factory discovery is inline (a child created at log i is in the
         // registry before its own activity at log j>i - RFC-0009 same-block handling), then
         // buy headers only for blocks that produced a kept row (#765). A topic0-only fetch
@@ -8190,13 +8023,11 @@ impl NestIngest {
         self.balances.apply(deltas.clone());
         self.exposure.apply(exp_deltas.clone());
         self.velocity.apply(vel_deltas.clone());
-        #[cfg(test)]
-        if let Err(e) = take_fold_failure() {
+        if let Err(e) = self.faults.folded() {
             self.retract_folded_window(deltas, exp_deltas, vel_deltas);
             return Err(e);
         }
-        #[cfg(test)]
-        before_commit();
+        self.faults.committing();
         let alerted = !outbox.is_empty();
         if let Some(gate) = &self.ipfs_gate {
             gate.written_from(next);
@@ -9175,54 +9006,6 @@ fn finish_unpruned_fold(dir: &std::path::Path, store: &dyn crate::store::HotStor
     Ok(())
 }
 
-/// A row's transfer as the derived views read it: (from, to, value), or `None` for any other row
-/// and for a value past i128 (#814). Ingest feeds the views through these two calls, so a reorg
-/// retracts and a restart replays through them too, whatever the token names its columns.
-fn view_transfer(row: &crate::registry::DecodedRow) -> Option<(String, String, i128)> {
-    let (from, to, value, _) = row.erc20_transfer_fields()?;
-    let value = value.as_deref().and_then(crate::views::transfer_value)?;
-    Some((from, to, value))
-}
-
-/// A transfer `view_transfer` passes over for its value alone, counted as `dropped_over_i128`.
-fn oversized_transfer(row: &crate::registry::DecodedRow) -> bool {
-    row.erc20_transfer_fields()
-        .and_then(|(_, _, value, _)| value)
-        .is_some_and(|v| crate::views::transfer_value(&v).is_none())
-}
-
-/// Build a weight −1 balance retraction batch from rolled-back rows (reorg).
-fn retraction_batch(rows: &[crate::registry::DecodedRow]) -> views::WeightedBatch {
-    rows.iter()
-        .filter_map(view_transfer)
-        .flat_map(|(from, to, v)| views::transfer_deltas(&from, &to, v, -1))
-        .collect()
-}
-
-/// Build a weight −1 exposure retraction batch from rolled-back rows (reorg), so a reorged
-/// flag/exposure retracts exactly like a balance.
-fn exposure_retraction_batch(
-    rows: &[crate::registry::DecodedRow],
-    labels: &LabelSet,
-) -> exposure::ExposureBatch {
-    rows.iter()
-        .filter_map(view_transfer)
-        .flat_map(|(from, to, v)| exposure::exposure_deltas(&from, &to, v, -1, labels))
-        .collect()
-}
-
-/// Build a weight −1 velocity retraction batch from rolled-back rows (reorg), so a reorged velocity
-/// flag drops.
-fn velocity_retraction_batch(
-    rows: &[crate::registry::DecodedRow],
-    window: u64,
-) -> velocity::VelocityBatch {
-    rows.iter()
-        .filter_map(|row| view_transfer(row).map(|t| (row.block_number, t)))
-        .flat_map(|(block, (from, _, v))| velocity::velocity_deltas(&from, block, v, -1, window))
-        .collect()
-}
-
 /// A follower's derived state (RFC-0073 FR1): the views and entities a writer keeps in memory,
 /// rebuilt the way a writer's restart rebuilds them and then fed the rows each feed delta stores or
 /// rolls back. Every one is a function of the stored rows, through the same conversion and batches
@@ -10101,6 +9884,31 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static BEFORE_PRUNE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// The node's fault points: the `#[cfg(test)]` switches below, keyed by the nest's directory.
+struct NodeFaults {
+    #[cfg_attr(not(test), allow(dead_code))]
+    dir: PathBuf,
+}
+
+#[cfg(not(test))]
+impl FaultPoints for NodeFaults {}
+
+#[cfg(test)]
+impl FaultPoints for NodeFaults {
+    fn window_started(&self) {
+        panic_if_armed(&self.dir);
+    }
+    fn folded(&self) -> Result<()> {
+        take_fold_failure()
+    }
+    fn committing(&self) {
+        before_commit();
+    }
+    fn sealed_before_prune(&self) {
+        between_seal_and_prune();
+    }
 }
 
 /// Every `process_window` of the nest at `dir` panics from now on. Keyed by directory, since the cursor

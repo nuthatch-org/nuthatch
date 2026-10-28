@@ -8,6 +8,7 @@ use crate::entity_row::{Row, Scalar};
 use crate::time::{self, Duration, Instant};
 use anyhow::{anyhow, Result};
 use dbsp::ZWeight;
+use nuthatch_decode::registry::DecodedRow;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -625,6 +626,36 @@ impl EntityLane {
     pub fn last_progress(&self) -> u64 {
         self.state.read().map(|s| s.progress_at).unwrap_or(0)
     }
+}
+
+/// An authored entity as the window path feeds it: decoded rows bound to its input relations, folded
+/// on its lane. The node's binding reads offchain Parquet, so the binding is the implementor's.
+pub trait WindowEntity: Send + Sync {
+    fn name(&self) -> &str;
+
+    /// `rows` bound to this entity's input at `weight`, not yet fed, so a caller can fail before a
+    /// commit and [`WindowEntity::apply`] only once it has landed. `None` for an entity fed nothing.
+    fn bind_window(&self, rows: &[DecodedRow], weight: ZWeight) -> Result<Option<Batch>>;
+
+    /// Enqueue a bound batch, carrying the entity through `through` once folded.
+    fn apply(&self, batch: Batch, through: u64);
+
+    /// Bind and enqueue in one step: `+1` for canonical facts, `-1` for the same rows a reorg takes
+    /// back before they are dropped (RFC-0041 §5.2).
+    fn apply_window(&self, rows: &[DecodedRow], weight: ZWeight, through: u64) -> Result<()> {
+        if let Some(batch) = self.bind_window(rows, weight)? {
+            self.apply(batch, through);
+        }
+        Ok(())
+    }
+
+    /// Why this entity stopped, if it has.
+    fn fault(&self) -> Option<String>;
+
+    fn applied_through(&self) -> u64;
+
+    /// Block until every batch enqueued so far has been folded.
+    fn flush(&self);
 }
 
 /// Fold one batch, bound first.
