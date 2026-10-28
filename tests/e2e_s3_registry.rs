@@ -22,7 +22,7 @@ use nuthatch::runtime;
 use crate::e2e_runtime_lifecycle::{body_json, call, empty_runtime, wait_for_phase};
 use common::tape::*;
 
-fn endpoint() -> Option<String> {
+pub(crate) fn endpoint() -> Option<String> {
     match std::env::var("NUTHATCH_MINIO_ENDPOINT") {
         Ok(u) => Some(u),
         Err(_) if std::env::var("NUTHATCH_REQUIRE_MINIO").is_ok() => {
@@ -31,7 +31,7 @@ fn endpoint() -> Option<String> {
         Err(_) => {
             eprintln!(
                 "SKIPPED: set NUTHATCH_MINIO_ENDPOINT (plus AWS_* env, incl. AWS_ALLOW_HTTP=true) \
-                 to run the S3 registry suite"
+                 to run the S3 registry and seed suites"
             );
             None
         }
@@ -262,7 +262,7 @@ async fn denied_mount(registry: &str, nid: &str) -> serde_json::Value {
     job
 }
 
-struct Killed(std::process::Child);
+pub(crate) struct Killed(pub(crate) std::process::Child);
 
 impl Drop for Killed {
     fn drop(&mut self) {
