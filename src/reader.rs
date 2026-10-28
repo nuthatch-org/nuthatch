@@ -305,6 +305,8 @@ impl Follower {
                     inner.link.since = Instant::now();
                     backoff = BACKOFF_FIRST;
                 }
+                // The gone writer's positions say nothing about the next one: no lag until it reports.
+                inner.positions.clear();
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(BACKOFF_MAX);

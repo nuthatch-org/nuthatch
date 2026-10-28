@@ -755,7 +755,10 @@ async fn a_resnapshot_is_charged_beside_the_copy_it_replaces() {
                 other => panic!("{size}: {other} {body}"),
             }
             let (_, ready) = get(&fbase, &format!("/{ROUTE}/ready")).await;
-            if status == 200 && ready["follower"]["lag_generations"] == 0 {
+            if status == 200
+                && ready["follower"]["writer"] == "connected"
+                && ready["follower"]["lag_generations"] == 0
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
