@@ -37,6 +37,45 @@ const SILENCE: Duration = Duration::from_secs(5);
 /// How often a follower tells the writer what it has applied.
 const REPORT_EVERY: Duration = Duration::from_secs(1);
 
+/// Lines the parser has handed on and the handler has applied, so that a line's cap is worked out
+/// only once every line before it, its dataset's `mount` among them, has been applied.
+#[derive(Default)]
+struct Applied {
+    /// Handed on, applied, and whether the handler has stopped.
+    counts: Mutex<(u64, u64, bool)>,
+    moved: std::sync::Condvar,
+}
+
+impl Applied {
+    fn counts(&self) -> std::sync::MutexGuard<'_, (u64, u64, bool)> {
+        self.counts.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn sent(&self) {
+        self.counts().0 += 1;
+    }
+
+    fn handled(&self) {
+        self.counts().1 += 1;
+        self.moved.notify_all();
+    }
+
+    fn done(&self) {
+        self.counts().2 = true;
+        self.moved.notify_all();
+    }
+
+    /// Wait until every line handed on has been applied; false if the handler stopped first, when
+    /// nothing more will be applied on this connection.
+    fn caught_up(&self) -> bool {
+        let mut c = self.counts();
+        while c.1 < c.0 && !c.2 {
+            c = self.moved.wait(c).unwrap_or_else(|e| e.into_inner());
+        }
+        !c.2
+    }
+}
+
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -415,6 +454,16 @@ pub struct Follower {
 impl Follower {
     /// Start following `writer` for the runtime at `root`.
     pub fn start(root: PathBuf, writer: String, token: String) -> Arc<Follower> {
+        Follower::start_with(root, writer, token, false)
+    }
+
+    /// [`Follower::start`], applying nothing the feed sends until [`Follower::pause`] lets it go.
+    #[doc(hidden)]
+    pub fn start_paused(root: PathBuf, writer: String, token: String) -> Arc<Follower> {
+        Follower::start_with(root, writer, token, true)
+    }
+
+    fn start_with(root: PathBuf, writer: String, token: String, paused: bool) -> Arc<Follower> {
         let follower = Arc::new(Follower {
             writer: writer.trim_end_matches('/').to_string(),
             token,
@@ -442,7 +491,7 @@ impl Follower {
             }),
             root,
             gates: Mutex::default(),
-            paused: tokio::sync::watch::Sender::new(false),
+            paused: tokio::sync::watch::Sender::new(paused),
             connects: Default::default(),
         });
         follower.recompose();
@@ -564,14 +613,21 @@ impl Follower {
             }
         });
         let weak = Arc::downgrade(self);
+        let applied = Arc::new(Applied::default());
+        let (caps, sends) = (applied.clone(), applied.clone());
         let parser = tokio::task::spawn_blocking(move || {
             let reader = std::io::BufReader::new(ChunkReader {
                 rx: chunk_rx,
                 cur: bytes::Bytes::new(),
             });
             let cap_for: crate::feed::CapFor = Box::new(move |dataset, kind| {
+                // Read ahead of the handler, a snapshot would find no `mount` for its dataset yet,
+                // and so no cursor to charge it to and no cap at all.
+                if !caps.caught_up() {
+                    return Some(0);
+                }
                 let f = weak.upgrade()?;
-                let cap = f.cap_for(dataset)?;
+                let cap = f.cap_for(dataset).unwrap_or(0);
                 let inner = f.lock();
                 Some(match kind {
                     // A replacement and its derived state are built beside the copy and derived
@@ -587,7 +643,10 @@ impl Follower {
                     ),
                 })
             });
-            crate::feed::read_lines(reader, cap_for, |line| line_tx.blocking_send(line).is_ok())
+            crate::feed::read_lines(reader, cap_for, |line| {
+                sends.sent();
+                line_tx.blocking_send(line).is_ok()
+            })
         });
         let reporter = tokio::spawn(self.clone().report_applied(client.clone()));
         let _reporter = AbortOnDrop(reporter);
@@ -596,10 +655,12 @@ impl Follower {
         let handled = async {
             while let Some(line) = line_rx.recv().await {
                 self.handle(line, &mut fresh).await?;
+                applied.handled();
             }
             Ok::<_, anyhow::Error>(())
         }
         .await;
+        applied.done();
         drop(line_rx);
         pump.abort();
         handled?;
@@ -707,7 +768,7 @@ impl Follower {
         self.connects.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Stop applying deltas, or go on, as a follower that has fallen behind would.
+    /// Stop applying what the feed sends, or go on, as a follower that has fallen behind would.
     #[doc(hidden)]
     pub fn pause(&self, paused: bool) {
         self.paused.send_replace(paused);
@@ -743,6 +804,7 @@ impl Follower {
     }
 
     async fn handle(self: &Arc<Self>, line: Line, fresh: &mut BTreeSet<String>) -> Result<()> {
+        let _ = self.paused.subscribe().wait_for(|p| !*p).await;
         match line {
             Line::Hello {
                 version,
@@ -877,7 +939,6 @@ impl Follower {
                 }
             }
             Line::Delta { dataset, delta } => {
-                let _ = self.paused.subscribe().wait_for(|p| !*p).await;
                 let dataset = dataset.0;
                 let (data, refused) = {
                     let inner = self.lock();

@@ -257,6 +257,58 @@ async fn bind_follower(root: &Path, writer: &Writer) -> (Arc<Follower>, String) 
     (follower, format!("http://{addr}"))
 }
 
+/// A snapshot the parser reads before its `mount` line has been applied is still read under its
+/// dataset's cap: the follower applies nothing until the whole feed has arrived, and the padded
+/// nest is still refused, never admitted for want of a cursor to charge it to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_read_ahead_of_its_mount_is_still_capped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("runtime");
+    let dir = root.join("data").join(ROUTE);
+    std::fs::create_dir_all(&dir).unwrap();
+    scaffold_nest(&dir, ROUTE, USDC);
+    // 12 MiB: the nest is charged 5 by admission, and its hot rows come to about 14.
+    std::fs::write(
+        root.join(nuthatch::runtime::MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\nmax_rss_mb = 12\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+         chain_id = 42161\nrpc_urls = []\n",
+    )
+    .unwrap();
+    let via: PathBuf = tmp.path().join("follower-view");
+    std::os::unix::fs::symlink(&root, &via).unwrap();
+    let tape = Arc::new(TapeSource::new());
+    let mut padded = block(1, 0, 100);
+    pad_address_to_seal(&mut padded, USDC, 0);
+    tape.insert_block(1, padded);
+    tape.advance_tip_to(1);
+    let writer = Writer::start(&root, tape.clone(), 0);
+    writer.reaches(1).await;
+
+    let follower = Follower::start_paused(
+        via.clone(),
+        format!("http://{}", writer.addr),
+        TOKEN.to_string(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fbase = format!("http://{}", listener.local_addr().unwrap());
+    let app = follower.service();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    // Time for a parser that does not wait on the handler to read the whole snapshot ahead of it.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    follower.pause(false);
+    let mut seen = (0, serde_json::Value::Null);
+    for _ in 0..400 {
+        seen = route_status(&fbase, ROUTE).await;
+        if seen.0 == 503 && seen.1["reason"] == "over_budget" {
+            break;
+        }
+        assert_ne!(seen.0, 200, "admitted past its budget: {}", seen.1);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(seen.1["reason"], "over_budget", "{}", seen.1);
+    writer.stop(&root);
+}
+
 fn block(b: u64, variant: u64, value: u128) -> BlockFixture {
     transfers_block(
         b,
