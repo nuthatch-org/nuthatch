@@ -56,6 +56,9 @@ impl Default for QueueLimits {
 pub struct FeedMemory {
     queued: AtomicU64,
     peak: AtomicU64,
+    /// Signalled whenever bytes are given back anywhere: a snapshot short of the total waits on any
+    /// connection's reader, not only its own.
+    room: (std::sync::Mutex<()>, std::sync::Condvar),
 }
 
 impl FeedMemory {
@@ -72,7 +75,8 @@ impl FeedMemory {
 struct Conn {
     queued: AtomicU64,
     peak: AtomicU64,
-    room: (std::sync::Mutex<()>, std::sync::Condvar),
+    /// Whether a snapshot is waiting for room on this connection.
+    waiting: AtomicBool,
     closed: tokio::sync::watch::Sender<bool>,
     memory: Arc<FeedMemory>,
     limits: QueueLimits,
@@ -108,8 +112,8 @@ impl Conn {
     fn release(&self, len: u64) {
         self.queued.fetch_sub(len, Ordering::SeqCst);
         self.memory.queued.fetch_sub(len, Ordering::SeqCst);
-        let _held = self.room.0.lock().unwrap_or_else(|e| e.into_inner());
-        self.room.1.notify_all();
+        let _held = self.memory.room.0.lock().unwrap_or_else(|e| e.into_inner());
+        self.memory.room.1.notify_all();
     }
 
     fn is_closed(&self) -> bool {
@@ -120,8 +124,8 @@ impl Conn {
         if !self.closed.send_replace(true) {
             tracing::info!("dropping a follower: {why}; it reconnects and resnapshots");
         }
-        let _held = self.room.0.lock().unwrap_or_else(|e| e.into_inner());
-        self.room.1.notify_all();
+        let _held = self.memory.room.0.lock().unwrap_or_else(|e| e.into_inner());
+        self.memory.room.1.notify_all();
     }
 }
 
@@ -154,7 +158,7 @@ impl Queue {
         let conn = Arc::new(Conn {
             queued: AtomicU64::new(0),
             peak: AtomicU64::new(0),
-            room: Default::default(),
+            waiting: AtomicBool::new(false),
             closed: tokio::sync::watch::Sender::new(false),
             memory,
             limits,
@@ -194,29 +198,32 @@ impl Queue {
     /// Queue `bytes`, waiting for room. Only a snapshot's chunks wait, on the snapshot's own thread.
     fn send_waiting(&self, bytes: bytes::Bytes) -> bool {
         let deadline = std::time::Instant::now() + self.conn.limits.stall;
-        let mut held = self.conn.room.0.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
+        let room = &self.conn.memory.room;
+        let mut held = room.0.lock().unwrap_or_else(|e| e.into_inner());
+        let queued = loop {
             if self.conn.is_closed() {
-                return false;
+                break false;
             }
             if self.conn.reserve(bytes.len() as u64) {
-                drop(held);
-                return self.charge(bytes);
+                break true;
             }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 drop(held);
                 self.conn.close("a snapshot found no room in its queue");
+                self.conn.waiting.store(false, Ordering::SeqCst);
                 return false;
             }
-            held = self
-                .conn
-                .room
+            self.conn.waiting.store(true, Ordering::SeqCst);
+            held = room
                 .1
                 .wait_timeout(held, left)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
-        }
+        };
+        drop(held);
+        self.conn.waiting.store(false, Ordering::SeqCst);
+        queued && self.charge(bytes)
     }
 
     fn charge(&self, bytes: bytes::Bytes) -> bool {
@@ -708,14 +715,14 @@ mod tests {
         got
     }
 
-    /// Waits for `queued` to settle at `bytes`, with nothing read meanwhile.
-    async fn fills_to(queued: impl Fn() -> u64, bytes: u64) {
+    /// Waits, with nothing read meanwhile, until every one of `queues` has a snapshot blocked for
+    /// room: each has queued all the budgets let it.
+    async fn blocked(queues: &[&Queue]) {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        while queued() != bytes {
+        while !queues.iter().all(|q| q.conn.waiting.load(Ordering::SeqCst)) {
             assert!(
                 std::time::Instant::now() < deadline,
-                "{} bytes queued, never {bytes}",
-                queued()
+                "a snapshot never ran out of room"
             );
             tokio::task::yield_now().await;
         }
@@ -737,11 +744,8 @@ mod tests {
         let (q, mut rx) = Queue::new(Arc::default(), limits);
         let task = tokio::spawn(forward("data/a".into(), store.clone(), q.clone()));
         // Nothing is read until the queue holds all it may.
-        fills_to(
-            || q.conn.queued.load(Ordering::SeqCst),
-            limits.per_connection,
-        )
-        .await;
+        blocked(&[&q]).await;
+        assert_eq!(q.conn.queued.load(Ordering::SeqCst), limits.per_connection);
         let got = read_line(&mut rx).await;
         assert_eq!(
             got,
@@ -814,7 +818,8 @@ mod tests {
         }
         // Nobody reads until every queue has taken what the budgets allow.
         let all = limits.total.min(4 * limits.per_connection);
-        fills_to(|| memory.queued(), all).await;
+        blocked(&queues.iter().collect::<Vec<_>>()).await;
+        assert_eq!(memory.queued(), all, "the total, and no more, is queued");
         for q in &queues {
             assert!(q.conn.queued.load(Ordering::SeqCst) <= limits.per_connection);
         }
