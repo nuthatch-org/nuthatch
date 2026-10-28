@@ -302,14 +302,22 @@ fuzz_target!(|input: Input| {
             if input.strict { "strict" } else { "shared" }
         );
     }
+    // Writing the view file moves its directory's mtime; that is the harness, not the statement.
+    let authored = |p: &PathBuf| *p == view_file || Some(p.as_path()) == view_file.parent();
     let now: Vec<_> = files_under(&f.root)
         .into_iter()
-        .filter(|(p, _, _)| *p != view_file)
+        .filter(|(p, _, _)| !authored(p))
+        .collect();
+    let before: Vec<_> = f
+        .files
+        .iter()
+        .filter(|(p, _, _)| !authored(p))
+        .cloned()
         .collect();
     assert!(
-        now == f.files,
+        now == before,
         "a statement changed the runtime directory: {sql}\nview: {view:?}\nbefore {:?}\nafter {:?}",
-        f.files,
+        before,
         now
     );
 });
