@@ -322,6 +322,16 @@ pub struct ExposureView {
 }
 
 impl ExposureView {
+    /// A view with no circuit, as [`crate::views::BalanceView::inert`].
+    pub fn inert() -> Self {
+        let (tx, _) = channel::<Msg>();
+        Self {
+            tx,
+            rows: Default::default(),
+            healthy: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
     /// Start the exposure view. When `enabled` is false (a nest with no labels) the DBSP circuit and
     /// its worker thread are *not* spawned - `apply` becomes a silent no-op (its send finds no
     /// receiver) and `snapshot` stays empty, so an unused view costs nothing (L10).

@@ -845,8 +845,12 @@ pub fn visit_segment_rows(
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let path = segment_path(dir, &segment.file, &segment.hash);
-    let file = std::fs::File::open(&path)
-        .with_context(|| format!("opening sealed segment {}", path.display()))?;
+    let file = match std::fs::File::open(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && follower_missing(dir, &path) => {
+            return Err(SegmentGone(path).into());
+        }
+        opened => opened.with_context(|| format!("opening sealed segment {}", path.display()))?,
+    };
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| format!("reading sealed segment {}", path.display()))?
         .build()
