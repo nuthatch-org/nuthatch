@@ -2038,7 +2038,24 @@ fn check_live_health(
     Ok(())
 }
 
-fn fan_out_rollback(
+/// Publish again for each live nest whose store moved outside a window (#2467).
+async fn republish_idle(
+    nests: &mut [Option<NestIngest>],
+    sup: &mut Supervisor,
+    live: &[usize],
+) -> Result<()> {
+    for &i in live {
+        let Some(nest) = nests[i].as_mut() else {
+            continue;
+        };
+        if let Err(e) = contained(nest.republish_if_moved()).await {
+            sup.quarantine(i, &e)?;
+        }
+    }
+    Ok(())
+}
+
+async fn fan_out_rollback(
     nests: &mut [Option<NestIngest>],
     nexts: &mut [u64],
     sup: &mut Supervisor,
@@ -2046,7 +2063,7 @@ fn fan_out_rollback(
     ancestor: u64,
 ) -> Result<()> {
     for &i in live {
-        match contained_sync(|| live_nest(nests, i).rollback_reorg(ancestor)) {
+        match contained(live_nest(nests, i).rollback_published(ancestor)).await {
             Ok(resume) => nexts[i] = nexts[i].min(resume),
             Err(e) => sup.quarantine(i, &e)?,
         }
@@ -2083,7 +2100,7 @@ async fn check_joined_nests(
                 "nest '{name}' rejoined behind a reorg to block {ancestor}: rolling it back"
             );
             source.forget_cached_above(ancestor);
-            nest.rollback_reorg(ancestor).map(Some)
+            nest.rollback_published(ancestor).await.map(Some)
         })
         .await
         .map(|resume| {
@@ -2537,7 +2554,7 @@ async fn runtime_index_loop(
                     // The timestamp cache is keyed by height. Drop it before the re-index, or the
                     // replaced blocks seal with the time they had before the reorg.
                     source.forget_cached_above(ancestor);
-                    fan_out_rollback(&mut nests, &mut nexts, &mut sup, &live, ancestor)?;
+                    fan_out_rollback(&mut nests, &mut nexts, &mut sup, &live, ancestor).await?;
                     continue;
                 }
                 Ok(None) => {}
@@ -2556,6 +2573,7 @@ async fn runtime_index_loop(
         heartbeat.maybe_log(global_next, tip);
         if global_next > ceiling {
             check_live_health(&nests, &mut sup, &live)?;
+            republish_idle(&mut nests, &mut sup, &live).await?;
             sleep_for(freshness.poll_interval).await;
             continue;
         }
@@ -3614,6 +3632,9 @@ async fn build_nest(
         calls: config.calls.clone(),
         state_rpc,
         rewound: None,
+        snapshots: Default::default(),
+        published_at: None,
+        published_generation: None,
     };
     // Stamps this nest's readiness clock (#510): `/ready`'s never-polled grace period is bounded from
     // here, not permanent - see `serve::poll_stalled`.
@@ -3697,6 +3718,7 @@ async fn build_nest(
         // Set by `spawn_runtime` for a co-tenanted nest; a solo `dev` nest has no mounts health surface.
         runtime_health: None,
         address_history: None,
+        snapshots: Some(nest.snapshots.clone()),
         isolation: None,
         admin_enabled,
         admin_token,
@@ -6962,6 +6984,12 @@ pub struct NestIngest {
     ipfs_window_deadline: std::time::Duration,
     /// Where a refused window rolled this nest back to, for the loop to resume from (#2146).
     rewound: Option<u64>,
+    /// Where each window's snapshot is published for requests to read (#2467).
+    snapshots: serve::Snapshots,
+    /// When the last snapshot was published, which catching up throttles on.
+    published_at: Option<std::time::Instant>,
+    /// The store's write generation the last snapshot was taken at.
+    published_generation: Option<u64>,
 }
 
 impl NestIngest {
@@ -7507,7 +7535,7 @@ impl NestIngest {
                 // timestamps and produce segments a re-execution against the canonical chain could not
                 // reproduce.
                 source.forget_cached_above(ancestor);
-                Ok(Some(self.rollback_reorg(ancestor)?))
+                Ok(Some(self.rollback_published(ancestor).await?))
             }
             Ok(None) => Ok(None),
             // A window committed now would checkpoint over a fork nobody checked (#2147).
@@ -7718,6 +7746,66 @@ impl NestIngest {
         Ok(ancestor + 1)
     }
 
+    /// Wait until every view and entity has published what was fed, off the runtime.
+    async fn flush_derived(&self) -> Result<()> {
+        let (balances, exposure, velocity, entities) = (
+            self.balances.clone(),
+            self.exposure.clone(),
+            self.velocity.clone(),
+            self.entities.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            balances.flush();
+            exposure.flush();
+            velocity.flush();
+            for e in entities.iter() {
+                e.flush();
+            }
+        })
+        .await
+        .context("flushing derived state")
+    }
+
+    /// Publish the store and every view as they stand, once each has folded what it was fed, as the
+    /// snapshot requests read (#2467).
+    async fn publish_snapshot(&mut self) -> Result<()> {
+        self.flush_derived().await?;
+        if let Some(delay) = feed_delay(&self.dir) {
+            tokio::time::sleep(delay).await;
+        }
+        // Read before the store is pinned, so a write between the two is published again rather than missed.
+        self.published_generation = self.store.write_generation();
+        let snapshot = serve::Snapshot::take(
+            &self.store,
+            &self.balances,
+            &self.exposure,
+            &self.velocity,
+            &self.entities,
+        )?;
+        self.snapshots.store(snapshot.map(Arc::new));
+        self.published_at = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    /// Publish again when the store moved outside a window, as documents resolved out of band move it,
+    /// so a nest idle at its tip does not serve them late. Nothing feeds the views between windows.
+    async fn republish_if_moved(&mut self) -> Result<()> {
+        let generation = self.store.write_generation();
+        if self.published_at.is_some()
+            && (generation.is_none() || generation == self.published_generation)
+        {
+            return Ok(());
+        }
+        self.publish_snapshot().await
+    }
+
+    /// [`Self::rollback_reorg`], published before a request reads past it.
+    async fn rollback_published(&mut self, ancestor: u64) -> Result<u64> {
+        let resume = self.rollback_reorg(ancestor)?;
+        self.publish_snapshot().await?;
+        Ok(resume)
+    }
+
     /// Undo the views this attempt just fed. The commit did not land, so a retry starts from here.
     /// Entities are absent because they are fed only after the commit.
     fn retract_folded_window(
@@ -7826,7 +7914,7 @@ impl NestIngest {
                          checkpoint above it is - rolling back to block {ancestor}"
                     );
                     source.forget_cached_above(ancestor);
-                    self.rewound = Some(self.rollback_reorg(ancestor)?);
+                    self.rewound = Some(self.rollback_published(ancestor).await?);
                     return Ok(None);
                 }
             }
@@ -8188,6 +8276,9 @@ impl NestIngest {
         }
         #[cfg(test)]
         before_commit();
+        if let Some(delay) = feed_delay(&self.dir) {
+            tokio::time::sleep(delay).await;
+        }
         let alerted = !outbox.is_empty();
         if let Some(gate) = &self.ipfs_gate {
             gate.written_from(next);
@@ -8199,6 +8290,9 @@ impl NestIngest {
         {
             self.retract_folded_window(deltas, exp_deltas, vel_deltas);
             return Err(e);
+        }
+        if let Some(delay) = feed_delay(&self.dir) {
+            tokio::time::sleep(delay).await;
         }
         self.balances.note_over_i128(oversized);
         // Only now: a refused or failed window must not leave its children routing later logs (#2153).
@@ -8212,11 +8306,6 @@ impl NestIngest {
             if let Some(batch) = batch {
                 entity.apply(batch, to);
             }
-        }
-        // RFC-0062 S2. Not while catching up: a build per backfill window is history-sized work
-        // that the next window makes nobody's.
-        if to >= tip {
-            crate::maintained::changed(&self.dir);
         }
         #[cfg(test)]
         take_after_commit_failure()?;
@@ -8239,6 +8328,20 @@ impl NestIngest {
             .await
             .context("the offchain refresh task did not complete")?;
             refreshed?;
+        }
+        // Catching up, a snapshot per window would make every window wait on its views, so requests
+        // read one about a second old instead.
+        let publish = to >= tip
+            || self
+                .published_at
+                .is_none_or(|at| at.elapsed() >= PUBLISH_WHILE_CATCHING_UP);
+        if publish {
+            self.publish_snapshot().await?;
+        }
+        // RFC-0062 S2, once the window is published. Not while catching up: a build per backfill
+        // window is history-sized work that the next window makes nobody's.
+        if to >= tip {
+            crate::maintained::changed(&self.dir);
         }
         self.metrics.set_last_block(to);
         self.metrics.add_rows_decoded(stored as u64);
@@ -8309,6 +8412,10 @@ impl NestIngest {
         #[cfg(feature = "folds")]
         if let Some(w) = &self.folds {
             w.sealed_through_advanced(self.store.sealed_through());
+        }
+        // A seal moves rows from hot to a segment; requests read past it once this is published.
+        if publish {
+            self.republish_if_moved().await?;
         }
         Ok(Some(stored))
     }
@@ -8468,6 +8575,7 @@ async fn index_loop(
             // As in the runtime loop: an entity fault recorded after its window was checked surfaces
             // here rather than waiting for a block.
             nest.ensure_views_healthy()?;
+            nest.republish_if_moved().await?;
             // Poll for new blocks. The wait is RFC-0040 §3 knob 1: every poll costs a tip call and,
             // when the tip has moved, a reorg check, a checkpoint header and a `finalized` probe -
             // whether or not any block carried an event. At two seconds that is the whole bill of a
@@ -9203,6 +9311,9 @@ pub struct FollowerDerived {
     dir: PathBuf,
 }
 
+/// How stale a snapshot may grow while a nest catches up (#2467).
+const PUBLISH_WHILE_CATCHING_UP: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A test seam: the next feed of `dir`'s derived state fails part-way, and the rebuild that follows
 /// waits for the receiver before it finishes, so a test can watch what is served meanwhile.
 #[doc(hidden)]
@@ -9217,22 +9328,29 @@ pub fn inject_follower_fault(dir: &Path, release: std::sync::mpsc::Receiver<()>)
 /// rows are in the copy, so a test can read inside that window.
 #[doc(hidden)]
 pub fn slow_follower_feed(dir: &Path, delay: std::time::Duration) {
-    follower_delays()
+    feed_delays()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(dir.to_path_buf(), delay);
 }
 
-/// What [`slow_follower_feed`] set for `dir`.
-pub(crate) fn follower_feed_delay(dir: &Path) -> Option<std::time::Duration> {
-    follower_delays()
+/// The same seam on the writer: each window of `dir` waits `delay` after its views are fed, after its
+/// commit, and after its entities have folded, before it is published.
+#[doc(hidden)]
+pub fn slow_writer_commit(dir: &Path, delay: std::time::Duration) {
+    slow_follower_feed(dir, delay);
+}
+
+/// What either seam set for `dir`.
+pub(crate) fn feed_delay(dir: &Path) -> Option<std::time::Duration> {
+    feed_delays()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(dir)
         .copied()
 }
 
-fn follower_delays(
+fn feed_delays(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Duration>> {
     static DELAYS: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::Duration>>,
@@ -13580,7 +13698,9 @@ template = "pool"
         let mut nexts = vec![1021];
         let mut sup = test_supervisor(1);
 
-        fan_out_rollback(&mut nests, &mut nexts, &mut sup, &[0], 0).unwrap();
+        fan_out_rollback(&mut nests, &mut nexts, &mut sup, &[0], 0)
+            .await
+            .unwrap();
 
         assert_eq!(nexts[0], 1000, "re-index from the origin, not block 1");
         let nest = nests[0].as_ref().unwrap();
@@ -16412,7 +16532,9 @@ template = "pool"
         let mut nexts = vec![101u64, 101];
         let mut sup = test_supervisor(2);
 
-        fan_out_rollback(&mut nests, &mut nexts, &mut sup, &[0, 1], 50).unwrap();
+        fan_out_rollback(&mut nests, &mut nexts, &mut sup, &[0, 1], 50)
+            .await
+            .unwrap();
 
         // The doomed nest: terminally quarantined, with the finality reason recorded for the operator.
         match &sup.states[0] {

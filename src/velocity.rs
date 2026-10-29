@@ -21,7 +21,9 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use crate::versioned::{Chunked, Versions};
 
 /// Field separator inside an encoded velocity key (ASCII Unit Separator).
 const SEP: char = '\u{1f}';
@@ -102,7 +104,11 @@ struct VelocityCircuit {
 }
 
 /// The published view: `(count, volume)` per encoded (address, window) key.
-type Buckets = HashMap<String, (i128, i128)>;
+type Buckets = Chunked<String, (i128, i128)>;
+
+fn new_buckets() -> Buckets {
+    Chunked::new(|k, _| k.len() as u64 + 32)
+}
 
 impl VelocityCircuit {
     fn new() -> Result<Self> {
@@ -159,15 +165,18 @@ impl Delta {
         // A bucket lives while it counts a transfer; its volume rides on it.
         for (k, count) in self.counts {
             match count {
-                Some(c) => into.entry(k).or_insert((0, 0)).0 = c,
+                Some(c) => {
+                    let volume = into.get(&k).map_or(0, |b| b.1);
+                    into.insert(k, (c, volume));
+                }
                 None => {
                     into.remove(&k);
                 }
             }
         }
         for (k, volume) in self.volumes {
-            if let Some(bucket) = into.get_mut(&k) {
-                bucket.1 = volume.unwrap_or(0);
+            if let Some(&(count, _)) = into.get(&k) {
+                into.insert(k, (count, volume.unwrap_or(0)));
             }
         }
     }
@@ -284,7 +293,9 @@ enum Msg {
 #[derive(Clone)]
 pub struct VelocityView {
     tx: Sender<Msg>,
-    rows: Arc<RwLock<HashMap<String, (i128, i128)>>>,
+    rows: Arc<Versions<Buckets>>,
+    /// The version a request was handed (#2467), read instead of the latest.
+    pinned: Option<Arc<Buckets>>,
     /// Flips false if the circuit thread dies on an error, so the ingest loop can fail loudly rather
     /// than serve frozen (and, for compliance, silently wrong) velocity flags. A disabled view stays healthy.
     healthy: Arc<AtomicBool>,
@@ -296,7 +307,8 @@ impl VelocityView {
         let (tx, _) = channel::<Msg>();
         Self {
             tx,
-            rows: Default::default(),
+            rows: Arc::new(Versions::new(new_buckets())),
+            pinned: None,
             healthy: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -305,11 +317,16 @@ impl VelocityView {
     /// and its worker thread are not spawned - `apply` no-ops and `snapshot` stays empty (L10).
     pub fn start(enabled: bool) -> Result<Self> {
         let (tx, rx) = channel::<Msg>();
-        let rows = Arc::new(RwLock::new(HashMap::new()));
+        let rows = Arc::new(Versions::new(new_buckets()));
         let healthy = Arc::new(AtomicBool::new(true));
         if !enabled {
             drop(rx);
-            return Ok(Self { tx, rows, healthy });
+            return Ok(Self {
+                tx,
+                rows,
+                pinned: None,
+                healthy,
+            });
         }
         let shared = rows.clone();
         let health = healthy.clone();
@@ -327,6 +344,7 @@ impl VelocityView {
                 // The first window not wholly sealed at the last sweep, so the buckets are walked
                 // once per window the watermark passes rather than once per seal.
                 let mut swept = 0u64;
+                let mut buckets = new_buckets();
                 while let Ok(msg) = rx.recv() {
                     let batch = match msg {
                         Msg::Batch(batch) => batch,
@@ -343,7 +361,7 @@ impl VelocityView {
                             let can = |k: &str, v: i128| {
                                 can_flag(k, v, threshold, window, sealed_through)
                             };
-                            match compacted(&shared.read().unwrap(), can) {
+                            match compacted(&buckets, can) {
                                 Ok(None) => continue,
                                 Ok(Some(c)) => circuit = c,
                                 Err(e) => {
@@ -352,7 +370,8 @@ impl VelocityView {
                                     break;
                                 }
                             }
-                            shared.write().unwrap().retain(|k, &mut (_, v)| can(k, v));
+                            buckets.retain(|k, &(_, v)| can(k, v));
+                            shared.publish(buckets.clone());
                             continue;
                         }
                         Msg::Flush(ack) => {
@@ -361,7 +380,10 @@ impl VelocityView {
                         }
                     };
                     match circuit.step(batch) {
-                        Ok(delta) => delta.apply(&mut shared.write().unwrap()),
+                        Ok(delta) => {
+                            delta.apply(&mut buckets);
+                            shared.publish(buckets.clone());
+                        }
                         Err(e) => {
                             tracing::error!("velocity step failed: {e:#}");
                             health.store(false, Ordering::SeqCst);
@@ -371,7 +393,12 @@ impl VelocityView {
                 }
             })
             .context("failed to spawn velocity thread")?;
-        Ok(Self { tx, rows, healthy })
+        Ok(Self {
+            tx,
+            rows,
+            pinned: None,
+            healthy,
+        })
     }
 
     /// Whether the circuit thread is alive; `false` means it died on an error and the view is frozen.
@@ -422,15 +449,29 @@ impl VelocityView {
 
     /// The first `limit` of [`Self::flags`], without ordering the rest (#2210).
     pub fn top_flags(&self, threshold: i128, limit: usize) -> Vec<VelocityFlag> {
-        match self.rows.read() {
-            Ok(buckets) => rows_over(&buckets, threshold, limit),
-            Err(_) => Vec::new(),
-        }
+        rows_over(&self.buckets(), threshold, limit)
     }
 
     /// Number of (address, window) buckets tracked - a small gauge for `/` and `/metrics`.
     pub fn entries(&self) -> usize {
-        self.rows.read().map(|m| m.len()).unwrap_or(0)
+        self.buckets().len()
+    }
+
+    fn buckets(&self) -> Arc<Buckets> {
+        self.pinned.clone().unwrap_or_else(|| self.rows.load())
+    }
+
+    /// This view held at what it has published now, which later batches leave alone (#2467).
+    pub fn pinned(&self) -> Self {
+        Self {
+            pinned: Some(self.rows.load()),
+            ..self.clone()
+        }
+    }
+
+    /// What published versions still referenced hold that the latest does not, in bytes.
+    pub fn retained_bytes(&self) -> u64 {
+        self.rows.retained()
     }
 }
 
@@ -596,7 +637,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 c: VelocityCircuit::new().unwrap(),
-                rows: Buckets::new(),
+                rows: new_buckets(),
             }
         }
 

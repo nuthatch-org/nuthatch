@@ -23,7 +23,9 @@ use dbsp::{IndexedZSetReader, OrdZSet, OutputHandle, RootCircuit, Runtime};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use crate::versioned::{Footprint, Versions};
 
 /// Field separator inside an encoded exposure key. ASCII Unit Separator (0x1f) - never appears in a
 /// hex address, a direction, or a sane label, so decoding is unambiguous.
@@ -284,6 +286,13 @@ struct Published {
     entries: usize,
 }
 
+impl Footprint for Published {
+    /// Rebuilt whole per step, so a version shares nothing and is charged entire.
+    fn footprint(&self, out: &mut Vec<(usize, u64)>) {
+        out.push((self as *const Self as usize, self.entries as u64 * 160));
+    }
+}
+
 impl Published {
     fn insert(&mut self, key: &str, count: i128, amount: i128) {
         let mut parts = key.splitn(3, SEP);
@@ -315,7 +324,9 @@ impl Published {
 pub struct ExposureView {
     tx: Sender<Msg>,
     /// Snapshot of the maintained view. Read by the API.
-    rows: Arc<RwLock<Published>>,
+    rows: Arc<Versions<Published>>,
+    /// The version a request was handed (#2467), read instead of the latest.
+    pinned: Option<Arc<Published>>,
     /// Flips false if the circuit thread dies on an error, so the ingest loop can fail loudly rather
     /// than serve frozen (and, for compliance, silently wrong) exposure. A disabled view stays healthy.
     healthy: Arc<AtomicBool>,
@@ -327,7 +338,8 @@ impl ExposureView {
         let (tx, _) = channel::<Msg>();
         Self {
             tx,
-            rows: Default::default(),
+            rows: Arc::new(Versions::new(Published::default())),
+            pinned: None,
             healthy: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -337,11 +349,16 @@ impl ExposureView {
     /// receiver) and `snapshot` stays empty, so an unused view costs nothing (L10).
     pub fn start(enabled: bool) -> Result<Self> {
         let (tx, rx) = channel::<Msg>();
-        let rows = Arc::new(RwLock::new(Published::default()));
+        let rows = Arc::new(Versions::new(Published::default()));
         let healthy = Arc::new(AtomicBool::new(true));
         if !enabled {
             drop(rx);
-            return Ok(Self { tx, rows, healthy });
+            return Ok(Self {
+                tx,
+                rows,
+                pinned: None,
+                healthy,
+            });
         }
         let shared = rows.clone();
         let health = healthy.clone();
@@ -371,8 +388,7 @@ impl ExposureView {
                             for (k, &c) in &circuit.counts {
                                 next.insert(k, c, circuit.amounts.get(k).copied().unwrap_or(0));
                             }
-                            let old = std::mem::replace(&mut *shared.write().unwrap(), next);
-                            drop(old);
+                            shared.publish(next);
                         }
                         Msg::Flush(ack) => {
                             let _ = ack.send(());
@@ -381,7 +397,12 @@ impl ExposureView {
                 }
             })
             .context("failed to spawn exposure thread")?;
-        Ok(Self { tx, rows, healthy })
+        Ok(Self {
+            tx,
+            rows,
+            pinned: None,
+            healthy,
+        })
     }
 
     /// Whether the circuit thread is alive; `false` means it died on an error and the view is frozen.
@@ -418,10 +439,12 @@ impl ExposureView {
 
     /// The exposure rows for `address`, descending by amount.
     pub fn exposure(&self, address: &str) -> Vec<ExposureRow> {
-        let mut rows = match self.rows.read() {
-            Ok(m) => m.by_address.get(address).cloned().unwrap_or_default(),
-            Err(_) => return Vec::new(),
-        };
+        let mut rows = self
+            .published()
+            .by_address
+            .get(address)
+            .cloned()
+            .unwrap_or_default();
         #[cfg(test)]
         EXPOSURE_ROWS_READ.with(|n| n.set(n.get() + rows.len()));
         rows.sort_by(|a, b| {
@@ -436,7 +459,24 @@ impl ExposureView {
     /// Number of distinct (address, label, direction) exposure entries maintained - a small gauge for
     /// `/` and `/metrics`.
     pub fn entries(&self) -> usize {
-        self.rows.read().map(|m| m.entries).unwrap_or(0)
+        self.published().entries
+    }
+
+    fn published(&self) -> Arc<Published> {
+        self.pinned.clone().unwrap_or_else(|| self.rows.load())
+    }
+
+    /// This view held at what it has published now, which later batches leave alone (#2467).
+    pub fn pinned(&self) -> Self {
+        Self {
+            pinned: Some(self.rows.load()),
+            ..self.clone()
+        }
+    }
+
+    /// What published versions still referenced hold that the latest does not, in bytes.
+    pub fn retained_bytes(&self) -> u64 {
+        self.rows.retained()
     }
 }
 

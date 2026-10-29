@@ -41,6 +41,7 @@
 use crate::entity_expr::{admits, Expr};
 use crate::entity_plan::{Agg, Plan, Relation};
 use crate::entity_row::{Row, Scalar};
+use crate::versioned::Sink;
 use anyhow::{anyhow, Result};
 use dbsp::algebra::{AddAssignByRef, AddByRef, HasZero, MulByRef};
 use dbsp::operator::{Max, Min};
@@ -325,7 +326,7 @@ impl EntityCircuit {
         &mut self,
         left: &[(Row, ZWeight)],
         right: &[(Row, ZWeight)],
-        into: &mut Relation,
+        into: &mut impl Sink<Row, Row>,
     ) -> Result<()> {
         if let Some(why) = &self.faulted {
             return Err(anyhow!(
@@ -377,7 +378,7 @@ impl EntityCircuit {
     }
 
     /// Run one transaction to completion, integrating the output after each of its steps.
-    fn step_to_commit(&mut self, into: &mut Relation) -> Result<()> {
+    fn step_to_commit(&mut self, into: &mut impl Sink<Row, Row>) -> Result<()> {
         self.handle.start_transaction()?;
         self.handle.start_commit_transaction()?;
         loop {
@@ -387,14 +388,14 @@ impl EntityCircuit {
             self.out.consolidate().iter().for_each(
                 |(Tup2(key, value), (), weight): (Tup2<Row, Row>, (), ZWeight)| {
                     if weight > 0 {
-                        into.insert(key, value);
-                    } else if into.get(&key) == Some(&value) {
-                        into.remove(&key);
+                        into.put(key, value);
+                    } else if into.peek(&key) == Some(&value) {
+                        into.take(&key);
                     }
                 },
             );
             if complete {
-                self.len = into.len();
+                self.len = into.count();
                 return Ok(());
             }
         }
