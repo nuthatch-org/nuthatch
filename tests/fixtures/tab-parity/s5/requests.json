@@ -16,6 +16,7 @@
   {"method": "GET", "path": "/entity/000000000001-000000"},
   {"method": "GET", "path": "/entity/not-an-id"},
   {"method": "GET", "path": "/entities?limit=3"},
+  {"method": "GET", "path": "/entities?limit=20"},
   {"method": "GET", "path": "/balances?limit=5"},
   {"method": "GET", "path": "/balances"},
   {"method": "GET", "path": "/balance/0xC8C5AE385BD79AF59E7BE41F05539AFC03815B95"},

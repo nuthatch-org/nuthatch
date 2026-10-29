@@ -1908,18 +1908,6 @@ fn fold_readiness(s: &AppState, now: u64) -> (Value, bool) {
     )
 }
 
-/// Label an entity that reads an offchain table as reproducible by snapshot, and name the snapshots
-/// its rows were applied through (#1437). The label follows from what the entity reads, not from
-/// what it has applied, so it is there before the first snapshot lands and nothing turns it off.
-/// Both are absent, not null, for an entity that reads no offchain table.
-fn with_offchain(
-    v: Value,
-    entity: &crate::entity_view::EntityView,
-    applied: &crate::entity_view::Applied,
-) -> Value {
-    answer::with_offchain(v, !entity.offchain_tables().is_empty(), applied)
-}
-
 fn entity_facts(entity: &crate::entity_view::EntityView) -> answer::EntityFacts<'_> {
     answer::EntityFacts {
         name: entity.name(),
@@ -5861,15 +5849,10 @@ fn sql_entity_provenance(
             let through = captured
                 .map(|a| a.through)
                 .unwrap_or_else(|| e.applied_through());
-            let v = json!({
-                "entity": e.name(),
-                "incremental": true,
-                "applied_through": through,
-                "current": through >= head,
-            });
-            with_offchain(
-                v,
-                e,
+            answer::sql_entity_item(
+                &entity_facts(e),
+                through,
+                head,
                 captured.unwrap_or(&crate::entity_view::Applied::default()),
             )
         })

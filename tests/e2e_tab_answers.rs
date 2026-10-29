@@ -191,8 +191,25 @@ fn the_node_answers_the_pinned_requests_byte_for_byte() {
     let got = Value::Array(got);
 
     let pinned = format!("{DIR}/s5-expected.json");
-    if std::env::var_os("NUTHATCH_PIN_TAB_PARITY").is_some() {
+    let pin = std::env::var_os("NUTHATCH_PIN_TAB_PARITY").is_some();
+    if pin {
         std::fs::write(&pinned, serde_json::to_string_pretty(&got).unwrap() + "\n").unwrap();
+    }
+    // The tab runs the examples `init` scaffolds for this nest, so its copies must be `init`'s.
+    for (scaffolded, copy) in [
+        (".claude/skills/nuthatch/SKILL.md", "SKILL.md"),
+        ("llms.txt", "llms.txt"),
+    ] {
+        let wrote = std::fs::read_to_string(nest.join(scaffolded)).unwrap();
+        let copy = format!("{DIR}/s5/{copy}");
+        if pin {
+            std::fs::write(&copy, &wrote).unwrap();
+        }
+        assert_eq!(
+            wrote,
+            std::fs::read_to_string(&copy).unwrap(),
+            "`init` scaffolds a different {scaffolded} from the one the tab runs"
+        );
     }
     let expected: Value = serde_json::from_str(&std::fs::read_to_string(&pinned).unwrap()).unwrap();
     for (g, e) in got

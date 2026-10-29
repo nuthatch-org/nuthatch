@@ -124,7 +124,9 @@ pub struct EntityFacts<'a> {
     pub reads_offchain: bool,
 }
 
-/// `v` with an entity's offchain provenance added, where it has any.
+/// `v` labelled reproducible by snapshot where the entity reads an offchain table, and naming the
+/// snapshots its rows were applied through (#1437). The label follows from what it reads, so it is
+/// there before the first snapshot lands; both are absent, not null, for an entity that reads none.
 pub fn with_offchain(mut v: Value, reads_offchain: bool, applied: &Applied) -> Value {
     if let Some(obj) = v.as_object_mut() {
         if reads_offchain {
@@ -351,6 +353,21 @@ pub struct SqlFacts<'a> {
     pub reproducible_by_snapshot: bool,
     /// The offchain snapshots it read, where it read any.
     pub offchain: Option<Value>,
+}
+
+/// One maintained relation in `/sql`'s `provenance.entities`: `through` is the watermark captured with
+/// the rows (#932), not a fresh read.
+pub fn sql_entity_item(e: &EntityFacts, through: u64, head: u64, applied: &Applied) -> Value {
+    with_offchain(
+        json!({
+            "entity": e.name,
+            "incremental": true,
+            "applied_through": through,
+            "current": through >= head,
+        }),
+        e.reads_offchain,
+        applied,
+    )
 }
 
 /// `/sql`'s envelope with `rows` in place; [`sql_bytes`] writes serialized rows into it instead.
