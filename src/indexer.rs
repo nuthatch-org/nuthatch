@@ -2748,6 +2748,589 @@ async fn runtime_index_loop(
     }
 }
 
+/// RFC-0076 S0: the buffered cursor, on only when `NUTHATCH_CURSOR_BUFFER` names a window count. Unset,
+/// every runtime runs [`runtime_index_loop`] as before.
+#[derive(Clone)]
+pub(crate) struct BufferOptions {
+    /// Windows extraction may hold ahead of its nests.
+    windows: usize,
+    /// Nests committing a window at once.
+    ingest_concurrency: usize,
+    stats: Arc<BufferStats>,
+}
+
+#[derive(Default)]
+pub(crate) struct BufferStats {
+    windows_fetched: std::sync::atomic::AtomicU64,
+    factory_refetches: std::sync::atomic::AtomicU64,
+    own_fetches: std::sync::atomic::AtomicU64,
+    evicted: std::sync::atomic::AtomicU64,
+}
+
+impl BufferOptions {
+    fn from_env() -> Option<Self> {
+        let windows = std::env::var("NUTHATCH_CURSOR_BUFFER")
+            .ok()?
+            .parse::<usize>()
+            .ok()
+            .filter(|&w| w > 0)?;
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let ingest_concurrency = std::env::var("NUTHATCH_INGEST_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(cores.min(4));
+        Some(Self {
+            windows,
+            ingest_concurrency,
+            stats: Arc::default(),
+        })
+    }
+}
+
+struct BufferedWindow {
+    from: u64,
+    to: u64,
+    tip: u64,
+    logs: Vec<crate::rpc::Log>,
+    /// The addresses the fetch asked for, lowercased; `None` when it asked by topic0 alone, which
+    /// already covers any child a nest discovers later.
+    asked: Option<std::collections::HashSet<String>>,
+}
+
+struct WindowBuffer {
+    windows: std::collections::VecDeque<Arc<BufferedWindow>>,
+    /// The first block extraction has not fetched.
+    next_fetch: u64,
+    tip: u64,
+}
+
+/// What extraction reads of a nest it no longer holds: the nest belongs to its ingest task.
+struct NestView {
+    addresses: Vec<String>,
+    topic0s: Vec<String>,
+    start_block: Option<u64>,
+    registry: Arc<DecodeRegistry>,
+    factory: Option<Arc<FactorySet>>,
+    children: ChildRegistry,
+    store: Arc<dyn crate::store::HotStore>,
+    metrics: Arc<crate::metrics::NestMetrics>,
+    window_ceiling: Option<u64>,
+    blocks: bool,
+}
+
+struct NestSlot {
+    view: std::sync::Mutex<NestView>,
+    next: std::sync::atomic::AtomicU64,
+    dead: std::sync::atomic::AtomicBool,
+}
+
+struct BufferShared {
+    buffer: std::sync::Mutex<WindowBuffer>,
+    nests: Vec<NestSlot>,
+    changed: tokio::sync::watch::Sender<u64>,
+}
+
+impl BufferShared {
+    fn bump(&self) {
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    fn live(&self) -> Vec<usize> {
+        use std::sync::atomic::Ordering;
+        (0..self.nests.len())
+            .filter(|&i| !self.nests[i].dead.load(Ordering::Acquire))
+            .collect()
+    }
+}
+
+/// A factory nest's filter inputs, cloned out of its view so no lock is held across a fetch.
+struct ExtractInputs {
+    addresses: Vec<String>,
+    topic0s: Vec<String>,
+    start_block: Option<u64>,
+    factory: Option<(Arc<DecodeRegistry>, Arc<FactorySet>, ChildRegistry)>,
+}
+
+impl ExtractInputs {
+    fn narrowed(&self) -> Vec<String> {
+        match &self.factory {
+            Some((reg, _, children)) => reg
+                .addresses()
+                .iter()
+                .map(|a| format!("0x{}", hex::encode(a)))
+                .chain(children.addresses().iter().map(|c| c.to_string()))
+                .collect(),
+            None => self.addresses.clone(),
+        }
+    }
+}
+
+/// RFC-0076 §3.2 for S0: the cursor as an extraction stage feeding a bounded window buffer, and one
+/// ingest task per nest running the unchanged [`NestIngest::process_window`] from its own watermark.
+///
+/// Not built here, and S2's work: lifecycle commands (the channel is held, never read), reorg markers
+/// (a detected reorg ends this cursor), quarantine re-admission (a fault is terminal), the over-cap
+/// recovery, the `topic0_refused` fallback, and any spill of the buffer to disk.
+#[allow(clippy::too_many_arguments)]
+async fn runtime_index_loop_buffered(
+    source: Arc<dyn Source>,
+    nests: Vec<NestIngest>,
+    backfill: Option<u64>,
+    seal_direct: bool,
+    concurrency: usize,
+    window: u64,
+    health: Arc<crate::health::RuntimeHealth>,
+    fail_fast: bool,
+    lifecycle: Option<CursorCommands>,
+    opts: BufferOptions,
+) -> Result<()> {
+    let _lifecycle = lifecycle;
+    let mut prepared = Vec::new();
+    for mut nest in nests {
+        match contained(nest.prepare(source.as_ref(), backfill, seal_direct, concurrency, window))
+            .await
+        {
+            Ok(next) => prepared.push((nest, next)),
+            Err(e) if fail_fast => anyhow::bail!("--fail-fast: nest '{}' faulted: {e:#}", nest.name),
+            Err(e) => health.quarantine_nest(&nest.name, format!("{e:#}"), 0, None),
+        }
+    }
+    if prepared.is_empty() {
+        anyhow::bail!(TerminalFault(
+            "every nest on this cursor failed to prepare".into()
+        ));
+    }
+    let freshness = cursor_freshness(prepared.iter().map(|(n, _)| n));
+    let finality = prepared[0].0.finality;
+    let documents = prepared.iter().any(|(n, _)| n.ipfs_gate.is_some());
+    let slots = prepared
+        .iter()
+        .map(|(n, next)| NestSlot {
+            view: std::sync::Mutex::new(NestView {
+                addresses: n.addresses.clone(),
+                topic0s: n.topic0s.clone(),
+                start_block: n.start_block,
+                registry: n.registry.clone(),
+                factory: n.factory.clone(),
+                children: n.children.clone(),
+                store: n.store.clone(),
+                metrics: n.metrics.clone(),
+                window_ceiling: n.window_ceiling,
+                blocks: n.registry.blocks(),
+            }),
+            next: (*next).into(),
+            dead: false.into(),
+        })
+        .collect();
+    let start = prepared.iter().map(|(_, next)| *next).min().unwrap();
+    let (changed, rx) = tokio::sync::watch::channel(0u64);
+    let shared = Arc::new(BufferShared {
+        buffer: std::sync::Mutex::new(WindowBuffer {
+            windows: Default::default(),
+            next_fetch: start,
+            tip: 0,
+        }),
+        nests: slots,
+        changed,
+    });
+    let permits = Arc::new(tokio::sync::Semaphore::new(opts.ingest_concurrency));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (i, (nest, _)) in prepared.into_iter().enumerate() {
+        tasks.spawn(buffered_nest_task(
+            i,
+            nest,
+            source.clone(),
+            shared.clone(),
+            rx.clone(),
+            permits.clone(),
+            window,
+            opts.stats.clone(),
+            health.clone(),
+            fail_fast,
+        ));
+    }
+    let extraction = buffered_extraction(
+        source.as_ref(),
+        &shared,
+        rx,
+        window,
+        documents,
+        finality,
+        freshness,
+        &opts,
+    );
+    tokio::pin!(extraction);
+    loop {
+        tokio::select! {
+            r = &mut extraction => return r,
+            Some(joined) = tasks.join_next() => match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(e) if e.is_panic() => anyhow::bail!("a nest's ingest task panicked: {e}"),
+                Err(_) => {}
+            },
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn buffered_extraction(
+    source: &dyn Source,
+    shared: &BufferShared,
+    mut rx: tokio::sync::watch::Receiver<u64>,
+    window: u64,
+    documents: bool,
+    finality: Finality,
+    freshness: crate::freshness::Freshness,
+    opts: &BufferOptions,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let views = |live: &[usize]| -> Vec<std::sync::MutexGuard<'_, NestView>> {
+        live.iter()
+            .map(|&i| shared.nests[i].view.lock().unwrap())
+            .collect()
+    };
+    let mut chunker = {
+        let all: Vec<usize> = (0..shared.nests.len()).collect();
+        let v = views(&all);
+        tip_window(
+            documents,
+            v.iter().any(|n| n.blocks),
+            window,
+            v.iter().filter_map(|n| n.window_ceiling).min(),
+        )
+    };
+    let mut poll_failures = 0u32;
+    loop {
+        let live = shared.live();
+        if live.is_empty() {
+            anyhow::bail!(TerminalFault(
+                "every nest on this buffered cursor is quarantined".into()
+            ));
+        }
+        let metrics: Vec<_> = views(&live).iter().map(|n| n.metrics.clone()).collect();
+        let tip = match source.tip().await {
+            Ok(t) => {
+                poll_failures = 0;
+                metrics.iter().for_each(|m| m.mark_poll_ok());
+                t
+            }
+            Err(e) => {
+                metrics.iter().for_each(|m| m.mark_poll_failed());
+                poll_failures = escalate_stall(poll_failures, &e);
+                sleep_secs(3).await;
+                continue;
+            }
+        };
+        let ceiling = cursor_ceiling(source, finality, freshness, tip).await;
+        for m in &metrics {
+            m.set_tip(tip);
+            m.set_ceiling(ceiling);
+        }
+        let next = shared.buffer.lock().unwrap().next_fetch;
+        if next > ceiling {
+            sleep_for(freshness.poll_interval).await;
+            continue;
+        }
+        // Full: wait for the slowest nest, unless a nest has drained the buffer and is waiting on
+        // extraction, in which case the oldest window goes and whoever still needed it fetches it.
+        loop {
+            rx.borrow_and_update();
+            {
+                let mut b = shared.buffer.lock().unwrap();
+                if b.windows.len() < opts.windows {
+                    break;
+                }
+                let starved = shared.live().iter().any(|&i| {
+                    shared.nests[i].next.load(Ordering::Acquire) >= b.next_fetch
+                });
+                if starved {
+                    b.windows.pop_front();
+                    opts.stats.evicted.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+            let _ = rx.changed().await;
+        }
+        // The same one detection per window the shared cursor pays, against its most caught-up nest.
+        let reference = live
+            .iter()
+            .copied()
+            .max_by_key(|&i| shared.nests[i].next.load(Ordering::Acquire))
+            .unwrap();
+        let ref_next = shared.nests[reference].next.load(Ordering::Acquire);
+        if ref_next > 0 {
+            let store = shared.nests[reference].view.lock().unwrap().store.clone();
+            match detect_reorg(source, store.as_ref(), ref_next - 1).await {
+                Ok(Some(ancestor)) => anyhow::bail!(
+                    "the buffered cursor found a reorg to block {ancestor}; reorg markers are \
+                     RFC-0076 S2 and not built"
+                ),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("buffered cursor reorg check could not complete: {e:#}");
+                    sleep_secs(2).await;
+                    continue;
+                }
+            }
+        }
+        let (inputs, window_cap) = {
+            let v = views(&live);
+            let cap = if v.iter().any(|n| n.blocks) {
+                crate::chunker::HEADER_WINDOW_CAP
+            } else {
+                crate::chunker::MAX_WINDOW
+            };
+            let cap = v
+                .iter()
+                .filter_map(|n| n.window_ceiling)
+                .fold(cap, u64::min);
+            let inputs: Vec<ExtractInputs> = v
+                .iter()
+                .map(|n| ExtractInputs {
+                    addresses: n.addresses.clone(),
+                    topic0s: n.topic0s.clone(),
+                    start_block: n.start_block,
+                    factory: n
+                        .factory
+                        .clone()
+                        .map(|fs| (n.registry.clone(), fs, n.children.clone())),
+                })
+                .collect();
+            (inputs, cap)
+        };
+        chunker.set_max(window_cap);
+        let to = (next + chunker.window() - 1).min(ceiling);
+        metrics
+            .iter()
+            .for_each(|m| m.set_fetch_window(chunker.window()));
+        let (u_addrs, u_topics) = union_filter(
+            inputs
+                .iter()
+                .map(|n| (n.addresses.as_slice(), n.topic0s.as_slice())),
+        );
+        let fetch_from = overlap_from(
+            next,
+            inputs
+                .iter()
+                .map(|n| n.start_block.unwrap_or(0))
+                .min()
+                .unwrap_or(0),
+        );
+        let factories: Vec<&FactorySet> = inputs
+            .iter()
+            .filter_map(|n| n.factory.as_ref().map(|(_, fs, _)| fs.as_ref()))
+            .collect();
+        let narrowed = if factories.is_empty() {
+            None
+        } else {
+            let mut addrs: Vec<String> = Vec::new();
+            for a in inputs.iter().flat_map(ExtractInputs::narrowed) {
+                if !addr_in(&addrs, &a) {
+                    addrs.push(a);
+                }
+            }
+            let wide = addrs.len() > FACTORY_FLIP_THRESHOLD
+                || factories.iter().any(|f| f.force_topic0());
+            (!addrs.is_empty() && !wide).then_some(addrs)
+        };
+        let lower = |a: &String| a.to_ascii_lowercase();
+        let fetched = match (&narrowed, LogFilter::new(&u_addrs, &u_topics)) {
+            (Some(addrs), _) => {
+                let mut asked: std::collections::HashSet<String> = addrs.iter().map(lower).collect();
+                fetch_discovering(source, addrs, &u_topics, fetch_from, to, |logs| {
+                    let mut known = Vec::new();
+                    for (reg, fs, children) in inputs.iter().filter_map(|n| n.factory.as_ref()) {
+                        known.extend(discover_children(reg, fs, children, logs));
+                    }
+                    asked.extend(known.iter().map(lower));
+                    known
+                })
+                .await
+                .map(|logs| (logs, Some(asked)))
+            }
+            (None, Some(f)) => source.logs(&f, fetch_from, to).await.map(|logs| {
+                let asked =
+                    (!u_addrs.is_empty()).then(|| u_addrs.iter().map(lower).collect());
+                (logs, asked)
+            }),
+            (None, None) => Ok((Vec::new(), None)),
+        };
+        match fetched {
+            Ok((logs, asked)) => {
+                chunker.observed(logs.len() as u64);
+                {
+                    let mut b = shared.buffer.lock().unwrap();
+                    b.windows.push_back(Arc::new(BufferedWindow {
+                        from: next,
+                        to,
+                        tip,
+                        logs,
+                        asked,
+                    }));
+                    b.next_fetch = to + 1;
+                    b.tip = tip;
+                }
+                opts.stats.windows_fetched.fetch_add(1, Ordering::Relaxed);
+                shared.bump();
+                if to == ceiling {
+                    sleep_for(freshness.poll_interval).await;
+                }
+            }
+            Err(e) if narrowing_can_help(&e, next, to) && next < to => chunker.too_large(),
+            Err(e) => {
+                tracing::warn!("buffered get_logs {next}..={to} failed: {e:#}; retrying");
+                sleep_secs(3).await;
+            }
+        }
+    }
+}
+
+/// The logs a nest takes from a buffered window: its own, from its watermark's overlap tail, plus
+/// the logs of any child it knows of that extraction did not ask for when it fetched the window.
+async fn buffered_window_logs(
+    nest: &NestIngest,
+    source: &dyn Source,
+    w: &BufferedWindow,
+    next: u64,
+    stats: &BufferStats,
+) -> Result<Vec<crate::rpc::Log>> {
+    let from = overlap_from(next, nest.start_block.unwrap_or(0));
+    let mut logs: Vec<crate::rpc::Log> = w
+        .logs
+        .iter()
+        .filter(|l| l.block_number >= from && nest.owns(l))
+        .cloned()
+        .collect();
+    let (Some(fs), Some(asked)) = (nest.factory.as_deref(), &w.asked) else {
+        return Ok(logs);
+    };
+    let missing: Vec<String> = nest
+        .children
+        .addresses()
+        .into_iter()
+        .filter(|c| !asked.contains(&c.to_ascii_lowercase()))
+        .map(str::to_string)
+        .collect();
+    if missing.is_empty() {
+        return Ok(logs);
+    }
+    stats
+        .factory_refetches
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let extra = fetch_discovering(source, &missing, &nest.topic0s, from, w.to, |seen| {
+        discover_children(&nest.registry, fs, &nest.children, seen)
+            .into_iter()
+            .filter(|c| !asked.contains(&c.to_ascii_lowercase()))
+            .collect()
+    })
+    .await?;
+    logs.extend(extra.into_iter().filter(|l| nest.owns(l)));
+    dedup_logs(&mut logs);
+    Ok(logs)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn buffered_nest_task(
+    i: usize,
+    mut nest: NestIngest,
+    source: Arc<dyn Source>,
+    shared: Arc<BufferShared>,
+    mut rx: tokio::sync::watch::Receiver<u64>,
+    permits: Arc<tokio::sync::Semaphore>,
+    window: u64,
+    stats: Arc<BufferStats>,
+    health: Arc<crate::health::RuntimeHealth>,
+    fail_fast: bool,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    enum Pick {
+        Wait,
+        Buffered(Arc<BufferedWindow>),
+        Own { to: u64, tip: u64 },
+    }
+    let slot = &shared.nests[i];
+    let mut next = slot.next.load(Ordering::Acquire);
+    let own_window = nest.window_ceiling.map_or(window, |c| c.min(window)).max(1);
+    // A refused window is asked for again, as the shared cursor's refetch does.
+    let mut refused = false;
+    loop {
+        rx.borrow_and_update();
+        let pick = {
+            let b = shared.buffer.lock().unwrap();
+            match b.windows.iter().find(|w| w.from <= next && next <= w.to) {
+                Some(w) if refused => Pick::Own {
+                    to: w.to,
+                    tip: w.tip,
+                },
+                Some(w) => Pick::Buffered(w.clone()),
+                // Behind the buffer's oldest window: detached, fetching for itself.
+                None if next < b.next_fetch => {
+                    let limit = b.windows.front().map_or(b.next_fetch, |w| w.from) - 1;
+                    Pick::Own {
+                        to: (next + own_window - 1).min(limit),
+                        tip: b.tip,
+                    }
+                }
+                None => Pick::Wait,
+            }
+        };
+        let (logs, to, tip) = match pick {
+            Pick::Wait => {
+                let _ = rx.changed().await;
+                continue;
+            }
+            Pick::Buffered(w) => (
+                buffered_window_logs(&nest, source.as_ref(), &w, next, &stats).await,
+                w.to,
+                w.tip,
+            ),
+            Pick::Own { to, tip } => {
+                stats.own_fetches.fetch_add(1, Ordering::Relaxed);
+                let from = overlap_from(next, nest.start_block.unwrap_or(0));
+                (nest.fetch_window(source.as_ref(), from, to).await, to, tip)
+            }
+        };
+        let logs = match logs {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("nest '{}' fetch {next}..={to} failed: {e:#}; retrying", nest.name);
+                sleep_secs(3).await;
+                continue;
+            }
+        };
+        let permit = permits.acquire().await.expect("never closed");
+        let done = contained(nest.process_window(source.as_ref(), &logs, next, to, tip)).await;
+        drop(permit);
+        match done {
+            Ok(Some(_)) => {
+                next = to + 1;
+                refused = false;
+                slot.view.lock().unwrap().children = nest.children.clone();
+            }
+            Ok(None) => {
+                if let Some(b) = nest.rewound.take() {
+                    next = b;
+                }
+                refused = true;
+            }
+            Err(e) if fail_fast => {
+                anyhow::bail!("--fail-fast: nest '{}' faulted: {e:#}", nest.name)
+            }
+            Err(e) => {
+                tracing::warn!("nest '{}' quarantined (terminal on the buffered cursor): {e:#}", nest.name);
+                health.quarantine_nest(&nest.name, format!("{e:#}"), 0, None);
+                slot.dead.store(true, Ordering::Release);
+                shared.bump();
+                return Ok(());
+            }
+        }
+        slot.next.store(next, Ordering::Release);
+        shared.bump();
+    }
+}
+
 /// Build every mounted nest and spawn ONE shared-cursor ingestion task driving them all (RFC-0012
 /// slice 2). Returns the per-nest serve states (for `/<name>/…` routing), the single shared ingest
 /// handle, and the nests' alert-delivery workers. Static and factory nests may be co-mounted (slice 2b):
@@ -2893,17 +3476,38 @@ async fn spawn_cursor(
         return Err(release_unstarted(e, ingests, states, alert_workers).await);
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let ingest = tokio::spawn(runtime_index_loop(
-        source,
-        ingests,
-        backfill,
-        seal_direct,
-        concurrency,
-        window,
-        health,
-        fail_fast,
-        Some(rx),
-    ));
+    let ingest = match BufferOptions::from_env() {
+        Some(opts) => {
+            tracing::warn!(
+                "NUTHATCH_CURSOR_BUFFER={}: this cursor runs the RFC-0076 S0 spike, which applies no \
+                 lifecycle command and stops on a reorg",
+                opts.windows
+            );
+            tokio::spawn(runtime_index_loop_buffered(
+                source,
+                ingests,
+                backfill,
+                seal_direct,
+                concurrency,
+                window,
+                health,
+                fail_fast,
+                Some(rx),
+                opts,
+            ))
+        }
+        None => tokio::spawn(runtime_index_loop(
+            source,
+            ingests,
+            backfill,
+            seal_direct,
+            concurrency,
+            window,
+            health,
+            fail_fast,
+            Some(rx),
+        )),
+    };
     Ok(ChainCursor {
         states,
         ingest,
@@ -7735,6 +8339,10 @@ impl NestIngest {
     ) -> Result<Option<usize>> {
         #[cfg(test)]
         panic_if_armed(&self.dir);
+        #[cfg(test)]
+        if let Some(d) = slowed_by(&self.dir) {
+            tokio::time::sleep(d).await;
+        }
         // Decode first so factory discovery is inline (a child created at log i is in the
         // registry before its own activity at log j>i - RFC-0009 same-block handling), then
         // buy headers only for blocks that produced a kept row (#765). A topic0-only fetch
@@ -10056,6 +10664,23 @@ pub(crate) fn panic_in_windows_of(dir: &Path) {
 fn panicking_nests() -> &'static std::sync::Mutex<Vec<PathBuf>> {
     static DIRS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> = std::sync::OnceLock::new();
     DIRS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn slowed_nests() -> &'static std::sync::Mutex<Vec<(PathBuf, std::time::Duration)>> {
+    static DIRS: std::sync::OnceLock<std::sync::Mutex<Vec<(PathBuf, std::time::Duration)>>> =
+        std::sync::OnceLock::new();
+    DIRS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn slowed_by(dir: &Path) -> Option<std::time::Duration> {
+    slowed_nests()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(d, _)| d == dir)
+        .map(|(_, t)| *t)
 }
 
 #[cfg(test)]
@@ -15333,6 +15958,327 @@ template = "pool"
             }),
             "one fetch serves the static co-tenant and the factory together: {calls:?}"
         );
+    }
+
+    const S0_A: &str = "0x0000000000000000000000000000000000000011";
+    const S0_B: &str = "0x0000000000000000000000000000000000000055";
+    const S0_C: &str = "0x0000000000000000000000000000000000000066";
+
+    fn s0_log(address: &str, topics: Vec<String>, data: String, b: u64, li: u64) -> crate::rpc::Log {
+        crate::rpc::Log {
+            address: address.into(),
+            topics,
+            data,
+            block_number: b,
+            block_hash: format!("0x{b:064x}"),
+            tx_hash: format!("0x{b:032x}{li:032x}"),
+            log_index: li,
+        }
+    }
+
+    fn s0_transfer(address: &str, b: u64, li: u64) -> crate::rpc::Log {
+        s0_log(
+            address,
+            vec![
+                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".into(),
+                format!("0x{:064x}", 0xa000 + b),
+                format!("0x{:064x}", 0xb000 + li),
+            ],
+            format!("0x{:064x}", b * 1000 + li),
+            b,
+            li,
+        )
+    }
+
+    /// RFC-0076 S0's chain: two static nests' transfers, and a factory whose children are announced at
+    /// blocks 10 and 25, the second emitting once before its announcement in that block.
+    fn s0_chain(fact: &NestIngest, tip: u64) -> Vec<crate::rpc::Log> {
+        let (fac, c, d, stranger) = (
+            "0x0000000000000000000000000000000000000022",
+            "0x0000000000000000000000000000000000000033",
+            "0x0000000000000000000000000000000000000044",
+            "0x0000000000000000000000000000000000000099",
+        );
+        let created = |child: &str, b, li| {
+            s0_log(
+                fac,
+                vec![
+                    nest_topic0(fact, "fac__child_created"),
+                    format!("0x{:0>64}", child.trim_start_matches("0x")),
+                ],
+                "0x".into(),
+                b,
+                li,
+            )
+        };
+        let ping = |a: &str, b, li| s0_log(a, vec![nest_topic0(fact, "child__ping")], "0x".into(), b, li);
+        let mut logs = Vec::new();
+        for b in 1..=tip {
+            logs.push(s0_transfer(S0_A, b, 0));
+            if b % 3 == 0 {
+                logs.push(s0_transfer(S0_B, b, 1));
+            }
+            if b > 10 && b % 2 == 0 {
+                logs.push(ping(c, b, 4));
+            }
+            if b > 25 && b % 3 == 1 {
+                logs.push(ping(d, b, 6));
+            }
+            if b % 7 == 0 {
+                logs.push(ping(stranger, b, 8));
+            }
+        }
+        logs.extend([
+            created(c, 10, 5),
+            ping(c, 10, 7),
+            ping(d, 25, 2),
+            created(d, 25, 3),
+            ping(d, 25, 9),
+        ]);
+        logs
+    }
+
+    async fn s0_nests(root: &std::path::Path, factory: bool) -> Vec<NestIngest> {
+        let mut out = Vec::new();
+        for (name, addr) in [("a", S0_A), ("b", S0_B)] {
+            let mut n = build_test_nest(&root.join(name), addr).await;
+            n.name = name.into();
+            out.push(n);
+        }
+        let mut third = if factory {
+            build_factory_test_nest(&root.join("f")).await
+        } else {
+            build_test_nest(&root.join("c"), S0_C).await
+        };
+        third.name = if factory { "f" } else { "c" }.into();
+        out.push(third);
+        for n in &mut out {
+            n.window_ceiling = Some(3);
+        }
+        out
+    }
+
+    /// Run a runtime cursor, the shared one or the buffered one, until every nest has committed
+    /// `tip`. Returns each nest's store and how long it took to get there.
+    async fn s0_run(
+        nests: Vec<NestIngest>,
+        source: Arc<dyn Source>,
+        opts: Option<BufferOptions>,
+        tip: u64,
+    ) -> Vec<(Arc<dyn crate::store::HotStore>, std::time::Duration)> {
+        let stores: Vec<_> = nests.iter().map(|n| n.store.clone()).collect();
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let started = std::time::Instant::now();
+        let task = match opts {
+            None => tokio::spawn(runtime_index_loop(
+                source,
+                nests,
+                Some(tip - 1),
+                false,
+                1,
+                3,
+                health,
+                true,
+                None,
+            )),
+            Some(opts) => tokio::spawn(runtime_index_loop_buffered(
+                source,
+                nests,
+                Some(tip - 1),
+                false,
+                1,
+                3,
+                health,
+                true,
+                None,
+                opts,
+            )),
+        };
+        let mut done: Vec<Option<std::time::Duration>> = vec![None; stores.len()];
+        let deadline = started + std::time::Duration::from_secs(120);
+        while done.iter().any(Option::is_none) {
+            if task.is_finished() {
+                panic!("the cursor ended: {:?}", task.await);
+            }
+            assert!(std::time::Instant::now() < deadline, "no convergence: {done:?}");
+            for (i, s) in stores.iter().enumerate() {
+                let at = s.get_meta("last_block").unwrap().and_then(|v| v.parse::<u64>().ok());
+                if done[i].is_none() && at == Some(tip) {
+                    done[i] = Some(started.elapsed());
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        task.abort();
+        let _ = task.await;
+        stores.into_iter().zip(done.into_iter().flatten()).collect()
+    }
+
+    /// Every table a nest holds, hot and sealed, row by row in full.
+    fn s0_contents(
+        dir: &std::path::Path,
+        store: &dyn crate::store::HotStore,
+    ) -> std::collections::BTreeMap<String, Vec<String>> {
+        let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for raw in store.entities_in_range(0, u64::MAX).unwrap() {
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let table = v["table"].as_str().unwrap_or("(no table)").to_string();
+            out.entry(table).or_default().push(raw);
+        }
+        let manifest = crate::seal::load_manifest(dir).unwrap();
+        for (table, segs) in &manifest.tables {
+            if segs.is_empty() {
+                continue;
+            }
+            let sql = format!("SELECT * FROM \"{table}\"");
+            let rows = crate::analytics::query(dir, &sql).unwrap();
+            out.entry(format!("sealed {table}"))
+                .or_default()
+                .extend(rows.iter().map(|r| r.to_string()));
+        }
+        for rows in out.values_mut() {
+            rows.sort();
+        }
+        out
+    }
+
+    fn s0_diff(
+        want: &std::collections::BTreeMap<String, Vec<String>>,
+        got: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Option<String> {
+        let mut out = Vec::new();
+        for table in want.keys().chain(got.keys()).collect::<std::collections::BTreeSet<_>>() {
+            let (w, g) = (
+                want.get(table).cloned().unwrap_or_default(),
+                got.get(table).cloned().unwrap_or_default(),
+            );
+            let missing: Vec<_> = w.iter().filter(|r| !g.contains(r)).collect();
+            let extra: Vec<_> = g.iter().filter(|r| !w.contains(r)).collect();
+            if !missing.is_empty() || !extra.is_empty() || w.len() != g.len() {
+                out.push(format!(
+                    "table {table}: {} rows wanted, {} stored; missing {missing:?}; extra {extra:?}",
+                    w.len(),
+                    g.len()
+                ));
+            }
+        }
+        (!out.is_empty()).then(|| out.join("\n"))
+    }
+
+    /// RFC-0076 S0's parity gate: the buffered cursor stores, row for row, what the shared cursor
+    /// stores, with a factory child discovered while later windows are already buffered without it
+    /// (the refetch path) and with the factory nest slowed past a small buffer (the detached path).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_buffered_cursor_stores_what_the_shared_cursor_stores() {
+        const TIP: u64 = 60;
+        let want_root = tempfile::tempdir().unwrap();
+        let nests = s0_nests(want_root.path(), true).await;
+        let source: Arc<dyn Source> = Arc::new(FilteringSource {
+            logs: s0_chain(&nests[2], TIP),
+        });
+        let dirs: Vec<PathBuf> = nests.iter().map(|n| n.dir.clone()).collect();
+        let ran = s0_run(nests, source.clone(), None, TIP).await;
+        let want: Vec<_> = dirs
+            .iter()
+            .zip(&ran)
+            .map(|(d, (s, _))| s0_contents(d, s.as_ref()))
+            .collect();
+        let pings = want[2].get("child__ping").map_or(0, Vec::len);
+        assert!(
+            pings > 20 && want[2]["child__ping"].iter().any(|r| r.contains("0x0000000000000000000000000000000000000044")),
+            "the shared cursor's run must hold both children's pings, or parity proves nothing: {:?}",
+            want[2].keys().collect::<Vec<_>>()
+        );
+
+        for (windows, path) in [(64usize, "refetch"), (2, "detached")] {
+            let root = tempfile::tempdir().unwrap();
+            let nests = s0_nests(root.path(), true).await;
+            let dirs: Vec<PathBuf> = nests.iter().map(|n| n.dir.clone()).collect();
+            slowed_nests()
+                .lock()
+                .unwrap()
+                .push((dirs[2].clone(), std::time::Duration::from_millis(30)));
+            let stats = Arc::new(BufferStats::default());
+            let opts = BufferOptions {
+                windows,
+                ingest_concurrency: 4,
+                stats: stats.clone(),
+            };
+            let ran = s0_run(nests, source.clone(), Some(opts), TIP).await;
+            slowed_nests().lock().unwrap().retain(|(d, _)| d != &dirs[2]);
+            for (i, (dir, (store, _))) in dirs.iter().zip(&ran).enumerate() {
+                let got = s0_contents(dir, store.as_ref());
+                if let Some(diff) = s0_diff(&want[i], &got) {
+                    panic!("nest {i}, buffer of {windows} windows ({path} path):\n{diff}");
+                }
+            }
+            let (refetches, own) = (
+                stats.factory_refetches.load(std::sync::atomic::Ordering::Relaxed),
+                stats.own_fetches.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            match path {
+                "refetch" => assert!(
+                    refetches > 0 && own == 0,
+                    "the factory nest must have refetched buffered windows for a child: \
+                     {refetches} refetches, {own} own fetches"
+                ),
+                _ => assert!(own > 0, "the slowed nest must have detached: {own} own fetches"),
+            }
+        }
+    }
+
+    /// RFC-0076 S0's slow-nest measurement. Prints figures; asserts only that every run converged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "a measurement: cargo test --lib s0_one_nest_slowed -- --ignored --nocapture"]
+    async fn s0_one_nest_slowed_tenfold() {
+        const TIP: u64 = 150;
+        let chain: Vec<crate::rpc::Log> = (1..=TIP)
+            .flat_map(|b| {
+                [S0_A, S0_B, S0_C]
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(i, a)| s0_transfer(a, b, i as u64))
+            })
+            .collect();
+        let source: Arc<dyn Source> = Arc::new(FilteringSource { logs: chain });
+        let windows = TIP.div_ceil(3) as u32;
+        // C's own window time, from a run in which nothing is slowed.
+        let mut unslowed = std::time::Duration::ZERO;
+        for _ in 0..3 {
+            let root = tempfile::tempdir().unwrap();
+            let mut nests = s0_nests(root.path(), false).await;
+            let c = nests.pop().unwrap();
+            let ran = s0_run(vec![c], source.clone(), None, TIP).await;
+            unslowed += ran[0].1 / windows;
+        }
+        let per_window = unslowed / 3;
+        let delay = per_window * 9;
+        println!("s0: c's window unslowed {per_window:?}; slowed by {delay:?} more, to ~10x");
+        for (label, opts, slow) in [
+            ("shared, none slowed", None, false),
+            ("shared, c slowed", None, true),
+            ("buffered(8), none slowed", Some(8usize), false),
+            ("buffered(8), c slowed", Some(8), true),
+        ] {
+            let mut rows = Vec::new();
+            for _ in 0..3 {
+                let root = tempfile::tempdir().unwrap();
+                let nests = s0_nests(root.path(), false).await;
+                let c_dir = nests[2].dir.clone();
+                if slow {
+                    slowed_nests().lock().unwrap().push((c_dir.clone(), delay));
+                }
+                let opts = opts.map(|windows| BufferOptions {
+                    windows,
+                    ingest_concurrency: 4,
+                    stats: Arc::default(),
+                });
+                let ran = s0_run(nests, source.clone(), opts, TIP).await;
+                slowed_nests().lock().unwrap().retain(|(d, _)| d != &c_dir);
+                rows.push(ran.iter().map(|(_, t)| t.as_millis()).collect::<Vec<_>>());
+            }
+            println!("s0: {label}: ms to tip for [a, b, c], three runs: {rows:?}");
+        }
     }
 
     /// A child announced at block 5 log 5 that also emits before its announcement: once in an earlier
