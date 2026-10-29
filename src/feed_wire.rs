@@ -807,7 +807,9 @@ mod tests {
         // 1 MiB of rows, and a stream of about the same: each fits 1.5 MiB alone.
         let limit = 3 << 19;
         let err = decode_delta(&body, Some(limit)).unwrap_err();
-        let too = err.downcast_ref::<TooLarge>().expect("refused as too large");
+        let too = err
+            .downcast_ref::<TooLarge>()
+            .expect("refused as too large");
         assert!(too.needed > limit, "{too:?}");
         assert_eq!(decode_delta(&body, Some(4 << 20)).unwrap().ops, d.ops);
     }
