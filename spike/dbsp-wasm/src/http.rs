@@ -43,11 +43,18 @@ pub async fn answer(n: &Nest<'_>, method: &str, target: &str, body: &[u8]) -> An
             .map(|v| v.parse().map_err(|e| rejected(&format!("{k}: {e}"))))
             .transpose()
     };
-    let path = path.strip_suffix('/').filter(|p| !p.is_empty()).unwrap_or(path);
+    let path = path
+        .strip_suffix('/')
+        .filter(|p| !p.is_empty())
+        .unwrap_or(path);
     let segs: Vec<String> = path
         .trim_start_matches('/')
         .split('/')
-        .map(|s| percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned())
+        .map(|s| {
+            percent_encoding::percent_decode_str(s)
+                .decode_utf8_lossy()
+                .into_owned()
+        })
         .collect();
     let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
     let store = &n.nest.store;
@@ -68,10 +75,7 @@ pub async fn answer(n: &Nest<'_>, method: &str, target: &str, body: &[u8]) -> An
                 answer::entities(store.recent(answer::listing_limit(number("limit")?)))
             }
             ("GET", ["balances"]) => {
-                let top = n
-                    .nest
-                    .balances
-                    .top(answer::listing_limit(number("limit")?));
+                let top = n.nest.balances.top(answer::listing_limit(number("limit")?));
                 answer::balances(&n.nest.balances, top)
             }
             ("GET", ["balance", address]) => answer::balance(&n.nest.balances, address),
@@ -145,9 +149,7 @@ fn derived(n: &Nest, name: &str, key: Option<&str>, limit: Option<usize>) -> Ans
     let head = dataset_head(n);
     match key {
         Some(key) => {
-            let (found, applied) = entity
-                .lane()
-                .get_with_watermark(&answer::key_readings(key));
+            let (found, applied) = entity.lane().get_with_watermark(&answer::key_readings(key));
             let provenance = answer::derived_provenance(n.nid, &facts, head, &applied);
             answer::derived_key(name, key, found, provenance)
         }
@@ -294,7 +296,10 @@ async fn entity(n: &Nest<'_>, id: &str) -> Answer {
         })
         .collect();
     let found = match engine
-        .collect(&format!("{} ORDER BY t LIMIT 1", probe.join(" UNION ALL ")), 1)
+        .collect(
+            &format!("{} ORDER BY t LIMIT 1", probe.join(" UNION ALL ")),
+            1,
+        )
         .await
     {
         Ok((rows, _, _)) => rows,
