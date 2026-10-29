@@ -197,7 +197,7 @@ impl TabNest {
             match process_window(window, tape, &logs, next, to, tip).await? {
                 Processed::Stored(_) => {}
                 Processed::Rewound(at) => rolled = Some(at),
-                Processed::Refused => {}
+                Processed::Refused | Processed::Abandoned => {}
             }
         }
     }
