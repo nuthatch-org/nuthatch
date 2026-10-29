@@ -20,10 +20,17 @@ pub mod entity_decl;
 pub mod entity_lower;
 #[path = "offchain_none.rs"]
 pub mod entity_offchain;
+pub mod http;
 #[cfg(target_arch = "wasm32")]
 pub mod live;
 pub mod query;
 pub mod reorg;
+// RFC-0075 S5: the node's error hints, compiled here unchanged.
+pub mod semantic {
+    pub use nuthatch_scaffold::semantic::*;
+}
+#[path = "../../../src/sql_errors.rs"]
+pub mod sql_errors;
 pub mod tab;
 pub mod tape;
 pub mod window;

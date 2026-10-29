@@ -28,6 +28,53 @@ pub struct LiveNest {
     rpc: RpcClient<Fetch>,
     backend: &'static str,
     files: NestFiles,
+    nid: String,
+    poll_interval_secs: Option<u64>,
+}
+
+/// One route's answer, as the Service Worker builds a `Response` from it.
+#[wasm_bindgen]
+pub struct HttpAnswer {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl HttpAnswer {
+    #[wasm_bindgen(getter)]
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Empty where the node sends no content type.
+    #[wasm_bindgen(getter, js_name = contentType)]
+    pub fn content_type(&self) -> String {
+        self.content_type.into()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn body(&self) -> Vec<u8> {
+        self.body.clone()
+    }
+
+    /// The body as text, which every route's is.
+    #[wasm_bindgen(getter)]
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+/// The binary's version, which `/ready` reports: the tab is built from the same tree.
+fn node_version() -> &'static str {
+    include_str!("../../../Cargo.toml")
+        .lines()
+        .find_map(|l| l.strip_prefix("version = \"")?.strip_suffix('"'))
+        .unwrap_or("unknown")
+}
+
+fn encode(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 fn js(e: impl std::fmt::Display) -> JsError {
@@ -76,7 +123,56 @@ impl LiveNest {
             rpc,
             backend,
             files: NestFiles::new(),
+            nid,
+            poll_interval_secs: None,
         })
+    }
+
+    /// How often the page follows the chain, which `/ready` reports as a node's `--poll-interval`.
+    #[wasm_bindgen(js_name = setPollInterval)]
+    pub fn set_poll_interval(&mut self, secs: u64) {
+        self.poll_interval_secs = Some(secs);
+    }
+
+    /// RFC-0075 S5: `method` and `target` (path and query) answered as the node's router answers
+    /// them, from the same `nuthatch_core::answer` functions.
+    pub async fn request(&self, method: String, target: String, body: Vec<u8>) -> HttpAnswer {
+        let nest = crate::http::Nest {
+            nest: &self.nest,
+            cellar: &self.cellar,
+            files: &self.files,
+            nid: Some(&self.nid),
+            version: node_version(),
+            poll_interval_secs: self.poll_interval_secs,
+            log_window: MAINNET_LOG_WINDOW,
+        };
+        let a = crate::http::answer(&nest, &method, &target, &body).await;
+        HttpAnswer {
+            status: a.status,
+            content_type: crate::http::content_type(&a),
+            body: a.body,
+        }
+    }
+
+    /// `GET /sql?q=…`'s body.
+    pub async fn sql(&self, q: String) -> String {
+        let target = format!("/sql?q={}", encode(&q));
+        self.request("GET".into(), target, Vec::new()).await.text()
+    }
+
+    /// `GET /entity/{id}`'s body.
+    pub async fn entity(&self, id: String) -> String {
+        let target = format!("/entity/{}", encode(&id));
+        self.request("GET".into(), target, Vec::new()).await.text()
+    }
+
+    /// `GET /derived/{name}`'s body, or `/derived/{name}/{key}`'s with a key.
+    pub async fn derived(&self, name: String, key: Option<String>) -> String {
+        let mut target = format!("/derived/{}", encode(&name));
+        if let Some(key) = key {
+            target = format!("{target}/{}", encode(&key));
+        }
+        self.request("GET".into(), target, Vec::new()).await.text()
     }
 
     /// Follow the chain to its tip, then report what the gate compares, in the node's shapes.

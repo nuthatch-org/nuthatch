@@ -2110,11 +2110,13 @@ version = "0.0.1"
 dependencies = [
  "alloy-primitives",
  "anyhow",
+ "arrow-array",
  "async-trait",
  "burrmill",
  "bytes",
  "dbsp",
  "feldera-size-of",
+ "form_urlencoded",
  "futures",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
@@ -2123,8 +2125,10 @@ dependencies = [
  "js-sys",
  "nuthatch-core",
  "nuthatch-decode",
+ "nuthatch-scaffold",
  "nuthatch-seal",
  "object_store 0.13.2",
+ "percent-encoding",
  "proptest",
  "redb",
  "rkyv",
@@ -3726,6 +3730,20 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "nuthatch-scaffold"
+version = "0.1.0"
+dependencies = [
+ "alloy-json-abi",
+ "alloy-primitives",
+ "anyhow",
+ "hex",
+ "nuthatch-decode",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

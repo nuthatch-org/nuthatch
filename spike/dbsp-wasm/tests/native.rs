@@ -90,3 +90,77 @@ fn the_reorg_property_converges_in_every_band() {
         REORG_TRANSCRIPT_SHA256
     );
 }
+
+/// The tab's `/sql` stops at the node's byte cap, not only its row cap: the node's own wide-cell case,
+/// 100 rows of ~1 MiB, far under 50,000 rows and past 64 MiB.
+#[test]
+fn sql_caps_result_bytes_not_just_rows() {
+    use dbsp_wasm_spike::{cellar::Cellar, derived::NestFiles, query::TabQuery};
+    let db = redb::Database::builder()
+        .create_with_backend(nuthatch_core::backend::Bytes::default())
+        .unwrap();
+    let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
+    let cellar = Cellar::default();
+    let q =
+        futures::executor::block_on(TabQuery::bind(&store, &cellar, &[], &[], &NestFiles::new()))
+            .unwrap();
+    let (rows, _, truncated) = futures::executor::block_on(
+        q.collect("SELECT repeat('A', 1000000) AS x FROM range(100)", 50_000),
+    )
+    .unwrap();
+    assert!(truncated, "the byte cap did not fire");
+    assert!(rows.len() < 100, "held {} wide rows", rows.len());
+}
+
+/// Burrmill refuses one value past 16 MiB, so the risk is a slice of near-limit rows: ten of 15 MB
+/// are 150 MB in one slice. The cap is met from Arrow lengths a row at a time, so no row that would
+/// cross it is encoded and what is held stays under it.
+#[test]
+fn sql_does_not_encode_the_row_that_would_cross_the_cap() {
+    use dbsp_wasm_spike::{cellar::Cellar, derived::NestFiles, query::TabQuery};
+    let db = redb::Database::builder()
+        .create_with_backend(nuthatch_core::backend::Bytes::default())
+        .unwrap();
+    let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
+    let cellar = Cellar::default();
+    let q =
+        futures::executor::block_on(TabQuery::bind(&store, &cellar, &[], &[], &NestFiles::new()))
+            .unwrap();
+    let (rows, _, truncated) = futures::executor::block_on(
+        q.collect("SELECT repeat('A', 15000000) AS x FROM range(10)", 50_000),
+    )
+    .unwrap();
+    assert!(truncated, "the byte cap did not fire");
+    let held: usize = rows.iter().map(nuthatch_core::answer::value_bytes).sum();
+    assert!(
+        held < nuthatch_core::answer::SQL_MAX_RESULT_BYTES,
+        "{} rows, {held} bytes held",
+        rows.len()
+    );
+}
+
+/// Nested values are sized before encoding too: ten rows of a 900,000-element list are ~7 MB each as
+/// `value_bytes` counts them, past the cap together, and what is held stays under it.
+#[test]
+fn sql_sizes_nested_values_before_encoding_them() {
+    use dbsp_wasm_spike::{cellar::Cellar, derived::NestFiles, query::TabQuery};
+    let db = redb::Database::builder()
+        .create_with_backend(nuthatch_core::backend::Bytes::default())
+        .unwrap();
+    let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
+    let cellar = Cellar::default();
+    let q =
+        futures::executor::block_on(TabQuery::bind(&store, &cellar, &[], &[], &NestFiles::new()))
+            .unwrap();
+    let (rows, _, truncated) = futures::executor::block_on(
+        q.collect("SELECT array_repeat(1, 900000) AS x FROM range(10)", 50_000),
+    )
+    .unwrap();
+    assert!(truncated, "the byte cap did not fire");
+    let held: usize = rows.iter().map(nuthatch_core::answer::value_bytes).sum();
+    assert!(
+        held < nuthatch_core::answer::SQL_MAX_RESULT_BYTES,
+        "{} rows, {held} bytes held",
+        rows.len()
+    );
+}

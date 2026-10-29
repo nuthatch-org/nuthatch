@@ -12,7 +12,7 @@ use nuthatch_core::cursor::{
 use nuthatch_core::drive::Driver;
 use nuthatch_core::exposure::ExposureView;
 use nuthatch_core::labels::LabelSet;
-use nuthatch_core::metrics::NoMetrics;
+use nuthatch_core::metrics::{CursorMetrics, UndecodedTally};
 use nuthatch_core::redb_store::Store;
 use nuthatch_core::seal::Sinks;
 use nuthatch_core::source::Source;
@@ -21,6 +21,8 @@ use nuthatch_core::velocity::VelocityView;
 use nuthatch_core::views::BalanceView;
 use nuthatch_core::window::{fetch_window, Finality, Wanted};
 use nuthatch_decode::registry::DecodeRegistry;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::Mutex;
 
 pub struct TabNest {
     pub store: Store,
@@ -35,6 +37,36 @@ pub struct TabNest {
     sealing: Sealing,
     window: u64,
     pub entities: Vec<TabEntity>,
+    pub cursor: Cursor,
+}
+
+/// What `/ready` reports of the cursor: the head it last saw and when, when the seal last moved,
+/// and the logs a decoder claimed and could not decode.
+#[derive(Default)]
+pub struct Cursor {
+    pub tip: AtomicU64,
+    pub last_poll: AtomicU64,
+    pub last_seal_progress: AtomicU64,
+    pub undecoded: Mutex<UndecodedTally>,
+}
+
+pub fn unix_now() -> u64 {
+    nuthatch_core::time::system_now()
+        .duration_since(nuthatch_core::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+impl CursorMetrics for Cursor {
+    fn set_sealed_through(&self, _block: u64) {
+        self.last_seal_progress.store(unix_now(), Relaxed);
+    }
+
+    fn add_undecoded(&self, contract: &str, topic0: &str, n: u64) {
+        self.undecoded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .add(contract, topic0, n);
+    }
 }
 
 /// When and where a tab nest seals.
@@ -104,6 +136,7 @@ impl TabNest {
             sealing,
             window: window.max(1),
             entities: Vec::new(),
+            cursor: Cursor::default(),
         })
     }
 
@@ -142,7 +175,7 @@ impl TabNest {
             entities: &self.entities,
             children: None,
             router: &self.router,
-            metrics: &NoMetrics,
+            metrics: &self.cursor,
         };
         let start: u64 = self
             .store
@@ -160,6 +193,8 @@ impl TabNest {
                 }
             }
             let tip = tape.tip().await?;
+            self.cursor.tip.store(tip, Relaxed);
+            self.cursor.last_poll.store(unix_now(), Relaxed);
             if next > tip {
                 self.balances.flush();
                 ensure!(self.balances.is_healthy(), "the balance view died");

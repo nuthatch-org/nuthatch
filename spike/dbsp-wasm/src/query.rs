@@ -7,11 +7,47 @@ use crate::cellar::Cellar;
 use crate::derived::{NestFiles, TabEntity};
 use crate::registry::TableSchema;
 use anyhow::{anyhow, Result};
+use nuthatch_core::answer::{value_bytes, SQL_MAX_RESULT_BYTES};
 use nuthatch_core::redb_store::Store;
 use nuthatch_core::store::SEALED_THROUGH_KEY;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+
+/// Rows of one batch turned into JSON before the byte cap is checked again, as the node's.
+const ENCODE_ROWS: usize = 32;
+
+/// What a slice would cost to encode, measured as `value_bytes` measures it, before it is encoded:
+/// string and binary payload exactly from offsets and views, every other type (nested ones too) from
+/// Arrow's slice size, which over-counts a sliced list's children. A type Arrow cannot size is refused.
+fn arrow_bytes(part: &arrow_array::RecordBatch) -> usize {
+    use arrow_array::cast::AsArray;
+    use arrow_array::Array;
+    part.columns()
+        .iter()
+        .map(|c| {
+            if let Some(a) = c.as_string_opt::<i32>() {
+                let o = a.value_offsets();
+                (o[o.len() - 1] - o[0]) as usize
+            } else if let Some(a) = c.as_string_opt::<i64>() {
+                let o = a.value_offsets();
+                (o[o.len() - 1] - o[0]) as usize
+            } else if let Some(a) = c.as_binary_opt::<i32>() {
+                let o = a.value_offsets();
+                (o[o.len() - 1] - o[0]) as usize
+            } else if let Some(a) = c.as_binary_opt::<i64>() {
+                let o = a.value_offsets();
+                (o[o.len() - 1] - o[0]) as usize
+            } else if let Some(a) = c.as_string_view_opt() {
+                a.iter().flatten().map(str::len).sum()
+            } else if let Some(a) = c.as_binary_view_opt() {
+                a.iter().flatten().map(<[u8]>::len).sum()
+            } else {
+                c.to_data().get_slice_memory_size().unwrap_or(usize::MAX)
+            }
+        })
+        .fold(0usize, usize::saturating_add)
+}
 
 fn engine_err(e: burrmill::BurrmillError) -> anyhow::Error {
     anyhow!("{e}")
@@ -123,6 +159,141 @@ impl TabQuery {
         }
         Ok(out)
     }
+
+    /// `/sql`'s rows, columns and whether more than `cap` rows were left out, as
+    /// `engine_burrmill`'s `collect` gives them. Dates are not rewritten to ISO text as the node's
+    /// are; no table a tab nest holds has one.
+    pub async fn collect(
+        &self,
+        sql: &str,
+        cap: usize,
+    ) -> Result<(Vec<Value>, Vec<String>, bool), burrmill::BurrmillError> {
+        let hard = cap + 1;
+        let mut bytes = 0usize;
+        let mut rows = Vec::new();
+        let mut over = false;
+        let mut columns: Vec<String> = Vec::new();
+        // Streamed and capped by bytes as the node's `engine_burrmill::collect` is, so a wide result
+        // stops at `SQL_MAX_RESULT_BYTES` instead of being held whole first (#1650).
+        let mut take = |batch: arrow_array::RecordBatch| {
+            if columns.is_empty() {
+                columns = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+            }
+            let mut start = 0;
+            while start < batch.num_rows() {
+                let n = (batch.num_rows() - start).min(ENCODE_ROWS);
+                let part = batch.slice(start, n);
+                start += n;
+                // A slice that could cross the cap goes a row at a time, so a cell wider than the cap
+                // is refused from its Arrow length before it becomes a `Value`.
+                let parts = if bytes.saturating_add(arrow_bytes(&part)) < SQL_MAX_RESULT_BYTES {
+                    vec![part]
+                } else {
+                    (0..part.num_rows()).map(|i| part.slice(i, 1)).collect()
+                };
+                for part in parts {
+                    if bytes.saturating_add(arrow_bytes(&part)) >= SQL_MAX_RESULT_BYTES {
+                        over = true;
+                        return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
+                    }
+                    for row in burrmill::df::encode::rows(&part)? {
+                        bytes += row
+                            .as_object()
+                            .map(|o| {
+                                o.iter()
+                                    .map(|(k, v)| k.len() + value_bytes(v))
+                                    .sum::<usize>()
+                            })
+                            .unwrap_or(0);
+                        rows.push(row);
+                        if rows.len() >= hard || bytes >= SQL_MAX_RESULT_BYTES {
+                            over = true;
+                            return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let r = self.engine.sql_for_each(sql, &mut take);
+        #[cfg(target_arch = "wasm32")]
+        let r = self.engine.sql_async_for_each(sql, &mut take).await;
+        let truncated = match r {
+            Ok(()) => false,
+            Err(_) if over => true,
+            Err(e) => return Err(e),
+        };
+        rows.truncate(cap);
+        if columns.is_empty() {
+            if let Ok(described) = self.engine.describe(sql) {
+                columns = described.into_iter().map(|(name, _)| name).collect();
+            }
+        }
+        Ok((rows, columns, truncated))
+    }
+
+    /// Plan `sql` without running it, as `/explain` does.
+    pub fn plan(&self, sql: &str) -> Result<(), burrmill::BurrmillError> {
+        self.engine.describe(sql).map(|_| ())
+    }
+}
+
+/// The base tables `sql` reads, lowercased, followed through the authored views, as the node's
+/// `reject_unknown_table_refs` and `expand_through_views` find them. `None` where it does not parse.
+pub fn referenced_tables(
+    sql: &str,
+    files: &NestFiles,
+) -> Option<Result<BTreeSet<String>, burrmill::BurrmillError>> {
+    let named = match burrmill::inspect::reach(sql) {
+        Ok(r) => r.tables,
+        Err(burrmill::BurrmillError::Parse(_)) => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    let bodies = view_bodies(files).unwrap_or_default();
+    let mut out = named.clone();
+    let mut frontier: Vec<String> = named.into_iter().collect();
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for name in frontier.drain(..) {
+            let Some(inner) = bodies
+                .get(&name)
+                .and_then(|b| burrmill::inspect::base_tables(b))
+            else {
+                continue;
+            };
+            for t in inner {
+                if out.insert(t.clone()) {
+                    next.push(t);
+                }
+            }
+        }
+        frontier = next;
+    }
+    Some(Ok(out))
+}
+
+/// Each authored view's lowercased name and the query it registers.
+fn view_bodies(files: &NestFiles) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for (path, text) in files {
+        if path.starts_with("views/") && path.ends_with(".sql") {
+            let stmts =
+                sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, text)?;
+            for s in stmts {
+                if let sqlparser::ast::Statement::CreateView(v) = s {
+                    let name = v.name.to_string().trim_matches('"').to_ascii_lowercase();
+                    out.insert(name, v.query.to_string());
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Rows in an order neither engine chose: each by its text with the keys sorted, as

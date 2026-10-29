@@ -120,6 +120,20 @@ impl TabEntity {
             .collect();
         json!({"rows": rows, "items": items, "unavailable": self.unavailable})
     }
+
+    pub fn lane(&self) -> &EntityLane {
+        &self.lane
+    }
+
+    /// What the answer routes need of it besides its lane. A tab has no offchain tables.
+    pub fn facts(&self) -> nuthatch_core::answer::EntityFacts<'_> {
+        nuthatch_core::answer::EntityFacts {
+            name: &self.name,
+            unavailable: self.unavailable.as_deref(),
+            fault: self.lane.fault(),
+            reads_offchain: false,
+        }
+    }
 }
 
 impl WindowEntity for TabEntity {
