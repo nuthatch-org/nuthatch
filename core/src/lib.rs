@@ -34,5 +34,6 @@ pub mod tap;
 pub mod time;
 pub mod transport;
 pub mod velocity;
+pub mod versioned;
 pub mod views;
 pub mod window;

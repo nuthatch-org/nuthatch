@@ -17,6 +17,8 @@ on:
         description: "pull request number to review"
         required: true
         type: string
+  # The queue's commit needs a `Jules approval` of its own or it waits forever. See `queue` below.
+  merge_group:
 
 permissions:
   contents: read
@@ -30,6 +32,7 @@ concurrency:
   # `/re-review` comments, PR synchronises and manual dispatches still supersede one another.
   group: >-
     jules-review-${{
+      github.event_name == 'merge_group' && github.run_id ||
       github.event_name == 'issue_comment' &&
       !(github.event.issue.pull_request &&
         contains(github.event.comment.body, '/re-review') &&
@@ -44,9 +47,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     if: >-
-      github.event_name != 'issue_comment' ||
-      (github.event.issue.pull_request && contains(github.event.comment.body, '/re-review') &&
-       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+      github.event_name != 'merge_group' &&
+      (github.event_name != 'issue_comment' ||
+       (github.event.issue.pull_request && contains(github.event.comment.body, '/re-review') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -277,4 +281,47 @@ jobs:
           payload="$(jq -n --arg conclusion "$conclusion" --arg title "$title" --arg summary "$summary" \
             '{status:"completed",conclusion:$conclusion,output:{title:$title,summary:$summary}}')"
           GH_TOKEN="$JULES_TOKEN" gh api --method PATCH "repos/$REPO/check-runs/$CHECK_ID" --input - <<<"$payload"
+          [ "$conclusion" = success ]
+
+  # A merge-queue commit is never a PR head, so no review is ever posted on it. Every PR entered the
+  # queue with its own `Jules approval` green; this carries the named PR's verdict onto the queue
+  # commit, as the App, and posts red if that verdict is not success.
+  queue:
+    name: Jules approval (merge queue)
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: mint Jules App token
+        id: jules
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.JULES_APP_ID }}
+          private-key: ${{ secrets.JULES_PRIVATE_KEY }}
+          permission-checks: write
+          permission-pull-requests: read
+
+      - name: carry the PR's verdict onto the queue commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.jules.outputs.token }}
+          REPO: ${{ github.repository }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          QUEUE_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          pr="$(sed -nE 's#^refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]+$#\1#p' <<<"$QUEUE_REF")"
+          [ -n "$pr" ] || { echo "::error::no PR number in $QUEUE_REF"; exit 1; }
+          head="$(gh api "repos/$REPO/pulls/$pr" --jq '.head.sha')"
+          # 4779024 is the Jules App, the source branch protection pins for this context.
+          verdict="$(gh api "repos/$REPO/commits/$head/check-runs?check_name=Jules%20approval&filter=latest" \
+            --jq '[.check_runs[] | select(.app.id == 4779024)][0].conclusion // "missing"')"
+          echo "PR #$pr head $head: Jules approval $verdict"
+          conclusion=failure
+          if [ "$verdict" = success ]; then conclusion=success; fi
+          payload="$(jq -n --arg sha "$QUEUE_SHA" --arg c "$conclusion" --arg pr "$pr" --arg v "$verdict" \
+            '{name:"Jules approval",head_sha:$sha,status:"completed",conclusion:$c,
+              output:{title:"Merge queue: PR #\($pr) Jules approval is \($v)",
+                      summary:"Carried from the PR head. The review itself ran on the pull request."}}')"
+          gh api --method POST "repos/$REPO/check-runs" --input - <<<"$payload" > /dev/null
           [ "$conclusion" = success ]

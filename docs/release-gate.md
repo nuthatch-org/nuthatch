@@ -205,8 +205,9 @@ the box to build one from the checkout (`scripts/fixture-rpc.sh`), which the Thi
 
 It lives here and not in `release.yml` because this is where a candidate is gated: the tag workflow
 publishes, and only the ThinkPad's statuses say whether a release is fit to roll. CI's
-`rolling-upgrade` job runs the same script against every PR and push to `main`, with the build as the
-candidate, so a change that breaks the procedure is caught before it is tagged.
+`rolling-upgrade` job runs the same script in the merge queue, on every push to `main` and on a PR
+labelled `full-ci`, with the build as the candidate, so a change that breaks the procedure is caught
+before it is tagged.
 
 ## What it does not catch
 
@@ -219,7 +220,7 @@ sees those. A per-nest DuckDB reference stage (#1796) also did, and was removed 
 The copy is a whole nest directory, segments and redb, and the gate wants a quiet box for its
 timings, so it does not fit a GitHub runner. It runs on the ThinkPad, which already runs the QoS nest; the gate is scheduled away from
 that nest's busy periods. Every gate run against a copy, the timer's or one by hand with
-`release-gate.sh`, takes the same lock beside it (`alloc-nest.gate-lock`; flock on Linux, a mkdir
+`release-gate.sh`, takes the same lock beside it (`alloc-nest.gate-lock`; flock on Linux, a pid-file
 lock elsewhere) and waits for any other: two `serve`s cannot open one redb.
 
 **The copy** lives at `~/release-gate/alloc-nest` and is refreshed from the Lodestar box in Helsinki

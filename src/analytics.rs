@@ -14,9 +14,7 @@ use serde_json::Value;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -138,7 +136,37 @@ static SESSION_CACHE: OnceLock<Mutex<std::collections::HashMap<SessionKey, Sessi
     OnceLock::new();
 static SESSION_OPENS: OnceLock<Mutex<std::collections::HashMap<SessionKey, u64>>> = OnceLock::new();
 static SESSION_USE: AtomicU64 = AtomicU64::new(0);
-const SESSION_CACHE_CAPACITY: usize = 16;
+/// Sessions the cache keeps where the split leaves nothing over, as at the 2 GiB default.
+pub const SESSION_CACHE_FLOOR: usize = 16;
+/// The most it keeps however much is over: each cached session carries its own runtime and fold
+/// threads, `analytics.threads` of each, so this is also a bound on idle threads.
+pub const SESSION_CACHE_MAX: usize = 256;
+/// An idle cached session's own resident memory, footers aside: 0.46 MiB measured in release
+/// (`measure_cold_session_cost`, `docs/bench/rfc-0076-tenants.md`), rounded up.
+const SESSION_BASE_MB: u64 = 1;
+static SESSION_CACHE_CAPACITY: AtomicUsize = AtomicUsize::new(SESSION_CACHE_FLOOR);
+
+/// What one cached session may come to hold: its own memory and up to an eighth of the engine
+/// limit in Parquet footers, the bound `docs/security/shared-runtime.md` states, not the idle figure.
+pub fn cached_session_mb(engine_limit_mb: u64) -> u64 {
+    engine_limit_mb / 8 + SESSION_BASE_MB
+}
+
+/// Size the session cache from the memory each cursor's split leaves over, summed (RFC-0076 §3.1).
+/// Under strict isolation every tenant of a dataset has its own sessions, so 1,000 tenants miss a
+/// cache of 16; past the floor, each `per_session_mb` of room keeps one more.
+pub fn size_session_cache(spare_mb: u64, per_session_mb: u64) -> usize {
+    let extra = usize::try_from(spare_mb / per_session_mb.max(1)).unwrap_or(usize::MAX);
+    let n = SESSION_CACHE_FLOOR
+        .saturating_add(extra)
+        .min(SESSION_CACHE_MAX);
+    SESSION_CACHE_CAPACITY.store(n, Ordering::Relaxed);
+    n
+}
+
+pub fn session_cache_capacity() -> usize {
+    SESSION_CACHE_CAPACITY.load(Ordering::Relaxed)
+}
 
 fn session_cache_lock(
 ) -> std::sync::MutexGuard<'static, std::collections::HashMap<SessionKey, SessionCache>> {
@@ -195,7 +223,7 @@ fn retain_session_cache(
     slot: SessionCache,
 ) {
     cache.insert((slot.dir.clone(), slot.tenant.clone()), slot);
-    while cache.len() > SESSION_CACHE_CAPACITY {
+    while cache.len() > session_cache_capacity() {
         let Some(victim) = cache
             .iter()
             .min_by_key(|(_, entry)| entry.last_used)
@@ -10515,11 +10543,94 @@ mod confinement {
         }
         let pools = crate::engine_burrmill::pool_reservations(&f.a);
         assert!(
-            pools.len() <= SESSION_CACHE_CAPACITY + 1,
+            pools.len() <= session_cache_capacity() + 1,
             "{} pools for one dataset",
             pools.len()
         );
         assert!(pools.iter().all(|(_, held)| *held == 0), "{pools:?}");
+    }
+
+    /// RFC-0076 §3.1 asks for a cold session's cost before the cache is sized from the budget: what a
+    /// strict tenant's first query pays over a cached one, and what an idle cached session holds.
+    /// `cargo test --release --lib measure_cold_session -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn measure_cold_session_cost() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("nest");
+        std::fs::create_dir_all(dir.join("views")).unwrap();
+        for t in 0..8 {
+            for s in 0..10u64 {
+                let rows: Vec<String> = (0..500)
+                    .map(|i| {
+                        json!({"table": format!("t{t}__e"), "block_number": s * 100 + 1,
+                               "log_index": i, "x": format!("v{i}")})
+                        .to_string()
+                    })
+                    .collect();
+                crate::seal::seal_range(&dir, &rows, s * 100 + 1, s * 100 + 100).unwrap();
+            }
+            std::fs::write(
+                dir.join("views").join(format!("v{t}.sql")),
+                format!("CREATE VIEW v{t} AS SELECT x, count(*) AS n FROM t{t}__e GROUP BY x;\n"),
+            )
+            .unwrap();
+        }
+        let sql = "SELECT count(*) AS n FROM v0 JOIN t1__e USING (x)";
+        let run = |tenant: &str| {
+            let t = Some(Arc::from(tenant));
+            isolated(t.as_ref(), || {
+                query_hot_cold(&dir, sql, guard(), &HotRows::new(), 1000, &[])
+            })
+            .unwrap()
+        };
+        let before = session_cache_capacity();
+        size_session_cache(u64::MAX, 1);
+        let n = 200;
+        let threads = || {
+            let out = std::process::Command::new("ps")
+                .args(["-M", "-p", &std::process::id().to_string()])
+                .output()
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .count()
+                        .saturating_sub(1)
+                })
+                .unwrap_or(0);
+            if out > 0 {
+                out
+            } else {
+                std::fs::read_dir("/proc/self/task").map_or(0, |d| d.count())
+            }
+        };
+        run("warm");
+        let (rss0, threads0) = (crate::metrics::rss_bytes(), threads());
+        let start = Instant::now();
+        for i in 0..n {
+            run(&format!("t{i}"));
+        }
+        let cold = start.elapsed() / n;
+        let (rss1, threads1) = (crate::metrics::rss_bytes(), threads());
+        let start = Instant::now();
+        for i in 0..n {
+            run(&format!("t{i}"));
+        }
+        let warm = start.elapsed() / n;
+        let opened = (0..n)
+            .filter(|i| session_opens_in(&dir, Some(&format!("t{i}"))) == 1)
+            .count();
+        println!(
+            "COLD_SESSION\tsessions={n}\treopened_on_second_pass={}\tcold_ms={:.2}\twarm_ms={:.2}\t\
+             resident_mib_per_session={:.2}\tthreads_per_session={:.2}",
+            n as usize - opened,
+            cold.as_secs_f64() * 1e3,
+            warm.as_secs_f64() * 1e3,
+            rss1.saturating_sub(rss0) as f64 / n as f64 / (1 << 20) as f64,
+            threads1.saturating_sub(threads0) as f64 / n as f64,
+        );
+        session_cache_lock().clear();
+        SESSION_CACHE_CAPACITY.store(before, Ordering::Relaxed);
     }
 
     #[test]
