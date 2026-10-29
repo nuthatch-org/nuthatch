@@ -540,6 +540,10 @@ max_rss_mb = 2048             # optional per-CURSOR RAM ceiling (default 2048, t
                               # /_admin/runtime` sets it live and writes it here. Mounts that do
                               # not fit boot quarantined, not the runtime refused; the entity cap
                               # is 32 per 2048 MB, rounded down
+sql_permits = 2               # optional SQL permits on each cursor's gate (default
+                              # NUTHATCH_SQL_MAX_CONCURRENCY, else 2). No fixed ceiling: the
+                              # cursor's analytics split must fit max_rss_mb, checked at boot
+                              # and on `PUT /_admin/runtime`, which sets it live and writes it here
 default_tenant = "acme"       # optional (default "default"); the tenant a mount without `tenant`
                               # belongs to, served with no tenant segment in the route. Opaque -
                               # nuthatch refcounts a tenant, nothing more.

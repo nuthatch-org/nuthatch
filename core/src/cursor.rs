@@ -799,6 +799,7 @@ pub async fn process_window<E: WindowEntity>(
         return Err(e);
     }
     faults.committing();
+    hooks.seam().await;
     let alerted = !outbox.is_empty();
     extra.committing(next);
     if let Err(e) = store
@@ -808,6 +809,7 @@ pub async fn process_window<E: WindowEntity>(
         retract(deltas, exp_deltas, vel_deltas);
         return Err(e);
     }
+    hooks.seam().await;
     nest.balances.note_over_i128(oversized);
     // Only now: a refused or failed window must not leave its children routing later logs (#2153).
     if let Some(children) = nest.children.as_deref_mut() {
@@ -867,6 +869,7 @@ pub async fn process_window<E: WindowEntity>(
             .settle(store.sealed_through(), threshold, window);
     }
     hooks.sealed(finalized_through, store.sealed_through(), to >= tip);
+    hooks.after_seal().await?;
     Ok(Processed::Stored(stored))
 }
 

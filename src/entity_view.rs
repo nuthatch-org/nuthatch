@@ -35,7 +35,7 @@ use crate::registry::{DecodeRegistry, DecodedRow};
 use dbsp::ZWeight;
 use nuthatch_core::entity_view::{EntityLane, Limits};
 
-pub use nuthatch_core::entity_view::{Applied, Batch, OffchainMark, Watermarks};
+pub use nuthatch_core::entity_view::{slow_entity_fold, Applied, Batch, OffchainMark, Watermarks};
 
 /// How often an entity's state size may be sampled: `NUTHATCH_ENTITY_STATE_SAMPLE_SECS`, default 60,
 /// `0` for never. A sample walks every trace (#1834), so it is rationed rather than taken per scrape.
@@ -56,6 +56,7 @@ fn state_sample_interval() -> Option<Duration> {
 }
 
 /// One maintained authored entity: its circuit, its state, and how far it has been applied.
+#[derive(Clone)]
 pub struct EntityView {
     name: String,
     /// The output columns' names, in the order the relation's key then aggregates appear.
@@ -73,10 +74,10 @@ pub struct EntityView {
     unavailable: Option<String>,
     /// Per offchain table, the snapshots sent to the circuit (#1437). Sent, not folded: the next
     /// refresh compares the manifest against this, so no snapshot is ever fed twice.
-    fed: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>,
+    fed: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
     /// Per offchain table, the rows and uncompressed bytes sent, against the allowance in
     /// [`Self::admit_offchain`].
-    held: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
+    held: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>>,
     max_rows: u64,
 }
 
@@ -155,6 +156,19 @@ impl EntityView {
             held: Default::default(),
             max_rows: max_rows as u64,
         })
+    }
+
+    /// This entity held at what it has published now, which later batches leave alone (#2467).
+    pub fn pinned(&self) -> Self {
+        Self {
+            lane: self.lane.pinned(),
+            ..self.clone()
+        }
+    }
+
+    /// What published versions still referenced hold that the latest does not, in bytes.
+    pub fn retained_bytes(&self) -> u64 {
+        self.lane.retained_bytes()
     }
 
     pub fn name(&self) -> &str {
@@ -898,6 +912,35 @@ mod tests {
             .expect("state past what admission charged is a fault");
         assert!(why.contains("allowance"), "{why}");
         assert!(!why.contains("max_rows exceeded"), "400 rows fit: {why}");
+    }
+
+    /// #2467: a pinned entity answers from its version while the entity folds on, and that version is
+    /// charged only while it is held.
+    #[test]
+    fn a_pinned_entity_keeps_its_version_and_is_charged_while_held() {
+        let reg = registry();
+        let v = EntityView::start("received", &received(), &cols(), &reg, 10_000, false).unwrap();
+        let logs: Vec<_> = (0..500u64)
+            .map(|i| {
+                let to = format!("0x{:040x}", i + 1);
+                log(TRANSFER_TOPIC0, ALICE, &to, "1", 100, i)
+            })
+            .collect();
+        v.apply_window(&decode(&reg, &logs), 1, 100).unwrap();
+        v.flush();
+        let pinned = v.pinned();
+        v.apply_window(
+            &decode(&reg, &[log(TRANSFER_TOPIC0, ALICE, BOB, "7", 101, 0)]),
+            1,
+            101,
+        )
+        .unwrap();
+        v.flush();
+        assert_eq!((pinned.len(), pinned.applied_through()), (500, 100));
+        assert_eq!((v.len(), v.applied_through()), (501, 101));
+        assert!(v.retained_bytes() > 0);
+        drop(pinned);
+        assert_eq!(v.retained_bytes(), 0);
     }
 
     #[test]
