@@ -771,6 +771,32 @@ async fn a_tampered_cache_file_is_fetched_again_never_served() {
     rig.writer.stop();
 }
 
+/// A cached nest edited between follower runs no longer computes to the writer's NID: the next
+/// follower over the cache reports it, installs it again from the registry, and serves that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edited_cached_nest_is_installed_again_never_served() {
+    let rig = rig(6, None, None).await;
+    rig.publish().await;
+    let grace = nuthatch::seal::FOLLOWER_GRACE;
+    let (_a, first, cache) = rig.remote_with(&rig.mirror, 2, grace).await;
+    let good = agree(&rig, &first, "after the snapshot").await;
+    let config = cache.join("data").join(ROUTE).join("nuthatch.toml");
+    let original = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{original}\n# edited in the cache\n")).unwrap();
+
+    let (_b, second, _) = rig.remote_at(&rig.mirror, 2, grace, cache.clone()).await;
+    assert_eq!(agree(&rig, &second, "over an edited cache").await, good);
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        original,
+        "installed again from the registry"
+    );
+    let (_, ready) = get(&second, &format!("/{ROUTE}/ready")).await;
+    let refused = ready["follower"]["cache_refused"].to_string();
+    assert!(refused.contains("the cached nest is not"), "{ready}");
+    rig.writer.stop();
+}
+
 /// The same comparison against a real S3 server for the mirror and the registry (versitygw in CI).
 #[cfg(feature = "object-store")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

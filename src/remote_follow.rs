@@ -136,6 +136,32 @@ fn file_hash(path: &Path) -> std::io::Result<String> {
     }
 }
 
+/// Beside the cached nests: what the registry installed of each one's offchain snapshots.
+const VERIFIED_DIR: &str = ".installed";
+
+fn is_offchain(path: &str) -> bool {
+    path.split('/').next() == Some(crate::offchain::DIR)
+}
+
+/// The NID the cached nest at `dir` computes to, by the identity code the registry check uses, with
+/// its offchain snapshots as the registry installed them: the follower brings those up to the
+/// writer's from the mirror, each checked against its hash there.
+fn cached_nid(dir: &Path, installed: &Path) -> Result<String> {
+    let mut manifest = crate::blob::build_manifest(dir, None)?;
+    let offchain: Vec<nuthatch_identity::FileEntry> = match std::fs::read(installed) {
+        Ok(raw) => serde_json::from_slice(&raw)
+            .with_context(|| format!("a corrupt {}", installed.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(manifest.nid());
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", installed.display())),
+    };
+    manifest.files.retain(|f| !is_offchain(&f.path));
+    manifest.files.extend(offchain);
+    manifest.files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(manifest.nid())
+}
+
 /// The most cache files [`Remote::refused`] remembers.
 const REFUSED_KEPT: usize = 16;
 
@@ -255,15 +281,60 @@ impl Remote {
     }
 
     /// Install the nest `nid` at `root/dataset` from the registry, verified, unless it is there.
+    /// A nest already in the cache is reused only if it still computes to `nid`; one that does not,
+    /// edited or left by another release, is reported and replaced by a verified install.
     pub async fn install(&self, root: &Path, dataset: &str, nid: &str) -> Result<()> {
         checked_dataset(dataset)?;
         let target = root.join(dataset);
+        let installed = root
+            .join(VERIFIED_DIR)
+            .join(format!("{}.json", dataset.trim_start_matches("data/")));
         if target.join(crate::config::CONFIG_FILE).exists() {
-            return Ok(());
+            let why = match cached_nid(&target, &installed) {
+                Ok(found) if found == nid => return Ok(()),
+                Ok(found) => format!("it computes to NID {found}"),
+                Err(e) => format!("its identity cannot be worked out: {e:#}"),
+            };
+            tracing::warn!(
+                "{}: the cached nest is not {nid}, {why}; installing it again from the registry",
+                target.display()
+            );
+            self.refuse(format!("{dataset}: the cached nest is not {nid}: {why}"));
+            let aside = tempfile::Builder::new()
+                .prefix(".stale-")
+                .tempdir_in(root.join(crate::runtime::DATA_DIR))
+                .context("a place to move the stale nest aside")?;
+            std::fs::rename(&target, aside.path().join("nest"))
+                .with_context(|| format!("moving {} aside", target.display()))?;
         }
         crate::distribution::install_by_nid(&self.registry, nid, &target)
             .await
-            .with_context(|| format!("installing nest {nid} from the registry"))
+            .with_context(|| format!("installing nest {nid} from the registry"))?;
+        // What the registry installed, so that offchain snapshots later brought up to the writer's
+        // do not read as an edit: they are checked against the mirror's hashes instead.
+        let manifest = crate::blob::build_manifest(&target, None)?;
+        if manifest.nid() != nid {
+            bail!(
+                "the registry's nest installed as {}, not {nid}",
+                manifest.nid()
+            );
+        }
+        let offchain: Vec<_> = manifest
+            .files
+            .into_iter()
+            .filter(|f| is_offchain(&f.path))
+            .collect();
+        std::fs::create_dir_all(root.join(VERIFIED_DIR))?;
+        std::fs::write(&installed, serde_json::to_vec(&offchain)?)
+            .with_context(|| format!("writing {}", installed.display()))?;
+        Ok(())
+    }
+
+    fn refuse(&self, what: String) {
+        let mut refused = self.refused.lock().unwrap_or_else(|e| e.into_inner());
+        refused.push(what);
+        let over = refused.len().saturating_sub(REFUSED_KEPT);
+        refused.drain(..over);
     }
 
     /// Fetch every one of `segments` into `root`'s segment store, each checked against its hash. A
