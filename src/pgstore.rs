@@ -63,8 +63,8 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
 
 use crate::store::{
-    HotScanTooLarge, HotStore, Lease, LeaseHeld, LostOwnership, LEASE_EXPIRES_AT, LEASE_OWNER,
-    OWNER_FENCE,
+    CoreHotStore as _, HotScanTooLarge, HotStore, Lease, LeaseHeld, LostOwnership,
+    LEASE_EXPIRES_AT, LEASE_OWNER, OWNER_FENCE,
 };
 
 /// A unit of work handed to the connection thread. Boxed so the trait methods can post arbitrary
@@ -481,7 +481,6 @@ fn redact(url: &str) -> String {
     crate::rpc::redact_url(url)
 }
 
-#[async_trait::async_trait]
 impl HotStore for PgStore {
     fn pinned(&self) -> Result<Option<std::sync::Arc<dyn HotStore>>> {
         Ok(Some(std::sync::Arc::new(PgStore {
@@ -496,7 +495,10 @@ impl HotStore for PgStore {
             held: self.held.clone(),
         })))
     }
+}
 
+#[async_trait::async_trait]
+impl nuthatch_core::store::HotStore for PgStore {
     // ---- entities ---------------------------------------------------------------------------
 
     fn put_entity(&self, key: &str, json: &str) -> Result<()> {

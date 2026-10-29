@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use nuthatch::runtime::{Dataset, MountTable, DATA_DIR, MOUNTS_FILE};
-use nuthatch::store::HotStore;
+use nuthatch::store::CoreHotStore as _;
 use nuthatch::{analytics, health::RuntimeHealth, indexer, migrate, runtime};
 
 use common::tape::*;

@@ -1186,7 +1186,6 @@ fn block_of(key: &str) -> Result<u64> {
         .with_context(|| format!("corrupt entity key {key:?}"))
 }
 
-#[async_trait::async_trait]
 impl HotStore for MemStore {
     fn retained_bytes(&self) -> u64 {
         self.copy.mirror.retained()
@@ -1204,7 +1203,10 @@ impl HotStore for MemStore {
             at: Some(at),
         })))
     }
+}
 
+#[async_trait::async_trait]
+impl nuthatch_core::store::HotStore for MemStore {
     fn write_generation(&self) -> Option<u64> {
         let g = match &self.at {
             Some((_, w, _)) => *w,
@@ -1564,24 +1566,26 @@ mod tests {
             !copy.tables().meta.contains_key("outbox_next_seq"),
             "the writer's outbox is not mirrored"
         );
-        let ours = HotStore::hot_rows_by_table_bounded_with_bytes(&copy, 100, u64::MAX).unwrap();
+        let ours =
+            crate::store::CoreHotStore::hot_rows_by_table_bounded_with_bytes(&copy, 100, u64::MAX)
+                .unwrap();
         let theirs = store
             .hot_rows_by_table_bounded_with_bytes(100, u64::MAX)
             .unwrap();
         assert_eq!(ours.rows, theirs.rows);
         assert_eq!(ours.source_bytes, theirs.source_bytes);
         assert_eq!(ours.last_block, theirs.last_block);
-        assert_eq!(HotStore::sealed_through(&copy), 3);
+        assert_eq!(crate::store::CoreHotStore::sealed_through(&copy), 3);
         assert_eq!(
-            HotStore::checkpoints_desc(&copy).unwrap(),
+            crate::store::CoreHotStore::checkpoints_desc(&copy).unwrap(),
             store.checkpoints_desc().unwrap()
         );
         assert_eq!(
-            HotStore::get_block_timestamp(&copy, 4).unwrap(),
+            crate::store::CoreHotStore::get_block_timestamp(&copy, 4).unwrap(),
             store.get_block_timestamp(4).unwrap()
         );
         assert_eq!(
-            HotStore::recent_by_table(&copy, "c", 10).unwrap(),
+            crate::store::CoreHotStore::recent_by_table(&copy, "c", 10).unwrap(),
             store.recent_by_table("c", 10).unwrap()
         );
     }
@@ -1620,8 +1624,16 @@ mod tests {
         );
         let latest = copy.copy.mirror.load().bytes;
         assert_eq!(copy.bytes(), latest + retained);
-        assert_eq!(HotStore::count(&*held).unwrap(), 400, "the held version");
-        assert_eq!(HotStore::count(&copy).unwrap(), 401, "the latest");
+        assert_eq!(
+            crate::store::CoreHotStore::count(&*held).unwrap(),
+            400,
+            "the held version"
+        );
+        assert_eq!(
+            crate::store::CoreHotStore::count(&copy).unwrap(),
+            401,
+            "the latest"
+        );
 
         drop(held);
         assert_eq!(copy.retained_bytes(), 0);
@@ -1657,7 +1669,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(pinned.tables["t"][0].to_block, 1);
-        assert_eq!(HotStore::count(&*copy).unwrap(), 1);
+        assert_eq!(crate::store::CoreHotStore::count(&*copy).unwrap(), 1);
         assert!(
             crate::seal::load_manifest(tmp.path()).is_err(),
             "outside a request on a copy, the disk is not read for a followed dataset"

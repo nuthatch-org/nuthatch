@@ -7346,9 +7346,9 @@ mod tests {
             address: Some("0x0".into()),
             chain: "ethereum".into(),
             dir: dir.to_path_buf(),
-            balances: BalanceView::start().unwrap(),
-            exposure: ExposureView::start(true).unwrap(),
-            velocity: VelocityView::start(true).unwrap(),
+            balances: BalanceView::start(crate::drive::Driver::Threaded).unwrap(),
+            exposure: ExposureView::start(crate::drive::Driver::Threaded, true).unwrap(),
+            velocity: VelocityView::start(crate::drive::Driver::Threaded, true).unwrap(),
             entities: Arc::new(Vec::new()),
             #[cfg(feature = "folds")]
             folds: None,
@@ -9652,16 +9652,18 @@ mod tests {
     /// the real store.
     struct OddTip(Store, Option<u64>);
 
+    impl crate::store::HotStore for OddTip {}
+
     #[async_trait::async_trait]
-    impl crate::store::HotStore for OddTip {
+    impl nuthatch_core::store::HotStore for OddTip {
         fn write_generation(&self) -> Option<u64> {
-            crate::store::HotStore::write_generation(&self.0)
+            crate::store::CoreHotStore::write_generation(&self.0)
         }
         fn rows_generation(&self) -> Option<u64> {
-            crate::store::HotStore::rows_generation(&self.0)
+            crate::store::CoreHotStore::rows_generation(&self.0)
         }
         fn put_entity(&self, key: &str, json: &str) -> Result<()> {
-            crate::store::HotStore::put_entity(&self.0, key, json)
+            crate::store::CoreHotStore::put_entity(&self.0, key, json)
         }
         fn put_entity_if_named(
             &self,
@@ -9683,25 +9685,25 @@ mod tests {
                 .put_entities_if_named(entries, source_key, block_hash)
         }
         fn get_entity(&self, key: &str) -> Result<Option<String>> {
-            crate::store::HotStore::get_entity(&self.0, key)
+            crate::store::CoreHotStore::get_entity(&self.0, key)
         }
         fn count(&self) -> Result<u64> {
-            crate::store::HotStore::count(&self.0)
+            crate::store::CoreHotStore::count(&self.0)
         }
         fn recent(&self, limit: usize) -> Result<Vec<String>> {
-            crate::store::HotStore::recent(&self.0, limit)
+            crate::store::CoreHotStore::recent(&self.0, limit)
         }
         fn recent_by_table(&self, table: &str, limit: usize) -> Result<Vec<String>> {
-            crate::store::HotStore::recent_by_table(&self.0, table, limit)
+            crate::store::CoreHotStore::recent_by_table(&self.0, table, limit)
         }
         fn hot_rows_by_table(&self) -> Result<std::collections::HashMap<String, Vec<Value>>> {
-            crate::store::HotStore::hot_rows_by_table(&self.0)
+            crate::store::CoreHotStore::hot_rows_by_table(&self.0)
         }
         fn hot_rows_by_table_bounded(
             &self,
             max_rows: usize,
         ) -> Result<std::collections::HashMap<String, Vec<Value>>> {
-            crate::store::HotStore::hot_rows_by_table_bounded(&self.0, max_rows)
+            crate::store::CoreHotStore::hot_rows_by_table_bounded(&self.0, max_rows)
         }
         fn hot_rows_by_table_bounded_with_bytes(
             &self,
@@ -9729,50 +9731,50 @@ mod tests {
                 anyhow::bail!("hot store would not scan")
             };
             let snapshot =
-                crate::store::HotStore::hot_rows_charged(&self.0, max_rows, max_bytes, charge)?;
+                crate::store::CoreHotStore::hot_rows_charged(&self.0, max_rows, max_bytes, charge)?;
             let row = json!({"table":"t","block_number":block,"log_index":0,"v":"x"}).to_string();
             self.0
                 .commit_window(&[(Store::entity_key(block, 0), row)], None, block)?;
             Ok(snapshot)
         }
         fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
-            crate::store::HotStore::entities_in_range(&self.0, from, to)
+            crate::store::CoreHotStore::entities_in_range(&self.0, from, to)
         }
         fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>> {
-            crate::store::HotStore::sample_entity_keys(&self.0, limit)
+            crate::store::CoreHotStore::sample_entity_keys(&self.0, limit)
         }
         fn get_meta(&self, key: &str) -> Result<Option<String>> {
-            crate::store::HotStore::get_meta(&self.0, key)
+            crate::store::CoreHotStore::get_meta(&self.0, key)
         }
         fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-            crate::store::HotStore::set_meta(&self.0, key, value)
+            crate::store::CoreHotStore::set_meta(&self.0, key, value)
         }
         fn meta_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, String)>> {
-            crate::store::HotStore::meta_with_prefix(&self.0, prefix, limit)
+            crate::store::CoreHotStore::meta_with_prefix(&self.0, prefix, limit)
         }
         fn count_meta_with_prefix(&self, prefix: &str) -> Result<u64> {
-            crate::store::HotStore::count_meta_with_prefix(&self.0, prefix)
+            crate::store::CoreHotStore::count_meta_with_prefix(&self.0, prefix)
         }
         fn indexed_head(&self) -> Result<Option<u64>> {
-            crate::store::HotStore::indexed_head(&self.0)
+            crate::store::CoreHotStore::indexed_head(&self.0)
         }
         fn sealed_through(&self) -> u64 {
-            crate::store::HotStore::sealed_through(&self.0)
+            crate::store::CoreHotStore::sealed_through(&self.0)
         }
         fn set_block_hash(&self, block: u64, hash: &str) -> Result<()> {
-            crate::store::HotStore::set_block_hash(&self.0, block, hash)
+            crate::store::CoreHotStore::set_block_hash(&self.0, block, hash)
         }
         fn get_block_hash(&self, block: u64) -> Result<Option<String>> {
-            crate::store::HotStore::get_block_hash(&self.0, block)
+            crate::store::CoreHotStore::get_block_hash(&self.0, block)
         }
         fn set_block_timestamp(&self, block: u64, timestamp: u64) -> Result<()> {
-            crate::store::HotStore::set_block_timestamp(&self.0, block, timestamp)
+            crate::store::CoreHotStore::set_block_timestamp(&self.0, block, timestamp)
         }
         fn get_block_timestamp(&self, block: u64) -> Result<Option<u64>> {
-            crate::store::HotStore::get_block_timestamp(&self.0, block)
+            crate::store::CoreHotStore::get_block_timestamp(&self.0, block)
         }
         fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>> {
-            crate::store::HotStore::checkpoints_desc(&self.0)
+            crate::store::CoreHotStore::checkpoints_desc(&self.0)
         }
         fn commit_window(
             &self,
@@ -9780,7 +9782,7 @@ mod tests {
             checkpoint: Option<(u64, &str)>,
             last_block: u64,
         ) -> Result<()> {
-            crate::store::HotStore::commit_window(&self.0, entities, checkpoint, last_block)
+            crate::store::CoreHotStore::commit_window(&self.0, entities, checkpoint, last_block)
         }
         async fn commit_window_blocking(
             &self,
@@ -9789,16 +9791,16 @@ mod tests {
             checkpoint: Option<(u64, String)>,
             last_block: u64,
         ) -> Result<()> {
-            crate::store::HotStore::commit_window_blocking(
+            crate::store::CoreHotStore::commit_window_blocking(
                 &self.0, entities, outbox, checkpoint, last_block,
             )
             .await
         }
         async fn settle_commits(&self) {
-            crate::store::HotStore::settle_commits(&self.0).await
+            crate::store::CoreHotStore::settle_commits(&self.0).await
         }
         fn rollback_to(&self, block: u64) -> Result<u64> {
-            crate::store::HotStore::rollback_to(&self.0, block)
+            crate::store::CoreHotStore::rollback_to(&self.0, block)
         }
         fn rollback_to_and_set_meta(
             &self,
@@ -9807,12 +9809,12 @@ mod tests {
             meta_val: &str,
             outbox: &[String],
         ) -> Result<u64> {
-            crate::store::HotStore::rollback_to_and_set_meta(
+            crate::store::CoreHotStore::rollback_to_and_set_meta(
                 &self.0, block, meta_key, meta_val, outbox,
             )
         }
         fn prune_range(&self, from: u64, to: u64) -> Result<u64> {
-            crate::store::HotStore::prune_range(&self.0, from, to)
+            crate::store::CoreHotStore::prune_range(&self.0, from, to)
         }
         fn prune_and_set_meta(
             &self,
@@ -9821,49 +9823,49 @@ mod tests {
             meta_key: &str,
             meta_val: &str,
         ) -> Result<u64> {
-            crate::store::HotStore::prune_and_set_meta(&self.0, from, to, meta_key, meta_val)
+            crate::store::CoreHotStore::prune_and_set_meta(&self.0, from, to, meta_key, meta_val)
         }
         fn claim(&self, owner: &str) -> Result<u64> {
-            crate::store::HotStore::claim(&self.0, owner)
+            crate::store::CoreHotStore::claim(&self.0, owner)
         }
         fn acquire_lease(&self, owner: &str, ttl_secs: u64) -> Result<crate::store::Lease> {
-            crate::store::HotStore::acquire_lease(&self.0, owner, ttl_secs)
+            crate::store::CoreHotStore::acquire_lease(&self.0, owner, ttl_secs)
         }
         fn renew_lease(&self, ttl_secs: u64) -> Result<crate::store::Lease> {
-            crate::store::HotStore::renew_lease(&self.0, ttl_secs)
+            crate::store::CoreHotStore::renew_lease(&self.0, ttl_secs)
         }
         fn release_lease(&self) -> Result<()> {
-            crate::store::HotStore::release_lease(&self.0)
+            crate::store::CoreHotStore::release_lease(&self.0)
         }
         fn current_lease(&self) -> Result<Option<crate::store::Lease>> {
-            crate::store::HotStore::current_lease(&self.0)
+            crate::store::CoreHotStore::current_lease(&self.0)
         }
         fn current_fence(&self) -> Result<u64> {
-            crate::store::HotStore::current_fence(&self.0)
+            crate::store::CoreHotStore::current_fence(&self.0)
         }
         fn held_fence(&self) -> u64 {
-            crate::store::HotStore::held_fence(&self.0)
+            crate::store::CoreHotStore::held_fence(&self.0)
         }
         fn outbox_push(&self, payload: &str) -> Result<u64> {
-            crate::store::HotStore::outbox_push(&self.0, payload)
+            crate::store::CoreHotStore::outbox_push(&self.0, payload)
         }
         fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>> {
-            crate::store::HotStore::outbox_pending(&self.0, limit)
+            crate::store::CoreHotStore::outbox_pending(&self.0, limit)
         }
         fn outbox_remove(&self, seq: u64) -> Result<()> {
-            crate::store::HotStore::outbox_remove(&self.0, seq)
+            crate::store::CoreHotStore::outbox_remove(&self.0, seq)
         }
         async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> Result<()> {
-            crate::store::HotStore::outbox_remove_batch_blocking(&self.0, seqs).await
+            crate::store::CoreHotStore::outbox_remove_batch_blocking(&self.0, seqs).await
         }
         fn outbox_len(&self) -> u64 {
-            crate::store::HotStore::outbox_len(&self.0)
+            crate::store::CoreHotStore::outbox_len(&self.0)
         }
         fn outbox_trim(&self, max: u64) -> Result<u64> {
-            crate::store::HotStore::outbox_trim(&self.0, max)
+            crate::store::CoreHotStore::outbox_trim(&self.0, max)
         }
         fn released(&self) -> futures::future::BoxFuture<'static, ()> {
-            crate::store::HotStore::released(&self.0)
+            crate::store::CoreHotStore::released(&self.0)
         }
     }
 

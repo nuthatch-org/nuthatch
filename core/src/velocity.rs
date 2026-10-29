@@ -14,13 +14,12 @@
 //! tuple aggregate isn't linear, and splitting them keeps both incrementally maintained *and* seedable
 //! on restart from a pre-summed cold aggregate (see `rebuild_velocity`).
 
+use crate::drive::{Driver, Lane, Step, ViewDriver};
 use anyhow::{anyhow, Context, Result};
 use dbsp::utils::Tup2;
 use dbsp::{IndexedZSetReader, OrdZSet, OutputHandle, RootCircuit, Runtime};
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
 use std::sync::Arc;
 
 use crate::versioned::{Chunked, Versions};
@@ -281,7 +280,6 @@ fn build_circuit(circuit: &mut RootCircuit) -> Result<CircuitHandles, anyhow::Er
 
 enum Msg {
     Batch(VelocityBatch),
-    Flush(SyncSender<()>),
     Settle {
         sealed_through: u64,
         threshold: i128,
@@ -292,123 +290,87 @@ enum Msg {
 /// Cheap-to-clone handle to the live velocity view. Mirrors [`crate::exposure::ExposureView`].
 #[derive(Clone)]
 pub struct VelocityView {
-    tx: Sender<Msg>,
+    /// Unhealthy once the circuit dies on an error, so the ingest loop fails loudly rather than serve
+    /// frozen (and, for compliance, silently wrong) velocity flags. A disabled view stays healthy.
+    lane: Lane<Msg>,
     rows: Arc<Versions<Buckets>>,
     /// The version a request was handed (#2467), read instead of the latest.
     pinned: Option<Arc<Buckets>>,
-    /// Flips false if the circuit thread dies on an error, so the ingest loop can fail loudly rather
-    /// than serve frozen (and, for compliance, silently wrong) velocity flags. A disabled view stays healthy.
-    healthy: Arc<AtomicBool>,
 }
 
 impl VelocityView {
     /// A view with no circuit, as [`crate::views::BalanceView::inert`].
     pub fn inert() -> Self {
-        let (tx, _) = channel::<Msg>();
         Self {
-            tx,
+            lane: Lane::off(),
             rows: Arc::new(Versions::new(new_buckets())),
             pinned: None,
-            healthy: Arc::new(AtomicBool::new(true)),
         }
     }
 
-    /// Start the velocity view. When `enabled` is false (no velocity flag configured) the DBSP circuit
-    /// and its worker thread are not spawned - `apply` no-ops and `snapshot` stays empty (L10).
-    pub fn start(enabled: bool) -> Result<Self> {
-        let (tx, rx) = channel::<Msg>();
+    /// Start the velocity view. When `enabled` is false (no velocity flag configured) no DBSP circuit
+    /// is built - `apply` no-ops and `snapshot` stays empty (L10).
+    pub fn start(driver: Driver, enabled: bool) -> Result<Self> {
         let rows = Arc::new(Versions::new(new_buckets()));
-        let healthy = Arc::new(AtomicBool::new(true));
         if !enabled {
-            drop(rx);
             return Ok(Self {
-                tx,
+                lane: Lane::off(),
                 rows,
                 pinned: None,
-                healthy,
             });
         }
         let shared = rows.clone();
-        let health = healthy.clone();
-        std::thread::Builder::new()
-            .name("nuthatch-velocity".into())
-            .spawn(move || {
-                let mut circuit = match VelocityCircuit::new() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("velocity circuit failed to start: {e:#}");
-                        health.store(false, Ordering::SeqCst);
-                        return;
+        let lane = driver.lane("velocity", "nuthatch-velocity", move || {
+            let mut circuit = VelocityCircuit::new()?;
+            // The first window not wholly sealed at the last sweep, so the buckets are walked
+            // once per window the watermark passes rather than once per seal.
+            let mut swept = 0u64;
+            let mut buckets = new_buckets();
+            Ok(Box::new(move |msg| {
+                let batch = match msg {
+                    Msg::Batch(batch) => batch,
+                    Msg::Settle {
+                        sealed_through,
+                        threshold,
+                        window,
+                    } => {
+                        let open = window_start(sealed_through.saturating_add(1), window);
+                        if open <= swept {
+                            return Ok(());
+                        }
+                        swept = open;
+                        let can =
+                            |k: &str, v: i128| can_flag(k, v, threshold, window, sealed_through);
+                        match compacted(&buckets, can).context("velocity compaction failed")? {
+                            None => return Ok(()),
+                            Some(c) => circuit = c,
+                        }
+                        buckets.retain(|k, &(_, v)| can(k, v));
+                        shared.publish(buckets.clone());
+                        return Ok(());
                     }
                 };
-                // The first window not wholly sealed at the last sweep, so the buckets are walked
-                // once per window the watermark passes rather than once per seal.
-                let mut swept = 0u64;
-                let mut buckets = new_buckets();
-                while let Ok(msg) = rx.recv() {
-                    let batch = match msg {
-                        Msg::Batch(batch) => batch,
-                        Msg::Settle {
-                            sealed_through,
-                            threshold,
-                            window,
-                        } => {
-                            let open = window_start(sealed_through.saturating_add(1), window);
-                            if open <= swept {
-                                continue;
-                            }
-                            swept = open;
-                            let can = |k: &str, v: i128| {
-                                can_flag(k, v, threshold, window, sealed_through)
-                            };
-                            match compacted(&buckets, can) {
-                                Ok(None) => continue,
-                                Ok(Some(c)) => circuit = c,
-                                Err(e) => {
-                                    tracing::error!("velocity compaction failed: {e:#}");
-                                    health.store(false, Ordering::SeqCst);
-                                    break;
-                                }
-                            }
-                            buckets.retain(|k, &(_, v)| can(k, v));
-                            shared.publish(buckets.clone());
-                            continue;
-                        }
-                        Msg::Flush(ack) => {
-                            let _ = ack.send(());
-                            continue;
-                        }
-                    };
-                    match circuit.step(batch) {
-                        Ok(delta) => {
-                            delta.apply(&mut buckets);
-                            shared.publish(buckets.clone());
-                        }
-                        Err(e) => {
-                            tracing::error!("velocity step failed: {e:#}");
-                            health.store(false, Ordering::SeqCst);
-                            break;
-                        }
-                    }
-                }
-            })
-            .context("failed to spawn velocity thread")?;
+                let delta = circuit.step(batch).context("velocity step failed")?;
+                delta.apply(&mut buckets);
+                shared.publish(buckets.clone());
+                Ok(())
+            }) as Step<Msg>)
+        })?;
         Ok(Self {
-            tx,
+            lane,
             rows,
             pinned: None,
-            healthy,
         })
     }
 
-    /// Whether the circuit thread is alive; `false` means it died on an error and the view is frozen.
+    /// Whether the circuit is alive; `false` means it died on an error and the view is frozen.
     pub fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::SeqCst)
+        self.lane.is_healthy()
     }
 
     pub fn apply(&self, batch: VelocityBatch) {
         if !batch.is_empty() {
-            let _ = self.tx.send(Msg::Batch(batch));
+            self.lane.send(Msg::Batch(batch));
         }
     }
 
@@ -426,16 +388,13 @@ impl VelocityView {
     }
 
     pub fn flush(&self) {
-        let (ack, wait) = sync_channel(0);
-        if self.tx.send(Msg::Flush(ack)).is_ok() {
-            let _ = wait.recv();
-        }
+        self.lane.flush();
     }
 
     /// Drop the buckets that can no longer flag at `threshold` now that `sealed_through` is sealed
     /// (#2173). Only buckets at or over the threshold are ever served, so no answer changes.
     pub fn settle(&self, sealed_through: u64, threshold: i128, window: u64) {
-        let _ = self.tx.send(Msg::Settle {
+        self.lane.send(Msg::Settle {
             sealed_through,
             threshold,
             window,
@@ -552,7 +511,7 @@ mod tests {
 
     #[test]
     fn view_thread_serves_after_flush() {
-        let view = VelocityView::start(true).unwrap();
+        let view = VelocityView::start(Driver::Threaded, true).unwrap();
         view.apply(velocity_deltas("a", 10, 4242, 1, 100));
         view.flush();
         assert_eq!(view.flags(1000)[0].volume, 4242);
@@ -563,7 +522,7 @@ mod tests {
     /// it is dropped from the circuit and the view; the flags served before and after are the same.
     #[test]
     fn a_sealed_window_keeps_only_the_buckets_that_flag() {
-        let view = VelocityView::start(true).unwrap();
+        let view = VelocityView::start(Driver::Threaded, true).unwrap();
         for (who, block, value) in [
             ("small", 10, 5),
             ("big", 20, 500),
@@ -597,7 +556,7 @@ mod tests {
     /// once per transaction kept only the last 10,000-row step, so a restart seed lost buckets.
     #[test]
     fn one_large_batch_keeps_every_bucket() {
-        let view = VelocityView::start(true).unwrap();
+        let view = VelocityView::start(Driver::Threaded, true).unwrap();
         let batch: VelocityBatch = (0..25_000u64)
             .flat_map(|i| velocity_deltas(&format!("0x{i:040x}"), 10, 1, 1, 100))
             .collect();
