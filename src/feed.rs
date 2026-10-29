@@ -32,84 +32,7 @@ pub const DELTA_BACKLOG: usize = 1024;
 /// The wire format of `GET /_admin/feed`. Bump it on any change an older follower would misread.
 pub const FEED_VERSION: u32 = 1;
 
-/// One change to the mirrored tables, in the order the commit made it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum Op {
-    Put {
-        key: String,
-        row: String,
-    },
-    /// Entity keys in `from..=to`: a seal's prune. Absent `to`, from `from` to the end: a reorg's
-    /// rollback, the only open-ended drop the store makes, which a follower's derived state retracts.
-    Drop {
-        from: String,
-        to: Option<String>,
-    },
-    Meta {
-        key: String,
-        value: String,
-    },
-    Unmeta {
-        key: String,
-    },
-    Block {
-        key: String,
-        record: String,
-    },
-    Unblock {
-        key: String,
-    },
-    /// Every checkpoint at or above `key`.
-    UnblockFrom {
-        key: String,
-    },
-}
-
-/// Meta keys that describe the writer's own process rather than the data: its outbox counter and its
-/// ownership lease. Neither is mirrored, so a reader cannot be mistaken for the owner.
-pub fn mirrored_meta(key: &str) -> bool {
-    !matches!(
-        key,
-        crate::store::OWNER_FENCE
-            | crate::store::LEASE_OWNER
-            | crate::store::LEASE_EXPIRES_AT
-            | "owner"
-            | "outbox_next_seq"
-    )
-}
-
-/// Ops gathered inside one write transaction, or `None` when nothing is subscribed and gathering
-/// them would only copy rows nobody reads.
-pub struct Recorder(Option<Vec<Op>>, bool);
-
-impl Recorder {
-    /// A meta write. One to `sealed_through` is noted whether or not anyone is subscribed, since
-    /// segments kept for followers wait on the commit that carries it.
-    pub fn meta(&mut self, key: &str, value: &str) {
-        self.1 |= key == "sealed_through";
-        self.push(|| Op::Meta {
-            key: key.to_string(),
-            value: value.to_string(),
-        });
-    }
-
-    fn seals(&self) -> bool {
-        self.1
-    }
-
-    pub fn push(&mut self, op: impl FnOnce() -> Op) {
-        if let Some(ops) = &mut self.0 {
-            let op = op();
-            if let Op::Meta { key, .. } | Op::Unmeta { key } = &op {
-                if !mirrored_meta(key) {
-                    return;
-                }
-            }
-            ops.push(op);
-        }
-    }
-}
+pub use nuthatch_core::tap::{mirrored_meta, Op, Recorder};
 
 /// A committed change to one dataset's hot store, numbered within its writer's `epoch`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -600,7 +523,7 @@ impl Tap {
     }
 
     pub fn recorder(&self) -> Recorder {
-        Recorder((self.tx.receiver_count() > 0).then(Vec::new), false)
+        Recorder::new(self.tx.receiver_count() > 0)
     }
 
     /// Run `commit` and number it, publishing its ops to any subscriber. Holding the lock across the
@@ -615,7 +538,7 @@ impl Tap {
         if self.tx.receiver_count() == 0 {
             return Ok(());
         }
-        let delta = match rec.0 {
+        let delta = match rec.into_ops() {
             Some(ops) => {
                 let seals = ops
                     .iter()
@@ -660,6 +583,24 @@ impl Tap {
                 .join(crate::seal::MANIFEST_FILE),
         )
         .ok()
+    }
+}
+
+impl nuthatch_core::tap::Feed for Tap {
+    fn open(dir: Option<&Path>) -> Tap {
+        Tap::new(dir.map(Path::to_path_buf))
+    }
+    fn recorder(&self) -> Recorder {
+        Tap::recorder(self)
+    }
+    fn commit(&self, rec: Recorder, commit: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        Tap::commit(self, rec, commit)
+    }
+    fn epoch(&self) -> u64 {
+        Tap::epoch(self)
+    }
+    fn generation(&self) -> u64 {
+        Tap::generation(self)
     }
 }
 
@@ -1534,7 +1475,7 @@ mod tests {
         store
             .commit_window(&[row(1, 0, "a")], Some((1, "0x01")), 1)
             .unwrap();
-        let mut sub = store.feed_subscribe().unwrap();
+        let mut sub = crate::store::feed_subscribe(&store).unwrap();
         let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot.clone());
 
         store
@@ -1559,7 +1500,7 @@ mod tests {
         store.rollback_to(4).unwrap();
         drain(&mut sub, &copy);
 
-        let now = store.feed_subscribe().unwrap().snapshot;
+        let now = crate::store::feed_subscribe(&store).unwrap().snapshot;
         assert_eq!(copy.applied(), (now.epoch, now.generation));
         assert_eq!(copy.tables(), MirroredTables::of(&now));
         assert!(
@@ -1598,7 +1539,7 @@ mod tests {
         let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
         let rows: Vec<_> = (1..=400).map(|b| row(b, 0, "t")).collect();
         store.commit_window(&rows, None, 400).unwrap();
-        let mut sub = store.feed_subscribe().unwrap();
+        let mut sub = crate::store::feed_subscribe(&store).unwrap();
         let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot.clone());
         let alone = copy.bytes();
         let held = HotStore::pinned(&copy).unwrap().unwrap();
@@ -1648,7 +1589,7 @@ mod tests {
         store
             .commit_window(&[row(1, 0, "t"), row(2, 0, "t")], None, 2)
             .unwrap();
-        let mut sub = store.feed_subscribe().unwrap();
+        let mut sub = crate::store::feed_subscribe(&store).unwrap();
         assert_eq!(sub.snapshot.catalogue, None);
         let copy = Arc::new(MemStore::from_snapshot(tmp.path(), sub.snapshot.clone()));
         write_catalogue(tmp.path(), 1);
@@ -1687,7 +1628,7 @@ mod tests {
             .unwrap();
         let old = Arc::new(MemStore::from_snapshot(
             tmp.path(),
-            store.feed_subscribe().unwrap().snapshot,
+            crate::store::feed_subscribe(&store).unwrap().snapshot,
         ));
         write_catalogue(tmp.path(), 1);
         store
@@ -1695,7 +1636,7 @@ mod tests {
             .unwrap();
         let new = Arc::new(MemStore::from_snapshot(
             tmp.path(),
-            store.feed_subscribe().unwrap().snapshot,
+            crate::store::feed_subscribe(&store).unwrap().snapshot,
         ));
         let sealed = |copy: &Arc<MemStore>| {
             crate::seal::within(tmp.path(), copy.clone(), || {
@@ -1731,7 +1672,7 @@ mod tests {
                     .unwrap();
             })
         };
-        let snap = store.feed_subscribe().unwrap().snapshot;
+        let snap = crate::store::feed_subscribe(&store).unwrap().snapshot;
         sealer.join().unwrap();
         let tables = MirroredTables::of(&snap);
         assert_eq!(
@@ -1745,7 +1686,7 @@ mod tests {
     fn a_delta_out_of_order_is_a_gap_and_changes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
-        let mut sub = store.feed_subscribe().unwrap();
+        let mut sub = crate::store::feed_subscribe(&store).unwrap();
         let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot.clone());
         store.commit_window(&[row(1, 0, "t")], None, 1).unwrap();
         store.commit_window(&[row(2, 0, "t")], None, 2).unwrap();
@@ -1794,7 +1735,7 @@ mod tests {
     fn a_delta_says_which_stored_rows_it_changed() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
-        let mut sub = store.feed_subscribe().unwrap();
+        let mut sub = crate::store::feed_subscribe(&store).unwrap();
         let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot.clone());
         let mut next = || copy.apply(&sub.deltas.try_recv().unwrap()).unwrap();
 
@@ -1978,7 +1919,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
         store.commit_window(&[row(1, 0, "t")], None, 1).unwrap();
-        let sub = store.feed_subscribe().unwrap();
+        let sub = crate::store::feed_subscribe(&store).unwrap();
         let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot);
         let before = copy.bytes();
         let (k, big) = (Store::entity_key(2, 0), "x".repeat(10_000));

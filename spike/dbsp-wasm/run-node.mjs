@@ -78,3 +78,18 @@ const entityMs = (performance.now() - t2).toFixed(0);
 const after = mod.wasm_memory_bytes();
 console.log(`entity ${ewin}x${erows}: ${e}`);
 console.log(`entity time ${entityMs} ms; wasm memory before ${mib(before)} MiB, after ${mib(after)} MiB, peak ${mib(Math.max(peak, after))} MiB; samples ${samples.join(" ")}`);
+
+// RFC-0075 S2: the reorg property over the redb hot store on a byte buffer. tests/native.rs pins the
+// same transcript digest, so a wasm32 run that converged differently fails here.
+const { createHash } = await import("node:crypto");
+const t3 = performance.now();
+const reorg = mod.spike_reorg(12);
+const reorgMs = (performance.now() - t3).toFixed(0);
+console.log(reorg);
+const reorgSha = createHash("sha256").update(reorg).digest("hex");
+const wantReorg = "4f3b8bec690c201973ce15e64987659f67dd912547767241f31121111e96592a";
+console.log(`reorg ${reorg.split("\n").length} cases in ${reorgMs} ms; transcript sha256 ${reorgSha}; wasm memory ${mib(mod.wasm_memory_bytes())} MiB`);
+if (reorgSha !== wantReorg) {
+  console.error(`MISMATCH\n got: ${reorgSha}\nwant: ${wantReorg}`);
+  process.exit(1);
+}
