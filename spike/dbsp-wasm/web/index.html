@@ -70,7 +70,7 @@ try {
     const m = line.match(/^- `GET (\/[^`\s]*)`/);
     if (!m) continue;
     const route = m[1];
-    if (/[{}]|\.\.\./.test(route)) {
+    if (/[{}]|\.\.\.|=[A-Z](&|$)/.test(route)) {
       examples.push({ source: "llms.txt", route, runnable: false });
       continue;
     }

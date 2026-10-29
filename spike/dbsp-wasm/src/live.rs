@@ -36,6 +36,7 @@ pub struct LiveNest {
 #[wasm_bindgen]
 pub struct HttpAnswer {
     status: u16,
+    content_type: &'static str,
     body: Vec<u8>,
 }
 
@@ -46,13 +47,10 @@ impl HttpAnswer {
         self.status
     }
 
+    /// Empty where the node sends no content type.
     #[wasm_bindgen(getter, js_name = contentType)]
     pub fn content_type(&self) -> String {
-        if self.body.is_empty() || self.status == 400 && !self.body.starts_with(b"{") {
-            "text/plain; charset=utf-8".into()
-        } else {
-            nuthatch_core::answer::CONTENT_TYPE.into()
-        }
+        self.content_type.into()
     }
 
     #[wasm_bindgen(getter)]
@@ -151,6 +149,7 @@ impl LiveNest {
         let a = crate::http::answer(&nest, &method, &target, &body).await;
         HttpAnswer {
             status: a.status,
+            content_type: crate::http::content_type(&a),
             body: a.body,
         }
     }

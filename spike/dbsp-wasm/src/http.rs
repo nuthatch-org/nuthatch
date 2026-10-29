@@ -38,7 +38,11 @@ pub async fn answer(n: &Nest<'_>, method: &str, target: &str, body: &[u8]) -> An
         .into_owned()
         .collect();
     let param = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-    let limit = || param("limit").and_then(|l| l.parse().ok());
+    let number = |k: &str| -> Result<Option<usize>, Answer> {
+        param(k)
+            .map(|v| v.parse().map_err(|e| rejected(&format!("{k}: {e}"))))
+            .transpose()
+    };
     let path = path.strip_suffix('/').filter(|p| !p.is_empty()).unwrap_or(path);
     let segs: Vec<String> = path
         .trim_start_matches('/')
@@ -47,51 +51,71 @@ pub async fn answer(n: &Nest<'_>, method: &str, target: &str, body: &[u8]) -> An
         .collect();
     let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
     let store = &n.nest.store;
-    match (method, segs.as_slice()) {
-        ("GET", ["ready"]) => ready(n),
-        ("GET", ["sql"]) | ("GET", ["explain"]) => match param("q") {
-            Some(q) => {
-                let max_rows = param("max_rows").and_then(|m| m.parse().ok());
+    let routed = async {
+        Ok(match (method, segs.as_slice()) {
+            ("GET", ["ready"]) => ready(n),
+            ("GET", ["sql"]) | ("GET", ["explain"]) => {
+                let q = param("q").ok_or_else(|| rejected("missing field `q`"))?;
+                let max_rows = number("max_rows")?;
                 route_sql(n, segs[0] == "explain", answer::SqlRequest { q, max_rows }).await
             }
-            None => Answer {
-                status: 400,
-                body: b"Failed to deserialize query string: missing field `q`".to_vec(),
-            },
-        },
-        ("POST", ["sql"]) | ("POST", ["explain"]) => {
-            let explain = segs[0] == "explain";
-            match answer::sql_request(body, explain) {
-                Ok(q) => route_sql(n, explain, q).await,
-                Err(refused) => refused,
+            ("POST", ["sql"]) | ("POST", ["explain"]) => {
+                let explain = segs[0] == "explain";
+                route_sql(n, explain, answer::sql_request(body, explain)?).await
             }
-        }
-        ("GET", ["entity", id]) => entity(n, id).await,
-        ("GET", ["entities"]) => answer::entities(store.recent(answer::listing_limit(limit()))),
-        ("GET", ["balances"]) => {
-            let top = n.nest.balances.top(answer::listing_limit(limit()));
-            answer::balances(&n.nest.balances, top)
-        }
-        ("GET", ["balance", address]) => answer::balance(&n.nest.balances, address),
-        ("GET", ["derived"]) => {
-            let head = dataset_head(n);
-            let items = n
-                .nest
-                .entities
-                .iter()
-                .map(|e| {
-                    let (rows, applied) = e.lane().len_and_watermark();
-                    answer::derived_index_item(&e.facts(), rows, &applied, head)
-                })
-                .collect();
-            answer::derived_index(head, items)
-        }
-        ("GET", ["derived", name]) => derived(n, name, None, limit()),
-        ("GET", ["derived", name, key]) => derived(n, name, Some(key), None),
-        _ => Answer {
-            status: 404,
-            body: Vec::new(),
-        },
+            ("GET", ["entity", id]) => entity(n, id).await,
+            ("GET", ["entities"]) => {
+                answer::entities(store.recent(answer::listing_limit(number("limit")?)))
+            }
+            ("GET", ["balances"]) => {
+                let top = n
+                    .nest
+                    .balances
+                    .top(answer::listing_limit(number("limit")?));
+                answer::balances(&n.nest.balances, top)
+            }
+            ("GET", ["balance", address]) => answer::balance(&n.nest.balances, address),
+            ("GET", ["derived"]) => {
+                let head = dataset_head(n);
+                let items = n
+                    .nest
+                    .entities
+                    .iter()
+                    .map(|e| {
+                        let (rows, applied) = e.lane().len_and_watermark();
+                        answer::derived_index_item(&e.facts(), rows, &applied, head)
+                    })
+                    .collect();
+                answer::derived_index(head, items)
+            }
+            ("GET", ["derived", name]) => derived(n, name, None, number("limit")?),
+            ("GET", ["derived", name, key]) => derived(n, name, Some(key), None),
+            _ => Answer {
+                status: 404,
+                body: Vec::new(),
+            },
+        })
+    };
+    routed.await.unwrap_or_else(|refused: Answer| refused)
+}
+
+/// axum's refusal of a query string its extractor cannot read: plain text, not JSON.
+fn rejected(why: &str) -> Answer {
+    Answer {
+        status: 400,
+        body: format!("Failed to deserialize query string: {why}").into_bytes(),
+    }
+}
+
+/// The content type the node sends with `a`: JSON, except an extractor's plain-text refusal, and
+/// none with an unrouted path's empty body.
+pub fn content_type(a: &Answer) -> &'static str {
+    if a.body.is_empty() {
+        ""
+    } else if !a.body.starts_with(b"{") {
+        "text/plain; charset=utf-8"
+    } else {
+        answer::CONTENT_TYPE
     }
 }
 
