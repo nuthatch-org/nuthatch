@@ -218,6 +218,8 @@ impl TabNest {
                 topic0_refused: &mut topic0_refused,
             };
             let logs = fetch_window(wanted, tape, next, to).await?;
+            // Again once the logs are held, before anything of the window is committed.
+            self.budget.check_memory(crate::budget::linear_memory())?;
             let window = Window {
                 nest: nest(),
                 registry: &self.registry,

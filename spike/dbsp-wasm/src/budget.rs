@@ -2,7 +2,9 @@
 //! a cursor and a statement running together. One statement at a time takes a quarter, the node's
 //! one-permit share of a cursor's 2 GiB (512 MiB), through Burrmill's pool; the cursor and its
 //! entities take the rest. Declared entity state is refused at admission as a node refuses a mount,
-//! and a window is refused once the module's linear memory has reached the ceiling.
+//! and a window is refused once the module's linear memory has reached the ceiling, checked before its
+//! fetch and again before its commit. That is a wall between steps, not an allocator cap: what one
+//! window decodes, folds and seals can pass the ceiling before the next check stops the cursor.
 
 use std::fmt;
 

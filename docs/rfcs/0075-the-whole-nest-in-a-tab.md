@@ -574,7 +574,7 @@ what a page fetches. gzip is level 9 and brotli quality 11.
 | S5's build (`release`: `opt-level = "s"`, thin LTO, 16 codegen units) | 67,716,902 | 14,145,877 | 8,458,837 |
 | `tab` profile: `opt-level = "z"`, fat LTO, one codegen unit | 51,341,329 | 11,375,825 | 7,464,839 |
 | names and producers stripped by `wasm-bindgen` | 36,276,359 | 8,176,948 | 5,327,469 |
-| `wasm-opt -O1`, **the module the gates run** | **34,493,172** | **8,023,650** | **5,243,540** |
+| `wasm-opt -O1`, **the module the gates run** | **34,493,236** | **8,023,682** | **5,244,321** |
 | *burrmill-wasm, for comparison* | | | *5.6 MB* |
 
 Rejected, measured on the stripped `tab` build:
@@ -612,8 +612,9 @@ cursor and its entities take the rest. It enforces three things:
   allowance, sampled every 60 seconds as the node's is. S4 had left both unbounded.
 - *A statement.* A statement past its share is refused with Burrmill's `Out of Memory Error` and the
   node's hint, at status 400. Nothing is killed.
-- *The wall.* Before each window, if the module's linear memory has reached the ceiling, the cursor stops
-  with a named error rather than wait for the browser to kill the tab.
+- *The wall.* Before each window's fetch, and again before it is committed, the cursor stops with a named
+  error if the module's linear memory has reached the ceiling, rather than wait for the browser to kill
+  the tab.
 
 The gate is `run-budget.mjs`, in Node against the shipped module, on S3's recording with S4's entities.
 At each ceiling, entities declaring 150,000 rows (about 466 MiB) are tried first. Then the cursor follows
@@ -635,12 +636,17 @@ disturbs the other's answer.
 **Every mutation fails.** Each one was built and run through `run-budget.mjs`. Admitting any declared
 state fails the phone's admission check. Never refusing at the wall fails the 1 MiB check, and so does
 removing the check from the window loop. Opening the statement's engine unbounded let the statement grow
-the module to 1,832 MiB on the phone ceiling. The wall then stopped the cursor, and the run failed.
+the module to 1,832 MiB on the phone ceiling. The wall then stopped the cursor, and the run failed. The
+wall's second check, after the fetch, is not covered on its own: with either check removed, the other
+still fires at 1 MiB.
 
 **What it does not show.**
 
 - The budget gate runs in Node, not Chrome or Safari. Chrome runs the shipped module only through S5's
   Service Worker gate. Safari is untried, for S3's reason.
+- The wall is a check between steps and not an allocator cap. What one window decodes, folds and seals
+  can pass the ceiling before the next check stops the cursor. A cap in the allocator would turn that
+  overshoot into a trap, which is the death the wall exists to name. Windows are 20 blocks on mainnet.
 - The wall reads linear memory, which never shrinks. After one statement has used its share, the module
   keeps the high-water mark, so on a phone the cursor grows only into what the mark leaves of 600 MiB. Nothing returns
   memory to the browser short of reloading the worker.
