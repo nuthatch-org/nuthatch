@@ -97,6 +97,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
             target,
             interval: args.publish_interval,
             parallelism: args.publish_parallelism as usize,
+            followers: false,
         });
     let audit = match &args.audit_rpc {
         Some(url) => {
@@ -3845,6 +3846,7 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
                     target,
                     interval: args.publish_interval,
                     parallelism: args.publish_parallelism as usize,
+                    followers: false,
                 },
             )
         })

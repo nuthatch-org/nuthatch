@@ -263,12 +263,24 @@ impl Rig {
 
     /// A follower on "another host": its own directory, nothing of the writer's but its URL.
     async fn remote(&self, mirror: &str, feed: u32) -> (Arc<Follower>, String, PathBuf) {
+        self.remote_with(mirror, feed, nuthatch::seal::FOLLOWER_GRACE)
+            .await
+    }
+
+    async fn remote_with(
+        &self,
+        mirror: &str,
+        feed: u32,
+        cache_grace: Duration,
+    ) -> (Arc<Follower>, String, PathBuf) {
         let cache = self
             .tmp
             .path()
             .join(format!("elsewhere-{feed}-{}", rand_suffix()));
         std::fs::create_dir_all(&cache).unwrap();
-        let remote = nuthatch::remote_follow::Remote::open(mirror, &self.registry, 2048).unwrap();
+        let mut remote =
+            nuthatch::remote_follow::Remote::open(mirror, &self.registry, 2048).unwrap();
+        remote.cache_grace = cache_grace;
         let f = Follower::start_remote(
             cache.clone(),
             self.writer.base(),
@@ -283,8 +295,9 @@ impl Rig {
         (f, base, cache)
     }
 
+    /// The writer's publisher with `followers = true`.
     async fn publish(&self) {
-        nuthatch::publish::sync(&self.dir(), &self.mirror, false)
+        nuthatch::publish::sync_for_followers(&self.dir(), &self.mirror)
             .await
             .unwrap();
     }
@@ -623,6 +636,73 @@ async fn a_file_that_does_not_hash_to_its_name_is_refused() {
     knobs.corrupt.lock().unwrap().clear();
     let after = agree(&rig, &remote, "once the mirror served the right bytes").await;
     assert_eq!(after["sealed_through"], 2);
+    rig.writer.stop();
+}
+
+/// A mirror whose publisher has `followers` off never gets the provisional segments a seal names.
+/// The follower says so on `/ready`, rather than looking like it waits on a slow mirror.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mirror_not_published_for_followers_says_so() {
+    let rig = rig(6, None, None).await;
+    nuthatch::publish::sync(&rig.dir(), &rig.mirror, false)
+        .await
+        .unwrap();
+    let (_f, remote, _) = rig.remote(&rig.mirror, 2).await;
+    agree(&rig, &remote, "after the snapshot").await;
+    rig.seal(1, 2);
+    nuthatch::publish::sync(&rig.dir(), &rig.mirror, false)
+        .await
+        .unwrap();
+    let mut said = serde_json::Value::Null;
+    for _ in 0..100 {
+        said = holds_before_the_seal(&remote, 6, Duration::from_millis(50)).await;
+        if said["follower"]["mirror"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("followers = true"))
+        {
+            break;
+        }
+    }
+    assert!(
+        said["follower"]["mirror"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("does not publish for followers")),
+        "{said}"
+    );
+    rig.writer.stop();
+}
+
+/// The follower's cache keeps what its copies name and lets go of a folded segment once no copy
+/// has named it for the grace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folded_segment_leaves_the_follower_cache_after_the_grace() {
+    let rig = rig(6, None, None).await;
+    rig.publish().await;
+    let (_f, remote, cache) = rig
+        .remote_with(&rig.mirror, 2, Duration::from_millis(300))
+        .await;
+    agree(&rig, &remote, "after the snapshot").await;
+    rig.seal(1, 2);
+    rig.publish().await;
+    agree(&rig, &remote, "across a seal").await;
+    let first = rig.segment_hash();
+    let cached = |h: &str| cache.join("segments").join(format!("{h}.parquet")).exists();
+    assert!(cached(&first));
+    // Several sweeps past the grace: a file a copy names stays.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert!(cached(&first), "a segment the copy names was swept");
+
+    rig.seal(3, 5);
+    rig.publish().await;
+    let folded = agree(&rig, &remote, "across a fold").await;
+    let second = rig.segment_hash();
+    assert_ne!(first, second, "premise: the fold replaced it");
+    assert!(
+        wait_until(Duration::from_secs(10), || !cached(&first)).await,
+        "the folded segment stayed in the cache"
+    );
+    assert!(cached(&second));
+    assert_eq!(agree(&rig, &remote, "after the sweep").await, folded);
     rig.writer.stop();
 }
 

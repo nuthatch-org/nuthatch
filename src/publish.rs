@@ -754,6 +754,10 @@ pub(crate) struct Present {
     /// Whether the mirror's provisional segments have been listed, so ones a previous process left
     /// are let go of too.
     listed: bool,
+    /// Whether the followers marker is known to be on the mirror.
+    marked: bool,
+    /// `followers = true`: publish what a follower on another host reads. Never cleared by [`Present::of`].
+    followers: bool,
 }
 
 impl Present {
@@ -763,6 +767,7 @@ impl Present {
             self.held.clear();
             self.provisional.clear();
             self.listed = false;
+            self.marked = false;
         }
         &mut self.held
     }
@@ -784,6 +789,14 @@ async fn put_follower_files(
     let prefix = |k: &str| format!("{data_identity}/{k}");
     let mut put = Vec::new();
     present.of(data_identity);
+    if !present.marked {
+        let key = prefix(crate::remote_follow::FOLLOWERS_MARKER);
+        if mirror.head(&key).await?.is_none() {
+            mirror.put(&key, b"{\"followers\":true}").await?;
+            put.push(crate::remote_follow::FOLLOWERS_MARKER.to_string());
+        }
+        present.marked = true;
+    }
     let named: BTreeSet<&str> = local
         .tables
         .values()
@@ -1107,6 +1120,15 @@ pub async fn sync_with(
     .await
 }
 
+/// [`sync`] with `followers = true`: also what a follower on another host reads (RFC-0076 FR17).
+pub async fn sync_for_followers(dir: &Path, target: &str) -> Result<SyncReport> {
+    let mut present = Present {
+        followers: true,
+        ..Present::default()
+    };
+    sync_pass(dir, target, false, DEFAULT_PARALLELISM, None, &mut present).await
+}
+
 /// One reconcile pass, skipping the HEAD for every segment `present` already holds.
 async fn sync_pass(
     dir: &Path,
@@ -1264,8 +1286,11 @@ async fn sync_pass(
             uploaded.extend(put_seed(mirror.as_ref(), dir, &seed).await?);
         }
     }
-    uploaded
-        .extend(put_follower_files(mirror.as_ref(), dir, &data_identity, &local, present).await?);
+    if present.followers {
+        uploaded.extend(
+            put_follower_files(mirror.as_ref(), dir, &data_identity, &local, present).await?,
+        );
+    }
 
     Ok(SyncReport {
         dataset: data_identity,
@@ -1641,6 +1666,9 @@ pub struct Settings {
     pub target: String,
     pub interval: std::time::Duration,
     pub parallelism: usize,
+    /// Also publish what a follower on another host reads (RFC-0076 FR17). Off, a pass uploads and
+    /// deletes exactly what it did before followers existed.
+    pub followers: bool,
 }
 
 /// A running mirror. Dropping it stops the reconciler and cancels any upload in flight.
@@ -1691,7 +1719,10 @@ async fn reconcile(
     metrics.set_publish_enabled(&settings.target);
     let mut changes = seal::manifest_changes(&dir);
     let mut failures = Failures::default();
-    let mut present = Present::default();
+    let mut present = Present {
+        followers: settings.followers,
+        ..Present::default()
+    };
     loop {
         let pass = sync_pass(
             &dir,
@@ -2012,6 +2043,7 @@ mod tests {
             target,
             interval,
             parallelism,
+            followers: false,
         }
     }
 
@@ -3222,7 +3254,7 @@ abi = "abis/usdc.json"
         seal::set_follower_retention(&dir, GRACE, Duration::from_secs(60));
         let mirror_dir = tempfile::tempdir().unwrap();
         let target = mirror_dir.path().display().to_string();
-        let mut present = Present::default();
+        let mut present = Present { followers: true, ..Present::default() };
         async fn run(dir: &Path, target: &str, present: &mut Present) -> SyncReport {
             sync_pass(dir, target, false, 1, None, present)
                 .await
@@ -3282,7 +3314,7 @@ abi = "abis/usdc.json"
         seal::follower_gone(&dir, 4242);
         seal_range(&dir, &[row(3, 3)], 3, 3).unwrap().unwrap();
         seal::catalogue_moved(&dir, (9, 3));
-        let mut fresh = Present::default();
+        let mut fresh = Present { followers: true, ..Present::default() };
         pass!(&mut fresh).await;
         tokio::time::sleep(GRACE * 3).await;
         pass!(&mut fresh).await;
@@ -3306,7 +3338,7 @@ abi = "abis/usdc.json"
         crate::offchain::drop_file(&dir, &csv, "prices").unwrap();
         let mirror_dir = tempfile::tempdir().unwrap();
         let target = mirror_dir.path().display().to_string();
-        let report = sync(&dir, &target, false).await.unwrap();
+        let report = sync_for_followers(&dir, &target).await.unwrap();
         let id = report.dataset;
         assert!(
             report
@@ -3354,5 +3386,72 @@ abi = "abis/usdc.json"
         assert!(refused.is_err(), "a tampered snapshot was taken");
         assert!(!crate::offchain::catalogue_path(&other.path().join("data/t")).exists());
         assert!(!crate::offchain::segment_path(&other.path().join("data/t"), snapshot).exists());
+    }
+
+    /// With `followers` off, which every mirror published before RFC-0076 is, a pass puts on the
+    /// mirror exactly what it did in v5.13.0 and deletes nothing: no provisional segment, no
+    /// offchain snapshot, however many seals and folds there have been. On, it adds only those.
+    #[tokio::test]
+    async fn without_followers_a_mirror_gets_exactly_what_it_did_before() {
+        async fn run(followers: bool, name: &str) -> (Vec<String>, Vec<String>) {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("data").join("t");
+            std::fs::create_dir_all(&dir).unwrap();
+            write_nest(&dir);
+            test_set_table_floor(&dir, 2);
+            seal::set_follower_retention(&dir, Duration::ZERO, Duration::from_secs(60));
+            let csv = root.path().join("prices.csv");
+            std::fs::write(&csv, "token,price\nusdc,1\n").unwrap();
+            crate::offchain::drop_file(&dir, &csv, "prices").unwrap();
+            let target = format!("memory://{name}");
+            let mut present = Present {
+                followers,
+                ..Present::default()
+            };
+            let mut reported = Vec::new();
+            let mut pass = async |present: &mut Present| {
+                let r = sync_pass(&dir, &target, false, 1, None, present)
+                    .await
+                    .unwrap();
+                reported.extend(r.uploaded);
+                r.dataset
+            };
+            seal_range(&dir, &[row(1, 1), row(2, 2)], 1, 2).unwrap().unwrap();
+            seal_range(&dir, &[row(3, 3)], 3, 3).unwrap().unwrap();
+            pass(&mut present).await;
+            // A fold replaces the provisional tail with a final segment.
+            seal_range(&dir, &[row(4, 4)], 4, 4).unwrap().unwrap();
+            pass(&mut present).await;
+            let id = pass(&mut present).await;
+            let keys = open_mirror(&target).unwrap().list(&id).await.unwrap();
+            let keys = keys
+                .into_iter()
+                .map(|k| k.trim_start_matches(&format!("{id}/")).to_string())
+                .collect();
+            (keys, reported)
+        }
+        let (off, off_reported) = run(false, "followers-off").await;
+        let (on, on_reported) = run(true, "followers-on").await;
+        let follower_key = |k: &String| {
+            k.starts_with(crate::remote_follow::PROVISIONAL_DIR)
+                || k.starts_with(crate::remote_follow::OFFCHAIN_DIR)
+                || k == crate::remote_follow::FOLLOWERS_MARKER
+        };
+        assert!(!off.iter().any(follower_key), "followers off: {off:?}");
+        assert!(
+            !off_reported.iter().any(|k| k.starts_with('-')),
+            "followers off deleted {off_reported:?}"
+        );
+        assert!(
+            off.iter().filter(|k| k.ends_with(".parquet")).count() >= 2,
+            "premise: final segments were published: {off:?}"
+        );
+        let added: Vec<&String> = on.iter().filter(|k| !off.contains(k)).collect();
+        assert!(!added.is_empty() && added.iter().all(|k| follower_key(k)), "{added:?}");
+        assert!(off.iter().all(|k| on.contains(k)), "on: {on:?}, off: {off:?}");
+        assert!(
+            on_reported.iter().any(|k| k.starts_with('-')),
+            "premise: with followers on, the folded tail was deleted: {on_reported:?}"
+        );
     }
 }

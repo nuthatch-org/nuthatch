@@ -568,6 +568,8 @@ pub struct Follower {
     ack: tokio::sync::Notify,
     /// The last measured round trip of a report to the writer.
     rtt: Mutex<Option<Duration>>,
+    /// On another host: cached segments no copy names, with when that was first seen.
+    unnamed: Mutex<HashMap<String, Instant>>,
 }
 
 /// How a follower is started.
@@ -635,6 +637,7 @@ impl Follower {
             feed: options.feed,
             ack: tokio::sync::Notify::new(),
             rtt: Mutex::new(None),
+            unnamed: Mutex::default(),
             inner: Mutex::new(Inner {
                 pending: HashMap::new(),
                 routes: BTreeMap::new(),
@@ -689,15 +692,80 @@ impl Follower {
             .and_then(|r| r.spec.data_identity.clone())
     }
 
+    /// Delete cached segments that no copy here names, served, retiring or waiting on the mirror,
+    /// once none has named them for `grace`: what a fold replaced, or an unmounted dataset left.
+    fn sweep_cache(&self, grace: Duration) -> Result<()> {
+        let mut named: BTreeSet<String> = BTreeSet::new();
+        let mut name = |raw: Option<&str>| {
+            if let Some(m) = raw.and_then(|r| serde_json::from_str::<crate::seal::Manifest>(r).ok()) {
+                named.extend(m.tables.into_values().flatten().map(|s| s.hash));
+            }
+        };
+        {
+            let inner = self.lock();
+            let mut copies: Vec<Arc<MemStore>> =
+                inner.datasets.values().map(|d| d.store.clone()).collect();
+            copies.extend(
+                inner
+                    .retiring
+                    .iter()
+                    .filter_map(|r| r.store.as_ref()?.upgrade()),
+            );
+            for copy in copies {
+                name(copy.served_catalogue().flatten().as_deref());
+            }
+            for p in inner.pending.values() {
+                for line in &p.items {
+                    name(catalogue_of(line));
+                }
+            }
+        }
+        let dir = self.root.join(crate::seal::SEGMENTS_DIR);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("listing {}", dir.display())),
+        };
+        let mut unnamed = self.unnamed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = BTreeSet::new();
+        for entry in entries {
+            let entry = entry?;
+            let file = entry.file_name().to_string_lossy().into_owned();
+            let Some(hash) = file.strip_suffix(".parquet") else {
+                continue;
+            };
+            if named.contains(hash) {
+                continue;
+            }
+            seen.insert(hash.to_string());
+            let since = *unnamed.entry(hash.to_string()).or_insert_with(Instant::now);
+            if since.elapsed() >= grace {
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => tracing::debug!("{file}: no copy names it; removed from the cache"),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).with_context(|| format!("removing {file}")),
+                }
+            }
+        }
+        unnamed.retain(|h, _| seen.contains(h));
+        Ok(())
+    }
+
     /// Keep every held dataset's offchain snapshots at the mirror's, as a writer's pulls move them.
     /// Entities reading them catch up after the next window, by the code the writer runs.
     async fn keep_offchain(self: Arc<Self>) {
         let Some(remote) = self.remote.clone() else {
             return;
         };
-        let mut every = tokio::time::interval(OFFCHAIN_EVERY);
+        let period = OFFCHAIN_EVERY
+            .min(remote.cache_grace)
+            .max(Duration::from_millis(50));
+        let mut every = tokio::time::interval(period);
         loop {
             every.tick().await;
+            if let Err(e) = self.sweep_cache(remote.cache_grace) {
+                tracing::warn!("sweeping the follower's segment cache: {e:#}");
+            }
             // A nest the registry did not have is asked for again, as an operator publishes it.
             let unserved: Vec<(String, Spec)> = self
                 .lock()
@@ -1374,9 +1442,19 @@ impl Follower {
             let mut backoff = Duration::from_millis(100);
             loop {
                 let got = remote.fetch(&root, &prefix, &segments).await;
+                let mut error = got.as_ref().err().map(|e| format!("{e:#}"));
+                // A mirror that never publishes for followers would otherwise read as a slow one.
+                if got.is_err() && !remote.publishes_for_followers(&prefix).await.unwrap_or(true) {
+                    error = Some(format!(
+                        "the mirror does not publish for followers on other hosts, so it will never \
+                         have the files this seal names: set `followers = true` in the writer's \
+                         [runtime.publish] or [mounts.publish] ({})",
+                        error.unwrap_or_default()
+                    ));
+                }
                 let Some(me) = me.upgrade() else { return };
                 if let Some(p) = me.lock().pending.get_mut(&dataset) {
-                    p.error = got.as_ref().err().map(|e| format!("{e:#}"));
+                    p.error = error;
                 }
                 if got.is_ok() {
                     crate::feed_metrics::metrics().seal_waited(started.elapsed());

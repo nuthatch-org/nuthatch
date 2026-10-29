@@ -212,6 +212,11 @@ pub struct MountPublish {
     pub interval: String,
     #[serde(default = "default_publish_parallelism")]
     pub parallelism: usize,
+    /// `followers = true`: also publish provisional segments and offchain snapshots, and delete
+    /// folded provisional segments, for followers on other hosts (RFC-0076 FR17). Off by default:
+    /// offchain snapshots may be data an operator never meant to publish.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub followers: bool,
 }
 
 fn default_publish_interval() -> String {
@@ -242,6 +247,7 @@ impl MountPublish {
             target: self.target.clone(),
             interval,
             parallelism: self.parallelism,
+            followers: self.followers,
         })
     }
 }
@@ -7387,6 +7393,7 @@ mod tests {
             target: mirror.path().to_str().unwrap().to_string(),
             interval: "1h".into(),
             parallelism: 2,
+            followers: false,
         });
         let mut quiet = table.mounts[0].clone();
         quiet.alias = "quiet".into();

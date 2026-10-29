@@ -36,6 +36,9 @@ pub fn offchain_key(file: &str) -> String {
 }
 
 pub const OFFCHAIN_CATALOGUE: &str = "_offchain/manifest.json";
+/// Under a dataset's mirror prefix: written by a publisher with `followers = true`, so a follower can
+/// tell a mirror without its files from one that has not uploaded them yet.
+pub const FOLLOWERS_MARKER: &str = "_followers.json";
 
 /// Where a follower's sources are.
 pub struct Remote {
@@ -43,6 +46,9 @@ pub struct Remote {
     registry: String,
     /// The per-cursor budget, which a follower with no `mounts.toml` of the writer's is given.
     pub max_rss_mb: u64,
+    /// How long a fetched segment no copy names is kept before it is deleted from the cache: the
+    /// same grace a writer keeps a folded segment for its followers.
+    pub cache_grace: std::time::Duration,
 }
 
 /// A segment a catalogue names that the mirror did not have, or that did not verify.
@@ -150,7 +156,17 @@ impl Remote {
                 .with_context(|| "opening the mirror".to_string())?,
             registry: registry.to_string(),
             max_rss_mb,
+            cache_grace: crate::seal::FOLLOWER_GRACE,
         })
+    }
+
+    /// Whether the publisher of `prefix` publishes for followers (`followers = true`).
+    pub async fn publishes_for_followers(&self, prefix: &str) -> Result<bool> {
+        Ok(self
+            .mirror
+            .head(&format!("{prefix}/{FOLLOWERS_MARKER}"))
+            .await?
+            .is_some())
     }
 
     /// Install the nest `nid` at `root/dataset` from the registry, verified, unless it is there.
