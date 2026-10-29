@@ -15143,7 +15143,17 @@ template = "pool"
                 break Err(format!("the cursor ended: {:?}", (&mut task).await));
             }
             let tip = chain.tip.load(std::sync::atomic::Ordering::SeqCst);
-            if tip < REORG_TIP && last_tick.elapsed() >= std::time::Duration::from_millis(15) {
+            // A case slowed after the flip holds the tip short of it until every nest has committed
+            // past the fork, so there is stale data for a marker to undo however slow the machine.
+            let held = case.slow_after_flip_ms > 0
+                && tip + 1 == case.flip_at
+                && !stores
+                    .iter()
+                    .all(|s| last_block_of(s.as_ref()) == Some(tip));
+            if tip < REORG_TIP
+                && !held
+                && last_tick.elapsed() >= std::time::Duration::from_millis(15)
+            {
                 if tip + 1 == case.flip_at {
                     if case.slow_after_flip_ms > 0 {
                         let mut slowed = slowed_nests().lock().unwrap();
