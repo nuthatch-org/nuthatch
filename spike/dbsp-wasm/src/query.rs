@@ -123,6 +123,96 @@ impl TabQuery {
         }
         Ok(out)
     }
+
+    /// `/sql`'s rows, columns and whether more than `cap` rows were left out, as
+    /// `engine_burrmill`'s `collect` gives them. Dates are not rewritten to ISO text as the node's
+    /// are; no table a tab nest holds has one.
+    pub async fn collect(
+        &self,
+        sql: &str,
+        cap: usize,
+    ) -> Result<(Vec<Value>, Vec<String>, bool), burrmill::BurrmillError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let batches = self.engine.sql(sql)?;
+        #[cfg(target_arch = "wasm32")]
+        let batches = self.engine.sql_async(sql).await?;
+        let mut columns: Vec<String> = match batches.first() {
+            Some(b) => b.schema().fields().iter().map(|f| f.name().clone()).collect(),
+            None => Vec::new(),
+        };
+        let mut rows = Vec::new();
+        for b in &batches {
+            rows.extend(burrmill::df::encode::rows(b)?);
+            if rows.len() > cap {
+                break;
+            }
+        }
+        let truncated = rows.len() > cap;
+        rows.truncate(cap);
+        if columns.is_empty() {
+            if let Ok(described) = self.engine.describe(sql) {
+                columns = described.into_iter().map(|(name, _)| name).collect();
+            }
+        }
+        Ok((rows, columns, truncated))
+    }
+
+    /// Plan `sql` without running it, as `/explain` does.
+    pub fn plan(&self, sql: &str) -> Result<(), burrmill::BurrmillError> {
+        self.engine.describe(sql).map(|_| ())
+    }
+}
+
+/// The base tables `sql` reads, lowercased, followed through the authored views, as the node's
+/// `reject_unknown_table_refs` and `expand_through_views` find them. `None` where it does not parse.
+pub fn referenced_tables(
+    sql: &str,
+    files: &NestFiles,
+) -> Option<Result<BTreeSet<String>, burrmill::BurrmillError>> {
+    let named = match burrmill::inspect::reach(sql) {
+        Ok(r) => r.tables,
+        Err(burrmill::BurrmillError::Parse(_)) => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    let bodies = view_bodies(files).unwrap_or_default();
+    let mut out = named.clone();
+    let mut frontier: Vec<String> = named.into_iter().collect();
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for name in frontier.drain(..) {
+            let Some(inner) = bodies
+                .get(&name)
+                .and_then(|b| burrmill::inspect::base_tables(b))
+            else {
+                continue;
+            };
+            for t in inner {
+                if out.insert(t.clone()) {
+                    next.push(t);
+                }
+            }
+        }
+        frontier = next;
+    }
+    Some(Ok(out))
+}
+
+/// Each authored view's lowercased name and the query it registers.
+fn view_bodies(files: &NestFiles) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for (path, text) in files {
+        if path.starts_with("views/") && path.ends_with(".sql") {
+            let stmts =
+                sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, text)?;
+            for s in stmts {
+                if let sqlparser::ast::Statement::CreateView(v) = s {
+                    let name = v.name.to_string().trim_matches('"').to_ascii_lowercase();
+                    out.insert(name, v.query.to_string());
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Rows in an order neither engine chose: each by its text with the keys sorted, as

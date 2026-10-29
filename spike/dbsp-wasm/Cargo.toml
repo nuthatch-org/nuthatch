@@ -36,6 +36,9 @@ object_store = { version = "0.13", default-features = false }
 futures = "0.3"
 bytes = "1"
 hex = "0.4"
+nuthatch-scaffold = { path = "../../scaffold" }
+form_urlencoded = "1"
+percent-encoding = "2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_64", "validation"] }
