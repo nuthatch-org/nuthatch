@@ -417,8 +417,11 @@ async fn a_remote_follower_answers_as_a_local_one_does() {
     assert!(cache.join("data").join(ROUTE).join("nuthatch.toml").exists());
     assert!(!cache.starts_with(&rig.root) && !rig.root.starts_with(&cache));
 
-    // A seal: the segment comes from the mirror, verified, and the follower moves with it.
+    // A seal: the segment comes from the mirror, verified, and the follower moves with it. Made
+    // final before it is published, so the mirror has it only where a final segment goes while the
+    // delta's catalogue still calls it provisional.
     rig.seal(1, 2);
+    assert!(!nuthatch::seal::finalise_provisional(&rig.dir()).unwrap().is_empty());
     rig.publish().await;
     let sealed = agree(&rig, &remote, "across a seal").await;
     assert_eq!(sealed["sealed_through"], 2);

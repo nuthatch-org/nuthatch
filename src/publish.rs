@@ -3212,4 +3212,143 @@ abi = "abis/usdc.json"
         assert_eq!(std::fs::read(&dest).unwrap(), vec![7u8; 4096]);
         server.abort();
     }
+
+    /// RFC-0076 FR17: a provisional segment a fold replaced stays on the mirror while a follower of
+    /// its dataset may still name it, by the rule that keeps it on disk, and goes once that follower
+    /// has applied the commit that stopped naming it and the grace has run.
+    #[tokio::test]
+    async fn a_folded_provisional_segment_leaves_the_mirror_only_once_followers_move_on() {
+        const GRACE: Duration = Duration::from_millis(100);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("data").join("t");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_nest(&dir);
+        test_set_table_floor(&dir, 100);
+        seal::set_follower_retention(&dir, GRACE, Duration::from_secs(60));
+        let mirror_dir = tempfile::tempdir().unwrap();
+        let target = mirror_dir.path().display().to_string();
+        let mut present = Present::default();
+        async fn run(dir: &Path, target: &str, present: &mut Present) -> SyncReport {
+            sync_pass(dir, target, false, 1, None, present)
+                .await
+                .unwrap()
+        }
+        macro_rules! pass {
+            ($p:expr) => {
+                run(&dir, &target, $p)
+            };
+        }
+        let tail = || {
+            seal::load_manifest(&dir).unwrap().tables["usdc__transfer"][0]
+                .hash
+                .clone()
+        };
+        let on_mirror = |id: &str, hash: &str| {
+            mirror_dir
+                .path()
+                .join(id)
+                .join(crate::remote_follow::provisional_key(hash))
+                .exists()
+        };
+
+        seal_range(&dir, &[row(1, 1)], 1, 1).unwrap().unwrap();
+        let first = tail();
+        let report = pass!(&mut present).await;
+        let id = report.dataset.clone();
+        assert!(on_mirror(&id, &first), "a provisional segment is published for followers");
+
+        seal::follower_connected(&dir, 4242);
+        seal_range(&dir, &[row(2, 2)], 2, 2).unwrap().unwrap();
+        seal::catalogue_moved(&dir, (9, 2));
+        let second = tail();
+        assert_ne!(first, second, "premise: the second seal folded the first");
+        pass!(&mut present).await;
+        tokio::time::sleep(GRACE * 3).await;
+        pass!(&mut present).await;
+        assert!(on_mirror(&id, &second));
+        assert!(
+            on_mirror(&id, &first),
+            "kept past the grace while the follower has not applied the commit"
+        );
+
+        seal::follower_applied(&dir, 4242, (9, 2));
+        pass!(&mut present).await;
+        assert!(!on_mirror(&id, &first), "deleted once the follower moved on");
+        assert!(on_mirror(&id, &second));
+
+        // A provisional segment nobody follows goes after the grace, and one a previous process
+        // left behind is found by listing.
+        seal::follower_gone(&dir, 4242);
+        seal_range(&dir, &[row(3, 3)], 3, 3).unwrap().unwrap();
+        seal::catalogue_moved(&dir, (9, 3));
+        let mut fresh = Present::default();
+        pass!(&mut fresh).await;
+        tokio::time::sleep(GRACE * 3).await;
+        pass!(&mut fresh).await;
+        assert!(!on_mirror(&id, &second), "an unfollowed tail goes after the grace");
+        assert!(on_mirror(&id, &tail()));
+    }
+
+    /// RFC-0076 FR17: offchain snapshots go to the mirror content-addressed, and a follower on
+    /// another host brings its copy up to them, each file checked against its hash.
+    #[tokio::test]
+    async fn offchain_snapshots_reach_a_remote_follower_verified() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("data").join("t");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_nest(&dir);
+        let csv = root.path().join("prices.csv");
+        std::fs::write(&csv, "token,price\nusdc,1\nweth,3000\n").unwrap();
+        crate::offchain::drop_file(&dir, &csv, "prices").unwrap();
+        let mirror_dir = tempfile::tempdir().unwrap();
+        let target = mirror_dir.path().display().to_string();
+        let report = sync(&dir, &target, false).await.unwrap();
+        let id = report.dataset;
+        assert!(
+            report
+                .uploaded
+                .iter()
+                .any(|k| k == crate::remote_follow::OFFCHAIN_CATALOGUE),
+            "{:?}",
+            report.uploaded
+        );
+
+        let remote = crate::remote_follow::Remote::open(&target, "unused", 2048).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cache.path().join("data/t")).unwrap();
+        assert!(remote
+            .sync_offchain(cache.path(), "data/t", &id)
+            .await
+            .unwrap());
+        let theirs = crate::offchain::load(&dir).unwrap();
+        let ours = crate::offchain::load(&cache.path().join("data/t")).unwrap();
+        let snapshot = &ours.tables["prices"][0];
+        assert_eq!(snapshot.hash, theirs.tables["prices"][0].hash);
+        let file = crate::offchain::segment_path(&cache.path().join("data/t"), snapshot);
+        assert_eq!(
+            sha256_hex(&std::fs::read(&file).unwrap()),
+            snapshot.hash,
+            "the copy is the bytes its catalogue names"
+        );
+        assert!(
+            !remote
+                .sync_offchain(cache.path(), "data/t", &id)
+                .await
+                .unwrap(),
+            "nothing to do the second time"
+        );
+
+        // Bytes that do not hash to the name are refused, and no catalogue names them.
+        let on_mirror = mirror_dir
+            .path()
+            .join(&id)
+            .join(crate::remote_follow::offchain_key(&snapshot.file));
+        std::fs::write(&on_mirror, b"not the snapshot").unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(other.path().join("data/t")).unwrap();
+        let refused = remote.sync_offchain(other.path(), "data/t", &id).await;
+        assert!(refused.is_err(), "a tampered snapshot was taken");
+        assert!(!crate::offchain::catalogue_path(&other.path().join("data/t")).exists());
+        assert!(!crate::offchain::segment_path(&other.path().join("data/t"), snapshot).exists());
+    }
 }
