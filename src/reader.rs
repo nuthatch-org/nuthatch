@@ -697,7 +697,8 @@ impl Follower {
     fn sweep_cache(&self, grace: Duration) -> Result<()> {
         let mut named: BTreeSet<String> = BTreeSet::new();
         let mut name = |raw: Option<&str>| {
-            if let Some(m) = raw.and_then(|r| serde_json::from_str::<crate::seal::Manifest>(r).ok()) {
+            if let Some(m) = raw.and_then(|r| serde_json::from_str::<crate::seal::Manifest>(r).ok())
+            {
                 named.extend(m.tables.into_values().flatten().map(|s| s.hash));
             }
         };
@@ -1444,7 +1445,12 @@ impl Follower {
                 let got = remote.fetch(&root, &prefix, &segments).await;
                 let mut error = got.as_ref().err().map(|e| format!("{e:#}"));
                 // A mirror that never publishes for followers would otherwise read as a slow one.
-                if got.is_err() && !remote.publishes_for_followers(&prefix).await.unwrap_or(true) {
+                if got.is_err()
+                    && !remote
+                        .publishes_for_followers(&prefix)
+                        .await
+                        .unwrap_or(true)
+                {
                     error = Some(format!(
                         "the mirror does not publish for followers on other hosts, so it will never \
                          have the files this seal names: set `followers = true` in the writer's \

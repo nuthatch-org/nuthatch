@@ -3254,7 +3254,10 @@ abi = "abis/usdc.json"
         seal::set_follower_retention(&dir, GRACE, Duration::from_secs(60));
         let mirror_dir = tempfile::tempdir().unwrap();
         let target = mirror_dir.path().display().to_string();
-        let mut present = Present { followers: true, ..Present::default() };
+        let mut present = Present {
+            followers: true,
+            ..Present::default()
+        };
         async fn run(dir: &Path, target: &str, present: &mut Present) -> SyncReport {
             sync_pass(dir, target, false, 1, None, present)
                 .await
@@ -3314,7 +3317,10 @@ abi = "abis/usdc.json"
         seal::follower_gone(&dir, 4242);
         seal_range(&dir, &[row(3, 3)], 3, 3).unwrap().unwrap();
         seal::catalogue_moved(&dir, (9, 3));
-        let mut fresh = Present { followers: true, ..Present::default() };
+        let mut fresh = Present {
+            followers: true,
+            ..Present::default()
+        };
         pass!(&mut fresh).await;
         tokio::time::sleep(GRACE * 3).await;
         pass!(&mut fresh).await;
@@ -3416,7 +3422,9 @@ abi = "abis/usdc.json"
                 reported.extend(r.uploaded);
                 r.dataset
             };
-            seal_range(&dir, &[row(1, 1), row(2, 2)], 1, 2).unwrap().unwrap();
+            seal_range(&dir, &[row(1, 1), row(2, 2)], 1, 2)
+                .unwrap()
+                .unwrap();
             seal_range(&dir, &[row(3, 3)], 3, 3).unwrap().unwrap();
             pass(&mut present).await;
             // A fold replaces the provisional tail with a final segment.
@@ -3447,8 +3455,14 @@ abi = "abis/usdc.json"
             "premise: final segments were published: {off:?}"
         );
         let added: Vec<&String> = on.iter().filter(|k| !off.contains(k)).collect();
-        assert!(!added.is_empty() && added.iter().all(|k| follower_key(k)), "{added:?}");
-        assert!(off.iter().all(|k| on.contains(k)), "on: {on:?}, off: {off:?}");
+        assert!(
+            !added.is_empty() && added.iter().all(|k| follower_key(k)),
+            "{added:?}"
+        );
+        assert!(
+            off.iter().all(|k| on.contains(k)),
+            "on: {on:?}, off: {off:?}"
+        );
         assert!(
             on_reported.iter().any(|k| k.starts_with('-')),
             "premise: with followers on, the folded tail was deleted: {on_reported:?}"

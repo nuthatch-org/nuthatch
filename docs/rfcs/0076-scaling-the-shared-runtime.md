@@ -312,6 +312,13 @@ long, and the last error. The publisher now also uploads each provisional segmen
 deleted anything from a mirror before; it now deletes a provisional segment a fold replaced, and only
 that, by `seal`'s `releasable` rule: every connected follower of the dataset has applied the commit
 that stopped naming it and the grace has passed, or the hour is up. Final segments stay append-only.
+All of this is behind `followers = true` in `[runtime.publish]` or `[mounts.publish]`, off by
+default: offchain snapshots may be data an operator never meant to publish, a public mirror's
+credentials may not allow deletes, and with it off a pass puts and deletes exactly what 5.13.0 did.
+On, the publisher also writes `_followers.json`, and a follower whose seal waits on a prefix without
+it says on `/ready` that the mirror does not publish for followers. The follower's `--cache` deletes a
+segment once no copy it holds, retiring copies and lines waiting on the mirror included, has named it
+for the same 5-minute grace.
 
 Feed v2 is negotiated by `?feed=2` and answered with its own content type, so a follower facing a
 writer that predates it reads v1, and a writer facing an old follower sends v1. Visibility,
@@ -368,17 +375,23 @@ the delta still calls it provisional, and over v1 too; the same against versityg
 registry (the `minio-publish` job); a slow mirror, a mirror missing the file and one serving the wrong
 bytes each leave it answering the generation before the seal, 200 and whole. `publish.rs` tests the
 mirror deletion against a follower that has and has not moved on, and offchain snapshots end to end
-with a tampered one refused. `scripts/rolling-upgrade.sh` gains a leg with a separate process, its
+with a tampered one refused, and that with `followers` off a seal and a fold leave a `memory://`
+mirror with no key a 5.13.0 pass would not have put and nothing deleted.
+`a_mirror_not_published_for_followers_says_so` and
+`a_folded_segment_leaves_the_follower_cache_after_the_grace` cover the follower side.
+`scripts/rolling-upgrade.sh` gains a leg with a separate process, its
 own directory, the registry and a filesystem mirror; its chain never seals, so it gates the CLI, the
 processes and the registry, and the e2e gates segments.
 
 Mutation checks, each red: applying a sealing delta before its files are in (a `503` where the
 held generation should answer, `a held seal is never a refusal`); skipping the hash check (a short
 answer, 4 rows of 6 with `degraded: true`, and a tampered offchain snapshot taken); splitting a row
-whose text the columns cannot rebuild (`a_v2_delta_decodes_to_exactly_the_delta_encoded`).
+whose text the columns cannot rebuild (`a_v2_delta_decodes_to_exactly_the_delta_encoded`);
+publishing follower files with `followers` off (`_followers.json`, `_offchain/` listed on the off
+mirror); sweeping a cached segment a copy names (a `503`, `a sealed segment this copy names is gone
+from disk`); dropping the marker check (`/ready` says only that the mirror lacks the file).
 
 **Not done.** Network namespaces: the gate's remote follower shares the host's loopback, and
-GraphOps's second-region environment answers the latency criterion, which CI cannot. A follower's
-`--cache` is never swept; tails later folded away stay until the operator clears it. An offchain
+GraphOps's second-region environment answers the latency criterion, which CI cannot. An offchain
 pull moving a dataset's data identity, and so its mirror prefix, predates this slice; a remote
 follower follows the new prefix within 30 s, once the publisher has refilled it.

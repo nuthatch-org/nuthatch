@@ -340,8 +340,9 @@ the same `as_of`, `sealed_through` and `nid`.
   `--cache` is the follower's own directory, laid out as a runtime's, and nothing in it is the
   writer's. Every remote source is one the operator names on the command line; credentials for an
   `s3://` mirror or registry come from the `AWS_*` environment, as publishing's do. Publish every
-  mount a remote follower serves (`[mounts.publish]` or `[runtime.publish]`), and publish each
-  nest's bundle to the registry (`nuthatch nest publish`): a mount whose NID the registry lacks
+  mount a remote follower serves (`[mounts.publish]` or `[runtime.publish]`, with
+  `followers = true`), and publish each nest's bundle to the registry (`nuthatch nest publish`): a
+  mount whose NID the registry lacks
   answers `503` `unservable` with why, and is asked for again every 5 s.
 - **A seal is applied whole, once its files are in.** A sealing delta moves rows from hot into a
   segment, so a follower cannot apply half of one. On another host, a delta whose catalogue names a
@@ -354,16 +355,23 @@ the same `as_of`, `sealed_through` and `nid`.
   publisher uploads after the writer's catalogue moves and the writer never waits for a follower,
   so a slow mirror shows as seal visibility lag on remote followers, which is reported apart from
   tip visibility, and never anywhere else.
-- **Provisional segments are on the mirror for followers only.** The published catalogue leaves a
-  table's provisional tail out, as before; the publisher also uploads each tail under
-  `_provisional/<hash>.seg`, where only a follower looks. A tail a fold replaced is deleted from the
-  mirror by the rule that keeps it on disk: once every connected follower of its dataset has
-  applied the commit that stopped naming it and 5 minutes have passed, and at most after an hour.
-  Nothing else is ever deleted from a mirror; sealed segments are append-only.
-- **Not yet:** a follower's `--cache` keeps every segment it has fetched, including tails later
-  folded away, until the operator clears it with the follower stopped. A writer whose dataset takes
-  an offchain pull moves its data identity, and with it the prefix its publisher mirrors under; a
-  remote follower follows the new prefix within 30 s, once the publisher has filled it.
+- **The mirror publishes for followers only when asked.** Set `followers = true` in the
+  `[runtime.publish]` or `[mounts.publish]` a remote follower reads. Off, which is the default and
+  every mirror published before it, a publish pass puts and deletes exactly what 5.13.0 did. On, the
+  publisher also uploads each table's provisional tail under `_provisional/<hash>.seg` (the
+  published catalogue still leaves tails out), the dataset's offchain snapshots and their catalogue
+  under `_offchain/`, and a `_followers.json` marker. Offchain snapshots may be data you did not mean
+  to publish, so turn it on only for a mirror you would publish them to. It also deletes: a tail a
+  fold replaced goes from the mirror by the rule that keeps it on disk, once every connected
+  follower of its dataset has applied the commit that stopped naming it and 5 minutes have passed,
+  and at most after an hour, so the credentials need delete. Nothing else is ever deleted; sealed
+  segments are append-only. A remote follower whose seal waits on a mirror without the marker says
+  so in `follower.mirror.error`, rather than looking like it waits on a slow one.
+- **The follower's cache is bounded.** A segment no copy it holds names, served, still in use by a
+  request, or waiting on the mirror, is deleted from `--cache` once none has named it for 5 minutes.
+- **Not yet:** a writer whose dataset takes an offchain pull moves its data identity, and with it
+  the prefix its publisher mirrors under; a remote follower follows the new prefix within 30 s, once
+  the publisher has filled it.
 
 A writer's restart, measured in-process on one cursor at 1, 10, 100 and 500 small mounts
 ([docs/bench/rfc-0073-fr7-restart-to-ready.md](bench/rfc-0073-fr7-restart-to-ready.md)), took 9 ms,

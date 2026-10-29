@@ -184,6 +184,7 @@ cat >>"$rt/mounts.toml" <<EOF
 [runtime.publish]
 target = "$mirror"
 interval = "1s"
+followers = true
 EOF
 nid=$(ls "$rt/data" | head -n 1)
 [ -n "$nid" ] || die "migrate left no dataset under $rt/data"
