@@ -2144,7 +2144,8 @@ pub async fn dev(
             .mounts
             .iter()
             .find(|r| mount_route(r, default_tenant) == *name)
-            .and_then(|r| r.limits.window_deadline());
+            .map(|r| r.limits.window_deadline())
+            .or(Some(None));
         config.runtime_dir = Some(dir.clone());
         stamp_operator_settings(
             config,
@@ -6187,7 +6188,7 @@ impl RuntimeHandles {
         }
         if let Some(mb) = max_rss_mb {
             self.mount_ctx.max_rss_mb = mb;
-            indexer::set_cursor_ceiling_mb(mb);
+            indexer::set_cursor_ceiling_mb(&self.mount_ctx.dir, mb);
             self.roster["max_rss_mb_per_cursor"] = serde_json::json!(mb);
             self.live.swap(self.compose()?);
             tracing::info!("per-cursor ceiling set to {mb} MB");
@@ -6492,9 +6493,10 @@ impl RuntimeHandles {
                     &self.mount_ctx.state_rpc,
                 );
                 config.cursor_max_rss_mb = Some(self.mount_ctx.max_rss_mb);
-                config.window_deadline = self
-                    .surface_record(name)
-                    .and_then(|r| r.limits.window_deadline());
+                config.window_deadline = Some(
+                    self.surface_record(name)
+                        .and_then(|r| r.limits.window_deadline()),
+                );
                 config.runtime_dir = Some(self.mount_ctx.dir.clone());
                 config.cursor_sql_permits = Some(self.mount_ctx.sql_permits);
                 if let Some(e) = self

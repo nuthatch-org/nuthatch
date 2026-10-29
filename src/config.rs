@@ -138,10 +138,11 @@ pub struct Config {
     /// outside a runtime, where the default holds. `#[serde(skip)]` like `chain_policy`.
     #[serde(skip)]
     pub cursor_max_rss_mb: Option<u64>,
-    /// The shortest `[mounts.limits] window_deadline_ms` of this dataset's mounts (RFC-0076 §3.2).
+    /// The indexing mount's `[mounts.limits] window_deadline_ms` (RFC-0076 §3.2): `Some` only when
+    /// stamped from the mount that indexes the dataset, so another mount's build leaves it alone.
     /// Mount config, so `#[serde(skip)]` like `cursor_max_rss_mb`.
     #[serde(skip)]
-    pub window_deadline: Option<std::time::Duration>,
+    pub window_deadline: Option<Option<std::time::Duration>>,
     /// The runtime's directory, whose `cursors/<chain>/buffer/` a buffered cursor spills to. `None`
     /// outside a runtime. `#[serde(skip)]` like `cursor_max_rss_mb`.
     #[serde(skip)]

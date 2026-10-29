@@ -3667,7 +3667,9 @@ async fn build_nest(
         rewound: None,
         window_deadline: {
             let d = WindowDeadline::of_dataset(&dir);
-            d.set(config.window_deadline);
+            if let Some(deadline) = config.window_deadline {
+                d.set(deadline);
+            }
             d
         },
         overruns: 0,
@@ -16977,6 +16979,57 @@ template = "pool"
             "a window whose commit landed ({stored} rows stored) reported {r:?} after {} overruns",
             nest.metrics.window_overruns()
         );
+    }
+
+    /// The window deadline is the indexing mount's: a nest built from another mount's config of the
+    /// same dataset, before or after the indexing one, leaves it as the indexing mount set it.
+    #[tokio::test]
+    async fn only_the_indexing_mount_sets_its_datasets_window_deadline() {
+        let deadline = Some(std::time::Duration::from_millis(40));
+        for alias_first in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            build_test_nest(d.path(), S0_A).await;
+            let build = |window_deadline| {
+                let mut config = Config::load(d.path()).unwrap();
+                config.window_deadline = window_deadline;
+                let dir = d.path().to_path_buf();
+                async move {
+                    let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+                    let (nest, state, worker, _w) = build_nest(
+                        &source,
+                        dir,
+                        &config,
+                        None,
+                        false,
+                        None,
+                        None,
+                        serve::new_sql_gate(),
+                    )
+                    .await
+                    .unwrap();
+                    if let Some(w) = worker {
+                        w.abort();
+                        let _ = w.await;
+                    }
+                    let released = nest.store.released();
+                    drop((nest, state));
+                    released.await;
+                }
+            };
+            if alias_first {
+                build(None).await;
+                build(Some(deadline)).await;
+            } else {
+                build(Some(deadline)).await;
+                build(None).await;
+            }
+            assert_eq!(
+                window_deadline_of(d.path()),
+                deadline,
+                "alias built {}",
+                if alias_first { "first" } else { "after" }
+            );
+        }
     }
 
     /// "A slow nest holds its co-tenants", resolved: with a deadline its windows are abandoned at

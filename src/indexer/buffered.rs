@@ -65,13 +65,26 @@ pub(crate) fn window_buffer_mb_at(ceiling_mb: u64) -> u64 {
     WINDOW_BUFFER_MB_AT_DEFAULT.saturating_mul(ceiling_mb) / crate::runtime::DEFAULT_MAX_RSS_MB
 }
 
-/// The per-cursor ceiling buffers are bounded by: one runtime per process, so one value, and
-/// `PUT /_admin/runtime` moves it for running cursors too.
-static CEILING_MB: AtomicU64 = AtomicU64::new(crate::runtime::DEFAULT_MAX_RSS_MB);
+/// Every buffered cursor's ceiling, by the runtime directory it belongs to, so
+/// `PUT /_admin/runtime` moves its own runtime's cursors and no other's.
+fn ceilings() -> &'static Mutex<Vec<(Option<PathBuf>, std::sync::Weak<AtomicU64>)>> {
+    static CEILINGS: std::sync::OnceLock<Mutex<Vec<(Option<PathBuf>, std::sync::Weak<AtomicU64>)>>> =
+        std::sync::OnceLock::new();
+    CEILINGS.get_or_init(Default::default)
+}
 
-/// Set the per-cursor ceiling every buffered cursor's byte bound follows.
-pub fn set_cursor_ceiling_mb(mb: u64) {
-    CEILING_MB.store(mb, Ordering::Relaxed);
+/// Set the per-cursor ceiling the byte bound of each buffered cursor of the runtime at `runtime_dir`
+/// follows.
+pub fn set_cursor_ceiling_mb(runtime_dir: &Path, mb: u64) {
+    let mut all = ceilings().lock().unwrap();
+    all.retain(|(_, c)| c.strong_count() > 0);
+    for (dir, cell) in all.iter() {
+        if dir.as_deref() == Some(runtime_dir) {
+            if let Some(cell) = cell.upgrade() {
+                cell.store(mb, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// `<runtime>/cursors/<chain>/buffer/`: scratch, never data.
@@ -102,6 +115,8 @@ pub(crate) struct BufferOptions {
     pub(crate) ingest_concurrency: usize,
     pub(crate) stats: Arc<BufferStats>,
     pub(crate) chain: String,
+    /// This cursor's `max_rss_mb`, which the memory bound follows when `memory_bytes` is `None`.
+    ceiling_mb: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -135,7 +150,20 @@ impl BufferOptions {
         runtime_dir: Option<&Path>,
     ) -> Option<Self> {
         let windows = buffer_windows()?;
-        set_cursor_ceiling_mb(max_rss_mb);
+        Some(Self::with_ceiling(windows, chain, max_rss_mb, runtime_dir))
+    }
+
+    pub(crate) fn with_ceiling(
+        windows: usize,
+        chain: &str,
+        max_rss_mb: u64,
+        runtime_dir: Option<&Path>,
+    ) -> Self {
+        let ceiling_mb = Arc::new(AtomicU64::new(max_rss_mb));
+        ceilings()
+            .lock()
+            .unwrap()
+            .push((runtime_dir.map(Path::to_path_buf), Arc::downgrade(&ceiling_mb)));
         let spill = runtime_dir.and_then(|r| {
             let dir = scratch_dir(r, chain);
             match std::fs::remove_dir_all(&dir) {
@@ -155,20 +183,21 @@ impl BufferOptions {
                 }
             }
         });
-        Some(Self {
+        Self {
             windows,
             memory_bytes: None,
             spill,
             ingest_concurrency: default_ingest_concurrency(),
             stats: Arc::default(),
             chain: chain.to_string(),
-        })
+            ceiling_mb,
+        }
     }
 
     /// Bytes of windows the buffer may hold in memory.
     pub(crate) fn memory_bound(&self) -> u64 {
         self.memory_bytes
-            .unwrap_or_else(|| window_buffer_mb_at(CEILING_MB.load(Ordering::Relaxed)) << 20)
+            .unwrap_or_else(|| window_buffer_mb_at(self.ceiling_mb.load(Ordering::Relaxed)) << 20)
     }
 
     fn spill_bound(&self) -> Option<u64> {
@@ -186,6 +215,7 @@ impl BufferOptions {
             ingest_concurrency: 4,
             stats: Arc::default(),
             chain: format!("test-{}", TEST_CHAIN.fetch_add(1, Ordering::Relaxed)),
+            ceiling_mb: Arc::new(AtomicU64::new(crate::runtime::DEFAULT_MAX_RSS_MB)),
         }
     }
 }
@@ -1838,6 +1868,27 @@ mod tests {
         assert_eq!(window_buffer_mb_at(1024), 32);
         assert_eq!(window_buffer_mb_at(4096), 128);
         assert_eq!(window_buffer_mb_at(2047), 63, "rounded down, never up");
+    }
+
+    /// Two cursors on different ceilings each hold their own bound, and a live change of one
+    /// runtime's ceiling moves only that runtime's cursors.
+    #[test]
+    fn each_cursor_holds_the_bound_of_its_own_ceiling() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let small = BufferOptions::with_ceiling(8, "small", 512, Some(a.path()));
+        let large = BufferOptions::with_ceiling(8, "large", 2048, Some(b.path()));
+        assert_eq!(
+            (small.memory_bound() >> 20, large.memory_bound() >> 20),
+            (window_buffer_mb_at(512), window_buffer_mb_at(2048)),
+            "each cursor is bounded by its own ceiling, whichever was built last"
+        );
+        set_cursor_ceiling_mb(a.path(), 1024);
+        assert_eq!(small.memory_bound() >> 20, window_buffer_mb_at(1024));
+        assert_eq!(
+            large.memory_bound() >> 20,
+            window_buffer_mb_at(2048),
+            "another runtime's ceiling does not move this cursor's bound"
+        );
     }
 
     #[test]
