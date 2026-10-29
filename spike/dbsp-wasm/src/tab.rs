@@ -2,7 +2,8 @@
 //! backend the worker opened, the three built-in views driven inline, and the node's tip loop:
 //! verify the last checkpoint, roll back to the surviving ancestor, index window by window.
 
-use crate::window::{NoEntity, NoWait, Shelf};
+use crate::derived::{NestFiles, TabEntity};
+use crate::window::{NoWait, Shelf};
 use anyhow::{ensure, Result};
 use nuthatch_core::alerts::{AlertRouter, AlertSink};
 use nuthatch_core::cursor::{
@@ -33,6 +34,7 @@ pub struct TabNest {
     router: AlertRouter,
     sealing: Sealing,
     window: u64,
+    pub entities: Vec<TabEntity>,
 }
 
 /// When and where a tab nest seals.
@@ -101,7 +103,20 @@ impl TabNest {
             router: AlertRouter::new(Vec::<AlertSink>::new()),
             sealing,
             window: window.max(1),
+            entities: Vec::new(),
         })
+    }
+
+    /// Start the entities `files` declares (RFC-0075 S4). A store that has indexed already is warm,
+    /// and its entities unavailable, as on a node.
+    pub fn derive(&mut self, files: &NestFiles) -> Result<()> {
+        let warm = self.last_block()?.is_some();
+        self.entities = crate::derived::start(files, &self.registry, warm)?;
+        Ok(())
+    }
+
+    pub fn registry(&self) -> &DecodeRegistry {
+        &self.registry
     }
 
     pub fn last_block(&self) -> Result<Option<u64>> {
@@ -124,7 +139,7 @@ impl TabNest {
             velocity: &self.velocity,
             labels: &self.labels,
             velocity_flag: None,
-            entities: &[] as &[NoEntity],
+            entities: &self.entities,
             children: None,
             router: &self.router,
             metrics: &NoMetrics,
@@ -148,6 +163,11 @@ impl TabNest {
             if next > tip {
                 self.balances.flush();
                 ensure!(self.balances.is_healthy(), "the balance view died");
+                for e in &self.entities {
+                    if let Some(f) = nuthatch_core::entity_view::WindowEntity::fault(e) {
+                        anyhow::bail!("entity `{}` stopped: {f}", e.name_lower());
+                    }
+                }
                 return Ok(rolled);
             }
             let to = (next + self.window - 1).min(tip);

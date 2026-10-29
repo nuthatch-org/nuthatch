@@ -513,7 +513,7 @@ jobs:
   wasm-core:
     name: nuthatch-core (native, wasm32, Node)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
@@ -569,6 +569,15 @@ jobs:
             --file ../../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8947/ && break; sleep 0.2; done
           node run-live.mjs pkg http://127.0.0.1:8947/ ../../tests/fixtures/tab-parity
+      # RFC-0075 S4: entities and views in the tab through the fixture's scripted reorg, held to the
+      # node's answers (`e2e_tab_entities` holds the node to the same file).
+      - name: entities and views in Node through a reorg (spike)
+        working-directory: spike/dbsp-wasm
+        run: |
+          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --fork --port 8949 \
+            --file ../../tests/fixtures/tab-parity/chain.json.gz &
+          for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8949/ && break; sleep 0.2; done
+          node run-entities.mjs pkg http://127.0.0.1:8949/ ../../tests/fixtures/tab-parity
       # RFC-0075 S2: Node has no OPFS, so the OPFS backend's round trip and its lock run in a
       # dedicated worker in Chrome for Testing; the 26.04 image ships no chromedriver.
       - name: OPFS in headless Chrome (spike)

@@ -83,6 +83,14 @@ impl Sinks for Cellar {
 }
 
 impl Cellar {
+    pub fn manifest(&self) -> Manifest {
+        self.manifest.lock().unwrap().clone()
+    }
+
+    pub fn file(&self, name: &str) -> Option<Vec<u8>> {
+        self.files.lock().unwrap().get(name).cloned()
+    }
+
     /// Every table's segments as the gate compares them, each with the hash of the bytes held.
     pub fn report(&self) -> Value {
         let files = self.files.lock().unwrap();

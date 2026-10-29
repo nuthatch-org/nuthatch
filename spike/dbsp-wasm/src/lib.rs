@@ -7,10 +7,22 @@ use dbsp::{IndexedZSetReader, OrdZSet, Runtime, ZWeight};
 // The binary's entity circuit, from `nuthatch-core` since RFC-0075 S1, so the plan stepped on wasm32
 // is the one a nest lowers, not a copy of it.
 pub use nuthatch_core::{entity_circuit, entity_expr, entity_plan, entity_row};
+pub use nuthatch_decode::registry;
+// RFC-0075 S4: the binary's own entity builder, compiled here unchanged, as S0 compiled the circuit.
 pub mod cellar;
+pub mod derived;
 pub mod entity;
+#[path = "../../../src/entity_bind.rs"]
+pub mod entity_bind;
+#[path = "../../../src/entity_decl.rs"]
+pub mod entity_decl;
+#[path = "../../../src/entity_lower.rs"]
+pub mod entity_lower;
+#[path = "offchain_none.rs"]
+pub mod entity_offchain;
 #[cfg(target_arch = "wasm32")]
 pub mod live;
+pub mod query;
 pub mod reorg;
 pub mod tab;
 pub mod tape;

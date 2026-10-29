@@ -2,6 +2,8 @@
 //! node's RPC client on `fetch`, sealing past finality as the node does.
 
 use crate::cellar::Cellar;
+use crate::derived::NestFiles;
+use crate::query::{sorted, view_names, TabQuery};
 use crate::tab::worker::opfs_db;
 use crate::tab::{erc20, Sealing, TabNest, TRANSFER};
 use nuthatch_core::backend::Bytes;
@@ -10,7 +12,7 @@ use nuthatch_core::opfs::OpenError;
 use nuthatch_core::rpc::RpcClient;
 use nuthatch_core::store::SEALED_THROUGH_KEY;
 use nuthatch_core::window::Finality;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
@@ -25,6 +27,7 @@ pub struct LiveNest {
     cellar: Arc<Cellar>,
     rpc: RpcClient<Fetch>,
     backend: &'static str,
+    files: NestFiles,
 }
 
 fn js(e: impl std::fmt::Display) -> JsError {
@@ -72,6 +75,7 @@ impl LiveNest {
             cellar,
             rpc,
             backend,
+            files: NestFiles::new(),
         })
     }
 
@@ -108,6 +112,56 @@ impl LiveNest {
             "first_rows": self.cellar.first_rows(),
             "hot_rows": self.nest.store.count().map_err(js)?,
             "backend": self.backend,
+        })
+        .to_string())
+    }
+
+    /// RFC-0075 S4: start the entities a scaffolded nest declares. `files_json` maps each authored
+    /// path (`entities.toml`, `entities/*.sql`, `views/*.sql`) to its text.
+    pub fn derive(&mut self, files_json: String) -> Result<(), JsError> {
+        let files: NestFiles = serde_json::from_str(&files_json).map_err(js)?;
+        self.nest.derive(&files).map_err(|e| js(format!("{e:#}")))?;
+        self.files = files;
+        Ok(())
+    }
+
+    /// What S4's gate compares, in the node's shapes: `/derived/{entity}?limit=1000` for each entity
+    /// and `SELECT * FROM <view>` for each authored view, each in a fixed order.
+    pub async fn answer(&self) -> Result<String, JsError> {
+        let q = TabQuery::bind(
+            &self.nest.store,
+            &self.cellar,
+            &self.nest.registry().schema(),
+            &self.nest.entities,
+            &self.files,
+        )
+        .await
+        .map_err(|e| js(format!("{e:#}")))?;
+        let mut derived = serde_json::Map::new();
+        for e in &self.nest.entities {
+            let d = e.derived(1000);
+            let items = sorted(d["items"].as_array().cloned().unwrap_or_default());
+            derived.insert(e.name_lower(), json!({"rows": d["rows"], "items": items}));
+        }
+        let mut views = serde_json::Map::new();
+        for name in view_names(&self.files).map_err(js)? {
+            let rows = q
+                .rows(&format!("SELECT * FROM {name}"))
+                .await
+                .map_err(|e| js(format!("{name}: {e:#}")))?;
+            views.insert(name, Value::Array(sorted(rows)));
+        }
+        let sealed_through: Option<u64> = self
+            .nest
+            .store
+            .get_meta(SEALED_THROUGH_KEY)
+            .map_err(js)?
+            .and_then(|v| v.parse().ok());
+        Ok(json!({
+            "last_block": self.nest.last_block().map_err(js)?,
+            "sealed_through": sealed_through,
+            "derived": derived,
+            "views": views,
         })
         .to_string())
     }

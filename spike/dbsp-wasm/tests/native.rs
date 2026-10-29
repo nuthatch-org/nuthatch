@@ -26,8 +26,8 @@ const WINDOW: &str = concat!(
     r#"("0x2222222222222222222222222222222222222222", 40), "#,
     r#"("0x0000000000000000000000000000000000000000", -100)] "#,
     r#"last=Some("12") sealed_through=12 hot=0 segments=["#,
-    r#""tok__transfer 10..=10 rows=1 4c63483c430d40b3e42a93728158d6fbc52a9ca2f258e52269563612b722c2e7", "#,
-    r#""tok__transfer 12..=12 rows=1 43ec70ec6f116bb227890db1d079a646eaa677d0ef208fb56c6e5f44e6d34a1f"]"#,
+    r#""tok__transfer 10..=10 rows=1 1418460664977e9b6456532bbbb32543ece957f189c8a1d45b65317ba1705ca1", "#,
+    r#""tok__transfer 12..=12 rows=1 170d4dc640f41dddf3718712c011bbdff3cd2286eed32f44df4180a4856e4346"]"#,
 );
 
 #[test]
