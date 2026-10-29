@@ -205,8 +205,9 @@ the box to build one from the checkout (`scripts/fixture-rpc.sh`), which the Thi
 
 It lives here and not in `release.yml` because this is where a candidate is gated: the tag workflow
 publishes, and only the ThinkPad's statuses say whether a release is fit to roll. CI's
-`rolling-upgrade` job runs the same script against every PR and push to `main`, with the build as the
-candidate, so a change that breaks the procedure is caught before it is tagged.
+`rolling-upgrade` job runs the same script in the merge queue, on every push to `main` and on a PR
+labelled `full-ci`, with the build as the candidate, so a change that breaks the procedure is caught
+before it is tagged.
 
 ## What it does not catch
 

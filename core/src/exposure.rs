@@ -22,7 +22,9 @@ use anyhow::{anyhow, Context, Result};
 use dbsp::utils::Tup2;
 use dbsp::{IndexedZSetReader, OrdZSet, OutputHandle, RootCircuit, Runtime};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use crate::versioned::{Footprint, Versions};
 
 /// Field separator inside an encoded exposure key. ASCII Unit Separator (0x1f) - never appears in a
 /// hex address, a direction, or a sane label, so decoding is unambiguous.
@@ -278,6 +280,13 @@ struct Published {
     entries: usize,
 }
 
+impl Footprint for Published {
+    /// Rebuilt whole per step, so a version shares nothing and is charged entire.
+    fn footprint(&self, out: &mut Vec<(usize, u64)>) {
+        out.push((self as *const Self as usize, self.entries as u64 * 160));
+    }
+}
+
 impl Published {
     fn insert(&mut self, key: &str, count: i128, amount: i128) {
         let mut parts = key.splitn(3, SEP);
@@ -311,7 +320,9 @@ pub struct ExposureView {
     /// frozen (and, for compliance, silently wrong) exposure. A disabled view stays healthy.
     lane: Lane<ExposureBatch>,
     /// Snapshot of the maintained view. Read by the API.
-    rows: Arc<RwLock<Published>>,
+    rows: Arc<Versions<Published>>,
+    /// The version a request was handed (#2467), read instead of the latest.
+    pinned: Option<Arc<Published>>,
 }
 
 impl ExposureView {
@@ -319,7 +330,8 @@ impl ExposureView {
     pub fn inert() -> Self {
         Self {
             lane: Lane::off(),
-            rows: Default::default(),
+            rows: Arc::new(Versions::new(Published::default())),
+            pinned: None,
         }
     }
 
@@ -327,11 +339,12 @@ impl ExposureView {
     /// built - `apply` is a silent no-op and `snapshot` stays empty, so an unused view costs nothing
     /// (L10).
     pub fn start(driver: Driver, enabled: bool) -> Result<Self> {
-        let rows = Arc::new(RwLock::new(Published::default()));
+        let rows = Arc::new(Versions::new(Published::default()));
         if !enabled {
             return Ok(Self {
                 lane: Lane::off(),
                 rows,
+                pinned: None,
             });
         }
         let shared = rows.clone();
@@ -346,12 +359,15 @@ impl ExposureView {
                 for (k, &c) in &circuit.counts {
                     next.insert(k, c, circuit.amounts.get(k).copied().unwrap_or(0));
                 }
-                let old = std::mem::replace(&mut *shared.write().unwrap(), next);
-                drop(old);
+                shared.publish(next);
                 Ok(())
             }) as Step<ExposureBatch>)
         })?;
-        Ok(Self { lane, rows })
+        Ok(Self {
+            lane,
+            rows,
+            pinned: None,
+        })
     }
 
     /// Whether the circuit is alive; `false` means it died on an error and the view is frozen.
@@ -385,10 +401,12 @@ impl ExposureView {
 
     /// The exposure rows for `address`, descending by amount.
     pub fn exposure(&self, address: &str) -> Vec<ExposureRow> {
-        let mut rows = match self.rows.read() {
-            Ok(m) => m.by_address.get(address).cloned().unwrap_or_default(),
-            Err(_) => return Vec::new(),
-        };
+        let mut rows = self
+            .published()
+            .by_address
+            .get(address)
+            .cloned()
+            .unwrap_or_default();
         #[cfg(test)]
         EXPOSURE_ROWS_READ.with(|n| n.set(n.get() + rows.len()));
         rows.sort_by(|a, b| {
@@ -403,7 +421,24 @@ impl ExposureView {
     /// Number of distinct (address, label, direction) exposure entries maintained - a small gauge for
     /// `/` and `/metrics`.
     pub fn entries(&self) -> usize {
-        self.rows.read().map(|m| m.entries).unwrap_or(0)
+        self.published().entries
+    }
+
+    fn published(&self) -> Arc<Published> {
+        self.pinned.clone().unwrap_or_else(|| self.rows.load())
+    }
+
+    /// This view held at what it has published now, which later batches leave alone (#2467).
+    pub fn pinned(&self) -> Self {
+        Self {
+            pinned: Some(self.rows.load()),
+            ..self.clone()
+        }
+    }
+
+    /// What published versions still referenced hold that the latest does not, in bytes.
+    pub fn retained_bytes(&self) -> u64 {
+        self.rows.retained()
     }
 }
 

@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+arc-swap = "1"
 async-trait = "0.1"
 dbsp = "0.320"
 nuthatch-decode = { path = "../decode" }

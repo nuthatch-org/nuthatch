@@ -276,6 +276,19 @@ pub use nuthatch_core::store::{HotRowsSnapshot, HotStore as CoreHotStore, Lease}
 /// The hot store as the node serves it: `nuthatch-core`'s contract, which the cursor writes through,
 /// plus the feed (RFC-0073 FR1), whose receivers are tokio's and so stay out of a tab.
 pub trait HotStore: nuthatch_core::store::HotStore {
+    /// A read-only handle that answers every read as of now, which a window's snapshot holds so a
+    /// request reads rows and derived state of one window (#2467). `None` from a backend that cannot
+    /// pin, whose requests read at the latest commit.
+    fn pinned(&self) -> Result<Option<Arc<dyn HotStore>>> {
+        Ok(None)
+    }
+
+    /// What versions taken by [`HotStore::pinned`] and still read hold beside the latest, in bytes.
+    /// Zero where nothing is kept in memory per version.
+    fn retained_bytes(&self) -> u64 {
+        0
+    }
+
     /// RFC-0073 FR1: a snapshot of the mirrored tables and a receiver for every commit after it, or
     /// `None` from a backend with no feed.
     fn feed_subscribe(&self) -> Result<Option<crate::feed::Subscription>> {
@@ -311,6 +324,10 @@ impl std::ops::Deref for OpenDb {
 
 #[derive(Clone)]
 pub struct Store {
+    /// The read transaction every read on this handle uses, set on a handle taken by
+    /// [`HotStore::pinned`] (#2467). `None` reads at the latest commit. Declared before `db` so it
+    /// drops first: redb keeps its file locked while a transaction lives, past `released`.
+    pinned: Option<Arc<Pin>>,
     db: Arc<OpenDb>,
     released: tokio::sync::watch::Receiver<()>,
     /// Fence this handle holds, shared across clones so every clone of one nest's handle speaks for
@@ -336,6 +353,29 @@ pub struct Store {
     pub(crate) commit_hold: CommitHold,
     #[cfg(test)]
     path: Arc<std::path::PathBuf>,
+}
+
+/// A read transaction a [`Store`] handle answers every read from, and the generations it was opened at.
+pub struct Pin {
+    txn: redb::ReadTransaction,
+    writes: Option<u64>,
+    rows: Option<u64>,
+}
+
+/// The transaction a read runs in: the handle's pinned one, or a fresh one at the latest commit.
+enum Rtx {
+    Fresh(redb::ReadTransaction),
+    Pinned(Arc<Pin>),
+}
+
+impl std::ops::Deref for Rtx {
+    type Target = redb::ReadTransaction;
+    fn deref(&self) -> &redb::ReadTransaction {
+        match self {
+            Rtx::Fresh(t) => t,
+            Rtx::Pinned(p) => &p.txn,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -524,6 +564,7 @@ impl Store {
             rows: Arc::new(std::sync::atomic::AtomicU64::new(rows_epoch())),
             commit_gate: Arc::default(),
             tap: Arc::new(crate::feed::Tap::new(path.parent().map(Path::to_path_buf))),
+            pinned: None,
             #[cfg(test)]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -606,6 +647,7 @@ impl Store {
             rows: Arc::new(std::sync::atomic::AtomicU64::new(rows_epoch())),
             commit_gate: Arc::default(),
             tap: Arc::new(crate::feed::Tap::new(dir.map(Path::to_path_buf))),
+            pinned: None,
             #[cfg(test)]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -1049,20 +1091,20 @@ impl Store {
     }
 
     pub fn get_entity(&self, key: &str) -> Result<Option<String>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         Ok(t.get(key)?.map(|v| v.value().to_string()))
     }
 
     pub fn count(&self) -> Result<u64> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         Ok(t.len()?)
     }
 
     /// The `limit` most-recent entities (highest keys first).
     pub fn recent(&self, limit: usize) -> Result<Vec<String>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         let mut out = Vec::with_capacity(limit.min(1024));
         for row in t.iter()?.rev() {
@@ -1096,7 +1138,7 @@ impl Store {
         limit: usize,
         max_scanned: usize,
     ) -> Result<Option<Vec<String>>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         // Cap the pre-allocation: `limit` may be usize::MAX (rebuild wants "all rows"); the Vec
         // still grows as needed, we just don't reserve an absurd capacity up front.
@@ -1177,7 +1219,7 @@ impl Store {
         max_bytes: u64,
         charge: Option<&mut dyn FnMut(u64) -> Result<()>>,
     ) -> Result<HotRowsSnapshot> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         if let Some(charge) = charge {
             // The copy's own refusals, in its order, reading `table` without building the row: a tip
@@ -1260,7 +1302,7 @@ impl Store {
     pub fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
         let lo = format!("{from:012}-000000");
         let hi = format!("{to:012}-999999");
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         let mut out = Vec::new();
         for row in t.range(lo.as_str()..=hi.as_str())? {
@@ -1284,7 +1326,7 @@ impl Store {
     ) -> Result<()> {
         let lo = format!("{from:012}-000000");
         let hi = format!("{to:012}-999999");
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         #[cfg(test)]
         let mut visited = 0usize;
@@ -1310,7 +1352,7 @@ impl Store {
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(META)?;
         Ok(t.get(key)?.map(|v| v.value().to_string()))
     }
@@ -1349,7 +1391,7 @@ impl Store {
     }
 
     pub fn meta_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, String)>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(META)?;
         let mut out = Vec::new();
         for row in t.range(prefix..)? {
@@ -1363,7 +1405,7 @@ impl Store {
     }
 
     pub fn count_meta_with_prefix(&self, prefix: &str) -> Result<u64> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(META)?;
         let mut n = 0;
         for row in t.range(prefix..)? {
@@ -1397,7 +1439,7 @@ impl Store {
     }
 
     fn block_record(&self, block: u64) -> Result<Option<(String, Option<u64>)>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(BLOCKS)?;
         Ok(t.get(Self::block_key(block).as_str())?
             .map(|v| decode_block_record(v.value())))
@@ -1454,7 +1496,7 @@ impl Store {
 
     /// All recorded checkpoints, highest block first - for walking back to a common ancestor.
     pub fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(BLOCKS)?;
         let mut out = Vec::new();
         for row in t.iter()?.rev() {
@@ -1470,7 +1512,7 @@ impl Store {
         if !INDEX_CHECKPOINT_HASHES {
             anyhow::bail!("hash-pinned reads need a nuthatch built with `--features graph`");
         }
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let table = rtx.open_table(CHECKPOINT_HASHES)
             .context("checkpoint hash index is unavailable; open this store with the current writer to upgrade it")?;
         Ok(table
@@ -1678,7 +1720,7 @@ impl Store {
     /// Test/consistency helper: the set of entity keys currently stored (chain-ordered).
     #[cfg(test)]
     pub fn entity_keys(&self) -> Result<Vec<String>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         let mut out = Vec::new();
         for row in t.iter()? {
@@ -1691,7 +1733,7 @@ impl Store {
     /// Up to `limit` entity keys, chain-ordered - the point-read bench (`nuthatch bench query`) samples
     /// from these. Bounded so a large hot store doesn't materialise every key just to time a few reads.
     pub fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         let mut out = Vec::with_capacity(limit.min(4096));
         for row in t.iter()? {
@@ -1766,6 +1808,37 @@ impl Store {
     }
 }
 
+impl Store {
+    fn read_txn(&self) -> Result<Rtx> {
+        Ok(match &self.pinned {
+            Some(p) => Rtx::Pinned(p.clone()),
+            None => Rtx::Fresh(self.db.begin_read()?),
+        })
+    }
+
+    /// This handle pinned at the latest commit. The generations are kept only when no commit
+    /// began while the transaction opened, so the memo never keys an answer to the wrong one.
+    pub fn pinned(&self) -> Result<Store> {
+        let generations = |s: &Store| {
+            (
+                CoreHotStore::write_generation(s),
+                CoreHotStore::rows_generation(s),
+            )
+        };
+        let before = generations(self);
+        let txn = self.db.begin_read()?;
+        let (writes, rows) = if generations(self) == before {
+            before
+        } else {
+            (None, None)
+        };
+        Ok(Store {
+            pinned: Some(Arc::new(Pin { txn, writes, rows })),
+            ..self.clone()
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl nuthatch_core::store::HotStore for Store {
     fn released(&self) -> futures::future::BoxFuture<'static, ()> {
@@ -1777,12 +1850,18 @@ impl nuthatch_core::store::HotStore for Store {
     }
 
     fn write_generation(&self) -> Option<u64> {
+        if let Some(p) = &self.pinned {
+            return p.writes;
+        }
         // Odd means a commit is in flight: see `Store::commit`.
         let g = self.writes.load(std::sync::atomic::Ordering::SeqCst);
         g.is_multiple_of(2).then_some(g)
     }
 
     fn rows_generation(&self) -> Option<u64> {
+        if let Some(p) = &self.pinned {
+            return p.rows;
+        }
         let g = self.rows.load(std::sync::atomic::Ordering::SeqCst);
         g.is_multiple_of(2).then_some(g)
     }
@@ -2073,6 +2152,10 @@ impl nuthatch_core::store::HotStore for Store {
 }
 
 impl HotStore for Store {
+    fn pinned(&self) -> Result<Option<Arc<dyn HotStore>>> {
+        Ok(Some(Arc::new(Store::pinned(self)?)))
+    }
+
     fn feed_subscribe(&self) -> Result<Option<crate::feed::Subscription>> {
         Store::feed_subscribe(self).map(Some)
     }
@@ -2084,6 +2167,12 @@ impl HotStore for Store {
 
 /// Every shared handle on a node store is one, as `nuthatch-core` makes it one of the core trait.
 impl<T: HotStore + ?Sized> HotStore for Arc<T> {
+    fn pinned(&self) -> Result<Option<Arc<dyn HotStore>>> {
+        (**self).pinned()
+    }
+    fn retained_bytes(&self) -> u64 {
+        (**self).retained_bytes()
+    }
     fn feed_subscribe(&self) -> Result<Option<crate::feed::Subscription>> {
         (**self).feed_subscribe()
     }

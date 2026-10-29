@@ -25,5 +25,6 @@ pub mod source;
 pub mod store;
 pub mod time;
 pub mod velocity;
+pub mod versioned;
 pub mod views;
 pub mod window;

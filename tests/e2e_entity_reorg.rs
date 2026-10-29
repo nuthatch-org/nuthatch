@@ -327,6 +327,22 @@ async fn entity_converges_after_reorg(fork: u64) {
     })
     .await;
     assert!(converged, "the reorg did not reconverge in time");
+    // `/sql` answers from the published snapshot (#2467), which follows the fold by a moment; two
+    // queries straddling a publish would compare different windows.
+    let snapshots = rt
+        .state
+        .snapshots
+        .clone()
+        .expect("a writer publishes snapshots");
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            snapshots
+                .load_full()
+                .is_some_and(|s| s.entities[0].applied_through() == CHAIN_LEN)
+        })
+        .await,
+        "the replayed window was not published in time"
+    );
     let after = relation(&rt);
     let health = rt.state.entities[0].fault();
 

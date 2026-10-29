@@ -9,7 +9,7 @@
 // old paths so nothing that names them changed.
 pub use nuthatch_core::{
     drive, entity_circuit, entity_expr, entity_plan, entity_row, exposure, flags, labels, velocity,
-    views,
+    versioned, views,
 };
 
 pub mod abi;
