@@ -8,6 +8,9 @@ use dbsp::{IndexedZSetReader, OrdZSet, Runtime, ZWeight};
 // is the one a nest lowers, not a copy of it.
 pub use nuthatch_core::{entity_circuit, entity_expr, entity_plan, entity_row};
 pub mod entity;
+pub mod reorg;
+pub mod tab;
+pub mod tape;
 pub mod window;
 
 /// Builds a one-worker circuit, feeds it three batches with a retraction in the middle, and
@@ -187,6 +190,13 @@ mod wasm {
             r.state_bytes,
             r.first_rows
         ))
+    }
+
+    /// RFC-0075 S2: the reorg property over the redb store on a byte buffer, `cases` depths drawn.
+    #[wasm_bindgen]
+    pub fn spike_reorg(cases: u32) -> Result<String, JsError> {
+        std::panic::set_hook(Box::new(|info| error(&format!("panic: {info}"))));
+        super::reorg::run_property(cases as usize).map_err(|e| JsError::new(&format!("{e:#}")))
     }
 
     /// The module's linear memory, in bytes. It only ever grows, so the last reading is the peak.

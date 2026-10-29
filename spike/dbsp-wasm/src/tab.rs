@@ -1,0 +1,247 @@
+//! RFC-0075 S2: a nest as the `/play` worker runs it. `nuthatch-core`'s redb store over whichever
+//! backend the worker opened, the three built-in views driven inline, and the node's tip loop:
+//! verify the last checkpoint, roll back to the surviving ancestor, index window by window.
+
+use crate::tape::TapeSource;
+use crate::window::{NoEntity, NoWait, Shelf};
+use anyhow::{bail, ensure, Result};
+use nuthatch_core::alerts::{AlertRouter, AlertSink};
+use nuthatch_core::cursor::{
+    detect_reorg, process_window, rollback_reorg, Nest, Processed, Window,
+};
+use nuthatch_core::drive::Driver;
+use nuthatch_core::exposure::ExposureView;
+use nuthatch_core::labels::LabelSet;
+use nuthatch_core::metrics::NoMetrics;
+use nuthatch_core::redb_store::Store;
+use nuthatch_core::source::Source;
+use nuthatch_core::store::{LAST_BLOCK_KEY, START_BLOCK_KEY};
+use nuthatch_core::velocity::VelocityView;
+use nuthatch_core::views::BalanceView;
+use nuthatch_core::window::{fetch_window, Finality, Wanted};
+use nuthatch_decode::registry::DecodeRegistry;
+
+pub struct TabNest {
+    pub store: Store,
+    registry: DecodeRegistry,
+    addresses: Vec<String>,
+    topic0s: Vec<String>,
+    pub balances: BalanceView,
+    exposure: ExposureView,
+    velocity: VelocityView,
+    labels: LabelSet,
+    router: AlertRouter,
+    shelf: Shelf,
+    window: u64,
+}
+
+impl TabNest {
+    /// A nest over `db`, indexing `addresses`' `topic0s` from `start` in windows of `window` blocks.
+    /// Nothing seals yet (S3): a reorg below the sealed watermark is a terminal fault by design.
+    pub fn open(
+        db: redb::Database,
+        registry: DecodeRegistry,
+        addresses: Vec<String>,
+        topic0s: Vec<String>,
+        start: u64,
+        window: u64,
+    ) -> Result<TabNest> {
+        let store = Store::from_db(db, None)?;
+        if store.get_meta(START_BLOCK_KEY)?.is_none() {
+            store.set_meta(START_BLOCK_KEY, &start.to_string())?;
+        }
+        Ok(TabNest {
+            store,
+            registry,
+            addresses,
+            topic0s,
+            balances: BalanceView::start(Driver::Inline)?,
+            exposure: ExposureView::start(Driver::Inline, false)?,
+            velocity: VelocityView::start(Driver::Inline, false)?,
+            labels: LabelSet::default(),
+            router: AlertRouter::new(Vec::<AlertSink>::new()),
+            shelf: Shelf::default(),
+            window: window.max(1),
+        })
+    }
+
+    pub fn last_block(&self) -> Result<Option<u64>> {
+        Ok(self
+            .store
+            .get_meta(LAST_BLOCK_KEY)?
+            .and_then(|v| v.parse().ok()))
+    }
+
+    /// Follow `tape` until it has nothing new. Returns the block the last rollback resumed from, if
+    /// one ran.
+    pub async fn follow(&self, tape: &TapeSource) -> Result<Option<u64>> {
+        let schema = self.registry.schema();
+        let nest = || Nest {
+            name: "tab",
+            store: &self.store,
+            schema: &schema,
+            balances: &self.balances,
+            exposure: &self.exposure,
+            velocity: &self.velocity,
+            labels: &self.labels,
+            velocity_flag: None,
+            entities: &[] as &[NoEntity],
+            children: None,
+            router: &self.router,
+            metrics: &NoMetrics,
+        };
+        let start: u64 = self
+            .store
+            .get_meta(START_BLOCK_KEY)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut topic0_refused = false;
+        let mut rolled = None;
+        loop {
+            let mut next = self.last_block()?.map_or(start, |b| b + 1);
+            if next > 0 {
+                if let Some(ancestor) = detect_reorg(tape, &self.store, next - 1).await? {
+                    next = rollback_reorg(nest(), ancestor)?;
+                    rolled = Some(next);
+                }
+            }
+            let tip = tape.tip().await?;
+            if next > tip {
+                self.balances.flush();
+                ensure!(self.balances.is_healthy(), "the balance view died");
+                return Ok(rolled);
+            }
+            let to = (next + self.window - 1).min(tip);
+            let wanted = Wanted {
+                registry: &self.registry,
+                factory: None,
+                children: &nuthatch_core::factory::ChildRegistry::new(),
+                addresses: &self.addresses,
+                topic0s: &self.topic0s,
+                topic0_refused: &mut topic0_refused,
+            };
+            let logs = fetch_window(wanted, tape, next, to).await?;
+            let window = Window {
+                nest: nest(),
+                registry: &self.registry,
+                factory: None,
+                threshold: None,
+                finality: Finality::Depth(1_000_000_000),
+                seal_span: 1,
+                sinks: &self.shelf,
+                extra: &nuthatch_core::extra::NoExtraRows,
+                hooks: &nuthatch_core::hooks::NoHooks,
+                faults: &nuthatch_core::fault::NoFaults,
+                clock: &NoWait,
+            };
+            match process_window(window, tape, &logs, next, to, tip).await? {
+                Processed::Stored(_) => {}
+                Processed::Rewound(at) => rolled = Some(at),
+                other => bail!("window {next}..={to}: {other:?}"),
+            }
+        }
+    }
+
+    /// What the page shows: the cursor, the hot rows and the balances.
+    pub fn status(&self, rolled: Option<u64>) -> Result<String> {
+        Ok(serde_json::json!({
+            "last_block": self.last_block()?,
+            "hot_rows": self.store.count()?,
+            "resumed_from": rolled,
+            "balances": self.balances.top(10),
+        })
+        .to_string())
+    }
+}
+
+/// The registry for one ERC-20 at `contract`, the shape a recorded `/play` chain carries.
+pub fn erc20(contract: &str) -> Result<DecodeRegistry> {
+    DecodeRegistry::build(vec![nuthatch_decode::registry::ContractSpec {
+        alias: "tab".into(),
+        address: contract.parse()?,
+        abi: serde_json::from_str(
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#,
+        )?,
+        events: Vec::new(),
+    }])
+}
+
+pub const TRANSFER: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+/// The `/play` worker's handle on a nest: its store in OPFS under the NID, or in a byte buffer where
+/// the worker has no sync access handles, fed by the recorded chains the page plays to it.
+#[cfg(target_arch = "wasm32")]
+pub mod worker {
+    use super::{erc20, TabNest, TRANSFER};
+    use crate::tape::TapeSource;
+    use nuthatch_core::backend::Bytes;
+    use nuthatch_core::opfs::{self, OpenError, OpfsBackend};
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    pub struct PlayNest {
+        nest: TabNest,
+        backend: &'static str,
+    }
+
+    fn js(e: impl std::fmt::Display) -> JsError {
+        JsError::new(&e.to_string())
+    }
+
+    #[wasm_bindgen]
+    impl PlayNest {
+        /// Open nest `nid`'s store at `<nid>/nuthatch.redb` in OPFS. A store another tab holds is
+        /// refused with that error's message; no OPFS at all falls back to a byte buffer.
+        pub async fn open(nid: String, contract: String, start: u64) -> Result<PlayNest, JsError> {
+            let (db, backend) = match opfs_db(&nid).await {
+                Ok(db) => (db, "opfs"),
+                Err(OpenError::Unavailable(_)) => (
+                    redb::Builder::new()
+                        .create_with_backend(Bytes::default())
+                        .map_err(js)?,
+                    "bytes",
+                ),
+                Err(e) => return Err(js(e)),
+            };
+            let registry = erc20(&contract).map_err(js)?;
+            let nest = TabNest::open(
+                db,
+                registry,
+                vec![contract],
+                vec![TRANSFER.into()],
+                start,
+                1000,
+            )
+            .map_err(js)?;
+            Ok(PlayNest { nest, backend })
+        }
+
+        /// `"opfs"` or `"bytes"`.
+        pub fn backend(&self) -> String {
+            self.backend.into()
+        }
+
+        /// Follow the chain in `chain_json` (a [`crate::tape::Chain`]) as far as its tip. A chain whose
+        /// blocks differ from the ones indexed is a reorg, and the nest rolls back as a node would.
+        pub async fn play(&self, chain_json: String) -> Result<String, JsError> {
+            let tape = TapeSource::from_json(&chain_json).map_err(js)?;
+            let rolled = self
+                .nest
+                .follow(&tape)
+                .await
+                .map_err(|e| js(format!("{e:#}")))?;
+            self.nest.status(rolled).map_err(js)
+        }
+    }
+
+    async fn opfs_db(nid: &str) -> Result<redb::Database, OpenError> {
+        let dir = opfs::directory(&opfs::root().await?, nid).await?;
+        let backend = OpfsBackend::open(&dir, "nuthatch.redb").await?;
+        redb::Builder::new()
+            .create_with_backend(backend)
+            .map_err(|e| OpenError::Js(e.to_string()))
+    }
+}

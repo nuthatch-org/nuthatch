@@ -50,12 +50,23 @@ fn js_error(e: JsValue) -> OpenError {
     }
 }
 
+// Calling a method the browser lacks throws past wasm-bindgen, so ask first.
+fn has(obj: &JsValue, method: &str) -> bool {
+    js_sys::Reflect::get(obj, &JsValue::from_str(method)).is_ok_and(|f| f.is_function())
+}
+
 /// The origin's OPFS root, from the worker's `navigator.storage`.
 pub async fn root() -> Result<FileSystemDirectoryHandle, OpenError> {
     let scope = js_sys::global()
         .dyn_into::<WorkerGlobalScope>()
         .map_err(|_| OpenError::Unavailable("not a worker".into()))?;
-    let dir = JsFuture::from(scope.navigator().storage().get_directory())
+    let storage = scope.navigator().storage();
+    if !has(&storage, "getDirectory") {
+        return Err(OpenError::Unavailable(
+            "no origin private file system".into(),
+        ));
+    }
+    let dir = JsFuture::from(storage.get_directory())
         .await
         .map_err(js_error)?;
     Ok(dir.unchecked_into())
@@ -105,6 +116,9 @@ impl OpfsBackend {
                 .await
                 .map_err(js_error)?
                 .unchecked_into();
+        if !has(&fh, "createSyncAccessHandle") {
+            return Err(OpenError::Unavailable("no sync access handles".into()));
+        }
         let handle = JsFuture::from(fh.create_sync_access_handle())
             .await
             .map_err(|e| match e.dyn_ref::<DomException>() {

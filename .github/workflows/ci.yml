@@ -532,6 +532,7 @@ jobs:
           cargo fmt --check --manifest-path core/Cargo.toml
           cargo clippy --locked --all-targets --manifest-path core/Cargo.toml -- -D warnings
           cargo test --locked --manifest-path core/Cargo.toml
+          cargo test --locked --manifest-path core/Cargo.toml --features checkpoint-hash-index
       - name: vendor the patched dbsp
         run: spike/dbsp-wasm/vendor.sh
       # zstd-sys (via nuthatch-seal) compiles C for the target: the runner's LLVM clang, with an empty
@@ -558,6 +559,14 @@ jobs:
           cargo build --locked --release --target wasm32-unknown-unknown
           wasm-bindgen --target nodejs --out-dir pkg target/wasm32-unknown-unknown/release/dbsp_wasm_spike.wasm
           node --stack-trace-limit=60 run-node.mjs pkg
+      # RFC-0075 S2: Node has no OPFS, so the OPFS backend's round trip and its lock run in a
+      # dedicated worker in the runner's own Chrome and chromedriver.
+      - name: OPFS in headless Chrome (spike)
+        working-directory: spike/dbsp-wasm
+        env:
+          CHROMEDRIVER: ${{ env.CHROMEWEBDRIVER }}/chromedriver
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test --locked --release --target wasm32-unknown-unknown --test opfs
 
   # The parked RFC-0060 replays (network_contract and serve's network_* tests) run nightly in
   # network-contract.yml instead; this filter must stay the complement of that one.
