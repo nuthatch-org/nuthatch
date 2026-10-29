@@ -8,6 +8,7 @@ use dbsp::{IndexedZSetReader, OrdZSet, Runtime, ZWeight};
 // is the one a nest lowers, not a copy of it.
 pub use nuthatch_core::{entity_circuit, entity_expr, entity_plan, entity_row};
 pub use nuthatch_decode::registry;
+pub mod budget;
 // RFC-0075 S4: the binary's own entity builder, compiled here unchanged, as S0 compiled the circuit.
 pub mod cellar;
 pub mod derived;
@@ -225,5 +226,12 @@ mod wasm {
     #[wasm_bindgen]
     pub fn wasm_memory_bytes() -> f64 {
         (core::arch::wasm32::memory_size(0) * 65536) as f64
+    }
+
+    /// RFC-0075 S6's gate: hold `mib` MiB at once. Past the ceiling the allocator refuses, and the
+    /// module traps rather than grow.
+    #[wasm_bindgen]
+    pub fn hold_mib(mib: u32) -> usize {
+        std::hint::black_box(vec![1u8; (mib as usize) << 20]).len()
     }
 }

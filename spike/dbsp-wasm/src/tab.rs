@@ -38,6 +38,7 @@ pub struct TabNest {
     window: u64,
     pub entities: Vec<TabEntity>,
     pub cursor: Cursor,
+    pub budget: crate::budget::TabBudget,
 }
 
 /// What `/ready` reports of the cursor: the head it last saw and when, when the seal last moved,
@@ -137,6 +138,7 @@ impl TabNest {
             window: window.max(1),
             entities: Vec::new(),
             cursor: Cursor::default(),
+            budget: crate::budget::TabBudget::default(),
         })
     }
 
@@ -144,7 +146,7 @@ impl TabNest {
     /// and its entities unavailable, as on a node.
     pub fn derive(&mut self, files: &NestFiles) -> Result<()> {
         let warm = self.last_block()?.is_some();
-        self.entities = crate::derived::start(files, &self.registry, warm)?;
+        self.entities = crate::derived::start(files, &self.registry, warm, self.budget)?;
         Ok(())
     }
 
@@ -205,6 +207,7 @@ impl TabNest {
                 }
                 return Ok(rolled);
             }
+            self.budget.check_memory(crate::budget::linear_memory())?;
             let to = (next + self.window - 1).min(tip);
             let wanted = Wanted {
                 registry: &self.registry,
@@ -215,6 +218,8 @@ impl TabNest {
                 topic0_refused: &mut topic0_refused,
             };
             let logs = fetch_window(wanted, tape, next, to).await?;
+            // Again once the logs are held, before anything of the window is committed.
+            self.budget.check_memory(crate::budget::linear_memory())?;
             let window = Window {
                 nest: nest(),
                 registry: &self.registry,

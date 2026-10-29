@@ -633,8 +633,15 @@ jobs:
         working-directory: spike/dbsp-wasm
         run: |
           cargo install --locked wasm-bindgen-cli --version 0.2.129
-          cargo build --locked --release --target wasm32-unknown-unknown
-          wasm-bindgen --target nodejs --out-dir pkg target/wasm32-unknown-unknown/release/dbsp_wasm_spike.wasm
+          curl -fsSL -o "$RUNNER_TEMP/binaryen.tgz" \
+            https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz
+          echo "2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489  $RUNNER_TEMP/binaryen.tgz" | sha256sum -c
+          tar -xzf "$RUNNER_TEMP/binaryen.tgz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/binaryen-version_133/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/binaryen-version_133/bin:$PATH"
+          # RFC-0075 S6: every gate below runs this module, whose size goes to the job summary.
+          size=$(./build-tab.sh nodejs pkg | tail -1)
+          echo "tab module bytes after wasm-bindgen and wasm-opt: \`$size\` (burrmill-wasm: 5.6 MB brotli)" >> "$GITHUB_STEP_SUMMARY"
           node --stack-trace-limit=60 run-node.mjs pkg
       # RFC-0075 S3: the tab's live cursor over `fetch`, held to the node's pinned segments and
       # balances for the recorded young contract (`e2e_tab_parity` holds the node to the same file).
@@ -664,6 +671,14 @@ jobs:
             --file ../../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8950/ && break; sleep 0.2; done
           node run-answers.mjs pkg http://127.0.0.1:8950/ ../../tests/fixtures/tab-parity
+      # RFC-0075 S6: the 600 MiB and 2 GiB ceilings with a cursor and a statement running together.
+      - name: memory budgets in Node (spike)
+        working-directory: spike/dbsp-wasm
+        run: |
+          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --port 8952 \
+            --file ../../tests/fixtures/tab-parity/chain.json.gz &
+          for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8952/ && break; sleep 0.2; done
+          node run-budget.mjs pkg http://127.0.0.1:8952/ ../../tests/fixtures/tab-parity
       # RFC-0075 S2: Node has no OPFS, so the OPFS backend's round trip and its lock run in a
       # dedicated worker in Chrome for Testing; the 26.04 image ships no chromedriver.
       - name: OPFS in headless Chrome (spike)
@@ -686,7 +701,7 @@ jobs:
         working-directory: spike/dbsp-wasm
         run: |
           chrome=$(npx -y @puppeteer/browsers@2.10.10 install chrome@stable --path "$RUNNER_TEMP/browsers" | tail -1 | cut -d' ' -f2-)
-          wasm-bindgen --target web --out-dir pkg-web target/wasm32-unknown-unknown/release/dbsp_wasm_spike.wasm
+          ./build-tab.sh web pkg-web
           ../../tools/fixture-rpc/target/release/fixture-rpc recorded --fork --port 8951 \
             --file ../../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8951/ && break; sleep 0.2; done

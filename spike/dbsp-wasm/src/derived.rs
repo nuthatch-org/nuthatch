@@ -1,6 +1,7 @@
 //! RFC-0075 S4: a nest's authored entities in the tab. Each is declared, lowered and bound by the
 //! binary's own files, then folded on `nuthatch-core`'s lane, inline.
 
+use crate::budget::TabBudget;
 use crate::entity_bind::Binding;
 use crate::entity_decl::{self, EntityDecl};
 use crate::entity_expr::Type;
@@ -63,11 +64,11 @@ impl TabEntity {
                 decl.name
             )
         });
-        // A tab's memory is S6's budget; nothing samples state here.
+        // The node's allowance and its default sampling interval (`entity_view::state_sample_interval`).
         let limits = Limits {
             max_rows: decl.max_rows,
-            allowance_bytes: u64::MAX,
-            sample_every: None,
+            allowance_bytes: crate::budget::entity_allowance_bytes(decl.max_rows as u64),
+            sample_every: Some(std::time::Duration::from_secs(60)),
         };
         let lane = EntityLane::start(Driver::Inline, &decl.name, plan, limits)?;
         Ok(TabEntity {
@@ -173,12 +174,18 @@ impl WindowEntity for TabEntity {
 }
 
 /// Every entity `files` declares, in declaration order. A nest that has indexed before is `warm`.
-pub fn start(files: &NestFiles, registry: &DecodeRegistry, warm: bool) -> Result<Vec<TabEntity>> {
+pub fn start(
+    files: &NestFiles,
+    registry: &DecodeRegistry,
+    warm: bool,
+    budget: TabBudget,
+) -> Result<Vec<TabEntity>> {
     let Some(raw) = files.get("entities.toml") else {
         return Ok(Vec::new());
     };
-    entity_decl::parse(raw)
-        .context("parse entities.toml")?
+    let decls = entity_decl::parse(raw).context("parse entities.toml")?;
+    budget.admit_entities(decls.iter().map(|d| d.max_rows as u64))?;
+    decls
         .iter()
         .map(|d| TabEntity::start(d, files, registry, warm))
         .collect()
