@@ -65,6 +65,7 @@ gate_lock_break() {
     rm -f "$t"
   done
   if [ "$(cat "$1/pid" 2>/dev/null || true)" = "$2" ] && ! kill -0 "$2" 2>/dev/null; then
+    [ -z "${GATE_LOCK_BEFORE_RM:-}" ] || eval "$GATE_LOCK_BEFORE_RM"
     rm -f "$1/pid" && broke=0
   fi
   rm -f "$mine"

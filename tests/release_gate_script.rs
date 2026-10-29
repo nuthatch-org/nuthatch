@@ -1189,38 +1189,48 @@ fn a_lock_left_by_a_killed_run_is_broken() {
 /// and acting on it while B breaks the lock and claims it.
 #[test]
 fn two_waiters_breaking_one_stale_lock_do_not_both_hold_it() {
+    two_breakers_one_paused_at("GATE_LOCK_BEFORE_BREAK");
+}
+
+/// Two waiters breaking the same dead pid at once: A has re-read the dead pid and is about to remove
+/// it when B gets there, so B must not remove it too and claim.
+#[test]
+fn two_waiters_breaking_at_once_do_not_both_hold_it() {
+    two_breakers_one_paused_at("GATE_LOCK_BEFORE_RM");
+}
+
+/// A pauses at `seam` in a lock left by a dead pid while B runs until it holds the lock or waits;
+/// then A goes on until it does the same. They must not both hold it, and both must finish.
+fn two_breakers_one_paused_at(seam: &str) {
     let dir = tempfile::tempdir().unwrap();
     let d = std::fs::canonicalize(dir.path()).unwrap();
     left_by_a_dead_pid(&d.join("nest.gate-lock.d"), None);
-    let start = |name: &str, hook: Option<&str>| lock_waiter(&d, name, hook);
     let read = |name: &str| std::fs::read_to_string(d.join(format!("{name}.out"))).unwrap();
+    let decided = |name: &str| {
+        poll(&format!("{name} to hold the lock or wait"), 30, || {
+            let t = read(name);
+            (t.contains("HOLDING") || t.contains("waiting")).then_some(t)
+        })
+    };
     let hook = format!(
         "touch '{0}/a-paused'; while [ ! -e '{0}/go' ]; do sleep 0.05; done",
         d.display()
     );
-    let a = start("a", Some(&hook));
-    poll("a to judge the lock stale", 30, || {
+    let a = lock_waiter(&d, "a", Some((seam, &hook)));
+    poll("a to reach the seam", 30, || {
         d.join("a-paused").exists().then_some(())
     });
-    let b = start("b", None);
-    poll("b to break the lock and hold it", 30, || {
-        read("b").contains("HOLDING").then_some(())
-    });
+    let b = lock_waiter(&d, "b", None);
+    let b_text = decided("b");
     std::fs::write(d.join("go"), "").unwrap();
-    let a_text = poll("a to claim or wait", 30, || {
-        let t = read("a");
-        (t.contains("HOLDING") || t.contains("waiting")).then_some(t)
-    });
-    std::fs::write(d.join("release.b"), "").unwrap();
-    let (code_b, text_b) = finish(b, &d, "b", 30);
-    poll("a to hold the lock b released", 30, || {
-        read("a").contains("HOLDING").then_some(())
-    });
+    let a_text = decided("a");
     std::fs::write(d.join("release.a"), "").unwrap();
+    std::fs::write(d.join("release.b"), "").unwrap();
     let (code_a, text_a) = finish(a, &d, "a", 30);
+    let (code_b, text_b) = finish(b, &d, "b", 30);
     assert!(
-        !a_text.contains("HOLDING"),
-        "a claimed the lock b held:\n{a_text}\n{text_b}"
+        !(a_text.contains("HOLDING") && b_text.contains("HOLDING")),
+        "both held the lock:\n{a_text}\n{b_text}"
     );
     assert_eq!(code_b, Some(0), "{text_b}");
     assert_eq!(code_a, Some(0), "{text_a}");
@@ -1275,7 +1285,7 @@ fn left_by_a_dead_pid(held: &Path, breaker: Option<u32>) {
 }
 
 /// Takes the lock on `<d>/nest`, says HOLDING, and holds it until `<d>/release.<name>` exists.
-fn lock_waiter(d: &Path, name: &str, hook: Option<&str>) -> Child {
+fn lock_waiter(d: &Path, name: &str, hook: Option<(&str, &str)>) -> Child {
     let waiter = d.join("waiter.sh");
     std::fs::write(
         &waiter,
@@ -1297,9 +1307,10 @@ rm -f "$2/inside"
         .arg(name)
         .env("GATE_LOCK_PORTABLE", "1")
         .env_remove("GATE_LOCK_HELD")
-        .env_remove("GATE_LOCK_BEFORE_BREAK");
-    if let Some(hook) = hook {
-        cmd.env("GATE_LOCK_BEFORE_BREAK", hook);
+        .env_remove("GATE_LOCK_BEFORE_BREAK")
+        .env_remove("GATE_LOCK_BEFORE_RM");
+    if let Some((seam, hook)) = hook {
+        cmd.env(seam, hook);
     }
     run_bounded(cmd, d, name)
 }
