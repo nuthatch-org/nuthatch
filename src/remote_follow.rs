@@ -14,7 +14,8 @@
 use crate::publish::Mirror;
 use crate::seal::{Manifest, Segment};
 use anyhow::{bail, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Under a dataset's mirror prefix: provisional segments, which the published catalogue leaves out
 /// and only followers fetch. Not named `.parquet`, so no reader's glob over the prefix counts one.
@@ -49,6 +50,9 @@ pub struct Remote {
     /// How long a fetched segment no copy names is kept before it is deleted from the cache: the
     /// same grace a writer keeps a folded segment for its followers.
     pub cache_grace: std::time::Duration,
+    /// Cached files whose bytes have been checked against their names since the last reverify.
+    verified: Mutex<std::collections::HashSet<PathBuf>>,
+    refused: Mutex<Vec<String>>,
 }
 
 /// A segment a catalogue names that the mirror did not have, or that did not verify.
@@ -88,8 +92,10 @@ pub fn checked_dataset(dataset: &str) -> Result<()> {
     }
 }
 
-/// Every segment `catalogue` names that `root`'s segment store does not hold, with its table.
-pub fn missing(root: &Path, catalogue: &str) -> Result<Vec<(String, Segment)>> {
+/// Every segment `catalogue` names that `root`'s segment store does not hold, with its table. A
+/// cached file not checked since the last [`Remote::reverify`] is hashed first, and one that does
+/// not hash to its name is removed and counted missing. Blocking: it may read whole files.
+pub fn missing(remote: &Remote, root: &Path, catalogue: &str) -> Result<Vec<(String, Segment)>> {
     let m: Manifest = serde_json::from_str(catalogue).context("a corrupt catalogue on the feed")?;
     let store = root.join(crate::seal::SEGMENTS_DIR);
     let mut out: Vec<(String, Segment)> = Vec::new();
@@ -101,8 +107,8 @@ pub fn missing(root: &Path, catalogue: &str) -> Result<Vec<(String, Segment)>> {
                     s.hash
                 );
             }
-            if !store.join(format!("{}.parquet", s.hash)).exists()
-                && !out.iter().any(|(_, o)| o.hash == s.hash)
+            if !remote.holds(&store.join(format!("{}.parquet", s.hash)), &s.hash)?
+                &&!out.iter().any(|(_, o)| o.hash == s.hash)
             {
                 out.push((table.clone(), s));
             }
@@ -115,28 +121,23 @@ fn is_hash(h: &str) -> bool {
     h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Write `key` to a temporary file beside `dest`, and rename it there only if its bytes hash to
-/// `hash`. `Ok(false)` when the mirror does not have it.
-async fn fetch_verified(mirror: &dyn Mirror, key: &str, dest: &Path, hash: &str) -> Result<bool> {
-    let dir = dest.parent().context("a destination with no directory")?;
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let tmp = tempfile::Builder::new()
-        .prefix(".incoming-")
-        .tempfile_in(dir)
-        .with_context(|| format!("a temporary file in {}", dir.display()))?;
-    let Some(got) = mirror.get_file(key, tmp.path(), SEGMENT_CAP).await? else {
-        return Ok(false);
-    };
-    if !got.eq_ignore_ascii_case(hash) {
-        crate::feed_metrics::metrics().mirror_refused();
-        return Err(Refused(key.to_string()).into());
+/// The sha256 of the file at `path`, read a block at a time.
+fn file_hash(path: &Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        match file.read(&mut buf)? {
+            0 => return Ok(hex::encode(hasher.finalize())),
+            n => hasher.update(&buf[..n]),
+        }
     }
-    let len = tmp.as_file().metadata().map(|m| m.len()).unwrap_or(0);
-    tmp.persist(dest)
-        .with_context(|| format!("moving a verified file to {}", dest.display()))?;
-    crate::feed_metrics::metrics().mirror_fetched(len);
-    Ok(true)
 }
+
+/// The most cache files [`Remote::refused`] remembers.
+const REFUSED_KEPT: usize = 16;
 
 #[derive(Debug)]
 struct Refused(String);
@@ -157,7 +158,91 @@ impl Remote {
             registry: registry.to_string(),
             max_rss_mb,
             cache_grace: crate::seal::FOLLOWER_GRACE,
+            verified: Default::default(),
+            refused: Default::default(),
         })
+    }
+
+    /// Whether `path` holds the bytes `hash` names. A file is hashed the first time it is asked
+    /// about after [`Remote::reverify`], since anything may have written to the cache meanwhile, and
+    /// one that does not hash to its name is removed, reported, and taken as absent.
+    pub fn holds(&self, path: &Path, hash: &str) -> Result<bool> {
+        let lock = |m: &'_ Mutex<std::collections::HashSet<PathBuf>>| {
+            m.lock().unwrap_or_else(|e| e.into_inner()).contains(path)
+        };
+        if lock(&self.verified) {
+            return Ok(true);
+        }
+        let got = match file_hash(path) {
+            Ok(got) => got,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e).with_context(|| format!("hashing {}", path.display())),
+        };
+        if got.eq_ignore_ascii_case(hash) {
+            self.verified
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(path.to_path_buf());
+            return Ok(true);
+        }
+        tracing::warn!(
+            "{}: the cached file does not hash to its name; removed, and fetched again",
+            path.display()
+        );
+        crate::feed_metrics::metrics().mirror_refused();
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+        }
+        let mut refused = self.refused.lock().unwrap_or_else(|e| e.into_inner());
+        refused.push(path.display().to_string());
+        let over = refused.len().saturating_sub(REFUSED_KEPT);
+        refused.drain(..over);
+        Ok(false)
+    }
+
+    /// Check every cached file again on its next use: called as a follower takes fresh snapshots.
+    pub fn reverify(&self) {
+        self.verified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Cached files found not to hash to their names and removed, most recent last.
+    pub fn refused(&self) -> Vec<String> {
+        self.refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Write `key` to a temporary file beside `dest`, and rename it there only if its bytes hash
+    /// to `hash`. `Ok(false)` when the mirror does not have it.
+    async fn fetch_verified(&self, key: &str, dest: &Path, hash: &str) -> Result<bool> {
+        let dir = dest.parent().context("a destination with no directory")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let tmp = tempfile::Builder::new()
+            .prefix(".incoming-")
+            .tempfile_in(dir)
+            .with_context(|| format!("a temporary file in {}", dir.display()))?;
+        let Some(got) = self.mirror.get_file(key, tmp.path(), SEGMENT_CAP).await? else {
+            return Ok(false);
+        };
+        if !got.eq_ignore_ascii_case(hash) {
+            crate::feed_metrics::metrics().mirror_refused();
+            return Err(Refused(key.to_string()).into());
+        }
+        let len = tmp.as_file().metadata().map(|m| m.len()).unwrap_or(0);
+        tmp.persist(dest)
+            .with_context(|| format!("moving a verified file to {}", dest.display()))?;
+        self.verified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(dest.to_path_buf());
+        crate::feed_metrics::metrics().mirror_fetched(len);
+        Ok(true)
     }
 
     /// Whether the publisher of `prefix` publishes for followers (`followers = true`).
@@ -197,7 +282,7 @@ impl Remote {
         };
         for (table, s) in segments {
             let dest = store.join(format!("{}.parquet", s.hash));
-            if dest.exists() {
+            if self.holds(&dest, &s.hash)? {
                 continue;
             }
             let final_key = format!("{prefix}/{}", crate::publish::parquet_key(table, &s.hash));
@@ -209,7 +294,7 @@ impl Remote {
             };
             let mut got = false;
             for key in &keys {
-                match fetch_verified(self.mirror.as_ref(), key, &dest, &s.hash).await {
+                match self.fetch_verified(key, &dest, &s.hash).await {
                     Ok(true) => {
                         got = true;
                         break;
@@ -251,9 +336,8 @@ impl Remote {
             bail!("the mirror's offchain catalogue is larger than {OFFCHAIN_CATALOGUE_CAP} bytes");
         }
         let path = crate::offchain::catalogue_path(&dir);
-        if std::fs::read(&path).ok().as_deref() == Some(raw.as_slice()) {
-            return Ok(false);
-        }
+        let same = std::fs::read(&path).ok().as_deref() == Some(raw.as_slice());
+        let mut changed = !same;
         let catalogue: crate::offchain::Catalogue =
             serde_json::from_slice(&raw).context("a corrupt offchain catalogue on the mirror")?;
         for snapshot in catalogue.tables.values().flatten() {
@@ -263,16 +347,20 @@ impl Remote {
                 bail!("offchain snapshot {} has no hash", snapshot.file);
             }
             let dest = crate::offchain::segment_path(&dir, snapshot);
-            if dest.exists() {
+            if self.holds(&dest, &snapshot.hash)? {
                 continue;
             }
+            changed = true;
             let key = format!("{prefix}/{}", offchain_key(&snapshot.file));
-            if !fetch_verified(self.mirror.as_ref(), &key, &dest, &snapshot.hash).await? {
+            if !self.fetch_verified(&key, &dest, &snapshot.hash).await? {
                 bail!(
                     "the mirror's offchain catalogue names {}, which it does not have",
                     key
                 );
             }
+        }
+        if same {
+            return Ok(changed);
         }
         let parent = path
             .parent()

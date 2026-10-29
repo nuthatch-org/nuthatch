@@ -277,6 +277,17 @@ impl Rig {
             .tmp
             .path()
             .join(format!("elsewhere-{feed}-{}", rand_suffix()));
+        self.remote_at(mirror, feed, cache_grace, cache).await
+    }
+
+    /// A follower over the cache `cache`, which a follower before it may have filled.
+    async fn remote_at(
+        &self,
+        mirror: &str,
+        feed: u32,
+        cache_grace: Duration,
+        cache: PathBuf,
+    ) -> (Arc<Follower>, String, PathBuf) {
         std::fs::create_dir_all(&cache).unwrap();
         let mut remote =
             nuthatch::remote_follow::Remote::open(mirror, &self.registry, 2048).unwrap();
@@ -703,6 +714,60 @@ async fn a_folded_segment_leaves_the_follower_cache_after_the_grace() {
     );
     assert!(cached(&second));
     assert_eq!(agree(&rig, &remote, "after the sweep").await, folded);
+    rig.writer.stop();
+}
+
+/// A cached segment is checked against its name before a follower relies on it: rewritten to other
+/// bytes of the same length while no follower ran, or while one is running and then takes fresh
+/// snapshots, it is removed, reported on `/ready`, fetched again, and never served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tampered_cache_file_is_fetched_again_never_served() {
+    let rig = rig(6, None, None).await;
+    rig.publish().await;
+    let grace = nuthatch::seal::FOLLOWER_GRACE;
+    let (_a, first, cache) = rig.remote_with(&rig.mirror, 2, grace).await;
+    agree(&rig, &first, "after the snapshot").await;
+    rig.seal(1, 2);
+    rig.publish().await;
+    let good = agree(&rig, &first, "across a seal").await;
+    let file = cache
+        .join("segments")
+        .join(format!("{}.parquet", rig.segment_hash()));
+    let bytes = std::fs::read(&file).unwrap();
+    let tamper = || {
+        let mut b = bytes.clone();
+        let mid = b.len() / 2;
+        b[mid] ^= 0xff;
+        std::fs::write(&file, &b).unwrap();
+    };
+    let refused = |ready: &serde_json::Value| {
+        ready["follower"]["cache_refused"]
+            .as_array()
+            .map_or(0, |r| r.len())
+    };
+
+    // Between two runs: the next follower over the same cache hashes it before using it.
+    tamper();
+    let (b, second, _) = rig.remote_at(&rig.mirror, 2, grace, cache.clone()).await;
+    assert_eq!(agree(&rig, &second, "over a tampered cache").await, good);
+    assert_eq!(std::fs::read(&file).unwrap(), bytes, "fetched again");
+    let (_, ready) = get(&second, &format!("/{ROUTE}/ready")).await;
+    assert_eq!(refused(&ready), 1, "reported: {ready}");
+
+    // While running: fresh snapshots check it again.
+    tamper();
+    b.resnapshot();
+    let mut ready = serde_json::Value::Null;
+    for _ in 0..200 {
+        ready = get(&second, &format!("/{ROUTE}/ready")).await.1;
+        if refused(&ready) == 2 && std::fs::read(&file).unwrap() == bytes {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(refused(&ready), 2, "reported: {ready}");
+    assert_eq!(std::fs::read(&file).unwrap(), bytes, "fetched again");
+    assert_eq!(agree(&rig, &second, "after the second tamper").await, good);
     rig.writer.stop();
 }
 

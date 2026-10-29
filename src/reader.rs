@@ -560,6 +560,8 @@ pub struct Follower {
     paused: tokio::sync::watch::Sender<bool>,
     /// Feed connections made, each of which takes fresh snapshots.
     connects: std::sync::atomic::AtomicU64,
+    /// A test's ask for fresh snapshots.
+    resnapshot: std::sync::atomic::AtomicBool,
     /// Where a follower on another host takes what one beside the writer reads from its directory.
     remote: Option<Arc<crate::remote_follow::Remote>>,
     /// The feed format asked for.
@@ -665,6 +667,7 @@ impl Follower {
             gates: Mutex::default(),
             paused: tokio::sync::watch::Sender::new(options.paused),
             connects: Default::default(),
+            resnapshot: Default::default(),
         });
         follower.recompose();
         tokio::spawn(follower.clone().run());
@@ -924,6 +927,11 @@ impl Follower {
             .is_some_and(|t| t.as_bytes() == crate::feed_wire::CONTENT_TYPE.as_bytes());
         // Whatever waited on the mirror belonged to the last connection's snapshots.
         self.lock().pending.clear();
+        // Fresh snapshots check every cached file they name again: the cache is a directory anyone
+        // with access may have written to since.
+        if let Some(remote) = &self.remote {
+            remote.reverify();
+        }
         {
             let mut inner = self.lock();
             inner.link.connected = true;
@@ -1146,6 +1154,13 @@ impl Follower {
         self.paused.send_replace(paused);
     }
 
+    /// Take fresh snapshots at the next heartbeat, as a writer restart would make it.
+    #[doc(hidden)]
+    pub fn resnapshot(&self) {
+        self.resnapshot
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// `dataset`'s copy, held as a request in flight would hold it.
     #[doc(hidden)]
     pub fn hold(&self, dataset: &str) -> Option<Arc<MemStore>> {
@@ -1301,7 +1316,7 @@ impl Follower {
                     dataset: crate::feed::DatasetName(dataset.clone()),
                     snapshot,
                 };
-                if self.waits_on_mirror(&dataset, &line, cx)? {
+                if self.waits_on_mirror(&dataset, &line, cx).await? {
                     return Ok(());
                 }
                 let Line::Snapshot { snapshot, .. } = line else {
@@ -1322,7 +1337,7 @@ impl Follower {
                     dataset: crate::feed::DeltaDataset(dataset.clone()),
                     delta,
                 };
-                if self.waits_on_mirror(&dataset, &line, cx)? {
+                if self.waits_on_mirror(&dataset, &line, cx).await? {
                     return Ok(());
                 }
                 let Line::Delta { delta, .. } = line else {
@@ -1368,14 +1383,19 @@ impl Follower {
     /// if its catalogue names a segment this follower does not hold yet; start fetching for it. A
     /// dataset whose held lines would pass its budget is resnapshotted, as a full queue is. Whether
     /// it was held.
-    fn waits_on_mirror(self: &Arc<Self>, dataset: &str, line: &Line, cx: &mut Cx) -> Result<bool> {
+    async fn waits_on_mirror(
+        self: &Arc<Self>,
+        dataset: &str,
+        line: &Line,
+        cx: &mut Cx,
+    ) -> Result<bool> {
         if self.remote.is_none() {
             return Ok(false);
         }
         let queued = self.lock().pending.contains_key(dataset);
         let needs = match (queued, catalogue_of(line)) {
             (true, _) | (_, None) => Vec::new(),
-            (false, Some(c)) => crate::remote_follow::missing(&self.root, c)?,
+            (false, Some(c)) => self.missing(c.to_string()).await?,
         };
         if !queued && needs.is_empty() {
             return Ok(false);
@@ -1475,11 +1495,25 @@ impl Follower {
         cx.fetches.push(AbortOnDrop(task));
     }
 
+    /// What `catalogue` names that the cache does not hold, checked off the async workers, since a
+    /// cached file is hashed on its first use after each connection.
+    async fn missing(&self, catalogue: String) -> Result<Vec<(String, crate::seal::Segment)>> {
+        let Some(remote) = self.remote.clone() else {
+            return Ok(Vec::new());
+        };
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::remote_follow::missing(&remote, &root, &catalogue)
+        })
+        .await
+        .context("checking the cache")?
+    }
+
     /// Apply what waited on the mirror for `dataset`, in order, until a line names a file still to
     /// fetch or none is left.
     async fn drain(self: &Arc<Self>, dataset: &str, cx: &mut Cx) -> Result<()> {
         loop {
-            let next = {
+            let catalogue = {
                 let mut inner = self.lock();
                 let Some(p) = inner.pending.get_mut(dataset) else {
                     return Ok(());
@@ -1488,15 +1522,21 @@ impl Follower {
                     inner.pending.remove(dataset);
                     return Ok(());
                 };
-                let needs = match catalogue_of(front) {
-                    Some(c) => crate::remote_follow::missing(&self.root, c)?,
+                catalogue_of(front).map(str::to_string)
+            };
+            let next = {
+                let needs = match catalogue {
+                    Some(c) => self.missing(c).await?,
                     None => Vec::new(),
                 };
                 if !needs.is_empty() {
-                    drop(inner);
                     self.fetch(dataset, needs, cx);
                     return Ok(());
                 }
+                let mut inner = self.lock();
+                let Some(p) = inner.pending.get_mut(dataset) else {
+                    return Ok(());
+                };
                 let line = p.items.pop_front().expect("a front was there");
                 p.bytes = p.bytes.saturating_sub(queued_bytes(&line));
                 p.waiting_for.clear();
@@ -1636,6 +1676,12 @@ impl Follower {
     }
 
     fn heartbeat(self: &Arc<Self>, positions: BTreeMap<String, (u64, u64)>) -> Result<()> {
+        if self
+            .resnapshot
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            bail!("asked to take fresh snapshots");
+        }
         let roomier = {
             let mut inner = self.lock();
             inner.positions = positions.into_iter().collect();
@@ -1968,6 +2014,10 @@ impl Follower {
                 "waiting_secs": p.since.elapsed().as_secs_f64(),
                 "error": p.error,
             });
+        }
+        // Cached files that did not hash to their names, removed and fetched again.
+        if let Some(refused) = self.remote.as_ref().map(|r| r.refused()).filter(|r| !r.is_empty()) {
+            out["cache_refused"] = refused.into();
         }
         out
     }
