@@ -37,6 +37,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # GCC 15 defaults to C23, which removed the ATOMIC_VAR_INIT that mimalloc (via dbsp) still uses.
+  CFLAGS: -std=gnu17
 
 jobs:
   # #733. The required check is this name. It used to be one job that compiled clippy and test,
