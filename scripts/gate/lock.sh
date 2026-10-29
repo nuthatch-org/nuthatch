@@ -25,23 +25,22 @@ gate_lock() {
       flock 9 || return 1
     fi
   else
-    while ! mkdir "$path.d" 2>/dev/null; do
-      if [ ! -d "$path.d" ]; then
-        # Not held, so mkdir failed for another reason (or the holder left between the looks).
-        mkdir "$path.d" && break
-        return 1
-      fi
+    # The pid file is the claim, created by the shell with O_EXCL: uutils mkdir (Ubuntu 26.04) is
+    # not exclusive, and two runs both "made" the directory.
+    while :; do
+      mkdir -p "$path.d" || return 1
+      (set -C; echo "$$" >"$path.d/pid") 2>/dev/null && break
+      [ -d "$path.d" ] || continue
       holder=$(cat "$path.d/pid" 2>/dev/null || true)
       if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
         echo "gate lock: breaking $path.d, left by pid $holder, which has gone" >&2
-        rm -rf "$path.d"
+        rm -f "$path.d/pid"
         continue
       fi
       [ "$said" -eq 1 ] || echo "gate lock: another gate run holds $path.d; waiting" >&2
       said=1
       sleep 1
     done
-    echo "$$" >"$path.d/pid" || return 1
     GATE_LOCK_DIR=$path.d
   fi
   export GATE_LOCK_HELD=$path
