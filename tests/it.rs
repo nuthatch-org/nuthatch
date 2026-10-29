@@ -76,6 +76,8 @@ mod e2e_prune_lifecycle;
 mod e2e_query_allowlist;
 #[path = "e2e_reconcile.rs"]
 mod e2e_reconcile;
+#[path = "e2e_remote_follower.rs"]
+mod e2e_remote_follower;
 #[path = "e2e_reorg.rs"]
 mod e2e_reorg;
 #[path = "e2e_resolution.rs"]

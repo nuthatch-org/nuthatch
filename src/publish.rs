@@ -65,6 +65,14 @@ pub(crate) trait Mirror: Send + Sync {
     fn content_etags(&self) -> bool {
         false
     }
+    /// Remove `key`; one already gone is not an error.
+    async fn delete(&self, key: &str) -> Result<()> {
+        bail!("this mirror cannot delete {key}")
+    }
+    /// Every key under `prefix`, relative to the mirror.
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        bail!("this mirror cannot list {prefix}")
+    }
     /// Write `key` to `dest`, refusing more than `cap` bytes, and return the sha256 of what was written.
     async fn get_file(&self, key: &str, dest: &Path, cap: u64) -> Result<Option<String>> {
         let Some(bytes) = self.get(key).await? else {
@@ -177,6 +185,36 @@ impl Mirror for FsMirror {
 
     fn content_etags(&self) -> bool {
         true
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        match std::fs::remove_file(self.path(key)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("deleting {key}")),
+        }
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let dir = self.path(prefix);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).with_context(|| format!("listing {prefix}")),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                out.push(format!(
+                    "{}/{}",
+                    prefix.trim_end_matches('/'),
+                    entry.file_name().to_string_lossy()
+                ));
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 }
 
@@ -463,6 +501,59 @@ impl Mirror for ObjMirror {
             Err(e) => Err(obj_read_err(e, key)),
         }
     }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        use object_store::ObjectStore as _;
+        match self.inner.delete(&self.key(key)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("deleting {key}"))),
+        }
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        use object_store::ObjectStore as _;
+        let base = self.key(prefix);
+        let mut listed = self.inner.list(Some(&base));
+        let mut out = Vec::new();
+        let skip = self.prefix.as_ref().len();
+        while let Some(meta) = listed.next().await {
+            let meta = meta.with_context(|| format!("listing {prefix}"))?;
+            let full = meta.location.as_ref();
+            out.push(full[skip..].trim_start_matches('/').to_string());
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// A chunk at a time, so fetching a segment never holds it whole.
+    async fn get_file(&self, key: &str, dest: &Path, cap: u64) -> Result<Option<String>> {
+        use object_store::ObjectStore as _;
+        use std::io::Write as _;
+        let got = match self.inner.get(&self.key(key)).await {
+            Ok(g) => g,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(obj_read_err(e, key)),
+        };
+        if got.meta.size > cap {
+            bail!("{key} is larger than {cap} bytes");
+        }
+        let mut file =
+            std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+        let mut hasher = Sha256::new();
+        let mut stream = got.into_stream();
+        let mut n = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.with_context(|| format!("reading {key}"))?;
+            n += chunk.len() as u64;
+            if n > cap {
+                bail!("{key} is larger than {cap} bytes");
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .with_context(|| format!("writing {}", dest.display()))?;
+        }
+        Ok(Some(hex::encode(hasher.finalize())))
+    }
 }
 
 /// A refused read carries `access_denied`, so a seeding mount's job says why it failed (RFC-0073 FR16).
@@ -657,6 +748,12 @@ fn want_entries(manifest: &Manifest) -> Vec<(String, &Segment)> {
 pub(crate) struct Present {
     dataset: String,
     held: BTreeSet<(String, String)>,
+    /// Provisional segments on the mirror for followers, with when this process first saw the
+    /// catalogue stop naming each.
+    provisional: HashMap<String, Option<std::time::Instant>>,
+    /// Whether the mirror's provisional segments have been listed, so ones a previous process left
+    /// are let go of too.
+    listed: bool,
 }
 
 impl Present {
@@ -664,9 +761,113 @@ impl Present {
         if self.dataset != dataset {
             self.dataset = dataset.to_string();
             self.held.clear();
+            self.provisional.clear();
+            self.listed = false;
         }
         &mut self.held
     }
+}
+
+/// What a follower on another host reads beside the published segments (RFC-0076 FR17): each
+/// table's provisional segment, which the published catalogue leaves out, and the offchain
+/// snapshots with their catalogue. A provisional segment the catalogue has stopped naming is
+/// deleted from the mirror by the rule that keeps it on disk for followers: once every follower of
+/// the dataset has applied the commit that stopped naming it and the grace has passed, or at most.
+async fn put_follower_files(
+    mirror: &dyn Mirror,
+    dir: &Path,
+    data_identity: &str,
+    local: &Manifest,
+    present: &mut Present,
+) -> Result<Vec<String>> {
+    use crate::remote_follow::{offchain_key, provisional_key, OFFCHAIN_CATALOGUE};
+    let prefix = |k: &str| format!("{data_identity}/{k}");
+    let mut put = Vec::new();
+    present.of(data_identity);
+    let named: BTreeSet<&str> = local
+        .tables
+        .values()
+        .flatten()
+        .filter(|s| s.provisional)
+        .map(|s| s.hash.as_str())
+        .collect();
+    for s in local.tables.values().flatten().filter(|s| s.provisional) {
+        if present.provisional.contains_key(&s.hash) {
+            continue;
+        }
+        let key = prefix(&provisional_key(&s.hash));
+        if mirror.head(&key).await?.is_none() {
+            let src = seal::segment_path(dir, &s.file, &s.hash);
+            if !src.exists() {
+                // Folded after the catalogue was read; the seal wakes the next pass.
+                continue;
+            }
+            mirror.put_file(&key, &src).await?;
+            put.push(provisional_key(&s.hash));
+        }
+        present.provisional.insert(s.hash.clone(), None);
+    }
+    if !present.listed {
+        match mirror
+            .list(&prefix(crate::remote_follow::PROVISIONAL_DIR))
+            .await
+        {
+            Ok(keys) => {
+                for k in keys {
+                    if let Some(hash) = k
+                        .rsplit('/')
+                        .next()
+                        .and_then(|f| f.strip_suffix(".seg"))
+                    {
+                        present.provisional.entry(hash.to_string()).or_default();
+                    }
+                }
+                present.listed = true;
+            }
+            Err(e) => tracing::debug!("listing provisional segments on the mirror: {e:#}"),
+        }
+    }
+    let grace = seal::follower_grace(dir);
+    let mut gone = Vec::new();
+    for (hash, unnamed) in present.provisional.iter_mut() {
+        if named.contains(hash.as_str()) {
+            *unnamed = None;
+            continue;
+        }
+        let since = *unnamed.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() >= grace && !seal::follower_may_name(dir, hash) {
+            gone.push(hash.clone());
+        }
+    }
+    for hash in gone {
+        mirror.delete(&prefix(&provisional_key(&hash))).await?;
+        present.provisional.remove(&hash);
+        put.push(format!("-{}", provisional_key(&hash)));
+    }
+
+    let offchain = crate::offchain::load(dir)?;
+    for s in offchain.tables.values().flatten() {
+        let id = ("_offchain".to_string(), s.hash.clone());
+        if present.held.contains(&id) {
+            continue;
+        }
+        let key = prefix(&offchain_key(&s.file));
+        if mirror.head(&key).await?.is_none() {
+            mirror
+                .put_file(&key, &crate::offchain::segment_path(dir, s))
+                .await?;
+            put.push(offchain_key(&s.file));
+        }
+        present.held.insert(id);
+    }
+    if let Ok(bytes) = std::fs::read(crate::offchain::catalogue_path(dir)) {
+        let key = prefix(OFFCHAIN_CATALOGUE);
+        if mirror.get(&key).await?.as_deref() != Some(bytes.as_slice()) {
+            mirror.put(&key, &bytes).await?;
+            put.push(OFFCHAIN_CATALOGUE.to_string());
+        }
+    }
+    Ok(put)
 }
 
 async fn remote_present(
@@ -1067,6 +1268,9 @@ async fn sync_pass(
             uploaded.extend(put_seed(mirror.as_ref(), dir, &seed).await?);
         }
     }
+    uploaded.extend(
+        put_follower_files(mirror.as_ref(), dir, &data_identity, &local, present).await?,
+    );
 
     Ok(SyncReport {
         dataset: data_identity,

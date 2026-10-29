@@ -83,19 +83,21 @@ pub fn checked_dataset(dataset: &str) -> Result<()> {
     }
 }
 
-/// Every segment `catalogue` names that `root`'s segment store does not hold.
-pub fn missing(root: &Path, catalogue: &str) -> Result<Vec<Segment>> {
+/// Every segment `catalogue` names that `root`'s segment store does not hold, with its table.
+pub fn missing(root: &Path, catalogue: &str) -> Result<Vec<(String, Segment)>> {
     let m: Manifest = serde_json::from_str(catalogue).context("a corrupt catalogue on the feed")?;
     let store = root.join(crate::seal::SEGMENTS_DIR);
-    let mut out: Vec<Segment> = Vec::new();
-    for s in m.tables.into_values().flatten() {
-        if !is_hash(&s.hash) {
-            bail!("the catalogue names a segment hash '{}' that is not one", s.hash);
-        }
-        if !store.join(format!("{}.parquet", s.hash)).exists()
-            && !out.iter().any(|o| o.hash == s.hash)
-        {
-            out.push(s);
+    let mut out: Vec<(String, Segment)> = Vec::new();
+    for (table, segments) in m.tables {
+        for s in segments {
+            if !is_hash(&s.hash) {
+                bail!("the catalogue names a segment hash '{}' that is not one", s.hash);
+            }
+            if !store.join(format!("{}.parquet", s.hash)).exists()
+                && !out.iter().any(|(_, o)| o.hash == s.hash)
+            {
+                out.push((table.clone(), s));
+            }
         }
     }
     Ok(out)
@@ -164,21 +166,22 @@ impl Remote {
     /// Fetch every one of `segments` into `root`'s segment store, each checked against its hash. A
     /// provisional segment is looked for where the publisher puts provisional ones and then where a
     /// final one goes, a final one the other way round: one may have aged out of being provisional.
-    pub async fn fetch(&self, root: &Path, prefix: &str, segments: &[Segment]) -> Result<()> {
+    pub async fn fetch(
+        &self,
+        root: &Path,
+        prefix: &str,
+        segments: &[(String, Segment)],
+    ) -> Result<()> {
         let store = root.join(crate::seal::SEGMENTS_DIR);
         let mut failed = NotFetched {
             missing: Vec::new(),
             refused: Vec::new(),
         };
-        for s in segments {
+        for (table, s) in segments {
             let dest = store.join(format!("{}.parquet", s.hash));
             if dest.exists() {
                 continue;
             }
-            let table = s
-                .file
-                .strip_suffix(&format!("-{}.parquet", s.hash))
-                .unwrap_or("");
             let final_key = format!(
                 "{prefix}/{}",
                 crate::publish::parquet_key(table, &s.hash)

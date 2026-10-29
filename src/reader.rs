@@ -1318,7 +1318,12 @@ impl Follower {
 
     /// Fetch `segments` for `dataset` from the mirror until every one is in place, then say so on
     /// the connection's ready channel. Retried with backoff for as long as the connection lasts.
-    fn fetch(self: &Arc<Self>, dataset: &str, segments: Vec<crate::seal::Segment>, cx: &mut Cx) {
+    fn fetch(
+        self: &Arc<Self>,
+        dataset: &str,
+        segments: Vec<(String, crate::seal::Segment)>,
+        cx: &mut Cx,
+    ) {
         let (Some(remote), Some(prefix)) = (self.remote.clone(), self.prefix_of(dataset)) else {
             if let Some(p) = self.lock().pending.get_mut(dataset) {
                 p.error = Some(
@@ -1331,7 +1336,7 @@ impl Follower {
         };
         if let Some(p) = self.lock().pending.get_mut(dataset) {
             p.fetching = true;
-            p.waiting_for = segments.iter().map(|s| s.file.clone()).collect();
+            p.waiting_for = segments.iter().map(|(_, s)| s.file.clone()).collect();
         }
         let me = Arc::downgrade(self);
         let ready = cx.ready.clone();
