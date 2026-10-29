@@ -14,9 +14,7 @@ use serde_json::Value;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
