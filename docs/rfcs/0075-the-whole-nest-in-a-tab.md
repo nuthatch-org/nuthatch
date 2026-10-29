@@ -388,14 +388,14 @@ span, the three views inline, and a sink with the node's table floor. Both are h
 
 **Gate: passed for Chrome, not run for Safari.**
 
-| | node (`nuthatch dev`) | tab, Node 26 | tab, Chrome for Testing 156 |
+| | node (`nuthatch dev`) | tab, Node 26, `Bytes` store | tab, Chrome for Testing 156, OPFS store |
 |---|---|---|---|
 | segment `tab__transfer` 26,239,813..=26,241,612, 2,259 rows | `c983470c…479aeae` | the same | the same |
 | sealed through / last block | 26,245,806 / 26,245,870 | the same | the same |
 | `/balances` (1,360 holders, the 1,000 served) | pinned | row-identical | row-identical |
 | hot rows after the seal | | 0 | 0 |
-| wall time | | 554 ms | 567 ms |
-| wasm linear memory at the end, the peak | | 30.6 MiB | 30.8 MiB |
+| wall time | | 945 ms | 940 ms |
+| wasm linear memory at the end, the peak | | 30.6 MiB | 27.8 MiB |
 | RPC requests, bytes received / sent | | 1,433, 1,673,693 / 163,741 | the same |
 | segment bytes held | | 88,012 | 88,012 |
 
@@ -414,6 +414,6 @@ C toolchain must be set as CI sets it.
 
 **What it does not show.** The contract's Transfers all fall within its first 1,800 blocks, so there
 is one segment, and it is final. A table's provisional segment, folded back through `segment_rows`,
-is not exercised by this chain. The recorded headers carry no transactions. The tab's store was the
-`Bytes` backend, not OPFS. No run followed a live public RPC; the recording was taken from public
-RPCs, and that is all.
+is not exercised by this chain. The recorded headers carry no transactions. Node has no OPFS, so
+there the store is `Bytes`; in Chrome it is OPFS, opened as `PlayNest` opens it. No run followed a
+live public RPC; the recording was taken from public RPCs, and that is all.

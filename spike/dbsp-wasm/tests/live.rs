@@ -26,7 +26,9 @@ async fn the_tab_seals_and_serves_what_the_node_does() {
     .call0(&wasm_bindgen::JsValue::NULL)
     .unwrap();
     let t0 = js_sys::Date::now();
-    let nest = LiveNest::new(rpc.into(), CONTRACT.into(), START).unwrap();
+    let nest = LiveNest::open("tab-parity".into(), rpc.into(), CONTRACT.into(), START)
+        .await
+        .unwrap();
     let got: serde_json::Value = serde_json::from_str(&nest.follow().await.unwrap()).unwrap();
     let ms = js_sys::Date::now() - t0;
     let memory = wasm_bindgen::memory()
@@ -36,7 +38,8 @@ async fn the_tab_seals_and_serves_what_the_node_does() {
         .byte_length();
     let rpc_stats = js_sys::Reflect::get(&js_sys::global(), &"__rpc".into()).unwrap();
     console_log!(
-        "live: {ms:.0} ms; wasm memory {:.1} MiB; rpc {}; segment bytes {}; hot rows {}",
+        "live on {}: {ms:.0} ms; wasm memory {:.1} MiB; rpc {}; segment bytes {}; hot rows {}",
+        got["backend"],
         memory as f64 / (1 << 20) as f64,
         js_sys::JSON::stringify(&rpc_stats).unwrap(),
         got["segment_bytes"],

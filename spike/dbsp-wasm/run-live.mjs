@@ -25,7 +25,7 @@ globalThis.fetch = async (url, init) => {
 };
 
 const t0 = performance.now();
-const nest = new mod.LiveNest(rpc, chain.contract, BigInt(start));
+const nest = await mod.LiveNest.open("tab-parity", rpc, chain.contract, BigInt(start));
 const got = JSON.parse(await nest.follow());
 const ms = performance.now() - t0;
 const mem = mod.wasm_memory_bytes();
@@ -38,7 +38,7 @@ console.log(JSON.stringify({
   rpc_posts: posts, rpc_requests: got.rpc_requests,
   bytes_sent: sent, bytes_received: received,
   segments: segs.length, segment_bytes: got.segment_bytes, hot_rows: got.hot_rows,
-  holders: got.balances.holders,
+  holders: got.balances.holders, backend: got.backend,
 }));
 const canon = (v) => Array.isArray(v) ? v.map(canon)
   : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])])) : v;

@@ -276,7 +276,7 @@ pub mod worker {
         }
     }
 
-    async fn opfs_db(nid: &str) -> Result<redb::Database, OpenError> {
+    pub(crate) async fn opfs_db(nid: &str) -> Result<redb::Database, OpenError> {
         let dir = opfs::directory(&opfs::root().await?, nid).await?;
         let backend = OpfsBackend::open(&dir, "nuthatch.redb").await?;
         redb::Builder::new()

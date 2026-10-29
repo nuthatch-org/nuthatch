@@ -2,9 +2,11 @@
 //! node's RPC client on `fetch`, sealing past finality as the node does.
 
 use crate::cellar::Cellar;
+use crate::tab::worker::opfs_db;
 use crate::tab::{erc20, Sealing, TabNest, TRANSFER};
 use nuthatch_core::backend::Bytes;
 use nuthatch_core::fetch::Fetch;
+use nuthatch_core::opfs::OpenError;
 use nuthatch_core::rpc::RpcClient;
 use nuthatch_core::store::SEALED_THROUGH_KEY;
 use nuthatch_core::window::Finality;
@@ -22,6 +24,7 @@ pub struct LiveNest {
     nest: TabNest,
     cellar: Arc<Cellar>,
     rpc: RpcClient<Fetch>,
+    backend: &'static str,
 }
 
 fn js(e: impl std::fmt::Display) -> JsError {
@@ -30,11 +33,24 @@ fn js(e: impl std::fmt::Display) -> JsError {
 
 #[wasm_bindgen]
 impl LiveNest {
-    #[wasm_bindgen(constructor)]
-    pub fn new(rpc_url: String, contract: String, start: u64) -> Result<LiveNest, JsError> {
-        let db = redb::Builder::new()
-            .create_with_backend(Bytes::default())
-            .map_err(js)?;
+    /// A nest whose store is `<nid>/nuthatch.redb` in OPFS, or a byte buffer where the worker has no
+    /// OPFS (Node), as `PlayNest` opens it.
+    pub async fn open(
+        nid: String,
+        rpc_url: String,
+        contract: String,
+        start: u64,
+    ) -> Result<LiveNest, JsError> {
+        let (db, backend) = match opfs_db(&nid).await {
+            Ok(db) => (db, "opfs"),
+            Err(OpenError::Unavailable(_)) => (
+                redb::Builder::new()
+                    .create_with_backend(Bytes::default())
+                    .map_err(js)?,
+                "bytes",
+            ),
+            Err(e) => return Err(js(e)),
+        };
         let cellar = Arc::new(Cellar::default());
         let nest = TabNest::open_sealing(
             db,
@@ -51,7 +67,12 @@ impl LiveNest {
         )
         .map_err(js)?;
         let rpc = RpcClient::new(vec![rpc_url]).map_err(js)?;
-        Ok(LiveNest { nest, cellar, rpc })
+        Ok(LiveNest {
+            nest,
+            cellar,
+            rpc,
+            backend,
+        })
     }
 
     /// Follow the chain to its tip, then report what the gate compares, in the node's shapes.
@@ -86,6 +107,7 @@ impl LiveNest {
             "segment_bytes": self.cellar.bytes(),
             "first_rows": self.cellar.first_rows(),
             "hot_rows": self.nest.store.count().map_err(js)?,
+            "backend": self.backend,
         })
         .to_string())
     }
