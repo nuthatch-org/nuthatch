@@ -2,7 +2,8 @@
 
 - Status: **Accepted 2026-10-28 (Chief): "i wanna do it".** S0's kill question was measured the same
   day and did not kill it (§3); S0 passed its gate the same day (§12). S1 to S6 are authorised in
-  order, each on its own gate (§9).
+  order, each on its own gate (§9). S6, the last, passed on 2026-10-29 (§17): 5.24 MB brotli, and both
+  ceilings held with a cursor and a statement running together.
 - Author: Pete (cargopete)
 - Date: 2026-10-28
 - Depends on: RFC-0065 (the nest in a tab: decode, sealing and Burrmill already in a browser worker),
@@ -550,3 +551,100 @@ node's side, `"returned": items.len() + 1` in `answer::derived_all` fails `e2e_t
   (§7) is not built.
 - Wiring the worker and the Service Worker into `/play` is a change to the frontend repo, and it has not
   been made.
+
+## 17. S6 outcome, 2026-10-29
+
+S6 (#2482): size and memory.
+
+**Where the bytes were.** Attributed by symbol (`twiggy top`, each function's shallow size summed by the
+crate its path names) on the `tab` build with its names kept: 51.3 MB, of which 15.1 MB is the name
+section. Of the 36.3 MB of code and data, DataFusion is 9.1 MB, arrow 4.0 MB, sqlparser 1.8 MB, parquet
+1.2 MB and Burrmill 0.6 MB. dbsp and the feldera crates are 1.3 MB, redb 0.3 MB and nuthatch's own crates
+0.3 MB. `core` and `alloc` are 8.3 MB, and `.rodata` is 4.1 MB. Those last two are generic code and
+tables instantiated for the crates above, mostly the engine's. clap, feldera's profiler (`feldera-samply`)
+and its LIR (`feldera-ir`) are 0 bytes: the linker already drops them, because nothing a tab calls
+reaches them. Trimming them in the dbsp patch would shorten the build and not the module, so the patch
+is unchanged.
+
+**The cuts.** Each row adds to the one above it. Sizes are of the module after `wasm-bindgen`, which is
+what a page fetches. gzip is level 9 and brotli quality 11.
+
+| | raw | gzip | brotli |
+|---|---|---|---|
+| S5's build (`release`: `opt-level = "s"`, thin LTO, 16 codegen units) | 67,716,902 | 14,145,877 | 8,458,837 |
+| `tab` profile: `opt-level = "z"`, fat LTO, one codegen unit | 51,341,329 | 11,375,825 | 7,464,839 |
+| names and producers stripped by `wasm-bindgen` | 36,276,359 | 8,176,948 | 5,327,469 |
+| `wasm-opt -O1`, **the module the gates run** | **34,493,172** | **8,023,650** | **5,243,540** |
+| *burrmill-wasm, for comparison* | | | *5.6 MB* |
+
+Rejected, measured on the stripped `tab` build:
+
+| | raw | gzip | brotli |
+|---|---|---|---|
+| `wasm-opt -Oz` | 31,350,905 | 8,891,201 | 5,650,944 |
+| `wasm-opt -Os` | 32,341,181 | 8,905,335 | 5,627,819 |
+| `wasm-opt -O2` | 33,010,728 | 9,038,051 | 5,708,954 |
+| `opt-level = "s"` with fat LTO, stripped, `-O1` | 42,421,237 | 10,048,748 | 6,018,392 |
+
+`-Oz` gives the smallest raw module and a larger download, by 0.41 MB of brotli and 0.87 MB of gzip.
+A page pays for the download, so `-O1` ships. `panic = "abort"` is already wasm32's default and changes
+nothing.
+
+**Gate: passed.** The tab is 5.24 MB brotli against burrmill-wasm's 5.6 MB, with dbsp, redb, decode,
+sealing and the routes included. The floor from here is the engine. DataFusion, arrow, sqlparser and
+parquet are about half the code directly, and most of the generic half besides. Burrmill enables its
+DataFusion crates whole (`datafusion` feature, including `functions-nested`), and the tab must answer
+what the node answers, so they are not trimmed here. Removing panic locations (`-Zlocation-detail=none`)
+and `panic_immediate_abort` need a nightly `build-std`, and they were not tried. `build-tab.sh` builds
+the module. CI's `wasm-core` job builds it once with binaryen 133 (pinned by sha256), runs every Node
+gate and the Service Worker gate against it, and writes its size to the job summary.
+
+**The budgets.** `TabBudget` (`spike/dbsp-wasm/src/budget.rs`) holds a ceiling of 2,048 MiB, or 600 MiB
+when the page calls `setMemoryCeiling(600)` on a phone. It splits the ceiling as the node splits a
+cursor's 2 GiB. One statement takes a quarter, the node's one-permit share of 512 MiB, through
+Burrmill's own pool (`Engine::open_empty_within`). Statements run one at a time, as S5 made them. The
+cursor and its entities take the rest. It enforces three things:
+
+- *Admission.* `derive` charges each entity what the node's admission charges, 8 MiB plus 3,200 bytes per
+  declared row. A nest whose entities would pass the cursor's share is refused by name before any circuit
+  starts, as a node refuses the mount (`MountRefusal::OverBudget`). `tests/native.rs` reads both
+  constants out of `src/runtime.rs`, so the two cannot drift. Each lane is also held to its own
+  allowance, sampled every 60 seconds as the node's is. S4 had left both unbounded.
+- *A statement.* A statement past its share is refused with Burrmill's `Out of Memory Error` and the
+  node's hint, at status 400. Nothing is killed.
+- *The wall.* Before each window, if the module's linear memory has reached the ceiling, the cursor stops
+  with a named error rather than wait for the browser to kill the tab.
+
+The gate is `run-budget.mjs`, in Node against the shipped module, on S3's recording with S4's entities.
+At each ceiling, entities declaring 150,000 rows (about 466 MiB) are tried first. Then the cursor follows
+from the deploy block while a Lodestar-class statement runs. That statement groups 8 million distinct
+100-byte keys, past both shares, as `lodestar_indexer_ledger`'s 963 MiB is.
+
+| | phone, 600 MiB | desktop, 2,048 MiB |
+|---|---|---|
+| 150,000 declared rows | refused at admission | admitted |
+| the statement | refused, `Out of Memory Error`, 161 ms in | refused, 289 ms in |
+| the cursor | followed on to 848 ms; segment and 1,000 balances equal the node's | the same, 822 ms |
+| `SELECT count(*)` afterwards | 2,259 | 2,259 |
+| linear memory at the end, the peak | 159.7 MiB | 600.0 MiB |
+
+A ceiling of 1 MiB, which the module already exceeds, stops the cursor at its first window. The
+statement is refused while the cursor is still following, so the two hold memory together, and neither
+disturbs the other's answer.
+
+**Every mutation fails.** Each one was built and run through `run-budget.mjs`. Admitting any declared
+state fails the phone's admission check. Never refusing at the wall fails the 1 MiB check, and so does
+removing the check from the window loop. Opening the statement's engine unbounded let the statement grow
+the module to 1,832 MiB on the phone ceiling. The wall then stopped the cursor, and the run failed.
+
+**What it does not show.**
+
+- The budget gate runs in Node, not Chrome or Safari. Chrome runs the shipped module only through S5's
+  Service Worker gate. Safari is untried, for S3's reason.
+- The wall reads linear memory, which never shrinks. After one statement has used its share, the module
+  keeps the high-water mark, so on a phone the cursor grows only into what the mark leaves of 600 MiB. Nothing returns
+  memory to the browser short of reloading the worker.
+- No page detects a phone. The page must choose the ceiling, and `/play` is not wired (§16).
+- The redb store, the cellar's segment bytes and the hot copies a statement binds are not charged at
+  admission. The node's admission charges a per-nest base for them, and the tab has no measured base.
+  Only the wall bounds them.
