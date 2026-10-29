@@ -14,8 +14,7 @@
 use crate::publish::Mirror;
 use crate::seal::{Manifest, Segment};
 use anyhow::{bail, Context, Result};
-use sha2::Digest;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Under a dataset's mirror prefix: provisional segments, which the published catalogue leaves out
 /// and only followers fetch. Not named `.parquet`, so no reader's glob over the prefix counts one.
@@ -91,7 +90,10 @@ pub fn missing(root: &Path, catalogue: &str) -> Result<Vec<(String, Segment)>> {
     for (table, segments) in m.tables {
         for s in segments {
             if !is_hash(&s.hash) {
-                bail!("the catalogue names a segment hash '{}' that is not one", s.hash);
+                bail!(
+                    "the catalogue names a segment hash '{}' that is not one",
+                    s.hash
+                );
             }
             if !store.join(format!("{}.parquet", s.hash)).exists()
                 && !out.iter().any(|(_, o)| o.hash == s.hash)
@@ -182,10 +184,7 @@ impl Remote {
             if dest.exists() {
                 continue;
             }
-            let final_key = format!(
-                "{prefix}/{}",
-                crate::publish::parquet_key(table, &s.hash)
-            );
+            let final_key = format!("{prefix}/{}", crate::publish::parquet_key(table, &s.hash));
             let provisional = format!("{prefix}/{}", provisional_key(&s.hash));
             let keys = if s.provisional {
                 [provisional, final_key]
@@ -253,10 +252,15 @@ impl Remote {
             }
             let key = format!("{prefix}/{}", offchain_key(&snapshot.file));
             if !fetch_verified(self.mirror.as_ref(), &key, &dest, &snapshot.hash).await? {
-                bail!("the mirror's offchain catalogue names {}, which it does not have", key);
+                bail!(
+                    "the mirror's offchain catalogue names {}, which it does not have",
+                    key
+                );
             }
         }
-        let parent = path.parent().context("an offchain catalogue with no directory")?;
+        let parent = path
+            .parent()
+            .context("an offchain catalogue with no directory")?;
         std::fs::create_dir_all(parent)?;
         let tmp = tempfile::NamedTempFile::new_in(parent)?;
         std::fs::write(tmp.path(), &raw)?;
@@ -266,14 +270,4 @@ impl Remote {
         crate::offchain::load(&dir)?;
         Ok(true)
     }
-}
-
-/// Where `root` keeps what it fetched, for an operator's eyes.
-pub fn segments_dir(root: &Path) -> PathBuf {
-    root.join(crate::seal::SEGMENTS_DIR)
-}
-
-/// The sha256 of `bytes`, as the catalogue names a file.
-pub fn hash(bytes: &[u8]) -> String {
-    hex::encode(sha2::Sha256::digest(bytes))
 }

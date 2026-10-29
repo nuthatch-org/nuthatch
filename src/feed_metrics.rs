@@ -17,15 +17,7 @@ const SECONDS: &[f64] = &[
     60.0,
 ];
 const BYTES: &[f64] = &[
-    256.0,
-    1024.0,
-    4096.0,
-    16384.0,
-    65536.0,
-    262144.0,
-    1048576.0,
-    4194304.0,
-    16777216.0,
+    256.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0, 4194304.0, 16777216.0,
 ];
 
 struct Hist {
@@ -65,7 +57,9 @@ impl Hist {
             s.push_str(&format!("{name}_bucket{{{labels}{sep}le=\"{b}\"}} {cum}\n"));
         }
         cum += self.counts[self.bounds.len()];
-        s.push_str(&format!("{name}_bucket{{{labels}{sep}le=\"+Inf\"}} {cum}\n"));
+        s.push_str(&format!(
+            "{name}_bucket{{{labels}{sep}le=\"+Inf\"}} {cum}\n"
+        ));
         let braces = |l: &str| {
             if l.is_empty() {
                 String::new()
@@ -119,7 +113,9 @@ impl Family {
 }
 
 fn label(v: &str) -> String {
-    v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Which kind of delta a visibility observation is: seals wait on the mirror and are reported apart.
@@ -285,7 +281,8 @@ impl FeedMetrics {
     }
 
     pub fn applied(&self, took: Duration) {
-        self.apply_seconds.observe(String::new(), took.as_secs_f64());
+        self.apply_seconds
+            .observe(String::new(), took.as_secs_f64());
     }
 
     /// How long a sealing delta waited for the mirror to serve every file its catalogue names.
@@ -429,7 +426,9 @@ mod tests {
         let sum = s
             .lines()
             .find(|l| {
-                l.starts_with("nuthatch_feed_visibility_seconds_sum{dataset=\"data/vis-test\",kind=\"tip\"}")
+                l.starts_with(
+                    "nuthatch_feed_visibility_seconds_sum{dataset=\"data/vis-test\",kind=\"tip\"}",
+                )
             })
             .unwrap();
         let v: f64 = sum.rsplit(' ').next().unwrap().parse().unwrap();

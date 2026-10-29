@@ -814,11 +814,7 @@ async fn put_follower_files(
         {
             Ok(keys) => {
                 for k in keys {
-                    if let Some(hash) = k
-                        .rsplit('/')
-                        .next()
-                        .and_then(|f| f.strip_suffix(".seg"))
-                    {
+                    if let Some(hash) = k.rsplit('/').next().and_then(|f| f.strip_suffix(".seg")) {
                         present.provisional.entry(hash.to_string()).or_default();
                     }
                 }
@@ -1268,9 +1264,8 @@ async fn sync_pass(
             uploaded.extend(put_seed(mirror.as_ref(), dir, &seed).await?);
         }
     }
-    uploaded.extend(
-        put_follower_files(mirror.as_ref(), dir, &data_identity, &local, present).await?,
-    );
+    uploaded
+        .extend(put_follower_files(mirror.as_ref(), dir, &data_identity, &local, present).await?);
 
     Ok(SyncReport {
         dataset: data_identity,
@@ -3255,7 +3250,10 @@ abi = "abis/usdc.json"
         let first = tail();
         let report = pass!(&mut present).await;
         let id = report.dataset.clone();
-        assert!(on_mirror(&id, &first), "a provisional segment is published for followers");
+        assert!(
+            on_mirror(&id, &first),
+            "a provisional segment is published for followers"
+        );
 
         seal::follower_connected(&dir, 4242);
         seal_range(&dir, &[row(2, 2)], 2, 2).unwrap().unwrap();
@@ -3273,7 +3271,10 @@ abi = "abis/usdc.json"
 
         seal::follower_applied(&dir, 4242, (9, 2));
         pass!(&mut present).await;
-        assert!(!on_mirror(&id, &first), "deleted once the follower moved on");
+        assert!(
+            !on_mirror(&id, &first),
+            "deleted once the follower moved on"
+        );
         assert!(on_mirror(&id, &second));
 
         // A provisional segment nobody follows goes after the grace, and one a previous process
@@ -3285,7 +3286,10 @@ abi = "abis/usdc.json"
         pass!(&mut fresh).await;
         tokio::time::sleep(GRACE * 3).await;
         pass!(&mut fresh).await;
-        assert!(!on_mirror(&id, &second), "an unfollowed tail goes after the grace");
+        assert!(
+            !on_mirror(&id, &second),
+            "an unfollowed tail goes after the grace"
+        );
         assert!(on_mirror(&id, &tail()));
     }
 

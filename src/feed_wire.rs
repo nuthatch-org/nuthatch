@@ -11,8 +11,10 @@
 //! object; each batch has the key, then one Utf8 column per field holding the field's JSON text,
 //! and a row is put back together from them byte for byte. A row that would not come back exactly
 //! (escaped keys, whitespace, a field order its batch cannot keep) travels whole in the `_row`
-//! column, so decoding is exact by construction, not by assumption. Drops, meta and checkpoint
-//! changes are compact tagged records, in the commit's order with the puts.
+//! column, so decoding is exact by construction, not by assumption. A table with fewer than
+//! [`ARROW_FROM_ROWS`] puts sends them as they are, since a schema costs more than columns save on
+//! a handful of rows. Drops, meta and checkpoint changes are compact tagged records, in the commit's
+//! order with the puts.
 
 use crate::feed::{Delta, Op};
 use anyhow::{bail, ensure, Context, Result};
@@ -124,6 +126,11 @@ impl<'a> Cursor<'a> {
 const RESYNC: u8 = 1;
 const CATALOGUE: u8 = 2;
 
+const BATCH_ARROW: u8 = 0;
+const BATCH_RAW: u8 = 1;
+/// A table's puts go as an Arrow batch from this many rows; fewer go as they are.
+const ARROW_FROM_ROWS: usize = 8;
+
 const OP_PUT: u8 = b'P';
 const OP_DROP: u8 = b'D';
 const OP_META: u8 = b'M';
@@ -182,12 +189,15 @@ struct Batch<'a> {
     columns: Vec<(&'a str, Vec<Option<&'a str>>)>,
     index: HashMap<&'a str, usize>,
     whole: Vec<Option<&'a str>>,
+    /// The rows as put, for a batch too small to be worth columns.
+    rows: Vec<&'a str>,
 }
 
 impl<'a> Batch<'a> {
     fn new() -> Self {
         Batch {
             keys: Vec::new(),
+            rows: Vec::new(),
             columns: Vec::new(),
             index: HashMap::new(),
             whole: Vec::new(),
@@ -197,6 +207,7 @@ impl<'a> Batch<'a> {
     fn push(&mut self, key: &'a str, row: &'a str, fields: Option<Vec<(&'a str, &'a RawValue)>>) {
         let n = self.keys.len();
         self.keys.push(key);
+        self.rows.push(row);
         let split = fields.filter(|f| {
             // Fields must keep the batch's column order, so a row put back together from the columns
             // lists them as its own text does.
@@ -361,14 +372,28 @@ pub fn encode_delta(delta: &Delta) -> Result<Vec<u8>> {
                     tables.len() - 1
                 }
             };
-            batches.entry(table).or_insert_with(Batch::new).push(key, row, f);
+            batches
+                .entry(table)
+                .or_insert_with(Batch::new)
+                .push(key, row, f);
             order.push(at as u64);
         }
     }
     varint(&mut out, tables.len() as u64);
     for t in &tables {
         let batch = batches.remove(t).context("a table with no batch")?;
+        // An Arrow stream carries its schema, which costs more than a few rows save.
+        if batch.keys.len() < ARROW_FROM_ROWS {
+            out.push(BATCH_RAW);
+            varint(&mut out, batch.keys.len() as u64);
+            for (k, r) in batch.keys.iter().zip(&batch.rows) {
+                string(&mut out, k);
+                string(&mut out, r);
+            }
+            continue;
+        }
         let bytes = ipc(&batch.record_batch()?)?;
+        out.push(BATCH_ARROW);
         varint(&mut out, bytes.len() as u64);
         out.extend_from_slice(&bytes);
     }
@@ -447,7 +472,11 @@ fn rows_of(bytes: &[u8], allow: &mut Allowance) -> Result<Vec<(String, String)>>
         // What the rows come to once put back together, from the columns' lengths alone.
         let mut bytes = 0u64;
         for r in 0..batch.num_rows() {
-            bytes += if keys.is_valid(r) { keys.value_length(r) as u64 } else { 0 };
+            bytes += if keys.is_valid(r) {
+                keys.value_length(r) as u64
+            } else {
+                0
+            };
             if whole.is_valid(r) {
                 bytes += whole.value_length(r) as u64;
                 continue;
@@ -505,8 +534,24 @@ pub fn decode_delta(body: &[u8], limit: Option<u64>) -> Result<Delta> {
     let tables = c.varint()? as usize;
     let mut batches = Vec::with_capacity(tables.min(1024));
     for _ in 0..tables {
-        let n = c.varint()? as usize;
-        batches.push(rows_of(c.take(n)?, &mut allow)?.into_iter());
+        let rows = match c.u8()? {
+            BATCH_ARROW => {
+                let n = c.varint()? as usize;
+                rows_of(c.take(n)?, &mut allow)?
+            }
+            BATCH_RAW => {
+                let n = c.varint()? as usize;
+                let mut rows = Vec::with_capacity(n.min(ARROW_FROM_ROWS));
+                for _ in 0..n {
+                    let (k, r) = (c.string()?, c.string()?);
+                    allow.take((k.len() + r.len()) as u64)?;
+                    rows.push((k, r));
+                }
+                rows
+            }
+            other => bail!("unknown batch kind {other} in a delta frame"),
+        };
+        batches.push(rows.into_iter());
     }
     let n = c.varint()? as usize;
     let mut ops = Vec::with_capacity(n.min(1 << 16));
@@ -610,8 +655,9 @@ mod tests {
         });
         ops.push(Op::Put {
             key: "000000000010-000104".into(),
-            row: r#"{"block_number":10,"note":"ünïcødé \"q\" null","v":null,"o":{"a":[1,{"b":2}]}}"#
-                .into(),
+            row:
+                r#"{"block_number":10,"note":"ünïcødé \"q\" null","v":null,"o":{"a":[1,{"b":2}]}}"#
+                    .into(),
         });
         ops.push(Op::Put {
             key: "000000000010-000105".into(),
@@ -631,9 +677,7 @@ mod tests {
         ops.push(Op::UnblockFrom {
             key: "000000000011".into(),
         });
-        ops.push(Op::Unmeta {
-            key: "gone".into(),
-        });
+        ops.push(Op::Unmeta { key: "gone".into() });
         ops.push(Op::Drop {
             from: "000000000001-000000".into(),
             to: Some("000000000002-999999".into()),
@@ -662,7 +706,11 @@ mod tests {
             resync: true,
             ..Delta::default()
         };
-        assert!(decode_delta(&encode_delta(&resync).unwrap(), None).unwrap().resync);
+        assert!(
+            decode_delta(&encode_delta(&resync).unwrap(), None)
+                .unwrap()
+                .resync
+        );
     }
 
     /// Generated rows in every shape a field may take, in random orders and mixes: what comes back
@@ -738,5 +786,117 @@ mod tests {
         // The catalogue's first byte sits after epoch, generation, flags, hash and its length.
         body[8 + 8 + 1 + 32 + 1] ^= 1;
         assert!(decode_delta(&body, None).is_err());
+    }
+
+    /// A row as the indexer stores a decoded ERC-20 Transfer.
+    fn transfer(block: u64, log: u64) -> (String, String) {
+        use crate::registry::{DecodedRow, Value};
+        let word = |n: u64| {
+            let mut w = [0u8; 32];
+            w[24..].copy_from_slice(&n.to_be_bytes());
+            w
+        };
+        let addr = |n: u64| {
+            let mut a = [0u8; 20];
+            a[12..].copy_from_slice(&n.to_be_bytes());
+            a
+        };
+        let row = DecodedRow {
+            table: "usdc__transfer".into(),
+            params: vec![
+                ("from".into(), Value::Address(addr(block * 31 + log))),
+                ("to".into(), Value::Address(addr(block * 17 + log * 3))),
+                ("value".into(), Value::Word32(word(block * 1_000_003 + log))),
+            ],
+            block_number: block,
+            block_hash: format!("0x{:064x}", block * 0x9e37_79b9),
+            block_timestamp: 1_700_000_000 + block,
+            timestamps: true,
+            log_index: log,
+            tx_hash: format!("0x{:064x}", block * 1_000 + log),
+            address: "0xaf88d065e77c8cc2239327c5edb3a432268e5831".into(),
+        };
+        (
+            crate::store::Store::entity_key(block, log),
+            row.to_json().to_string(),
+        )
+    }
+
+    /// RFC-0076 §10's figures: bytes per delta and the time to encode, decode and apply it, v1
+    /// against v2, on deltas a real store commits for windows of decoded transfers. Run with
+    /// `cargo test --release --lib feed_wire::tests::measure_v1_against_v2 -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn measure_v1_against_v2() {
+        use crate::feed::{Line, MemStore};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
+        let mut sub = store.feed_subscribe().unwrap();
+        let shapes: [(&str, u64, u64); 4] = [
+            ("one row", 1, 1),
+            ("a tip block, 40 transfers", 1, 40),
+            ("a 50-block window, 1,000 transfers", 50, 20),
+            ("a 1,000-block backfill window, 20,000 transfers", 1_000, 20),
+        ];
+        let mut block = 1;
+        println!("| delta | v1 bytes | v2 bytes | v2/v1 | v1 encode | v2 encode | v1 decode | v2 decode | apply |");
+        println!("|---|---|---|---|---|---|---|---|---|");
+        for (name, blocks, per) in shapes {
+            let mut rows = Vec::new();
+            for b in block..block + blocks {
+                for l in 0..per {
+                    rows.push(transfer(b, l));
+                }
+            }
+            block += blocks;
+            store
+                .commit_window(&rows, Some((block - 1, "0xabc")), block - 1)
+                .unwrap();
+            let delta = sub.deltas.try_recv().unwrap();
+            let line = Line::Delta {
+                dataset: crate::feed::DeltaDataset("data/bench".into()),
+                delta: (*delta).clone(),
+            };
+            let rounds = (200_000 / (rows.len() as u32 + 10)).clamp(5, 2_000);
+            let time = |f: &mut dyn FnMut()| {
+                let t = std::time::Instant::now();
+                for _ in 0..rounds {
+                    f();
+                }
+                t.elapsed() / rounds
+            };
+            let v1 = serde_json::to_vec(&line).unwrap();
+            let v2 = delta_frame("data/bench", &encode_delta(&delta).unwrap());
+            let e1 = time(&mut || {
+                std::hint::black_box(serde_json::to_vec(&line).unwrap());
+            });
+            let e2 = time(&mut || {
+                std::hint::black_box(encode_delta(&delta).unwrap());
+            });
+            let d1 = time(&mut || {
+                std::hint::black_box(serde_json::from_slice::<Line>(&v1).unwrap());
+            });
+            let body = &v2[HEADER + 2 + "data/bench".len()..];
+            let d2 = time(&mut || {
+                std::hint::black_box(decode_delta(body, None).unwrap());
+            });
+            let back = decode_delta(body, None).unwrap();
+            assert_eq!(back.ops, delta.ops, "{name}: v2 decodes to the delta");
+            let base = crate::feed::Snapshot {
+                epoch: delta.epoch,
+                generation: delta.generation - 1,
+                ..Default::default()
+            };
+            let a = time(&mut || {
+                let copy = MemStore::from_snapshot(tmp.path(), base.clone());
+                copy.apply(&back).unwrap();
+            });
+            println!(
+                "| {name} | {} | {} | {:.2} | {e1:.1?} | {e2:.1?} | {d1:.1?} | {d2:.1?} | {a:.1?} |",
+                v1.len() + 1,
+                v2.len(),
+                v2.len() as f64 / (v1.len() + 1) as f64
+            );
+        }
     }
 }

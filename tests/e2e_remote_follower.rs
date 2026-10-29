@@ -155,13 +155,25 @@ async fn serve_mirror(dir: PathBuf, knobs: Arc<MirrorKnobs>) -> String {
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
                     let name = key.rsplit('/').next().unwrap_or("").to_string();
-                    if knobs.hidden.lock().unwrap().iter().any(|h| name.starts_with(h)) {
+                    if knobs
+                        .hidden
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|h| name.starts_with(h))
+                    {
                         return StatusCode::NOT_FOUND.into_response();
                     }
                     let Ok(mut bytes) = std::fs::read(dir.join(&key)) else {
                         return StatusCode::NOT_FOUND.into_response();
                     };
-                    if knobs.corrupt.lock().unwrap().iter().any(|h| name.starts_with(h)) {
+                    if knobs
+                        .corrupt
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|h| name.starts_with(h))
+                    {
                         let last = bytes.len() / 2;
                         bytes[last] ^= 0xff;
                     }
@@ -251,7 +263,10 @@ impl Rig {
 
     /// A follower on "another host": its own directory, nothing of the writer's but its URL.
     async fn remote(&self, mirror: &str, feed: u32) -> (Arc<Follower>, String, PathBuf) {
-        let cache = self.tmp.path().join(format!("elsewhere-{feed}-{}", rand_suffix()));
+        let cache = self
+            .tmp
+            .path()
+            .join(format!("elsewhere-{feed}-{}", rand_suffix()));
         std::fs::create_dir_all(&cache).unwrap();
         let remote = nuthatch::remote_follow::Remote::open(mirror, &self.registry, 2048).unwrap();
         let f = Follower::start_remote(
@@ -288,7 +303,14 @@ impl Rig {
     /// The segment file the catalogue names for the transfer table at `to`.
     fn segment_hash(&self) -> String {
         let m = nuthatch::seal::load_manifest(&self.dir()).unwrap();
-        m.tables.values().next().unwrap().last().unwrap().hash.clone()
+        m.tables
+            .values()
+            .next()
+            .unwrap()
+            .last()
+            .unwrap()
+            .hash
+            .clone()
     }
 }
 
@@ -374,7 +396,11 @@ async fn agree(rig: &Rig, remote: &str, why: &str) -> serde_json::Value {
                 same &= lr[k] == rr[k];
             }
             if same && rig.writer.generation() == g {
-                assert_eq!(out["nid"], rig.nid.as_str(), "{why}: the provenance names the nest");
+                assert_eq!(
+                    out["nid"],
+                    rig.nid.as_str(),
+                    "{why}: the provenance names the nest"
+                );
                 return out;
             }
         }
@@ -413,20 +439,33 @@ async fn a_remote_follower_answers_as_a_local_one_does() {
     assert_eq!(first["as_of"], 6);
 
     // Nothing of the writer's is under the follower's directory: its nest came from the registry.
-    assert!(!cache.join("data").join(ROUTE).join("nuthatch.redb").exists());
-    assert!(cache.join("data").join(ROUTE).join("nuthatch.toml").exists());
+    assert!(!cache
+        .join("data")
+        .join(ROUTE)
+        .join("nuthatch.redb")
+        .exists());
+    assert!(cache
+        .join("data")
+        .join(ROUTE)
+        .join("nuthatch.toml")
+        .exists());
     assert!(!cache.starts_with(&rig.root) && !rig.root.starts_with(&cache));
 
     // A seal: the segment comes from the mirror, verified, and the follower moves with it. Made
     // final before it is published, so the mirror has it only where a final segment goes while the
     // delta's catalogue still calls it provisional.
     rig.seal(1, 2);
-    assert!(!nuthatch::seal::finalise_provisional(&rig.dir()).unwrap().is_empty());
+    assert!(!nuthatch::seal::finalise_provisional(&rig.dir())
+        .unwrap()
+        .is_empty());
     rig.publish().await;
     let sealed = agree(&rig, &remote, "across a seal").await;
     assert_eq!(sealed["sealed_through"], 2);
     let hash = rig.segment_hash();
-    assert!(cache.join("segments").join(format!("{hash}.parquet")).exists());
+    assert!(cache
+        .join("segments")
+        .join(format!("{hash}.parquet"))
+        .exists());
 
     // Tip deltas, and a second seal that folds the first's provisional segment.
     for b in 7..=8 {
@@ -475,8 +514,14 @@ async fn a_remote_follower_answers_as_a_local_one_does() {
         .text()
         .await
         .unwrap();
-    assert!(follower.contains("nuthatch_follower_apply_seconds_count"), "{follower}");
-    assert!(follower.contains("nuthatch_follower_mirror_files_total"), "{follower}");
+    assert!(
+        follower.contains("nuthatch_follower_apply_seconds_count"),
+        "{follower}"
+    );
+    assert!(
+        follower.contains("nuthatch_follower_mirror_files_total"),
+        "{follower}"
+    );
     rig.writer.stop();
 }
 
@@ -538,7 +583,10 @@ async fn a_seal_naming_a_file_the_mirror_lacks_is_never_applied() {
     let ready = holds_before_the_seal(&remote, 6, Duration::from_millis(1_500)).await;
     let error = ready["follower"]["mirror"]["error"].as_str().unwrap_or("");
     assert!(error.contains("does not have"), "{ready}");
-    assert!(!cache.join("segments").join(format!("{hash}.parquet")).exists());
+    assert!(!cache
+        .join("segments")
+        .join(format!("{hash}.parquet"))
+        .exists());
 
     rig.publish().await;
     let after = agree(&rig, &remote, "once the publisher caught up").await;
@@ -565,7 +613,10 @@ async fn a_file_that_does_not_hash_to_its_name_is_refused() {
     let error = ready["follower"]["mirror"]["error"].as_str().unwrap_or("");
     assert!(error.contains("did not hash"), "{ready}");
     assert!(
-        !cache.join("segments").join(format!("{hash}.parquet")).exists(),
+        !cache
+            .join("segments")
+            .join(format!("{hash}.parquet"))
+            .exists(),
         "a refused file is never put where a query reads"
     );
 
@@ -615,5 +666,52 @@ async fn a_remote_follower_over_s3_answers_as_a_local_one_does() {
     rig.seal(3, 4);
     rig.publish().await;
     agree(&rig, &remote, "across a fold, over S3").await;
+    rig.writer.stop();
+}
+
+/// Visibility lag as the writer records it, for RFC-0076 §10: tip deltas block by block and a seal
+/// every ten, one remote follower over loopback and a filesystem mirror. Prints the histograms.
+/// `cargo test --release --test it e2e_remote_follower::measure_visibility -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn measure_visibility() {
+    let rig = rig(10, None, None).await;
+    rig.publish().await;
+    let (_f, remote, _) = rig.remote(&rig.mirror, 2).await;
+    agree(&rig, &remote, "after the snapshot").await;
+    let mut sealed = 0;
+    for b in 11..=210u64 {
+        rig.tape.insert_block(b, block(b, 100 * b as u128));
+        rig.tape.advance_tip_to(b);
+        rig.writer.reaches(b).await;
+        if b % 10 == 0 {
+            rig.seal(sealed + 1, b - 5);
+            sealed = b - 5;
+            rig.publish().await;
+        }
+    }
+    agree(&rig, &remote, "at the end").await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let text = reqwest::get(format!("{}/metrics", rig.writer.base()))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for l in text.lines().filter(|l| l.starts_with("nuthatch_feed_")) {
+        println!("{l}");
+    }
+    let follower = reqwest::get(format!("{remote}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for l in follower
+        .lines()
+        .filter(|l| l.starts_with("nuthatch_follower_"))
+    {
+        println!("{l}");
+    }
     rig.writer.stop();
 }

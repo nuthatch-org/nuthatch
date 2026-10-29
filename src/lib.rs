@@ -118,12 +118,12 @@ pub mod prune;
 pub mod publish;
 pub mod range_story;
 pub mod reader;
-pub mod remote_follow;
 pub mod recipes;
 /// The reconcile loop for scaled mode (RFC-0022 §2/§3): plan in, leases out.
 #[cfg(feature = "postgres-store")]
 pub mod reconcile;
 pub mod registry;
+pub mod remote_follow;
 pub mod requests;
 pub mod rpc;
 pub mod runtime;

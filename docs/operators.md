@@ -318,8 +318,52 @@ the same `as_of`, `sealed_through` and `nid`.
   `segments/.retained.json` records what is kept, so a `nuthatch prune` in another process skips it
   too. A follower that finds a segment its catalogue names missing never answers around it: the
   request is `503` `catching_up` and the follower takes fresh snapshots.
-- **Beside the writer only, for now.** It reads segments from the runtime directory; following from
-  another host with a segment mirror is RFC-0073's open question 2, not built.
+- **On another host, from the mirror and the registry (RFC-0076 FR17).** A follower that shares no
+  disk with the writer takes from the writer's `[runtime.publish]` mirror and its registry what one
+  beside it reads from the runtime directory:
+
+  ```
+  NUTHATCH_ADMIN_TOKEN=<the writer's token> \
+    nuthatch serve --follow https://writer.internal:8288 \
+      --mirror s3://nests/mirror --registry s3://nests/registry \
+      --cache /var/lib/nuthatch/follower --max-rss-mb 2048 --listen 0.0.0.0:8289
+  ```
+
+  | Beside the writer | On another host |
+  |---|---|
+  | Sealed segments from the runtime directory | From the mirror, each file's sha256 checked against the hash its catalogue names before anything reads it |
+  | Each nest's `nuthatch.toml`, labels and entities from `data/<nid>` | From the registry by the NID the `mount` line carries, verified as `nest load` verifies it |
+  | Offchain snapshots from `<dataset>/offchain` | From the mirror's `_offchain/`, content-addressed and checked the same way, every 5 s |
+  | `max_rss_mb` from `mounts.toml` | `--max-rss-mb`, default 2048 |
+  | The token from the environment or `.admin-token` | `NUTHATCH_ADMIN_TOKEN` only |
+
+  `--cache` is the follower's own directory, laid out as a runtime's, and nothing in it is the
+  writer's. Every remote source is one the operator names on the command line; credentials for an
+  `s3://` mirror or registry come from the `AWS_*` environment, as publishing's do. Publish every
+  mount a remote follower serves (`[mounts.publish]` or `[runtime.publish]`), and publish each
+  nest's bundle to the registry (`nuthatch nest publish`): a mount whose NID the registry lacks
+  answers `503` `unservable` with why, and is asked for again every 5 s.
+- **A seal is applied whole, once its files are in.** A sealing delta moves rows from hot into a
+  segment, so a follower cannot apply half of one. On another host, a delta whose catalogue names a
+  segment the follower does not yet hold waits while the follower fetches and verifies every such
+  file; the deltas behind it wait too, charged to the dataset's budget, and past that budget the
+  follower takes fresh snapshots as a full queue does. Meanwhile it answers the generation before
+  the seal, whole, and `/<tenant>/<alias>/ready`'s `follower.mirror` says what it waits for and why
+  the last attempt failed: the publisher has not uploaded it yet, or the bytes did not hash to the
+  name and were refused. It never names a segment it cannot read, and never answers short. The
+  publisher uploads after the writer's catalogue moves and the writer never waits for a follower,
+  so a slow mirror shows as seal visibility lag on remote followers, which is reported apart from
+  tip visibility, and never anywhere else.
+- **Provisional segments are on the mirror for followers only.** The published catalogue leaves a
+  table's provisional tail out, as before; the publisher also uploads each tail under
+  `_provisional/<hash>.seg`, where only a follower looks. A tail a fold replaced is deleted from the
+  mirror by the rule that keeps it on disk: once every connected follower of its dataset has
+  applied the commit that stopped naming it and 5 minutes have passed, and at most after an hour.
+  Nothing else is ever deleted from a mirror; sealed segments are append-only.
+- **Not yet:** a follower's `--cache` keeps every segment it has fetched, including tails later
+  folded away, until the operator clears it with the follower stopped. A writer whose dataset takes
+  an offchain pull moves its data identity, and with it the prefix its publisher mirrors under; a
+  remote follower follows the new prefix within 30 s, once the publisher has filled it.
 
 A writer's restart, measured in-process on one cursor at 1, 10, 100 and 500 small mounts
 ([docs/bench/rfc-0073-fr7-restart-to-ready.md](bench/rfc-0073-fr7-restart-to-ready.md)), took 9 ms,

@@ -568,7 +568,8 @@ fn retained(key: &Path) -> bool {
 /// Whether a follower of `dir` may still name the segment `hash`, by the rule that keeps it on disk:
 /// what a mirror deletion asks before removing the copy a follower on another host reads.
 pub fn follower_may_name(dir: &Path, hash: &str) -> bool {
-    shared_store(dir).is_some_and(|store| retained(&segment_key(&store.join(format!("{hash}.parquet")))))
+    shared_store(dir)
+        .is_some_and(|store| retained(&segment_key(&store.join(format!("{hash}.parquet")))))
 }
 
 /// The least time a file a fold replaced in `dir` is kept for followers.

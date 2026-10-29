@@ -161,11 +161,10 @@ pub async fn serve(args: crate::cli::ServeArgs) -> Result<()> {
             Follower::start_remote(root, writer, token, Arc::new(remote), options)
         }
         None => {
-            let root = PathBuf::from(
-                args.runtime
-                    .as_deref()
-                    .context("--follow needs --runtime, or --mirror for a follower on another host")?,
-            );
+            let root =
+                PathBuf::from(args.runtime.as_deref().context(
+                    "--follow needs --runtime, or --mirror for a follower on another host",
+                )?);
             if !root.join(crate::runtime::MOUNTS_FILE).is_file() {
                 bail!(
                     "'{}' is not a runtime directory (no {})",
@@ -700,6 +699,34 @@ impl Follower {
         let mut every = tokio::time::interval(OFFCHAIN_EVERY);
         loop {
             every.tick().await;
+            // A nest the registry did not have is asked for again, as an operator publishes it.
+            let unserved: Vec<(String, Spec)> = self
+                .lock()
+                .routes
+                .iter()
+                .filter(|(_, r)| {
+                    matches!(r.served, Some(Err(_)))
+                        && !self
+                            .root
+                            .join(&r.spec.dataset)
+                            .join(crate::config::CONFIG_FILE)
+                            .exists()
+                })
+                .map(|(route, r)| (route.clone(), r.spec.clone()))
+                .collect();
+            for (route, spec) in unserved {
+                if self.install(&remote, &spec).await.is_ok() {
+                    let estimate = nest_estimate(&self.root.join(&spec.dataset));
+                    let mut inner = self.lock();
+                    inner.estimates.insert(spec.dataset.clone(), estimate);
+                    if let Some(r) = inner.routes.get_mut(&route).filter(|r| r.spec == spec) {
+                        r.served = None;
+                    }
+                    drop(inner);
+                    self.realise();
+                    self.recompose();
+                }
+            }
             let held: Vec<(String, String)> = {
                 let inner = self.lock();
                 inner
@@ -1260,7 +1287,10 @@ impl Follower {
                 .sync_offchain(&self.root, &spec.dataset, prefix)
                 .await
             {
-                tracing::warn!("{}: offchain snapshots from the mirror: {e:#}", spec.dataset);
+                tracing::warn!(
+                    "{}: offchain snapshots from the mirror: {e:#}",
+                    spec.dataset
+                );
             }
         }
         Ok(())
@@ -1416,34 +1446,30 @@ impl Follower {
         snapshot: crate::feed::Snapshot,
     ) -> Result<()> {
         let dataset = dataset.to_string();
-        {
-            {
-                let dir = self.root.join(&dataset);
-                let data = tokio::task::spawn_blocking(move || {
-                    let store = Arc::new(MemStore::from_snapshot(&dir, snapshot));
-                    let derived = derive(&dir, &store);
-                    Data {
-                        building: rebuilding(&derived),
-                        store,
-                        derived,
-                    }
-                })
-                .await
-                .context("building a snapshot's store")?;
-                let lifted = {
-                    let mut inner = self.lock();
-                    if let Some(old) = inner.datasets.insert(dataset.clone(), data) {
-                        inner.retire(&dataset, Some(&old.store), old.derived.as_ref().ok());
-                    }
-                    inner.note_peak(&dataset);
-                    inner.awaiting_room.remove(&dataset);
-                    inner.over_budget.remove(&dataset).is_some()
-                };
-                self.realise();
-                if lifted {
-                    self.recompose();
-                }
+        let dir = self.root.join(&dataset);
+        let data = tokio::task::spawn_blocking(move || {
+            let store = Arc::new(MemStore::from_snapshot(&dir, snapshot));
+            let derived = derive(&dir, &store);
+            Data {
+                building: rebuilding(&derived),
+                store,
+                derived,
             }
+        })
+        .await
+        .context("building a snapshot's store")?;
+        let lifted = {
+            let mut inner = self.lock();
+            if let Some(old) = inner.datasets.insert(dataset.clone(), data) {
+                inner.retire(&dataset, Some(&old.store), old.derived.as_ref().ok());
+            }
+            inner.note_peak(&dataset);
+            inner.awaiting_room.remove(&dataset);
+            inner.over_budget.remove(&dataset).is_some()
+        };
+        self.realise();
+        if lifted {
+            self.recompose();
         }
         Ok(())
     }
@@ -1452,134 +1478,120 @@ impl Follower {
     async fn apply_delta(self: &Arc<Self>, dataset: &str, delta: crate::feed::Delta) -> Result<()> {
         let dataset = dataset.to_string();
         let started = Instant::now();
-        {
-            {
-                let data = self.lock().datasets.get(&dataset).cloned();
-                let Some(data) = data else {
-                    bail!("{dataset}: a delta before its snapshot; resnapshotting");
-                };
-                // Charged before it is applied, at its peak, so the copy never holds more than its
-                // budget even part-way through a delta.
-                let peak = data.store.peak_with(&delta);
-                if let Some(cap) = self.cap_for(&dataset).filter(|cap| peak > *cap) {
-                    let max = {
-                        let mut inner = self.lock();
-                        inner.excluded.insert(dataset.clone());
-                        inner.max_rss_mb
-                    };
-                    self.refuse(
-                        &dataset,
-                        format!(
-                            "{}; refused before it was applied",
-                            budget_reason(&dataset, peak, cap, max)
-                        ),
-                    );
-                    return Ok(());
-                }
-                let gate = self
-                    .lock()
-                    .applying
-                    .entry(dataset.clone())
-                    .or_default()
-                    .clone();
-                let whole = gate.write().await;
-                // The old state keeps serving while a new connection takes fresh snapshots.
-                let changes = data
-                    .store
-                    .apply(&delta)
-                    .with_context(|| format!("{dataset}: resnapshotting"))?;
-                self.lock().note_peak(&dataset);
-                if let Some(delay) = crate::indexer::follower_feed_delay(&self.root.join(&dataset))
-                {
-                    tokio::time::sleep(delay).await;
-                }
-                let torn = if changes.sealed_unseen {
-                    // Rows sealed straight to segments never crossed the feed: derive again.
-                    Some("rows were sealed that never passed through hot".to_string())
-                } else if let (Ok(derived), Some(through)) = (&data.derived, changes.through) {
-                    let (derived, store) = (derived.clone(), data.store.clone());
-                    let dir = self.root.join(&dataset);
-                    // Fed and then flushed, so every view has published the delta before a reader
-                    // is let back in.
-                    tokio::task::spawn_blocking(move || {
-                        crate::seal::within(&dir, store.clone(), || {
-                            derived.apply(
-                                store.as_ref(),
-                                &changes.removed,
-                                &changes.added,
-                                through,
-                            )?;
-                            derived.flush();
-                            Ok::<_, anyhow::Error>(())
-                        })
-                    })
-                    .await
-                    .context("feeding derived state")?
-                    .err()
-                    .map(|e| format!("feeding it failed part-way: {e:#}"))
-                } else {
-                    None
-                };
-                if let Some(why) = &torn {
-                    // Marked before readers are let back in, so none reads the torn state.
-                    if let Some(d) = self.lock().datasets.get_mut(&dataset) {
-                        d.building = Some(why.clone());
-                    }
-                }
-                drop(whole);
-                crate::feed_metrics::metrics().applied(started.elapsed());
-                self.ack.notify_one();
-                if let Some(why) = torn {
-                    let store = data.store.clone();
-                    drop(data);
-                    self.rederive(&dataset, store, why).await?;
-                }
+        let data = self.lock().datasets.get(&dataset).cloned();
+        let Some(data) = data else {
+            bail!("{dataset}: a delta before its snapshot; resnapshotting");
+        };
+        // Charged before it is applied, at its peak, so the copy never holds more than its
+        // budget even part-way through a delta.
+        let peak = data.store.peak_with(&delta);
+        if let Some(cap) = self.cap_for(&dataset).filter(|cap| peak > *cap) {
+            let max = {
+                let mut inner = self.lock();
+                inner.excluded.insert(dataset.clone());
+                inner.max_rss_mb
+            };
+            self.refuse(
+                &dataset,
+                format!(
+                    "{}; refused before it was applied",
+                    budget_reason(&dataset, peak, cap, max)
+                ),
+            );
+            return Ok(());
+        }
+        let gate = self
+            .lock()
+            .applying
+            .entry(dataset.clone())
+            .or_default()
+            .clone();
+        let whole = gate.write().await;
+        // The old state keeps serving while a new connection takes fresh snapshots.
+        let changes = data
+            .store
+            .apply(&delta)
+            .with_context(|| format!("{dataset}: resnapshotting"))?;
+        self.lock().note_peak(&dataset);
+        if let Some(delay) = crate::indexer::follower_feed_delay(&self.root.join(&dataset)) {
+            tokio::time::sleep(delay).await;
+        }
+        let torn = if changes.sealed_unseen {
+            // Rows sealed straight to segments never crossed the feed: derive again.
+            Some("rows were sealed that never passed through hot".to_string())
+        } else if let (Ok(derived), Some(through)) = (&data.derived, changes.through) {
+            let (derived, store) = (derived.clone(), data.store.clone());
+            let dir = self.root.join(&dataset);
+            // Fed and then flushed, so every view has published the delta before a reader
+            // is let back in.
+            tokio::task::spawn_blocking(move || {
+                crate::seal::within(&dir, store.clone(), || {
+                    derived.apply(store.as_ref(), &changes.removed, &changes.added, through)?;
+                    derived.flush();
+                    Ok::<_, anyhow::Error>(())
+                })
+            })
+            .await
+            .context("feeding derived state")?
+            .err()
+            .map(|e| format!("feeding it failed part-way: {e:#}"))
+        } else {
+            None
+        };
+        if let Some(why) = &torn {
+            // Marked before readers are let back in, so none reads the torn state.
+            if let Some(d) = self.lock().datasets.get_mut(&dataset) {
+                d.building = Some(why.clone());
             }
+        }
+        drop(whole);
+        crate::feed_metrics::metrics().applied(started.elapsed());
+        self.ack.notify_one();
+        if let Some(why) = torn {
+            let store = data.store.clone();
+            drop(data);
+            self.rederive(&dataset, store, why).await?;
         }
         Ok(())
     }
 
     fn heartbeat(self: &Arc<Self>, positions: BTreeMap<String, (u64, u64)>) -> Result<()> {
-        {
-            {
-                let roomier = {
-                    let mut inner = self.lock();
-                    inner.positions = positions.into_iter().collect();
-                    let roomier: Vec<String> = inner
-                        .awaiting_room
-                        .iter()
-                        .filter(|(_, (chain, was))| inner.retiring_on(chain) < *was)
-                        .map(|(d, _)| d.clone())
-                        .collect();
-                    for d in &roomier {
-                        inner.awaiting_room.remove(d);
-                        inner.excluded.remove(d);
-                        inner.over_budget.remove(d);
-                    }
-                    roomier
-                };
-                if !roomier.is_empty() {
-                    self.recompose();
-                    // The feed sends a snapshot only on connecting, so ask again by reconnecting.
-                    bail!(
-                        "room came back for {}; asking for it again",
-                        roomier.join(", ")
-                    );
-                }
-                let gone: Vec<String> = self
-                    .lock()
-                    .datasets
-                    .iter()
-                    .filter(|(_, copy)| copy.store.take_missing())
-                    .map(|(d, _)| d.clone())
-                    .collect();
-                if !gone.is_empty() {
-                    bail!(
-                        "{}: a segment the copy names is gone; taking fresh snapshots",
-                        gone.join(", ")
-                    );
-                }
+        let roomier = {
+            let mut inner = self.lock();
+            inner.positions = positions.into_iter().collect();
+            let roomier: Vec<String> = inner
+                .awaiting_room
+                .iter()
+                .filter(|(_, (chain, was))| inner.retiring_on(chain) < *was)
+                .map(|(d, _)| d.clone())
+                .collect();
+            for d in &roomier {
+                inner.awaiting_room.remove(d);
+                inner.excluded.remove(d);
+                inner.over_budget.remove(d);
             }
+            roomier
+        };
+        if !roomier.is_empty() {
+            self.recompose();
+            // The feed sends a snapshot only on connecting, so ask again by reconnecting.
+            bail!(
+                "room came back for {}; asking for it again",
+                roomier.join(", ")
+            );
+        }
+        let gone: Vec<String> = self
+            .lock()
+            .datasets
+            .iter()
+            .filter(|(_, copy)| copy.store.take_missing())
+            .map(|(d, _)| d.clone())
+            .collect();
+        if !gone.is_empty() {
+            bail!(
+                "{}: a segment the copy names is gone; taking fresh snapshots",
+                gone.join(", ")
+            );
         }
         Ok(())
     }

@@ -469,12 +469,37 @@ The answer is a stream of newline-delimited JSON, one connection for every mount
 | Line | When | Carries |
 |---|---|---|
 | `{"hello": …}` | first | the writer's version and `feed`, the format's version; a follower refuses a writer speaking another |
-| `{"mount": …}` | per route, then on any change | `route`, `dataset` (`data/<nid>`, relative to the runtime), `nid`, `chain`, and the SQL surface, tenant share and limits the writer serves it with |
+| `{"mount": …}` | per route, then on any change | `route`, `dataset` (`data/<nid>`, relative to the runtime), `nid`, `chain`, the SQL surface, tenant share and limits the writer serves it with, and `data_identity`, the prefix its mirror holds it under |
 | `"mounted"` | once, after the first `mount`s | every route mounted when the connection opened has been sent |
 | `{"unmount": …}` | a route goes | `route` |
 | `{"snapshot": …}` | per dataset, after its mounts | `dataset` first, then the hot window as of one generation: entity rows, meta and block checkpoints as JSON objects keyed by key, and the segment catalogue, read in one hot-store transaction |
 | `{"delta": …}` | every hot-store commit after it | `epoch`, `generation`, the commit's changes, and the catalogue when the commit raised `sealed_through` |
 | `{"heartbeat": …}` | every second | each dataset's `[epoch, generation]` now |
+
+**Feed v2 (RFC-0076 FR17).** `?feed=2` asks for frames instead of lines, and a writer that speaks
+them answers `Content-Type: application/vnd.nuthatch.feed-v2` and `hello` with `"feed": 2`; one
+that does not answers NDJSON as above, which the follower reads as v1. Followers from this release
+ask for v2; v1 stays for older followers and for reading the feed by eye. Each frame is a `u32`
+big-endian payload length, a kind byte, then the payload:
+
+| Kind | Payload |
+|---|---|
+| `1` JSON | one line above, as JSON: `hello`, `mount`, `mounted`, `unmount`, `heartbeat` |
+| `2` part, `3` end | a snapshot, or a delta too large for one frame, as v1's JSON in parts as it is read, then an empty end frame |
+| `4` delta | `u16` dataset length and the dataset, then epoch and generation (`u64` each), flags, the catalogue behind its sha256 when the commit seals, each entity table's puts, then the commit's ops in order |
+
+A table's puts are an Arrow IPC record batch, LZ4-compressed whole behind its decompressed size:
+the key, then one Utf8 column per field holding that field's JSON text, and a `_row` column for a
+row that would not come back byte for byte from its fields, which travels whole. A table with
+fewer than 8 puts sends them as they are. Drops, meta and checkpoint changes are tagged records. A
+follower holds a delta frame to what its dataset has left twice: its wire bytes before the body is
+read, and its decompressed size and rows before either is allocated.
+
+**What a follower has applied, and how soon.** Every second, and within 10 ms of each delta it
+applies, a follower sends `POST /_admin/feed/applied?conn=<n>&rtt_us=<µs>` (below), `rtt_us` being
+the round trip its last report took. The writer records, for each generation newly acknowledged,
+the time from its commit to the report's arrival less half that round trip: when the follower could
+first answer from it, measured on the writer's clock alone.
 
 **Generations.** Each dataset's commits are numbered from its writer's start: generation G+1 follows G
 within one `epoch`, and a restarted writer is a new epoch. A follower that receives anything other
@@ -510,6 +535,20 @@ that read offchain tables up to the dataset's offchain snapshots, by the code th
 **A slow follower never slows the writer.** A follower more than 1,024 commits behind on a dataset is
 sent a fresh snapshot of it instead of the commits it missed, and nothing is gathered for the feed
 while nothing is following. The writer's own tip path is unchanged in either case.
+
+**What the feed costs, and how far behind followers see.** On the writer's `/metrics`:
+
+| Series | What |
+|---|---|
+| `nuthatch_feed_visibility_seconds{dataset,kind}` | histogram, commit to a follower being able to answer from it, as above; `kind` is `tip` or `seal`, since a seal on another host waits on the mirror |
+| `nuthatch_feed_delta_bytes{encoding}` | histogram, one delta as sent, `v1` or `v2` |
+| `nuthatch_feed_encode_seconds{encoding}` | histogram, encoding one delta; v2 is encoded once however many followers it goes to |
+| `nuthatch_feed_connection_queue_bytes{conn}` | gauge, what one connection has queued, for each connection open |
+
+`dataset` is `data/<nid>`, one series pair per followed dataset; no series is labelled by follower,
+whose connections come and go. A follower serves its own `/metrics`: `nuthatch_follower_apply_seconds`
+(applying one delta, its derived state included), `nuthatch_follower_seal_wait_seconds` (a seal's
+wait for the mirror) and, on another host, `nuthatch_follower_mirror_{files,bytes,refused,missing}_total`.
 
 ## What to meter
 

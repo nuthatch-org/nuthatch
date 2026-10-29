@@ -538,11 +538,8 @@ pub fn read_frames(
                 let rest = u64::from(len)
                     .checked_sub(2 + dlen as u64)
                     .context("a delta frame shorter than its dataset")?;
-                let cap = CAP_FOR.with(|f| {
-                    f.borrow()
-                        .as_ref()
-                        .and_then(|f| f(&dataset, Kind::Delta))
-                });
+                let cap =
+                    CAP_FOR.with(|f| f.borrow().as_ref().and_then(|f| f(&dataset, Kind::Delta)));
                 if let Some(cap) = cap.filter(|cap| rest > cap + SNAPSHOT_SLACK) {
                     return Err(LineOverBudget {
                         dataset,
