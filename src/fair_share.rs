@@ -2,13 +2,15 @@
 //! bytes in flight, divided by the opaque tenant string a mount carries.
 //!
 //! Admitted work is never preempted, so queueing alone cannot bound how long one tenant waits behind
-//! another. Every tenant with a mount on a gate therefore holds a **reservation**: one permit, and a
-//! slice of half the response-bytes budget. A tenant may borrow beyond it only while every other
-//! seated tenant's reservation stays free, so a tenant under its reservation waits behind its own work
-//! and never behind another's. Weights order the queue when several tenants wait, and set the share a
-//! refusal is measured against.
+//! another. A gate's permits are divided between its **active** tenants (RFC-0076 §3.1), those with a
+//! query queued or running on it, so a tenant with a thousand idle mounts holds nothing. To let a
+//! tenant that becomes active find a permit free, the gate keeps a **reserve** of `max(1, permits/8)`
+//! that only a tenant holding none may take: one already holding a permit borrows only while the
+//! reserve stays free. Weights order the queue when several tenants wait, and set the share a refusal
+//! is measured against. Response bytes keep a reservation per mounted tenant: a slice of half the
+//! budget.
 //!
-//! A gate with one tenant, or none, behaves as the plain semaphore it wraps: no reservation is held
+//! A gate with one tenant, or none, behaves as the plain semaphore it wraps: no reserve is kept
 //! for anybody else, and a refusal is `busy` as it always was.
 //!
 //! The hot-tip rows a query copies (RFC-0073 FR5) are a third budget, one per gate, divided the same
@@ -69,16 +71,81 @@ impl std::fmt::Display for HotShareRefused {
 impl std::error::Error for HotShareRefused {}
 
 struct GateShares {
-    total: usize,
     ledger: Mutex<GateLedger>,
     changed: Notify,
 }
 
+/// Upper bounds, in seconds, of the admission-wait histogram. The wait is capped at 250 ms, so the
+/// last bound is the cap and `+Inf` holds only what overran it.
+pub const WAIT_BOUNDS: [f64; 7] = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25];
+
+/// One tenant's admissions on one gate since the process started.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WaitStats {
+    /// Admissions that found no permit at once and queued.
+    pub waits: u64,
+    /// Cumulative counts per [`WAIT_BOUNDS`] entry, then `+Inf`, of every admission's wait.
+    pub buckets: [u64; WAIT_BOUNDS.len() + 1],
+    pub sum_secs: f64,
+    pub count: u64,
+    pub rejected_busy: u64,
+    pub rejected_tenant_share: u64,
+}
+
+impl WaitStats {
+    fn observe(&mut self, waited: Duration, queued: bool, refused: Option<Refusal>) {
+        let secs = waited.as_secs_f64();
+        self.waits += u64::from(queued);
+        self.count += 1;
+        self.sum_secs += secs;
+        for (i, bound) in WAIT_BOUNDS.iter().enumerate() {
+            if secs <= *bound {
+                self.buckets[i] += 1;
+            }
+        }
+        self.buckets[WAIT_BOUNDS.len()] += 1;
+        match refused {
+            Some(Refusal::Busy) => self.rejected_busy += 1,
+            Some(Refusal::TenantShare) => self.rejected_tenant_share += 1,
+            None => {}
+        }
+    }
+
+    /// The smallest bound holding at least `q` of the admissions, `None` past the last bound.
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        let want = (self.count as f64 * q).ceil().max(1.0) as u64;
+        WAIT_BOUNDS
+            .iter()
+            .zip(self.buckets)
+            .find(|(_, n)| *n >= want)
+            .map(|(b, _)| *b)
+    }
+}
+
+/// What one tenant holds and has waited on one gate, for `GET /_admin/tenants`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GateTenantReport {
+    pub active: bool,
+    pub held: usize,
+    pub stats: WaitStats,
+}
+
 #[derive(Default)]
 struct GateLedger {
+    total: usize,
+    /// Permits a lowered total still has to take out of circulation as they come back.
+    debt: usize,
     tenants: BTreeMap<Arc<str>, GateTenant>,
     shares: BTreeMap<Arc<str>, TenantShare>,
     next_ticket: u64,
+    /// Seated tenants holding no permit: those the reserve is kept for.
+    idle_seated: usize,
+    /// Tenants with a query queued or running here, and their weights summed.
+    active: usize,
+    active_weight: u64,
+    /// Tenants with a waiter, so ordering looks only at them and not at every mount.
+    queued: std::collections::BTreeSet<Arc<str>>,
+    stats: BTreeMap<Arc<str>, WaitStats>,
 }
 
 #[derive(Default)]
@@ -87,12 +154,24 @@ struct GateTenant {
     seats: Vec<PathBuf>,
     held: usize,
     waiting: VecDeque<u64>,
+    /// What this tenant adds to the ledger's tallies, so a change can take back exactly that.
+    counted_idle: bool,
+    counted_weight: Option<u64>,
 }
 
 impl GateTenant {
     fn seated(&self) -> bool {
         !self.seats.is_empty()
     }
+
+    fn active(&self) -> bool {
+        self.held > 0 || !self.waiting.is_empty()
+    }
+}
+
+/// Permits only a tenant holding none may take: `max(1, total / 8)`.
+pub fn reserve(total: usize) -> usize {
+    (total / 8).max(1)
 }
 
 impl GateLedger {
@@ -100,31 +179,91 @@ impl GateLedger {
         self.shares.get(tenant).copied().unwrap_or_default()
     }
 
-    fn seated(&self) -> impl Iterator<Item = (&Arc<str>, &GateTenant)> {
-        self.tenants.iter().filter(|(_, t)| t.seated())
-    }
-
     fn held(&self, tenant: &str) -> usize {
         self.tenants.get(tenant).map_or(0, |t| t.held)
     }
 
-    /// The permits `tenant` is entitled to by weight among the seated tenants, at least one.
-    fn fair(&self, tenant: &str, total: usize) -> usize {
-        let weights: u64 = self
-            .seated()
-            .map(|(t, _)| self.share(t).weight as u64)
-            .sum();
+    /// Bring the tallies in line with `tenant` after anything about it changed, then drop it if
+    /// nothing is left of it.
+    fn refresh(&mut self, tenant: &str) {
+        let weight = self.share(tenant).weight as u64;
+        let Some((key, t)) = self.tenants.get_key_value(tenant) else {
+            return;
+        };
+        let key = Arc::clone(key);
+        let idle = t.seated() && t.held == 0;
+        let active = t.active().then_some(weight);
+        let (was_idle, was_active) = (t.counted_idle, t.counted_weight);
+        let queued = !t.waiting.is_empty();
+        let gone = !t.seated() && t.held == 0 && t.waiting.is_empty();
+        self.idle_seated = self.idle_seated + usize::from(idle) - usize::from(was_idle);
+        if let Some(w) = was_active {
+            self.active -= 1;
+            self.active_weight -= w;
+        }
+        if let Some(w) = active {
+            self.active += 1;
+            self.active_weight += w;
+        }
+        if queued {
+            self.queued.insert(Arc::clone(&key));
+        } else {
+            self.queued.remove(tenant);
+        }
+        if gone {
+            self.tenants.remove(tenant);
+            self.stats.remove(tenant);
+        } else if let Some(t) = self.tenants.get_mut(tenant) {
+            t.counted_idle = idle;
+            t.counted_weight = active;
+        }
+    }
+
+    fn entry(&mut self, tenant: &str) -> &mut GateTenant {
+        if !self.tenants.contains_key(tenant) {
+            self.tenants
+                .insert(Arc::from(tenant), GateTenant::default());
+        }
+        self.tenants.get_mut(tenant).expect("inserted above")
+    }
+
+    /// Seated tenants other than `tenant` holding no permit.
+    fn others_idle(&self, tenant: &str) -> usize {
+        let mine = self.tenants.get(tenant).is_some_and(|t| t.counted_idle);
+        self.idle_seated - usize::from(mine)
+    }
+
+    /// Active tenants other than `tenant`, and their weights.
+    fn others_active(&self, tenant: &str) -> (usize, u64) {
+        match self.tenants.get(tenant).and_then(|t| t.counted_weight) {
+            Some(w) => (self.active - 1, self.active_weight - w),
+            None => (self.active, self.active_weight),
+        }
+    }
+
+    /// The permits `tenant` is entitled to by weight among the active tenants, itself counted as one,
+    /// at least one.
+    fn fair(&self, tenant: &str) -> usize {
         let mine = self.share(tenant).weight as u64;
-        let weights = weights.max(mine);
-        let fair = ((total as u64 * mine) / weights.max(1)) as usize;
+        let weights = self.others_active(tenant).1 + mine;
+        let fair = ((self.total as u64 * mine) / weights.max(1)) as usize;
         let fair = fair.max(1);
         self.share(tenant)
             .max_permits
             .map_or(fair, |cap| fair.min(cap))
     }
 
+    /// What `tenant` must leave free on the semaphore before it may take one more permit.
+    fn kept_from(&self, tenant: &str) -> usize {
+        if self.held(tenant) == 0 || self.others_idle(tenant) == 0 {
+            0
+        } else {
+            reserve(self.total)
+        }
+    }
+
     /// Whether `tenant` may take one permit with `free` on the semaphore, and why not.
-    fn may_take(&self, tenant: &str, free: usize, total: usize) -> Result<(), Refusal> {
+    fn may_take(&self, tenant: &str, free: usize) -> Result<(), Refusal> {
         let held = self.held(tenant);
         if self
             .share(tenant)
@@ -133,31 +272,21 @@ impl GateLedger {
         {
             return Err(Refusal::TenantShare);
         }
-        let seated = self.seated().count();
-        let idle_others = self
-            .seated()
-            .filter(|(t, s)| &***t != tenant && s.held == 0)
-            .count();
-        let ok = if seated > total {
-            free >= 1 && held == 0
-        } else {
-            free > idle_others
-        };
-        if ok {
+        if free > self.kept_from(tenant) {
             Ok(())
         } else {
-            Err(self.reason(tenant, total))
+            Err(self.reason(tenant, free))
         }
     }
 
-    fn reason(&self, tenant: &str, total: usize) -> Refusal {
-        let seated = self.seated().count();
+    fn reason(&self, tenant: &str, free: usize) -> Refusal {
         let held = self.held(tenant);
         let capped = self
             .share(tenant)
             .max_permits
             .is_some_and(|cap| held >= cap);
-        if capped || (seated > 1 && (seated > total || held >= self.fair(tenant, total))) {
+        let others = self.others_active(tenant).0 > 0 || self.others_idle(tenant) > 0;
+        if capped || (others && held > 0 && (free > 0 || held >= self.fair(tenant))) {
             Refusal::TenantShare
         } else {
             Refusal::Busy
@@ -179,28 +308,39 @@ impl GateLedger {
     }
 
     /// Whether `tenant`, holding `ticket` (`u64::MAX` for a request that has not queued), is next.
-    fn next_in_line(&self, tenant: &str, ticket: u64, free: usize, total: usize) -> bool {
+    fn next_in_line(&self, tenant: &str, ticket: u64, free: usize) -> bool {
         if let Some(front) = self.tenants.get(tenant).and_then(|t| t.waiting.front()) {
             if *front != ticket {
                 return false;
             }
         }
-        !self.tenants.iter().any(|(other, t)| {
+        !self.queued.iter().any(|other| {
             &**other != tenant
-                && t.waiting.front().is_some_and(|&front| {
-                    self.may_take(other, free, total).is_ok()
-                        && self.before((other, front), (tenant, ticket))
-                })
+                && self
+                    .tenants
+                    .get(other)
+                    .and_then(|t| t.waiting.front())
+                    .is_some_and(|&front| {
+                        self.may_take(other, free).is_ok()
+                            && self.before((other, front), (tenant, ticket))
+                    })
         })
     }
 
-    fn gc(&mut self, tenant: &str) {
-        if self
-            .tenants
-            .get(tenant)
-            .is_some_and(|t| !t.seated() && t.held == 0 && t.waiting.is_empty())
-        {
-            self.tenants.remove(tenant);
+    /// Hand back a permit, or take it out of circulation if a lowered total is still owed.
+    fn give_back(&mut self, permit: OwnedSemaphorePermit, semaphore: &Semaphore) {
+        if self.debt > 0 {
+            permit.forget();
+            self.debt -= 1;
+        } else {
+            drop(permit);
+        }
+        self.settle(semaphore);
+    }
+
+    fn settle(&mut self, semaphore: &Semaphore) {
+        if self.debt > 0 {
+            self.debt -= semaphore.forget_permits(self.debt);
         }
     }
 }
@@ -208,20 +348,24 @@ impl GateLedger {
 /// A permit from a [`SqlGate`], charged to a tenant or to nobody, released on drop.
 pub struct GatePermit {
     permit: Option<OwnedSemaphorePermit>,
+    semaphore: Arc<Semaphore>,
     shares: Arc<GateShares>,
     tenant: Option<Arc<str>>,
 }
 
 impl Drop for GatePermit {
     fn drop(&mut self) {
-        drop(self.permit.take());
+        let mut l = lock(&self.shares.ledger);
+        if let Some(permit) = self.permit.take() {
+            l.give_back(permit, &self.semaphore);
+        }
         if let Some(tenant) = &self.tenant {
-            let mut l = lock(&self.shares.ledger);
             if let Some(t) = l.tenants.get_mut(tenant) {
                 t.held = t.held.saturating_sub(1);
             }
-            l.gc(tenant);
+            l.refresh(tenant);
         }
+        drop(l);
         self.shares.changed.notify_waiters();
     }
 }
@@ -247,8 +391,10 @@ impl SqlGate {
         Self {
             permits: Arc::new(Semaphore::new(permits)),
             shares: Arc::new(GateShares {
-                total: permits,
-                ledger: Mutex::default(),
+                ledger: Mutex::new(GateLedger {
+                    total: permits,
+                    ..GateLedger::default()
+                }),
                 changed: Notify::new(),
             }),
             hot: Arc::new(ByteShares::uncapped((hot_bytes / 1024).max(1) as usize)),
@@ -256,7 +402,26 @@ impl SqlGate {
     }
 
     pub fn total(&self) -> usize {
-        self.shares.total
+        lock(&self.shares.ledger).total
+    }
+
+    /// Change how many permits the gate has (RFC-0076 §3.1). A raise is free at once; a cut takes
+    /// free permits now and the rest as running queries finish, never preempting one.
+    pub fn set_total(&self, permits: usize) {
+        let permits = permits.max(1);
+        let mut l = lock(&self.shares.ledger);
+        let old = l.total;
+        l.total = permits;
+        if permits > old {
+            let owed = l.debt.min(permits - old);
+            l.debt -= owed;
+            self.permits.add_permits(permits - old - owed);
+        } else {
+            l.debt += old - permits;
+            l.settle(&self.permits);
+        }
+        drop(l);
+        self.shares.changed.notify_waiters();
     }
 
     /// The hot-tip bytes this gate's queries may hold copied at once.
@@ -284,6 +449,7 @@ impl SqlGate {
         } else {
             l.shares.insert(Arc::from(tenant), share);
         }
+        l.refresh(tenant);
         drop(l);
         self.shares.changed.notify_waiters();
     }
@@ -298,13 +464,63 @@ impl SqlGate {
             .collect()
     }
 
+    /// Tenants with a query queued or running on this gate.
+    pub fn active(&self) -> usize {
+        lock(&self.shares.ledger).active
+    }
+
+    /// Every tenant this gate has seen: whether it is active, what it holds and how it has waited.
+    pub fn tenant_reports(&self) -> BTreeMap<String, GateTenantReport> {
+        let l = lock(&self.shares.ledger);
+        let mut out: BTreeMap<String, GateTenantReport> = l
+            .stats
+            .iter()
+            .map(|(k, s)| {
+                (
+                    k.to_string(),
+                    GateTenantReport {
+                        stats: s.clone(),
+                        ..GateTenantReport::default()
+                    },
+                )
+            })
+            .collect();
+        for (k, t) in &l.tenants {
+            let r = out.entry(k.to_string()).or_default();
+            r.active = t.active();
+            r.held = t.held;
+        }
+        out
+    }
+
+    /// Record one admission of `tenant`'s: how long it took, whether it queued, and how it ended.
+    pub fn observe_admission(
+        &self,
+        tenant: &str,
+        waited: Duration,
+        queued: bool,
+        refused: Option<Refusal>,
+    ) {
+        let mut l = lock(&self.shares.ledger);
+        // Kept only while the tenant is on this gate, so labels that come and go leave nothing behind.
+        if !l.tenants.contains_key(tenant) {
+            return;
+        }
+        match l.stats.get_mut(tenant) {
+            Some(s) => s.observe(waited, queued, refused),
+            None => {
+                let mut s = WaitStats::default();
+                s.observe(waited, queued, refused);
+                l.stats.insert(Arc::from(tenant), s);
+            }
+        }
+    }
+
     fn seat(&self, tenant: &Arc<str>, dir: &Path) {
-        lock(&self.shares.ledger)
-            .tenants
-            .entry(Arc::clone(tenant))
-            .or_default()
-            .seats
-            .push(dir.to_path_buf());
+        let mut l = lock(&self.shares.ledger);
+        l.entry(tenant).seats.push(dir.to_path_buf());
+        l.refresh(tenant);
+        drop(l);
         self.hot.seat(tenant);
         self.shares.changed.notify_waiters();
     }
@@ -317,42 +533,41 @@ impl SqlGate {
                 t.seats.remove(i);
             }
         }
-        l.gc(tenant);
+        l.refresh(tenant);
         drop(l);
         self.shares.changed.notify_waiters();
     }
 
-    fn raw(&self, permit: OwnedSemaphorePermit) -> GatePermit {
+    fn permit(&self, permit: OwnedSemaphorePermit, tenant: Option<Arc<str>>) -> GatePermit {
         GatePermit {
             permit: Some(permit),
+            semaphore: Arc::clone(&self.permits),
             shares: Arc::clone(&self.shares),
-            tenant: None,
+            tenant,
         }
     }
 
     fn grant(&self, l: &mut GateLedger, tenant: &str, ticket: u64) -> Result<GatePermit, Refusal> {
         let free = self.permits.available_permits();
-        l.may_take(tenant, free, self.shares.total)?;
-        if !l.next_in_line(tenant, ticket, free, self.shares.total) {
-            return Err(l.reason(tenant, self.shares.total));
+        l.may_take(tenant, free)?;
+        if !l.next_in_line(tenant, ticket, free) {
+            return Err(l.reason(tenant, free));
         }
         let permit = Arc::clone(&self.permits)
             .try_acquire_owned()
-            .map_err(|_| l.reason(tenant, self.shares.total))?;
-        let key = l
-            .tenants
-            .get_key_value(tenant)
-            .map_or_else(|| Arc::from(tenant), |(k, _)| Arc::clone(k));
-        let entry = l.tenants.entry(Arc::clone(&key)).or_default();
+            .map_err(|_| l.reason(tenant, 0))?;
+        let entry = l.entry(tenant);
         if entry.waiting.front() == Some(&ticket) {
             entry.waiting.pop_front();
         }
         entry.held += 1;
-        Ok(GatePermit {
-            permit: Some(permit),
-            shares: Arc::clone(&self.shares),
-            tenant: Some(key),
-        })
+        l.refresh(tenant);
+        let key = l
+            .tenants
+            .get_key_value(tenant)
+            .map(|(k, _)| Arc::clone(k))
+            .expect("held a permit, so present");
+        Ok(self.permit(permit, Some(key)))
     }
 
     /// A permit now, or why not. `None` is untenanted: the bare semaphore, as before FR2.
@@ -360,7 +575,7 @@ impl SqlGate {
         let Some(tenant) = tenant else {
             return Arc::clone(&self.permits)
                 .try_acquire_owned()
-                .map(|p| self.raw(p))
+                .map(|p| self.permit(p, None))
                 .map_err(|_| Refusal::Busy);
         };
         let r = self.grant(&mut lock(&self.shares.ledger), tenant, u64::MAX);
@@ -379,7 +594,7 @@ impl SqlGate {
         let Some(tenant) = tenant else {
             return match tokio::time::timeout(wait, Arc::clone(&self.permits).acquire_owned()).await
             {
-                Ok(Ok(p)) => Ok(self.raw(p)),
+                Ok(Ok(p)) => Ok(self.permit(p, None)),
                 _ => Err(Refusal::Busy),
             };
         };
@@ -388,11 +603,8 @@ impl SqlGate {
             let mut l = lock(&self.shares.ledger);
             let ticket = l.next_ticket;
             l.next_ticket += 1;
-            l.tenants
-                .entry(Arc::from(tenant))
-                .or_default()
-                .waiting
-                .push_back(ticket);
+            l.entry(tenant).waiting.push_back(ticket);
+            l.refresh(tenant);
             ticket
         };
         let _queued = Ticket {
@@ -422,7 +634,7 @@ impl SqlGate {
     }
 
     /// A permit for background work on `dir`'s behalf, charged to a tenant seated with it, or `None`.
-    /// Work for a dataset no tenant has seated takes only a permit no reservation needs.
+    /// Work for a dataset no tenant has seated borrows, and so leaves the reserve free.
     pub fn try_admit_for(&self, dir: &Path) -> Option<GatePermit> {
         let mut l = lock(&self.shares.ledger);
         let owners: Vec<Arc<str>> = l
@@ -432,15 +644,19 @@ impl SqlGate {
             .map(|(k, _)| Arc::clone(k))
             .collect();
         if owners.is_empty() {
-            let idle = l.seated().filter(|(_, t)| t.held == 0).count();
-            if self.permits.available_permits() <= idle {
+            let kept = if l.idle_seated > 0 {
+                reserve(l.total)
+            } else {
+                0
+            };
+            if self.permits.available_permits() <= kept {
                 return None;
             }
             drop(l);
             return Arc::clone(&self.permits)
                 .try_acquire_owned()
                 .ok()
-                .map(|p| self.raw(p));
+                .map(|p| self.permit(p, None));
         }
         let granted = owners
             .iter()
@@ -466,7 +682,7 @@ impl Drop for Ticket<'_> {
         if let Some(t) = l.tenants.get_mut(self.tenant) {
             t.waiting.retain(|&k| k != self.ticket);
         }
-        l.gc(self.tenant);
+        l.refresh(self.tenant);
         drop(l);
         self.gate.shares.changed.notify_waiters();
     }
@@ -735,20 +951,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_borrower_leaves_every_idle_reservation_free() {
+    async fn a_borrower_leaves_the_reserve_free() {
         let (gate, bytes) = (SqlGate::new(4), Arc::new(ByteShares::new(64)));
         let (_a, _b, _c) = (
             seat(&gate, &bytes, "a"),
             seat(&gate, &bytes, "b"),
             seat(&gate, &bytes, "c"),
         );
-        let a1 = gate.try_admit(Some("a")).unwrap();
-        let a2 = gate.try_admit(Some("a")).unwrap();
+        let a: Vec<_> = (0..3).map(|_| gate.try_admit(Some("a")).unwrap()).collect();
         assert_eq!(gate.try_admit(Some("a")).err(), Some(Refusal::TenantShare));
         let b = gate.try_admit(Some("b")).unwrap();
-        let c = gate.try_admit(Some("c")).unwrap();
         assert_eq!(gate.available_permits(), 0);
-        drop((a1, a2, b, c));
+        assert_eq!(gate.try_admit(Some("c")).err(), Some(Refusal::Busy));
+        drop((a, b));
         assert_eq!(gate.available_permits(), 4);
         assert!(gate.held().is_empty());
     }
@@ -791,9 +1006,10 @@ mod tests {
         let _c = waiting
             .await
             .unwrap()
-            .expect("c takes the reservation a gave back");
+            .expect("c takes the permit a gave back");
+        // a now holds none and is under its share, so a full gate is `busy` to it.
         let refused = gate.wait_admit(Some("a"), Duration::from_millis(250)).await;
-        assert_eq!(refused.err(), Some(Refusal::TenantShare));
+        assert_eq!(refused.err(), Some(Refusal::Busy));
     }
 
     #[tokio::test(start_paused = true)]
@@ -853,16 +1069,171 @@ mod tests {
     }
 
     #[test]
-    fn background_work_borrows_only_what_no_reservation_needs() {
+    fn background_work_borrows_only_what_the_reserve_does_not_need() {
         let (gate, bytes) = (SqlGate::new(2), Arc::new(ByteShares::new(64)));
         let (_a, _b) = (seat(&gate, &bytes, "a"), seat(&gate, &bytes, "b"));
+        let unowned = gate
+            .try_admit_for(Path::new("/elsewhere"))
+            .expect("one permit is free past the reserve");
         assert!(gate.try_admit_for(Path::new("/elsewhere")).is_none());
+        drop(unowned);
         let build = gate
             .try_admit_for(Path::new("/data/a"))
             .expect("charged to a");
         assert_eq!(gate.held().get("a"), Some(&1));
         assert!(gate.try_admit(Some("b")).is_ok());
         drop(build);
+    }
+
+    fn seat_many(gate: &SqlGate, bytes: &Arc<ByteShares>, n: usize) -> Vec<Seat> {
+        (0..n)
+            .map(|i| seat(gate, bytes, &format!("t{i}")))
+            .collect()
+    }
+
+    /// Take permits for `tenant` until the gate says no, and say why it did.
+    fn take_all(gate: &SqlGate, tenant: &str) -> (Vec<GatePermit>, Refusal) {
+        let mut held = Vec::new();
+        loop {
+            match gate.try_admit(Some(tenant)) {
+                Ok(p) => held.push(p),
+                Err(why) => return (held, why),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_tenants_hold_nothing() {
+        let (gate, bytes) = (SqlGate::new(16), Arc::new(ByteShares::new(64)));
+        let _seats = seat_many(&gate, &bytes, 1000);
+        assert_eq!(gate.active(), 0);
+        let (held, why) = take_all(&gate, "t0");
+        assert_eq!(
+            held.len(),
+            16 - reserve(16),
+            "one active tenant among 1,000 mounted uses all but the reserve"
+        );
+        assert_eq!(why, Refusal::TenantShare);
+        assert_eq!(gate.active(), 1);
+        drop(held);
+        assert_eq!(gate.active(), 0);
+        assert_eq!(gate.available_permits(), 16);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_newly_active_tenant_takes_a_reserve_permit_while_borrowers_hold_the_rest() {
+        let (gate, bytes) = (SqlGate::new(16), Arc::new(ByteShares::new(64)));
+        let _seats = seat_many(&gate, &bytes, 1000);
+        // Four tenants become active together, then borrow in turn until the gate stops them.
+        let borrowers = ["t1", "t2", "t3", "t4"];
+        let mut borrowed: Vec<_> = borrowers
+            .iter()
+            .map(|b| gate.try_admit(Some(b)).unwrap())
+            .collect();
+        while let Some(p) = borrowers.iter().find_map(|b| gate.try_admit(Some(b)).ok()) {
+            borrowed.push(p);
+        }
+        assert_eq!(borrowed.len(), 16 - reserve(16));
+        assert_eq!(gate.try_admit(Some("t1")).err(), Some(Refusal::TenantShare));
+        let start = tokio::time::Instant::now();
+        let newcomer = gate
+            .wait_admit(Some("t500"), Duration::from_millis(250))
+            .await
+            .expect("a tenant holding none takes a reserve permit");
+        assert_eq!(start.elapsed(), Duration::ZERO, "admitted without waiting");
+        drop((newcomer, borrowed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_larger_than_the_reserve_waits() {
+        let (gate, bytes) = (SqlGate::new(16), Arc::new(ByteShares::new(64)));
+        let _seats = seat_many(&gate, &bytes, 1000);
+        let (mut borrowed, _) = take_all(&gate, "t1");
+        let newcomers: Vec<_> = (0..reserve(16) + 1)
+            .map(|i| {
+                let gate = gate.clone();
+                tokio::spawn(async move {
+                    let start = tokio::time::Instant::now();
+                    let p = gate
+                        .wait_admit(Some(&format!("t{}", 100 + i)), Duration::from_millis(250))
+                        .await;
+                    (p, start.elapsed())
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(borrowed.pop());
+        let mut waits = Vec::new();
+        let mut admitted = Vec::new();
+        for n in newcomers {
+            let (p, waited) = n.await.unwrap();
+            admitted.push(p.expect("admitted once a borrower's query ends"));
+            waits.push(waited);
+        }
+        waits.sort();
+        // The reserve is a bound, not a promise: `reserve` newcomers in one instant are admitted at
+        // once, and the one past it waits for a running query to end.
+        assert!(
+            waits[..reserve(16)].iter().all(|w| w.is_zero()),
+            "{waits:?}"
+        );
+        assert_eq!(waits[reserve(16)], Duration::from_millis(100), "{waits:?}");
+        drop((admitted, borrowed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lowered_total_takes_permits_back_as_queries_end() {
+        let gate = SqlGate::new(4);
+        let held: Vec<_> = (0..3).map(|_| gate.try_admit(None).unwrap()).collect();
+        gate.set_total(2);
+        assert_eq!((gate.total(), gate.available_permits()), (2, 0));
+        let mut held = held;
+        drop(held.pop());
+        assert_eq!(gate.available_permits(), 0, "the first returned is owed");
+        drop(held.pop());
+        assert_eq!(gate.available_permits(), 1);
+        gate.set_total(8);
+        assert_eq!(gate.available_permits(), 7);
+        drop(held);
+        assert_eq!(gate.available_permits(), 8);
+    }
+
+    #[test]
+    fn the_reserve_is_an_eighth_and_at_least_one() {
+        let cases = [(1, 1), (2, 1), (8, 1), (15, 1), (16, 2), (64, 8)];
+        for (total, want) in cases {
+            assert_eq!(reserve(total), want, "permits {total}");
+        }
+    }
+
+    #[test]
+    fn admission_waits_are_kept_per_tenant() {
+        let bytes = Arc::new(ByteShares::new(100));
+        let gate = SqlGate::new(2);
+        let _a = seat(&gate, &bytes, "a");
+        gate.observe_admission("a", Duration::ZERO, false, None);
+        gate.observe_admission("a", Duration::from_millis(30), true, None);
+        gate.observe_admission("a", Duration::from_millis(250), true, Some(Refusal::Busy));
+        let reports = gate.tenant_reports();
+        let a = &reports["a"].stats;
+        assert_eq!((a.count, a.waits, a.rejected_busy), (3, 2, 1));
+        assert_eq!(a.quantile(0.5), Some(0.05));
+        assert_eq!(a.quantile(0.99), Some(0.25));
+        assert!(!reports["a"].active);
+    }
+
+    #[test]
+    fn a_tenant_that_leaves_takes_its_statistics_with_it() {
+        let bytes = Arc::new(ByteShares::new(100));
+        let gate = SqlGate::new(2);
+        for i in 0..1000 {
+            let name = format!("t{i}");
+            let seat = seat(&gate, &bytes, &name);
+            gate.observe_admission(&name, Duration::from_millis(5), true, None);
+            drop(seat);
+        }
+        gate.observe_admission("never-mounted", Duration::ZERO, false, None);
+        assert_eq!(lock(&gate.shares.ledger).stats.len(), 0);
     }
 
     #[test]

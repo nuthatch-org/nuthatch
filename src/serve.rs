@@ -43,22 +43,17 @@ pub const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// Docker's default 10 s stop grace, so the ingest is still stopped by us and not by SIGKILL.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// Hard ceiling on the override below.
+/// The most permits `sql_permits` or `NUTHATCH_SQL_MAX_CONCURRENCY` may name: a guard against a typo,
+/// not the ceiling. The ceiling is memory, checked per cursor by `analytics_budget` (RFC-0076 §3.1).
+pub const SQL_PERMITS_LIMIT: usize = 1024;
+
+/// The boot default permit count: [`SQL_MAX_CONCURRENCY`] unless `NUTHATCH_SQL_MAX_CONCURRENCY`
+/// overrides it. A runtime's `[runtime] sql_permits` takes its place, and `PUT /_admin/runtime`
+/// changes it live.
 ///
 /// The permit count is a **memory** bound, not a throughput one (#1006, and the correction in
-/// RFC-0042 §14): concurrent queries do not serialise, but each one that misses the connection cache
-/// opens its own session. Measured on a 32-core box under DuckDB (before 4.1), unbounded at 32 clients reached **1,313 MB - 64%
-/// of one cursor's entire 2 GB budget**, shared across every nest on that cursor. So this is capped
-/// rather than free-form: an operator raising it is trading RAM they may not have, and the
-/// non-negotiable budget is per cursor rather than per nest.
-pub const SQL_MAX_CONCURRENCY_CEILING: usize = 16;
-
-/// The live permit count: [`SQL_MAX_CONCURRENCY`] unless `NUTHATCH_SQL_MAX_CONCURRENCY` overrides it.
-///
-/// **This exists so the value can be measured, not so it can be tuned casually.** #1006 asks for the
-/// throughput/RSS curve at 1/2/4/8/16 permits on the box that enforces the RAM budget, and with a
-/// bare `const` that needs five separate builds - which is how a ceiling ends up being set from
-/// whichever box was convenient. One binary, five settings, measured where it is enforced.
+/// RFC-0042 §14): each running statement may open its own session. So whatever it is set to has to
+/// fit the cursor's split, which `analytics_budget` refuses at boot and on every live change.
 ///
 /// Refusals are loud and the value is clamped rather than silently accepted: a benchmark that
 /// requested 64 and quietly got 2 would publish a curve that is flat for the wrong reason.
@@ -157,15 +152,14 @@ pub fn sql_max_concurrency() -> usize {
                 );
                 SQL_MAX_CONCURRENCY
             }
-            Ok(n) if n > SQL_MAX_CONCURRENCY_CEILING => {
+            Ok(n) if n > SQL_PERMITS_LIMIT => {
                 tracing::warn!(
                     requested = n,
-                    ceiling = SQL_MAX_CONCURRENCY_CEILING,
-                    "NUTHATCH_SQL_MAX_CONCURRENCY above the ceiling; clamping. Each concurrent query \
-                     can open its own session, and the per-cursor budget is 2 GB shared across every \
-                     nest on the cursor (#1006)"
+                    limit = SQL_PERMITS_LIMIT,
+                    "NUTHATCH_SQL_MAX_CONCURRENCY above the most this accepts; clamping. Whatever is \
+                     left must still fit the cursor's memory split (#1006)"
                 );
-                SQL_MAX_CONCURRENCY_CEILING
+                SQL_PERMITS_LIMIT
             }
             Ok(n) => n,
         },
@@ -2605,7 +2599,7 @@ async fn admin_config(
             "seal_span": s.seal_span,
             "seal_table_floor": crate::seal::SEAL_TABLE_FLOOR,
             "sql": {
-                "max_concurrency": sql_max_concurrency(),
+                "max_concurrency": s.sql_gate.total(),
                 "max_queued": s.limits.max_queued,
                 "max_rows": s.limits.max_rows,
                 "max_query_len": SQL_MAX_QUERY_LEN,
@@ -3721,14 +3715,31 @@ async fn admit(s: &AppState) -> std::result::Result<GatePermit, axum::response::
 /// and in how many wait.
 async fn gate_admit(s: &AppState) -> std::result::Result<GatePermit, Refusal> {
     let tenant = s.tenant_label();
+    let start = tokio::time::Instant::now();
+    let observe = |queued: bool, r: &std::result::Result<GatePermit, Refusal>| {
+        if let Some(tenant) = tenant {
+            let waited = start.elapsed();
+            s.sql_gate
+                .observe_admission(tenant, waited, queued, r.as_ref().err().copied());
+            crate::metrics::METRICS.observe_admission_wait(tenant, waited);
+        }
+    };
     let first = match s.sql_gate.try_admit(tenant) {
-        Ok(permit) => return Ok(permit),
+        Ok(permit) => {
+            let r = Ok(permit);
+            observe(false, &r);
+            return r;
+        }
         Err(why) => why,
     };
     let Some(_slot) = QueueSlot::take(&s.sql_queued, s.limits.max_queued) else {
-        return Err(first);
+        let r = Err(first);
+        observe(false, &r);
+        return r;
     };
-    s.sql_gate.wait_admit(tenant, SQL_ADMISSION_WAIT).await
+    let r = s.sql_gate.wait_admit(tenant, SQL_ADMISSION_WAIT).await;
+    observe(true, &r);
+    r
 }
 
 /// A refusal from the gate or the response-bytes budget, counted under its reason. `busy` keeps its
@@ -10133,6 +10144,23 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["reason"], "tenant_share", "{body}");
         assert!(rejections("tenant_share").unwrap() > before);
+        // RFC-0076: the wait is kept for the tenant on its gate and in the histogram.
+        let acme = shared.tenant_reports()["acme"].stats.clone();
+        assert_eq!(
+            (acme.count, acme.waits, acme.rejected_tenant_share),
+            (1, 1, 1)
+        );
+        assert!(
+            acme.sum_secs >= SQL_ADMISSION_WAIT.as_secs_f64(),
+            "{acme:?}"
+        );
+        let scrape = crate::metrics::METRICS.render();
+        assert!(
+            scrape.contains(
+                "nuthatch_sql_admission_wait_seconds_bucket{tenant=\"acme\",le=\"+Inf\"}"
+            ),
+            "{scrape}"
+        );
 
         // One tenant alone on a full gate is the process at capacity, exactly as before FR2.
         let alone = SqlGate::new(1);

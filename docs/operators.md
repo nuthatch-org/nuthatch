@@ -490,8 +490,11 @@ The wall is 2 GiB, raised by `NUTHATCH_MAX_RSS` or by a `max_rss_mb` above 2048,
 higher. A `max_rss_mb` below 2048 does not lower it.
 
 `pools` is the smaller of `sql_permits` and the number of nest datasets on the cursor, since a
-dataset's sessions share one pool however many permits it has (#1825). `sql_permits` is
-cursor-wide (the same gate every nest on the cursor shares), default 2. The
+dataset's sessions share one pool however many permits it has (#1825). Under `isolation = "strict"`
+it is `sql_permits` itself, since each running statement draws a pool of its own (RFC-0076).
+`sql_permits` is cursor-wide (the same gate every nest on the cursor shares), default 2, and in a
+runtime is `[runtime] sql_permits` in `mounts.toml`, changed live by `PUT /_admin/runtime`
+([admin API](admin-api.md#sql-permits)). The other
 analytics knobs are **runtime**, not nest identity: they live in the environment, never in
 `nuthatch.toml`, so two operators with different RAM still share a nest content address.
 
@@ -506,9 +509,10 @@ analytics knobs are **runtime**, not nest identity: they live in the environment
 | the wall | `NUTHATCH_MAX_RSS` | 2048MB | the ceiling the split is held to, for a process given more than 2 GiB. **Raise-only**, and a statement by the operator, not a measurement: the footprint job measures the default and nothing above it |
 | `runtime_headroom` | `NUTHATCH_RUNTIME_HEADROOM` | 0 (inside the derived reservation) | what the process holds outside the engine pool while it answers: the runtime, the unsealed rows each statement reads from the hot store, the segment lists it binds, and pages the allocator has not yet returned. Set it from a measurement, and with it the reservation may be measured too |
 
-Sizes accept `512`, `512MB`, `1GB`, `2GiB`. `NUTHATCH_SQL_MAX_CONCURRENCY` remains the permit
-count, still capped at 16, and is **not** an unconstrained config key. `analytics.threads` shares
-that ceiling. Raising permits on a one-nest cursor costs no memory in the split, since its
+Sizes accept `512`, `512MB`, `1GB`, `2GiB`. `NUTHATCH_SQL_MAX_CONCURRENCY` sets the permit count
+where `mounts.toml` does not. The ceiling of 16 it had until RFC-0076 is gone: the split above is
+the ceiling, checked at startup and on every live change, and a count over 1024 is refused as a typo.
+`analytics.threads` keeps its own ceiling of 16. Raising permits on a one-nest cursor costs no memory in the split, since its
 statements share one pool; two datasets at 1024 MB each plus the derived ingest floor is 3072 MB,
 and is refused at startup.
 
@@ -1148,10 +1152,10 @@ job:
 | max result rows | 50,000 | the Rust-side result buffer, outside the engine's own memory limit |
 | max result bytes | 64 MiB | the same buffer measured in bytes, against a wide-cell `SELECT`. Past either cap the answer stops there and carries `truncated: true`, so a caller checks that field rather than trusting a `200` as complete |
 | response bytes in flight | 256 MiB per process | `/sql` and `/q` bodies held while slow readers drain them, shared by every nest in the process. Past it a request is refused with `503` and counts as `busy` |
-| max concurrent queries | 2 | the real DoS multiplier: a semaphore. A request over the limit waits up to **250 ms** for a permit and only then returns `503`, so a short burst smooths instead of bouncing (#1319); the wait is charged against the statement timeout, so queuing cannot extend a request's total deadline. The permit count still decides how many queries run at once. `NUTHATCH_SQL_MAX_CONCURRENCY` still overrides it, ceiling 16, and is not an unconstrained config key |
+| max concurrent queries | 2 | the real DoS multiplier: a semaphore. A request over the limit waits up to **250 ms** for a permit and only then returns `503`, so a short burst smooths instead of bouncing (#1319); the wait is charged against the statement timeout, so queuing cannot extend a request's total deadline. The permit count still decides how many queries run at once. `sql_permits` in `mounts.toml`, or `NUTHATCH_SQL_MAX_CONCURRENCY`, overrides it, held to the cursor's memory split rather than to a fixed ceiling |
 | max queued queries | 256 per nest | the bound that makes the wait above safe: it caps how *many* requests may be parked waiting, where the 250 ms caps how *long* each one waits. Without it a burst parks arrival-rate × 250 ms requests before any time out. Past the cap a request is refused immediately, as every over-limit request was before the wait existed. A parked request holds only its query string (≤ 16 KiB), so the worst case is roughly 4 MB per nest |
-| tenant share | one permit per tenant on each gate, and half the response bytes and of the hot-tip copies split by weight, reserved | in a runtime, each tenant label's part of its chain's gate and of the response bytes (RFC-0073 FR2). A tenant borrows past its reservation only while every other tenant's stays free, so one tenant's burst cannot hold another's query past the 250 ms wait. Past its share a tenant is refused `429` with `"reason": "tenant_share"`; a runtime with one tenant, and a lone nest, are only ever told `busy`. Weights and caps are `[tenants.<tenant>]` in `mounts.toml`, set live by `PUT /_admin/tenants/<tenant>`; see [admin-api.md](admin-api.md#tenant-shares) |
-| engine memory / threads | 512 MB / 2 (threads ceiling 16) | `analytics.memory_limit` / `analytics.threads`. Memory times the pools (the smaller of the permit count and the cursor's datasets) is refused at startup if it plus `ingestion_reservation` exceeds 2 GiB. Threads share the permit ceiling of 16 and are refused above it |
+| tenant share | a reserve of `max(1, permits / 8)` on each gate for tenants holding none, and half the response bytes and of the hot-tip copies split by weight, reserved | in a runtime, each tenant label's part of its chain's gate and of the response bytes (RFC-0073 FR2). Only tenants with a query queued or running share a gate, and a tenant already holding a permit borrows only while the reserve stays free, so a newly active tenant finds a permit within the 250 ms wait unless more tenants arrive in that wait than the reserve holds (RFC-0076). Past its share a tenant is refused `429` with `"reason": "tenant_share"`; a runtime with one tenant, and a lone nest, are only ever told `busy`. Weights and caps are `[tenants.<tenant>]` in `mounts.toml`, set live by `PUT /_admin/tenants/<tenant>`; see [admin-api.md](admin-api.md#tenant-shares) |
+| engine memory / threads | 512 MB / 2 (threads ceiling 16) | `analytics.memory_limit` / `analytics.threads`. Memory times the pools (the smaller of the permit count and the cursor's datasets; the permit count under strict isolation) is refused at startup, and on a live change, if it plus `ingestion_reservation` exceeds the cursor's wall. Threads are refused above 16 |
 | max query length | 16 KiB | rejects absurd query strings before the planner |
 | max unsealed rows scanned | 2,000,000 | the tip is materialised per query; past this the query is refused with `503` rather than served partially. The same holds past **64 MiB** of stored hot-row JSON, whichever comes first |
 | hot-tip copies in flight | 128 MiB per chain gate | the stored hot-row JSON every query on one chain's gate holds copied at once, `/sql`, `/explain`, `/diff`, `/q` and GraphQL alike, measured before a row is parsed and given back when the query ends (RFC-0073 FR5). It is what the two default permits could already hold, so it adds nothing to the 2 GiB budget, and raising the permit count no longer multiplies it. A copy that does not fit now is refused `503` `busy`; one larger than the whole budget is refused as an over-budget tip. In a runtime it is divided between tenants like response bytes, and a tenant past its share is refused `429` `tenant_share` before copying |

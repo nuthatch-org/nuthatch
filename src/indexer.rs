@@ -2834,14 +2834,19 @@ async fn spawn_cursor(
     // **One gate for this cursor** (#1024). `group_by_chain` gives one `spawn_runtime` per chain, so
     // this call *is* the cursor, and every nest built below shares the budget rather than each
     // getting its own copy of it.
-    let sql_gate = serve::new_sql_gate();
+    let permits = nests
+        .iter()
+        .filter_map(|(_, _, c)| c.cursor_sql_permits)
+        .max()
+        .unwrap_or_else(serve::sql_max_concurrency);
+    let sql_gate = serve::SqlGate::new(permits);
     let datasets: std::collections::BTreeSet<&PathBuf> =
         nests.iter().map(|(_, dir, _)| dir).collect();
     let ceiling = nests
         .iter()
         .filter_map(|(_, _, c)| c.cursor_max_rss_mb)
         .max();
-    crate::analytics_budget::validate_cursor_budget(datasets.len(), ceiling)?;
+    crate::analytics_budget::validate_cursor_budget(datasets.len(), permits, ceiling)?;
     for (name, dir, mut config) in nests {
         config.route = Some(name.clone());
         let (nest, state, worker, w) = match build_nest(
@@ -3132,7 +3137,13 @@ async fn build_nest(
             dir.display()
         );
     }
-    crate::analytics_budget::validate_cursor_budget(1, config.cursor_max_rss_mb)?;
+    crate::analytics_budget::validate_cursor_budget(
+        1,
+        config
+            .cursor_sql_permits
+            .unwrap_or_else(serve::sql_max_concurrency),
+        config.cursor_max_rss_mb,
+    )?;
     // A symlinked input is read here but invisible to the NID (#2355).
     crate::blob::collect_files(&dir, None)?;
     // RFC-0014 extraction is configured but not yet sourceable. Refuse rather than start, because the
