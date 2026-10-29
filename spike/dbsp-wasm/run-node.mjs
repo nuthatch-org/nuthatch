@@ -35,3 +35,21 @@ const s = mod.spike_stress(steps, rows);
 const stressMs = (performance.now() - t1).toFixed(0);
 const mem2 = mod.__wasm?.memory?.buffer?.byteLength;
 console.log(`stress ${steps}x${rows}: ${s} in ${stressMs} ms${mem2 ? `; wasm memory ${(mem2 / 2 ** 20).toFixed(0)} MiB` : ""}`);
+
+// S0 remainder (#2476): the binary's own entity circuit, join and min/max included, with memory
+// sampled every hundred windows. Linear memory never shrinks, so the last sample is the peak.
+const [ewin, erows] = [Number(process.argv[5] ?? 1000), Number(process.argv[6] ?? 100)];
+const mib = (b) => (b / 2 ** 20).toFixed(1);
+const before = mod.wasm_memory_bytes();
+let peak = before;
+const samples = [];
+const t2 = performance.now();
+const e = mod.spike_entity(ewin, erows, (w) => {
+  const m = mod.wasm_memory_bytes();
+  peak = Math.max(peak, m);
+  if (w % 250 === 0) samples.push(`${w}:${mib(m)}`);
+});
+const entityMs = (performance.now() - t2).toFixed(0);
+const after = mod.wasm_memory_bytes();
+console.log(`entity ${ewin}x${erows}: ${e}`);
+console.log(`entity time ${entityMs} ms; wasm memory before ${mib(before)} MiB, after ${mib(after)} MiB, peak ${mib(Math.max(peak, after))} MiB; samples ${samples.join(" ")}`);

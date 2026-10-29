@@ -1,8 +1,8 @@
 # RFC-0075: The whole nest in a tab - ingest, hot store, reorgs, entities and the API in a browser
 
 - Status: **Accepted 2026-10-28 (Chief): "i wanna do it".** S0's kill question was measured the same
-  day and did not kill it (§3). The rest of S0 and S1 to S6 are authorised in order, each on its own
-  gate (§9).
+  day and did not kill it (§3); S0 passed its gate the same day (§12). S1 to S6 are authorised in
+  order, each on its own gate (§9).
 - Author: Pete (cargopete)
 - Date: 2026-10-28
 - Depends on: RFC-0065 (the nest in a tab: decode, sealing and Burrmill already in a browser worker),
@@ -77,10 +77,10 @@ between merging and folding.
 The spike is in `spike/dbsp-wasm/`; `vendor.sh` rebuilds the patched crates from the registry and the
 patch file, which is the full diff.
 
-**Not yet reached**: an entity-shaped circuit (a join over `entity_row.rs`'s `Row`),
+~~**Not yet reached**: an entity-shaped circuit (a join over `entity_row.rs`'s `Row`),
 `sharded_accumulator`'s backpressure waiter (`operator/dynamic/sharded_accumulator.rs:288`), which
 awaits a `Notify` only a merger task signals, `complete_merges` and `retain_keys`. The rest of S0
-covers them.
+covers them.~~ Reached, or shown to be off the one-worker path, in §12.
 
 ## 4. The design
 
@@ -250,3 +250,65 @@ Each ends runnable, and each gate can fail. Sizes are days of focused work.
 Threads (nightly only). Memory64 (not in Safari). Publishing what a tab seals (RFC-0065 §7). Anything
 hosted or any account. Folds and the `graph` feature. Address history, which has RFC-0074's module.
 MCP over stdio.
+
+## 12. S0 measured outcome, 2026-10-28
+
+The remainder of S0 (#2476): the binary's own entity circuit on wasm32.
+
+**What was lifted.** `src/entity_circuit.rs`, `entity_plan.rs`, `entity_expr.rs` and `entity_row.rs`
+are compiled into the spike by `#[path]`, unchanged, as RFC-0074 compiled the address-history
+files: the plan stepped is the one a nest lowers (`map_index` → `join_index` → `aggregate_linear`,
+`aggregate(Min)`, `aggregate(Max)` and the `outer_join_default` graft, over the rkyv-archived
+`Row`), not a copy of it. The harness (`spike/dbsp-wasm/src/entity.rs`) declares
+`transfers ⋈ labels on to = address`, grouped by `(to, tier)`, with `count`, `sum`, `avg`, `min` and
+`max` over the value, a left filter dropping zero values and a right filter dropping tier 0. It steps
+1,000 windows of 100 transfers; every fourth window retracts 50 earlier transfers, every fiftieth
+retracts a label and re-inserts it with a new tier, so both inputs see weight `-1` and a tier change
+moves a whole group. One in sixteen values is NULL. The oracle is `Plan::evaluate`, the batch fold the
+binary's own tests hold the circuit to (RFC-0041 §8), checked every 250 windows and at the end.
+
+**Gate: passed.** In Node 26, release build (`opt-level = "s"`, thin LTO):
+
+| | wasm32, Node | native aarch64 |
+|---|---|---|
+| windows / rows | 1,000 × 100 | the same |
+| facts | 75,000 inserted, 12,500 retracted; labels 531 inserted, 19 retracted | the same |
+| groups | 504 | 504 |
+| relation digest | `d4b83ac16862b79d` | `d4b83ac16862b79d` |
+| oracle agreed at every checkpoint | yes | yes |
+| wall time | 1,996 ms (debug build: 13,069 ms) | 1,034 ms (release), so wasm is 1.9x |
+| wasm linear memory | 14.3 MiB before, 53.9 MiB after, which is the peak (linear memory never shrinks); 38.6 MiB at window 500 | |
+| dbsp's own profile of the circuit's state | 36,970,128 bytes | 38,174,568 bytes |
+| module after wasm-bindgen | 5,849,145 bytes raw, 944,210 brotli (3.57 MB / 679 KB before the entity circuit) | |
+
+The digest is SipHash over the relation rendered as text, so a 32-bit and a 64-bit build hash the
+same bytes. The profile's state sizes differ by 3 % because rkyv archives sizes as 32-bit on wasm32
+(§3); the relation is the same.
+
+No panic and no deadlock; nothing in the dbsp patch changed for this half of S0, so
+`rfc-0075-dbsp-wasm32.patch` is as §3 left it.
+
+**The three paths named in §3.** None is on the path a nest runs:
+
+- `sharded_accumulator`'s backpressure waiter (`operator/dynamic/sharded_accumulator.rs:288`) is
+  reached only through `ShardedAccumulator`, and `dyn_shard_accumulate` takes `dyn_accumulate`
+  instead when `Runtime::num_workers() == 1` (`sharded_accumulator.rs:60-63`). Every circuit the
+  binary builds is `init_circuit(1, ..)`. The one-worker accumulator inserts into a `Spine`, whose
+  `backpressure_wait` the patch drains synchronously, and that path ran here.
+- `complete_merges` has no caller in dbsp outside its tests.
+- `retain_keys` is reached only through `integrate_trace_retain_keys`, which none of the binary's
+  circuits calls (`entity_circuit.rs`, `views.rs`, `exposure.rs`, `velocity.rs`).
+
+A multi-worker layout under the single-thread runtime would reach the first; it should be refused at
+`Runtime::run` rather than supported, and the upstream draft says so.
+
+**A finding about the binary, not the tab.** `Plan::evaluate`'s accumulator (`entity_plan.rs`,
+`Acc`) keeps one `sum`, one `min` and one `max` per group, so a plan with two `Sum`s folds both into
+one field, while the circuit keeps a slot pair per aggregate (`LinAcc`). The harness's first plan had
+`sum(value), sum(tier)`, and the circuit was right where the oracle was wrong. `Plan::evaluate` is
+test-only (`grep -rn "\.evaluate(" src` finds only `entity_circuit.rs`'s and `entity_plan.rs`'s
+tests), and no test declares two aggregates of one kind, so nothing a nest serves is affected. It
+wants its own issue as a test-oracle defect; it is not fixed here.
+
+**Upstream.** The feldera issue and the four PRs are drafted in `spike/dbsp-wasm/UPSTREAM.md` and
+not posted.
