@@ -1726,12 +1726,8 @@ impl<F: Feed> Store<F> {
     /// This handle pinned at the latest commit. The generations are kept only when no commit
     /// began while the transaction opened, so the memo never keys an answer to the wrong one.
     pub fn pinned(&self) -> Result<Store<F>> {
-        let generations = |s: &Store<F>| {
-            (
-                HotStore::write_generation(s),
-                HotStore::rows_generation(s),
-            )
-        };
+        let generations =
+            |s: &Store<F>| (HotStore::write_generation(s), HotStore::rows_generation(s));
         let before = generations(self);
         let txn = self.db.begin_read()?;
         let (writes, rows) = if generations(self) == before {
