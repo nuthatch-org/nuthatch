@@ -192,6 +192,7 @@ impl TabNest {
                 hooks: &nuthatch_core::hooks::NoHooks,
                 faults: &nuthatch_core::fault::NoFaults,
                 clock: &NoWait,
+                deadline: None,
             };
             match process_window(window, tape, &logs, next, to, tip).await? {
                 Processed::Stored(_) => {}
