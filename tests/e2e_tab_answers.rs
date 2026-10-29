@@ -4,7 +4,8 @@
 //! The tab's half (`spike/dbsp-wasm`, `run-answers.mjs`) is held to the same file.
 //!
 //! `/ready`'s clock readings, the version and the NID are masked: the clock is not the nest's, and the
-//! NID moves with the version and the RPC port `init` was given.
+//! NID moves with the version and the RPC port `init` was given. `fetch_window_blocks` is masked too:
+//! it is the cursor's getLogs pacing, which a node adapts to its RPC and a tab sets itself.
 //! `NUTHATCH_PIN_TAB_PARITY=1` writes the file from this run instead of comparing.
 
 use std::path::Path;
@@ -22,7 +23,8 @@ const ABI: &str = r#"[{"type":"event","name":"Transfer","anonymous":false,"input
   {"name":"to","type":"address","indexed":true},
   {"name":"value","type":"uint256","indexed":false}]}]"#;
 const ENTITIES: [&str; 2] = ["received", "sent"];
-const MASKED: [&str; 6] = [
+const MASKED: [&str; 7] = [
+    "fetch_window_blocks",
     "version",
     "last_poll_unixtime",
     "seconds_since_poll",
@@ -57,10 +59,9 @@ fn mask(body: &str) -> String {
         while let Some(at) = out[from..].find(&needle) {
             let start = from + at + needle.len();
             let rest = &out[start..];
-            let len = if rest.starts_with('"') {
-                rest[1..].find('"').map_or(rest.len(), |i| i + 2)
-            } else {
-                rest.find([',', '}']).unwrap_or(rest.len())
+            let len = match rest.strip_prefix('"') {
+                Some(text) => text.find('"').map_or(rest.len(), |i| i + 2),
+                None => rest.find([',', '}']).unwrap_or(rest.len()),
             };
             out.replace_range(start..start + len, "\"<masked>\"");
             from = start;

@@ -68,52 +68,7 @@ impl SqlRejection {
     }
 }
 
-/// Distinct (contract, topic0) pairs a nest's undecoded tally keeps before folding the rest into
-/// `("other", "other")`, so a label set cannot grow without bound.
-pub const UNDECODED_PAIRS_MAX: usize = 256;
-
-/// Logs whose topic0 a declared decoder claims and whose body did not decode against it (RFC-0049
-/// §2, RFC-0073 FR14), by contract alias or template name and topic0.
-#[derive(Default)]
-pub struct UndecodedTally {
-    pairs: BTreeMap<(String, String), u64>,
-}
-
-impl UndecodedTally {
-    const fn new() -> Self {
-        Self {
-            pairs: BTreeMap::new(),
-        }
-    }
-
-    fn add(&mut self, contract: &str, topic0: &str, n: u64) {
-        let key = (contract.to_string(), topic0.to_string());
-        let key = if self.pairs.contains_key(&key) || self.pairs.len() < UNDECODED_PAIRS_MAX {
-            key
-        } else {
-            ("other".to_string(), "other".to_string())
-        };
-        *self.pairs.entry(key).or_default() += n;
-    }
-
-    pub fn total(&self) -> u64 {
-        self.pairs.values().sum()
-    }
-
-    /// The `undecoded` block `/ready` and `/nest` carry: the total and the five largest pairs.
-    pub fn summary(&self) -> serde_json::Value {
-        let mut top: Vec<_> = self.pairs.iter().collect();
-        top.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-        let top: Vec<_> = top
-            .into_iter()
-            .take(5)
-            .map(|((contract, topic0), logs)| {
-                serde_json::json!({ "contract": contract, "topic0": topic0, "logs": logs })
-            })
-            .collect();
-        serde_json::json!({ "total": self.total(), "top": top })
-    }
-}
+pub use nuthatch_core::metrics::{UndecodedTally, UNDECODED_PAIRS_MAX};
 
 /// Per-nest counterparts of the nest-scoped signals (SEC-9). In a runtime the process-global gauges and
 /// counters blend every mounted nest into one number; these let an operator see each nest's own
@@ -1969,7 +1924,7 @@ impl Metrics {
                  # TYPE nuthatch_nest_logs_undecoded_total counter\n",
             );
             for (nest, m) in per.iter() {
-                for ((contract, topic0), n) in &m.undecoded.lock().unwrap().pairs {
+                for ((contract, topic0), n) in m.undecoded.lock().unwrap().pairs() {
                     s.push_str(&format!(
                         "nuthatch_nest_logs_undecoded_total{{nest=\"{nest}\",contract=\"{contract}\",topic0=\"{topic0}\"}} {n}\n"
                     ));
@@ -2495,9 +2450,9 @@ mod tests {
         t.add("c", "0x00", 1);
         t.add("late", "0xff", 2);
         t.add("later", "0xfe", 3);
-        assert_eq!(t.pairs.len(), UNDECODED_PAIRS_MAX + 1);
-        assert_eq!(t.pairs[&("c".to_string(), "0x00".to_string())], 2);
-        assert_eq!(t.pairs[&("other".to_string(), "other".to_string())], 5);
+        assert_eq!(t.pairs().len(), UNDECODED_PAIRS_MAX + 1);
+        assert_eq!(t.pairs()[&("c".to_string(), "0x00".to_string())], 2);
+        assert_eq!(t.pairs()[&("other".to_string(), "other".to_string())], 5);
         assert_eq!(t.total(), UNDECODED_PAIRS_MAX as u64 + 6);
     }
 

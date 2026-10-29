@@ -1862,37 +1862,19 @@ fn entity_readiness(s: &AppState, head: u64, now: u64) -> (Value, bool) {
             // #932: one acquisition for the pair, so `rows` and `applied_through` cannot describe
             // two different moments.
             let (row_count, applied) = e.len_and_watermark();
-            let through = applied.through;
-            let fault = e.fault();
-            let unavailable = e.unavailable();
-            let behind = through < head;
             let progress = e.last_progress();
             // A nest that has indexed nothing yet has no head to be behind, so an entity at zero is
             // waiting rather than wedged.
-            let wedged = entity_wedged(through, head, progress, now);
-            // Unavailable is unready too. It is not a fault - nothing died - but an entity holding
-            // no answer must not be reachable behind a 200, which is the whole of §5.1's "never
-            // serves a plausible partial relation as current" applied to the case where there is no
-            // relation at all.
-            if fault.is_some() || wedged || unavailable.is_some() {
-                stalled = true;
-            }
-            with_offchain(
-                json!({
-                    "name": e.name(),
-                    "applied_through": through,
-                    "current": !behind,
-                    "catching_up": behind && fault.is_none() && !wedged && unavailable.is_none(),
-                    "rows": row_count,
-                    "faulted": fault.is_some(),
-                    "fault": fault,
-                    "wedged": wedged,
-                    "unavailable": unavailable,
-                    "seconds_since_progress": (progress != 0).then(|| now.saturating_sub(progress)),
-                }),
-                e,
+            let wedged = entity_wedged(applied.through, head, progress, now);
+            let (item, unready) = answer::entity_readiness(
+                &entity_facts(e),
+                row_count,
                 &applied,
-            )
+                (head, progress, now),
+                wedged,
+            );
+            stalled |= unready;
+            item
         })
         .collect();
     (Value::Array(entities), stalled)

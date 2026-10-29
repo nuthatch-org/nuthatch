@@ -153,6 +153,37 @@ pub fn derived_index_item(e: &EntityFacts, rows: usize, applied: &Applied, head:
     )
 }
 
+/// One entity in `/ready`'s `entities`, and whether it makes the nest unready. `progress` is when its
+/// watermark last moved, and `wedged` is the caller's verdict on that.
+pub fn entity_readiness(
+    e: &EntityFacts,
+    rows: usize,
+    applied: &Applied,
+    (head, progress, now): (u64, u64, u64),
+    wedged: bool,
+) -> (Value, bool) {
+    let behind = applied.through < head;
+    // Unavailable is unready too: an entity holding no answer must not be reachable behind a 200.
+    let unready = e.fault.is_some() || wedged || e.unavailable.is_some();
+    let item = with_offchain(
+        json!({
+            "name": e.name,
+            "applied_through": applied.through,
+            "current": !behind,
+            "catching_up": behind && e.fault.is_none() && !wedged && e.unavailable.is_none(),
+            "rows": rows,
+            "faulted": e.fault.is_some(),
+            "fault": e.fault,
+            "wedged": wedged,
+            "unavailable": e.unavailable,
+            "seconds_since_progress": (progress != 0).then(|| now.saturating_sub(progress)),
+        }),
+        e.reads_offchain,
+        applied,
+    );
+    (item, unready)
+}
+
 /// `/derived`.
 pub fn derived_index(head: u64, items: Vec<Value>) -> Answer {
     Answer::ok(&json!({ "count": items.len(), "head": head, "entities": items }))
