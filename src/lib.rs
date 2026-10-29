@@ -63,6 +63,7 @@ pub(crate) mod engine;
 pub(crate) mod engine_burrmill;
 pub mod entities;
 pub mod entity_bind;
+pub mod entity_decl;
 pub mod entity_lower;
 pub mod entity_offchain;
 pub mod entity_view;
