@@ -1,12 +1,62 @@
 //! RFC-0075 S6: a tab nest's memory ceiling, 2 GiB on a desktop and 600 MiB on a phone, held with
 //! a cursor and a statement running together. One statement at a time takes a quarter, the node's
 //! one-permit share of a cursor's 2 GiB (512 MiB), through Burrmill's pool; the cursor and its
-//! entities take the rest. Declared entity state is refused at admission as a node refuses a mount,
-//! and a window is refused once the module's linear memory has reached the ceiling, checked before its
-//! fetch and again before its commit. That is a wall between steps, not an allocator cap: what one
-//! window decodes, folds and seals can pass the ceiling before the next check stops the cursor.
+//! entities take the rest. Declared entity state is refused at admission as a node refuses a mount.
+//! The allocator never grows linear memory past the ceiling. Below it, a wall a sixteenth of the
+//! ceiling lower stops the cursor by name before a window's fetch and before its commit, so the cap,
+//! which can only trap, is what a single window's overshoot meets rather than what a nest normally
+//! stops at.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+/// The ceiling the allocator holds, one per module: a worker runs one nest.
+static CEILING: AtomicU64 = AtomicU64::new(DESKTOP_CEILING_MIB as u64 * MIB);
+
+#[cfg(target_arch = "wasm32")]
+mod cap {
+    use std::alloc::{GlobalAlloc, Layout, System};
+
+    /// dlmalloc asks for more than the request when it grows: its footers, rounded to 64 KiB pages.
+    const GROWTH_SLACK: u64 = 1 << 20;
+
+    /// Refuses, as an allocation failure, any request that could grow linear memory past `CEILING`.
+    struct Capped;
+
+    fn could_pass(size: usize) -> bool {
+        super::linear_memory() + size as u64 + GROWTH_SLACK > super::CEILING.load(super::Relaxed)
+    }
+
+    unsafe impl GlobalAlloc for Capped {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if could_pass(layout.size()) {
+                return std::ptr::null_mut();
+            }
+            System.alloc(layout)
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if could_pass(layout.size()) {
+                return std::ptr::null_mut();
+            }
+            System.alloc_zeroed(layout)
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if new_size > layout.size() && could_pass(new_size) {
+                return std::ptr::null_mut();
+            }
+            System.realloc(ptr, layout, new_size)
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout)
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Capped = Capped;
+}
 
 pub const DESKTOP_CEILING_MIB: u32 = 2048;
 pub const PHONE_CEILING_MIB: u32 = 600;
@@ -122,9 +172,19 @@ impl TabBudget {
         Ok(())
     }
 
-    /// Before a window: refuse once the module's memory has reached the ceiling.
+    /// Make this the ceiling the allocator holds.
+    pub fn enforce(&self) {
+        CEILING.store(self.ceiling, Relaxed);
+    }
+
+    /// Where the cursor stops by name, a sixteenth below the cap.
+    pub fn wall(&self) -> u64 {
+        self.ceiling - self.ceiling / 16
+    }
+
+    /// Before a window's fetch and before its commit: refuse once the module has reached the wall.
     pub fn check_memory(&self, linear: u64) -> Result<(), OverBudget> {
-        if linear >= self.ceiling {
+        if linear >= self.wall() {
             return Err(OverBudget::Memory {
                 linear,
                 ceiling: self.ceiling,

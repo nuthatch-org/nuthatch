@@ -135,10 +135,11 @@ impl LiveNest {
     }
 
     /// RFC-0075 S6: the memory ceiling in MiB, 2,048 unless set; a phone's is 600. Set it before
-    /// `derive`, which admits entities against it.
+    /// `derive`, which admits entities against it. The allocator holds the whole module to it.
     #[wasm_bindgen(js_name = setMemoryCeiling)]
     pub fn set_memory_ceiling(&mut self, mib: u32) {
         self.nest.budget = crate::budget::TabBudget::mib(mib);
+        self.nest.budget.enforce();
     }
 
     /// RFC-0075 S5: `method` and `target` (path and query) answered as the node's router answers

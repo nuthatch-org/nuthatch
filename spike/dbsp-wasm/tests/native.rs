@@ -217,11 +217,12 @@ fn entities_are_admitted_against_the_cursor_share() {
 }
 
 #[test]
-fn a_window_is_refused_at_the_ceiling() {
+fn a_window_is_refused_at_the_wall_below_the_ceiling() {
     use dbsp_wasm_spike::budget::TabBudget;
     let b = TabBudget::mib(600);
-    assert!(b.check_memory(b.ceiling - 65_536).is_ok());
-    assert!(b.check_memory(b.ceiling).is_err());
+    assert_eq!(b.wall(), 600 * 1024 * 1024 - 600 * 1024 * 1024 / 16);
+    assert!(b.check_memory(b.wall() - 65_536).is_ok());
+    assert!(b.check_memory(b.wall()).is_err());
 }
 
 /// A statement whose working memory passes a phone's share is refused by name, as the node's is.

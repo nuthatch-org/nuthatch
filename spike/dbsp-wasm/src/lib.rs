@@ -227,4 +227,11 @@ mod wasm {
     pub fn wasm_memory_bytes() -> f64 {
         (core::arch::wasm32::memory_size(0) * 65536) as f64
     }
+
+    /// RFC-0075 S6's gate: hold `mib` MiB at once. Past the ceiling the allocator refuses, and the
+    /// module traps rather than grow.
+    #[wasm_bindgen]
+    pub fn hold_mib(mib: u32) -> usize {
+        std::hint::black_box(vec![1u8; (mib as usize) << 20]).len()
+    }
 }

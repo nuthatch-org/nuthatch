@@ -1,8 +1,8 @@
 // RFC-0075 S6's budget gate, in Node against the wasm build. At a phone's 600 MiB and a desktop's
 // 2 GiB: entities declaring more state than the cursor's share are refused at admission, a statement
 // past one statement's share is refused by name while the cursor follows the recorded contract, and
-// the cursor still seals and serves exactly what the node does (S3's `expected.json`). A ceiling the
-// module already holds more than stops the cursor at its first window.
+// the cursor still seals and serves exactly what the node does (S3's `expected.json`). The wall below a
+// ceiling stops the cursor by name, and the allocator refuses to grow the module past the ceiling.
 // Usage: node run-budget.mjs <pkg-dir> <rpc-url> <tab-parity-dir>
 //   (fixture-rpc recorded --file <tab-parity-dir>/chain.json.gz serving <rpc-url>)
 import { createRequire } from "node:module";
@@ -68,11 +68,20 @@ for (const [device, mib] of [["phone", 600], ["desktop", 2048]]) {
   nest.free();
 }
 
+// A ceiling 8 MiB over what the module holds puts the wall, a sixteenth lower, under it.
+const holding = Math.ceil(mod.wasm_memory_bytes() / 2 ** 20);
 const walled = await mod.LiveNest.open("tab-budget-wall", rpc, chain.contract, start);
-walled.setMemoryCeiling(1);
+walled.setMemoryCeiling(holding + 8);
 let wall = "";
 try { await walled.follow(); } catch (e) { wall = e.message; }
-check(wall.startsWith("over the tab's memory budget: the module holds"), `a 1 MiB ceiling did not stop the cursor: ${wall || "it followed"}`);
+check(wall.startsWith("over the tab's memory budget: the module holds"), `the wall did not stop the cursor: ${wall || "it followed"}`);
+// Last, since a trap ends the instance: 64 MiB more than the ceiling admits is refused, not grown into.
+let trapped = false;
+try { mod.hold_mib(64); } catch (e) { trapped = e instanceof WebAssembly.RuntimeError; }
+const capped = mod.wasm_memory_bytes();
+check(trapped, "holding 64 MiB past the ceiling did not trap");
+check(capped <= (holding + 8) * 2 ** 20, `the module grew to ${capped} bytes past its ${holding + 8} MiB ceiling`);
+console.log(JSON.stringify({ wall_ceiling_mib: holding + 8, wall, cap_trapped: trapped, memory_mib: +(capped / 2 ** 20).toFixed(1) }));
 
 if (failures.length) {
   for (const f of failures) console.error(`FAIL ${f}`);
