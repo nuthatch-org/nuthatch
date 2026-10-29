@@ -1234,10 +1234,10 @@ fn two_waiters_breaking_one_stale_lock_do_not_both_hold_it() {
     );
 }
 
-/// A waiter killed while it held the right to break a dead pid's claim must not leave that claim
-/// unbreakable: the next waiter takes the right over from the dead breaker.
+/// A waiter killed while breaking a dead pid's claim must not leave that claim unbreakable: the next
+/// waiter ignores the dead breaker's file.
 #[test]
-fn a_break_left_by_a_killed_waiter_is_taken_over() {
+fn a_break_left_by_a_killed_waiter_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
     let d = std::fs::canonicalize(dir.path()).unwrap();
     let held = d.join("nest.gate-lock.d");
@@ -1263,17 +1263,15 @@ fn dead_pid() -> u32 {
     pid
 }
 
-/// The lock directory a run killed while holding it leaves: its claim and its `own.<pid>`, or with
-/// `breaker`, the `brk.<pid>.<breaker>` a waiter killed mid-break leaves in place of `own.<pid>`.
+/// The lock directory a run killed while holding it leaves, and with `breaker`, the
+/// `brk.<pid>.<breaker>` a waiter killed while breaking it leaves too.
 fn left_by_a_dead_pid(held: &Path, breaker: Option<u32>) {
     let pid = dead_pid();
     std::fs::create_dir(held).unwrap();
     std::fs::write(held.join("pid"), format!("{pid}\n")).unwrap();
-    let right = match breaker {
-        Some(b) => format!("brk.{pid}.{b}"),
-        None => format!("own.{pid}"),
-    };
-    std::fs::write(held.join(right), format!("{pid}\n")).unwrap();
+    if let Some(b) = breaker {
+        std::fs::write(held.join(format!("brk.{pid}.{b}")), "").unwrap();
+    }
 }
 
 /// Takes the lock on `<d>/nest`, says HOLDING, and holds it until `<d>/release.<name>` exists.

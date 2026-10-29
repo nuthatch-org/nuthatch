@@ -26,11 +26,9 @@ gate_lock() {
     fi
   else
     # The pid file is the claim, created by the shell with O_EXCL: uutils mkdir (Ubuntu 26.04) is
-    # not exclusive, and two runs both "made" the directory. own.<pid> is written before the claim
-    # and kept with it: it is the one right to break that claim, see gate_lock_break.
+    # not exclusive, and two runs both "made" the directory.
     while :; do
       mkdir -p "$path.d" || return 1
-      echo "$$" 2>/dev/null >"$path.d/own.$$" || continue
       (set -C; echo "$$" >"$path.d/pid") 2>/dev/null && break
       [ -d "$path.d" ] || continue
       holder=$(cat "$path.d/pid" 2>/dev/null || true)
@@ -52,29 +50,32 @@ gate_lock() {
 
 # gate_lock_break <lock-dir> <dead-pid> removes the claim only if it is still that pid's. Two waiters
 # that saw the same dead pid would otherwise both remove "it", the second removing the first's new
-# claim. The right to break a claim is one file, own.<pid> and then brk.<pid>.<breaker>, and it only
-# ever moves by rename, so one waiter holds it; a dead breaker's is taken over the same way. While
-# it is held nothing else can remove that claim and no claim can replace it.
+# claim. Each breaker writes brk.<pid>.<itself> and then looks for another's: of two live breakers
+# whose files overlap, the later to look sees the earlier, so at most one goes on, and while it does
+# no claim can replace the pid it re-reads. A dead breaker's file is ignored.
 gate_lock_break() {
-  local token=$1/brk.$2.$$ t broke=1
-  if ! mv "$1/own.$2" "$token" 2>/dev/null; then
-    for t in "$1/brk.$2".*; do
-      [ -e "$t" ] && ! kill -0 "${t##*.}" 2>/dev/null && mv "$t" "$token" 2>/dev/null && break
-    done
-    [ -e "$token" ] || return 1
-  fi
+  local mine=$1/brk.$2.$$ t broke=1
+  : >"$mine" 2>/dev/null || return 1
+  for t in "$1/brk.$2".*; do
+    [ "$t" != "$mine" ] && [ -e "$t" ] || continue
+    if kill -0 "${t##*.}" 2>/dev/null; then
+      rm -f "$mine"
+      return 1
+    fi
+    rm -f "$t"
+  done
   if [ "$(cat "$1/pid" 2>/dev/null || true)" = "$2" ] && ! kill -0 "$2" 2>/dev/null; then
     rm -f "$1/pid" && broke=0
   fi
-  rm -f "$token"
+  rm -f "$mine"
   return "$broke"
 }
 
-# Unlinks our own files by name and nothing else, so no claim is removed but by its owner or a
+# Unlinks our own claim by name and nothing else, so no claim is removed but by its owner or a
 # breaker; an rm -rf would take whatever else is in the directory when it reads it.
 gate_unlock() {
   if [ -n "${GATE_LOCK_DIR:-}" ] && [ "$(cat "$GATE_LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then
-    rm -f "$GATE_LOCK_DIR/pid" "$GATE_LOCK_DIR/own.$$"
+    rm -f "$GATE_LOCK_DIR/pid"
     rmdir "$GATE_LOCK_DIR" 2>/dev/null || true
   fi
   GATE_LOCK_DIR=""
