@@ -38,10 +38,17 @@ pub(crate) fn parse_buffer_windows(raw: Option<&str>) -> Option<usize> {
     match raw.map(str::trim) {
         None | Some("") => Some(DEFAULT_BUFFER_WINDOWS),
         Some("0" | "off" | "shared") => None,
-        Some(v) => Some(v.parse::<usize>().ok().filter(|&w| w > 0).unwrap_or_else(|| {
-            tracing::warn!("{BUFFER_ENV}={v} is not a window count; using {DEFAULT_BUFFER_WINDOWS}");
-            DEFAULT_BUFFER_WINDOWS
-        })),
+        Some(v) => Some(
+            v.parse::<usize>()
+                .ok()
+                .filter(|&w| w > 0)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "{BUFFER_ENV}={v} is not a window count; using {DEFAULT_BUFFER_WINDOWS}"
+                    );
+                    DEFAULT_BUFFER_WINDOWS
+                }),
+        ),
     }
 }
 
@@ -165,9 +172,9 @@ impl BufferOptions {
     }
 
     fn spill_bound(&self) -> Option<u64> {
-        self.spill.as_ref().map(|(_, cap)| {
-            cap.unwrap_or_else(|| self.memory_bound().saturating_mul(SPILL_FACTOR))
-        })
+        self.spill
+            .as_ref()
+            .map(|(_, cap)| cap.unwrap_or_else(|| self.memory_bound().saturating_mul(SPILL_FACTOR)))
     }
 
     #[cfg(test)]
@@ -334,7 +341,10 @@ enum MarkerCheck {
     None,
     /// Older markers than this nest has seen were dropped: it checks its own checkpoints.
     Missed(u64),
-    Apply { id: u64, ancestor: u64 },
+    Apply {
+        id: u64,
+        ancestor: u64,
+    },
 }
 
 impl BufferShared {
@@ -951,7 +961,8 @@ impl Extraction<'_> {
                     // Read after both, the previous window's end settles that this window extends
                     // the chain extraction holds, as a nest's parent check does (#2146). Checked
                     // only before the fetch, a reorg between the two left that chain mixed.
-                    if let Some((prev, hash)) = self.headers.back().cloned().filter(|(b, _)| *b + 1 == next)
+                    if let Some((prev, hash)) =
+                        self.headers.back().cloned().filter(|(b, _)| *b + 1 == next)
                     {
                         match self.source.block_hash(prev).await {
                             Ok(Some(now)) if now.eq_ignore_ascii_case(&hash) => {}
@@ -1083,15 +1094,17 @@ impl Extraction<'_> {
         match (&narrowed, LogFilter::new(&u_addrs, &u_topics)) {
             (Some(addrs), _) => {
                 let mut asked: HashSet<String> = addrs.iter().map(lower).collect();
-                let logs = fetch_discovering(self.source, addrs, &u_topics, fetch_from, to, |logs| {
-                    let mut known = Vec::new();
-                    for (reg, fs, children) in inputs.iter().filter_map(|n| n.factory.as_ref()) {
-                        known.extend(discover_children(reg, fs, children, logs));
-                    }
-                    asked.extend(known.iter().map(lower));
-                    known
-                })
-                .await?;
+                let logs =
+                    fetch_discovering(self.source, addrs, &u_topics, fetch_from, to, |logs| {
+                        let mut known = Vec::new();
+                        for (reg, fs, children) in inputs.iter().filter_map(|n| n.factory.as_ref())
+                        {
+                            known.extend(discover_children(reg, fs, children, logs));
+                        }
+                        asked.extend(known.iter().map(lower));
+                        known
+                    })
+                    .await?;
                 Ok((logs, Some(asked)))
             }
             (None, Some(f)) => match self.source.logs(&f, fetch_from, to).await {
@@ -1252,7 +1265,8 @@ impl Extraction<'_> {
             }
         };
         if let Some(path) = spill_to {
-            let WindowLogs::Memory(logs) = std::mem::replace(&mut w.logs, WindowLogs::Spilled(path.clone()))
+            let WindowLogs::Memory(logs) =
+                std::mem::replace(&mut w.logs, WindowLogs::Spilled(path.clone()))
             else {
                 unreachable!("a fetched window is in memory");
             };
@@ -1466,10 +1480,7 @@ impl Source for HeaderedSource<'_> {
         }
         self.inner.block_hash(number).await
     }
-    async fn block_hashes(
-        &self,
-        blocks: &[u64],
-    ) -> Result<std::collections::HashMap<u64, String>> {
+    async fn block_hashes(&self, blocks: &[u64]) -> Result<std::collections::HashMap<u64, String>> {
         self.inner.block_hashes(blocks).await
     }
     async fn finalized(&self) -> Result<Option<u64>> {
@@ -1569,8 +1580,11 @@ async fn nest_task(
                         }
                         let now = std::time::Instant::now();
                         if now < at {
-                            wait_changed(&mut rx, (at - now).min(std::time::Duration::from_secs(1)))
-                                .await;
+                            wait_changed(
+                                &mut rx,
+                                (at - now).min(std::time::Duration::from_secs(1)),
+                            )
+                            .await;
                             continue;
                         }
                         // Back from its own position, never extraction's: behind the buffer it
@@ -1707,7 +1721,12 @@ async fn nest_task(
             }
             Pick::Buffered(w) => {
                 let (to, tip, header) = (w.to, w.tip, w.header.clone());
-                (window_logs(&nest, source, w, next, &stats).await, to, tip, header)
+                (
+                    window_logs(&nest, source, w, next, &stats).await,
+                    to,
+                    tip,
+                    header,
+                )
             }
             Pick::Own { to, tip } => {
                 stats.own_fetches.fetch_add(1, Ordering::Relaxed);
@@ -1718,9 +1737,14 @@ async fn nest_task(
                         chunker.too_large();
                         continue;
                     }
-                    Err(e) if narrowing_can_help(&e, next, to) => {
-                        (fetch_over_cap(&mut nest, source, next).await.map(NestLogs::Own), next, tip, None)
-                    }
+                    Err(e) if narrowing_can_help(&e, next, to) => (
+                        fetch_over_cap(&mut nest, source, next)
+                            .await
+                            .map(NestLogs::Own),
+                        next,
+                        tip,
+                        None,
+                    ),
                     r => {
                         if let Ok(logs) = &r {
                             chunker.observed(logs.len() as u64);
@@ -1729,9 +1753,14 @@ async fn nest_task(
                     }
                 }
             }
-            Pick::OverCap { block, tip } => {
-                (fetch_over_cap(&mut nest, source, block).await.map(NestLogs::Own), block, tip, None)
-            }
+            Pick::OverCap { block, tip } => (
+                fetch_over_cap(&mut nest, source, block)
+                    .await
+                    .map(NestLogs::Own),
+                block,
+                tip,
+                None,
+            ),
         };
         let logs = match logs {
             Ok(l) => l,
