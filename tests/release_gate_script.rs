@@ -1189,6 +1189,87 @@ fn a_lock_left_by_a_killed_run_is_broken() {
     assert!(text.contains("breaking"), "{text}");
 }
 
+/// Two waiters that both found the same dead pid both broke "the" stale lock, and the second
+/// removed the claim the first had just made, so both held it. A waits between judging the pid dead
+/// and acting on it while B breaks the lock and claims it.
+#[test]
+fn two_waiters_breaking_one_stale_lock_do_not_both_hold_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::create_dir(d.join("nest")).unwrap();
+    let mut gone = Command::new("true").spawn().unwrap();
+    let pid = gone.id();
+    gone.wait().unwrap();
+    std::fs::create_dir(d.join("nest.gate-lock.d")).unwrap();
+    std::fs::write(d.join("nest.gate-lock.d/pid"), format!("{pid}\n")).unwrap();
+    let waiter = d.join("waiter.sh");
+    std::fs::write(
+        &waiter,
+        r#". "$1"
+trap gate_unlock EXIT
+gate_lock "$2/nest" || exit 1
+(set -C; : >"$2/inside") 2>/dev/null || echo OVERLAP
+echo HOLDING
+while [ ! -e "$2/release.$3" ]; do sleep 0.05; done
+rm -f "$2/inside"
+"#,
+    )
+    .unwrap();
+    let start = |name: &str, hook: Option<&str>| {
+        let mut cmd = Command::new("bash");
+        cmd.arg(&waiter)
+            .arg(root().join("scripts/gate/lock.sh"))
+            .arg(&d)
+            .arg(name)
+            .env("GATE_LOCK_PORTABLE", "1")
+            .env_remove("GATE_LOCK_HELD")
+            .env_remove("GATE_LOCK_BEFORE_BREAK");
+        if let Some(hook) = hook {
+            cmd.env("GATE_LOCK_BEFORE_BREAK", hook);
+        }
+        run_bounded(cmd, &d, name)
+    };
+    let read = |name: &str| std::fs::read_to_string(d.join(format!("{name}.out"))).unwrap();
+    let hook = format!(
+        "touch '{0}/a-paused'; while [ ! -e '{0}/go' ]; do sleep 0.05; done",
+        d.display()
+    );
+    let a = start("a", Some(&hook));
+    poll("a to judge the lock stale", 30, || {
+        d.join("a-paused").exists().then_some(())
+    });
+    let b = start("b", None);
+    poll("b to break the lock and hold it", 30, || {
+        read("b").contains("HOLDING").then_some(())
+    });
+    std::fs::write(d.join("go"), "").unwrap();
+    let a_text = poll("a to claim or wait", 30, || {
+        let t = read("a");
+        (t.contains("HOLDING") || t.contains("waiting")).then_some(t)
+    });
+    std::fs::write(d.join("release.b"), "").unwrap();
+    let (code_b, text_b) = finish(b, &d, "b", 30);
+    poll("a to hold the lock b released", 30, || {
+        read("a").contains("HOLDING").then_some(())
+    });
+    std::fs::write(d.join("release.a"), "").unwrap();
+    let (code_a, text_a) = finish(a, &d, "a", 30);
+    assert!(
+        !a_text.contains("HOLDING"),
+        "a claimed the lock b held:\n{a_text}\n{text_b}"
+    );
+    assert_eq!(code_b, Some(0), "{text_b}");
+    assert_eq!(code_a, Some(0), "{text_a}");
+    assert!(
+        !format!("{text_a}{text_b}").contains("OVERLAP"),
+        "{text_a}\n{text_b}"
+    );
+    assert!(
+        !d.join("nest.gate-lock.d").exists(),
+        "the lock is released on exit"
+    );
+}
+
 /// On 2026-10-04 v4.3.1 was gated against v4.3.0, the latest release, while the allocations nest
 /// ran 4.2.1, so the statements 4.3.1 fixed read as answers that differ. Production is the version
 /// the refreshed copy's PROVENANCE records.

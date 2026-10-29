@@ -33,9 +33,11 @@ gate_lock() {
       [ -d "$path.d" ] || continue
       holder=$(cat "$path.d/pid" 2>/dev/null || true)
       if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
-        echo "gate lock: breaking $path.d, left by pid $holder, which has gone" >&2
-        rm -f "$path.d/pid"
-        continue
+        [ -z "${GATE_LOCK_BEFORE_BREAK:-}" ] || eval "$GATE_LOCK_BEFORE_BREAK"
+        if gate_lock_break "$path.d" "$holder"; then
+          echo "gate lock: breaking $path.d, left by pid $holder, which has gone" >&2
+          continue
+        fi
       fi
       [ "$said" -eq 1 ] || echo "gate lock: another gate run holds $path.d; waiting" >&2
       said=1
@@ -46,9 +48,26 @@ gate_lock() {
   export GATE_LOCK_HELD=$path
 }
 
+# gate_lock_break <lock-dir> <dead-pid> removes the claim only if it is still that pid's. Two waiters
+# that saw the same dead pid would otherwise both remove "it", the second removing the first's new
+# claim. break.<pid> is created O_EXCL, and while it exists nothing else can remove that pid's claim
+# and no claim can replace it, so the pid read under it is still there at the rm.
+gate_lock_break() {
+  local broke=1
+  (set -C; echo "$$" >"$1/break.$2") 2>/dev/null || return 1
+  if [ "$(cat "$1/pid" 2>/dev/null || true)" = "$2" ] && ! kill -0 "$2" 2>/dev/null; then
+    rm -f "$1/pid" && broke=0
+  fi
+  rm -f "$1/break.$2"
+  return "$broke"
+}
+
+# Unlinks our own claim by name and nothing else, so no claim is removed but by its owner or a
+# breaker; an rm -rf would take whatever else is in the directory when it reads it.
 gate_unlock() {
   if [ -n "${GATE_LOCK_DIR:-}" ] && [ "$(cat "$GATE_LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then
-    rm -rf "$GATE_LOCK_DIR"
+    rm -f "$GATE_LOCK_DIR/pid"
+    rmdir "$GATE_LOCK_DIR" 2>/dev/null || true
   fi
   GATE_LOCK_DIR=""
 }
