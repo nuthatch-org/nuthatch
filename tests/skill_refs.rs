@@ -297,6 +297,8 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     ("src/folds.rs", Some(&["FoldsToml", "FoldDecl"])),
     // RFC-0063: `[address_history]` in `nuthatch.toml`.
     ("src/address_history.rs", Some(&["AddressHistoryConfig"])),
+    // `[[alerts]] format`'s values, in nuthatch-core since RFC-0075 S1.
+    ("core/src/alerts.rs", Some(&["AlertFormat"])),
 ];
 
 /// `src/*.rs` files that derive `Deserialize` for wire formats, snapshots, or HTTP bodies - not
@@ -366,13 +368,13 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         // circuit can archive its own row type (#870). Nothing here is ever read from a nest's TOML.
         // The gate matches on the derive *name*, which cannot tell the two apart; classifying it is
         // the intended way to say so.
-        "src/entity_row.rs",
+        "core/src/entity_row.rs",
         "rkyv archival for DBSP row state, not nest config",
     ),
     (
         // Same story as `entity_row.rs`: rkyv's `Deserialize`, not serde's, because the linear
         // aggregate accumulator is a DBSP value and has to archive itself (#870).
-        "src/entity_circuit.rs",
+        "core/src/entity_circuit.rs",
         "rkyv archival for DBSP aggregate state, not nest config",
     ),
     (
@@ -383,8 +385,12 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "src/seal.rs",
         "sealed-segment catalogue, written by the indexer",
     ),
+    (
+        "core/src/seal.rs",
+        "sealed-segment catalogue, written by the indexer",
+    ),
     ("src/pack.rs", "compliance-pack manifest, not nest config"),
-    ("src/labels.rs", "imported label snapshots, not nest toml"),
+    ("core/src/labels.rs", "imported label snapshots, not nest toml"),
     ("src/lists.rs", "fetched list snapshots, not nest toml"),
     ("src/metadata.rs", "cached token metadata, not nest toml"),
     ("src/lifecycle.rs", "HTTP request bodies for the admin API"),
@@ -451,14 +457,18 @@ fn config_sources_names_every_operator_config_file() {
          the same way. Put it back, or this gate is decorative."
     );
 
-    let src = root.join("src");
+    // `core/src` is the binary's too since RFC-0075 S1, and its files moved there from `src`.
     let mut missing = Vec::new();
-    for entry in std::fs::read_dir(&src).unwrap() {
-        let path = entry.unwrap().path();
+    let files = ["src", "core/src"].into_iter().flat_map(|dir| {
+        std::fs::read_dir(root.join(dir))
+            .unwrap()
+            .map(move |entry| (dir, entry.unwrap().path()))
+    });
+    for (dir, path) in files {
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let rel = format!("src/{}", path.file_name().unwrap().to_string_lossy());
+        let rel = format!("{dir}/{}", path.file_name().unwrap().to_string_lossy());
         let text = std::fs::read_to_string(&path).unwrap();
         if !text.contains("Deserialize") {
             continue;

@@ -181,7 +181,12 @@ impl GaveUp {
     }
 }
 
-fn recorded(store: &dyn HotStore, block: u64, slot: usize, cid: &str) -> Result<bool> {
+fn recorded(
+    store: &dyn nuthatch_core::store::HotStore,
+    block: u64,
+    slot: usize,
+    cid: &str,
+) -> Result<bool> {
     let key = gave_up_key_at(block, slot);
     Ok(store
         .get_meta(&key)?
@@ -189,7 +194,7 @@ fn recorded(store: &dyn HotStore, block: u64, slot: usize, cid: &str) -> Result<
         .is_some_and(|r| r.cid == cid))
 }
 
-fn gave_up(store: &dyn HotStore, p: &Planned) -> Result<bool> {
+fn gave_up(store: &dyn nuthatch_core::store::HotStore, p: &Planned) -> Result<bool> {
     recorded(store, p.block, p.slot, &p.cid)
 }
 
@@ -347,7 +352,11 @@ impl Gate {
     }
 
     /// The lowest block in `entities` holding a document that is neither stored nor given up on.
-    pub fn lowest_pending(&self, store: &dyn HotStore, entities: &[String]) -> Result<Option<u64>> {
+    pub fn lowest_pending(
+        &self,
+        store: &dyn nuthatch_core::store::HotStore,
+        entities: &[String],
+    ) -> Result<Option<u64>> {
         for (block, (planned, present)) in self.plan_stored(entities) {
             for p in &planned {
                 if !present.contains(&p.key()) && !gave_up(store, p)? {

@@ -141,7 +141,10 @@ seal) and `rollback_reorg`, over four traits:
 
 - `Source`, which exists.
 - `HotStore`, which exists; its two `spawn_blocking` commit wrappers become the synchronous calls,
-  with the binary keeping its blocking-pool version.
+  with the binary keeping its blocking-pool version. *(S1, as built: the core trait keeps
+  `commit_window_blocking` async, and each store decides how to run it. The node keeps the blocking
+  pool, so its commit fsync stays off the async workers (audit F-C3); a tab's store does the work
+  inside the future. The trait has no cfg and the node's behaviour is unchanged.)*
 - `SegmentSink`, for `seal_range`'s writes: bytes under `segments/<hash>`, then the manifest. The pure
   half is `nuthatch-seal` already.
 - `Clock`, for the 52 clock and sleep sites, most of which are in the solo loop and pacing rather than

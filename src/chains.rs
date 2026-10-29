@@ -28,17 +28,7 @@
 
 use anyhow::Context;
 
-/// How a chain decides a block is final enough to seal to the immutable cold layer. The sealing
-/// invariant is unchanged either way: the columnar layer never sees a reorg, so this only sets *how
-/// far behind the tip* we wait before a block is beyond reorg risk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Finality {
-    /// Seal blocks at least `n` behind the tip. A conservative proxy for finality (Ethereum L1).
-    Depth(u64),
-    /// Prefer the node's L1-aware `finalized` block tag (correct by construction on an L2 like
-    /// Arbitrum); fall back to `Depth(fallback_depth)` when the endpoint doesn't serve the tag.
-    FinalizedTag { fallback_depth: u64 },
-}
+pub use nuthatch_core::window::Finality;
 
 pub struct Chain {
     pub name: &'static str,

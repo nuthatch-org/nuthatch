@@ -4,21 +4,11 @@
 
 use dbsp::{IndexedZSetReader, OrdZSet, Runtime, ZWeight};
 
-// The S0 remainder (#2476): the binary's entity circuit, compiled here from its own files so the
-// plan stepped on wasm32 is the one a nest lowers, not a copy of it.
-#[path = "../../../src/entity_row.rs"]
-#[allow(dead_code, unused_imports, clippy::all)]
-pub mod entity_row;
-#[path = "../../../src/entity_expr.rs"]
-#[allow(dead_code, unused_imports, clippy::all)]
-pub mod entity_expr;
-#[path = "../../../src/entity_plan.rs"]
-#[allow(dead_code, unused_imports, clippy::all)]
-pub mod entity_plan;
-#[path = "../../../src/entity_circuit.rs"]
-#[allow(dead_code, unused_imports, clippy::all)]
-pub mod entity_circuit;
+// The binary's entity circuit, from `nuthatch-core` since RFC-0075 S1, so the plan stepped on wasm32
+// is the one a nest lowers, not a copy of it.
+pub use nuthatch_core::{entity_circuit, entity_expr, entity_plan, entity_row};
 pub mod entity;
+pub mod window;
 
 /// Builds a one-worker circuit, feeds it three batches with a retraction in the middle, and
 /// answers the running sum of `doubled` after each step, plus the final `count_by_parity` relation.
@@ -54,10 +44,7 @@ pub fn run_steps() -> Result<(Vec<Vec<(u64, ZWeight)>>, Vec<((u64, i64), ZWeight
         steps.push(out.iter().map(|(k, (), w)| (k, w)).collect());
     }
     let parity = parity_out.consolidate();
-    let parity: Vec<((u64, i64), ZWeight)> = parity
-        .iter()
-        .map(|(k, v, w)| ((k, v), w))
-        .collect();
+    let parity: Vec<((u64, i64), ZWeight)> = parity.iter().map(|(k, v, w)| ((k, v), w)).collect();
     circuit.kill().map_err(|_| "kill".to_string())?;
     Ok((steps, parity))
 }
@@ -121,6 +108,22 @@ pub fn run_stress(steps: u64, rows: u64) -> Result<(usize, i64), String> {
     Ok((groups, total))
 }
 
+/// RFC-0075 S1: the built-in views from `nuthatch-core` under `driver`. Balances after a mint, two
+/// transfers and a retraction of one; a thread would panic on wasm32, so only `Inline` runs there.
+pub fn run_views(driver: nuthatch_core::drive::Driver) -> Result<String, String> {
+    use nuthatch_core::views::{transfer_deltas, BalanceView};
+    let view = BalanceView::start(driver).map_err(|e| format!("{e:#}"))?;
+    view.apply(transfer_deltas("0xmint", "0xa", 100, 1));
+    view.apply(transfer_deltas("0xa", "0xb", 30, 1));
+    view.apply(transfer_deltas("0xb", "0xc", 5, 1));
+    view.retract(transfer_deltas("0xb", "0xc", 5, 1));
+    view.flush();
+    if !view.is_healthy() {
+        return Err("the balance view died".into());
+    }
+    Ok(format!("{:?}", view.top(10)))
+}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use wasm_bindgen::prelude::*;
@@ -138,6 +141,17 @@ mod wasm {
         std::panic::set_hook(Box::new(|info| error(&format!("panic: {info}"))));
         let (steps, parity) = super::run_steps().map_err(|e| JsError::new(&e))?;
         Ok(format!("{steps:?} {parity:?}"))
+    }
+
+    #[wasm_bindgen]
+    pub fn spike_views() -> Result<String, JsError> {
+        super::run_views(nuthatch_core::drive::Driver::Inline).map_err(|e| JsError::new(&e))
+    }
+
+    #[wasm_bindgen]
+    pub fn spike_window() -> Result<String, JsError> {
+        std::panic::set_hook(Box::new(|info| error(&format!("panic: {info}"))));
+        super::window::run_window().map_err(|e| JsError::new(&e))
     }
 
     #[wasm_bindgen]
@@ -181,4 +195,3 @@ mod wasm {
         (core::arch::wasm32::memory_size(0) * 65536) as f64
     }
 }
-

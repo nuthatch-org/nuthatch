@@ -18,7 +18,7 @@ use nuthatch::controlplane::ControlPlane;
 use nuthatch::pgstore::PgStore;
 use nuthatch::reconcile::{tick, CursorHosts};
 use nuthatch::scheduler::DesiredNest;
-use nuthatch::store::HotStore;
+use nuthatch::store::{CoreHotStore as _, HotStore};
 
 const TTL: u64 = 60;
 

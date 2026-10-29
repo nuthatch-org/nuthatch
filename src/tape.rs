@@ -299,6 +299,9 @@ impl<S: Source> Source for RecordingSource<S> {
         // source holds no cache to forget.
         self.inner.forget_cached_above(block)
     }
+    fn refuses_topic0_only(&self, err: &anyhow::Error) -> bool {
+        self.inner.refuses_topic0_only(err)
+    }
     async fn logs(&self, filter: &LogFilter, from: u64, to: u64) -> Result<Vec<Log>> {
         record!(
             self,

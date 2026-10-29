@@ -23,10 +23,24 @@ use crate::source::{LogFilter, Source};
 use crate::store::Store;
 use crate::velocity::{self, VelocityView};
 use crate::views::{self, BalanceView};
+pub use nuthatch_core::fault::TerminalFault;
+use nuthatch_core::fault::{is_terminal, FaultPoints};
+use nuthatch_core::feed::{
+    decode_stored_rows, exposure_retraction_batch, oversized_transfer, retraction_batch,
+    velocity_retraction_batch, view_transfer,
+};
+use nuthatch_core::metrics::CursorMetrics;
+use nuthatch_core::seal::pin_checkpoint;
+pub(crate) use nuthatch_core::window::fetch_window_block_data;
+use nuthatch_core::window::{
+    apply_row_timestamps, blocks_needing_timestamps, decode_window, dedup_logs, fetch_discovering,
+    l1_block_rows, note_undecoded, seal_ceiling, wide_templates, Undecoded, WindowForked,
+    FACTORY_FLIP_THRESHOLD,
+};
 use nuthatch_seal::cut::CutScan;
 pub use nuthatch_seal::cut::{SEAL_DIRECT_BATCH, SEAL_DIRECT_BYTES};
 
-pub(crate) const LAST_BLOCK_KEY: &str = "last_block";
+pub(crate) use nuthatch_core::store::{LAST_BLOCK_KEY, SEALED_THROUGH_KEY, START_BLOCK_KEY};
 /// What this nest's stored data was indexed *with*: `"1"` if rows carry `block_timestamp`, `"0"` if
 /// not (RFC-0029 §6b). Written on first index and compared on every start.
 ///
@@ -39,8 +53,6 @@ const TIMESTAMPS_KEY: &str = "block_timestamps";
 /// [`TIMESTAMPS_KEY`]: that one guards a column, this one guards the *identity* of the whole decode
 /// configuration, which is what a nest's content address is a statement about.
 use crate::store::{IDENTITY_FORMULA, IDENTITY_FORMULA_KEY, REGISTRY_KEY};
-pub(crate) const SEALED_THROUGH_KEY: &str = "sealed_through";
-pub(crate) const START_BLOCK_KEY: &str = "start_block";
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
 const DEFAULT_BACKFILL: u64 = 5_000;
 
@@ -1017,35 +1029,6 @@ fn seed_entities(
     Ok(())
 }
 
-/// Stored JSON rows to decoded rows, against a nest's table schemas.
-///
-/// One conversion, and every caller uses it - the reorg path, the restart seed, and whatever needs it
-/// next. A second one written separately is how a retraction stops cancelling its insertion (#864).
-///
-/// A row of a table the registry does not decode (a threshold flag, a `[[calls]]` or `[[ipfs]]` row)
-/// is skipped: ingest never feeds one to an entity or a view, so nothing seeds or retracts it.
-fn decode_stored_rows(
-    schema: &[crate::registry::TableSchema],
-    stored: &[String],
-) -> Result<Vec<crate::registry::DecodedRow>> {
-    let mut rows = Vec::with_capacity(stored.len());
-    for raw in stored {
-        let value: serde_json::Value =
-            serde_json::from_str(raw).context("an unparseable row in the hot store")?;
-        let Some(table) = value.get("table").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
-            continue;
-        };
-        rows.push(crate::registry::DecodedRow::from_stored(
-            &value,
-            table_schema,
-        )?);
-    }
-    Ok(rows)
-}
-
 /// #866 criterion 13: `--seal-direct` either rebuilds entities from the finished sealed corpus before
 /// serving, or refuses the combination clearly. It refuses, **before anything is spawned**.
 ///
@@ -1338,42 +1321,6 @@ fn discover_children(
         .collect()
 }
 
-/// `from..=to` address-filtered, then refetched for the children each round discovers until a round
-/// finds none: the backfill's pass 1 and pass 2 fixpoint, for the tip loops.
-///
-/// `discover` decodes everything fetched so far and returns every child it knows of. A child
-/// created in the range announces itself from its factory's address, which round 1 fetched, so its
-/// own logs in the same range arrive in round 2.
-async fn fetch_discovering(
-    source: &dyn Source,
-    addresses: &[String],
-    topics: &[String],
-    from: u64,
-    to: u64,
-    mut discover: impl FnMut(&[crate::rpc::Log]) -> Vec<String>,
-) -> Result<Vec<crate::rpc::Log>> {
-    use std::collections::HashSet;
-    let mut fetched: HashSet<String> = addresses.iter().map(|a| a.to_ascii_lowercase()).collect();
-    let Some(filter) = LogFilter::new(addresses, topics) else {
-        return Ok(Vec::new());
-    };
-    let mut all = source.logs(&filter, from, to).await?;
-    loop {
-        let new: Vec<String> = discover(&all)
-            .into_iter()
-            .filter(|c| fetched.insert(c.to_ascii_lowercase()))
-            .collect();
-        // An empty `new` would make the filter below address-less, so it returns first.
-        if new.is_empty() {
-            return Ok(all);
-        }
-        let Some(child_filter) = LogFilter::new(&new, topics) else {
-            return Ok(all);
-        };
-        all.extend(source.logs(&child_filter, from, to).await?);
-    }
-}
-
 /// COR-5: a single block whose topic0-only union fetch broke the provider's `getLogs` cap. Recover it
 /// address-filtered if we can, and quarantine the factory nests that forced the wide filter if we
 /// cannot. Exactly one of those happens - the cursor never both recovers and faults, and never neither.
@@ -1497,28 +1444,6 @@ async fn recover_over_cap_static(
     fan_out_window(source, nests, nexts, sup, &served, &logs, block, tip).await
 }
 
-/// A fault that will re-fail identically on retry (RFC-0026 §3), so the unit it kills is quarantined
-/// **until restart** rather than backed off and re-admitted: a reorg below the sealed watermark bails
-/// again on the next attempt by construction, and a dead IVM circuit thread cannot be revived
-/// in-process. Retrying either is a busy-loop that spams the log and hides the operator's real job.
-/// Carried through `anyhow` and recognised by downcast, so the bail sites stay one-liners.
-#[derive(Debug)]
-pub struct TerminalFault(pub String);
-
-impl std::fmt::Display for TerminalFault {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for TerminalFault {}
-
-/// Whether any link in the error chain is a [`TerminalFault`] - i.e. a retry is pointless. Everything
-/// else is assumed retryable: a transient store/RPC/webhook error that a later window may well survive.
-fn is_terminal(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.is::<TerminalFault>())
-}
-
 /// One nest's work on the shared cursor, with a panic in it made that nest's terminal fault
 /// (RFC-0073 FR6). Unwound, the cursor task died and took every co-tenant on the chain with it.
 async fn contained<T>(work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
@@ -1547,19 +1472,6 @@ fn panicked(payload: Box<dyn std::any::Any + Send>) -> anyhow::Error {
         "this nest's ingest panicked: {message}"
     )))
 }
-
-/// The chain moved under a window while it was being read: the tip loop reads the window again
-/// rather than ending the nest (#2154).
-#[derive(Debug)]
-struct WindowForked(String);
-
-impl std::fmt::Display for WindowForked {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for WindowForked {}
 
 /// Tags a [`NestIngest::prepare`] failure as "the chain wasn't reachable yet", not a real fault (#510).
 /// `prepare`'s cold-start tip lookups used to be a bare `?`: a fully dead RPC pool killed the whole
@@ -3312,7 +3224,7 @@ async fn build_nest(
         finish_unpruned_fold(&dir, store.as_ref())?;
     }
 
-    let balances = BalanceView::start()?;
+    let balances = BalanceView::start(crate::drive::Driver::Threaded)?;
     // Labels (RFC-0008 C1) are the annotation substrate the exposure view joins against. Loaded before
     // the exposure view so it only spins up when there's actually something to track.
     let labels = Arc::new(labels::load(&dir));
@@ -3324,7 +3236,7 @@ async fn build_nest(
     }
     // The exposure view joins transfers against the labeled set - with no labels it can only ever be
     // empty, so don't spend a DBSP circuit + dedicated thread on it (deadlock-review finding L10).
-    let exposure = ExposureView::start(!labels.is_empty())?;
+    let exposure = ExposureView::start(crate::drive::Driver::Threaded, !labels.is_empty())?;
 
     // Optional threshold & velocity flags (RFC-0008 C3). Threshold flags are per-transfer stored
     // annotations (block-keyed → roll back with their transfer); velocity is a DBSP windowed view
@@ -3332,7 +3244,7 @@ async fn build_nest(
     let threshold = config.flags.threshold_amount();
     let velocity_cfg = config.flags.velocity();
     // Only fed when a velocity flag is configured - skip its circuit + thread otherwise (L10).
-    let velocity = VelocityView::start(velocity_cfg.is_some())?;
+    let velocity = VelocityView::start(crate::drive::Driver::Threaded, velocity_cfg.is_some())?;
     // Authored incremental entities (RFC-0041). A declaration that will not lower or will not bind
     // stops the nest here rather than at the first block that would have used it - `?`, deliberately.
     // A nest with indexed history behind it starts its entities *unavailable* rather than empty and
@@ -3587,6 +3499,7 @@ async fn build_nest(
         freshness: config.freshness,
         name: key.clone(),
         dir: dir.clone(),
+        faults: Arc::new(NodeFaults { dir: dir.clone() }),
         store: shared_store.clone(),
         registry: registry.clone(),
         balances: balances.clone(),
@@ -3673,9 +3586,8 @@ async fn build_nest(
             d
         },
         overruns: 0,
-        snapshots: Default::default(),
-        published_at: None,
-        published_generation: None,
+        hooks: Arc::new(nuthatch_core::hooks::NoHooks),
+        publisher: Default::default(),
     };
     // Stamps this nest's readiness clock (#510): `/ready`'s never-polled grace period is bounded from
     // here, not permanent - see `serve::poll_stalled`.
@@ -3692,6 +3604,11 @@ async fn build_nest(
             nest.metrics.clone(),
         )?
         .map(Arc::new),
+        ..nest
+    };
+    // Last, so they hold the fold writer.
+    let nest = NestIngest {
+        hooks: Arc::new(nest.node_hooks()),
         ..nest
     };
 
@@ -3759,7 +3676,7 @@ async fn build_nest(
         // Set by `spawn_runtime` for a co-tenanted nest; a solo `dev` nest has no mounts health surface.
         runtime_health: None,
         address_history: None,
-        snapshots: Some(nest.snapshots.clone()),
+        snapshots: Some(nest.publisher.snapshots.clone()),
         isolation: None,
         admin_enabled,
         admin_token,
@@ -4181,65 +4098,6 @@ fn drain_all_sealable(
     Ok(())
 }
 
-/// Above this many discovered children, the factory backfill flips from an address-list filter to a
-/// topic0-only fetch with local registry-lookup filtering (RFC-0009 §4) - providers cap address-list
-/// size, and a huge list is slower than fetching by topic0 and discarding non-children locally.
-const FACTORY_FLIP_THRESHOLD: usize = 500;
-
-/// The templates a flipped factory nest fetches by topic0 alone, and those topic0s.
-struct WideTemplates {
-    names: std::collections::BTreeSet<String>,
-    topic0s: Vec<String>,
-}
-
-impl WideTemplates {
-    fn covers(&self, template: Option<&str>) -> bool {
-        template.is_some_and(|t| self.names.contains(t))
-    }
-}
-
-/// Past the flip, only a template with more than [`FACTORY_FLIP_THRESHOLD`] children of its own is
-/// fetched without an address. Static contracts never are: one declaring a generic event (ENS's
-/// BaseRegistrar and its ERC-721 `Transfer`) would otherwise ask for every such log on the chain.
-/// Small templates that together cross the threshold go wide, but only those with a child: a
-/// template with none has nothing to cover, and its events may be as generic as ERC-1155 transfers.
-fn wide_templates(
-    registry: &DecodeRegistry,
-    factory: &FactorySet,
-    children: &ChildRegistry,
-    base: usize,
-    force: bool,
-) -> Option<WideTemplates> {
-    let mut names: std::collections::BTreeSet<String> = factory
-        .templates()
-        .iter()
-        .filter(|t| force || children.addresses_for_template(t).len() > FACTORY_FLIP_THRESHOLD)
-        .cloned()
-        .collect();
-    if names.is_empty() && base + children.len() > FACTORY_FLIP_THRESHOLD {
-        names = factory
-            .templates()
-            .iter()
-            .filter(|t| !children.addresses_for_template(t).is_empty())
-            .cloned()
-            .collect();
-    }
-    let mut topic0s: Vec<String> = names
-        .iter()
-        .flat_map(|t| registry.template_topic0s(t))
-        .map(|t| format!("0x{}", hex::encode(t)))
-        .collect();
-    topic0s.sort();
-    topic0s.dedup();
-    (!topic0s.is_empty()).then_some(WideTemplates { names, topic0s })
-}
-
-/// One copy of each log, in chain order. A wide fetch and an address fetch can both return a log.
-fn dedup_logs(logs: &mut Vec<crate::rpc::Log>) {
-    logs.sort_by_key(|l| (l.block_number, l.log_index));
-    logs.dedup_by_key(|l| (l.block_number, l.log_index));
-}
-
 /// Refuse to start when `[nest] block_timestamps` disagrees with what this nest already indexed.
 ///
 /// Flipping the declaration is not a config edit, it is a **breaking schema change** (RFC-0029 §6b-i):
@@ -4599,161 +4457,6 @@ fn guard_timestamp_policy(
             }
             Ok(())
         }
-    }
-}
-
-/// Block timestamps for `blocks` - or an empty map, without touching the network, when the nest
-/// declared it doesn't index them (RFC-0029 §6b).
-///
-/// **This is where the win actually is.** Timestamps arrive one `eth_getBlockByNumber` per block over
-/// a round trip `eth_getLogs` does not carry, measured at ~85% of backfill wall clock (RFC-0029 §4).
-/// Every path that stamps rows goes through here so there is exactly one place the decision is made,
-/// and no path can quietly keep paying for a column its nest doesn't have.
-///
-/// Returning an empty map is safe rather than lossy: `DecodedRow::block_timestamp` stays 0 and
-/// `to_json` omits the key entirely, so the zero never reaches the store or a segment.
-async fn fetch_timestamps(
-    source: &dyn Source,
-    registry: &DecodeRegistry,
-    blocks: &[u64],
-) -> Result<std::collections::HashMap<u64, u64>> {
-    if !registry.timestamps() {
-        return Ok(std::collections::HashMap::new());
-    }
-    source.block_timestamps(blocks).await
-}
-
-/// A block the source answered without a timestamp, or with 0, refuses the window: the stamp
-/// below would store 0, and once sealed it is permanent (#1911). Genesis is the one block at 0.
-fn refuse_unstamped(
-    registry: &DecodeRegistry,
-    blocks: &[u64],
-    timestamps: &std::collections::HashMap<u64, u64>,
-) -> Result<()> {
-    if !registry.timestamps() {
-        return Ok(());
-    }
-    match blocks
-        .iter()
-        .find(|&&b| b != 0 && timestamps.get(&b).is_none_or(|&t| t == 0))
-    {
-        Some(b) => anyhow::bail!(
-            "the source gave block {b} no timestamp (missing or 0); refusing the window rather \
-             than storing block_timestamp 0"
-        ),
-        None => Ok(()),
-    }
-}
-
-pub(crate) struct WindowBlockData {
-    pub(crate) timestamps: std::collections::HashMap<u64, u64>,
-    pub(crate) headers: Option<std::collections::HashMap<u64, serde_json::Value>>,
-    /// The same headers, for an `[extract] l1_blocks` nest's rows (#1839); empty otherwise.
-    pub(crate) l1_headers: std::collections::HashMap<u64, serde_json::Value>,
-}
-
-/// Canonical reads need the same header as the event timestamps. Keep it only
-/// for this window; a retry or another window must fetch its own fork evidence.
-pub(crate) async fn fetch_window_block_data(
-    source: &dyn Source,
-    registry: &DecodeRegistry,
-    blocks: &[u64],
-    canonical_calls: bool,
-) -> Result<WindowBlockData> {
-    if !canonical_calls && !registry.l1_blocks() {
-        let timestamps = fetch_timestamps(source, registry, blocks).await?;
-        refuse_unstamped(registry, blocks, &timestamps)?;
-        return Ok(WindowBlockData {
-            timestamps,
-            headers: None,
-            l1_headers: std::collections::HashMap::new(),
-        });
-    }
-    let headers = source.block_headers(blocks).await?;
-    let mut timestamps = std::collections::HashMap::new();
-    for block in blocks {
-        let header = headers
-            .get(block)
-            .with_context(|| format!("missing window header at {block}"))?;
-        if registry.timestamps() {
-            let timestamp = header
-                .get("timestamp")
-                .and_then(|v| {
-                    v.as_u64().or_else(|| {
-                        v.as_str()?
-                            .strip_prefix("0x")
-                            .and_then(|s| u64::from_str_radix(s, 16).ok())
-                    })
-                })
-                .with_context(|| format!("missing window timestamp at {block}"))?;
-            timestamps.insert(*block, timestamp);
-        }
-    }
-    refuse_unstamped(registry, blocks, &timestamps)?;
-    let (headers, l1_headers) = match (canonical_calls, registry.l1_blocks()) {
-        (true, true) => (Some(headers.clone()), headers),
-        (true, false) => (Some(headers), std::collections::HashMap::new()),
-        (false, _) => (None, headers),
-    };
-    Ok(WindowBlockData {
-        timestamps,
-        headers,
-        l1_headers,
-    })
-}
-
-/// One `l1_blocks` row per block that carries a row in `rows` (#1839). A header without
-/// `l1BlockNumber` refuses the window, as a missing timestamp does: a 0 would be sealed for good.
-fn l1_block_rows(
-    registry: &DecodeRegistry,
-    rows: &[crate::registry::DecodedRow],
-    data: &WindowBlockData,
-) -> Result<Vec<crate::registry::DecodedRow>> {
-    if !registry.l1_blocks() {
-        return Ok(Vec::new());
-    }
-    let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
-    blocks.sort_unstable();
-    blocks.dedup();
-    blocks
-        .into_iter()
-        .map(|b| {
-            data.l1_headers
-                .get(&b)
-                .and_then(|h| crate::registry::l1_block_row(b, h, registry.timestamps()))
-                .with_context(|| {
-                    format!(
-                        "block {b}'s header carries no l1BlockNumber; [extract] l1_blocks needs an \
-                         Arbitrum-family chain and an endpoint that returns it"
-                    )
-                })
-        })
-        .collect()
-}
-
-/// Blocks that still need a header after local filtering (#765).
-///
-/// A topic0-only fetch (factory flip, RFC-0009 §4) returns every log on the chain with that
-/// topic0, including other protocols that share the event shape. Stamping timestamps from the
-/// raw log list paid `eth_getBlockByNumber` for blocks whose rows we then discarded. The kept
-/// rows plus any `[[calls]]` sample blocks are the only headers worth buying.
-fn blocks_needing_timestamps(
-    rows: &[crate::registry::DecodedRow],
-    extra: impl IntoIterator<Item = u64>,
-) -> Vec<u64> {
-    let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
-    blocks.extend(extra);
-    blocks.sort_unstable();
-    blocks.dedup();
-    blocks
-}
-
-fn apply_row_timestamps(
-    rows: &mut [crate::registry::DecodedRow],
-    ts: &std::collections::HashMap<u64, u64>,
-) {
-    for r in rows {
-        r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
     }
 }
 
@@ -5891,9 +5594,6 @@ fn fetch_logs_splitting_tracking<'a>(
 /// nothing, which is exactly how the gates in #913 became decorative.
 const NO_PROGRESS_LIMIT: usize = 64;
 
-/// A warning that can repeat every poll fires on the first and then every this many (#1666, #1667).
-const REPEAT_WARN_EVERY: u64 = 100;
-
 const BACKFILL_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(250);
 const BACKFILL_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -6267,7 +5967,12 @@ pub async fn backfill_direct_pipelined_with(
             .filter_map(|log| decode_or_note(registry, log, &mut undecoded))
             .collect();
         if !final_pass {
-            note_undecoded(extras.metrics, &undecoded, w_from, w_to);
+            note_undecoded(
+                extras.metrics.map(|m| m as &dyn CursorMetrics),
+                &undecoded,
+                w_from,
+                w_to,
+            );
         }
         let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
         // Include blocks sampled by [[calls]] so their timestamps are available for call rows.
@@ -6789,7 +6494,12 @@ pub async fn backfill_direct_factory_with(
         // Headers only for kept rows (#765).
         let (mut rows, found, undecoded) = decoded;
         if !final_pass {
-            note_undecoded(extras.metrics, &undecoded, next, chunk_to);
+            note_undecoded(
+                extras.metrics.map(|m| m as &dyn CursorMetrics),
+                &undecoded,
+                next,
+                chunk_to,
+            );
         }
         children.extend(found);
         let extra = if state_rpc.is_some() {
@@ -6990,22 +6700,6 @@ pub fn set_window_deadline(dir: &Path, deadline: Option<std::time::Duration>) {
     WindowDeadline::of_dataset(dir).set(deadline);
 }
 
-/// A window decoded, checked and bound, waiting for its commit (RFC-0076 §3.2).
-struct PreparedWindow {
-    stored: usize,
-    to_store: Vec<(String, String)>,
-    outbox: Vec<String>,
-    checkpoint: Option<(u64, String)>,
-    deltas: crate::views::WeightedBatch,
-    exp_deltas: crate::exposure::ExposureBatch,
-    vel_deltas: crate::velocity::VelocityBatch,
-    oversized: u64,
-    found: ChildRegistry,
-    bound: Vec<Option<crate::entity_view::Batch>>,
-    undecoded: Vec<Undecoded>,
-    fold_floor: u64,
-}
-
 pub struct NestIngest {
     /// The nest's configured name - the label a quarantine is reported under (RFC-0026 §5) and the
     /// key its metrics are already registered by.
@@ -7038,6 +6732,8 @@ pub struct NestIngest {
     /// Per-nest metrics handle (SEC-9): nest-scoped updates go here, which also feed the process-global
     /// aggregates. In a runtime each nest gets its own, keyed by name.
     metrics: Arc<crate::metrics::NestMetrics>,
+    /// Where the node's tests make a window fail; inert outside them.
+    faults: Arc<dyn FaultPoints>,
     /// RFC-0059 §5: the seal loop's checkpoint writer, when the nest ships `folds/`.
     #[cfg(feature = "folds")]
     folds: Option<Arc<crate::folds::Writer>>,
@@ -7091,95 +6787,83 @@ pub struct NestIngest {
     window_deadline: WindowDeadline,
     /// Windows in a row that overran `window_deadline`.
     overruns: u32,
+    /// What runs around a committed window that is the node's and not the window path's.
+    hooks: Arc<dyn nuthatch_core::hooks::WindowHooks>,
     /// Where each window's snapshot is published for requests to read (#2467).
-    snapshots: serve::Snapshots,
-    /// When the last snapshot was published, which catching up throttles on.
-    published_at: Option<std::time::Instant>,
-    /// The store's write generation the last snapshot was taken at.
-    published_generation: Option<u64>,
+    publisher: Arc<Publisher>,
+}
+
+/// A [`nuthatch_core::cursor::Nest`] over a [`NestIngest`]'s fields. A macro rather than a method, so
+/// `children` can be borrowed mutably beside the rest.
+macro_rules! nest_of {
+    ($n:expr, $schema:expr, $children:expr) => {
+        nuthatch_core::cursor::Nest {
+            name: &$n.name,
+            store: $n.store.as_ref(),
+            schema: $schema,
+            balances: &$n.balances,
+            exposure: &$n.exposure,
+            velocity: &$n.velocity,
+            labels: &$n.labels,
+            velocity_flag: $n.velocity_cfg,
+            entities: $n.entities.as_slice(),
+            children: $children,
+            router: &$n.router,
+            metrics: $n.metrics.as_ref(),
+        }
+    };
 }
 
 impl NestIngest {
-    /// This window's logs. A factory nest is asked by `base ∪ children` until it has more than
-    /// [`FACTORY_FLIP_THRESHOLD`] children, the rule the seal-direct factory backfill follows (#1941).
+    fn node_hooks(&self) -> NodeHooks {
+        NodeHooks {
+            dir: self.dir.clone(),
+            store: self.store.clone(),
+            registry: self.registry.clone(),
+            entities: self.entities.clone(),
+            webhooks: self.webhooks.clone(),
+            #[cfg(feature = "folds")]
+            folds: self.folds.clone(),
+            balances: self.balances.clone(),
+            exposure: self.exposure.clone(),
+            velocity: self.velocity.clone(),
+            publisher: self.publisher.clone(),
+        }
+    }
+
+    /// See [`NodeHooks::publish_snapshot`].
+    async fn publish_snapshot(&self) -> Result<()> {
+        self.node_hooks().publish_snapshot().await
+    }
+
+    /// See [`NodeHooks::republish_if_moved`].
+    async fn republish_if_moved(&self) -> Result<()> {
+        self.node_hooks().republish_if_moved().await
+    }
+
+    /// [`Self::rollback_reorg`], published before a request reads past it.
+    async fn rollback_published(&mut self, ancestor: u64) -> Result<u64> {
+        let resume = self.rollback_reorg(ancestor)?;
+        self.publish_snapshot().await?;
+        Ok(resume)
+    }
+
+    /// This window's logs; see [`nuthatch_core::window::fetch_window`].
     async fn fetch_window(
         &mut self,
         source: &dyn Source,
         from: u64,
         to: u64,
     ) -> Result<Vec<crate::rpc::Log>> {
-        let Some(fs) = self.factory.clone() else {
-            return match LogFilter::new(&self.addresses, &self.topic0s) {
-                Some(f) => source.logs(&f, from, to).await,
-                None => Ok(Vec::new()),
-            };
+        let wanted = nuthatch_core::window::Wanted {
+            registry: &self.registry,
+            factory: self.factory.as_deref(),
+            children: &self.children,
+            addresses: &self.addresses,
+            topic0s: &self.topic0s,
+            topic0_refused: &mut self.topic0_refused,
         };
-        let known: Vec<String> = self
-            .registry
-            .addresses()
-            .iter()
-            .map(|a| format!("0x{}", hex::encode(a)))
-            .chain(self.children.addresses().into_iter().map(str::to_string))
-            .collect();
-        // Per template, as the backfill does: see `wide_templates`.
-        let mut wide = if self.topic0_refused {
-            None
-        } else {
-            wide_templates(
-                &self.registry,
-                &fs,
-                &self.children,
-                self.registry.addresses().len(),
-                fs.force_topic0(),
-            )
-        };
-        let mut wide_logs = Vec::new();
-        if let Some(w) = &wide {
-            let f = LogFilter::new(&[], &w.topic0s)
-                .expect("a wide template decodes at least one event");
-            match source.logs(&f, from, to).await {
-                Err(e) if crate::rpc::filter_refused(&e) => {
-                    tracing::warn!(
-                        "the endpoint refuses getLogs without an address list ({e:#}); asking by \
-                         factory and child address from now on"
-                    );
-                    self.topic0_refused = true;
-                    wide = None;
-                }
-                r => wide_logs = r?,
-            }
-        }
-        let covered = |c: &str, reg: &ChildRegistry| {
-            wide.as_ref().is_some_and(|w| w.covers(reg.template_of(c)))
-        };
-        let narrow: Vec<String> = known
-            .into_iter()
-            .filter(|c| !covered(c, &self.children))
-            .collect();
-        let mut logs = fetch_discovering(source, &narrow, &self.topic0s, from, to, |logs| {
-            let mut seen = wide_logs.clone();
-            seen.extend_from_slice(logs);
-            let (_, found, _) = decode_window(
-                &self.registry,
-                Some(&fs),
-                &self.children,
-                &seen,
-                &std::collections::HashMap::new(),
-            );
-            self.children
-                .addresses()
-                .into_iter()
-                .chain(found.addresses())
-                .filter(|c| !covered(c, &self.children) && !covered(c, &found))
-                .map(str::to_string)
-                .collect()
-        })
-        .await?;
-        if !wide_logs.is_empty() {
-            logs.extend(wide_logs);
-            dedup_logs(&mut logs);
-        }
-        Ok(logs)
+        nuthatch_core::window::fetch_window(wanted, source, from, to).await
     }
 
     /// The policy a seal-direct pass resolves its documents on.
@@ -7654,205 +7338,239 @@ impl NestIngest {
         }
     }
 
-    /// Roll this nest's mutable hot store + IVM views back to `ancestor` (the deepest reorg-survivor
-    /// block). Detection is the *caller's* job: a solo nest detects on its own cursor (`handle_reorg`);
-    /// a runtime detects **once** at the shared boundary and fans this out to every nest (slice 3). A
-    /// nest already at or below `ancestor` (e.g. a still-backfilling nest in a runtime while the tip
-    /// reorgs) is a no-op - nothing above `ancestor` to undo, and its cursor must NOT be bumped up to
-    /// `ancestor` (that would claim blocks it never indexed). Propagates the finality-violation bail.
-    /// Fail loudly if any derived-view circuit thread has died. A dead IVM thread silently freezes the
-    /// balance/exposure/velocity views while ingest keeps committing and serving - so a dead thread must
-    /// surface as a fatal ingest error, never be served over (audit: correctness M1). A disabled view
-    /// (no labels / no velocity flag) reports healthy, so this only bites a genuinely crashed circuit.
+    /// See [`nuthatch_core::cursor::Nest::ensure_views_healthy`].
     fn ensure_views_healthy(&self) -> Result<()> {
-        // Terminal (RFC-0026 §3): a crashed circuit thread cannot be revived in-process, so this nest
-        // is quarantined until restart rather than retried.
-        if !self.balances.is_healthy() {
-            anyhow::bail!(TerminalFault(
-                "the balance IVM circuit thread has died - refusing to serve a frozen view".into()
-            ));
-        }
-        if !self.exposure.is_healthy() {
-            anyhow::bail!(TerminalFault("the exposure IVM circuit thread has died - refusing to serve frozen compliance data".into()));
-        }
-        if !self.velocity.is_healthy() {
-            anyhow::bail!(TerminalFault("the velocity IVM circuit thread has died - refusing to serve frozen compliance data".into()));
-        }
-        // §5.2: "Serving frozen derived state as healthy is not graceful degradation; it is a lie
-        // with a pleasant HTTP status." The entity carries *why* it stopped, so the quarantine
-        // reason names the cause rather than sending whoever is on call to the logs of a process
-        // that may since have restarted.
-        for entity in self.entities.iter() {
-            if let Some(why) = entity.fault() {
-                // Push it before bailing. A fault here is terminal and quarantines the nest, so the
-                // operator finds out from `/ready` - if they are looking. `nuthatch_entity_faulted`
-                // is the series to build a dashboard on; this is the one that arrives unasked.
-                //
-                // Best-effort on purpose: a webhook that will not enqueue must not change what
-                // happens to the nest, and what happens to the nest is that it stops either way.
-                if self.router.watches("entity_fault") {
-                    let ann = serde_json::json!({
-                        "nest": self.name,
-                        "entity": entity.name(),
-                        "reason": why,
-                        "applied_through": entity.applied_through(),
-                    });
-                    if let Err(e) = alerts::enqueue(
-                        &self.store,
-                        &self.router,
-                        &format!("entity `{}` stopped", entity.name()),
-                        "entity_fault",
-                        &ann,
-                    ) {
-                        tracing::warn!("could not enqueue the entity_fault alert: {e:#}");
-                    }
-                }
-                anyhow::bail!(TerminalFault(format!(
-                    "the circuit for entity `{}` has stopped: {why}",
-                    entity.name()
-                )));
-            }
-        }
-        Ok(())
+        nest_of!(self, &[], None).ensure_views_healthy()
     }
 
-    /// Feed rolled-back rows to every authored entity at weight `-1`.
-    fn retract_entities(&self, rows: &[crate::registry::DecodedRow], ancestor: u64) -> Result<()> {
-        if self.entities.is_empty() || rows.is_empty() {
-            return Ok(());
-        }
-        for entity in self.entities.iter() {
-            entity.apply_window(rows, -1, ancestor).with_context(|| {
-                format!(
-                    "retracting rolled-back rows from entity `{}`",
-                    entity.name()
-                )
-            })?;
-        }
-        Ok(())
-    }
-
+    /// Roll this nest back to `ancestor`; see [`nuthatch_core::cursor::rollback_reorg`].
     fn rollback_reorg(&mut self, ancestor: u64) -> Result<u64> {
-        // Nothing below this nest's origin was indexed, so no rollback goes below it, and a fork
-        // deeper than every checkpoint resumes there rather than at block 1 (#2174).
-        let deepest = ancestor == 0;
-        let ancestor = ancestor.max(
-            self.store
-                .get_meta(START_BLOCK_KEY)?
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0)
-                .saturating_sub(1),
-        );
-        // Retract the rolled-back transfers from the IVM view *before* dropping them from the hot
-        // store - a reorg is just the same facts re-fed with weight −1.
-        let last_indexed = self
-            .store
-            .get_meta(LAST_BLOCK_KEY)?
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(ancestor);
-        // This nest hasn't reached past the fork: nothing to undo, and don't advance its cursor.
-        if last_indexed <= ancestor {
-            return Ok(ancestor + 1);
-        }
-        // A reorg below the sealed watermark is a finality violation this model can't repair: the
-        // doomed blocks are already in immutable sealed segments (and pruned from hot), so the
-        // retraction below would be silently incomplete and the sealed layer would permanently disagree
-        // with the canonical chain. Halt loudly instead (deadlock-review finding M6). The `--seal-direct`
-        // finality depth / `finalized` tag is the contract; if it's being violated, it needs raising.
-        let sealed_through = self
-            .store
-            .get_meta(SEALED_THROUGH_KEY)?
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        if ancestor < sealed_through {
-            // Terminal (RFC-0026 §3): the next attempt re-derives the same watermark and bails
-            // identically, so this nest is quarantined until an operator raises the finality depth.
-            // `detect_reorg` answers 0 when no checkpoint it holds is canonical, which is not a fork
-            // at genesis and must not read as one.
-            let fork = if deepest {
-                "a fork deeper than every checkpoint this nest holds".to_string()
-            } else {
-                format!("a reorg to block {ancestor}")
-            };
-            anyhow::bail!(TerminalFault(format!(
-                "{fork} is below the sealed/finalized watermark {sealed_through} - a finality \
-                 violation this indexer cannot repair; halting. Raise the chain's finality depth."
-            )));
-        }
-        let doomed = self.store.entities_in_range(ancestor + 1, last_indexed)?;
-        // A retry reads the same rows and fails the same way.
-        let rows = decode_stored_rows(&self.registry.schema(), &doomed).map_err(|e| {
-            anyhow::Error::new(TerminalFault(format!(
-                "the rows a reorg to block {ancestor} rolls back do not decode: {e:#}"
-            )))
-        })?;
-        // From here the views are being retracted: a failure leaves them out of step with the store
-        // and a retry would retract them twice, so only a restart, which rebuilds them, recovers.
-        let torn = move |e: anyhow::Error| {
-            anyhow::Error::new(TerminalFault(format!(
-                "rolling back to block {ancestor} failed part-way, leaving the derived views out of \
-                 step with the hot store; restart to rebuild them: {e:#}"
-            )))
-        };
-        // §5.2, for the authored entities: the same rows, at weight -1, *before* they are dropped
-        // from the hot store. There is no rollback interface because there is nothing to roll back.
-        //
-        // These are reconstructed through `DecodedRow::from_stored` rather than parsed here, and
-        // that is the whole point: DBSP cancels by key, so a retraction built by a different
-        // converter than the insertion does not cancel it - it lands beside it and stays forever.
-        // One conversion, both directions, and the views read the decoded rows as ingest does.
-        self.retract_entities(&rows, ancestor).map_err(torn)?;
-        self.balances.apply(retraction_batch(&rows));
-        self.balances
-            .retract_over_i128(rows.iter().filter(|r| oversized_transfer(r)).count() as u64);
-        self.exposure
-            .apply(exposure_retraction_batch(&rows, &self.labels));
-        if let Some((_, w)) = self.velocity_cfg {
-            self.velocity.apply(velocity_retraction_batch(&rows, w));
-        }
-        // Drop children whose announcing factory event was rolled back (RFC-0009): the registry state
-        // at B is a pure fold over factory events ≤ B.
-        if self.factory.is_some() {
-            let dropped = self.children.rollback_to(ancestor);
-            if dropped > 0 {
-                tracing::warn!("reorg: dropped {dropped} discovered child contract(s)");
-            }
-        }
-        // Fire a `flag_retracted` alert for every rolled-back annotation a sink watches - a consumer
-        // that acted on a flag learns the chain took it back (RFC-0008 C5). Queued by the rollback's
-        // own transaction, so a rollback that fails retracts nothing (#2177).
-        let mut outbox = Vec::new();
-        if !self.router.is_empty() {
-            for j in &doomed {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(j) {
-                    if let Some(kind) = v.get("kind").and_then(|k| k.as_str()) {
-                        outbox.extend(alerts::payloads(&self.router, "flag_retracted", kind, &v));
-                    }
-                }
-            }
-        }
-
-        // Roll the hot store back to the ancestor AND reset the `last_block` watermark in ONE txn: a
-        // crash between a separate delete and watermark reset would leave `last_block` past the fork and
-        // the rolled-back range permanently un-reindexed (a silent gap).
-        let removed = self
-            .store
-            .rollback_to_and_set_meta(ancestor, LAST_BLOCK_KEY, &ancestor.to_string(), &outbox)
-            .map_err(torn)?;
-        if !outbox.is_empty() {
-            if let Err(e) = alerts::trim(self.store.as_ref()) {
-                tracing::warn!("could not bound the alert outbox: {e:#}");
-            }
-        }
-
-        self.metrics.record_reorg(last_indexed - ancestor);
-        self.metrics.set_last_block(ancestor);
-        tracing::warn!(
-            "reorg detected: rolled back to block {ancestor} (removed {removed} entities)"
-        );
-        Ok(ancestor + 1)
+        let schema = self.registry.schema();
+        let children = self.factory.is_some().then_some(&mut self.children);
+        nuthatch_core::cursor::rollback_reorg(nest_of!(self, &schema, children), ancestor)
     }
 
+    /// One fetched window `[next, to]`; see [`nuthatch_core::cursor::process_window`]. `Ok(Some(n))`
+    /// commits `n` rows and the caller advances; `Ok(None)` was refused, or resumes from `rewound`.
+    async fn process_window(
+        &mut self,
+        source: &dyn Source,
+        logs: &[crate::rpc::Log],
+        next: u64,
+        to: u64,
+        tip: u64,
+    ) -> Result<Option<usize>> {
+        use nuthatch_core::cursor::Processed;
+        let schema = self.registry.schema();
+        let extra = NodeRows {
+            registry: &self.registry,
+            top_level_calls: self.top_level_calls,
+            call_registry: self.call_registry.as_deref(),
+            addresses: &self.addresses,
+            ipfs_gate: self.ipfs_gate.as_deref(),
+            calls: &self.calls,
+            state_rpc: self.state_rpc.as_deref(),
+            chain_id: self.chain_id,
+        };
+        let children = self.factory.is_some().then_some(&mut self.children);
+        let window = nuthatch_core::cursor::Window {
+            nest: nest_of!(self, &schema, children),
+            registry: &self.registry,
+            factory: self.factory.as_deref(),
+            threshold: self.threshold,
+            finality: self.finality,
+            seal_span: self.seal_span,
+            sinks: &seal::FsSinks(&self.dir),
+            extra: &extra,
+            hooks: self.hooks.as_ref(),
+            faults: self.faults.as_ref(),
+            clock: &TokioClock,
+            deadline: self.window_deadline.get(),
+        };
+        let started = std::time::Instant::now();
+        let processed =
+            nuthatch_core::cursor::process_window(window, source, logs, next, to, tip).await;
+        self.metrics.observe_window(started.elapsed());
+        match processed? {
+            Processed::Stored(n) => {
+                self.overruns = 0;
+                Ok(Some(n))
+            }
+            Processed::Refused => Ok(None),
+            Processed::Rewound(b) => {
+                self.rewound = Some(b);
+                self.publish_snapshot().await?;
+                Ok(None)
+            }
+            Processed::Abandoned => self.window_overran(next, to),
+        }
+    }
+
+    /// A window whose part before the commit outran `[mounts.limits] window_deadline_ms`. Nothing of
+    /// it was stored or fed, so it is asked for again; the third in a row is a retryable fault.
+    fn window_overran(&mut self, next: u64, to: u64) -> Result<Option<usize>> {
+        let deadline = self.window_deadline.get().unwrap_or_default().as_millis();
+        self.overruns += 1;
+        self.metrics.inc_window_overruns();
+        if self.overruns >= WINDOW_OVERRUNS_TO_QUARANTINE {
+            self.overruns = 0;
+            anyhow::bail!(
+                "blocks {next}..={to} overran this nest's window deadline of {deadline} ms \
+                 {WINDOW_OVERRUNS_TO_QUARANTINE} times in a row"
+            );
+        }
+        tracing::warn!(
+            "blocks {next}..={to} overran this nest's window deadline of {deadline} ms ({} of \
+             {WINDOW_OVERRUNS_TO_QUARANTINE} before a quarantine); abandoned before its commit, \
+             retrying",
+            self.overruns
+        );
+        Ok(None)
+    }
+}
+
+/// The node's reads beyond a window's logs: top-level calls, `[[ipfs]]` documents and tier-3 calls.
+struct NodeRows<'a> {
+    registry: &'a DecodeRegistry,
+    top_level_calls: bool,
+    call_registry: Option<&'a crate::calldata::CallRegistry>,
+    addresses: &'a [String],
+    ipfs_gate: Option<&'a crate::ipfs_resolve::Gate>,
+    calls: &'a [crate::calls::CallDecl],
+    state_rpc: Option<&'a crate::rpc::RpcClient>,
+    chain_id: u64,
+}
+
+#[async_trait::async_trait]
+impl nuthatch_core::extra::ExtraRows for NodeRows<'_> {
+    fn sampled_blocks(&self, next: u64, to: u64) -> Vec<u64> {
+        self.calls
+            .iter()
+            .flat_map(|d| d.blocks_in(next, to))
+            .collect()
+    }
+
+    fn keeps_headers(&self) -> bool {
+        self.calls.iter().any(|c| c.canonical)
+    }
+
+    async fn top_level_calls(
+        &self,
+        source: &dyn Source,
+        next: u64,
+        to: u64,
+    ) -> Result<Vec<crate::registry::DecodedRow>> {
+        let Some(creg) = self.call_registry.filter(|_| self.top_level_calls) else {
+            return Ok(Vec::new());
+        };
+        decode_top_level_calls_upto(
+            source,
+            creg,
+            self.addresses,
+            next,
+            to,
+            self.registry.timestamps(),
+            call_body_concurrency(),
+            Some(TIP_RETRY_ATTEMPTS),
+        )
+        .await
+    }
+
+    fn unreadable(&self, rows: &[&crate::registry::DecodedRow]) -> usize {
+        self.ipfs_gate.map_or(0, |gate| {
+            crate::ipfs_resolve::unreadable(gate.decls(), rows)
+        })
+    }
+
+    async fn pinned_reads(
+        &self,
+        source: &dyn Source,
+        rows: &[crate::registry::DecodedRow],
+        next: u64,
+        to: u64,
+        timestamps: &std::collections::HashMap<u64, u64>,
+        headers: Option<&std::collections::HashMap<u64, serde_json::Value>>,
+    ) -> Result<Vec<crate::registry::DecodedRow>> {
+        if self.calls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rpc = self
+            .state_rpc
+            .context("tier-3 calls declared with no --state-rpc; refused at startup")?;
+        resolve_calls_for_window_upto(
+            source,
+            self.calls,
+            rpc,
+            self.chain_id,
+            rows,
+            next,
+            to,
+            timestamps,
+            self.registry.timestamps(),
+            headers,
+            Some(TIP_RETRY_ATTEMPTS),
+        )
+        .await
+    }
+
+    fn committing(&self, next: u64) {
+        if let Some(gate) = self.ipfs_gate {
+            gate.written_from(next);
+        }
+    }
+
+    fn seal_through(
+        &self,
+        store: &dyn nuthatch_core::store::HotStore,
+        finalized_through: u64,
+    ) -> Result<Option<u64>> {
+        match self.ipfs_gate {
+            Some(gate) => hold_for_documents(store, gate, finalized_through),
+            None => Ok(Some(finalized_through)),
+        }
+    }
+}
+
+/// The node's side of a window: maintained views, offchain entity inputs, webhooks and the fold
+/// writer, none of which a tab has.
+struct NodeHooks {
+    dir: PathBuf,
+    store: Arc<dyn crate::store::HotStore>,
+    registry: Arc<DecodeRegistry>,
+    entities: Arc<Vec<EntityView>>,
+    webhooks: Arc<Vec<crate::config::Webhook>>,
+    #[cfg(feature = "folds")]
+    folds: Option<Arc<crate::folds::Writer>>,
+    balances: crate::views::BalanceView,
+    exposure: crate::exposure::ExposureView,
+    velocity: crate::velocity::VelocityView,
+    publisher: Arc<Publisher>,
+}
+
+/// Where each window's snapshot is published for requests to read (#2467), and when it last was.
+#[derive(Default)]
+struct Publisher {
+    snapshots: serve::Snapshots,
+    last: std::sync::Mutex<LastPublish>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LastPublish {
+    /// When the last snapshot was published, which catching up throttles on.
+    at: Option<std::time::Instant>,
+    /// The store's write generation the last snapshot was taken at.
+    generation: Option<u64>,
+    /// Whether the window in flight was published, so what its seal moved is published too.
+    window: bool,
+}
+
+impl Publisher {
+    fn last(&self) -> std::sync::MutexGuard<'_, LastPublish> {
+        self.last.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl NodeHooks {
     /// Wait until every view and entity has published what was fed, off the runtime.
     async fn flush_derived(&self) -> Result<()> {
         let (balances, exposure, velocity, entities) = (
@@ -7875,13 +7593,13 @@ impl NestIngest {
 
     /// Publish the store and every view as they stand, once each has folded what it was fed, as the
     /// snapshot requests read (#2467).
-    async fn publish_snapshot(&mut self) -> Result<()> {
+    async fn publish_snapshot(&self) -> Result<()> {
         self.flush_derived().await?;
         if let Some(delay) = feed_delay(&self.dir) {
             tokio::time::sleep(delay).await;
         }
         // Read before the store is pinned, so a write between the two is published again rather than missed.
-        self.published_generation = self.store.write_generation();
+        self.publisher.last().generation = self.store.write_generation();
         let snapshot = serve::Snapshot::take(
             &self.store,
             &self.balances,
@@ -7889,127 +7607,36 @@ impl NestIngest {
             &self.velocity,
             &self.entities,
         )?;
-        self.snapshots.store(snapshot.map(Arc::new));
-        self.published_at = Some(std::time::Instant::now());
+        self.publisher.snapshots.store(snapshot.map(Arc::new));
+        self.publisher.last().at = Some(std::time::Instant::now());
         Ok(())
     }
 
     /// Publish again when the store moved outside a window, as documents resolved out of band move it,
     /// so a nest idle at its tip does not serve them late. Nothing feeds the views between windows.
-    async fn republish_if_moved(&mut self) -> Result<()> {
+    async fn republish_if_moved(&self) -> Result<()> {
         let generation = self.store.write_generation();
-        if self.published_at.is_some()
-            && (generation.is_none() || generation == self.published_generation)
-        {
+        let last = *self.publisher.last();
+        if last.at.is_some() && (generation.is_none() || generation == last.generation) {
             return Ok(());
         }
         self.publish_snapshot().await
     }
+}
 
-    /// [`Self::rollback_reorg`], published before a request reads past it.
-    async fn rollback_published(&mut self, ancestor: u64) -> Result<u64> {
-        let resume = self.rollback_reorg(ancestor)?;
-        self.publish_snapshot().await?;
-        Ok(resume)
-    }
-
-    /// Undo the views this attempt just fed. The commit did not land, so a retry starts from here.
-    /// Entities are absent because they are fed only after the commit.
-    fn retract_folded_window(
-        &self,
-        deltas: crate::views::WeightedBatch,
-        exp_deltas: crate::exposure::ExposureBatch,
-        vel_deltas: crate::velocity::VelocityBatch,
-    ) {
-        self.balances.retract(deltas);
-        self.exposure.retract(exp_deltas);
-        self.velocity.retract(vel_deltas);
-    }
-
-    /// Decode, store, IVM-feed, checkpoint, seal and deliver webhooks for one fetched window
-    /// `[next, to]` (with `tip` the current chain tip, used for the finality ceiling). Returns
-    /// `Ok(Some(stored))` - the row count, caller advances the cursor - or `Ok(None)` when the window
-    /// was refused and must be retried WITHOUT advancing (the cursor stays put so a freshly-finalized
-    /// window never seals `block_timestamp = 0`, deadlock-review H4), or resumed from `rewound`.
-    async fn process_window(
-        &mut self,
-        source: &dyn Source,
-        logs: &[crate::rpc::Log],
-        next: u64,
-        to: u64,
-        tip: u64,
-    ) -> Result<Option<usize>> {
-        let started = std::time::Instant::now();
-        // RFC-0076 §3.2: only the part before the commit is abandoned. Dropping the commit's future
-        // would let its write land after the derived state that goes with it was dropped.
-        let prepared = match self.window_deadline.get() {
-            Some(d) => {
-                match tokio::time::timeout(d, self.prepare_window(source, logs, next, to, tip))
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(_) => {
-                        self.metrics.observe_window(started.elapsed());
-                        return self.window_overran(d, next, to);
-                    }
-                }
-            }
-            None => self.prepare_window(source, logs, next, to, tip).await,
-        };
-        let done = match prepared {
-            Ok(Some(w)) => self.commit_window(source, w, next, to, tip).await,
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
-        };
-        self.metrics.observe_window(started.elapsed());
-        if matches!(done, Ok(Some(_))) {
-            self.overruns = 0;
+#[async_trait::async_trait]
+impl nuthatch_core::hooks::WindowHooks for NodeHooks {
+    async fn seam(&self) {
+        if let Some(delay) = feed_delay(&self.dir) {
+            tokio::time::sleep(delay).await;
         }
-        done
-    }
-
-    /// A window whose part before the commit outran `[mounts.limits] window_deadline_ms`. Nothing of
-    /// it was stored or fed, so it is asked for again; the third in a row is a retryable fault.
-    fn window_overran(
-        &mut self,
-        deadline: std::time::Duration,
-        next: u64,
-        to: u64,
-    ) -> Result<Option<usize>> {
-        self.overruns += 1;
-        self.metrics.inc_window_overruns();
-        if self.overruns >= WINDOW_OVERRUNS_TO_QUARANTINE {
-            self.overruns = 0;
-            anyhow::bail!(
-                "blocks {next}..={to} overran this nest's window deadline of {} ms {} times in a \
-                 row",
-                deadline.as_millis(),
-                WINDOW_OVERRUNS_TO_QUARANTINE
-            );
-        }
-        tracing::warn!(
-            "blocks {next}..={to} overran this nest's window deadline of {} ms ({} of {} before a \
-             quarantine); abandoned before its commit, retrying",
-            deadline.as_millis(),
-            self.overruns,
-            WINDOW_OVERRUNS_TO_QUARANTINE
-        );
-        Ok(None)
-    }
-
-    /// Everything of a window before its commit: decode, the reads it needs, the checks that refuse
-    /// it, and the rows, alerts and view deltas the commit will write. Nothing here is stored or fed,
-    /// so a deadline may drop it at any await. `None` is a refused window.
-    async fn prepare_window(
-        &mut self,
-        source: &dyn Source,
-        logs: &[crate::rpc::Log],
-        next: u64,
-        to: u64,
-        tip: u64,
-    ) -> Result<Option<PreparedWindow>> {
         #[cfg(test)]
-        panic_if_armed(&self.dir);
+        if let Some(d) = slowed_commit_of(&self.dir) {
+            tokio::time::sleep(d).await;
+        }
+    }
+
+    async fn started(&self) -> Result<()> {
         #[cfg(test)]
         if let Some(d) = slowed_by(&self.dir) {
             tokio::time::sleep(d).await;
@@ -8018,522 +7645,10 @@ impl NestIngest {
         if take_injected_failure(&self.dir) {
             anyhow::bail!("an injected window failure");
         }
-        // Decode first so factory discovery is inline (a child created at log i is in the
-        // registry before its own activity at log j>i - RFC-0009 same-block handling), then
-        // buy headers only for blocks that produced a kept row (#765). A topic0-only fetch
-        // returns every matching event on the chain; stamping from the raw log list paid
-        // eth_getBlockByNumber for foreign protocols we then discarded.
-        let empty_ts = std::collections::HashMap::new();
-        let (mut rows, mut found, undecoded) = decode_window(
-            &self.registry,
-            self.factory.as_deref(),
-            &self.children,
-            logs,
-            &empty_ts,
-        );
-        // Rows below the cursor are the refetched tail (#1144). Any the store already holds have
-        // already been folded into every view and entity; folding them again would double-count, so
-        // they are dropped here, before the fold, and only the rows the first answer missed go on.
-        // Checked only below `next`, so the ordinary window costs no store reads.
-        //
-        // "Already holds" means the same row, not merely the same key: the stored row's `block_hash`
-        // must match. The loop runs `handle_reorg` before every fetch, so a reorged tail block has
-        // been rolled back before its refetch arrives and this never fires in practice - but if it
-        // ever does, the stale row must not be mistaken for the current one and silently kept. The
-        // window is refused instead and asked for again on the next poll, by which time the reorg
-        // handler has run over it.
-        // A window that committed and then failed is asked for again, and not always with the same
-        // end: the ceiling has moved by the time a quarantined nest is re-admitted. So its rows take
-        // the same check as the tail, row by row, up to what the store has committed (#1635).
-        let committed_through = self
-            .store
-            .get_meta("last_block")?
-            .and_then(|v| v.parse::<u64>().ok());
-        let fold_floor = next.max(committed_through.map_or(0, |b| b + 1));
-        // A sealed block's rows were folded when they first arrived and are pruned from hot since, so
-        // the lookup below would find nothing and fold them a second time.
-        let sealed_through = self.store.sealed_through();
-        let mut stale_tail: Option<(u64, u64, Option<String>)> = None;
-        rows.retain(|r| {
-            if r.block_number >= fold_floor {
-                return true;
-            }
-            if sealed_through > 0 && r.block_number <= sealed_through {
-                return false;
-            }
-            match self
-                .store
-                .get_entity(&Store::entity_key(r.block_number, r.log_index))
-                .ok()
-                .flatten()
-            {
-                None => true,
-                Some(stored) => {
-                    let stored_hash = serde_json::from_str::<serde_json::Value>(&stored)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("block_hash")
-                                .and_then(|h| h.as_str())
-                                .map(str::to_string)
-                        });
-                    if !stored_hash
-                        .as_deref()
-                        .is_some_and(|h| h.eq_ignore_ascii_case(&r.block_hash))
-                    {
-                        stale_tail.get_or_insert((r.block_number, r.log_index, stored_hash));
-                    }
-                    false
-                }
-            }
-        });
-        let read_from = logs.iter().map(|l| l.block_number).fold(next, u64::min);
-        if let Some((b, i, stored_hash)) = stale_tail {
-            // The reorg check passed, so the checkpoint above this row matches. A row the chain no
-            // longer has under it is one no later check would ever roll back (#2146).
-            if let Ok(Some(now)) = source.block_hash(b).await {
-                if !stored_hash.is_some_and(|h| h.eq_ignore_ascii_case(&now)) {
-                    let ancestor = b.saturating_sub(1);
-                    tracing::warn!(
-                        "stored row ({b}, {i}) is not on the chain the source has now, though the \
-                         checkpoint above it is - rolling back to block {ancestor}"
-                    );
-                    source.forget_cached_above(ancestor);
-                    self.rewound = Some(self.rollback_published(ancestor).await?);
-                    return Ok(None);
-                }
-            }
-            tracing::warn!(
-                "refetched tail row ({b}, {i}) is already stored under a different block hash: a \
-                 reorg the handler has not yet rolled back - refusing this window, retrying"
-            );
-            return refuse_window(source, read_from).await;
-        }
-        // RFC-0023 tier 3 samples blocks that may have emitted no log at all, and a stored row
-        // with `block_timestamp = 0` seals that zero permanently once it finalizes (H4). Sampled
-        // blocks join the timestamp fetch rather than being handled after it.
-        let extra = self.calls.iter().flat_map(|d| d.blocks_in(next, to));
-        let blocks = blocks_needing_timestamps(&rows, extra);
-        let block_data = match fetch_window_block_data(
-            source,
-            &self.registry,
-            &blocks,
-            self.calls.iter().any(|c| c.canonical),
-        )
-        .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                // Don't store this window with zeroed timestamps - once it finalizes it would
-                // seal `block_timestamp = 0` permanently (deadlock-review finding H4). The
-                // cursor hasn't advanced, so skip and re-fetch the same window next poll.
-                tracing::warn!(
-                    "block timestamps unavailable for {next}..={to}: {e:#} - retrying window"
-                );
-                return refuse_window(source, read_from).await;
-            }
-        };
-        let l1_rows = match l1_block_rows(&self.registry, &rows, &block_data) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("{e:#} - retrying window {next}..={to}");
-                return refuse_window(source, read_from).await;
-            }
-        };
-        let timestamps = block_data.timestamps;
-        apply_row_timestamps(&mut rows, &timestamps);
-        found.apply_timestamps(&timestamps);
-        // The logs and this hash are two calls. A tip that moved between them would commit the
-        // fork's rows under the hash the chain has now, and the next reorg check would see them agree.
-        // When no kept row stamped `to`, its hash and timestamp come from one header (#1494).
-        let record = match timestamps.get(&to).copied() {
-            Some(t) => source.block_hash(to).await.map(|h| h.map(|h| (h, Some(t)))),
-            None => source.block_record(to).await,
-        };
-        let checkpoint = match &record {
-            Ok(Some((hash, ts))) => Some((to, crate::store::encode_block_record(hash, *ts))),
-            _ => None,
-        };
-        let checkpoint_missed = match &record {
-            Ok(Some(_)) => None,
-            Ok(None) => Some("no block at that height".to_string()),
-            Err(e) => Some(format!("{e:#}")),
-        };
-        if let Some((hash, _)) = record.as_ref().ok().and_then(|r| r.as_ref()) {
-            if rows.iter().any(|r| {
-                r.block_number == to
-                    && !r.block_hash.is_empty()
-                    && !r.block_hash.eq_ignore_ascii_case(hash)
-            }) {
-                tracing::warn!(
-                    "block {to} moved between the log fetch and the checkpoint: refusing this window, retrying"
-                );
-                return refuse_window(source, read_from).await;
-            }
-        }
-        // Below the fallback finality depth no reorg can reach a block, so only rows above it need
-        // checking, and only a window ending above it needs a checkpoint to be checked against later.
-        let final_through = seal_ceiling(self.finality, tip, None);
-        if let (Some(why), true) = (&checkpoint_missed, to > final_through) {
-            let n = self.metrics.inc_checkpoints_missed();
-            if n == 1 || n.is_multiple_of(REPEAT_WARN_EVERY) {
-                tracing::warn!(
-                    "blocks {next}..={to} refused: the source gave no hash for block {to} ({why}), \
-                     and a window is not committed without a reorg checkpoint. {n} window(s) so far \
-                     (nuthatch_nest_checkpoints_missed_total)."
-                );
-            }
-            return refuse_window(source, read_from).await;
-        }
-        // Every row read before the checkpoint must be on the chain it names, and the window must
-        // extend the stored chain. Hashes read after the checkpoint settle both (#2146).
-        let exposed: Vec<_> = rows
-            .iter()
-            .filter(|r| r.block_number > final_through)
-            .collect();
-        // A row with no hash cannot be checked, so it cannot be committed where a reorg can reach.
-        if let Some(r) = exposed.iter().find(|r| r.block_hash.is_empty()) {
-            tracing::warn!(
-                "the source gave the log at ({}, {}) no block hash: refusing window {next}..={to}, \
-                 retrying",
-                r.block_number,
-                r.log_index
-            );
-            return refuse_window(source, read_from).await;
-        }
-        let mut expected: Vec<(u64, String)> = exposed
-            .iter()
-            .map(|r| (r.block_number, r.block_hash.clone()))
-            .collect();
-        if let Some(parent) = next.checked_sub(1).filter(|&p| p > final_through) {
-            if let Some(h) = self.store.get_block_hash(parent)? {
-                expected.push((parent, h));
-            }
-        }
-        if !expected.is_empty() {
-            let mut blocks: Vec<u64> = expected.iter().map(|(b, _)| *b).collect();
-            blocks.sort_unstable();
-            blocks.dedup();
-            let moved = match source.block_hashes(&blocks).await {
-                Ok(now) => expected
-                    .iter()
-                    .find(|(b, h)| !now.get(b).is_some_and(|n| n.eq_ignore_ascii_case(h)))
-                    .map(|(b, _)| format!("block {b} is not on the chain the source has now")),
-                Err(e) => Some(format!("block hashes unavailable: {e:#}")),
-            };
-            if let Some(why) = moved {
-                tracing::warn!("{why}: refusing window {next}..={to}, retrying");
-                return refuse_window(source, read_from).await;
-            }
-        }
-
-        let mut stored = 0usize;
-        let mut deltas = Vec::new();
-        let mut exp_deltas = Vec::new();
-        let mut vel_deltas = Vec::new();
-        let mut oversized = 0u64;
-        // PERF-2: accumulate every write and commit the whole window in ONE redb txn at the end,
-        // instead of a `begin_write`/`commit` (fsync) per row. `(key, json)` for rows + annotations.
-        let mut to_store: Vec<(String, String)> = Vec::with_capacity(rows.len());
-        // Alerts commit with the window, so a refused or failed window queues none (#2177).
-        let mut outbox: Vec<String> = Vec::new();
-        for row in &mut rows {
-            let key = Store::entity_key(row.block_number, row.log_index);
-            // Feed the IVM balance + exposure views for transfer rows (extracted before storing).
-            if let Some((from, to_addr, value, _hex)) = row.erc20_transfer_fields() {
-                if let Some(v) = value.as_deref().and_then(crate::views::transfer_value) {
-                    deltas.extend(views::transfer_deltas(&from, &to_addr, v, 1));
-                    // Direct exposure to the labeled set (empty when neither side is labeled).
-                    exp_deltas.extend(exposure::exposure_deltas(
-                        &from,
-                        &to_addr,
-                        v,
-                        1,
-                        &self.labels,
-                    ));
-                    // Velocity: the sender's outbound volume in this block's window (C3).
-                    if let Some((_, w)) = self.velocity_cfg {
-                        vel_deltas.extend(velocity::velocity_deltas(
-                            &from,
-                            row.block_number,
-                            v,
-                            1,
-                            w,
-                        ));
-                    }
-                    // Threshold flag: a single transfer at/above the configured amount (C3).
-                    if let Some(t) = self.threshold {
-                        if let Some((fkey, ann)) = crate::flags::threshold_annotation(
-                            &from,
-                            &to_addr,
-                            v,
-                            row.block_number,
-                            row.log_index,
-                            &row.tx_hash,
-                            t,
-                        ) {
-                            to_store.push((fkey, ann.to_string()));
-                            outbox.extend(alerts::payloads(
-                                &self.router,
-                                "flag",
-                                "threshold_flag",
-                                &ann,
-                            ));
-                        }
-                    }
-                } else if value.is_some() {
-                    // COR-8 (#814): a live transfer whose value exceeds 38 digits. Skipped here exactly
-                    // as the cold fold skips it, so hot and sealed agree - but counted now, so the
-                    // balance says it is incomplete instead of looking complete. Noted once the
-                    // window commits, as a reorg retracts it from the stored row.
-                    oversized += 1;
-                    tracing::warn!(
-                        block = row.block_number,
-                        log_index = row.log_index,
-                        "transfer value has more than 38 digits; excluded from balances (#814)"
-                    );
-                }
-            }
-            // Every row is stored uniformly as typed JSON with a `table` field; per-table
-            // sealing groups by it.
-            to_store.push((key, row.to_json().to_string()));
-            stored += 1;
-        }
-        for r in &l1_rows {
-            to_store.push((
-                Store::entity_key(r.block_number, r.log_index),
-                r.to_json().to_string(),
-            ));
-            stored += 1;
-        }
-
-        // RFC-0036 §4.2: one row per block in the window for a blocks nest - same logic as the
-        // backfill paths. Must enumerate from the window [next..=to], not from `logs`, because
-        // a blocks table covers blocks that emitted no matching log at all (#447).
-        let mut block_rows = Vec::new();
-        if self.registry.blocks() {
-            let want: Vec<u64> = (next..=to).collect();
-            // A block without its row would seal as a block the chain never had (#2149).
-            let headers = match source.block_headers(&want).await {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!(
-                        "block_headers unavailable for {next}..={to}: {e:#} - retrying window"
-                    );
-                    return refuse_window(source, read_from).await;
-                }
-            };
-            for b in &want {
-                let Some(r) = headers
-                    .get(b)
-                    .and_then(|h| crate::registry::block_row(*b, h, self.registry.timestamps()))
-                else {
-                    tracing::warn!(
-                        "block {b} has no usable header - retrying window {next}..={to}"
-                    );
-                    return refuse_window(source, read_from).await;
-                };
-                to_store.push((
-                    Store::entity_key(r.block_number, r.log_index),
-                    r.to_json().to_string(),
-                ));
-                stored += 1;
-                block_rows.push(r);
-            }
-        }
-
-        // A derived-view circuit thread that has died silently drops its batches and freezes
-        // `/balances` + the compliance flags while ingest keeps committing - stale data served as
-        // healthy. Surface it before the commit (the dead-task-must-surface rule, extended to the
-        // IVM threads that were previously exempt).
-        self.ensure_views_healthy()?;
-
-        // Off the runtime's worker threads (audit F-C3): this ends in an fsync, and the API is served
-        // from the same runtime, so a contended commit here would surface as latency on unrelated
-        // Decoded before IPFS resolution, so an `[[ipfs]]` declaration can name a call table: the QoS
-        // oracle's CIDs arrive as calldata, not as logs.
-        let mut call_rows: Vec<crate::registry::DecodedRow> = Vec::new();
-        if self.top_level_calls {
-            if let Some(creg) = self.call_registry.clone() {
-                call_rows = decode_top_level_calls_upto(
-                    source,
-                    &creg,
-                    &self.addresses,
-                    next,
-                    to,
-                    self.registry.timestamps(),
-                    call_body_concurrency(),
-                    Some(TIP_RETRY_ATTEMPTS),
-                )
-                .await?;
-            }
-        }
-        for row in &call_rows {
-            to_store.push((
-                Store::entity_key(row.block_number, row.log_index),
-                row.to_json().to_string(),
-            ));
-            stored += 1;
-        }
-
-        // RFC-0037 §3: the documents these rows name are fetched out of band (`ipfs_resolve`), never
-        // here, and sealing below waits for them. What the tip path still owns is saying so when a row
-        // names nothing that could be resolved.
-        if let Some(gate) = &self.ipfs_gate {
-            let named: Vec<&crate::registry::DecodedRow> = rows.iter().chain(&call_rows).collect();
-            let unreadable = crate::ipfs_resolve::unreadable(gate.decls(), &named);
-            if unreadable > 0 {
-                self.metrics.add_ipfs_unreadable(unreadable as u64);
-                tracing::warn!(
-                    "ipfs: {unreadable} row(s) in {next}..={to} named no usable CID - nothing to \
-                     resolve for them (nuthatch_nest_ipfs_unreadable_total)"
-                );
-            }
-        }
-
-        // RFC-0023 tier 3 + RFC-0038 §3: resolve the declared reads this window asks for.
-        //
-        // Two forms. A **sampled** declaration fires at the blocks `blocks_in` yields. A **row-driven**
-        // one fires once per row of the table it names, which is what a subgraph mapping does - the
-        // call happens as the row is produced, the same moment a handler would have made it.
-        //
-        // Ordering is identity, not presentation: declarations in config order, and within a
-        // row-driven declaration its source rows in `log_index` order. Two operators running the same
-        // nest must produce the same keys, not merely the same content addresses.
-        if !self.calls.is_empty() {
-            let rpc = self
-                .state_rpc
-                .clone()
-                .context("tier-3 calls declared with no --state-rpc; refused at startup")?;
-            let call_rows = resolve_calls_for_window_upto(
-                source,
-                &self.calls,
-                rpc.as_ref(),
-                self.chain_id,
-                &rows,
-                next,
-                to,
-                &timestamps,
-                self.registry.timestamps(),
-                block_data.headers.as_ref(),
-                Some(TIP_RETRY_ATTEMPTS),
-            )
-            .await;
-            let call_rows = match call_rows {
-                Ok(r) => r,
-                Err(e) if e.chain().any(|c| c.is::<WindowForked>()) => {
-                    tracing::warn!("{e:#}: refusing window {next}..={to}, retrying");
-                    return refuse_window(source, read_from).await;
-                }
-                Err(e) => return Err(e),
-            };
-            for row in call_rows {
-                to_store.push((
-                    Store::entity_key(row.block_number, row.log_index),
-                    row.to_json().to_string(),
-                ));
-                stored += 1;
-            }
-        }
-
-        // Bound before the commit and fed after it (#1906). An entity's watermark claims its blocks
-        // are in the store, and `/sql` over the store is what a reader reconciles it against.
-        // Every registry row this window stores, since the seed and a reorg read all of them (#2166).
-        rows.extend(l1_rows);
-        rows.extend(block_rows);
-        let mut bound = Vec::with_capacity(self.entities.len());
-        for entity in self.entities.iter() {
-            bound.push(
-                entity.bind_window(&rows, 1).with_context(|| {
-                    format!("feeding this window to entity `{}`", entity.name())
-                })?,
-            );
-        }
-        Ok(Some(PreparedWindow {
-            stored,
-            to_store,
-            outbox,
-            checkpoint,
-            deltas,
-            exp_deltas,
-            vel_deltas,
-            oversized,
-            found,
-            bound,
-            undecoded,
-            fold_floor,
-        }))
+        Ok(())
     }
 
-    /// The commit of a prepared window and everything after it. Never abandoned.
-    async fn commit_window(
-        &mut self,
-        source: &dyn Source,
-        w: PreparedWindow,
-        next: u64,
-        to: u64,
-        tip: u64,
-    ) -> Result<Option<usize>> {
-        let PreparedWindow {
-            stored,
-            mut to_store,
-            outbox,
-            checkpoint,
-            deltas,
-            exp_deltas,
-            vel_deltas,
-            oversized,
-            found,
-            bound,
-            undecoded,
-            fold_floor,
-        } = w;
-        // Before the commit. A failure retracts what this attempt fed, so a retry folds the
-        // window once. A restart still rebuilds these views from the store.
-        self.balances.apply(deltas.clone());
-        self.exposure.apply(exp_deltas.clone());
-        self.velocity.apply(vel_deltas.clone());
-        #[cfg(test)]
-        if let Err(e) = take_fold_failure() {
-            self.retract_folded_window(deltas, exp_deltas, vel_deltas);
-            return Err(e);
-        }
-        #[cfg(test)]
-        before_commit();
-        if let Some(delay) = feed_delay(&self.dir) {
-            tokio::time::sleep(delay).await;
-        }
-        let alerted = !outbox.is_empty();
-        if let Some(gate) = &self.ipfs_gate {
-            gate.written_from(next);
-        }
-        if let Err(e) = self
-            .store
-            .commit_window_blocking(std::mem::take(&mut to_store), outbox, checkpoint, to)
-            .await
-        {
-            self.retract_folded_window(deltas, exp_deltas, vel_deltas);
-            return Err(e);
-        }
-        #[cfg(test)]
-        if let Some(d) = slowed_commit_of(&self.dir) {
-            tokio::time::sleep(d).await;
-        }
-        if let Some(delay) = feed_delay(&self.dir) {
-            tokio::time::sleep(delay).await;
-        }
-        self.balances.note_over_i128(oversized);
-        // Only now: a refused or failed window must not leave its children routing later logs (#2153).
-        self.children.extend(found);
-        if alerted {
-            if let Err(e) = alerts::trim(self.store.as_ref()) {
-                tracing::warn!("could not bound the alert outbox: {e:#}");
-            }
-        }
-        for (entity, batch) in self.entities.iter().zip(bound) {
-            if let Some(batch) = batch {
-                entity.apply(batch, to);
-            }
-        }
+    async fn committed(&self, to: u64, tip: u64) -> Result<()> {
         #[cfg(test)]
         take_after_commit_failure()?;
         // After the commit, so a rebuild reads exactly the history the entities have folded. Off the
@@ -8558,10 +7673,9 @@ impl NestIngest {
         }
         // Catching up, a snapshot per window would make every window wait on its views, so requests
         // read one about a second old instead.
-        let publish = to >= tip
-            || self
-                .published_at
-                .is_none_or(|at| at.elapsed() >= PUBLISH_WHILE_CATCHING_UP);
+        let at = self.publisher.last().at;
+        let publish = to >= tip || at.is_none_or(|at| at.elapsed() >= PUBLISH_WHILE_CATCHING_UP);
+        self.publisher.last().window = publish;
         if publish {
             self.publish_snapshot().await?;
         }
@@ -8570,52 +7684,21 @@ impl NestIngest {
         if to >= tip {
             crate::maintained::changed(&self.dir);
         }
-        self.metrics.set_last_block(to);
-        self.metrics.add_rows_decoded(stored as u64);
-        // Counted once committed, so a refused window asked for again is not counted twice.
-        note_undecoded(Some(&self.metrics), &undecoded, fold_floor, to);
-        if stored > 0 {
-            // Per-window detail is debug: the live progress line (RFC-0015 slice 3) is the
-            // user-facing narrative during catch-up, and this fires once per window - pure spam at
-            // info over a long backfill. `count()` is only paid when debug is on.
-            tracing::debug!(
-                "blocks {next}..={to}: +{stored} rows (total {})",
-                self.store.count()?
-            );
-        }
+        Ok(())
+    }
 
-        // The highest block considered final under this chain's policy. For an L2 with the
-        // `finalized` tag we ask the node; otherwise (and on tag failure) it's a fixed depth.
-        let finalized_tag = match self.finality {
-            Finality::FinalizedTag { .. } => source.finalized().await.ok().flatten(),
-            Finality::Depth(_) => None,
-        };
-        let finalized_through = seal_ceiling(self.finality, tip, finalized_tag);
-        let held_for_documents = match &self.ipfs_gate {
-            Some(gate) => hold_for_documents(self.store.as_ref(), gate, finalized_through)?,
-            None => Some(finalized_through),
-        };
-        let Some(finalized_through) = held_for_documents else {
-            return Ok(Some(stored));
-        };
-
-        // Seal any newly-finalized range to an immutable Parquet segment, stamping the
-        // discovered-child registry snapshot for a factory nest (RFC-0009 step 4).
-        let snapshot = self.factory.as_ref().map(|_| self.children.hash());
-        if let Err(e) = maybe_seal(
-            &self.dir,
-            &self.store,
-            source,
-            finalized_through,
-            snapshot.as_deref(),
-            &self.metrics,
-            self.seal_span,
-        )
-        .await
-        {
-            tracing::warn!("sealing failed: {e:#}");
+    // A seal moves rows from hot to a segment; requests read past it once this is published.
+    async fn after_seal(&self) -> Result<()> {
+        let published = self.publisher.last().window;
+        if published {
+            self.republish_if_moved().await?;
         }
-        if to >= tip {
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "folds"), allow(unused_variables))]
+    fn sealed(&self, finalized_through: u64, sealed_through: u64, at_tip: bool) {
+        if at_tip {
             crate::maintained::changed(&self.dir);
         }
         // Deliver user webhooks for whatever just sealed (RFC-0010 Part B) - enqueue only,
@@ -8630,30 +7713,13 @@ impl NestIngest {
                 tracing::warn!("webhook delivery failed: {e:#}");
             }
         }
-        if let Some((threshold, window)) = self.velocity_cfg {
-            self.velocity
-                .settle(self.store.sealed_through(), threshold, window);
-        }
         // Whatever advanced the watermark, the fold writer hears of it here; an unchanged one costs an
         // atomic compare.
         #[cfg(feature = "folds")]
         if let Some(w) = &self.folds {
-            w.sealed_through_advanced(self.store.sealed_through());
+            w.sealed_through_advanced(sealed_through);
         }
-        // A seal moves rows from hot to a segment; requests read past it once this is published.
-        if publish {
-            self.republish_if_moved().await?;
-        }
-        Ok(Some(stored))
     }
-}
-
-/// Refuse a window for a retry. What it read may be from a chain that has moved since, and the
-/// timestamp cache is keyed by height, so it forgets from where the window began reading (#2152).
-async fn refuse_window<T>(source: &dyn Source, read_from: u64) -> Result<Option<T>> {
-    source.forget_cached_above(read_from.saturating_sub(1));
-    sleep_secs(2).await;
-    Ok(None)
 }
 
 /// Drive [`NestIngest::prepare`] to completion, retrying a [`ColdStartUnreachable`] failure forever
@@ -9121,35 +8187,6 @@ pub(crate) fn long_backfill(start: u64, tip: u64, window: u64) -> Option<u64> {
     (span > window.saturating_mul(1_000)).then_some(span)
 }
 
-/// The highest block safe to seal under `finality`: the `finalized` tag when the chain uses it and
-/// the node serves it, else a fixed depth below the tip. Pure, so the policy is unit-testable.
-fn seal_ceiling(finality: Finality, tip: u64, finalized_tag: Option<u64>) -> u64 {
-    match finality {
-        Finality::Depth(d) => tip.saturating_sub(d),
-        Finality::FinalizedTag { fallback_depth } => match finalized_tag {
-            Some(n) if n < tip => n,
-            Some(n) => {
-                warn_implausible_finalized(n, tip, fallback_depth);
-                tip.saturating_sub(fallback_depth)
-            }
-            None => tip.saturating_sub(fallback_depth),
-        },
-    }
-}
-
-/// A `finalized` tag at or past the tip is what an endpoint aliasing it to `latest` answers (#1667).
-/// It can also be a tip read a block or two before the tag, which costs one poll's seal advance.
-fn warn_implausible_finalized(finalized: u64, tip: u64, fallback_depth: u64) {
-    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if n == 1 || n.is_multiple_of(REPEAT_WARN_EVERY) {
-        tracing::warn!(
-            "the endpoint's finalized block {finalized} is not below the tip {tip}, so it is not \
-             trusted: sealing falls back to {fallback_depth} blocks below the tip ({n} time(s) so far)"
-        );
-    }
-}
-
 /// Block at which the tip path should cut a segment, or `None` to keep holding in the hot store.
 ///
 /// Same rule as [`take_sealable`], via the same [`CutScan`]. The cut is a function of the rows, not
@@ -9193,7 +8230,7 @@ thread_local! {
 /// Read in chunks from the watermark, or from where the last read found every document settled if
 /// that is higher (#2231), and stopped at the first outstanding one.
 fn hold_for_documents(
-    store: &dyn crate::store::HotStore,
+    store: &dyn nuthatch_core::store::HotStore,
     gate: &crate::ipfs_resolve::Gate,
     finalized_through: u64,
 ) -> Result<Option<u64>> {
@@ -9221,52 +8258,8 @@ fn hold_for_documents(
     Ok(Some(finalized_through))
 }
 
-/// `block:hash` of the checkpoint `maybe_seal` last pinned while holding rows (#1495).
-const SEAL_PIN_KEY: &str = "seal_pin";
-
-/// Whether that pin still anchors the reorg walk: at or above the watermark (`from - 1`), at or
-/// below `ceiling`, and still the checkpoint the store holds at its block.
-fn held_pin_covers(store: &dyn crate::store::HotStore, from: u64, ceiling: u64) -> Result<bool> {
-    let Some(pin) = store.get_meta(SEAL_PIN_KEY)? else {
-        return Ok(false);
-    };
-    let Some((block, hash)) = pin
-        .split_once(':')
-        .and_then(|(b, h)| Some((b.parse::<u64>().ok()?, h)))
-    else {
-        return Ok(false);
-    };
-    Ok(block + 1 >= from
-        && block <= ceiling
-        && store.get_block_hash(block)?.as_deref() == Some(hash))
-}
-
-/// Checkpoint `block` with the source's hash before the watermark may move to it (#1665). `false`
-/// when the source could not answer; the watermark then stays where it is until a later poll.
-async fn pin_checkpoint(
-    store: &dyn crate::store::HotStore,
-    source: &dyn Source,
-    block: u64,
-) -> Result<bool> {
-    match source.block_hash(block).await {
-        Ok(Some(hash)) => {
-            store.set_block_hash(block, &hash)?;
-            Ok(true)
-        }
-        Ok(None) | Err(_) => {
-            tracing::debug!("no hash for block {block}; the sealed watermark waits for one");
-            Ok(false)
-        }
-    }
-}
-
-/// Seal finalized rows that have accumulated to [`SEAL_DIRECT_BATCH`], cutting at a block boundary
-/// chosen from the data. Rows short of the threshold stay in the hot store until the next call.
-///
-/// Earlier write-ups called this `seal_finalized`. It sealed `from..=ceiling` with no row threshold,
-/// which is why 80% of a long-running nest's segments were under 20 KB (docs/bench/segment-layout.md).
-///
-/// The outcome goes to `metrics`, so `/ready` sees a seal that fails on every attempt (#2262).
+/// [`nuthatch_core::seal::maybe_seal`] over the nest's files at `dir`.
+#[cfg(test)]
 async fn maybe_seal(
     dir: &std::path::Path,
     store: &dyn crate::store::HotStore,
@@ -9276,180 +8269,22 @@ async fn maybe_seal(
     metrics: &crate::metrics::NestMetrics,
     seal_span: u64,
 ) -> Result<()> {
-    let sealed = try_seal(
-        dir,
-        store,
+    let faults = NodeFaults {
+        dir: dir.to_path_buf(),
+    };
+    nuthatch_core::seal::maybe_seal(
+        nuthatch_core::seal::TipSeal {
+            sinks: &seal::FsSinks(dir),
+            faults: &faults,
+            store,
+            metrics,
+            seal_span,
+        },
         source,
         finalized_through,
         registry_snapshot,
-        metrics,
-        seal_span,
     )
-    .await;
-    metrics.record_seal(sealed.as_ref().err().map(|e| format!("{e:#}")));
-    sealed
-}
-
-async fn try_seal(
-    dir: &std::path::Path,
-    store: &dyn crate::store::HotStore,
-    source: &dyn Source,
-    finalized_through: u64,
-    registry_snapshot: Option<&str>,
-    metrics: &crate::metrics::NestMetrics,
-    seal_span: u64,
-) -> Result<()> {
-    if finalized_through == 0 {
-        return Ok(());
-    }
-    let last_indexed = match store.get_meta(LAST_BLOCK_KEY)? {
-        Some(v) => v.parse::<u64>().context("corrupt last_block")?,
-        None => return Ok(()),
-    };
-    let ceiling = finalized_through.min(last_indexed);
-
-    let watermark = match store.get_meta(SEALED_THROUGH_KEY)? {
-        Some(v) => Some(v.parse::<u64>().context("corrupt sealed_through")?),
-        None => None,
-    };
-    let mut from = match watermark {
-        Some(w) => w + 1,
-        None => store
-            .get_meta(START_BLOCK_KEY)?
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0),
-    };
-    if ceiling < from {
-        // A watermark with no checkpoint, as a `--seal-direct` backfill can leave, sends a one-block
-        // reorg's walk below it until finality passes it, and that reads as a finality violation (#2175).
-        if let Some(w) = watermark {
-            if store.get_block_hash(w)?.is_none() {
-                pin_checkpoint(store, source, w).await?;
-            }
-        }
-        return Ok(()); // nothing new has finalized
-    }
-
-    loop {
-        if ceiling < from {
-            return Ok(());
-        }
-        // Read only as far as the cut: a finalized range of documents is gigabytes (3.17 GB RSS
-        // measured on 678 QoS payloads, 2026-09-13), and the cut needs a block and a length per row.
-        let mut scan = CutScan::new(ceiling, seal_span);
-        store.scan_entities_in_range(from, ceiling, &mut |block, json| {
-            scan.push_at(json.len(), block)
-        })?;
-        // **Advance across a leading stretch that carries no rows, before deciding anything.**
-        //
-        // Without this the span bound is `first_held_row + seal_span`, not `watermark + seal_span`,
-        // so a nest whose watermark sits at 10,800 and whose next event is at block 100,000 holds
-        // 89,200 finalized blocks and the bound is the event gap plus the span rather than the span.
-        // Found by review on #1200; the row anchor is deliberate (see `seal_cut`) and this is what
-        // makes it coincide with the watermark instead of drifting from it.
-        //
-        // Nothing is sealed here and no segment is written, because there is nothing in the range -
-        // it is the empty-range arm below applied to the empty *prefix* rather than only to a wholly
-        // empty range. `sealed_through` means "every row at or below this block is in cold storage",
-        // which is vacuously true of a range holding no rows. The checkpoint is pinned for the same
-        // reason the empty arm pins one: a later reorg walk must not skip past the watermark to an
-        // older sparse checkpoint and trip the finality guard on a block it never touched (#461).
-        if let Some(first) = scan.first() {
-            if first > from {
-                if !pin_checkpoint(store, source, first - 1).await? {
-                    return Ok(());
-                }
-                store.set_meta(SEALED_THROUGH_KEY, &(first - 1).to_string())?;
-                metrics.set_sealed_through(first - 1);
-                tracing::debug!(
-                    from,
-                    first,
-                    "blocks {from}..={} carried no rows; watermark advanced to the first held row",
-                    first - 1
-                );
-                from = first;
-            }
-        }
-        let cut = match scan.cut() {
-            None if scan.first().is_none() => {
-                // Finalized range with no transfers - just advance the watermark. Pinning a
-                // checkpoint at the new watermark is what stops a later reorg from walking past it
-                // to an older surviving checkpoint and tripping the finality guard on a block the
-                // reorg never touched (#461).
-                if !pin_checkpoint(store, source, ceiling).await? {
-                    return Ok(());
-                }
-                store.set_meta(SEALED_THROUGH_KEY, &ceiling.to_string())?;
-                metrics.set_sealed_through(ceiling);
-                tracing::debug!(
-                    "blocks {from}..={ceiling} finalized with no transfers; watermark advanced"
-                );
-                return Ok(());
-            }
-            None => {
-                // Held, not drained. A cursor-wide "seal because co-tenants are fat"
-                // flush was considered and reverted: it made segment identity depend
-                // on which nests share the cursor. The 2 GB budget is the multinest
-                // RAM job (measured 372 MB for 20 nests × 12,010 rows against 2048).
-                // Still pin the finalized ceiling. Holding rows does not mean the reorg
-                // walker can do without a checkpoint: #461 was a walk that skipped past
-                // sealed_through to an older sparse checkpoint and tripped the finality
-                // guard on a block the reorg never touched. The empty-range arm already
-                // pins; this one must too (#1067).
-                //
-                // One pin serves until the watermark moves (#1495). The walk needs a final
-                // checkpoint at or above the watermark, not a new one per window.
-                if !held_pin_covers(store, from, ceiling)? {
-                    if let Ok(Some(hash)) = source.block_hash(ceiling).await {
-                        store.set_block_hash(ceiling, &hash)?;
-                        store.set_meta(SEAL_PIN_KEY, &format!("{ceiling}:{hash}"))?;
-                    }
-                }
-                tracing::debug!(
-                    rows = scan.rows(),
-                    threshold = SEAL_DIRECT_BATCH,
-                    from,
-                    ceiling,
-                    "tip path holding finalized rows until the batch threshold"
-                );
-                return Ok(());
-            }
-            Some(cut) => cut,
-        };
-
-        if !pin_checkpoint(store, source, cut).await? {
-            return Ok(());
-        }
-
-        let to_seal = store.entities_in_range(from, cut)?;
-        match seal::seal_range_with_snapshot(dir, &to_seal, from, cut, registry_snapshot)? {
-            Some(summary) => {
-                #[cfg(test)]
-                between_seal_and_prune();
-                // After the seal. It fsyncs the bytes and the manifest entry before returning, and
-                // this commit fsyncs the watermark (#1632).
-                let pruned =
-                    store.prune_and_set_meta(from, cut, SEALED_THROUGH_KEY, &cut.to_string())?;
-                metrics.set_sealed_through(cut);
-                metrics.add_rows_sealed(summary.rows as u64);
-                tracing::debug!(
-                    "sealed blocks {from}..={cut}: {} rows across {} table(s); pruned {pruned} from hot",
-                    summary.rows,
-                    summary.tables
-                );
-            }
-            None => {
-                store.set_meta(SEALED_THROUGH_KEY, &cut.to_string())?;
-                metrics.set_sealed_through(cut);
-                tracing::debug!(
-                    "blocks {from}..={cut} finalized with no transfers; watermark advanced"
-                );
-            }
-        }
-        from = cut + 1;
-        // Sealing is synchronous; yielding between segments lets an aborted ingest stop here.
-        tokio::task::yield_now().await;
-    }
+    .await
 }
 
 /// Finish a seal that installed a fold's catalogue and died before its prune (#2169): the prune and
@@ -9473,54 +8308,6 @@ fn finish_unpruned_fold(dir: &std::path::Path, store: &dyn crate::store::HotStor
         "finished a seal through block {cut} that stopped before its prune: pruned {pruned} rows from hot"
     );
     Ok(())
-}
-
-/// A row's transfer as the derived views read it: (from, to, value), or `None` for any other row
-/// and for a value past i128 (#814). Ingest feeds the views through these two calls, so a reorg
-/// retracts and a restart replays through them too, whatever the token names its columns.
-fn view_transfer(row: &crate::registry::DecodedRow) -> Option<(String, String, i128)> {
-    let (from, to, value, _) = row.erc20_transfer_fields()?;
-    let value = value.as_deref().and_then(crate::views::transfer_value)?;
-    Some((from, to, value))
-}
-
-/// A transfer `view_transfer` passes over for its value alone, counted as `dropped_over_i128`.
-fn oversized_transfer(row: &crate::registry::DecodedRow) -> bool {
-    row.erc20_transfer_fields()
-        .and_then(|(_, _, value, _)| value)
-        .is_some_and(|v| crate::views::transfer_value(&v).is_none())
-}
-
-/// Build a weight −1 balance retraction batch from rolled-back rows (reorg).
-fn retraction_batch(rows: &[crate::registry::DecodedRow]) -> views::WeightedBatch {
-    rows.iter()
-        .filter_map(view_transfer)
-        .flat_map(|(from, to, v)| views::transfer_deltas(&from, &to, v, -1))
-        .collect()
-}
-
-/// Build a weight −1 exposure retraction batch from rolled-back rows (reorg), so a reorged
-/// flag/exposure retracts exactly like a balance.
-fn exposure_retraction_batch(
-    rows: &[crate::registry::DecodedRow],
-    labels: &LabelSet,
-) -> exposure::ExposureBatch {
-    rows.iter()
-        .filter_map(view_transfer)
-        .flat_map(|(from, to, v)| exposure::exposure_deltas(&from, &to, v, -1, labels))
-        .collect()
-}
-
-/// Build a weight −1 velocity retraction batch from rolled-back rows (reorg), so a reorged velocity
-/// flag drops.
-fn velocity_retraction_batch(
-    rows: &[crate::registry::DecodedRow],
-    window: u64,
-) -> velocity::VelocityBatch {
-    rows.iter()
-        .filter_map(|row| view_transfer(row).map(|t| (row.block_number, t)))
-        .flat_map(|(block, (from, _, v))| velocity::velocity_deltas(&from, block, v, -1, window))
-        .collect()
 }
 
 /// A follower's derived state (RFC-0073 FR1): the views and entities a writer keeps in memory,
@@ -9605,9 +8392,9 @@ impl FollowerDerived {
         let registry = Arc::new(crate::registry::from_nest(dir, config)?);
         let labels = Arc::new(labels::load(dir));
         let velocity_cfg = config.flags.velocity();
-        let balances = BalanceView::start()?;
-        let exposure = ExposureView::start(!labels.is_empty())?;
-        let velocity = VelocityView::start(velocity_cfg.is_some())?;
+        let balances = BalanceView::start(crate::drive::Driver::Threaded)?;
+        let exposure = ExposureView::start(crate::drive::Driver::Threaded, !labels.is_empty())?;
+        let velocity = VelocityView::start(crate::drive::Driver::Threaded, velocity_cfg.is_some())?;
         let through = store
             .get_meta(LAST_BLOCK_KEY)?
             .and_then(|v| v.parse::<u64>().ok());
@@ -9976,29 +8763,6 @@ fn rebuild_views(
     Ok(())
 }
 
-/// A log whose topic0 a declared decoder claims and whose body did not decode (RFC-0049 §2).
-#[derive(Debug)]
-pub(crate) struct Undecoded {
-    block: u64,
-    contract: String,
-    topic0: String,
-    error: String,
-}
-
-impl Undecoded {
-    fn new(log: &crate::rpc::Log, contract: Option<&str>, e: &anyhow::Error) -> Self {
-        Undecoded {
-            block: log.block_number,
-            contract: contract.unwrap_or("other").to_string(),
-            topic0: log
-                .topics
-                .first()
-                .map_or_else(String::new, |t| t.to_ascii_lowercase()),
-            error: format!("{e:#}"),
-        }
-    }
-}
-
 /// A contract log that fails to decode is kept as [`Undecoded`] rather than dropped unseen.
 fn decode_or_note(
     registry: &DecodeRegistry,
@@ -10012,142 +8776,6 @@ fn decode_or_note(
             None
         }
     }
-}
-
-/// Counts a window's undecoded logs into `metrics` and logs them as one line, not one per log. Only
-/// blocks `from..=to` count: below `from` is a refetched tail the previous window already counted.
-fn note_undecoded(
-    metrics: Option<&crate::metrics::NestMetrics>,
-    undecoded: &[Undecoded],
-    from: u64,
-    to: u64,
-) {
-    let counted: Vec<&Undecoded> = undecoded
-        .iter()
-        .filter(|u| (from..=to).contains(&u.block))
-        .collect();
-    let Some(first) = counted.first() else {
-        return;
-    };
-    if let Some(m) = metrics {
-        for u in &counted {
-            m.add_undecoded(&u.contract, &u.topic0, 1);
-        }
-    }
-    tracing::warn!(
-        "{} log(s) in blocks {from}..={to} matched a declared event and did not decode; the first, \
-         {} {}: {}",
-        counted.len(),
-        first.contract,
-        first.topic0,
-        first.error
-    );
-}
-
-/// Decode a window's logs in chain order (block, log_index), routing each to a contract decoder or -
-/// for a factory nest - a discovered child's template decoder. Timestamps may be empty here: #765
-/// fetches headers only after local filtering, then `apply_row_timestamps` /
-/// `ChildRegistry::apply_timestamps` fill `block_timestamp` and `discovered_timestamp`.
-///
-/// A child's logs are decoded from its announcing block on, including those earlier in that block
-/// (its constructor's), and never from an earlier block, so what is kept does not depend on window
-/// size or fetch path (#2150, RFC-0009 §3). `children` is only read: the children this window
-/// announces are returned for the caller to register once the window commits (#2153).
-fn decode_window(
-    registry: &DecodeRegistry,
-    factory: Option<&FactorySet>,
-    children: &ChildRegistry,
-    logs: &[crate::rpc::Log],
-    timestamps: &std::collections::HashMap<u64, u64>,
-) -> (
-    Vec<crate::registry::DecodedRow>,
-    ChildRegistry,
-    Vec<Undecoded>,
-) {
-    let mut ordered: Vec<&crate::rpc::Log> = logs.iter().collect();
-    ordered.sort_by(|a, b| {
-        a.block_number
-            .cmp(&b.block_number)
-            .then_with(|| a.log_index.cmp(&b.log_index))
-    });
-
-    let mut found = ChildRegistry::new();
-    let mut rows = Vec::new();
-    let mut undecoded = Vec::new();
-    for block in ordered.chunk_by(|a, b| a.block_number == b.block_number) {
-        // Children announced in this block route its logs; a pass that announces a child whose log
-        // it already passed over is run again, and only the last pass's failures are kept.
-        let mut in_block = ChildRegistry::new();
-        let (block_rows, block_undecoded) = loop {
-            let mut missed = std::collections::HashSet::new();
-            let mut grew = false;
-            let mut block_rows = Vec::new();
-            let mut block_undecoded = Vec::new();
-            for &log in block {
-                let decoded = match registry.decode(log) {
-                    Ok(Some(r)) => Some(r),
-                    Ok(None) => factory.and_then(|_| {
-                        let addr = log.address.to_ascii_lowercase();
-                        let template = children
-                            .get(&addr)
-                            .filter(|c| c.discovered_block <= log.block_number)
-                            .or_else(|| found.get(&addr))
-                            .or_else(|| in_block.get(&addr))
-                            .map(|c| c.template.clone());
-                        if template.is_none() {
-                            missed.insert(addr);
-                        }
-                        let t = template?;
-                        match registry.decode_child(log, &t) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                block_undecoded.push(Undecoded::new(log, Some(&t), &e));
-                                None
-                            }
-                        }
-                    }),
-                    Err(e) => {
-                        block_undecoded.push(Undecoded::new(log, registry.alias_of(log), &e));
-                        None
-                    }
-                };
-                if let Some(mut r) = decoded {
-                    r.block_timestamp = timestamps.get(&r.block_number).copied().unwrap_or(0);
-                    if let Some(fs) = factory {
-                        // Every child this event announces, not just the first (issue #241).
-                        for child in fs.discover(&r) {
-                            let known =
-                                children.contains(&child.address) || found.contains(&child.address);
-                            grew |= !known && missed.contains(&child.address);
-                            if !known {
-                                in_block.insert(child);
-                            }
-                        }
-                    }
-                    block_rows.push(r);
-                }
-            }
-            if !grew {
-                break (block_rows, block_undecoded);
-            }
-        };
-        undecoded.extend(block_undecoded);
-        // Registered in the order the stored rows fold, as `rebuild_children` does after a restart.
-        if let Some(fs) = factory {
-            for child in block_rows.iter().flat_map(|r| fs.discover(r)) {
-                if !children.contains(&child.address) && found.insert(child.clone()) {
-                    tracing::info!(
-                        "factory discovered {} child {}… at block {}",
-                        child.template,
-                        &child.address[..12.min(child.address.len())],
-                        child.discovered_block
-                    );
-                }
-            }
-        }
-        rows.extend(block_rows);
-    }
-    (rows, found, undecoded)
 }
 
 /// Rebuild the discovered-child registry on a warm restart by folding the stored factory events
@@ -10271,12 +8899,24 @@ fn visit_sealed_columns(
     Ok(())
 }
 
+/// The node's [`nuthatch_core::time::Clock`]: tokio's timer, so paused-time tests still steer it.
+pub struct TokioClock;
+
+impl nuthatch_core::time::Clock for TokioClock {
+    fn sleep(
+        &self,
+        d: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(tokio::time::sleep(d))
+    }
+}
+
 async fn sleep_secs(s: u64) {
-    tokio::time::sleep(std::time::Duration::from_secs(s)).await;
+    sleep_for(std::time::Duration::from_secs(s)).await;
 }
 
 async fn sleep_for(d: std::time::Duration) {
-    tokio::time::sleep(d).await;
+    nuthatch_core::time::Clock::sleep(&TokioClock, d).await;
 }
 
 /// The highest block a cursor may index this iteration (RFC-0040 §3 knob 2). The tip unless the
@@ -10402,6 +9042,31 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static BEFORE_PRUNE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// The node's fault points: the `#[cfg(test)]` switches below, keyed by the nest's directory.
+struct NodeFaults {
+    #[cfg_attr(not(test), allow(dead_code))]
+    dir: PathBuf,
+}
+
+#[cfg(not(test))]
+impl FaultPoints for NodeFaults {}
+
+#[cfg(test)]
+impl FaultPoints for NodeFaults {
+    fn window_started(&self) {
+        panic_if_armed(&self.dir);
+    }
+    fn folded(&self) -> Result<()> {
+        take_fold_failure()
+    }
+    fn committing(&self) {
+        before_commit();
+    }
+    fn sealed_before_prune(&self) {
+        between_seal_and_prune();
+    }
 }
 
 /// Every `process_window` of the nest at `dir` panics from now on. Keyed by directory, since the cursor
@@ -15272,6 +13937,9 @@ template = "pool"
                 .filter(|l| allow.contains(&l.address.to_ascii_lowercase()))
                 .cloned()
                 .collect())
+        }
+        fn refuses_topic0_only(&self, err: &anyhow::Error) -> bool {
+            crate::rpc::filter_refused(err)
         }
         async fn block_timestamps(
             &self,
@@ -20555,7 +19223,7 @@ template = "pool"
     /// prove, and otherwise starts without writing, even over a store no build has recorded.
     #[test]
     fn a_reader_compares_what_a_store_was_indexed_under_but_never_records_it() {
-        use crate::store::HotStore as _;
+        use crate::store::CoreHotStore as _;
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
         store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
@@ -20589,7 +19257,7 @@ template = "pool"
     /// already matches on a later start.
     #[test]
     fn an_owner_records_coverage_once_and_leaves_a_matching_store_alone() {
-        use crate::store::HotStore as _;
+        use crate::store::CoreHotStore as _;
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
         let config = covering("n", "http://a", ADDRESS, 100);
@@ -29269,7 +27937,7 @@ rpc_urls = ["https://rpc.example"]
                 &transfer_row(10, 0, SENDER, Some(RECIPIENT), &huge),
             )
             .unwrap();
-        let balances = BalanceView::start().unwrap();
+        let balances = BalanceView::start(crate::drive::Driver::Threaded).unwrap();
         rebuild_views(
             dir.path(),
             &store,
@@ -29277,8 +27945,8 @@ rpc_urls = ["https://rpc.example"]
             &DerivedViews {
                 labels: &LabelSet::default(),
                 balances: &balances,
-                exposure: &ExposureView::start(true).unwrap(),
-                velocity: &VelocityView::start(true).unwrap(),
+                exposure: &ExposureView::start(crate::drive::Driver::Threaded, true).unwrap(),
+                velocity: &VelocityView::start(crate::drive::Driver::Threaded, true).unwrap(),
                 velocity_cfg: None,
             },
         )
@@ -29327,9 +27995,9 @@ rpc_urls = ["https://rpc.example"]
         );
 
         // Under test: one pass, all three views.
-        let balances = BalanceView::start().unwrap();
-        let exposure_v = ExposureView::start(true).unwrap();
-        let velocity_v = VelocityView::start(true).unwrap();
+        let balances = BalanceView::start(crate::drive::Driver::Threaded).unwrap();
+        let exposure_v = ExposureView::start(crate::drive::Driver::Threaded, true).unwrap();
+        let velocity_v = VelocityView::start(crate::drive::Driver::Threaded, true).unwrap();
         rebuild_views(
             dir.path(),
             &store,
@@ -29346,9 +28014,9 @@ rpc_urls = ["https://rpc.example"]
 
         // Reference: the same facts, fed one transfer at a time exactly as the live loop feeds them.
         // Nothing is sealed, so there is no cold seed on either side - this is purely the hot tail.
-        let want_balances = BalanceView::start().unwrap();
-        let want_exposure = ExposureView::start(true).unwrap();
-        let want_velocity = VelocityView::start(true).unwrap();
+        let want_balances = BalanceView::start(crate::drive::Driver::Threaded).unwrap();
+        let want_exposure = ExposureView::start(crate::drive::Driver::Threaded, true).unwrap();
+        let want_velocity = VelocityView::start(crate::drive::Driver::Threaded, true).unwrap();
         for (b, _li, from, to, val) in fixture {
             let v: i128 = val.parse().unwrap();
             let to = to.expect("every fixture row has a recipient");
@@ -29413,8 +28081,8 @@ rpc_urls = ["https://rpc.example"]
         store.commit_window(&rows, None, N).unwrap();
         let labels = labelset(&[(MIXER, "mixer")]);
 
-        let balances = BalanceView::start().unwrap();
-        let exposure_v = ExposureView::start(true).unwrap();
+        let balances = BalanceView::start(crate::drive::Driver::Threaded).unwrap();
+        let exposure_v = ExposureView::start(crate::drive::Driver::Threaded, true).unwrap();
         rebuild_views(
             dir.path(),
             &store,
@@ -29423,15 +28091,15 @@ rpc_urls = ["https://rpc.example"]
                 labels: &labels,
                 balances: &balances,
                 exposure: &exposure_v,
-                velocity: &VelocityView::start(false).unwrap(),
+                velocity: &VelocityView::start(crate::drive::Driver::Threaded, false).unwrap(),
                 velocity_cfg: None,
             },
         )
         .unwrap();
 
         // The reference arrives as the tip loop feeds it, in batches well under one DBSP step.
-        let want_balances = BalanceView::start().unwrap();
-        let want_exposure = ExposureView::start(true).unwrap();
+        let want_balances = BalanceView::start(crate::drive::Driver::Threaded).unwrap();
+        let want_exposure = ExposureView::start(crate::drive::Driver::Threaded, true).unwrap();
         for chunk in (1..=N).collect::<Vec<_>>().chunks(100) {
             let mut b = Vec::new();
             let mut e = Vec::new();
@@ -29480,9 +28148,9 @@ rpc_urls = ["https://rpc.example"]
                 &erc20_registry(),
                 &DerivedViews {
                     labels: &LabelSet::default(),
-                    balances: &BalanceView::start().unwrap(),
-                    exposure: &ExposureView::start(false).unwrap(),
-                    velocity: &VelocityView::start(false).unwrap(),
+                    balances: &BalanceView::start(crate::drive::Driver::Threaded).unwrap(),
+                    exposure: &ExposureView::start(crate::drive::Driver::Threaded, false).unwrap(),
+                    velocity: &VelocityView::start(crate::drive::Driver::Threaded, false).unwrap(),
                     velocity_cfg: None,
                 },
             )
@@ -29523,8 +28191,8 @@ rpc_urls = ["https://rpc.example"]
             )
             .unwrap();
 
-        let velocity = VelocityView::start(true).unwrap();
-        let none = BalanceView::start().unwrap();
+        let velocity = VelocityView::start(crate::drive::Driver::Threaded, true).unwrap();
+        let none = BalanceView::start(crate::drive::Driver::Threaded).unwrap();
         rebuild_views(
             dir.path(),
             &store,
@@ -29532,7 +28200,7 @@ rpc_urls = ["https://rpc.example"]
             &DerivedViews {
                 labels: &labelset(&[]),
                 balances: &none,
-                exposure: &ExposureView::start(false).unwrap(),
+                exposure: &ExposureView::start(crate::drive::Driver::Threaded, false).unwrap(),
                 velocity: &velocity,
                 velocity_cfg: Some((100, 100)),
             },

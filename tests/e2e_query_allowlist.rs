@@ -64,7 +64,7 @@ async fn serve_with(surface: Surface) -> (AppState, tempfile::TempDir) {
     .expect("spawn_nest");
 
     let landed = wait_until(POLL_TIMEOUT, || {
-        use nuthatch::store::HotStore;
+        use nuthatch::store::CoreHotStore as _;
         rt.state
             .store
             .get_meta("last_block")
@@ -82,7 +82,6 @@ async fn serve_with(surface: Surface) -> (AppState, tempfile::TempDir) {
         .clone()
         .expect("a writer publishes snapshots");
     let published = wait_until(POLL_TIMEOUT, || {
-        use nuthatch::store::HotStore;
         snapshots
             .load_full()
             .is_some_and(|s| s.store.get_meta("last_block").ok().flatten().as_deref() == Some("3"))

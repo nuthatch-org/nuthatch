@@ -17,7 +17,7 @@ keywords = ["blockchain", "indexer", "ethereum", "self-hosted", "mcp"]
 categories = ["command-line-utilities", "database", "cryptography::cryptocurrencies"]
 # Keep the published crate lean: the scratch/docs aren't needed to build the host, and
 # fuzz/ is dev-only tooling (its own package, nightly-only, never in the data path per CLAUDE.md §4).
-exclude = ["/scratchpad", "/fuzz", "/decode", "/seal", "/tools", "/count"]
+exclude = ["/scratchpad", "/fuzz", "/decode", "/seal", "/core", "/tools", "/count"]
 
 [[bin]]
 name = "nuthatch"
@@ -95,6 +95,7 @@ required-features = ["crash-points"]
 Inflector = { version = "0.11.3", optional = true }
 nuthatch-decode = { path = "decode" }
 nuthatch-seal = { path = "seal" }
+nuthatch-core = { path = "core" }
 nuthatch-identity = { path = "identity" }
 nuthatch-scaffold = { path = "scaffold" }
 clap = { version = "4", features = ["derive", "env"] }

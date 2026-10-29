@@ -1,6 +1,8 @@
 # Contexts required on `main` (and every protected branch a PR can target).
 # One name per line. Comments and blanks ignored.
 # The live list is GitHub settings; this file is what the repo can disagree with (#715).
+# On an ordinary PR, scaled mode, the compose fleet and the dense multi-nest budget are the slow tier
+# and report skipped; they gate for real only in the merge queue (ci.yml, `changes`).
 fmt · clippy · test
 footprint (RAM budget)
 build release

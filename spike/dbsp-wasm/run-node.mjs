@@ -28,6 +28,31 @@ if (out !== want) {
   process.exit(1);
 }
 
+// RFC-0075 S1: nuthatch-core's balance view under the inline driver, the shape a tab runs.
+const views = mod.spike_views();
+const wantViews = '[("0xa", 70), ("0xb", 30), ("0xmint", -100)]';
+console.log(`views ${views}`);
+if (views !== wantViews) {
+  console.error(`MISMATCH\n got: ${views}\nwant: ${wantViews}`);
+  process.exit(1);
+}
+
+// RFC-0075 S1: one window through core's fetch_window and process_window, the native test's pin.
+const win = mod.spike_window();
+const wantWin =
+  "committed=2 rows_sha256=8b6b04dba6c9e66507c3a23852d42c97a102850215b6e22b2b3c36e19eb3f491 " +
+  'balances=[("0x1111111111111111111111111111111111111111", 60), ' +
+  '("0x2222222222222222222222222222222222222222", 40), ' +
+  '("0x0000000000000000000000000000000000000000", -100)] ' +
+  'last=Some("12") sealed_through=12 hot=0 segments=[' +
+  '"tok__transfer 10..=10 rows=1 4c63483c430d40b3e42a93728158d6fbc52a9ca2f258e52269563612b722c2e7", ' +
+  '"tok__transfer 12..=12 rows=1 43ec70ec6f116bb227890db1d079a646eaa677d0ef208fb56c6e5f44e6d34a1f"]';
+console.log(`window ${win}`);
+if (win !== wantWin) {
+  console.error(`MISMATCH\n got: ${win}\nwant: ${wantWin}`);
+  process.exit(1);
+}
+
 // The stress: many transactions through a spine, so merging and backpressure run on this thread.
 const [steps, rows] = [Number(process.argv[3] ?? 2000), Number(process.argv[4] ?? 100)];
 const t1 = performance.now();

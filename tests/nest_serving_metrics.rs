@@ -8,7 +8,7 @@ mod common;
 use std::sync::Arc;
 
 use axum::body::Body;
-use nuthatch::store::HotStore;
+use nuthatch::store::CoreHotStore as _;
 use nuthatch::{health::RuntimeHealth, indexer, serve};
 use tower::ServiceExt;
 

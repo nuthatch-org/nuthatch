@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use nuthatch::runtime::{MountTable, DATA_DIR, MOUNTS_FILE, NESTS_DIR};
-use nuthatch::store::HotStore;
+use nuthatch::store::{CoreHotStore as _, HotStore};
 use nuthatch::{analytics, indexer, migrate, seal};
 
 use common::tape::*;

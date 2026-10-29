@@ -21,7 +21,7 @@ mod common;
 
 use std::sync::Arc;
 
-use nuthatch::store::{HotStore, Store};
+use nuthatch::store::{CoreHotStore as _, HotStore, Store};
 
 use common::tape::*;
 
