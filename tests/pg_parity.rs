@@ -136,6 +136,64 @@ fn row(table: &str, block: u64, log_index: u64) -> (String, String) {
     )
 }
 
+/// #2467: a pinned handle reads the store as it stood when it was pinned. The window committed after
+/// it, rows and `last_block` together, reaches every read on the latest handle and none on the pinned
+/// one, on both backends.
+#[tokio::test]
+async fn a_pinned_handle_reads_the_window_it_was_taken_at_on_both_backends() {
+    let Some((redb, pg, _dir)) = pair("pinned_window") else {
+        return;
+    };
+    let tip_rows = |s: &dyn HotStore| {
+        s.hot_rows_charged(1_000, u64::MAX, &mut |_| Ok(()))
+            .unwrap()
+            .rows
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+    };
+    let scanned = |s: &dyn HotStore| {
+        let mut n = 0;
+        s.scan_entities_in_range(0, 100, &mut |_, _| {
+            n += 1;
+            true
+        })
+        .unwrap();
+        n
+    };
+    for (name, store) in [("redb", &redb), ("postgres", &pg)] {
+        store
+            .commit_window(&[row("t", 1, 0), row("t", 1, 1)], None, 1)
+            .unwrap();
+        let pinned = store.pinned().unwrap().expect("both backends pin");
+        store
+            .commit_window(&[row("t", 2, 0), row("t", 3, 0)], None, 3)
+            .unwrap();
+        for (handle, s, rows, last) in [("pinned", &pinned, 2, "1"), ("latest", store, 4, "3")] {
+            let at = format!("{name}, {handle}");
+            assert_eq!(s.count().unwrap(), rows as u64, "count, {at}");
+            assert_eq!(s.recent(10).unwrap().len(), rows, "recent, {at}");
+            assert_eq!(
+                s.entities_in_range(0, 100).unwrap().len(),
+                rows,
+                "entities_in_range, {at}"
+            );
+            assert_eq!(scanned(s.as_ref()), rows, "scan_entities_in_range, {at}");
+            assert_eq!(tip_rows(s.as_ref()), rows, "hot_rows_charged, {at}");
+            assert_eq!(
+                s.get_meta("last_block").unwrap().as_deref(),
+                Some(last),
+                "last_block, {at}"
+            );
+        }
+    }
+    assert_agree(
+        redb.as_ref(),
+        pg.as_ref(),
+        "a window committed past a pinned handle",
+    );
+}
+
 /// The main event: a realistic sequence of everything the indexer does to a hot store.
 #[tokio::test]
 async fn the_two_backends_agree_through_an_indexing_lifecycle() {
