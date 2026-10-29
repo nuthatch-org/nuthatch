@@ -128,3 +128,4 @@ Dated records, not live plans. Read them for *why*, never for *what is left*:
 - `sprint-*.md` - completed sprint scopes as they stood, kept at
   [`ede03ca7`](https://github.com/nuthatch-org/nuthatch/tree/ede03ca7/docs)
 - [high-level-roadmap-jul-aug-2026.md](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/high-level-roadmap-jul-aug-2026.md) - the architecture session that produced RFCs 0032-0035
+
