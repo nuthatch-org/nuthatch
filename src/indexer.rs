@@ -3636,7 +3636,11 @@ async fn build_nest(
         calls: config.calls.clone(),
         state_rpc,
         rewound: None,
-        window_deadline: config.window_deadline,
+        window_deadline: {
+            let d = WindowDeadline::of_dataset(&dir);
+            d.set(config.window_deadline);
+            d
+        },
         overruns: 0,
     };
     // Stamps this nest's readiness clock (#510): `/ready`'s never-polled grace period is bounded from
@@ -6909,6 +6913,48 @@ fn publish_direct_seal(
 /// Consecutive windows over `[mounts.limits] window_deadline_ms` that quarantine a nest, retryably.
 const WINDOW_OVERRUNS_TO_QUARANTINE: u32 = 3;
 
+/// A dataset's window deadline in milliseconds, `0` for none, shared with `PATCH /_admin/mounts` so
+/// a change reaches the running ingest at its next window.
+#[derive(Clone, Default)]
+pub(crate) struct WindowDeadline(Arc<std::sync::atomic::AtomicU64>);
+
+impl WindowDeadline {
+    fn of_dataset(dir: &Path) -> Self {
+        static CELLS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<PathBuf, WindowDeadline>>,
+        > = std::sync::OnceLock::new();
+        CELLS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .entry(dir.to_path_buf())
+            .or_default()
+            .clone()
+    }
+
+    fn get(&self) -> Option<std::time::Duration> {
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            ms => Some(std::time::Duration::from_millis(ms)),
+        }
+    }
+
+    pub(crate) fn set(&self, d: Option<std::time::Duration>) {
+        let ms = d.map_or(0, |d| (d.as_millis() as u64).max(1));
+        self.0.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The window deadline the dataset at `dir` runs under.
+pub fn window_deadline_of(dir: &Path) -> Option<std::time::Duration> {
+    WindowDeadline::of_dataset(dir).get()
+}
+
+/// Set the window deadline of the dataset at `dir`, for its running ingest and the next one built.
+pub fn set_window_deadline(dir: &Path, deadline: Option<std::time::Duration>) {
+    WindowDeadline::of_dataset(dir).set(deadline);
+}
+
 /// A window decoded, checked and bound, waiting for its commit (RFC-0076 §3.2).
 struct PreparedWindow {
     stored: usize,
@@ -7006,8 +7052,8 @@ pub struct NestIngest {
     /// Where a refused window rolled this nest back to, for the loop to resume from (#2146).
     rewound: Option<u64>,
     /// `[mounts.limits] window_deadline_ms` (RFC-0076 §3.2): how long the part of a window before
-    /// its commit may take. `None` outside a runtime and when no mount of the dataset sets one.
-    window_deadline: Option<std::time::Duration>,
+    /// its commit may take. Unset outside a runtime and when the indexing mount sets none.
+    window_deadline: WindowDeadline,
     /// Windows in a row that overran `window_deadline`.
     overruns: u32,
 }
@@ -7795,7 +7841,7 @@ impl NestIngest {
         let started = std::time::Instant::now();
         // RFC-0076 §3.2: only the part before the commit is abandoned. Dropping the commit's future
         // would let its write land after the derived state that goes with it was dropped.
-        let prepared = match self.window_deadline {
+        let prepared = match self.window_deadline.get() {
             Some(d) => match tokio::time::timeout(d, self.prepare_window(source, logs, next, to, tip))
                 .await
             {
@@ -16717,7 +16763,9 @@ template = "pool"
         let d = tempfile::tempdir().unwrap();
         let mut nest = build_test_nest(d.path(), S0_A).await;
         nest.metrics = Arc::new(crate::metrics::NestMetrics::default());
-        nest.window_deadline = Some(std::time::Duration::from_millis(20));
+        nest.window_deadline = WindowDeadline::default();
+        nest.window_deadline
+            .set(Some(std::time::Duration::from_millis(20)));
         let logs = vec![s0_transfer(S0_A, 5, 0)];
         let source = FilteringSource { logs: logs.clone() };
         slowed_nests()
@@ -16755,7 +16803,9 @@ template = "pool"
         let d = tempfile::tempdir().unwrap();
         let mut nest = build_test_nest(d.path(), S0_A).await;
         nest.metrics = Arc::new(crate::metrics::NestMetrics::default());
-        nest.window_deadline = Some(std::time::Duration::from_millis(20));
+        nest.window_deadline = WindowDeadline::default();
+        nest.window_deadline
+            .set(Some(std::time::Duration::from_millis(20)));
         let logs = vec![s0_transfer(S0_A, 5, 0)];
         let source = FilteringSource { logs: logs.clone() };
         slowed_commits()
@@ -16783,7 +16833,10 @@ template = "pool"
         for kind in BOTH_CURSORS {
             let root = tempfile::tempdir().unwrap();
             let mut nests = s0_nests(root.path(), false).await;
-            nests[2].window_deadline = Some(std::time::Duration::from_millis(30));
+            nests[2].window_deadline = WindowDeadline::default();
+            nests[2]
+                .window_deadline
+                .set(Some(std::time::Duration::from_millis(30)));
             let slow_dir = nests[2].dir.clone();
             slowed_nests()
                 .lock()
@@ -16933,6 +16986,213 @@ template = "pool"
                 out.contains(&format!("{series}{{chain=\"{chain}\"}}")),
                 "{series} missing for {chain}"
             );
+        }
+    }
+
+    /// A transfer chain whose tip the test publishes, recording when each block became visible.
+    struct TickingChain {
+        inner: FilteringSource,
+        tip: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for TickingChain {
+        async fn tip(&self) -> Result<u64> {
+            Ok(self.tip.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            if n > self.tip.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(None);
+            }
+            self.inner.block_hash(n).await
+        }
+        async fn logs(
+            &self,
+            filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            let tip = self.tip.load(std::sync::atomic::Ordering::SeqCst);
+            self.inner.logs(filter, from, to.min(tip)).await
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            self.inner.block_timestamps(blocks).await
+        }
+    }
+
+    /// Three static nests following a tip that moves `window` blocks every `tick`, the third slowed
+    /// by `slow` a window. Returns the two siblings' lags, from a block's publication to its commit,
+    /// over the blocks published after the cursor reached the tip.
+    async fn sibling_tip_lags(
+        kind: CursorKind,
+        window: u64,
+        concurrency: usize,
+        slow: std::time::Duration,
+        tick: std::time::Duration,
+        ticks: u64,
+    ) -> Vec<std::time::Duration> {
+        const START: u64 = 20;
+        let tip_at_end = START + window * ticks;
+        let root = tempfile::tempdir().unwrap();
+        let mut nests = s0_nests(root.path(), false).await;
+        for n in &mut nests {
+            n.window_ceiling = Some(window);
+            n.freshness.poll_interval = std::time::Duration::from_millis(2);
+        }
+        let stores: Vec<_> = nests.iter().map(|n| n.store.clone()).collect();
+        let slow_dir = nests[2].dir.clone();
+        if !slow.is_zero() {
+            slowed_nests().lock().unwrap().push((slow_dir.clone(), slow));
+        }
+        let chain = Arc::new(TickingChain {
+            inner: FilteringSource {
+                logs: three_transfer_chain(tip_at_end),
+            },
+            tip: START.into(),
+        });
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let task = match kind {
+            CursorKind::Shared => spawn_test_cursor(
+                kind,
+                chain.clone(),
+                nests,
+                Some(START - 1),
+                window,
+                health,
+                true,
+                None,
+            ),
+            CursorKind::Buffered(w) => {
+                let mut opts = BufferOptions::for_test(w);
+                opts.ingest_concurrency = concurrency;
+                tokio::spawn(runtime_index_loop_buffered(
+                    chain.clone(),
+                    nests,
+                    Some(START - 1),
+                    false,
+                    1,
+                    window,
+                    health,
+                    true,
+                    None,
+                    opts,
+                ))
+            }
+        };
+        wait_for(
+            "the siblings reach the first tip",
+            std::time::Duration::from_secs(60),
+            || {
+                stores[..2]
+                    .iter()
+                    .all(|s| last_block_of(s.as_ref()) == Some(START))
+            },
+        )
+        .await;
+        let mut published: std::collections::BTreeMap<u64, std::time::Instant> = Default::default();
+        let mut committed: [std::collections::BTreeMap<u64, std::time::Instant>; 2] =
+            Default::default();
+        let mut next_tick = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let now = std::time::Instant::now();
+            let tip = chain.tip.load(std::sync::atomic::Ordering::SeqCst);
+            if tip < tip_at_end && now >= next_tick {
+                let to = tip + window;
+                chain.tip.store(to, std::sync::atomic::Ordering::SeqCst);
+                for b in tip + 1..=to {
+                    published.insert(b, now);
+                }
+                next_tick = now + tick;
+            }
+            for (i, s) in stores[..2].iter().enumerate() {
+                let at = last_block_of(s.as_ref()).unwrap_or(0);
+                for b in START + 1..=at {
+                    committed[i].entry(b).or_insert(now);
+                }
+            }
+            if committed
+                .iter()
+                .all(|c| c.contains_key(&tip_at_end))
+            {
+                break;
+            }
+            assert!(now < deadline, "the siblings did not reach {tip_at_end}");
+            tokio::time::sleep(std::time::Duration::from_micros(500)).await;
+        }
+        task.abort();
+        slowed_nests().lock().unwrap().retain(|(d, _)| d != &slow_dir);
+        let mut lags: Vec<std::time::Duration> = committed
+            .iter()
+            .flat_map(|c| {
+                c.iter()
+                    .filter_map(|(b, at)| published.get(b).map(|p| at.saturating_duration_since(*p)))
+            })
+            .collect();
+        lags.sort();
+        lags
+    }
+
+    fn quantile(sorted: &[std::time::Duration], q: f64) -> std::time::Duration {
+        sorted[((sorted.len() - 1) as f64 * q).round() as usize]
+    }
+
+    /// The bound RFC-0076 §3.2 asks for: a nest slowed far past its siblings' windows does not set
+    /// their pace on the buffered cursor while a permit is free for them, where on the shared
+    /// cursor every sibling waits out each of its windows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_nest_slowed_tenfold_does_not_set_its_siblings_pace_on_the_buffered_cursor() {
+        let slow = std::time::Duration::from_millis(150);
+        let tick = std::time::Duration::from_millis(40);
+        let buffered = sibling_tip_lags(CursorKind::Buffered(8), 3, 4, slow, tick, 25).await;
+        let shared = sibling_tip_lags(CursorKind::Shared, 3, 4, slow, tick, 25).await;
+        let (b50, s50) = (quantile(&buffered, 0.5), quantile(&shared, 0.5));
+        assert!(
+            b50 < slow / 2 && s50 >= slow / 2,
+            "siblings' p50 tip lag with one nest slowed {slow:?} a window: buffered {b50:?}, shared \
+             {s50:?}"
+        );
+    }
+
+    /// RFC-0076 S2's slow-nest measurement, per window size: the siblings' tip lag with nothing
+    /// slowed and with one nest slowed tenfold, on each cursor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "a measurement: cargo test --lib s2_one_nest_slowed -- --ignored --nocapture"]
+    async fn s2_one_nest_slowed_tenfold_per_window_size() {
+        let tick = std::time::Duration::from_millis(40);
+        for window in [1u64, 4, 16] {
+            let unslowed = sibling_tip_lags(
+                CursorKind::Buffered(8),
+                window,
+                4,
+                std::time::Duration::ZERO,
+                tick,
+                20,
+            )
+            .await;
+            // The slowed nest's own window time, unslowed, from its histogram, is a few ms at
+            // these sizes; ten times the siblings' p50 lag is the more demanding delay.
+            let slow = (quantile(&unslowed, 0.5) * 10).max(std::time::Duration::from_millis(20));
+            for (label, kind, conc) in [
+                ("shared", CursorKind::Shared, 4),
+                ("buffered(8), 4 permits", CursorKind::Buffered(8), 4),
+                ("buffered(8), 1 permit", CursorKind::Buffered(8), 1),
+            ] {
+                for (what, delay) in [("none slowed", std::time::Duration::ZERO), ("one slowed", slow)] {
+                    let lags = sibling_tip_lags(kind, window, conc, delay, tick, 20).await;
+                    println!(
+                        "s2: window {window}, {label}, {what} ({delay:?}): siblings' tip lag p50 \
+                         {:?}, p95 {:?}, max {:?} over {} blocks",
+                        quantile(&lags, 0.5),
+                        quantile(&lags, 0.95),
+                        lags.last().unwrap(),
+                        lags.len()
+                    );
+                }
+            }
         }
     }
 

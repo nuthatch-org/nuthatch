@@ -26,6 +26,8 @@ const SPILL_FACTOR: u64 = 4;
 const MARKERS_KEPT: usize = 64;
 /// Window ends extraction remembers for its own reorg detection.
 const HEADERS_KEPT: usize = 256;
+/// Windows extraction holds at or ahead of its fastest nest: the one it is processing and the next.
+const LOOKAHEAD: usize = 2;
 
 /// The window count the buffered cursor runs with, or `None` for the shared cursor.
 pub(crate) fn buffer_windows() -> Option<usize> {
@@ -1173,7 +1175,20 @@ impl Extraction<'_> {
                 let mut b = self.shared.buffer.lock().unwrap();
                 let counted = b.windows.len() < opts.windows;
                 let fits = match w {
-                    None => b.memory < opts.memory_bound() || self.spill_room(&b, 1),
+                    // Windows are held for the nests behind the fastest; ahead of it, one is enough
+                    // to overlap a fetch with its processing, and more is memory for nobody.
+                    None => {
+                        let lead = self
+                            .shared
+                            .live()
+                            .iter()
+                            .map(|s| s.next.load(Ordering::Acquire))
+                            .max()
+                            .unwrap_or(0);
+                        let ahead = b.windows.iter().filter(|w| w.to >= lead).count();
+                        ahead < LOOKAHEAD
+                            && (b.memory < opts.memory_bound() || self.spill_room(&b, 1))
+                    }
                     Some(w) => {
                         b.windows.is_empty()
                             || b.memory + w.bytes <= opts.memory_bound()

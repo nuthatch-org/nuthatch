@@ -1391,9 +1391,18 @@ rows, so neither the document nor any row was written),
 `nuthatch_nest_ipfs_retries_total` (failed document fetches tried again, each also a warn line naming
 the CID, block, attempt, error and the wait before the next; a window paused on a gateway shows here),
 `nuthatch_nest_seal_direct_fetched`,
-`nuthatch_nest_fetch_window_blocks`, `nuthatch_nest_health` (1 indexing / 0 quarantined; an unmounted or
-suspended mount has no series),
-`nuthatch_nest_quarantine_total`, and `nuthatch_cursor_live{chain}`.
+`nuthatch_nest_fetch_window_blocks`, `nuthatch_nest_window_seconds` (a histogram from 1 ms to 30 s of
+each window's wall time, from its start to its commit or refusal, on either cursor),
+`nuthatch_nest_window_overruns_total` (windows abandoned before their commit for outrunning
+`window_deadline_ms`), `nuthatch_nest_behind_extraction_blocks` (blocks between the nest's position
+and its buffered cursor's extraction; 0 on the shared cursor),
+`nuthatch_nest_extraction_wait_seconds_total` (time the nest has waited on its buffered cursor's
+extraction with no window to process: at the tip that is most of the time, and while it climbs with
+`behind_extraction_blocks` at 0 extraction is the bottleneck), `nuthatch_nest_health` (1 indexing / 0
+quarantined; an unmounted or suspended mount has no series),
+`nuthatch_nest_quarantine_total`, and `nuthatch_cursor_live{chain}`. A buffered cursor adds
+`nuthatch_cursor_buffer_bytes{chain}` and `nuthatch_cursor_buffer_spilled_bytes{chain}`: what its
+window buffer holds in memory, bounded by `window_buffer_mb`, and in its scratch directory.
 
 The serving counters are broken down the same way, by the mount a request arrived through (RFC-0073
 FR4): `nuthatch_nest_http_requests_total`, `nuthatch_nest_sql_queries_total`,
@@ -1691,10 +1700,14 @@ unbounded attempts - so restarting a wedged RPC provider recovers within minutes
 typing anything. Terminal faults do not retry and stay quarantined until restart, with the reason on
 `/nests`.
 
-**Re-admission is safe by construction.** A re-admitted nest rejoins behind its siblings, pulls the
-cursor's window position back, and siblings skip windows they already committed. No nest re-processes
-or skips a window. The cost is a re-fetch of the intervening range, which is why the backoff cap is
-minutes rather than seconds.
+**Re-admission is safe by construction.** A re-admitted nest resumes from its own position, checked
+against its own checkpoints first, so no nest re-processes or skips a window. On the shared cursor it
+rejoins behind its siblings, pulls the cursor's window position back, and its siblings skip the
+windows they already committed; the cost is a re-fetch of the intervening range for the whole
+cursor, which is why the backoff cap is minutes rather than seconds. On the buffered cursor (RFC-0076)
+it fetches its missed range for itself, by its own filter, until it reaches the oldest window still
+in the buffer, and rejoins there: extraction's position never moves back, so no sibling fetches
+anything twice.
 
 **The process exits in exactly three cases:** the server stops (bind failure or shutdown signal);
 every cursor has been quarantined (nothing will advance again, so dying honestly under a supervisor

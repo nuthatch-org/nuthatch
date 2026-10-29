@@ -6993,6 +6993,10 @@ impl RuntimeHandles {
         let next = config.applied(&self.mount_ctx.mounts[at])?;
         if let Some(i) = self.states.iter().position(|(n, _)| n == name) {
             let mut state = self.states[i].1.clone();
+            // Only the mount that indexes the dataset sets its deadline.
+            if state.runtime_health.as_ref().is_none_or(|(k, _)| k == name) {
+                indexer::set_window_deadline(&state.dir, next.limits.window_deadline());
+            }
             let surface = served_surface(Some(&next), &state.dir, name)?;
             let nid = state.nid.clone();
             overlay_mount_record(
