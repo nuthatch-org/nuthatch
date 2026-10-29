@@ -2748,598 +2748,6 @@ async fn runtime_index_loop(
     }
 }
 
-/// RFC-0076 S0: the buffered cursor, on only when `NUTHATCH_CURSOR_BUFFER` names a window count. Unset,
-/// every runtime runs [`runtime_index_loop`] as before.
-#[derive(Clone)]
-pub(crate) struct BufferOptions {
-    /// Windows extraction may hold ahead of its nests.
-    windows: usize,
-    /// Nests committing a window at once.
-    ingest_concurrency: usize,
-    stats: Arc<BufferStats>,
-}
-
-#[derive(Default)]
-pub(crate) struct BufferStats {
-    windows_fetched: std::sync::atomic::AtomicU64,
-    factory_refetches: std::sync::atomic::AtomicU64,
-    own_fetches: std::sync::atomic::AtomicU64,
-    evicted: std::sync::atomic::AtomicU64,
-}
-
-impl BufferOptions {
-    fn from_env() -> Option<Self> {
-        let windows = std::env::var("NUTHATCH_CURSOR_BUFFER")
-            .ok()?
-            .parse::<usize>()
-            .ok()
-            .filter(|&w| w > 0)?;
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let ingest_concurrency = std::env::var("NUTHATCH_INGEST_CONCURRENCY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&c| c > 0)
-            .unwrap_or(cores.min(4));
-        Some(Self {
-            windows,
-            ingest_concurrency,
-            stats: Arc::default(),
-        })
-    }
-}
-
-struct BufferedWindow {
-    from: u64,
-    to: u64,
-    tip: u64,
-    logs: Vec<crate::rpc::Log>,
-    /// The addresses the fetch asked for, lowercased; `None` when it asked by topic0 alone, which
-    /// already covers any child a nest discovers later.
-    asked: Option<std::collections::HashSet<String>>,
-}
-
-struct WindowBuffer {
-    windows: std::collections::VecDeque<Arc<BufferedWindow>>,
-    /// The first block extraction has not fetched.
-    next_fetch: u64,
-    tip: u64,
-}
-
-/// What extraction reads of a nest it no longer holds: the nest belongs to its ingest task.
-struct NestView {
-    addresses: Vec<String>,
-    topic0s: Vec<String>,
-    start_block: Option<u64>,
-    registry: Arc<DecodeRegistry>,
-    factory: Option<Arc<FactorySet>>,
-    children: ChildRegistry,
-    store: Arc<dyn crate::store::HotStore>,
-    metrics: Arc<crate::metrics::NestMetrics>,
-    window_ceiling: Option<u64>,
-    blocks: bool,
-}
-
-struct NestSlot {
-    view: std::sync::Mutex<NestView>,
-    next: std::sync::atomic::AtomicU64,
-    dead: std::sync::atomic::AtomicBool,
-}
-
-struct BufferShared {
-    buffer: std::sync::Mutex<WindowBuffer>,
-    nests: Vec<NestSlot>,
-    changed: tokio::sync::watch::Sender<u64>,
-}
-
-impl BufferShared {
-    fn bump(&self) {
-        self.changed.send_modify(|v| *v = v.wrapping_add(1));
-    }
-
-    fn live(&self) -> Vec<usize> {
-        use std::sync::atomic::Ordering;
-        (0..self.nests.len())
-            .filter(|&i| !self.nests[i].dead.load(Ordering::Acquire))
-            .collect()
-    }
-}
-
-/// A factory nest's filter inputs, cloned out of its view so no lock is held across a fetch.
-struct ExtractInputs {
-    addresses: Vec<String>,
-    topic0s: Vec<String>,
-    start_block: Option<u64>,
-    factory: Option<(Arc<DecodeRegistry>, Arc<FactorySet>, ChildRegistry)>,
-}
-
-impl ExtractInputs {
-    fn narrowed(&self) -> Vec<String> {
-        match &self.factory {
-            Some((reg, _, children)) => reg
-                .addresses()
-                .iter()
-                .map(|a| format!("0x{}", hex::encode(a)))
-                .chain(children.addresses().iter().map(|c| c.to_string()))
-                .collect(),
-            None => self.addresses.clone(),
-        }
-    }
-}
-
-/// RFC-0076 §3.2 for S0: the cursor as an extraction stage feeding a bounded window buffer, and one
-/// ingest task per nest running the unchanged [`NestIngest::process_window`] from its own watermark.
-///
-/// Not built here, and S2's work: lifecycle commands (the channel is held, never read), reorg markers
-/// (a detected reorg ends this cursor), quarantine re-admission (a fault is terminal), the over-cap
-/// recovery, the `topic0_refused` fallback, and any spill of the buffer to disk.
-#[allow(clippy::too_many_arguments)]
-async fn runtime_index_loop_buffered(
-    source: Arc<dyn Source>,
-    nests: Vec<NestIngest>,
-    backfill: Option<u64>,
-    seal_direct: bool,
-    concurrency: usize,
-    window: u64,
-    health: Arc<crate::health::RuntimeHealth>,
-    fail_fast: bool,
-    lifecycle: Option<CursorCommands>,
-    opts: BufferOptions,
-) -> Result<()> {
-    let _lifecycle = lifecycle;
-    let mut prepared = Vec::new();
-    for mut nest in nests {
-        match contained(nest.prepare(source.as_ref(), backfill, seal_direct, concurrency, window))
-            .await
-        {
-            Ok(next) => prepared.push((nest, next)),
-            Err(e) if fail_fast => {
-                anyhow::bail!("--fail-fast: nest '{}' faulted: {e:#}", nest.name)
-            }
-            Err(e) => health.quarantine_nest(&nest.name, format!("{e:#}"), 0, None),
-        }
-    }
-    if prepared.is_empty() {
-        anyhow::bail!(TerminalFault(
-            "every nest on this cursor failed to prepare".into()
-        ));
-    }
-    let freshness = cursor_freshness(prepared.iter().map(|(n, _)| n));
-    let finality = prepared[0].0.finality;
-    let documents = prepared.iter().any(|(n, _)| n.ipfs_gate.is_some());
-    let slots = prepared
-        .iter()
-        .map(|(n, next)| NestSlot {
-            view: std::sync::Mutex::new(NestView {
-                addresses: n.addresses.clone(),
-                topic0s: n.topic0s.clone(),
-                start_block: n.start_block,
-                registry: n.registry.clone(),
-                factory: n.factory.clone(),
-                children: n.children.clone(),
-                store: n.store.clone(),
-                metrics: n.metrics.clone(),
-                window_ceiling: n.window_ceiling,
-                blocks: n.registry.blocks(),
-            }),
-            next: (*next).into(),
-            dead: false.into(),
-        })
-        .collect();
-    let start = prepared.iter().map(|(_, next)| *next).min().unwrap();
-    let (changed, rx) = tokio::sync::watch::channel(0u64);
-    let shared = Arc::new(BufferShared {
-        buffer: std::sync::Mutex::new(WindowBuffer {
-            windows: Default::default(),
-            next_fetch: start,
-            tip: 0,
-        }),
-        nests: slots,
-        changed,
-    });
-    let permits = Arc::new(tokio::sync::Semaphore::new(opts.ingest_concurrency));
-    let mut tasks = tokio::task::JoinSet::new();
-    for (i, (nest, _)) in prepared.into_iter().enumerate() {
-        tasks.spawn(buffered_nest_task(
-            i,
-            nest,
-            source.clone(),
-            shared.clone(),
-            rx.clone(),
-            permits.clone(),
-            window,
-            opts.stats.clone(),
-            health.clone(),
-            fail_fast,
-        ));
-    }
-    let extraction = buffered_extraction(
-        source.as_ref(),
-        &shared,
-        rx,
-        window,
-        documents,
-        finality,
-        freshness,
-        &opts,
-    );
-    tokio::pin!(extraction);
-    loop {
-        tokio::select! {
-            r = &mut extraction => return r,
-            Some(joined) = tasks.join_next() => match joined {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(e),
-                Err(e) if e.is_panic() => anyhow::bail!("a nest's ingest task panicked: {e}"),
-                Err(_) => {}
-            },
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn buffered_extraction(
-    source: &dyn Source,
-    shared: &BufferShared,
-    mut rx: tokio::sync::watch::Receiver<u64>,
-    window: u64,
-    documents: bool,
-    finality: Finality,
-    freshness: crate::freshness::Freshness,
-    opts: &BufferOptions,
-) -> Result<()> {
-    use std::sync::atomic::Ordering;
-    let views = |live: &[usize]| -> Vec<std::sync::MutexGuard<'_, NestView>> {
-        live.iter()
-            .map(|&i| shared.nests[i].view.lock().unwrap())
-            .collect()
-    };
-    let mut chunker = {
-        let all: Vec<usize> = (0..shared.nests.len()).collect();
-        let v = views(&all);
-        tip_window(
-            documents,
-            v.iter().any(|n| n.blocks),
-            window,
-            v.iter().filter_map(|n| n.window_ceiling).min(),
-        )
-    };
-    let mut poll_failures = 0u32;
-    loop {
-        let live = shared.live();
-        if live.is_empty() {
-            anyhow::bail!(TerminalFault(
-                "every nest on this buffered cursor is quarantined".into()
-            ));
-        }
-        let metrics: Vec<_> = views(&live).iter().map(|n| n.metrics.clone()).collect();
-        let tip = match source.tip().await {
-            Ok(t) => {
-                poll_failures = 0;
-                metrics.iter().for_each(|m| m.mark_poll_ok());
-                t
-            }
-            Err(e) => {
-                metrics.iter().for_each(|m| m.mark_poll_failed());
-                poll_failures = escalate_stall(poll_failures, &e);
-                sleep_secs(3).await;
-                continue;
-            }
-        };
-        let ceiling = cursor_ceiling(source, finality, freshness, tip).await;
-        for m in &metrics {
-            m.set_tip(tip);
-            m.set_ceiling(ceiling);
-        }
-        let next = shared.buffer.lock().unwrap().next_fetch;
-        if next > ceiling {
-            sleep_for(freshness.poll_interval).await;
-            continue;
-        }
-        // Full: wait for the slowest nest, unless a nest has drained the buffer and is waiting on
-        // extraction, in which case the oldest window goes and whoever still needed it fetches it.
-        loop {
-            rx.borrow_and_update();
-            {
-                let mut b = shared.buffer.lock().unwrap();
-                if b.windows.len() < opts.windows {
-                    break;
-                }
-                let starved = shared
-                    .live()
-                    .iter()
-                    .any(|&i| shared.nests[i].next.load(Ordering::Acquire) >= b.next_fetch);
-                if starved {
-                    b.windows.pop_front();
-                    opts.stats.evicted.fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
-            }
-            let _ = rx.changed().await;
-        }
-        // The same one detection per window the shared cursor pays, against its most caught-up nest.
-        let reference = live
-            .iter()
-            .copied()
-            .max_by_key(|&i| shared.nests[i].next.load(Ordering::Acquire))
-            .unwrap();
-        let ref_next = shared.nests[reference].next.load(Ordering::Acquire);
-        if ref_next > 0 {
-            let store = shared.nests[reference].view.lock().unwrap().store.clone();
-            match detect_reorg(source, store.as_ref(), ref_next - 1).await {
-                Ok(Some(ancestor)) => anyhow::bail!(
-                    "the buffered cursor found a reorg to block {ancestor}; reorg markers are \
-                     RFC-0076 S2 and not built"
-                ),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!("buffered cursor reorg check could not complete: {e:#}");
-                    sleep_secs(2).await;
-                    continue;
-                }
-            }
-        }
-        let (inputs, window_cap) = {
-            let v = views(&live);
-            let cap = if v.iter().any(|n| n.blocks) {
-                crate::chunker::HEADER_WINDOW_CAP
-            } else {
-                crate::chunker::MAX_WINDOW
-            };
-            let cap = v
-                .iter()
-                .filter_map(|n| n.window_ceiling)
-                .fold(cap, u64::min);
-            let inputs: Vec<ExtractInputs> = v
-                .iter()
-                .map(|n| ExtractInputs {
-                    addresses: n.addresses.clone(),
-                    topic0s: n.topic0s.clone(),
-                    start_block: n.start_block,
-                    factory: n
-                        .factory
-                        .clone()
-                        .map(|fs| (n.registry.clone(), fs, n.children.clone())),
-                })
-                .collect();
-            (inputs, cap)
-        };
-        chunker.set_max(window_cap);
-        let to = (next + chunker.window() - 1).min(ceiling);
-        metrics
-            .iter()
-            .for_each(|m| m.set_fetch_window(chunker.window()));
-        let (u_addrs, u_topics) = union_filter(
-            inputs
-                .iter()
-                .map(|n| (n.addresses.as_slice(), n.topic0s.as_slice())),
-        );
-        let fetch_from = overlap_from(
-            next,
-            inputs
-                .iter()
-                .map(|n| n.start_block.unwrap_or(0))
-                .min()
-                .unwrap_or(0),
-        );
-        let factories: Vec<&FactorySet> = inputs
-            .iter()
-            .filter_map(|n| n.factory.as_ref().map(|(_, fs, _)| fs.as_ref()))
-            .collect();
-        let narrowed = if factories.is_empty() {
-            None
-        } else {
-            let mut addrs: Vec<String> = Vec::new();
-            for a in inputs.iter().flat_map(ExtractInputs::narrowed) {
-                if !addr_in(&addrs, &a) {
-                    addrs.push(a);
-                }
-            }
-            let wide =
-                addrs.len() > FACTORY_FLIP_THRESHOLD || factories.iter().any(|f| f.force_topic0());
-            (!addrs.is_empty() && !wide).then_some(addrs)
-        };
-        let lower = |a: &String| a.to_ascii_lowercase();
-        let fetched = match (&narrowed, LogFilter::new(&u_addrs, &u_topics)) {
-            (Some(addrs), _) => {
-                let mut asked: std::collections::HashSet<String> =
-                    addrs.iter().map(lower).collect();
-                fetch_discovering(source, addrs, &u_topics, fetch_from, to, |logs| {
-                    let mut known = Vec::new();
-                    for (reg, fs, children) in inputs.iter().filter_map(|n| n.factory.as_ref()) {
-                        known.extend(discover_children(reg, fs, children, logs));
-                    }
-                    asked.extend(known.iter().map(lower));
-                    known
-                })
-                .await
-                .map(|logs| (logs, Some(asked)))
-            }
-            (None, Some(f)) => source.logs(&f, fetch_from, to).await.map(|logs| {
-                let asked = (!u_addrs.is_empty()).then(|| u_addrs.iter().map(lower).collect());
-                (logs, asked)
-            }),
-            (None, None) => Ok((Vec::new(), None)),
-        };
-        match fetched {
-            Ok((logs, asked)) => {
-                chunker.observed(logs.len() as u64);
-                {
-                    let mut b = shared.buffer.lock().unwrap();
-                    b.windows.push_back(Arc::new(BufferedWindow {
-                        from: next,
-                        to,
-                        tip,
-                        logs,
-                        asked,
-                    }));
-                    b.next_fetch = to + 1;
-                    b.tip = tip;
-                }
-                opts.stats.windows_fetched.fetch_add(1, Ordering::Relaxed);
-                shared.bump();
-                if to == ceiling {
-                    sleep_for(freshness.poll_interval).await;
-                }
-            }
-            Err(e) if narrowing_can_help(&e, next, to) && next < to => chunker.too_large(),
-            Err(e) => {
-                tracing::warn!("buffered get_logs {next}..={to} failed: {e:#}; retrying");
-                sleep_secs(3).await;
-            }
-        }
-    }
-}
-
-/// The logs a nest takes from a buffered window: its own, from its watermark's overlap tail, plus
-/// the logs of any child it knows of that extraction did not ask for when it fetched the window.
-async fn buffered_window_logs(
-    nest: &NestIngest,
-    source: &dyn Source,
-    w: &BufferedWindow,
-    next: u64,
-    stats: &BufferStats,
-) -> Result<Vec<crate::rpc::Log>> {
-    let from = overlap_from(next, nest.start_block.unwrap_or(0));
-    let mut logs: Vec<crate::rpc::Log> = w
-        .logs
-        .iter()
-        .filter(|l| l.block_number >= from && nest.owns(l))
-        .cloned()
-        .collect();
-    let (Some(fs), Some(asked)) = (nest.factory.as_deref(), &w.asked) else {
-        return Ok(logs);
-    };
-    let missing: Vec<String> = nest
-        .children
-        .addresses()
-        .into_iter()
-        .filter(|c| !asked.contains(&c.to_ascii_lowercase()))
-        .map(str::to_string)
-        .collect();
-    if missing.is_empty() {
-        return Ok(logs);
-    }
-    stats
-        .factory_refetches
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let extra = fetch_discovering(source, &missing, &nest.topic0s, from, w.to, |seen| {
-        discover_children(&nest.registry, fs, &nest.children, seen)
-            .into_iter()
-            .filter(|c| !asked.contains(&c.to_ascii_lowercase()))
-            .collect()
-    })
-    .await?;
-    logs.extend(extra.into_iter().filter(|l| nest.owns(l)));
-    dedup_logs(&mut logs);
-    Ok(logs)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn buffered_nest_task(
-    i: usize,
-    mut nest: NestIngest,
-    source: Arc<dyn Source>,
-    shared: Arc<BufferShared>,
-    mut rx: tokio::sync::watch::Receiver<u64>,
-    permits: Arc<tokio::sync::Semaphore>,
-    window: u64,
-    stats: Arc<BufferStats>,
-    health: Arc<crate::health::RuntimeHealth>,
-    fail_fast: bool,
-) -> Result<()> {
-    use std::sync::atomic::Ordering;
-    enum Pick {
-        Wait,
-        Buffered(Arc<BufferedWindow>),
-        Own { to: u64, tip: u64 },
-    }
-    let slot = &shared.nests[i];
-    let mut next = slot.next.load(Ordering::Acquire);
-    let own_window = nest.window_ceiling.map_or(window, |c| c.min(window)).max(1);
-    // A refused window is asked for again, as the shared cursor's refetch does.
-    let mut refused = false;
-    loop {
-        rx.borrow_and_update();
-        let pick = {
-            let b = shared.buffer.lock().unwrap();
-            match b.windows.iter().find(|w| w.from <= next && next <= w.to) {
-                Some(w) if refused => Pick::Own {
-                    to: w.to,
-                    tip: w.tip,
-                },
-                Some(w) => Pick::Buffered(w.clone()),
-                // Behind the buffer's oldest window: detached, fetching for itself.
-                None if next < b.next_fetch => {
-                    let limit = b.windows.front().map_or(b.next_fetch, |w| w.from) - 1;
-                    Pick::Own {
-                        to: (next + own_window - 1).min(limit),
-                        tip: b.tip,
-                    }
-                }
-                None => Pick::Wait,
-            }
-        };
-        let (logs, to, tip) = match pick {
-            Pick::Wait => {
-                let _ = rx.changed().await;
-                continue;
-            }
-            Pick::Buffered(w) => (
-                buffered_window_logs(&nest, source.as_ref(), &w, next, &stats).await,
-                w.to,
-                w.tip,
-            ),
-            Pick::Own { to, tip } => {
-                stats.own_fetches.fetch_add(1, Ordering::Relaxed);
-                let from = overlap_from(next, nest.start_block.unwrap_or(0));
-                (nest.fetch_window(source.as_ref(), from, to).await, to, tip)
-            }
-        };
-        let logs = match logs {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!(
-                    "nest '{}' fetch {next}..={to} failed: {e:#}; retrying",
-                    nest.name
-                );
-                sleep_secs(3).await;
-                continue;
-            }
-        };
-        let permit = permits.acquire().await.expect("never closed");
-        let done = contained(nest.process_window(source.as_ref(), &logs, next, to, tip)).await;
-        drop(permit);
-        match done {
-            Ok(Some(_)) => {
-                next = to + 1;
-                refused = false;
-                slot.view.lock().unwrap().children = nest.children.clone();
-            }
-            Ok(None) => {
-                if let Some(b) = nest.rewound.take() {
-                    next = b;
-                }
-                refused = true;
-            }
-            Err(e) if fail_fast => {
-                anyhow::bail!("--fail-fast: nest '{}' faulted: {e:#}", nest.name)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "nest '{}' quarantined (terminal on the buffered cursor): {e:#}",
-                    nest.name
-                );
-                health.quarantine_nest(&nest.name, format!("{e:#}"), 0, None);
-                slot.dead.store(true, Ordering::Release);
-                shared.bump();
-                return Ok(());
-            }
-        }
-        slot.next.store(next, Ordering::Release);
-        shared.bump();
-    }
-}
-
 /// Build every mounted nest and spawn ONE shared-cursor ingestion task driving them all (RFC-0012
 /// slice 2). Returns the per-nest serve states (for `/<name>/…` routing), the single shared ingest
 /// handle, and the nests' alert-delivery workers. Static and factory nests may be co-mounted (slice 2b):
@@ -3434,6 +2842,11 @@ async fn spawn_cursor(
         .filter_map(|(_, _, c)| c.cursor_max_rss_mb)
         .max();
     crate::analytics_budget::validate_cursor_budget(datasets.len(), ceiling)?;
+    let chain = nests
+        .first()
+        .map(|(_, _, c)| c.nest.chain.clone())
+        .unwrap_or_default();
+    let runtime_dir = nests.iter().find_map(|(_, _, c)| c.runtime_dir.clone());
     for (name, dir, mut config) in nests {
         config.route = Some(name.clone());
         let (nest, state, worker, w) = match build_nest(
@@ -3485,12 +2898,19 @@ async fn spawn_cursor(
         return Err(release_unstarted(e, ingests, states, alert_workers).await);
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let ingest = match BufferOptions::from_env() {
+    let buffer = ingests.first().and_then(|_| {
+        BufferOptions::for_cursor(
+            &chain,
+            ceiling.unwrap_or(crate::runtime::DEFAULT_MAX_RSS_MB),
+            runtime_dir.as_deref(),
+        )
+    });
+    let ingest = match buffer {
         Some(opts) => {
-            tracing::warn!(
-                "NUTHATCH_CURSOR_BUFFER={}: this cursor runs the RFC-0076 S0 spike, which applies no \
-                 lifecycle command and stops on a reorg",
-                opts.windows
+            tracing::info!(
+                "the {chain} cursor runs buffered (RFC-0076): up to {} windows, {} MiB in memory",
+                opts.windows,
+                opts.memory_bytes >> 20
             );
             tokio::spawn(runtime_index_loop_buffered(
                 source,
@@ -4216,6 +3636,8 @@ async fn build_nest(
         calls: config.calls.clone(),
         state_rpc,
         rewound: None,
+        window_deadline: config.window_deadline,
+        overruns: 0,
     };
     // Stamps this nest's readiness clock (#510): `/ready`'s never-polled grace period is bounded from
     // here, not permanent - see `serve::poll_stalled`.
@@ -7484,6 +6906,25 @@ fn publish_direct_seal(
     Ok(())
 }
 
+/// Consecutive windows over `[mounts.limits] window_deadline_ms` that quarantine a nest, retryably.
+const WINDOW_OVERRUNS_TO_QUARANTINE: u32 = 3;
+
+/// A window decoded, checked and bound, waiting for its commit (RFC-0076 §3.2).
+struct PreparedWindow {
+    stored: usize,
+    to_store: Vec<(String, String)>,
+    outbox: Vec<String>,
+    checkpoint: Option<(u64, String)>,
+    deltas: crate::views::WeightedBatch,
+    exp_deltas: crate::exposure::ExposureBatch,
+    vel_deltas: crate::velocity::VelocityBatch,
+    oversized: u64,
+    found: ChildRegistry,
+    bound: Vec<Option<crate::entity_view::Batch>>,
+    undecoded: Vec<Undecoded>,
+    fold_floor: u64,
+}
+
 pub struct NestIngest {
     /// The nest's configured name - the label a quarantine is reported under (RFC-0026 §5) and the
     /// key its metrics are already registered by.
@@ -7564,6 +7005,11 @@ pub struct NestIngest {
     ipfs_window_deadline: std::time::Duration,
     /// Where a refused window rolled this nest back to, for the loop to resume from (#2146).
     rewound: Option<u64>,
+    /// `[mounts.limits] window_deadline_ms` (RFC-0076 §3.2): how long the part of a window before
+    /// its commit may take. `None` outside a runtime and when no mount of the dataset sets one.
+    window_deadline: Option<std::time::Duration>,
+    /// Windows in a row that overran `window_deadline`.
+    overruns: u32,
 }
 
 impl NestIngest {
@@ -8346,6 +7792,73 @@ impl NestIngest {
         to: u64,
         tip: u64,
     ) -> Result<Option<usize>> {
+        let started = std::time::Instant::now();
+        // RFC-0076 §3.2: only the part before the commit is abandoned. Dropping the commit's future
+        // would let its write land after the derived state that goes with it was dropped.
+        let prepared = match self.window_deadline {
+            Some(d) => match tokio::time::timeout(d, self.prepare_window(source, logs, next, to, tip))
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    self.metrics.observe_window(started.elapsed());
+                    return self.window_overran(d, next, to);
+                }
+            },
+            None => self.prepare_window(source, logs, next, to, tip).await,
+        };
+        let done = match prepared {
+            Ok(Some(w)) => self.commit_window(source, w, next, to, tip).await,
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        };
+        self.metrics.observe_window(started.elapsed());
+        if matches!(done, Ok(Some(_))) {
+            self.overruns = 0;
+        }
+        done
+    }
+
+    /// A window whose part before the commit outran `[mounts.limits] window_deadline_ms`. Nothing of
+    /// it was stored or fed, so it is asked for again; the third in a row is a retryable fault.
+    fn window_overran(
+        &mut self,
+        deadline: std::time::Duration,
+        next: u64,
+        to: u64,
+    ) -> Result<Option<usize>> {
+        self.overruns += 1;
+        self.metrics.inc_window_overruns();
+        if self.overruns >= WINDOW_OVERRUNS_TO_QUARANTINE {
+            self.overruns = 0;
+            anyhow::bail!(
+                "blocks {next}..={to} overran this nest's window deadline of {} ms {} times in a \
+                 row",
+                deadline.as_millis(),
+                WINDOW_OVERRUNS_TO_QUARANTINE
+            );
+        }
+        tracing::warn!(
+            "blocks {next}..={to} overran this nest's window deadline of {} ms ({} of {} before a \
+             quarantine); abandoned before its commit, retrying",
+            deadline.as_millis(),
+            self.overruns,
+            WINDOW_OVERRUNS_TO_QUARANTINE
+        );
+        Ok(None)
+    }
+
+    /// Everything of a window before its commit: decode, the reads it needs, the checks that refuse
+    /// it, and the rows, alerts and view deltas the commit will write. Nothing here is stored or fed,
+    /// so a deadline may drop it at any await. `None` is a refused window.
+    async fn prepare_window(
+        &mut self,
+        source: &dyn Source,
+        logs: &[crate::rpc::Log],
+        next: u64,
+        to: u64,
+        tip: u64,
+    ) -> Result<Option<PreparedWindow>> {
         #[cfg(test)]
         panic_if_armed(&self.dir);
         #[cfg(test)]
@@ -8782,6 +8295,45 @@ impl NestIngest {
                 })?,
             );
         }
+        Ok(Some(PreparedWindow {
+            stored,
+            to_store,
+            outbox,
+            checkpoint,
+            deltas,
+            exp_deltas,
+            vel_deltas,
+            oversized,
+            found,
+            bound,
+            undecoded,
+            fold_floor,
+        }))
+    }
+
+    /// The commit of a prepared window and everything after it. Never abandoned.
+    async fn commit_window(
+        &mut self,
+        source: &dyn Source,
+        w: PreparedWindow,
+        next: u64,
+        to: u64,
+        tip: u64,
+    ) -> Result<Option<usize>> {
+        let PreparedWindow {
+            stored,
+            mut to_store,
+            outbox,
+            checkpoint,
+            deltas,
+            exp_deltas,
+            vel_deltas,
+            oversized,
+            found,
+            bound,
+            undecoded,
+            fold_floor,
+        } = w;
         // Before the commit. A failure retracts what this attempt fed, so a retry folds the
         // window once. A restart still rebuilds these views from the store.
         self.balances.apply(deltas.clone());
@@ -8922,7 +8474,7 @@ impl NestIngest {
 
 /// Refuse a window for a retry. What it read may be from a chain that has moved since, and the
 /// timestamp cache is keyed by height, so it forgets from where the window began reading (#2152).
-async fn refuse_window(source: &dyn Source, read_from: u64) -> Result<Option<usize>> {
+async fn refuse_window<T>(source: &dyn Source, read_from: u64) -> Result<Option<T>> {
     source.forget_cached_above(read_from.saturating_sub(1));
     sleep_secs(2).await;
     Ok(None)
@@ -10648,6 +10200,9 @@ fn webhook_host(url: &str) -> String {
     }
 }
 
+mod buffered;
+pub use buffered::window_buffer_mb;
+use buffered::{runtime_index_loop_buffered, BufferOptions};
 #[cfg(test)]
 #[path = "../tests/common/entity_fixture.rs"]
 mod entity_fixture;
@@ -16231,12 +15786,8 @@ template = "pool"
                 .lock()
                 .unwrap()
                 .push((dirs[2].clone(), std::time::Duration::from_millis(30)));
-            let stats = Arc::new(BufferStats::default());
-            let opts = BufferOptions {
-                windows,
-                ingest_concurrency: 4,
-                stats: stats.clone(),
-            };
+            let opts = BufferOptions::for_test(windows);
+            let stats = opts.stats.clone();
             let ran = s0_run(nests, source.clone(), Some(opts), TIP).await;
             slowed_nests()
                 .lock()
@@ -16309,11 +15860,7 @@ template = "pool"
                 if slow {
                     slowed_nests().lock().unwrap().push((c_dir.clone(), delay));
                 }
-                let opts = opts.map(|windows| BufferOptions {
-                    windows,
-                    ingest_concurrency: 4,
-                    stats: Arc::default(),
-                });
+                let opts = opts.map(BufferOptions::for_test);
                 let ran = s0_run(nests, source.clone(), opts, TIP).await;
                 slowed_nests().lock().unwrap().retain(|(d, _)| d != &c_dir);
                 rows.push(ran.iter().map(|(_, t)| t.as_millis()).collect::<Vec<_>>());
