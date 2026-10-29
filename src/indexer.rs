@@ -2892,7 +2892,9 @@ async fn runtime_index_loop_buffered(
             .await
         {
             Ok(next) => prepared.push((nest, next)),
-            Err(e) if fail_fast => anyhow::bail!("--fail-fast: nest '{}' faulted: {e:#}", nest.name),
+            Err(e) if fail_fast => {
+                anyhow::bail!("--fail-fast: nest '{}' faulted: {e:#}", nest.name)
+            }
             Err(e) => health.quarantine_nest(&nest.name, format!("{e:#}"), 0, None),
         }
     }
@@ -3042,9 +3044,10 @@ async fn buffered_extraction(
                 if b.windows.len() < opts.windows {
                     break;
                 }
-                let starved = shared.live().iter().any(|&i| {
-                    shared.nests[i].next.load(Ordering::Acquire) >= b.next_fetch
-                });
+                let starved = shared
+                    .live()
+                    .iter()
+                    .any(|&i| shared.nests[i].next.load(Ordering::Acquire) >= b.next_fetch);
                 if starved {
                     b.windows.pop_front();
                     opts.stats.evicted.fetch_add(1, Ordering::Relaxed);
@@ -3131,14 +3134,15 @@ async fn buffered_extraction(
                     addrs.push(a);
                 }
             }
-            let wide = addrs.len() > FACTORY_FLIP_THRESHOLD
-                || factories.iter().any(|f| f.force_topic0());
+            let wide =
+                addrs.len() > FACTORY_FLIP_THRESHOLD || factories.iter().any(|f| f.force_topic0());
             (!addrs.is_empty() && !wide).then_some(addrs)
         };
         let lower = |a: &String| a.to_ascii_lowercase();
         let fetched = match (&narrowed, LogFilter::new(&u_addrs, &u_topics)) {
             (Some(addrs), _) => {
-                let mut asked: std::collections::HashSet<String> = addrs.iter().map(lower).collect();
+                let mut asked: std::collections::HashSet<String> =
+                    addrs.iter().map(lower).collect();
                 fetch_discovering(source, addrs, &u_topics, fetch_from, to, |logs| {
                     let mut known = Vec::new();
                     for (reg, fs, children) in inputs.iter().filter_map(|n| n.factory.as_ref()) {
@@ -3151,8 +3155,7 @@ async fn buffered_extraction(
                 .map(|logs| (logs, Some(asked)))
             }
             (None, Some(f)) => source.logs(&f, fetch_from, to).await.map(|logs| {
-                let asked =
-                    (!u_addrs.is_empty()).then(|| u_addrs.iter().map(lower).collect());
+                let asked = (!u_addrs.is_empty()).then(|| u_addrs.iter().map(lower).collect());
                 (logs, asked)
             }),
             (None, None) => Ok((Vec::new(), None)),
@@ -3295,7 +3298,10 @@ async fn buffered_nest_task(
         let logs = match logs {
             Ok(l) => l,
             Err(e) => {
-                tracing::warn!("nest '{}' fetch {next}..={to} failed: {e:#}; retrying", nest.name);
+                tracing::warn!(
+                    "nest '{}' fetch {next}..={to} failed: {e:#}; retrying",
+                    nest.name
+                );
                 sleep_secs(3).await;
                 continue;
             }
@@ -3319,7 +3325,10 @@ async fn buffered_nest_task(
                 anyhow::bail!("--fail-fast: nest '{}' faulted: {e:#}", nest.name)
             }
             Err(e) => {
-                tracing::warn!("nest '{}' quarantined (terminal on the buffered cursor): {e:#}", nest.name);
+                tracing::warn!(
+                    "nest '{}' quarantined (terminal on the buffered cursor): {e:#}",
+                    nest.name
+                );
                 health.quarantine_nest(&nest.name, format!("{e:#}"), 0, None);
                 slot.dead.store(true, Ordering::Release);
                 shared.bump();
@@ -15964,7 +15973,13 @@ template = "pool"
     const S0_B: &str = "0x0000000000000000000000000000000000000055";
     const S0_C: &str = "0x0000000000000000000000000000000000000066";
 
-    fn s0_log(address: &str, topics: Vec<String>, data: String, b: u64, li: u64) -> crate::rpc::Log {
+    fn s0_log(
+        address: &str,
+        topics: Vec<String>,
+        data: String,
+        b: u64,
+        li: u64,
+    ) -> crate::rpc::Log {
         crate::rpc::Log {
             address: address.into(),
             topics,
@@ -16011,7 +16026,15 @@ template = "pool"
                 li,
             )
         };
-        let ping = |a: &str, b, li| s0_log(a, vec![nest_topic0(fact, "child__ping")], "0x".into(), b, li);
+        let ping = |a: &str, b, li| {
+            s0_log(
+                a,
+                vec![nest_topic0(fact, "child__ping")],
+                "0x".into(),
+                b,
+                li,
+            )
+        };
         let mut logs = Vec::new();
         for b in 1..=tip {
             logs.push(s0_transfer(S0_A, b, 0));
@@ -16100,9 +16123,15 @@ template = "pool"
             if task.is_finished() {
                 panic!("the cursor ended: {:?}", task.await);
             }
-            assert!(std::time::Instant::now() < deadline, "no convergence: {done:?}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no convergence: {done:?}"
+            );
             for (i, s) in stores.iter().enumerate() {
-                let at = s.get_meta("last_block").unwrap().and_then(|v| v.parse::<u64>().ok());
+                let at = s
+                    .get_meta("last_block")
+                    .unwrap()
+                    .and_then(|v| v.parse::<u64>().ok());
                 if done[i].is_none() && at == Some(tip) {
                     done[i] = Some(started.elapsed());
                 }
@@ -16147,7 +16176,11 @@ template = "pool"
         got: &std::collections::BTreeMap<String, Vec<String>>,
     ) -> Option<String> {
         let mut out = Vec::new();
-        for table in want.keys().chain(got.keys()).collect::<std::collections::BTreeSet<_>>() {
+        for table in want
+            .keys()
+            .chain(got.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
             let (w, g) = (
                 want.get(table).cloned().unwrap_or_default(),
                 got.get(table).cloned().unwrap_or_default(),
@@ -16205,7 +16238,10 @@ template = "pool"
                 stats: stats.clone(),
             };
             let ran = s0_run(nests, source.clone(), Some(opts), TIP).await;
-            slowed_nests().lock().unwrap().retain(|(d, _)| d != &dirs[2]);
+            slowed_nests()
+                .lock()
+                .unwrap()
+                .retain(|(d, _)| d != &dirs[2]);
             for (i, (dir, (store, _))) in dirs.iter().zip(&ran).enumerate() {
                 let got = s0_contents(dir, store.as_ref());
                 if let Some(diff) = s0_diff(&want[i], &got) {
@@ -16213,7 +16249,9 @@ template = "pool"
                 }
             }
             let (refetches, own) = (
-                stats.factory_refetches.load(std::sync::atomic::Ordering::Relaxed),
+                stats
+                    .factory_refetches
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 stats.own_fetches.load(std::sync::atomic::Ordering::Relaxed),
             );
             match path {
@@ -16222,7 +16260,10 @@ template = "pool"
                     "the factory nest must have refetched buffered windows for a child: \
                      {refetches} refetches, {own} own fetches"
                 ),
-                _ => assert!(own > 0, "the slowed nest must have detached: {own} own fetches"),
+                _ => assert!(
+                    own > 0,
+                    "the slowed nest must have detached: {own} own fetches"
+                ),
             }
         }
     }
