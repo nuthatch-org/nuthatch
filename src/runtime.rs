@@ -4773,7 +4773,8 @@ impl MountRefusal {
 
 /// One cursor's use, as admission prices it.
 struct CursorUse {
-    /// [`RUNTIME_BASE_RSS_MB`] plus every live and joining mount's estimate.
+    /// [`RUNTIME_BASE_RSS_MB`] plus every live and joining mount's estimate, plus what versions
+    /// requests still read of each live dataset hold.
     projected_mb: u64,
     /// Authored entities across the cursor's datasets, each dataset once.
     entities: usize,
@@ -6002,17 +6003,21 @@ impl RuntimeHandles {
         // twice. Boot groups by dataset; this does the same by directory.
         let mut dirs = std::collections::HashSet::new();
         let mut entities = 0usize;
-        let on_chain = self.states.iter().filter(|(_, s)| s.chain == chain);
-        for dir in on_chain
-            .map(|(_, s)| &s.dir)
-            .chain(joining.iter().map(|j| &j.dir))
-        {
-            if dirs.insert(dir.clone()) {
-                entities += declared_entities(dir).0;
+        // Versions requests still read are held now, beside every estimate (#2467).
+        let mut retained = 0u64;
+        for (_, s) in self.states.iter().filter(|(_, s)| s.chain == chain) {
+            if dirs.insert(s.dir.clone()) {
+                entities += declared_entities(&s.dir).0;
+                retained += s.retained_bytes();
+            }
+        }
+        for j in &joining {
+            if dirs.insert(j.dir.clone()) {
+                entities += declared_entities(&j.dir).0;
             }
         }
         CursorUse {
-            projected_mb: RUNTIME_BASE_RSS_MB + existing,
+            projected_mb: RUNTIME_BASE_RSS_MB + existing + retained.div_ceil(1024 * 1024),
             entities,
             dirs,
         }
@@ -9738,6 +9743,7 @@ mod tests {
             nid: None,
             runtime_health: None,
             address_history: None,
+            snapshots: None,
             isolation: None,
         }
     }
@@ -10898,6 +10904,49 @@ mod tests {
             w.abort();
             let _ = w.await;
         }
+    }
+
+    /// #2467: what versions requests still read of a live mount's views hold counts against its
+    /// cursor's ceiling beside the estimates, and stops counting once they are let go.
+    #[tokio::test]
+    async fn versions_still_read_count_against_the_cursor_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"ethereum\"\nchain_id = 1\nrpc_urls = []\n",
+        )
+        .unwrap();
+        let state = nest_state(dir.path(), "ethereum");
+        let balances = state.balances.clone();
+        balances.apply(
+            (0..2_000)
+                .flat_map(|i| crate::views::transfer_deltas("0xm", &format!("0x{i:040x}"), 1, 1))
+                .collect(),
+        );
+        balances.flush();
+        let mut handles = idle_handles(dir.path());
+        handles.states.push(("usdc".to_string(), state));
+        let before = handles.cursor_use("ethereum").projected_mb;
+
+        let pinned = balances.pinned();
+        balances.apply(crate::views::transfer_deltas("0xm", "0xnew", 1, 1));
+        balances.flush();
+        assert!(balances.retained_bytes() > 0);
+        assert_eq!(handles.cursor_use("ethereum").projected_mb, before + 1);
+        let err = handles.set_max_rss_mb(before).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<CeilingRefusal>(),
+                Some(CeilingRefusal::BelowUse { projected_mb, .. }) if *projected_mb == before + 1
+            ),
+            "{err:#}"
+        );
+
+        drop(pinned);
+        assert_eq!(handles.cursor_use("ethereum").projected_mb, before);
+        handles
+            .set_max_rss_mb(before)
+            .expect("with the version let go the cursor fits its estimates again");
     }
 
     /// #2134: a mount catching up with no lock held keeps its place. A second mount of its name is

@@ -215,6 +215,8 @@ struct Link {
 #[derive(Clone)]
 struct Data {
     store: Arc<MemStore>,
+    /// Where each delta's copy and derived state are published together for its routes (#2467).
+    snapshots: crate::serve::Snapshots,
     /// Why there is none, when it could not be built; those routes are then the writer's.
     derived: std::result::Result<Arc<crate::indexer::FollowerDerived>, Refused>,
     /// Why the derived state is being rebuilt, while it is: it is not served until it is whole.
@@ -281,9 +283,45 @@ fn with_derived(state: &mut AppState, data: &Data) {
             state.entities = r.entities.clone();
         }
     }
+    state.snapshots = Some(data.snapshots.clone());
 }
 
 impl Data {
+    /// What versions of the derived state requests still read hold beside its latest, in bytes.
+    fn derived_retained(&self) -> u64 {
+        let Ok(d) = &self.derived else {
+            return 0;
+        };
+        d.balances.retained_bytes()
+            + d.exposure.retained_bytes()
+            + d.velocity.retained_bytes()
+            + d.entities.iter().map(|e| e.retained_bytes()).sum::<u64>()
+    }
+
+    /// Publish the copy and derived state as they stand as the snapshot every route of this dataset
+    /// reads (#2467). The derived state has folded everything it was fed.
+    fn publish(&self) -> Result<()> {
+        let store: Arc<dyn HotStore> = self.store.clone();
+        let snapshot = match &self.derived {
+            Ok(d) => crate::serve::Snapshot::take(
+                &store,
+                &d.balances,
+                &d.exposure,
+                &d.velocity,
+                &d.entities,
+            )?,
+            Err(r) => crate::serve::Snapshot::take(
+                &store,
+                &crate::views::BalanceView::inert(),
+                &crate::exposure::ExposureView::inert(),
+                &crate::velocity::VelocityView::inert(),
+                &r.entities,
+            )?,
+        };
+        self.snapshots.store(snapshot.map(Arc::new));
+        Ok(())
+    }
+
     fn entities(&self) -> Arc<Vec<crate::entity_view::EntityView>> {
         match &self.derived {
             Ok(d) => d.entities.clone(),
@@ -316,9 +354,6 @@ struct Inner {
     /// Datasets refused while retiring copies held part of their cursor's budget, with that chain
     /// and what those copies came to. Each is asked for again once that falls.
     awaiting_room: HashMap<String, (Option<String>, u64)>,
-    /// Per dataset, held for writing while a delta's rows and derived state are applied and for
-    /// reading by every request, which so sees each delta wholly or not at all.
-    applying: HashMap<String, Arc<tokio::sync::RwLock<()>>>,
     /// Times a held copy was released so that a new snapshot of it could load under the full budget.
     reloads: u64,
     /// Copies and derived states ever handed to `retiring`.
@@ -415,7 +450,12 @@ impl Inner {
         let Some(data) = self.datasets.get(dataset) else {
             return (pending > 0).then_some(pending);
         };
-        Some(data.store.bytes() + self.estimates.get(dataset).copied().unwrap_or(0) + pending)
+        Some(
+            data.store.bytes()
+                + data.derived_retained()
+                + self.estimates.get(dataset).copied().unwrap_or(0)
+                + pending,
+        )
     }
 
     /// Hand a copy, its derived state, or both, no longer served to the retiring list, each charged
@@ -441,7 +481,7 @@ impl Inner {
         self.retiring.retain(Retiring::live);
         let retiring = Retiring {
             chain,
-            store: store.map(Arc::downgrade),
+            store: store.map(|s| s.copy()),
             derived: derived.map(|d| Arc::downgrade(&d.entities)),
             estimate: self.estimates.get(dataset).copied().unwrap_or(0),
         };
@@ -462,7 +502,7 @@ type Derived = Arc<crate::indexer::FollowerDerived>;
 #[derive(Clone)]
 struct Retiring {
     chain: Option<String>,
-    store: Option<std::sync::Weak<MemStore>>,
+    store: Option<std::sync::Weak<crate::feed::MemCopy>>,
     /// Every serving state built from derived views shares their entity list, so this lives exactly
     /// as long as the views do.
     derived: Option<std::sync::Weak<Vec<crate::entity_view::EntityView>>>,
@@ -652,7 +692,6 @@ impl Follower {
                 excluded: BTreeSet::new(),
                 retiring: Vec::new(),
                 awaiting_room: HashMap::new(),
-                applying: HashMap::new(),
                 reloads: 0,
                 retired: 0,
                 peak: 0,
@@ -707,16 +746,19 @@ impl Follower {
         };
         {
             let inner = self.lock();
-            let mut copies: Vec<Arc<MemStore>> =
-                inner.datasets.values().map(|d| d.store.clone()).collect();
-            copies.extend(
-                inner
-                    .retiring
-                    .iter()
-                    .filter_map(|r| r.store.as_ref()?.upgrade()),
-            );
+            // A request still on an older version of a copy names at most what the grace covers.
+            let copies = inner
+                .datasets
+                .values()
+                .filter_map(|d| d.store.copy().upgrade())
+                .chain(
+                    inner
+                        .retiring
+                        .iter()
+                        .filter_map(|r| r.store.as_ref()?.upgrade()),
+                );
             for copy in copies {
-                name(copy.served_catalogue().flatten().as_deref());
+                name(copy.catalogue().as_deref());
             }
             for p in inner.pending.values() {
                 for line in &p.items {
@@ -1089,10 +1131,19 @@ impl Follower {
                 let Some(held) = inner.datasets.get(d) else {
                     return (pending > 0).then_some(pending);
                 };
-                Some(held.store.bytes() + inner.estimates.get(d).copied().unwrap_or(0) + pending)
+                Some(
+                    held.store.bytes()
+                        + held.derived_retained()
+                        + inner.estimates.get(d).copied().unwrap_or(0)
+                        + pending,
+                )
             })
             .sum();
-        let own = inner.estimates.get(dataset).copied().unwrap_or(0);
+        let own = inner.estimates.get(dataset).copied().unwrap_or(0)
+            + inner
+                .datasets
+                .get(dataset)
+                .map_or(0, Data::derived_retained);
         let retiring = inner.retiring_on(&chain);
         Some(
             inner
@@ -1570,14 +1621,16 @@ impl Follower {
         let data = tokio::task::spawn_blocking(move || {
             let store = Arc::new(MemStore::from_snapshot(&dir, snapshot));
             let derived = derive(&dir, &store);
-            Data {
+            let data = Data {
                 building: rebuilding(&derived),
                 store,
+                snapshots: Default::default(),
                 derived,
-            }
+            };
+            data.publish().map(|()| data)
         })
         .await
-        .context("building a snapshot's store")?;
+        .context("building a snapshot's store")??;
         let lifted = {
             let mut inner = self.lock();
             if let Some(old) = inner.datasets.insert(dataset.clone(), data) {
@@ -1620,20 +1673,13 @@ impl Follower {
             );
             return Ok(());
         }
-        let gate = self
-            .lock()
-            .applying
-            .entry(dataset.clone())
-            .or_default()
-            .clone();
-        let whole = gate.write().await;
         // The old state keeps serving while a new connection takes fresh snapshots.
         let changes = data
             .store
             .apply(&delta)
             .with_context(|| format!("{dataset}: resnapshotting"))?;
         self.lock().note_peak(&dataset);
-        if let Some(delay) = crate::indexer::follower_feed_delay(&self.root.join(&dataset)) {
+        if let Some(delay) = crate::indexer::feed_delay(&self.root.join(&dataset)) {
             tokio::time::sleep(delay).await;
         }
         let torn = if changes.sealed_unseen {
@@ -1642,8 +1688,7 @@ impl Follower {
         } else if let (Ok(derived), Some(through)) = (&data.derived, changes.through) {
             let (derived, store) = (derived.clone(), data.store.clone());
             let dir = self.root.join(&dataset);
-            // Fed and then flushed, so every view has published the delta before a reader
-            // is let back in.
+            // Fed and then flushed, so every view has published the delta before it is.
             tokio::task::spawn_blocking(move || {
                 crate::seal::within(&dir, store.clone(), || {
                     derived.apply(store.as_ref(), &changes.removed, &changes.added, through)?;
@@ -1659,12 +1704,13 @@ impl Follower {
             None
         };
         if let Some(why) = &torn {
-            // Marked before readers are let back in, so none reads the torn state.
+            // Marked before the delta is published, so no request reads the torn state.
             if let Some(d) = self.lock().datasets.get_mut(&dataset) {
                 d.building = Some(why.clone());
             }
         }
-        drop(whole);
+        data.publish()
+            .with_context(|| format!("{dataset}: publishing a delta"))?;
         crate::feed_metrics::metrics().applied(started.elapsed());
         self.ack.notify_one();
         if let Some(why) = torn {
@@ -1758,6 +1804,8 @@ impl Follower {
         if let Some(d) = self.lock().datasets.get_mut(dataset) {
             d.building = rebuilding(&derived);
             d.derived = derived;
+            d.publish()
+                .with_context(|| format!("{dataset}: publishing rebuilt derived state"))?;
         }
         self.realise();
         Ok(())
@@ -1890,6 +1938,7 @@ impl Follower {
             isolation: r.isolation.as_deref().map(Arc::from),
             runtime_health: Some((route.to_string(), health)),
             address_history: None,
+            snapshots: None,
             admin_enabled: false,
             admin_token: None,
             nest_info: Arc::new(nest_info),
@@ -1972,13 +2021,6 @@ impl Follower {
             ));
         }
         self.live.swap(app);
-    }
-
-    /// The gate a delta to `route`'s dataset holds the write side of while it is applied.
-    fn route_gate(&self, route: &str) -> Option<Arc<tokio::sync::RwLock<()>>> {
-        let mut inner = self.lock();
-        let dataset = inner.routes.get(route)?.spec.dataset.clone();
-        Some(inner.applying.entry(dataset).or_default().clone())
     }
 
     fn data(&self, route: &str) -> Option<Data> {
@@ -2196,13 +2238,6 @@ fn guarded(
                 if path == "/ready" {
                     return follower.route_ready(&route);
                 }
-                // Held for the whole request, so it reads a delta's rows and derived state wholly or
-                // not at all.
-                let gate = follower.route_gate(&route);
-                let _whole = match &gate {
-                    Some(g) => Some(g.read().await),
-                    None => None,
-                };
                 // Derived state being rebuilt, or that could not be built, is never served in part.
                 let refusal = match follower.data(&route) {
                     Some(Data {
@@ -2269,6 +2304,122 @@ mod tests {
             &entities
         ));
         assert_eq!(decode_query("a%2"), "a%2");
+    }
+
+    /// #2467: what versions of a dataset's derived state still being read hold is charged to its
+    /// cursor: in what the dataset holds, and in the room left for its next delta and for every other
+    /// dataset on the cursor.
+    #[tokio::test]
+    async fn derived_versions_still_read_are_charged_to_the_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ds");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"ds\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"t\"\naddress = \"0x0000000000000000000000000000000000000001\"\n\
+             abi = \"abi.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("abi.json"), "[]").unwrap();
+        let writer = crate::store::Store::open(&dir.join(crate::config::DB_FILE)).unwrap();
+        let store = Arc::new(MemStore::from_snapshot(
+            &dir,
+            writer.feed_subscribe().unwrap().snapshot,
+        ));
+        let config = crate::config::Config::load(&dir).unwrap();
+        let derived = Arc::new(
+            crate::indexer::FollowerDerived::build(&dir, &config, store.as_ref()).unwrap(),
+        );
+        derived.balances.apply(
+            (0..2_000)
+                .flat_map(|i| crate::views::transfer_deltas("0xm", &format!("0x{i:040x}"), 1, 1))
+                .collect(),
+        );
+        derived.balances.flush();
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        {
+            let mut inner = follower.lock();
+            inner.routes.insert(
+                "ds".into(),
+                Route {
+                    spec: Spec {
+                        dataset: "ds".into(),
+                        nid: None,
+                        surface: Default::default(),
+                        tenant: None,
+                        share: None,
+                        limits: None,
+                        chain: Some("mainnet".into()),
+                        isolation: None,
+                        data_identity: None,
+                    },
+                    served: None,
+                },
+            );
+            let mut beside = inner.routes["ds"].spec.clone();
+            beside.dataset = "beside".into();
+            inner.routes.insert(
+                "beside".into(),
+                Route {
+                    spec: beside,
+                    served: None,
+                },
+            );
+            inner.datasets.insert(
+                "beside".into(),
+                Data {
+                    store: store.clone(),
+                    snapshots: Default::default(),
+                    derived: Err(Refused {
+                        why: "not built here".into(),
+                        entities: Arc::default(),
+                        gone: false,
+                    }),
+                    building: None,
+                },
+            );
+            inner.datasets.insert(
+                "ds".into(),
+                Data {
+                    store,
+                    snapshots: Default::default(),
+                    derived: Ok(derived.clone()),
+                    building: None,
+                },
+            );
+        }
+        let held = || follower.lock().held("ds").unwrap();
+        let room = |dataset: &str| follower.cap_for(dataset).unwrap();
+        let (held_before, room_before, beside_before) = (held(), room("ds"), room("beside"));
+
+        let pinned = derived.balances.pinned();
+        derived
+            .balances
+            .apply(crate::views::transfer_deltas("0xm", "0xnew", 1, 1));
+        derived.balances.flush();
+        let retained = derived.balances.retained_bytes();
+        assert!(
+            retained > 0,
+            "the pinned version keeps what the batch replaced"
+        );
+        assert_eq!(held(), held_before + retained);
+        assert_eq!(room("ds"), room_before - retained);
+        assert_eq!(
+            room("beside"),
+            beside_before - retained,
+            "a dataset beside it on the cursor has that much less room"
+        );
+
+        drop(pinned);
+        assert_eq!(
+            (held(), room("ds"), room("beside")),
+            (held_before, room_before, beside_before)
+        );
     }
 
     #[test]
