@@ -11725,6 +11725,8 @@ mod fr5_tests {
     /// permits already set, as boot would hold it, under strict isolation where every permit costs a
     /// pool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // Held across the whole test so no env-setting budget test runs inside it; nothing else awaits it.
+    #[allow(clippy::await_holding_lock)]
     async fn sql_permits_move_live_and_are_held_to_the_memory_split() {
         let _env = crate::analytics_budget::tests::env_lock()
             .lock()
