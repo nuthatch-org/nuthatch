@@ -52,7 +52,7 @@ pub struct Cursor {
 
 pub fn unix_now() -> u64 {
     nuthatch_core::time::system_now()
-        .duration_since(std::time::UNIX_EPOCH)
+        .duration_since(nuthatch_core::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
 
@@ -232,7 +232,7 @@ impl TabNest {
             match process_window(window, tape, &logs, next, to, tip).await? {
                 Processed::Stored(_) => {}
                 Processed::Rewound(at) => rolled = Some(at),
-                Processed::Refused => {}
+                Processed::Refused | Processed::Abandoned => {}
             }
         }
     }

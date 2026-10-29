@@ -1,0 +1,85 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nest in a tab: S5 gate</title>
+<pre id="out">running</pre>
+<script type="module">
+// RFC-0075 S5's browser gate. The nest runs in a worker on this page; every request below is a plain
+// `fetch` on this page's origin, answered by the Service Worker. It runs S5's pinned requests, then
+// the scaffolded skill's examples and llms.txt's routes as written, and posts what it saw to the
+// harness (`run-sw.mjs`), which compares it with the node's.
+import { openNest } from "./page.js";
+
+const out = document.getElementById("out");
+const p = new URLSearchParams(location.search);
+const fixture = "../fixture/";
+const report = async (r) => {
+  out.textContent = JSON.stringify(r, null, 1);
+  await fetch("../result", { method: "POST", body: JSON.stringify(r) });
+};
+
+try {
+  const text = async (f) => (await fetch(fixture + f)).text();
+  const files = { "entities.toml": await text("s4/entities.toml") };
+  for (const f of ["entities/received.sql", "entities/sent.sql", "views/20-s4.sql"]) {
+    files[f] = await text(`s4/${f}`);
+  }
+  const t0 = performance.now();
+  const opened = await openNest({
+    scope: "./",
+    swUrl: "./sw.js",
+    workerUrl: "./nest-worker.js",
+    open: {
+      nid: "tab-answers", rpc: p.get("rpc"), contract: p.get("contract"),
+      start: p.get("start"), files, pollIntervalSecs: 1,
+    },
+  });
+  const followMs = performance.now() - t0;
+
+  const base = new URL("./", location.href);
+  const answers = [];
+  for (const req of JSON.parse(await text("s5/requests.json"))) {
+    const init = { method: req.method };
+    if (req.body !== undefined) init.body = req.body;
+    const r = await fetch(new URL(req.path.slice(1), base), init);
+    answers.push({
+      method: req.method, path: req.path, status: r.status,
+      content_type: r.headers.get("content-type"), body: await r.text(),
+    });
+  }
+
+  // The skill's `curl` lines and llms.txt's `GET` routes, as written, against this page.
+  const examples = [];
+  for (const line of (await text("s5/SKILL.md")).split("\n")) {
+    const m = line.match(/`curl (.*)`/);
+    if (!m) continue;
+    const args = m[1].match(/'[^']*'|\S+/g).map((a) => a.replace(/^'|'$/g, ""));
+    let url, get = false, params = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "-G") get = true;
+      else if (args[i] === "--data-urlencode") {
+        const [k, ...v] = args[++i].split("=");
+        params.push([k, v.join("=")]);
+      } else url = args[i];
+    }
+    const target = new URL(url.replace(/^localhost:8288\//, ""), base);
+    for (const [k, v] of params) target.searchParams.append(k, v);
+    const r = await fetch(target);
+    examples.push({ source: "SKILL.md", curl: m[1], path: target.pathname.slice(base.pathname.length - 1) + target.search, status: r.status, body: await r.text() });
+  }
+  for (const line of (await text("s5/llms.txt")).split("\n")) {
+    const m = line.match(/^- `GET (\/[^`\s]*)`/);
+    if (!m) continue;
+    const route = m[1];
+    if (/[{}]|\.\.\./.test(route)) {
+      examples.push({ source: "llms.txt", route, runnable: false });
+      continue;
+    }
+    const r = await fetch(new URL(route.slice(1), base));
+    const served = r.headers.get("content-type") === "application/json";
+    examples.push({ source: "llms.txt", route, status: r.status, served, body: served ? await r.text() : undefined });
+  }
+  await report({ ok: true, opened, follow_ms: Math.round(followMs), answers, examples });
+} catch (e) {
+  await report({ ok: false, error: String(e && e.stack || e) });
+}
+</script>
