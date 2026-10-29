@@ -30,6 +30,19 @@ const FEED_TABLES: [FeedTable; 3] = [
 /// The hot store as the node serves it: `nuthatch-core`'s contract, which the cursor writes through,
 /// plus the feed (RFC-0073 FR1), whose receivers are tokio's and so stay out of a tab.
 pub trait HotStore: nuthatch_core::store::HotStore {
+    /// A read-only handle that answers every read as of now, which a window's snapshot holds so a
+    /// request reads rows and derived state of one window (#2467). `None` from a backend that cannot
+    /// pin, whose requests read at the latest commit.
+    fn pinned(&self) -> Result<Option<Arc<dyn HotStore>>> {
+        Ok(None)
+    }
+
+    /// What versions taken by [`HotStore::pinned`] and still read hold beside the latest, in bytes.
+    /// Zero where nothing is kept in memory per version.
+    fn retained_bytes(&self) -> u64 {
+        0
+    }
+
     /// RFC-0073 FR1: a snapshot of the mirrored tables and a receiver for every commit after it, or
     /// `None` from a backend with no feed.
     fn feed_subscribe(&self) -> Result<Option<crate::feed::Subscription>> {
@@ -43,6 +56,10 @@ pub trait HotStore: nuthatch_core::store::HotStore {
 }
 
 impl HotStore for Store {
+    fn pinned(&self) -> Result<Option<Arc<dyn HotStore>>> {
+        Ok(Some(Arc::new(Store::pinned(self)?)))
+    }
+
     fn feed_subscribe(&self) -> Result<Option<crate::feed::Subscription>> {
         feed_subscribe(self).map(Some)
     }
@@ -54,6 +71,12 @@ impl HotStore for Store {
 
 /// Every shared handle on a node store is one, as `nuthatch-core` makes it one of the core trait.
 impl<T: HotStore + ?Sized> HotStore for Arc<T> {
+    fn pinned(&self) -> Result<Option<Arc<dyn HotStore>>> {
+        (**self).pinned()
+    }
+    fn retained_bytes(&self) -> u64 {
+        (**self).retained_bytes()
+    }
     fn feed_subscribe(&self) -> Result<Option<crate::feed::Subscription>> {
         (**self).feed_subscribe()
     }

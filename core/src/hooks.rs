@@ -13,6 +13,14 @@ pub trait WindowHooks: Send + Sync {
     /// Sealing ran for what is final through `finalized_through`, and the store is sealed through
     /// `sealed_through`. Nothing here may fail the window.
     fn sealed(&self, _finalized_through: u64, _sealed_through: u64, _at_tip: bool) {}
+
+    /// After [`WindowHooks::sealed`], with the store as sealing left it. An error fails the window.
+    async fn after_seal(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// A test seam waited on once the views are fed and again once the commit has landed (#2467).
+    async fn seam(&self) {}
 }
 
 /// Does nothing around a window.

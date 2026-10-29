@@ -12,6 +12,26 @@ use nuthatch_decode::registry::DecodedRow;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::versioned::{Chunked, Footprint, Sink, Versions};
+
+/// The relation an entity publishes: a [`Relation`] held as copy-on-write chunks (#2467).
+pub type Maintained = Chunked<Row, Row>;
+
+fn row_bytes(r: &Row) -> u64 {
+    24 + r
+        .0
+        .iter()
+        .map(|s| match s {
+            Scalar::Str(s) => 32 + s.len() as u64,
+            _ => 32,
+        })
+        .sum::<u64>()
+}
+
+pub(crate) fn new_maintained() -> Maintained {
+    Chunked::new(|k, v| row_bytes(k) + row_bytes(v) + 32)
+}
+
 /// One window's facts, already bound to the plan's input relations and weighted.
 ///
 /// Binding happens on the caller's thread rather than the circuit's, so a window that cannot be
@@ -64,11 +84,12 @@ fn sample_state(circuit: &mut EntityCircuit, into: &Mutex<Option<u64>>) -> Resul
 
 /// Why a sampled state of `bytes` stops the entity, or `None` inside `allowance` (#2167). `max_rows`
 /// bounds input rows; a join's output, and the values a MIN or MAX keeps from it, can outgrow them.
-fn over_allowance(bytes: u64, allowance: u64) -> Option<String> {
-    (bytes > allowance).then(|| {
+fn over_allowance(bytes: u64, retained: u64, allowance: u64) -> Option<String> {
+    (bytes.saturating_add(retained) > allowance).then(|| {
         format!(
-            "the circuit holds {bytes} bytes of state, past the allowance of {allowance} bytes \
-             admission charged for this entity. Raise its max_rows, which admission charges for"
+            "the circuit holds {bytes} bytes of state and versions still being read hold {retained} \
+             more, past the allowance of {allowance} bytes admission charged for this entity. Raise \
+             its max_rows, which admission charges for"
         )
     })
 }
@@ -143,9 +164,9 @@ impl Applied {
 /// comment explaining why the order mattered. It is not a comment's job to hold an invariant: a
 /// reader between the two stores sees a head whose rows are not published yet, and no test can catch
 /// that reliably. One lock, one publication, and the ordering has nowhere to go wrong.
-#[derive(Default)]
+#[derive(Clone)]
 struct Published {
-    relation: Relation,
+    relation: Maintained,
     /// The dataset head this entity has **actually folded**, which is not the nest's head while it
     /// is catching up. Advanced only after the batch carrying it has been applied.
     through: u64,
@@ -161,6 +182,23 @@ struct Published {
     offchain: std::collections::BTreeMap<String, OffchainMark>,
 }
 
+impl Default for Published {
+    fn default() -> Self {
+        Self {
+            relation: new_maintained(),
+            through: 0,
+            progress_at: 0,
+            offchain: Default::default(),
+        }
+    }
+}
+
+impl Footprint for Published {
+    fn footprint(&self, out: &mut Vec<(usize, u64)>) {
+        self.relation.footprint(out)
+    }
+}
+
 impl Published {
     fn applied(&self) -> Applied {
         Applied {
@@ -169,9 +207,9 @@ impl Published {
         }
     }
 
-    /// Stamp the watermark onto the already-updated relation. **The relation is not copied here.**
-    /// `circuit.apply` folds its deltas straight into `relation` under the same lock, so a batch
-    /// costs what the batch changed rather than what the relation holds (#897).
+    /// Stamp the watermark onto the already-updated relation. `circuit.apply` folds its deltas into
+    /// `relation`, and a version shares every chunk the batch did not touch, so a batch costs what it
+    /// changed rather than what the relation holds (#897, #2467).
     fn stamp(&mut self, through: u64) {
         // Only when the watermark moves: a window that carries the entity no further is not
         // progress, and counting it as such is how a wedged entity looks busy.
@@ -199,10 +237,13 @@ pub struct Limits {
 }
 
 /// One entity's circuit on a lane, and the relation and watermark it publishes.
+#[derive(Clone)]
 pub struct EntityLane {
     name: String,
     lane: Lane<Msg>,
-    state: Arc<RwLock<Published>>,
+    state: Arc<Versions<Published>>,
+    /// The version a request was handed (#2467), read instead of the latest.
+    pinned: Option<Arc<Published>>,
     /// Why the circuit stopped, if it has - on start, on a step, or on the declared bound. The
     /// reason and not merely the fact, because #866 asks for an entity that is *visibly* dead.
     fault: Arc<RwLock<Option<String>>>,
@@ -223,7 +264,7 @@ struct Folding {
     /// A rebuild in progress (#1437): circuit, relation, live count and offchain marks.
     rebuilding: Option<(
         EntityCircuit,
-        Relation,
+        Maintained,
         i64,
         std::collections::BTreeMap<String, OffchainMark>,
     )>,
@@ -231,7 +272,9 @@ struct Folding {
     /// never while it sits idle, since an idle circuit's size has not moved.
     changed: bool,
     due: Instant,
-    shared: Arc<RwLock<Published>>,
+    shared: Arc<Versions<Published>>,
+    /// What the step folds into; each change is published as a version of it.
+    published: Published,
     sampled: Arc<Mutex<Option<u64>>>,
     fault: Arc<RwLock<Option<String>>>,
     label: String,
@@ -240,7 +283,11 @@ struct Folding {
 impl Folding {
     fn sample(&mut self) -> Result<Option<String>> {
         let (bytes, _) = sample_state(&mut self.circuit, &self.sampled)?;
-        Ok(over_allowance(bytes, self.limits.allowance_bytes))
+        Ok(over_allowance(
+            bytes,
+            self.shared.retained(),
+            self.limits.allowance_bytes,
+        ))
     }
 
     fn handle(&mut self, msg: Option<Msg>) -> Result<Option<Instant>> {
@@ -252,7 +299,9 @@ impl Folding {
             match sample_state(&mut self.circuit, &self.sampled) {
                 Ok((bytes, took)) => {
                     tracing::debug!("entity `{}` state sampled in {took:?}", self.label);
-                    if let Some(why) = over_allowance(bytes, self.limits.allowance_bytes) {
+                    if let Some(why) =
+                        over_allowance(bytes, self.shared.retained(), self.limits.allowance_bytes)
+                    {
                         // Published before `msg` drops, since it may be a sample's ack (#2167).
                         return Err(self.stop(why));
                     }
@@ -277,10 +326,9 @@ impl Folding {
         let max_rows = self.limits.max_rows;
         match msg {
             Msg::Batch(batch, through, should_publish) => {
-                // The write lock is held across the fold, so no reader ever sees the relation
-                // mid-transaction. A fold is microseconds; the clone it replaces was tens of
-                // milliseconds (#897).
-                let mut published = self.shared.write().unwrap();
+                if let Some(delay) = fold_delay(&self.label) {
+                    std::thread::sleep(delay);
+                }
                 // Includes crossing the declared `max_rows`, which is a fault and not a warning
                 // (criterion 10). The watermark does not advance: the entity did not fold it.
                 step(
@@ -288,29 +336,30 @@ impl Folding {
                     &batch,
                     &mut self.live,
                     max_rows,
-                    &mut published.relation,
+                    &mut self.published.relation,
                 )?;
                 if should_publish {
                     self.pending = None;
-                    published.stamp(through);
+                    self.published.stamp(through);
+                    self.shared.publish(self.published.clone());
                 } else {
                     self.pending = Some(through);
                 }
             }
             Msg::Offchain(batch, table, mark) => {
-                let mut published = self.shared.write().unwrap();
                 step(
                     &mut self.circuit,
                     &batch,
                     &mut self.live,
                     max_rows,
-                    &mut published.relation,
+                    &mut self.published.relation,
                 )?;
-                published.offchain.insert(table, mark);
+                self.published.offchain.insert(table, mark);
+                self.shared.publish(self.published.clone());
             }
             Msg::Rebuild(Rebuild::Begin) => {
                 let c = EntityCircuit::build(self.plan.clone())?;
-                self.rebuilding = Some((c, Relation::new(), 0, Default::default()));
+                self.rebuilding = Some((c, new_maintained(), 0, Default::default()));
             }
             Msg::Rebuild(Rebuild::Batch(batch)) => {
                 let (c, relation, count, _) = self
@@ -332,13 +381,13 @@ impl Folding {
                     .rebuilding
                     .take()
                     .ok_or_else(|| anyhow!(REBUILD_ORDER))?;
-                let mut published = self.shared.write().unwrap();
                 self.circuit = c;
                 self.live = count;
-                published.relation = relation;
-                published.offchain = marks;
+                self.published.relation = relation;
+                self.published.offchain = marks;
                 self.pending = None;
-                published.stamp(through);
+                self.published.stamp(through);
+                self.shared.publish(self.published.clone());
             }
             Msg::Stop => anyhow::bail!("stopped: its input was refused"),
             // Messages are processed in order, so by the time the barrier is seen every prior
@@ -356,16 +405,16 @@ impl Folding {
                     return Err(e);
                 }
                 if let Some(through) = self.pending.take() {
-                    self.shared.write().unwrap().stamp(through);
+                    self.published.stamp(through);
+                    self.shared.publish(self.published.clone());
                 }
                 let _ = ack.send(());
             }
             Msg::SampleState(ack) => {
                 let sample = sample_state(&mut self.circuit, &self.sampled);
-                let why = sample
-                    .as_ref()
-                    .ok()
-                    .and_then(|(bytes, _)| over_allowance(*bytes, self.limits.allowance_bytes));
+                let why = sample.as_ref().ok().and_then(|(bytes, _)| {
+                    over_allowance(*bytes, self.shared.retained(), self.limits.allowance_bytes)
+                });
                 // The fault is published before the ack, so a caller that sees this sample also
                 // sees the entity stopped.
                 let stopped = why.map(|why| self.stop(why));
@@ -389,11 +438,35 @@ impl Folding {
     }
 }
 
+/// A test seam: every entity named `name`, in any nest, waits `delay` before folding a batch, so a
+/// test can read between a window being fed and its entity publishing.
+#[doc(hidden)]
+pub fn slow_entity_fold(name: &str, delay: Duration) {
+    fold_delays()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(name.to_string(), delay);
+}
+
+fn fold_delay(name: &str) -> Option<Duration> {
+    fold_delays()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .copied()
+}
+
+fn fold_delays() -> &'static Mutex<std::collections::HashMap<String, Duration>> {
+    static DELAYS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Duration>>> =
+        std::sync::OnceLock::new();
+    DELAYS.get_or_init(Default::default)
+}
+
 impl EntityLane {
     /// Start the circuit on a lane under `driver`. The node's keeps DBSP on its own thread, off the
     /// async pool, as the built-in views do.
     pub fn start(driver: Driver, name: &str, plan: &Plan, limits: Limits) -> Result<Self> {
-        let state = Arc::new(RwLock::new(Published::default()));
+        let state = Arc::new(Versions::new(Published::default()));
         let fault = Arc::new(RwLock::new(None::<String>));
         let state_bytes = Arc::new(Mutex::new(None::<u64>));
         let (shared, stopped, sampled) = (state.clone(), fault.clone(), state_bytes.clone());
@@ -414,6 +487,7 @@ impl EntityLane {
                 changed: false,
                 due: time::now(),
                 shared,
+                published: Published::default(),
                 sampled,
                 fault: stopped,
                 label: label.clone(),
@@ -432,6 +506,7 @@ impl EntityLane {
             name: name.to_string(),
             lane,
             state,
+            pinned: None,
             fault,
             state_bytes,
         })
@@ -514,24 +589,40 @@ impl EntityLane {
             .map_err(|_| anyhow!("entity `{}` has stopped", self.name))?
     }
 
+    fn published(&self) -> Arc<Published> {
+        self.pinned.clone().unwrap_or_else(|| self.state.load())
+    }
+
+    /// This entity held at what it has published now, which later batches leave alone (#2467).
+    pub fn pinned(&self) -> Self {
+        Self {
+            pinned: Some(self.state.load()),
+            ..self.clone()
+        }
+    }
+
+    /// What published versions still referenced hold that the latest does not, in bytes.
+    pub fn retained_bytes(&self) -> u64 {
+        self.state.retained()
+    }
+
     /// A copy of the whole relation.
     pub fn relation(&self) -> Relation {
-        self.state
-            .read()
-            .map(|s| s.relation.clone())
-            .unwrap_or_default()
+        self.published()
+            .relation
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     pub fn get(&self, key: &Row) -> Option<Row> {
-        self.state.read().ok()?.relation.get(key).cloned()
+        self.published().relation.get(key).cloned()
     }
 
     /// The first key built from one reading per column that the relation holds, and the watermark,
     /// under one lock.
     pub fn get_with_watermark(&self, readings: &[Vec<Scalar>]) -> (Option<Row>, Applied) {
-        let Ok(s) = self.state.read() else {
-            return (None, Applied::default());
-        };
+        let s = self.published();
         let width = s.relation.keys().next().map_or(0, |k| k.0.len());
         if width == 0 || width != readings.len() || readings.iter().any(Vec::is_empty) {
             return (None, s.applied());
@@ -567,10 +658,7 @@ impl EntityLane {
         &self,
         columns: &[String],
     ) -> (Vec<serde_json::Value>, Applied) {
-        let state = match self.state.read() {
-            Ok(s) => s,
-            Err(_) => return (Vec::new(), Applied::default()),
-        };
+        let state = self.published();
         let applied = state.applied();
         let rows = state
             .relation
@@ -587,22 +675,20 @@ impl EntityLane {
     }
 
     pub fn head_rows_with_watermark(&self, limit: usize) -> (usize, Vec<(Row, Row)>, Applied) {
-        match self.state.read() {
-            Ok(s) => (
-                s.relation.len(),
-                s.relation
-                    .iter()
-                    .take(limit)
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                s.applied(),
-            ),
-            Err(_) => (0, Vec::new(), Applied::default()),
-        }
+        let s = self.published();
+        (
+            s.relation.len(),
+            s.relation
+                .iter()
+                .take(limit)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            s.applied(),
+        )
     }
 
     pub fn len(&self) -> usize {
-        self.state.read().map(|s| s.relation.len()).unwrap_or(0)
+        self.published().relation.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -610,22 +696,20 @@ impl EntityLane {
     }
 
     pub fn len_and_watermark(&self) -> (usize, Applied) {
-        self.state
-            .read()
-            .map(|s| (s.relation.len(), s.applied()))
-            .unwrap_or_default()
+        let s = self.published();
+        (s.relation.len(), s.applied())
     }
 
     pub fn applied_through(&self) -> u64 {
-        self.state.read().map(|s| s.through).unwrap_or(0)
+        self.published().through
     }
 
     pub fn fence_watermark(&self) -> Applied {
-        self.state.read().map(|s| s.applied()).unwrap_or_default()
+        self.published().applied()
     }
 
     pub fn last_progress(&self) -> u64 {
-        self.state.read().map(|s| s.progress_at).unwrap_or(0)
+        self.published().progress_at
     }
 }
 
@@ -670,7 +754,7 @@ fn step(
     batch: &Batch,
     live: &mut i64,
     max_rows: usize,
-    into: &mut Relation,
+    into: &mut impl Sink<Row, Row>,
 ) -> Result<()> {
     let next = live
         .checked_add(batch.weight())
@@ -759,6 +843,14 @@ mod tests {
             assert_eq!(v.state_bytes(), Some(bytes), "{driver:?}");
             assert!(v.is_healthy());
         }
+    }
+
+    /// #2467: versions requests still read are charged to the entity's allowance with its state.
+    #[test]
+    fn versions_still_read_count_against_the_allowance() {
+        assert_eq!(over_allowance(600, 0, 1_000), None);
+        let why = over_allowance(600, 500, 1_000).expect("600 + 500 is past 1,000");
+        assert!(why.contains("versions still being read hold 500"), "{why}");
     }
 
     #[test]

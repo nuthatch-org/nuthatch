@@ -280,6 +280,10 @@ impl std::ops::Deref for OpenDb {
 
 /// The hot store over redb. `F` is whoever mirrors its commits: the node's feed, or nobody.
 pub struct Store<F = crate::tap::NoFeed> {
+    /// The read transaction every read on this handle uses, set on a handle taken by
+    /// [`Store::pinned`] (#2467). `None` reads at the latest commit. Declared before `db` so it
+    /// drops first: redb keeps its file locked while a transaction lives, past `released`.
+    pinned: Option<Arc<Pin>>,
     db: Arc<OpenDb>,
     released: tokio::sync::watch::Receiver<()>,
     /// Fence this handle holds, shared across clones so every clone of one nest's handle speaks for
@@ -307,6 +311,29 @@ pub struct Store<F = crate::tap::NoFeed> {
     path: Arc<std::path::PathBuf>,
 }
 
+/// A read transaction a [`Store`] handle answers every read from, and the generations it was opened at.
+pub struct Pin {
+    txn: redb::ReadTransaction,
+    writes: Option<u64>,
+    rows: Option<u64>,
+}
+
+/// The transaction a read runs in: the handle's pinned one, or a fresh one at the latest commit.
+enum Rtx {
+    Fresh(redb::ReadTransaction),
+    Pinned(Arc<Pin>),
+}
+
+impl std::ops::Deref for Rtx {
+    type Target = redb::ReadTransaction;
+    fn deref(&self) -> &redb::ReadTransaction {
+        match self {
+            Rtx::Fresh(t) => t,
+            Rtx::Pinned(p) => &p.txn,
+        }
+    }
+}
+
 // By hand: a derive would ask `F: Clone`, and the tap is shared, not copied.
 impl<F> Clone for Store<F> {
     fn clone(&self) -> Self {
@@ -318,6 +345,7 @@ impl<F> Clone for Store<F> {
             rows: self.rows.clone(),
             commit_gate: self.commit_gate.clone(),
             tap: self.tap.clone(),
+            pinned: self.pinned.clone(),
             #[cfg(any(test, feature = "test-hooks"))]
             largest_range_read: self.largest_range_read.clone(),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -516,6 +544,7 @@ impl<F: Feed> Store<F> {
             rows: Arc::new(std::sync::atomic::AtomicU64::new(rows_epoch())),
             commit_gate: Arc::default(),
             tap: Arc::new(F::open(path.parent())),
+            pinned: None,
             #[cfg(any(test, feature = "test-hooks"))]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -600,6 +629,7 @@ impl<F: Feed> Store<F> {
             rows: Arc::new(std::sync::atomic::AtomicU64::new(rows_epoch())),
             commit_gate: Arc::default(),
             tap: Arc::new(F::open(dir)),
+            pinned: None,
             #[cfg(any(test, feature = "test-hooks"))]
             largest_range_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -968,20 +998,20 @@ impl<F: Feed> Store<F> {
     }
 
     pub fn get_entity(&self, key: &str) -> Result<Option<String>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         Ok(t.get(key)?.map(|v| v.value().to_string()))
     }
 
     pub fn count(&self) -> Result<u64> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         Ok(t.len()?)
     }
 
     /// The `limit` most-recent entities (highest keys first).
     pub fn recent(&self, limit: usize) -> Result<Vec<String>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         let mut out = Vec::with_capacity(limit.min(1024));
         for row in t.iter()?.rev() {
@@ -1015,7 +1045,7 @@ impl<F: Feed> Store<F> {
         limit: usize,
         max_scanned: usize,
     ) -> Result<Option<Vec<String>>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         // Cap the pre-allocation: `limit` may be usize::MAX (rebuild wants "all rows"); the Vec
         // still grows as needed, we just don't reserve an absurd capacity up front.
@@ -1096,7 +1126,7 @@ impl<F: Feed> Store<F> {
         max_bytes: u64,
         charge: Option<&mut dyn FnMut(u64) -> Result<()>>,
     ) -> Result<HotRowsSnapshot> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         if let Some(charge) = charge {
             // The copy's own refusals, in its order, reading `table` without building the row: a tip
@@ -1179,7 +1209,7 @@ impl<F: Feed> Store<F> {
     pub fn entities_in_range(&self, from: u64, to: u64) -> Result<Vec<String>> {
         let lo = format!("{from:012}-000000");
         let hi = format!("{to:012}-999999");
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         let mut out = Vec::new();
         for row in t.range(lo.as_str()..=hi.as_str())? {
@@ -1203,7 +1233,7 @@ impl<F: Feed> Store<F> {
     ) -> Result<()> {
         let lo = format!("{from:012}-000000");
         let hi = format!("{to:012}-999999");
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         #[cfg(any(test, feature = "test-hooks"))]
         let mut visited = 0usize;
@@ -1229,7 +1259,7 @@ impl<F: Feed> Store<F> {
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(META)?;
         Ok(t.get(key)?.map(|v| v.value().to_string()))
     }
@@ -1268,7 +1298,7 @@ impl<F: Feed> Store<F> {
     }
 
     pub fn meta_with_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<(String, String)>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(META)?;
         let mut out = Vec::new();
         for row in t.range(prefix..)? {
@@ -1282,7 +1312,7 @@ impl<F: Feed> Store<F> {
     }
 
     pub fn count_meta_with_prefix(&self, prefix: &str) -> Result<u64> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(META)?;
         let mut n = 0;
         for row in t.range(prefix..)? {
@@ -1316,7 +1346,7 @@ impl<F: Feed> Store<F> {
     }
 
     fn block_record(&self, block: u64) -> Result<Option<(String, Option<u64>)>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(BLOCKS)?;
         Ok(t.get(Self::block_key(block).as_str())?
             .map(|v| decode_block_record(v.value())))
@@ -1373,7 +1403,7 @@ impl<F: Feed> Store<F> {
 
     /// All recorded checkpoints, highest block first - for walking back to a common ancestor.
     pub fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(BLOCKS)?;
         let mut out = Vec::new();
         for row in t.iter()?.rev() {
@@ -1389,7 +1419,7 @@ impl<F: Feed> Store<F> {
         if !INDEX_CHECKPOINT_HASHES {
             anyhow::bail!("hash-pinned reads need a nuthatch built with `--features graph`");
         }
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let table = rtx.open_table(CHECKPOINT_HASHES)
             .context("checkpoint hash index is unavailable; open this store with the current writer to upgrade it")?;
         Ok(table
@@ -1597,7 +1627,7 @@ impl<F: Feed> Store<F> {
     /// Test/consistency helper: the set of entity keys currently stored (chain-ordered).
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn entity_keys(&self) -> Result<Vec<String>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         let mut out = Vec::new();
         for row in t.iter()? {
@@ -1610,7 +1640,7 @@ impl<F: Feed> Store<F> {
     /// Up to `limit` entity keys, chain-ordered - the point-read bench (`nuthatch bench query`) samples
     /// from these. Bounded so a large hot store doesn't materialise every key just to time a few reads.
     pub fn sample_entity_keys(&self, limit: usize) -> Result<Vec<String>> {
-        let rtx = self.db.begin_read()?;
+        let rtx = self.read_txn()?;
         let t = rtx.open_table(ENTITIES)?;
         let mut out = Vec::with_capacity(limit.min(4096));
         for row in t.iter()? {
@@ -1685,6 +1715,37 @@ impl<F: Feed> Store<F> {
     }
 }
 
+impl<F: Feed> Store<F> {
+    fn read_txn(&self) -> Result<Rtx> {
+        Ok(match &self.pinned {
+            Some(p) => Rtx::Pinned(p.clone()),
+            None => Rtx::Fresh(self.db.begin_read()?),
+        })
+    }
+
+    /// This handle pinned at the latest commit. The generations are kept only when no commit
+    /// began while the transaction opened, so the memo never keys an answer to the wrong one.
+    pub fn pinned(&self) -> Result<Store<F>> {
+        let generations = |s: &Store<F>| {
+            (
+                HotStore::write_generation(s),
+                HotStore::rows_generation(s),
+            )
+        };
+        let before = generations(self);
+        let txn = self.db.begin_read()?;
+        let (writes, rows) = if generations(self) == before {
+            before
+        } else {
+            (None, None)
+        };
+        Ok(Store {
+            pinned: Some(Arc::new(Pin { txn, writes, rows })),
+            ..self.clone()
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl<F: Feed> HotStore for Store<F> {
     fn released(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
@@ -1696,12 +1757,18 @@ impl<F: Feed> HotStore for Store<F> {
     }
 
     fn write_generation(&self) -> Option<u64> {
+        if let Some(p) = &self.pinned {
+            return p.writes;
+        }
         // Odd means a commit is in flight: see `Store::commit`.
         let g = self.writes.load(std::sync::atomic::Ordering::SeqCst);
         g.is_multiple_of(2).then_some(g)
     }
 
     fn rows_generation(&self) -> Option<u64> {
+        if let Some(p) = &self.pinned {
+            return p.rows;
+        }
         let g = self.rows.load(std::sync::atomic::Ordering::SeqCst);
         g.is_multiple_of(2).then_some(g)
     }

@@ -29,7 +29,16 @@ use dbsp::{IndexedZSetReader, OrdZSet, OutputHandle, RootCircuit, Runtime};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use crate::versioned::{Chunked, Sink, Versions};
+
+/// The published balances: address to net balance.
+pub type Balances = Chunked<String, i128>;
+
+fn new_balances() -> Balances {
+    Chunked::new(|k, _| k.len() as u64 + 40)
+}
 
 /// A balance delta fed to the circuit: (address, signed_value). Insert carries weight +1, a reorg
 /// retraction carries weight −1.
@@ -89,7 +98,7 @@ impl BalanceCircuit {
     fn step(
         &mut self,
         mut batch: WeightedBatch,
-        balances: &mut HashMap<String, i128>,
+        balances: &mut impl Sink<String, i128>,
     ) -> Result<()> {
         self.input.append(&mut batch);
         let output = &self.output;
@@ -139,7 +148,7 @@ pub fn step_to_commit(
 
 fn fold_balances(
     output: &OutputHandle<OrdZSet<Tup2<String, i128>>>,
-    balances: &mut HashMap<String, i128>,
+    balances: &mut impl Sink<String, i128>,
 ) {
     // The aggregate emits a change stream: a key whose balance moves from old→new appears as
     // (key,old,−1) and (key,new,+1); a key falling to zero appears only as (key,old,−1).
@@ -156,11 +165,11 @@ fn fold_balances(
             }
         });
     for (k, v) in set.iter() {
-        balances.insert(k.clone(), *v);
+        balances.put(k.clone(), *v);
     }
     for k in cleared {
         if !set.contains_key(&k) {
-            balances.remove(&k); // balance returned to zero → drop the key
+            balances.take(&k); // balance returned to zero → drop the key
         }
     }
 }
@@ -183,7 +192,9 @@ pub struct BalanceView {
     /// Unhealthy for good once the circuit dies on an error, so the ingest loop fails loudly instead
     /// of serving frozen balances as if healthy (a dead task must surface, never be served over).
     lane: Lane<WeightedBatch>,
-    balances: Arc<RwLock<HashMap<String, i128>>>,
+    balances: Arc<Versions<Balances>>,
+    /// The version a request was handed (#2467), read instead of the latest.
+    pinned: Option<Arc<Balances>>,
     /// Transfers whose value has more than 38 digits and were therefore **dropped from these
     /// balances** (COR-8, #814). Served as `dropped_over_i128`, the name from when the line was
     /// `i128`, kept because callers read it.
@@ -209,25 +220,29 @@ impl BalanceView {
     pub fn inert() -> Self {
         Self {
             lane: Lane::off(),
-            balances: Default::default(),
+            balances: Arc::new(Versions::new(new_balances())),
+            pinned: None,
             over_i128: Default::default(),
         }
     }
 
     /// Start the circuit under `driver`; the node's keeps DBSP on its own thread, off the async pool.
     pub fn start(driver: Driver) -> Result<Self> {
-        let balances = Arc::new(RwLock::new(HashMap::new()));
+        let balances = Arc::new(Versions::new(new_balances()));
         let shared = balances.clone();
         let lane = driver.lane("IVM", "nuthatch-ivm", move || {
             let mut circuit = BalanceCircuit::new()?;
+            let mut map = new_balances();
             Ok(Box::new(move |batch| {
-                let mut map = shared.write().unwrap();
-                circuit.step(batch, &mut map).context("IVM step failed")
+                circuit.step(batch, &mut map).context("IVM step failed")?;
+                shared.publish(map.clone());
+                Ok(())
             }) as Step<WeightedBatch>)
         })?;
         Ok(Self {
             lane,
             balances,
+            pinned: None,
             over_i128: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -264,15 +279,29 @@ impl BalanceView {
     }
 
     pub fn balance(&self, address: &str) -> Option<i128> {
-        self.balances.read().ok()?.get(address).copied()
+        self.map().get(address).copied()
+    }
+
+    fn map(&self) -> Arc<Balances> {
+        self.pinned.clone().unwrap_or_else(|| self.balances.load())
+    }
+
+    /// This view held at what it has published now, which later batches leave alone (#2467).
+    pub fn pinned(&self) -> Self {
+        Self {
+            pinned: Some(self.balances.load()),
+            ..self.clone()
+        }
+    }
+
+    /// What published versions still referenced hold that the latest does not, in bytes.
+    pub fn retained_bytes(&self) -> u64 {
+        self.balances.retained()
     }
 
     /// Top `n` addresses by balance, descending, ties by address.
     pub fn top(&self, n: usize) -> Vec<(String, i128)> {
-        let map = match self.balances.read() {
-            Ok(m) => m,
-            Err(_) => return Vec::new(),
-        };
+        let map = self.map();
         top_k(map.iter().map(|(k, v)| (*v, Reverse(k.as_str()))), n)
             .into_iter()
             .map(|(v, Reverse(k))| (k.to_string(), v))
@@ -280,7 +309,7 @@ impl BalanceView {
     }
 
     pub fn holders(&self) -> usize {
-        self.balances.read().map(|m| m.len()).unwrap_or(0)
+        self.map().len()
     }
 
     /// Record `n` transfers dropped for exceeding 38 digits (COR-8, #814).
@@ -438,6 +467,33 @@ mod tests {
         assert_eq!(bal.get("0xwhale"), Some(&(2 * big)));
     }
 
+    /// #2467: a pinned view answers from its version while the view moves on, and the version is
+    /// charged only while it is held.
+    #[test]
+    fn a_pinned_view_keeps_its_version_and_is_charged_while_held() {
+        let view = BalanceView::start(Driver::Threaded).unwrap();
+        let batch: WeightedBatch = (0..1_000)
+            .flat_map(|i| transfer_deltas("0xminter", &format!("0x{i:040x}"), 1, 1))
+            .collect();
+        view.apply(batch);
+        view.flush();
+        let pinned = view.pinned();
+        assert_eq!(view.retained_bytes(), 0);
+        view.apply(transfer_deltas("0xminter", "0xnew", 7, 1));
+        view.flush();
+        assert_eq!(pinned.balance("0xnew"), None);
+        assert_eq!(pinned.holders(), 1_001);
+        assert_eq!(view.balance("0xnew"), Some(7));
+        let retained = view.retained_bytes();
+        assert!(
+            retained > 0,
+            "the pinned version keeps the chunks the batch replaced"
+        );
+        assert!(retained < 1_000 * 50, "and only those: {retained}");
+        drop(pinned);
+        assert_eq!(view.retained_bytes(), 0);
+    }
+
     /// A flush barrier returns only once queued work is drained - the property `rebuild` relies on.
     #[test]
     fn flush_waits_for_enqueued_work() {
@@ -488,12 +544,11 @@ mod tests {
     #[test]
     fn top_breaks_ties_by_address_and_takes_at_most_n() {
         let view = BalanceView::start(Driver::Threaded).unwrap();
-        view.balances.write().unwrap().extend([
-            ("0xc".to_string(), 5),
-            ("0xa".to_string(), 5),
-            ("0xb".to_string(), 9),
-            ("0xd".to_string(), -1),
-        ]);
+        let mut map = new_balances();
+        for (k, v) in [("0xc", 5), ("0xa", 5), ("0xb", 9), ("0xd", -1)] {
+            map.insert(k.to_string(), v);
+        }
+        view.balances.publish(map);
         assert_eq!(
             view.top(3),
             vec![

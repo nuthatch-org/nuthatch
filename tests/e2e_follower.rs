@@ -1279,6 +1279,108 @@ async fn a_reader_sees_each_delta_wholly_or_not_at_all() {
     writer.stop(&root);
 }
 
+fn as_u64(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str()?.parse().ok())
+}
+
+/// The writer's side of #2467. A window's velocity is fed before its commit, its threshold flags land
+/// with the commit and its entity is fed after. Every transfer is 1,000, so a whole state has a
+/// velocity volume of 1,000 per flag and an entity sum of 1,000 per row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_request_sees_each_window_wholly_or_not_at_all() {
+    const LAST: u64 = 16;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("runtime");
+    let dir = root.join("data").join(ROUTE);
+    std::fs::create_dir_all(&dir).unwrap();
+    scaffold_nest(&dir, ROUTE, USDC);
+    let toml = dir.join("nuthatch.toml");
+    let cfg = std::fs::read_to_string(&toml).unwrap();
+    std::fs::write(
+        &toml,
+        format!(
+            "{cfg}\n[flags]\nthreshold = \"150\"\nvelocity_amount = \"300\"\nvelocity_window = 100\n"
+        ),
+    )
+    .unwrap();
+    entity_fixture::write(
+        &dir,
+        "[[entities]]\nname = \"received_whole\"\nquery = \"SELECT t.to, SUM(CAST(t.value AS HUGEINT)) AS sum_value FROM usdc__transfer t GROUP BY t.to\"\nkey = [\"to\"]\nmax_rows = 50000\n",
+    )
+    .unwrap();
+    let tape = Arc::new(TapeSource::new());
+    for b in 1..=3 {
+        tape.insert_block(b, block(b, 0, 1_000));
+    }
+    tape.advance_tip_to(3);
+    let writer = Writer::start(&root, tape.clone(), 0);
+    writer.reaches(3).await;
+    let base = format!("http://{}", writer.addr);
+    // Each window waits 50 ms after its views are fed, after its commit and after its entity folds, and
+    // the entity 30 ms before it folds: a request reading live state at any of those points sees one
+    // part of the window without another.
+    nuthatch::indexer::slow_writer_commit(&dir, Duration::from_millis(50));
+    nuthatch::entity_view::slow_entity_fold("received_whole", Duration::from_millis(30));
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let (stop, base) = (stop.clone(), base.clone());
+        tokio::spawn(async move {
+            let (mut flags_seen, mut sql_seen) = (Vec::new(), Vec::new());
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let (status, body) = get(&base, &format!("/{ROUTE}/flags")).await;
+                if status == 200 {
+                    let flags = body["threshold"]["flags"].as_array().map_or(0, Vec::len) as u64;
+                    let volume = as_u64(&body["velocity"]["flags"][0]["volume"]).unwrap_or(0);
+                    flags_seen.push((flags, volume));
+                }
+                let (status, body) = sql(
+                    &base,
+                    "SELECT (SELECT count(*) FROM usdc__transfer) AS n, \
+                     (SELECT sum_value FROM received_whole) AS s",
+                )
+                .await;
+                assert_eq!(status, 200, "{body}");
+                let row = &body["rows"][0];
+                sql_seen.push((as_u64(&row["n"]).unwrap(), as_u64(&row["s"]).unwrap_or(0)));
+            }
+            (flags_seen, sql_seen)
+        })
+    };
+    // One block at a time, so each is a window of its own.
+    for b in 4..=LAST {
+        tape.insert_block(b, block(b, 0, 1_000));
+        tape.advance_tip_to(b);
+        writer.reaches(b).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (flags_seen, sql_seen) = reader.await.unwrap();
+    let torn: Vec<_> = flags_seen.iter().filter(|(n, v)| *v != 1_000 * n).collect();
+    assert!(
+        torn.is_empty(),
+        "/flags read part-way through a window: {torn:?}"
+    );
+    let torn: Vec<_> = sql_seen.iter().filter(|(n, s)| *s != 1_000 * n).collect();
+    assert!(
+        torn.is_empty(),
+        "/sql read part-way through a window: {torn:?}"
+    );
+    for (what, states) in [
+        (
+            "/flags",
+            flags_seen
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<std::collections::BTreeSet<_>>(),
+        ),
+        ("/sql", sql_seen.iter().map(|(n, _)| *n).collect()),
+    ] {
+        assert!(states.len() > 8, "{what} saw the stream move: {states:?}");
+    }
+    writer.stop(&root);
+}
+
 /// Every route a follower answers from derived state, compared with the writer's answer.
 async fn derived_agree(writer: &Writer, follower: &str, why: &str) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
