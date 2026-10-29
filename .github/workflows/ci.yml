@@ -17,6 +17,11 @@ on:
   # (#491) doesn't help a PR based on a `pete/*` branch forked from `sprint/diligent-dormouse`,
   # since that branch still carried the filtered version.
   pull_request:
+    # `labeled` so adding `full-ci` runs the slow tier. Any other label reruns the fast tier as well:
+    # a run of skipped jobs would post green over a red check of the same name on the same head.
+    types: [opened, synchronize, reopened, labeled]
+  # The merge queue runs both tiers on the commit that will land. See `changes` below.
+  merge_group:
 
 concurrency:
   # A superseded run wastes a runner nobody will read the result of, and doubles the
@@ -41,6 +46,60 @@ env:
   CFLAGS: -std=gnu17
 
 jobs:
+  # Two tiers, to fit a 20-job org on a single PR. `full` is false for a change only to docs/ (bar
+  # docs/bench/, which point-read reads) or to root *.md: the default leg still runs, since it holds
+  # every test that reads docs. `slow` is the merge queue, a push, or a PR labelled `full-ci`.
+  # Gated jobs test `!= 'false'`, so a failed `changes` (empty outputs) runs everything, not nothing.
+  changes:
+    name: changes (which tiers run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      full: ${{ steps.tiers.outputs.full }}
+      slow: ${{ steps.tiers.outputs.slow }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A PR checks out its merge ref, whose first parent is the base.
+          fetch-depth: 2
+      - id: tiers
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
+          FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+        run: |
+          set -euo pipefail
+          full=true
+          case "$EVENT" in
+            pull_request) base=$(git rev-parse HEAD^1) ;;
+            merge_group) git fetch --no-tags --depth=1 origin "$QUEUE_BASE"; base=$QUEUE_BASE ;;
+            *) base= ;;
+          esac
+          if [ -n "$base" ]; then
+            git diff --name-only --no-renames "$base" HEAD > changed
+            echo "$(wc -l < changed) paths changed against $base"
+            full=false
+            [ -s changed ] || full=true
+            while IFS= read -r f; do
+              case "$f" in
+                docs/bench/*) full=true ;;
+                docs/*) ;;
+                */*) full=true ;;
+                *.md) ;;
+                *) full=true ;;
+              esac
+            done < changed
+          fi
+          slow=false
+          if [ "$full" = true ] && { [ "$EVENT" != pull_request ] || [ "$FULL_CI" = true ]; }; then
+            slow=true
+          fi
+          [ "$full" = true ] || echo "::notice::docs-only change: the default leg runs (it holds every doc test); the rest is skipped"
+          [ "$slow" = true ] || [ "$full" = false ] || echo "::notice::fast tier only. The slow tier runs in the merge queue, on main, or with the full-ci label"
+          echo "full=$full slow=$slow"
+          { echo "full=$full"; echo "slow=$slow"; } >> "$GITHUB_OUTPUT"
+
   # #733. The required check is this name. It used to be one job that compiled clippy and test,
   # each again for `exex`, into one `target/` - four artifact sets, ~69G, ENOSPC on a docs-only
   # PR. The hostedtoolcache reclaim (#639) bought back a few gigabytes and did not change the
@@ -59,16 +118,28 @@ jobs:
   check:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
-    needs: [check-default, test-default, check-no-count, test-no-count]
+    needs: [changes, check-default, test-default, check-no-count, test-no-count]
     if: always()
     timeout-minutes: 5
     steps:
       - name: every build and every shard green
+        shell: bash
         run: |
           echo "default build: ${{ needs.check-default.result }}"
           echo "default shards: ${{ needs.test-default.result }}"
           echo "head-count-deleted build: ${{ needs.check-no-count.result }}"
           echo "head-count-deleted shards: ${{ needs.test-no-count.result }}"
+          # Only a `changes` that succeeded can say `false`, so a broken one never excuses a leg.
+          if [ "${{ needs.changes.outputs.full }}" = false ] \
+            && [ "${{ needs.check-no-count.result }}" = skipped ] \
+            && [ "${{ needs.test-no-count.result }}" = skipped ]; then
+            echo "::notice::docs-only change: the head-count-deleted leg was skipped by design; the default leg must be green"
+            if [ "${{ needs.check-default.result }}" != success ] || [ "${{ needs.test-default.result }}" != success ]; then
+              echo "::error::fmt · clippy · test needs the default leg green, build and shards"
+              exit 1
+            fi
+            exit 0
+          fi
           # A shard reads `skipped` when its build did not succeed, so no test of that leg ran. That
           # has happened with no step of the build executed, when GitHub assigned it no runner inside
           # its window (#1920, during an Actions incident): a cancelled build, skipped shards, and
@@ -366,6 +437,8 @@ jobs:
   # `nuthatch count` is correctly unresolved, which is a doc question rather than a lost capability.
   check-no-count:
     name: fmt · clippy · build (head count deleted)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -452,6 +525,8 @@ jobs:
   # no-count legs above, not this one.
   check-features:
     name: fmt · clippy · build (optional features)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -530,6 +605,8 @@ jobs:
 
   pg-parity:
     name: scaled mode (parity · control plane · reconcile)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -607,6 +684,8 @@ jobs:
   # here ever started a real object store - S3 publishing had never touched one. This job does.
   minio-publish:
     name: publish (S3 via versitygw)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     env:
       ROOT_ACCESS_KEY: nuthatch
@@ -680,6 +759,8 @@ jobs:
   # reads, including a table whose columns drifted across seals. Not a required check.
   trino-contract:
     name: Trino contract (RFC-0052 S3)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     env:
       ROOT_ACCESS_KEY: nuthatch
@@ -772,6 +853,8 @@ jobs:
 
   fleet:
     name: the compose fleet comes up
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.slow != 'false' }}
     # The compose stack requires its credentials rather than shipping defaults, so CI supplies them
     # like any other operator. Job-level because several steps invoke `docker compose` and a missing
     # value fails interpolation before a single container starts. These are throwaway values for an
@@ -919,6 +1002,8 @@ jobs:
 
   deny:
     name: cargo-deny (vulns · licences · bans)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -947,6 +1032,8 @@ jobs:
 
   build-release:
     name: build release
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
     # 45, not 20 (#584). Warm this job is 3m40s-5m12s; cold - triggered by any `Cargo.lock`
     # change, since `Swatinem/rust-cache` keys on the lock hash - it is a full `--release` build
@@ -1026,7 +1113,8 @@ jobs:
 
   rolling-upgrade:
     name: rolling upgrade (followers answer throughout)
-    needs: build-release
+    needs: [changes, build-release]
+    if: ${{ !cancelled() && needs.build-release.result == 'success' && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1194,15 +1282,21 @@ jobs:
   # the binary, so each has its own runner and this job fails if either does.
   multinest-budget:
     name: per-cursor RAM budget (dense multi-nest)
-    needs: [multinest-footprint, wideabi-footprint]
+    needs: [changes, multinest-footprint, wideabi-footprint]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: both measurements green
+        shell: bash
         run: |
           echo "density: ${{ needs.multinest-footprint.result }}"
           echo "wide ABI: ${{ needs.wideabi-footprint.result }}"
+          # Only a `changes` that succeeded can say `false`, so a broken one never excuses this.
+          if [ "${{ needs.changes.outputs.slow }}" = false ]; then
+            echo "::notice::slow tier not run on this event (full=${{ needs.changes.outputs.full }}): nothing was measured. The merge queue measures it; label the PR full-ci to measure it here."
+            exit 0
+          fi
           # `skipped` means the release build did not succeed and neither measurement ran; see the
           # same case in `check` above.
           for r in "${{ needs.multinest-footprint.result }}" "${{ needs.wideabi-footprint.result }}"; do
@@ -1219,7 +1313,8 @@ jobs:
 
   multinest-footprint:
     name: per-cursor RAM budget (20 nests, one cursor)
-    needs: build-release
+    needs: [changes, build-release]
+    if: ${{ !cancelled() && needs.build-release.result == 'success' && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     # TIMEOUT_S (default 1800s = 30 min) bounds the harness's own wait loop; this is the backstop for
     # everything around it (checkout, artifact download, RPC startup) plus headroom, so a harness bug
@@ -1298,7 +1393,8 @@ jobs:
 
   wideabi-footprint:
     name: per-cursor RAM budget (wide ABI, one nest)
-    needs: build-release
+    needs: [changes, build-release]
+    if: ${{ !cancelled() && needs.build-release.result == 'success' && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -1331,6 +1427,8 @@ jobs:
 
   fuzz-smoke:
     name: fuzz smoke (decode path)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
     # A short, bounded regression run, not a real fuzzing campaign - libFuzzer needs a fresh
     # sanitizer-instrumented build (SanitizerCoverage), which only exists on nightly, so this
@@ -1414,6 +1512,8 @@ jobs:
 
   fuzz-sql:
     name: fuzz smoke (SQL confinement)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     # RFC-0073 FR8: read-only enforcement and confinement under fuzzed statements, shared and strict
     # (docs/security/shared-runtime.md). A tripwire like fuzz-smoke, not a campaign.
