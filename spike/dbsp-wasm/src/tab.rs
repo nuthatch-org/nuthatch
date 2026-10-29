@@ -197,7 +197,10 @@ impl TabNest {
             match process_window(window, tape, &logs, next, to, tip).await? {
                 Processed::Stored(_) => {}
                 Processed::Rewound(at) => rolled = Some(at),
-                Processed::Refused | Processed::Abandoned => {}
+                Processed::Refused => {}
+                Processed::Abandoned => {
+                    anyhow::bail!("window {next}..={to} was abandoned with no deadline set")
+                }
             }
         }
     }
