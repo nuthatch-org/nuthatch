@@ -186,6 +186,16 @@ async fn a_pinned_handle_reads_the_window_it_was_taken_at_on_both_backends() {
                 "last_block, {at}"
             );
         }
+        // Released, its holder is reused for the next pin, which must not see the old window.
+        drop(pinned);
+        store.commit_window(&[row("t", 4, 0)], None, 4).unwrap();
+        let again = store.pinned().unwrap().expect("both backends pin");
+        assert_eq!(again.count().unwrap(), 5, "a later pin, {name}");
+        assert_eq!(
+            tip_rows(again.as_ref()),
+            5,
+            "a later pin's hot rows, {name}"
+        );
     }
     assert_agree(
         redb.as_ref(),

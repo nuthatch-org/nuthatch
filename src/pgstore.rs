@@ -166,6 +166,7 @@ pub struct PgStore {
     snapshot: Option<std::sync::Arc<Exported>>,
     /// What [`HotStore::pinned`] connects with, to hold the snapshot it exports.
     config: postgres::Config,
+    holders: Holders,
     /// The nest's schema, already validated and quoted-safe.
     schema: String,
     /// Fence this handle holds (RFC-0022 slice 4); `0` means it has never claimed, which disables
@@ -173,22 +174,44 @@ pub struct PgStore {
     held: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// Connections that held a snapshot and are free to hold the next, so a window does not pay for a
+/// new connection (measured at 22 ms) each time it publishes.
+type Holders = std::sync::Arc<Mutex<Vec<Conn>>>;
+
+/// How many free holders a store keeps; one more is connected only when more snapshots are held.
+const IDLE_HOLDERS: usize = 4;
+
 /// A database snapshot held open on a connection of its own, so every read that imports it sees
 /// the store exactly as it stood when it was taken. The holding transaction ends when this drops.
 pub(crate) struct Exported {
     id: String,
-    _holder: Conn,
+    holder: Option<Conn>,
+    holders: Holders,
+}
+
+fn export(holder: &Conn) -> Result<String> {
+    holder.with(|c| {
+        // A holder handed back is rolled back on release; ending any transaction here as well means
+        // a snapshot is never one a release failed to end.
+        c.batch_execute("ROLLBACK; START TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")?;
+        Ok(c.query_one("SELECT pg_export_snapshot()", &[])?
+            .get::<_, String>(0))
+    })
 }
 
 impl Exported {
-    /// Take a snapshot now, on a new connection that holds it.
-    fn take(config: &postgres::Config) -> Result<Exported> {
-        let holder = Conn::spawn(config.clone()).context("connecting to hold a snapshot")?;
-        let id = holder.with(|c| {
-            c.batch_execute("START TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")?;
-            Ok(c.query_one("SELECT pg_export_snapshot()", &[])?
-                .get::<_, String>(0))
-        })?;
+    /// Take a snapshot now, on a free holder, or a new connection when none is free or the free one
+    /// has gone bad.
+    fn take(config: &postgres::Config, holders: &Holders) -> Result<Exported> {
+        let free = holders.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let (holder, id) = match free.map(|c| (export(&c), c)) {
+            Some((Ok(id), c)) => (c, id),
+            _ => {
+                let c = Conn::spawn(config.clone()).context("connecting to hold a snapshot")?;
+                let id = export(&c)?;
+                (c, id)
+            }
+        };
         // Spliced into SQL below, so it is checked to be what Postgres issues: hex and dashes.
         if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
             return Err(anyhow!(
@@ -197,12 +220,29 @@ impl Exported {
         }
         Ok(Exported {
             id,
-            _holder: holder,
+            holder: Some(holder),
+            holders: holders.clone(),
         })
     }
 
     fn import(&self) -> String {
         format!("SET TRANSACTION SNAPSHOT '{}'", self.id)
+    }
+}
+
+impl Drop for Exported {
+    /// Ends the holding transaction without waiting for it: the rollback is queued ahead of anything
+    /// the holder is given next.
+    fn drop(&mut self) {
+        let Some(holder) = self.holder.take() else {
+            return;
+        };
+        if holder.start(|c| Ok(c.batch_execute("ROLLBACK")?)).is_ok() {
+            let mut free = self.holders.lock().unwrap_or_else(|e| e.into_inner());
+            if free.len() < IDLE_HOLDERS {
+                free.push(holder);
+            }
+        }
     }
 }
 
@@ -326,6 +366,7 @@ impl PgStore {
             conn: std::sync::Arc::new(conn),
             snapshot: None,
             config,
+            holders: Holders::default(),
             schema,
             held: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -445,8 +486,12 @@ impl HotStore for PgStore {
     fn pinned(&self) -> Result<Option<std::sync::Arc<dyn HotStore>>> {
         Ok(Some(std::sync::Arc::new(PgStore {
             conn: self.conn.clone(),
-            snapshot: Some(std::sync::Arc::new(Exported::take(&self.config)?)),
+            snapshot: Some(std::sync::Arc::new(Exported::take(
+                &self.config,
+                &self.holders,
+            )?)),
             config: self.config.clone(),
+            holders: self.holders.clone(),
             schema: self.schema.clone(),
             held: self.held.clone(),
         })))
