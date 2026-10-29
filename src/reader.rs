@@ -339,7 +339,6 @@ struct Pending {
     /// The files waited for, and why the last attempt did not get them.
     waiting_for: Vec<String>,
     error: Option<String>,
-    fetching: bool,
 }
 
 /// What a queued line is charged: its keys and values, as [`crate::feed::row_bytes`] counts them.
@@ -1335,7 +1334,6 @@ impl Follower {
                     since: Instant::now(),
                     waiting_for: Vec::new(),
                     error: None,
-                    fetching: false,
                 });
             p.items.push_back(line.clone());
             p.bytes += bytes;
@@ -1365,7 +1363,6 @@ impl Follower {
             return;
         };
         if let Some(p) = self.lock().pending.get_mut(dataset) {
-            p.fetching = true;
             p.waiting_for = segments.iter().map(|(_, s)| s.file.clone()).collect();
         }
         let me = Arc::downgrade(self);
@@ -1403,7 +1400,6 @@ impl Follower {
                 let Some(p) = inner.pending.get_mut(dataset) else {
                     return Ok(());
                 };
-                p.fetching = false;
                 let Some(front) = p.items.front() else {
                     inner.pending.remove(dataset);
                     return Ok(());
