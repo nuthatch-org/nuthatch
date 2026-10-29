@@ -1162,18 +1162,13 @@ fn two_gate_runs_against_one_copy_serialise() {
     }
 }
 
-/// Nothing releases a mkdir lock for a holder that was killed, so a lock whose pid has gone is
+/// Nothing releases a pid-file lock for a holder that was killed, so a lock whose pid has gone is
 /// broken rather than waited on for ever.
 #[test]
 fn a_lock_left_by_a_killed_run_is_broken() {
     let c = case();
     let set = c.set(&[("answers", c.counts())]);
-    let mut gone = Command::new("true").spawn().unwrap();
-    let pid = gone.id();
-    gone.wait().unwrap();
-    let held = c.dir.path().join("nest.gate-lock.d");
-    std::fs::create_dir(&held).unwrap();
-    std::fs::write(held.join("pid"), format!("{pid}\n")).unwrap();
+    left_by_a_dead_pid(&c.dir.path().join("nest.gate-lock.d"), None);
     let mut cmd = Command::new(root().join("scripts/release-gate.sh"));
     calm(&mut cmd);
     cmd.args(["--passes", "1", "--out"])
@@ -1187,6 +1182,137 @@ fn a_lock_left_by_a_killed_run_is_broken() {
     let (code, text) = finish(child, c.dir.path(), "gate", 120);
     assert_eq!(code, Some(0), "{text}");
     assert!(text.contains("breaking"), "{text}");
+}
+
+/// Two waiters that both found the same dead pid both broke "the" stale lock, and the second
+/// removed the claim the first had just made, so both held it. A waits between judging the pid dead
+/// and acting on it while B breaks the lock and claims it.
+#[test]
+fn two_waiters_breaking_one_stale_lock_do_not_both_hold_it() {
+    two_breakers_one_paused_at("GATE_LOCK_BEFORE_BREAK");
+}
+
+/// Two waiters breaking the same dead pid at once: A has re-read the dead pid and is about to remove
+/// it when B gets there, so B must not remove it too and claim.
+#[test]
+fn two_waiters_breaking_at_once_do_not_both_hold_it() {
+    two_breakers_one_paused_at("GATE_LOCK_BEFORE_RM");
+}
+
+/// A pauses at `seam` in a lock left by a dead pid while B runs until it holds the lock or waits;
+/// then A goes on until it does the same. They must not both hold it, and both must finish.
+fn two_breakers_one_paused_at(seam: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let d = std::fs::canonicalize(dir.path()).unwrap();
+    left_by_a_dead_pid(&d.join("nest.gate-lock.d"), None);
+    let read = |name: &str| std::fs::read_to_string(d.join(format!("{name}.out"))).unwrap();
+    let decided = |name: &str| {
+        poll(&format!("{name} to hold the lock or wait"), 30, || {
+            let t = read(name);
+            (t.contains("HOLDING") || t.contains("waiting")).then_some(t)
+        })
+    };
+    let hook = format!(
+        "touch '{0}/a-paused'; while [ ! -e '{0}/go' ]; do sleep 0.05; done",
+        d.display()
+    );
+    let a = lock_waiter(&d, "a", Some((seam, &hook)));
+    poll("a to reach the seam", 30, || {
+        d.join("a-paused").exists().then_some(())
+    });
+    let b = lock_waiter(&d, "b", None);
+    let b_text = decided("b");
+    std::fs::write(d.join("go"), "").unwrap();
+    let a_text = decided("a");
+    std::fs::write(d.join("release.a"), "").unwrap();
+    std::fs::write(d.join("release.b"), "").unwrap();
+    let (code_a, text_a) = finish(a, &d, "a", 30);
+    let (code_b, text_b) = finish(b, &d, "b", 30);
+    assert!(
+        !(a_text.contains("HOLDING") && b_text.contains("HOLDING")),
+        "both held the lock:\n{a_text}\n{b_text}"
+    );
+    assert_eq!(code_b, Some(0), "{text_b}");
+    assert_eq!(code_a, Some(0), "{text_a}");
+    assert!(
+        !format!("{text_a}{text_b}").contains("OVERLAP"),
+        "{text_a}\n{text_b}"
+    );
+    assert!(
+        !d.join("nest.gate-lock.d").exists(),
+        "the lock is released on exit"
+    );
+}
+
+/// A waiter killed while breaking a dead pid's claim must not leave that claim unbreakable: the next
+/// waiter ignores the dead breaker's file.
+#[test]
+fn a_break_left_by_a_killed_waiter_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = std::fs::canonicalize(dir.path()).unwrap();
+    let held = d.join("nest.gate-lock.d");
+    left_by_a_dead_pid(&held, Some(dead_pid()));
+    let a = lock_waiter(&d, "a", None);
+    poll("a to break the lock and hold it", 30, || {
+        std::fs::read_to_string(d.join("a.out"))
+            .unwrap()
+            .contains("HOLDING")
+            .then_some(())
+    });
+    std::fs::write(d.join("release.a"), "").unwrap();
+    let (code, text) = finish(a, &d, "a", 30);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("breaking"), "{text}");
+    assert!(!held.exists(), "the lock is released on exit:\n{text}");
+}
+
+fn dead_pid() -> u32 {
+    let mut gone = Command::new("true").spawn().unwrap();
+    let pid = gone.id();
+    gone.wait().unwrap();
+    pid
+}
+
+/// The lock directory a run killed while holding it leaves, and with `breaker`, the
+/// `brk.<pid>.<breaker>` a waiter killed while breaking it leaves too.
+fn left_by_a_dead_pid(held: &Path, breaker: Option<u32>) {
+    let pid = dead_pid();
+    std::fs::create_dir(held).unwrap();
+    std::fs::write(held.join("pid"), format!("{pid}\n")).unwrap();
+    if let Some(b) = breaker {
+        std::fs::write(held.join(format!("brk.{pid}.{b}")), "").unwrap();
+    }
+}
+
+/// Takes the lock on `<d>/nest`, says HOLDING, and holds it until `<d>/release.<name>` exists.
+fn lock_waiter(d: &Path, name: &str, hook: Option<(&str, &str)>) -> Child {
+    let waiter = d.join("waiter.sh");
+    std::fs::write(
+        &waiter,
+        r#". "$1"
+trap gate_unlock EXIT
+gate_lock "$2/nest" || exit 1
+(set -C; : >"$2/inside") 2>/dev/null || echo OVERLAP
+echo HOLDING
+while [ ! -e "$2/release.$3" ]; do sleep 0.05; done
+rm -f "$2/inside"
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(d.join("nest")).unwrap();
+    let mut cmd = Command::new("bash");
+    cmd.arg(&waiter)
+        .arg(root().join("scripts/gate/lock.sh"))
+        .arg(d)
+        .arg(name)
+        .env("GATE_LOCK_PORTABLE", "1")
+        .env_remove("GATE_LOCK_HELD")
+        .env_remove("GATE_LOCK_BEFORE_BREAK")
+        .env_remove("GATE_LOCK_BEFORE_RM");
+    if let Some((seam, hook)) = hook {
+        cmd.env(seam, hook);
+    }
+    run_bounded(cmd, d, name)
 }
 
 /// On 2026-10-04 v4.3.1 was gated against v4.3.0, the latest release, while the allocations nest

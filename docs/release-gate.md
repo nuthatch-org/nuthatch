@@ -220,7 +220,7 @@ sees those. A per-nest DuckDB reference stage (#1796) also did, and was removed 
 The copy is a whole nest directory, segments and redb, and the gate wants a quiet box for its
 timings, so it does not fit a GitHub runner. It runs on the ThinkPad, which already runs the QoS nest; the gate is scheduled away from
 that nest's busy periods. Every gate run against a copy, the timer's or one by hand with
-`release-gate.sh`, takes the same lock beside it (`alloc-nest.gate-lock`; flock on Linux, a mkdir
+`release-gate.sh`, takes the same lock beside it (`alloc-nest.gate-lock`; flock on Linux, a pid-file
 lock elsewhere) and waits for any other: two `serve`s cannot open one redb.
 
 **The copy** lives at `~/release-gate/alloc-nest` and is refreshed from the Lodestar box in Helsinki
