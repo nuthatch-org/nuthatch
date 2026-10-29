@@ -75,6 +75,11 @@ async fn serve_without_hot_store_refuses_a_nest_with_no_store_rather_than_creati
         publish_parallelism: 2,
         runtime: None,
         follow: None,
+        mirror: None,
+        registry: None,
+        cache: None,
+        max_rss_mb: None,
+        feed_version: 2,
     };
     let err = refusal(args).await;
 
@@ -114,6 +119,11 @@ async fn serve_without_hot_store_refuses_a_store_a_live_handle_holds() {
         publish_parallelism: 2,
         runtime: None,
         follow: None,
+        mirror: None,
+        registry: None,
+        cache: None,
+        max_rss_mb: None,
+        feed_version: 2,
     };
     let err = refusal(args).await;
 
@@ -148,6 +158,11 @@ async fn serve_without_hot_store_serves_a_store_the_writer_left_behind() {
         publish_parallelism: 2,
         runtime: None,
         follow: None,
+        mirror: None,
+        registry: None,
+        cache: None,
+        max_rss_mb: None,
+        feed_version: 2,
     };
     let task = tokio::spawn(async move {
         let _ = nuthatch::indexer::serve_role(args).await;

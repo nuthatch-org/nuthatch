@@ -320,6 +320,7 @@ async fn a_running_nest_publishes_a_snapshot_another_can_seed_from() {
             target: mirror.path().to_str().unwrap().to_string(),
             interval: std::time::Duration::from_millis(200),
             parallelism: 2,
+            followers: false,
         },
     )
     .expect("the publisher starts");

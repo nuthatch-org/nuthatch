@@ -1491,14 +1491,39 @@ pub struct ServeArgs {
 
     /// Serve every mount of the runtime at this directory, read-only, beside the writer named by
     /// `--follow` (RFC-0073 FR1). Sealed segments are read from here; redb is never opened.
-    #[arg(long, value_name = "DIR", requires = "follow", conflicts_with_all = ["hot_store", "publish_target", "admin"])]
+    #[arg(long, value_name = "DIR", requires = "follow", conflicts_with_all = ["hot_store", "publish_target", "admin", "mirror"])]
     pub runtime: Option<String>,
 
     /// The writer's address, e.g. `http://127.0.0.1:8288`, whose hot-state feed this process
     /// follows. Its admin token comes from `NUTHATCH_ADMIN_TOKEN`, or the token file the writer keeps
     /// in the runtime directory; never from the command line.
-    #[arg(long, value_name = "URL", requires = "runtime")]
+    #[arg(long, value_name = "URL")]
     pub follow: Option<String>,
+
+    /// Follow from another host (RFC-0076 FR17): take sealed segments and offchain snapshots from
+    /// the writer's `[runtime.publish]` mirror (`s3://…`, `https://…` or a path), each checked
+    /// against its hash, instead of from a runtime directory.
+    #[arg(long, value_name = "MIRROR", requires_all = ["follow", "registry", "cache"], conflicts_with_all = ["hot_store", "publish_target", "admin"])]
+    pub mirror: Option<String>,
+
+    /// With `--mirror`: the registry the writer's nests are published to, each fetched by its NID
+    /// and verified as `nest load` verifies it.
+    #[arg(long, value_name = "REGISTRY", requires = "mirror")]
+    pub registry: Option<String>,
+
+    /// With `--mirror`: this follower's own directory, for the nests and segments it fetches.
+    #[arg(long, value_name = "DIR", requires = "mirror")]
+    pub cache: Option<String>,
+
+    /// With `--mirror`: the per-cursor budget in MiB, which beside the writer comes from its
+    /// `mounts.toml`.
+    #[arg(long, value_name = "MB", requires = "mirror")]
+    pub max_rss_mb: Option<u64>,
+
+    /// The feed format a follower asks the writer for: 2, framed with Arrow batches, or 1,
+    /// newline-delimited JSON.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=2), hide = true)]
+    pub feed_version: u32,
 }
 
 #[derive(Args)]

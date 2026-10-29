@@ -71,6 +71,8 @@ pub mod factory;
 pub mod fair_share;
 pub mod feed;
 pub mod feed_http;
+pub mod feed_metrics;
+pub mod feed_wire;
 /// RFC-0059 checkpointed folds, behind the off-by-default `folds` feature.
 #[cfg(feature = "folds")]
 pub mod folds;
@@ -122,6 +124,7 @@ pub mod recipes;
 #[cfg(feature = "postgres-store")]
 pub mod reconcile;
 pub mod registry;
+pub mod remote_follow;
 pub mod requests;
 pub mod rpc;
 pub mod runtime;

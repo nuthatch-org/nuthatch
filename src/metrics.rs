@@ -2077,6 +2077,7 @@ impl Metrics {
         }
         self.render_serving(&mut s);
         self.render_cursors(&mut s);
+        crate::feed_metrics::metrics().render(&mut s);
         s
     }
 

@@ -175,6 +175,24 @@ chain_id = 42161
 rpc_urls = ["http://127.0.0.1:$rpc_port/"]
 EOF
 "$current" migrate --dir "$rt" >"$out/migrate.log" 2>&1 || die "migrate failed: $(tail -n 5 "$out/migrate.log")"
+# RFC-0076 FR17's leg needs the dataset mirrored and the nest in a registry. ROLLING_MIRROR and
+# ROLLING_REGISTRY may name s3:// prefixes; by default both are directories outside the runtime.
+mirror=${ROLLING_MIRROR:-$out/mirror}
+registry=${ROLLING_REGISTRY:-$out/registry}
+cat >>"$rt/mounts.toml" <<EOF
+
+[runtime.publish]
+target = "$mirror"
+interval = "1s"
+followers = true
+EOF
+nid=$(ls "$rt/data" | head -n 1)
+[ -n "$nid" ] || die "migrate left no dataset under $rt/data"
+"$current" nest bundle "$rt/data/$nid" --out "$out/gate.bundle" >"$out/bundle.log" 2>&1 \
+  || die "bundle failed: $(tail -n 5 "$out/bundle.log")"
+"$current" nest publish "$out/gate.bundle" --registry "$registry" >"$out/publish.log" 2>&1 \
+  || die "nest publish failed: $(tail -n 5 "$out/publish.log")"
+grep -q "nid:   $nid" "$out/publish.log" || die "the bundle's NID is not the mount's $nid: $(cat "$out/publish.log")"
 
 NUTHATCH_ADMIN_TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 export NUTHATCH_ADMIN_TOKEN
@@ -278,6 +296,30 @@ wait_for "follower two follows the upgraded writer" follower_caught_up "$f_port2
 
 kill "$prober"
 wait "$prober" 2>/dev/null || true
+
+# RFC-0076 FR17: a follower on another host, sharing no path with the writer, answers as follower
+# one does, provenance included.
+f_port3=$(free_port)
+"$current" serve --follow "$writer_url" --mirror "$mirror" --registry "$registry" \
+  --cache "$out/elsewhere" --listen "127.0.0.1:$f_port3" >>"$out/remote.log" 2>&1 &
+pids="$pids $!"
+provenance() { # <port> -> as_of, sealed_through and nid
+  json_get "http://127.0.0.1:$1/gate/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20$table" \
+    | grep -Eo '"(as_of|sealed_through|nid|n)":("[0-9a-f]*"|[0-9]+|null)' | sort | tr '\n' ' '
+}
+remote_agrees() {
+  follower_caught_up "$f_port3" || return 1
+  local a b
+  a=$(provenance "$f_port1") b=$(provenance "$f_port3")
+  [ -n "$b" ] && [ "$a" = "$b" ] && printf '%s' "$b" | grep -q "\"nid\":\"$nid\""
+}
+wait_for "a follower on another host answers as follower one does" remote_agrees
+[ -f "$out/elsewhere/data/$nid/nuthatch.toml" ] || fail "the remote follower did not install the nest from the registry"
+[ ! -e "$out/elsewhere/data/$nid/nuthatch.redb" ] || fail "the remote follower holds a store"
+# Eight transfers never reach a seal on the tip path, so segments from the mirror are gated by
+# tests/e2e_remote_follower.rs; this leg is the separate processes, the CLI and the registry.
+say "ok: remote follower agrees: $(provenance "$f_port3")"
+
 probes=$(wc -l <"$probe_log" | tr -d ' ')
 failed=$(grep -c '^FAIL' "$probe_log" || true)
 [ "$probes" -gt 0 ] || fail "the prober recorded nothing"

@@ -4889,6 +4889,7 @@ dependencies = [
  "hyper-util",
  "k256",
  "libc",
+ "lz4_flex",
  "md-5 0.10.6",
  "num-bigint 0.4.8",
  "nuthatch-core",

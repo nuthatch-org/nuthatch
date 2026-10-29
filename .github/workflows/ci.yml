@@ -832,8 +832,8 @@ jobs:
         run: |
           aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_MINIO_BUCKET"
           aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_REGISTRY_BUCKET"
-      - name: publish, registry and seed suites against a real S3 server
-        run: cargo test --locked --test it -- e2e_minio_publish e2e_s3_registry e2e_s3_seed_mount
+      - name: publish, registry, seed and remote follower suites against a real S3 server
+        run: cargo test --locked --test it -- e2e_minio_publish e2e_s3_registry e2e_s3_seed_mount e2e_remote_follower
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
         uses: ./.github/actions/timeout-or-cancel

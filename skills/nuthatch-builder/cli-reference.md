@@ -476,6 +476,10 @@ Serve a nest without indexing it (RFC-0022 slice 3)
 - `--publish-parallelism <PUBLISH_PARALLELISM>` - Objects the mirror uploads at once
 - `--runtime <RUNTIME>` - Serve every mount of the runtime at this directory, read-only, beside the writer named by `--follow` (RFC-0073 FR1). Sealed segments are read from here; redb is never opened
 - `--follow <FOLLOW>` - The writer's address, e.g. `http://127.0.0.1:8288`, whose hot-state feed this process follows. Its admin token comes from `NUTHATCH_ADMIN_TOKEN`, or the token file the writer keeps in the runtime directory; never from the command line
+- `--mirror <MIRROR>` - Follow from another host (RFC-0076 FR17): take sealed segments and offchain snapshots from the writer's `[runtime.publish]` mirror (`s3://…`, `https://…` or a path), each checked against its hash, instead of from a runtime directory
+- `--registry <REGISTRY>` - With `--mirror`: the registry the writer's nests are published to, each fetched by its NID and verified as `nest load` verifies it
+- `--cache <CACHE>` - With `--mirror`: this follower's own directory, for the nests and segments it fetches
+- `--max-rss-mb <MAX_RSS_MB>` - With `--mirror`: the per-cursor budget in MiB, which beside the writer comes from its `mounts.toml`
 
 ## `nuthatch settle`
 

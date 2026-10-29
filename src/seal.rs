@@ -491,6 +491,19 @@ fn retained(key: &Path) -> bool {
     r.files.iter().any(|f| f.key == key)
 }
 
+/// Whether a follower of `dir` may still name the segment `hash`, by the rule that keeps it on disk:
+/// what a mirror deletion asks before removing the copy a follower on another host reads.
+pub fn follower_may_name(dir: &Path, hash: &str) -> bool {
+    shared_store(dir)
+        .is_some_and(|store| retained(&segment_key(&store.join(format!("{hash}.parquet")))))
+}
+
+/// The least time a file a fold replaced in `dir` is kept for followers.
+pub fn follower_grace(dir: &Path) -> Duration {
+    let r = retention().lock().unwrap();
+    r.window(&lease_key(dir)).0
+}
+
 /// Let go of every retained segment that may go. Called as followers report.
 pub fn release_retained() {
     retention().lock().unwrap().release();

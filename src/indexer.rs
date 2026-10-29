@@ -109,6 +109,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
             target,
             interval: args.publish_interval,
             parallelism: args.publish_parallelism as usize,
+            followers: false,
         });
     let audit = match &args.audit_rpc {
         Some(url) => {
@@ -3836,6 +3837,7 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
                     target,
                     interval: args.publish_interval,
                     parallelism: args.publish_parallelism as usize,
+                    followers: false,
                 },
             )
         })
@@ -15230,18 +15232,22 @@ template = "pool"
             };
             match run_reorg_case(&case, &want).await {
                 Ok(Some(stats)) => {
-                    let (markers, applied) = (
-                        stats
-                            .reorg_markers
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                        stats
-                            .markers_applied
-                            .load(std::sync::atomic::Ordering::Relaxed),
+                    let load = |a: &std::sync::atomic::AtomicU64| {
+                        a.load(std::sync::atomic::Ordering::Relaxed)
+                    };
+                    let (markers, applied, missed) = (
+                        load(&stats.reorg_markers),
+                        load(&stats.markers_applied),
+                        load(&stats.markers_missed),
                     );
+                    // Extraction issues a marker each pass that finds the nest it checks against still
+                    // holding the replaced chain, so under load more can be issued than are kept; a nest that
+                    // finds its marker evicted is told so and checks for itself. Either way the reorg
+                    // reached it through a marker.
                     assert!(
-                        !marked || (markers >= 1 && applied >= 1),
+                        !marked || (markers >= 1 && applied + missed >= 1),
                         "{kind:?}: the reorg must have gone through a marker: {markers} issued, \
-                         {applied} applied"
+                         {applied} applied, {missed} found evicted"
                     );
                 }
                 Ok(None) => {}

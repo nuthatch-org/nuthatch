@@ -168,7 +168,9 @@ async fn main() -> Result<()> {
                 indexer::dev(args).await
             }
         }
-        cli::Command::Serve(args) if args.runtime.is_some() => nuthatch::reader::serve(args).await,
+        cli::Command::Serve(args) if args.runtime.is_some() || args.follow.is_some() => {
+            nuthatch::reader::serve(args).await
+        }
         cli::Command::Serve(args) => indexer::serve_role(args).await,
         #[cfg(feature = "postgres-store")]
         cli::Command::Worker(args) => {

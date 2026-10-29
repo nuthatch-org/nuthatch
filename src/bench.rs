@@ -1013,6 +1013,7 @@ async fn one_run(
                 target: format!("{}/{name}", target.trim_end_matches('/')),
                 interval: std::time::Duration::from_secs(60),
                 parallelism: crate::publish::DEFAULT_PARALLELISM,
+                followers: false,
             };
             Some((
                 crate::publish::spawn(work.clone(), name.clone(), settings)?,

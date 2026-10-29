@@ -65,6 +65,14 @@ pub(crate) trait Mirror: Send + Sync {
     fn content_etags(&self) -> bool {
         false
     }
+    /// Remove `key`; one already gone is not an error.
+    async fn delete(&self, key: &str) -> Result<()> {
+        bail!("this mirror cannot delete {key}")
+    }
+    /// Every key under `prefix`, relative to the mirror.
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        bail!("this mirror cannot list {prefix}")
+    }
     /// Write `key` to `dest`, refusing more than `cap` bytes, and return the sha256 of what was written.
     async fn get_file(&self, key: &str, dest: &Path, cap: u64) -> Result<Option<String>> {
         let Some(bytes) = self.get(key).await? else {
@@ -177,6 +185,36 @@ impl Mirror for FsMirror {
 
     fn content_etags(&self) -> bool {
         true
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        match std::fs::remove_file(self.path(key)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("deleting {key}")),
+        }
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let dir = self.path(prefix);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).with_context(|| format!("listing {prefix}")),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                out.push(format!(
+                    "{}/{}",
+                    prefix.trim_end_matches('/'),
+                    entry.file_name().to_string_lossy()
+                ));
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 }
 
@@ -463,6 +501,59 @@ impl Mirror for ObjMirror {
             Err(e) => Err(obj_read_err(e, key)),
         }
     }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        use object_store::ObjectStore as _;
+        match self.inner.delete(&self.key(key)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("deleting {key}"))),
+        }
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        use object_store::ObjectStore as _;
+        let base = self.key(prefix);
+        let mut listed = self.inner.list(Some(&base));
+        let mut out = Vec::new();
+        let skip = self.prefix.as_ref().len();
+        while let Some(meta) = listed.next().await {
+            let meta = meta.with_context(|| format!("listing {prefix}"))?;
+            let full = meta.location.as_ref();
+            out.push(full[skip..].trim_start_matches('/').to_string());
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// A chunk at a time, so fetching a segment never holds it whole.
+    async fn get_file(&self, key: &str, dest: &Path, cap: u64) -> Result<Option<String>> {
+        use object_store::ObjectStore as _;
+        use std::io::Write as _;
+        let got = match self.inner.get(&self.key(key)).await {
+            Ok(g) => g,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(obj_read_err(e, key)),
+        };
+        if got.meta.size > cap {
+            bail!("{key} is larger than {cap} bytes");
+        }
+        let mut file =
+            std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+        let mut hasher = Sha256::new();
+        let mut stream = got.into_stream();
+        let mut n = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.with_context(|| format!("reading {key}"))?;
+            n += chunk.len() as u64;
+            if n > cap {
+                bail!("{key} is larger than {cap} bytes");
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .with_context(|| format!("writing {}", dest.display()))?;
+        }
+        Ok(Some(hex::encode(hasher.finalize())))
+    }
 }
 
 /// A refused read carries `access_denied`, so a seeding mount's job says why it failed (RFC-0073 FR16).
@@ -657,6 +748,16 @@ fn want_entries(manifest: &Manifest) -> Vec<(String, &Segment)> {
 pub(crate) struct Present {
     dataset: String,
     held: BTreeSet<(String, String)>,
+    /// Provisional segments on the mirror for followers, with when this process first saw the
+    /// catalogue stop naming each.
+    provisional: HashMap<String, Option<std::time::Instant>>,
+    /// Whether the mirror's provisional segments have been listed, so ones a previous process left
+    /// are let go of too.
+    listed: bool,
+    /// Whether the followers marker is known to be on the mirror.
+    marked: bool,
+    /// `followers = true`: publish what a follower on another host reads. Never cleared by [`Present::of`].
+    followers: bool,
 }
 
 impl Present {
@@ -664,9 +765,118 @@ impl Present {
         if self.dataset != dataset {
             self.dataset = dataset.to_string();
             self.held.clear();
+            self.provisional.clear();
+            self.listed = false;
+            self.marked = false;
         }
         &mut self.held
     }
+}
+
+/// What a follower on another host reads beside the published segments (RFC-0076 FR17): each
+/// table's provisional segment, which the published catalogue leaves out, and the offchain
+/// snapshots with their catalogue. A provisional segment the catalogue has stopped naming is
+/// deleted from the mirror by the rule that keeps it on disk for followers: once every follower of
+/// the dataset has applied the commit that stopped naming it and the grace has passed, or at most.
+async fn put_follower_files(
+    mirror: &dyn Mirror,
+    dir: &Path,
+    data_identity: &str,
+    local: &Manifest,
+    present: &mut Present,
+) -> Result<Vec<String>> {
+    use crate::remote_follow::{offchain_key, provisional_key, OFFCHAIN_CATALOGUE};
+    let prefix = |k: &str| format!("{data_identity}/{k}");
+    let mut put = Vec::new();
+    present.of(data_identity);
+    if !present.marked {
+        let key = prefix(crate::remote_follow::FOLLOWERS_MARKER);
+        if mirror.head(&key).await?.is_none() {
+            mirror.put(&key, b"{\"followers\":true}").await?;
+            put.push(crate::remote_follow::FOLLOWERS_MARKER.to_string());
+        }
+        present.marked = true;
+    }
+    let named: BTreeSet<&str> = local
+        .tables
+        .values()
+        .flatten()
+        .filter(|s| s.provisional)
+        .map(|s| s.hash.as_str())
+        .collect();
+    for s in local.tables.values().flatten().filter(|s| s.provisional) {
+        if present.provisional.contains_key(&s.hash) {
+            continue;
+        }
+        let key = prefix(&provisional_key(&s.hash));
+        if mirror.head(&key).await?.is_none() {
+            let src = seal::segment_path(dir, &s.file, &s.hash);
+            if !src.exists() {
+                // Folded after the catalogue was read; the seal wakes the next pass.
+                continue;
+            }
+            mirror.put_file(&key, &src).await?;
+            put.push(provisional_key(&s.hash));
+        }
+        present.provisional.insert(s.hash.clone(), None);
+    }
+    if !present.listed {
+        match mirror
+            .list(&prefix(crate::remote_follow::PROVISIONAL_DIR))
+            .await
+        {
+            Ok(keys) => {
+                for k in keys {
+                    if let Some(hash) = k.rsplit('/').next().and_then(|f| f.strip_suffix(".seg")) {
+                        present.provisional.entry(hash.to_string()).or_default();
+                    }
+                }
+                present.listed = true;
+            }
+            Err(e) => tracing::debug!("listing provisional segments on the mirror: {e:#}"),
+        }
+    }
+    let grace = seal::follower_grace(dir);
+    let mut gone = Vec::new();
+    for (hash, unnamed) in present.provisional.iter_mut() {
+        if named.contains(hash.as_str()) {
+            *unnamed = None;
+            continue;
+        }
+        let since = *unnamed.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() >= grace && !seal::follower_may_name(dir, hash) {
+            gone.push(hash.clone());
+        }
+    }
+    for hash in gone {
+        mirror.delete(&prefix(&provisional_key(&hash))).await?;
+        present.provisional.remove(&hash);
+        put.push(format!("-{}", provisional_key(&hash)));
+    }
+
+    let offchain = crate::offchain::load(dir)?;
+    for s in offchain.tables.values().flatten() {
+        let id = ("_offchain".to_string(), s.hash.clone());
+        if present.held.contains(&id) {
+            continue;
+        }
+        let key = prefix(&offchain_key(&s.file));
+        if mirror.head(&key).await?.is_none() {
+            mirror
+                .put_file(&key, &crate::offchain::segment_path(dir, s))
+                .await?;
+            put.push(offchain_key(&s.file));
+        }
+        present.held.insert(id);
+    }
+    if let Ok(bytes) = std::fs::read(crate::offchain::catalogue_path(dir)) {
+        let key = prefix(OFFCHAIN_CATALOGUE);
+        if mirror.get(&key).await?.as_deref() != Some(bytes.as_slice()) {
+            mirror.put(&key, &bytes).await?;
+            put.push(OFFCHAIN_CATALOGUE.to_string());
+        }
+    }
+    Ok(put)
 }
 
 async fn remote_present(
@@ -910,6 +1120,15 @@ pub async fn sync_with(
     .await
 }
 
+/// [`sync`] with `followers = true`: also what a follower on another host reads (RFC-0076 FR17).
+pub async fn sync_for_followers(dir: &Path, target: &str) -> Result<SyncReport> {
+    let mut present = Present {
+        followers: true,
+        ..Present::default()
+    };
+    sync_pass(dir, target, false, DEFAULT_PARALLELISM, None, &mut present).await
+}
+
 /// One reconcile pass, skipping the HEAD for every segment `present` already holds.
 async fn sync_pass(
     dir: &Path,
@@ -1066,6 +1285,11 @@ async fn sync_pass(
         if let Some(seed) = seed {
             uploaded.extend(put_seed(mirror.as_ref(), dir, &seed).await?);
         }
+    }
+    if present.followers {
+        uploaded.extend(
+            put_follower_files(mirror.as_ref(), dir, &data_identity, &local, present).await?,
+        );
     }
 
     Ok(SyncReport {
@@ -1442,6 +1666,9 @@ pub struct Settings {
     pub target: String,
     pub interval: std::time::Duration,
     pub parallelism: usize,
+    /// Also publish what a follower on another host reads (RFC-0076 FR17). Off, a pass uploads and
+    /// deletes exactly what it did before followers existed.
+    pub followers: bool,
 }
 
 /// A running mirror. Dropping it stops the reconciler and cancels any upload in flight.
@@ -1492,7 +1719,10 @@ async fn reconcile(
     metrics.set_publish_enabled(&settings.target);
     let mut changes = seal::manifest_changes(&dir);
     let mut failures = Failures::default();
-    let mut present = Present::default();
+    let mut present = Present {
+        followers: settings.followers,
+        ..Present::default()
+    };
     loop {
         let pass = sync_pass(
             &dir,
@@ -1813,6 +2043,7 @@ mod tests {
             target,
             interval,
             parallelism,
+            followers: false,
         }
     }
 
@@ -3007,5 +3238,234 @@ abi = "abis/usdc.json"
         assert_eq!(got, Some(sha256_hex(&[7u8; 4096])));
         assert_eq!(std::fs::read(&dest).unwrap(), vec![7u8; 4096]);
         server.abort();
+    }
+
+    /// RFC-0076 FR17: a provisional segment a fold replaced stays on the mirror while a follower of
+    /// its dataset may still name it, by the rule that keeps it on disk, and goes once that follower
+    /// has applied the commit that stopped naming it and the grace has run.
+    #[tokio::test]
+    async fn a_folded_provisional_segment_leaves_the_mirror_only_once_followers_move_on() {
+        const GRACE: Duration = Duration::from_millis(100);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("data").join("t");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_nest(&dir);
+        test_set_table_floor(&dir, 100);
+        seal::set_follower_retention(&dir, GRACE, Duration::from_secs(60));
+        let mirror_dir = tempfile::tempdir().unwrap();
+        let target = mirror_dir.path().display().to_string();
+        let mut present = Present {
+            followers: true,
+            ..Present::default()
+        };
+        async fn run(dir: &Path, target: &str, present: &mut Present) -> SyncReport {
+            sync_pass(dir, target, false, 1, None, present)
+                .await
+                .unwrap()
+        }
+        macro_rules! pass {
+            ($p:expr) => {
+                run(&dir, &target, $p)
+            };
+        }
+        let tail = || {
+            seal::load_manifest(&dir).unwrap().tables["usdc__transfer"][0]
+                .hash
+                .clone()
+        };
+        let on_mirror = |id: &str, hash: &str| {
+            mirror_dir
+                .path()
+                .join(id)
+                .join(crate::remote_follow::provisional_key(hash))
+                .exists()
+        };
+
+        seal_range(&dir, &[row(1, 1)], 1, 1).unwrap().unwrap();
+        let first = tail();
+        let report = pass!(&mut present).await;
+        let id = report.dataset.clone();
+        assert!(
+            on_mirror(&id, &first),
+            "a provisional segment is published for followers"
+        );
+
+        seal::follower_connected(&dir, 4242);
+        seal_range(&dir, &[row(2, 2)], 2, 2).unwrap().unwrap();
+        seal::catalogue_moved(&dir, (9, 2));
+        let second = tail();
+        assert_ne!(first, second, "premise: the second seal folded the first");
+        pass!(&mut present).await;
+        tokio::time::sleep(GRACE * 3).await;
+        pass!(&mut present).await;
+        assert!(on_mirror(&id, &second));
+        assert!(
+            on_mirror(&id, &first),
+            "kept past the grace while the follower has not applied the commit"
+        );
+
+        seal::follower_applied(&dir, 4242, (9, 2));
+        pass!(&mut present).await;
+        assert!(
+            !on_mirror(&id, &first),
+            "deleted once the follower moved on"
+        );
+        assert!(on_mirror(&id, &second));
+
+        // A provisional segment nobody follows goes after the grace, and one a previous process
+        // left behind is found by listing.
+        seal::follower_gone(&dir, 4242);
+        seal_range(&dir, &[row(3, 3)], 3, 3).unwrap().unwrap();
+        seal::catalogue_moved(&dir, (9, 3));
+        let mut fresh = Present {
+            followers: true,
+            ..Present::default()
+        };
+        pass!(&mut fresh).await;
+        tokio::time::sleep(GRACE * 3).await;
+        pass!(&mut fresh).await;
+        assert!(
+            !on_mirror(&id, &second),
+            "an unfollowed tail goes after the grace"
+        );
+        assert!(on_mirror(&id, &tail()));
+    }
+
+    /// RFC-0076 FR17: offchain snapshots go to the mirror content-addressed, and a follower on
+    /// another host brings its copy up to them, each file checked against its hash.
+    #[tokio::test]
+    async fn offchain_snapshots_reach_a_remote_follower_verified() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("data").join("t");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_nest(&dir);
+        let csv = root.path().join("prices.csv");
+        std::fs::write(&csv, "token,price\nusdc,1\nweth,3000\n").unwrap();
+        crate::offchain::drop_file(&dir, &csv, "prices").unwrap();
+        let mirror_dir = tempfile::tempdir().unwrap();
+        let target = mirror_dir.path().display().to_string();
+        let report = sync_for_followers(&dir, &target).await.unwrap();
+        let id = report.dataset;
+        assert!(
+            report
+                .uploaded
+                .iter()
+                .any(|k| k == crate::remote_follow::OFFCHAIN_CATALOGUE),
+            "{:?}",
+            report.uploaded
+        );
+
+        let remote = crate::remote_follow::Remote::open(&target, "unused", 2048).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cache.path().join("data/t")).unwrap();
+        assert!(remote
+            .sync_offchain(cache.path(), "data/t", &id)
+            .await
+            .unwrap());
+        let theirs = crate::offchain::load(&dir).unwrap();
+        let ours = crate::offchain::load(&cache.path().join("data/t")).unwrap();
+        let snapshot = &ours.tables["prices"][0];
+        assert_eq!(snapshot.hash, theirs.tables["prices"][0].hash);
+        let file = crate::offchain::segment_path(&cache.path().join("data/t"), snapshot);
+        assert_eq!(
+            sha256_hex(&std::fs::read(&file).unwrap()),
+            snapshot.hash,
+            "the copy is the bytes its catalogue names"
+        );
+        assert!(
+            !remote
+                .sync_offchain(cache.path(), "data/t", &id)
+                .await
+                .unwrap(),
+            "nothing to do the second time"
+        );
+
+        // Bytes that do not hash to the name are refused, and no catalogue names them.
+        let on_mirror = mirror_dir
+            .path()
+            .join(&id)
+            .join(crate::remote_follow::offchain_key(&snapshot.file));
+        std::fs::write(&on_mirror, b"not the snapshot").unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(other.path().join("data/t")).unwrap();
+        let refused = remote.sync_offchain(other.path(), "data/t", &id).await;
+        assert!(refused.is_err(), "a tampered snapshot was taken");
+        assert!(!crate::offchain::catalogue_path(&other.path().join("data/t")).exists());
+        assert!(!crate::offchain::segment_path(&other.path().join("data/t"), snapshot).exists());
+    }
+
+    /// With `followers` off, which every mirror published before RFC-0076 is, a pass puts on the
+    /// mirror exactly what it did in v5.13.0 and deletes nothing: no provisional segment, no
+    /// offchain snapshot, however many seals and folds there have been. On, it adds only those.
+    #[tokio::test]
+    async fn without_followers_a_mirror_gets_exactly_what_it_did_before() {
+        async fn run(followers: bool, name: &str) -> (Vec<String>, Vec<String>) {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("data").join("t");
+            std::fs::create_dir_all(&dir).unwrap();
+            write_nest(&dir);
+            test_set_table_floor(&dir, 2);
+            seal::set_follower_retention(&dir, Duration::ZERO, Duration::from_secs(60));
+            let csv = root.path().join("prices.csv");
+            std::fs::write(&csv, "token,price\nusdc,1\n").unwrap();
+            crate::offchain::drop_file(&dir, &csv, "prices").unwrap();
+            let target = format!("memory://{name}");
+            let mut present = Present {
+                followers,
+                ..Present::default()
+            };
+            let mut reported = Vec::new();
+            let mut pass = async |present: &mut Present| {
+                let r = sync_pass(&dir, &target, false, 1, None, present)
+                    .await
+                    .unwrap();
+                reported.extend(r.uploaded);
+                r.dataset
+            };
+            seal_range(&dir, &[row(1, 1), row(2, 2)], 1, 2)
+                .unwrap()
+                .unwrap();
+            seal_range(&dir, &[row(3, 3)], 3, 3).unwrap().unwrap();
+            pass(&mut present).await;
+            // A fold replaces the provisional tail with a final segment.
+            seal_range(&dir, &[row(4, 4)], 4, 4).unwrap().unwrap();
+            pass(&mut present).await;
+            let id = pass(&mut present).await;
+            let keys = open_mirror(&target).unwrap().list(&id).await.unwrap();
+            let keys = keys
+                .into_iter()
+                .map(|k| k.trim_start_matches(&format!("{id}/")).to_string())
+                .collect();
+            (keys, reported)
+        }
+        let (off, off_reported) = run(false, "followers-off").await;
+        let (on, on_reported) = run(true, "followers-on").await;
+        let follower_key = |k: &String| {
+            k.starts_with(crate::remote_follow::PROVISIONAL_DIR)
+                || k.starts_with(crate::remote_follow::OFFCHAIN_DIR)
+                || k == crate::remote_follow::FOLLOWERS_MARKER
+        };
+        assert!(!off.iter().any(follower_key), "followers off: {off:?}");
+        assert!(
+            !off_reported.iter().any(|k| k.starts_with('-')),
+            "followers off deleted {off_reported:?}"
+        );
+        assert!(
+            off.iter().filter(|k| k.ends_with(".parquet")).count() >= 2,
+            "premise: final segments were published: {off:?}"
+        );
+        let added: Vec<&String> = on.iter().filter(|k| !off.contains(k)).collect();
+        assert!(
+            !added.is_empty() && added.iter().all(|k| follower_key(k)),
+            "{added:?}"
+        );
+        assert!(
+            off.iter().all(|k| on.contains(k)),
+            "on: {on:?}, off: {off:?}"
+        );
+        assert!(
+            on_reported.iter().any(|k| k.starts_with('-')),
+            "premise: with followers on, the folded tail was deleted: {on_reported:?}"
+        );
     }
 }
