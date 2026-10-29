@@ -1,0 +1,17 @@
+[package]
+name = "rfc-0076-tenants"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "RFC-0076 S1: admission waits on one chain's SQL gate, 1,000 tenants mounted, today's ledger against 5.13.0's"
+publish = false
+
+# Its own crate, outside the binary and the workspace: a measurement, not a shipped surface. It
+# compiles src/fair_share.rs as it stands beside the 5.13.0 copy run.sh extracts, so both ledgers
+# see the same workload in the same virtual time.
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync", "time", "test-util"] }
+
+[profile.release]
+debug = false
