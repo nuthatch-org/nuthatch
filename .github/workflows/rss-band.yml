@@ -26,6 +26,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # GCC 15 defaults to C23, which removed the ATOMIC_VAR_INIT that mimalloc (via dbsp) still uses.
+  CFLAGS: -std=gnu17
+
 jobs:
   band:
     name: ${{ inputs.runs || 7 }} sequential runs of the dense multi-nest scenario
