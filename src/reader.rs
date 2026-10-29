@@ -2312,7 +2312,7 @@ mod tests {
         let writer = crate::store::Store::open(&dir.join(crate::config::DB_FILE)).unwrap();
         let store = Arc::new(MemStore::from_snapshot(
             &dir,
-            writer.feed_subscribe().unwrap().snapshot,
+            crate::store::feed_subscribe(&writer).unwrap().snapshot,
         ));
         let config = crate::config::Config::load(&dir).unwrap();
         let derived = Arc::new(

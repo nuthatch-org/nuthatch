@@ -74,3 +74,19 @@ fn entity_every_window() {
     eprintln!("{r:?}");
     assert!(r.is_ok());
 }
+
+/// RFC-0075 S2: `run-node.mjs` holds the wasm32 transcript to this digest.
+const REORG_CASES: usize = 12;
+const REORG_TRANSCRIPT_SHA256: &str =
+    "4f3b8bec690c201973ce15e64987659f67dd912547767241f31121111e96592a";
+
+#[test]
+fn the_reorg_property_converges_in_every_band() {
+    let t0 = Instant::now();
+    let transcript = dbsp_wasm_spike::reorg::run_property(REORG_CASES).unwrap();
+    eprintln!("{transcript}\nin {:?}", t0.elapsed());
+    assert_eq!(
+        nuthatch_seal::content_hash(transcript.as_bytes()),
+        REORG_TRANSCRIPT_SHA256
+    );
+}

@@ -1039,7 +1039,7 @@ mod tests {
         use crate::feed::{Line, MemStore};
         let tmp = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
-        let mut sub = store.feed_subscribe().unwrap();
+        let mut sub = crate::store::feed_subscribe(&store).unwrap();
         let shapes: [(&str, u64, u64); 4] = [
             ("one row", 1, 1),
             ("a tip block, 40 transfers", 1, 40),

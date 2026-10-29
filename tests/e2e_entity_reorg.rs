@@ -219,6 +219,24 @@ async fn spawn_loaded(
     })
     .await;
     assert!(fed, "the entities did not fold through block {tip} in time");
+    // `/sql` answers from the published snapshot (#2467), which follows the fold by a moment.
+    let snapshots = rt
+        .state
+        .snapshots
+        .clone()
+        .expect("a writer publishes snapshots");
+    let published = wait_until(POLL_TIMEOUT, || {
+        snapshots.load_full().is_some_and(|s| {
+            s.entities
+                .iter()
+                .zip(rt.state.entities.iter())
+                .all(|(p, e)| {
+                    e.unavailable().is_some() || e.fault().is_some() || p.applied_through() >= tip
+                })
+        })
+    })
+    .await;
+    assert!(published, "block {tip} was not published in time");
     rt
 }
 

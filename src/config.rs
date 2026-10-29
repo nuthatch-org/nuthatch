@@ -138,6 +138,15 @@ pub struct Config {
     /// outside a runtime, where the default holds. `#[serde(skip)]` like `chain_policy`.
     #[serde(skip)]
     pub cursor_max_rss_mb: Option<u64>,
+    /// The indexing mount's `[mounts.limits] window_deadline_ms` (RFC-0076 §3.2): `Some` only when
+    /// stamped from the mount that indexes the dataset, so another mount's build leaves it alone.
+    /// Mount config, so `#[serde(skip)]` like `cursor_max_rss_mb`.
+    #[serde(skip)]
+    pub window_deadline: Option<Option<std::time::Duration>>,
+    /// The runtime's directory, whose `cursors/<chain>/buffer/` a buffered cursor spills to. `None`
+    /// outside a runtime. `#[serde(skip)]` like `cursor_max_rss_mb`.
+    #[serde(skip)]
+    pub runtime_dir: Option<std::path::PathBuf>,
     /// The runtime's `sql_permits` for this nest's cursor (RFC-0076 §3.1). `None` outside a runtime,
     /// where `NUTHATCH_SQL_MAX_CONCURRENCY` or the default holds.
     #[serde(skip)]
@@ -831,6 +840,8 @@ impl Config {
             route: None,
             chain_policy: Default::default(),
             cursor_max_rss_mb: None,
+            window_deadline: None,
+            runtime_dir: None,
             cursor_sql_permits: None,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
@@ -1098,6 +1109,8 @@ mod tests {
             route: None,
             chain_policy: Default::default(),
             cursor_max_rss_mb: None,
+            window_deadline: None,
+            runtime_dir: None,
             cursor_sql_permits: None,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),

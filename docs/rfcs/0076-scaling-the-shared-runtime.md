@@ -292,6 +292,279 @@ writer processes per chain (§3.4).
 3. FR19: the reserve's size, once the bench has GraphOps's activity profile.
 4. FR20: Chief's decision on the direction and, separately and later, on the amendment.
 
+## 8. S0 measured
+
+Measured 2026-10-29 on `pete/2487-rfc-0076-s0-window-buffer` (#2487), off `546b94a8`, on a MacBook
+(Apple silicon, other nuthatch sessions running on it). Nothing here has run on a CI runner.
+
+### What was built
+
+Behind `NUTHATCH_CURSOR_BUFFER=<windows>` (`NUTHATCH_INGEST_CONCURRENCY` optional), read in
+`spawn_cursor`. Unset, every runtime runs `runtime_index_loop` exactly as before; no test sets it.
+
+- **Extraction** (`buffered_extraction`): one task per chain that polls the tip, fetches each range once
+  with the union filter, the narrowed `base ∪ children` filter and its in-window discovery fixpoint
+  included, and appends windows to an in-memory buffer bounded by window count. Each window records
+  the addresses it asked for. It runs the same one `detect_reorg` per window the shared cursor does.
+- **Per-nest ingest** (`buffered_nest_task`): one tokio task per nest, owning its `NestIngest`, the
+  only writer of its dataset, reading the buffer from its own watermark and calling the unchanged
+  `process_window`. A semaphore bounds how many commit at once (default `min(cores, 4)`).
+- **Factory refetch** (`buffered_window_logs`): before a nest processes a buffered window, any child
+  it knows that the window's fetch did not ask for is fetched for that nest alone, address-filtered,
+  over the window's range from the nest's own watermark, with the discovery fixpoint, and merged.
+  Extraction reads each nest's children after every committed window, so its next fetch is wider.
+- **Minimal detachment.** A full buffer waits for the slowest nest unless some nest has drained it,
+  in which case the oldest window is dropped. A nest behind the oldest window fetches for itself with
+  its own `fetch_window` and rejoins the buffer when its watermark reaches it.
+
+### What was not built
+
+Reorg markers: a reorg extraction detects ends the buffered cursor with an error. Lifecycle commands:
+the channel is held and never read, so a live mount, unmount or rename waits until the driver times
+out. Quarantine re-admission: a nest's fault is terminal on this cursor. The over-cap single-block
+recovery (COR-5), the `topic0_refused` fallback, a byte bound on the buffer and any spill to disk,
+the window deadline, and every metric in §3.2. Headers are not carried in the buffer: each nest's
+`process_window` still asks for its own timestamps and checkpoint hash, as it does today.
+
+### Parity
+
+`indexer::tests::the_buffered_cursor_stores_what_the_shared_cursor_stores`: two static nests and a
+factory nest on one 60-block chain, windows capped at 3, children announced at blocks 10 and 25
+(the second emitting once before its announcement in that block) and a never-adopted stranger. The
+shared cursor's run is the reference; every table of every nest, hot and sealed, is compared row by
+row in full JSON. Two buffered runs, the factory nest slowed 30 ms a window in both:
+
+- a 64-window buffer, so every window is fetched before the factory nest reaches it and the refetch
+  path carries both children (asserted: refetches > 0, no own fetches);
+- a 2-window buffer, so the fast nests drain it and the factory nest detaches (asserted: own fetches > 0).
+
+Both are identical to the reference. **Mutation:** dropping the refetched logs instead of merging them
+turns it red on the refetch run, for the reason it exists:
+`nest 2, buffer of 64 windows (refetch path): table child__ping: 39 rows wanted, 4 stored; missing [...block 14...]`.
+
+### One nest slowed tenfold
+
+`indexer::tests::s0_one_nest_slowed_tenfold` (ignored; a measurement). Three static nests, 150 blocks,
+windows of 3. The slowed nest's unslowed window time was 4.4 ms; 39 ms was added, about ten times.
+Milliseconds for the two siblings to reach the tip, three runs each:
+
+| Cursor | Nothing slowed | One nest slowed |
+|---|---|---|
+| Shared (today) | 661 to 729 | 2,621 to 2,750 |
+| Buffered, 8 windows | 565 to 671 | 436 to 545 |
+
+Today a slow nest is every sibling's pace. Buffered, the siblings do not notice it and the slow nest
+takes what its own delay costs (2,311 to 2,350 ms). The price is that the slow nest, once detached,
+fetches its windows a second time.
+
+### Tip lag, after-seen p50
+
+`tip-lag.sh`'s fixture and method with the nest mounted in a runtime directory, so the cursor is the
+one measured, 100 samples a run. The poller is perl rather than bash 5, which this machine lacks.
+
+| Run | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| Shared cursor | 24 ms | 29 ms | 27 ms | 26 ms |
+| Buffered | 24 ms | 29 ms | 32 ms | 23 ms |
+
+No difference the noise does not cover. Both sit above CI's 17 to 19 ms on this laptop, so the 30 ms
+gate itself was not tested here; the buffer hop is not visible in it.
+
+### RSS, one nest
+
+`multinest-footprint.sh` with `NESTS=1`, median RSS while following the live tip, three runs:
+shared cursor 84, 80 and 84 MB; buffered 92, 93 and 93 MB. **About 10 MB more**, not explained yet:
+an eight-window buffer holding the backfill's widest windows is the first suspect, and a byte bound
+is what §3.2's `window_buffer_mb` already proposes, but it was not profiled. Far inside the 2 GiB
+budget, and still a regression S2 must account for before any footprint gate sees it.
+
+### Verdict
+
+**Continue.** The two things that could stop FR18 did not: factory parity holds row for row through
+both the refetch and the detached path, with a mutation to prove the test can see a lost child, and
+the buffer hop adds nothing measurable to after-seen tip lag. A slow nest stops costing its siblings.
+S2 carries what S0 stubbed: reorg markers, lifecycle at window boundaries, re-admission, the
+buffer's byte bound (and the 10 MB above), and the after-seen gate measured on a CI runner.
+
+## 9. S2 built
+
+Built 2026-10-29 on `pete/2489-rfc-0076-s2-independent-nests` (#2489), off S0's branch, and measured on
+the same MacBook as §8, other nuthatch sessions running on it. Nothing here has run on a CI runner.
+
+### What was built
+
+The S0 spike is rewritten as `src/indexer/buffered.rs`, a child of the indexer, and is **the default**
+(below). `NUTHATCH_CURSOR_BUFFER=0` runs the shared cursor for one release.
+
+- **Extraction** keeps the window ends it fetched with the hash it read for each, and decides a reorg
+  from them, falling back to the most caught-up nest's checkpoints when it has none or none is
+  canonical. It checks before a fetch, as the shared cursor does, **and after one**: the previous
+  window's end is read again once the new window's logs and header are in, and a window that does not
+  extend the chain extraction holds is not buffered. The property test found that second check
+  missing (below). On a reorg it drops every buffered window above the ancestor and issues a
+  **marker**; each nest rolls back from its own position with the unchanged `rollback_reorg` at its
+  next window boundary, terminally if the fork is below its sealed watermark, as today. A nest that has
+  missed markers older than the 64 kept, or rejoins from a quarantine, checks its own checkpoints
+  first, as `check_joined_nests` does.
+- **Headers in the buffer.** Each window carries the hash and timestamp extraction read for its end,
+  and a nest's checkpoint for that block is answered from it; every other hash a window is checked
+  against still comes from the source, so the per-window backstops (#2146) are unchanged.
+- **Lifecycle.** Mount, unmount and rename are applied as they arrive. A mounted nest behind the
+  buffer catches up by itself; an unmount is acknowledged once its task has ended and nothing on the
+  cursor holds its store (extraction reads a nest's store through a `Weak`, under a lock the
+  acknowledgement waits on). A retryable fault backs off as today and the re-admitted nest **fetches
+  its missed range for itself**, never moving extraction back; a panic is that nest's terminal fault,
+  contained per nest as before. The over-cap block (COR-5) becomes a window each nest asks for by its
+  own filter, a factory nest then by `base ∪ children`, so only a nest still over the cap is faulted;
+  the `topic0_refused` fallback is extraction's, as it was the cursor's.
+- **The bound.** `window_buffer_mb` is charged to every cursor's admission (64 MiB at 2048, scaling
+  with the ceiling, following `PUT /_admin/runtime` live). Past it windows spill to
+  `<runtime>/cursors/<chain>/buffer/`, four times the bound, emptied when the cursor starts. Extraction
+  holds windows for the nests behind the fastest and **at most two at or ahead of the fastest**: a
+  single nest's cursor holds the window it is processing and the next.
+  A nest that owns every log in a window is lent the window rather than given a copy.
+- **The window split and the deadline.** `process_window` is now `prepare_window`, which decodes,
+  reads, checks and binds and has no side effect a retry would see, and `commit_window`, which feeds
+  the views, commits, and does everything after. `[mounts.limits] window_deadline_ms` (on the mount
+  that indexes the dataset, live by `PATCH`) times out the first only; three overruns in a row are a
+  retryable quarantine. It applies on both cursors.
+- **Metrics**: `nuthatch_nest_window_seconds`, `nuthatch_nest_window_overruns_total`,
+  `nuthatch_nest_behind_extraction_blocks`, `nuthatch_nest_extraction_wait_seconds_total`,
+  `nuthatch_cursor_buffer_bytes`, `nuthatch_cursor_buffer_spilled_bytes`.
+
+Not built: factory refetch across the network for FR20, a per-nest `ingest_concurrency` above the
+process setting, and §7's question 2, which still wants a measurement of concurrent windows'
+memory on a multi-nest cursor.
+
+### The default
+
+The buffered cursor is the default because the three conditions set for it hold with it on: the whole
+`it` suite (622 tests, 0 failed), the reorg property suite (16 cases) and the parity tests. Every test
+target, the lib suite included, was run with the switch in both positions: every target passed but one in both runs, 2,978 tests each, and the one was the same in both: the
+builder's config reference did not yet name `window_deadline_ms`, now documented. The suite's
+runtimes really ran buffered: a probe that made the buffered cursor fail at once turned
+`e2e_runtime_parity` red with the switch on.
+
+### Parity
+
+`the_buffered_cursor_stores_what_the_shared_cursor_stores` (S0's, unchanged) passes on the rewrite,
+through the refetch path (64 windows) and the detached path (2 windows). New,
+`the_buffered_cursor_converges_through_a_reorg_as_the_shared_cursor_does`: the reorg fixture below
+under the shared cursor and three buffered configurations, each compared row for row with the shared
+cursor's run over the replacement chain alone, and asserting the buffered runs went through a marker.
+
+### Reorgs
+
+The fixture: three nests, two static and a factory; the chain is replaced from block `fork` while
+the tip moves, a child announced only on the replaced chain must vanish and one announced only on
+the replacement must appear, and every replaced block differs in hash, timestamp and value.
+`every_nest_on_the_buffered_cursor_converges_after_a_reorg` is the property: fork 8 to 30, replaced 1
+to 8 blocks later, each nest slowed 0 to 19 ms a window, 1 to 6 buffered windows (small enough to
+detach the slow nests), windows of 1 to 4 blocks. 16 cases, 59 s.
+
+Its first run failed, on its own random draw: `fork 20, replaced at tip 22, delays [14, 12, 13] ms, 3
+windows of 2: no nest-wide tip: [Some(40), Some(20), Some(40)]`. Extraction had checked its newest
+window end before a fetch, the chain was replaced between that check and the fetch, and the new
+window's header was read from the replacement, so the chain extraction held was mixed and looked
+canonical at its end. Nest `b`, with no rows in 19..=20, had committed extraction's old checkpoint for
+block 20 and refused every window after it on its parent check, waiting for a marker that never
+came. The shared cursor closes this race at the nest, by reading hashes after the logs; extraction
+now does the same (§9 "What was built"). The case is pinned in the parity test.
+
+### One nest slowed tenfold
+
+`s2_one_nest_slowed_tenfold_per_window_size` (ignored; a measurement). Three nests following a tip
+that publishes a window's worth of blocks every 40 ms; the third slowed to ten times its siblings'
+unslowed p50 tip lag; the siblings' lag is from a block's publication to its commit. p50, ms:
+
+| Window | Shared, none / one slowed | Buffered, 4 permits | Buffered, 1 permit |
+|---|---|---|---|
+| 1 block (slowed 73 ms) | 10.0 / 541 | 9.1 / 8.0 | 10.4 / 458 |
+| 4 blocks (slowed 80 ms) | 9.9 / 670 | 8.8 / 9.5 | 16.2 / 647 |
+| 16 blocks (slowed 94 ms) | 10.8 / 802 | 9.4 / 8.5 | 13.5 / 712 |
+
+**The bound, per window size: with an ingest permit free, the slowed nest adds nothing to its
+siblings' tip lag at any of the three sizes** (the differences are inside run-to-run noise, p95 under
+16 ms throughout). With every permit held by slower nests a sibling queues behind them at their pace,
+as on the shared cursor, which is why `NUTHATCH_INGEST_CONCURRENCY` should stay above the number of
+nests expected to be slow; at the default (cores, at most 4) a single slow nest never takes the last
+permit. `a_nest_slowed_tenfold_does_not_set_its_siblings_pace_on_the_buffered_cursor` gates it: a
+nest slowed 150 ms a window, siblings' p50 under 75 ms buffered and at least 75 ms shared.
+`a_nest_over_its_window_deadline_is_quarantined_and_its_co_tenants_index_on` covers the deadline on
+both cursors.
+
+### Tip lag, after-seen p50
+
+`tip-lag.sh`'s fixture and method with the nest mounted in a runtime directory, 100 samples a run,
+the two cursors alternated, the S2b binary (whose log confirms which cursor each run started).
+
+| Run | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| Shared cursor | 27 ms | 33 ms | 34 ms | 30 ms |
+| Buffered | 29 ms | 33 ms | 32 ms | 28 ms |
+
+p99 52 to 67 ms either way. No difference the noise does not cover, as in S0; this laptop reads
+above CI's 17 to 19 ms on both, so the 30 ms gate itself is still CI's to judge.
+
+### RSS, one nest, and S0's 10 MB
+
+`multinest-footprint.sh` with `NESTS=1`, median RSS while following the live tip, three runs each,
+release binaries built with symbols kept for the profiler. "S2" is this branch before the window was
+lent to the nest, "S2b" after (`c0012c74`).
+
+| Binary | Shared cursor | Buffered, default | Buffered, 8 windows | Buffered, 1 window |
+|---|---|---|---|---|
+| S0 (`cf02f9ab`) | 85, 86, 86 | - | 95, 95, 93 | 85, 83, 84 |
+| S2 | 83, 87, 83 | 89, 89, 88 | - | - |
+| S2b | 79, 79, 79 | 84, 81, 81 | - | 84, 79, 81 |
+
+**S0's 10 MB was not data at the tip.** A `vmmap -summary` and `heap` snapshot of each process
+four minutes in, at the tip:
+
+| Process | RSS | Physical footprint (peak) | Malloc live | Malloc resident | Malloc dirty |
+|---|---|---|---|---|---|
+| S0, shared | 85 MB | 30.0 (49.5) MB | 14.7 MB | 43.0 MB | 23.5 MB |
+| S0, buffered(8) | 95 MB | 30.1 (58.7) MB | 15.3 MB | 52.3 MB | 23.5 MB |
+| S2b, shared | 81 MB | 30.3 (43.9) MB | 14.7 MB | 39.2 MB | 23.7 MB |
+| S2b, buffered | 84 MB | 30.3 (46.4) MB | 14.6 MB | 41.7 MB | 23.6 MB |
+
+At the tip S0's buffered process held 0.6 MB more live memory than its shared one; its peak footprint
+was 9.2 MB higher, which is the RSS gap. S0 never dropped a window its nests had passed: it held
+eight, and the eight it held while catching up from the backfill to the tip were the widest of the
+run. Freed, those pages stay resident in macOS's malloc zone, clean and outside the footprint, and
+`ps` counts them. One window removes the gap (83 to 85 MB). S2 drops a window once every live nest
+has passed it, holds at most two at or ahead of the fastest nest, and lends a nest the window instead
+of copying it when the nest owns every log in it, as a single nest does. What remains is 2 to 5 MB
+by the harness, with equal live memory and equal footprint by the profile: a 2.5 MB higher peak,
+retained the same way. A one-window buffer did not separate from the default inside run-to-run
+noise, so it is not attributed further. On Linux the release binary uses jemalloc with a one-second
+dirty decay, which returns such pages; the footprint gates run there and have not been run.
+
+### Mutations
+
+Each against the committed tree, reverted after, the red assertion as printed:
+
+- **Nests ignore reorg markers** (the rollback replaced by keeping the position): the parity test,
+  `Buffered(64) did not converge: no nest-wide tip: [Some(40), Some(29), Some(40)]`. On the other two
+  buffered cases of that run the per-window backstop rolled the nests back without the marker, which
+  is why the fixture includes a nest with no rows over the fork.
+- **The deadline wraps the commit** (one timeout over prepare and commit together):
+  `a window whose commit landed (1 rows stored) reported Ok(None) after 1 overruns`.
+- **The byte bound ignored** (a window always kept in memory): `spill true: the buffer held 194924
+  bytes in memory against a bound of 11948 (largest window 9940)`.
+
+### Not verified
+
+- Nothing has run on a CI runner: the after-seen gate at 30 ms, the dense multi-nest footprint gate
+  (`REGRESSION_MB` 602) and the RSS figures above are this laptop's. The footprint gate measures 20
+  nests on one cursor and should be re-banded with `rss-band.yml` before the default ships.
+- §3.2's factory test ("discovers a child in a buffered window and compares row for row with today's
+  cursor") is S0's parity test, kept; it has not been run against a real factory corpus.
+- §7 question 2, `ingest_concurrency` at the 2048 MB ceiling, is unanswered: what concurrent windows
+  cost in memory was not measured on a multi-nest cursor.
+- The spill path is exercised by a test with a 12 KB bound, not by a chain whose windows are tens of
+  megabytes.
+
 ## 10. S3 built (2026-10-29, #2490)
 
 FR17 as §3.3 describes it, with three departures, each for a reason found while building.

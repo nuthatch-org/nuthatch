@@ -21,6 +21,12 @@ pub trait WindowHooks: Send + Sync {
 
     /// A test seam waited on once the views are fed and again once the commit has landed (#2467).
     async fn seam(&self) {}
+
+    /// A test seam at the start of the part of a window a deadline may abandon. An error fails the
+    /// window there.
+    async fn started(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Does nothing around a window.

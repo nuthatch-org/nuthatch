@@ -323,7 +323,8 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "src/isolation.rs",
         "the value of `[runtime] isolation`, which RuntimeMeta carries; it has no keys of its own",
     ),
-    ("src/store.rs", "the table tag of a hot row, not nest config"),
+    ("core/src/redb_store.rs", "the table tag of a hot row, not nest config"),
+    ("core/src/tap.rs", "the hot-state feed's ops (RFC-0073 FR1), not nest config"),
     (
         "src/mount_jobs.rs",
         "mount-jobs.json: live-mount progress the runtime writes and resumes (#1544), never operator input",
@@ -440,6 +441,8 @@ const KNOWN_UNDOCUMENTED: &[(&str, &str)] = &[
     ("Config.chain_policy", "`#[serde(skip)]` - an unregistered chain's finality depth and window, stamped by the runtime from its `[[chains]]` entry before `build_nest` (RFC-0073 FR9). The reference documents them there, as `finality_depth` and `log_window`; a nest never writes them."),
     ("Config.cursor_sql_permits", "`#[serde(skip)]` - the runtime's `[runtime] sql_permits`, stamped onto each mounted nest so its cursor's gate is built with it (RFC-0076). The reference documents it under `[runtime]`; a nest never writes it."),
     ("Config.cursor_max_rss_mb", "`#[serde(skip)]` - the runtime's `[runtime] max_rss_mb`, stamped onto each mounted nest before `build_nest` so the analytics split is checked against its cursor's ceiling (#2441). The reference documents it under `[runtime]`; a nest never writes it."),
+    ("Config.window_deadline", "`#[serde(skip)]` - the indexing mount's `[mounts.limits] window_deadline_ms`, stamped by the runtime before `build_nest` (RFC-0076). The reference documents it there; a nest never writes it."),
+    ("Config.runtime_dir", "`#[serde(skip)]` - the runtime's directory, stamped before `build_nest` so a buffered cursor knows where its scratch buffer goes (RFC-0076). Where a nest is mounted is not what it is."),
     ("Config.read_only_role","`#[serde(skip)]` - the `serve` role, set by `serve_role` before `build_nest` so a `[[calls]]` nest it will never sample is not refused for lacking an archive endpoint (#1167). A role is not data identity and is never a config key."),
 ];
 

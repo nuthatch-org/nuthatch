@@ -75,6 +75,19 @@ async fn serve_with(surface: Surface) -> (AppState, tempfile::TempDir) {
     })
     .await;
     assert!(landed, "fixture did not index");
+    // `/sql` answers from the published snapshot (#2467), which follows the commit by a moment.
+    let snapshots = rt
+        .state
+        .snapshots
+        .clone()
+        .expect("a writer publishes snapshots");
+    let published = wait_until(POLL_TIMEOUT, || {
+        snapshots
+            .load_full()
+            .is_some_and(|s| s.store.get_meta("last_block").ok().flatten().as_deref() == Some("3"))
+    })
+    .await;
+    assert!(published, "fixture's last window was not published");
     rt.ingest.abort();
 
     let mut state = rt.state;

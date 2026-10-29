@@ -4579,6 +4579,84 @@ fn heavy_sort(tag: u32) -> String {
     )
 }
 
+/// RFC-0076 §3.2: `[mounts.limits] window_deadline_ms` set by `PATCH` on the mount that indexes a
+/// dataset reaches its running ingest with no remount, and one set on an alias of that dataset does
+/// not, so a tenant mounting another's nest cannot shorten its deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_deadline_patched_on_the_indexing_mount_reaches_its_ingest() {
+    use axum::http::StatusCode;
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "7d".repeat(32);
+    let (handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    let data_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
+    // The indexing mount sets a deadline; an alias mounted after it, with none, must not clear it.
+    for (name, limits) in [
+        ("usdc", r#","limits":{"window_deadline_ms":4000}"#),
+        ("alias", ""),
+    ] {
+        let mount = format!(r#"{{"name":"{name}","nid":"{nid}"{limits}}}"#);
+        let (status, body) = call(
+            &routes,
+            "POST",
+            "/_admin/nests?wait=true",
+            None,
+            Some(&mount),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+    }
+    assert_eq!(
+        nuthatch::indexer::window_deadline_of(&data_dir),
+        Some(std::time::Duration::from_millis(4000)),
+        "an alias mounted without a deadline left the indexing mount's"
+    );
+    let (status, body) = call(
+        &routes,
+        "PATCH",
+        "/_admin/mounts/alias",
+        None,
+        Some(r#"{"limits":{"window_deadline_ms":5}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        nuthatch::indexer::window_deadline_of(&data_dir),
+        Some(std::time::Duration::from_millis(4000)),
+        "an alias does not set the dataset's deadline"
+    );
+    let (status, body) = call(
+        &routes,
+        "PATCH",
+        "/_admin/mounts/usdc",
+        None,
+        Some(r#"{"limits":{"window_deadline_ms":2500}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        nuthatch::indexer::window_deadline_of(&data_dir),
+        Some(std::time::Duration::from_millis(2500))
+    );
+    let (status, body) = call(
+        &routes,
+        "PATCH",
+        "/_admin/mounts/usdc",
+        None,
+        Some(r#"{"limits":{"window_deadline_ms":0}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("limits.window_deadline_ms"), "{body}");
+    let file = runtime::MountTable::load(roost.path()).unwrap();
+    let usdc = file.mounts.iter().find(|m| m.alias == "usdc").unwrap();
+    assert_eq!(usdc.limits.window_deadline_ms, Some(2500));
+}
+
 /// RFC-0073 FR3: limits on one mount of a shared dataset bound that mount's queries and not its
 /// co-tenant's, change on the next request after a `PATCH` with no remount, refuse a value above
 /// the process ceiling by name, survive a restart from `mounts.toml`, and move neither the NID nor

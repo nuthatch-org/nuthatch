@@ -172,6 +172,7 @@ on a live mount:
 | `max_named_scan_bytes` | `NUTHATCH_SQL_MAX_NAMED_SCAN_BYTES`, 512 MiB at most |
 | `analytics_memory_bytes` | the analytics pool, `analytics.memory_limit` |
 | `max_queued` | `NUTHATCH_SQL_MAX_QUEUED`, 256 at most |
+| `window_deadline_ms` | none: not a `/sql` guard. How long the part of one window before its commit may take, for the dataset this mount indexes; on an alias of another mount's dataset it is recorded and has no effect ([Faults](#faults)) |
 
 A limit only ever lowers: a value above the process's, or zero, is refused with `400` naming the field
 and the ceiling, never clamped. An absent field is the process value. The limits are recorded in the
@@ -181,7 +182,7 @@ no data, and two mounts of one NID may carry different ones.
 `PATCH` takes any of `sql`, `queries` and `limits`. Each one given replaces the record's whole value, so
 `{"limits": {}}` returns a mount to the process values. Nothing is remounted or restarted: the next
 request runs under the new limits, and a request already in flight finishes under the ones it started
-with. A mount still being mounted or moved answers `409` with its job; a name with no mount record
+with. A new `window_deadline_ms` applies from the dataset's next window. A mount still being mounted or moved answers `409` with its job; a name with no mount record
 `404`. On `POST`, giving `sql` or `limits` for a name that is already live is `409` unless they match
 its record: change a live mount with `PATCH`.
 
@@ -225,7 +226,7 @@ the next boot holds to it; the next mount is admitted against it at once.
 
 ```json
 {"max_rss_mb": 1536, "max_rss_mb_default": 2048, "above_default": false,
- "max_entities_per_cursor": 24, "sql_permits": 2, "sql_permits_default": 2,
+ "max_entities_per_cursor": 24, "window_buffer_mb": 48, "sql_permits": 2, "sql_permits_default": 2,
  "session_cache_capacity": 16,
  "cursors": [{"chain": "mainnet", "projected_mb": 420, "entities": 3, "sql_permits": 2,
               "sql_permits_ceiling": 2, "sql_reserve": 1, "active_tenants": 0}]}
@@ -241,6 +242,10 @@ the next boot holds to it; the next mount is admitted against it at once.
   lowered ceiling always admits what is already running. It never unmounts anything.
 - **The entity cap follows it**: 32 authored entities per cursor for each 2048 MB, rounded down, so
   24 at 1536 and 64 at 4096. A value whose cap is under a cursor's `entities` is `409` too.
+- **So does the window buffer.** `window_buffer_mb`, what a buffered cursor (RFC-0076) may hold of
+  fetched windows in memory, is 64 per 2048 MB, rounded down, and part of every cursor's
+  `projected_mb`; a running cursor's buffer follows a changed ceiling at its next window. It is 0
+  under `NUTHATCH_CURSOR_BUFFER=0`.
 - **The analytics split follows it upward.** Above 2048, `(pools × analytics.memory_limit) +
   ingestion_reservation` is checked against the raised ceiling at startup, as `NUTHATCH_MAX_RSS`
   would raise it. Below 2048 the split is still held to the default. A `PUT` is held to the split
@@ -418,9 +423,10 @@ the end of the runtime.
 | Entity over `max_rows` | Terminal quarantine; the entity stops. | Keep indexing | `quarantined`, terminal, the entity named; `503` |
 | Maintained-view build failure | Not quarantined. The view answers from its definition at request time; `nuthatch_maintained_build_failures_total` counts it. | Unaffected | `indexing`, `200` |
 | Query panic | That request answers `500`. Its permit on the cursor's SQL gate is returned. | Keep serving on the same gate | Unchanged |
-| Extraction RPC error | A failed shared `getLogs` is retried for the whole cursor, so a dead pool stalls every nest on the chain. A missing header or timestamp refuses that nest's window, retried without advancing. A block over the provider's cap that an address-filtered refetch cannot fit is a terminal quarantine of the factory nests that forced the wide fetch. | Other chains unaffected; on the same chain they stall with it, as extraction is shared | Stalled: `indexing`, `503` naming `poll_stalled`. Over-cap: `quarantined`, terminal. |
+| Extraction RPC error | A failed shared `getLogs` is retried for the whole cursor. On the shared cursor a dead pool stalls every nest on the chain at once. On the buffered cursor (RFC-0076) each nest first commits the windows already buffered for it, then waits, which `nuthatch_nest_extraction_wait_seconds_total` counts. A missing header or timestamp refuses that nest's window, retried without advancing. A block over the provider's cap: the shared cursor refetches it address-filtered and terminally quarantines the factory nests that forced the wide fetch if that cannot fit either; the buffered cursor has each nest ask for the block by its own filter, and terminally quarantines only a nest still over the cap. | Other chains unaffected; on the same chain they stall with it, once their buffered windows are spent, as extraction is shared | Stalled: `indexing`, `503` naming `poll_stalled`. Over-cap: `quarantined`, terminal. |
+| A window over `window_deadline_ms` | Its part before the hot-store commit is abandoned at the deadline, with nothing stored and nothing fed to a view, and the window is asked for again. The third in a row is a retryable quarantine, `reason` naming the deadline; `nuthatch_nest_window_overruns_total` counts each. A commit already begun always finishes. | Keep indexing. On the shared cursor each waits at most the deadline for that nest's window; on the buffered cursor none waits for it while an ingest permit is free | `indexing` until the third, then `quarantined`, retryable; `503` |
 | A dead IVM circuit, or a reorg below the sealed watermark | Terminal quarantine. | Keep indexing | `quarantined`, terminal; `503` |
-| Any other window error, such as a failed store write | Retryable quarantine with backoff, then re-admitted behind the cursor. | Keep indexing | `quarantined`, retryable; `503` |
+| Any other window error, such as a failed store write | Retryable quarantine with backoff, then re-admitted at its own position, checked against its own checkpoints first. On the shared cursor the cursor fetches back to it; on the buffered cursor it fetches its missed range for itself until it reaches the buffer, and extraction does not move. | Keep indexing | `quarantined`, retryable; `503` |
 | Ingest panic | Terminal quarantine, `reason` `this nest's ingest panicked: <message>`. Covers its window, its `prepare` and its reorg rollback. | Keep indexing; the cursor carries on | `quarantined`, terminal; `503` |
 | Build failure at boot | Booted quarantined, `reason` `this nest failed to build: <error>`. Every route answers `503` naming it; its record stays in `mounts.toml`. Unmount drops it; a restart builds it again. | Boot and index | `quarantined`, terminal; `503` |
 | Over the ceiling at boot | Booted quarantined, `reason` `refused at boot: <the refusal a mount would answer>`, naming projected and ceiling MB or the entity cap. Mounts are admitted in `mounts.toml` order; one that does not fit takes no room from those after it. Its record stays; unmount drops it, and a restart with room boots it. | Boot and index | `quarantined`, terminal; `503` |
@@ -432,10 +438,23 @@ leaves the store at a window boundary and `/sql` answers the last committed wind
 any quarantined nest. In-memory state the panic interrupted is not trusted again: the nest indexes
 nothing until a restart rebuilds it from the store.
 
-**A slow nest holds its co-tenants.** The cursor runs each nest's window in turn, so a nest whose
-windows are slow but succeed slows every nest on its chain. There is no per-nest window deadline
-yet: abandoning a window part-way can let its commit land after its derived state was dropped, so a
-deadline needs the window split into a part that can be abandoned and a commit that cannot.
+**A slow nest, and the window deadline.** The shared cursor runs each nest's window in turn, so a
+nest whose windows are slow but succeed slows every nest on its chain. Two things bound that.
+
+`[mounts.limits] window_deadline_ms`, on the mount that indexes the dataset, is how long the part of
+one window before its hot-store commit may take: decoding, the header, timestamp and call reads, the
+checks that can refuse the window, and binding its rows for the authored entities. Past it the
+window is abandoned and asked for again. A window is split there, at its commit, because that is the
+only place it can be abandoned safely: the views it feeds are fed in the commit, not before it, and
+once the commit has begun the window always finishes, however long the rest takes, so its rows and
+its derived state land together or not at all. A deadline that could fire mid-commit is how a commit
+lands after the derived state that goes with it was dropped.
+
+The [buffered cursor](operators.md#the-buffered-cursor-rfc-0076), the default from 5.14, removes the
+coupling itself. Each nest is its own task, reading
+windows from a buffer extraction fills, so a slow nest delays only itself until it falls behind the
+buffer, and then fetches for itself. A sibling waits for it only for an ingest permit, and only when
+every permit is held by slower nests; RFC-0076 §9 has the measured tip lag per window size.
 
 ## Bundles
 

@@ -66,7 +66,7 @@ impl Source for Tape {
 }
 
 /// The window path feeds no entity here.
-enum NoEntity {}
+pub(crate) enum NoEntity {}
 
 impl WindowEntity for NoEntity {
     fn name(&self) -> &str {
@@ -298,7 +298,7 @@ impl HotStore for Mem {
 }
 /// Segments held in memory.
 #[derive(Default)]
-struct Shelf {
+pub(crate) struct Shelf {
     manifest: Mutex<nuthatch_core::seal::Manifest>,
     files: Mutex<HashMap<String, Vec<u8>>>,
 }
@@ -348,7 +348,7 @@ impl Sinks for Shelf {
 }
 
 /// Sleeps for no time at all.
-struct NoWait;
+pub(crate) struct NoWait;
 
 impl Clock for NoWait {
     fn sleep(
@@ -360,7 +360,7 @@ impl Clock for NoWait {
 }
 
 /// Polls `f` to completion. Nothing on the window path waits on anything but itself.
-fn block_on<F: std::future::Future>(f: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
     let mut f = std::pin::pin!(f);
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     loop {
@@ -370,7 +370,7 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
     }
 }
 
-fn token() -> DecodeRegistry {
+pub(crate) fn token() -> DecodeRegistry {
     DecodeRegistry::build(vec![nuthatch_decode::registry::ContractSpec {
         alias: "tok".into(),
         address: [0x33; 20].into(),
@@ -463,6 +463,7 @@ fn run() -> Result<String> {
         hooks: &nuthatch_core::hooks::NoHooks,
         faults: &nuthatch_core::fault::NoFaults,
         clock: &NoWait,
+        deadline: None,
     };
     let processed = block_on(process_window(window, &tape, &logs, 10, 12, 12))?;
     anyhow::ensure!(processed == Processed::Stored(2), "processed {processed:?}");
@@ -491,7 +492,10 @@ fn run() -> Result<String> {
         }
     }
     let committed = store.committed.lock().unwrap();
-    let rows: String = committed.iter().map(|(k, j)| format!("{k}\t{j}\n")).collect();
+    let rows: String = committed
+        .iter()
+        .map(|(k, j)| format!("{k}\t{j}\n"))
+        .collect();
     Ok(format!(
         "committed={} rows_sha256={} balances={:?} last={:?} sealed_through={} hot={} segments={:?}",
         committed.len(),

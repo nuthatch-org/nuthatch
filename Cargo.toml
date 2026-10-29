@@ -210,7 +210,7 @@ postgres-store = ["dep:postgres"]
 counter = ["dep:base64", "dep:k256", "alloy-primitives/k256"]
 # RFC-0060 §5.6: the Graph network facade. Off by default: a default build never shows it and
 # refuses a nest that needs it.
-graph = ["folds", "dep:Inflector"]
+graph = ["folds", "dep:Inflector", "nuthatch-core/checkpoint-hash-index"]
 # RFC-0059: checkpointed folds. Off by default, and a default build refuses a nest that ships `folds/`.
 folds = []
 # #1717: named points where a test build aborts when `NUTHATCH_CRASH_AT` names them. Off by default,
@@ -222,6 +222,8 @@ crash-points = []
 nuthatch-fixture-rpc = { path = "tools/fixture-rpc" }
 # RFC-0070: the time-lapse tool must compute the NID the node does.
 nuthatch-timelapse = { path = "timelapse" }
+# The outbox-drain hold `runtime`'s stop test parks on.
+nuthatch-core = { path = "core", features = ["test-hooks"] }
 proptest = "1"
 # `start_paused` for virtual time in tests. Dev-only, so the shipped binary is unchanged: it lets a
 # retry-pacing test assert *how long* a pause was without actually waiting for it (#361).

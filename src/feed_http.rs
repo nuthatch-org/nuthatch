@@ -973,7 +973,7 @@ mod tests {
     fn expected(store: &Store, dataset: &str) -> Vec<u8> {
         line(&Line::Snapshot {
             dataset: crate::feed::DatasetName(dataset.to_string()),
-            snapshot: store.feed_subscribe().unwrap().snapshot,
+            snapshot: crate::store::feed_subscribe(store).unwrap().snapshot,
         })
         .to_vec()
     }
