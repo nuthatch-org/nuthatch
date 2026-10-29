@@ -1627,7 +1627,8 @@ mod tests {
     }
 
     /// #2467: what versions of a dataset's derived state still being read hold is charged to its
-    /// cursor, both in what the dataset holds and in the room left for its next delta.
+    /// cursor: in what the dataset holds, and in the room left for its next delta and for every other
+    /// dataset on the cursor.
     #[tokio::test]
     async fn derived_versions_still_read_are_charged_to_the_cursor() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1679,6 +1680,28 @@ mod tests {
                     served: None,
                 },
             );
+            let mut beside = inner.routes["ds"].spec.clone();
+            beside.dataset = "beside".into();
+            inner.routes.insert(
+                "beside".into(),
+                Route {
+                    spec: beside,
+                    served: None,
+                },
+            );
+            inner.datasets.insert(
+                "beside".into(),
+                Data {
+                    store: store.clone(),
+                    snapshots: Default::default(),
+                    derived: Err(Refused {
+                        why: "not built here".into(),
+                        entities: Arc::default(),
+                        gone: false,
+                    }),
+                    building: None,
+                },
+            );
             inner.datasets.insert(
                 "ds".into(),
                 Data {
@@ -1690,8 +1713,8 @@ mod tests {
             );
         }
         let held = || follower.lock().held("ds").unwrap();
-        let room = || follower.cap_for("ds").unwrap();
-        let (held_before, room_before) = (held(), room());
+        let room = |dataset: &str| follower.cap_for(dataset).unwrap();
+        let (held_before, room_before, beside_before) = (held(), room("ds"), room("beside"));
 
         let pinned = derived.balances.pinned();
         derived
@@ -1704,10 +1727,18 @@ mod tests {
             "the pinned version keeps what the batch replaced"
         );
         assert_eq!(held(), held_before + retained);
-        assert_eq!(room(), room_before - retained);
+        assert_eq!(room("ds"), room_before - retained);
+        assert_eq!(
+            room("beside"),
+            beside_before - retained,
+            "a dataset beside it on the cursor has that much less room"
+        );
 
         drop(pinned);
-        assert_eq!((held(), room()), (held_before, room_before));
+        assert_eq!(
+            (held(), room("ds"), room("beside")),
+            (held_before, room_before, beside_before)
+        );
     }
 
     #[test]

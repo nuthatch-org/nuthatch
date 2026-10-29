@@ -441,6 +441,15 @@ fn pin_snapshot(state: Arc<AppState>) -> Arc<AppState> {
 }
 
 impl AppState {
+    /// What versions requests still read of the hot store and the built-in views hold beside the
+    /// latest (#2467). Not the entities': each entity's allowance already counts its own.
+    pub fn retained_bytes(&self) -> u64 {
+        self.balances.retained_bytes()
+            + self.exposure.retained_bytes()
+            + self.velocity.retained_bytes()
+            + self.store.retained_bytes()
+    }
+
     /// An analytics guard under this mount's limits.
     fn query_guard(&self, timeout: Duration, max_rows: usize) -> analytics::QueryGuard {
         analytics::QueryGuard {
@@ -1598,11 +1607,7 @@ fn snapshot_metrics(s: &AppState) -> String {
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let bytes = s.balances.retained_bytes()
-        + s.exposure.retained_bytes()
-        + s.velocity.retained_bytes()
-        + s.entities.iter().map(|e| e.retained_bytes()).sum::<u64>()
-        + s.store.retained_bytes();
+    let bytes = s.retained_bytes() + s.entities.iter().map(|e| e.retained_bytes()).sum::<u64>();
     format!(
         "# HELP nuthatch_snapshot_retained_bytes Bytes that versions still being read hold beside the latest.\n\
          # TYPE nuthatch_snapshot_retained_bytes gauge\n\
