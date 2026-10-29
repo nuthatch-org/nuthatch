@@ -346,6 +346,35 @@ encode, delta-size, apply, seal-wait, mirror and per-connection queue figures ar
 3. *The visibility series is labelled by dataset and kind, not follower.* Connections come and go;
    a follower label would grow without bound.
 
+**What a delta costs a follower, from the socket to the applied copy.** `A` is what the dataset has
+left when the delta's dataset name is read; the slack is `SNAPSHOT_SLACK`, 64 KiB, plus the frame
+header and a dataset name of at most 4 KiB. Every row below is alive at the instant named, and
+their sum at any instant is at most `A` plus the slack.
+
+| Allocation | Alive | Charged by | Released |
+|---|---|---|---|
+| frame header, dataset name | while the frame is read | the slack | next frame |
+| payload (v2) | read to the end of decoding | refused unread past `A` + slack, then taken first by `decode_delta` | dropped, and given back, when decoding returns |
+| catalogue, op keys and values, raw rows (v2) | from decoding until applied | taken before each copy is made | with the delta, after it is applied |
+| one `Op` per op (v2) | from decoding until applied | its size taken as it is pushed | with the delta |
+| decompressed batch and its Arrow buffers (v2) | while one batch is decoded | twice its decompressed size, taken before decompressing | given back once both are dropped |
+| rows rebuilt from columns (v2) | from decoding until applied | worked out from column lengths and taken before any is built | moved into the ops; with the delta |
+| the decoded delta in the handler (v1 and v2) | until applied | `Delta::bytes()` added to the copy's peak, checked against `A` | after the apply |
+| the copy's growth while applying (v1 and v2) | from the apply on | `MemStore::peak_with`, worst point of the apply | it is the copy |
+| a line held for the mirror | until its files are in | `Pending::bytes`, with the copy, against `A`; moved into the queue, not copied | applied or dropped with the connection |
+| v1 line text | while parsed | refused at `A` + slack on the wire, read without holding the line whole; a decoded value is never longer than its text | as parsed |
+
+The parser works out a delta's `A` only once every line before it is applied, so one capped delta is
+in flight at a time. Under v2 the payload and the rows copied out of it are alive together, so a
+large delta a v1 follower would refuse by its peak is refused by a v2 follower as it is decoded; both
+refuse before the copy grows. Each charge has a mutation that turns its test red:
+`the_payload_is_charged_beside_what_is_copied_from_it`, `a_catalogue_is_charged_as_it_is_copied`,
+`ops_are_charged_as_they_are_decoded`, `rebuilt_rows_are_charged_before_they_are_built`,
+`a_batch_is_held_to_its_peak_not_to_each_part_alone`, and the 1.2 MiB v1 case of
+`a_delta_over_the_budget_is_refused_before_it_is_applied` for the handler.
+`a_payload_near_the_limit_that_decompresses_to_it_is_refused` drives the worst case: a payload near
+`A` whose batch decompresses to near `A` again.
+
 **Figures.** v1 against v2 on deltas a real store commits for windows of decoded ERC-20 transfers,
 release build, Apple M5 Pro, one thread (`feed_wire::tests::measure_v1_against_v2`):
 
