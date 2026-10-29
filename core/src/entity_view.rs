@@ -253,7 +253,8 @@ impl Folding {
                 Ok((bytes, took)) => {
                     tracing::debug!("entity `{}` state sampled in {took:?}", self.label);
                     if let Some(why) = over_allowance(bytes, self.limits.allowance_bytes) {
-                        anyhow::bail!(why);
+                        // Published before `msg` drops, since it may be a sample's ack (#2167).
+                        return Err(self.stop(why));
                     }
                 }
                 Err(e) => tracing::warn!("entity `{}` state size not sampled: {e:#}", self.label),
