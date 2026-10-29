@@ -1,7 +1,6 @@
 //! RFC-0041 slice one: explicit authored incremental-entity declarations and conservative refusal.
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
@@ -12,6 +11,10 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::Duration;
+
+pub use crate::entity_decl::EntityDecl;
+use crate::entity_decl::EntityFile;
+use crate::entity_lower::{sql_tokens, uses_sample};
 
 pub const ENTITY_FILE: &str = "entities.toml";
 pub const ENTITY_COMPILER_ID: &str = "nuthatch-rfc0041-v1";
@@ -107,42 +110,6 @@ pub fn identity(
         output_schema,
         engine: parser.engine_version(),
     })
-}
-
-#[derive(Debug, Deserialize)]
-struct EntityFile {
-    #[serde(default)]
-    entities: Vec<EntityDecl>,
-}
-
-/// One author-declared maintained relation. Parsing is centralised here so startup, `check`, and a
-/// future serving surface all act on exactly the file whose bytes form the nest identity.
-#[derive(Debug, Clone, Deserialize)]
-pub struct EntityDecl {
-    pub name: String,
-    pub sql: String,
-    pub key: Vec<String>,
-    pub max_rows: usize,
-}
-
-impl EntityDecl {
-    /// Resolve the same authored SQL file for validation and runtime startup.
-    pub fn read_sql(&self, dir: &Path) -> Result<String> {
-        let rel = Path::new(&self.sql);
-        if rel.components().count() != 2
-            || rel.parent() != Some(Path::new("entities"))
-            || rel.extension().and_then(|x| x.to_str()) != Some("sql")
-        {
-            bail!(
-                "sql must name one entities/<name>.sql file; move the SQL into entities/{}.sql and set sql = \"entities/{}.sql\"",
-                self.name, self.name
-            );
-        }
-        if rel.file_stem().and_then(|s| s.to_str()) != Some(self.name.as_str()) {
-            bail!("entity name must match the declared SQL filename");
-        }
-        std::fs::read_to_string(dir.join(rel)).with_context(|| format!("cannot read {}", self.sql))
-    }
 }
 
 /// Validation failures are collected so `nuthatch check` names every bad declaration at once.
@@ -975,95 +942,6 @@ fn validate_sql(sql: &str) -> Result<()> {
         bail!("holistic aggregates are not incremental v1 SQL; keep this as views/*.sql")
     }
     Ok(())
-}
-
-/// `USING SAMPLE`, which sqlparser does not parse: recognised here so its refusal still says what it
-/// is rather than that the statement does not parse.
-pub(crate) fn uses_sample(sql: &str) -> bool {
-    sql_tokens(sql)
-        .windows(2)
-        .any(|pair| pair[0] == "USING" && pair[1] == "SAMPLE")
-}
-
-/// SQL tokens relevant to the refusal list. The parser owns the statement-shape gate above;
-/// this only recognises constructs whose AST forms are deliberately not yet lowered. Quoted text and
-/// comments are discarded first, so an entity may quite safely produce the string `"ORDER BY"`.
-fn sql_tokens(sql: &str) -> Vec<String> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum State {
-        Code,
-        /// Inside `"..."` - a name, so its characters accumulate into the current token.
-        Ident,
-        Quote(char),
-        LineComment,
-        BlockComment,
-    }
-
-    let mut state = State::Code;
-    let mut current = String::new();
-    let mut tokens = Vec::new();
-    let chars: Vec<char> = sql.chars().collect();
-    let mut at = 0;
-    let flush = |current: &mut String, tokens: &mut Vec<String>| {
-        if !current.is_empty() {
-            tokens.push(current.to_ascii_uppercase());
-            current.clear();
-        }
-    };
-    while at < chars.len() {
-        let ch = chars[at];
-        let next = chars.get(at + 1).copied();
-        match state {
-            State::Code if ch == '-' && next == Some('-') => {
-                flush(&mut current, &mut tokens);
-                state = State::LineComment;
-                at += 1;
-            }
-            State::Code if ch == '/' && next == Some('*') => {
-                flush(&mut current, &mut tokens);
-                state = State::BlockComment;
-                at += 1;
-            }
-            // A single quote opens a string literal, whose contents are text and are discarded. A
-            // double quote opens a **quoted identifier**, whose contents are a *name* - discarding
-            // those is what let `"median"(v)` past the refusal list (#836). `analytics.rs` learned
-            // the same lesson from `"read_csv"('/etc/passwd')` and fixed it by stripping the quotes
-            // rather than the contents; this does the same.
-            State::Code if ch == '\'' => {
-                flush(&mut current, &mut tokens);
-                state = State::Quote(ch);
-            }
-            State::Code if ch == '"' => {
-                flush(&mut current, &mut tokens);
-                state = State::Ident;
-            }
-            State::Code if ch.is_ascii_alphanumeric() || ch == '_' => current.push(ch),
-            State::Code if ch == '(' => {
-                flush(&mut current, &mut tokens);
-                tokens.push("(".into());
-            }
-            State::Code => flush(&mut current, &mut tokens),
-            State::Ident if ch == '"' && next == Some('"') => {
-                current.push('"');
-                at += 1;
-            }
-            State::Ident if ch == '"' => state = State::Code,
-            State::Ident => current.push(ch),
-            State::Quote(quote) if ch == quote && next == Some(quote) => at += 1,
-            State::Quote(quote) if ch == quote => state = State::Code,
-            State::Quote(_) => {}
-            State::LineComment if ch == '\n' => state = State::Code,
-            State::LineComment => {}
-            State::BlockComment if ch == '*' && next == Some('/') => {
-                state = State::Code;
-                at += 1;
-            }
-            State::BlockComment => {}
-        }
-        at += 1;
-    }
-    flush(&mut current, &mut tokens);
-    tokens
 }
 
 /// Referenced relations from the same parse the statement-shape gate reads. The caller resolves

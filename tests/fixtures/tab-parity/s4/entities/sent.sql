@@ -1,0 +1,4 @@
+SELECT t."from", COUNT(*) AS n, SUM(CAST(t.value AS HUGEINT)) AS total
+FROM tab__transfer t
+WHERE t."from" <> '0x0000000000000000000000000000000000000000'
+GROUP BY t."from"

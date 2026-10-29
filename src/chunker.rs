@@ -262,41 +262,7 @@ impl AdaptiveWindow {
     }
 }
 
-/// Whether an RPC error looks like a result-size / range cap (so the caller shrinks and retries the
-/// same range) rather than a transient failure.
-///
-/// **This list is a liability, and it has already cost us.** It was written against Alchemy and Infura,
-/// and `arb1.arbitrum.io` - an endpoint nuthatch *ships as an Arbitrum default* - says
-/// `"logs matched by query exceeds limit of 10000"`, which matched **none** of the original markers. So
-/// splitting never fired on our own zero-setup path, and a busy Arbitrum contract retried the same
-/// oversized window until the operator intervened (RFC-0028 §1, measured 2026-07-28).
-///
-/// Widening the list fixes the providers we have met. The durable fix is the caller's speculative split
-/// for failures this cannot classify (RFC-0028 §3b) - because any design that needs to have seen a
-/// provider's phrasing in advance will keep failing on providers we have not met.
-pub fn is_result_too_large(err: &anyhow::Error) -> bool {
-    // Prefer the structured classification when the error came from `RpcClient`, which inspected the
-    // HTTP status and the JSON-RPC error object rather than a flattened string (RFC-0028 §3e).
-    //
-    // Two independent classifiers that can disagree about the same error is worse than one: which
-    // answer wins would depend on the code path, and the resulting bug would be unreproducible. So the
-    // text matching below is now the *fallback* - for `Source` implementations that are not the RPC
-    // client (the test tapes, the ExEx source) and raise plain `anyhow!` errors.
-    if let Some(class) = crate::rpc::class_of(err) {
-        match class {
-            crate::rpc::FailureClass::Narrowable { .. } => return true,
-            // **`Transient` does not mean "not a cap"** (RFC-0029 §3b). It is the fall-through default
-            // of `classify_status` - the *absence* of a classification rather than a positive finding -
-            // so it must never outrank direct textual evidence below. Returning `false` here is what
-            // made the widened marker list unreachable for Alchemy's HTTP 400, and turned a splittable
-            // window into five same-width retries and a dead backfill.
-            crate::rpc::FailureClass::Transient => {}
-            // RateLimited and Terminal *are* positive findings: back off or stop, never split.
-            _ => return false,
-        }
-    }
-    crate::rpc::looks_like_cap(&format!("{err:#}"))
-}
+pub use nuthatch_core::rpc::is_result_too_large;
 
 #[cfg(test)]
 mod tests {
