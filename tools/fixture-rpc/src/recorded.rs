@@ -5,16 +5,24 @@
 //! Headers carry no transactions; a block outside the range is an error, not an empty answer.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{json, Value};
 
 use crate::{hex, hex_u64, Fault, Fixture};
+use hyper::{Method, StatusCode};
 
 /// Mainnet's finality depth, so a `finalized` tag agrees with the depth the node applies.
 const FINALITY_DEPTH: u64 = 64;
 
 pub struct Recorded {
     chain_id: u64,
+    /// The chain as served before each `POST /control/fork`, the first being the recording.
+    eras: Vec<Era>,
+    era: AtomicUsize,
+}
+
+struct Era {
     tip: u64,
     /// number -> (hash, timestamp)
     headers: BTreeMap<u64, (String, String)>,
@@ -54,26 +62,40 @@ impl Recorded {
         let logs = v["logs"].as_array().ok_or("no logs")?.clone();
         Ok(Recorded {
             chain_id: 1,
-            tip,
-            headers,
-            logs,
+            eras: vec![Era { tip, headers, logs }],
+            era: AtomicUsize::new(0),
         })
     }
 
+    /// The tip served now.
     pub fn tip(&self) -> u64 {
-        self.tip
+        self.now().tip
+    }
+
+    /// Each era's tip, in the order `POST /control/fork` moves through them.
+    pub fn tips(&self) -> Vec<u64> {
+        self.eras.iter().map(|e| e.tip).collect()
+    }
+
+    fn now(&self) -> &Era {
+        &self.eras[self.era.load(Ordering::SeqCst)]
     }
 
     pub fn first(&self) -> u64 {
-        *self.headers.keys().next().expect("a recording has headers")
+        *self.eras[0]
+            .headers
+            .keys()
+            .next()
+            .expect("a recording has headers")
     }
 
     fn header(&self, n: u64) -> Result<Value, Fault> {
-        let (hash, ts) = self
+        let era = self.now();
+        let (hash, ts) = era
             .headers
             .get(&n)
             .ok_or_else(|| err(format!("block {n} is outside the recording")))?;
-        let parent = match n.checked_sub(1).and_then(|p| self.headers.get(&p)) {
+        let parent = match n.checked_sub(1).and_then(|p| era.headers.get(&p)) {
             Some((h, _)) => h.clone(),
             None => format!("0x{:064x}", 0),
         };
@@ -87,23 +109,25 @@ impl Recorded {
     }
 
     fn resolve(&self, tag: &Value) -> Result<u64, Fault> {
+        let tip = self.now().tip;
         match tag.as_str() {
-            Some("latest") | Some("pending") => Ok(self.tip),
-            Some("finalized") | Some("safe") => Ok(self.tip - FINALITY_DEPTH),
+            Some("latest") | Some("pending") => Ok(tip),
+            Some("finalized") | Some("safe") => Ok(tip - FINALITY_DEPTH),
             Some("earliest") => Ok(self.first()),
             _ => hex_u64(tag).ok_or_else(|| err(format!("not a block: {tag}"))),
         }
     }
 
     fn get_logs(&self, filter: &Value) -> Result<Value, Fault> {
+        let era = self.now();
         let bound = |k: &str, default: u64| match filter.get(k) {
             None | Some(Value::Null) => Ok(default),
             Some(v) => self.resolve(v),
         };
-        let from = bound("fromBlock", self.tip)?;
-        let to = bound("toBlock", self.tip)?;
-        if to > self.tip {
-            return Err(err(format!("toBlock {to} is past the tip {}", self.tip)));
+        let from = bound("fromBlock", era.tip)?;
+        let to = bound("toBlock", era.tip)?;
+        if to > era.tip {
+            return Err(err(format!("toBlock {to} is past the tip {}", era.tip)));
         }
         let addresses: Option<Vec<String>> = match filter.get("address") {
             None | Some(Value::Null) => None,
@@ -133,7 +157,7 @@ impl Recorded {
         {
             return Err(err("only topic0 filters are recorded".into()));
         }
-        let out: Vec<Value> = self
+        let out: Vec<Value> = era
             .logs
             .iter()
             .filter(|l| {
@@ -148,15 +172,114 @@ impl Recorded {
             .collect();
         Ok(Value::Array(out))
     }
+
+    /// RFC-0075 S4's scripted reorg. Before the fork the recording carries synthetic Transfers in its
+    /// last ten blocks; `POST /control/fork` then replaces its last six blocks with others carrying
+    /// different Transfers, and adds two, so a follower must take back what the old ones gave.
+    pub fn with_fork(mut self) -> Recorded {
+        let base = self.eras.remove(0);
+        let t = base.tip;
+        let mut before = Era {
+            tip: t,
+            headers: base.headers.clone(),
+            logs: base.logs.clone(),
+        };
+        before.logs.extend(tail(&before.headers, t - 9..=t, 0));
+        let mut after = Era {
+            tip: t + 2,
+            headers: base.headers,
+            logs: base.logs,
+        };
+        let last_ts = hex_u64(&json!(after.headers[&t].1)).unwrap_or(0);
+        for n in t - 5..=t + 2 {
+            let ts = after
+                .headers
+                .get(&n)
+                .map(|h| h.1.clone())
+                .unwrap_or_else(|| hex(last_ts + 12 * (n - t)));
+            let hash = format!(
+                "0x{}",
+                crate::multinest::keccak256(format!("rfc-0075-s4-fork/{n}").as_bytes())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            );
+            after.headers.insert(n, (hash, ts));
+        }
+        let kept = tail(&after.headers, t - 9..=t - 6, 0);
+        let replaced = tail(&after.headers, t - 5..=t + 2, 1);
+        after.logs.extend(kept.into_iter().chain(replaced));
+        self.eras = vec![before, after];
+        self
+    }
+}
+
+/// An existing holder of the recorded token, so a tail Transfer lands in a group the sealed rows
+/// already hold as well as in new ones.
+const HOLDER: &str = "0x78f3b1558952774e4520868cb8e34bf256d6209b";
+const CONTRACT: &str = "0x0c26fe5e579c3b007ba16d921ba8204a47c05f1a";
+const TRANSFER: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+/// Mints over `blocks`, one or two a block, whose recipients and amounts depend on `variant`.
+fn tail(
+    headers: &BTreeMap<u64, (String, String)>,
+    blocks: std::ops::RangeInclusive<u64>,
+    variant: u64,
+) -> Vec<Value> {
+    let word = |s: &str| format!("0x{:0>64}", s.trim_start_matches("0x"));
+    let mut out = Vec::new();
+    for n in blocks {
+        let (hash, ts) = &headers[&n];
+        let count = if (n + variant).is_multiple_of(3) { 1 } else { 2 };
+        for i in 0..count {
+            let to = if i == 0 && n.is_multiple_of(2) {
+                HOLDER.to_string()
+            } else {
+                format!(
+                    "0x{:040x}",
+                    (0xaa00 + 0x1100 * variant) + n % (5 + 2 * variant)
+                )
+            };
+            let value = ((n % 1000) + 1) as u128 * 1_000_000_000_000_000 * (variant as u128 + 1)
+                + i as u128;
+            let tx =
+                crate::multinest::keccak256(format!("rfc-0075-s4-tx/{n}/{i}/{variant}").as_bytes());
+            out.push(json!({
+                "address": CONTRACT,
+                "topics": [TRANSFER, word("0"), word(&to)],
+                "data": format!("0x{value:064x}"),
+                "blockNumber": hex(n),
+                "transactionHash": format!("0x{}", tx.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+                "transactionIndex": hex(i),
+                "blockHash": hash,
+                "logIndex": hex(i),
+                "blockTimestamp": ts,
+                "removed": false,
+            }));
+        }
+    }
+    out
 }
 
 impl Fixture for Recorded {
+    fn control(&self, method: &Method, path: &str, _: &[u8]) -> Option<(StatusCode, Value)> {
+        if *method != Method::POST || path != "/control/fork" {
+            return None;
+        }
+        let era = (self.era.load(Ordering::SeqCst) + 1).min(self.eras.len() - 1);
+        self.era.store(era, Ordering::SeqCst);
+        Some((
+            StatusCode::OK,
+            json!({"era": era, "tip": self.eras[era].tip}),
+        ))
+    }
+
     fn call(&self, req: &Value) -> Result<Value, Fault> {
         let params = req.get("params").cloned().unwrap_or_else(|| json!([]));
         let first = || params.get(0).ok_or_else(|| err("no params".into()));
         match req.get("method").and_then(Value::as_str) {
             Some("eth_chainId") => Ok(json!(hex(self.chain_id))),
-            Some("eth_blockNumber") => Ok(json!(hex(self.tip))),
+            Some("eth_blockNumber") => Ok(json!(hex(self.now().tip))),
             Some("eth_getBlockByNumber") => self.header(self.resolve(first()?)?),
             Some("eth_getLogs") => self.get_logs(first()?),
             other => Err(err(format!("unsupported method {other:?}"))),
