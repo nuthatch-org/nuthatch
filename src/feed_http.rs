@@ -32,6 +32,8 @@ const CHUNK: usize = 64 << 10;
 /// How long a snapshot waits for room before its follower is taken to have stalled and is dropped,
 /// which also ends the read transaction it is taken in.
 const SNAPSHOT_STALL: Duration = Duration::from_secs(30);
+/// Ops past which a delta's v2 body is encoded off the async workers.
+const ENCODE_INLINE_OPS: usize = 512;
 
 /// The bounds on queued feed bytes.
 #[derive(Clone, Copy, Debug)]
@@ -822,18 +824,34 @@ async fn forward(dataset: String, store: Arc<dyn HotStore>, tx: Queue, v2: bool)
                         );
                     }
                     if v2 {
-                        let body = delta.wire.get_or_init(|| {
-                            let started = std::time::Instant::now();
-                            let body = crate::feed_wire::encode_delta(&delta)
-                                .map(bytes::Bytes::from)
-                                .unwrap_or_default();
-                            crate::feed_metrics::metrics().encoded("v2", started.elapsed());
-                            body
-                        });
+                        fn encoded(delta: &crate::feed::Delta) -> bytes::Bytes {
+                            delta
+                                .wire
+                                .get_or_init(|| {
+                                    let started = std::time::Instant::now();
+                                    let body = crate::feed_wire::encode_delta(delta)
+                                        .map(bytes::Bytes::from)
+                                        .unwrap_or_default();
+                                    crate::feed_metrics::metrics()
+                                        .encoded("v2", started.elapsed());
+                                    body
+                                })
+                                .clone()
+                        }
+                        // A backfill window takes tens of milliseconds to encode: not on a worker
+                        // the runtime's other tasks are waiting for.
+                        let body = if delta.ops.len() > ENCODE_INLINE_OPS && delta.wire.get().is_none() {
+                            let d = delta.clone();
+                            tokio::task::spawn_blocking(move || encoded(&d))
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            encoded(&delta)
+                        };
                         if body.is_empty() {
                             continue 'snapshot;
                         }
-                        let frame = crate::feed_wire::delta_frame(&dataset, body);
+                        let frame = crate::feed_wire::delta_frame(&dataset, &body);
                         if frame.len() as u64 <= tx.conn.limits.per_connection {
                             crate::feed_metrics::metrics().delta_sent("v2", frame.len());
                             if !tx.line(frame.into()).await {
