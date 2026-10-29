@@ -137,7 +137,12 @@ impl TabQuery {
         #[cfg(target_arch = "wasm32")]
         let batches = self.engine.sql_async(sql).await?;
         let mut columns: Vec<String> = match batches.first() {
-            Some(b) => b.schema().fields().iter().map(|f| f.name().clone()).collect(),
+            Some(b) => b
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect(),
             None => Vec::new(),
         };
         let mut rows = Vec::new();
