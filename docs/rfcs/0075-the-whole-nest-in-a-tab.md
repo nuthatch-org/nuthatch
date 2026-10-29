@@ -574,7 +574,7 @@ what a page fetches. gzip is level 9 and brotli quality 11.
 | S5's build (`release`: `opt-level = "s"`, thin LTO, 16 codegen units) | 67,716,902 | 14,145,877 | 8,458,837 |
 | `tab` profile: `opt-level = "z"`, fat LTO, one codegen unit | 51,341,329 | 11,375,825 | 7,464,839 |
 | names and producers stripped by `wasm-bindgen` | 36,276,359 | 8,176,948 | 5,327,469 |
-| `wasm-opt -O1`, **the module the gates run** | **34,493,236** | **8,023,682** | **5,244,321** |
+| `wasm-opt -O1`, **the module the gates run** | **34,498,509** | **8,025,902** | **5,244,476** |
 | *burrmill-wasm, for comparison* | | | *5.6 MB* |
 
 Rejected, measured on the stripped `tab` build:
@@ -603,7 +603,7 @@ gate and the Service Worker gate against it, and writes its size to the job summ
 when the page calls `setMemoryCeiling(600)` on a phone. It splits the ceiling as the node splits a
 cursor's 2 GiB. One statement takes a quarter, the node's one-permit share of 512 MiB, through
 Burrmill's own pool (`Engine::open_empty_within`). Statements run one at a time, as S5 made them. The
-cursor and its entities take the rest. It enforces three things:
+cursor and its entities take the rest. It enforces four things:
 
 - *Admission.* `derive` charges each entity what the node's admission charges, 8 MiB plus 3,200 bytes per
   declared row. A nest whose entities would pass the cursor's share is refused by name before any circuit
@@ -613,8 +613,11 @@ cursor and its entities take the rest. It enforces three things:
 - *A statement.* A statement past its share is refused with Burrmill's `Out of Memory Error` and the
   node's hint, at status 400. Nothing is killed.
 - *The wall.* Before each window's fetch, and again before it is committed, the cursor stops with a named
-  error if the module's linear memory has reached the ceiling, rather than wait for the browser to kill
-  the tab.
+  error once the module's linear memory reaches a sixteenth below the ceiling (562 MiB of 600).
+- *The cap.* The module's global allocator refuses any request that could grow linear memory past the
+  ceiling, so the module never holds more than the ceiling. A refused allocation traps, which ends the
+  instance. The wall exists so that a nest normally stops by name before the cap is met. The cap is there
+  for what one window decodes, folds and seals after the last check passed.
 
 The gate is `run-budget.mjs`, in Node against the shipped module, on S3's recording with S4's entities.
 At each ceiling, entities declaring 150,000 rows (about 466 MiB) are tried first. Then the cursor follows
@@ -625,32 +628,40 @@ from the deploy block while a Lodestar-class statement runs. That statement grou
 |---|---|---|
 | 150,000 declared rows | refused at admission | admitted |
 | the statement | refused, `Out of Memory Error`, 161 ms in | refused, 289 ms in |
-| the cursor | followed on to 848 ms; segment and 1,000 balances equal the node's | the same, 822 ms |
+| the cursor | followed on to 863 ms; segment and 1,000 balances equal the node's | the same, 837 ms |
 | `SELECT count(*)` afterwards | 2,259 | 2,259 |
 | linear memory at the end, the peak | 159.7 MiB | 600.0 MiB |
 
-A ceiling of 1 MiB, which the module already exceeds, stops the cursor at its first window. The
-statement is refused while the cursor is still following, so the two hold memory together, and neither
-disturbs the other's answer.
+The statement is refused while the cursor is still following, so the two hold memory together, and
+neither disturbs the other's answer. Last, the module holding 600 MiB is given a ceiling of 608 MiB,
+whose wall is 570 MiB. The cursor stops at its first window with the wall's error. Asking then for 64 MiB
+at once traps, and linear memory stays at 600 MiB.
 
-**Every mutation fails.** Each one was built and run through `run-budget.mjs`. Admitting any declared
-state fails the phone's admission check. Never refusing at the wall fails the 1 MiB check, and so does
-removing the check from the window loop. Opening the statement's engine unbounded let the statement grow
-the module to 1,832 MiB on the phone ceiling. The wall then stopped the cursor, and the run failed. The
-wall's second check, after the fetch, is not covered on its own: with either check removed, the other
-still fires at 1 MiB.
+**The mutations.** Each one was built and run through `run-budget.mjs`.
+
+- Admitting any declared state fails the phone's admission check.
+- Never refusing at the wall fails the wall check. So does removing both of its calls from the window
+  loop.
+- An allocator that never refuses fails the cap check.
+- An unbounded statement engine fails too: on the phone ceiling the statement meets the cap, and the
+  instance traps.
+- Removing only one of the wall's two calls passes, because the other still fires. Neither call is
+  covered on its own.
 
 **What it does not show.**
 
 - The budget gate runs in Node, not Chrome or Safari. Chrome runs the shipped module only through S5's
   Service Worker gate. Safari is untried, for S3's reason.
-- The wall is a check between steps and not an allocator cap. What one window decodes, folds and seals
-  can pass the ceiling before the next check stops the cursor. A cap in the allocator would turn that
-  overshoot into a trap, which is the death the wall exists to name. Windows are 20 blocks on mainnet.
-- The wall reads linear memory, which never shrinks. After one statement has used its share, the module
-  keeps the high-water mark, so on a phone the cursor grows only into what the mark leaves of 600 MiB. Nothing returns
-  memory to the browser short of reloading the worker.
+- A window that crosses from below the wall to the cap within its decode, fold and seal meets the cap,
+  and the cap traps. The store keeps every committed window, so a reloaded worker resumes, but nothing
+  names the stop. Windows are 20 blocks on mainnet, and a sixteenth of 600 MiB is 37.5 MiB.
+- The cap reads linear memory, which never shrinks. It refuses a request that could grow past the
+  ceiling even where dlmalloc has free space for it, so near the ceiling it refuses early, by at most the
+  request and 1 MiB. After one statement has used its share, the module keeps the high-water mark, so on
+  a phone the cursor grows only into what the mark leaves of 600 MiB. Nothing returns memory to the
+  browser short of reloading the worker.
+- The ceiling is one per module. A worker runs one nest, and the last `setMemoryCeiling` holds.
 - No page detects a phone. The page must choose the ceiling, and `/play` is not wired (§16).
 - The redb store, the cellar's segment bytes and the hot copies a statement binds are not charged at
   admission. The node's admission charges a per-nest base for them, and the tab has no measured base.
-  Only the wall bounds them.
+  Only the wall and the cap bound them.
