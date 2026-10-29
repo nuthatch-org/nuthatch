@@ -417,3 +417,71 @@ is one segment, and it is final. A table's provisional segment, folded back thro
 is not exercised by this chain. The recorded headers carry no transactions. Node has no OPFS, so
 there the store is `Bytes`; in Chrome it is OPFS, opened as `PlayNest` opens it. No run followed a
 live public RPC; the recording was taken from public RPCs, and that is all.
+
+## 15. S4 outcome, 2026-10-29
+
+S4 (#2480): entities and views.
+
+**What moved.** `entities.toml`'s declaration is `src/entity_decl.rs` (`EntityDecl`, `parse`, and
+`sql_path`, the rule `read_sql` applies), and `uses_sample` and `sql_tokens` moved from
+`entities.rs` into `entity_lower.rs`, their one other caller. Nothing else in the binary changed. The
+spike compiles `entity_decl.rs`, `entity_lower.rs` and `entity_bind.rs` by `#[path]`, unchanged, as
+S0 compiled the circuit, so an entity is declared, lowered and bound by the binary's own code, then
+folded on `nuthatch-core`'s `EntityLane` with `Driver::Inline`. The tab has no offchain tables
+(§11), so `entity_bind.rs`'s offchain imports resolve to uninhabited types, and an `offchain__` source
+gets the binder's own "no offchain table" refusal. A warm store's entities are unavailable, with the
+node's reason.
+
+**The query side.** The binary's pinned Burrmill rev (`ea8cf40`) already carries the wasm32 tail:
+`attach_store`, `register_store_facts`, which reads footers by range from an object store, and
+`sql_async`. `burrmill-wasm` itself, the JS package, is not used; it is not in that rev. `query.rs`
+ports `analytics::define_views_bound`'s table loop: schema ∪ manifest ∪ hot, segments at or below
+`sealed_through`, hot rows past it where cold covers the table. It also ports `bind_relation` onto
+that tail, with the cellar's segments in an in-memory store. Views come from each `CREATE VIEW` in
+`views/*.sql`. There is a real difference in execution. The node binds segment files, and Burrmill
+substitutes its owned fold for their aggregates. A store-backed table declines that substitution,
+so the tab's aggregates are DataFusion's plans. The gate holds the answers of the two paths equal.
+
+**The gate's chain.** It is S3's recording, with a scripted reorg added to `fixture-rpc recorded
+--fork`. Before the fork, the last ten blocks carry 17 synthetic mints, and `POST /control/fork`
+replaces the last six and adds two, with different recipients and amounts. The nest
+(`tests/fixtures/tab-parity/s4/`) declares `received` (by `to`: count, sum, min and max block) and
+`sent` (by `from`, filtered), plus three views: one over the facts by thousand-block bucket, one over
+an entity, and a join of the two entities. The node runs `nuthatch dev` (`tests/e2e_tab_entities.rs`).
+The tab runs the wasm build in Node (`run-entities.mjs`). Each reads `/derived/{entity}?limit=1000`
+and `SELECT * FROM <view>` at the tip, then again after the fork once the new tip has been applied.
+Rows are compared whole, ordered by their key-sorted text, and both are held to
+`s4-expected.json`.
+
+**Gate: passed in Node, not run in Chrome or Safari.**
+
+| | before the fork (tip 26,245,870) | after (26,245,872) |
+|---|---|---|
+| `received` / `sent` rows | 722 / 645 | 727 / 645 |
+| `per_kblock` | 3 rows: 703, 1,556 and 17 transfers | 3 rows |
+| `busy_receivers` / `two_way` | 242 / 2 | 240 / 2 |
+| sealed through | 26,245,806 | 26,245,808 |
+| tab wall time | 793 ms from deploy block to answers | 32 ms |
+| wasm linear memory at the end | | 39.3 MiB |
+
+The views read both halves. `per_kblock`'s last bucket is the 17 hot mints, and its first two are the
+sealed segment. The module is 67.3 MB raw (48.3 MB of code and 14.1 MB of names) and 8.39 MB brotli,
+against S2's 10.9 MB and 1.78 MB. That is DataFusion, and S6 is where it gets cut.
+
+**Both mutations fail.** Skipping `retract_entities` in core's `rollback_reorg` fails `after.derived`.
+The rolled-back mints stay counted, and a recipient below the fork is counted twice, since the
+rollback resumes below the fork. Binding no sealed segments in `query.rs` fails `before.views`.
+
+**A finding in the spike.** With Burrmill in its graph, the spike resolves `serde_json`'s and
+`parquet`'s features exactly as the binary does (`cargo tree -e features`, identical lists;
+`arbitrary_precision` arrives with Burrmill). The two synthetic segments that `tests/native.rs` and
+`run-node.mjs` pin changed hash, and they are re-pinned. S3's real segment did not change, and
+neither did any version in the lockfile. Which feature moved them was not isolated. The pins were
+the spike's own, under a dependency graph the node never had.
+
+**What it does not show.** Neither S4 run was in Chrome or Safari. The view port skips what the node
+does for a degraded or missing segment, a historical window, the `wanted`-table pruning,
+`load_relation`'s range checks, and the rewrite of dates to ISO text. No view here returns a date. A
+view's body is sqlparser's rendering of the query, not the file's text as `view_body` slices it.
+Entity state is unbounded in the tab (`allowance_bytes` is `u64::MAX`, never sampled), which is S6's
+budget.
