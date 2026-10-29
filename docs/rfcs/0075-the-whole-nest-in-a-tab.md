@@ -352,7 +352,7 @@ it was written again here. `opfs::OpfsBackend` implements redb's five methods ov
   keeps its meta, rows and checkpoint. A second `OpfsBackend::open` of a held store is
   `OpenError::Locked`. A second worker's `createSyncAccessHandle` on the held file is refused with
   `NoModificationAllowedError` and succeeds once the handle drops. CI runs the three tests in
-  `wasm-core` on the runner's Chrome.
+  `wasm-core` on Chrome for Testing.
 - *Both mutations fail.* Dropping the balance retraction in `rollback_reorg` fails the property at
   the first case. Mapping the DOM error to anything but `Locked` fails the lock test.
 
