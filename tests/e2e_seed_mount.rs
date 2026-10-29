@@ -84,6 +84,7 @@ pub(crate) async fn seeding_runtime_of(
         target: m.to_str().unwrap().to_string(),
         interval: "60s".to_string(),
         parallelism: 4,
+        followers: false,
     });
     let handles = Arc::new(tokio::sync::Mutex::new(handles));
     let jobs = runtime::start_mount_jobs(roost, &handles, true)
