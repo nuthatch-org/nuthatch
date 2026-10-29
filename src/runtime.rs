@@ -466,6 +466,10 @@ pub struct RuntimeMeta {
     /// Absent → the CLAUDE.md 2 GB budget ([`DEFAULT_MAX_RSS_MB`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rss_mb: Option<u64>,
+    /// SQL permits on each cursor's gate (RFC-0076 §3.1), bounded by the cursor's memory split, not
+    /// by a constant. `PUT /_admin/runtime` rewrites it. Absent → `NUTHATCH_SQL_MAX_CONCURRENCY`, else 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_permits: Option<usize>,
     /// Route keys of mounts suspended by the operator (#1548). Their records and data are kept; they
     /// are not indexed or served until resumed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2100,6 +2104,13 @@ pub async fn dev(
              {DEFAULT_MAX_RSS_MB} MB default nuthatch is designed and gated for"
         );
     }
+    let sql_permits = match meta.sql_permits {
+        Some(n) => {
+            check_sql_permits(n)?;
+            n
+        }
+        None => crate::serve::sql_max_concurrency(),
+    };
 
     // Load every mounted **dataset** - not every alias (RFC-0032 §4). Aliases sharing one nest
     // identity share one store and one place in the cursor; only the canonical one indexes, and the
@@ -2136,10 +2147,11 @@ pub async fn dev(
             &state_rpc,
         );
         config.cursor_max_rss_mb = Some(max_rss);
+        config.cursor_sql_permits = Some(sql_permits);
     }
     let groups = group_by_chain(&endpoints, mounted)?;
     if meta.isolation == crate::isolation::Isolation::Strict {
-        crate::analytics_budget::validate_strict_budget(Some(max_rss))?;
+        crate::analytics_budget::validate_strict_budget(sql_permits, Some(max_rss))?;
     }
 
     // A mount may narrow its author's ceiling, never widen it (RFC-0034 §3). Checked before any
@@ -2479,6 +2491,7 @@ pub async fn dev(
             admin_enabled,
             admin_token: admin_token.clone(),
             max_rss_mb: max_rss,
+            sql_permits,
             freshness,
             chain_freshness,
             dormant,
@@ -3433,8 +3446,10 @@ pub fn lifecycle_routes(
     }
 
     #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct RuntimeBody {
-        max_rss_mb: u64,
+        max_rss_mb: Option<u64>,
+        sql_permits: Option<usize>,
     }
 
     async fn get_runtime(
@@ -3448,7 +3463,7 @@ pub fn lifecycle_routes(
         (StatusCode::OK, Json(handles.lock().await.runtime_report()))
     }
 
-    /// RFC-0073 FR5: raise or lower the per-cursor ceiling without a restart.
+    /// RFC-0073 FR5, RFC-0076 §3.1: change the per-cursor ceiling or SQL permits without a restart.
     async fn put_runtime(
         State((handles, _, required)): State<Shared>,
         Query(q): Query<TokenQuery>,
@@ -3462,8 +3477,14 @@ pub fn lifecycle_routes(
             Ok(Json(body)) => body,
             Err(e) => return bad_body(e),
         };
+        if body.max_rss_mb.is_none() && body.sql_permits.is_none() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "name max_rss_mb, sql_permits, or both"})),
+            );
+        }
         let mut h = handles.lock().await;
-        match h.set_max_rss_mb(body.max_rss_mb) {
+        match h.set_runtime(body.max_rss_mb, body.sql_permits) {
             Ok(()) => (StatusCode::OK, Json(h.runtime_report())),
             Err(e) => {
                 let status = e
@@ -4057,14 +4078,23 @@ fn persist_mounted_nests(
     write_mount_table(dir, &mounts)
 }
 
-/// Persist a per-cursor ceiling set over the admin API (RFC-0073 FR5).
-fn persist_max_rss_mb(dir: &Path, max_rss_mb: u64) -> Result<()> {
+/// Persist a per-cursor ceiling or permit count set over the admin API (RFC-0073 FR5, RFC-0076).
+fn persist_runtime_settings(
+    dir: &Path,
+    max_rss_mb: Option<u64>,
+    sql_permits: Option<usize>,
+) -> Result<()> {
     let path = dir.join(MOUNTS_FILE);
     let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {} to persist max_rss_mb", path.display()))?;
+        .with_context(|| format!("reading {} to persist [runtime]", path.display()))?;
     let mut mounts: MountTable = toml::from_str(&raw)
         .with_context(|| format!("parsing {} before rewriting it", path.display()))?;
-    mounts.runtime.max_rss_mb = Some(max_rss_mb);
+    if let Some(mb) = max_rss_mb {
+        mounts.runtime.max_rss_mb = Some(mb);
+    }
+    if let Some(n) = sql_permits {
+        mounts.runtime.sql_permits = Some(n);
+    }
     write_mount_table(dir, &mounts)
 }
 
@@ -4534,6 +4564,8 @@ pub struct MountContext {
     pub admin_token: Option<String>,
     /// The per-cursor RSS ceiling a mount must not breach (`CLAUDE.md`; RFC-0021 §0).
     pub max_rss_mb: u64,
+    /// Permits on each cursor's SQL gate (RFC-0076 §3.1).
+    pub sql_permits: usize,
     /// The runtime's freshness dial (RFC-0040), stamped onto a hot-mounted nest's config so it runs
     /// at the cadence its co-tenants do.
     pub freshness: crate::freshness::Freshness,
@@ -4760,6 +4792,10 @@ pub enum CeilingRefusal {
         entities: usize,
         cap: usize,
     },
+    /// `sql_permits` is zero or past [`crate::serve::SQL_PERMITS_LIMIT`].
+    PermitsOutOfRange { requested: usize },
+    /// The permits and the ceiling together do not fit a cursor's analytics split (RFC-0076 §3.1).
+    SplitDoesNotFit { chain: Option<String>, why: String },
 }
 
 impl std::fmt::Display for CeilingRefusal {
@@ -4798,17 +4834,43 @@ impl std::fmt::Display for CeilingRefusal {
                 "max_rss_mb {requested} caps a cursor at {cap} authored entities, and the {chain} \
                  cursor carries {entities}; unmount something first"
             ),
+            CeilingRefusal::PermitsOutOfRange { requested } => write!(
+                f,
+                "sql_permits {requested} is outside 1 to {}",
+                crate::serve::SQL_PERMITS_LIMIT
+            ),
+            CeilingRefusal::SplitDoesNotFit {
+                chain: Some(chain),
+                why,
+            } => write!(f, "the {chain} cursor's analytics split would not fit: {why}"),
+            CeilingRefusal::SplitDoesNotFit { chain: None, why } => {
+                write!(f, "the analytics split would not fit: {why}")
+            }
         }
     }
 }
 
 impl std::error::Error for CeilingRefusal {}
 
+/// `sql_permits` as `mounts.toml` and the admin API accept it, before memory is asked.
+fn check_sql_permits(permits: usize) -> Result<()> {
+    if permits == 0 || permits > crate::serve::SQL_PERMITS_LIMIT {
+        return Err(CeilingRefusal::PermitsOutOfRange {
+            requested: permits,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 impl CeilingRefusal {
     pub fn status(&self) -> u16 {
         match self {
             CeilingRefusal::AboveLimit { .. } => 400,
-            CeilingRefusal::BelowUse { .. } | CeilingRefusal::BelowEntities { .. } => 409,
+            CeilingRefusal::PermitsOutOfRange { .. } => 400,
+            CeilingRefusal::BelowUse { .. }
+            | CeilingRefusal::BelowEntities { .. }
+            | CeilingRefusal::SplitDoesNotFit { .. } => 409,
         }
     }
 }
@@ -5620,6 +5682,33 @@ struct Seating<'a> {
     isolation: crate::isolation::Isolation,
 }
 
+/// One tenant's place on one gate as `GET /_admin/tenants` reports it (RFC-0076 §3.1).
+fn gate_waits(r: &crate::fair_share::GateTenantReport) -> serde_json::Value {
+    let s = &r.stats;
+    let le: serde_json::Map<String, serde_json::Value> = crate::fair_share::WAIT_BOUNDS
+        .iter()
+        .map(|b| b.to_string())
+        .chain(["+Inf".to_string()])
+        .zip(s.buckets.iter().map(|n| serde_json::json!(n)))
+        .collect();
+    serde_json::json!({
+        "active": r.active,
+        "permits_held": r.held,
+        "waits_total": s.waits,
+        "wait_seconds": {
+            "count": s.count,
+            "sum": s.sum_secs,
+            "p50": s.quantile(0.5),
+            "p99": s.quantile(0.99),
+            "le": le,
+        },
+        "rejections_total": {
+            "busy": s.rejected_busy,
+            "tenant_share": s.rejected_tenant_share,
+        },
+    })
+}
+
 /// Stamp a mount's dataset identity, record, [`served_surface`] and tenant seat onto the state served
 /// under its name. Every path that installs a state under a name goes through here: boot, mount,
 /// resume and move (#1536, #2129).
@@ -5681,10 +5770,10 @@ impl RuntimeHandles {
 
     /// Every tenant configured or mounted, with its share and what it holds right now.
     pub fn tenant_report(&self) -> Vec<serde_json::Value> {
-        let mut gates: Vec<&crate::serve::SqlGate> = Vec::new();
+        let mut gates: Vec<(&str, &crate::serve::SqlGate)> = Vec::new();
         for (_, s) in &self.states {
-            if !gates.iter().any(|g| Arc::ptr_eq(g, &s.sql_gate)) {
-                gates.push(&s.sql_gate);
+            if !gates.iter().any(|(_, g)| Arc::ptr_eq(g, &s.sql_gate)) {
+                gates.push((&s.chain, &s.sql_gate));
             }
         }
         let mut mounts: BTreeMap<String, usize> =
@@ -5693,8 +5782,12 @@ impl RuntimeHandles {
             let tenant = split_route_key(name).0.unwrap_or(&self.default_tenant);
             *mounts.entry(tenant.to_string()).or_default() += 1;
         }
-        let held: Vec<BTreeMap<String, usize>> = gates.iter().map(|g| g.held()).collect();
-        let hot: Vec<BTreeMap<String, usize>> = gates.iter().map(|g| g.hot_used()).collect();
+        let held: Vec<BTreeMap<String, usize>> = gates.iter().map(|(_, g)| g.held()).collect();
+        let hot: Vec<BTreeMap<String, usize>> = gates.iter().map(|(_, g)| g.hot_used()).collect();
+        let waits: Vec<_> = gates
+            .iter()
+            .map(|(chain, g)| (*chain, g.tenant_reports()))
+            .collect();
         let bytes = self
             .states
             .first()
@@ -5704,11 +5797,30 @@ impl RuntimeHandles {
             .into_iter()
             .map(|(tenant, mounted)| {
                 let share = self.tenant_shares.get(&tenant).copied().unwrap_or_default();
+                let on: Vec<_> = waits
+                    .iter()
+                    .filter_map(|(chain, r)| Some((*chain, r.get(&tenant)?)))
+                    .collect();
+                let per_gate: Vec<_> = on
+                    .iter()
+                    .map(|(chain, r)| {
+                        let mut v = gate_waits(r);
+                        v["chain"] = serde_json::json!(chain);
+                        v
+                    })
+                    .collect();
                 serde_json::json!({
                     "tenant": tenant,
                     "share": share,
                     "mounts": mounted,
+                    "active": on.iter().any(|(_, r)| r.active),
                     "permits_held": held.iter().filter_map(|h| h.get(&tenant)).sum::<usize>(),
+                    "waits_total": on.iter().map(|(_, r)| r.stats.waits).sum::<u64>(),
+                    "rejections_total": on
+                        .iter()
+                        .map(|(_, r)| r.stats.rejected_busy + r.stats.rejected_tenant_share)
+                        .sum::<u64>(),
+                    "gates": per_gate,
                     "response_kib_in_flight": bytes.get(&tenant).copied().unwrap_or(0),
                     "hot_kib_in_flight": hot.iter().filter_map(|h| h.get(&tenant)).sum::<usize>(),
                 })
@@ -5908,18 +6020,92 @@ impl RuntimeHandles {
             .collect()
     }
 
+    /// Datasets on `chain`'s cursor, live or joining: what its shared pools are counted by.
+    fn cursor_datasets(&self, chain: &str) -> usize {
+        self.states
+            .iter()
+            .filter(|(_, s)| s.chain == chain)
+            .map(|(_, s)| s.dir.clone())
+            .chain(
+                self.joining
+                    .list()
+                    .into_iter()
+                    .filter(|j| j.chain == chain)
+                    .map(|j| j.dir),
+            )
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
+    /// The gate of `chain`'s cursor, if a mount on it is live.
+    fn cursor_gate(&self, chain: &str) -> Option<&crate::serve::SqlGate> {
+        self.states
+            .iter()
+            .find(|(_, s)| s.chain == chain)
+            .map(|(_, s)| &s.sql_gate)
+    }
+
+    fn strict(&self) -> bool {
+        self.mount_ctx.isolation == crate::isolation::Isolation::Strict
+    }
+
+    /// The analytics split as each cursor would hold it at `max_rss_mb` and `permits`, as boot checks
+    /// it: every permit charged a pool under strict isolation, else no more pools than datasets.
+    fn check_split(&self, max_rss_mb: u64, permits: usize) -> Result<()> {
+        let cfg = crate::analytics_budget::AnalyticsConfig {
+            cursor_max_rss_mb: Some(max_rss_mb),
+            ..crate::analytics_budget::from_env()
+        };
+        let chains = self.chains_in_use();
+        let refuse = |chain: Option<String>, e: anyhow::Error| CeilingRefusal::SplitDoesNotFit {
+            chain,
+            why: format!("{e:#}"),
+        };
+        if chains.is_empty() && self.strict() {
+            crate::analytics_budget::validate_on_cursor(&cfg, permits, usize::MAX)
+                .map_err(|e| refuse(None, e))?;
+        }
+        for chain in chains {
+            let datasets = if self.strict() {
+                usize::MAX
+            } else {
+                self.cursor_datasets(&chain)
+            };
+            crate::analytics_budget::validate_on_cursor(&cfg, permits, datasets)
+                .map_err(|e| refuse(Some(chain), e))?;
+        }
+        Ok(())
+    }
+
     /// `GET /_admin/runtime`: the per-cursor ceiling and what each cursor holds against it.
     pub fn runtime_report(&self) -> serde_json::Value {
         let ceiling = self.mount_ctx.max_rss_mb;
+        let permits = self.mount_ctx.sql_permits;
+        let cfg = crate::analytics_budget::AnalyticsConfig {
+            cursor_max_rss_mb: Some(ceiling),
+            ..crate::analytics_budget::from_env()
+        };
         let cursors: Vec<_> = self
             .chains_in_use()
             .into_iter()
             .map(|chain| {
                 let used = self.cursor_use(&chain);
+                let fit = crate::analytics_budget::permits_ceiling(
+                    &cfg,
+                    self.cursor_datasets(&chain),
+                    self.strict(),
+                )
+                .unwrap_or(crate::serve::SQL_PERMITS_LIMIT)
+                .min(crate::serve::SQL_PERMITS_LIMIT);
+                let gate = self.cursor_gate(&chain);
                 serde_json::json!({
                     "chain": chain,
                     "projected_mb": used.projected_mb,
                     "entities": used.entities,
+                    "sql_permits": gate.map_or(permits, |g| g.total()),
+                    "sql_permits_ceiling": fit,
+                    "sql_reserve": crate::fair_share::reserve(gate.map_or(permits, |g| g.total())),
+                    "active_tenants": gate.map_or(0, |g| g.active()),
                 })
             })
             .collect();
@@ -5928,6 +6114,8 @@ impl RuntimeHandles {
             "max_rss_mb_default": DEFAULT_MAX_RSS_MB,
             "above_default": ceiling > DEFAULT_MAX_RSS_MB,
             "max_entities_per_cursor": max_entities_per_cursor(ceiling),
+            "sql_permits": permits,
+            "sql_permits_default": crate::serve::sql_max_concurrency(),
             "cursors": cursors,
         });
         if ceiling > DEFAULT_MAX_RSS_MB {
@@ -5943,6 +6131,48 @@ impl RuntimeHandles {
     /// cursor already holds. Above the 2 GiB default is the operator's choice (#2441). Persisted
     /// before it applies, so a ceiling a restart would not keep is never in force.
     pub fn set_max_rss_mb(&mut self, max_rss_mb: u64) -> Result<()> {
+        self.set_runtime(Some(max_rss_mb), None)
+    }
+
+    /// Change the per-cursor ceiling, the SQL permits on every cursor's gate, or both, live
+    /// (RFC-0073 FR5, RFC-0076 §3.1). Whatever changes, each cursor's analytics split is held to
+    /// the pair as boot would hold it (#2491). Persisted before it applies.
+    pub fn set_runtime(&mut self, max_rss_mb: Option<u64>, sql_permits: Option<usize>) -> Result<()> {
+        if let Some(mb) = max_rss_mb {
+            self.check_ceiling(mb)?;
+        }
+        if let Some(n) = sql_permits {
+            check_sql_permits(n)?;
+        }
+        let mb = max_rss_mb.unwrap_or(self.mount_ctx.max_rss_mb);
+        let permits = sql_permits.unwrap_or(self.mount_ctx.sql_permits);
+        self.check_split(mb, permits)?;
+        persist_runtime_settings(&self.mount_ctx.dir, max_rss_mb, sql_permits).with_context(|| {
+            format!("the runtime is unchanged: {MOUNTS_FILE} could not be updated")
+        })?;
+        if let Some(n) = sql_permits {
+            let mut gates: Vec<&crate::serve::SqlGate> = Vec::new();
+            for (_, s) in &self.states {
+                if !gates.iter().any(|g| Arc::ptr_eq(g, &s.sql_gate)) {
+                    gates.push(&s.sql_gate);
+                }
+            }
+            for g in gates {
+                g.set_total(n);
+            }
+            self.mount_ctx.sql_permits = n;
+            tracing::info!("SQL permits set to {n} per cursor");
+        }
+        if let Some(mb) = max_rss_mb {
+            self.mount_ctx.max_rss_mb = mb;
+            self.roster["max_rss_mb_per_cursor"] = serde_json::json!(mb);
+            self.live.swap(self.compose()?);
+            tracing::info!("per-cursor ceiling set to {mb} MB");
+        }
+        Ok(())
+    }
+
+    fn check_ceiling(&self, max_rss_mb: u64) -> Result<()> {
         if max_rss_mb > MAX_RSS_MB_CEILING {
             return Err(CeilingRefusal::AboveLimit {
                 requested: max_rss_mb,
@@ -5978,13 +6208,6 @@ impl RuntimeHandles {
                 .into());
             }
         }
-        persist_max_rss_mb(&self.mount_ctx.dir, max_rss_mb).with_context(|| {
-            format!("the ceiling is unchanged: {MOUNTS_FILE} could not be updated")
-        })?;
-        self.mount_ctx.max_rss_mb = max_rss_mb;
-        self.roster["max_rss_mb_per_cursor"] = serde_json::json!(max_rss_mb);
-        self.live.swap(self.compose()?);
-        tracing::info!("per-cursor ceiling set to {max_rss_mb} MB");
         Ok(())
     }
 
@@ -6216,6 +6439,7 @@ impl RuntimeHandles {
                     &self.mount_ctx.state_rpc,
                 );
                 config.cursor_max_rss_mb = Some(self.mount_ctx.max_rss_mb);
+                config.cursor_sql_permits = Some(self.mount_ctx.sql_permits);
                 if let Some(e) = self
                     .mount_ctx
                     .chains
@@ -6353,7 +6577,9 @@ impl RuntimeHandles {
                             .iter()
                             .find(|(_, s)| s.chain == chain)
                             .map(|(_, s)| s.sql_gate.clone())
-                            .unwrap_or_else(crate::serve::new_sql_gate);
+                            .unwrap_or_else(|| {
+                                crate::serve::SqlGate::new(self.mount_ctx.sql_permits)
+                            });
                         let co_tenants = self
                             .states
                             .iter()
@@ -8353,6 +8579,7 @@ mod tests {
                 admin_enabled: true,
                 admin_token: None,
                 max_rss_mb: DEFAULT_MAX_RSS_MB,
+                sql_permits: crate::serve::SQL_MAX_CONCURRENCY,
                 freshness: Default::default(),
                 chain_freshness: std::collections::HashMap::new(),
                 dormant: std::collections::HashMap::new(),
@@ -9090,6 +9317,7 @@ mod tests {
                 admin_enabled: true,
                 admin_token: None,
                 max_rss_mb: DEFAULT_MAX_RSS_MB,
+                sql_permits: crate::serve::SQL_MAX_CONCURRENCY,
                 freshness: Default::default(),
                 chain_freshness: std::collections::HashMap::new(),
                 dormant: std::collections::HashMap::new(),
@@ -9746,6 +9974,12 @@ mod tests {
             Some(Refusal::TenantShare),
             "the cap binds the running mount"
         );
+        gate.observe_admission(
+            "acme",
+            std::time::Duration::from_millis(40),
+            true,
+            Some(Refusal::TenantShare),
+        );
 
         let req = axum::http::Request::get("/_admin/tenants")
             .header(axum::http::header::AUTHORIZATION, "Bearer t")
@@ -9759,6 +9993,16 @@ mod tests {
         assert_eq!(listed["tenants"][0]["tenant"], "acme");
         assert_eq!(listed["tenants"][0]["share"]["max_permits"], 1);
         assert_eq!(listed["tenants"][0]["permits_held"], 1);
+        let acme = &listed["tenants"][0];
+        assert_eq!(acme["active"], true, "{acme}");
+        assert_eq!(acme["waits_total"], 1, "{acme}");
+        assert_eq!(acme["rejections_total"], 1, "{acme}");
+        let on = &acme["gates"][0];
+        assert_eq!(on["rejections_total"]["tenant_share"], 1, "{acme}");
+        assert_eq!(on["wait_seconds"]["count"], 1, "{acme}");
+        assert_eq!(on["wait_seconds"]["p99"], 0.05, "{acme}");
+        assert_eq!(on["wait_seconds"]["le"]["0.025"], 0, "{acme}");
+        assert_eq!(on["wait_seconds"]["le"]["+Inf"], 1, "{acme}");
 
         // The next start reads it back and seats its mounts with it.
         let table = MountTable::load(dir.path()).unwrap();
@@ -9832,6 +10076,7 @@ mod tests {
                 admin_enabled: true,
                 admin_token: None,
                 max_rss_mb: DEFAULT_MAX_RSS_MB,
+                sql_permits: crate::serve::SQL_MAX_CONCURRENCY,
                 freshness: Default::default(),
                 chain_freshness: std::collections::HashMap::new(),
                 dormant: std::collections::HashMap::new(),
@@ -11180,6 +11425,7 @@ mod fr5_tests {
                 admin_enabled: true,
                 admin_token: None,
                 max_rss_mb: DEFAULT_MAX_RSS_MB,
+                sql_permits: crate::serve::SQL_MAX_CONCURRENCY,
                 freshness: Default::default(),
                 chain_freshness: std::collections::HashMap::new(),
                 dormant: std::collections::HashMap::new(),
@@ -11412,6 +11658,91 @@ mod fr5_tests {
             vec!["fr5-c"]
         );
         stop(restarted, cursor).await;
+    }
+
+    /// RFC-0076 §3.1: `sql_permits` moves live on the cursor's gate, is written to `mounts.toml`
+    /// first, and is refused past the cursor's memory split. #2491: a lower ceiling is held to the
+    /// permits already set, as boot would hold it, under strict isolation where every permit costs a
+    /// pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sql_permits_move_live_and_are_held_to_the_memory_split() {
+        let _env = crate::analytics_budget::tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"t\"\nchain = \"ethereum\"\nchain_id = 1\nrpc_urls = []\n",
+        )
+        .unwrap();
+        let a = write_nest(root.path(), "fr19-a");
+        let mut handles = handles_at(root.path());
+        let (cursor, refused) = boot(vec![a], DEFAULT_MAX_RSS_MB, &mut handles).await;
+        assert!(refused.is_empty(), "{refused:?}");
+        handles.mount_ctx.isolation = crate::isolation::Isolation::Strict;
+        let gate = handles.states[0].1.sql_gate.clone();
+        let handles = Arc::new(tokio::sync::Mutex::new(handles));
+        let jobs = Arc::new(crate::mount_jobs::MountJobs::load(root.path()));
+        let routes = lifecycle_routes(handles.clone(), jobs, true, Some("t".into()));
+        let permits_on_disk = || MountTable::load(root.path()).unwrap().runtime.sql_permits;
+        let put = |body: serde_json::Value| call(&routes, "PUT", "/_admin/runtime", Some(body));
+
+        let (status, body) = call(&routes, "GET", "/_admin/runtime", None).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(body["sql_permits"], 2, "{body}");
+        assert_eq!(body["cursors"][0]["sql_permits_ceiling"], 2, "{body}");
+
+        // Three pools of 512 beside the 1,024 reservation is 2,560 MB, past the 2,048 wall.
+        let (status, body) = put(serde_json::json!({ "sql_permits": 3 })).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("2560 MB"),
+            "{body}"
+        );
+        assert_eq!((permits_on_disk(), gate.total()), (None, 2));
+
+        let (status, body) = put(serde_json::json!({ "max_rss_mb": 4096 })).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let (status, body) = put(serde_json::json!({ "sql_permits": 6 })).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(body["sql_permits"], 6, "{body}");
+        assert_eq!(body["cursors"][0]["sql_permits"], 6, "{body}");
+        assert_eq!(body["cursors"][0]["sql_permits_ceiling"], 6, "{body}");
+        assert_eq!((permits_on_disk(), gate.total()), (Some(6), 6));
+        assert_eq!(gate.available_permits(), 6, "the raise is free at once");
+        let (status, _) = put(serde_json::json!({ "sql_permits": 7 })).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+
+        // #2491: six pools of 512 and the reservation are 4,096 MB; 3,072 cannot hold them.
+        let (status, body) = put(serde_json::json!({ "max_rss_mb": 3072 })).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("4096 MB"), "{body}");
+        assert_eq!(persisted(root.path()), Some(4096), "a refusal wrote mounts.toml");
+        assert_eq!(handles.lock().await.mount_ctx.max_rss_mb, 4096);
+
+        let (status, body) =
+            put(serde_json::json!({ "max_rss_mb": 3072, "sql_permits": 4 })).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(persisted(root.path()), Some(3072));
+        assert_eq!((permits_on_disk(), gate.total()), (Some(4), 4));
+
+        for bad in [
+            serde_json::json!({ "sql_permits": 0 }),
+            serde_json::json!({ "sql_permits": crate::serve::SQL_PERMITS_LIMIT + 1 }),
+            serde_json::json!({}),
+        ] {
+            let (status, body) = put(bad.clone()).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{bad} {body}");
+        }
+        let (status, _) = put(serde_json::json!({ "sql_permit": 3 })).await;
+        assert!(status.is_client_error(), "a misspelt field is not ignored");
+        assert_eq!(permits_on_disk(), Some(4));
+
+        drop(routes);
+        let Ok(handles) = Arc::try_unwrap(handles) else {
+            panic!("the routes still hold the handles");
+        };
+        stop(handles.into_inner(), cursor).await;
     }
 
     /// RFC-0073 FR5: a cursor over its ceiling at boot boots the mounts that fit, in `mounts.toml`

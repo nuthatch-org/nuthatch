@@ -445,6 +445,7 @@ async fn bring_up_live(
             admin_enabled: false,
             admin_token: None,
             max_rss_mb: 2048,
+            sql_permits: nuthatch::serve::SQL_MAX_CONCURRENCY,
             freshness: Default::default(),
             chain_freshness: Default::default(),
             dormant: Default::default(),
