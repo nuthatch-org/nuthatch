@@ -2001,7 +2001,8 @@ pub fn admit_at_boot(
         let (entity_count, entity_rows) = declared_entities(&path);
         let mb = estimate_nest_rss_mb(&config, has_labels, entity_count, entity_rows)
             + hot_store_cache_mb(&path);
-        let projected_mb = RUNTIME_BASE_RSS_MB + admitted.cursor_mb + mb;
+        let projected_mb =
+            RUNTIME_BASE_RSS_MB + indexer::window_buffer_mb(max_rss_mb) + admitted.cursor_mb + mb;
         let refusal = refuse_over_entity_ceiling(
             entities + entity_count,
             admitted.nests.len() + 1,
@@ -5899,7 +5900,9 @@ impl RuntimeHandles {
             }
         }
         CursorUse {
-            projected_mb: RUNTIME_BASE_RSS_MB + existing,
+            projected_mb: RUNTIME_BASE_RSS_MB
+                + indexer::window_buffer_mb(self.mount_ctx.max_rss_mb)
+                + existing,
             entities,
             dirs,
         }
@@ -5934,6 +5937,7 @@ impl RuntimeHandles {
             "max_rss_mb_default": DEFAULT_MAX_RSS_MB,
             "above_default": ceiling > DEFAULT_MAX_RSS_MB,
             "max_entities_per_cursor": max_entities_per_cursor(ceiling),
+            "window_buffer_mb": indexer::window_buffer_mb(ceiling),
             "cursors": cursors,
         });
         if ceiling > DEFAULT_MAX_RSS_MB {
@@ -5966,11 +5970,15 @@ impl RuntimeHandles {
         let entity_cap = max_entities_per_cursor(max_rss_mb);
         for chain in self.chains_in_use() {
             let used = self.cursor_use(&chain);
-            if used.projected_mb > max_rss_mb {
+            // The buffer's term moves with the ceiling, so it is priced at the one asked for.
+            let projected_mb = used.projected_mb
+                - indexer::window_buffer_mb(self.mount_ctx.max_rss_mb)
+                + indexer::window_buffer_mb(max_rss_mb);
+            if projected_mb > max_rss_mb {
                 return Err(CeilingRefusal::BelowUse {
                     requested: max_rss_mb,
                     chain: Some(chain),
-                    projected_mb: used.projected_mb,
+                    projected_mb,
                 }
                 .into());
             }
@@ -5988,6 +5996,7 @@ impl RuntimeHandles {
             format!("the ceiling is unchanged: {MOUNTS_FILE} could not be updated")
         })?;
         self.mount_ctx.max_rss_mb = max_rss_mb;
+        indexer::set_cursor_ceiling_mb(max_rss_mb);
         self.roster["max_rss_mb_per_cursor"] = serde_json::json!(max_rss_mb);
         self.live.swap(self.compose()?);
         tracing::info!("per-cursor ceiling set to {max_rss_mb} MB");

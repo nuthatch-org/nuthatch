@@ -56,6 +56,15 @@ pub(crate) fn window_buffer_mb_at(ceiling_mb: u64) -> u64 {
     WINDOW_BUFFER_MB_AT_DEFAULT.saturating_mul(ceiling_mb) / crate::runtime::DEFAULT_MAX_RSS_MB
 }
 
+/// The per-cursor ceiling buffers are bounded by: one runtime per process, so one value, and
+/// `PUT /_admin/runtime` moves it for running cursors too.
+static CEILING_MB: AtomicU64 = AtomicU64::new(crate::runtime::DEFAULT_MAX_RSS_MB);
+
+/// Set the per-cursor ceiling every buffered cursor's byte bound follows.
+pub fn set_cursor_ceiling_mb(mb: u64) {
+    CEILING_MB.store(mb, Ordering::Relaxed);
+}
+
 /// `<runtime>/cursors/<chain>/buffer/`: scratch, never data.
 pub(crate) fn scratch_dir(runtime: &Path, chain: &str) -> PathBuf {
     let chain: String = chain
@@ -75,10 +84,11 @@ pub(crate) fn scratch_dir(runtime: &Path, chain: &str) -> PathBuf {
 pub(crate) struct BufferOptions {
     /// Windows extraction may hold ahead of its nests.
     pub(crate) windows: usize,
-    /// Bytes of windows held in memory before the buffer spills.
-    pub(crate) memory_bytes: u64,
-    /// Where windows past `memory_bytes` go, and how many bytes may go there.
-    pub(crate) spill: Option<(PathBuf, u64)>,
+    /// Bytes of windows held in memory before the buffer spills; `None` follows the live ceiling.
+    pub(crate) memory_bytes: Option<u64>,
+    /// Where windows past the memory bound go, and how many bytes may go there; `None` is
+    /// [`SPILL_FACTOR`] times the memory bound.
+    pub(crate) spill: Option<(PathBuf, Option<u64>)>,
     /// Nests committing a window at once.
     pub(crate) ingest_concurrency: usize,
     pub(crate) stats: Arc<BufferStats>,
@@ -116,7 +126,7 @@ impl BufferOptions {
         runtime_dir: Option<&Path>,
     ) -> Option<Self> {
         let windows = buffer_windows()?;
-        let memory_bytes = window_buffer_mb_at(max_rss_mb) << 20;
+        set_cursor_ceiling_mb(max_rss_mb);
         let spill = runtime_dir.and_then(|r| {
             let dir = scratch_dir(r, chain);
             match std::fs::remove_dir_all(&dir) {
@@ -125,11 +135,11 @@ impl BufferOptions {
                 Err(e) => tracing::warn!("could not empty {}: {e}", dir.display()),
             }
             match std::fs::create_dir_all(&dir) {
-                Ok(()) => Some((dir, memory_bytes.saturating_mul(SPILL_FACTOR))),
+                Ok(()) => Some((dir, None)),
                 Err(e) => {
                     tracing::warn!(
-                        "the {chain} cursor cannot spill its buffer to {}: {e}; it holds \
-                         {memory_bytes} bytes in memory and waits past that",
+                        "the {chain} cursor cannot spill its buffer to {}: {e}; it waits once its \
+                         memory bound is full",
                         dir.display()
                     );
                     None
@@ -138,7 +148,7 @@ impl BufferOptions {
         });
         Some(Self {
             windows,
-            memory_bytes,
+            memory_bytes: None,
             spill,
             ingest_concurrency: default_ingest_concurrency(),
             stats: Arc::default(),
@@ -146,11 +156,23 @@ impl BufferOptions {
         })
     }
 
+    /// Bytes of windows the buffer may hold in memory.
+    pub(crate) fn memory_bound(&self) -> u64 {
+        self.memory_bytes
+            .unwrap_or_else(|| window_buffer_mb_at(CEILING_MB.load(Ordering::Relaxed)) << 20)
+    }
+
+    fn spill_bound(&self) -> Option<u64> {
+        self.spill.as_ref().map(|(_, cap)| {
+            cap.unwrap_or_else(|| self.memory_bound().saturating_mul(SPILL_FACTOR))
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(windows: usize) -> Self {
         Self {
             windows,
-            memory_bytes: u64::MAX / 4,
+            memory_bytes: Some(u64::MAX / 4),
             spill: None,
             ingest_concurrency: 4,
             stats: Arc::default(),
@@ -924,6 +946,41 @@ impl Extraction<'_> {
                     // After the logs, as a window's checkpoint is read, so its hash is of the chain
                     // they came from or later.
                     let header = self.source.block_record(to).await.ok().flatten();
+                    // Read after both, the previous window's end settles that this window extends
+                    // the chain extraction holds, as a nest's parent check does (#2146). Checked
+                    // only before the fetch, a reorg between the two left that chain mixed.
+                    if let Some((prev, hash)) = self.headers.back().cloned().filter(|(b, _)| *b + 1 == next)
+                    {
+                        match self.source.block_hash(prev).await {
+                            Ok(Some(now)) if now.eq_ignore_ascii_case(&hash) => {}
+                            Ok(Some(_)) => match self.detect(&live, prev).await {
+                                Ok(Some(ancestor)) => {
+                                    tracing::warn!(
+                                        "mounts reorg to block {ancestor}, found extending block \
+                                         {prev}: every nest rolls back from its own position"
+                                    );
+                                    self.source.forget_cached_above(ancestor);
+                                    while self.headers.back().is_some_and(|(b, _)| *b > ancestor) {
+                                        self.headers.pop_back();
+                                    }
+                                    self.shared.reorg(ancestor);
+                                    continue;
+                                }
+                                _ => {
+                                    sleep_secs(2).await;
+                                    continue;
+                                }
+                            },
+                            _ => {
+                                tracing::warn!(
+                                    "the source has no hash for block {prev}; not buffering \
+                                     {next}..={to} until it answers"
+                                );
+                                sleep_secs(2).await;
+                                continue;
+                            }
+                        }
+                    }
                     if let Some((hash, _)) = &header {
                         self.headers.push_back((to, hash.clone()));
                         while self.headers.len() > HEADERS_KEPT {
@@ -1116,10 +1173,10 @@ impl Extraction<'_> {
                 let mut b = self.shared.buffer.lock().unwrap();
                 let counted = b.windows.len() < opts.windows;
                 let fits = match w {
-                    None => b.memory < opts.memory_bytes || self.spill_room(&b, 1),
+                    None => b.memory < opts.memory_bound() || self.spill_room(&b, 1),
                     Some(w) => {
                         b.windows.is_empty()
-                            || b.memory + w.bytes <= opts.memory_bytes
+                            || b.memory + w.bytes <= opts.memory_bound()
                             || self.spill_room(&b, w.bytes)
                     }
                 };
@@ -1150,9 +1207,8 @@ impl Extraction<'_> {
     fn spill_room(&self, b: &WindowBuffer, bytes: u64) -> bool {
         self.shared
             .opts
-            .spill
-            .as_ref()
-            .is_some_and(|(_, cap)| b.spilled + bytes <= *cap)
+            .spill_bound()
+            .is_some_and(|cap| b.spilled + bytes <= cap)
     }
 
     /// Put a fetched window in the buffer: in memory while it fits, spilled past that, and waiting
@@ -1171,7 +1227,7 @@ impl Extraction<'_> {
             if b.next_fetch != Some(w.from) {
                 return false;
             }
-            if b.windows.is_empty() || b.memory + w.bytes <= opts.memory_bytes {
+            if b.windows.is_empty() || b.memory + w.bytes <= opts.memory_bound() {
                 None
             } else {
                 b.spill_id += 1;
@@ -1682,5 +1738,38 @@ async fn nest_task(
         slot.next.store(next, Ordering::Release);
         shared.trim();
         shared.bump();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn window_bytes_for_test(logs: &[crate::rpc::Log]) -> u64 {
+    window_bytes(logs, &None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `window_buffer_mb` is 64 MiB at the default ceiling and scales with it, rounded down, as
+    /// the entity cap does.
+    #[test]
+    fn the_buffer_bound_scales_with_the_ceiling() {
+        assert_eq!(window_buffer_mb_at(crate::runtime::DEFAULT_MAX_RSS_MB), 64);
+        assert_eq!(window_buffer_mb_at(1024), 32);
+        assert_eq!(window_buffer_mb_at(4096), 128);
+        assert_eq!(window_buffer_mb_at(2047), 63, "rounded down, never up");
+    }
+
+    #[test]
+    fn the_switch_reads_a_window_count_or_off() {
+        assert_eq!(parse_buffer_windows(None), None);
+        for off in ["0", "off", "shared", " off "] {
+            assert_eq!(parse_buffer_windows(Some(off)), None, "{off}");
+        }
+        assert_eq!(parse_buffer_windows(Some("8")), Some(8));
+        assert_eq!(
+            parse_buffer_windows(Some("lots")),
+            Some(DEFAULT_BUFFER_WINDOWS)
+        );
     }
 }
