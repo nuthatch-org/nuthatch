@@ -19,6 +19,8 @@
   {"method": "GET", "path": "/entities?limit=20"},
   {"method": "GET", "path": "/balances?limit=5"},
   {"method": "GET", "path": "/balances"},
+  {"method": "GET", "path": "/balances?limit=N"},
+  {"method": "GET", "path": "/sql"},
   {"method": "GET", "path": "/balance/0xC8C5AE385BD79AF59E7BE41F05539AFC03815B95"},
   {"method": "GET", "path": "/balance/0x000000000000000000000000000000000000dead"},
   {"method": "GET", "path": "/derived"},
