@@ -47,15 +47,17 @@ const page = `${origin}/web/index.html?rpc=${encodeURIComponent(rpc)}&contract=$
 
 const profile = mkdtempSync(path.join(tmpdir(), "nest-sw-"));
 const browser = spawn(chrome, [
-  "--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-gpu",
+  "--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-gpu", "--enable-logging=stderr",
   `--user-data-dir=${profile}`, page,
-], { stdio: "ignore" });
+], { stdio: ["ignore", "ignore", process.env.CHROME_LOG ? "inherit" : "ignore"] });
 const timeout = setTimeout(() => done({ ok: false, error: "no result within 300 s" }), 300_000);
 const r = await result;
 clearTimeout(timeout);
+const exited = new Promise((r) => browser.once("exit", r));
 browser.kill();
+await exited;
 server.close();
-rmSync(profile, { recursive: true, force: true });
+rmSync(profile, { recursive: true, force: true, maxRetries: 5 });
 
 if (!r.ok) {
   console.error(`the page failed: ${r.error}`);
