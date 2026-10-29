@@ -230,7 +230,11 @@ fn tail(
     let mut out = Vec::new();
     for n in blocks {
         let (hash, ts) = &headers[&n];
-        let count = if (n + variant).is_multiple_of(3) { 1 } else { 2 };
+        let count = if (n + variant).is_multiple_of(3) {
+            1
+        } else {
+            2
+        };
         for i in 0..count {
             let to = if i == 0 && n.is_multiple_of(2) {
                 HOLDER.to_string()
