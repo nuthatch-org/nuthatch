@@ -745,6 +745,20 @@ pub struct Metrics {
     /// RFC-0073 FR4: per-mount serving counters, keyed by route. Separate from `per_nest`, which is
     /// keyed by dataset: an alias of a shared dataset has routes but no ingest of its own.
     serving: Mutex<BTreeMap<String, Arc<NestServing>>>,
+    /// RFC-0076 §3.1: how long `/sql` admission took, per tenant label, at most
+    /// [`ADMISSION_WAIT_TENANTS_MAX`] of them.
+    admission_waits: Mutex<BTreeMap<String, WaitHistogram>>,
+}
+
+/// Tenant labels the admission-wait histogram keeps before folding the rest into `tenant="other"`.
+/// Eight buckets, a sum and a count each: 2,560 series at the cap, where 1,000 tenants would be 10,000.
+pub const ADMISSION_WAIT_TENANTS_MAX: usize = 256;
+
+#[derive(Default)]
+struct WaitHistogram {
+    buckets: [u64; crate::fair_share::WAIT_BOUNDS.len() + 1],
+    sum: f64,
+    count: u64,
 }
 
 /// Prometheus histogram bounds for RPC duration (seconds). The `+Inf` bucket is implicit.
@@ -817,6 +831,7 @@ impl Metrics {
             rpc_endpoints: Mutex::new(BTreeMap::new()),
             per_nest: Mutex::new(BTreeMap::new()),
             serving: Mutex::new(BTreeMap::new()),
+            admission_waits: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1022,6 +1037,29 @@ impl Metrics {
             s.ran_sql.store(true, Relaxed);
         });
     }
+    /// One `/sql` admission of `tenant`'s took `waited`, admitted or refused (RFC-0076 §3.1).
+    pub fn observe_admission_wait(&self, tenant: &str, waited: Duration) {
+        let mut waits = self
+            .admission_waits
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let key = if waits.contains_key(tenant) || waits.len() < ADMISSION_WAIT_TENANTS_MAX {
+            tenant
+        } else {
+            "other"
+        };
+        let h = waits.entry(key.to_string()).or_default();
+        let secs = waited.as_secs_f64();
+        for (i, bound) in crate::fair_share::WAIT_BOUNDS.iter().enumerate() {
+            if secs <= *bound {
+                h.buckets[i] += 1;
+            }
+        }
+        h.buckets[crate::fair_share::WAIT_BOUNDS.len()] += 1;
+        h.sum += secs;
+        h.count += 1;
+    }
+
     pub fn inc_sql_rejected(&self, reason: SqlRejection) {
         self.sql_rejections.fetch_add(1, Relaxed);
         self.sql_rejections_by_reason[reason.index()].fetch_add(1, Relaxed);
@@ -1368,6 +1406,33 @@ impl Metrics {
                 reason.label(),
                 self.sql_rejections_by_reason[reason.index()].load(Relaxed),
             ));
+        }
+        {
+            let waits = self
+                .admission_waits
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            s.push_str(&format!(
+                "# HELP nuthatch_sql_admission_wait_seconds How long a /sql request waited for its gate's permit, admitted or refused, by tenant label (RFC-0076). At most {ADMISSION_WAIT_TENANTS_MAX} tenants; the rest are tenant=\"other\".\n\
+                 # TYPE nuthatch_sql_admission_wait_seconds histogram\n",
+            ));
+            for (tenant, h) in waits.iter() {
+                let tenant = label_value(tenant);
+                for (i, bound) in crate::fair_share::WAIT_BOUNDS.iter().enumerate() {
+                    s.push_str(&format!(
+                        "nuthatch_sql_admission_wait_seconds_bucket{{tenant=\"{tenant}\",le=\"{bound}\"}} {}\n",
+                        h.buckets[i]
+                    ));
+                }
+                s.push_str(&format!(
+                    "nuthatch_sql_admission_wait_seconds_bucket{{tenant=\"{tenant}\",le=\"+Inf\"}} {}\n\
+                     nuthatch_sql_admission_wait_seconds_sum{{tenant=\"{tenant}\"}} {}\n\
+                     nuthatch_sql_admission_wait_seconds_count{{tenant=\"{tenant}\"}} {}\n",
+                    h.buckets[crate::fair_share::WAIT_BOUNDS.len()],
+                    h.sum,
+                    h.count
+                ));
+            }
         }
         s.push_str(
             "# HELP nuthatch_named_scan_bytes Source-byte bound declared queries were answered under (RFC-0048).\n\
@@ -2802,5 +2867,40 @@ mod tests {
             m.last_seal_progress() >= stamped,
             "a real advance must stamp the clock"
         );
+    }
+}
+
+/// A Prometheus label value: a tenant label is any string, so `\`, `"` and newline are escaped.
+fn label_value(v: &str) -> std::borrow::Cow<'_, str> {
+    if !v.contains(['\\', '"', '\n']) {
+        return std::borrow::Cow::Borrowed(v);
+    }
+    std::borrow::Cow::Owned(
+        v.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n"),
+    )
+}
+
+#[cfg(test)]
+mod label_value_tests {
+    #[test]
+    fn a_tenant_label_cannot_break_out_of_its_quotes() {
+        let m = super::Metrics::new();
+        m.observe_admission_wait("a\"} 1\nx{b=\"\\", std::time::Duration::from_millis(3));
+        let out = m.render();
+        let ours: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("admission_wait_seconds") && !l.starts_with('#'))
+            .collect();
+        assert_eq!(
+            ours.len(),
+            super::super::fair_share::WAIT_BOUNDS.len() + 3,
+            "{ours:#?}"
+        );
+        for l in ours {
+            assert!(l.starts_with("nuthatch_sql_admission_wait_seconds_"), "{l}");
+            assert!(l.contains(r#"tenant="a\"} 1\nx{b=\"\\""#), "{l}");
+        }
     }
 }

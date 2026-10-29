@@ -41,8 +41,8 @@ pub(crate) fn value_bytes(v: &Value) -> usize {
 /// Opens sessions.
 pub(crate) trait Engine: Send + Sync {
     /// A session bounded and locked to `dir`: the nest's memory, thread and spill limits, file
-    /// access confined to its data directories. A `tenant` gets a memory pool of its own rather than
-    /// the one every session over `dir` shares (RFC-0073 FR8).
+    /// access confined to its data directories. A `tenant`'s session gets a memory pool of its own
+    /// rather than the one every session over `dir` shares (RFC-0073 FR8, RFC-0076 §3.1).
     fn open(&self, dir: &Path, tenant: Option<&str>) -> Result<Box<dyn Session>>;
     /// An unbounded session with no nest behind it, for binding authored SQL to see whether it
     /// parses and validates. Nothing untrusted runs on one.

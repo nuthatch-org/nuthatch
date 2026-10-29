@@ -10,7 +10,7 @@
 //! the connection cache opens its own DuckDB, and unbounded at 32 clients reached **1,313 MB - 64%
 //! of one cursor's entire 2 GB**, shared across every nest on that cursor.
 
-use nuthatch::serve::{sql_max_concurrency, SQL_MAX_CONCURRENCY, SQL_MAX_CONCURRENCY_CEILING};
+use nuthatch::serve::{sql_max_concurrency, SQL_MAX_CONCURRENCY, SQL_PERMITS_LIMIT};
 
 /// **One lock for every read or write of the variable** (#1035).
 ///
@@ -93,8 +93,8 @@ impl Drop for MemRestore {
 #[must_use]
 fn install_fitting_memory(permits: usize) -> MemRestore {
     let prev = std::env::var(MEM_KEY).ok();
-    let admitted = permits.clamp(1, SQL_MAX_CONCURRENCY_CEILING);
-    let mb = 1024 / admitted;
+    let admitted = permits.clamp(1, SQL_PERMITS_LIMIT);
+    let mb = (1024 / admitted).max(1);
     std::env::set_var(MEM_KEY, mb.to_string());
     MemRestore(prev)
 }
@@ -126,15 +126,14 @@ fn a_requested_value_is_honoured_across_the_measured_range() {
 }
 
 #[test]
-fn above_the_ceiling_is_clamped_not_obeyed() {
-    // The RAM argument, enforced rather than documented. 64 permits could open 64 DuckDBs.
-    for n in [17usize, 64, 10_000] {
+fn above_the_limit_is_clamped_not_obeyed() {
+    // RFC-0076 retired the ceiling of 16: memory bounds the count, checked per cursor at startup.
+    assert_eq!(with_env(Some("64"), sql_max_concurrency), 64);
+    for n in [SQL_PERMITS_LIMIT + 1, 1_000_000] {
         assert_eq!(
             with_env(Some(&n.to_string()), sql_max_concurrency),
-            SQL_MAX_CONCURRENCY_CEILING,
-            "a request above the ceiling must clamp. Each concurrent query can open its own DuckDB \
-             and the budget is 2 GB per cursor, shared across every nest on it - an unbounded knob \
-             would let an operator spend a budget they cannot see"
+            SQL_PERMITS_LIMIT,
+            "a request past the limit must clamp; it is a typo, not a sizing"
         );
     }
 }
@@ -226,8 +225,8 @@ async fn the_gate_the_handlers_acquire_is_built_from_the_live_value() {
     );
     assert_eq!(
         permits_with(Some("64")).await,
-        SQL_MAX_CONCURRENCY_CEILING,
-        "the ceiling must hold at the gate, not only in the parser"
+        64,
+        "past the retired ceiling of 16, where one dataset's memory split still fits"
     );
 }
 

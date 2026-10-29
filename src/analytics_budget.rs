@@ -11,8 +11,8 @@ use std::path::PathBuf;
 pub const DEFAULT_MEMORY_LIMIT_MB: u64 = 512;
 /// Burrmill worker threads. Operator key `analytics.threads`.
 pub const DEFAULT_THREADS: i64 = 2;
-/// Hard ceiling on `analytics.threads`. Matches [`crate::serve::SQL_MAX_CONCURRENCY_CEILING`].
-pub const THREADS_CEILING: i64 = crate::serve::SQL_MAX_CONCURRENCY_CEILING as i64;
+/// Hard ceiling on `analytics.threads`: worker threads per session, the permit ceiling of 5.13.0.
+pub const THREADS_CEILING: i64 = 16;
 
 pub const ENV_MEMORY_LIMIT: &str = "NUTHATCH_ANALYTICS_MEMORY_LIMIT";
 pub const ENV_THREADS: &str = "NUTHATCH_ANALYTICS_THREADS";
@@ -139,18 +139,34 @@ pub fn from_env() -> AnalyticsConfig {
 /// [`THREADS_CEILING`]. Does not cap ingest, DBSP, redb, or result materialisation - which is
 /// exactly why the reservation may only be raised. The wall is 2 GiB, what the footprint CI job
 /// measures, unless [`ENV_MAX_RSS`] or the cursor's `max_rss_mb` raises it.
-pub fn validate_cursor_budget(datasets: usize, cursor_max_rss_mb: Option<u64>) -> Result<()> {
+pub fn validate_cursor_budget(
+    datasets: usize,
+    permits: usize,
+    cursor_max_rss_mb: Option<u64>,
+) -> Result<()> {
     let cfg = AnalyticsConfig {
         cursor_max_rss_mb,
         ..from_env()
     };
-    validate_on_cursor(&cfg, crate::serve::sql_max_concurrency(), datasets)
+    validate_on_cursor(&cfg, permits, datasets)
 }
 
-/// Under `isolation = "strict"` each tenant of a dataset has a pool of its own (RFC-0073 FR8), so a
+/// Under `isolation = "strict"` each running statement draws a pool of its own (RFC-0076 §3.1), so a
 /// cursor's datasets no longer bound its pools and every permit is charged one.
-pub fn validate_strict_budget(cursor_max_rss_mb: Option<u64>) -> Result<()> {
-    validate_cursor_budget(usize::MAX, cursor_max_rss_mb)
+pub fn validate_strict_budget(permits: usize, cursor_max_rss_mb: Option<u64>) -> Result<()> {
+    validate_cursor_budget(usize::MAX, permits, cursor_max_rss_mb)
+}
+
+/// The most permits a cursor with `datasets` fits beside its reservation and headroom, `None` when
+/// any count fits because a dataset's statements share one pool. `strict` charges every permit.
+pub fn permits_ceiling(cfg: &AnalyticsConfig, datasets: usize, strict: bool) -> Option<usize> {
+    let reservation = cfg.reservation_mb();
+    let headroom = cfg.runtime_headroom_mb.unwrap_or(RUNTIME_HEADROOM_MB);
+    let room = cfg
+        .max_rss()
+        .saturating_sub(reservation.saturating_add(headroom));
+    let fit = usize::try_from(room / cfg.burrmill_limit_mb().max(1)).unwrap_or(usize::MAX);
+    (strict || fit < datasets).then_some(fit)
 }
 
 /// A dataset's sessions share one pool (#1792), so no more pools reserve at once than the cursor
@@ -160,10 +176,10 @@ pub fn validate_on_cursor(cfg: &AnalyticsConfig, permits: usize, datasets: usize
 }
 
 /// Same check against an explicit config, so a test can drive the inequality without the process
-/// environment. `pools` is how many nest pools can reserve at once, clamped to the gate's ceiling;
-/// each counts at Burrmill's limit where one is set.
+/// environment. `pools` is how many nest pools can reserve at once; each counts at Burrmill's limit
+/// where one is set.
 pub fn validate_against(cfg: &AnalyticsConfig, pools: usize) -> Result<()> {
-    let pools = pools.clamp(1, crate::serve::SQL_MAX_CONCURRENCY_CEILING) as u64;
+    let pools = pools.max(1) as u64;
     if cfg.memory_limit_mb == 0 {
         bail!(
             "analytics.memory_limit must be greater than zero (set {ENV_MEMORY_LIMIT}, default \
@@ -244,7 +260,7 @@ pub fn validate_against(cfg: &AnalyticsConfig, pools: usize) -> Result<()> {
             format!("Set {knob} at most {fit} MB")
         };
         let permits = if pools > 1 {
-            " or lower NUTHATCH_SQL_MAX_CONCURRENCY"
+            " or lower sql_permits (NUTHATCH_SQL_MAX_CONCURRENCY)"
         } else {
             ""
         };
@@ -256,8 +272,9 @@ pub fn validate_against(cfg: &AnalyticsConfig, pools: usize) -> Result<()> {
         bail!(
             "the analytics split does not fit its wall: (pools × {knob}) + ingestion_reservation + \
              runtime_headroom = ({pools} × {limit} MB) + {reservation} MB + {headroom} MB = {total} \
-             MB, above {wall}. pools is the smaller of sql_permits and the cursor's nest datasets, \
-             since a dataset's sessions share one pool. {remedy}{permits}{raised}. \
+             MB, above {wall}. pools is sql_permits under strict isolation, and otherwise the \
+             smaller of sql_permits and the cursor's nest datasets, since a dataset's sessions share \
+             one pool. {remedy}{permits}{raised}. \
              ingestion_reservation ({ENV_INGESTION_RESERVATION}) goes below its derived floor only beside a \
              measured runtime_headroom ({ENV_RUNTIME_HEADROOM}). \
              {ENV_MAX_RSS}, or a runtime's max_rss_mb above 2048, raises the wall only where the \
@@ -401,13 +418,13 @@ fn split_size(raw: &str) -> Option<(u64, String)> {
 pub(crate) mod tests {
     use super::*;
     use crate::runtime::DEFAULT_MAX_RSS_MB;
-    use crate::serve::{SQL_MAX_CONCURRENCY, SQL_MAX_CONCURRENCY_CEILING};
+    use crate::serve::SQL_MAX_CONCURRENCY;
 
     /// A cursor's hot-tip copies (RFC-0073 FR5) are held outside the pool, so they are paid from the
     /// reservation; no accepted split leaves a reservation they do not fit in.
     #[test]
     fn the_hot_copy_budget_fits_the_smallest_reservation() {
-        let gate = crate::serve::SqlGate::new(SQL_MAX_CONCURRENCY_CEILING);
+        let gate = crate::serve::SqlGate::new(64);
         assert_eq!(
             gate.hot_total_bytes(),
             crate::serve::SQL_MAX_HOT_INFLIGHT_BYTES,
@@ -488,7 +505,6 @@ pub(crate) mod tests {
         assert_eq!(SQL_MAX_CONCURRENCY, 2);
         assert_eq!(DEFAULT_MEMORY_LIMIT_MB, 512);
         assert_eq!(DEFAULT_THREADS, 2);
-        assert_eq!(THREADS_CEILING, SQL_MAX_CONCURRENCY_CEILING as i64);
         assert_eq!(THREADS_CEILING, 16);
         assert_eq!(derived_ingestion_reservation_mb(), 1024);
         assert_eq!(DEFAULT_MAX_RSS_MB, 2048);
@@ -580,11 +596,11 @@ pub(crate) mod tests {
     fn the_startup_check_takes_the_cursor_ceiling() {
         let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _v = EnvVars::set(&[(ENV_BURRMILL_MEMORY_LIMIT, "2048MB")]);
-        assert!(validate_cursor_budget(1, None).is_err());
-        assert!(validate_cursor_budget(1, Some(DEFAULT_MAX_RSS_MB)).is_err());
-        validate_cursor_budget(1, Some(4096)).expect("3,072 MB under the cursor's 4,096");
+        assert!(validate_cursor_budget(1, 2, None).is_err());
+        assert!(validate_cursor_budget(1, 2, Some(DEFAULT_MAX_RSS_MB)).is_err());
+        validate_cursor_budget(1, 2, Some(4096)).expect("3,072 MB under the cursor's 4,096");
         assert!(
-            validate_strict_budget(Some(4096)).is_err(),
+            validate_strict_budget(2, Some(4096)).is_err(),
             "two pools of 2,048"
         );
     }
@@ -832,7 +848,7 @@ pub(crate) mod tests {
     fn no_accepted_split_gives_duckdb_more_than_the_measured_default() {
         let shipped = SQL_MAX_CONCURRENCY as u64 * DEFAULT_MEMORY_LIMIT_MB;
         let mut accepted = 0;
-        for permits in 1..=SQL_MAX_CONCURRENCY_CEILING {
+        for permits in 1..=64 {
             for memory_limit_mb in [64, 128, 256, 512, 768, 1024, 1536, 2048] {
                 for reservation in [0, 256, 512, 1023, 1024, 1536, 2048] {
                     let cfg = AnalyticsConfig {
@@ -870,20 +886,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn permits_above_the_gate_ceiling_are_costed_at_the_ceiling() {
+    fn every_permit_is_costed_and_memory_is_the_ceiling() {
         let cfg = AnalyticsConfig {
-            memory_limit_mb: 64,
+            memory_limit_mb: 16,
             ingestion_reservation_mb: Some(1024),
             ..AnalyticsConfig::default()
         };
-        validate_against(&cfg, 64).expect("clamped to 16 × 64 + 1024 = 2048");
-        let too_big = AnalyticsConfig {
-            memory_limit_mb: 128,
-            ingestion_reservation_mb: Some(1024),
+        validate_against(&cfg, 64).expect("64 × 16 + 1024 = 2048");
+        assert!(
+            validate_against(&cfg, 65).is_err(),
+            "65 × 16 + 1024 = 2064, past 2048; nothing clamps it to 16"
+        );
+        assert_eq!(permits_ceiling(&cfg, 1, true), Some(64));
+        assert_eq!(permits_ceiling(&cfg, 1, false), None, "one shared pool");
+        assert_eq!(permits_ceiling(&cfg, 100, false), Some(64));
+        let wide = AnalyticsConfig {
+            cursor_max_rss_mb: Some(8192),
             ..AnalyticsConfig::default()
         };
-        assert!(validate_against(&too_big, 64).is_err());
-        assert_eq!(SQL_MAX_CONCURRENCY_CEILING, 16);
+        assert_eq!(
+            permits_ceiling(&wide, 1, true),
+            Some(14),
+            "(8192 - 1024) / 512"
+        );
+        assert_eq!(
+            permits_ceiling(&AnalyticsConfig::default(), 1, true),
+            Some(2),
+            "the default ceiling is the default count"
+        );
     }
 
     #[test]
