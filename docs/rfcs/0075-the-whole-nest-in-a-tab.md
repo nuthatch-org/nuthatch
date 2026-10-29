@@ -485,3 +485,68 @@ does for a degraded or missing segment, a historical window, the `wanted`-table 
 view's body is sqlparser's rendering of the query, not the file's text as `view_body` slices it.
 Entity state is unbounded in the tab (`allowance_bytes` is `u64::MAX`, never sampled), which is S6's
 budget.
+
+## 16. S5 outcome, 2026-10-29
+
+S5 (#2481): the query surface.
+
+**What moved.** `nuthatch_core::answer` builds the status and the JSON bytes for `/ready`, `/sql`,
+`/explain`, `/entity/{id}`, `/entities`, `/balances`, `/balance/{address}` and `/derived/*`. The node's
+handlers keep what a tab has none of: admission, fair share, the memo, cost, metrics and the bounded
+response body. Each then makes one `answer::` call, so axum appears only at the router. `UndecodedTally`
+moved to `core::metrics`. The tab routes a method and target to the same functions (`spike/dbsp-wasm/src/http.rs`), over its
+store, views, entities and S4's Burrmill binding. It compiles the node's `sql_errors.rs` by `#[path]`,
+so a failed statement carries the node's hint. The spike's `LiveNest` offers `request(method, target,
+body)` and `sql`, `entity` and `derived`. `web/sw.js` is a Service Worker that answers those routes on
+the page's origin by relaying each `fetch` through the page to the nest worker (`web/nest-worker.js`,
+`web/page.js`). Anything else goes to the network.
+
+**The gate's nest.** It is S4's nest on S3's recording with the fixture's mints, before any fork. There
+are 29 requests (`tests/fixtures/tab-parity/s5/requests.json`): the six routes, `/entities`,
+`/balance` and `/derived`'s index, refusals among them (a bad column, an unknown table, a non-JSON body,
+an id in no table, an unknown entity or key, and two query strings axum cannot read). The node's answers
+were pinned as status, content type and body bytes (`s5-expected.json`) against the binary before the
+refactor (`tests/e2e_tab_answers.rs`), and the refactor kept them. Seven fields are masked. Five are
+`/ready`'s clock readings and the version. `nid` moves with the version and the fixture RPC's port.
+`fetch_window_blocks` is getLogs pacing: a node adapts it to its RPC, and a tab sets it.
+
+**Gate: passed in Node and in Chrome, not run in Safari.**
+
+| | tab, Node 26, `Bytes` store | tab, Chrome for Testing 156, OPFS, through the Service Worker |
+|---|---|---|
+| answers byte-identical to the node's | 29 of 29 | 29 of 29 |
+| follow from the deploy block | 766 ms | 1,279 ms |
+| one answer, p50 / max | 0.2 ms / 92 ms (a `/sql`, which binds Burrmill afresh) | |
+| wasm linear memory at the end | 39.4 MiB | |
+
+The module is 67.7 MB raw and 8.45 MB brotli, against S4's 67.3 MB and 8.39 MB.
+
+**The skill and `llms.txt`, run unchanged.** The test also pins the `SKILL.md` and `llms.txt` that
+`init` scaffolds for this nest, so the tab runs `init`'s text. The page lifts each `curl` line from the
+skill: `/entities?limit=20`, and `-G /sql --data-urlencode 'q=SELECT count(*) FROM tab__transfer'`. It
+turns each into a `fetch` on its own origin with the host dropped, and both answer the node's bytes.
+`llms.txt`'s routes split three ways:
+
+- Answered by the Service Worker: `/derived`.
+- Written with placeholders, and so not run as written: `/table/{name}`, `/entity/{id}`,
+  `/sql?q=SELECT...`, `/balance/{address}`, `/balances?limit=N` and `/diff?from=X&to=Y`. The pinned
+  requests cover the S5 routes among them.
+- Not served by the tab: `/`, `/tables`, `/queries`, `/q/{name}` and `/diff`. They fall through to the
+  network, which on `/play` is the static host.
+
+**Both mutations fail.** `explain_valid(true)` in the tab's `/explain` fails the Node run on both
+`/explain` answers. Dropping the content type in `sw.js` fails the Chrome run, on `/ready` first. On the
+node's side, `"returned": items.len() + 1` in `answer::derived_all` fails `e2e_tab_answers`.
+
+**What it does not show.**
+
+- No Safari run, for S3's reason.
+- The tab has no admission gate, fair share, memo, byte cap on a response, or per-request deadline.
+  None of them changes an answer below their limits, and none is reached here.
+- A query naming a date column would differ: the node rewrites dates to ISO text, and the tab does not.
+- `/ready` reports what a tab knows. A seal-direct pass and its fields are absent, `stalled` is only an
+  entity's fault, and the poll interval is the page's.
+- The relay needs the page open, because the Service Worker reaches the nest through it. MCP over HTTP
+  (§7) is not built.
+- Wiring the worker and the Service Worker into `/play` is a change to the frontend repo, and it has not
+  been made.
