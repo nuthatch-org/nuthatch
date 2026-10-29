@@ -291,3 +291,94 @@ writer processes per chain (§3.4).
    has measured what concurrent windows cost in memory.
 3. FR19: the reserve's size, once the bench has GraphOps's activity profile.
 4. FR20: Chief's decision on the direction and, separately and later, on the amendment.
+
+## 10. S3 built (2026-10-29, #2490)
+
+FR17 as §3.3 describes it, with three departures, each for a reason found while building.
+
+**What was built.** `nuthatch serve --follow <writer> --mirror <mirror> --registry <registry>
+--cache <dir> [--max-rss-mb N]` runs a follower that shares no path with the writer. `--cache` is its
+own directory, laid out as a runtime's: each mount's nest is installed at `data/<nid>` from the
+registry, each segment a catalogue names lands at `segments/<hash>.parquet` once its bytes hash to
+that name, each dataset's offchain snapshots under its `offchain/`. The token is
+`NUTHATCH_ADMIN_TOKEN` alone. The local follower is unchanged; `--runtime` still selects it.
+
+A delta or snapshot whose catalogue names a segment the follower does not hold is held, with every
+line behind it for that dataset, charged to the dataset's budget, while a fetch task retries with
+backoff from 100 ms to 2 s; past the budget the follower resnapshots. The held lines are applied in
+order once the files are in. `/<route>/ready` reports `follower.mirror`: what is waited for, how
+long, and the last error. The publisher now also uploads each provisional segment to
+`_provisional/<hash>.seg` and each offchain snapshot, then its catalogue, to `_offchain/`. It never
+deleted anything from a mirror before; it now deletes a provisional segment a fold replaced, and only
+that, by `seal`'s `releasable` rule: every connected follower of the dataset has applied the commit
+that stopped naming it and the grace has passed, or the hour is up. Final segments stay append-only.
+
+Feed v2 is negotiated by `?feed=2` and answered with its own content type, so a follower facing a
+writer that predates it reads v1, and a writer facing an old follower sends v1. Visibility,
+encode, delta-size, apply, seal-wait, mirror and per-connection queue figures are exported as
+`docs/admin-api.md` lists them.
+
+**Departures.**
+
+1. *The registry fetch is by NID, not by bundle hash.* The bundle hash includes `generator_version`,
+   so the hash a 5.14 writer computes for its dataset directory is not the hash of the bundle a 5.13
+   `nest publish` put in the registry. The `mount` line already carries the NID, which is a content
+   address over the same manifest less the generator version, and `pull_by_nid` refuses a bundle
+   that does not compute to it before `nest load`'s checks run. What the `mount` line gained instead
+   is `data_identity`, the prefix the writer's publisher mirrors the dataset under, which the
+   follower cannot work out from the bundle: an offchain pull moves it.
+2. *Feed v2 compresses each batch itself.* Arrow's IPC compression decompresses into whatever size
+   the sender declares, which broke the follower's guarantee that nothing it reads is allocated past
+   its budget: a compressible delta well under its wire limit decompressed past it. Each batch is
+   now an uncompressed IPC stream LZ4-compressed whole behind its size, and the follower checks that
+   size, then the rows the columns rebuild to, against what the dataset has left before allocating
+   either. A table with fewer than 8 puts sends them as they are: the schema cost more than columns
+   saved.
+3. *The visibility series is labelled by dataset and kind, not follower.* Connections come and go;
+   a follower label would grow without bound.
+
+**Figures.** v1 against v2 on deltas a real store commits for windows of decoded ERC-20 transfers,
+release build, Apple M5 Pro, one thread (`feed_wire::tests::measure_v1_against_v2`):
+
+| Delta | v1 bytes | v2 bytes | v2/v1 | v1 encode | v2 encode | v1 decode | v2 decode | apply |
+|---|---|---|---|---|---|---|---|---|
+| one row | 717 | 533 | 0.74 | 0.5 µs | 2.3 µs | 1.1 µs | 0.2 µs | 0.5 µs |
+| a tip block, 40 transfers | 21,144 | 3,647 | 0.17 | 10.5 µs | 76.4 µs | 19.8 µs | 38.5 µs | 3.9 µs |
+| 50 blocks, 1,000 transfers | 526,275 | 74,433 | 0.14 | 0.25 ms | 1.7 ms | 0.49 ms | 0.85 ms | 0.11 ms |
+| 1,000 blocks, 20,000 transfers | 10,591,557 | 1,682,962 | 0.16 | 5.4 ms | 34.5 ms | 9.9 ms | 17.8 ms | 2.8 ms |
+
+v2 is a sixth of v1's bytes on any window worth the name, and costs about seven times v1's encode
+and twice its decode. Encoding is once per delta however many followers it goes to, where v1
+serialises once per connection, so the writer's cost evens out at about seven followers; a delta of
+more than 512 ops is encoded off the async workers. Apply is the same either way.
+
+Visibility lag as the writer records it, 200 tip blocks and 20 seals, one follower beside the writer
+and one on "another host" in the same process over loopback with a filesystem mirror, debug build
+(`e2e_remote_follower::measure_visibility`): tip deltas 398 observations, mean 1.4 ms, p50 under
+2.5 ms, all but one under 5 ms, the slowest under 25 ms. Seals: the follower beside the writer, all
+20 under 1 ms; the remote one, all 20 between 100 and 250 ms, every one of them spent waiting for the
+publisher, which the test runs after the seal commits, so each first fetch missed and waited out the
+100 ms backoff (`nuthatch_follower_seal_wait_seconds` mean 120 ms). That is the shape §3.3 predicted:
+tip visibility is the feed's, seal visibility is the mirror's.
+
+**Gates.** `tests/e2e_remote_follower.rs`: a remote follower answers as a local one on `/sql`,
+`/tables`, `/entities`, `/schema` and `/ready`, `as_of`, `sealed_through` and `nid` included, through
+the snapshot, tip deltas, a seal, a fold and a seal published only where a final segment goes while
+the delta still calls it provisional, and over v1 too; the same against versitygw for both mirror and
+registry (the `minio-publish` job); a slow mirror, a mirror missing the file and one serving the wrong
+bytes each leave it answering the generation before the seal, 200 and whole. `publish.rs` tests the
+mirror deletion against a follower that has and has not moved on, and offchain snapshots end to end
+with a tampered one refused. `scripts/rolling-upgrade.sh` gains a leg with a separate process, its
+own directory, the registry and a filesystem mirror; its chain never seals, so it gates the CLI, the
+processes and the registry, and the e2e gates segments.
+
+Mutation checks, each red: applying a sealing delta before its files are in (a `503` where the
+held generation should answer, `a held seal is never a refusal`); skipping the hash check (a short
+answer, 4 rows of 6 with `degraded: true`, and a tampered offchain snapshot taken); splitting a row
+whose text the columns cannot rebuild (`a_v2_delta_decodes_to_exactly_the_delta_encoded`).
+
+**Not done.** Network namespaces: the gate's remote follower shares the host's loopback, and
+GraphOps's second-region environment answers the latency criterion, which CI cannot. A follower's
+`--cache` is never swept; tails later folded away stay until the operator clears it. An offchain
+pull moving a dataset's data identity, and so its mirror prefix, predates this slice; a remote
+follower follows the new prefix within 30 s, once the publisher has refilled it.

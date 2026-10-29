@@ -552,9 +552,9 @@ pub fn read_frames(
                 let mut payload = vec![0u8; rest as usize];
                 body.read_exact(&mut payload)
                     .context("reading a delta frame")?;
-                // Compressed, the wire says little about what the rows come to; decoding is held to
-                // what is left after the frame itself.
-                let limit = cap.map(|cap| (cap + SNAPSHOT_SLACK).saturating_sub(rest));
+                // Compressed, the wire says little about what the rows come to, so decoding is held
+                // to the frame's own limit: any one batch, and the rows they rebuild to.
+                let limit = cap.map(|cap| cap + SNAPSHOT_SLACK);
                 let delta = match wire::decode_delta(&payload, limit) {
                     Ok(delta) => delta,
                     Err(e) if e.is::<wire::TooLarge>() => {

@@ -832,22 +832,22 @@ async fn forward(dataset: String, store: Arc<dyn HotStore>, tx: Queue, v2: bool)
                                     let body = crate::feed_wire::encode_delta(delta)
                                         .map(bytes::Bytes::from)
                                         .unwrap_or_default();
-                                    crate::feed_metrics::metrics()
-                                        .encoded("v2", started.elapsed());
+                                    crate::feed_metrics::metrics().encoded("v2", started.elapsed());
                                     body
                                 })
                                 .clone()
                         }
                         // A backfill window takes tens of milliseconds to encode: not on a worker
                         // the runtime's other tasks are waiting for.
-                        let body = if delta.ops.len() > ENCODE_INLINE_OPS && delta.wire.get().is_none() {
-                            let d = delta.clone();
-                            tokio::task::spawn_blocking(move || encoded(&d))
-                                .await
-                                .unwrap_or_default()
-                        } else {
-                            encoded(&delta)
-                        };
+                        let body =
+                            if delta.ops.len() > ENCODE_INLINE_OPS && delta.wire.get().is_none() {
+                                let d = delta.clone();
+                                tokio::task::spawn_blocking(move || encoded(&d))
+                                    .await
+                                    .unwrap_or_default()
+                            } else {
+                                encoded(&delta)
+                            };
                         if body.is_empty() {
                             continue 'snapshot;
                         }

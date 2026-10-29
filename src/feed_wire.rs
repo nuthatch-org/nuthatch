@@ -779,6 +779,35 @@ mod tests {
         }
     }
 
+    /// Compressed, a delta's wire bytes say little about its rows: 32 rows of 64 KiB of one byte
+    /// come to a few KiB on the wire. Decoding is refused before the 2 MiB they rebuild to, or the
+    /// batch they decompress to, is allocated past the limit.
+    #[test]
+    fn a_compressed_delta_is_held_to_its_limit_before_it_is_decoded() {
+        let ops = (0..32)
+            .map(|i| Op::Put {
+                key: format!("000000000001-{i:06}"),
+                row: format!(r#"{{"table":"t","pad":"{}"}}"#, "x".repeat(64 << 10)),
+            })
+            .collect();
+        let d = Delta {
+            ops,
+            ..Delta::default()
+        };
+        let body = encode_delta(&d).unwrap();
+        assert!(
+            body.len() < 64 << 10,
+            "premise: it compresses ({} bytes)",
+            body.len()
+        );
+        let err = decode_delta(&body, Some(1 << 20)).unwrap_err();
+        let too = err
+            .downcast_ref::<TooLarge>()
+            .expect("refused as too large");
+        assert!(too.needed > 1 << 20, "{too:?}");
+        assert_eq!(decode_delta(&body, Some(4 << 20)).unwrap().ops, d.ops);
+    }
+
     #[test]
     fn a_tampered_catalogue_is_refused() {
         let d = sample();
