@@ -1,0 +1,184 @@
+[
+  {
+    "method": "GET",
+    "path": "/ready",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"version\":\"<masked>\",\"ready\":true,\"stalled\":false,\"wedged\":false,\"initial_poll_failed\":false,\"tip\":26245870,\"last_block\":26245870,\"lag_blocks\":0,\"cursorless\":false,\"freshness\":{\"mode\":\"tip\",\"poll_interval_secs\":1,\"poll_interval_source\":\"flag\"},\"sealed_through\":26245806,\"seal_lag_blocks\":64,\"last_poll_unixtime\":\"<masked>\",\"seconds_since_poll\":\"<masked>\",\"seal_direct_active\":false,\"seal_direct_origin\":0,\"seal_direct_completed\":0,\"seal_direct_fetched\":0,\"fetch_window_blocks\":5988,\"seal_direct_target\":0,\"seal_direct_concurrency\":null,\"ipfs_gave_up_documents\":0,\"seal_direct_ipfs_window_deadline_secs\":300,\"seal_direct_stalled\":false,\"tip_seal_stalled\":false,\"seal_faulted\":false,\"seconds_since_seal_progress\":\"<masked>\",\"entities\":[{\"name\":\"received\",\"applied_through\":26245870,\"current\":true,\"catching_up\":false,\"rows\":722,\"faulted\":false,\"fault\":null,\"wedged\":false,\"unavailable\":null,\"seconds_since_progress\":\"<masked>\"},{\"name\":\"sent\",\"applied_through\":26245870,\"current\":true,\"catching_up\":false,\"rows\":645,\"faulted\":false,\"fault\":null,\"wedged\":false,\"unavailable\":null,\"seconds_since_progress\":\"<masked>\"}],\"entities_stalled\":false,\"views_failed\":[],\"undecoded\":{\"total\":0,\"top\":[]}}"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20count(*)%20FROM%20tab__transfer",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"count\":1,\"truncated\":false,\"degraded\":false,\"degraded_tables\":[],\"tip_unavailable\":false,\"columns\":[\"count_star()\"],\"rows\":[{\"count_star()\":2276}],\"cached\":false,\"provenance\":{\"as_of\":26245870,\"sealed_through\":26245806,\"source\":\"hot+sealed\",\"registry_hash\":\"0x94ba85b9815a879678bac1e89f20ed71cd246c099fff458967e3398d0f88f4c3\",\"nid\":\"<masked>\",\"entities\":null}}"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20kblock%2C%20transfers%2C%20volume%20FROM%20per_kblock%20ORDER%20BY%20kblock",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"count\":3,\"truncated\":false,\"degraded\":false,\"degraded_tables\":[],\"tip_unavailable\":false,\"columns\":[\"kblock\",\"transfers\",\"volume\"],\"rows\":[{\"kblock\":26239000,\"transfers\":703,\"volume\":\"47678292398128008487330\"},{\"kblock\":26240000,\"transfers\":1556,\"volume\":\"154467576375757792100620\"},{\"kblock\":26245000,\"transfers\":17,\"volume\":\"14729000000000000007\"}],\"cached\":false,\"provenance\":{\"as_of\":26245870,\"sealed_through\":26245806,\"source\":\"hot+sealed\",\"registry_hash\":\"0x94ba85b9815a879678bac1e89f20ed71cd246c099fff458967e3398d0f88f4c3\",\"nid\":\"<masked>\",\"entities\":null}}"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20*%20FROM%20two_way%20ORDER%20BY%20account",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"count\":2,\"truncated\":false,\"degraded\":false,\"degraded_tables\":[],\"tip_unavailable\":false,\"columns\":[\"account\",\"received_n\",\"sent_n\",\"net\"],\"rows\":[{\"account\":\"0x85ab8707e9c4f49dcd8c54912d1355a8348934ae\",\"received_n\":\"1\",\"sent_n\":\"5\",\"net\":\"-398152938455297709700\"},{\"account\":\"0xff291d561d1366489a7036ec23c27ebc24bcdc36\",\"received_n\":\"1\",\"sent_n\":\"10\",\"net\":\"-1730027534222902547870\"}],\"cached\":false,\"provenance\":{\"as_of\":26245870,\"sealed_through\":26245806,\"source\":\"hot+sealed\",\"registry_hash\":\"0x94ba85b9815a879678bac1e89f20ed71cd246c099fff458967e3398d0f88f4c3\",\"nid\":\"<masked>\",\"entities\":[{\"entity\":\"received\",\"incremental\":true,\"applied_through\":26245870,\"current\":true},{\"entity\":\"sent\",\"incremental\":true,\"applied_through\":26245870,\"current\":true}]}}"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20block_number%2C%20log_index%2C%20%22from%22%2C%20%22to%22%2C%20value%20FROM%20tab__transfer%20ORDER%20BY%20block_number%20DESC%2C%20log_index%20DESC%20LIMIT%205",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"count\":5,\"truncated\":false,\"degraded\":false,\"degraded_tables\":[],\"tip_unavailable\":false,\"columns\":[\"block_number\",\"log_index\",\"from\",\"to\",\"value\"],\"rows\":[{\"block_number\":26245870,\"log_index\":1,\"from\":\"0x0000000000000000000000000000000000000000\",\"to\":\"0x000000000000000000000000000000000000aa00\",\"value\":\"871000000000000001\"},{\"block_number\":26245870,\"log_index\":0,\"from\":\"0x0000000000000000000000000000000000000000\",\"to\":\"0x78f3b1558952774e4520868cb8e34bf256d6209b\",\"value\":\"871000000000000000\"},{\"block_number\":26245869,\"log_index\":0,\"from\":\"0x0000000000000000000000000000000000000000\",\"to\":\"0x000000000000000000000000000000000000aa04\",\"value\":\"870000000000000000\"},{\"block_number\":26245868,\"log_index\":1,\"from\":\"0x0000000000000000000000000000000000000000\",\"to\":\"0x000000000000000000000000000000000000aa03\",\"value\":\"869000000000000001\"},{\"block_number\":26245868,\"log_index\":0,\"from\":\"0x0000000000000000000000000000000000000000\",\"to\":\"0x78f3b1558952774e4520868cb8e34bf256d6209b\",\"value\":\"869000000000000000\"}],\"cached\":false,\"provenance\":{\"as_of\":26245870,\"sealed_through\":26245806,\"source\":\"hot+sealed\",\"registry_hash\":\"0x94ba85b9815a879678bac1e89f20ed71cd246c099fff458967e3398d0f88f4c3\",\"nid\":\"<masked>\",\"entities\":null}}"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20%22to%22%2C%20n%2C%20total%20FROM%20received%20ORDER%20BY%20n%20DESC%2C%20%22to%22%20LIMIT%203",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"count\":3,\"truncated\":false,\"degraded\":false,\"degraded_tables\":[],\"tip_unavailable\":false,\"columns\":[\"to\",\"n\",\"total\"],\"rows\":[{\"to\":\"0x37c9ef5d0801abdc25d9bbed096a080fa3c54e4c\",\"n\":\"147\",\"total\":\"7350000000000000000\"},{\"to\":\"0xcee939daf4981e0eea8ffe9e41bde3d28ca77964\",\"n\":\"103\",\"total\":\"350899219738589874\"},{\"to\":\"0x06307b90e02eb784a88826d9bdc657a2eff4467d\",\"n\":\"66\",\"total\":\"198000000000000000\"}],\"cached\":false,\"provenance\":{\"as_of\":26245870,\"sealed_through\":26245806,\"source\":\"hot+sealed\",\"registry_hash\":\"0x94ba85b9815a879678bac1e89f20ed71cd246c099fff458967e3398d0f88f4c3\",\"nid\":\"<masked>\",\"entities\":[{\"entity\":\"received\",\"incremental\":true,\"applied_through\":26245870,\"current\":true}]}}"
+  },
+  {
+    "method": "POST",
+    "path": "/sql",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"count\":2,\"truncated\":true,\"degraded\":false,\"degraded_tables\":[],\"tip_unavailable\":false,\"columns\":[\"block_number\"],\"rows\":[{\"block_number\":26239813},{\"block_number\":26239813}],\"cached\":false,\"provenance\":{\"as_of\":26245870,\"sealed_through\":26245806,\"source\":\"hot+sealed\",\"registry_hash\":\"0x94ba85b9815a879678bac1e89f20ed71cd246c099fff458967e3398d0f88f4c3\",\"nid\":\"<masked>\",\"entities\":null}}"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20nope%20FROM%20tab__transfer",
+    "status": 400,
+    "content_type": "application/json",
+    "body": "{\"error\":\"plan error: Binder Error: Referenced column \\\"nope\\\" not found in FROM clause!\\nSchema error: No field named nope.\\nValid fields are tab__transfer._seq, tab__transfer.address, tab__transfer.block_hash, tab__transfer.block_number, tab__transfer.block_timestamp, tab__transfer.from, tab__transfer.log_index, tab__transfer.table, tab__transfer.to, tab__transfer.tx_hash, tab__transfer.value, tab__transfer.value_dec, tab__transfer.value_overflow.\\n\\nhint: no column `nope`; the closest is `to`. Call `schema` for this table's columns.\"}"
+  },
+  {
+    "method": "POST",
+    "path": "/sql",
+    "status": 400,
+    "content_type": "application/json",
+    "body": "{\"error\":\"the body must be {\\\"q\\\": \\\"...\\\", \\\"max_rows\\\": n}: expected value at line 1 column 1\"}"
+  },
+  {
+    "method": "GET",
+    "path": "/explain?q=SELECT%20count(*)%20FROM%20tab__transfer",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"valid\":true,\"note\":\"query binds; run it with the sql tool\",\"tip_unavailable\":false}"
+  },
+  {
+    "method": "POST",
+    "path": "/explain",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"valid\":true,\"note\":\"query binds; run it with the sql tool\",\"tip_unavailable\":false}"
+  },
+  {
+    "method": "GET",
+    "path": "/explain?q=SELECT%20*%20FROM%20no_such_table",
+    "status": 400,
+    "content_type": "application/json",
+    "body": "{\"valid\":false,\"error\":\"no segments: Catalog Error: Table with name no_such_table does not exist!\\nError during planning: no table no_such_table\\n\\nhint: no table `no_such_table`. Call the `schema` tool for the list of tables.\"}"
+  },
+  {
+    "method": "GET",
+    "path": "/entity/000026245870-000001",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"table\":\"tab__transfer\",\"block_number\":26245870,\"block_hash\":\"0xf3f40436645e09f0c4f5c904a5896d69e405f503778f0e1db37d000c28c70d87\",\"block_timestamp\":1792644575,\"tx_hash\":\"0x05268eb72f86de9c1b43f82de4cd0f5502ea3a50d11c9f18d73662a5395e2ef5\",\"log_index\":1,\"address\":\"0x0c26fe5e579c3b007ba16d921ba8204a47c05f1a\",\"_seq\":27520789381121,\"from\":\"0x0000000000000000000000000000000000000000\",\"to\":\"0x000000000000000000000000000000000000aa00\",\"value\":\"871000000000000001\"}"
+  },
+  {
+    "method": "GET",
+    "path": "/entity/000026239813-000981",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"_seq\":27514438157269,\"address\":\"0x0c26fe5e579c3b007ba16d921ba8204a47c05f1a\",\"block_hash\":\"0x0dc58733510c951774182d213613f6a674a6036fe089331e4b8897dddef8a4a4\",\"block_number\":26239813,\"block_timestamp\":1792571735,\"from\":\"0x11efa2aea151bffa46eebf9c7a5b99966fba03d8\",\"log_index\":981,\"table\":\"tab__transfer\",\"to\":\"0x90127c4c11eecf879c59b446ff9ce5f0cd48fceb\",\"tx_hash\":\"0xa105161aca7498437f21debe4434a2940bce3c5bdf2ac7b89be652e15dda5901\",\"value\":\"1049317943336831149\",\"value_dec\":\"1049317943336831149\",\"value_overflow\":false}"
+  },
+  {
+    "method": "GET",
+    "path": "/entity/000000000001-000000",
+    "status": 404,
+    "content_type": "application/json",
+    "body": "{\"error\":\"not found\",\"id\":\"000000000001-000000\"}"
+  },
+  {
+    "method": "GET",
+    "path": "/entity/not-an-id",
+    "status": 404,
+    "content_type": "application/json",
+    "body": "{\"error\":\"not found\",\"id\":\"not-an-id\"}"
+  },
+  {
+    "method": "GET",
+    "path": "/entities?limit=3",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"count\":3,\"items\":[{\"table\":\"tab__transfer\",\"block_number\":26245870,\"block_hash\":\"0xf3f40436645e09f0c4f5c904a5896d69e405f503778f0e1db37d000c28c70d87\",\"block_timestamp\":1792644575,\"tx_hash\":\"0x05268eb72f86de9c1b43f82de4cd0f5502ea3a50d11c9f18d73662a5395e2ef5\",\"log_index\":1,\"address\":\"0x0c26fe5e579c3b007ba16d921ba8204a47c05f1a\",\"_seq\":27520789381121,\"from\":\"0x0000000000000000000000000000000000000000\",\"to\":\"0x000000000000000000000000000000000000aa00\",\"value\":\"871000000000000001\"},{\"table\":\"tab__transfer\",\"block_number\":26245870,\"block_hash\":\"0xf3f40436645e09f0c4f5c904a5896d69e405f503778f0e1db37d000c28c70d87\",\"block_timestamp\":1792644575,\"tx_hash\":\"0x175cdc68c2b133bd175aa6ba0c9d1f3cebe45fdeb34761ffee45c2002fd517f9\",\"log_index\":0,\"address\":\"0x0c26fe5e579c3b007ba16d921ba8204a47c05f1a\",\"_seq\":27520789381120,\"from\":\"0x0000000000000000000000000000000000000000\",\"to\":\"0x78f3b1558952774e4520868cb8e34bf256d6209b\",\"value\":\"871000000000000000\"},{\"table\":\"tab__transfer\",\"block_number\":26245869,\"block_hash\":\"0x3a41f3444e5501016b0cfb09eb32691447e0d62cdff2a7b3453a7ba10daade8b\",\"block_timestamp\":1792644563,\"tx_hash\":\"0x47d4a24846d8d9d9aaaa648f03e17c65e93c7f59e5ff4827445b2efeaae21683\",\"log_index\":0,\"address\":\"0x0c26fe5e579c3b007ba16d921ba8204a47c05f1a\",\"_seq\":27520788332544,\"from\":\"0x0000000000000000000000000000000000000000\",\"to\":\"0x000000000000000000000000000000000000aa04\",\"value\":\"870000000000000000\"}]}"
+  },
+  {
+    "method": "GET",
+    "path": "/balances?limit=5",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"holders\":1366,\"count\":5,\"items\":[{\"address\":\"0xc8c5ae385bd79af59e7be41f05539afc03815b95\",\"balance\":\"85061711942160000000000\"},{\"address\":\"0xa148ce5104c9a935f06c3e299f08f374b78294e1\",\"balance\":\"8291338025579265997332\"},{\"address\":\"0x78f3b1558952774e4520868cb8e34bf256d6209b\",\"balance\":\"8004334748000000000000\"},{\"address\":\"0xf5cc34ea62964dada82a2651100216cdca99c27e\",\"balance\":\"7800000000000000000000\"},{\"address\":\"0xf66ca686a1e191c518b9a421c97b01b96919dac2\",\"balance\":\"6581998000000000000000\"}],\"dropped_over_i128\":0}"
+  },
+  {
+    "method": "GET",
+    "path": "/balances",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"holders\":1366,\"count\":100,\"items\":[{\"address\":\"0xc8c5ae385bd79af59e7be41f05539afc03815b95\",\"balance\":\"85061711942160000000000\"},{\"address\":\"0xa148ce5104c9a935f06c3e299f08f374b78294e1\",\"balance\":\"8291338025579265997332\"},{\"address\":\"0x78f3b1558952774e4520868cb8e34bf256d6209b\",\"balance\":\"8004334748000000000000\"},{\"address\":\"0xf5cc34ea62964dada82a2651100216cdca99c27e\",\"balance\":\"7800000000000000000000\"},{\"address\":\"0xf66ca686a1e191c518b9a421c97b01b96919dac2\",\"balance\":\"6581998000000000000000\"},{\"address\":\"0x2337ce65d5bfb8220f6fa138ffba433b4a5295a4\",\"balance\":\"5196000000000000000000\"},{\"address\":\"0x9638201606168155c7e0082d68a028f55bd9d343\",\"balance\":\"4999999991000000000000\"},{\"address\":\"0xcfbb5f25e3e2813d48f1ef9ee2da6e5e474d3230\",\"balance\":\"4800000005138687100000\"},{\"address\":\"0x8a8fe368e0102933a64647eff99fe7588358a6cb\",\"balance\":\"3104230000000000000000\"},{\"address\":\"0xc76c19c77b2b54b4bce481bed2ceb17dab99d6f7\",\"balance\":\"3000000000000000000000\"},{\"address\":\"0x08849aff0cecce5d3794a1c1921c23c4076a02e0\",\"balance\":\"2850000000000000000000\"},{\"address\":\"0x18f51f638be2263f95adbe6c55d0f3e88346c1bf\",\"balance\":\"2548000000000000000000\"},{\"address\":\"0x5c42c1934fa7a16316825cf0224ba1bf33b53e1d\",\"balance\":\"2453499681284900008000\"},{\"address\":\"0x98abbce628e9172ed2714b94450e31044c762006\",\"balance\":\"1731027534222902547870\"},{\"address\":\"0x14c69426e7014f9a13f7bc041425fb1fa8df5529\",\"balance\":\"1725000000000000000000\"},{\"address\":\"0x325252528fe7320b1e4c345463f2ed07f1a2e80d\",\"balance\":\"1399600000000000000000\"},{\"address\":\"0xdd3689db26e7d9adf363cc1f89ae87db6528c72a\",\"balance\":\"1341509986034343591284\"},{\"address\":\"0xc0ee28bde0fc158bbd291aefb32fd2afb127a44b\",\"balance\":\"1199500000000000000000\"},{\"address\":\"0x09653c2637bad154a81011b90bd2caa18913d4d0\",\"balance\":\"1150000000000000000000\"},{\"address\":\"0x4b88049988ab0e0e5924e8df2763389ff7681396\",\"balance\":\"1140000000000000000000\"},{\"address\":\"0x725aa91d2153e547ecb62153501dab0062889d07\",\"balance\":\"1040000226279026760168\"},{\"address\":\"0x2757cdc19d6f9384f7625f45afaa0c587e03489c\",\"balance\":\"1025000000000000000000\"},{\"address\":\"0xb99574643c7a0eb0c1b2aab5153eb60b69d07fd5\",\"balance\":\"1000000000000000000000\"},{\"address\":\"0xb5f1d132c3264753676ea1ac1d546d0c12a42385\",\"balance\":\"907500000000000000000\"},{\"address\":\"0xf0e1995bd1df0ed4c931eb49494ca216f6958026\",\"balance\":\"894621740000000000000\"},{\"address\":\"0x21161999ac83c2a5870877ca3905f1d95352ed84\",\"balance\":\"882245607360000000000\"},{\"address\":\"0xbddd866e27aa992b8f2b6705f1e1d818af0c7f7e\",\"balance\":\"873769907837615034000\"},{\"address\":\"0x9f5909142ab9d7473872dd37ccad6120ccd7b838\",\"balance\":\"827475414000000000000\"},{\"address\":\"0x27efb62a2255dc4650479d1614484d1fb9c9d261\",\"balance\":\"810000000000000000000\"},{\"address\":\"0xe95bd44df106a735870f405326c736d45b7aec86\",\"balance\":\"779970000000000000000\"},{\"address\":\"0xec2e5cff8b926599ef97dec31a54dde216ddc9bc\",\"balance\":\"744000000000000000000\"},{\"address\":\"0x87abe8d049a98ab42379ce719191f51d02400212\",\"balance\":\"720000000000000000000\"},{\"address\":\"0xc9b41688bee728681c3214141c81416f81b380a2\",\"balance\":\"714996446103356456092\"},{\"address\":\"0x3af20bf487757a7b29a7c7cb2af6769f652aa413\",\"balance\":\"660000000000000000000\"},{\"address\":\"0xcc3b53577b07eecced7c15523beb68b6974e3868\",\"balance\":\"620200000000000000000\"},{\"address\":\"0xdaf7c1d2e1947a6db76bd9c7223fc8a418b9c23d\",\"balance\":\"620000000000000000000\"},{\"address\":\"0xc56a956b180d8bab3beea8d2b7949b3374f4f7e8\",\"balance\":\"602447700000000000000\"},{\"address\":\"0x667a2b151f695447debe12141707b02413b1dd55\",\"balance\":\"600000000000000000000\"},{\"address\":\"0xd56f71b03507144cb74996a9bc04fb5975f0f6ab\",\"balance\":\"595051218723307666154\"},{\"address\":\"0x939f78c5e5c0fa88681cfdcf999c586c438bbe5a\",\"balance\":\"500000000000000000000\"},{\"address\":\"0x228017ee99d0a900412e922b506e5dc294b485e2\",\"balance\":\"498656556000000000000\"},{\"address\":\"0x85afa84fcb7e79b2409838f70f43b780728934ae\",\"balance\":\"497691181576662776500\"},{\"address\":\"0x8479ba8d6cb6c46aaa27fe1cee4b3247cc1c8600\",\"balance\":\"463382400000000000000\"},{\"address\":\"0xcfbb7b7f526e7d3618ca4a4ba203a43b490b6bec\",\"balance\":\"441917551378893200000\"},{\"address\":\"0x0d8b30cc0d0ae3c6e6a0d292f657d09f076b1919\",\"balance\":\"440584277999155796216\"},{\"address\":\"0xa91514e689b03273993321a17c8fa10dbf78ed7e\",\"balance\":\"426001000000000000000\"},{\"address\":\"0x1ec3dff9a5a3bb76ed379549c75073b085e76626\",\"balance\":\"418000000000000000000\"},{\"address\":\"0xbf482adf5d37c2ef7f60c41a527c58133e84ffdd\",\"balance\":\"414000000000000000000\"},{\"address\":\"0x4e672e778b7459e5fe884195f81bcd5db9963cac\",\"balance\":\"411847424000000000000\"},{\"address\":\"0xdee22817625454b57bcd16383df557458badf5ab\",\"balance\":\"400400000000000000000\"},{\"address\":\"0xfc239b9b5464963c511282eec36d41140a595cd1\",\"balance\":\"399995969280000000000\"},{\"address\":\"0xdab4194c5fe16df932d65e138ca85893a6e08863\",\"balance\":\"399984000000000000000\"},{\"address\":\"0x3aa52d593d2053fbd45852a08d6f414d8143aee4\",\"balance\":\"398152939816504212000\"},{\"address\":\"0xd70526169a0a10cc2553efd799b42c19949d4606\",\"balance\":\"397860000000000000000\"},{\"address\":\"0x4186a6666d2c3bfc87d2541686adb34938c3621b\",\"balance\":\"395000000000000000000\"},{\"address\":\"0xcc177d77a27ec16bdcbede7457dd74ac4787f75a\",\"balance\":\"389665241930364070992\"},{\"address\":\"0x62bfca1c7c44a6be1c741958e48a07e61e508dc5\",\"balance\":\"360000000000000000000\"},{\"address\":\"0xd528daac52ee640cb1438e13b1149026a9fc6c5b\",\"balance\":\"340000000000000000000\"},{\"address\":\"0x0eaba48627460f58e366a7b29607409ebc404ea4\",\"balance\":\"328000000000000000000\"},{\"address\":\"0xfd5d978473246ff8fe4263ef9dbaa2a227c536c6\",\"balance\":\"312000000000000000000\"},{\"address\":\"0x5a3da11da266f05473fafdea906536da69a7f118\",\"balance\":\"300000000000000000000\"},{\"address\":\"0xaff6896afd6e6e2d9a87c5d4a1a9b0abd3fbc75f\",\"balance\":\"300000000000000000000\"},{\"address\":\"0xf408204208f97d22c203aec09abc3361807c27a8\",\"balance\":\"298907284040748000000\"},{\"address\":\"0x64fa93b43a2c974a10b448ed684b87f64fd1314a\",\"balance\":\"296400000000000000000\"},{\"address\":\"0xc4633bc2c2d2cb2a803906c015a68d9d100b5362\",\"balance\":\"293911907880000000000\"},{\"address\":\"0xcf02534f9d7da5f5939579b9ea9c5fec03015e33\",\"balance\":\"290771907748387720000\"},{\"address\":\"0x391bff730c96c96fd258b2370b3248d20785686b\",\"balance\":\"286953588000000000000\"},{\"address\":\"0xe921c646f796423f7213a66b7ead9062c84ad057\",\"balance\":\"282353741322161803960\"},{\"address\":\"0x3ace59f64f54175897708d556f01c2676a63c715\",\"balance\":\"282270447224000000000\"},{\"address\":\"0x54784fdd7405b36d0f4aed58e2962b710918c197\",\"balance\":\"279998800000000000000\"},{\"address\":\"0x7b7ca8991651e8bd427cda682a0d3d941bc3cb6b\",\"balance\":\"276299030509813141800\"},{\"address\":\"0x844efc7a20b13161ef72e3bd2fedecfa573d697d\",\"balance\":\"270000000000000000000\"},{\"address\":\"0x73de198a74e7b1b16a0ceb9b74edf9d4e81e6294\",\"balance\":\"260000000000000000000\"},{\"address\":\"0x01ecc163f1103c11e10612485f6eebb3a3368940\",\"balance\":\"259539558000000000000\"},{\"address\":\"0xc1a4bd8a3c0e57f867e4fc17be944c8e42699f43\",\"balance\":\"250000000000000000000\"},{\"address\":\"0x49ab7d05de4d42df2ddd8dc1e6360fa327d39799\",\"balance\":\"240000000000000000000\"},{\"address\":\"0xf689ab4a642156710dc4f37d53cc81046e6541a6\",\"balance\":\"239999995233212100000\"},{\"address\":\"0x5bdb9c0ea237b40d42c87f198b2623629a4117e2\",\"balance\":\"236000000000000000000\"},{\"address\":\"0xf88fb0d143e4cb2bffdb564670007a0ac3f5e7c7\",\"balance\":\"232102664679405356800\"},{\"address\":\"0x63b30308432e6cd5154d45eb247f48824a2a64ce\",\"balance\":\"226900000000000000000\"},{\"address\":\"0xb23ceee4d491249b062b1e7e9eb719bb0e1839be\",\"balance\":\"212067966302640582496\"},{\"address\":\"0x83f140fad61028e6d53b202453d99c9f0ca35833\",\"balance\":\"207200000000000000000\"},{\"address\":\"0xb1829bc40ada5a6647dc1b818a4382eb50a226be\",\"balance\":\"205501116825916235632\"},{\"address\":\"0x6d04e94e384f7885e5de0e41f56af97ddced8b6c\",\"balance\":\"201915449985347424000\"},{\"address\":\"0x7d10883e968bad7c77132d6e9de440446463b73d\",\"balance\":\"200000000000000000000\"},{\"address\":\"0xb4fcb13b51c3247919a84cbbc6be3c7d0f764fe8\",\"balance\":\"200000000000000000000\"},{\"address\":\"0x94771620fdbd1d9dbfe2ffcb1f28b79f79b5f026\",\"balance\":\"199200000000000000000\"},{\"address\":\"0x1a6fcec6de2106746b0e54f7207af05a9f5bf6e5\",\"balance\":\"198273258737451468000\"},{\"address\":\"0xceb03df4a46e8249cc3116c877c5a6ae0ee24436\",\"balance\":\"198273214435817580000\"},{\"address\":\"0xbeeedd95e973fc0b96dfada2e09adf489c9916d6\",\"balance\":\"198273212424019660000\"},{\"address\":\"0x8541b492f46efd3bfcc6810f4c4311cbd226dbab\",\"balance\":\"196198216910018310652\"},{\"address\":\"0xe403ef9e305a4a423759f0168ac1a7fc24f21217\",\"balance\":\"184142440000000000000\"},{\"address\":\"0x21b5cedb5efc28154dc04b4c59253ae765cad920\",\"balance\":\"182175005138813775626\"},{\"address\":\"0x21b94ab34051402236b14b7134b66a6229cad920\",\"balance\":\"182175005138813775626\"},{\"address\":\"0x157af58bda4ebf81305c41a92f1c0c4d7915ace4\",\"balance\":\"180000000000000000000\"},{\"address\":\"0x76645ef12e25d58d9724c0ff9478c8c41d7d7199\",\"balance\":\"179999993213641092000\"},{\"address\":\"0x83c97259816e9cda3e5d70d6071574c84af1974a\",\"balance\":\"177696000000000000000\"},{\"address\":\"0x7021296782f776023e24fa4012254ac54cd9d0c7\",\"balance\":\"177438000011200002000\"},{\"address\":\"0x8831c5ff60b6df05090cdabc0f159f6a76935640\",\"balance\":\"172300000000000000000\"},{\"address\":\"0xf28d997f969b76f27e65469683276bd885ecf489\",\"balance\":\"172000000000000000000\"}],\"dropped_over_i128\":0}"
+  },
+  {
+    "method": "GET",
+    "path": "/balance/0xC8C5AE385BD79AF59E7BE41F05539AFC03815B95",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"address\":\"0xc8c5ae385bd79af59e7be41f05539afc03815b95\",\"balance\":\"85061711942160000000000\",\"dropped_over_i128\":0}"
+  },
+  {
+    "method": "GET",
+    "path": "/balance/0x000000000000000000000000000000000000dead",
+    "status": 404,
+    "content_type": "application/json",
+    "body": "{\"error\":\"no balance\",\"address\":\"0x000000000000000000000000000000000000dead\"}"
+  },
+  {
+    "method": "GET",
+    "path": "/derived",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"count\":2,\"head\":26245870,\"entities\":[{\"name\":\"received\",\"rows\":722,\"incremental\":true,\"applied_through\":26245870,\"current\":true,\"available\":true},{\"name\":\"sent\",\"rows\":645,\"incremental\":true,\"applied_through\":26245870,\"current\":true,\"available\":true}]}"
+  },
+  {
+    "method": "GET",
+    "path": "/derived/received?limit=5",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"entity\":\"received\",\"rows\":722,\"returned\":5,\"items\":[{\"key\":[\"0x000000000000000000000000000000000000aa00\"],\"row\":[\"3\",\"2603000000000000002\",\"26245865\",\"26245870\"]},{\"key\":[\"0x000000000000000000000000000000000000aa01\"],\"row\":[\"2\",\"1724000000000000001\",\"26245861\",\"26245861\"]},{\"key\":[\"0x000000000000000000000000000000000000aa02\"],\"row\":[\"3\",\"2599000000000000002\",\"26245862\",\"26245867\"]},{\"key\":[\"0x000000000000000000000000000000000000aa03\"],\"row\":[\"2\",\"1733000000000000001\",\"26245863\",\"26245868\"]},{\"key\":[\"0x000000000000000000000000000000000000aa04\"],\"row\":[\"2\",\"1735000000000000001\",\"26245864\",\"26245869\"]}],\"provenance\":{\"nid\":\"<masked>\",\"entity\":\"received\",\"incremental\":true,\"from_maintained_state\":true,\"applied_through\":26245870,\"dataset_head\":26245870,\"current\":true}}"
+  },
+  {
+    "method": "GET",
+    "path": "/derived/received/0x37C9EF5D0801ABDC25D9BBED096A080FA3C54E4C",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"key\":\"0x37C9EF5D0801ABDC25D9BBED096A080FA3C54E4C\",\"row\":[\"147\",\"7350000000000000000\",\"26239813\",\"26240399\"],\"provenance\":{\"nid\":\"<masked>\",\"entity\":\"received\",\"incremental\":true,\"from_maintained_state\":true,\"applied_through\":26245870,\"dataset_head\":26245870,\"current\":true}}"
+  },
+  {
+    "method": "GET",
+    "path": "/derived/sent/0x000000000000000000000000000000000000dead",
+    "status": 404,
+    "content_type": "application/json",
+    "body": "{\"error\":\"no such key\",\"entity\":\"sent\",\"key\":\"0x000000000000000000000000000000000000dead\",\"provenance\":{\"nid\":\"<masked>\",\"entity\":\"sent\",\"incremental\":true,\"from_maintained_state\":true,\"applied_through\":26245870,\"dataset_head\":26245870,\"current\":true}}"
+  },
+  {
+    "method": "GET",
+    "path": "/derived/nope",
+    "status": 404,
+    "content_type": "application/json",
+    "body": "{\"error\":\"no such entity\",\"entity\":\"nope\",\"entities\":[\"received\",\"sent\"]}"
+  }
+]
