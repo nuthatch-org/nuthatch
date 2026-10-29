@@ -56,8 +56,8 @@ NUTHATCH_ADMIN_TOKEN=… nuthatch dev --dir fleet-1 --listen 0.0.0.0:8288 --regi
 | Unmount | `DELETE /_admin/nests/<name>` | `200`, with `"was_mounted": false` when there was nothing to unmount (a retry is not a failure); `400` for a name no mount could have |
 | Unmount and free the disk | `DELETE /_admin/nests/<name>?reclaim=true` | `200` and the reclaim, for a live or suspended mount; `409`, with nothing unmounted, for a mount with no recorded NID |
 | Free a dataset unmounted earlier | `DELETE /_admin/datasets/<nid>` | `200`, `409` kept, `404` absent |
-| Read the memory ceiling | `GET /_admin/runtime` | `200` and the ceiling, with what each cursor holds |
-| Raise or lower it | `PUT /_admin/runtime` `{"max_rss_mb": 1536}` | `200` and the same; `409` below what a cursor holds |
+| Read the memory ceiling and SQL permits | `GET /_admin/runtime` | `200` and both, with what each cursor holds |
+| Raise or lower either | `PUT /_admin/runtime` `{"max_rss_mb": 4096, "sql_permits": 6}` | `200` and the same; `409` below what a cursor holds, or past what its memory split fits |
 
 `<name>` is the route the nest serves at, `/<name>/…`: `usdc` for the runtime's default tenant, and
 `acme/usdc` for any other tenant. Each mount's route depends on its own tenant alone, so it never
@@ -226,8 +226,10 @@ the next boot holds to it; the next mount is admitted against it at once.
 
 ```json
 {"max_rss_mb": 1536, "max_rss_mb_default": 2048, "above_default": false,
- "max_entities_per_cursor": 24, "window_buffer_mb": 48,
- "cursors": [{"chain": "mainnet", "projected_mb": 420, "entities": 3}]}
+ "max_entities_per_cursor": 24, "window_buffer_mb": 48, "sql_permits": 2, "sql_permits_default": 2,
+ "session_cache_capacity": 16,
+ "cursors": [{"chain": "mainnet", "projected_mb": 420, "entities": 3, "sql_permits": 2,
+              "sql_permits_ceiling": 2, "sql_reserve": 1, "active_tenants": 0}]}
 ```
 
 - **2048 is the default, and the budget nuthatch is designed and gated for.** CI holds a cursor to
@@ -246,7 +248,33 @@ the next boot holds to it; the next mount is admitted against it at once.
   under `NUTHATCH_CURSOR_BUFFER=0`.
 - **The analytics split follows it upward.** Above 2048, `(pools × analytics.memory_limit) +
   ingestion_reservation` is checked against the raised ceiling at startup, as `NUTHATCH_MAX_RSS`
-  would raise it. Below 2048 the split is still held to the default.
+  would raise it. Below 2048 the split is still held to the default. A `PUT` is held to the split
+  too, with the permits already set (#2491): a ceiling that cannot hold them is `409`, naming the
+  chain and the arithmetic, and nothing is written.
+
+### SQL permits
+
+`sql_permits` is how many analytical statements each chain cursor's gate runs at once (RFC-0076).
+It lives in `mounts.toml` as `[runtime] sql_permits`; absent, `NUTHATCH_SQL_MAX_CONCURRENCY` sets it
+at boot, and absent too it is 2. `PUT /_admin/runtime` `{"sql_permits": n}` changes every cursor's
+gate with no restart, written to `mounts.toml` first. A raise is free at once; a cut takes free
+permits at once and the rest as running queries finish, and never stops one.
+
+There is no fixed ceiling. The ceiling is memory: each cursor's split, `(pools ×
+analytics.memory_limit) + ingestion_reservation + runtime_headroom`, must fit `max_rss_mb`, and `PUT`
+refuses a count that does not with `409`. Under `isolation = "strict"` every permit is a pool, since
+each running statement draws one of its own; otherwise a cursor has no more pools than nest datasets,
+because a dataset's statements share one. `sql_permits_ceiling` in `GET /_admin/runtime` is the most
+that fits each cursor; it reads 1024, the most this accepts, where any count fits. At the 2048 default
+with the shipped 512 MB limit, the ceiling under strict isolation is 2: nothing changes until the
+operator gives a cursor more. A count of 0 or over 1024 is `400`, and a body naming neither field, or
+any other field, is refused.
+
+`session_cache_capacity` is how many analytics sessions the process keeps open between queries. Under
+strict isolation a tenant's sessions are its own, so a thousand tenants would miss a cache of 16 on
+nearly every query. It is 16 while the split leaves nothing over, as at the default, and one more for
+each 65 MB the split leaves over on each cursor, up to 256: what one cached session may hold, an eighth
+of the engine limit in Parquet footers and 1 MB of its own.
 - Boot prices each store at its size then, so a ceiling set to exactly `projected_mb` can refuse the
   last mount at the next start once stores have grown. Leave headroom.
 
@@ -319,15 +347,15 @@ what the next start runs; a write that fails answers `500` and changes nothing.
 
 ## Tenant shares
 
-Each chain's cursor has one SQL gate, two permits by default, shared by every mount on that chain, and
-the process has one budget of response bytes in flight. Both are divided by tenant label (RFC-0073
+Each chain's cursor has one SQL gate, `sql_permits` permits (two by default), shared by every mount on
+that chain, and the process has one budget of response bytes in flight. Both are divided by tenant label (RFC-0073
 FR2). Nuthatch still knows nothing about who a tenant is; the label is the first part of a mount's name.
 
 | Do | Call | Answers |
 |---|---|---|
 | Set a tenant's share | `PUT /_admin/tenants/<tenant>` `{"weight": 2, "max_permits": 1, "max_response_mib": 32}` | `200`, `{"tenant", "share"}` |
 | Restore the default | `PUT /_admin/tenants/<tenant>` `{}` | `200` |
-| Read every tenant's share and use | `GET /_admin/tenants` | `{"tenants": [{"tenant", "share", "mounts", "permits_held", "response_kib_in_flight", "hot_kib_in_flight"}, …]}` |
+| Read every tenant's share and use | `GET /_admin/tenants` | `{"tenants": [{"tenant", "share", "mounts", "active", "permits_held", "waits_total", "rejections_total", "gates", "response_kib_in_flight", "hot_kib_in_flight"}, …]}` |
 
 A `PUT` replaces the tenant's whole share, every field optional. It is written to `mounts.toml` under
 `[tenants.<tenant>]` first and then applied to every running mount, with no restart; a share the file
@@ -336,12 +364,15 @@ could not take is refused and changes nothing. A tenant may be given a share bef
 `max_response_mib` caps its response bytes in flight across the process. A bad value is `400`, an
 unknown field `422`.
 
-**How the gate is divided.** Every tenant with a mount on a gate holds a reservation of one permit. A
-tenant may borrow more only while every other tenant's reservation stays free, so a tenant below its
-reservation is admitted within the 250 ms admission wait however busy another tenant is: it waits
-behind its own queries, never another's. When several tenants wait, a freed permit goes to the one
-holding the fewest permits per unit of weight. Half the response-bytes budget is reserved the same way,
-split by weight between the tenants mounted; the other half is borrowed first come.
+**How the gate is divided.** Only a tenant with a query queued or running on a gate is *active* there,
+and only active tenants share it: a tenant with a thousand idle mounts holds nothing (RFC-0076). The
+gate keeps a **reserve** of `max(1, sql_permits / 8)` permits, one at the default, that only a tenant
+holding no permit may take. A tenant already holding one borrows more only while the reserve stays
+free, so a tenant that becomes active finds a reserve permit within the 250 ms admission wait however
+busy the others are. When several tenants wait, a freed permit goes to the one holding the fewest
+permits per unit of weight, and its fair share is the gate divided by weight among the active
+tenants. Half the response-bytes budget is reserved per mounted tenant, split by weight; the other
+half is borrowed first come.
 
 **Hot-tip copies.** A query over the unsealed tip copies those rows for as long as it runs, a memory
 apart from its response. Each gate has 128 MiB of them in flight (RFC-0073 FR5), divided between its
@@ -349,20 +380,32 @@ tenants exactly as response bytes are, and `max_response_mib` does not cap it. T
 before a row is parsed and charged to the tenant until the query ends, however it ends, so a tenant
 past its share is refused before it copies anything. `hot_kib_in_flight` is what each tenant holds.
 
-**The trade.** A permit already running is never taken back, so a reservation is held whether or not
-its tenant is busy. A tenant can use every permit only when it is the only tenant on the gate. With as
-many tenants as permits each holds at most one, and with more tenants than permits a tenant without a
-permit waits for any reservation to free. Raising `NUTHATCH_SQL_MAX_CONCURRENCY` buys room, within the
-per-cursor memory budget its ceiling protects.
+**The trade, and the bound.** A permit already running is never taken back, so the reserve is what a
+newly active tenant can count on, and it is a bound rather than a promise: when more tenants become
+active within one 250 ms wait than the reserve holds, the ones past it wait for a running query to
+end, and are refused if none ends in time. `docs/bench/rfc-0076-tenants.md` measures it. A tenant uses
+every permit only when it is the only tenant mounted on the gate; otherwise one tenant alone uses all
+but the reserve. Raising `sql_permits` buys room and a larger reserve, within the cursor's memory
+split.
 
-**Refusals.** A tenant at its own share, at its cap, or waiting with every reservation taken, is
+**Refusals.** A tenant at its cap, or already holding a permit and held back by the reserve, is
 answered `429` with `"reason": "tenant_share"` and counted as `nuthatch_sql_rejections_total
-{reason="tenant_share"}`. A full gate while the tenant is under its share is still `503`, `server busy`,
+{reason="tenant_share"}`. A full gate while the tenant holds no permit is still `503`, `server busy`,
 and `reason="busy"`. A runtime with one tenant behaves as it did before shares existed: it may hold
 every permit and is only ever told `busy`. A lone nest outside a runtime has no tenant at all.
 
-A maintained-view build takes a permit as a tenant mounting its dataset, so it never takes another
-tenant's reservation.
+**Waits.** For each tenant, `GET /_admin/tenants` gives `active` (a query queued or running on any
+gate), `waits_total` (`/sql` admissions that found no permit free and queued) and `rejections_total`,
+and under `gates` the same per chain with `wait_seconds`: the count, sum, `p50` and `p99` and the
+cumulative buckets (`le`) of every `/sql` admission's wait, zero waits included, with
+`rejections_total` split into `busy` and `tenant_share`. `p50` and `p99` are the bucket bounds
+holding that share, `null` past 250 ms. The same waits are the histogram
+`nuthatch_sql_admission_wait_seconds{tenant}`, for at most 256 tenant labels; the rest share
+`tenant="other"`, so a thousand tenants cost 2,560 series rather than 10,000.
+
+A maintained-view build takes a permit as a tenant mounting its dataset, so it is admitted as that
+tenant's own query would be. A build for a dataset no tenant mounts borrows, and leaves the reserve
+free.
 
 ## Faults
 

@@ -161,7 +161,12 @@ fn rows_within(lengths: &[i64], budget: i64) -> usize {
 const OUTBOX_SEQ: &str = "outbox_next_seq";
 
 pub struct PgStore {
-    conn: Conn,
+    conn: std::sync::Arc<Conn>,
+    /// Where a handle from [`HotStore::pinned`] reads (#2467); `None` reads at the latest commit.
+    snapshot: Option<std::sync::Arc<Exported>>,
+    /// What [`HotStore::pinned`] connects with, to hold the snapshot it exports.
+    config: postgres::Config,
+    holders: Holders,
     /// The nest's schema, already validated and quoted-safe.
     schema: String,
     /// Fence this handle holds (RFC-0022 slice 4); `0` means it has never claimed, which disables
@@ -169,7 +174,103 @@ pub struct PgStore {
     held: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// Connections that held a snapshot and are free to hold the next, so a window does not pay for a
+/// new connection (measured at 22 ms) each time it publishes.
+type Holders = std::sync::Arc<Mutex<Vec<Conn>>>;
+
+/// How many free holders a store keeps; one more is connected only when more snapshots are held.
+const IDLE_HOLDERS: usize = 4;
+
+/// A database snapshot held open on a connection of its own, so every read that imports it sees
+/// the store exactly as it stood when it was taken. The holding transaction ends when this drops.
+pub(crate) struct Exported {
+    id: String,
+    holder: Option<Conn>,
+    holders: Holders,
+}
+
+fn export(holder: &Conn) -> Result<String> {
+    holder.with(|c| {
+        // A holder handed back is rolled back on release; ending any transaction here as well means
+        // a snapshot is never one a release failed to end.
+        c.batch_execute("ROLLBACK; START TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")?;
+        Ok(c.query_one("SELECT pg_export_snapshot()", &[])?
+            .get::<_, String>(0))
+    })
+}
+
+impl Exported {
+    /// Take a snapshot now, on a free holder, or a new connection when none is free or the free one
+    /// has gone bad.
+    fn take(config: &postgres::Config, holders: &Holders) -> Result<Exported> {
+        let free = holders.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let (holder, id) = match free.map(|c| (export(&c), c)) {
+            Some((Ok(id), c)) => (c, id),
+            _ => {
+                let c = Conn::spawn(config.clone()).context("connecting to hold a snapshot")?;
+                let id = export(&c)?;
+                (c, id)
+            }
+        };
+        // Spliced into SQL below, so it is checked to be what Postgres issues: hex and dashes.
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            return Err(anyhow!(
+                "Postgres exported an unexpected snapshot id {id:?}"
+            ));
+        }
+        Ok(Exported {
+            id,
+            holder: Some(holder),
+            holders: holders.clone(),
+        })
+    }
+
+    fn import(&self) -> String {
+        format!("SET TRANSACTION SNAPSHOT '{}'", self.id)
+    }
+}
+
+impl Drop for Exported {
+    /// Ends the holding transaction without waiting for it: the rollback is queued ahead of anything
+    /// the holder is given next.
+    fn drop(&mut self) {
+        let Some(holder) = self.holder.take() else {
+            return;
+        };
+        if holder.start(|c| Ok(c.batch_execute("ROLLBACK")?)).is_ok() {
+            let mut free = self.holders.lock().unwrap_or_else(|e| e.into_inner());
+            if free.len() < IDLE_HOLDERS {
+                free.push(holder);
+            }
+        }
+    }
+}
+
 impl PgStore {
+    /// Run a read on the connection thread: as is, or for a pinned handle inside a read-only
+    /// transaction that imports its snapshot first.
+    fn read<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut postgres::Client) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let Some(snapshot) = &self.snapshot else {
+            return self.conn.with(f);
+        };
+        let begin = format!(
+            "START TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; {}",
+            snapshot.import()
+        );
+        self.conn.with(move |c| {
+            c.batch_execute(&begin)?;
+            let out = f(c);
+            // Ended either way, so the shared connection is never left inside it.
+            let end = c.batch_execute(if out.is_ok() { "COMMIT" } else { "ROLLBACK" });
+            let out = out?;
+            end?;
+            Ok(out)
+        })
+    }
+
     /// The trait's `commit_window`, with alert-outbox entries that land only if the window does.
     fn commit_window_with(
         &self,
@@ -258,11 +359,14 @@ impl PgStore {
         let config: postgres::Config = url
             .parse()
             .with_context(|| format!("cannot parse Postgres URL '{}'", redact(url)))?;
-        let conn = Conn::spawn(config)
+        let conn = Conn::spawn(config.clone())
             .with_context(|| format!("cannot connect to Postgres at '{}'", redact(url)))?;
 
         let store = PgStore {
-            conn,
+            conn: std::sync::Arc::new(conn),
+            snapshot: None,
+            config,
+            holders: Holders::default(),
             schema,
             held: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -323,8 +427,7 @@ impl PgStore {
             self.schema
         );
         let key = key.to_string();
-        self.conn
-            .with(move |c| Ok(c.query_opt(&sql, &[&key])?.map(|r| r.get::<_, String>(0))))
+        self.read(move |c| Ok(c.query_opt(&sql, &[&key])?.map(|r| r.get::<_, String>(0))))
     }
 
     /// Every single-key write goes through here, so this is where the fence has to bite for
@@ -380,6 +483,20 @@ fn redact(url: &str) -> String {
 
 #[async_trait::async_trait]
 impl HotStore for PgStore {
+    fn pinned(&self) -> Result<Option<std::sync::Arc<dyn HotStore>>> {
+        Ok(Some(std::sync::Arc::new(PgStore {
+            conn: self.conn.clone(),
+            snapshot: Some(std::sync::Arc::new(Exported::take(
+                &self.config,
+                &self.holders,
+            )?)),
+            config: self.config.clone(),
+            holders: self.holders.clone(),
+            schema: self.schema.clone(),
+            held: self.held.clone(),
+        })))
+    }
+
     // ---- entities ---------------------------------------------------------------------------
 
     fn put_entity(&self, key: &str, json: &str) -> Result<()> {
@@ -442,8 +559,7 @@ impl HotStore for PgStore {
 
     fn count(&self) -> Result<u64> {
         let sql = format!("SELECT count(*) FROM \"{}\".entities", self.schema);
-        self.conn
-            .with(move |c| Ok(c.query_one(&sql, &[])?.get::<_, i64>(0) as u64))
+        self.read(move |c| Ok(c.query_one(&sql, &[])?.get::<_, i64>(0) as u64))
     }
 
     fn recent(&self, limit: usize) -> Result<Vec<String>> {
@@ -456,7 +572,7 @@ impl HotStore for PgStore {
             self.schema
         );
         let limit = limit as i64;
-        self.conn.with(move |c| {
+        self.read(move |c| {
             Ok(c.query(&sql, &[&limit])?
                 .into_iter()
                 .map(|r| r.get::<_, String>(0))
@@ -474,7 +590,7 @@ impl HotStore for PgStore {
             self.schema
         );
         let (table, limit) = (table.to_string(), limit as i64);
-        self.conn.with(move |c| {
+        self.read(move |c| {
             Ok(c.query(&sql, &[&table, &limit])?
                 .into_iter()
                 .map(|r| r.get::<_, String>(0))
@@ -495,7 +611,7 @@ impl HotStore for PgStore {
             "SELECT value FROM \"{}\".entities ORDER BY key",
             self.schema
         );
-        self.conn.with(move |c| {
+        self.read(move |c| {
             let total = c.query_one(&count_sql, &[])?.get::<_, i64>(0) as usize;
             if total > max_rows {
                 // The same refusal redb gives, for the same reason: a partial tip silently changes
@@ -527,7 +643,7 @@ impl HotStore for PgStore {
             "SELECT value FROM \"{}\".entities ORDER BY key",
             self.schema
         );
-        self.conn.with(move |c| {
+        self.read(move |c| {
             let total = c.query_one(&count_sql, &[])?.get::<_, i64>(0) as usize;
             if total > max_rows {
                 return Err(HotScanTooLarge { cap: max_rows }.into());
@@ -563,6 +679,7 @@ impl HotStore for PgStore {
         max_bytes: u64,
         charge: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<crate::store::HotRowsSnapshot> {
+        let import = self.snapshot.as_ref().map(|s| s.import());
         let size_sql = format!(
             "SELECT count(*), coalesce(sum(octet_length(value)), 0)::bigint FROM \"{}\".entities",
             self.schema
@@ -579,6 +696,9 @@ impl HotStore for PgStore {
                 .isolation_level(postgres::IsolationLevel::RepeatableRead)
                 .read_only(true)
                 .start()?;
+            if let Some(import) = &import {
+                tx.batch_execute(import)?;
+            }
             let sized = tx.query_one(&size_sql, &[])?;
             let (total, bytes) = (
                 sized.get::<_, i64>(0) as usize,
@@ -632,7 +752,7 @@ impl HotStore for PgStore {
             "SELECT value FROM \"{}\".entities WHERE key >= $1 AND key <= $2 ORDER BY key",
             self.schema
         );
-        self.conn.with(move |c| {
+        self.read(move |c| {
             Ok(c.query(&sql, &[&lo, &hi])?
                 .into_iter()
                 .map(|r| r.get::<_, String>(0))
@@ -662,7 +782,7 @@ impl HotStore for PgStore {
                 self.schema
             );
             let (size_lo, size_hi) = (lo.clone(), hi.clone());
-            let sizes: Vec<(String, i64)> = self.conn.with(move |c| {
+            let sizes: Vec<(String, i64)> = self.read(move |c| {
                 Ok(c.query(&sizes_sql, &[&size_lo, &size_hi, &PAGE])?
                     .into_iter()
                     .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
@@ -680,7 +800,7 @@ impl HotStore for PgStore {
                 self.schema
             );
             let limit = take as i64;
-            let page: Vec<(String, String)> = self.conn.with(move |c| {
+            let page: Vec<(String, String)> = self.read(move |c| {
                 Ok(c.query(&values_sql, &[&lo, &last, &limit])?
                     .into_iter()
                     .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
@@ -709,7 +829,7 @@ impl HotStore for PgStore {
             self.schema
         );
         let limit = limit as i64;
-        self.conn.with(move |c| {
+        self.read(move |c| {
             Ok(c.query(&sql, &[&limit])?
                 .into_iter()
                 .map(|r| r.get::<_, String>(0))
@@ -735,7 +855,7 @@ impl HotStore for PgStore {
             self.schema
         );
         let (prefix, limit) = (prefix.to_string(), limit as i64);
-        self.conn.with(move |c| {
+        self.read(move |c| {
             Ok(c.query(&sql, &[&prefix, &limit])?
                 .iter()
                 .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
@@ -749,8 +869,7 @@ impl HotStore for PgStore {
             self.schema
         );
         let prefix = prefix.to_string();
-        self.conn
-            .with(move |c| Ok(c.query_one(&sql, &[&prefix])?.get::<_, i64>(0) as u64))
+        self.read(move |c| Ok(c.query_one(&sql, &[&prefix])?.get::<_, i64>(0) as u64))
     }
 
     fn indexed_head(&self) -> Result<Option<u64>> {
@@ -794,7 +913,7 @@ impl HotStore for PgStore {
             "SELECT key, value FROM \"{}\".blocks ORDER BY key DESC",
             self.schema
         );
-        self.conn.with(move |c| {
+        self.read(move |c| {
             c.query(&sql, &[])?
                 .into_iter()
                 .map(|r| {

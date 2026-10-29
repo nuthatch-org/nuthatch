@@ -199,22 +199,28 @@ charges for that.
 
 - **Engine pools.** Under `shared` a dataset's sessions share one pool, so a cursor's pools are at
   most its datasets and at most its permits, and the boot check charges the smaller. Under `strict`
-  each tenant of a dataset has its own, so the check charges one pool per permit
-  (`analytics_budget::validate_strict_budget`). With the shipped split (2 permits × 512 MB, 1,024 MB
-  reserved) nothing changes; a configuration that relied on a single dataset to run two permits at
-  768 MB each is refused at boot, because two tenants of that dataset are 2 × 768 MB.
+  each session has its own, and a session runs one statement at a time, so every running statement
+  draws its limit and the check charges one pool per permit (`analytics_budget::validate_strict_budget`,
+  RFC-0076). The same check runs on every live change of `sql_permits` or `max_rss_mb`. With the
+  shipped split (2 permits × 512 MB, 1,024 MB reserved) nothing changes; a configuration that relied
+  on a single dataset to run two permits at 768 MB each is refused, because two statements of that
+  dataset's tenants are 2 × 768 MB.
   A pool is a limit, not an allocation: it reserves only while a statement runs, and only as many
-  statements run at once as there are permits, so a hundred tenants still hold at most permits ×
-  pool size. A pool no session holds is dropped and rebuilt on demand, so tenant labels that come
-  and go do not accumulate
+  statements run at once as there are permits, so a thousand tenants still hold at most permits ×
+  pool size, and nothing while they are idle. A pool lives only as long as its session, so tenant
+  labels that come and go do not accumulate
   (`confinement::a_hundred_tenants_leave_no_pool_reserved_and_no_pool_without_a_session`).
   Since burrmill#122 the values a statement builds are charged too, from 256 KiB per output, and no
   one value passes 16 MiB, so a statement holds at most its pool plus that slack (Burrmill tests 24
   MiB). Before it, one `repeat` call could grow the process by gigabytes; see the findings above.
 - **Cached sessions.** Each holds its view catalogue and up to an eighth of the engine limit in
-  Parquet footers (64 MB at the default 512 MB). The cache is 16 sessions for the process whatever
-  the mode, so `strict` adds no slots: it fills them with more distinct keys, which costs misses and
-  rebuild latency rather than memory. The worst case, 16 × 64 MB, is the same as today.
+  Parquet footers (64 MB at the default 512 MB). The cache is 16 sessions for the process while each
+  cursor's split leaves nothing over, as at the default, whatever the mode: there `strict` fills the
+  same slots with more distinct keys, which costs misses rather than memory. Where an operator has
+  given a cursor more than its split charges, the cache keeps one more session for each 65 MB left
+  over, the most one may hold, up to 256 (RFC-0076). A cold session costs 0.9 ms over a cached one in
+  release on the bench fixture, and an idle one 0.46 MiB and about six threads
+  (`docs/bench/rfc-0076-tenants.md`).
 - **Memo.** Entries are keyed by tenant, so two tenants asking the same question store it twice.
   The memo's process ceiling (64 MiB, `NUTHATCH_SQL_MEMO_BYTES`) is unchanged.
 

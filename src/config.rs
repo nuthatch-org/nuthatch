@@ -146,6 +146,10 @@ pub struct Config {
     /// outside a runtime. `#[serde(skip)]` like `cursor_max_rss_mb`.
     #[serde(skip)]
     pub runtime_dir: Option<std::path::PathBuf>,
+    /// The runtime's `sql_permits` for this nest's cursor (RFC-0076 §3.1). `None` outside a runtime,
+    /// where `NUTHATCH_SQL_MAX_CONCURRENCY` or the default holds.
+    #[serde(skip)]
+    pub cursor_sql_permits: Option<usize>,
     /// RFC-0037: IPFS gateways (or a local node) for resolving declared `[[ipfs]]` documents,
     /// supplied at run time (`--ipfs`), **never** written to `nuthatch.toml`.
     ///
@@ -847,6 +851,7 @@ impl Config {
             cursor_max_rss_mb: None,
             window_deadline: None,
             runtime_dir: None,
+            cursor_sql_permits: None,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {
@@ -1115,6 +1120,7 @@ mod tests {
             cursor_max_rss_mb: None,
             window_deadline: None,
             runtime_dir: None,
+            cursor_sql_permits: None,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {

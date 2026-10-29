@@ -1637,7 +1637,7 @@ async fn nest_task(
                     "nest '{name}' rejoined behind a reorg to block {ancestor}: rolling it back"
                 );
                 source.forget_cached_above(ancestor);
-                nest.rollback_reorg(ancestor).map(Some)
+                nest.rollback_published(ancestor).await.map(Some)
             })
             .await;
             match rolled {
@@ -1663,7 +1663,7 @@ async fn nest_task(
                 seen_marker = id;
                 refused = false;
                 stats.markers_applied.fetch_add(1, Ordering::Relaxed);
-                match contained_sync(|| nest.rollback_reorg(ancestor)) {
+                match contained(nest.rollback_published(ancestor)).await {
                     Ok(resume) => {
                         next = next.min(resume);
                         slot.next.store(next, Ordering::Release);
@@ -1711,6 +1711,11 @@ async fn nest_task(
         let (logs, to, tip, header) = match pick {
             Pick::Wait => {
                 if let Err(e) = contained_sync(|| nest.ensure_views_healthy()) {
+                    sup.quarantine(0, &e)?;
+                    continue;
+                }
+                // The store can move between windows, as resolved documents move it (#2467).
+                if let Err(e) = contained(nest.republish_if_moved()).await {
                     sup.quarantine(0, &e)?;
                     continue;
                 }
