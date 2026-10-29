@@ -474,10 +474,10 @@ rollback resumes below the fork. Binding no sealed segments in `query.rs` fails 
 
 **A finding in the spike.** With Burrmill in its graph, the spike resolves `serde_json`'s and
 `parquet`'s features exactly as the binary does (`cargo tree -e features`, identical lists;
-`arbitrary_precision` arrives with Burrmill). The two synthetic segments that `tests/native.rs` and
-`run-node.mjs` pin changed hash, and they are re-pinned. S3's real segment did not change, and
-neither did any version in the lockfile. Which feature moved them was not isolated. The pins were
-the spike's own, under a dependency graph the node never had.
+`arbitrary_precision` arrives with Burrmill). Burrmill did not move any segment hash. The two
+synthetic segments that `tests/native.rs` and `run-node.mjs` pin moved in S3, when the spike's
+parquet went from 59.3.2 to the node's 59.3.0 and the version string written into each file changed
+with it. S3 carries the re-pin.
 
 **What it does not show.** Neither S4 run was in Chrome or Safari. The view port skips what the node
 does for a degraded or missing segment, a historical window, the `wanted`-table pruning,
