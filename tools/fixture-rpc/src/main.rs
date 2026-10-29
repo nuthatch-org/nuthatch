@@ -4,6 +4,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use nuthatch_fixture_rpc::footprint::{self, Footprint};
 use nuthatch_fixture_rpc::multinest::{self, Multinest};
+use nuthatch_fixture_rpc::recorded::Recorded;
 use nuthatch_fixture_rpc::scripted::Scripted;
 use nuthatch_fixture_rpc::{serve, Fixture};
 
@@ -16,6 +17,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Chain {
+    /// A recorded stretch of a real chain, replayed (RFC-0075 S3)
+    Recorded {
+        #[arg(long, default_value_t = 8947)]
+        port: u16,
+        #[arg(long)]
+        file: PathBuf,
+        /// Carry RFC-0075 S4's scripted reorg, taken by `POST /control/fork`
+        #[arg(long)]
+        fork: bool,
+    },
     /// One Transfer a block over blocks 1..=8, switchable through /control/mode to zero logs
     Scripted {
         #[arg(long, default_value_t = 8945)]
@@ -72,6 +83,18 @@ enum Chain {
 
 fn main() {
     match Cli::parse().chain {
+        Chain::Recorded { port, file, fork } => {
+            let mut fx = Recorded::from_path(&file).unwrap_or_else(|e| die(&e));
+            if fork {
+                fx = fx.with_fork();
+            }
+            let banner = format!(
+                "fixture-rpc listening on http://127.0.0.1:{port}/ recorded {}..={}",
+                fx.first(),
+                fx.tip()
+            );
+            run("127.0.0.1", port, fx, Some(banner));
+        }
         Chain::Scripted {
             port,
             contract,

@@ -26,6 +26,16 @@ redb = "2"
 proptest = { version = "1", default-features = false, features = ["std"] }
 # As the binary pins them (`Cargo.toml` of nuthatch): `Row` derives `SizeOf` and rkyv archival.
 size-of = { package = "feldera-size-of", version = "0.1.7" }
+# RFC-0075 S4: the binary's entity builder (`src/entity_decl.rs`, `entity_lower.rs`, `entity_bind.rs`)
+# and the engine its `/sql` runs, at the binary's pinned rev.
+toml = "0.8"
+sqlparser = { version = "0.62", features = ["visitor"] }
+alloy-primitives = "1.6"
+burrmill = { git = "https://github.com/nuthatch-org/burrmill", rev = "ea8cf40c74b4e9da61983c4658d50d2d18217b7f", default-features = false, features = ["datafusion"] }
+object_store = { version = "0.13", default-features = false }
+futures = "0.3"
+bytes = "1"
+hex = "0.4"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_64", "validation"] }

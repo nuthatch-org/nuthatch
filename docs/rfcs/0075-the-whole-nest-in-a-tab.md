@@ -363,3 +363,125 @@ reaches block 1. Sealing from the store is S3. The module is 10.9 MB raw and 1.7
 wasm-bindgen, against S0's 5.8 MB and 944 KB, with redb, proptest and the S2 harness added. S6 is
 where that gets cut. Wiring `PlayNest` into the `/play` page is a change to the frontend repo, and
 it has not been made.
+
+## 14. S3 outcome, 2026-10-29
+
+S3 (#2479): the live cursor.
+
+**What moved.** The RPC client is `nuthatch_core::rpc::RpcClient<T: Transport>`, and the node's is
+`RpcClient<Http>` over reqwest. The decision logic moved as it was: endpoint order, health, rests,
+retries, batching, splitting and classification. What changed in the move is the bytes (`post` and a
+`Reply`), the request deadline (`Transport::build`), the waits (`time::sleep` and `timeout`, which are
+tokio's natively and `setTimeout` in a tab), the Prometheus counters (hooks the node implements) and
+visibility. `src/rpc.rs` keeps its two test modules byte for byte: 90 tests, plus chunker's 21, pass
+as they did. The tab's transport is `nuthatch_core::fetch::Fetch`, which holds every JS value in a
+`SendWrapper`. Its deadline is `AbortSignal.timeout`, and it covers the body as reqwest's does.
+
+**The gate's chain.** It is a recording, so CI needs no network. A young mainnet ERC-20,
+`0x0c26fe5e579c3b007ba16d921ba8204a47c05f1a`, was recorded from its deploy block 26,239,807 to
+26,245,870 from two keyless public RPCs (`tests/fixtures/tab-parity/record.sh`). That is 6,065 headers
+(hash and timestamp) and 2,259 Transfers, 430 KB gzipped. `fixture-rpc recorded` serves it over HTTP,
+and refuses any block outside it. The node runs `nuthatch dev` on an `init`ed nest
+(`tests/e2e_tab_parity.rs`). The tab runs the wasm build: `TabNest` with mainnet's finality and seal
+span, the three views inline, and a sink with the node's table floor. Both are held to one pinned
+`expected.json`.
+
+**Gate: passed for Chrome, not run for Safari.**
+
+| | node (`nuthatch dev`) | tab, Node 26, `Bytes` store | tab, Chrome for Testing 156, OPFS store |
+|---|---|---|---|
+| segment `tab__transfer` 26,239,813..=26,241,612, 2,259 rows | `c983470c…479aeae` | the same | the same |
+| sealed through / last block | 26,245,806 / 26,245,870 | the same | the same |
+| `/balances` (1,360 holders, the 1,000 served) | pinned | row-identical | row-identical |
+| hot rows after the seal | | 0 | 0 |
+| wall time | | 945 ms | 940 ms |
+| wasm linear memory at the end, the peak | | 30.6 MiB | 27.8 MiB |
+| RPC requests, bytes received / sent | | 1,433, 1,673,693 / 163,741 | the same |
+| segment bytes held | | 88,012 | 88,012 |
+
+**The gate failed first, for a real reason.** The spike's lockfile had parquet 59.3.2 and the
+binary's had 59.3.0. parquet writes its version into each file's `created_by`, so the rows were equal
+and the bytes were not. Pinning the spike's arrow and parquet to 59.3.0 made them equal. A tab must
+therefore ship the node's parquet, to the patch version. This gate catches it, and nothing else does.
+
+**Safari** was not measured. `safaridriver --enable` asks for an administrator's password, and
+without it the WebDriver session is refused. Chief, to run it once enabled: start
+`fixture-rpc recorded --port 18947 --file tests/fixtures/tab-parity/chain.json.gz`, then from
+`spike/dbsp-wasm` run `SAFARIDRIVER=/usr/bin/safaridriver TAB_PARITY_RPC=http://127.0.0.1:18947/
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner cargo test --release --target
+wasm32-unknown-unknown --test live -- --nocapture`. `vendor.sh` must have run first, and the wasm32
+C toolchain must be set as CI sets it.
+
+**What it does not show.** The contract's Transfers all fall within its first 1,800 blocks, so there
+is one segment, and it is final. A table's provisional segment, folded back through `segment_rows`,
+is not exercised by this chain. The recorded headers carry no transactions. Node has no OPFS, so
+there the store is `Bytes`; in Chrome it is OPFS, opened as `PlayNest` opens it. No run followed a
+live public RPC; the recording was taken from public RPCs, and that is all.
+
+## 15. S4 outcome, 2026-10-29
+
+S4 (#2480): entities and views.
+
+**What moved.** `entities.toml`'s declaration is `src/entity_decl.rs` (`EntityDecl`, `parse`, and
+`sql_path`, the rule `read_sql` applies), and `uses_sample` and `sql_tokens` moved from
+`entities.rs` into `entity_lower.rs`, their one other caller. Nothing else in the binary changed. The
+spike compiles `entity_decl.rs`, `entity_lower.rs` and `entity_bind.rs` by `#[path]`, unchanged, as
+S0 compiled the circuit, so an entity is declared, lowered and bound by the binary's own code, then
+folded on `nuthatch-core`'s `EntityLane` with `Driver::Inline`. The tab has no offchain tables
+(§11), so `entity_bind.rs`'s offchain imports resolve to uninhabited types, and an `offchain__` source
+gets the binder's own "no offchain table" refusal. A warm store's entities are unavailable, with the
+node's reason.
+
+**The query side.** The binary's pinned Burrmill rev (`ea8cf40`) already carries the wasm32 tail:
+`attach_store`, `register_store_facts`, which reads footers by range from an object store, and
+`sql_async`. `burrmill-wasm` itself, the JS package, is not used; it is not in that rev. `query.rs`
+ports `analytics::define_views_bound`'s table loop: schema ∪ manifest ∪ hot, segments at or below
+`sealed_through`, hot rows past it where cold covers the table. It also ports `bind_relation` onto
+that tail, with the cellar's segments in an in-memory store. Views come from each `CREATE VIEW` in
+`views/*.sql`. There is a real difference in execution. The node binds segment files, and Burrmill
+substitutes its owned fold for their aggregates. A store-backed table declines that substitution,
+so the tab's aggregates are DataFusion's plans. The gate holds the answers of the two paths equal.
+
+**The gate's chain.** It is S3's recording, with a scripted reorg added to `fixture-rpc recorded
+--fork`. Before the fork, the last ten blocks carry 17 synthetic mints, and `POST /control/fork`
+replaces the last six and adds two, with different recipients and amounts. The nest
+(`tests/fixtures/tab-parity/s4/`) declares `received` (by `to`: count, sum, min and max block) and
+`sent` (by `from`, filtered), plus three views: one over the facts by thousand-block bucket, one over
+an entity, and a join of the two entities. The node runs `nuthatch dev` (`tests/e2e_tab_entities.rs`).
+The tab runs the wasm build in Node (`run-entities.mjs`). Each reads `/derived/{entity}?limit=1000`
+and `SELECT * FROM <view>` at the tip, then again after the fork once the new tip has been applied.
+Rows are compared whole, ordered by their key-sorted text, and both are held to
+`s4-expected.json`.
+
+**Gate: passed in Node, not run in Chrome or Safari.**
+
+| | before the fork (tip 26,245,870) | after (26,245,872) |
+|---|---|---|
+| `received` / `sent` rows | 722 / 645 | 727 / 645 |
+| `per_kblock` | 3 rows: 703, 1,556 and 17 transfers | 3 rows |
+| `busy_receivers` / `two_way` | 242 / 2 | 240 / 2 |
+| sealed through | 26,245,806 | 26,245,808 |
+| tab wall time | 793 ms from deploy block to answers | 32 ms |
+| wasm linear memory at the end | | 39.3 MiB |
+
+The views read both halves. `per_kblock`'s last bucket is the 17 hot mints, and its first two are the
+sealed segment. The module is 67.3 MB raw (48.3 MB of code and 14.1 MB of names) and 8.39 MB brotli,
+against S2's 10.9 MB and 1.78 MB. That is DataFusion, and S6 is where it gets cut.
+
+**Both mutations fail.** Skipping `retract_entities` in core's `rollback_reorg` fails `after.derived`.
+The rolled-back mints stay counted, and a recipient below the fork is counted twice, since the
+rollback resumes below the fork. Binding no sealed segments in `query.rs` fails `before.views`.
+
+**A finding in the spike.** With Burrmill in its graph, the spike resolves `serde_json`'s and
+`parquet`'s features exactly as the binary does (`cargo tree -e features`, identical lists;
+`arbitrary_precision` arrives with Burrmill). Burrmill did not move any segment hash. The two
+synthetic segments that `tests/native.rs` and `run-node.mjs` pin moved in S3, when the spike's
+parquet went from 59.3.2 to the node's 59.3.0 and the version string written into each file changed
+with it. S3 carries the re-pin.
+
+**What it does not show.** Neither S4 run was in Chrome or Safari. The view port skips what the node
+does for a degraded or missing segment, a historical window, the `wanted`-table pruning,
+`load_relation`'s range checks, and the rewrite of dates to ISO text. No view here returns a date. A
+view's body is sqlparser's rendering of the query, not the file's text as `view_body` slices it.
+Entity state is unbounded in the tab (`allowance_bytes` is `u64::MAX`, never sampled), which is S6's
+budget.

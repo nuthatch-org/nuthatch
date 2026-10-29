@@ -108,6 +108,10 @@ mod e2e_sql_cli_backend;
 mod e2e_stall_isolation;
 #[path = "e2e_stop_releases_store.rs"]
 mod e2e_stop_releases_store;
+#[path = "e2e_tab_entities.rs"]
+mod e2e_tab_entities;
+#[path = "e2e_tab_parity.rs"]
+mod e2e_tab_parity;
 #[path = "e2e_trino_contract.rs"]
 mod e2e_trino_contract;
 #[path = "engine_batch_boundary.rs"]
