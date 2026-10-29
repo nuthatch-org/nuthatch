@@ -11303,6 +11303,16 @@ mod fr5_tests {
         cursor.shutdown().await.unwrap();
     }
 
+    /// The lowest ceiling a cursor holding `held` MB of mounts fits under. The buffer's term scales
+    /// with the ceiling, so it is found rather than summed.
+    fn least_ceiling(held: u64) -> u64 {
+        let mut c = RUNTIME_BASE_RSS_MB + held;
+        while c < RUNTIME_BASE_RSS_MB + crate::indexer::window_buffer_mb(c) + held {
+            c += 1;
+        }
+        c
+    }
+
     /// RFC-0073 FR5: `PUT /_admin/runtime` lowers and raises the per-cursor ceiling with no restart,
     /// a mount's admission follows it at once, `mounts.toml` keeps it, and the next boot is held to
     /// it. Above 2048 is accepted and flagged (#2441); below what the cursor projects is refused and
@@ -11325,7 +11335,8 @@ mod fr5_tests {
             .unwrap()
             .set_len(32 * 1024 * 1024)
             .unwrap();
-        let used = RUNTIME_BASE_RSS_MB + priced(&a) + priced(&b);
+        let held = priced(&a) + priced(&b);
+        let used = least_ceiling(held);
         let mut handles = handles_at(root.path());
         let (cursor, refused) = boot(vec![a, b], DEFAULT_MAX_RSS_MB, &mut handles).await;
         assert!(refused.is_empty(), "{refused:?}");
@@ -11337,7 +11348,11 @@ mod fr5_tests {
         assert_eq!(status, axum::http::StatusCode::OK, "{body}");
         assert_eq!(body["max_rss_mb"], DEFAULT_MAX_RSS_MB);
         assert_eq!(body["max_entities_per_cursor"], 32);
-        assert_eq!(body["cursors"][0]["projected_mb"], used, "{body}");
+        assert_eq!(
+            body["cursors"][0]["projected_mb"],
+            RUNTIME_BASE_RSS_MB + crate::indexer::window_buffer_mb(DEFAULT_MAX_RSS_MB) + held,
+            "{body}"
+        );
 
         assert_eq!(body["above_default"], false, "{body}");
         assert!(body.get("note").is_none(), "{body}");
@@ -11453,7 +11468,7 @@ mod fr5_tests {
             .set_len(32 * 1024 * 1024)
             .unwrap();
         assert!(priced(&over) > priced(&after));
-        let ceiling = RUNTIME_BASE_RSS_MB + priced(&first) + priced(&after);
+        let ceiling = least_ceiling(priced(&first) + priced(&after));
         let mut handles = handles_at(root.path());
         let (cursor, refused) = boot(vec![first, over, after], ceiling, &mut handles).await;
         assert_eq!(

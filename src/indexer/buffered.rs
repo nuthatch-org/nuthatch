@@ -12,8 +12,8 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
-/// `NUTHATCH_CURSOR_BUFFER`: `0` or `off` runs the shared cursor, a number the buffered cursor with
-/// that many windows at most.
+/// `NUTHATCH_CURSOR_BUFFER`: unset, the buffered cursor with [`DEFAULT_BUFFER_WINDOWS`]; a number,
+/// with that many windows at most; `0` or `off`, the shared cursor, kept for 5.14 only.
 pub(crate) const BUFFER_ENV: &str = "NUTHATCH_CURSOR_BUFFER";
 /// The window count when the buffered cursor runs without a number. The byte bound binds first on
 /// any chain whose windows carry logs; this caps a buffer of empty windows.
@@ -36,7 +36,7 @@ pub(crate) fn buffer_windows() -> Option<usize> {
 
 pub(crate) fn parse_buffer_windows(raw: Option<&str>) -> Option<usize> {
     match raw.map(str::trim) {
-        None => None,
+        None | Some("") => Some(DEFAULT_BUFFER_WINDOWS),
         Some("0" | "off" | "shared") => None,
         Some(v) => Some(v.parse::<usize>().ok().filter(|&w| w > 0).unwrap_or_else(|| {
             tracing::warn!("{BUFFER_ENV}={v} is not a window count; using {DEFAULT_BUFFER_WINDOWS}");
@@ -1777,7 +1777,7 @@ mod tests {
 
     #[test]
     fn the_switch_reads_a_window_count_or_off() {
-        assert_eq!(parse_buffer_windows(None), None);
+        assert_eq!(parse_buffer_windows(None), Some(DEFAULT_BUFFER_WINDOWS));
         for off in ["0", "off", "shared", " off "] {
             assert_eq!(parse_buffer_windows(Some(off)), None, "{off}");
         }
