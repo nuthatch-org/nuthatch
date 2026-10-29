@@ -128,6 +128,8 @@ pub(crate) struct BufferStats {
     pub(crate) evicted: AtomicU64,
     pub(crate) reorg_markers: AtomicU64,
     pub(crate) markers_applied: AtomicU64,
+    /// Markers a nest found already evicted when it looked, and checked for a reorg itself.
+    pub(crate) markers_missed: AtomicU64,
     pub(crate) spilled_windows: AtomicU64,
     pub(crate) peak_memory_bytes: AtomicU64,
     pub(crate) largest_window_bytes: AtomicU64,
@@ -1687,6 +1689,7 @@ async fn nest_task(
             MarkerCheck::None => {}
             MarkerCheck::Missed(id) => {
                 seen_marker = id;
+                stats.markers_missed.fetch_add(1, Ordering::Relaxed);
                 sup.reorg_checked[0] = false;
                 continue;
             }

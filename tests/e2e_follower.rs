@@ -663,10 +663,13 @@ async fn a_snapshot_over_the_cursor_budget_is_refused_and_its_co_mount_serves() 
     tape.insert_block(2, grown);
     tape.advance_tip_to(2);
     writer.reaches(2).await;
+    // A connection made while block 2 lands snapshots the co-mount past its budget beside the copy
+    // it holds: that copy is released first and the route is `catching_up` until the snapshot,
+    // alone, is refused too. Either way it ends refused by name, never served past its budget.
     let mut refused = serde_json::Value::Null;
     for _ in 0..400 {
         let (status, body) = route_status(&fbase, SMALL).await;
-        if status == 503 {
+        if status == 503 && body["reason"] != "catching_up" {
             refused = body;
             break;
         }

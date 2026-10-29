@@ -1276,9 +1276,21 @@ impl Follower {
                 };
                 // A reconnect repeats every mount; only a changed one is rebuilt, or one that could
                 // not be installed, which is tried again.
-                let unchanged = self.lock().routes.get(&route).is_some_and(|r| {
-                    r.spec == spec && !(self.remote.is_some() && matches!(r.served, Some(Err(_))))
-                });
+                // The mirror prefix is where fetches go, not how the route is served: a dataset
+                // whose identity moves keeps its route, and only the prefix is updated.
+                let unchanged = {
+                    let mut inner = self.lock();
+                    inner.routes.get_mut(&route).is_some_and(|r| {
+                        let same = Spec {
+                            data_identity: r.spec.data_identity.clone(),
+                            ..spec.clone()
+                        } == r.spec;
+                        if same {
+                            r.spec.data_identity = spec.data_identity.clone();
+                        }
+                        same && !(self.remote.is_some() && matches!(r.served, Some(Err(_))))
+                    })
+                };
                 if unchanged {
                     let estimate = nest_estimate(&self.root.join(&spec.dataset));
                     self.lock().estimates.insert(spec.dataset.clone(), estimate);
