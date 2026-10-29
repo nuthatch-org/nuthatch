@@ -212,6 +212,7 @@ impl GateLedger {
         }
         if gone {
             self.tenants.remove(tenant);
+            self.stats.remove(tenant);
         } else if let Some(t) = self.tenants.get_mut(tenant) {
             t.counted_idle = idle;
             t.counted_weight = active;
@@ -501,6 +502,10 @@ impl SqlGate {
         refused: Option<Refusal>,
     ) {
         let mut l = lock(&self.shares.ledger);
+        // Kept only while the tenant is on this gate, so labels that come and go leave nothing behind.
+        if !l.tenants.contains_key(tenant) {
+            return;
+        }
         match l.stats.get_mut(tenant) {
             Some(s) => s.observe(waited, queued, refused),
             None => {
@@ -1203,7 +1208,9 @@ mod tests {
 
     #[test]
     fn admission_waits_are_kept_per_tenant() {
+        let bytes = Arc::new(ByteShares::new(100));
         let gate = SqlGate::new(2);
+        let _a = seat(&gate, &bytes, "a");
         gate.observe_admission("a", Duration::ZERO, false, None);
         gate.observe_admission("a", Duration::from_millis(30), true, None);
         gate.observe_admission("a", Duration::from_millis(250), true, Some(Refusal::Busy));
@@ -1213,6 +1220,20 @@ mod tests {
         assert_eq!(a.quantile(0.5), Some(0.05));
         assert_eq!(a.quantile(0.99), Some(0.25));
         assert!(!reports["a"].active);
+    }
+
+    #[test]
+    fn a_tenant_that_leaves_takes_its_statistics_with_it() {
+        let bytes = Arc::new(ByteShares::new(100));
+        let gate = SqlGate::new(2);
+        for i in 0..1000 {
+            let name = format!("t{i}");
+            let seat = seat(&gate, &bytes, &name);
+            gate.observe_admission(&name, Duration::from_millis(5), true, None);
+            drop(seat);
+        }
+        gate.observe_admission("never-mounted", Duration::ZERO, false, None);
+        assert_eq!(lock(&gate.shares.ledger).stats.len(), 0);
     }
 
     #[test]
