@@ -5,8 +5,8 @@
 # gate_lock <nest-copy-dir> takes the copy's lock, waiting for whoever holds it, and keeps it until
 # the shell exits (call gate_unlock from the EXIT trap). It exports GATE_LOCK_HELD, so a child gate
 # run on the same copy, as release-gate-run.sh starts, rides on its parent's lock instead of waiting
-# on it for ever. flock where there is one; elsewhere (macOS) a mkdir lock that records its pid and
-# is broken once that pid has gone, since nothing releases it for a killed holder.
+# on it for ever. flock where there is one; elsewhere (macOS) a pid file created O_EXCL, which is
+# broken once that pid has gone, since nothing releases it for a killed holder.
 
 gate_lock_path() {
   local parent

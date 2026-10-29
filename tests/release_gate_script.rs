@@ -1162,7 +1162,7 @@ fn two_gate_runs_against_one_copy_serialise() {
     }
 }
 
-/// Nothing releases a mkdir lock for a holder that was killed, so a lock whose pid has gone is
+/// Nothing releases a pid-file lock for a holder that was killed, so a lock whose pid has gone is
 /// broken rather than waited on for ever.
 #[test]
 fn a_lock_left_by_a_killed_run_is_broken() {
