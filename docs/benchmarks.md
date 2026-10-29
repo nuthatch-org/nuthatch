@@ -520,6 +520,7 @@ margin is real (the derivation sits beside the value in `ci.yml`):
 
 | | |
 |---|---|
+| buffered cursor (RFC-0076, 5.14) | 414 to 427 MB over seven sequential runs, median 423, 362 to 364 at the tip (`rss-band.yml` run 40933697538, 2026-10-29, main at 0d1b76e8); ceiling left at 602, where the script suggested 534 |
 | runner band (#1156) | 387 to 481 MB over seven sequential runs, median 429 (`rss-band.yml` run 33956127005, 2026-09-05); ceiling 481 x 1.25 + 1 |
 | previous (#1067) | 372 MB from a single run, ceiling 466 MB, which main then crossed at random |
 | before batching | 131 MB, ceiling 180 MB |
