@@ -233,9 +233,87 @@ pub struct NestMetrics {
     /// fixture; the store's whole size then stands in.
     dataset: Mutex<Option<PathBuf>>,
     dataset_sealed_bytes: AtomicU64,
+    /// RFC-0076 §3.2: each window's wall time, cumulative per [`WINDOW_SECONDS_BOUNDS`] entry then
+    /// `+Inf`, and their sum.
+    window_buckets: [AtomicU64; WINDOW_SECONDS_BOUNDS.len() + 1],
+    window_micros: AtomicU64,
+    /// RFC-0076: blocks between this nest's position and the buffered cursor's extraction, and how
+    /// long it has waited on extraction with nothing to do.
+    behind_extraction: AtomicU64,
+    extraction_wait_micros: AtomicU64,
+    /// Windows abandoned before their commit for outrunning `window_deadline_ms`.
+    window_overruns: AtomicU64,
+}
+
+/// Bounds, in seconds, of `nuthatch_nest_window_seconds`. The `+Inf` bucket is implicit.
+pub const WINDOW_SECONDS_BOUNDS: [f64; 13] = [
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// One chain cursor's window buffer (RFC-0076 §3.2), under `{chain}`.
+#[derive(Default)]
+pub struct CursorMetrics {
+    buffer_bytes: AtomicU64,
+    spilled_bytes: AtomicU64,
+}
+
+impl CursorMetrics {
+    pub fn set_buffer_bytes(&self, memory: u64, spilled: u64) {
+        self.buffer_bytes.store(memory, Relaxed);
+        self.spilled_bytes.store(spilled, Relaxed);
+    }
+
+    pub fn buffer_bytes(&self) -> (u64, u64) {
+        (
+            self.buffer_bytes.load(Relaxed),
+            self.spilled_bytes.load(Relaxed),
+        )
+    }
 }
 
 impl NestMetrics {
+    /// One window's wall time, from its start to its commit or refusal.
+    pub fn observe_window(&self, elapsed: Duration) {
+        let secs = elapsed.as_secs_f64();
+        self.window_micros
+            .fetch_add(elapsed.as_micros() as u64, Relaxed);
+        for (i, bound) in WINDOW_SECONDS_BOUNDS.iter().enumerate() {
+            if secs <= *bound {
+                self.window_buckets[i].fetch_add(1, Relaxed);
+            }
+        }
+        self.window_buckets[WINDOW_SECONDS_BOUNDS.len()].fetch_add(1, Relaxed);
+    }
+
+    pub fn inc_window_overruns(&self) {
+        self.window_overruns.fetch_add(1, Relaxed);
+    }
+
+    pub fn window_overruns(&self) -> u64 {
+        self.window_overruns.load(Relaxed)
+    }
+
+    pub fn windows_observed(&self) -> u64 {
+        self.window_buckets[WINDOW_SECONDS_BOUNDS.len()].load(Relaxed)
+    }
+
+    pub fn set_behind_extraction(&self, blocks: u64) {
+        self.behind_extraction.store(blocks, Relaxed);
+    }
+
+    pub fn behind_extraction(&self) -> u64 {
+        self.behind_extraction.load(Relaxed)
+    }
+
+    pub fn add_extraction_wait(&self, waited: Duration) {
+        self.extraction_wait_micros
+            .fetch_add(waited.as_micros() as u64, Relaxed);
+    }
+
+    pub fn extraction_wait(&self) -> Duration {
+        Duration::from_micros(self.extraction_wait_micros.load(Relaxed))
+    }
+
     /// Also stamps `last_progress` when `v` actually advances the watermark, so `/ready` can tell "the
     /// source answered" apart from "the cursor is getting somewhere" (#578).
     pub fn set_last_block(&self, v: u64) {
@@ -745,6 +823,8 @@ pub struct Metrics {
     /// RFC-0073 FR4: per-mount serving counters, keyed by route. Separate from `per_nest`, which is
     /// keyed by dataset: an alias of a shared dataset has routes but no ingest of its own.
     serving: Mutex<BTreeMap<String, Arc<NestServing>>>,
+    /// RFC-0076: each buffered cursor's window buffer, keyed by chain.
+    cursors: Mutex<BTreeMap<String, Arc<CursorMetrics>>>,
 }
 
 /// Prometheus histogram bounds for RPC duration (seconds). The `+Inf` bucket is implicit.
@@ -817,6 +897,7 @@ impl Metrics {
             rpc_endpoints: Mutex::new(BTreeMap::new()),
             per_nest: Mutex::new(BTreeMap::new()),
             serving: Mutex::new(BTreeMap::new()),
+            cursors: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -845,6 +926,16 @@ impl Metrics {
             .lock()
             .unwrap()
             .entry(label.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// The buffer gauges of `chain`'s cursor, registered on first use.
+    pub fn cursor(&self, chain: &str) -> Arc<CursorMetrics> {
+        self.cursors
+            .lock()
+            .unwrap()
+            .entry(chain.to_string())
             .or_default()
             .clone()
     }
@@ -1737,6 +1828,47 @@ impl Metrics {
                 "gauge",
                 &|m| m.fetch_window.load(Relaxed),
             );
+            labelled(
+                "nuthatch_nest_window_overruns_total",
+                "Windows abandoned before their commit for outrunning [mounts.limits] window_deadline_ms (RFC-0076).",
+                "counter",
+                &|m| m.window_overruns.load(Relaxed),
+            );
+            labelled(
+                "nuthatch_nest_behind_extraction_blocks",
+                "Blocks between this nest's position and its buffered cursor's extraction (RFC-0076); 0 on the shared cursor.",
+                "gauge",
+                &|m| m.behind_extraction.load(Relaxed),
+            );
+            s.push_str(
+                "# HELP nuthatch_nest_extraction_wait_seconds_total Seconds this nest has waited on its buffered cursor's extraction with no window to process (RFC-0076).\n\
+                 # TYPE nuthatch_nest_extraction_wait_seconds_total counter\n",
+            );
+            for (nest, m) in per.iter() {
+                s.push_str(&format!(
+                    "nuthatch_nest_extraction_wait_seconds_total{{nest=\"{nest}\"}} {}\n",
+                    m.extraction_wait_micros.load(Relaxed) as f64 / 1e6
+                ));
+            }
+            s.push_str(
+                "# HELP nuthatch_nest_window_seconds Wall time of each of this nest's windows, from its start to its commit or refusal.\n\
+                 # TYPE nuthatch_nest_window_seconds histogram\n",
+            );
+            for (nest, m) in per.iter() {
+                for (i, bound) in WINDOW_SECONDS_BOUNDS.iter().enumerate() {
+                    s.push_str(&format!(
+                        "nuthatch_nest_window_seconds_bucket{{nest=\"{nest}\",le=\"{bound}\"}} {}\n",
+                        m.window_buckets[i].load(Relaxed)
+                    ));
+                }
+                let count = m.window_buckets[WINDOW_SECONDS_BOUNDS.len()].load(Relaxed);
+                s.push_str(&format!(
+                    "nuthatch_nest_window_seconds_bucket{{nest=\"{nest}\",le=\"+Inf\"}} {count}\n\
+                     nuthatch_nest_window_seconds_sum{{nest=\"{nest}\"}} {}\n\
+                     nuthatch_nest_window_seconds_count{{nest=\"{nest}\"}} {count}\n",
+                    m.window_micros.load(Relaxed) as f64 / 1e6
+                ));
+            }
             s.push_str(
                 "# HELP nuthatch_nest_logs_undecoded_total Logs a declared event claimed that did not decode against its ABI, per nest, contract and topic0.\n\
                  # TYPE nuthatch_nest_logs_undecoded_total counter\n",
@@ -1894,7 +2026,35 @@ impl Metrics {
             }
         }
         self.render_serving(&mut s);
+        self.render_cursors(&mut s);
         s
+    }
+
+    /// RFC-0076: what each buffered cursor's window buffer holds, in memory and spilled to disk.
+    fn render_cursors(&self, s: &mut String) {
+        let cursors = self.cursors.lock().unwrap();
+        if cursors.is_empty() {
+            return;
+        }
+        for (name, help, pick) in [
+            (
+                "nuthatch_cursor_buffer_bytes",
+                "Bytes of fetched windows this chain's buffered cursor holds in memory for its nests.",
+                0usize,
+            ),
+            (
+                "nuthatch_cursor_buffer_spilled_bytes",
+                "Bytes of fetched windows this chain's buffered cursor has spilled to its scratch directory.",
+                1,
+            ),
+        ] {
+            s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+            for (chain, m) in cursors.iter() {
+                let (memory, spilled) = m.buffer_bytes();
+                let v = if pick == 0 { memory } else { spilled };
+                s.push_str(&format!("{name}{{chain=\"{chain}\"}} {v}\n"));
+            }
+        }
     }
 
     /// RFC-0073 FR4: the serving counters per mount, beside the unlabelled totals they sum to.

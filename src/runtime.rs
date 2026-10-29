@@ -2127,7 +2127,13 @@ pub async fn dev(
     let mut mounted = load_mounted(&dir, &datasets, default_tenant)?;
     // The dial is the operator's, not the nest's (RFC-0040), so it is stamped onto every mounted
     // config here rather than read from any of them - `Config::freshness` is `#[serde(skip)]`.
-    for (_, _, config) in &mut mounted {
+    for (name, _, config) in &mut mounted {
+        config.window_deadline = mounts
+            .mounts
+            .iter()
+            .find(|r| mount_route(r, default_tenant) == *name)
+            .and_then(|r| r.limits.window_deadline());
+        config.runtime_dir = Some(dir.clone());
         stamp_operator_settings(
             config,
             freshness,
@@ -6216,6 +6222,10 @@ impl RuntimeHandles {
                     &self.mount_ctx.state_rpc,
                 );
                 config.cursor_max_rss_mb = Some(self.mount_ctx.max_rss_mb);
+                config.window_deadline = self
+                    .surface_record(name)
+                    .and_then(|r| r.limits.window_deadline());
+                config.runtime_dir = Some(self.mount_ctx.dir.clone());
                 if let Some(e) = self
                     .mount_ctx
                     .chains

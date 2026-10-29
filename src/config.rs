@@ -138,6 +138,14 @@ pub struct Config {
     /// outside a runtime, where the default holds. `#[serde(skip)]` like `chain_policy`.
     #[serde(skip)]
     pub cursor_max_rss_mb: Option<u64>,
+    /// The shortest `[mounts.limits] window_deadline_ms` of this dataset's mounts (RFC-0076 §3.2).
+    /// Mount config, so `#[serde(skip)]` like `cursor_max_rss_mb`.
+    #[serde(skip)]
+    pub window_deadline: Option<std::time::Duration>,
+    /// The runtime's directory, whose `cursors/<chain>/buffer/` a buffered cursor spills to. `None`
+    /// outside a runtime. `#[serde(skip)]` like `cursor_max_rss_mb`.
+    #[serde(skip)]
+    pub runtime_dir: Option<std::path::PathBuf>,
     /// RFC-0037: IPFS gateways (or a local node) for resolving declared `[[ipfs]]` documents,
     /// supplied at run time (`--ipfs`), **never** written to `nuthatch.toml`.
     ///
@@ -837,6 +845,8 @@ impl Config {
             route: None,
             chain_policy: Default::default(),
             cursor_max_rss_mb: None,
+            window_deadline: None,
+            runtime_dir: None,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {
@@ -1103,6 +1113,8 @@ mod tests {
             route: None,
             chain_policy: Default::default(),
             cursor_max_rss_mb: None,
+            window_deadline: None,
+            runtime_dir: None,
             ipfs_gateways: Vec::new(),
             ipfs: Vec::new(),
             nest: Nest {
