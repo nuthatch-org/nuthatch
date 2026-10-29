@@ -380,21 +380,7 @@ struct Pending {
 fn queued_bytes(line: &Line) -> u64 {
     match line {
         Line::Snapshot { snapshot, .. } => snapshot.bytes(),
-        Line::Delta { delta, .. } => {
-            let op = |op: &crate::feed::Op| -> u64 {
-                use crate::feed::Op::*;
-                let (a, b) = match op {
-                    Put { key, row } => (key.len(), row.len()),
-                    Drop { from, to } => (from.len(), to.as_ref().map_or(0, String::len)),
-                    Meta { key, value } => (key.len(), value.len()),
-                    Block { key, record } => (key.len(), record.len()),
-                    Unmeta { key } | Unblock { key } | UnblockFrom { key } => (key.len(), 0),
-                };
-                (a + b) as u64 + crate::feed::ROW_OVERHEAD
-            };
-            delta.ops.iter().map(op).sum::<u64>()
-                + delta.catalogue.as_ref().map_or(0, |c| c.len() as u64)
-        }
+        Line::Delta { delta, .. } => delta.bytes(),
         _ => 0,
     }
 }
@@ -1367,9 +1353,9 @@ impl Follower {
                     dataset: crate::feed::DatasetName(dataset.clone()),
                     snapshot,
                 };
-                if self.waits_on_mirror(&dataset, &line, cx).await? {
+                let Some(line) = self.waits_on_mirror(&dataset, line, cx).await? else {
                     return Ok(());
-                }
+                };
                 let Line::Snapshot { snapshot, .. } = line else {
                     unreachable!("a snapshot was put in")
                 };
@@ -1388,9 +1374,9 @@ impl Follower {
                     dataset: crate::feed::DeltaDataset(dataset.clone()),
                     delta,
                 };
-                if self.waits_on_mirror(&dataset, &line, cx).await? {
+                let Some(line) = self.waits_on_mirror(&dataset, line, cx).await? else {
                     return Ok(());
-                }
+                };
                 let Line::Delta { delta, .. } = line else {
                     unreachable!("a delta was put in")
                 };
@@ -1432,26 +1418,26 @@ impl Follower {
 
     /// On another host, hold `line` back if its dataset already has lines waiting on the mirror, or
     /// if its catalogue names a segment this follower does not hold yet; start fetching for it. A
-    /// dataset whose held lines would pass its budget is resnapshotted, as a full queue is. Whether
-    /// it was held.
+    /// dataset whose held lines would pass its budget is resnapshotted, as a full queue is. The line
+    /// back when it was not held; it is moved, never copied, into the queue when it is.
     async fn waits_on_mirror(
         self: &Arc<Self>,
         dataset: &str,
-        line: &Line,
+        line: Line,
         cx: &mut Cx,
-    ) -> Result<bool> {
+    ) -> Result<Option<Line>> {
         if self.remote.is_none() {
-            return Ok(false);
+            return Ok(Some(line));
         }
         let queued = self.lock().pending.contains_key(dataset);
-        let needs = match (queued, catalogue_of(line)) {
+        let needs = match (queued, catalogue_of(&line)) {
             (true, _) | (_, None) => Vec::new(),
             (false, Some(c)) => self.missing(c.to_string()).await?,
         };
         if !queued && needs.is_empty() {
-            return Ok(false);
+            return Ok(Some(line));
         }
-        let bytes = queued_bytes(line);
+        let bytes = queued_bytes(&line);
         let cap = self.cap_for(dataset).unwrap_or(0);
         {
             let mut inner = self.lock();
@@ -1475,13 +1461,13 @@ impl Follower {
                     waiting_for: Vec::new(),
                     error: None,
                 });
-            p.items.push_back(line.clone());
+            p.items.push_back(line);
             p.bytes += bytes;
         }
         if !needs.is_empty() {
             self.fetch(dataset, needs, cx);
         }
-        Ok(true)
+        Ok(None)
     }
 
     /// Fetch `segments` for `dataset` from the mirror until every one is in place, then say so on
@@ -1657,7 +1643,8 @@ impl Follower {
         };
         // Charged before it is applied, at its peak, so the copy never holds more than its
         // budget even part-way through a delta.
-        let peak = data.store.peak_with(&delta);
+        // The decoded delta itself is alive beside the copy until the apply is done.
+        let peak = data.store.peak_with(&delta) + delta.bytes();
         if let Some(cap) = self.cap_for(&dataset).filter(|cap| peak > *cap) {
             let max = {
                 let mut inner = self.lock();

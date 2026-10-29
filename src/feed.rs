@@ -133,6 +133,26 @@ pub struct Delta {
     pub wire: std::sync::OnceLock<bytes::Bytes>,
 }
 
+impl Delta {
+    /// What a decoded delta holds while it waits to be applied: its keys and values, with
+    /// [`ROW_OVERHEAD`] per op, and its catalogue.
+    pub fn bytes(&self) -> u64 {
+        let op = |op: &Op| -> u64 {
+            let (a, b) = match op {
+                Op::Put { key, row } => (key.len(), row.len()),
+                Op::Drop { from, to } => (from.len(), to.as_ref().map_or(0, String::len)),
+                Op::Meta { key, value } => (key.len(), value.len()),
+                Op::Block { key, record } => (key.len(), record.len()),
+                Op::Unmeta { key } | Op::Unblock { key } | Op::UnblockFrom { key } => {
+                    (key.len(), 0)
+                }
+            };
+            (a + b) as u64 + ROW_OVERHEAD
+        };
+        self.ops.iter().map(op).sum::<u64>() + self.catalogue.as_ref().map_or(0, |c| c.len() as u64)
+    }
+}
+
 /// A dataset's hot window as of one generation, read in one transaction.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -552,10 +572,12 @@ pub fn read_frames(
                 let mut payload = vec![0u8; rest as usize];
                 body.read_exact(&mut payload)
                     .context("reading a delta frame")?;
-                // Compressed, the wire says little about what the rows come to, so decoding is held
-                // to the frame's own limit: any one batch, and the rows they rebuild to.
+                // Held, with everything decoding allocates beside it, to one limit: the payload is
+                // charged first, and given back when it is dropped after decoding.
                 let limit = cap.map(|cap| cap + SNAPSHOT_SLACK);
-                let delta = match wire::decode_delta(&payload, limit) {
+                let decoded = wire::decode_delta(&payload, limit);
+                drop(payload);
+                let delta = match decoded {
                     Ok(delta) => delta,
                     Err(e) if e.is::<wire::TooLarge>() => {
                         let read = e.downcast_ref::<wire::TooLarge>().map_or(0, |t| t.needed);

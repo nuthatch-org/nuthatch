@@ -245,10 +245,20 @@ async fn agree_on(writer: &Writer, follower: &str, path: &str, why: &str) -> ser
 }
 
 async fn bind_follower(root: &Path, writer: &Writer) -> (Arc<Follower>, String) {
-    let follower = Follower::start(
+    bind_follower_on(root, writer, 2).await
+}
+
+/// A follower asking for feed format `feed`.
+async fn bind_follower_on(root: &Path, writer: &Writer, feed: u32) -> (Arc<Follower>, String) {
+    let follower = Follower::start_with(
         root.to_path_buf(),
         format!("http://{}", writer.addr),
         TOKEN.to_string(),
+        None,
+        nuthatch::reader::Options {
+            feed,
+            paused: false,
+        },
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -777,18 +787,24 @@ async fn a_single_value_over_the_budget_is_refused_without_being_read() {
 
 /// A held mount's delta that would take it past what its cursor has left is refused before any of
 /// it is applied: by its peak, worked out from the decoded delta, or before that by its wire bytes.
-/// The co-mount goes on following.
+/// The co-mount goes on following. The decoded delta is charged beside the copy it grows, so one of
+/// 1.2 MiB, with a little under 2 MiB left, is refused though the copy alone would fit. Under v2 the
+/// frame is held whole while its rows are copied out of it, so the same deltas are refused while
+/// they are decoded, by their size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delta_over_the_budget_is_refused_before_it_is_applied() {
-    for (size, refused_by) in [
-        ((2 << 20) + (8 << 10), "refused before it was applied"),
-        (3 << 20, "delta passed"),
+    for (feed, size, refused_by) in [
+        (1, 1_200_000, "refused before it was applied"),
+        (1, (2 << 20) + (8 << 10), "refused before it was applied"),
+        (1, 3 << 20, "delta passed"),
+        (2, 1_200_000, "delta passed"),
+        (2, 3 << 20, "delta passed"),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let (root, via, tape) = two_mounts(tmp.path());
         let writer = Writer::start_many(&root, tape.clone(), 0, &[ROUTE, SMALL]);
         writer.reaches(1).await;
-        let (_f, fbase) = bind_follower(&via, &writer).await;
+        let (_f, fbase) = bind_follower_on(&via, &writer, feed).await;
         let mut held = 0;
         for _ in 0..800 {
             held = route_status(&fbase, ROUTE).await.0;
@@ -811,7 +827,7 @@ async fn a_delta_over_the_budget_is_refused_before_it_is_applied() {
             body["error"]
                 .as_str()
                 .is_some_and(|e| e.contains(refused_by)),
-            "{size}: {body}"
+            "v{feed}, {size}: {body}"
         );
         co_mount_follows(&writer, &tape, &fbase, 2).await;
         writer.stop(&root);

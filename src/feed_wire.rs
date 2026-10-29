@@ -115,6 +115,15 @@ impl<'a> Cursor<'a> {
         bail!("a varint in a delta frame runs past 64 bits")
     }
 
+    /// [`Cursor::string`], its bytes taken from `allow` before the copy is made.
+    fn owned(&mut self, allow: &mut Allowance) -> Result<String> {
+        let at = self.at;
+        let n = self.varint()?;
+        allow.take(n).inspect_err(|_| self.at = at)?;
+        self.at = at;
+        self.string()
+    }
+
     fn string(&mut self) -> Result<String> {
         let n = self.varint()? as usize;
         Ok(std::str::from_utf8(self.take(n)?)
@@ -476,7 +485,13 @@ fn batch_rows(bytes: &[u8], allow: &mut Allowance) -> Result<Vec<(String, String
         let data: Vec<(&str, &StringArray)> = (2..batch.num_columns())
             .map(|i| Ok((schema.field(i).name().as_str(), col(i)?)))
             .collect::<Result<_>>()?;
-        // What the rows come to once put back together, from the columns' lengths alone.
+        // Each name as a row writes it, quoted and escaped, worked out once per column.
+        let quoted: Vec<u64> = data
+            .iter()
+            .map(|(k, _)| serde_json::Value::String(k.to_string()).to_string().len() as u64)
+            .collect();
+        // What the rows come to once put back together, from the columns' lengths alone: each
+        // field its quoted name, a colon and a comma beside its value.
         let mut bytes = 0u64;
         for r in 0..batch.num_rows() {
             bytes += if keys.is_valid(r) {
@@ -489,10 +504,9 @@ fn batch_rows(bytes: &[u8], allow: &mut Allowance) -> Result<Vec<(String, String
                 continue;
             }
             bytes += 2;
-            for (k, c) in &data {
+            for (j, (_, c)) in data.iter().enumerate() {
                 if c.is_valid(r) {
-                    // Quotes, colon, comma and the escapes a name could take at most.
-                    bytes += 6 * k.len() as u64 + 4 + c.value_length(r) as u64;
+                    bytes += quoted[j] + 2 + c.value_length(r) as u64;
                 }
             }
         }
@@ -522,6 +536,8 @@ pub fn decode_delta(body: &[u8], limit: Option<u64>) -> Result<Delta> {
         limit: limit.unwrap_or(u64::MAX),
         used: 0,
     };
+    // The body is alive until decoding ends, so it is the first thing charged.
+    allow.take(body.len() as u64)?;
     let mut c = Cursor { buf: body, at: 0 };
     let epoch = c.u64()?;
     let generation = c.u64()?;
@@ -529,7 +545,7 @@ pub fn decode_delta(body: &[u8], limit: Option<u64>) -> Result<Delta> {
     let catalogue = if flags & CATALOGUE != 0 {
         use sha2::Digest;
         let want = c.take(32)?.to_vec();
-        let raw = c.string()?;
+        let raw = c.owned(&mut allow)?;
         ensure!(
             sha2::Sha256::digest(raw.as_bytes()).as_slice() == want.as_slice(),
             "a delta's catalogue does not match the hash its header carries"
@@ -550,8 +566,7 @@ pub fn decode_delta(body: &[u8], limit: Option<u64>) -> Result<Delta> {
                 let n = c.varint()? as usize;
                 let mut rows = Vec::with_capacity(n.min(ARROW_FROM_ROWS));
                 for _ in 0..n {
-                    let (k, r) = (c.string()?, c.string()?);
-                    allow.take((k.len() + r.len()) as u64)?;
+                    let (k, r) = (c.owned(&mut allow)?, c.owned(&mut allow)?);
                     rows.push((k, r));
                 }
                 rows
@@ -573,26 +588,33 @@ pub fn decode_delta(body: &[u8], limit: Option<u64>) -> Result<Delta> {
                 Op::Put { key, row }
             }
             OP_DROP => {
-                let from = c.string()?;
+                let from = c.owned(&mut allow)?;
                 let to = match c.u8()? {
                     0 => None,
-                    _ => Some(c.string()?),
+                    _ => Some(c.owned(&mut allow)?),
                 };
                 Op::Drop { from, to }
             }
             OP_META => Op::Meta {
-                key: c.string()?,
-                value: c.string()?,
+                key: c.owned(&mut allow)?,
+                value: c.owned(&mut allow)?,
             },
-            OP_UNMETA => Op::Unmeta { key: c.string()? },
+            OP_UNMETA => Op::Unmeta {
+                key: c.owned(&mut allow)?,
+            },
             OP_BLOCK => Op::Block {
-                key: c.string()?,
-                record: c.string()?,
+                key: c.owned(&mut allow)?,
+                record: c.owned(&mut allow)?,
             },
-            OP_UNBLOCK => Op::Unblock { key: c.string()? },
-            OP_UNBLOCK_FROM => Op::UnblockFrom { key: c.string()? },
+            OP_UNBLOCK => Op::Unblock {
+                key: c.owned(&mut allow)?,
+            },
+            OP_UNBLOCK_FROM => Op::UnblockFrom {
+                key: c.owned(&mut allow)?,
+            },
             other => bail!("unknown op {other} in a delta frame"),
         };
+        allow.take(std::mem::size_of::<Op>() as u64)?;
         ops.push(op);
     }
     ensure!(c.at == body.len(), "a delta frame has bytes past its ops");
@@ -812,6 +834,131 @@ mod tests {
             .expect("refused as too large");
         assert!(too.needed > limit, "{too:?}");
         assert_eq!(decode_delta(&body, Some(4 << 20)).unwrap().ops, d.ops);
+    }
+
+    fn too_large(body: &[u8], limit: u64) -> TooLarge {
+        let err = decode_delta(body, Some(limit)).expect_err("decoded past its limit");
+        let too = err
+            .downcast_ref::<TooLarge>()
+            .expect("refused as too large");
+        TooLarge {
+            needed: too.needed,
+            limit: too.limit,
+        }
+    }
+
+    fn put(i: u64, row: String) -> Op {
+        Op::Put {
+            key: format!("000000000001-{i:06}"),
+            row,
+        }
+    }
+
+    /// The worst case: a payload near the allowance whose batch also decompresses to near it.
+    /// Each fits; alive together they do not, and decoding stops before the batch is decompressed.
+    #[test]
+    fn a_payload_near_the_limit_that_decompresses_to_it_is_refused() {
+        let noise: String = (0..(900u64 << 10))
+            .map(|i| char::from(b'a' + ((i * 2_654_435_761) >> 7) as u8 % 26))
+            .collect();
+        let mut ops = vec![put(0, format!(r#"{{"table":"raw","n":"{noise}"}}"#))];
+        ops.extend((1..=8).map(|i| {
+            put(
+                i,
+                format!(r#"{{"table":"t","p":"{}"}}"#, "z".repeat(110 << 10)),
+            )
+        }));
+        let d = Delta {
+            ops,
+            ..Delta::default()
+        };
+        let body = encode_delta(&d).unwrap();
+        let limit = 1 << 20;
+        assert!(
+            (body.len() as u64) < limit && body.len() as u64 > limit * 3 / 4,
+            "premise: the payload is near the limit ({} bytes)",
+            body.len()
+        );
+        let too = too_large(&body, limit);
+        assert!(too.needed > limit, "{too:?}");
+        assert_eq!(decode_delta(&body, Some(8 << 20)).unwrap().ops, d.ops);
+    }
+
+    /// The payload is alive while what is decoded from it is copied out, so it is charged first:
+    /// a row of 1 MiB fits 1.5 MiB alone, and twice over does not.
+    #[test]
+    fn the_payload_is_charged_beside_what_is_copied_from_it() {
+        let d = Delta {
+            ops: vec![put(0, format!(r#"{{"x":"{}"}}"#, "q".repeat(1 << 20)))],
+            ..Delta::default()
+        };
+        let body = encode_delta(&d).unwrap();
+        too_large(&body, 3 << 19);
+        assert_eq!(decode_delta(&body, Some(3 << 20)).unwrap().ops, d.ops);
+    }
+
+    /// Strings copied from the payload, a catalogue among them, are charged as they are copied.
+    #[test]
+    fn a_catalogue_is_charged_as_it_is_copied() {
+        let d = Delta {
+            catalogue: Some(format!(
+                r#"{{"tables":{{}},"pad":"{}"}}"#,
+                "c".repeat(1 << 20)
+            )),
+            ..Delta::default()
+        };
+        let body = encode_delta(&d).unwrap();
+        too_large(&body, 3 << 19);
+        assert!(decode_delta(&body, Some(3 << 20)).is_ok());
+    }
+
+    /// Each op is charged its size as it is decoded: 100,000 one-byte drops come to a few hundred
+    /// KiB on the wire and several MiB once decoded.
+    #[test]
+    fn ops_are_charged_as_they_are_decoded() {
+        let d = Delta {
+            ops: (0..100_000)
+                .map(|_| Op::Unmeta { key: "k".into() })
+                .collect(),
+            ..Delta::default()
+        };
+        let body = encode_delta(&d).unwrap();
+        assert!(body.len() < 1 << 20, "premise: {} bytes", body.len());
+        too_large(&body, 2 << 20);
+        assert_eq!(decode_delta(&body, Some(16 << 20)).unwrap().ops, d.ops);
+    }
+
+    /// Rows rebuilt from columns repeat each field's name, which the batch carries once: they are
+    /// charged from the columns' lengths before any is built.
+    #[test]
+    fn rebuilt_rows_are_charged_before_they_are_built() {
+        let names: Vec<String> = (0..20).map(|i| format!("{i:0>200}")).collect();
+        let ops: Vec<Op> = (0..32)
+            .map(|i| {
+                let fields: Vec<String> = names.iter().map(|n| format!(r#""{n}":{i}"#)).collect();
+                put(i, format!("{{{}}}", fields.join(",")))
+            })
+            .collect();
+        let rows: u64 = ops
+            .iter()
+            .map(|o| match o {
+                Op::Put { row, .. } => row.len() as u64,
+                _ => 0,
+            })
+            .sum();
+        let d = Delta {
+            ops,
+            ..Delta::default()
+        };
+        let body = encode_delta(&d).unwrap();
+        let limit = rows / 2;
+        assert!(
+            (body.len() as u64) * 8 < limit,
+            "premise: the batch is small beside its rows ({} of {rows})",
+            body.len()
+        );
+        too_large(&body, limit);
+        assert_eq!(decode_delta(&body, Some(rows * 4)).unwrap().ops, d.ops);
     }
 
     #[test]
