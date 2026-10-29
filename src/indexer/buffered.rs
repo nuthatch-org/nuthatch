@@ -67,9 +67,10 @@ pub(crate) fn window_buffer_mb_at(ceiling_mb: u64) -> u64 {
 
 /// Every buffered cursor's ceiling, by the runtime directory it belongs to, so
 /// `PUT /_admin/runtime` moves its own runtime's cursors and no other's.
-fn ceilings() -> &'static Mutex<Vec<(Option<PathBuf>, std::sync::Weak<AtomicU64>)>> {
-    static CEILINGS: std::sync::OnceLock<Mutex<Vec<(Option<PathBuf>, std::sync::Weak<AtomicU64>)>>> =
-        std::sync::OnceLock::new();
+type Ceilings = Mutex<Vec<(Option<PathBuf>, std::sync::Weak<AtomicU64>)>>;
+
+fn ceilings() -> &'static Ceilings {
+    static CEILINGS: std::sync::OnceLock<Ceilings> = std::sync::OnceLock::new();
     CEILINGS.get_or_init(Default::default)
 }
 
@@ -160,10 +161,10 @@ impl BufferOptions {
         runtime_dir: Option<&Path>,
     ) -> Self {
         let ceiling_mb = Arc::new(AtomicU64::new(max_rss_mb));
-        ceilings()
-            .lock()
-            .unwrap()
-            .push((runtime_dir.map(Path::to_path_buf), Arc::downgrade(&ceiling_mb)));
+        ceilings().lock().unwrap().push((
+            runtime_dir.map(Path::to_path_buf),
+            Arc::downgrade(&ceiling_mb),
+        ));
         let spill = runtime_dir.and_then(|r| {
             let dir = scratch_dir(r, chain);
             match std::fs::remove_dir_all(&dir) {
