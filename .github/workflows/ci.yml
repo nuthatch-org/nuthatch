@@ -655,6 +655,15 @@ jobs:
             --file ../../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8949/ && break; sleep 0.2; done
           node run-entities.mjs pkg http://127.0.0.1:8949/ ../../tests/fixtures/tab-parity
+      # RFC-0075 S5: the query routes answered in the tab, byte for byte against the node's pin
+      # (`e2e_tab_answers` holds the node to the same file).
+      - name: query routes in Node (spike)
+        working-directory: spike/dbsp-wasm
+        run: |
+          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --fork --port 8950 \
+            --file ../../tests/fixtures/tab-parity/chain.json.gz &
+          for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8950/ && break; sleep 0.2; done
+          node run-answers.mjs pkg http://127.0.0.1:8950/ ../../tests/fixtures/tab-parity
       # RFC-0075 S2: Node has no OPFS, so the OPFS backend's round trip and its lock run in a
       # dedicated worker in Chrome for Testing; the 26.04 image ships no chromedriver.
       - name: OPFS in headless Chrome (spike)
@@ -671,6 +680,17 @@ jobs:
           CHROMEDRIVER="$driver" WASM_BINDGEN_TEST_WEBDRIVER_JSON="$b/webdriver.json" \
           TAB_PARITY_RPC=http://127.0.0.1:8948/ \
             cargo test --locked --release --target wasm32-unknown-unknown --test opfs --test live -- --nocapture
+      # RFC-0075 S5: the same routes through the Service Worker, as plain `fetch`es on the page's
+      # origin, with the scaffolded skill's examples run as written.
+      - name: query routes through a Service Worker in headless Chrome (spike)
+        working-directory: spike/dbsp-wasm
+        run: |
+          chrome=$(npx -y @puppeteer/browsers@2.10.10 install chrome@stable --path "$RUNNER_TEMP/browsers" | tail -1 | cut -d' ' -f2-)
+          wasm-bindgen --target web --out-dir pkg-web target/wasm32-unknown-unknown/release/dbsp_wasm_spike.wasm
+          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --fork --port 8951 \
+            --file ../../tests/fixtures/tab-parity/chain.json.gz &
+          for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8951/ && break; sleep 0.2; done
+          node run-sw.mjs "$chrome" http://127.0.0.1:8951/ ../../tests/fixtures/tab-parity
 
   # The parked RFC-0060 replays (network_contract and serve's network_* tests) run nightly in
   # network-contract.yml instead; this filter must stay the complement of that one.
