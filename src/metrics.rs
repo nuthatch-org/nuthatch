@@ -1417,6 +1417,7 @@ impl Metrics {
                  # TYPE nuthatch_sql_admission_wait_seconds histogram\n",
             ));
             for (tenant, h) in waits.iter() {
+                let tenant = label_value(tenant);
                 for (i, bound) in crate::fair_share::WAIT_BOUNDS.iter().enumerate() {
                     s.push_str(&format!(
                         "nuthatch_sql_admission_wait_seconds_bucket{{tenant=\"{tenant}\",le=\"{bound}\"}} {}\n",
@@ -2865,5 +2866,40 @@ mod tests {
             m.last_seal_progress() >= stamped,
             "a real advance must stamp the clock"
         );
+    }
+}
+
+/// A Prometheus label value: a tenant label is any string, so `\`, `"` and newline are escaped.
+fn label_value(v: &str) -> std::borrow::Cow<'_, str> {
+    if !v.contains(['\\', '"', '\n']) {
+        return std::borrow::Cow::Borrowed(v);
+    }
+    std::borrow::Cow::Owned(
+        v.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n"),
+    )
+}
+
+#[cfg(test)]
+mod label_value_tests {
+    #[test]
+    fn a_tenant_label_cannot_break_out_of_its_quotes() {
+        let m = super::Metrics::new();
+        m.observe_admission_wait("a\"} 1\nx{b=\"\\", std::time::Duration::from_millis(3));
+        let out = m.render();
+        let ours: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("admission_wait_seconds") && !l.starts_with('#'))
+            .collect();
+        assert_eq!(
+            ours.len(),
+            super::super::fair_share::WAIT_BOUNDS.len() + 3,
+            "{ours:#?}"
+        );
+        for l in ours {
+            assert!(l.starts_with("nuthatch_sql_admission_wait_seconds_"), "{l}");
+            assert!(l.contains(r#"tenant="a\"} 1\nx{b=\"\\""#), "{l}");
+        }
     }
 }
