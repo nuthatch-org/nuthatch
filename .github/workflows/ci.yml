@@ -584,7 +584,7 @@ jobs:
             --file ../../tests/fixtures/tab-parity/chain.json.gz &
           CHROMEDRIVER="$driver" WASM_BINDGEN_TEST_WEBDRIVER_JSON="$b/webdriver.json" \
           TAB_PARITY_RPC=http://127.0.0.1:8948/ \
-            cargo test --locked --release --target wasm32-unknown-unknown --test opfs --test live
+            cargo test --locked --release --target wasm32-unknown-unknown --test opfs --test live -- --nocapture
 
   # The parked RFC-0060 replays (network_contract and serve's network_* tests) run nightly in
   # network-contract.yml instead; this filter must stay the complement of that one.

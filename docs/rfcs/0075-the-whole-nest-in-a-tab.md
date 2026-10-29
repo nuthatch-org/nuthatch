@@ -363,3 +363,57 @@ reaches block 1. Sealing from the store is S3. The module is 10.9 MB raw and 1.7
 wasm-bindgen, against S0's 5.8 MB and 944 KB, with redb, proptest and the S2 harness added. S6 is
 where that gets cut. Wiring `PlayNest` into the `/play` page is a change to the frontend repo, and
 it has not been made.
+
+## 14. S3 outcome, 2026-10-29
+
+S3 (#2479): the live cursor.
+
+**What moved.** The RPC client is `nuthatch_core::rpc::RpcClient<T: Transport>`, and the node's is
+`RpcClient<Http>` over reqwest. The decision logic moved as it was: endpoint order, health, rests,
+retries, batching, splitting and classification. What changed in the move is the bytes (`post` and a
+`Reply`), the request deadline (`Transport::build`), the waits (`time::sleep` and `timeout`, which are
+tokio's natively and `setTimeout` in a tab), the Prometheus counters (hooks the node implements) and
+visibility. `src/rpc.rs` keeps its two test modules byte for byte: 90 tests, plus chunker's 21, pass
+as they did. The tab's transport is `nuthatch_core::fetch::Fetch`, which holds every JS value in a
+`SendWrapper`. Its deadline is `AbortSignal.timeout`, and it covers the body as reqwest's does.
+
+**The gate's chain.** It is a recording, so CI needs no network. A young mainnet ERC-20,
+`0x0c26fe5e579c3b007ba16d921ba8204a47c05f1a`, was recorded from its deploy block 26,239,807 to
+26,245,870 from two keyless public RPCs (`tests/fixtures/tab-parity/record.sh`). That is 6,065 headers
+(hash and timestamp) and 2,259 Transfers, 430 KB gzipped. `fixture-rpc recorded` serves it over HTTP,
+and refuses any block outside it. The node runs `nuthatch dev` on an `init`ed nest
+(`tests/e2e_tab_parity.rs`). The tab runs the wasm build: `TabNest` with mainnet's finality and seal
+span, the three views inline, and a sink with the node's table floor. Both are held to one pinned
+`expected.json`.
+
+**Gate: passed for Chrome, not run for Safari.**
+
+| | node (`nuthatch dev`) | tab, Node 26 | tab, Chrome for Testing 156 |
+|---|---|---|---|
+| segment `tab__transfer` 26,239,813..=26,241,612, 2,259 rows | `c983470c…479aeae` | the same | the same |
+| sealed through / last block | 26,245,806 / 26,245,870 | the same | the same |
+| `/balances` (1,360 holders, the 1,000 served) | pinned | row-identical | row-identical |
+| hot rows after the seal | | 0 | 0 |
+| wall time | | 554 ms | 567 ms |
+| wasm linear memory at the end, the peak | | 30.6 MiB | 30.8 MiB |
+| RPC requests, bytes received / sent | | 1,433, 1,673,693 / 163,741 | the same |
+| segment bytes held | | 88,012 | 88,012 |
+
+**The gate failed first, for a real reason.** The spike's lockfile had parquet 59.3.2 and the
+binary's had 59.3.0. parquet writes its version into each file's `created_by`, so the rows were equal
+and the bytes were not. Pinning the spike's arrow and parquet to 59.3.0 made them equal. A tab must
+therefore ship the node's parquet, to the patch version. This gate catches it, and nothing else does.
+
+**Safari** was not measured. `safaridriver --enable` asks for an administrator's password, and
+without it the WebDriver session is refused. Chief, to run it once enabled: start
+`fixture-rpc recorded --port 18947 --file tests/fixtures/tab-parity/chain.json.gz`, then from
+`spike/dbsp-wasm` run `SAFARIDRIVER=/usr/bin/safaridriver TAB_PARITY_RPC=http://127.0.0.1:18947/
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner cargo test --release --target
+wasm32-unknown-unknown --test live -- --nocapture`. `vendor.sh` must have run first, and the wasm32
+C toolchain must be set as CI sets it.
+
+**What it does not show.** The contract's Transfers all fall within its first 1,800 blocks, so there
+is one segment, and it is final. A table's provisional segment, folded back through `segment_rows`,
+is not exercised by this chain. The recorded headers carry no transactions. The tab's store was the
+`Bytes` backend, not OPFS. No run followed a live public RPC; the recording was taken from public
+RPCs, and that is all.
