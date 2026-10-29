@@ -198,6 +198,9 @@ impl TabNest {
                 Processed::Stored(_) => {}
                 Processed::Rewound(at) => rolled = Some(at),
                 Processed::Refused => {}
+                Processed::Abandoned => {
+                    anyhow::bail!("window {next}..={to} was abandoned with no deadline set")
+                }
             }
         }
     }
