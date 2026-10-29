@@ -141,6 +141,20 @@
   },
   {
     "method": "GET",
+    "path": "/balances?limit=N",
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "Failed to deserialize query string: limit: invalid digit found in string"
+  },
+  {
+    "method": "GET",
+    "path": "/sql",
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "Failed to deserialize query string: missing field `q`"
+  },
+  {
+    "method": "GET",
     "path": "/balance/0xC8C5AE385BD79AF59E7BE41F05539AFC03815B95",
     "status": 200,
     "content_type": "application/json",
