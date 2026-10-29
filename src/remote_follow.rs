@@ -108,7 +108,7 @@ pub fn missing(remote: &Remote, root: &Path, catalogue: &str) -> Result<Vec<(Str
                 );
             }
             if !remote.holds(&store.join(format!("{}.parquet", s.hash)), &s.hash)?
-                &&!out.iter().any(|(_, o)| o.hash == s.hash)
+                && !out.iter().any(|(_, o)| o.hash == s.hash)
             {
                 out.push((table.clone(), s));
             }

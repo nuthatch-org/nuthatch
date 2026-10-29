@@ -2016,7 +2016,12 @@ impl Follower {
             });
         }
         // Cached files that did not hash to their names, removed and fetched again.
-        if let Some(refused) = self.remote.as_ref().map(|r| r.refused()).filter(|r| !r.is_empty()) {
+        if let Some(refused) = self
+            .remote
+            .as_ref()
+            .map(|r| r.refused())
+            .filter(|r| !r.is_empty())
+        {
             out["cache_refused"] = refused.into();
         }
         out

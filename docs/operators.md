@@ -369,6 +369,9 @@ the same `as_of`, `sealed_through` and `nid`.
   so in `follower.mirror.error`, rather than looking like it waits on a slow one.
 - **The follower's cache is bounded.** A segment no copy it holds names, served, still in use by a
   request, or waiting on the mirror, is deleted from `--cache` once none has named it for 5 minutes.
+  A cached file is hashed against its name the first time a connection's snapshots use it, and when
+  fetched; one that does not match is removed, fetched again and listed under `follower.cache_refused`
+  on `/ready`, never served.
 - **Not yet:** a writer whose dataset takes an offchain pull moves its data identity, and with it
   the prefix its publisher mirrors under; a remote follower follows the new prefix within 30 s, once
   the publisher has filled it.

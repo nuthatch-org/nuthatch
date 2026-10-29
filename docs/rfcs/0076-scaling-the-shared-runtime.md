@@ -318,7 +318,9 @@ credentials may not allow deletes, and with it off a pass puts and deletes exact
 On, the publisher also writes `_followers.json`, and a follower whose seal waits on a prefix without
 it says on `/ready` that the mirror does not publish for followers. The follower's `--cache` deletes a
 segment once no copy it holds, retiring copies and lines waiting on the mirror included, has named it
-for the same 5-minute grace.
+for the same 5-minute grace. A cached file is hashed against its name on first use after each connection and when fetched;
+one that does not match is removed, fetched again and listed on `/ready` (`follower.cache_refused`).
+A file rewritten after its check is read as it is until the follower's next connection.
 
 Feed v2 is negotiated by `?feed=2` and answered with its own content type, so a follower facing a
 writer that predates it reads v1, and a writer facing an old follower sends v1. Visibility,
