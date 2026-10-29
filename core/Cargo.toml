@@ -7,6 +7,12 @@ description = "A nest's cursor without the operating system: decode to commit to
 license = "MIT OR Apache-2.0"
 publish = false
 
+[features]
+# The `graph` build's hash-to-checkpoint index, rebuilt at every open.
+checkpoint-hash-index = []
+# The node's tests park an outbox drain by store path.
+test-hooks = []
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
@@ -14,22 +20,43 @@ dbsp = "0.320"
 nuthatch-decode = { path = "../decode" }
 nuthatch-seal = { path = "../seal" }
 hex = "0.4"
+redb = "2"
 # `Row` derives `SizeOf` and rkyv archival for `dbsp::DBData`; the versions dbsp itself pins.
 size-of = { package = "feldera-size-of", version = "0.1.7" }
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` as nuthatch-decode has it, so a hash over JSON here is the one the binary computes.
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
+tokio = { version = "1", default-features = false, features = ["sync"] }
 tracing = "0.1"
 web-time = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_64", "validation"] }
+tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # rkyv 0.7 archives `usize` as 64-bit only on 64-bit targets; nothing here persists the archive.
 rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_32", "validation"] }
+# RFC-0075 S2: the OPFS backend.
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "DomException",
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemGetDirectoryOptions",
+    "FileSystemGetFileOptions",
+    "FileSystemHandle",
+    "FileSystemReadWriteOptions",
+    "FileSystemSyncAccessHandle",
+    "StorageManager",
+    "WorkerGlobalScope",
+    "WorkerNavigator",
+] }
 
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

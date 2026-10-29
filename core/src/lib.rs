@@ -4,6 +4,7 @@
 //! Nothing here opens a socket, spawns a runtime or reads a clock except through [`time`].
 
 pub mod alerts;
+pub mod backend;
 pub mod cursor;
 pub mod drive;
 pub mod entity_circuit;
@@ -20,9 +21,13 @@ pub mod flags;
 pub mod hooks;
 pub mod labels;
 pub mod metrics;
+#[cfg(target_arch = "wasm32")]
+pub mod opfs;
+pub mod redb_store;
 pub mod seal;
 pub mod source;
 pub mod store;
+pub mod tap;
 pub mod time;
 pub mod velocity;
 pub mod views;

@@ -216,7 +216,7 @@ async fn follower_snapshot_and_derive_over_a_long_sealed_history() {
     let config = nuthatch::config::Config::load(&dir).unwrap();
     let t = Instant::now();
     let store = nuthatch::store::Store::open(&dir.join("nuthatch.redb")).unwrap();
-    let sub = store.feed_subscribe().unwrap();
+    let sub = nuthatch::store::feed_subscribe(&store).unwrap();
     let wire = serde_json::to_vec(&nuthatch::feed::Line::Snapshot {
         dataset: nuthatch::feed::DatasetName("data/m0".into()),
         snapshot: sub.snapshot,

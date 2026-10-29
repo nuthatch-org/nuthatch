@@ -322,7 +322,8 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "src/isolation.rs",
         "the value of `[runtime] isolation`, which RuntimeMeta carries; it has no keys of its own",
     ),
-    ("src/store.rs", "the table tag of a hot row, not nest config"),
+    ("core/src/redb_store.rs", "the table tag of a hot row, not nest config"),
+    ("core/src/tap.rs", "the hot-state feed's ops (RFC-0073 FR1), not nest config"),
     (
         "src/mount_jobs.rs",
         "mount-jobs.json: live-mount progress the runtime writes and resumes (#1544), never operator input",

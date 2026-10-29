@@ -146,6 +146,69 @@ fn retract_entities<E: WindowEntity>(
     Ok(())
 }
 
+/// If the checkpoint at `last` is no longer canonical, return the deepest checkpoint that still
+/// is (the common ancestor to roll back to); otherwise None. Returns Some(0) if none survive.
+/// Errs when the source cannot answer: unverified is not canonical, and nothing may commit on it.
+pub async fn detect_reorg(
+    source: &dyn Source,
+    store: &dyn HotStore,
+    last: u64,
+) -> Result<Option<u64>> {
+    // Usually `last` itself, but if that boundary's hash couldn't be stored (a transient block_hash
+    // failure at checkpoint time), fall back to the newest checkpoint we *do* have at/below `last`, so
+    // a reorg is still verified against a real checkpoint instead of giving up entirely - the previous
+    // "no hash here → nothing to verify" was a reorg blind spot (deadlock-review finding M7).
+    let (checkpoint, stored) = match store.get_block_hash(last)? {
+        Some(h) => (last, h),
+        None => match store
+            .checkpoints_desc()?
+            .into_iter()
+            .find(|(b, _)| *b <= last)
+        {
+            Some((b, h)) => (b, h),
+            None => return Ok(None), // genuinely no checkpoint yet (cold start)
+        },
+    };
+    let Some(canonical) = source.block_hash(checkpoint).await? else {
+        anyhow::bail!("the source has no hash for checkpoint {checkpoint}");
+    };
+    if stored.eq_ignore_ascii_case(&canonical) {
+        return Ok(None);
+    }
+    for (block, hash) in store.checkpoints_desc()? {
+        if block >= checkpoint {
+            continue;
+        }
+        // An unanswered checkpoint may be the ancestor or the seal pin, so walking past it can land
+        // below the watermark, or at 0 if none answers (#1668). A lagging replica clears by the next poll.
+        let Some(canon) = source.block_hash(block).await? else {
+            anyhow::bail!(
+                "block {checkpoint} no longer matches its checkpoint, but the source has no hash for \
+                 checkpoint {block}; not rolling back until it answers"
+            );
+        };
+        if canon.eq_ignore_ascii_case(&hash) {
+            return Ok(Some(block));
+        }
+    }
+    // No checkpoint we hold is canonical, so the fork is deeper than our entire recorded history.
+    // Rolling back everything is the CORRECT recovery here: re-indexing from the nest's origin
+    // reconverges on the canonical chain (`e2e_reorg::reorg_converges_to_canonical` asserts exactly
+    // this for a fork below the oldest checkpoint).
+    //
+    // It looks identical to a wrong-network endpoint (issue #150) - both make every stored hash
+    // mismatch - and block hashes alone cannot tell them apart. So the wrong-chain case is caught
+    // *upstream*, by `RpcClient::verify_chain_ids` at startup, and the established-nest case is caught
+    // *downstream*, by `rollback_reorg`'s sealed-watermark bail. Refusing here instead would break the
+    // legitimate deep-reorg recovery, which is a real correctness regression rather than a guard.
+    tracing::warn!(
+        "no checkpoint at or below block {checkpoint} is canonical - rolling back the whole hot store \
+         and re-indexing from origin. If this repeats, check every url in `rpc_urls` is on this \
+         nest's chain (a wrong-network endpoint looks exactly like this)."
+    );
+    Ok(Some(0))
+}
+
 /// Roll a nest's mutable hot store + IVM views back to `ancestor` (the deepest reorg-survivor block),
 /// returning the block to continue from. Detection is the *caller's* job: a solo nest detects on its
 /// own cursor; a runtime detects **once** at the shared boundary and fans this out to every nest. A
