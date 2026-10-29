@@ -760,7 +760,8 @@ async fn a_tampered_cache_file_is_fetched_again_never_served() {
     let mut ready = serde_json::Value::Null;
     for _ in 0..200 {
         ready = get(&second, &format!("/{ROUTE}/ready")).await.1;
-        if refused(&ready) == 2 && std::fs::read(&file).unwrap() == bytes {
+        // The follower removes a tampered file before fetching it again, so it may be absent here.
+        if refused(&ready) == 2 && std::fs::read(&file).ok().as_deref() == Some(&bytes[..]) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
