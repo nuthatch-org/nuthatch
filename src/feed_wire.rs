@@ -311,15 +311,12 @@ struct Allowance {
 }
 
 impl Allowance {
-    fn fits(&self, n: u64) -> Result<()> {
-        if self.left.is_some_and(|left| n > left) {
-            return Err(TooLarge {
-                needed: self.used.saturating_add(n),
-                limit: self.limit,
-            }
-            .into());
+    /// Give back `n` taken for something now dropped.
+    fn give(&mut self, n: u64) {
+        self.used = self.used.saturating_sub(n);
+        if let Some(left) = &mut self.left {
+            *left = left.saturating_add(n);
         }
-        Ok(())
     }
 
     fn take(&mut self, n: u64) -> Result<()> {
@@ -443,13 +440,23 @@ pub fn encode_delta(delta: &Delta) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// One batch's rows, back as `(key, row)` in the order they were put: its decompressed size and
-/// then its rows' are taken from `allow` before either is allocated.
+/// One batch's rows, back as `(key, row)` in the order they were put. What decoding holds at its
+/// peak, the decompressed stream, its Arrow buffers and the rows, is taken from `allow` before any
+/// of it is allocated.
 fn rows_of(bytes: &[u8], allow: &mut Allowance) -> Result<Vec<(String, String)>> {
     let (size, _) = lz4_flex::block::uncompressed_size(bytes)
         .map_err(|e| anyhow::anyhow!("a delta batch with no size: {e}"))?;
-    // Freed once the rows are built from it, so held to what is left rather than taken from it.
-    allow.fits(size as u64)?;
+    // The decompressed stream and the Arrow buffers read from it, about its size again, are alive
+    // with the rows built from them, so both are taken before either is allocated and given back
+    // only once they are dropped, at the end.
+    let held = 2 * size as u64;
+    allow.take(held)?;
+    let out = batch_rows(bytes, allow);
+    allow.give(held);
+    out
+}
+
+fn batch_rows(bytes: &[u8], allow: &mut Allowance) -> Result<Vec<(String, String)>> {
     let ipc = lz4_flex::block::decompress_size_prepended(bytes)
         .map_err(|e| anyhow::anyhow!("a delta batch that does not decompress: {e}"))?;
     let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)?;
@@ -782,6 +789,29 @@ mod tests {
     /// Compressed, a delta's wire bytes say little about its rows: 32 rows of 64 KiB of one byte
     /// come to a few KiB on the wire. Decoding is refused before the 2 MiB they rebuild to, or the
     /// batch they decompress to, is allocated past the limit.
+    /// A batch whose decompressed stream fits what is left, and whose rows fit too, but not both
+    /// alive together with the Arrow buffers between them, is refused before it is decompressed.
+    #[test]
+    fn a_batch_is_held_to_its_peak_not_to_each_part_alone() {
+        let ops = (0..32)
+            .map(|i| Op::Put {
+                key: format!("000000000001-{i:06}"),
+                row: format!(r#"{{"table":"t","pad":"{}"}}"#, "y".repeat(32 << 10)),
+            })
+            .collect();
+        let d = Delta {
+            ops,
+            ..Delta::default()
+        };
+        let body = encode_delta(&d).unwrap();
+        // 1 MiB of rows, and a stream of about the same: each fits 1.5 MiB alone.
+        let limit = 3 << 19;
+        let err = decode_delta(&body, Some(limit)).unwrap_err();
+        let too = err.downcast_ref::<TooLarge>().expect("refused as too large");
+        assert!(too.needed > limit, "{too:?}");
+        assert_eq!(decode_delta(&body, Some(4 << 20)).unwrap().ops, d.ops);
+    }
+
     #[test]
     fn a_compressed_delta_is_held_to_its_limit_before_it_is_decoded() {
         let ops = (0..32)
@@ -805,7 +835,7 @@ mod tests {
             .downcast_ref::<TooLarge>()
             .expect("refused as too large");
         assert!(too.needed > 1 << 20, "{too:?}");
-        assert_eq!(decode_delta(&body, Some(4 << 20)).unwrap().ops, d.ops);
+        assert_eq!(decode_delta(&body, Some(8 << 20)).unwrap().ops, d.ops);
     }
 
     #[test]
