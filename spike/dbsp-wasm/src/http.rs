@@ -183,7 +183,12 @@ fn engine_error(e: &burrmill::BurrmillError, sql: &str, n: &Nest) -> String {
     }
 }
 
+/// One `/sql` at a time: a statement yields at each batch, and without this a second could start
+/// and hold its own `SQL_MAX_RESULT_BYTES` beside the first's.
+static SQL_ONE_AT_A_TIME: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
+
 async fn route_sql(n: &Nest<'_>, explain: bool, q: answer::SqlRequest) -> Answer {
+    let _one = SQL_ONE_AT_A_TIME.lock().await;
     if q.q.len() > SQL_MAX_QUERY_LEN {
         return if explain {
             answer::explain_too_long()
