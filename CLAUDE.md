@@ -299,6 +299,16 @@ unconfigured.
 > first, then per-mount limits and fault containment, then fair share and runtime memory, then the
 > hardened SQL surface, with read replicas and upgrades without an outage as the last and largest
 > slices. FR8's isolation guarantee ships only after an independent review.
+>
+> **RFC-0076 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
+> [RFC-0076](docs/rfcs/0076-scaling-the-shared-runtime.md) (scaling the shared runtime) on 2026-10-29,
+> GraphOps's follow-up requests: "yes. letsgooo". FR17 to FR19 are new capability in the default binary:
+> followers on other hosts from the mirror, nests on one chain progressing from their own watermarks
+> behind one extraction stage, and tenant reservations held only while a tenant queries. The cursor
+> stays one per chain. S0, a spike of FR18's window buffer, goes first and can stop FR18. **FR20, several
+> writer processes per chain, is accepted as direction only**: nothing of it is built, and the
+> single-cursor law above is not amended, until FR18 and FR19 have shipped and a chain is shown to
+> exceed one machine after them.
 
 >
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.
