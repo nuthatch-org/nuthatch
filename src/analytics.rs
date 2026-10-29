@@ -10591,7 +10591,12 @@ mod confinement {
             let out = std::process::Command::new("ps")
                 .args(["-M", "-p", &std::process::id().to_string()])
                 .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).lines().count().saturating_sub(1))
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .count()
+                        .saturating_sub(1)
+                })
                 .unwrap_or(0);
             if out > 0 {
                 out

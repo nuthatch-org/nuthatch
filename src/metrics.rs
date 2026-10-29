@@ -1039,7 +1039,10 @@ impl Metrics {
     }
     /// One `/sql` admission of `tenant`'s took `waited`, admitted or refused (RFC-0076 §3.1).
     pub fn observe_admission_wait(&self, tenant: &str, waited: Duration) {
-        let mut waits = self.admission_waits.lock().unwrap_or_else(|p| p.into_inner());
+        let mut waits = self
+            .admission_waits
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let key = if waits.contains_key(tenant) || waits.len() < ADMISSION_WAIT_TENANTS_MAX {
             tenant
         } else {

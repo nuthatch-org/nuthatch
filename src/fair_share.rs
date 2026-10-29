@@ -220,17 +220,15 @@ impl GateLedger {
 
     fn entry(&mut self, tenant: &str) -> &mut GateTenant {
         if !self.tenants.contains_key(tenant) {
-            self.tenants.insert(Arc::from(tenant), GateTenant::default());
+            self.tenants
+                .insert(Arc::from(tenant), GateTenant::default());
         }
         self.tenants.get_mut(tenant).expect("inserted above")
     }
 
     /// Seated tenants other than `tenant` holding no permit.
     fn others_idle(&self, tenant: &str) -> usize {
-        let mine = self
-            .tenants
-            .get(tenant)
-            .is_some_and(|t| t.counted_idle);
+        let mine = self.tenants.get(tenant).is_some_and(|t| t.counted_idle);
         self.idle_seated - usize::from(mine)
     }
 
@@ -1127,10 +1125,7 @@ mod tests {
             .iter()
             .map(|b| gate.try_admit(Some(b)).unwrap())
             .collect();
-        while let Some(p) = borrowers
-            .iter()
-            .find_map(|b| gate.try_admit(Some(b)).ok())
-        {
+        while let Some(p) = borrowers.iter().find_map(|b| gate.try_admit(Some(b)).ok()) {
             borrowed.push(p);
         }
         assert_eq!(borrowed.len(), 16 - reserve(16));
@@ -1173,7 +1168,10 @@ mod tests {
         waits.sort();
         // The reserve is a bound, not a promise: `reserve` newcomers in one instant are admitted at
         // once, and the one past it waits for a running query to end.
-        assert!(waits[..reserve(16)].iter().all(|w| w.is_zero()), "{waits:?}");
+        assert!(
+            waits[..reserve(16)].iter().all(|w| w.is_zero()),
+            "{waits:?}"
+        );
         assert_eq!(waits[reserve(16)], Duration::from_millis(100), "{waits:?}");
         drop((admitted, borrowed));
     }

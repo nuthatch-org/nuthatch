@@ -162,7 +162,9 @@ pub fn validate_strict_budget(permits: usize, cursor_max_rss_mb: Option<u64>) ->
 pub fn permits_ceiling(cfg: &AnalyticsConfig, datasets: usize, strict: bool) -> Option<usize> {
     let reservation = cfg.reservation_mb();
     let headroom = cfg.runtime_headroom_mb.unwrap_or(RUNTIME_HEADROOM_MB);
-    let room = cfg.max_rss().saturating_sub(reservation.saturating_add(headroom));
+    let room = cfg
+        .max_rss()
+        .saturating_sub(reservation.saturating_add(headroom));
     let fit = usize::try_from(room / cfg.burrmill_limit_mb().max(1)).unwrap_or(usize::MAX);
     (strict || fit < datasets).then_some(fit)
 }
@@ -902,7 +904,11 @@ pub(crate) mod tests {
             cursor_max_rss_mb: Some(8192),
             ..AnalyticsConfig::default()
         };
-        assert_eq!(permits_ceiling(&wide, 1, true), Some(14), "(8192 - 1024) / 512");
+        assert_eq!(
+            permits_ceiling(&wide, 1, true),
+            Some(14),
+            "(8192 - 1024) / 512"
+        );
         assert_eq!(
             permits_ceiling(&AnalyticsConfig::default(), 1, true),
             Some(2),

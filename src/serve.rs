@@ -10146,11 +10146,19 @@ mod tests {
         assert!(rejections("tenant_share").unwrap() > before);
         // RFC-0076: the wait is kept for the tenant on its gate and in the histogram.
         let acme = shared.tenant_reports()["acme"].stats.clone();
-        assert_eq!((acme.count, acme.waits, acme.rejected_tenant_share), (1, 1, 1));
-        assert!(acme.sum_secs >= SQL_ADMISSION_WAIT.as_secs_f64(), "{acme:?}");
+        assert_eq!(
+            (acme.count, acme.waits, acme.rejected_tenant_share),
+            (1, 1, 1)
+        );
+        assert!(
+            acme.sum_secs >= SQL_ADMISSION_WAIT.as_secs_f64(),
+            "{acme:?}"
+        );
         let scrape = crate::metrics::METRICS.render();
         assert!(
-            scrape.contains("nuthatch_sql_admission_wait_seconds_bucket{tenant=\"acme\",le=\"+Inf\"}"),
+            scrape.contains(
+                "nuthatch_sql_admission_wait_seconds_bucket{tenant=\"acme\",le=\"+Inf\"}"
+            ),
             "{scrape}"
         );
 

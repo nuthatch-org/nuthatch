@@ -4843,7 +4843,10 @@ impl std::fmt::Display for CeilingRefusal {
             CeilingRefusal::SplitDoesNotFit {
                 chain: Some(chain),
                 why,
-            } => write!(f, "the {chain} cursor's analytics split would not fit: {why}"),
+            } => write!(
+                f,
+                "the {chain} cursor's analytics split would not fit: {why}"
+            ),
             CeilingRefusal::SplitDoesNotFit { chain: None, why } => {
                 write!(f, "the analytics split would not fit: {why}")
             }
@@ -4856,10 +4859,7 @@ impl std::error::Error for CeilingRefusal {}
 /// `sql_permits` as `mounts.toml` and the admin API accept it, before memory is asked.
 fn check_sql_permits(permits: usize) -> Result<()> {
     if permits == 0 || permits > crate::serve::SQL_PERMITS_LIMIT {
-        return Err(CeilingRefusal::PermitsOutOfRange {
-            requested: permits,
-        }
-        .into());
+        return Err(CeilingRefusal::PermitsOutOfRange { requested: permits }.into());
     }
     Ok(())
 }
@@ -6139,7 +6139,11 @@ impl RuntimeHandles {
     /// Change the per-cursor ceiling, the SQL permits on every cursor's gate, or both, live
     /// (RFC-0073 FR5, RFC-0076 §3.1). Whatever changes, each cursor's analytics split is held to
     /// the pair as boot would hold it (#2491). Persisted before it applies.
-    pub fn set_runtime(&mut self, max_rss_mb: Option<u64>, sql_permits: Option<usize>) -> Result<()> {
+    pub fn set_runtime(
+        &mut self,
+        max_rss_mb: Option<u64>,
+        sql_permits: Option<usize>,
+    ) -> Result<()> {
         if let Some(mb) = max_rss_mb {
             self.check_ceiling(mb)?;
         }
@@ -6149,9 +6153,9 @@ impl RuntimeHandles {
         let mb = max_rss_mb.unwrap_or(self.mount_ctx.max_rss_mb);
         let permits = sql_permits.unwrap_or(self.mount_ctx.sql_permits);
         self.check_split(mb, permits)?;
-        persist_runtime_settings(&self.mount_ctx.dir, max_rss_mb, sql_permits).with_context(|| {
-            format!("the runtime is unchanged: {MOUNTS_FILE} could not be updated")
-        })?;
+        persist_runtime_settings(&self.mount_ctx.dir, max_rss_mb, sql_permits).with_context(
+            || format!("the runtime is unchanged: {MOUNTS_FILE} could not be updated"),
+        )?;
         if let Some(n) = sql_permits {
             let mut gates: Vec<&crate::serve::SqlGate> = Vec::new();
             for (_, s) in &self.states {
@@ -6190,7 +6194,10 @@ impl RuntimeHandles {
                     .unwrap_or(crate::analytics_budget::RUNTIME_HEADROOM_MB),
             );
         let cursors = self.chains_in_use().len().max(1) as u64;
-        let spare = cfg.max_rss().saturating_sub(charged).saturating_mul(cursors);
+        let spare = cfg
+            .max_rss()
+            .saturating_sub(charged)
+            .saturating_mul(cursors);
         crate::analytics::size_session_cache(
             spare,
             crate::analytics::cached_session_mb(cfg.burrmill_limit_mb()),
@@ -11685,6 +11692,34 @@ mod fr5_tests {
         stop(restarted, cursor).await;
     }
 
+    /// `[runtime] sql_permits` reaches the gate a cursor builds at boot, and a count no gate could
+    /// have is refused before memory is asked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mounts_toml_sql_permits_size_the_cursors_gate() {
+        let table: MountTable = toml::from_str(
+            "[runtime]\nname = \"t\"\nchain = \"ethereum\"\nchain_id = 1\nsql_permits = 5\n",
+        )
+        .unwrap();
+        assert_eq!(table.runtime.sql_permits, Some(5));
+        for bad in [0, crate::serve::SQL_PERMITS_LIMIT + 1] {
+            let err = check_sql_permits(bad).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<CeilingRefusal>()
+                    .map(CeilingRefusal::status),
+                Some(400),
+                "{err:#}"
+            );
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut a = write_nest(root.path(), "fr19-boot");
+        a.2.cursor_sql_permits = Some(1);
+        let mut handles = handles_at(root.path());
+        let (cursor, refused) = boot(vec![a], DEFAULT_MAX_RSS_MB, &mut handles).await;
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(handles.states[0].1.sql_gate.total(), 1);
+        stop(handles, cursor).await;
+    }
+
     /// RFC-0076 §3.1: `sql_permits` moves live on the cursor's gate, is written to `mounts.toml`
     /// first, and is refused past the cursor's memory split. #2491: a lower ceiling is held to the
     /// permits already set, as boot would hold it, under strict isolation where every permit costs a
@@ -11748,12 +11783,18 @@ mod fr5_tests {
         // #2491: six pools of 512 and the reservation are 4,096 MB; 3,072 cannot hold them.
         let (status, body) = put(serde_json::json!({ "max_rss_mb": 3072 })).await;
         assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
-        assert!(body["error"].as_str().unwrap().contains("4096 MB"), "{body}");
-        assert_eq!(persisted(root.path()), Some(4096), "a refusal wrote mounts.toml");
+        assert!(
+            body["error"].as_str().unwrap().contains("4096 MB"),
+            "{body}"
+        );
+        assert_eq!(
+            persisted(root.path()),
+            Some(4096),
+            "a refusal wrote mounts.toml"
+        );
         assert_eq!(handles.lock().await.mount_ctx.max_rss_mb, 4096);
 
-        let (status, body) =
-            put(serde_json::json!({ "max_rss_mb": 3072, "sql_permits": 4 })).await;
+        let (status, body) = put(serde_json::json!({ "max_rss_mb": 3072, "sql_permits": 4 })).await;
         assert_eq!(status, axum::http::StatusCode::OK, "{body}");
         assert_eq!(persisted(root.path()), Some(3072));
         assert_eq!((permits_on_disk(), gate.total()), (Some(4), 4));
