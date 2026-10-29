@@ -1168,12 +1168,7 @@ fn two_gate_runs_against_one_copy_serialise() {
 fn a_lock_left_by_a_killed_run_is_broken() {
     let c = case();
     let set = c.set(&[("answers", c.counts())]);
-    let mut gone = Command::new("true").spawn().unwrap();
-    let pid = gone.id();
-    gone.wait().unwrap();
-    let held = c.dir.path().join("nest.gate-lock.d");
-    std::fs::create_dir(&held).unwrap();
-    std::fs::write(held.join("pid"), format!("{pid}\n")).unwrap();
+    left_by_a_dead_pid(&c.dir.path().join("nest.gate-lock.d"), None);
     let mut cmd = Command::new(root().join("scripts/release-gate.sh"));
     calm(&mut cmd);
     cmd.args(["--passes", "1", "--out"])
@@ -1196,39 +1191,8 @@ fn a_lock_left_by_a_killed_run_is_broken() {
 fn two_waiters_breaking_one_stale_lock_do_not_both_hold_it() {
     let dir = tempfile::tempdir().unwrap();
     let d = std::fs::canonicalize(dir.path()).unwrap();
-    std::fs::create_dir(d.join("nest")).unwrap();
-    let mut gone = Command::new("true").spawn().unwrap();
-    let pid = gone.id();
-    gone.wait().unwrap();
-    std::fs::create_dir(d.join("nest.gate-lock.d")).unwrap();
-    std::fs::write(d.join("nest.gate-lock.d/pid"), format!("{pid}\n")).unwrap();
-    let waiter = d.join("waiter.sh");
-    std::fs::write(
-        &waiter,
-        r#". "$1"
-trap gate_unlock EXIT
-gate_lock "$2/nest" || exit 1
-(set -C; : >"$2/inside") 2>/dev/null || echo OVERLAP
-echo HOLDING
-while [ ! -e "$2/release.$3" ]; do sleep 0.05; done
-rm -f "$2/inside"
-"#,
-    )
-    .unwrap();
-    let start = |name: &str, hook: Option<&str>| {
-        let mut cmd = Command::new("bash");
-        cmd.arg(&waiter)
-            .arg(root().join("scripts/gate/lock.sh"))
-            .arg(&d)
-            .arg(name)
-            .env("GATE_LOCK_PORTABLE", "1")
-            .env_remove("GATE_LOCK_HELD")
-            .env_remove("GATE_LOCK_BEFORE_BREAK");
-        if let Some(hook) = hook {
-            cmd.env("GATE_LOCK_BEFORE_BREAK", hook);
-        }
-        run_bounded(cmd, &d, name)
-    };
+    left_by_a_dead_pid(&d.join("nest.gate-lock.d"), None);
+    let start = |name: &str, hook: Option<&str>| lock_waiter(&d, name, hook);
     let read = |name: &str| std::fs::read_to_string(d.join(format!("{name}.out"))).unwrap();
     let hook = format!(
         "touch '{0}/a-paused'; while [ ! -e '{0}/go' ]; do sleep 0.05; done",
@@ -1268,6 +1232,78 @@ rm -f "$2/inside"
         !d.join("nest.gate-lock.d").exists(),
         "the lock is released on exit"
     );
+}
+
+/// A waiter killed while it held the right to break a dead pid's claim must not leave that claim
+/// unbreakable: the next waiter takes the right over from the dead breaker.
+#[test]
+fn a_break_left_by_a_killed_waiter_is_taken_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = std::fs::canonicalize(dir.path()).unwrap();
+    let held = d.join("nest.gate-lock.d");
+    left_by_a_dead_pid(&held, Some(dead_pid()));
+    let a = lock_waiter(&d, "a", None);
+    poll("a to break the lock and hold it", 30, || {
+        std::fs::read_to_string(d.join("a.out"))
+            .unwrap()
+            .contains("HOLDING")
+            .then_some(())
+    });
+    std::fs::write(d.join("release.a"), "").unwrap();
+    let (code, text) = finish(a, &d, "a", 30);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("breaking"), "{text}");
+    assert!(!held.exists(), "the lock is released on exit:\n{text}");
+}
+
+fn dead_pid() -> u32 {
+    let mut gone = Command::new("true").spawn().unwrap();
+    let pid = gone.id();
+    gone.wait().unwrap();
+    pid
+}
+
+/// The lock directory a run killed while holding it leaves: its claim and its `own.<pid>`, or with
+/// `breaker`, the `brk.<pid>.<breaker>` a waiter killed mid-break leaves in place of `own.<pid>`.
+fn left_by_a_dead_pid(held: &Path, breaker: Option<u32>) {
+    let pid = dead_pid();
+    std::fs::create_dir(held).unwrap();
+    std::fs::write(held.join("pid"), format!("{pid}\n")).unwrap();
+    let right = match breaker {
+        Some(b) => format!("brk.{pid}.{b}"),
+        None => format!("own.{pid}"),
+    };
+    std::fs::write(held.join(right), format!("{pid}\n")).unwrap();
+}
+
+/// Takes the lock on `<d>/nest`, says HOLDING, and holds it until `<d>/release.<name>` exists.
+fn lock_waiter(d: &Path, name: &str, hook: Option<&str>) -> Child {
+    let waiter = d.join("waiter.sh");
+    std::fs::write(
+        &waiter,
+        r#". "$1"
+trap gate_unlock EXIT
+gate_lock "$2/nest" || exit 1
+(set -C; : >"$2/inside") 2>/dev/null || echo OVERLAP
+echo HOLDING
+while [ ! -e "$2/release.$3" ]; do sleep 0.05; done
+rm -f "$2/inside"
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(d.join("nest")).unwrap();
+    let mut cmd = Command::new("bash");
+    cmd.arg(&waiter)
+        .arg(root().join("scripts/gate/lock.sh"))
+        .arg(d)
+        .arg(name)
+        .env("GATE_LOCK_PORTABLE", "1")
+        .env_remove("GATE_LOCK_HELD")
+        .env_remove("GATE_LOCK_BEFORE_BREAK");
+    if let Some(hook) = hook {
+        cmd.env("GATE_LOCK_BEFORE_BREAK", hook);
+    }
+    run_bounded(cmd, d, name)
 }
 
 /// On 2026-10-04 v4.3.1 was gated against v4.3.0, the latest release, while the allocations nest

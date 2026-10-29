@@ -26,9 +26,11 @@ gate_lock() {
     fi
   else
     # The pid file is the claim, created by the shell with O_EXCL: uutils mkdir (Ubuntu 26.04) is
-    # not exclusive, and two runs both "made" the directory.
+    # not exclusive, and two runs both "made" the directory. own.<pid> is written before the claim
+    # and kept with it: it is the one right to break that claim, see gate_lock_break.
     while :; do
       mkdir -p "$path.d" || return 1
+      echo "$$" 2>/dev/null >"$path.d/own.$$" || continue
       (set -C; echo "$$" >"$path.d/pid") 2>/dev/null && break
       [ -d "$path.d" ] || continue
       holder=$(cat "$path.d/pid" 2>/dev/null || true)
@@ -50,23 +52,29 @@ gate_lock() {
 
 # gate_lock_break <lock-dir> <dead-pid> removes the claim only if it is still that pid's. Two waiters
 # that saw the same dead pid would otherwise both remove "it", the second removing the first's new
-# claim. break.<pid> is created O_EXCL, and while it exists nothing else can remove that pid's claim
-# and no claim can replace it, so the pid read under it is still there at the rm.
+# claim. The right to break a claim is one file, own.<pid> and then brk.<pid>.<breaker>, and it only
+# ever moves by rename, so one waiter holds it; a dead breaker's is taken over the same way. While
+# it is held nothing else can remove that claim and no claim can replace it.
 gate_lock_break() {
-  local broke=1
-  (set -C; echo "$$" >"$1/break.$2") 2>/dev/null || return 1
+  local token=$1/brk.$2.$$ t broke=1
+  if ! mv "$1/own.$2" "$token" 2>/dev/null; then
+    for t in "$1/brk.$2".*; do
+      [ -e "$t" ] && ! kill -0 "${t##*.}" 2>/dev/null && mv "$t" "$token" 2>/dev/null && break
+    done
+    [ -e "$token" ] || return 1
+  fi
   if [ "$(cat "$1/pid" 2>/dev/null || true)" = "$2" ] && ! kill -0 "$2" 2>/dev/null; then
     rm -f "$1/pid" && broke=0
   fi
-  rm -f "$1/break.$2"
+  rm -f "$token"
   return "$broke"
 }
 
-# Unlinks our own claim by name and nothing else, so no claim is removed but by its owner or a
+# Unlinks our own files by name and nothing else, so no claim is removed but by its owner or a
 # breaker; an rm -rf would take whatever else is in the directory when it reads it.
 gate_unlock() {
   if [ -n "${GATE_LOCK_DIR:-}" ] && [ "$(cat "$GATE_LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then
-    rm -f "$GATE_LOCK_DIR/pid"
+    rm -f "$GATE_LOCK_DIR/pid" "$GATE_LOCK_DIR/own.$$"
     rmdir "$GATE_LOCK_DIR" 2>/dev/null || true
   fi
   GATE_LOCK_DIR=""
