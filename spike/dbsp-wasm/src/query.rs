@@ -7,11 +7,15 @@ use crate::cellar::Cellar;
 use crate::derived::{NestFiles, TabEntity};
 use crate::registry::TableSchema;
 use anyhow::{anyhow, Result};
+use nuthatch_core::answer::{value_bytes, SQL_MAX_RESULT_BYTES};
 use nuthatch_core::redb_store::Store;
 use nuthatch_core::store::SEALED_THROUGH_KEY;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+
+/// Rows of one batch turned into JSON before the byte cap is checked again, as the node's.
+const ENCODE_ROWS: usize = 32;
 
 fn engine_err(e: burrmill::BurrmillError) -> anyhow::Error {
     anyhow!("{e}")
@@ -132,27 +136,54 @@ impl TabQuery {
         sql: &str,
         cap: usize,
     ) -> Result<(Vec<Value>, Vec<String>, bool), burrmill::BurrmillError> {
-        #[cfg(not(target_arch = "wasm32"))]
-        let batches = self.engine.sql(sql)?;
-        #[cfg(target_arch = "wasm32")]
-        let batches = self.engine.sql_async(sql).await?;
-        let mut columns: Vec<String> = match batches.first() {
-            Some(b) => b
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect(),
-            None => Vec::new(),
-        };
+        let hard = cap + 1;
+        let mut bytes = 0usize;
         let mut rows = Vec::new();
-        for b in &batches {
-            rows.extend(burrmill::df::encode::rows(b)?);
-            if rows.len() > cap {
-                break;
+        let mut over = false;
+        let mut columns: Vec<String> = Vec::new();
+        // Streamed and capped by bytes as the node's `engine_burrmill::collect` is, so a wide result
+        // stops at `SQL_MAX_RESULT_BYTES` instead of being held whole first (#1650).
+        let mut take = |batch: arrow_array::RecordBatch| {
+            if columns.is_empty() {
+                columns = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
             }
-        }
-        let truncated = rows.len() > cap;
+            let mut start = 0;
+            while start < batch.num_rows() {
+                let n = (batch.num_rows() - start).min(ENCODE_ROWS);
+                let part = batch.slice(start, n);
+                start += n;
+                for row in burrmill::df::encode::rows(&part)? {
+                    bytes += row
+                        .as_object()
+                        .map(|o| {
+                            o.iter()
+                                .map(|(k, v)| k.len() + value_bytes(v))
+                                .sum::<usize>()
+                        })
+                        .unwrap_or(0);
+                    rows.push(row);
+                    if rows.len() >= hard || bytes >= SQL_MAX_RESULT_BYTES {
+                        over = true;
+                        return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
+                    }
+                }
+            }
+            Ok(())
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let r = self.engine.sql_for_each(sql, &mut take);
+        #[cfg(target_arch = "wasm32")]
+        let r = self.engine.sql_async_for_each(sql, &mut take).await;
+        let truncated = match r {
+            Ok(()) => false,
+            Err(_) if over => true,
+            Err(e) => return Err(e),
+        };
         rows.truncate(cap);
         if columns.is_empty() {
             if let Ok(described) = self.engine.describe(sql) {

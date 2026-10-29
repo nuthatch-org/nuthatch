@@ -90,3 +90,24 @@ fn the_reorg_property_converges_in_every_band() {
         REORG_TRANSCRIPT_SHA256
     );
 }
+
+/// The tab's `/sql` stops at the node's byte cap, not only its row cap: the node's own wide-cell case,
+/// 100 rows of ~1 MiB, far under 50,000 rows and past 64 MiB.
+#[test]
+fn sql_caps_result_bytes_not_just_rows() {
+    use dbsp_wasm_spike::{cellar::Cellar, derived::NestFiles, query::TabQuery};
+    let db = redb::Database::builder()
+        .create_with_backend(nuthatch_core::backend::Bytes::default())
+        .unwrap();
+    let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
+    let cellar = Cellar::default();
+    let q =
+        futures::executor::block_on(TabQuery::bind(&store, &cellar, &[], &[], &NestFiles::new()))
+            .unwrap();
+    let (rows, _, truncated) = futures::executor::block_on(
+        q.collect("SELECT repeat('A', 1000000) AS x FROM range(100)", 50_000),
+    )
+    .unwrap();
+    assert!(truncated, "the byte cap did not fire");
+    assert!(rows.len() < 100, "held {} wide rows", rows.len());
+}

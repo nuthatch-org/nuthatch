@@ -9,6 +9,28 @@ use serde_json::{json, Value};
 
 pub const CONTENT_TYPE: &str = "application/json";
 
+/// The per-result Rust-side byte ceiling for the guarded `/sql` surface (64 MiB). Comfortably above
+/// any legitimate 50k-row result, far below the per-cursor RAM budget - the backstop against a
+/// wide-cell `SELECT` inflating the materialised buffer past the budget. Part of `collect`'s
+/// contract whenever a row cap is given.
+pub const SQL_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
+
+/// A cheap lower-bound byte estimate of a materialised cell - dominated by string payloads, which is
+/// exactly the wide-cell attack vector. Numbers/bools/null count a small fixed cost.
+pub fn value_bytes(v: &Value) -> usize {
+    match v {
+        Value::String(s) => s.len(),
+        Value::Array(a) => 8 + a.iter().map(value_bytes).sum::<usize>(),
+        Value::Object(o) => {
+            8 + o
+                .iter()
+                .map(|(k, x)| k.len() + value_bytes(x))
+                .sum::<usize>()
+        }
+        _ => 8,
+    }
+}
+
 /// What an offchain read is reproducible by (RFC-0045 §6).
 pub const SNAPSHOT_REPRODUCIBLE: &str = "snapshot";
 
