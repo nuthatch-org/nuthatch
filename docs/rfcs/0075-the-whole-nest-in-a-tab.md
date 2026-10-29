@@ -315,3 +315,51 @@ wants its own issue as a test-oracle defect; it is not fixed here.
 
 **Upstream.** The feldera issue and the four PRs are drafted in `spike/dbsp-wasm/UPSTREAM.md` and
 not posted.
+
+## 13. S2 outcome, 2026-10-29
+
+S2 (#2478): the hot store in the tab.
+
+**What moved.** The binary's redb store is `nuthatch_core::redb_store::Store<F>`, where `F` is the
+feed's tap (RFC-0073 FR1). The node's `Store` is `Store<feed::Tap>`. The tab's is `Store<NoFeed>`,
+which numbers commits and records nothing. The feed's snapshot reads stay in the binary because
+their receivers are tokio's. `Store::from_db` is public and takes a `Database` over any backend, as
+§4 says. `detect_reorg` moved into `cursor` beside `rollback_reorg`. A commit runs on tokio's
+blocking pool when a runtime is current, so the node is unchanged, and inline when none is, as in a
+tab or a bare test.
+
+**The backends.** `backend::Bytes` is RFC-0074's `Vec<u8>` backend, which was not in the tree, so
+it was written again here. `opfs::OpfsBackend` implements redb's five methods over one
+`FileSystemSyncAccessHandle`. It was written from redb's trait and the File System Standard, and
+`redb-opfs` was not read. A `NoModificationAllowedError` from `createSyncAccessHandle` becomes
+`OpenError::Locked`. A worker without sync handles or OPFS gets `OpenError::Unavailable`, and the
+`/play` entry point (`PlayNest`) falls back to `Bytes` on that error alone.
+
+**Gate: passed.**
+
+- *Reorg property, Node against the wasm build.* `tests/e2e_reorg.rs`'s property and its
+  `reorg_depth` strategy, unchanged, run through core's `detect_reorg`, `rollback_reorg`,
+  `fetch_window` and `process_window`. The store is the real redb store on `Bytes`, the source a
+  `TapeSource`, the windows four blocks wide. Proptest's deterministic ChaCha runner draws 12 depths
+  and each band's edges are added, which makes 18 cases: shallow 1-2, mid 3-12, and deep 13-23,
+  including depth 23, a fork below every checkpoint. Every case converges. The tip row carries the
+  replacement hash, the cursor resumes after the checkpoint the node's would, and the hot rows and
+  balances equal a clean run over the post-reorg chain. The transcript's sha256 is
+  `4f3b8bec…6e96592a` in Node 26 and natively, so the two builds converged identically. Node takes
+  227 ms and native 248 ms. Linear memory is 58.9 MiB at the end of `run-node.mjs`.
+- *A second tab is refused.* Under headless Chrome for Testing 156, in a dedicated worker (as
+  `tests/opfs.rs` declares), there are three tests. A store written, closed and reopened on OPFS
+  keeps its meta, rows and checkpoint. A second `OpfsBackend::open` of a held store is
+  `OpenError::Locked`. A second worker's `createSyncAccessHandle` on the held file is refused with
+  `NoModificationAllowedError` and succeeds once the handle drops. CI runs the three tests in
+  `wasm-core` on the runner's Chrome.
+- *Both mutations fail.* Dropping the balance retraction in `rollback_reorg` fails the property at
+  the first case. Mapping the DOM error to anything but `Locked` fails the lock test.
+
+**What it does not show.** The second worker stands in for a second tab. The lock belongs to the
+file and not to the context, so this is the same refusal, but no test opens two tabs. Nothing seals
+in the property: a fork below `sealed_through` is a terminal fault by design, and the deep band
+reaches block 1. Sealing from the store is S3. The module is 10.9 MB raw and 1.78 MB brotli after
+wasm-bindgen, against S0's 5.8 MB and 944 KB, with redb, proptest and the S2 harness added. S6 is
+where that gets cut. Wiring `PlayNest` into the `/play` page is a change to the frontend repo, and
+it has not been made.
