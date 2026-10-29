@@ -17,6 +17,37 @@ use std::sync::Arc;
 /// Rows of one batch turned into JSON before the byte cap is checked again, as the node's.
 const ENCODE_ROWS: usize = 32;
 
+/// The string and binary payload a slice holds, read from its offsets and views without copying:
+/// a lower bound on what encoding it would cost, as `value_bytes` is.
+fn arrow_bytes(part: &arrow_array::RecordBatch) -> usize {
+    use arrow_array::cast::AsArray;
+    use arrow_array::Array;
+    part.columns()
+        .iter()
+        .map(|c| {
+            if let Some(a) = c.as_string_opt::<i32>() {
+                let o = a.value_offsets();
+                (o[o.len() - 1] - o[0]) as usize
+            } else if let Some(a) = c.as_string_opt::<i64>() {
+                let o = a.value_offsets();
+                (o[o.len() - 1] - o[0]) as usize
+            } else if let Some(a) = c.as_binary_opt::<i32>() {
+                let o = a.value_offsets();
+                (o[o.len() - 1] - o[0]) as usize
+            } else if let Some(a) = c.as_binary_opt::<i64>() {
+                let o = a.value_offsets();
+                (o[o.len() - 1] - o[0]) as usize
+            } else if let Some(a) = c.as_string_view_opt() {
+                a.iter().flatten().map(str::len).sum()
+            } else if let Some(a) = c.as_binary_view_opt() {
+                a.iter().flatten().map(<[u8]>::len).sum()
+            } else {
+                8 * c.len()
+            }
+        })
+        .sum()
+}
+
 fn engine_err(e: burrmill::BurrmillError) -> anyhow::Error {
     anyhow!("{e}")
 }
@@ -157,19 +188,32 @@ impl TabQuery {
                 let n = (batch.num_rows() - start).min(ENCODE_ROWS);
                 let part = batch.slice(start, n);
                 start += n;
-                for row in burrmill::df::encode::rows(&part)? {
-                    bytes += row
-                        .as_object()
-                        .map(|o| {
-                            o.iter()
-                                .map(|(k, v)| k.len() + value_bytes(v))
-                                .sum::<usize>()
-                        })
-                        .unwrap_or(0);
-                    rows.push(row);
-                    if rows.len() >= hard || bytes >= SQL_MAX_RESULT_BYTES {
+                // A slice that could cross the cap goes a row at a time, so a cell wider than the cap
+                // is refused from its Arrow length before it becomes a `Value`.
+                let parts = if bytes + arrow_bytes(&part) < SQL_MAX_RESULT_BYTES {
+                    vec![part]
+                } else {
+                    (0..part.num_rows()).map(|i| part.slice(i, 1)).collect()
+                };
+                for part in parts {
+                    if bytes + arrow_bytes(&part) >= SQL_MAX_RESULT_BYTES {
                         over = true;
                         return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
+                    }
+                    for row in burrmill::df::encode::rows(&part)? {
+                        bytes += row
+                            .as_object()
+                            .map(|o| {
+                                o.iter()
+                                    .map(|(k, v)| k.len() + value_bytes(v))
+                                    .sum::<usize>()
+                            })
+                            .unwrap_or(0);
+                        rows.push(row);
+                        if rows.len() >= hard || bytes >= SQL_MAX_RESULT_BYTES {
+                            over = true;
+                            return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
+                        }
                     }
                 }
             }
