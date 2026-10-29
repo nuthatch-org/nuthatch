@@ -7,59 +7,6 @@ use std::collections::HashMap;
 use crate::rpc::RpcClient;
 pub use nuthatch_core::source::*;
 
-#[async_trait::async_trait]
-impl Source for RpcClient {
-    fn forget_cached_above(&self, block: u64) {
-        self.forget_timestamps_above(block);
-    }
-
-    fn refuses_topic0_only(&self, err: &anyhow::Error) -> bool {
-        crate::rpc::filter_refused(err)
-    }
-
-    async fn tip(&self) -> Result<u64> {
-        self.block_number().await
-    }
-
-    async fn block_hash(&self, number: u64) -> Result<Option<String>> {
-        // Disambiguate from this trait method - call the inherent one.
-        RpcClient::block_hash(self, number).await
-    }
-
-    async fn block_hashes(&self, blocks: &[u64]) -> Result<HashMap<u64, String>> {
-        Ok(RpcClient::block_headers(self, blocks)
-            .await?
-            .into_iter()
-            .filter_map(|(b, h)| Some((b, h.get("hash")?.as_str()?.to_string())))
-            .collect())
-    }
-
-    async fn finalized(&self) -> Result<Option<u64>> {
-        self.finalized_block().await
-    }
-
-    async fn block_timestamps(&self, blocks: &[u64]) -> Result<HashMap<u64, u64>> {
-        RpcClient::block_timestamps(self, blocks).await
-    }
-
-    async fn block_record(&self, number: u64) -> Result<Option<(String, Option<u64>)>> {
-        RpcClient::block_record(self, number).await
-    }
-
-    async fn block_headers(&self, blocks: &[u64]) -> Result<HashMap<u64, serde_json::Value>> {
-        RpcClient::block_headers(self, blocks).await
-    }
-
-    async fn block_bodies(&self, blocks: &[u64]) -> Result<HashMap<u64, serde_json::Value>> {
-        RpcClient::block_bodies(self, blocks).await
-    }
-
-    async fn logs(&self, filter: &LogFilter, from: u64, to: u64) -> Result<Vec<Log>> {
-        self.get_logs(filter.addresses(), filter.topic0s(), from, to)
-            .await
-    }
-}
-
 /// A chain's RPC pool behind its cursor, replaceable while the cursor runs (RFC-0073 FR9).
 ///
 /// Each call takes the pool current when it starts and finishes on it, so a replacement never cuts a

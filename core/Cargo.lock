@@ -3487,8 +3487,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "dbsp",
  "feldera-size-of",
+ "futures",
  "hex",
  "js-sys",
  "nuthatch-decode",
@@ -3496,12 +3498,14 @@ dependencies = [
  "proptest",
  "redb",
  "rkyv",
+ "send_wrapper",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
  "tracing",
+ "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -4714,6 +4718,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9900206b54a3527fdc7b8a938bffd94a568bac4f4aa8113b209df75a09c0dec2"
 dependencies = [
  "pest",
+]
+
+[[package]]
+name = "send_wrapper"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
+dependencies = [
+ "futures-core",
 ]
 
 [[package]]
