@@ -463,6 +463,7 @@ fn run() -> Result<String> {
         hooks: &nuthatch_core::hooks::NoHooks,
         faults: &nuthatch_core::fault::NoFaults,
         clock: &NoWait,
+        deadline: None,
     };
     let processed = block_on(process_window(window, &tape, &logs, 10, 12, 12))?;
     anyhow::ensure!(processed == Processed::Stored(2), "processed {processed:?}");

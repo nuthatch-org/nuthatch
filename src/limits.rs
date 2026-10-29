@@ -42,6 +42,11 @@ pub struct MountLimits {
     pub analytics_memory_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_queued: Option<u64>,
+    /// RFC-0076 §3.2: how long the part of one window before its commit may take, for the dataset
+    /// this mount indexes. Not a `/sql` guard and has no process ceiling; read from the mount that
+    /// indexes, so an alias onto another tenant's dataset cannot shorten its deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_deadline_ms: Option<u64>,
 }
 
 pub const ENV_TIMEOUT_MS: &str = "NUTHATCH_SQL_TIMEOUT_MS";
@@ -118,6 +123,13 @@ impl MountLimits {
         *self == Self::default()
     }
 
+    /// `window_deadline_ms` as a duration, when set.
+    pub fn window_deadline(&self) -> Option<Duration> {
+        self.window_deadline_ms
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+    }
+
     fn fields(&self, process: &Limits, pool: u64) -> [(&'static str, Option<u64>, u64); 8] {
         [
             (
@@ -153,6 +165,9 @@ impl MountLimits {
     }
 
     fn check_against(&self, process: &Limits, pool: u64) -> Result<()> {
+        if self.window_deadline_ms == Some(0) {
+            bail!("limits.window_deadline_ms must be at least 1");
+        }
         for (field, asked, ceiling) in self.fields(process, pool) {
             match asked {
                 Some(0) => bail!("limits.{field} must be at least 1"),

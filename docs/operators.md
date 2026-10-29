@@ -578,6 +578,30 @@ stays small.
 
 ---
 
+### The buffered cursor (RFC-0076)
+
+A chain still has one cursor: one fetch position, one finality view, one reorg authority. The
+buffered cursor splits it in two. **Extraction** fetches each range once, with the union filter of
+every nest on the chain, reads the header that ends each window, and appends the window to a
+**buffer**. **Each nest is a task of its own**, the only writer of its dataset, reading the buffer from
+its own position. A nest that falls behind the buffer's oldest window, or comes back from a
+quarantine, fetches for itself by its own filter until it reaches the buffer, so neither a slow nest
+nor a re-admitted one moves extraction back and no co-tenant fetches anything twice. A reorg is
+decided once, by extraction: it drops the buffered windows above the common ancestor, and each nest
+rolls back from its own position when it next looks.
+
+It is the default from 5.14. `NUTHATCH_CURSOR_BUFFER=0` (or `off`) runs the shared cursor that
+came before it, in which every nest on a chain moves at the pace of the slowest; that switch is kept
+for 5.14 only.
+
+| | |
+|---|---|
+| `window_buffer_mb` | what the buffer may hold in memory: 64 MiB at the default 2048 MB ceiling, scaling with `max_rss_mb` as the entity cap does, and charged to the cursor's admission beside its mounts. `GET /_admin/runtime` reports it. Lowering the ceiling live lowers it for running cursors too |
+| spill | past `window_buffer_mb`, windows go to `<runtime>/cursors/<chain>/buffer/`, up to four times the memory bound. It is scratch, never data: a cursor empties it when it starts. Without it, extraction waits for room |
+| lookahead | extraction holds windows for the nests behind the fastest, and at most two at or ahead of the fastest one, so a single nest's cursor holds one window beside the one it is processing |
+| `NUTHATCH_INGEST_CONCURRENCY` | how many nests on a cursor process a window at once; default the core count, at most 4. A nest holds its permit for its whole window, so a sibling waits for a slow nest only when every permit is held by slower ones, and then at the slow nest's pace, as on the shared cursor: keep it above the number of nests you expect to be slow |
+| `NUTHATCH_CURSOR_BUFFER` | `0` or `off`: the shared cursor. A number: the most windows the buffer holds, whatever their size; default 64 |
+
 ### The analytical memo
 
 A `/sql` answer is a function of its inputs: the statement and its row cap, the sealed watermark, the
@@ -1395,9 +1419,18 @@ rows, so neither the document nor any row was written),
 `nuthatch_nest_ipfs_retries_total` (failed document fetches tried again, each also a warn line naming
 the CID, block, attempt, error and the wait before the next; a window paused on a gateway shows here),
 `nuthatch_nest_seal_direct_fetched`,
-`nuthatch_nest_fetch_window_blocks`, `nuthatch_nest_health` (1 indexing / 0 quarantined; an unmounted or
-suspended mount has no series),
-`nuthatch_nest_quarantine_total`, and `nuthatch_cursor_live{chain}`.
+`nuthatch_nest_fetch_window_blocks`, `nuthatch_nest_window_seconds` (a histogram from 1 ms to 30 s of
+each window's wall time, from its start to its commit or refusal, on either cursor),
+`nuthatch_nest_window_overruns_total` (windows abandoned before their commit for outrunning
+`window_deadline_ms`), `nuthatch_nest_behind_extraction_blocks` (blocks between the nest's position
+and its buffered cursor's extraction; 0 on the shared cursor),
+`nuthatch_nest_extraction_wait_seconds_total` (time the nest has waited on its buffered cursor's
+extraction with no window to process: at the tip that is most of the time, and while it climbs with
+`behind_extraction_blocks` at 0 extraction is the bottleneck), `nuthatch_nest_health` (1 indexing / 0
+quarantined; an unmounted or suspended mount has no series),
+`nuthatch_nest_quarantine_total`, and `nuthatch_cursor_live{chain}`. A buffered cursor adds
+`nuthatch_cursor_buffer_bytes{chain}` and `nuthatch_cursor_buffer_spilled_bytes{chain}`: what its
+window buffer holds in memory, bounded by `window_buffer_mb`, and in its scratch directory.
 
 The serving counters are broken down the same way, by the mount a request arrived through (RFC-0073
 FR4): `nuthatch_nest_http_requests_total`, `nuthatch_nest_sql_queries_total`,
@@ -1695,10 +1728,14 @@ unbounded attempts - so restarting a wedged RPC provider recovers within minutes
 typing anything. Terminal faults do not retry and stay quarantined until restart, with the reason on
 `/nests`.
 
-**Re-admission is safe by construction.** A re-admitted nest rejoins behind its siblings, pulls the
-cursor's window position back, and siblings skip windows they already committed. No nest re-processes
-or skips a window. The cost is a re-fetch of the intervening range, which is why the backoff cap is
-minutes rather than seconds.
+**Re-admission is safe by construction.** A re-admitted nest resumes from its own position, checked
+against its own checkpoints first, so no nest re-processes or skips a window. On the shared cursor it
+rejoins behind its siblings, pulls the cursor's window position back, and its siblings skip the
+windows they already committed; the cost is a re-fetch of the intervening range for the whole
+cursor, which is why the backoff cap is minutes rather than seconds. On the buffered cursor (RFC-0076)
+it fetches its missed range for itself, by its own filter, until it reaches the oldest window still
+in the buffer, and rejoins there: extraction's position never moves back, so no sibling fetches
+anything twice.
 
 **The process exits in exactly three cases:** the server stops (bind failure or shutdown signal);
 every cursor has been quarantined (nothing will advance again, so dying honestly under a supervisor

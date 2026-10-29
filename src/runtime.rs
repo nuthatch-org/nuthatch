@@ -1608,6 +1608,26 @@ pub fn load_mounted(
     Ok(out)
 }
 
+/// Each dataset's window deadline at boot (RFC-0076 §3.2): its indexing mount's, the first in serving
+/// order. No other mount's record is read, so an alias cannot change or clear it.
+pub(crate) fn boot_window_deadlines(
+    table: &MountTable,
+    datasets: &[Dataset],
+) -> std::collections::HashMap<PathBuf, Option<std::time::Duration>> {
+    datasets
+        .iter()
+        .map(|ds| {
+            let c = ds.canonical();
+            let deadline = table
+                .mounts
+                .iter()
+                .find(|r| r.tenant == c.tenant && r.alias == c.alias)
+                .and_then(|r| r.limits.window_deadline());
+            (ds.dir.clone(), deadline)
+        })
+        .collect()
+}
+
 /// A publisher for every mount that declares `[mounts.publish]` (RFC-0052 S2), keyed by route, and
 /// for each dataset `[runtime.publish]` covers. One per record: two mounts of one dataset naming one
 /// target contend on S1's conditional catalogue put.
@@ -2005,7 +2025,8 @@ pub fn admit_at_boot(
         let (entity_count, entity_rows) = declared_entities(&path);
         let mb = estimate_nest_rss_mb(&config, has_labels, entity_count, entity_rows)
             + hot_store_cache_mb(&path);
-        let projected_mb = RUNTIME_BASE_RSS_MB + admitted.cursor_mb + mb;
+        let projected_mb =
+            RUNTIME_BASE_RSS_MB + indexer::window_buffer_mb(max_rss_mb) + admitted.cursor_mb + mb;
         let refusal = refuse_over_entity_ceiling(
             entities + entity_count,
             admitted.nests.len() + 1,
@@ -2136,9 +2157,12 @@ pub async fn dev(
     let default_tenant_owned = all_mounts.tenant_default();
     let default_tenant = default_tenant_owned.as_str();
     let mut mounted = load_mounted(&dir, &datasets, default_tenant)?;
+    let deadlines = boot_window_deadlines(&mounts, &datasets);
     // The dial is the operator's, not the nest's (RFC-0040), so it is stamped onto every mounted
     // config here rather than read from any of them - `Config::freshness` is `#[serde(skip)]`.
-    for (_, _, config) in &mut mounted {
+    for (_, ds_dir, config) in &mut mounted {
+        config.window_deadline = deadlines.get(ds_dir.as_path()).copied();
+        config.runtime_dir = Some(dir.clone());
         stamp_operator_settings(
             config,
             freshness,
@@ -6011,7 +6035,10 @@ impl RuntimeHandles {
             }
         }
         CursorUse {
-            projected_mb: RUNTIME_BASE_RSS_MB + existing + retained.div_ceil(1024 * 1024),
+            projected_mb: RUNTIME_BASE_RSS_MB
+                + indexer::window_buffer_mb(self.mount_ctx.max_rss_mb)
+                + existing
+                + retained.div_ceil(1024 * 1024),
             entities,
             dirs,
         }
@@ -6120,6 +6147,7 @@ impl RuntimeHandles {
             "max_rss_mb_default": DEFAULT_MAX_RSS_MB,
             "above_default": ceiling > DEFAULT_MAX_RSS_MB,
             "max_entities_per_cursor": max_entities_per_cursor(ceiling),
+            "window_buffer_mb": indexer::window_buffer_mb(ceiling),
             "sql_permits": permits,
             "sql_permits_default": crate::serve::sql_max_concurrency(),
             "session_cache_capacity": crate::analytics::session_cache_capacity(),
@@ -6176,6 +6204,7 @@ impl RuntimeHandles {
         }
         if let Some(mb) = max_rss_mb {
             self.mount_ctx.max_rss_mb = mb;
+            indexer::set_cursor_ceiling_mb(&self.mount_ctx.dir, mb);
             self.roster["max_rss_mb_per_cursor"] = serde_json::json!(mb);
             self.live.swap(self.compose()?);
             tracing::info!("per-cursor ceiling set to {mb} MB");
@@ -6227,11 +6256,15 @@ impl RuntimeHandles {
         let entity_cap = max_entities_per_cursor(max_rss_mb);
         for chain in self.chains_in_use() {
             let used = self.cursor_use(&chain);
-            if used.projected_mb > max_rss_mb {
+            // The buffer's term moves with the ceiling, so it is priced at the one asked for.
+            let projected_mb = used.projected_mb
+                - indexer::window_buffer_mb(self.mount_ctx.max_rss_mb)
+                + indexer::window_buffer_mb(max_rss_mb);
+            if projected_mb > max_rss_mb {
                 return Err(CeilingRefusal::BelowUse {
                     requested: max_rss_mb,
                     chain: Some(chain),
-                    projected_mb: used.projected_mb,
+                    projected_mb,
                 }
                 .into());
             }
@@ -6476,6 +6509,11 @@ impl RuntimeHandles {
                     &self.mount_ctx.state_rpc,
                 );
                 config.cursor_max_rss_mb = Some(self.mount_ctx.max_rss_mb);
+                config.window_deadline = Some(
+                    self.surface_record(name)
+                        .and_then(|r| r.limits.window_deadline()),
+                );
+                config.runtime_dir = Some(self.mount_ctx.dir.clone());
                 config.cursor_sql_permits = Some(self.mount_ctx.sql_permits);
                 if let Some(e) = self
                     .mount_ctx
@@ -7237,6 +7275,10 @@ impl RuntimeHandles {
         let next = config.applied(&self.mount_ctx.mounts[at])?;
         if let Some(i) = self.states.iter().position(|(n, _)| n == name) {
             let mut state = self.states[i].1.clone();
+            // Only the mount that indexes the dataset sets its deadline.
+            if state.runtime_health.as_ref().is_none_or(|(k, _)| k == name) {
+                indexer::set_window_deadline(&state.dir, next.limits.window_deadline());
+            }
             let surface = served_surface(Some(&next), &state.dir, name)?;
             let nid = state.nid.clone();
             overlay_mount_record(
@@ -8832,6 +8874,33 @@ mod tests {
         .unwrap();
         let mounts = MountTable::load(d.path()).expect("a migrated directory loads");
         assert_eq!(mounts.mounts.len(), 1);
+    }
+
+    /// RFC-0076 §3.2: boot reads a dataset's window deadline from the mount that indexes it, listed
+    /// before or after an alias that sets another.
+    #[test]
+    fn boot_takes_each_datasets_window_deadline_from_its_indexing_mount() {
+        let nid = "dd".repeat(32);
+        for (first, second, want) in [
+            ("window_deadline_ms = 2500\n", "", Some(2500)),
+            ("", "window_deadline_ms = 2500\n", None),
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            let table: MountTable = toml::from_str(&format!(
+                "[runtime]\nname = \"t\"\nchain = \"ethereum\"\nchain_id = 1\n\n\
+                 [[mounts]]\nalias = \"usdc\"\nnid = \"{nid}\"\n[mounts.limits]\n{first}\n\
+                 [[mounts]]\nalias = \"alias\"\nnid = \"{nid}\"\n[mounts.limits]\n{second}"
+            ))
+            .unwrap();
+            let datasets = table.datasets(d.path());
+            assert_eq!(datasets.len(), 1, "premise: one dataset, two mounts");
+            let deadlines = boot_window_deadlines(&table, &datasets);
+            assert_eq!(
+                deadlines[&datasets[0].dir],
+                want.map(std::time::Duration::from_millis),
+                "the indexing mount's deadline, whatever the alias's record says"
+            );
+        }
     }
 
     /// RFC-0032 §4: grouping is by *dataset*, and a runtime may be half-migrated while it happens.
@@ -10922,17 +10991,26 @@ mod tests {
         let mut handles = idle_handles(dir.path());
         handles.states.push(("usdc".to_string(), state));
         let before = handles.cursor_use("ethereum").projected_mb;
+        // The window buffer's charge scales with the ceiling, so the lowest ceiling the estimates
+        // fit is found rather than read off `projected_mb`.
+        let buffer = crate::indexer::window_buffer_mb;
+        let fixed = before - buffer(handles.mount_ctx.max_rss_mb);
+        let mut tight = fixed;
+        while tight < fixed + buffer(tight) {
+            tight += 1;
+        }
 
         let pinned = balances.pinned();
         balances.apply(crate::views::transfer_deltas("0xm", "0xnew", 1, 1));
         balances.flush();
         assert!(balances.retained_bytes() > 0);
         assert_eq!(handles.cursor_use("ethereum").projected_mb, before + 1);
-        let err = handles.set_max_rss_mb(before).unwrap_err();
+        let err = handles.set_max_rss_mb(tight).unwrap_err();
         assert!(
             matches!(
                 err.downcast_ref::<CeilingRefusal>(),
-                Some(CeilingRefusal::BelowUse { projected_mb, .. }) if *projected_mb == before + 1
+                Some(CeilingRefusal::BelowUse { projected_mb, .. })
+                    if *projected_mb == fixed + 1 + buffer(tight)
             ),
             "{err:#}"
         );
@@ -10940,7 +11018,7 @@ mod tests {
         drop(pinned);
         assert_eq!(handles.cursor_use("ethereum").projected_mb, before);
         handles
-            .set_max_rss_mb(before)
+            .set_max_rss_mb(tight)
             .expect("with the version let go the cursor fits its estimates again");
     }
 
@@ -11609,6 +11687,16 @@ mod fr5_tests {
         cursor.shutdown().await.unwrap();
     }
 
+    /// The lowest ceiling a cursor holding `held` MB of mounts fits under. The buffer's term scales
+    /// with the ceiling, so it is found rather than summed.
+    fn least_ceiling(held: u64) -> u64 {
+        let mut c = RUNTIME_BASE_RSS_MB + held;
+        while c < RUNTIME_BASE_RSS_MB + crate::indexer::window_buffer_mb(c) + held {
+            c += 1;
+        }
+        c
+    }
+
     /// RFC-0073 FR5: `PUT /_admin/runtime` lowers and raises the per-cursor ceiling with no restart,
     /// a mount's admission follows it at once, `mounts.toml` keeps it, and the next boot is held to
     /// it. Above 2048 is accepted and flagged (#2441); below what the cursor projects is refused and
@@ -11631,7 +11719,8 @@ mod fr5_tests {
             .unwrap()
             .set_len(32 * 1024 * 1024)
             .unwrap();
-        let used = RUNTIME_BASE_RSS_MB + priced(&a) + priced(&b);
+        let held = priced(&a) + priced(&b);
+        let used = least_ceiling(held);
         let mut handles = handles_at(root.path());
         let (cursor, refused) = boot(vec![a, b], DEFAULT_MAX_RSS_MB, &mut handles).await;
         assert!(refused.is_empty(), "{refused:?}");
@@ -11643,7 +11732,11 @@ mod fr5_tests {
         assert_eq!(status, axum::http::StatusCode::OK, "{body}");
         assert_eq!(body["max_rss_mb"], DEFAULT_MAX_RSS_MB);
         assert_eq!(body["max_entities_per_cursor"], 32);
-        assert_eq!(body["cursors"][0]["projected_mb"], used, "{body}");
+        assert_eq!(
+            body["cursors"][0]["projected_mb"],
+            RUNTIME_BASE_RSS_MB + crate::indexer::window_buffer_mb(DEFAULT_MAX_RSS_MB) + held,
+            "{body}"
+        );
 
         assert_eq!(body["above_default"], false, "{body}");
         assert!(body.get("note").is_none(), "{body}");
@@ -11887,7 +11980,7 @@ mod fr5_tests {
             .set_len(32 * 1024 * 1024)
             .unwrap();
         assert!(priced(&over) > priced(&after));
-        let ceiling = RUNTIME_BASE_RSS_MB + priced(&first) + priced(&after);
+        let ceiling = least_ceiling(priced(&first) + priced(&after));
         let mut handles = handles_at(root.path());
         let (cursor, refused) = boot(vec![first, over, after], ceiling, &mut handles).await;
         assert_eq!(
