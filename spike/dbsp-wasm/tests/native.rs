@@ -138,3 +138,29 @@ fn sql_does_not_encode_the_row_that_would_cross_the_cap() {
         rows.len()
     );
 }
+
+/// Nested values are sized before encoding too: ten rows of a 900,000-element list are ~7 MB each as
+/// `value_bytes` counts them, past the cap together, and what is held stays under it.
+#[test]
+fn sql_sizes_nested_values_before_encoding_them() {
+    use dbsp_wasm_spike::{cellar::Cellar, derived::NestFiles, query::TabQuery};
+    let db = redb::Database::builder()
+        .create_with_backend(nuthatch_core::backend::Bytes::default())
+        .unwrap();
+    let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
+    let cellar = Cellar::default();
+    let q =
+        futures::executor::block_on(TabQuery::bind(&store, &cellar, &[], &[], &NestFiles::new()))
+            .unwrap();
+    let (rows, _, truncated) = futures::executor::block_on(
+        q.collect("SELECT array_repeat(1, 900000) AS x FROM range(10)", 50_000),
+    )
+    .unwrap();
+    assert!(truncated, "the byte cap did not fire");
+    let held: usize = rows.iter().map(nuthatch_core::answer::value_bytes).sum();
+    assert!(
+        held < nuthatch_core::answer::SQL_MAX_RESULT_BYTES,
+        "{} rows, {held} bytes held",
+        rows.len()
+    );
+}

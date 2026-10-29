@@ -17,8 +17,9 @@ use std::sync::Arc;
 /// Rows of one batch turned into JSON before the byte cap is checked again, as the node's.
 const ENCODE_ROWS: usize = 32;
 
-/// The string and binary payload a slice holds, read from its offsets and views without copying:
-/// a lower bound on what encoding it would cost, as `value_bytes` is.
+/// What a slice would cost to encode, measured as `value_bytes` measures it, before it is encoded:
+/// string and binary payload exactly from offsets and views, every other type (nested ones too) from
+/// Arrow's slice size, which over-counts a sliced list's children. A type Arrow cannot size is refused.
 fn arrow_bytes(part: &arrow_array::RecordBatch) -> usize {
     use arrow_array::cast::AsArray;
     use arrow_array::Array;
@@ -42,10 +43,10 @@ fn arrow_bytes(part: &arrow_array::RecordBatch) -> usize {
             } else if let Some(a) = c.as_binary_view_opt() {
                 a.iter().flatten().map(<[u8]>::len).sum()
             } else {
-                8 * c.len()
+                c.to_data().get_slice_memory_size().unwrap_or(usize::MAX)
             }
         })
-        .sum()
+        .fold(0usize, usize::saturating_add)
 }
 
 fn engine_err(e: burrmill::BurrmillError) -> anyhow::Error {
@@ -190,13 +191,13 @@ impl TabQuery {
                 start += n;
                 // A slice that could cross the cap goes a row at a time, so a cell wider than the cap
                 // is refused from its Arrow length before it becomes a `Value`.
-                let parts = if bytes + arrow_bytes(&part) < SQL_MAX_RESULT_BYTES {
+                let parts = if bytes.saturating_add(arrow_bytes(&part)) < SQL_MAX_RESULT_BYTES {
                     vec![part]
                 } else {
                     (0..part.num_rows()).map(|i| part.slice(i, 1)).collect()
                 };
                 for part in parts {
-                    if bytes + arrow_bytes(&part) >= SQL_MAX_RESULT_BYTES {
+                    if bytes.saturating_add(arrow_bytes(&part)) >= SQL_MAX_RESULT_BYTES {
                         over = true;
                         return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
                     }
