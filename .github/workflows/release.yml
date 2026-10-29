@@ -20,6 +20,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # GCC 15 defaults to C23, which removed the ATOMIC_VAR_INIT that mimalloc (via dbsp) still uses.
+  CFLAGS: -std=gnu17
 
 jobs:
   # Creates (or updates) the release with its body, before the matrix starts. Must be a separate
