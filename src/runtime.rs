@@ -2507,6 +2507,7 @@ pub async fn dev(
             isolation: meta.isolation,
         },
     }));
+    handles.lock().await.size_session_cache();
 
     // The server and the cursor supervisor race; whichever ends first decides the exit (RFC-0026 §6).
     // A *single* cursor's death no longer ends anything - that is the supervisor's job to absorb.
@@ -6116,6 +6117,7 @@ impl RuntimeHandles {
             "max_entities_per_cursor": max_entities_per_cursor(ceiling),
             "sql_permits": permits,
             "sql_permits_default": crate::serve::sql_max_concurrency(),
+            "session_cache_capacity": crate::analytics::session_cache_capacity(),
             "cursors": cursors,
         });
         if ceiling > DEFAULT_MAX_RSS_MB {
@@ -6169,7 +6171,30 @@ impl RuntimeHandles {
             self.live.swap(self.compose()?);
             tracing::info!("per-cursor ceiling set to {mb} MB");
         }
+        self.size_session_cache();
         Ok(())
+    }
+
+    /// Size the analytics session cache from what each cursor's split leaves over (RFC-0076 §3.1),
+    /// counting every permit a pool as strict isolation does: at the 2 GiB default, nothing.
+    fn size_session_cache(&self) -> usize {
+        let cfg = crate::analytics_budget::AnalyticsConfig {
+            cursor_max_rss_mb: Some(self.mount_ctx.max_rss_mb),
+            ..crate::analytics_budget::from_env()
+        };
+        let charged = (self.mount_ctx.sql_permits as u64)
+            .saturating_mul(cfg.burrmill_limit_mb())
+            .saturating_add(cfg.reservation_mb())
+            .saturating_add(
+                cfg.runtime_headroom_mb
+                    .unwrap_or(crate::analytics_budget::RUNTIME_HEADROOM_MB),
+            );
+        let cursors = self.chains_in_use().len().max(1) as u64;
+        let spare = cfg.max_rss().saturating_sub(charged).saturating_mul(cursors);
+        crate::analytics::size_session_cache(
+            spare,
+            crate::analytics::cached_session_mb(cfg.burrmill_limit_mb()),
+        )
     }
 
     fn check_ceiling(&self, max_rss_mb: u64) -> Result<()> {
@@ -11703,6 +11728,8 @@ mod fr5_tests {
 
         let (status, body) = put(serde_json::json!({ "max_rss_mb": 4096 })).await;
         assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        // 2,048 MB over the split keeps one more session for each 65 MB a cached one may hold.
+        assert_eq!(body["session_cache_capacity"], 16 + 2048 / 65, "{body}");
         let (status, body) = put(serde_json::json!({ "sql_permits": 6 })).await;
         assert_eq!(status, axum::http::StatusCode::OK, "{body}");
         assert_eq!(body["sql_permits"], 6, "{body}");
@@ -11710,6 +11737,11 @@ mod fr5_tests {
         assert_eq!(body["cursors"][0]["sql_permits_ceiling"], 6, "{body}");
         assert_eq!((permits_on_disk(), gate.total()), (Some(6), 6));
         assert_eq!(gate.available_permits(), 6, "the raise is free at once");
+        assert_eq!(
+            body["session_cache_capacity"],
+            crate::analytics::SESSION_CACHE_FLOOR,
+            "nothing is left over: {body}"
+        );
         let (status, _) = put(serde_json::json!({ "sql_permits": 7 })).await;
         assert_eq!(status, axum::http::StatusCode::CONFLICT);
 
