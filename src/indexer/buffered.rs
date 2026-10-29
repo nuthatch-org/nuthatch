@@ -1319,22 +1319,55 @@ async fn read_logs(w: &BufferedWindow) -> Result<std::borrow::Cow<'_, [crate::rp
 
 /// The logs a nest takes from a buffered window: its own, from its watermark's overlap tail, plus
 /// the logs of any child it knows of that extraction did not ask for when it fetched the window.
+/// A nest's logs for one window: the buffered window itself when the nest takes every log in it,
+/// which a single-nest cursor always does, or the nest's own copy.
+enum NestLogs {
+    Window(Arc<BufferedWindow>),
+    Own(Vec<crate::rpc::Log>),
+}
+
+impl std::ops::Deref for NestLogs {
+    type Target = [crate::rpc::Log];
+    fn deref(&self) -> &[crate::rpc::Log] {
+        match self {
+            NestLogs::Window(w) => match &w.logs {
+                WindowLogs::Memory(logs) => logs,
+                WindowLogs::Spilled(_) => unreachable!("only an in-memory window is lent"),
+            },
+            NestLogs::Own(logs) => logs,
+        }
+    }
+}
+
 async fn window_logs(
     nest: &NestIngest,
     source: &dyn Source,
-    w: &BufferedWindow,
+    w: Arc<BufferedWindow>,
     next: u64,
     stats: &BufferStats,
-) -> Result<Vec<crate::rpc::Log>> {
+) -> Result<NestLogs> {
     let from = overlap_from(next, nest.start_block.unwrap_or(0));
-    let mut logs: Vec<crate::rpc::Log> = read_logs(w)
+    let refetch = match (nest.factory.as_deref(), &w.asked) {
+        (Some(_), Some(asked)) => nest
+            .children
+            .addresses()
+            .into_iter()
+            .any(|c| !asked.contains(&c.to_ascii_lowercase())),
+        _ => false,
+    };
+    if let WindowLogs::Memory(all) = &w.logs {
+        if !refetch && all.iter().all(|l| l.block_number >= from && nest.owns(l)) {
+            return Ok(NestLogs::Window(w));
+        }
+    }
+    let mut logs: Vec<crate::rpc::Log> = read_logs(&w)
         .await?
         .iter()
         .filter(|l| l.block_number >= from && nest.owns(l))
         .cloned()
         .collect();
     let (Some(fs), Some(asked)) = (nest.factory.as_deref(), &w.asked) else {
-        return Ok(logs);
+        return Ok(NestLogs::Own(logs));
     };
     let missing: Vec<String> = nest
         .children
@@ -1344,7 +1377,7 @@ async fn window_logs(
         .map(str::to_string)
         .collect();
     if missing.is_empty() {
-        return Ok(logs);
+        return Ok(NestLogs::Own(logs));
     }
     stats.factory_refetches.fetch_add(1, Ordering::Relaxed);
     let extra = fetch_discovering(source, &missing, &nest.topic0s, from, w.to, |seen| {
@@ -1356,7 +1389,7 @@ async fn window_logs(
     .await?;
     logs.extend(extra.into_iter().filter(|l| nest.owns(l)));
     dedup_logs(&mut logs);
-    Ok(logs)
+    Ok(NestLogs::Own(logs))
 }
 
 /// COR-5 for one nest: a block the union fetch could not fit, asked for by this nest's own filter,
@@ -1672,12 +1705,10 @@ async fn nest_task(
                 nest.metrics.add_extraction_wait(waited.elapsed());
                 continue;
             }
-            Pick::Buffered(w) => (
-                window_logs(&nest, source, &w, next, &stats).await,
-                w.to,
-                w.tip,
-                w.header.clone(),
-            ),
+            Pick::Buffered(w) => {
+                let (to, tip, header) = (w.to, w.tip, w.header.clone());
+                (window_logs(&nest, source, w, next, &stats).await, to, tip, header)
+            }
             Pick::Own { to, tip } => {
                 stats.own_fetches.fetch_add(1, Ordering::Relaxed);
                 nest.metrics.set_fetch_window(to - next + 1);
@@ -1688,18 +1719,18 @@ async fn nest_task(
                         continue;
                     }
                     Err(e) if narrowing_can_help(&e, next, to) => {
-                        (fetch_over_cap(&mut nest, source, next).await, next, tip, None)
+                        (fetch_over_cap(&mut nest, source, next).await.map(NestLogs::Own), next, tip, None)
                     }
                     r => {
                         if let Ok(logs) = &r {
                             chunker.observed(logs.len() as u64);
                         }
-                        (r, to, tip, None)
+                        (r.map(NestLogs::Own), to, tip, None)
                     }
                 }
             }
             Pick::OverCap { block, tip } => {
-                (fetch_over_cap(&mut nest, source, block).await, block, tip, None)
+                (fetch_over_cap(&mut nest, source, block).await.map(NestLogs::Own), block, tip, None)
             }
         };
         let logs = match logs {
