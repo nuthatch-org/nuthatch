@@ -226,7 +226,7 @@ the next boot holds to it; the next mount is admitted against it at once.
 
 ```json
 {"max_rss_mb": 1536, "max_rss_mb_default": 2048, "above_default": false,
- "max_entities_per_cursor": 24,
+ "max_entities_per_cursor": 24, "window_buffer_mb": 48,
  "cursors": [{"chain": "mainnet", "projected_mb": 420, "entities": 3}]}
 ```
 
@@ -240,6 +240,10 @@ the next boot holds to it; the next mount is admitted against it at once.
   lowered ceiling always admits what is already running. It never unmounts anything.
 - **The entity cap follows it**: 32 authored entities per cursor for each 2048 MB, rounded down, so
   24 at 1536 and 64 at 4096. A value whose cap is under a cursor's `entities` is `409` too.
+- **So does the window buffer.** `window_buffer_mb`, what a buffered cursor (RFC-0076) may hold of
+  fetched windows in memory, is 64 per 2048 MB, rounded down, and part of every cursor's
+  `projected_mb`; a running cursor's buffer follows a changed ceiling at its next window. It is 0
+  under `NUTHATCH_CURSOR_BUFFER=0`.
 - **The analytics split follows it upward.** Above 2048, `(pools × analytics.memory_limit) +
   ingestion_reservation` is checked against the raised ceiling at startup, as `NUTHATCH_MAX_RSS`
   would raise it. Below 2048 the split is still held to the default.
@@ -403,7 +407,8 @@ once the commit has begun the window always finishes, however long the rest take
 its derived state land together or not at all. A deadline that could fire mid-commit is how a commit
 lands after the derived state that goes with it was dropped.
 
-The buffered cursor (RFC-0076, below) removes the coupling itself. Each nest is its own task, reading
+The [buffered cursor](operators.md#the-buffered-cursor-rfc-0076), the default from 5.14, removes the
+coupling itself. Each nest is its own task, reading
 windows from a buffer extraction fills, so a slow nest delays only itself until it falls behind the
 buffer, and then fetches for itself. A sibling waits for it only for an ingest permit, and only when
 every permit is held by slower nests; RFC-0076 §9 has the measured tip lag per window size.

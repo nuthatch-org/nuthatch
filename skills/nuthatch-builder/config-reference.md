@@ -732,7 +732,14 @@ max_hot_bytes = 33554432
 max_named_scan_bytes = 268435456
 analytics_memory_bytes = 268435456
 max_queued = 64
+window_deadline_ms = 2000        # not a /sql guard: see below
 ```
+
+`window_deadline_ms` (RFC-0076) bounds ingest, not queries: how long the part of one window before
+its hot-store commit may take for the dataset this mount indexes. A window past it is abandoned with
+nothing stored and asked for again, and the third in a row quarantines the nest retryably; a commit
+already begun always finishes. It has no process ceiling, is read only from the mount that indexes
+the dataset, and a `PATCH` applies it from the next window.
 
 An unknown field is refused at load. The admin API sets the same table on a running mount
 (`docs/admin-api.md`) and refuses zero or a value above the process value; a recorded value above

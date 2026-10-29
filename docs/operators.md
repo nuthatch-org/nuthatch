@@ -574,6 +574,30 @@ stays small.
 
 ---
 
+### The buffered cursor (RFC-0076)
+
+A chain still has one cursor: one fetch position, one finality view, one reorg authority. The
+buffered cursor splits it in two. **Extraction** fetches each range once, with the union filter of
+every nest on the chain, reads the header that ends each window, and appends the window to a
+**buffer**. **Each nest is a task of its own**, the only writer of its dataset, reading the buffer from
+its own position. A nest that falls behind the buffer's oldest window, or comes back from a
+quarantine, fetches for itself by its own filter until it reaches the buffer, so neither a slow nest
+nor a re-admitted one moves extraction back and no co-tenant fetches anything twice. A reorg is
+decided once, by extraction: it drops the buffered windows above the common ancestor, and each nest
+rolls back from its own position when it next looks.
+
+It is the default from 5.14. `NUTHATCH_CURSOR_BUFFER=0` (or `off`) runs the shared cursor that
+came before it, in which every nest on a chain moves at the pace of the slowest; that switch is kept
+for 5.14 only.
+
+| | |
+|---|---|
+| `window_buffer_mb` | what the buffer may hold in memory: 64 MiB at the default 2048 MB ceiling, scaling with `max_rss_mb` as the entity cap does, and charged to the cursor's admission beside its mounts. `GET /_admin/runtime` reports it. Lowering the ceiling live lowers it for running cursors too |
+| spill | past `window_buffer_mb`, windows go to `<runtime>/cursors/<chain>/buffer/`, up to four times the memory bound. It is scratch, never data: a cursor empties it when it starts. Without it, extraction waits for room |
+| lookahead | extraction holds windows for the nests behind the fastest, and at most two at or ahead of the fastest one, so a single nest's cursor holds one window beside the one it is processing |
+| `NUTHATCH_INGEST_CONCURRENCY` | how many nests on a cursor process a window at once; default the core count, at most 4 |
+| `NUTHATCH_CURSOR_BUFFER` | `0` or `off`: the shared cursor. A number: the most windows the buffer holds, whatever their size; default 64 |
+
 ### The analytical memo
 
 A `/sql` answer is a function of its inputs: the statement and its row cap, the sealed watermark, the

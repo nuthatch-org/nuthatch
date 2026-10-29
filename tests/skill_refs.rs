@@ -432,6 +432,8 @@ const KNOWN_UNDOCUMENTED: &[(&str, &str)] = &[
     ("Config.route", "`#[serde(skip)]` - the route a runtime serves a nest under, stamped by the runtime before `build_nest` so its cursor, health and metrics are keyed by it (#1415). Where a nest is mounted is not what it is, and an author never writes it."),
     ("Config.chain_policy", "`#[serde(skip)]` - an unregistered chain's finality depth and window, stamped by the runtime from its `[[chains]]` entry before `build_nest` (RFC-0073 FR9). The reference documents them there, as `finality_depth` and `log_window`; a nest never writes them."),
     ("Config.cursor_max_rss_mb", "`#[serde(skip)]` - the runtime's `[runtime] max_rss_mb`, stamped onto each mounted nest before `build_nest` so the analytics split is checked against its cursor's ceiling (#2441). The reference documents it under `[runtime]`; a nest never writes it."),
+    ("Config.window_deadline", "`#[serde(skip)]` - the indexing mount's `[mounts.limits] window_deadline_ms`, stamped by the runtime before `build_nest` (RFC-0076). The reference documents it there; a nest never writes it."),
+    ("Config.runtime_dir", "`#[serde(skip)]` - the runtime's directory, stamped before `build_nest` so a buffered cursor knows where its scratch buffer goes (RFC-0076). Where a nest is mounted is not what it is."),
     ("Config.read_only_role","`#[serde(skip)]` - the `serve` role, set by `serve_role` before `build_nest` so a `[[calls]]` nest it will never sample is not refused for lacking an archive endpoint (#1167). A role is not data identity and is never a config key."),
 ];
 
