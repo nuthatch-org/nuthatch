@@ -1156,8 +1156,10 @@ async fn a_page_corrupt_segment_under_a_running_node_reduces_the_table_over_http
 /// database - so this is the deterministic way to reach the arm #472 found silent.
 struct HotScanFails(std::sync::Arc<dyn nuthatch::store::HotStore>);
 
+impl nuthatch::store::HotStore for HotScanFails {}
+
 #[async_trait::async_trait]
-impl nuthatch::store::HotStore for HotScanFails {
+impl nuthatch::store::CoreHotStore for HotScanFails {
     fn put_entity(&self, key: &str, json: &str) -> anyhow::Result<()> {
         self.0.put_entity(key, json)
     }

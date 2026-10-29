@@ -29,8 +29,9 @@ faked: a restart drill, a deliberate reorg, breaking a nest to watch its co-tena
 comparing a row count against an independent source. That last one is the step separating *it ran* from
 *it is correct*, and no script can do it for you.
 
-CI runs the fleet half on every push to `main` and every pull request - `the compose fleet comes up`
-stands the whole stack up, walks level 5, and asserts exactly one worker takes the lease.
+CI runs the fleet half in the merge queue, on every push to `main`, and on a pull request labelled
+`full-ci` (it is in the slow tier, skipped on an ordinary PR) - `the compose fleet comes up` stands
+the whole stack up, walks level 5, and asserts exactly one worker takes the lease.
 
 ## How to use it
 

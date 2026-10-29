@@ -20,7 +20,7 @@
 
 use crate::feed::{Line, MemStore};
 use crate::serve::{AppState, LiveRuntime, SharedNest};
-use crate::store::HotStore;
+use crate::store::{CoreHotStore as _, HotStore};
 use anyhow::{bail, Context, Result};
 use axum::extract::Request;
 use axum::http::StatusCode;
@@ -1902,8 +1902,8 @@ impl Follower {
             chain: config.nest.chain.clone(),
             dir,
             balances: crate::views::BalanceView::inert(),
-            exposure: crate::exposure::ExposureView::start(false)?,
-            velocity: crate::velocity::VelocityView::start(false)?,
+            exposure: crate::exposure::ExposureView::start(crate::drive::Driver::Threaded, false)?,
+            velocity: crate::velocity::VelocityView::start(crate::drive::Driver::Threaded, false)?,
             #[cfg(feature = "folds")]
             folds: None,
             entities: Arc::new(Vec::new()),

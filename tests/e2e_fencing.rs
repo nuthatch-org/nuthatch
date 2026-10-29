@@ -27,7 +27,7 @@
 
 mod common;
 
-use nuthatch::store::{HotStore, LostOwnership, Store};
+use nuthatch::store::{CoreHotStore as _, LostOwnership, Store};
 
 fn row(block: u64) -> Vec<(String, String)> {
     vec![(

@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use nuthatch::pgstore::PgStore;
-use nuthatch::store::{HotStore, Store};
+use nuthatch::store::{CoreHotStore as _, HotStore, Store};
 
 /// A unique schema per test run, so a re-run never inherits the last one's rows and two tests can
 /// share a database. Derived from the test name plus the process id rather than a random value,

@@ -22,13 +22,13 @@
 //! The view is in-memory but not ephemeral: `rebuild` reconstructs it from stored facts on a warm
 //! restart (see `indexer::rebuild_balances`), so balances survive a process bounce.
 
+use crate::drive::{Driver, Lane, Step, ViewDriver};
 use anyhow::{anyhow, Context, Result};
 use dbsp::utils::Tup2;
 use dbsp::{IndexedZSetReader, OrdZSet, OutputHandle, RootCircuit, Runtime};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::versioned::{Chunked, Sink, Versions};
@@ -108,7 +108,7 @@ impl BalanceCircuit {
 }
 
 /// The `k` greatest of `items`, greatest first, in one pass that keeps only `k` of them (#2210).
-pub(crate) fn top_k<T: Ord>(items: impl Iterator<Item = T>, k: usize) -> Vec<T> {
+pub fn top_k<T: Ord>(items: impl Iterator<Item = T>, k: usize) -> Vec<T> {
     if k == 0 {
         return Vec::new();
     }
@@ -131,7 +131,7 @@ pub(crate) fn top_k<T: Ord>(items: impl Iterator<Item = T>, k: usize) -> Vec<T> 
 /// Run one transaction to completion, calling `drain` after each of its steps. DBSP splits a large
 /// input into internal steps of 10,000 rows and each overwrites the output handles, so reading them
 /// once after `transaction()` keeps only the last step's changes (#2268).
-pub(crate) fn step_to_commit(
+pub fn step_to_commit(
     circuit: &mut dbsp::DBSPHandle,
     mut drain: impl FnMut(),
 ) -> Result<(), dbsp::Error> {
@@ -185,25 +185,16 @@ fn build_circuit(circuit: &mut RootCircuit) -> Result<CircuitHandles, anyhow::Er
     Ok((handle, out.output()))
 }
 
-/// A message to the circuit thread: a batch to apply, or a flush barrier that acks once every
-/// previously-enqueued batch has been folded in (used to make `rebuild` synchronous).
-enum Msg {
-    Batch(WeightedBatch),
-    Flush(SyncSender<()>),
-}
-
-/// Cheap-to-clone handle to the live balance view. Sends batches to the circuit thread; reads the
+/// Cheap-to-clone handle to the live balance view. Feeds batches to the circuit; reads the
 /// maintained balances from shared state.
 #[derive(Clone)]
 pub struct BalanceView {
-    tx: Sender<Msg>,
+    /// Unhealthy for good once the circuit dies on an error, so the ingest loop fails loudly instead
+    /// of serving frozen balances as if healthy (a dead task must surface, never be served over).
+    lane: Lane<WeightedBatch>,
     balances: Arc<Versions<Balances>>,
     /// The version a request was handed (#2467), read instead of the latest.
     pinned: Option<Arc<Balances>>,
-    /// Flips to `false` (permanently) if the circuit thread dies on an error - so the ingest loop can
-    /// surface a dead derived-view thread and fail loudly, instead of silently serving frozen balances
-    /// as if healthy (a dead task must surface, never be served over).
-    healthy: Arc<AtomicBool>,
     /// Transfers whose value has more than 38 digits and were therefore **dropped from these
     /// balances** (COR-8, #814). Served as `dropped_over_i128`, the name from when the line was
     /// `i128`, kept because callers read it.
@@ -227,75 +218,47 @@ impl BalanceView {
     /// A view with no circuit, for a process that serves a nest it does not index (RFC-0073 FR1),
     /// which refuses the routes that read it rather than answer them empty.
     pub fn inert() -> Self {
-        let (tx, _) = channel::<Msg>();
         Self {
-            tx,
+            lane: Lane::off(),
             balances: Arc::new(Versions::new(new_balances())),
             pinned: None,
-            healthy: Arc::new(AtomicBool::new(true)),
             over_i128: Default::default(),
         }
     }
 
-    /// Spawn the circuit on its own thread (DBSP drives worker threads; keep it off the async pool).
-    pub fn start() -> Result<Self> {
-        let (tx, rx) = channel::<Msg>();
+    /// Start the circuit under `driver`; the node's keeps DBSP on its own thread, off the async pool.
+    pub fn start(driver: Driver) -> Result<Self> {
         let balances = Arc::new(Versions::new(new_balances()));
         let shared = balances.clone();
-        let healthy = Arc::new(AtomicBool::new(true));
-        let health = healthy.clone();
-        std::thread::Builder::new()
-            .name("nuthatch-ivm".into())
-            .spawn(move || {
-                let mut circuit = match BalanceCircuit::new() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("IVM circuit failed to start: {e:#}");
-                        health.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                };
-                let mut map = new_balances();
-                while let Ok(msg) = rx.recv() {
-                    match msg {
-                        Msg::Batch(batch) => {
-                            if let Err(e) = circuit.step(batch, &mut map) {
-                                tracing::error!("IVM step failed: {e:#}");
-                                health.store(false, Ordering::SeqCst);
-                                break;
-                            }
-                            shared.publish(map.clone());
-                        }
-                        // Messages are processed in order, so by the time we see the barrier every
-                        // prior batch is applied - ack unblocks the waiter.
-                        Msg::Flush(ack) => {
-                            let _ = ack.send(());
-                        }
-                    }
-                }
-            })
-            .context("failed to spawn IVM thread")?;
+        let lane = driver.lane("IVM", "nuthatch-ivm", move || {
+            let mut circuit = BalanceCircuit::new()?;
+            let mut map = new_balances();
+            Ok(Box::new(move |batch| {
+                circuit.step(batch, &mut map).context("IVM step failed")?;
+                shared.publish(map.clone());
+                Ok(())
+            }) as Step<WeightedBatch>)
+        })?;
         Ok(Self {
-            tx,
+            lane,
             balances,
             pinned: None,
-            healthy,
             over_i128: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    /// Whether the IVM circuit thread is still alive and folding. `false` means it died on an error
+    /// Whether the IVM circuit is still alive and folding. `false` means it died on an error
     /// (circuit start or a `step`); the ingest loop treats that as fatal rather than serving a frozen
-    /// view. (A clean shutdown drops the sender and exits the loop without flipping this.)
+    /// view.
     pub fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::SeqCst)
+        self.lane.is_healthy()
     }
 
-    /// Enqueue a weighted batch (built via `transfer_deltas`/`seed_delta`). Non-blocking; drops
-    /// silently if the circuit thread has died (already logged there).
+    /// Feed a weighted batch (built via `transfer_deltas`/`seed_delta`). Dropped silently once the
+    /// circuit has died (already logged there).
     pub fn apply(&self, batch: WeightedBatch) {
         if !batch.is_empty() {
-            let _ = self.tx.send(Msg::Batch(batch));
+            self.lane.send(batch);
         }
     }
 
@@ -309,13 +272,10 @@ impl BalanceView {
         );
     }
 
-    /// Block until every batch enqueued so far has been folded into the view. Used after a restart
+    /// Block until every batch fed so far has been folded into the view. Used after a restart
     /// rebuild so the API serves complete balances from the first request.
     pub fn flush(&self) {
-        let (ack, wait) = sync_channel(0);
-        if self.tx.send(Msg::Flush(ack)).is_ok() {
-            let _ = wait.recv();
-        }
+        self.lane.flush();
     }
 
     pub fn balance(&self, address: &str) -> Option<i128> {
@@ -511,7 +471,7 @@ mod tests {
     /// charged only while it is held.
     #[test]
     fn a_pinned_view_keeps_its_version_and_is_charged_while_held() {
-        let view = BalanceView::start().unwrap();
+        let view = BalanceView::start(Driver::Threaded).unwrap();
         let batch: WeightedBatch = (0..1_000)
             .flat_map(|i| transfer_deltas("0xminter", &format!("0x{i:040x}"), 1, 1))
             .collect();
@@ -537,11 +497,13 @@ mod tests {
     /// A flush barrier returns only once queued work is drained - the property `rebuild` relies on.
     #[test]
     fn flush_waits_for_enqueued_work() {
-        let view = BalanceView::start().unwrap();
-        view.apply(transfer_deltas("a", "b", 42, 1));
-        view.flush();
-        assert_eq!(view.balance("b"), Some(42));
-        assert_eq!(view.balance("a"), Some(-42));
+        for driver in [Driver::Threaded, Driver::Inline] {
+            let view = BalanceView::start(driver).unwrap();
+            view.apply(transfer_deltas("a", "b", 42, 1));
+            view.flush();
+            assert_eq!(view.balance("b"), Some(42), "{driver:?}");
+            assert_eq!(view.balance("a"), Some(-42), "{driver:?}");
+        }
     }
 
     /// #2210: `/balances?limit=1` sorted every holder to keep one. A top-`k` compares each item about
@@ -581,7 +543,7 @@ mod tests {
 
     #[test]
     fn top_breaks_ties_by_address_and_takes_at_most_n() {
-        let view = BalanceView::start().unwrap();
+        let view = BalanceView::start(Driver::Threaded).unwrap();
         let mut map = new_balances();
         for (k, v) in [("0xc", 5), ("0xa", 5), ("0xb", 9), ("0xd", -1)] {
             map.insert(k.to_string(), v);

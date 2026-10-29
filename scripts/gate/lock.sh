@@ -5,8 +5,8 @@
 # gate_lock <nest-copy-dir> takes the copy's lock, waiting for whoever holds it, and keeps it until
 # the shell exits (call gate_unlock from the EXIT trap). It exports GATE_LOCK_HELD, so a child gate
 # run on the same copy, as release-gate-run.sh starts, rides on its parent's lock instead of waiting
-# on it for ever. flock where there is one; elsewhere (macOS) a mkdir lock that records its pid and
-# is broken once that pid has gone, since nothing releases it for a killed holder.
+# on it for ever. flock where there is one; elsewhere (macOS) a pid file created O_EXCL, which is
+# broken once that pid has gone, since nothing releases it for a killed holder.
 
 gate_lock_path() {
   local parent
@@ -33,9 +33,11 @@ gate_lock() {
       [ -d "$path.d" ] || continue
       holder=$(cat "$path.d/pid" 2>/dev/null || true)
       if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
-        echo "gate lock: breaking $path.d, left by pid $holder, which has gone" >&2
-        rm -f "$path.d/pid"
-        continue
+        [ -z "${GATE_LOCK_BEFORE_BREAK:-}" ] || eval "$GATE_LOCK_BEFORE_BREAK"
+        if gate_lock_break "$path.d" "$holder"; then
+          echo "gate lock: breaking $path.d, left by pid $holder, which has gone" >&2
+          continue
+        fi
       fi
       [ "$said" -eq 1 ] || echo "gate lock: another gate run holds $path.d; waiting" >&2
       said=1
@@ -46,9 +48,36 @@ gate_lock() {
   export GATE_LOCK_HELD=$path
 }
 
+# gate_lock_break <lock-dir> <dead-pid> removes the claim only if it is still that pid's. Two waiters
+# that saw the same dead pid would otherwise both remove "it", the second removing the first's new
+# claim. Each breaker writes brk.<pid>.<itself> and then looks for another's: of two live breakers
+# whose files overlap, the later to look sees the earlier, so at most one goes on, and while it does
+# no claim can replace the pid it re-reads. A dead breaker's file is ignored.
+gate_lock_break() {
+  local mine=$1/brk.$2.$$ t broke=1
+  : >"$mine" 2>/dev/null || return 1
+  for t in "$1/brk.$2".*; do
+    [ "$t" != "$mine" ] && [ -e "$t" ] || continue
+    if kill -0 "${t##*.}" 2>/dev/null; then
+      rm -f "$mine"
+      return 1
+    fi
+    rm -f "$t"
+  done
+  if [ "$(cat "$1/pid" 2>/dev/null || true)" = "$2" ] && ! kill -0 "$2" 2>/dev/null; then
+    [ -z "${GATE_LOCK_BEFORE_RM:-}" ] || eval "$GATE_LOCK_BEFORE_RM"
+    rm -f "$1/pid" && broke=0
+  fi
+  rm -f "$mine"
+  return "$broke"
+}
+
+# Unlinks our own claim by name and nothing else, so no claim is removed but by its owner or a
+# breaker; an rm -rf would take whatever else is in the directory when it reads it.
 gate_unlock() {
   if [ -n "${GATE_LOCK_DIR:-}" ] && [ "$(cat "$GATE_LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then
-    rm -rf "$GATE_LOCK_DIR"
+    rm -f "$GATE_LOCK_DIR/pid"
+    rmdir "$GATE_LOCK_DIR" 2>/dev/null || true
   fi
   GATE_LOCK_DIR=""
 }

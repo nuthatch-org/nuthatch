@@ -1,0 +1,5 @@
+# RFC-0075 §6: a missed clock read is a panic on wasm32, not a compile error. `time.rs` is the shim.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "panics on wasm32; use crate::time::now" },
+    { path = "std::time::SystemTime::now", reason = "panics on wasm32; use crate::time::system_now" },
+]

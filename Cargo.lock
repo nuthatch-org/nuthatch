@@ -4892,6 +4892,7 @@ dependencies = [
  "lz4_flex",
  "md-5 0.10.6",
  "num-bigint 0.4.8",
+ "nuthatch-core",
  "nuthatch-decode",
  "nuthatch-fixture-rpc",
  "nuthatch-identity",
@@ -4924,6 +4925,26 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "yaml-rust2",
+]
+
+[[package]]
+name = "nuthatch-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "dbsp",
+ "feldera-size-of",
+ "hex",
+ "nuthatch-decode",
+ "nuthatch-seal",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tracing",
+ "web-time",
 ]
 
 [[package]]
