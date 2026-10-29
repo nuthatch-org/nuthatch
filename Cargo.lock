@@ -4974,6 +4974,7 @@ name = "nuthatch-fixture-rpc"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "flate2",
  "http-body-util",
  "hyper",
  "hyper-util",

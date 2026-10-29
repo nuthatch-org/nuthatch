@@ -2,9 +2,8 @@
 //! backend the worker opened, the three built-in views driven inline, and the node's tip loop:
 //! verify the last checkpoint, roll back to the surviving ancestor, index window by window.
 
-use crate::tape::TapeSource;
 use crate::window::{NoEntity, NoWait, Shelf};
-use anyhow::{bail, ensure, Result};
+use anyhow::{ensure, Result};
 use nuthatch_core::alerts::{AlertRouter, AlertSink};
 use nuthatch_core::cursor::{
     detect_reorg, process_window, rollback_reorg, Nest, Processed, Window,
@@ -14,6 +13,7 @@ use nuthatch_core::exposure::ExposureView;
 use nuthatch_core::labels::LabelSet;
 use nuthatch_core::metrics::NoMetrics;
 use nuthatch_core::redb_store::Store;
+use nuthatch_core::seal::Sinks;
 use nuthatch_core::source::Source;
 use nuthatch_core::store::{LAST_BLOCK_KEY, START_BLOCK_KEY};
 use nuthatch_core::velocity::VelocityView;
@@ -31,8 +31,26 @@ pub struct TabNest {
     velocity: VelocityView,
     labels: LabelSet,
     router: AlertRouter,
-    shelf: Shelf,
+    sealing: Sealing,
     window: u64,
+}
+
+/// When and where a tab nest seals.
+pub struct Sealing {
+    pub finality: Finality,
+    pub seal_span: u64,
+    pub sinks: std::sync::Arc<dyn Sinks>,
+}
+
+impl Sealing {
+    /// S2's: nothing finalizes, so nothing seals.
+    pub fn never() -> Sealing {
+        Sealing {
+            finality: Finality::Depth(1_000_000_000),
+            seal_span: 1,
+            sinks: std::sync::Arc::new(Shelf::default()),
+        }
+    }
 }
 
 impl TabNest {
@@ -45,6 +63,27 @@ impl TabNest {
         topic0s: Vec<String>,
         start: u64,
         window: u64,
+    ) -> Result<TabNest> {
+        Self::open_sealing(
+            db,
+            registry,
+            addresses,
+            topic0s,
+            start,
+            window,
+            Sealing::never(),
+        )
+    }
+
+    /// [`Self::open`], sealing past `sealing.finality` as a node does.
+    pub fn open_sealing(
+        db: redb::Database,
+        registry: DecodeRegistry,
+        addresses: Vec<String>,
+        topic0s: Vec<String>,
+        start: u64,
+        window: u64,
+        sealing: Sealing,
     ) -> Result<TabNest> {
         let store = Store::from_db(db, None)?;
         if store.get_meta(START_BLOCK_KEY)?.is_none() {
@@ -60,7 +99,7 @@ impl TabNest {
             velocity: VelocityView::start(Driver::Inline, false)?,
             labels: LabelSet::default(),
             router: AlertRouter::new(Vec::<AlertSink>::new()),
-            shelf: Shelf::default(),
+            sealing,
             window: window.max(1),
         })
     }
@@ -74,7 +113,7 @@ impl TabNest {
 
     /// Follow `tape` until it has nothing new. Returns the block the last rollback resumed from, if
     /// one ran.
-    pub async fn follow(&self, tape: &TapeSource) -> Result<Option<u64>> {
+    pub async fn follow(&self, tape: &dyn Source) -> Result<Option<u64>> {
         let schema = self.registry.schema();
         let nest = || Nest {
             name: "tab",
@@ -126,9 +165,9 @@ impl TabNest {
                 registry: &self.registry,
                 factory: None,
                 threshold: None,
-                finality: Finality::Depth(1_000_000_000),
-                seal_span: 1,
-                sinks: &self.shelf,
+                finality: self.sealing.finality,
+                seal_span: self.sealing.seal_span,
+                sinks: &*self.sealing.sinks,
                 extra: &nuthatch_core::extra::NoExtraRows,
                 hooks: &nuthatch_core::hooks::NoHooks,
                 faults: &nuthatch_core::fault::NoFaults,
@@ -137,7 +176,7 @@ impl TabNest {
             match process_window(window, tape, &logs, next, to, tip).await? {
                 Processed::Stored(_) => {}
                 Processed::Rewound(at) => rolled = Some(at),
-                other => bail!("window {next}..={to}: {other:?}"),
+                Processed::Refused => {}
             }
         }
     }

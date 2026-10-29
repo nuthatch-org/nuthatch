@@ -29,11 +29,21 @@ fn failed(e: JsValue) -> TransportError {
     let name = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
         .ok()
         .and_then(|n| n.as_string());
-    let message = js_sys::Reflect::get(&e, &JsValue::from_str("message"))
+    let text = |v: &JsValue| {
+        js_sys::Reflect::get(v, &JsValue::from_str("message"))
+            .ok()
+            .and_then(|m| m.as_string())
+            .or_else(|| v.as_string())
+    };
+    let mut message = text(&e).unwrap_or_else(|| format!("{e:?}"));
+    // Node's undici says only "fetch failed" and puts the reason in `cause`.
+    if let Some(cause) = js_sys::Reflect::get(&e, &JsValue::from_str("cause"))
         .ok()
-        .and_then(|m| m.as_string())
-        .or_else(|| e.as_string())
-        .unwrap_or_else(|| format!("{e:?}"));
+        .filter(|c| !c.is_undefined())
+        .and_then(|c| text(&c))
+    {
+        message = format!("{message}: {cause}");
+    }
     TransportError {
         // `AbortSignal.timeout` rejects with a `TimeoutError` DOMException, on the request or the body.
         timed_out: name.as_deref() == Some("TimeoutError"),

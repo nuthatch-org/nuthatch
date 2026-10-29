@@ -15,6 +15,7 @@
 
 pub mod footprint;
 pub mod multinest;
+pub mod recorded;
 pub mod scripted;
 
 use std::convert::Infallible;
@@ -134,6 +135,20 @@ async fn handle<F: Fixture>(
     if let Some((status, v)) = fixture.control(&method, &path, &body) {
         return Ok(json_response(status, &v));
     }
+    // A page served from another origin posts JSON, which needs a preflight (RFC-0075 S3's browser run).
+    if method == Method::OPTIONS {
+        let mut r = empty(StatusCode::NO_CONTENT);
+        let h = r.headers_mut();
+        h.insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_METHODS,
+            hyper::header::HeaderValue::from_static("POST"),
+        );
+        h.insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
+            hyper::header::HeaderValue::from_static("content-type"),
+        );
+        return Ok(r);
+    }
     if method != Method::POST {
         return Ok(empty(StatusCode::NOT_IMPLEMENTED));
     }
@@ -177,13 +192,22 @@ fn json_response(status: StatusCode, v: &Value) -> Response<Full<Bytes>> {
         hyper::header::CONTENT_TYPE,
         hyper::header::HeaderValue::from_static("application/json"),
     );
+    allow_any_origin(&mut r);
     r
 }
 
 fn empty(status: StatusCode) -> Response<Full<Bytes>> {
     let mut r = Response::new(Full::new(Bytes::new()));
     *r.status_mut() = status;
+    allow_any_origin(&mut r);
     r
+}
+
+fn allow_any_origin(r: &mut Response<Full<Bytes>>) {
+    r.headers_mut().insert(
+        hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        hyper::header::HeaderValue::from_static("*"),
+    );
 }
 
 /// A hex quantity, with or without its `0x`.
