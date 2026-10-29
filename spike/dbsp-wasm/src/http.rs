@@ -170,6 +170,7 @@ async fn bind(n: &Nest<'_>) -> anyhow::Result<TabQuery> {
         &n.nest.registry().schema(),
         &n.nest.entities,
         n.files,
+        n.nest.budget,
     )
     .await
 }

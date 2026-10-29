@@ -3,6 +3,7 @@
 //! Burrmill's store tail (`attach_store`, `register_store_facts`), since a tab's segments are bytes
 //! in its cellar and not files.
 
+use crate::budget::TabBudget;
 use crate::cellar::Cellar;
 use crate::derived::{NestFiles, TabEntity};
 use crate::registry::TableSchema;
@@ -59,15 +60,17 @@ pub struct TabQuery {
 
 impl TabQuery {
     /// One engine with every fact table, entity and authored view bound as the node binds them for
-    /// a statement at the store's current watermark.
+    /// a statement at the store's current watermark, its working memory held to `budget`'s share.
     pub async fn bind(
         store: &Store,
         cellar: &Cellar,
         schema: &[TableSchema],
         entities: &[TabEntity],
         files: &NestFiles,
+        budget: TabBudget,
     ) -> Result<TabQuery> {
-        let mut engine = burrmill::Engine::open_empty().map_err(engine_err)?;
+        let mut engine = burrmill::Engine::open_empty_within(budget.query_bytes() as usize)
+            .map_err(engine_err)?;
         let sealed_through: u64 = store
             .get_meta(SEALED_THROUGH_KEY)?
             .and_then(|v| v.parse().ok())

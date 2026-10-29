@@ -134,6 +134,13 @@ impl LiveNest {
         self.poll_interval_secs = Some(secs);
     }
 
+    /// RFC-0075 S6: the memory ceiling in MiB, 2,048 unless set; a phone's is 600. Set it before
+    /// `derive`, which admits entities against it.
+    #[wasm_bindgen(js_name = setMemoryCeiling)]
+    pub fn set_memory_ceiling(&mut self, mib: u32) {
+        self.nest.budget = crate::budget::TabBudget::mib(mib);
+    }
+
     /// RFC-0075 S5: `method` and `target` (path and query) answered as the node's router answers
     /// them, from the same `nuthatch_core::answer` functions.
     pub async fn request(&self, method: String, target: String, body: Vec<u8>) -> HttpAnswer {
@@ -230,6 +237,7 @@ impl LiveNest {
             &self.nest.registry().schema(),
             &self.nest.entities,
             &self.files,
+            self.nest.budget,
         )
         .await
         .map_err(|e| js(format!("{e:#}")))?;

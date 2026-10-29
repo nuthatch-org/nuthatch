@@ -87,3 +87,10 @@ feldera-size-of = { path = "vendor/feldera-size-of" }
 opt-level = "s"
 lto = "thin"
 codegen-units = 16
+
+# RFC-0075 S6: the module a tab loads, which CI's gates run after `wasm-opt`.
+[profile.tab]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1

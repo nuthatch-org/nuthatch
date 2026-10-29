@@ -95,15 +95,21 @@ fn the_reorg_property_converges_in_every_band() {
 /// 100 rows of ~1 MiB, far under 50,000 rows and past 64 MiB.
 #[test]
 fn sql_caps_result_bytes_not_just_rows() {
-    use dbsp_wasm_spike::{cellar::Cellar, derived::NestFiles, query::TabQuery};
+    use dbsp_wasm_spike::{budget::TabBudget, cellar::Cellar, derived::NestFiles, query::TabQuery};
     let db = redb::Database::builder()
         .create_with_backend(nuthatch_core::backend::Bytes::default())
         .unwrap();
     let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
     let cellar = Cellar::default();
-    let q =
-        futures::executor::block_on(TabQuery::bind(&store, &cellar, &[], &[], &NestFiles::new()))
-            .unwrap();
+    let q = futures::executor::block_on(TabQuery::bind(
+        &store,
+        &cellar,
+        &[],
+        &[],
+        &NestFiles::new(),
+        TabBudget::default(),
+    ))
+    .unwrap();
     let (rows, _, truncated) = futures::executor::block_on(
         q.collect("SELECT repeat('A', 1000000) AS x FROM range(100)", 50_000),
     )
@@ -117,15 +123,21 @@ fn sql_caps_result_bytes_not_just_rows() {
 /// cross it is encoded and what is held stays under it.
 #[test]
 fn sql_does_not_encode_the_row_that_would_cross_the_cap() {
-    use dbsp_wasm_spike::{cellar::Cellar, derived::NestFiles, query::TabQuery};
+    use dbsp_wasm_spike::{budget::TabBudget, cellar::Cellar, derived::NestFiles, query::TabQuery};
     let db = redb::Database::builder()
         .create_with_backend(nuthatch_core::backend::Bytes::default())
         .unwrap();
     let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
     let cellar = Cellar::default();
-    let q =
-        futures::executor::block_on(TabQuery::bind(&store, &cellar, &[], &[], &NestFiles::new()))
-            .unwrap();
+    let q = futures::executor::block_on(TabQuery::bind(
+        &store,
+        &cellar,
+        &[],
+        &[],
+        &NestFiles::new(),
+        TabBudget::default(),
+    ))
+    .unwrap();
     let (rows, _, truncated) = futures::executor::block_on(
         q.collect("SELECT repeat('A', 15000000) AS x FROM range(10)", 50_000),
     )
@@ -143,15 +155,21 @@ fn sql_does_not_encode_the_row_that_would_cross_the_cap() {
 /// `value_bytes` counts them, past the cap together, and what is held stays under it.
 #[test]
 fn sql_sizes_nested_values_before_encoding_them() {
-    use dbsp_wasm_spike::{cellar::Cellar, derived::NestFiles, query::TabQuery};
+    use dbsp_wasm_spike::{budget::TabBudget, cellar::Cellar, derived::NestFiles, query::TabQuery};
     let db = redb::Database::builder()
         .create_with_backend(nuthatch_core::backend::Bytes::default())
         .unwrap();
     let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
     let cellar = Cellar::default();
-    let q =
-        futures::executor::block_on(TabQuery::bind(&store, &cellar, &[], &[], &NestFiles::new()))
-            .unwrap();
+    let q = futures::executor::block_on(TabQuery::bind(
+        &store,
+        &cellar,
+        &[],
+        &[],
+        &NestFiles::new(),
+        TabBudget::default(),
+    ))
+    .unwrap();
     let (rows, _, truncated) = futures::executor::block_on(
         q.collect("SELECT array_repeat(1, 900000) AS x FROM range(10)", 50_000),
     )
@@ -164,3 +182,73 @@ fn sql_sizes_nested_values_before_encoding_them() {
         rows.len()
     );
 }
+
+/// The admission charge is the node's: its constants as `src/runtime.rs` states them.
+#[test]
+fn entity_charge_is_the_nodes() {
+    use dbsp_wasm_spike::budget::{ENTITY_CIRCUIT_RSS_MB, ENTITY_RSS_BYTES_PER_ROW};
+    let runtime = include_str!("../../../src/runtime.rs");
+    let stated = |name: &str| -> u64 {
+        let line = runtime
+            .lines()
+            .find(|l| l.contains(&format!("const {name}: u64 = ")))
+            .unwrap_or_else(|| panic!("src/runtime.rs no longer states {name}"));
+        let v = line.split(" = ").nth(1).unwrap().trim_end_matches(';');
+        v.replace('_', "").parse().unwrap()
+    };
+    assert_eq!(stated("ENTITY_RSS_BYTES_PER_ROW"), ENTITY_RSS_BYTES_PER_ROW);
+    assert_eq!(stated("ENTITY_CIRCUIT_RSS_MB"), ENTITY_CIRCUIT_RSS_MB);
+}
+
+/// 150,000 declared rows (~466 MiB) fit a desktop's cursor share and not a phone's.
+#[test]
+fn entities_are_admitted_against_the_cursor_share() {
+    use dbsp_wasm_spike::budget::{OverBudget, TabBudget, PHONE_CEILING_MIB};
+    let phone = TabBudget::mib(PHONE_CEILING_MIB);
+    assert_eq!(phone.query_bytes() + phone.cursor_bytes(), phone.ceiling);
+    assert!(TabBudget::default().admit_entities([150_000]).is_ok());
+    assert!(phone.admit_entities([10_000, 10_000]).is_ok());
+    let err = phone.admit_entities([150_000]).unwrap_err();
+    assert!(matches!(err, OverBudget::Entities { .. }), "{err:?}");
+    assert!(
+        err.to_string().starts_with("over the tab's memory budget"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_window_is_refused_at_the_ceiling() {
+    use dbsp_wasm_spike::budget::TabBudget;
+    let b = TabBudget::mib(600);
+    assert!(b.check_memory(b.ceiling - 65_536).is_ok());
+    assert!(b.check_memory(b.ceiling).is_err());
+}
+
+/// A statement whose working memory passes a phone's share is refused by name, as the node's is.
+#[test]
+fn a_statement_over_the_phone_share_is_refused() {
+    use dbsp_wasm_spike::budget::{TabBudget, PHONE_CEILING_MIB};
+    use dbsp_wasm_spike::{cellar::Cellar, derived::NestFiles, query::TabQuery};
+    let db = redb::Database::builder()
+        .create_with_backend(nuthatch_core::backend::Bytes::default())
+        .unwrap();
+    let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
+    let cellar = Cellar::default();
+    let phone = TabBudget::mib(PHONE_CEILING_MIB);
+    let q = futures::executor::block_on(TabQuery::bind(
+        &store,
+        &cellar,
+        &[],
+        &[],
+        &NestFiles::new(),
+        phone,
+    ))
+    .unwrap();
+    let err = futures::executor::block_on(q.collect(LODESTAR_CLASS, 10)).unwrap_err();
+    assert!(err.to_string().contains("Out of Memory Error"), "{err}");
+}
+
+/// 4 million distinct 100-byte group keys, a hash table past a phone's 150 MiB share as
+/// `lodestar_indexer_ledger`'s 963 MiB is.
+const LODESTAR_CLASS: &str = "SELECT k, count(*) AS n FROM (SELECT repeat('k', 100) || \
+                              CAST(range AS VARCHAR) AS k FROM range(4000000)) GROUP BY k";
