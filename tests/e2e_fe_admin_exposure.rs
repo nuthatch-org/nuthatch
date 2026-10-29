@@ -136,6 +136,11 @@ async fn start_fe_on(
         publish_parallelism: 2,
         runtime: None,
         follow: None,
+        mirror: None,
+        registry: None,
+        cache: None,
+        max_rss_mb: None,
+        feed_version: 2,
     };
     let task = tokio::spawn(async move {
         // Runs until the process is signalled; the test aborts it instead.

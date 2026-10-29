@@ -127,6 +127,10 @@ toml = "0.8"
 serde_ignored = "0.1"
 redb = "2"
 arrow = { version = "59", features = ["ipc"] }
+# Feed v2 compresses each record batch itself (RFC-0076 FR17), so a follower reads a batch's
+# decompressed size before allocating it. Already in the tree through arrow-ipc; `safe-decode`,
+# since the bytes come off the network.
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-decode"] }
 parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
 # Already in the tree via parquet; an offchain snapshot is parsed from the same bytes it was hashed from.
 bytes = "1"

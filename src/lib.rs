@@ -68,6 +68,8 @@ pub mod factory;
 pub mod fair_share;
 pub mod feed;
 pub mod feed_http;
+pub mod feed_metrics;
+pub mod feed_wire;
 pub mod flags;
 /// RFC-0059 checkpointed folds, behind the off-by-default `folds` feature.
 #[cfg(feature = "folds")]
@@ -116,6 +118,7 @@ pub mod prune;
 pub mod publish;
 pub mod range_story;
 pub mod reader;
+pub mod remote_follow;
 pub mod recipes;
 /// The reconcile loop for scaled mode (RFC-0022 §2/§3): plan in, leases out.
 #[cfg(feature = "postgres-store")]

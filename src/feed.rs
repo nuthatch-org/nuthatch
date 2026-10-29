@@ -112,7 +112,7 @@ impl Recorder {
 }
 
 /// A committed change to one dataset's hot store, numbered within its writer's `epoch`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Delta {
     pub epoch: u64,
     pub generation: u64,
@@ -125,6 +125,12 @@ pub struct Delta {
     /// subscriber must resnapshot; the serving side does that before a reader ever sees one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resync: bool,
+    /// When the writer's commit landed, on the writer's clock, for visibility lag (RFC-0076 FR17).
+    #[serde(skip)]
+    pub committed: Option<std::time::Instant>,
+    /// Its v2 body, encoded once however many followers it is sent to.
+    #[serde(skip)]
+    pub wire: std::sync::OnceLock<bytes::Bytes>,
 }
 
 /// A dataset's hot window as of one generation, read in one transaction.
@@ -386,39 +392,199 @@ pub fn read_lines(
     CAP_FOR.with(|f| *f.borrow_mut() = Some(cap_for));
     WIRE.with(|w| *w.borrow_mut() = WireLimit::default());
     for line in serde_json::Deserializer::from_reader(Limited(body)).into_iter::<Line>() {
-        let budget = BUDGET.with(|b| b.replace(Budget::default()));
-        let stopped = WIRE.with(|w| {
-            let mut w = w.borrow_mut();
-            let at = w.position;
-            w.stop_at.take().filter(|(_, stop, _, _)| at >= *stop).map(
-                |(start, stop, dataset, kind)| LineOverBudget {
-                    dataset,
-                    kind,
-                    read: at - start,
-                    limit: stop - start,
-                },
-            )
-        });
-        if let (Err(_), Some(over)) = (&line, stopped) {
-            CAP_FOR.with(|f| *f.borrow_mut() = None);
-            return Err(over.into());
-        }
-        let mut line = line.context("an unreadable line on the feed")?;
-        if let Line::Snapshot { snapshot, .. } = &mut line {
-            // A table read before the cap was passed kept its rows; none of them is kept now.
-            if budget.over() {
-                *snapshot = Snapshot {
-                    over: Some(budget.seen),
-                    ..Default::default()
-                };
+        let line = match finish(line) {
+            Ok(line) => line,
+            Err(e) => {
+                CAP_FOR.with(|f| *f.borrow_mut() = None);
+                return Err(e);
             }
-        }
+        };
         if !each(line) {
             break;
         }
     }
     CAP_FOR.with(|f| *f.borrow_mut() = None);
     Ok(())
+}
+
+/// One value as the parser left it, with the limits it was read under applied.
+fn finish(line: serde_json::Result<Line>) -> Result<Line> {
+    let budget = BUDGET.with(|b| b.replace(Budget::default()));
+    let stopped = WIRE.with(|w| {
+        let mut w = w.borrow_mut();
+        let at = w.position;
+        w.stop_at.take().filter(|(_, stop, _, _)| at >= *stop).map(
+            |(start, stop, dataset, kind)| LineOverBudget {
+                dataset,
+                kind,
+                read: at - start,
+                limit: stop - start,
+            },
+        )
+    });
+    if let (Err(_), Some(over)) = (&line, stopped) {
+        return Err(over.into());
+    }
+    let mut line = line.context("an unreadable line on the feed")?;
+    if let Line::Snapshot { snapshot, .. } = &mut line {
+        // A table read before the cap was passed kept its rows; none of them is kept now.
+        if budget.over() {
+            *snapshot = Snapshot {
+                over: Some(budget.seen),
+                ..Default::default()
+            };
+        }
+    }
+    Ok(line)
+}
+
+/// The payload of one JSON frame, or of a run of parts up to its end frame, as one stream.
+struct Parts<'a, R> {
+    body: &'a mut R,
+    left: u64,
+    chained: bool,
+    done: bool,
+}
+
+impl<R: std::io::Read> std::io::Read for Parts<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.left == 0 {
+            if self.done || !self.chained {
+                self.done = true;
+                return Ok(0);
+            }
+            let mut head = [0u8; crate::feed_wire::HEADER];
+            self.body.read_exact(&mut head)?;
+            match head[4] {
+                crate::feed_wire::END => {
+                    self.done = true;
+                    return Ok(0);
+                }
+                crate::feed_wire::PART => {
+                    self.left = u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]))
+                }
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "frame kind {other} inside a run of parts"
+                    )))
+                }
+            }
+        }
+        let take = (self.left as usize).min(buf.len());
+        let n = self.body.read(&mut buf[..take])?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Fill `buf`, or say the stream ended cleanly before its first byte.
+fn read_or_end(body: &mut impl std::io::Read, buf: &mut [u8]) -> Result<bool> {
+    let mut got = 0;
+    while got < buf.len() {
+        match body.read(&mut buf[got..]) {
+            Ok(0) if got == 0 => return Ok(false),
+            Ok(0) => bail!("the feed ended part-way through a frame"),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("reading the feed"),
+        }
+    }
+    Ok(true)
+}
+
+/// [`read_lines`] for feed v2's frames ([`crate::feed_wire`]): JSON values under the same limits as
+/// v1's lines, and each delta frame held to what its dataset has left before its body is read.
+pub fn read_frames(
+    mut body: impl std::io::Read,
+    cap_for: CapFor,
+    mut each: impl FnMut(Line) -> bool,
+) -> Result<()> {
+    use crate::feed_wire as wire;
+    CAP_FOR.with(|f| *f.borrow_mut() = Some(cap_for));
+    let read = (|| loop {
+        let mut head = [0u8; wire::HEADER];
+        if !read_or_end(&mut body, &mut head)? {
+            return Ok(());
+        }
+        let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
+        let line = match head[4] {
+            kind @ (wire::JSON | wire::PART) => {
+                if kind == wire::JSON && len > wire::MAX_JSON_FRAME {
+                    bail!("a feed frame of {len} bytes, past the most one may carry");
+                }
+                WIRE.with(|w| *w.borrow_mut() = WireLimit::default());
+                let mut parts = Parts {
+                    body: &mut body,
+                    left: u64::from(len),
+                    chained: kind == wire::PART,
+                    done: false,
+                };
+                let mut de = serde_json::Deserializer::from_reader(Limited(&mut parts));
+                let line = Line::deserialize(&mut de).and_then(|l| de.end().map(|()| l));
+                finish(line)?
+            }
+            wire::DELTA => {
+                let mut n = [0u8; 2];
+                body.read_exact(&mut n).context("reading a delta frame")?;
+                let dlen = wire::split_dataset(&n)?;
+                let mut name = vec![0u8; dlen];
+                body.read_exact(&mut name)
+                    .context("reading a delta frame")?;
+                let dataset =
+                    String::from_utf8(name).context("a delta frame's dataset is not UTF-8")?;
+                let rest = u64::from(len)
+                    .checked_sub(2 + dlen as u64)
+                    .context("a delta frame shorter than its dataset")?;
+                let cap = CAP_FOR.with(|f| {
+                    f.borrow()
+                        .as_ref()
+                        .and_then(|f| f(&dataset, Kind::Delta))
+                });
+                if let Some(cap) = cap.filter(|cap| rest > cap + SNAPSHOT_SLACK) {
+                    return Err(LineOverBudget {
+                        dataset,
+                        kind: Kind::Delta,
+                        read: 0,
+                        limit: cap + SNAPSHOT_SLACK,
+                    }
+                    .into());
+                }
+                let mut payload = vec![0u8; rest as usize];
+                body.read_exact(&mut payload)
+                    .context("reading a delta frame")?;
+                // Compressed, the wire says little about what the rows come to; decoding is held to
+                // what is left after the frame itself.
+                let limit = cap.map(|cap| (cap + SNAPSHOT_SLACK).saturating_sub(rest));
+                let delta = match wire::decode_delta(&payload, limit) {
+                    Ok(delta) => delta,
+                    Err(e) if e.is::<wire::TooLarge>() => {
+                        let read = e.downcast_ref::<wire::TooLarge>().map_or(0, |t| t.needed);
+                        return Err(LineOverBudget {
+                            dataset,
+                            kind: Kind::Delta,
+                            read: rest + read,
+                            limit: cap.unwrap_or(0) + SNAPSHOT_SLACK,
+                        }
+                        .into());
+                    }
+                    Err(e) => return Err(e),
+                };
+                Line::Delta {
+                    dataset: DeltaDataset(dataset),
+                    delta,
+                }
+            }
+            other => bail!("an unexpected feed frame of kind {other}"),
+        };
+        if !each(line) {
+            return Ok(());
+        }
+    })();
+    CAP_FOR.with(|f| *f.borrow_mut() = None);
+    read
 }
 
 /// A mount's resolved guards ([`crate::limits::Limits`]) as the feed carries them.
@@ -521,6 +687,10 @@ pub enum Line {
         /// (RFC-0073 FR8), which a follower isolates them to as well.
         #[serde(default)]
         isolation: Option<String>,
+        /// The dataset's data identity, the prefix its `[runtime.publish]` mirror holds it under,
+        /// which a follower with no shared disk fetches its segments from (RFC-0076 FR17).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data_identity: Option<String>,
     },
     /// Every route mounted when the connection opened has been sent: a route not named by now does
     /// not exist, rather than not having arrived yet.
@@ -625,15 +795,15 @@ impl Tap {
                     generation: state.generation,
                     catalogue: if seals { self.catalogue() } else { None },
                     ops,
-                    resync: false,
+                    committed: Some(std::time::Instant::now()),
+                    ..Delta::default()
                 }
             }
             None => Delta {
                 epoch: self.epoch,
                 generation: state.generation,
-                ops: Vec::new(),
-                catalogue: None,
                 resync: true,
+                ..Delta::default()
             },
         };
         let _ = self.tx.send(Arc::new(delta));
@@ -1641,7 +1811,7 @@ mod tests {
             generation: copy.applied().1 + 1,
             ops: Vec::new(),
             catalogue: None,
-            resync: false,
+            ..Delta::default()
         };
         assert!(copy.apply(&other_epoch).is_err(), "a restarted writer");
     }
@@ -1882,7 +2052,7 @@ mod tests {
                 },
             ],
             catalogue: None,
-            resync: false,
+            ..Delta::default()
         };
         assert_eq!(copy.peak_with(&delta), before + row_bytes(&k, &big));
         copy.apply(&delta).unwrap();
@@ -1904,7 +2074,7 @@ mod tests {
                 row: "x".repeat(8 << 20),
             }],
             catalogue: None,
-            resync: false,
+            ..Delta::default()
         };
         let mut wire = serde_json::to_vec(&Line::Delta {
             dataset: DeltaDataset("data/huge".into()),

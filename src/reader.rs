@@ -76,6 +76,18 @@ impl Applied {
     }
 }
 
+/// One feed connection's own state.
+struct Cx {
+    /// Datasets snapshotted on this connection: a delta for any other is a gap.
+    fresh: BTreeSet<String>,
+    /// A fetch from the mirror sends its dataset here once every file it waited for is in place.
+    ready: tokio::sync::mpsc::Sender<String>,
+    /// Fetches in flight, which end with the connection.
+    fetches: Vec<AbortOnDrop>,
+    /// The format this connection speaks, which its `hello` must name.
+    feed: u32,
+}
+
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -106,26 +118,65 @@ pub fn writer_token(root: &Path) -> Result<String> {
     })
 }
 
+/// The admin token from `NUTHATCH_ADMIN_TOKEN` alone, for a follower with no directory of the
+/// writer's to find one in.
+fn writer_token_from_env() -> Result<String> {
+    std::env::var("NUTHATCH_ADMIN_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .context(
+            "no admin token for the writer: a follower on another host takes it from \
+             NUTHATCH_ADMIN_TOKEN, and only from there",
+        )
+}
+
 pub async fn serve(args: crate::cli::ServeArgs) -> Result<()> {
-    let root = PathBuf::from(
-        args.runtime
-            .as_deref()
-            .context("--follow needs --runtime")?,
-    );
     let writer = args
         .follow
         .clone()
-        .context("--runtime needs --follow <writer-url>")?;
-    if !root.join(crate::runtime::MOUNTS_FILE).is_file() {
-        bail!(
-            "'{}' is not a runtime directory (no {})",
-            root.display(),
-            crate::runtime::MOUNTS_FILE
-        );
-    }
+        .context("a follower needs --follow <writer-url>")?;
     let cors = crate::serve::cors_layer(&args.cors)?;
-    let token = writer_token(&root)?;
-    let follower = Follower::start(root, writer, token);
+    let options = Options {
+        feed: args.feed_version,
+        paused: false,
+    };
+    let follower = match &args.mirror {
+        Some(mirror) => {
+            let root = PathBuf::from(
+                args.cache
+                    .as_deref()
+                    .context("--mirror needs --cache <dir>, the follower's own directory")?,
+            );
+            std::fs::create_dir_all(&root)
+                .with_context(|| format!("creating {}", root.display()))?;
+            let registry = args
+                .registry
+                .as_deref()
+                .context("--mirror needs --registry, where the writer's nests are published")?;
+            let max = args
+                .max_rss_mb
+                .unwrap_or(crate::runtime::DEFAULT_MAX_RSS_MB);
+            let remote = crate::remote_follow::Remote::open(mirror, registry, max)?;
+            let token = writer_token_from_env()?;
+            Follower::start_remote(root, writer, token, Arc::new(remote), options)
+        }
+        None => {
+            let root = PathBuf::from(
+                args.runtime
+                    .as_deref()
+                    .context("--follow needs --runtime, or --mirror for a follower on another host")?,
+            );
+            if !root.join(crate::runtime::MOUNTS_FILE).is_file() {
+                bail!(
+                    "'{}' is not a runtime directory (no {})",
+                    root.display(),
+                    crate::runtime::MOUNTS_FILE
+                );
+            }
+            let token = writer_token(&root)?;
+            Follower::start_with(root, writer, token, None, options)
+        }
+    };
     tracing::info!(
         listen = %args.listen,
         writer = %follower.writer,
@@ -145,6 +196,7 @@ struct Spec {
     limits: Option<crate::feed::WireLimits>,
     chain: Option<String>,
     isolation: Option<String>,
+    data_identity: Option<String>,
 }
 
 struct Route {
@@ -274,9 +326,60 @@ struct Inner {
     retired: u64,
     /// The most any cursor here has been charged, in bytes.
     peak: u64,
+    /// A follower on another host: per dataset, what waits on the mirror for files its catalogue
+    /// names, and everything that arrived for the dataset behind it, in order.
+    pending: HashMap<String, Pending>,
+}
+
+/// A dataset's lines held while the files the first one names are fetched.
+struct Pending {
+    items: std::collections::VecDeque<Line>,
+    /// What the queued lines would hold once applied, charged to the dataset meanwhile.
+    bytes: u64,
+    since: Instant,
+    /// The files waited for, and why the last attempt did not get them.
+    waiting_for: Vec<String>,
+    error: Option<String>,
+    fetching: bool,
+}
+
+/// What a queued line is charged: its keys and values, as [`crate::feed::row_bytes`] counts them.
+fn queued_bytes(line: &Line) -> u64 {
+    match line {
+        Line::Snapshot { snapshot, .. } => snapshot.bytes(),
+        Line::Delta { delta, .. } => {
+            let op = |op: &crate::feed::Op| -> u64 {
+                use crate::feed::Op::*;
+                let (a, b) = match op {
+                    Put { key, row } => (key.len(), row.len()),
+                    Drop { from, to } => (from.len(), to.as_ref().map_or(0, String::len)),
+                    Meta { key, value } => (key.len(), value.len()),
+                    Block { key, record } => (key.len(), record.len()),
+                    Unmeta { key } | Unblock { key } | UnblockFrom { key } => (key.len(), 0),
+                };
+                (a + b) as u64 + crate::feed::ROW_OVERHEAD
+            };
+            delta.ops.iter().map(op).sum::<u64>()
+                + delta.catalogue.as_ref().map_or(0, |c| c.len() as u64)
+        }
+        _ => 0,
+    }
+}
+
+/// The catalogue a snapshot or delta carries.
+fn catalogue_of(line: &Line) -> Option<&str> {
+    match line {
+        Line::Snapshot { snapshot, .. } => snapshot.catalogue.as_deref(),
+        Line::Delta { delta, .. } => delta.catalogue.as_deref(),
+        _ => None,
+    }
 }
 
 impl Inner {
+    fn pending_bytes(&self, dataset: &str) -> u64 {
+        self.pending.get(dataset).map_or(0, |p| p.bytes)
+    }
+
     fn chain_of(&self, dataset: &str) -> Option<Option<String>> {
         self.routes
             .values()
@@ -307,10 +410,14 @@ impl Inner {
             .sum()
     }
 
-    /// What `dataset`'s held copy and derived state are charged, which a replacement is read beside.
+    /// What `dataset`'s held copy and derived state are charged, which a replacement is read beside,
+    /// with whatever waits on the mirror for it.
     fn held(&self, dataset: &str) -> Option<u64> {
-        let data = self.datasets.get(dataset)?;
-        Some(data.store.bytes() + self.estimates.get(dataset).copied().unwrap_or(0))
+        let pending = self.pending_bytes(dataset);
+        let Some(data) = self.datasets.get(dataset) else {
+            return (pending > 0).then_some(pending);
+        };
+        Some(data.store.bytes() + self.estimates.get(dataset).copied().unwrap_or(0) + pending)
     }
 
     /// Hand a copy, its derived state, or both, no longer served to the retiring list, each charged
@@ -387,6 +494,9 @@ impl Retiring {
     }
 }
 
+/// How often a follower on another host brings offchain snapshots up to the mirror's.
+const OFFCHAIN_EVERY: Duration = Duration::from_secs(5);
+
 /// How long a released copy is waited for, while requests that started on it finish, before its
 /// replacement is read under whatever budget is then left.
 const RELEASE_WAIT: Duration = Duration::from_secs(10);
@@ -452,31 +562,88 @@ pub struct Follower {
     paused: tokio::sync::watch::Sender<bool>,
     /// Feed connections made, each of which takes fresh snapshots.
     connects: std::sync::atomic::AtomicU64,
+    /// Where a follower on another host takes what one beside the writer reads from its directory.
+    remote: Option<Arc<crate::remote_follow::Remote>>,
+    /// The feed format asked for.
+    feed: u32,
+    /// Woken when a delta is applied, so the writer hears of it within 10 ms.
+    ack: tokio::sync::Notify,
+    /// The last measured round trip of a report to the writer.
+    rtt: Mutex<Option<Duration>>,
+}
+
+/// How a follower is started.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    /// The feed format to ask for: 2, or 1 for newline-delimited JSON.
+    pub feed: u32,
+    /// Apply nothing the feed sends until [`Follower::pause`] lets it go.
+    pub paused: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            feed: crate::feed_wire::FEED_V2,
+            paused: false,
+        }
+    }
 }
 
 impl Follower {
     /// Start following `writer` for the runtime at `root`.
     pub fn start(root: PathBuf, writer: String, token: String) -> Arc<Follower> {
-        Follower::start_with(root, writer, token, false)
+        Follower::start_with(root, writer, token, None, Options::default())
     }
 
     /// [`Follower::start`], applying nothing the feed sends until [`Follower::pause`] lets it go.
     #[doc(hidden)]
     pub fn start_paused(root: PathBuf, writer: String, token: String) -> Arc<Follower> {
-        Follower::start_with(root, writer, token, true)
+        let options = Options {
+            paused: true,
+            ..Options::default()
+        };
+        Follower::start_with(root, writer, token, None, options)
     }
 
-    fn start_with(root: PathBuf, writer: String, token: String, paused: bool) -> Arc<Follower> {
+    /// Follow `writer` from another host: `root` is this follower's own directory, filled from
+    /// `remote`'s mirror and registry.
+    pub fn start_remote(
+        root: PathBuf,
+        writer: String,
+        token: String,
+        remote: Arc<crate::remote_follow::Remote>,
+        options: Options,
+    ) -> Arc<Follower> {
+        Follower::start_with(root, writer, token, Some(remote), options)
+    }
+
+    pub fn start_with(
+        root: PathBuf,
+        writer: String,
+        token: String,
+        remote: Option<Arc<crate::remote_follow::Remote>>,
+        options: Options,
+    ) -> Arc<Follower> {
+        let budget = match &remote {
+            Some(r) => r.max_rss_mb,
+            None => max_rss_mb(&root),
+        };
         let follower = Arc::new(Follower {
             writer: writer.trim_end_matches('/').to_string(),
             token,
             live: LiveRuntime::new(axum::Router::new()),
+            remote,
+            feed: options.feed,
+            ack: tokio::sync::Notify::new(),
+            rtt: Mutex::new(None),
             inner: Mutex::new(Inner {
+                pending: HashMap::new(),
                 routes: BTreeMap::new(),
                 datasets: HashMap::new(),
                 positions: HashMap::new(),
                 mounts_known: false,
-                max_rss_mb: max_rss_mb(&root),
+                max_rss_mb: budget,
                 estimates: HashMap::new(),
                 over_budget: HashMap::new(),
                 excluded: BTreeSet::new(),
@@ -495,12 +662,60 @@ impl Follower {
             }),
             root,
             gates: Mutex::default(),
-            paused: tokio::sync::watch::Sender::new(paused),
+            paused: tokio::sync::watch::Sender::new(options.paused),
             connects: Default::default(),
         });
         follower.recompose();
         tokio::spawn(follower.clone().run());
+        if follower.remote.is_some() {
+            tokio::spawn(follower.clone().keep_offchain());
+        }
         follower
+    }
+
+    /// The per-cursor budget in MiB: the runtime's `mounts.toml` beside the writer, the follower's
+    /// own `--max-rss-mb` on another host.
+    fn budget_mb(&self) -> u64 {
+        match &self.remote {
+            Some(r) => r.max_rss_mb,
+            None => max_rss_mb(&self.root),
+        }
+    }
+
+    /// The mirror prefix the writer named for `dataset`.
+    fn prefix_of(&self, dataset: &str) -> Option<String> {
+        self.lock()
+            .routes
+            .values()
+            .find(|r| r.spec.dataset == dataset)
+            .and_then(|r| r.spec.data_identity.clone())
+    }
+
+    /// Keep every held dataset's offchain snapshots at the mirror's, as a writer's pulls move them.
+    /// Entities reading them catch up after the next window, by the code the writer runs.
+    async fn keep_offchain(self: Arc<Self>) {
+        let Some(remote) = self.remote.clone() else {
+            return;
+        };
+        let mut every = tokio::time::interval(OFFCHAIN_EVERY);
+        loop {
+            every.tick().await;
+            let held: Vec<(String, String)> = {
+                let inner = self.lock();
+                inner
+                    .routes
+                    .values()
+                    .filter_map(|r| Some((r.spec.dataset.clone(), r.spec.data_identity.clone()?)))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            };
+            for (dataset, prefix) in held {
+                if let Err(e) = remote.sync_offchain(&self.root, &dataset, &prefix).await {
+                    tracing::warn!("{dataset}: offchain snapshots from the mirror: {e:#}");
+                }
+            }
+        }
     }
 
     /// What to serve: resolves the current composition per request.
@@ -542,10 +757,15 @@ impl Follower {
     /// Tell the writer, every [`REPORT_EVERY`], what each copy has applied, so it keeps the
     /// segments a copy may still name until it has moved on. Best effort: unreported, the writer
     /// keeps them until its grace and most run out, never less.
+    /// Also within 10 ms of each delta applied, carrying the round trip the last report
+    /// took, from which the writer works out visibility lag on its own clock (RFC-0076 FR17).
     async fn report_applied(self: Arc<Self>, client: reqwest::Client) {
         let mut every = tokio::time::interval(REPORT_EVERY);
         loop {
-            every.tick().await;
+            tokio::select! {
+                _ = every.tick() => {}
+                _ = self.ack.notified() => {}
+            }
             let (conn, applied) = {
                 let inner = self.lock();
                 let applied: BTreeMap<String, (u64, u64)> = inner
@@ -558,16 +778,26 @@ impl Follower {
             let Some(conn) = conn else {
                 continue;
             };
+            let rtt = *self.rtt.lock().unwrap_or_else(|e| e.into_inner());
+            let mut query = vec![("conn", conn)];
+            if let Some(rtt) = rtt {
+                query.push(("rtt_us", rtt.as_micros() as u64));
+            }
+            let started = Instant::now();
             let sent = client
                 .post(format!("{}/_admin/feed/applied", self.writer))
-                .query(&[("conn", conn)])
+                .query(&query)
                 .bearer_auth(&self.token)
                 .timeout(REPORT_EVERY)
                 .json(&applied)
                 .send()
                 .await;
-            if let Err(e) = sent {
-                tracing::debug!("reporting what is applied: {}", e.without_url());
+            match sent {
+                Ok(resp) if resp.status().is_success() => {
+                    *self.rtt.lock().unwrap_or_else(|e| e.into_inner()) = Some(started.elapsed());
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!("reporting what is applied: {}", e.without_url()),
             }
         }
     }
@@ -583,7 +813,7 @@ impl Follower {
             .join(",");
         let resp = client
             .get(format!("{}/_admin/feed", self.writer))
-            .query(&[("exclude", excluded)])
+            .query(&[("exclude", excluded), ("feed", self.feed.to_string())])
             .bearer_auth(&self.token)
             .send()
             .await
@@ -592,6 +822,13 @@ impl Follower {
         if !resp.status().is_success() {
             bail!("the writer refused the feed: {}", resp.status());
         }
+        // A writer that predates v2 ignores the ask and answers v1, which is read as v1.
+        let framed = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .is_some_and(|t| t.as_bytes() == crate::feed_wire::CONTENT_TYPE.as_bytes());
+        // Whatever waited on the mirror belonged to the last connection's snapshots.
+        self.lock().pending.clear();
         {
             let mut inner = self.lock();
             inner.link.connected = true;
@@ -642,28 +879,56 @@ impl Follower {
                         cap.saturating_sub(inner.held(dataset).unwrap_or(0))
                     }
                     // A dataset not held has nothing left to grow into: its deltas are skipped.
-                    crate::feed::Kind::Delta => cap.saturating_sub(
-                        inner.datasets.get(dataset).map_or(cap, |s| s.store.bytes()),
-                    ),
+                    // One whose lines wait on the mirror grows into what they leave.
+                    crate::feed::Kind::Delta => match inner.pending.get(dataset) {
+                        Some(p) => cap.saturating_sub(
+                            inner.datasets.get(dataset).map_or(0, |s| s.store.bytes()) + p.bytes,
+                        ),
+                        None => cap.saturating_sub(
+                            inner.datasets.get(dataset).map_or(cap, |s| s.store.bytes()),
+                        ),
+                    },
                 })
             });
-            crate::feed::read_lines(reader, cap_for, |line| {
+            let each = |line| {
                 sends.sent();
                 line_tx.blocking_send(line).is_ok()
-            })
+            };
+            if framed {
+                crate::feed::read_frames(reader, cap_for, each)
+            } else {
+                crate::feed::read_lines(reader, cap_for, each)
+            }
         });
         let reporter = tokio::spawn(self.clone().report_applied(client.clone()));
         let _reporter = AbortOnDrop(reporter);
-        // Datasets snapshotted on this connection: a delta for any other is a gap.
-        let mut fresh: BTreeSet<String> = BTreeSet::new();
+        let (ready, mut fetched) = tokio::sync::mpsc::channel::<String>(64);
+        let mut cx = Cx {
+            fresh: BTreeSet::new(),
+            ready,
+            fetches: Vec::new(),
+            feed: if framed {
+                crate::feed_wire::FEED_V2
+            } else {
+                crate::feed::FEED_VERSION
+            },
+        };
         let handled = async {
-            while let Some(line) = line_rx.recv().await {
-                self.handle(line, &mut fresh).await?;
-                applied.handled();
+            loop {
+                tokio::select! {
+                    line = line_rx.recv() => {
+                        let Some(line) = line else { break };
+                        self.handle(line, &mut cx).await?;
+                        applied.handled();
+                    }
+                    Some(dataset) = fetched.recv() => self.drain(&dataset, &mut cx).await?,
+                }
             }
             Ok::<_, anyhow::Error>(())
         }
         .await;
+        drop(cx);
+        self.lock().pending.clear();
         applied.done();
         drop(line_rx);
         pump.abort();
@@ -717,8 +982,11 @@ impl Follower {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .filter_map(|d| {
-                let held = inner.datasets.get(d)?;
-                Some(held.store.bytes() + inner.estimates.get(d).copied().unwrap_or(0))
+                let pending = inner.pending_bytes(d);
+                let Some(held) = inner.datasets.get(d) else {
+                    return (pending > 0).then_some(pending);
+                };
+                Some(held.store.bytes() + inner.estimates.get(d).copied().unwrap_or(0) + pending)
             })
             .sum();
         let own = inner.estimates.get(dataset).copied().unwrap_or(0);
@@ -812,7 +1080,7 @@ impl Follower {
         self.recompose();
     }
 
-    async fn handle(self: &Arc<Self>, line: Line, fresh: &mut BTreeSet<String>) -> Result<()> {
+    async fn handle(self: &Arc<Self>, line: Line, cx: &mut Cx) -> Result<()> {
         let _ = self.paused.subscribe().wait_for(|p| !*p).await;
         match line {
             Line::Hello {
@@ -820,12 +1088,12 @@ impl Follower {
                 feed,
                 conn,
             } => {
-                if feed != crate::feed::FEED_VERSION {
+                if feed != cx.feed {
                     bail!(
                         "the writer ({version}) speaks feed version {feed} and this follower ({}) \
-                         speaks {}: upgrade them to one release",
+                         expected {}: upgrade them to one release",
                         env!("CARGO_PKG_VERSION"),
-                        crate::feed::FEED_VERSION
+                        cx.feed
                     );
                 }
                 let mut inner = self.lock();
@@ -843,8 +1111,8 @@ impl Follower {
                 limits,
                 chain,
                 isolation,
+                data_identity,
             } => {
-                let estimate = nest_estimate(&self.root.join(&dataset));
                 let spec = Spec {
                     dataset,
                     nid,
@@ -857,15 +1125,28 @@ impl Follower {
                     limits,
                     chain,
                     isolation,
+                    data_identity,
                 };
+                // A reconnect repeats every mount; only a changed one is rebuilt, or one that could
+                // not be installed, which is tried again.
+                let unchanged = self.lock().routes.get(&route).is_some_and(|r| {
+                    r.spec == spec && !(self.remote.is_some() && matches!(r.served, Some(Err(_))))
+                });
+                if unchanged {
+                    let estimate = nest_estimate(&self.root.join(&spec.dataset));
+                    self.lock().estimates.insert(spec.dataset.clone(), estimate);
+                    return Ok(());
+                }
+                let installed = match &self.remote {
+                    Some(remote) => self.install(remote, &spec).await,
+                    None => Ok(()),
+                };
+                let estimate = nest_estimate(&self.root.join(&spec.dataset));
                 {
                     let mut inner = self.lock();
                     inner.estimates.insert(spec.dataset.clone(), estimate);
-                    // A reconnect repeats every mount; only a changed one is rebuilt.
-                    if inner.routes.get(&route).is_some_and(|r| r.spec == spec) {
-                        return Ok(());
-                    }
-                    inner.routes.insert(route, Route { spec, served: None });
+                    let served = installed.err().map(Err);
+                    inner.routes.insert(route, Route { spec, served });
                 }
                 self.realise();
                 self.recompose();
@@ -874,7 +1155,7 @@ impl Follower {
                 {
                     let mut inner = self.lock();
                     inner.mounts_known = true;
-                    let max = max_rss_mb(&self.root);
+                    let max = self.budget_mb();
                     // A new budget may fit what an old one could not: ask again on the next connection.
                     if max != inner.max_rss_mb {
                         inner.excluded.clear();
@@ -908,7 +1189,7 @@ impl Follower {
             }
             Line::Snapshot { dataset, snapshot } => {
                 let dataset = dataset.0;
-                fresh.insert(dataset.clone());
+                cx.fresh.insert(dataset.clone());
                 // Read under its cap, so a snapshot over budget arrives holding no rows.
                 if let Some(held) = snapshot.over {
                     if self.lock().datasets.contains_key(&dataset) {
@@ -921,6 +1202,217 @@ impl Follower {
                     self.refuse(&dataset, budget_reason(&dataset, held, cap, max));
                     return Ok(());
                 }
+                let line = Line::Snapshot {
+                    dataset: crate::feed::DatasetName(dataset.clone()),
+                    snapshot,
+                };
+                if self.waits_on_mirror(&dataset, &line, cx)? {
+                    return Ok(());
+                }
+                let Line::Snapshot { snapshot, .. } = line else {
+                    unreachable!("a snapshot was put in")
+                };
+                self.apply_snapshot(&dataset, snapshot).await?;
+            }
+            Line::Delta { dataset, delta } => {
+                let dataset = dataset.0;
+                let refused = self.lock().over_budget.contains_key(&dataset);
+                if refused {
+                    return Ok(());
+                }
+                if !cx.fresh.contains(&dataset) {
+                    bail!("{dataset}: a delta before its snapshot; resnapshotting");
+                }
+                let line = Line::Delta {
+                    dataset: crate::feed::DeltaDataset(dataset.clone()),
+                    delta,
+                };
+                if self.waits_on_mirror(&dataset, &line, cx)? {
+                    return Ok(());
+                }
+                let Line::Delta { delta, .. } = line else {
+                    unreachable!("a delta was put in")
+                };
+                self.apply_delta(&dataset, delta).await?;
+            }
+            Line::Heartbeat { positions } => self.heartbeat(positions)?,
+        }
+        Ok(())
+    }
+
+    /// Install `spec`'s nest from the registry, so its config, labels and entities are read as a
+    /// follower beside the writer reads them from the runtime directory.
+    async fn install(
+        &self,
+        remote: &crate::remote_follow::Remote,
+        spec: &Spec,
+    ) -> std::result::Result<(), String> {
+        let nid = spec
+            .nid
+            .as_deref()
+            .ok_or("the writer names no NID for it, so it cannot be fetched from a registry")?;
+        remote
+            .install(&self.root, &spec.dataset, nid)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        if let Some(prefix) = &spec.data_identity {
+            if let Err(e) = remote
+                .sync_offchain(&self.root, &spec.dataset, prefix)
+                .await
+            {
+                tracing::warn!("{}: offchain snapshots from the mirror: {e:#}", spec.dataset);
+            }
+        }
+        Ok(())
+    }
+
+    /// On another host, hold `line` back if its dataset already has lines waiting on the mirror, or
+    /// if its catalogue names a segment this follower does not hold yet; start fetching for it. A
+    /// dataset whose held lines would pass its budget is resnapshotted, as a full queue is. Whether
+    /// it was held.
+    fn waits_on_mirror(self: &Arc<Self>, dataset: &str, line: &Line, cx: &mut Cx) -> Result<bool> {
+        if self.remote.is_none() {
+            return Ok(false);
+        }
+        let queued = self.lock().pending.contains_key(dataset);
+        let needs = match (queued, catalogue_of(line)) {
+            (true, _) | (_, None) => Vec::new(),
+            (false, Some(c)) => crate::remote_follow::missing(&self.root, c)?,
+        };
+        if !queued && needs.is_empty() {
+            return Ok(false);
+        }
+        let bytes = queued_bytes(line);
+        let cap = self.cap_for(dataset).unwrap_or(0);
+        {
+            let mut inner = self.lock();
+            let held = inner.datasets.get(dataset).map_or(0, |d| d.store.bytes());
+            let pending = inner.pending_bytes(dataset);
+            if held + pending + bytes > cap {
+                inner.pending.remove(dataset);
+                drop(inner);
+                bail!(
+                    "{dataset}: what arrived behind a seal waiting on the mirror passed the {cap} \
+                     bytes it has left; resnapshotting"
+                );
+            }
+            let p = inner
+                .pending
+                .entry(dataset.to_string())
+                .or_insert_with(|| Pending {
+                    items: Default::default(),
+                    bytes: 0,
+                    since: Instant::now(),
+                    waiting_for: Vec::new(),
+                    error: None,
+                    fetching: false,
+                });
+            p.items.push_back(line.clone());
+            p.bytes += bytes;
+        }
+        if !needs.is_empty() {
+            self.fetch(dataset, needs, cx);
+        }
+        Ok(true)
+    }
+
+    /// Fetch `segments` for `dataset` from the mirror until every one is in place, then say so on
+    /// the connection's ready channel. Retried with backoff for as long as the connection lasts.
+    fn fetch(self: &Arc<Self>, dataset: &str, segments: Vec<crate::seal::Segment>, cx: &mut Cx) {
+        let (Some(remote), Some(prefix)) = (self.remote.clone(), self.prefix_of(dataset)) else {
+            if let Some(p) = self.lock().pending.get_mut(dataset) {
+                p.error = Some(
+                    "the writer names no data identity for it, so its segments cannot be found on \
+                     a mirror; is the writer older than this follower?"
+                        .into(),
+                );
+            }
+            return;
+        };
+        if let Some(p) = self.lock().pending.get_mut(dataset) {
+            p.fetching = true;
+            p.waiting_for = segments.iter().map(|s| s.file.clone()).collect();
+        }
+        let me = Arc::downgrade(self);
+        let ready = cx.ready.clone();
+        let dataset = dataset.to_string();
+        let root = self.root.clone();
+        let task = tokio::spawn(async move {
+            let started = Instant::now();
+            let mut backoff = Duration::from_millis(100);
+            loop {
+                let got = remote.fetch(&root, &prefix, &segments).await;
+                let Some(me) = me.upgrade() else { return };
+                if let Some(p) = me.lock().pending.get_mut(&dataset) {
+                    p.error = got.as_ref().err().map(|e| format!("{e:#}"));
+                }
+                if got.is_ok() {
+                    crate::feed_metrics::metrics().seal_waited(started.elapsed());
+                    let _ = ready.send(dataset).await;
+                    return;
+                }
+                drop(me);
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(2));
+            }
+        });
+        cx.fetches.push(AbortOnDrop(task));
+    }
+
+    /// Apply what waited on the mirror for `dataset`, in order, until a line names a file still to
+    /// fetch or none is left.
+    async fn drain(self: &Arc<Self>, dataset: &str, cx: &mut Cx) -> Result<()> {
+        loop {
+            let next = {
+                let mut inner = self.lock();
+                let Some(p) = inner.pending.get_mut(dataset) else {
+                    return Ok(());
+                };
+                p.fetching = false;
+                let Some(front) = p.items.front() else {
+                    inner.pending.remove(dataset);
+                    return Ok(());
+                };
+                let needs = match catalogue_of(front) {
+                    Some(c) => crate::remote_follow::missing(&self.root, c)?,
+                    None => Vec::new(),
+                };
+                if !needs.is_empty() {
+                    drop(inner);
+                    self.fetch(dataset, needs, cx);
+                    return Ok(());
+                }
+                let line = p.items.pop_front().expect("a front was there");
+                p.bytes = p.bytes.saturating_sub(queued_bytes(&line));
+                p.waiting_for.clear();
+                p.error = None;
+                if p.items.is_empty() {
+                    inner.pending.remove(dataset);
+                }
+                line
+            };
+            match next {
+                Line::Snapshot { snapshot, .. } => self.apply_snapshot(dataset, snapshot).await?,
+                Line::Delta { delta, .. } => {
+                    if !cx.fresh.contains(dataset) {
+                        bail!("{dataset}: a delta before its snapshot; resnapshotting");
+                    }
+                    self.apply_delta(dataset, delta).await?
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Build `dataset`'s copy and derived state from `snapshot` and serve it.
+    async fn apply_snapshot(
+        self: &Arc<Self>,
+        dataset: &str,
+        snapshot: crate::feed::Snapshot,
+    ) -> Result<()> {
+        let dataset = dataset.to_string();
+        {
+            {
                 let dir = self.root.join(&dataset);
                 let data = tokio::task::spawn_blocking(move || {
                     let store = Arc::new(MemStore::from_snapshot(&dir, snapshot));
@@ -947,21 +1439,19 @@ impl Follower {
                     self.recompose();
                 }
             }
-            Line::Delta { dataset, delta } => {
-                let dataset = dataset.0;
-                let (data, refused) = {
-                    let inner = self.lock();
-                    (
-                        inner.datasets.get(&dataset).cloned(),
-                        inner.over_budget.contains_key(&dataset),
-                    )
-                };
-                if refused {
-                    return Ok(());
-                }
-                let data = match (fresh.contains(&dataset), data) {
-                    (true, Some(data)) => data,
-                    _ => bail!("{dataset}: a delta before its snapshot; resnapshotting"),
+        }
+        Ok(())
+    }
+
+    /// Apply the next delta to `dataset`'s copy and feed its derived state.
+    async fn apply_delta(self: &Arc<Self>, dataset: &str, delta: crate::feed::Delta) -> Result<()> {
+        let dataset = dataset.to_string();
+        let started = Instant::now();
+        {
+            {
+                let data = self.lock().datasets.get(&dataset).cloned();
+                let Some(data) = data else {
+                    bail!("{dataset}: a delta before its snapshot; resnapshotting");
                 };
                 // Charged before it is applied, at its peak, so the copy never holds more than its
                 // budget even part-way through a delta.
@@ -1032,13 +1522,21 @@ impl Follower {
                     }
                 }
                 drop(whole);
+                crate::feed_metrics::metrics().applied(started.elapsed());
+                self.ack.notify_one();
                 if let Some(why) = torn {
                     let store = data.store.clone();
                     drop(data);
                     self.rederive(&dataset, store, why).await?;
                 }
             }
-            Line::Heartbeat { positions } => {
+        }
+        Ok(())
+    }
+
+    fn heartbeat(self: &Arc<Self>, positions: BTreeMap<String, (u64, u64)>) -> Result<()> {
+        {
+            {
                 let roomier = {
                     let mut inner = self.lock();
                     inner.positions = positions.into_iter().collect();
@@ -1276,6 +1774,20 @@ impl Follower {
                     let f = nests.clone();
                     async move { Json(f.roster()) }
                 }),
+            )
+            .route(
+                "/metrics",
+                axum::routing::get(|| async {
+                    let mut s = String::new();
+                    crate::feed_metrics::metrics().render(&mut s);
+                    (
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4",
+                        )],
+                        s,
+                    )
+                }),
             );
         for (route, r) in &inner.routes {
             if let Some(why) = inner.over_budget.get(&r.spec.dataset) {
@@ -1349,6 +1861,16 @@ impl Follower {
         });
         if !inner.link.connected {
             out["absent_for_secs"] = inner.link.since.elapsed().as_secs().into();
+        }
+        // On another host: a seal whose files the mirror has not yet served. What is served
+        // meanwhile is the generation before it, whole.
+        if let Some(p) = inner.pending.get(dataset) {
+            out["mirror"] = serde_json::json!({
+                "waiting_for": p.waiting_for,
+                "queued": p.items.len(),
+                "waiting_secs": p.since.elapsed().as_secs_f64(),
+                "error": p.error,
+            });
         }
         out
     }

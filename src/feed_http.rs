@@ -73,7 +73,7 @@ impl FeedMemory {
 
 /// One connection's queue: its bytes, and whether its follower was dropped.
 struct Conn {
-    queued: AtomicU64,
+    queued: Arc<AtomicU64>,
     peak: AtomicU64,
     /// Whether a snapshot is waiting for room on this connection.
     waiting: AtomicBool,
@@ -156,7 +156,7 @@ impl Queue {
     ) -> (Queue, mpsc::UnboundedReceiver<Charged>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let conn = Arc::new(Conn {
-            queued: AtomicU64::new(0),
+            queued: Arc::default(),
             peak: AtomicU64::new(0),
             waiting: AtomicBool::new(false),
             closed: tokio::sync::watch::Sender::new(false),
@@ -243,6 +243,8 @@ struct Chunks<'q> {
     sent: bool,
     /// Set when the forwarder that asked for this line is gone.
     cancelled: Option<Arc<AtomicBool>>,
+    /// Feed v2: each chunk goes as a part frame, and [`Chunks::end`] closes the run.
+    framed: bool,
 }
 
 impl<'q> Chunks<'q> {
@@ -253,6 +255,42 @@ impl<'q> Chunks<'q> {
             wait,
             sent: false,
             cancelled: None,
+            framed: false,
+        }
+    }
+
+    fn framed(queue: &'q Queue, wait: bool, framed: bool) -> Self {
+        Chunks {
+            framed,
+            ..Chunks::new(queue, wait)
+        }
+    }
+
+    /// The line is written: send what is left, and under v2 the frame that ends its parts.
+    fn end(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        if !self.framed {
+            self.write_all(b"\n")?;
+            return self.flush();
+        }
+        self.flush()?;
+        self.put(bytes::Bytes::copy_from_slice(&crate::feed_wire::header(
+            crate::feed_wire::END,
+            0,
+        )))
+    }
+
+    fn put(&mut self, bytes: bytes::Bytes) -> std::io::Result<()> {
+        self.sent = true;
+        let queued = if self.wait {
+            self.queue.send_waiting(bytes)
+        } else {
+            self.queue.send(bytes)
+        };
+        if queued {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("the follower was dropped"))
         }
     }
 }
@@ -293,18 +331,13 @@ impl std::io::Write for Chunks<'_> {
             }
             return Err(std::io::Error::other("the forwarder went"));
         }
-        let bytes = bytes::Bytes::from(std::mem::take(&mut self.buf));
-        self.sent = true;
-        let queued = if self.wait {
-            self.queue.send_waiting(bytes)
+        let chunk = std::mem::take(&mut self.buf);
+        let bytes = if self.framed {
+            crate::feed_wire::frame(crate::feed_wire::PART, &chunk).into()
         } else {
-            self.queue.send(bytes)
+            bytes::Bytes::from(chunk)
         };
-        if queued {
-            Ok(())
-        } else {
-            Err(std::io::Error::other("the follower was dropped"))
-        }
+        self.put(bytes)
     }
 }
 
@@ -394,6 +427,8 @@ struct TokenQuery {
     /// Datasets, comma-separated, whose snapshots and deltas the follower cannot hold: their mounts
     /// are still sent, their data is not.
     exclude: Option<String>,
+    /// The highest feed format the follower reads; 2 asks for frames ([`crate::feed_wire`]).
+    feed: Option<u32>,
 }
 
 /// The feed's route. Absent, like the rest of the admin surface, when the admin API is off.
@@ -432,6 +467,41 @@ fn line(l: &Line) -> bytes::Bytes {
     out.into()
 }
 
+/// `l` as the connection's format carries it: a line, or one JSON frame.
+fn encode(l: &Line, v2: bool) -> bytes::Bytes {
+    if !v2 {
+        return line(l);
+    }
+    crate::feed_wire::frame(
+        crate::feed_wire::JSON,
+        &serde_json::to_vec(l).unwrap_or_default(),
+    )
+    .into()
+}
+
+/// A dataset's data identity, the prefix its publisher mirrors it under, as the publisher works it
+/// out. Worked out at most every [`IDENTITY_TTL`] per dataset, since every connection asks.
+fn data_identity(dir: &Path) -> Option<String> {
+    type Cache = std::sync::Mutex<HashMap<PathBuf, (std::time::Instant, Option<String>)>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((at, id)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(dir) {
+        if at.elapsed() < IDENTITY_TTL {
+            return id.clone();
+        }
+    }
+    let id = crate::blob::build_manifest(dir, None)
+        .ok()
+        .map(|m| m.data_identity());
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dir.to_path_buf(), (std::time::Instant::now(), id.clone()));
+    id
+}
+
+const IDENTITY_TTL: Duration = Duration::from_secs(30);
+
 async fn feed(
     State(s): State<FeedState>,
     Query(q): Query<TokenQuery>,
@@ -454,7 +524,8 @@ async fn feed(
         .map(str::to_string)
         .collect();
     let closed = tx.conn.closed.subscribe();
-    tokio::spawn(serve_connection(s, tx, excluded));
+    let v2 = q.feed.is_some_and(|v| v >= crate::feed_wire::FEED_V2);
+    tokio::spawn(serve_connection(s, tx, excluded, v2));
     let body = futures::stream::unfold((rx, closed), |(mut rx, mut closed)| async move {
         // A dropped follower's queue is discarded, not drained: what is left may be part of a line.
         let next = tokio::select! {
@@ -468,8 +539,13 @@ async fn feed(
             (Ok::<_, std::convert::Infallible>(bytes), (rx, closed))
         })
     });
+    let content_type = if v2 {
+        crate::feed_wire::CONTENT_TYPE
+    } else {
+        "application/x-ndjson"
+    };
     (
-        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        [(axum::http::header::CONTENT_TYPE, content_type)],
         axum::body::Body::from_stream(body),
     )
         .into_response()
@@ -479,6 +555,9 @@ async fn feed(
 struct AppliedQuery {
     token: Option<String>,
     conn: u64,
+    /// The round trip the follower last measured for one of these reports, in microseconds, which
+    /// visibility lag takes half of.
+    rtt_us: Option<u64>,
 }
 
 /// `POST /_admin/feed/applied?conn=<n>`: what a follower has applied, per dataset, as
@@ -496,7 +575,10 @@ async fn applied(
         )
             .into_response();
     }
+    let now = std::time::Instant::now();
+    let rtt = q.rtt_us.map(Duration::from_micros);
     for (dataset, at) in positions {
+        crate::feed_metrics::metrics().acked(q.conn, &dataset, at, rtt, now);
         crate::seal::follower_applied(&s.root.join(dataset), q.conn, at);
     }
     crate::seal::release_retained();
@@ -541,15 +623,35 @@ impl Drop for Following {
     }
 }
 
-async fn serve_connection(s: FeedState, tx: Queue, excluded: std::collections::BTreeSet<String>) {
+/// Forgets a connection's figures when it ends.
+struct Gone(u64);
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        crate::feed_metrics::metrics().gone(self.0);
+    }
+}
+
+async fn serve_connection(
+    s: FeedState,
+    tx: Queue,
+    excluded: std::collections::BTreeSet<String>,
+    v2: bool,
+) {
     static CONNS: AtomicU64 = AtomicU64::new(1);
     let conn = CONNS.fetch_add(1, Ordering::Relaxed);
+    crate::feed_metrics::metrics().connection(conn, &tx.conn.queued);
+    let _gone = Gone(conn);
     let hello = Line::Hello {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        feed: crate::feed::FEED_VERSION,
+        feed: if v2 {
+            crate::feed_wire::FEED_V2
+        } else {
+            crate::feed::FEED_VERSION
+        },
         conn: Some(conn),
     };
-    if !tx.line(line(&hello)).await {
+    if !tx.line(encode(&hello, v2)).await {
         return;
     }
     let mut following = Following {
@@ -570,12 +672,24 @@ async fn serve_connection(s: FeedState, tx: Queue, excluded: std::collections::B
                     served.iter().map(|m| (m.route.clone(), m)).collect();
                 for gone in routes.keys().filter(|r| !now.contains_key(*r)).cloned().collect::<Vec<_>>() {
                     routes.remove(&gone);
-                    if !tx.line(line(&Line::Unmount { route: gone })).await {
+                    if !tx.line(encode(&Line::Unmount { route: gone }, v2)).await {
                         return;
                     }
                 }
+                let dirs: Vec<PathBuf> = now.values().map(|m| m.dir.clone()).collect();
+                let identities: HashMap<PathBuf, Option<String>> =
+                    tokio::task::spawn_blocking(move || {
+                        dirs.into_iter()
+                            .map(|d| {
+                                let id = data_identity(&d);
+                                (d, id)
+                            })
+                            .collect()
+                    })
+                    .await
+                    .unwrap_or_default();
                 for (route, m) in &now {
-                    let mount = line(&Line::Mount {
+                    let mount = encode(&Line::Mount {
                         route: route.clone(),
                         dataset: dataset_key(&s.root, &m.dir),
                         nid: m.nid.clone(),
@@ -586,7 +700,8 @@ async fn serve_connection(s: FeedState, tx: Queue, excluded: std::collections::B
                         limits: Some((&m.limits).into()),
                         chain: Some(m.chain.clone()),
                         isolation: m.isolation.clone(),
-                    });
+                        data_identity: identities.get(&m.dir).cloned().flatten(),
+                    }, v2);
                     if routes.get(route).is_some_and(|sent| sent[..] == mount[..]) {
                         continue;
                     }
@@ -597,7 +712,7 @@ async fn serve_connection(s: FeedState, tx: Queue, excluded: std::collections::B
                 }
                 if !announced {
                     announced = true;
-                    if !tx.line(line(&Line::Mounted)).await {
+                    if !tx.line(encode(&Line::Mounted, v2)).await {
                         return;
                     }
                 }
@@ -613,7 +728,7 @@ async fn serve_connection(s: FeedState, tx: Queue, excluded: std::collections::B
                             h.abort();
                         }
                         following.follow(s.root.join(dataset));
-                        let task = tokio::spawn(forward(dataset.clone(), store.clone(), tx.clone()));
+                        let task = tokio::spawn(forward(dataset.clone(), store.clone(), tx.clone(), v2));
                         forwarders.0.insert(dataset.clone(), task);
                     }
                 }
@@ -635,7 +750,7 @@ async fn serve_connection(s: FeedState, tx: Queue, excluded: std::collections::B
                 let Ok(_line) = tx.line.try_lock() else {
                     continue;
                 };
-                if !tx.send(line(&Line::Heartbeat { positions })) {
+                if !tx.send(encode(&Line::Heartbeat { positions }, v2)) {
                     return;
                 }
             }
@@ -646,7 +761,7 @@ async fn serve_connection(s: FeedState, tx: Queue, excluded: std::collections::B
 
 /// One dataset's snapshot and deltas onto the connection, resnapshotting whenever the deltas cannot
 /// be relied on to follow: the follower fell behind, or a commit could not be described.
-async fn forward(dataset: String, store: Arc<dyn HotStore>, tx: Queue) {
+async fn forward(dataset: String, store: Arc<dyn HotStore>, tx: Queue, v2: bool) {
     use std::io::Write;
     use tokio::sync::broadcast::error::RecvError;
     let name = serde_json::Value::String(dataset.clone()).to_string();
@@ -658,13 +773,13 @@ async fn forward(dataset: String, store: Arc<dyn HotStore>, tx: Queue) {
         let head = format!("{{\"snapshot\":{{\"dataset\":{name},\"snapshot\":");
         let taken = tokio::task::spawn_blocking(move || {
             let _line = q.line.blocking_lock();
-            let mut out = Chunks::new(&q, true);
+            let mut out = Chunks::framed(&q, true, v2);
             out.cancelled = Some(flag);
             out.buf.extend_from_slice(head.as_bytes());
             let streamed = st.feed_stream(&mut out).and_then(|deltas| {
                 if deltas.is_some() {
-                    out.write_all(b"}}\n")?;
-                    out.flush()?;
+                    out.write_all(b"}}")?;
+                    out.end()?;
                 }
                 Ok(deltas)
             });
@@ -692,20 +807,61 @@ async fn forward(dataset: String, store: Arc<dyn HotStore>, tx: Queue) {
             match deltas.recv().await {
                 Ok(delta) if delta.resync => continue 'snapshot,
                 Ok(delta) => {
+                    if let Some(at) = delta.committed {
+                        let kind = if delta.catalogue.is_some() {
+                            crate::feed_metrics::Kind::Seal
+                        } else {
+                            crate::feed_metrics::Kind::Tip
+                        };
+                        crate::feed_metrics::metrics().committed(
+                            &dataset,
+                            delta.epoch,
+                            delta.generation,
+                            at,
+                            kind,
+                        );
+                    }
+                    if v2 {
+                        let body = delta.wire.get_or_init(|| {
+                            let started = std::time::Instant::now();
+                            let body = crate::feed_wire::encode_delta(&delta)
+                                .map(bytes::Bytes::from)
+                                .unwrap_or_default();
+                            crate::feed_metrics::metrics().encoded("v2", started.elapsed());
+                            body
+                        });
+                        if body.is_empty() {
+                            continue 'snapshot;
+                        }
+                        let frame = crate::feed_wire::delta_frame(&dataset, body);
+                        if frame.len() as u64 <= tx.conn.limits.per_connection {
+                            crate::feed_metrics::metrics().delta_sent("v2", frame.len());
+                            if !tx.line(frame.into()).await {
+                                return;
+                            }
+                            continue;
+                        }
+                    }
                     let head = format!("{{\"delta\":{{\"dataset\":{name},\"delta\":");
+                    let started = std::time::Instant::now();
                     let mut size = Counted(head.len() as u64 + 3);
                     if serde_json::to_writer(&mut size, &*delta).is_err() {
                         continue 'snapshot;
                     }
+                    if !v2 {
+                        crate::feed_metrics::metrics().encoded("v1", started.elapsed());
+                        crate::feed_metrics::metrics().delta_sent("v1", size.0 as usize);
+                    }
                     let write = move |q: &Queue, wait: bool| {
-                        let mut out = Chunks::new(q, wait);
+                        // Under v2, a delta too large for one frame goes as v1's JSON in parts.
+                        let mut out = Chunks::framed(q, wait, v2);
                         out.buf.extend_from_slice(head.as_bytes());
                         serde_json::to_writer(&mut out, &*delta)
                             .map_err(std::io::Error::from)
-                            .and_then(|()| out.write_all(b"}}\n"))
-                            .and_then(|()| out.flush())
+                            .and_then(|()| out.write_all(b"}}"))
+                            .and_then(|()| out.end())
                     };
-                    let sent = if size.0 <= tx.conn.limits.per_connection {
+                    let sent = if size.0 <= tx.conn.limits.per_connection && !v2 {
                         let _line = tx.line.lock().await;
                         write(&tx, false)
                     } else {
@@ -810,7 +966,7 @@ mod tests {
         let store = store(tmp.path(), 64);
         let limits = limits(256 * KIB, 1 << 20);
         let (q, mut rx) = Queue::new(Arc::default(), limits);
-        let task = tokio::spawn(forward("data/a".into(), store.clone(), q.clone()));
+        let task = tokio::spawn(forward("data/a".into(), store.clone(), q.clone(), false));
         // Nothing is read until the queue holds all it may.
         blocked(&[&q]).await;
         assert_eq!(q.conn.queued.load(Ordering::SeqCst), limits.per_connection);
@@ -833,7 +989,7 @@ mod tests {
         let memory = Arc::<FeedMemory>::default();
         let limits = limits(256 * KIB, 1 << 20);
         let (q, mut rx) = Queue::new(memory.clone(), limits);
-        let task = tokio::spawn(forward("data/a".into(), store.clone(), q.clone()));
+        let task = tokio::spawn(forward("data/a".into(), store.clone(), q.clone(), false));
         read_line(&mut rx).await;
         // The follower reads no further while the writer goes on committing.
         let started = std::time::Instant::now();
@@ -874,7 +1030,7 @@ mod tests {
         let mut queues = Vec::new();
         for _ in 0..4 {
             let (q, mut rx) = Queue::new(memory.clone(), limits);
-            let task = tokio::spawn(forward("data/a".into(), store.clone(), q.clone()));
+            let task = tokio::spawn(forward("data/a".into(), store.clone(), q.clone(), false));
             let mut gate = gate.clone();
             followers.push(tokio::spawn(async move {
                 gate.wait_for(|open| *open).await.unwrap();
