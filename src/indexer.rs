@@ -16499,6 +16499,25 @@ template = "pool"
                 )
             }
         };
+        // A cold start begins at `tip - backfill`, and the cursor prepares its nests in turn: a tip
+        // that moved meanwhile would start a later nest above block 1, which the reference never does.
+        wait_for(
+            "every nest prepares at the first tip",
+            std::time::Duration::from_secs(60),
+            || {
+                stores
+                    .iter()
+                    .all(|s| s.get_meta(START_BLOCK_KEY).unwrap().is_some())
+            },
+        )
+        .await;
+        for s in &stores {
+            assert_eq!(
+                s.get_meta(START_BLOCK_KEY).unwrap().as_deref(),
+                Some("1"),
+                "premise: every nest indexes from block 1, as the reference does"
+            );
+        }
         let started = std::time::Instant::now();
         let deadline = started + std::time::Duration::from_secs(60);
         let mut last_tick = started;
@@ -16617,9 +16636,28 @@ template = "pool"
         }
     }
 
+    /// The property test's second counterexample, from CI: rows far below the fork were lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reorg_on_a_one_window_buffer_loses_no_history() {
+        let want = reorg_reference(REORG_TIP, 24).await;
+        let case = ReorgCase {
+            kind: CursorKind::Buffered(1),
+            fork: 24,
+            flip_at: 28,
+            delays_ms: [8, 1, 0],
+            window: 3,
+        };
+        if let Err(e) = run_reorg_case(&case, &want).await {
+            panic!("did not converge:\n{e}");
+        }
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig {
-            cases: 16,
+            cases: std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16),
             failure_persistence: None,
             ..proptest::prelude::ProptestConfig::default()
         })]
@@ -16634,7 +16672,7 @@ template = "pool"
             d0 in 0u64..20,
             d1 in 0u64..20,
             d2 in 0u64..20,
-            windows in 1usize..=6,
+            windows in 0usize..=6,
             window in 1u64..=4,
         ) {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -16643,7 +16681,8 @@ template = "pool"
                 .build()
                 .unwrap();
             let case = ReorgCase {
-                kind: CursorKind::Buffered(windows),
+                // 0 is the shared cursor, which must converge on the same fixture.
+                kind: if windows == 0 { CursorKind::Shared } else { CursorKind::Buffered(windows) },
                 fork,
                 flip_at: (fork + 1 + depth).min(REORG_TIP - 1),
                 delays_ms: [d0, d1, d2],

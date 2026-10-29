@@ -4594,8 +4594,12 @@ async fn a_window_deadline_patched_on_the_indexing_mount_reaches_its_ingest() {
         .await
         .unwrap();
     let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
-    for name in ["usdc", "alias"] {
-        let mount = format!(r#"{{"name":"{name}","nid":"{nid}"}}"#);
+    // The indexing mount sets a deadline; an alias mounted after it, with none, must not clear it.
+    for (name, limits) in [
+        ("usdc", r#","limits":{"window_deadline_ms":4000}"#),
+        ("alias", ""),
+    ] {
+        let mount = format!(r#"{{"name":"{name}","nid":"{nid}"{limits}}}"#);
         let (status, body) = call(
             &routes,
             "POST",
@@ -4606,7 +4610,11 @@ async fn a_window_deadline_patched_on_the_indexing_mount_reaches_its_ingest() {
         .await;
         assert_eq!(status, StatusCode::OK, "{name}: {body}");
     }
-    assert_eq!(nuthatch::indexer::window_deadline_of(&data_dir), None);
+    assert_eq!(
+        nuthatch::indexer::window_deadline_of(&data_dir),
+        Some(std::time::Duration::from_millis(4000)),
+        "an alias mounted without a deadline left the indexing mount's"
+    );
     let (status, body) = call(
         &routes,
         "PATCH",
@@ -4618,7 +4626,7 @@ async fn a_window_deadline_patched_on_the_indexing_mount_reaches_its_ingest() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         nuthatch::indexer::window_deadline_of(&data_dir),
-        None,
+        Some(std::time::Duration::from_millis(4000)),
         "an alias does not set the dataset's deadline"
     );
     let (status, body) = call(

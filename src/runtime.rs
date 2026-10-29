@@ -1608,6 +1608,26 @@ pub fn load_mounted(
     Ok(out)
 }
 
+/// Each dataset's window deadline at boot (RFC-0076 §3.2): its indexing mount's, the first in serving
+/// order. No other mount's record is read, so an alias cannot change or clear it.
+pub(crate) fn boot_window_deadlines(
+    table: &MountTable,
+    datasets: &[Dataset],
+) -> std::collections::HashMap<PathBuf, Option<std::time::Duration>> {
+    datasets
+        .iter()
+        .map(|ds| {
+            let c = ds.canonical();
+            let deadline = table
+                .mounts
+                .iter()
+                .find(|r| r.tenant == c.tenant && r.alias == c.alias)
+                .and_then(|r| r.limits.window_deadline());
+            (ds.dir.clone(), deadline)
+        })
+        .collect()
+}
+
 /// A publisher for every mount that declares `[mounts.publish]` (RFC-0052 S2), keyed by route, and
 /// for each dataset `[runtime.publish]` covers. One per record: two mounts of one dataset naming one
 /// target contend on S1's conditional catalogue put.
@@ -2137,15 +2157,11 @@ pub async fn dev(
     let default_tenant_owned = all_mounts.tenant_default();
     let default_tenant = default_tenant_owned.as_str();
     let mut mounted = load_mounted(&dir, &datasets, default_tenant)?;
+    let deadlines = boot_window_deadlines(&mounts, &datasets);
     // The dial is the operator's, not the nest's (RFC-0040), so it is stamped onto every mounted
     // config here rather than read from any of them - `Config::freshness` is `#[serde(skip)]`.
-    for (name, _, config) in &mut mounted {
-        config.window_deadline = mounts
-            .mounts
-            .iter()
-            .find(|r| mount_route(r, default_tenant) == *name)
-            .map(|r| r.limits.window_deadline())
-            .or(Some(None));
+    for (_, ds_dir, config) in &mut mounted {
+        config.window_deadline = deadlines.get(ds_dir.as_path()).copied();
         config.runtime_dir = Some(dir.clone());
         stamp_operator_settings(
             config,
@@ -8858,6 +8874,33 @@ mod tests {
         .unwrap();
         let mounts = MountTable::load(d.path()).expect("a migrated directory loads");
         assert_eq!(mounts.mounts.len(), 1);
+    }
+
+    /// RFC-0076 §3.2: boot reads a dataset's window deadline from the mount that indexes it, listed
+    /// before or after an alias that sets another.
+    #[test]
+    fn boot_takes_each_datasets_window_deadline_from_its_indexing_mount() {
+        let nid = "dd".repeat(32);
+        for (first, second, want) in [
+            ("window_deadline_ms = 2500\n", "", Some(2500)),
+            ("", "window_deadline_ms = 2500\n", None),
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            let table: MountTable = toml::from_str(&format!(
+                "[runtime]\nname = \"t\"\nchain = \"ethereum\"\nchain_id = 1\n\n\
+                 [[mounts]]\nalias = \"usdc\"\nnid = \"{nid}\"\n[mounts.limits]\n{first}\n\
+                 [[mounts]]\nalias = \"alias\"\nnid = \"{nid}\"\n[mounts.limits]\n{second}"
+            ))
+            .unwrap();
+            let datasets = table.datasets(d.path());
+            assert_eq!(datasets.len(), 1, "premise: one dataset, two mounts");
+            let deadlines = boot_window_deadlines(&table, &datasets);
+            assert_eq!(
+                deadlines[&datasets[0].dir],
+                want.map(std::time::Duration::from_millis),
+                "the indexing mount's deadline, whatever the alias's record says"
+            );
+        }
     }
 
     /// RFC-0032 §4: grouping is by *dataset*, and a runtime may be half-migrated while it happens.
