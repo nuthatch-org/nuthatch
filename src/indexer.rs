@@ -15047,6 +15047,9 @@ template = "pool"
         flip_at: u64,
         delays_ms: [u64; 3],
         window: u64,
+        /// Every nest's delay a window from the flip on, so they are at the tip when it comes and
+        /// slow to apply its marker.
+        slow_after_flip_ms: u64,
     }
 
     const REORG_START: u64 = 8;
@@ -15142,6 +15145,16 @@ template = "pool"
             let tip = chain.tip.load(std::sync::atomic::Ordering::SeqCst);
             if tip < REORG_TIP && last_tick.elapsed() >= std::time::Duration::from_millis(15) {
                 if tip + 1 == case.flip_at {
+                    if case.slow_after_flip_ms > 0 {
+                        let mut slowed = slowed_nests().lock().unwrap();
+                        slowed.retain(|(d, _)| !dirs.contains(d));
+                        slowed.extend(dirs.iter().map(|d| {
+                            (
+                                d.clone(),
+                                std::time::Duration::from_millis(case.slow_after_flip_ms),
+                            )
+                        }));
+                    }
                     chain
                         .forked
                         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -15193,6 +15206,32 @@ template = "pool"
         outcome
     }
 
+    /// #2514: one reorg is one marker. Every nest is slow, so each is still inside a window when the
+    /// chain is replaced and applies the marker late; until it does, its position is from before the
+    /// fork and must not move extraction back over it to issue the same marker again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_reorg_issues_one_marker_while_its_nests_are_slow_to_apply_it() {
+        const FORK: u64 = 20;
+        let want = reorg_reference(REORG_TIP, FORK).await;
+        let case = ReorgCase {
+            kind: CursorKind::Buffered(8),
+            fork: FORK,
+            flip_at: 30,
+            delays_ms: [0, 0, 0],
+            window: 3,
+            slow_after_flip_ms: 150,
+        };
+        let stats = match run_reorg_case(&case, &want).await {
+            Ok(Some(stats)) => stats,
+            Ok(None) => unreachable!("a buffered case has stats"),
+            Err(e) => panic!("did not converge:\n{e}"),
+        };
+        let issued = stats
+            .reorg_markers
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(issued, 1, "one reorg issued {issued} markers");
+    }
+
     /// RFC-0076 S2's parity case with a reorg: the chain is replaced under a factory child the
     /// replacement never announces, and every nest on either cursor ends holding exactly what the
     /// shared cursor indexes over the replacement alone.
@@ -15227,6 +15266,7 @@ template = "pool"
                 flip_at,
                 delays_ms,
                 window,
+                slow_after_flip_ms: 0,
             };
             match run_reorg_case(&case, &want).await {
                 Ok(Some(stats)) => {
@@ -15260,6 +15300,7 @@ template = "pool"
             flip_at: 28,
             delays_ms: [8, 1, 0],
             window: 3,
+            slow_after_flip_ms: 0,
         };
         if let Err(e) = run_reorg_case(&case, &want).await {
             panic!("did not converge:\n{e}");
@@ -15301,6 +15342,7 @@ template = "pool"
                 flip_at: (fork + 1 + depth).min(REORG_TIP - 1),
                 delays_ms: [d0, d1, d2],
                 window,
+                slow_after_flip_ms: 0,
             };
             let outcome = rt.block_on(async {
                 let want = reorg_reference(REORG_TIP, fork).await;

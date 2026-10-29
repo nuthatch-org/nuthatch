@@ -345,6 +345,9 @@ struct NestSlot {
     status: AtomicU8,
     reason: Mutex<Option<String>>,
     stop: AtomicBool,
+    /// The last reorg marker this nest has rolled back for. Until it has applied a newer one, its
+    /// `next` is from before that fork.
+    seen_marker: AtomicU64,
 }
 
 impl NestSlot {
@@ -399,13 +402,28 @@ impl BufferShared {
             .fetch_max(b.memory, Ordering::Relaxed);
     }
 
+    /// Where `slot` stands as far as extraction may rely on it: its `next`, or the block after the
+    /// lowest fork it has not yet rolled back for, whichever is lower (#2514).
+    fn position(&self, slot: &NestSlot) -> u64 {
+        position_in(&self.buffer.lock().unwrap(), slot)
+    }
+}
+
+/// [`BufferShared::position`] with the buffer already held.
+fn position_in(b: &WindowBuffer, slot: &NestSlot) -> u64 {
+    let next = slot.next.load(Ordering::Acquire);
+    let seen = slot.seen_marker.load(Ordering::Acquire);
+    b.markers
+        .iter()
+        .filter(|(id, _)| *id > seen)
+        .map(|(_, a)| a + 1)
+        .fold(next, u64::min)
+}
+
+impl BufferShared {
     /// Drop every window no live nest still needs.
     fn trim(&self) {
-        let floor = self
-            .live()
-            .iter()
-            .map(|s| s.next.load(Ordering::Acquire))
-            .min();
+        let floor = self.live().iter().map(|s| self.position(s)).min();
         let mut b = self.buffer.lock().unwrap();
         if let Some(floor) = floor {
             while b.windows.front().is_some_and(|w| w.to < floor) {
@@ -655,6 +673,7 @@ fn spawn_nest(
         status: status.into(),
         reason: Mutex::new(None),
         stop: false.into(),
+        seen_marker: seen_marker.into(),
     });
     shared.slots.lock().unwrap().push(slot.clone());
     let handle = tasks.spawn(nest_task(
@@ -899,7 +918,7 @@ impl Extraction<'_> {
             // nest needs, which forgets the header chain those windows were checked against.
             let floor = live
                 .iter()
-                .map(|s| s.next.load(Ordering::Acquire))
+                .map(|s| self.shared.position(s))
                 .min()
                 .expect("live is not empty");
             let next = {
@@ -1226,7 +1245,7 @@ impl Extraction<'_> {
                             .shared
                             .live()
                             .iter()
-                            .map(|s| s.next.load(Ordering::Acquire))
+                            .map(|s| position_in(&b, s))
                             .max()
                             .unwrap_or(0);
                         let ahead = b.windows.iter().filter(|w| w.to >= lead).count();
@@ -1677,6 +1696,7 @@ async fn nest_task(
                         next = next.min(resume);
                         slot.next.store(next, Ordering::Release);
                     }
+                    slot.seen_marker.store(seen_marker, Ordering::Release);
                     sup.reorg_checked[0] = true;
                 }
                 Err(e) => sup.quarantine(0, &e)?,
@@ -1698,6 +1718,7 @@ async fn nest_task(
                     Ok(resume) => {
                         next = next.min(resume);
                         slot.next.store(next, Ordering::Release);
+                        slot.seen_marker.store(id, Ordering::Release);
                         slot.view.lock().unwrap().children = nest.children.clone();
                     }
                     Err(e) => sup.quarantine(0, &e)?,
