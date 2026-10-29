@@ -23,6 +23,7 @@ use crate::exposure::ExposureView;
 use crate::registry::TableSchema;
 use crate::velocity::VelocityView;
 use crate::views::BalanceView;
+use nuthatch_core::answer::{self, Answer};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -1925,28 +1926,36 @@ fn fold_readiness(s: &AppState, now: u64) -> (Value, bool) {
     )
 }
 
-/// RFC-0045 §6's second guarantee: rows that can be re-checked given the snapshots, but not
-/// re-derived from chain.
-const SNAPSHOT_REPRODUCIBLE: &str = "snapshot";
-
 /// Label an entity that reads an offchain table as reproducible by snapshot, and name the snapshots
 /// its rows were applied through (#1437). The label follows from what the entity reads, not from
 /// what it has applied, so it is there before the first snapshot lands and nothing turns it off.
 /// Both are absent, not null, for an entity that reads no offchain table.
 fn with_offchain(
-    mut v: Value,
+    v: Value,
     entity: &crate::entity_view::EntityView,
     applied: &crate::entity_view::Applied,
 ) -> Value {
-    if let Some(obj) = v.as_object_mut() {
-        if !entity.offchain_tables().is_empty() {
-            obj.insert("reproducibility".into(), json!(SNAPSHOT_REPRODUCIBLE));
-        }
-        if let Some(offchain) = applied.offchain_json() {
-            obj.insert("offchain".into(), offchain);
-        }
+    answer::with_offchain(v, !entity.offchain_tables().is_empty(), applied)
+}
+
+fn entity_facts(entity: &crate::entity_view::EntityView) -> answer::EntityFacts<'_> {
+    answer::EntityFacts {
+        name: entity.name(),
+        unavailable: entity.unavailable(),
+        fault: entity.fault(),
+        reads_offchain: !entity.offchain_tables().is_empty(),
     }
-    v
+}
+
+/// A route's answer as axum sends it, with the headers `Json` gives a body.
+fn respond(a: Answer) -> axum::response::Response {
+    let status = StatusCode::from_u16(a.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, answer::CONTENT_TYPE)],
+        a.body,
+    )
+        .into_response()
 }
 
 /// The offchain views an answer read directly, each with the snapshots behind it.
@@ -2246,14 +2255,18 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
 }
 
 async fn ready(State(s): State<AppState>) -> impl IntoResponse {
+    respond(ready_answer(&s))
+}
+
+fn ready_answer(s: &AppState) -> Answer {
     // In a runtime, this nest answers for ITSELF (RFC-0026 §5): a consumer polling `/lodestar/ready`
     // must not be told the runtime is unwell because some unrelated co-tenant is quarantined - nor told
     // all is well when *this* nest is the one that is frozen.
     if let Some((name, health)) = &s.runtime_health {
         if let Some(q) = health.status(name) {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
+            return Answer::json(
+                503,
+                &json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "ready": false,
                     "quarantined": true,
@@ -2262,9 +2275,8 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
                     "reason": q.reason,
                     "since_unixtime": q.since_unixtime,
                     "next_retry_unixtime": q.next_retry_unixtime,
-                })),
-            )
-                .into_response();
+                }),
+            );
         }
     }
     // Answer from **this nest's** counters when it is one of several in a runtime. The process-global
@@ -2305,128 +2317,56 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
         folds,
         #[cfg(feature = "folds")]
             folds_stalled: _,
-    } = nest_readiness(&s);
-    let body = json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "ready": !stalled,
-        "stalled": stalled,
-        "wedged": wedged,
-        "initial_poll_failed": initial_failure,
-        // Null rather than 0 for a cursorless role: it has no tip and no lag, and **0 is a value**
-        // an operator or a dashboard will read as "exactly at tip" (the #1020 lesson, on the other
-        // surface). Absent is honest; zero is a claim. The same holds before a cursor's first poll,
-        // which a long seal-direct pass can postpone by minutes (#2342).
-        "tip": if s.cursorless || last_poll == 0 { serde_json::Value::Null } else { tip.into() },
-        "last_block": last,
-        "lag_blocks": if s.cursorless || last_poll == 0 { serde_json::Value::Null } else { lag.into() },
-        "cursorless": s.cursorless,
-        // RFC-0040 §4: a deliberately stale cursor says so here. `lag_blocks` above is then the
-        // distance the operator chose, and the stall thresholds behind `ready` are scaled to
-        // `poll_interval_secs`, so a quiet five-minute cursor is not reported as a dead one.
-        "freshness": {
-            "mode": s.freshness.mode(),
-            "poll_interval_secs": s.freshness.poll_interval.as_secs(),
-            "poll_interval_source": s.freshness.poll_interval_source(),
+    } = nest_readiness(s);
+    #[cfg(feature = "folds")]
+    let folds = (!folds.is_null()).then_some(folds);
+    #[cfg(not(feature = "folds"))]
+    let folds = None;
+    answer::ready(&answer::Ready {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        stalled,
+        wedged,
+        initial_failure,
+        cursorless: s.cursorless,
+        tip,
+        last,
+        lag,
+        sealed,
+        freshness: answer::Freshness {
+            mode: s.freshness.mode(),
+            poll_interval_secs: s.freshness.poll_interval.as_secs(),
+            poll_interval_source: s.freshness.poll_interval_source(),
         },
-        "sealed_through": sealed,
-        // **How far the sealed watermark trails what the cursor has indexed** (#1199).
-        //
-        // `lag_blocks` above describes *following*, which is a different question, and on both Graph
-        // protocol nests it read 0 while the seal sat 739,192 blocks back. A stalled seal and a
-        // healthy one were indistinguishable through this endpoint, so Lodestar's health check passed
-        // for days while every tattler receipt pinned a watermark two days stale.
-        //
-        // **A fact, not a verdict.** This deliberately does not feed `stalled`. `maybe_seal` holds a
-        // finalized range until SEAL_DIRECT_BATCH rows accumulate, so on a sparse nest the lag grows
-        // without bound *by construction* and any threshold worth having would refuse service on
-        // nests that are answering correctly. The verdict belongs with the fix to that holding rule,
-        // not ahead of it.
-        //
-        // Null rather than 0 when nothing has sealed: `sealed_through` defaults to 0, so the
-        // subtraction would report a nest's entire indexed history as lag during its first minutes.
-        // `sealed_through: 0` beside a null lag reads as "nothing sealed yet"; a 0 there would be a
-        // claim that the seal is caught up (the #1020 lesson, on this surface).
-        "seal_lag_blocks": if s.cursorless || sealed == 0 {
-            serde_json::Value::Null
-        } else {
-            last.saturating_sub(sealed).into()
-        },
-        "last_poll_unixtime": last_poll,
-        "seconds_since_poll": age,
-        "seal_direct_active": seal_direct_active,
-        "seal_direct_origin": seal_direct_origin,
-        "seal_direct_completed": seal_direct_completed,
-        // The pass's fetch position (#1169). `seal_direct_completed` is what a restart resumes from;
-        // this is how far fetching has run ahead of it, which is exactly the work a restart redoes.
-        // They were one number until a restart on the gns nest redid 47.6M blocks the number had
-        // called done.
-        "seal_direct_fetched": seal_direct_fetched,
-        // The cursor's current getLogs span (#1170): a backfill crawling at ten blocks a window
-        // after a rate-limited hour is visible here, not only in its ETA.
-        "fetch_window_blocks": fetch_window,
-        "seal_direct_target": seal_direct_target,
-        // #1399: one `--rpc` quietly runs the pass a window at a time, which a startup warning alone
-        // did not make visible. Null when no seal-direct pass recorded it.
-        "seal_direct_concurrency": seal_direct_concurrency.map(|(requested, effective)| json!({
-            "requested": requested,
-            "effective": effective,
-            "capped_by": (effective < requested).then_some("single_rpc_endpoint"),
-        })),
-        // How long a seal-direct window waits for one ipfs document, `0` for no limit. A document
-        // given up on is absent from the sealed segment (#1410), so this is the operator's trade.
-        // #1410: documents given up on, by either path, and so absent from sealed history. Listed at
-        // `/ipfs/gave-up`.
-        "ipfs_gave_up_documents": s
+        last_poll,
+        age,
+        now,
+        seal_direct_active,
+        seal_direct_origin,
+        seal_direct_completed,
+        seal_direct_fetched,
+        fetch_window,
+        seal_direct_target,
+        seal_direct_concurrency,
+        ipfs_gave_up_documents: s
             .store
             .count_meta_with_prefix(crate::ipfs_resolve::GAVE_UP_PREFIX)
             .ok(),
-        "seal_direct_ipfs_window_deadline_secs": if s.cursorless {
-            serde_json::Value::Null
-        } else {
-            ipfs_window_deadline.into()
-        },
-        "seal_direct_stalled": seal_stalled,
-        // The tip path's verdict, reported beside the backfill's so an operator can tell which term
-        // took the nest unready without reading this source (#1199).
-        "tip_seal_stalled": tip_seal_stalled,
-        "seal_faulted": seal_faulted,
-        // No longer gated on `seal_direct_active`: the tip path stamps this clock too now, and the
-        // number was null on precisely the nests that needed it.
-        "seconds_since_seal_progress": (last_seal_progress != 0)
-            .then(|| now.saturating_sub(last_seal_progress)),
-        "entities": entities,
-        "entities_stalled": entities_stalled,
-        // A fact, not a verdict: one broken view must not take a serving nest out of rotation (#1653).
-        "views_failed": crate::analytics::view_failures(&s.dir)
-            .into_iter()
-            .map(|(file, view, error)| json!({ "file": file, "view": view, "error": error }))
-            .collect::<Vec<_>>(),
-    });
-    #[cfg(feature = "folds")]
-    let body = {
-        let mut body = body;
-        if !folds.is_null() {
-            body["folds"] = folds;
-        }
-        body
-    };
-    let mut body = body;
-    // A fact, not a verdict: a nest whose ABI no longer fits indexes less and is otherwise healthy.
-    body["undecoded"] = undecoded(&s);
-    // #2262: the tip seal's error while every attempt fails, absent while it succeeds.
-    if let Some((since, reason)) = seal_fault {
-        body["seal_fault"] = json!({ "reason": reason, "since_unixtime": since });
-    }
-    // RFC-0062: absent unless the nest declares a maintained view.
-    if crate::maintained::is_declared(&s.dir) {
-        body["maintained"] = maintained_status(&s.dir);
-    }
-    let code = if stalled {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        StatusCode::OK
-    };
-    (code, Json(body)).into_response()
+        ipfs_window_deadline,
+        seal_stalled,
+        tip_seal_stalled,
+        seal_faulted,
+        last_seal_progress,
+        entities,
+        entities_stalled,
+        views_failed: crate::analytics::view_failures(&s.dir),
+        folds,
+        // A fact, not a verdict: a nest whose ABI no longer fits indexes less and is otherwise healthy.
+        undecoded: undecoded(s),
+        // #2262: the tip seal's error while every attempt fails, absent while it succeeds.
+        seal_fault,
+        // RFC-0062: absent unless the nest declares a maintained view.
+        maintained: crate::maintained::is_declared(&s.dir).then(|| maintained_status(&s.dir)),
+    })
 }
 
 /// Each maintained view's copies and counters. A fact, not a verdict: a view with no copy still
@@ -4153,16 +4093,9 @@ struct EntitiesQuery {
 }
 
 async fn entities(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> impl IntoResponse {
-    let limit = q.limit.unwrap_or(100).min(1000);
-    let items = s.store.recent(limit).and_then(|rows| {
-        rows.iter()
-            .map(|r| serde_json::from_str::<Value>(r).context("unparseable hot row"))
-            .collect::<Result<Vec<Value>>>()
-    });
-    match items {
-        Ok(items) => Json(json!({ "count": items.len(), "items": items })).into_response(),
-        Err(e) => error(format!("{e:#}")),
-    }
+    respond(answer::entities(
+        s.store.recent(answer::listing_limit(q.limit)),
+    ))
 }
 
 /// Documents either resolving path gave up on, in block order (#1410). Each is absent from sealed history.
@@ -4194,54 +4127,42 @@ async fn entity(State(s): State<AppState>, Path(id): Path<String>) -> impl IntoR
     match s.store.get_entity(&id) {
         Ok(Some(raw)) => {
             crate::cost::hot_rows(1);
-            return match serde_json::from_str::<Value>(&raw) {
-                Ok(v) => Json(v).into_response(),
-                Err(e) => error(format!("{e:#}")),
-            };
+            return respond(answer::entity_hot(&raw));
         }
         Ok(None) => {}
         Err(e) => return error(format!("{e:#}")),
     }
 
-    match parse_id(&id) {
-        Some((block, log_index)) => {
-            // A hot miss scans sealed segments. Same admission and deadline as `/sql` (#1657).
-            let admission = std::time::Instant::now();
-            let permit = match admit(&s).await {
-                Ok(p) => p,
-                Err(refused) => return refused,
-            };
-            crate::cost::queued(admission.elapsed());
-            let guard = s.query_guard(s.limits.timeout.saturating_sub(admission.elapsed()), 1);
-            let dir = s.dir.clone();
-            let tenant = s.isolation.clone();
-            let sealed = crate::cost::spawn_blocking(move || {
-                let _permit = permit;
-                analytics::isolated(tenant.as_ref(), || {
-                    analytics::get_row_guarded(&dir, block, log_index, guard)
-                })
-            })
-            .await;
-            match sealed {
-                Ok(Ok(Some(v))) => Json(v).into_response(),
-                Ok(Ok(None)) => not_found(&id),
-                Ok(Err(e)) => error(format!("{e:#}")),
-                Err(e) => error(format!("{e}")),
-            }
-        }
-        None => not_found(&id),
+    let Some((block, log_index)) = answer::parse_id(&id) else {
+        return respond(answer::not_found(&id));
+    };
+    // A hot miss scans sealed segments. Same admission and deadline as `/sql` (#1657).
+    let admission = std::time::Instant::now();
+    let permit = match admit(&s).await {
+        Ok(p) => p,
+        Err(refused) => return refused,
+    };
+    crate::cost::queued(admission.elapsed());
+    let guard = s.query_guard(s.limits.timeout.saturating_sub(admission.elapsed()), 1);
+    let dir = s.dir.clone();
+    let tenant = s.isolation.clone();
+    let sealed = crate::cost::spawn_blocking(move || {
+        let _permit = permit;
+        analytics::isolated(tenant.as_ref(), || {
+            analytics::get_row_guarded(&dir, block, log_index, guard)
+        })
+    })
+    .await;
+    match sealed {
+        Ok(Ok(found)) => respond(answer::entity_sealed(&id, found)),
+        Ok(Err(e)) => error(format!("{e:#}")),
+        Err(e) => error(format!("{e}")),
     }
 }
 
-#[derive(Deserialize)]
-struct SqlQuery {
-    q: String,
-    /// Optional row cap for this request, clamped to `[1, SQL_MAX_ROWS]`. The MCP bridge passes a
-    /// small value (default 200) so an agent's context isn't flooded (RFC-0016 §4); curl gets the
-    /// full cap. Absent → the node cap.
-    #[serde(default)]
-    max_rows: Option<usize>,
-}
+/// `/sql`'s and `/explain`'s request. `max_rows` is clamped to `[1, SQL_MAX_ROWS]`: the MCP bridge
+/// passes a small value (default 200) so an agent's context isn't flooded (RFC-0016 §4).
+type SqlQuery = answer::SqlRequest;
 
 /// The refusal a bounded mount gives free-form SQL (RFC-0034 §2).
 ///
@@ -4880,15 +4801,9 @@ async fn sql_post(State(s): State<AppState>, body: axum::body::Bytes) -> axum::r
 
 /// A POST body as a [`SqlQuery`], or the `400` refusing it in the route's own error envelope.
 fn sql_body(body: &[u8], explain: bool) -> Result<SqlQuery, Box<axum::response::Response>> {
-    serde_json::from_slice(body).map_err(|e| {
+    answer::sql_request(body, explain).map_err(|refused| {
         crate::metrics::METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Invalid);
-        let error = format!("the body must be {{\"q\": \"...\", \"max_rows\": n}}: {e}");
-        let body = if explain {
-            json!({ "valid": false, "error": error })
-        } else {
-            json!({ "error": error })
-        };
-        Box::new((StatusCode::BAD_REQUEST, Json(body)).into_response())
+        Box::new(respond(refused))
     })
 }
 
@@ -4899,11 +4814,7 @@ async fn sql_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
     }
     if q.q.len() > SQL_MAX_QUERY_LEN {
         METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Invalid);
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("query too long: {} bytes (max {SQL_MAX_QUERY_LEN})", q.q.len()) })),
-        )
-            .into_response();
+        return respond(answer::sql_too_long(q.q.len(), SQL_MAX_QUERY_LEN));
     }
     run_sql_query(s, q.q, q.max_rows).await
 }
@@ -5619,11 +5530,7 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
         return refuse_free_form(&s.surface);
     }
     if q.q.len() > SQL_MAX_QUERY_LEN {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "valid": false, "error": "query too long" })),
-        )
-            .into_response();
+        return respond(answer::explain_too_long());
     }
     let permit = match s.sql_gate.try_admit(s.tenant_label()) {
         Ok(p) => p,
@@ -5713,14 +5620,8 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
     })
     .await;
     match result {
-        Ok(Ok(out)) => Json(json!({
-            "valid": true,
-            "note": "query binds; run it with the sql tool",
-            // Same field, same meaning as `/sql` (#528): the hot-tip scan failed, so this bind
-            // answer is against sealed history alone and may miss a table/column the tip would add.
-            "tip_unavailable": out.tip_unavailable,
-        }))
-        .into_response(),
+        // `tip_unavailable` as on `/sql` (#528): bound against sealed history alone.
+        Ok(Ok(out)) => respond(answer::explain_valid(out.tip_unavailable)),
         Ok(Err(e)) if e.downcast_ref::<HotShareRefused>().is_some() => {
             sql_error_response(&s, e, &q.q)
         }
@@ -5766,42 +5667,20 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
                     Some(hint) => format!("{raw}\n\nhint: {hint}"),
                     None => raw,
                 };
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "valid": false, "error": msg })),
-            )
-                .into_response()
+            respond(answer::explain_invalid(&msg))
         }
         Err(e) => error(format!("{e}")),
     }
 }
 
-/// Top balances from the IVM view, descending. Balances are in i64 token base units.
+/// Top balances from the IVM view, descending, in i128 base units as decimal strings.
 async fn balances(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> impl IntoResponse {
-    let limit = q.limit.unwrap_or(100).min(1000);
+    let limit = answer::listing_limit(q.limit);
     let view = s.balances.clone();
-    let top = match sized(&s, s.balances.holders(), move || view.top(limit)).await {
-        Ok(top) => top,
-        Err(refused) => return refused,
-    };
-    // Balances are i128 base units, serialised as decimal strings - JSON numbers can't carry i128
-    // losslessly, and a client parsing a huge balance as an f64 would silently corrupt it.
-    let items: Vec<Value> = top
-        .into_iter()
-        .map(|(address, balance)| json!({ "address": address, "balance": balance.to_string() }))
-        .collect();
-    // COR-8 (#814): a transfer whose value exceeds 38 digits is dropped from these balances - both
-    // legs, deliberately, because dropping one would invent value. Saying so is the whole fix: the
-    // numbers stay what they are, and a caller can tell an incomplete answer from a complete one.
-    // Zero is the ordinary case and is reported rather than omitted, so its absence means an old
-    // build rather than a clean nest.
-    Json(json!({
-        "holders": s.balances.holders(),
-        "count": items.len(),
-        "items": items,
-        "dropped_over_i128": s.balances.dropped_over_i128(),
-    }))
-    .into_response()
+    match sized(&s, s.balances.holders(), move || view.top(limit)).await {
+        Ok(top) => respond(answer::balances(&s.balances, top)),
+        Err(refused) => refused,
+    }
 }
 
 /// The nest's authored incremental entities, and how current each one is (RFC-0041 §5.4, #822).
@@ -5816,64 +5695,19 @@ async fn derived_index(State(s): State<AppState>) -> impl IntoResponse {
         .map(|e| {
             // #932: the pair under one lock.
             let (row_count, applied) = e.len_and_watermark();
-            with_offchain(
-                json!({
-                    "name": e.name(),
-                    "rows": row_count,
-                    "incremental": true,
-                    "applied_through": applied.through,
-                    "current": applied.through >= head,
-                    "available": e.unavailable().is_none() && e.fault().is_none(),
-                }),
-                e,
-                &applied,
-            )
+            answer::derived_index_item(&entity_facts(e), row_count, &applied, head)
         })
         .collect();
-    Json(json!({ "count": items.len(), "head": head, "entities": items }))
-}
-
-/// Why an entity cannot answer right now, if it cannot.
-///
-/// **§5.1: "A catching-up entity is reported as such; it never serves a plausible partial relation as
-/// current."** Criterion 8 asks the keyed and SQL routes to refuse or report not-current
-/// *consistently*, so the decision lives in one function rather than being made twice and drifting.
-///
-/// A faulted or unavailable entity is a **503**: it holds no answer and will not without operator
-/// action. A catching-up one is **not** an error - it is the ordinary state during backfill - but it
-/// is served with `current: false` and its own watermark, never stamped with the nest's head.
-fn derived_refusal(entity: &crate::entity_view::EntityView) -> Option<(StatusCode, Value)> {
-    if let Some(why) = entity.unavailable() {
-        return Some((
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({ "error": "entity unavailable", "entity": entity.name(), "reason": why }),
-        ));
-    }
-    if let Some(why) = entity.fault() {
-        return Some((
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({ "error": "entity faulted", "entity": entity.name(), "reason": why }),
-        ));
-    }
-    None
+    respond(answer::derived_index(head, items))
 }
 
 fn find_entity<'a>(
     s: &'a AppState,
     name: &str,
-) -> Result<&'a crate::entity_view::EntityView, Box<axum::response::Response>> {
+) -> Result<&'a crate::entity_view::EntityView, Answer> {
     s.entities.iter().find(|e| e.name() == name).ok_or_else(|| {
         let known: Vec<&str> = s.entities.iter().map(|e| e.name()).collect();
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": "no such entity",
-                "entity": name,
-                "entities": known,
-            })),
-        )
-            .into_response()
-            .into()
+        answer::no_such_entity(name, &known)
     })
 }
 
@@ -5909,60 +5743,6 @@ fn sql_response(
     (as_of, sealed_through): (Option<u64>, u64),
     cached: bool,
 ) -> axum::response::Response {
-    let mut response = json!({
-        "count": rows.count(),
-        "truncated": out.truncated,
-        // Cold data was incomplete when this answer was computed (#435): a sealed segment the
-        // manifest lists could not be read, so its table was *reduced* and the query succeeded
-        // with quietly less data. Reduction is the right policy (#430) - a bad segment must not
-        // delete a table - but it is only defensible if the caller is told, or `SUM(value)`
-        // comes back wrong rather than absent. Always present, so a caller cannot mistake the
-        // healthy shape for an older build that never reported it.
-        //
-        // `degraded_tables` names the tables and nothing else. Table names are already public on
-        // this surface (`/schema` lists them, and you must name one to query it); segment paths
-        // and content addresses are not, and must never appear here - `/sql` is untrusted, which
-        // is the same reason errors go through `sanitize_sql_error`.
-        "degraded": out.degraded(),
-        "degraded_tables": out.degraded_tables,
-        // Tip failure, not per-table cold reduction (#472): the hot-tip scan itself errored, so
-        // this answer is sealed-history-only regardless of what `degraded_tables` says. Distinct
-        // cause (a damaged/unreadable hot store, not a bad segment) and distinct remedy, so it does
-        // not belong inside `degraded_tables` - see `QueryOutput::tip_unavailable`.
-        "tip_unavailable": out.tip_unavailable,
-        // The query's column order (#1609), which the row objects do not keep.
-        "columns": out.columns,
-        "rows": match rows {
-            SqlRows::Values(v) => json!(v),
-            // Written in place when the body is serialized, below.
-            SqlRows::Serialized { .. } => Value::Null,
-        },
-        // Answered from the deterministic memo (#1186): the same rows this statement produced the
-        // last time every input it reads was in this state. Never stale by construction; here so a
-        // caller measuring the nest can tell a computed answer from a remembered one.
-        "cached": cached,
-        // Provenance (RFC-0016 §4, extended by RFC-0035 §3). `registry_hash` says *how* the rows
-        // were decoded; it does not say **which dataset answered**, and since RFC-0033's early
-        // cutoff a result may legitimately come from data a *different* identity produced - the
-        // adoption is correct, and the old stamp could not express it. `nid` closes that: an agent
-        // citing an answer can now name the dataset, not just the decode.
-        "provenance": {
-            "as_of": as_of,
-            "sealed_through": sealed_through,
-            // Cold-only when the hot scan failed (#1935): the field named for the answer's source must
-            // not say the tip was read when `tip_unavailable` says it was not.
-            "source": if out.tip_unavailable { "sealed" } else { "hot+sealed" },
-            "registry_hash": s.nest_info.get("registry_hash").and_then(Value::as_str),
-            "nid": s.nid.as_deref(),
-            // **#822 criterion 9, on the analytical route.** `source: hot+sealed` describes the
-            // fact tables; it says nothing about a maintained relation, whose rows came from a
-            // circuit rather than from a scan and are current only as far as its own watermark.
-            // A caller citing this answer needs to know both. Absent when the statement
-            // referenced no entity, and absent when the parse was unavailable - see
-            // `QueryOutput::referenced_tables`, which is why this is not an empty array.
-            "entities": sql_entity_provenance(s, out.referenced_tables.as_ref(), watermarks),
-        },
-    });
     // #1437, RFC-0045 stage 1's "provenance visible in the result": an answer that read an offchain
     // table, directly or through an entity, is reproducible by snapshot and says which snapshots.
     let read = out.offchain.as_ref().and_then(read_offchain_json);
@@ -5971,14 +5751,31 @@ fn sql_response(
             names.contains(&e.name().to_ascii_lowercase()) && !e.offchain_tables().is_empty()
         })
     });
-    if let Some(provenance) = response["provenance"].as_object_mut() {
-        if read.is_some() || through_entity {
-            provenance.insert("reproducibility".into(), json!(SNAPSHOT_REPRODUCIBLE));
-        }
-        if let Some(read) = read {
-            provenance.insert("offchain".into(), read);
-        }
-    }
+    let response = answer::sql_envelope(
+        &answer::SqlFacts {
+            count: rows.count(),
+            truncated: out.truncated,
+            degraded_tables: &out.degraded_tables,
+            tip_unavailable: out.tip_unavailable,
+            columns: &out.columns,
+            cached,
+            as_of,
+            sealed_through,
+            // `registry_hash` says how the rows were decoded and `nid` which dataset answered, since
+            // RFC-0033's early cutoff can adopt data another identity produced (RFC-0035 §3).
+            registry_hash: s.nest_info.get("registry_hash").and_then(Value::as_str),
+            nid: s.nid.as_deref(),
+            // #822 criterion 9: a maintained relation is current only as far as its own watermark.
+            entities: sql_entity_provenance(s, out.referenced_tables.as_ref(), watermarks),
+            reproducible_by_snapshot: read.is_some() || through_entity,
+            offchain: read,
+        },
+        match rows {
+            SqlRows::Values(v) => json!(v),
+            // Written in place when the body is serialized, below.
+            SqlRows::Serialized { .. } => Value::Null,
+        },
+    );
     // Room for the body is taken before a remembered one is copied, and after a computed one,
     // already bounded by the permit that computed it, is serialized (#2212).
     let full = |why| refused(s, why, "SQL response bytes in flight");
@@ -5996,11 +5793,11 @@ fn sql_response(
         }
         SqlRows::Values(_) => None,
     };
-    let body = match rows {
-        SqlRows::Values(_) => serde_json::to_vec(&response),
-        SqlRows::Serialized { json, .. } => serde_json::to_vec(&WithRows(&response, json)),
+    let serialized = match rows {
+        SqlRows::Values(_) => None,
+        SqlRows::Serialized { json, .. } => Some(json),
     };
-    let body = match body {
+    let body = match answer::sql_bytes(&response, serialized) {
         Ok(body) => body,
         Err(e) => {
             return (
@@ -6061,27 +5858,6 @@ impl SqlRows<'_> {
     }
 }
 
-/// A response object with its `rows` key's value written from stored JSON, in the key's own place.
-struct WithRows<'a>(&'a Value, &'a serde_json::value::RawValue);
-
-impl serde::Serialize for WithRows<'_> {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let Some(fields) = self.0.as_object() else {
-            return self.0.serialize(ser);
-        };
-        let mut map = ser.serialize_map(Some(fields.len()))?;
-        for (k, v) in fields {
-            if k == "rows" {
-                map.serialize_entry(k, self.1)?;
-            } else {
-                map.serialize_entry(k, v)?;
-            }
-        }
-        map.end()
-    }
-}
-
 fn sql_entity_provenance(
     s: &AppState,
     referenced: Option<&std::collections::BTreeSet<String>>,
@@ -6134,19 +5910,7 @@ fn derived_provenance(
     head: u64,
     applied: &crate::entity_view::Applied,
 ) -> Value {
-    with_offchain(
-        json!({
-            "nid": s.nid,
-            "entity": entity.name(),
-            "incremental": true,
-            "from_maintained_state": true,
-            "applied_through": applied.through,
-            "dataset_head": head,
-            "current": applied.through >= head,
-        }),
-        entity,
-        applied,
-    )
+    answer::derived_provenance(s.nid.as_deref(), &entity_facts(entity), head, applied)
 }
 
 /// **Criterion 2: a direct keyed read does not invoke Burrmill or scan canonical fact history.**
@@ -6160,55 +5924,19 @@ async fn derived_key(
 ) -> impl IntoResponse {
     let entity = match find_entity(&s, &name) {
         Ok(e) => e,
-        Err(r) => return *r,
+        Err(r) => return respond(r),
     };
-    if let Some((code, body)) = derived_refusal(entity) {
-        return (code, Json(body)).into_response();
+    if let Some(refused) = answer::derived_refusal(&entity_facts(entity)) {
+        return respond(refused);
     }
     let head = dataset_head(&s);
-
-    // The key is a single column here. A composite key arrives as its parts joined by the unit
-    // separator, the same character the built-in views use, so a key containing a comma or a slash
-    // cannot be mistaken for a delimiter.
-    let readings: Vec<Vec<crate::entity_row::Scalar>> =
-        key.split('\u{1f}').map(key_part_readings).collect();
-    let (found, applied) = entity.get_with_watermark(&readings);
-    match found {
-        Some(row) => Json(json!({
-            "key": key,
-            "row": row.0.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
-            "provenance": derived_provenance(&s, entity, head, &applied),
-        }))
-        .into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": "no such key",
-                "entity": name,
-                "key": key,
-                "provenance": derived_provenance(&s, entity, head, &applied),
-            })),
-        )
-            .into_response(),
-    }
-}
-
-/// What one path segment can be as a key part: the integer or bool it spells, the text itself, and a
-/// `0x` text lowercased, as addresses and hashes are stored (#2205). At most two per part.
-fn key_part_readings(part: &str) -> Vec<crate::entity_row::Scalar> {
-    use crate::entity_row::Scalar;
-    let mut out = Vec::with_capacity(2);
-    if let Ok(n) = part.parse::<i128>() {
-        out.push(Scalar::Int(n));
-    } else if let Ok(b) = part.parse::<bool>() {
-        out.push(Scalar::Bool(b));
-    }
-    out.push(Scalar::Str(part.to_string()));
-    let lower = part.to_ascii_lowercase();
-    if lower.starts_with("0x") && lower != part {
-        out.push(Scalar::Str(lower));
-    }
-    out
+    let (found, applied) = entity.get_with_watermark(&answer::key_readings(&key));
+    respond(answer::derived_key(
+        &name,
+        &key,
+        found,
+        derived_provenance(&s, entity, head, &applied),
+    ))
 }
 
 /// The whole maintained relation, bounded.
@@ -6223,52 +5951,24 @@ async fn derived_all(
 ) -> impl IntoResponse {
     let entity = match find_entity(&s, &name) {
         Ok(e) => e,
-        Err(r) => return *r,
+        Err(r) => return respond(r),
     };
-    if let Some((code, body)) = derived_refusal(entity) {
-        return (code, Json(body)).into_response();
+    if let Some(refused) = answer::derived_refusal(&entity_facts(entity)) {
+        return respond(refused);
     }
     let head = dataset_head(&s);
-    let limit = q.limit.unwrap_or(100).min(1000);
-    let (rows, first, applied) = entity.head_rows_with_watermark(limit);
-    let items: Vec<Value> = first
-        .iter()
-        .map(|(k, v)| {
-            json!({
-                "key": k.0.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
-                "row": v.0.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-    Json(json!({
-        "entity": name,
-        "rows": rows,
-        "returned": items.len(),
-        "items": items,
-        "provenance": derived_provenance(&s, entity, head, &applied),
-    }))
-    .into_response()
+    let (rows, first, applied) = entity.head_rows_with_watermark(answer::listing_limit(q.limit));
+    respond(answer::derived_all(
+        &name,
+        rows,
+        &first,
+        derived_provenance(&s, entity, head, &applied),
+    ))
 }
 
-/// Point-read a single address's derived balance.
+/// Point-read a single address's derived balance. Same COR-8 caveat as `/balances`.
 async fn balance(State(s): State<AppState>, Path(address): Path<String>) -> impl IntoResponse {
-    let address = address.to_ascii_lowercase();
-    match s.balances.balance(&address) {
-        // Same COR-8 caveat as `/balances`: a single address's balance is as incomplete as the set
-        // it came from, and a caller reading one address should not have to query another endpoint
-        // to learn that.
-        Some(b) => Json(json!({
-            "address": address,
-            "balance": b.to_string(),
-            "dropped_over_i128": s.balances.dropped_over_i128(),
-        }))
-        .into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "no balance", "address": address })),
-        )
-            .into_response(),
-    }
+    respond(answer::balance(&s.balances, &address))
 }
 
 /// Direct counterparty-exposure for an address: how much it has transacted, directly, with the
@@ -6375,29 +6075,13 @@ async fn flags(State(s): State<AppState>, Query(q): Query<FlagsQuery>) -> impl I
     answer.await.unwrap_or_else(|refused| refused)
 }
 
-/// Parse an entity id `{block:012}-{log_index:06}` back into its components.
-fn parse_id(id: &str) -> Option<(u64, u64)> {
-    let (b, l) = id.split_once('-')?;
-    Some((b.parse().ok()?, l.parse().ok()?))
-}
-
 fn not_found(id: &str) -> axum::response::Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({ "error": "not found", "id": id })),
-    )
-        .into_response()
+    respond(answer::not_found(id))
 }
 
+/// SEC-11: the detail is logged and the client gets a generic message.
 fn error(msg: String) -> axum::response::Response {
-    // SEC-11: internal error chains include absolute segment/dir paths (a filesystem-layout disclosure).
-    // Log the detail server-side; hand the client a generic message.
-    tracing::warn!("internal error serving request: {msg}");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": "internal error" })),
-    )
-        .into_response()
+    respond(answer::internal_error(&msg))
 }
 
 /// Constant-time string equality for the admin token - no early return on the first differing byte, so
@@ -6872,6 +6556,14 @@ mod tests {
     /// it were the truth.
     #[test]
     fn a_derived_route_refuses_an_entity_that_holds_no_answer() {
+        fn derived_refusal(e: &crate::entity_view::EntityView) -> Option<(StatusCode, Value)> {
+            answer::derived_refusal(&entity_facts(e)).map(|a| {
+                (
+                    StatusCode::from_u16(a.status).unwrap(),
+                    serde_json::from_slice(&a.body).unwrap(),
+                )
+            })
+        }
         fn cols() -> Vec<String> {
             vec!["to".into(), "sum_value".into()]
         }

@@ -28,7 +28,7 @@ redb = "2"
 size-of = { package = "feldera-size-of", version = "0.1.7" }
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` as nuthatch-decode has it, so a hash over JSON here is the one the binary computes.
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 sha2 = "0.10"
 tokio = { version = "1", default-features = false, features = ["macros", "sync"] }
 tracing = "0.1"
