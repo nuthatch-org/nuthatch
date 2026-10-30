@@ -2604,45 +2604,9 @@ fn define_children_views(session: &dyn Session, dir: &Path) {
     // `debug!` below, so a factory nest would silently lose `{template}__children` entirely. Omitted
     // rather than `0 AS discovered_timestamp` for the same reason the column itself is omitted: a
     // zero that looks like a timestamp is worse than an error.
-    let (ts, cols) = if config.nest.block_timestamps {
-        (
-            "block_timestamp AS discovered_timestamp, ",
-            "discovered_timestamp, ",
-        )
-    } else {
-        ("", "")
-    };
-
-    let mut by_template: std::collections::BTreeMap<String, Vec<(String, String)>> =
-        std::collections::BTreeMap::new();
-    for (template, table, child_param) in fs.view_sources() {
-        by_template
-            .entry(template)
-            .or_default()
-            .push((table, child_param));
-    }
-
-    for (template, sources) in by_template {
-        // `child_param`/`table` are registry-derived (never user text) → no injection surface.
-        let selects: Vec<String> = sources
-            .iter()
-            .map(|(table, cp)| {
-                format!(
-                    "SELECT lower(\"{cp}\") AS address, block_number AS discovered_block, \
-                     log_index AS discovered_log_index, {ts}\
-                     lower(address) AS parent_address FROM \"{table}\""
-                )
-            })
-            .collect();
-        let union = selects.join(" UNION ALL ");
-        let ddl = format!(
-            "CREATE OR REPLACE VIEW \"{template}__children\" AS \
-             SELECT address, discovered_block, discovered_log_index, {cols}parent_address \
-             FROM ({union}) \
-             QUALIFY row_number() OVER (PARTITION BY address ORDER BY discovered_block, discovered_log_index) = 1"
-        );
+    for (name, ddl) in nuthatch_core::bind::children_views(&fs, config.nest.block_timestamps) {
         if let Err(e) = session.execute(&ddl) {
-            tracing::debug!("children view {template}__children skipped: {e}");
+            tracing::debug!("children view {name} skipped: {e}");
         }
     }
 }

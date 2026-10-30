@@ -3588,6 +3588,7 @@ dependencies = [
 name = "nuthatch-embed"
 version = "0.0.1"
 dependencies = [
+ "alloy-primitives",
  "anyhow",
  "arrow-array",
  "async-trait",

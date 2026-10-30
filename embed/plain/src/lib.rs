@@ -15,7 +15,8 @@ use nuthatch_embed::cellar::Cellar;
 use nuthatch_embed::derived::NestFiles;
 use nuthatch_embed::mirror::{self, Hydrated, MirrorConfig, MirrorHost};
 use nuthatch_embed::nest::{NestSpec, CONFIG_FILE};
-use nuthatch_embed::tab::TabNest;
+use nuthatch_embed::tab::{TabNest, Verified};
+use nuthatch_embed::verified::{VerifiedHead, Verifier};
 use nuthatch_embed::young;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -133,6 +134,9 @@ struct Config {
     mirror: Option<MirrorConfig>,
     /// Whether `nh_step` follows the chain past what the store holds; true unless set.
     follow: Option<bool>,
+    /// RFC-0077 S5: seal only under a finalized block the host verified, asked for by request.
+    #[serde(default)]
+    verified: bool,
     #[serde(default)]
     storage: Storage,
     #[serde(default)]
@@ -152,6 +156,7 @@ type Opening = Pin<Box<dyn Future<Output = anyhow::Result<Engine>>>>;
 
 struct Engine {
     nest: Arc<TabNest>,
+    verifier: Option<Arc<Verifier>>,
     follows: bool,
     hydrated: Option<Hydrated>,
     cellar: Arc<Cellar>,
@@ -513,6 +518,23 @@ impl MirrorHost for HostMirror {
     }
 }
 
+/// The host's verified finalized block, asked for once a follow (RFC-0077 S5).
+struct HostHead;
+
+#[async_trait::async_trait(?Send)]
+impl VerifiedHead for HostHead {
+    async fn finalized(&self) -> anyhow::Result<(u64, String)> {
+        let a = ask(json!({"kind": "verified_finalized"})).await;
+        if let Some(e) = a.get("error") {
+            anyhow::bail!("{}", e.as_str().unwrap_or("failed"));
+        }
+        match (a["number"].as_u64(), a["hash"].as_str()) {
+            (Some(n), Some(h)) => Ok((n, h.to_string())),
+            _ => anyhow::bail!("verified_finalized answered {a}, not a number and a hash"),
+        }
+    }
+}
+
 /// Storage mode `host`: clear the nest's files if asked, then open the store, each through the host.
 async fn open_host(c: Config, spec: NestSpec) -> anyhow::Result<Engine> {
     if c.fresh {
@@ -567,8 +589,16 @@ fn build(
     if !c.files.is_empty() {
         nest.derive(&c.files)?;
     }
+    let verifier = c.verified.then(|| Arc::new(Verifier::new()));
+    if let Some(v) = &verifier {
+        nest.verify_with(Verified {
+            verifier: v.clone(),
+            head: Arc::new(HostHead),
+        });
+    }
     Ok(Engine {
         nest: Arc::new(nest),
+        verifier,
         follows: c
             .follow
             .unwrap_or(c.mirror.as_ref().is_none_or(|m| m.postcard.is_none())),
@@ -677,7 +707,10 @@ fn step(engine: &mut Engine) -> Result<Value, Fault> {
         Driven::Done(r) => {
             engine.follow = None;
             engine.rolled = r.map_err(|e| fault_of("follow_failed", e))?;
-            Ok(json!({"idle": true}))
+            match engine.verifier.as_ref().and_then(|v| v.unverified()) {
+                Some(why) => Ok(json!({"idle": true, "unverified": why})),
+                None => Ok(json!({"idle": true})),
+            }
         }
     }
 }
@@ -787,6 +820,7 @@ pub extern "C" fn nh_report() -> i32 {
         )
         .map(|mut r| {
             r["mirror"] = engine.hydrated.as_ref().map(Hydrated::to_json).into();
+            r["verified"] = engine.verifier.as_ref().map(|v| v.report()).into();
             r
         })
         .map_err(|e| fault("report_failed", format!("{e:#}")))

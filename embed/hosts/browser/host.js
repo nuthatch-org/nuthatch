@@ -52,7 +52,9 @@ export const onceSealed = (engine) => (stats) =>
 
 /// Instantiate `module` (bytes or a `WebAssembly.Module`). `storage` is `{open, remove, list}`, whose
 /// `open` resolves to a file with the sync access handle's methods; `rpc` performs an `rpc` request.
-export async function load(module, { storage, rpc, log }) {
+/// `verified`, for a nest opened with `verified: true`, resolves to the finalized block `{number,
+/// hash}` a light client verified (in a page, Helios: burrmill-wasm's `verifiedFinalized`).
+export async function load(module, { storage, rpc, log, verified }) {
   const files = new Map();
   let nextHandle = 1;
   let mem;
@@ -157,6 +159,11 @@ export async function load(module, { storage, rpc, log }) {
           return await rpc(r);
         case "get":
           return await get(r);
+        case "verified_finalized": {
+          if (!verified) return { error: "this host has no light client" };
+          const { number, hash } = await verified();
+          return { number, hash };
+        }
         case "open": {
           const f = await storage.open(checkName(r.name));
           const h = nextHandle++;
@@ -190,7 +197,7 @@ export async function load(module, { storage, rpc, log }) {
       for (;;) {
         stats.steps += 1;
         const s = call("nh_step");
-        if (s.idle) return stats;
+        if (s.idle) return { ...stats, ...(s.unverified ? { unverified: s.unverified } : {}) };
         if (s.requests && stop?.(stats)) return { ...stats, stopped: true };
         if (s.requests) {
           const answers = await Promise.all(s.requests.map(perform));

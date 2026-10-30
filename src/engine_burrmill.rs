@@ -803,24 +803,19 @@ impl Session for BurrmillSession {
     }
 
     fn bind_labels(&self, labels_dir: &Path) -> Result<()> {
-        let mut rows = Vec::new();
+        let mut snapshots = Vec::new();
         for e in std::fs::read_dir(labels_dir)?.flatten() {
             let p = e.path();
             if p.extension().is_none_or(|x| x != "json") {
                 continue;
             }
-            let text = std::fs::read_to_string(&p)?;
-            let doc: Value = serde_json::from_str(&text)
-                .with_context(|| format!("{} is not JSON", p.display()))?;
-            for item in doc.as_array().into_iter().flatten() {
-                let address = item
-                    .get("address")
-                    .and_then(Value::as_str)
-                    .map(str::to_ascii_lowercase);
-                let label = item.get("label").cloned().unwrap_or(Value::Null);
-                rows.push(serde_json::json!({ "address": address, "label": label }));
-            }
+            snapshots.push((p.display().to_string(), std::fs::read_to_string(&p)?));
         }
+        let rows = nuthatch_core::bind::label_rows(
+            snapshots
+                .iter()
+                .map(|(name, text)| (name.clone(), text.as_str())),
+        )?;
         if rows.is_empty() {
             return Err(anyhow!("no label snapshots"));
         }

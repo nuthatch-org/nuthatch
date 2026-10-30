@@ -53,6 +53,7 @@ pub fn open_nest(
         seal_span: spec.chain.seal_span,
         sinks: cellar,
         history: Some(Arc::new(history)),
+        verified: None,
     };
     TabNest::open_sealing(store, spec, start, sealing)
 }

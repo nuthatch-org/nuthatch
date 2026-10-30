@@ -30,6 +30,8 @@ nuthatch-decode = { path = "../decode" }
 nuthatch-seal = { path = "../seal" }
 # RFC-0077 S4: a nest's data identity from its files, which names its dataset on a mirror.
 nuthatch-identity = { path = "../identity" }
+# RFC-0077 S5: keccak for the headers a verified head is checked through.
+alloy-primitives = "1.6"
 anyhow = "1"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }

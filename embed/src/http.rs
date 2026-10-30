@@ -171,6 +171,7 @@ async fn bind(n: &Nest<'_>) -> anyhow::Result<TabQuery> {
         &n.nest.entities,
         n.files,
         n.nest.budget,
+        &n.nest.children_views(),
     )
     .await
 }
