@@ -478,3 +478,111 @@ pub fn rebuild_children(
     }
     Ok(children)
 }
+
+// The views' cold folds as SQL over a nest's sealed transfer tables, and their rows read back: what a
+// node's `ColdFolds` asks Burrmill, so an embedding asking the same engine folds the same way.
+
+/// `expr` as `ty` when it has at most 38 digits, else NULL: the nest's `DECIMAL(38,0)` line (COR-8),
+/// spelled so the drop is visible to an engine that refuses to sum a `TRY_CAST` (Burrmill's checked
+/// rule). [`crate::views::transfer_value`] draws the same line for the live views.
+pub fn exact_or_null(expr: &str, ty: &str) -> String {
+    format!("CASE WHEN TRY_CAST({expr} AS DECIMAL(38,0)) IS NOT NULL THEN CAST({expr} AS {ty}) END")
+}
+
+pub fn net_balances_sql(table: &str, from_col: &str, to_col: &str, value_col: &str) -> String {
+    // `to` receives (+value), `from` sends (−value); a value past 38 digits is NULL (skipped),
+    // mirroring the live views' `transfer_value`.
+    let d = exact_or_null(&format!("\"{value_col}\""), "HUGEINT");
+    format!(
+        "SELECT addr, SUM(d)::VARCHAR AS net FROM (\
+           SELECT \"{to_col}\" AS addr, {d} AS d FROM \"{table}\" \
+           UNION ALL \
+           SELECT \"{from_col}\" AS addr, -{d} AS d FROM \"{table}\"\
+         ) GROUP BY addr HAVING SUM(d) <> 0"
+    )
+}
+
+pub fn cold_exposure_sql(table: &str, from_col: &str, to_col: &str, value_col: &str) -> String {
+    // Outbound: the sender has exposure to the labels of a labeled recipient. Inbound: the recipient
+    // has exposure from the labels of a labeled sender. COUNT/SUM per (address, label, direction).
+    let d = exact_or_null(&format!("t.\"{value_col}\""), "HUGEINT");
+    format!(
+        "SELECT addr, label, dir, SUM(d)::VARCHAR AS amount, COUNT(*) AS cnt FROM (\
+           SELECT lower(t.\"{from_col}\") AS addr, l.label AS label, 'out' AS dir, \
+                  {d} AS d \
+           FROM \"{table}\" t JOIN labels l ON lower(t.\"{to_col}\") = l.address \
+           UNION ALL \
+           SELECT lower(t.\"{to_col}\") AS addr, l.label, 'in', \
+                  {d} AS d \
+           FROM \"{table}\" t JOIN labels l ON lower(t.\"{from_col}\") = l.address\
+         ) WHERE d IS NOT NULL GROUP BY addr, label, dir"
+    )
+}
+
+pub fn cold_velocity_sql(table: &str, from_col: &str, value_col: &str, window: u64) -> String {
+    let w = window.max(1);
+    // window_start = (block // W) * W; sum outbound volume + count per (sender, window). A value
+    // past 38 digits leaves the count too, as the hot replay never feeds that transfer at all.
+    let d = exact_or_null(&format!("\"{value_col}\""), "HUGEINT");
+    format!(
+        "SELECT lower(\"{from_col}\") AS addr, (block_number // {w}) * {w} AS ws, \
+                SUM({d})::VARCHAR AS vol, COUNT(*) AS cnt \
+         FROM \"{table}\" WHERE {d} IS NOT NULL GROUP BY addr, ws"
+    )
+}
+
+pub fn oversized_sql(table: &str, value_col: &str) -> String {
+    format!(
+        "SELECT COUNT(*)::VARCHAR AS n FROM \"{table}\"          WHERE \"{value_col}\" IS NOT NULL AND TRY_CAST(\"{value_col}\" AS DECIMAL(38,0)) IS NULL"
+    )
+}
+
+fn i128_of(v: &Value) -> Option<i128> {
+    v.as_str().and_then(|s| s.parse().ok())
+}
+
+/// [`oversized_sql`]'s count.
+pub fn oversized_rows(rows: &[Value]) -> u64 {
+    rows.first()
+        .and_then(|r| r["n"].as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// [`net_balances_sql`]'s `(address, net)` rows.
+pub fn net_balances_rows(rows: &[Value]) -> Vec<(String, i128)> {
+    rows.iter()
+        .filter_map(|r| Some((r["addr"].as_str()?.to_string(), i128_of(&r["net"])?)))
+        .collect()
+}
+
+/// [`cold_exposure_sql`]'s rows, keyed `address\u{1f}label\u{1f}direction` as `exposure::seed_item` takes them.
+pub fn cold_exposure_rows(rows: &[Value]) -> Vec<(String, i128, i128)> {
+    rows.iter()
+        .filter_map(|r| {
+            let (addr, label, dir, cnt) = (
+                r["addr"].as_str()?,
+                r["label"].as_str()?,
+                r["dir"].as_str()?,
+                r["cnt"].as_i64()?,
+            );
+            let amount = i128_of(&r["amount"]).unwrap_or(0);
+            Some((
+                format!("{addr}\u{1f}{label}\u{1f}{dir}"),
+                amount,
+                cnt as i128,
+            ))
+        })
+        .collect()
+}
+
+/// [`cold_velocity_sql`]'s rows, keyed `address\u{1f}window_start` as `velocity::seed_item` takes them.
+pub fn cold_velocity_rows(rows: &[Value]) -> Vec<(String, i128, i128)> {
+    rows.iter()
+        .filter_map(|r| {
+            let (addr, ws, cnt) = (r["addr"].as_str()?, r["ws"].as_u64()?, r["cnt"].as_i64()?);
+            let vol = i128_of(&r["vol"]).unwrap_or(0);
+            Some((format!("{addr}\u{1f}{ws}"), vol, cnt as i128))
+        })
+        .collect()
+}

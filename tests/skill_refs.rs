@@ -305,7 +305,9 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     // The nest's part of `nuthatch.toml`, in nuthatch-core since RFC-0077 S4.
     (
         "core/src/nest_config.rs",
-        Some(&["Nest", "Contract", "Template", "Factory", "Flags", "Extract"]),
+        Some(&[
+            "Nest", "Contract", "Template", "Factory", "Flags", "Extract",
+        ]),
     ),
 ];
 
