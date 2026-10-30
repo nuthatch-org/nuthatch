@@ -1,0 +1,10 @@
+{
+  "layout_version": 1,
+  "chain_id": 1,
+  "data_identity": "6eb46815c819ffdf1a6e06e870394eb5a4173fb55471fdfd9e3c83d79da8fdaa",
+  "indexed_from": 26239807,
+  "complete_through": 26245806,
+  "catalogue_sha256": "33a42e113fc8359810630da37fd9fb540425485131c4fd6c10bb2fe3e420bcea",
+  "tails_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "tails": {}
+}

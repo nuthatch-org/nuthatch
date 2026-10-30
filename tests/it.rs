@@ -114,6 +114,8 @@ mod e2e_stop_releases_store;
 mod e2e_tab_answers;
 #[path = "e2e_tab_entities.rs"]
 mod e2e_tab_entities;
+#[path = "e2e_tab_mirror.rs"]
+mod e2e_tab_mirror;
 #[path = "e2e_tab_parity.rs"]
 mod e2e_tab_parity;
 #[path = "e2e_trino_contract.rs"]
