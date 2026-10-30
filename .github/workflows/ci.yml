@@ -1,4 +1,3 @@
-          ./build-tab.sh nodejs pkg 2>&1 | tee "$RUNNER_TEMP/tab-nodejs.log"
 name: ci
 
 on:
@@ -669,6 +668,8 @@ jobs:
         uses: ./.github/actions/wasm-tools
       - name: the tab module (embed)
         working-directory: embed
+        # `shell: bash` for pipefail: the build is piped into tee.
+        shell: bash
         run: |
           ./build-tab.sh nodejs pkg 2>&1 | tee "$RUNNER_TEMP/tab-nodejs.log"
           # RFC-0075 S6: every gate below runs this module, whose size goes to the job summary.
@@ -756,6 +757,8 @@ jobs:
           cargo build --locked --release --manifest-path tests/wasmtime-host/Cargo.toml
       - name: the plain module, its imports, and its pinned interface
         working-directory: embed
+        # `shell: bash` for pipefail: the compile and the interface check are piped.
+        shell: bash
         run: |
           plain/build.sh "$RUNNER_TEMP/plain.wasm"
           node plain/imports.mjs "$RUNNER_TEMP/plain.wasm"
