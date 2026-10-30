@@ -300,6 +300,17 @@ unconfigured.
 > hardened SQL surface, with read replicas and upgrades without an outage as the last and largest
 > slices. FR8's isolation guarantee ships only after an independent review.
 >
+> **RFC-0077 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
+> [RFC-0077](docs/rfcs/0077-the-embeddable-engine.md) (the embeddable engine) on 2026-10-30, from
+> Chris's "it's pure rust and can(?) be embedded as a wasm blob". Chief's rule binds every slice:
+> "nuthatch is one indexer software with many ways to run it, wasm only if needed (as a feature) and
+> the main path, the delightful core, stays as is." The binary stays the main pitch. The engine is
+> an opt-in separate crate, off by default; the default binary gains no wasmtime and no wasm
+> toolchain, and RFC-0046 §1's deletion test applies. The wasm32 constraint binds only the modules
+> the two share, and where it would cost the native path, the binary keeps its own implementation.
+> S0 to S5 are authorised in order, each on its own gate; S6 (rotki) waits for Lefteris to ask. A
+> blog post on what it is and how it works follows completion.
+>
 > **RFC-0076 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
 > [RFC-0076](docs/rfcs/0076-scaling-the-shared-runtime.md) (scaling the shared runtime) on 2026-10-29,
 > GraphOps's follow-up requests: "yes. letsgooo". FR17 to FR19 are new capability in the default binary:
