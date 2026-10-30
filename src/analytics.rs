@@ -2227,31 +2227,9 @@ fn expand_through_views(
         .into_iter()
         .map(|(name, sql)| (name.to_ascii_lowercase(), sql))
         .collect();
-
-    let mut out = named.clone();
-    let mut frontier: Vec<String> = named.iter().cloned().collect();
-    // Visit each name once. The finite catalogue and `out` bound traversal without
-    // silently dropping sources beyond an arbitrary dependency depth.
-    while !frontier.is_empty() {
-        let mut next = Vec::new();
-        for name in frontier.drain(..) {
-            let Some(sql) = defs.get(&name) else { continue };
-            let Some(body) = view_body(sql) else { continue };
-            let Some(inner) = base_tables_in(session, body) else {
-                continue;
-            };
-            for t in inner {
-                if out.insert(t.clone()) {
-                    next.push(t);
-                }
-            }
-        }
-        if next.is_empty() {
-            break;
-        }
-        frontier = next;
-    }
-    out
+    nuthatch_core::bind::through_views(named, |name| {
+        base_tables_in(session, view_body(defs.get(name)?)?)
+    })
 }
 
 /// The `SELECT` inside a stored `CREATE VIEW … AS …`, the body Burrmill's `register_view` takes.
@@ -2792,27 +2770,15 @@ fn read_sealed(
     mut guard: Option<QueryGuard>,
 ) -> Result<Option<Value>> {
     let manifest = crate::seal::load_manifest(dir)?;
-    // The id names no table. Asking each in turn cost a query per table (#1574), so one probe finds
-    // the table and the row is then read from it alone, in the shape a single-table query gives.
-    let probe = manifest
-        .tables
-        .keys()
-        .map(|t| {
-            format!(
-                "SELECT '{}' AS t FROM \"{t}\" WHERE block_number = {block} AND log_index = {log_index}",
-                t.replace('\'', "''")
-            )
-        })
-        .collect::<Vec<_>>();
-    if probe.is_empty() {
+    let Some(probe) = nuthatch_core::bind::sealed_probe(
+        manifest.tables.keys().map(String::as_str),
+        block,
+        log_index,
+    ) else {
         return Ok(None);
-    }
+    };
     let started = Instant::now();
-    let found = sealed_rows(
-        dir,
-        &format!("{} ORDER BY t LIMIT 1", probe.join(" UNION ALL ")),
-        guard,
-    )?;
+    let found = sealed_rows(dir, &probe, guard)?;
     // The second read spends what the probe left of the one deadline.
     if let Some(g) = guard.as_mut() {
         g.timeout = g.timeout.saturating_sub(started.elapsed());
@@ -2820,9 +2786,7 @@ fn read_sealed(
     let Some(table) = found.first().and_then(|r| r["t"].as_str()) else {
         return Ok(None);
     };
-    let sql = format!(
-        "SELECT * FROM \"{table}\" WHERE block_number = {block} AND log_index = {log_index} LIMIT 1"
-    );
+    let sql = nuthatch_core::bind::sealed_row(table, block, log_index);
     Ok(sealed_rows(dir, &sql, guard)?.into_iter().next())
 }
 
@@ -3274,26 +3238,17 @@ fn held_relation_types() -> &'static HeldRelationTypes {
 }
 
 /// Record an entity's output columns with the types its plan gives them (#1598), so its relation
-/// exists before it holds a row and keeps one type whatever its values. A column whose type the plan
-/// cannot fix, a `CASE` over mixed branches for one, is text.
+/// exists before it holds a row and keeps one type whatever its values.
 pub(crate) fn hold_relation_types(
     dir: &Path,
     name: &str,
     columns: &[String],
     types: &[Option<crate::entity_expr::Type>],
 ) {
-    use crate::entity_expr::Type;
     let cols = columns
         .iter()
         .zip(types)
-        .map(|(c, t)| {
-            let ty = match t {
-                Some(Type::Int) => "HUGEINT",
-                Some(Type::Bool) => "BOOLEAN",
-                Some(Type::Str) | None => "VARCHAR",
-            };
-            (c.clone(), ty)
-        })
+        .map(|(c, t)| (c.clone(), nuthatch_core::bind::relation_type(*t)))
         .collect();
     held_relation_types()
         .lock()

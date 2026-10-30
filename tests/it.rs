@@ -118,6 +118,8 @@ mod e2e_tab_entities;
 mod e2e_tab_parity;
 #[path = "e2e_trino_contract.rs"]
 mod e2e_trino_contract;
+#[path = "embed_versions.rs"]
+mod embed_versions;
 #[path = "engine_batch_boundary.rs"]
 mod engine_batch_boundary;
 #[path = "entity_provenance_is_atomic.rs"]

@@ -4931,6 +4931,7 @@ dependencies = [
 name = "nuthatch-core"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -4941,6 +4942,7 @@ dependencies = [
  "hex",
  "js-sys",
  "nuthatch-decode",
+ "nuthatch-scaffold",
  "nuthatch-seal",
  "redb",
  "rkyv",
@@ -4948,7 +4950,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlparser",
  "tokio",
+ "toml",
  "tracing",
  "url",
  "wasm-bindgen",

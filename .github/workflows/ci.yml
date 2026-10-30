@@ -582,12 +582,12 @@ jobs:
         with:
           ceiling: 90
 
-  # RFC-0075 S1. `nuthatch-core` must keep building for a tab, on the patched dbsp the spike carries:
-  # the patch lives in `spike/dbsp-wasm`'s own `[patch.crates-io]`, so the binary never sees it. The
+  # RFC-0075 S1. `nuthatch-core` must keep building for a tab, on the patched dbsp `embed/` carries:
+  # the patch is `embed/`'s own `[patch.crates-io]`, onto our forks, so the binary never sees it. The
   # Node run steps the circuits there, the views under the inline driver among them.
   #
   # Three runners in parallel, then this name over all of them. As one job it took 18-39 minutes, most
-  # of it compiling the spike once per profile in turn: native release, the tab module, wasm32 release.
+  # of it compiling `embed/` once per profile in turn: native release, the tab module, wasm32 release.
   wasm-core:
     name: nuthatch-core (native, wasm32, Node)
     runs-on: ubuntu-latest
@@ -598,7 +598,7 @@ jobs:
       - name: every leg green
         shell: bash
         run: |
-          echo "native spike: ${{ needs.wasm-native.result }}"
+          echo "native embed: ${{ needs.wasm-native.result }}"
           echo "core, tab module, Node, Service Worker: ${{ needs.wasm-tab.result }}"
           echo "wasm32 in Chrome: ${{ needs.wasm-chrome.result }}"
           echo "plain module, Node and wasmtime: ${{ needs.wasm-plain.result }}"
@@ -614,9 +614,9 @@ jobs:
             exit 1
           fi
 
-  # The native release build of the spike is the longest single compile, so it has a runner to itself.
+  # The native release build of `embed/` is the longest single compile, so it has a runner to itself.
   wasm-native:
-    name: nuthatch-core (native spike)
+    name: nuthatch-core (native embed)
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
@@ -627,12 +627,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-on-failure: true
-          workspaces: spike/dbsp-wasm
+          workspaces: embed
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: vendor the patched dbsp
-        run: spike/dbsp-wasm/vendor.sh
-      - name: native step test (spike)
-        working-directory: spike/dbsp-wasm
+      - name: native step test (embed)
+        working-directory: embed
         run: cargo test --locked --release --test native
 
   # Every gate here runs the module the tab ships: the `tab` profile, then wasm-opt.
@@ -653,7 +651,7 @@ jobs:
           cache-on-failure: true
           workspaces: |
             core
-            spike/dbsp-wasm
+            embed
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: fmt · clippy · test (core)
         run: |
@@ -661,17 +659,15 @@ jobs:
           cargo clippy --locked --all-targets --manifest-path core/Cargo.toml -- -D warnings
           cargo test --locked --manifest-path core/Cargo.toml
           cargo test --locked --manifest-path core/Cargo.toml --features checkpoint-hash-index
-      - name: vendor the patched dbsp
-        run: spike/dbsp-wasm/vendor.sh
       - name: C toolchain for wasm32
         uses: ./.github/actions/wasm32-c-toolchain
       - name: wasm check (core)
-        working-directory: spike/dbsp-wasm
+        working-directory: embed
         run: cargo check --locked --target wasm32-unknown-unknown -p nuthatch-core
       - name: wasm-bindgen and binaryen
         uses: ./.github/actions/wasm-tools
-      - name: the tab module (spike)
-        working-directory: spike/dbsp-wasm
+      - name: the tab module (embed)
+        working-directory: embed
         run: |
           cargo build --locked --profile tab --target wasm32-unknown-unknown
           # One cargo build, two bindings: wasm-opt and size.mjs's brotli each leave cores idle.
@@ -686,56 +682,56 @@ jobs:
           # RFC-0075 S6: every gate below runs this module, whose size goes to the job summary.
           size=$(tail -1 "$RUNNER_TEMP/tab-nodejs.log")
           echo "tab module bytes after wasm-bindgen and wasm-opt: \`$size\` (burrmill-wasm: 5.6 MB brotli)" >> "$GITHUB_STEP_SUMMARY"
-      - name: Node step test (spike)
-        working-directory: spike/dbsp-wasm
+      - name: Node step test (embed)
+        working-directory: embed
         run: node --stack-trace-limit=60 run-node.mjs pkg
       - name: fixture-rpc
         run: cargo build --locked --release --manifest-path tools/fixture-rpc/Cargo.toml
       # RFC-0075 S3: the tab's live cursor over `fetch`, held to the node's pinned segments and
       # balances for the recorded young contract (`e2e_tab_parity` holds the node to the same file).
-      - name: live cursor in Node against the recording (spike)
-        working-directory: spike/dbsp-wasm
+      - name: live cursor in Node against the recording (embed)
+        working-directory: embed
         run: |
-          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --port 8947 \
-            --file ../../tests/fixtures/tab-parity/chain.json.gz &
+          ../tools/fixture-rpc/target/release/fixture-rpc recorded --port 8947 \
+            --file ../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8947/ && break; sleep 0.2; done
-          node run-live.mjs pkg http://127.0.0.1:8947/ ../../tests/fixtures/tab-parity
+          node run-live.mjs pkg http://127.0.0.1:8947/ ../tests/fixtures/tab-parity
       # RFC-0075 S4: entities and views in the tab through the fixture's scripted reorg, held to the
       # node's answers (`e2e_tab_entities` holds the node to the same file).
-      - name: entities and views in Node through a reorg (spike)
-        working-directory: spike/dbsp-wasm
+      - name: entities and views in Node through a reorg (embed)
+        working-directory: embed
         run: |
-          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --fork --port 8949 \
-            --file ../../tests/fixtures/tab-parity/chain.json.gz &
+          ../tools/fixture-rpc/target/release/fixture-rpc recorded --fork --port 8949 \
+            --file ../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8949/ && break; sleep 0.2; done
-          node run-entities.mjs pkg http://127.0.0.1:8949/ ../../tests/fixtures/tab-parity
+          node run-entities.mjs pkg http://127.0.0.1:8949/ ../tests/fixtures/tab-parity
       # RFC-0075 S5: the query routes answered in the tab, byte for byte against the node's pin
       # (`e2e_tab_answers` holds the node to the same file).
-      - name: query routes in Node (spike)
-        working-directory: spike/dbsp-wasm
+      - name: query routes in Node (embed)
+        working-directory: embed
         run: |
-          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --fork --port 8950 \
-            --file ../../tests/fixtures/tab-parity/chain.json.gz &
+          ../tools/fixture-rpc/target/release/fixture-rpc recorded --fork --port 8950 \
+            --file ../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8950/ && break; sleep 0.2; done
-          node run-answers.mjs pkg http://127.0.0.1:8950/ ../../tests/fixtures/tab-parity
+          node run-answers.mjs pkg http://127.0.0.1:8950/ ../tests/fixtures/tab-parity
       # RFC-0075 S6: the 600 MiB and 2 GiB ceilings with a cursor and a statement running together.
-      - name: memory budgets in Node (spike)
-        working-directory: spike/dbsp-wasm
+      - name: memory budgets in Node (embed)
+        working-directory: embed
         run: |
-          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --port 8952 \
-            --file ../../tests/fixtures/tab-parity/chain.json.gz &
+          ../tools/fixture-rpc/target/release/fixture-rpc recorded --port 8952 \
+            --file ../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8952/ && break; sleep 0.2; done
-          node run-budget.mjs pkg http://127.0.0.1:8952/ ../../tests/fixtures/tab-parity
+          node run-budget.mjs pkg http://127.0.0.1:8952/ ../tests/fixtures/tab-parity
       # RFC-0075 S5: the same routes through the Service Worker, as plain `fetch`es on the page's
       # origin, with the scaffolded skill's examples run as written.
-      - name: query routes through a Service Worker in headless Chrome (spike)
-        working-directory: spike/dbsp-wasm
+      - name: query routes through a Service Worker in headless Chrome (embed)
+        working-directory: embed
         run: |
           chrome=$(npx -y @puppeteer/browsers@2.10.10 install chrome@stable --path "$RUNNER_TEMP/browsers" | tail -1 | cut -d' ' -f2-)
-          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --fork --port 8951 \
-            --file ../../tests/fixtures/tab-parity/chain.json.gz &
+          ../tools/fixture-rpc/target/release/fixture-rpc recorded --fork --port 8951 \
+            --file ../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8951/ && break; sleep 0.2; done
-          node run-sw.mjs "$chrome" http://127.0.0.1:8951/ ../../tests/fixtures/tab-parity
+          node run-sw.mjs "$chrome" http://127.0.0.1:8951/ ../tests/fixtures/tab-parity
 
   # RFC-0077 S0: the tab's live cursor as a plain core module, imports `nuthatch.*` only, driven by
   # two hosts that perform its requests: Node with no wasm-bindgen glue, and wasmtime from Rust. Both
@@ -756,26 +752,22 @@ jobs:
         with:
           cache-on-failure: true
           workspaces: |
-            spike/dbsp-wasm/plain
-            spike/dbsp-wasm/plain/host
+            embed/plain
+            embed/plain/host
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: vendor the patched dbsp and the four host-neutral crates
-        run: |
-          spike/dbsp-wasm/vendor.sh
-          spike/dbsp-wasm/plain/vendor.sh
       - name: C toolchain for wasm32
         uses: ./.github/actions/wasm32-c-toolchain
       - name: wasm-bindgen and binaryen
         uses: ./.github/actions/wasm-tools
       - name: fmt · clippy (plain module, wasmtime host)
-        working-directory: spike/dbsp-wasm/plain
+        working-directory: embed/plain
         run: |
           cargo fmt --check
           cargo fmt --check --manifest-path host/Cargo.toml
           RUSTFLAGS='--cfg getrandom_backend="custom"' cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
           cargo clippy --locked --manifest-path host/Cargo.toml -- -D warnings
       - name: the plain module, and its imports
-        working-directory: spike/dbsp-wasm/plain
+        working-directory: embed/plain
         run: |
           ./build.sh "$RUNNER_TEMP/plain.wasm"
           node imports.mjs "$RUNNER_TEMP/plain.wasm"
@@ -783,16 +775,16 @@ jobs:
       - name: fixture-rpc and the wasmtime host
         run: |
           cargo build --locked --release --manifest-path tools/fixture-rpc/Cargo.toml
-          cargo build --locked --release --manifest-path spike/dbsp-wasm/plain/host/Cargo.toml
+          cargo build --locked --release --manifest-path embed/plain/host/Cargo.toml
       - name: S3's recording in Node and in wasmtime
-        working-directory: spike/dbsp-wasm/plain
+        working-directory: embed/plain
         # `shell: bash` for pipefail: each run is piped into tee.
         shell: bash
         run: |
-          ../../../tools/fixture-rpc/target/release/fixture-rpc recorded --port 8953 \
-            --file ../../../tests/fixtures/tab-parity/chain.json.gz &
+          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --port 8953 \
+            --file ../../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8953/ && break; sleep 0.2; done
-          d=../../../tests/fixtures/tab-parity
+          d=../../tests/fixtures/tab-parity
           node run-node.mjs "$RUNNER_TEMP/plain.wasm" http://127.0.0.1:8953/ $d | tee "$RUNNER_TEMP/node.log"
           host/target/release/plain-host compile "$RUNNER_TEMP/plain.wasm" "$RUNNER_TEMP/plain.cwasm" | tee "$RUNNER_TEMP/compile.log"
           host/target/release/plain-host compile "$RUNNER_TEMP/plain.wasm" "$RUNNER_TEMP/serial.cwasm" --serial | tee -a "$RUNNER_TEMP/compile.log"
@@ -820,18 +812,16 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-on-failure: true
-          workspaces: spike/dbsp-wasm
+          workspaces: embed
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: vendor the patched dbsp
-        run: spike/dbsp-wasm/vendor.sh
       - name: C toolchain for wasm32
         uses: ./.github/actions/wasm32-c-toolchain
       - name: wasm-bindgen and binaryen
         uses: ./.github/actions/wasm-tools
       - name: fixture-rpc
         run: cargo build --locked --release --manifest-path tools/fixture-rpc/Cargo.toml
-      - name: OPFS and the live cursor in headless Chrome (spike)
-        working-directory: spike/dbsp-wasm
+      - name: OPFS and the live cursor in headless Chrome (embed)
+        working-directory: embed
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
         run: |
@@ -839,8 +829,8 @@ jobs:
           chrome=$(npx -y @puppeteer/browsers@2.10.10 install chrome@stable --path "$b" | tail -1 | cut -d' ' -f2-)
           driver=$(npx -y @puppeteer/browsers@2.10.10 install chromedriver@stable --path "$b" | tail -1 | cut -d' ' -f2-)
           printf '{"goog:chromeOptions":{"binary":"%s"}}' "$chrome" > "$b/webdriver.json"
-          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --port 8948 \
-            --file ../../tests/fixtures/tab-parity/chain.json.gz &
+          ../tools/fixture-rpc/target/release/fixture-rpc recorded --port 8948 \
+            --file ../tests/fixtures/tab-parity/chain.json.gz &
           CHROMEDRIVER="$driver" WASM_BINDGEN_TEST_WEBDRIVER_JSON="$b/webdriver.json" \
           TAB_PARITY_RPC=http://127.0.0.1:8948/ \
             cargo test --locked --release --target wasm32-unknown-unknown --test opfs --test live -- --nocapture

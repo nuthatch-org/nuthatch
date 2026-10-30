@@ -1,6 +1,6 @@
 //! RFC-0075 S3's gate, the node's half: the real binary follows a recorded young mainnet ERC-20 from
 //! its deploy block, and what it seals and serves must equal `tests/fixtures/tab-parity/expected.json`.
-//! The tab's half (`spike/dbsp-wasm`, `run-live.mjs`) holds the wasm build to the same file, against
+//! The tab's half (`embed/`, `run-live.mjs`) holds the wasm build to the same file, against
 //! the same recording, so the two are equal to each other through it.
 //!
 //! `NUTHATCH_PIN_TAB_PARITY=1` writes the file from this run instead of comparing.

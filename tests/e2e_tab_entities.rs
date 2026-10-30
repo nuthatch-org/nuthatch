@@ -1,7 +1,7 @@
 //! RFC-0075 S4's gate, the node's half: the real binary follows the recorded young ERC-20 with two
 //! authored entities and three views, takes a scripted reorg of its last six blocks, and what
 //! `/derived/{entity}` and each view answer, before and after, must equal
-//! `tests/fixtures/tab-parity/s4-expected.json`. The tab's half (`spike/dbsp-wasm`, `run-live.mjs`)
+//! `tests/fixtures/tab-parity/s4-expected.json`. The tab's half (`embed/`, `run-live.mjs`)
 //! is held to the same file over the same fixture.
 //!
 //! `NUTHATCH_PIN_TAB_PARITY=1` writes the file from this run instead of comparing.

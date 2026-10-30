@@ -1,0 +1,57 @@
+[package]
+name = "nuthatch-embed-plain"
+version = "0.0.1"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "RFC-0077 S0: the tab's live cursor as a plain core module whose only imports are nuthatch.*."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+test = false
+doctest = false
+
+[dependencies]
+nuthatch-embed = { path = "..", default-features = false }
+nuthatch-core = { path = "../../core", default-features = false }
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+redb = "2"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# No features: `.cargo/config.toml` selects their custom backend, which `random_fill` answers.
+getrandom03 = { package = "getrandom", version = "0.3" }
+
+# `embed/`'s patched dbsp, and the four leaf crates whose wasm32 build reaches JavaScript, patched on
+# our forks' `nuthatch/plain-<version>` to reach the host instead (RFC-0077 S0, S1).
+[patch.crates-io]
+dbsp = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-types = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-storage = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-buffer-cache = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-samply = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-ir = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-macros = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-size-of = { git = "https://github.com/nuthatch-org/size-of", rev = "1181ec2f62317a85f8a4d57abb4c2170adf9d771" }
+# Clock to `nuthatch.now_ms`; chrono's `Utc::now` through web-time; uuid's and getrandom 0.2's `js`
+# select the custom randomness backend.
+web-time = { git = "https://github.com/nuthatch-org/web-time", rev = "d5700e7e2b52014d4c9ba0069c6e579b4ffe25bc" }
+chrono = { git = "https://github.com/nuthatch-org/chrono", rev = "8a1f8f622fbbdda6643e26a40215abc5ee59880d" }
+uuid = { git = "https://github.com/nuthatch-org/uuid", rev = "66da85976996b773333c232d9e4cfc7986a2d537" }
+getrandom = { git = "https://github.com/nuthatch-org/getrandom", rev = "48857ee93b0729a1745510aaf68223db3677389f" }
+
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 16
+
+# As `embed/`'s: the module the gates run.
+[profile.tab]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1

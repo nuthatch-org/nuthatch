@@ -130,56 +130,15 @@ pub(crate) struct BurrmillSession {
 }
 
 impl BurrmillSession {
-    /// A maintained relation as a table of its declared types: its rows as text under a hidden
-    /// name (`register_rows` makes every column text), and a view under its own that casts each
-    /// column. A marker column keeps the one placeholder row an empty relation needs out of it.
+    /// A maintained relation as a table of its declared types (`nuthatch_core::bind::relation`):
+    /// `register_rows` makes every column text, and the view casts each back.
     fn bind_relation(&self, table: &str, declared: &[(String, &'static str)]) -> Result<bool> {
         let staged = self.take_hot(table);
-        let mut rows: Vec<Value> = staged
-            .iter()
-            .map(|row| {
-                let mut out = serde_json::Map::new();
-                for (c, _) in declared {
-                    out.insert(
-                        c.clone(),
-                        match row.get(c) {
-                            None | Some(Value::Null) => Value::Null,
-                            Some(v @ (Value::Bool(_) | Value::String(_))) => v.clone(),
-                            Some(v) => Value::String(v.to_string()),
-                        },
-                    );
-                }
-                out.insert("__present".into(), Value::Bool(true));
-                Value::Object(out)
-            })
-            .collect();
-        if rows.is_empty() {
-            let mut out: serde_json::Map<String, Value> = declared
-                .iter()
-                .map(|(c, _)| (c.clone(), Value::Null))
-                .collect();
-            out.insert("__present".into(), Value::Bool(false));
-            rows.push(Value::Object(out));
-        }
-        let raw = format!("{table}__raw");
-        let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-        let columns: Vec<String> = declared
-            .iter()
-            .map(|(c, t)| format!("CAST({0} AS {t}) AS {0}", quote(c)))
-            .collect();
+        let (raw, rows, view) = nuthatch_core::bind::relation(table, declared, &staged);
         let mut engine = self.engine();
         let registered = engine
             .register_rows(&raw, &rows)
-            .and_then(|()| {
-                engine.register_view(
-                    table,
-                    &format!(
-                        "SELECT {} FROM {} WHERE \"__present\" = 'true'",
-                        columns.join(", "),
-                        quote(&raw)
-                    ),
-                )
-            })
+            .and_then(|()| engine.register_view(table, &view))
             .map_err(engine_err);
         if let Err(e) = registered {
             // As in `bind_facts`: a retry binds from the same rows.
@@ -1207,5 +1166,180 @@ mod tests {
                 serde_json::json!("Date32(1)")
             ]
         );
+    }
+}
+
+/// `sql_errors::enrich` for each class, from the error Burrmill actually raises for the fault rather
+/// than a remembered string.
+#[cfg(test)]
+mod sql_error_hints {
+    use crate::engine::{Died, Engine, FactWindow, Session};
+    use crate::registry::{ColumnSchema, TableKind, TableSchema};
+    use crate::sql_errors::enrich;
+
+    fn schema() -> Vec<TableSchema> {
+        vec![TableSchema {
+            table: "usdc__transfer".into(),
+            alias: "usdc".into(),
+            kind: TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "Transfer".into(),
+            topic0: "0xddf2".into(),
+            columns: vec![
+                ColumnSchema {
+                    name: "from".into(),
+                    sol_type: "address".into(),
+                    storage: "address".into(),
+                    indexed: true,
+                    components: Vec::new(),
+                },
+                ColumnSchema {
+                    name: "to".into(),
+                    sol_type: "address".into(),
+                    storage: "address".into(),
+                    indexed: true,
+                    components: Vec::new(),
+                },
+                ColumnSchema {
+                    name: "value".into(),
+                    sol_type: "uint256".into(),
+                    storage: "word32".into(),
+                    indexed: false,
+                    components: Vec::new(),
+                },
+                ColumnSchema {
+                    name: "enabled".into(),
+                    sol_type: "bool".into(),
+                    storage: "bool".into(),
+                    indexed: false,
+                    components: Vec::new(),
+                },
+                ColumnSchema {
+                    name: "block_number".into(),
+                    sol_type: "implicit".into(),
+                    storage: "u64".into(),
+                    indexed: false,
+                    components: Vec::new(),
+                },
+            ],
+        }]
+    }
+
+    fn session() -> Box<dyn Session> {
+        let s = crate::engine_burrmill::BurrmillEngine.open_bare().unwrap();
+        let rows = [
+            serde_json::json!({"block_number": 1, "from": "0xa", "to": "0xb", "value": "5", "enabled": "true"}),
+            serde_json::json!({"block_number": 2, "from": "0xc", "to": "0xd", "value": "7", "enabled": "false"}),
+        ];
+        let refs: Vec<&serde_json::Value> = rows.iter().collect();
+        s.load_hot("usdc__transfer", &refs).unwrap();
+        assert!(s
+            .bind_facts("usdc__transfer", &[], &[], true, FactWindow::default())
+            .unwrap());
+        s
+    }
+
+    fn fails(s: &dyn Session, sql: &str) -> String {
+        match s.collect(sql, Some((10, crate::engine::SQL_MAX_RESULT_BYTES))) {
+            Ok(_) => panic!("`{sql}` answered"),
+            Err(Died::Binding(e) | Died::Executing(e)) => format!("{e:#}"),
+        }
+    }
+
+    fn hint(sql: &str) -> String {
+        let s = session();
+        let raw = fails(s.as_ref(), sql);
+        enrich(&raw, sql, &schema()).unwrap_or_else(|| panic!("no hint for: {raw}"))
+    }
+
+    #[test]
+    fn an_unknown_table() {
+        let h = hint("SELECT count(*) FROM transfers");
+        assert!(h.contains("the closest is `usdc__transfer`"), "{h}");
+    }
+
+    #[test]
+    fn an_unknown_column_is_matched_against_the_fields_in_scope() {
+        let h = hint("SELECT valu FROM usdc__transfer");
+        assert!(h.contains("the closest is `value`"), "{h}");
+    }
+
+    #[test]
+    fn an_unknown_column_with_no_near_match_or_a_quoted_name() {
+        let h = hint("SELECT zzzz FROM usdc__transfer");
+        assert!(h.starts_with("no column `zzzz`."), "{h}");
+        let h = hint("SELECT \"Total Value\" FROM usdc__transfer");
+        assert!(h.starts_with("no column `Total Value`."), "{h}");
+    }
+
+    #[test]
+    fn a_dec_column_whose_base_is_in_scope() {
+        let h = hint("SELECT \"from\" FROM usdc__transfer WHERE value_dec > 1");
+        assert!(h.contains("derived on the fly"), "{h}");
+    }
+
+    #[test]
+    fn a_bare_reserved_word() {
+        let h = hint("SELECT from FROM usdc__transfer");
+        assert!(h.contains("reserved word"), "{h}");
+    }
+
+    #[test]
+    fn a_big_integer_summed_as_text() {
+        let h = hint("SELECT sum(value) FROM usdc__transfer");
+        assert!(h.contains("value_dec"), "{h}");
+    }
+
+    #[test]
+    fn a_text_bool_in_coalesce_case_and_bool_and() {
+        for sql in [
+            "SELECT COALESCE(enabled, false) FROM usdc__transfer",
+            "SELECT CASE WHEN true THEN enabled ELSE false END FROM usdc__transfer",
+            "SELECT bool_and(enabled) FROM usdc__transfer",
+            "SELECT bool_or(enabled) FROM usdc__transfer",
+        ] {
+            let h = hint(sql);
+            assert!(h.contains("Solidity bool"), "{sql}: {h}");
+        }
+    }
+
+    /// #433 through the engine: pages destroyed, footer intact, so the segment binds and the read fails.
+    #[test]
+    fn a_segment_corrupt_past_its_footer() {
+        let s = session();
+        let dir = tempfile::tempdir().unwrap();
+        let seg = dir.path().join("seg.parquet");
+        s.write_parquet("usdc__transfer", &seg).unwrap();
+        let mut bytes = std::fs::read(&seg).unwrap();
+        let len = bytes.len();
+        let footer = u32::from_le_bytes(bytes[len - 8..len - 4].try_into().unwrap()) as usize;
+        bytes[4..len - 8 - footer].fill(0xFF);
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let c = crate::engine_burrmill::BurrmillEngine.open_bare().unwrap();
+        c.load_hot("usdc__transfer", &[]).unwrap();
+        assert!(c
+            .bind_facts("usdc__transfer", &[], &[seg], false, FactWindow::default())
+            .unwrap());
+        let sql = "SELECT max(value) FROM usdc__transfer";
+        let raw = fails(c.as_ref(), sql);
+        let h = enrich(&raw, sql, &schema()).unwrap_or_default();
+        assert!(h.contains("corrupt file on disk"), "{raw}");
+        assert!(h.contains("`usdc__transfer`"), "{h}");
+    }
+
+    /// The phrase quoted back from the caller's own text is not a corrupt file.
+    #[test]
+    fn the_phrase_in_caller_text_is_not_a_corrupt_file() {
+        let s = session();
+        for sql in [
+            "SELECT CAST('Parquet error: x' AS INTEGER) FROM usdc__transfer",
+            "SELECT \"Parquet error: x\" FROM usdc__transfer",
+        ] {
+            let raw = fails(s.as_ref(), sql);
+            let h = enrich(&raw, sql, &schema()).unwrap_or_default();
+            assert!(!h.contains("corrupt file"), "{sql}: {h}");
+        }
     }
 }

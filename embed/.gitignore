@@ -1,0 +1,7 @@
+target/
+target-native/
+pkg/
+pkg-dev/
+*.log
+patch-*.diff
+pkg-web/

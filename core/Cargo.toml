@@ -19,12 +19,14 @@ default = ["js"]
 
 [dependencies]
 anyhow = "1"
+alloy-primitives = "1.6"
 arc-swap = "1"
 bytes = "1"
 async-trait = "0.1"
 dbsp = "0.320"
 nuthatch-decode = { path = "../decode" }
 nuthatch-seal = { path = "../seal" }
+nuthatch-scaffold = { path = "../scaffold" }
 futures = "0.3"
 hex = "0.4"
 redb = "2"
@@ -34,6 +36,9 @@ serde = { version = "1", features = ["derive"] }
 # `preserve_order` as nuthatch-decode has it, so a hash over JSON here is the one the binary computes.
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 sha2 = "0.10"
+# RFC-0077 S1: `entities.toml` and its SQL, parsed here so a node and an embedding lower it alike.
+sqlparser = { version = "0.62", features = ["visitor"] }
+toml = "0.8"
 tokio = { version = "1", default-features = false, features = ["macros", "sync"] }
 tracing = "0.1"
 url = "2"
@@ -70,6 +75,7 @@ web-sys = { version = "0.3", optional = true, features = [
 ] }
 
 [dev-dependencies]
+alloy-json-abi = "1.6"
 proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

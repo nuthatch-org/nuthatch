@@ -16,18 +16,9 @@ use arrow::datatypes::{
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-pub use crate::registry::OFFCHAIN_NAMESPACE;
-
-/// The offchain table an entity source names, if it names one.
-///
-/// Case-insensitive, as `/sql` resolves it. The table after the prefix is returned as written, and
-/// [`Tables`] resolves it case-insensitively too.
-pub fn table_of(source: &str) -> Option<&str> {
-    // `get`, not indexing: a quoted identifier may put a multibyte character across the boundary.
-    let head = source.get(..OFFCHAIN_NAMESPACE.len())?;
-    let table = &source[OFFCHAIN_NAMESPACE.len()..];
-    (head.eq_ignore_ascii_case(OFFCHAIN_NAMESPACE) && !table.is_empty()).then_some(table)
-}
+pub use nuthatch_core::entity_offchain::{
+    table_of, Column, Kind, OffchainSnapshot, OffchainTables, OFFCHAIN_NAMESPACE,
+};
 
 /// Whether an entity's SQL reads an offchain table. Admission charges such an entity for the
 /// offchain input it may hold (RFC-0041 §7), so it must agree with what `start_entities` binds.
@@ -37,61 +28,36 @@ pub fn reads_offchain(plan: &crate::entity_plan::Plan) -> bool {
         .any(|s| table_of(&s.table).is_some())
 }
 
-/// What an offchain column's values become in an entity. §3.3 has no float, and there is no
-/// decimal scalar yet, so a feed carrying either is refused at load rather than rounded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    Str,
-    Int,
-    Bool,
-}
-
-impl Kind {
-    fn of(ty: &DataType) -> std::result::Result<Kind, &'static str> {
-        Ok(match ty {
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Kind::Str,
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64 => Kind::Int,
-            DataType::Boolean => Kind::Bool,
-            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                return Err(
-                    "floating point is not exact (RFC-0041 §3.3); publish a scaled \
-                            integer such as price_e8, or text and CAST it",
-                )
-            }
-            DataType::Decimal32(..)
-            | DataType::Decimal64(..)
-            | DataType::Decimal128(..)
-            | DataType::Decimal256(..) => {
-                return Err(
-                    "entities have no decimal type yet; publish a scaled integer such \
-                            as price_e8",
-                )
-            }
-            _ => return Err("an entity reads text, integer and boolean columns only"),
-        })
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Kind::Str => "text",
-            Kind::Int => "integer",
-            Kind::Bool => "boolean",
+/// What a Parquet column's type becomes in an entity, or why it is refused.
+fn kind_of(ty: &DataType) -> std::result::Result<Kind, &'static str> {
+    Ok(match ty {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Kind::Str,
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => Kind::Int,
+        DataType::Boolean => Kind::Bool,
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+            return Err(
+                "floating point is not exact (RFC-0041 §3.3); publish a scaled \
+                        integer such as price_e8, or text and CAST it",
+            )
         }
-    }
-}
-
-/// One column an entity reads from an offchain table, and the kind every snapshot carrying it has.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Column {
-    pub name: String,
-    pub kind: Kind,
+        DataType::Decimal32(..)
+        | DataType::Decimal64(..)
+        | DataType::Decimal128(..)
+        | DataType::Decimal256(..) => {
+            return Err(
+                "entities have no decimal type yet; publish a scaled integer such \
+                        as price_e8",
+            )
+        }
+        _ => return Err("an entity reads text, integer and boolean columns only"),
+    })
 }
 
 /// One retained snapshot whose segment is present.
@@ -144,7 +110,7 @@ impl Table {
                     let Ok(field) = s.schema.field_with_name(name) else {
                         continue;
                     };
-                    let k = Kind::of(field.data_type()).map_err(|why| {
+                    let k = kind_of(field.data_type()).map_err(|why| {
                         anyhow!(
                             "{source}.{name} is {} in snapshot {}: {why}",
                             field.data_type(),
@@ -316,6 +282,25 @@ impl Tables {
     }
 }
 
+impl OffchainTables for Tables {
+    fn bind(&self, table: &str, source: &str, columns: &[String]) -> Result<Option<Vec<Column>>> {
+        match self.table(table)? {
+            Some(found) => found.bind(source, columns).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn names(&self) -> Vec<&str> {
+        Tables::names(self)
+    }
+}
+
+impl OffchainSnapshot for Snapshot {
+    fn rows(&self, columns: &[Column]) -> Result<Vec<Row>> {
+        Snapshot::rows(self, columns)
+    }
+}
+
 fn batch_rows(batch: &RecordBatch, columns: &[Column]) -> Result<Vec<Row>> {
     let arrays = columns
         .iter()
@@ -324,7 +309,7 @@ fn batch_rows(batch: &RecordBatch, columns: &[Column]) -> Result<Vec<Row>> {
                 return Ok(None);
             };
             let array = batch.column(i).clone();
-            match Kind::of(array.data_type()) {
+            match kind_of(array.data_type()) {
                 Ok(k) if k == c.kind => Ok(Some(array)),
                 _ => bail!(
                     "{} is {} in this snapshot but was bound as {}; the entity must be rebuilt",
@@ -709,5 +694,183 @@ mod tests {
         assert_eq!(advance(&v(&["a", "b"]), &v(&["a", "c"])), Advance::Rebuild);
         assert_eq!(advance(&v(&["a", "b"]), &v(&["a"])), Advance::Rebuild);
         assert_eq!(advance(&v(&["a", "b"]), &v(&["b", "a"])), Advance::Rebuild);
+    }
+}
+
+/// The entity binder (`nuthatch_core::entity_bind`) over this module's file-backed tables (#1437).
+#[cfg(test)]
+mod through_the_binder {
+    use crate::entity_bind::Binding;
+    use crate::entity_circuit::EntityCircuit;
+    use crate::entity_expr::Expr;
+    use crate::entity_offchain::Tables;
+    use crate::entity_plan::{Agg, Join, Plan, Source};
+    use crate::entity_row::{Row, Scalar};
+    use crate::registry::{ContractSpec, DecodeRegistry, DecodedRow};
+    use crate::rpc::Log;
+
+    const ERC20: &str = r#"[
+        {"type":"event","name":"Transfer","inputs":[
+            {"name":"from","type":"address","indexed":true},
+            {"name":"to","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false}],"anonymous":false}
+    ]"#;
+    const TRANSFER_TOPIC0: &str =
+        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    const TOKEN: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+    const ALICE: &str = "0x1111111111111111111111111111111111111111";
+    const BOB: &str = "0x2222222222222222222222222222222222222222";
+
+    fn registry() -> DecodeRegistry {
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20).unwrap();
+        DecodeRegistry::build(vec![ContractSpec {
+            alias: "usdc".into(),
+            address: TOKEN.parse().unwrap(),
+            abi,
+            events: Vec::new(),
+        }])
+        .unwrap()
+    }
+
+    fn transfer(from: &str, to: &str, value: &str, block: u64, li: u64) -> Log {
+        let topic = |a: &str| format!("0x{:0>64}", a.trim_start_matches("0x"));
+        Log {
+            address: TOKEN.into(),
+            topics: vec![TRANSFER_TOPIC0.into(), topic(from), topic(to)],
+            data: format!("0x{value:0>64}"),
+            block_number: block,
+            block_hash: "0xbh".into(),
+            tx_hash: "0xtx".into(),
+            log_index: li,
+        }
+    }
+
+    fn decode(reg: &DecodeRegistry, logs: &[Log]) -> Vec<DecodedRow> {
+        logs.iter()
+            .map(|l| reg.decode(l).unwrap().unwrap())
+            .collect()
+    }
+
+    fn transfer_source(columns: &[&str]) -> Source {
+        Source {
+            table: "usdc__transfer".into(),
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    /// Seal one `tiers(account, tier)` snapshot the way `offchain drop` does.
+    fn tiers(dir: &std::path::Path, rows: &[(&str, i64)]) {
+        use arrow::array::{Int64Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(Schema::new(vec![
+                Field::new("account", DataType::Utf8, false),
+                Field::new("tier", DataType::Int64, false),
+            ])),
+            vec![
+                std::sync::Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                std::sync::Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let src = dir.join("tiers.parquet");
+        std::fs::write(&src, bytes).unwrap();
+        crate::offchain::drop_file(dir, &src, "tiers").unwrap();
+    }
+
+    /// `SELECT t.tier, SUM(x.value) FROM usdc__transfer x JOIN offchain__tiers t ON x.to = t.account
+    /// GROUP BY t.tier`
+    fn received_by_tier() -> Plan {
+        Plan {
+            left: transfer_source(&["to", "value"]),
+            left_filter: None,
+            join: Some(Join {
+                right: Source {
+                    table: "offchain__tiers".into(),
+                    columns: vec!["account".into(), "tier".into()],
+                },
+                right_filter: None,
+                on: (0, 0),
+            }),
+            key: vec![Expr::Column(3)],
+            aggregates: vec![Agg::Sum(Expr::Column(1))],
+        }
+    }
+
+    /// #1437: a chain source and an offchain source in one entity. Decoded windows feed only the
+    /// chain side and snapshots only the offchain side, and the circuit agrees with the evaluator.
+    #[test]
+    fn an_offchain_snapshot_joins_a_decoded_window_through_the_binding_and_the_circuit() {
+        let reg = registry();
+        let dir = tempfile::tempdir().unwrap();
+        tiers(dir.path(), &[(BOB, 1), (ALICE, 2)]);
+        let offchain = Tables::load(dir.path()).unwrap();
+        let plan = received_by_tier();
+        let binding = Binding::bind_with_offchain(&plan, &reg, &offchain).unwrap();
+        assert_eq!(binding.offchain_tables(), vec!["tiers"]);
+
+        let (left, right) = binding
+            .window(&decode(
+                &reg,
+                &[
+                    transfer(ALICE, BOB, "64", 10, 0),
+                    transfer(BOB, ALICE, "5", 11, 0),
+                ],
+            ))
+            .unwrap();
+        assert_eq!(
+            (left.len(), right.len()),
+            (2, 0),
+            "a window never feeds the offchain side"
+        );
+
+        let snapshot = &offchain.table("tiers").unwrap().unwrap().snapshots()[0].clone();
+        let (none, tiers) = binding.snapshot("tiers", snapshot).unwrap();
+        assert_eq!(
+            (none.len(), tiers.len()),
+            (0, 2),
+            "a snapshot never feeds the chain side"
+        );
+        let (a, b) = binding.snapshot("other", snapshot).unwrap();
+        assert!(
+            a.is_empty() && b.is_empty(),
+            "a snapshot of another table feeds nothing"
+        );
+
+        let weighted = |rows: &[Row]| rows.iter().map(|r| (r.clone(), 1)).collect::<Vec<_>>();
+        let mut circuit = EntityCircuit::build(plan.clone()).unwrap();
+        let mut relation = crate::entity_plan::Relation::new();
+        circuit
+            .apply(&weighted(&left), &weighted(&tiers), &mut relation)
+            .unwrap();
+        assert_eq!(
+            relation.get(&Row(vec![Scalar::Int(1)])),
+            Some(&Row(vec![Scalar::Int(100)])),
+            "0x64 to bob, who is tier 1"
+        );
+        assert_eq!(relation, plan.evaluate(&left, &tiers).unwrap());
+    }
+
+    #[test]
+    fn an_unknown_offchain_table_names_the_ones_there_are() {
+        let reg = registry();
+        let dir = tempfile::tempdir().unwrap();
+        tiers(dir.path(), &[(BOB, 1)]);
+        let mut plan = received_by_tier();
+        plan.join.as_mut().unwrap().right.table = "offchain__tier".into();
+        let err = format!(
+            "{:#}",
+            Binding::bind_with_offchain(&plan, &reg, &Tables::load(dir.path()).unwrap())
+                .unwrap_err()
+        );
+        assert!(err.contains("Offchain tables: offchain__tiers"), "{err}");
     }
 }

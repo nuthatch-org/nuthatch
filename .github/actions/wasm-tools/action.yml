@@ -1,7 +1,7 @@
 name: wasm-bindgen and binaryen
 description: >
   wasm-bindgen, wasm-bindgen-test-runner and wasm-opt on PATH, from their release tarballs pinned by
-  sha256. wasm-bindgen must match the version in spike/dbsp-wasm/Cargo.lock.
+  sha256. wasm-bindgen must match the version in embed/Cargo.lock.
 
 runs:
   using: composite
