@@ -1,0 +1,106 @@
+[package]
+name = "nuthatch-embed"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[features]
+# The module `/play` loads, bound by wasm-bindgen. Off, `plain/` builds the same nest with no JavaScript
+# (RFC-0077 S0).
+default = ["js"]
+js = [
+    "nuthatch-core/js",
+    "dep:getrandom02",
+    "dep:getrandom03",
+    "dep:getrandom04",
+    "dep:uuid",
+    "dep:wasm-bindgen",
+    "dep:js-sys",
+    "dep:wasm-bindgen-futures",
+]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+dbsp = "=0.320.0"
+# RFC-0075 S1: the crate this build exists to hold to wasm32; the patch below is applied only here.
+nuthatch-core = { path = "../core", default-features = false }
+nuthatch-decode = { path = "../decode" }
+nuthatch-seal = { path = "../seal" }
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# RFC-0075 S2: the hot store's database, opened over a tab's backend.
+redb = "2"
+# RFC-0075 S2: `tests/e2e_reorg.rs`'s depth strategy, drawn by its deterministic runner.
+proptest = { version = "1", default-features = false, features = ["std"] }
+# As the binary pins them (`Cargo.toml` of nuthatch): `Row` derives `SizeOf` and rkyv archival.
+size-of = { package = "feldera-size-of", version = "0.1.7" }
+# RFC-0075 S4: the engine the binary's `/sql` runs, at its pinned rev, and what the tab binds with it.
+sqlparser = { version = "0.62", features = ["visitor"] }
+burrmill = { git = "https://github.com/nuthatch-org/burrmill", rev = "ea8cf40c74b4e9da61983c4658d50d2d18217b7f", default-features = false, features = ["datafusion"] }
+object_store = { version = "0.13", default-features = false }
+arrow-array = { version = "=59.3.0", default-features = false }
+futures = "0.3"
+bytes = "1"
+hex = "0.4"
+form_urlencoded = "1"
+percent-encoding = "2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_64", "validation"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# rkyv 0.7 archives `usize` as 64-bit only on 64-bit targets (see the patch); the layout is in-memory only.
+rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_32", "validation"] }
+# Feature unification only: these give the wasm32 tree a source of randomness.
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"], optional = true }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"], optional = true }
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"], optional = true }
+uuid = { version = "1", features = ["js"], optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+
+# RFC-0075 S2: `tests/opfs.rs`, in a dedicated worker in headless Chrome. The second worker it starts
+# stands in for a second tab.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "BlobPropertyBag",
+    "FileSystemDirectoryHandle",
+    "FileSystemRemoveOptions",
+    "MessageEvent",
+    "Url",
+    "Worker",
+] }
+
+# RFC-0075 S0: dbsp 0.320.0 and its feldera siblings, patched for wasm32-unknown-unknown on our forks'
+# `nuthatch/wasm32-0.320.0` and `nuthatch/wasm32-0.1.7`: the published crates' rev and manifests, then
+# the patch (RFC-0077 S1).
+[patch.crates-io]
+dbsp = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-types = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-storage = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-buffer-cache = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-samply = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-ir = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-macros = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-size-of = { git = "https://github.com/nuthatch-org/size-of", rev = "1181ec2f62317a85f8a4d57abb4c2170adf9d771" }
+
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 16
+
+# RFC-0075 S6: the module a tab loads, which CI's gates run after `wasm-opt`.
+[profile.tab]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1

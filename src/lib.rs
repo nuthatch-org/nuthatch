@@ -11,6 +11,8 @@ pub use nuthatch_core::{
     drive, entity_circuit, entity_expr, entity_plan, entity_row, exposure, flags, labels, velocity,
     versioned, views,
 };
+// RFC-0077 S1: likewise, so an embedding builds entities and SQL hints from these, not copies.
+pub use nuthatch_core::{entity_bind, entity_decl, entity_lower, sql_errors};
 
 pub mod abi;
 pub mod address_discovery;
@@ -62,9 +64,6 @@ pub mod doctor;
 pub(crate) mod engine;
 pub(crate) mod engine_burrmill;
 pub mod entities;
-pub mod entity_bind;
-pub mod entity_decl;
-pub mod entity_lower;
 pub mod entity_offchain;
 pub mod entity_view;
 pub mod factory;
@@ -141,7 +140,6 @@ pub mod settle;
 pub mod skill;
 pub mod source;
 pub(crate) mod spill;
-pub mod sql_errors;
 pub mod sqlmemo;
 pub mod store;
 pub mod story;

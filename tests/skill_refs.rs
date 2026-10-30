@@ -282,7 +282,10 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     // `[[calls]]` key ships undocumented, the same hole #713 is for `allowlist.rs`.
     ("src/calls.rs", Some(&["CallDecl"])),
     ("src/ipfs.rs", Some(&["IpfsDecl"])),
-    ("src/entity_decl.rs", Some(&["EntityFile", "EntityDecl"])),
+    (
+        "core/src/entity_decl.rs",
+        Some(&["EntityFile", "EntityDecl"]),
+    ),
     // RFC-0062: `maintained.toml`, the views a nest answers from stored copies.
     ("src/maintained.rs", Some(&["Declaration", "DeclaredView"])),
     // RFC-0046 S2's optional counter. Feature-gated off by default, but `[counter]` under a mount is

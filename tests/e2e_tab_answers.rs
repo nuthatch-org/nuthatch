@@ -1,7 +1,7 @@
 //! RFC-0075 S5's gate, the node's half: the real binary follows the recorded young ERC-20 with S4's
 //! entities and views, and each request in `tests/fixtures/tab-parity/s5/requests.json` must answer
 //! with the status, content type and body bytes `tests/fixtures/tab-parity/s5-expected.json` pins.
-//! The tab's half (`spike/dbsp-wasm`, `run-answers.mjs`) is held to the same file.
+//! The tab's half (`embed/`, `run-answers.mjs`) is held to the same file.
 //!
 //! `/ready`'s clock readings, the version and the NID are masked: the clock is not the nest's, and the
 //! NID moves with the version and the RPC port `init` was given. `fetch_window_blocks` is masked too:
