@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use wasmtime::{Caller, Config, Engine, Instance, Linker, Memory, Module, Store, Strategy, TypedFunc};
+use wasmtime::{
+    Caller, Config, Engine, Instance, Linker, Memory, Module, Store, Strategy, TypedFunc,
+};
 
 /// This process's peak resident set, in MiB.
 fn peak_rss_mib() -> f64 {
