@@ -15053,6 +15053,9 @@ template = "pool"
         /// Every nest's delay a window from the flip on, so they are at the tip when it comes and
         /// slow to apply its marker.
         slow_after_flip_ms: u64,
+        /// Hold the tip short of the flip until every nest has committed past the fork, so a marker
+        /// is due however slow the machine (#2516).
+        held_past_fork: bool,
     }
 
     const REORG_START: u64 = 8;
@@ -15146,13 +15149,18 @@ template = "pool"
                 break Err(format!("the cursor ended: {:?}", (&mut task).await));
             }
             let tip = chain.tip.load(std::sync::atomic::Ordering::SeqCst);
-            // A case slowed after the flip holds the tip short of it until every nest has committed
-            // past the fork, so there is stale data for a marker to undo however slow the machine.
-            let held = case.slow_after_flip_ms > 0
-                && tip + 1 == case.flip_at
-                && !stores
-                    .iter()
-                    .all(|s| last_block_of(s.as_ref()) == Some(tip));
+            // A held case keeps the tip short of the flip until every nest has committed past the
+            // fork (at the tip, if slowed after it), so there is stale data for a marker to undo
+            // however slow the machine.
+            let held = tip + 1 == case.flip_at
+                && ((case.slow_after_flip_ms > 0
+                    && !stores
+                        .iter()
+                        .all(|s| last_block_of(s.as_ref()) == Some(tip)))
+                    || (case.held_past_fork
+                        && !stores
+                            .iter()
+                            .all(|s| last_block_of(s.as_ref()).is_some_and(|b| b >= case.fork))));
             if tip < REORG_TIP
                 && !held
                 && last_tick.elapsed() >= std::time::Duration::from_millis(15)
@@ -15233,6 +15241,7 @@ template = "pool"
             delays_ms: [0, 0, 0],
             window: 3,
             slow_after_flip_ms: 150,
+            held_past_fork: false,
         };
         let stats = match run_reorg_case(&case, &want).await {
             Ok(Some(stats)) => stats,
@@ -15266,7 +15275,7 @@ template = "pool"
         // The last is the property test's first counterexample: replaced two blocks after the fork,
         // between extraction's reorg check and its next fetch, under a nest with no rows there. Its
         // nests are slowed, so extraction may not have read past the fork when it is replaced, and
-        // then no marker is due; the others have two unslowed nests at the tip.
+        // then no marker is due; the others hold the flip until every nest is past the fork (#2516).
         for (kind, flip_at, delays_ms, window, marked) in [
             (CursorKind::Shared, 30, [0, 0, 15], 3, false),
             (CursorKind::Buffered(64), 30, [0, 0, 15], 3, true),
@@ -15280,6 +15289,7 @@ template = "pool"
                 delays_ms,
                 window,
                 slow_after_flip_ms: 0,
+                held_past_fork: marked,
             };
             match run_reorg_case(&case, &want).await {
                 Ok(Some(stats)) => {
@@ -15318,6 +15328,7 @@ template = "pool"
             delays_ms: [8, 1, 0],
             window: 3,
             slow_after_flip_ms: 0,
+            held_past_fork: false,
         };
         if let Err(e) = run_reorg_case(&case, &want).await {
             panic!("did not converge:\n{e}");
@@ -15360,6 +15371,7 @@ template = "pool"
                 delays_ms: [d0, d1, d2],
                 window,
                 slow_after_flip_ms: 0,
+                held_past_fork: false,
             };
             let outcome = rt.block_on(async {
                 let want = reorg_reference(REORG_TIP, fork).await;
