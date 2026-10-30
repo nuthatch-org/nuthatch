@@ -57,10 +57,13 @@ impl TabEntity {
                 decl.name
             ));
         }
-        // The node's reason, as `EntityView::start_bound` gives it: state is derived and not persisted.
+        // The node's reason, as `EntityView::start_bound` gives it, until a seed clears it.
         let unavailable = warm.then(|| {
             format!(
-                "entity `{}` cannot be rebuilt after a restart: its state is derived and not persisted",
+                "entity `{}` was not rebuilt after a restart: its state is derived and not \
+                 persisted, and seeding it from this nest's sealed segments and hot tail (RFC-0041 \
+                 §5.3) did not complete, so it holds no answer rather than part of one. The log \
+                 says why; the next restart seeds it again.",
                 decl.name
             )
         });
@@ -163,6 +166,46 @@ impl WindowEntity for TabEntity {
 
     fn flush(&self) {
         self.lane.flush();
+    }
+}
+
+/// A warm start's seed, as the node's `EntityView` takes it: deferred until `seed_end` flushes.
+impl nuthatch_core::restart::SeedEntity for TabEntity {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn chain_tables(&self) -> Vec<&str> {
+        std::iter::once(&self.binding.left)
+            .chain(self.binding.right.as_ref())
+            .filter(|s| s.offchain_table().is_none())
+            .map(|s| s.table.as_str())
+            .collect()
+    }
+
+    fn seed_begin(&mut self) {
+        self.unavailable = None;
+    }
+
+    fn seed_chunk(&self, rows: &[DecodedRow], through: u64) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        if let Some(batch) = self
+            .bind_window(rows, 1)
+            .with_context(|| format!("seeding entity `{}` from stored history", self.name))?
+        {
+            self.lane.apply_deferred(batch, through);
+        }
+        Ok(())
+    }
+
+    fn seed_end(&self) -> Result<()> {
+        self.lane.flush();
+        if let Some(why) = self.lane.fault() {
+            return Err(anyhow!("seeding entity `{}` faulted: {why}", self.name));
+        }
+        Ok(())
     }
 }
 

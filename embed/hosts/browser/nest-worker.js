@@ -3,18 +3,21 @@
 // page posts `{nest: "open", ...}` once, then `{nest: "request", ...}` with a port for each answer, or
 // `{nest: "call", ...}` for RFC-0075 §7's JS API. With `keepFollowing` it follows the tip every poll
 // interval and posts `{nest: "followed", ...}` after each pass.
-import { fetchRpc, load } from "./host.js";
+// With `stopOnceSealed` it follows only until a segment is sealed and posts `{nest: "stopped", ...}`
+// with requests outstanding, for a harness to kill the browser there (RFC-0077 S3).
+import { fetchRpc, load, onceSealed } from "./host.js";
 import { opfsStorage } from "./opfs.js";
 
 let engine;
 const enc = new TextEncoder();
 
-async function follow() {
-  await engine.run();
+async function follow(stop) {
+  const s = await engine.run(stop);
   const f = engine.report();
   return {
     last_block: f.last_block, sealed_through: f.sealed_through, hot_rows: f.hot_rows,
     holders: f.balances.holders, resumed_from: f.resumed_from, backend: f.backend,
+    segments: f.segments, stopped: s.stopped ?? false,
   };
 }
 
@@ -45,10 +48,13 @@ self.onmessage = async (m) => {
       });
       engine.open({
         nid: d.nid, contract: d.contract, start: Number(d.start), rpc: ["main"], storage: "host",
-        // A warm reopen is RFC-0077 S3's: until then each open starts from an empty store.
         fresh: d.fresh ?? true,
         memory_mib: d.memoryCeilingMib, poll_interval_secs: d.pollIntervalSecs, files: d.files,
       });
+      if (d.stopOnceSealed) {
+        self.postMessage({ nest: "stopped", module_sha256, ...(await follow(onceSealed(engine))) });
+        return;
+      }
       self.postMessage({ nest: "opened", module_sha256, abi: engine.abi(), ...(await follow()) });
       if (d.keepFollowing) keepFollowing(d.pollIntervalSecs || 12);
     } else if (d.nest === "request") {

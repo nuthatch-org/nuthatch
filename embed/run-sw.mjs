@@ -3,7 +3,9 @@
 // plain same-origin `fetch`, answered by the Service Worker (`hosts/browser/sw.js`). Its answers must
 // equal the node's pinned bytes, the scaffolded skill's examples and llms.txt's routes are run as
 // written against the page, and the module the page ran must hash to the file given here.
-// Usage: node run-sw.mjs <chrome> <module.wasm> <rpc-url> <tab-parity-dir>
+// With `--restart` (RFC-0077 S3) Chrome first follows from an empty store until a segment is sealed,
+// is killed there with SIGKILL, and is started again on the same profile, which reopens the same OPFS.
+// Usage: node run-sw.mjs <chrome> <module.wasm> <rpc-url> <tab-parity-dir> [--restart]
 //   (fixture-rpc recorded --fork serving <rpc-url>)
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
@@ -12,9 +14,10 @@ import { gunzipSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { answersDigest, differences, mask, sameTarget } from "./mask.mjs";
+import { answersDigest, differences, mask, sameTarget, segmentsDigest } from "./mask.mjs";
 
-const [chrome, wasm, rpc, dir] = process.argv.slice(2);
+const [chrome, wasm, rpc, dir, ...flags] = process.argv.slice(2);
+const restart = flags.includes("--restart");
 const module_sha256 = createHash("sha256").update(readFileSync(wasm)).digest("hex");
 const here = path.dirname(new URL(import.meta.url).pathname);
 const chain = JSON.parse(gunzipSync(readFileSync(path.join(dir, "chain.json.gz"))));
@@ -23,8 +26,7 @@ const start = Number(BigInt(chain.headers[0][0])) + 1;
 const roots = { browser: path.join(here, "hosts", "browser"), fixture: dir };
 const types = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm" };
 
-let done;
-const result = new Promise((resolve) => { done = resolve; });
+let done, result;
 const server = createServer((req, res) => {
   const url = new URL(req.url, "http://x/");
   if (req.method === "POST" && url.pathname === "/result") {
@@ -45,22 +47,41 @@ const server = createServer((req, res) => {
   }
 });
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
+// One origin for both launches, so the second sees the first's OPFS.
 const origin = `http://127.0.0.1:${server.address().port}`;
 const page = `${origin}/browser/index.html?rpc=${encodeURIComponent(rpc)}&contract=${chain.contract}&start=${start}&module=../module/plain.wasm`;
-
 const profile = mkdtempSync(path.join(tmpdir(), "nest-sw-"));
-const browser = spawn(chrome, [
-  "--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-gpu", "--enable-logging=stderr",
-  // A CI runner's AppArmor refuses Chrome's sandbox its user namespace.
-  ...(process.env.CI ? ["--no-sandbox"] : []),
-  `--user-data-dir=${profile}`, page,
-],{ stdio: ["ignore", "ignore", process.env.CHROME_LOG ? "inherit" : "ignore"] });
-const timeout = setTimeout(() => done({ ok: false, error: "no result within 300 s" }), 300_000);
-const r = await result;
-clearTimeout(timeout);
-const exited = new Promise((r) => browser.once("exit", r));
-browser.kill();
-await exited;
+
+/// Chrome on `url` until the page posts its result, then stopped by `signal`.
+async function launch(url, signal) {
+  result = new Promise((resolve) => { done = resolve; });
+  const browser = spawn(chrome, [
+    "--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-gpu", "--enable-logging=stderr",
+    // A CI runner's AppArmor refuses Chrome's sandbox its user namespace.
+    ...(process.env.CI ? ["--no-sandbox"] : []),
+    `--user-data-dir=${profile}`, url,
+  ],{ stdio: ["ignore", "ignore", process.env.CHROME_LOG ? "inherit" : "ignore"] });
+  const exited = new Promise((r) => browser.once("exit", r));
+  const timeout = setTimeout(() => done({ ok: false, error: "no result within 300 s" }), 300_000);
+  const r = await result;
+  clearTimeout(timeout);
+  browser.kill(signal);
+  await exited;
+  return r;
+}
+
+let killed;
+if (restart) {
+  const d = await launch(`${page}&phase=die`, "SIGKILL");
+  if (!d.ok) {
+    console.error(`the follow to kill failed: ${d.error}`);
+    process.exit(1);
+  }
+  killed = { last_block: d.stopped.last_block, sealed_through: d.stopped.sealed_through };
+  // The browser's helper processes outlive it by a moment; they hold the profile's OPFS.
+  await new Promise((r) => setTimeout(r, 2000));
+}
+const r = await launch(restart ? `${page}&fresh=0` : page, "SIGTERM");
 server.close();
 rmSync(profile, { recursive: true, force: true, maxRetries: 5 });
 
@@ -85,7 +106,8 @@ for (const e of skill) {
 }
 const llms = r.examples.filter((e) => e.source === "llms.txt");
 console.log(JSON.stringify({
-  host: "chrome", gate: "s5", storage: "host", module_sha256: r.opened.module_sha256,
+  host: "chrome", gate: "s5", storage: "host", ...(restart ? { restart: true, killed_at: killed } : {}),
+  module_sha256: r.opened.module_sha256, segments_sha256: segmentsDigest(r.opened.segments),
   answers_sha256: answersDigest(r.answers), pin_sha256: answersDigest(expected, { pinned: true }),
   follow_ms: r.follow_ms,
   opened: r.opened,
@@ -99,4 +121,5 @@ if (failures.length) {
   for (const f of failures) console.error(`MISMATCH ${f}`);
   process.exit(1);
 }
-console.log(`gate: all ${r.answers.length} answers through the Service Worker byte-identical to the node's, and the skill's examples with them`);
+const after = restart ? `, after a kill at block ${killed.last_block}, sealed through ${killed.sealed_through}` : "";
+console.log(`gate: all ${r.answers.length} answers through the Service Worker byte-identical to the node's, and the skill's examples with them${after}`);

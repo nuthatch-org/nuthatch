@@ -722,7 +722,8 @@ jobs:
   # `abi: 1` (embed/README.md). One module file, three reference hosts: the browser host in Chrome
   # (OPFS) and in Node (files), and wasmtime from Rust (files). Each answers RFC-0075 S5's requests
   # equal to the node's pin and to each other; Node and wasmtime also hold S3's segment hash and
-  # balances. A shape change without an `abi` bump fails `wasmtime-host abi`.
+  # balances. A shape change without an `abi` bump fails `wasmtime-host abi`. RFC-0077 S3: every host
+  # also runs killed mid-follow and reopened from the same storage (`--restart`), to the same pins.
   wasm-plain:
     name: nuthatch-core (plain module, Node, wasmtime, Chrome)
     needs: changes
@@ -783,11 +784,16 @@ jobs:
           node hosts/node/run.mjs "$m" http://127.0.0.1:8953/ $d s3 | tee "$RUNNER_TEMP/node.log"
           node hosts/node/run.mjs "$m" http://127.0.0.1:8954/ $d s5 | tee -a "$RUNNER_TEMP/node.log"
           node hosts/node/run.mjs "$m" http://127.0.0.1:8954/ $d s5 --storage bytes | tee -a "$RUNNER_TEMP/node.log"
+          node hosts/node/run.mjs "$m" http://127.0.0.1:8953/ $d s3 --restart | tee -a "$RUNNER_TEMP/node.log"
+          node hosts/node/run.mjs "$m" http://127.0.0.1:8954/ $d s5 --restart | tee -a "$RUNNER_TEMP/node.log"
           $host run "$m" http://127.0.0.1:8953/ $d s3 "${cache[@]}" | tee "$RUNNER_TEMP/wasmtime.log"
           $host run "$m" http://127.0.0.1:8954/ $d s5 "${cache[@]}" | tee -a "$RUNNER_TEMP/wasmtime.log"
           $host run "$m" http://127.0.0.1:8954/ $d s5 --storage bytes "${cache[@]}" | tee -a "$RUNNER_TEMP/wasmtime.log"
+          $host run "$m" http://127.0.0.1:8953/ $d s3 --restart "${cache[@]}" | tee -a "$RUNNER_TEMP/wasmtime.log"
+          $host run "$m" http://127.0.0.1:8954/ $d s5 --restart "${cache[@]}" | tee -a "$RUNNER_TEMP/wasmtime.log"
           chrome=$(npx -y @puppeteer/browsers@2.10.10 install chrome@stable --path "$RUNNER_TEMP/browsers" | tail -1 | cut -d' ' -f2-)
           node run-sw.mjs "$chrome" "$m" http://127.0.0.1:8954/ $d | tee "$RUNNER_TEMP/chrome.log"
+          node run-sw.mjs "$chrome" "$m" http://127.0.0.1:8954/ $d --restart | tee -a "$RUNNER_TEMP/chrome.log"
           node hosts/agree.mjs "$m" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" "$RUNNER_TEMP/chrome.log" \
             --hosts node,wasmtime,chrome | tee "$RUNNER_TEMP/agree.log"
           { echo '```'; cat "$RUNNER_TEMP/compile.log" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" \

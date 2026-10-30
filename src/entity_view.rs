@@ -89,16 +89,11 @@ impl EntityView {
     /// not have is refused now rather than at the first block that would have used it.
     /// `warm` says this nest already has indexed history behind it.
     ///
-    /// **A warm start makes the entity unavailable, deliberately.** Entity state is derived and not
-    /// persisted, and it cannot be rebuilt yet: sealing *prunes* the sealed rows from the hot store,
-    /// so replaying what is left would cover only the unsealed tail and produce a relation that is
-    /// missing all of history while looking perfectly populated. Rebuilding from sealed Parquet is
-    /// §5.3's warm-restart seed, which is not built.
-    ///
-    /// Feeding it from the cursor onward would be worse than leaving it empty: a relation holding
-    /// *some* of the answer is the "plausible partial relation served as current" §5.1 forbids,
-    /// where an empty one at least cannot be mistaken for the truth. So it is fed nothing and says
-    /// why.
+    /// **A warm start makes the entity unavailable until it is seeded.** Entity state is derived and
+    /// not persisted, and sealing *prunes* the sealed rows from the hot store, so only the seed from
+    /// sealed segments plus the hot tail (RFC-0041 §5.3, [`Self::seed`]) can rebuild it. Until that
+    /// completes it is fed nothing and says why: a relation holding *some* of the answer is the
+    /// "plausible partial relation served as current" §5.1 forbids.
     pub fn start(
         name: &str,
         plan: &Plan,
@@ -130,10 +125,10 @@ impl EntityView {
         }
         let unavailable = warm.then(|| {
             format!(
-                "entity `{name}` cannot be rebuilt after a restart: its state is derived and not \
-                 persisted, and sealing prunes sealed rows from the hot store, so replaying what \
-                 remains would cover only the unsealed tail. RFC-0041 §5.3's warm-restart seed is \
-                 not implemented. Re-index this nest from its start block to repopulate it."
+                "entity `{name}` was not rebuilt after a restart: its state is derived and not \
+                 persisted, and seeding it from this nest's sealed segments and hot tail (RFC-0041 \
+                 §5.3) did not complete, so it holds no answer rather than part of one. The log \
+                 says why; the next restart seeds it again."
             )
         });
         let limits = Limits {
@@ -621,6 +616,24 @@ impl nuthatch_core::entity_view::WindowEntity for EntityView {
     }
     fn flush(&self) {
         EntityView::flush(self)
+    }
+}
+
+impl nuthatch_core::restart::SeedEntity for EntityView {
+    fn name(&self) -> &str {
+        EntityView::name(self)
+    }
+    fn chain_tables(&self) -> Vec<&str> {
+        EntityView::chain_tables(self)
+    }
+    fn seed_begin(&mut self) {
+        EntityView::seed_begin(self)
+    }
+    fn seed_chunk(&self, rows: &[DecodedRow], through: u64) -> Result<()> {
+        EntityView::seed_chunk(self, rows, through)
+    }
+    fn seed_end(&self) -> Result<()> {
+        EntityView::seed_end(self)
     }
 }
 

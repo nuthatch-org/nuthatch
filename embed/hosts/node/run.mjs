@@ -3,21 +3,32 @@
 //   s3  RFC-0075 S3's recording: the segment hashes and 1,000 balances equal `expected.json`.
 //   s5  the same with `--fork` and S4's entities and views: all 32 of RFC-0075 S5's answers equal
 //       `s5-expected.json`, masked as `tests/e2e_tab_answers.rs` masks.
+// `--restart` is RFC-0077 S3's: a child process follows from an empty store until a segment is
+// sealed and is killed with requests outstanding, then this one reopens the same files and finishes.
 // Prints one JSON line of what it measured, then the gate's verdict; exits non-zero on a mismatch.
 // Usage: node run.mjs <module.wasm> <rpc-url> <tab-parity-dir> <s3|s5> [--storage bytes|host]
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+//          [--restart]
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fetchRpc, load } from "../browser/host.js";
+import { fetchRpc, load, onceSealed } from "../browser/host.js";
 import { fsStorage } from "./fs-storage.mjs";
-import { answersDigest, differences } from "../../mask.mjs";
+import { answersDigest, differences, segmentsDigest } from "../../mask.mjs";
 
 const [wasm, rpc, dir, gate, ...flags] = process.argv.slice(2);
-const storage = flags[0] === "--storage" ? flags[1] : "host";
-if (!["s3", "s5"].includes(gate) || !["bytes", "host"].includes(storage)) {
-  console.error("usage: run.mjs <module.wasm> <rpc-url> <tab-parity-dir> <s3|s5> [--storage bytes|host]");
+const flag = (name) => {
+  const at = flags.indexOf(name);
+  return at < 0 ? undefined : flags[at + 1];
+};
+const storage = flag("--storage") ?? "host";
+const restart = flags.includes("--restart");
+// The child's half of `--restart`: the directory to follow into, then die.
+const dying = flag("--die-mid-follow");
+if (!["s3", "s5"].includes(gate) || !["bytes", "host"].includes(storage) || (restart && storage !== "host")) {
+  console.error("usage: run.mjs <module.wasm> <rpc-url> <tab-parity-dir> <s3|s5> [--storage bytes|host] [--restart]");
   process.exit(2);
 }
 const chain = JSON.parse(gunzipSync(readFileSync(path.join(dir, "chain.json.gz"))));
@@ -34,8 +45,21 @@ if (gate === "s5") {
   }
 }
 
+const root = dying ?? mkdtempSync(path.join(tmpdir(), "nest-node-host-"));
+let killed;
+if (restart) {
+  const script = new URL(import.meta.url).pathname;
+  const child = spawnSync(process.execPath, [script, wasm, rpc, dir, gate, "--die-mid-follow", root], {
+    stdio: ["ignore", "pipe", "inherit"], encoding: "utf8",
+  });
+  if (child.signal !== "SIGKILL") {
+    console.error(`the follow to kill ended ${child.signal ?? `with exit ${child.status}`}, not by SIGKILL`);
+    process.exit(1);
+  }
+  killed = JSON.parse(child.stdout.trim().split("\n").pop());
+}
+
 const bytes = readFileSync(wasm);
-const root = mkdtempSync(path.join(tmpdir(), "nest-node-host-"));
 const t0 = performance.now();
 const engine = await load(bytes, {
   storage: fsStorage(root),
@@ -46,22 +70,34 @@ const ms_instantiate = performance.now() - t0;
 console.error(JSON.stringify(engine.abi()));
 engine.open({
   nid: gate === "s5" ? "tab-answers" : "tab-parity", contract: chain.contract, start, rpc: ["main"],
-  storage, ...(storage === "host" ? { fresh: true } : {}),
+  storage, ...(storage === "host" ? { fresh: !restart } : {}),
   ...(gate === "s5" ? { poll_interval_secs: 1, files } : {}),
 });
 
 const t1 = performance.now();
+if (dying) {
+  const s = await engine.run(onceSealed(engine));
+  if (!s.stopped) {
+    console.error("the follow reached the tip before anything sealed");
+    process.exit(1);
+  }
+  const r = engine.report();
+  // Written synchronously: a pipe's stdout may still be buffered when the signal lands.
+  writeSync(1, `${JSON.stringify({ last_block: r.last_block, sealed_through: r.sealed_through, steps: s.steps })}\n`);
+  process.kill(process.pid, "SIGKILL");
+}
 const stats = await engine.run();
 const ms_follow = performance.now() - t1;
 const got = engine.report();
 const segs = Object.values(got.segments).flat();
 const out = {
-  host: "node", gate, storage,
+  host: "node", gate, storage, ...(restart ? { restart: true, killed_at: killed } : {}),
   module_sha256: createHash("sha256").update(bytes).digest("hex"),
   ms_instantiate: Math.round(ms_instantiate), ms_follow: Math.round(ms_follow),
   wasm_memory_mib: +(engine.memoryBytes() / 2 ** 20).toFixed(1),
   peak_rss_mib: +(process.resourceUsage().maxRSS / 1024).toFixed(1),
   ...stats, rpc_requests: got.rpc_requests, segments: segs.length, hot_rows: got.hot_rows,
+  segments_sha256: segmentsDigest(got.segments),
 };
 if (storage === "bytes") out.export_bytes = engine.export().length;
 
@@ -94,6 +130,7 @@ if (failures.length) {
   for (const f of failures) console.error(`MISMATCH ${f}`);
   process.exit(1);
 }
+const after = restart ? ` after a kill at block ${killed.last_block}, sealed through ${killed.sealed_through}` : "";
 console.log(gate === "s3"
-  ? `gate: ${segs.length} segment hashes and ${got.balances.count} balances equal the node's`
-  : `gate: all ${out.answers} answers equal the node's pin (${out.answers_sha256})`);
+  ? `gate: ${segs.length} segment hashes and ${got.balances.count} balances equal the node's${after}`
+  : `gate: all ${out.answers} answers equal the node's pin (${out.answers_sha256})${after}`);

@@ -4,6 +4,7 @@
 use crate::cellar::Cellar;
 use crate::tab::{erc20, Sealing, TabNest, TRANSFER};
 use anyhow::Result;
+use nuthatch_core::redb_store::Store;
 use nuthatch_core::rpc::RpcClient;
 use nuthatch_core::store::SEALED_THROUGH_KEY;
 use nuthatch_core::transport::Transport;
@@ -24,11 +25,13 @@ pub fn node_version() -> &'static str {
         .unwrap_or("unknown")
 }
 
-/// `contract`'s `Transfer`s from `start` into `db`, sealing into the returned cellar.
+/// `contract`'s `Transfer`s from `start` into `db`, sealing into the returned cellar, which keeps
+/// its segments in `db` too. A warm `db` comes back with its views rebuilt (RFC-0077 S3).
 pub fn open(db: redb::Database, contract: &str, start: u64) -> Result<(TabNest, Arc<Cellar>)> {
-    let cellar = Arc::new(Cellar::default());
+    let store = Store::from_db(db, None)?;
+    let cellar = Arc::new(Cellar::over(store.clone())?);
     let nest = TabNest::open_sealing(
-        db,
+        store,
         erc20(contract)?,
         vec![contract.to_string()],
         vec![TRANSFER.into()],
@@ -38,6 +41,7 @@ pub fn open(db: redb::Database, contract: &str, start: u64) -> Result<(TabNest, 
             finality: Finality::Depth(MAINNET_FINALITY),
             seal_span: MAINNET_SEAL_SPAN,
             sinks: cellar.clone(),
+            history: Some(cellar.clone()),
         },
     )?;
     Ok((nest, cellar))

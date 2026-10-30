@@ -136,7 +136,15 @@ the node's `--poll-interval`. `files` are a nest's authored files, `entities.tom
 and `views/*.sql`, by path. Unknown keys are refused, so a host never believes a setting took.
 
 Until RFC-0077 S4 the nest is one ERC-20's `Transfer` on mainnet from `start`, as RFC-0075's tab is;
-S4 adds `nuthatch.toml`. A warm reopen is S3's: until then a host opens `fresh`.
+S4 adds `nuthatch.toml`.
+
+**Reopening.** Storage `host` without `fresh` opens the store the host kept, and the nest carries on
+from its last block, as a node restarted on its data directory does. Before it answers anything it
+rebuilds what is derived and not stored, from the sealed segments and the hot rows, with no RPC:
+`balances`, `exposure` and `velocity`, and every entity in `files`. That costs a pass over the nest's
+history at every open. A store whose rebuild fails does not open (`open_failed`, saying why), so a
+reopened nest never answers from part of its history. One that sealed before its segments were kept
+in storage (an engine older than RFC-0077 S3) is refused the same way, and is opened `fresh`.
 
 ### Stepping
 
@@ -203,9 +211,13 @@ Chosen at `nh_open`:
 
 Names are relative, `/`-separated, with no empty, `.` or `..` part; a host refuses any other. The
 host keeps one directory per nest, as the node keeps `data/<nid>/`: the browser host uses an OPFS
-directory named for the `nid`, the Node and wasmtime hosts a directory they are given. Today the
-guest opens one file, `nuthatch.redb`; sealed segments stay in memory until RFC-0077 S3 moves them
-to `segments/<hash>.parquet` beside it.
+directory named for the `nid`, the Node and wasmtime hosts a directory they are given. The guest
+opens one file, `nuthatch.redb`. Sealed segments and their catalogue live inside it, in tables beside
+the hot rows, not as `segments/<hash>.parquet` files as on a node: a seal happens inside a window's
+commit, which is synchronous, and a browser can open a new file only asynchronously, so a file per
+segment could only be written after the seal had pruned the rows it holds. In the store they commit
+before the prune, as the node's `manifest.json` does. The segment bytes are the node's, hash for
+hash. In storage `bytes` they are part of what `nh_export` returns.
 
 The single-writer lock is the host's. In a browser a second `createSyncAccessHandle` on the same
 file throws `NoModificationAllowedError`, which the browser host answers as `"locked": true`, and
@@ -260,3 +272,9 @@ node run-sw.mjs <chrome> /tmp/plain.wasm http://127.0.0.1:8954/ ../tests/fixture
 
 `fixture-rpc` is `tools/fixture-rpc`. Without `--fork` and with `s3` in place of `s5`, the Node and
 wasmtime hosts run RFC-0075 S3's gate instead: the segment hash and the 1,000 balances.
+
+`--restart` (all three hosts, storage `host`) is RFC-0077 S3's gate: the host follows from an empty
+store until a segment is sealed, is killed there with requests outstanding (SIGKILL: a child process
+for Node and wasmtime, the whole browser for Chrome), then reopens the same files and finishes. The
+answers must still equal the pin, and the segments those of a run that was never killed;
+`hosts/agree.mjs` holds every host to both.

@@ -2,7 +2,7 @@
 
 - Status: **Accepted, 2026-10-30.** S0 to S5 and S7 (the Lodestar demo) authorised in order; S6 waits for rotki
   to ask. S0 passed 2026-10-30 (§12). S1 built in part, 2026-10-30 (§13). S2 built 2026-10-30, its
-  address-build half deferred (§14).
+  address-build half deferred (§14). S3 built 2026-10-30, its Chrome leg CI's (§15).
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0075 (the whole nest in a tab, S0 to S6 merged), RFC-0074 (address history as a
@@ -741,3 +741,116 @@ opens `fresh`.
 
 **The binary.** Unchanged. The diff outside `embed/` is `.github/workflows/ci.yml`, this RFC and a
 comment in `tests/embed_versions.rs`; no `Cargo.toml` or `Cargo.lock` of the binary changed.
+
+## 15. S3 measured outcome, 2026-10-30
+
+**What was built.**
+
+- *The rebuilds, in core.* `nuthatch_core::restart` holds what a warm start rebuilds from stored
+  history with no RPC: `rebuild_views` (balances, exposure, velocity; #294's one hot scan),
+  `seed_entities` (RFC-0041 §5.3, #865) and `rebuild_children` (#373). They read sealed segments
+  through `SealedHistory`: the catalogue, one segment's rows through `DecodedRow::from_stored`, one
+  segment's columns. An entity is seeded through `SeedEntity`, which the node's `EntityView` and the
+  tab's `TabEntity` both implement. Error texts, the segment order, the `sealed_through` bound and
+  the per-segment chunking are the node's, moved, not rewritten.
+- *The native path wins.* The node's implementation is `SegmentFiles` over `data/<nid>/`, in
+  `src/indexer.rs`: segments through `seal::read_segment_decoded`, columns through the existing
+  `visit_sealed_columns`, and the views' cold folds through `ColdFolds`, which is Burrmill's
+  pre-summed `net_balances`, `oversized_transfers`, `cold_exposure` and `cold_velocity`, as before. An
+  implementation without `ColdFolds` replays each sealed transfer through the live loop's deltas
+  instead, which equals the view grown from genesis. The embed takes that path. The node's three
+  functions keep their names and signatures as thin calls into core, so `build_nest`,
+  `FollowerDerived::build`, the follower and their tests are untouched.
+  `the_restart_rebuild_walks_the_hot_store_once` reads `core/src/restart.rs` now, where the scan moved.
+- *The cellar persists.* Over a store, `Cellar` keeps each segment's bytes and the catalogue in two
+  tables of the store's own file, `cellar_segments` and `cellar_manifest`. A seal's new segments, its
+  catalogue and the removal of what the catalogue no longer names commit in one transaction, before
+  the seal prunes hot. Nothing is held in linear memory between seals any more: a segment is read
+  from the store when a query binds it, and storage `bytes` carries the segments in `nh_export`.
+- *The module, on open.* `young::open` builds the store, the cellar over it, and the views rebuilt
+  from both when the store has indexed before; `TabNest::derive` seeds the entities the same way. A
+  rebuild or seed that fails fails `nh_open` (`open_failed`, with its reason) rather than serve part
+  of a history: a reopened embedded nest has no `unavailable` state of its own. A store that sealed
+  before its segments were kept (any engine before S3) has lost them and is refused by name; no gate builds such a store.
+- *Hosts.* `--restart` on all three reference hosts (README, "The reference hosts and the gate"):
+  follow from an empty store until a segment is sealed, die by SIGKILL with requests outstanding (a
+  child process for Node and wasmtime; for Chrome, the browser process, then a second launch on the
+  same profile and origin), reopen the same storage with `fresh: false`, finish. `hosts/agree.mjs`
+  now also requires an S5 restart run from every host, and one set of segments per gate across every
+  run, killed or not. Each run prints `segments_sha256`, one digest over its segments computed the
+  same way in `mask.mjs` and the wasmtime host.
+
+**Where this departs from §3.3: segments are not `segments/<hash>.parquet`.** §3.3 had the module
+write the node's layout, a file per segment. It cannot, without bending one side. A seal runs inside
+the window's commit, synchronously, through `SegmentSink`; a browser opens a file only through a
+promise (S2's reason `open` became a request). A file per segment could only be written behind the
+seal, after the prune had removed its rows from hot, which is the crash window #2261 closed on the
+node. Making the seal path asynchronous would change the node's, which §1a rules out. Inside the
+store, the segments commit before the prune, as the node's `manifest.json` does, through the same
+`store_sync`. The bytes are the node's: the gate compares their hashes. **`abi` stays 1**: no export
+or import changed, and no request kind was added. Hydrating a mirror (S4) happens before the cursor
+runs, when asynchronous opens are fine, so S4 may still write `segments/` files for mirrored history.
+
+**`rebuild_children` is in core and unused by the module.** The tab has no factories until S4, so it
+is exercised only by the node's tests (`rebuild_children_*`, unchanged and green).
+
+**Gate.**
+
+| | Result |
+|---|---|
+| S3's recording, killed mid-follow and reopened from the same storage: segment hashes and the 1,000 balances equal the node's | **pass**, Node and wasmtime over files. Killed at block 26,241,666 with the first segment sealed through it and 380 steps taken; the reopen finished in 1,058 steps. Segment `c983470c…479aeae`, and `expected.json` whole |
+| S4's fork with entities (S5's chain), killed and reopened: `/balances`, `/derived/*`, every view, against the node's pin | **pass**, Node and wasmtime over files: all 32 of S5's answers digest to `22966cee…363febc5`, the pin's, the same kill point. Chrome on OPFS: CI's (below) |
+| The segment hashes equal an uninterrupted run's | **pass**: every run, killed or not, in `bytes` or over files, in both hosts, gives segments digest `68db3e3e…2d853cbf37` |
+| The same in the browser host on OPFS | **CI's** `wasm-plain` leg: `run-sw.mjs --restart`. Chrome for Testing does not launch on this Mac (§14) |
+| Binary: `e2e_warm_restart`, `e2e_entity_reorg`, `bench_restart_mounts` unchanged and green | **pass**: no file changed; 4 and 29 tests pass, the bench runs (below) |
+| Binary: restart no slower on the same bench | **pass**: `bench_restart_mounts`, release, on the M5 Pro, two runs of each build (main at `5b7cadfe`, then this branch). Serving and resumed at 500 mounts, before: 7,007 / 8,703 ms and 5,838 / 7,757 ms; after: 6,782 / 8,408 ms and 5,962 / 7,344 ms. At 100 mounts 1,711 and 1,549 ms before, 1,550 and 1,546 ms after. The follower's derived state over 500 sealed segments of 500,000 rows, built through the moved `seed_entities` and `rebuild_views`: 986 and 916 ms before, 838 and 827 ms after. The run-to-run spread is wider than any difference |
+
+Both halves were mutation-checked on the plain module. With the views' rebuild skipped on open, S3's
+restart run fails on its report and S5's on `/balances` and `/balance/…`, while the uninterrupted S3
+run still passes. With the entities' seed skipped, S5's restart run fails on `/ready`, the two views
+that read `received`, and every `/derived` route; the uninterrupted run still passes.
+
+**Numbers.** Apple M5 Pro, macOS, Node 26.11.1, wasmtime 48.0.8, the `tab` module of 34,017,235
+bytes (`86d9dca7…7035c7`), one run each.
+
+| | Node, files | wasmtime, files |
+|---|---|---|
+| S3, uninterrupted follow | 3,620 ms, 1,436 steps | 3,484 ms |
+| S3, reopen after the kill, to the tip | 2,762 ms, 1,058 steps | 2,443 ms |
+| S5, uninterrupted follow | 3,805 ms | 3,494 ms |
+| S5, reopen after the kill, to the tip | 3,042 ms | 2,684 ms |
+| Linear memory at the end: uninterrupted, reopened | 34.3 MiB, 23.9 MiB (S5) | the same |
+
+A reopen of S5's finished store, rebuilding the views and both entities from one sealed segment of
+2,259 rows and 17 hot rows, then checking the tip: 116 ms in Node, three RPC posts, with `/balances`
+and `/derived/received` byte-identical before and after.
+
+The rebuild replays sealed history row by row, so its cost grows with the nest. That is fine for a
+young contract and not for RFC-0068's 128 MB DeFi Pulse segments: S4, which opens mirrored nests,
+should give the module a `ColdFolds` in Burrmill as the node has, and measure it.
+
+**#2534.** The unavailable reason (`EntityView::start_bound`, and the tab's copy) said RFC-0041
+§5.3's warm-restart seed was not implemented. It is, and the reason now says what it means when it
+shows: the seed did not complete, the log says why, and the next restart seeds again. The comment
+above `refuse_seal_direct_with_entities` and its message are corrected the same way. The refusal
+stays: the seed runs only when a nest starts warm, so a seal-direct run would serve its entities
+empty until the next restart. Moving the seed found a defect it did not fix, filed as #2539: an
+entity whose seed fails after `seed_begin` is left available and partly fed, not unavailable.
+
+**For burrmill-wasm's `/play/live`.** It opens a fresh store on every visit because entities started
+unavailable on a warm one. That reason is gone: `LiveNest::open` rebuilds the views and `derive`
+seeds the entities from the cellar, which now lives in the OPFS store. To stop sweeping, `live.js`
+needs a stable `nid` per contract and start block in place of a fresh one per load, no sweep of old
+stores, `derive` called with the same files as before, and its comment ("Each load opens a fresh
+store") dropped. A store a pre-S3 build sealed is refused at open, so the page should sweep that one
+store on that error and open it fresh.
+
+**What it does not show.** Chrome has not run this on the Mac; Safari not at all. The kill lands
+between steps, with RPC requests outstanding; a kill inside a host storage call is redb's
+crash-safety, which this does not test separately. Node and wasmtime hosts still take no lock.
+
+**The binary.** Unchanged in behaviour: the three rebuilds run the same code through the trait, the
+views' cold folds are the same Burrmill queries, and only the unavailable reason and the seal-direct
+refusal's last sentence read differently (#2534). `cargo tree` and `Cargo.lock` unchanged. Every
+subcommand's `--help`, two levels deep (60 files), and the files `init --abi` writes are
+byte-identical before and after. The whole suite: 2,877 passed, none failed, 18 ignored.
