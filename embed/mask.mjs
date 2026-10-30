@@ -61,6 +61,18 @@ export function answersDigest(answers, { pinned = false } = {}) {
   return h.digest("hex");
 }
 
+/// RFC-0077 S3: one sha256 over a report's segments, by table name, so a run that was killed and
+/// reopened compares with one that was not. `embed/tests/wasmtime-host` computes the same.
+export function segmentsDigest(segments) {
+  const h = createHash("sha256");
+  for (const table of Object.keys(segments).sort()) {
+    for (const s of segments[table]) {
+      h.update(`${table} ${s.from_block} ${s.to_block} ${s.rows} ${s.hash} ${s.bytes_hash}\n`);
+    }
+  }
+  return h.digest("hex");
+}
+
 /// A path with its query, comparable however the query was encoded.
 export function sameTarget(a, b) {
   const ua = new URL(a, "http://x/"), ub = new URL(b, "http://x/");

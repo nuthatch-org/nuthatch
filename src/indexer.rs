@@ -961,21 +961,9 @@ async fn restart_old_writer(
     })
 }
 
-/// Seed every warm-started entity from the nest's own stored history (RFC-0041 §5.3, #865).
-///
-/// **Zero historical RPC calls, by construction** - criterion #865's claim, and it is a claim about
-/// the *arguments*: this function is handed a directory, a store and a registry, and has no source
-/// to call. Sealed Parquet plus the unsealed hot tail is the whole of a nest's canonical history,
-/// which is the point of §5.3's "canonical facts remain the durable source of truth".
-///
-/// The two halves are read separately because they are stored separately - sealing prunes sealed
-/// rows out of hot (`prune_and_set_meta`), so neither layer holds the answer alone. They are then
-/// fed as **one batch**: §5.1's "backfill uses larger batches, but not different semantics", and the
-/// reason a finalized row joining a hot row is not a problem here the way it is for a base-plus-delta
-/// seed, where such a pair is in neither half.
-///
-/// A failure leaves the entity `unavailable` rather than partly filled, and says so: `seed` clears
-/// that state only on the way in, so an entity that faulted mid-seed is not left looking maintained.
+/// Seed every warm-started entity from the nest's own stored history (RFC-0041 §5.3, #865), as
+/// [`nuthatch_core::restart::seed_entities`] does, over this nest's segment files and offchain
+/// snapshots.
 fn seed_entities(
     dir: &std::path::Path,
     store: &dyn crate::store::HotStore,
@@ -983,51 +971,19 @@ fn seed_entities(
     entities: &mut [EntityView],
     through: u64,
 ) -> Result<()> {
-    if entities.is_empty() {
-        return Ok(());
-    }
-    let schema = registry.schema();
-    let sealed_through = store.sealed_through();
-
-    // The hot tail, read once and shared. Every entity on this nest sees the same window at `+1`
-    // during normal ingest, and a seed is a window like any other.
-    let hot = decode_stored_rows(&schema, &store.entities_in_range(0, through)?)?;
-
-    for entity in entities.iter_mut() {
-        entity.seed_begin();
-        // One sealed segment at a time, never the whole history at once - see
-        // `seal::read_table_rows_by_segment` for what that is worth in peak RSS. The hot tail is
-        // fed by reference for the same reason: it used to be cloned once per entity on the nest.
-        let mut sealed = 0usize;
-        for table in entity.chain_tables() {
-            let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
-                anyhow::bail!(TerminalFault(format!(
-                    "entity `{}` reads `{table}`, which this nest's registry does not describe",
-                    entity.name()
-                )))
-            };
-            crate::seal::read_table_rows_by_segment(
-                dir,
-                table_schema,
-                sealed_through,
-                &mut |rows| {
-                    sealed += rows.len();
-                    entity.seed_chunk(&rows, through)
-                },
-            )?;
-        }
-        entity.seed_chunk(&hot, through)?;
-        if !entity.offchain_tables().is_empty() {
-            feed_offchain(&crate::entity_offchain::Tables::load(dir)?, entity)?;
-        }
-        tracing::info!(
-            "entity `{}` seeding from {sealed} sealed and {} hot row(s) through block {through}",
-            entity.name(),
-            hot.len(),
-        );
-        entity.seed_end()?;
-    }
-    Ok(())
+    nuthatch_core::restart::seed_entities(
+        &SegmentFiles(dir),
+        store,
+        registry,
+        entities,
+        through,
+        &mut |entity| {
+            if !entity.offchain_tables().is_empty() {
+                feed_offchain(&crate::entity_offchain::Tables::load(dir)?, entity)?;
+            }
+            Ok(())
+        },
+    )
 }
 
 /// #866 criterion 13: `--seal-direct` either rebuilds entities from the finished sealed corpus before
@@ -1043,9 +999,9 @@ fn seed_entities(
 /// the loop to reach the check. A refusal that arrives after the thing it refuses has started is a
 /// fault report, not a refusal.
 ///
-/// Rebuilding from the sealed corpus instead is RFC-0041 §5.3's warm-restart seed, which is not
-/// built, and is unsound as written for any entity with a join: a finalized row joining a hot row is
-/// in neither half. Refusing is the honest half of the criterion until that is settled.
+/// The warm-restart seed (`seed_entities`, RFC-0041 §5.3, #865) does rebuild an entity from the
+/// sealed corpus, but only when a nest starts warm: a seal-direct run would serve its entities empty
+/// until the next restart, so it still refuses.
 fn refuse_seal_direct_with_entities(seal_direct: bool, nest: &NestIngest) -> Result<()> {
     if !seal_direct || nest.entities.is_empty() {
         return Ok(());
@@ -1060,7 +1016,7 @@ fn refuse_seal_direct_with_entities(seal_direct: bool, nest: &NestIngest) -> Res
         "--seal-direct cannot be combined with authored incremental entities ({named}). \
          Seal-direct writes finalized history straight to Parquet without passing it through the \
          ingest path, so the entit{} would be served empty. Start this nest without --seal-direct; \
-         rebuilding an entity from sealed history is RFC-0041 §5.3 and is not implemented.",
+         an entity is rebuilt from sealed history only when a nest restarts (RFC-0041 §5.3).",
         if nest.entities.len() == 1 { "y" } else { "ies" },
     )))
 }
@@ -8477,239 +8433,87 @@ impl FollowerDerived {
     }
 }
 
-/// The derived IVM views a restart has to reconstruct, and the two things that decide whether each is
-/// fed at all. They travel together because they are always rebuilt together, off one pass over the
-/// same facts - passed singly they made `rebuild_views` an eight-argument function.
-#[derive(Clone, Copy)]
-struct DerivedViews<'a> {
-    /// Exposure joins transfers against this; empty means the view can only ever be empty.
-    labels: &'a LabelSet,
-    balances: &'a BalanceView,
-    exposure: &'a ExposureView,
-    velocity: &'a VelocityView,
-    /// `Some((threshold, window))` only when a velocity flag is configured (RFC-0008 C3).
-    velocity_cfg: Option<(i128, u64)>,
+use nuthatch_core::restart::DerivedViews;
+
+/// A nest's sealed history as the node keeps it: `manifest.json` and segment files under `dir`,
+/// with the views' cold folds in Burrmill.
+struct SegmentFiles<'a>(&'a std::path::Path);
+
+impl nuthatch_core::restart::SealedHistory for SegmentFiles<'_> {
+    fn manifest(&self) -> Result<seal::Manifest> {
+        seal::load_manifest(self.0)
+    }
+
+    fn segment_rows(
+        &self,
+        segment: &seal::Segment,
+        schema: &crate::registry::TableSchema,
+    ) -> Result<Vec<crate::registry::DecodedRow>> {
+        seal::read_segment_decoded(self.0, segment, schema)
+    }
+
+    fn segment_columns(
+        &self,
+        segment: &seal::Segment,
+        columns: &[&str],
+        visit: &mut dyn FnMut(serde_json::Value),
+    ) -> Result<()> {
+        visit_sealed_columns(self.0, std::slice::from_ref(segment), columns, visit)
+    }
+
+    fn folds(&self) -> Option<&dyn nuthatch_core::restart::ColdFolds> {
+        Some(self)
+    }
 }
 
-/// Rebuild every derived IVM view - balances, exposure and velocity - from stored facts, in a single
-/// pass over the hot store.
-///
-/// The views are derived state, not durable state: rather than persist them (and risk drift from the
-/// canonical store) we reconstruct them from the facts that *are* durable, through the same circuits
-/// that maintain them live. All three are built the same way. Cold (sealed, immutable) segments fold
-/// to one pre-summed row per key directly in Burrmill - no need to replay millions of transfers - and
-/// only the small un-sealed hot tail is replayed transfer by transfer. Hot and cold are disjoint
-/// (sealed rows are pruned from hot), so nothing is double-counted, and the result is identical to
-/// views grown from genesis.
-///
-/// This was three functions, each opening its own scan (issue #294). That was never *three* scans: it
-/// was `3 × transfer_tables`, because `recent_by_table` walks the whole entity table and JSON-parses
-/// every row just to test its `table` field, and each rebuild then parsed the rows it got back a
-/// second time. `hot_rows_by_table` walks once, parses each row once, and returns them already
-/// grouped, so one scan now feeds all three views. This runs on every restart and every crash
-/// recovery, which is precisely when an operator is watching.
-///
-/// The scan is deliberately **unbounded**, unlike `/sql` and `/explain` which cap it and answer 503.
-/// A query may refuse and be retried; a rebuild may not. Dropping hot rows here would leave a view
-/// quietly missing its tip for the life of the process - those transfers are never decoded again - and
-/// a silently wrong balance is far worse than a slow start.
+impl nuthatch_core::restart::ColdFolds for SegmentFiles<'_> {
+    fn net_balances(
+        &self,
+        table: &str,
+        from: &str,
+        to: &str,
+        value: &str,
+        through: u64,
+    ) -> Result<Vec<(String, i128)>> {
+        crate::analytics::net_balances(self.0, table, from, to, value, through)
+    }
+
+    fn oversized_transfers(&self, table: &str, value: &str, through: u64) -> Result<u64> {
+        crate::analytics::oversized_transfers(self.0, table, value, through)
+    }
+
+    fn exposure(
+        &self,
+        table: &str,
+        from: &str,
+        to: &str,
+        value: &str,
+        through: u64,
+    ) -> Result<Vec<(String, i128, i128)>> {
+        crate::analytics::cold_exposure(self.0, table, from, to, value, through)
+    }
+
+    fn velocity(
+        &self,
+        table: &str,
+        from: &str,
+        value: &str,
+        window: u64,
+        through: u64,
+    ) -> Result<Vec<(String, i128, i128)>> {
+        crate::analytics::cold_velocity(self.0, table, from, value, window, through)
+    }
+}
+
+/// Rebuild balances, exposure and velocity from stored facts on a warm start, as
+/// [`nuthatch_core::restart::rebuild_views`] does, over this nest's segment files.
 fn rebuild_views(
     dir: &std::path::Path,
     store: &dyn crate::store::HotStore,
     registry: &DecodeRegistry,
     into: &DerivedViews<'_>,
 ) -> Result<()> {
-    let DerivedViews {
-        labels,
-        balances,
-        exposure,
-        velocity,
-        velocity_cfg,
-    } = *into;
-
-    // Each transfer table with its (from, to, value) column names - which vary by token (USDC:
-    // from/to/value; WETH: src/dst/wad), so we read them from the registry, never hardcode them.
-    // Velocity uses the same list and simply ignores `to`.
-    let transfer_tables: Vec<(String, String, String, String)> = registry
-        .tables()
-        .iter()
-        .filter_map(|d| {
-            d.transfer_columns()
-                .map(|(f, t, v)| (d.table.clone(), f.to_string(), t.to_string(), v.to_string()))
-        })
-        .collect();
-    if transfer_tables.is_empty() {
-        return Ok(());
-    }
-
-    // The gates the three separate rebuilds each applied. Exposure joins transfers against the
-    // labeled set, so with no labels it can only ever be empty - there is nothing to be exposed *to*.
-    // Velocity is fed only when a velocity flag is configured (RFC-0008 C3).
-    let want_exposure = !labels.is_empty();
-
-    let sealed_through = store.sealed_through();
-
-    let mut balance_batch: views::WeightedBatch = Vec::new();
-    let mut exposure_batch: exposure::ExposureBatch = Vec::new();
-    let mut velocity_batch: velocity::VelocityBatch = Vec::new();
-
-    // Cold seed. Three different aggregations over the same segments, so this stays three Burrmill
-    // queries per table - they are pre-summed server-side and cheap, and it is the hot store, not
-    // the analytical engine, that #294 was about. A table the manifest catalogues nothing for at or
-    // below the watermark has nothing cold to seed; for one it does, a failed query is a failed
-    // rebuild, never a view served from the hot tail alone (#2171).
-    let manifest = crate::seal::load_manifest(dir)?;
-    let mut cold_balances = 0usize;
-    let mut cold_exposure = 0usize;
-    let mut cold_velocity = 0usize;
-    let mut cold_buckets: std::collections::HashMap<String, (i128, i128)> = Default::default();
-    for (table, from_col, to_col, val_col) in &transfer_tables {
-        let catalogued = manifest
-            .tables
-            .get(table)
-            .is_some_and(|segments| segments.iter().any(|s| s.to_block <= sealed_through));
-        if !catalogued {
-            continue;
-        }
-        let nets =
-            crate::analytics::net_balances(dir, table, from_col, to_col, val_col, sealed_through)
-                .with_context(|| format!("seeding balances from the sealed {table}"))?;
-        cold_balances += nets.len();
-        for (addr, net) in nets {
-            balance_batch.push(views::seed_delta(addr, net));
-        }
-        // COR-8 (#814): the fold silently drops a transfer whose value exceeds 38 digits. The drop is
-        // correct - both legs go, or the balance would gain value from nowhere - but it used to be
-        // invisible, so a balance missing a transfer was served exactly like a complete one.
-        let n = crate::analytics::oversized_transfers(dir, table, val_col, sealed_through)
-            .with_context(|| format!("counting oversized transfers in the sealed {table}"))?;
-        if n > 0 {
-            tracing::warn!(
-                "{n} transfer(s) in {table} have a value of more than 38 digits and are \
-                 excluded from balances; /balances reports this as `dropped_over_i128` (#814)"
-            );
-            balances.note_over_i128(n);
-        }
-        if want_exposure {
-            let rows = crate::analytics::cold_exposure(
-                dir,
-                table,
-                from_col,
-                to_col,
-                val_col,
-                sealed_through,
-            )
-            .with_context(|| format!("seeding exposure from the sealed {table}"))?;
-            cold_exposure += rows.len();
-            for (key, amount, count) in rows {
-                exposure_batch.push(exposure::seed_item(key, amount, count));
-            }
-        }
-        if let Some((_, window)) = velocity_cfg {
-            let rows = crate::analytics::cold_velocity(
-                dir,
-                table,
-                from_col,
-                val_col,
-                window,
-                sealed_through,
-            )
-            .with_context(|| format!("seeding velocity from the sealed {table}"))?;
-            cold_velocity += rows.len();
-            for (key, volume, count) in rows {
-                let bucket = cold_buckets.entry(key).or_insert((0, 0));
-                bucket.0 = bucket.0.saturating_add(volume);
-                bucket.1 = bucket.1.saturating_add(count);
-            }
-        }
-    }
-    // Summed across tables before the threshold is applied, since a bucket is a sender's window
-    // over every token. One that can never flag is not seeded (#2173).
-    if let Some((threshold, window)) = velocity_cfg {
-        for (key, (volume, count)) in cold_buckets {
-            if velocity::can_flag(&key, volume, threshold, window, sealed_through) {
-                velocity_batch.push(velocity::seed_item(key, volume, count));
-            }
-        }
-    }
-
-    // Hot replay: the un-sealed tip, decoded and read through `view_transfer` exactly as the live
-    // loop reads it. One scan, one parse, fanned out to all three views.
-    //
-    // A read failure propagates rather than being swallowed into an empty tail. The old per-view
-    // `unwrap_or_default()` would have applied the cold seed alone and logged nothing - a view short
-    // of its entire hot tail, presented as a successful rebuild. The caller warns and carries on.
-    let hot_rows = store.hot_rows_by_table()?;
-    let schema = registry.schema();
-    let mut hot_balances = 0usize;
-    let mut hot_exposure = 0usize;
-    let mut hot_velocity = 0usize;
-    for (table, ..) in &transfer_tables {
-        let Some(rows) = hot_rows.get(table) else {
-            continue;
-        };
-        let table_schema = schema
-            .iter()
-            .find(|t| &t.table == table)
-            .with_context(|| format!("the registry has no schema for {table}"))?;
-        // Newest first, matching the order `recent_by_table` returned. The circuits fold weighted
-        // deltas, so the summed result does not depend on it - but keeping the order identical means
-        // "same views as the three-scan build" holds structurally rather than by argument.
-        for v in rows.iter().rev() {
-            let row = crate::registry::DecodedRow::from_stored(v, table_schema)?;
-            let Some((from, to, val)) = view_transfer(&row) else {
-                if oversized_transfer(&row) {
-                    balances.note_over_i128(1);
-                }
-                continue;
-            };
-            balance_batch.extend(views::transfer_deltas(&from, &to, val, 1));
-            hot_balances += 1;
-            if want_exposure {
-                let d = exposure::exposure_deltas(&from, &to, val, 1, labels);
-                if !d.is_empty() {
-                    hot_exposure += 1;
-                    exposure_batch.extend(d);
-                }
-            }
-            if let Some((_, window)) = velocity_cfg {
-                velocity_batch.extend(velocity::velocity_deltas(
-                    &from,
-                    row.block_number,
-                    val,
-                    1,
-                    window,
-                ));
-                hot_velocity += 1;
-            }
-        }
-    }
-
-    if !balance_batch.is_empty() {
-        balances.apply(balance_batch);
-        balances.flush();
-        tracing::info!(
-            "rebuilt balance view: {} holders ({cold_balances} cold-seeded net(s) + {hot_balances} hot transfer(s) replayed)",
-            balances.holders()
-        );
-    }
-    if !exposure_batch.is_empty() {
-        exposure.apply(exposure_batch);
-        exposure.flush();
-        tracing::info!(
-            "rebuilt exposure view: {} entries ({cold_exposure} cold-seeded + {hot_exposure} hot transfer(s) replayed)",
-            exposure.entries()
-        );
-    }
-    if !velocity_batch.is_empty() {
-        velocity.apply(velocity_batch);
-        velocity.flush();
-        tracing::info!(
-            "rebuilt velocity view: {} bucket(s) ({cold_velocity} cold-seeded + {hot_velocity} hot transfer(s) replayed)",
-            velocity.entries()
-        );
-    }
-    Ok(())
+    nuthatch_core::restart::rebuild_views(&SegmentFiles(dir), store, registry, into)
 }
 
 /// A contract log that fails to decode is kept as [`Undecoded`] rather than dropped unseen.
@@ -8727,82 +8531,15 @@ fn decode_or_note(
     }
 }
 
-/// Rebuild the discovered-child registry on a warm restart by folding the stored factory events
-/// (RFC-0009). Cold (sealed) and hot factory-event rows are read as JSON and re-discovered - a pure
-/// fold, so the reconstructed registry is identical to the one grown live. Best-effort per table.
-/// Rebuild the discovered-child registry from stored factory events (#373).
-///
-/// **Every read here is load-bearing and none of them may be swallowed.** What this returns is the
-/// set of contracts the nest indexes; a rebuild that quietly yields *fewer* children than were
-/// discovered does not fail, it silently stops indexing them, and the nest goes on looking healthy
-/// with a hole in its data. That is the worst shape a fault can take in this codebase and it is the
-/// one this function used to have three times over: a Burrmill failure was `if let Ok(cold)`, a hot
-/// store failure was `.unwrap_or_default()`, and an unparseable stored row was `if let Ok(v)`.
-///
-/// The cold read is the only genuinely-expected absence, and it is now decided from the **segment
-/// catalogue** rather than inferred from an error. That distinction is the whole fix: "this table
-/// has never been sealed" and "Burrmill could not read this table" both arrived as `Err` and were
-/// discarded together, so the benign case was hiding the fatal one.
+/// Rebuild the discovered-child registry from stored factory events (#373), as
+/// [`nuthatch_core::restart::rebuild_children`] does, over this nest's segment files.
 fn rebuild_children(
     dir: &std::path::Path,
     store: &dyn crate::store::HotStore,
     _registry: &DecodeRegistry,
     factory: &FactorySet,
 ) -> Result<ChildRegistry> {
-    let mut children = ChildRegistry::new();
-    let manifest = crate::seal::load_manifest(dir)
-        .context("reading the segment catalogue to rebuild the child registry")?;
-    // Each child's earliest announcement across every announcing table, cold and hot, so the
-    // earliest discovery of a child two rules announce wins as it does live (#1637). Only children
-    // are held, not the rows announcing them (#2160).
-    let mut earliest: std::collections::HashMap<String, crate::factory::ChildEntry> =
-        Default::default();
-    let mut fold = |table: &str, row: &serde_json::Value| {
-        for child in factory.discover_stored(table, row) {
-            let at = (child.discovered_block, child.discovered_log_index);
-            match earliest.entry(child.address.clone()) {
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if at < (e.get().discovered_block, e.get().discovered_log_index) {
-                        e.insert(child);
-                    }
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(child);
-                }
-            }
-        }
-    };
-    let sources = factory.view_sources();
-    for table in factory.factory_tables() {
-        // Cold (sealed) rows - but only where the catalogue says a segment exists, so an unsealed
-        // table is skipped rather than read-and-forgiven.
-        if let Some(segments) = manifest.tables.get(&table).filter(|s| !s.is_empty()) {
-            let mut columns = vec!["block_number", "log_index", "block_timestamp", "address"];
-            columns.extend(
-                sources
-                    .iter()
-                    .filter(|(_, t, _)| *t == table)
-                    .map(|(_, _, param)| param.as_str()),
-            );
-            visit_sealed_columns(dir, segments, &columns, &mut |row| fold(&table, &row))
-                .with_context(|| format!("reading sealed factory rows for '{table}' (#373)"))?;
-        }
-        for raw in store
-            .recent_by_table(&table, usize::MAX)
-            .with_context(|| format!("reading hot factory rows for '{table}' (#373)"))?
-        {
-            let row = serde_json::from_str::<serde_json::Value>(&raw).with_context(|| {
-                format!("unparseable stored row in factory table '{table}' (#373)")
-            })?;
-            fold(&table, &row);
-        }
-    }
-    let mut found: Vec<_> = earliest.into_values().collect();
-    found.sort_by_key(|c| (c.discovered_block, c.discovered_log_index));
-    for child in found {
-        children.insert(child);
-    }
-    Ok(children)
+    nuthatch_core::restart::rebuild_children(&SegmentFiles(dir), store, factory)
 }
 
 /// Every row of `segments`, narrowed to whichever of `columns` they carry, as the JSON
@@ -28243,9 +27980,9 @@ rpc_urls = ["https://rpc.example"]
     /// `3 × tables` full walks on a path that runs at every restart and every crash recovery.
     #[test]
     fn the_restart_rebuild_walks_the_hot_store_once() {
-        let src = include_str!("indexer.rs");
+        let src = include_str!("../core/src/restart.rs");
         let start = src
-            .find("\nfn rebuild_views(")
+            .find("\npub fn rebuild_views(")
             .expect("rebuild_views must exist - if it was renamed, retarget this test");
         // The function ends where the next item at column 0 begins.
         let body = &src[start + 1..];

@@ -50,6 +50,28 @@ pub fn digest(answers: &[Value], pinned: bool) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// `embed/mask.mjs`'s `segmentsDigest`: one sha256 over a report's segments, by table name.
+pub fn segments_digest(segments: &Value) -> String {
+    let mut h = Sha256::new();
+    if let Some(tables) = segments.as_object() {
+        let mut names: Vec<&String> = tables.keys().collect();
+        names.sort();
+        for table in names {
+            for s in tables[table].as_array().into_iter().flatten() {
+                h.update(format!(
+                    "{table} {} {} {} {} {}\n",
+                    s["from_block"],
+                    s["to_block"],
+                    s["rows"],
+                    s["hash"].as_str().unwrap_or_default(),
+                    s["bytes_hash"].as_str().unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    format!("{:x}", h.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::mask;

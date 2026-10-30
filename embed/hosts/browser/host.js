@@ -45,6 +45,11 @@ export function checkName(name) {
   return name;
 }
 
+/// A `run` stop for RFC-0077 S3's gate: once a segment is sealed, so a reopen has sealed history
+/// and pruned hot rows to rebuild from. `nh_report` is a probe, so it is asked every 20 steps.
+export const onceSealed = (engine) => (stats) =>
+  stats.steps % 20 === 0 && Object.keys(engine.report().segments).length > 0;
+
 /// Instantiate `module` (bytes or a `WebAssembly.Module`). `storage` is `{open, remove, list}`, whose
 /// `open` resolves to a file with the sync access handle's methods; `rpc` performs an `rpc` request.
 export async function load(module, { storage, rpc, log }) {
@@ -145,12 +150,14 @@ export async function load(module, { storage, rpc, log }) {
     stats,
     abi: () => call("nh_abi"),
     open: (config) => call("nh_open", ...put(JSON.stringify(config))),
-    /// Step until the engine is idle at the tip, performing what it asks.
-    async run() {
+    /// Step until the engine is idle at the tip, performing what it asks. `stop`, asked before each
+    /// batch of requests is performed, ends the run with them outstanding: RFC-0077 S3's kill.
+    async run(stop) {
       for (;;) {
         stats.steps += 1;
         const s = call("nh_step");
         if (s.idle) return stats;
+        if (s.requests && stop?.(stats)) return { ...stats, stopped: true };
         if (s.requests) {
           const answers = await Promise.all(s.requests.map(perform));
           const json = JSON.stringify(answers);

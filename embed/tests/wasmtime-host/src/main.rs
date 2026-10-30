@@ -51,6 +51,9 @@ struct Opts {
     winch: bool,
     storage: Option<String>,
     cache: Option<PathBuf>,
+    restart: bool,
+    /// The child's half of `--restart`: the directory to follow into, then die.
+    die_mid_follow: Option<PathBuf>,
 }
 
 impl Opts {
@@ -63,6 +66,8 @@ impl Opts {
                 "--winch" => o.winch = true,
                 "--storage" => o.storage = it.next().map(|s| s.to_string()),
                 "--cache" => o.cache = it.next().map(PathBuf::from),
+                "--restart" => o.restart = true,
+                "--die-mid-follow" => o.die_mid_follow = it.next().map(PathBuf::from),
                 _ => bail!("unknown flag {f}"),
             }
         }
@@ -575,6 +580,10 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
         storage == "bytes" || storage == "host",
         "storage is bytes or host"
     );
+    ensure!(
+        storage == "host" || !o.restart,
+        "--restart reopens files: storage host"
+    );
     let mut gz = String::new();
     flate2::read::GzDecoder::new(File::open(dir.join("chain.json.gz"))?).read_to_string(&mut gz)?;
     let chain: Value = serde_json::from_str(&gz)?;
@@ -591,7 +600,14 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
     let (module, cache) = load(&engine, &wasm, &o.cache())?;
     let ms_load = t.elapsed().as_millis();
     let rss_loaded = peak_rss_mib();
-    let root = std::env::temp_dir().join(format!("nest-wasmtime-host-{}", std::process::id()));
+    let root = o.die_mid_follow.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("nest-wasmtime-host-{}", std::process::id()))
+    });
+    let killed = if o.restart {
+        Some(kill_mid_follow(wasm_path, rpc_url, dir, gate, &root, o)?)
+    } else {
+        None
+    };
     let t = Instant::now();
     let mut g = instantiate(&engine, &module, root.clone())?;
     let ms_instantiate = t.elapsed().as_millis();
@@ -602,7 +618,7 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
         "contract": chain["contract"], "start": start, "rpc": ["main"], "storage": storage,
     });
     if storage == "host" {
-        config["fresh"] = true.into();
+        config["fresh"] = (!o.restart).into();
     }
     if gate == "s5" {
         config["poll_interval_secs"] = 1.into();
@@ -621,6 +637,15 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
             break;
         }
         if let Some(reqs) = s["requests"].as_array() {
+            if o.die_mid_follow.is_some() && steps % 20 == 0 {
+                let r = g.call0("nh_report")?;
+                if r["segments"].as_object().is_some_and(|t| !t.is_empty()) {
+                    // With these requests outstanding, as a crash would leave them.
+                    let line = json!({"last_block": r["last_block"], "sealed_through": r["sealed_through"], "steps": steps});
+                    std::io::Write::write_all(&mut std::io::stdout(), format!("{line}\n").as_bytes())?;
+                    unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+                }
+            }
             let answers: Vec<Value> = reqs
                 .iter()
                 .map(|r| {
@@ -636,6 +661,10 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
             bail!("nh_step answered {s}");
         }
     }
+    ensure!(
+        o.die_mid_follow.is_none(),
+        "the follow reached the tip before anything sealed"
+    );
     let ms_follow = t.elapsed().as_millis();
     let got = g.call0("nh_report")?;
     let memory_bytes = g
@@ -659,7 +688,12 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
         "wasm_memory_mib": mib(memory_bytes),
         "steps": steps, "waits": waits, "requests": requests, "rpc_requests": got["rpc_requests"],
         "segments": segs.len(), "hot_rows": got["hot_rows"],
+        "segments_sha256": mask::segments_digest(&got["segments"]),
     });
+    if let Some(k) = &killed {
+        out["restart"] = true.into();
+        out["killed_at"] = k.clone();
+    }
     if storage == "bytes" {
         out["export_bytes"] = g.export()?.len().into();
     }
@@ -728,20 +762,54 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
         }
         bail!("{} mismatches", failures.len());
     }
+    let after = killed.map_or(String::new(), |k| {
+        format!(
+            " after a kill at block {}, sealed through {}",
+            k["last_block"], k["sealed_through"]
+        )
+    });
     if gate == "s3" {
         println!(
-            "gate: {} segment hashes and {} balances equal the node's",
+            "gate: {} segment hashes and {} balances equal the node's{after}",
             segs.len(),
             got["balances"]["count"]
         );
     } else {
         println!(
-            "gate: all {} answers equal the node's pin ({})",
+            "gate: all {} answers equal the node's pin ({}){after}",
             out["answers"],
             out["answers_sha256"].as_str().unwrap_or_default()
         );
     }
     Ok(())
+}
+
+/// RFC-0077 S3: this host run again as a child that follows into `root` from an empty store until
+/// something has sealed, and is killed with requests outstanding. Answers where it died.
+fn kill_mid_follow(
+    wasm: &Path,
+    rpc: &str,
+    dir: &Path,
+    gate: &str,
+    root: &Path,
+    o: &Opts,
+) -> Result<Value> {
+    use std::os::unix::process::ExitStatusExt;
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.arg("run").arg(wasm).arg(rpc).arg(dir).arg(gate);
+    cmd.arg("--die-mid-follow").arg(root).arg("--cache").arg(o.cache());
+    if o.winch {
+        cmd.arg("--winch");
+    }
+    let child = cmd.stderr(std::process::Stdio::inherit()).output()?;
+    ensure!(
+        child.status.signal() == Some(libc::SIGKILL),
+        "the follow to kill ended {}, not by SIGKILL",
+        child.status
+    );
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    let line = stdout.lines().last().context("the killed follow said nothing")?;
+    Ok(serde_json::from_str(line)?)
 }
 
 fn main() -> Result<()> {

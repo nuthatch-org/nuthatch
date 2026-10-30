@@ -32,6 +32,7 @@ pub mod metrics;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub mod opfs;
 pub mod redb_store;
+pub mod restart;
 pub mod rpc;
 pub mod seal;
 pub mod source;

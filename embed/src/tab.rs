@@ -4,7 +4,8 @@
 
 use crate::derived::{NestFiles, TabEntity};
 use crate::window::{NoWait, Shelf};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
+use nuthatch_core::restart::{self, DerivedViews, SealedHistory};
 use nuthatch_core::alerts::{AlertRouter, AlertSink};
 use nuthatch_core::cursor::{
     detect_reorg, process_window, rollback_reorg, Nest, Processed, Window,
@@ -75,6 +76,8 @@ pub struct Sealing {
     pub finality: Finality,
     pub seal_span: u64,
     pub sinks: std::sync::Arc<dyn Sinks>,
+    /// What a warm open rebuilds the views and entities from (RFC-0077 S3).
+    pub history: Option<std::sync::Arc<dyn SealedHistory + Send + Sync>>,
 }
 
 impl Sealing {
@@ -84,6 +87,7 @@ impl Sealing {
             finality: Finality::Depth(1_000_000_000),
             seal_span: 1,
             sinks: std::sync::Arc::new(Shelf::default()),
+            history: None,
         }
     }
 }
@@ -100,7 +104,7 @@ impl TabNest {
         window: u64,
     ) -> Result<TabNest> {
         Self::open_sealing(
-            db,
+            Store::from_db(db, None)?,
             registry,
             addresses,
             topic0s,
@@ -110,9 +114,10 @@ impl TabNest {
         )
     }
 
-    /// [`Self::open`], sealing past `sealing.finality` as a node does.
+    /// [`Self::open`] over a store already opened, sealing past `sealing.finality` as a node does.
+    /// A warm store's views are rebuilt from `sealing.history` and the hot tail, as a node's are.
     pub fn open_sealing(
-        db: redb::Database,
+        store: Store,
         registry: DecodeRegistry,
         addresses: Vec<String>,
         topic0s: Vec<String>,
@@ -120,11 +125,10 @@ impl TabNest {
         window: u64,
         sealing: Sealing,
     ) -> Result<TabNest> {
-        let store = Store::from_db(db, None)?;
         if store.get_meta(START_BLOCK_KEY)?.is_none() {
             store.set_meta(START_BLOCK_KEY, &start.to_string())?;
         }
-        Ok(TabNest {
+        let nest = TabNest {
             store,
             registry,
             addresses,
@@ -139,14 +143,38 @@ impl TabNest {
             entities: Vec::new(),
             cursor: Cursor::default(),
             budget: crate::budget::TabBudget::default(),
-        })
+        };
+        if let (Some(history), Some(_)) = (&nest.sealing.history, nest.last_block()?) {
+            let views = DerivedViews {
+                labels: &nest.labels,
+                balances: &nest.balances,
+                exposure: &nest.exposure,
+                velocity: &nest.velocity,
+                velocity_cfg: None,
+            };
+            restart::rebuild_views(&**history, &nest.store, &nest.registry, &views)
+                .context("rebuilding the views from this nest's stored history")?;
+        }
+        Ok(nest)
     }
 
-    /// Start the entities `files` declares (RFC-0075 S4). A store that has indexed already is warm,
-    /// and its entities unavailable, as on a node.
+    /// Start the entities `files` declares (RFC-0075 S4). A store that has indexed already is warm:
+    /// its entities are seeded from `sealing.history` and the hot tail as a node seeds them, and
+    /// without a history they stay unavailable, as on a node whose seed did not complete.
     pub fn derive(&mut self, files: &NestFiles) -> Result<()> {
-        let warm = self.last_block()?.is_some();
-        self.entities = crate::derived::start(files, &self.registry, warm, self.budget)?;
+        let through = self.last_block()?;
+        self.entities = crate::derived::start(files, &self.registry, through.is_some(), self.budget)?;
+        if let (Some(history), Some(through)) = (&self.sealing.history, through) {
+            restart::seed_entities(
+                &**history,
+                &self.store,
+                &self.registry,
+                &mut self.entities,
+                through,
+                &mut |_| Ok(()),
+            )
+            .context("seeding the entities from this nest's stored history")?;
+        }
         Ok(())
     }
 
