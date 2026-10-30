@@ -1,7 +1,7 @@
 # RFC-0077: The embeddable engine - nuthatch's core as an opt-in wasm module, beside the binary
 
-- Status: **Accepted, 2026-10-30.** S0 to S5 authorised in order; S6 waits for rotki to ask. S0 passed
-  2026-10-30 (§12). S1 built in part, 2026-10-30 (§13).
+- Status: **Accepted, 2026-10-30.** S0 to S5 and S7 (the Lodestar demo) authorised in order; S6 waits for rotki
+  to ask. S0 passed 2026-10-30 (§12). S1 built in part, 2026-10-30 (§13).
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0075 (the whole nest in a tab, S0 to S6 merged), RFC-0074 (address history as a
@@ -331,6 +331,18 @@ Each ends runnable, and each gate can fail. Sizes are days of focused work, esti
   build replaces `embed/`'s S0 module and rotki's host answers `nh_step`'s requests where it answered
   `rpc_batch`. No rotki PR is opened otherwise. **Gate**: RFC-0074 §5's parity in rotki's host, and
   rotki's tests and linters. Binary: unchanged.
+- **S7, the demo: Lodestar's `/profile`, verified locally.** Chief, 2026-10-30. Not started: it is built after S5, in the Lodestar repository, and nothing here implements it. Lodestar's network-wide
+  pages are the shared-view case and stay on the hosted `graph-allocations-nest`. Its wallet-connected
+  `/profile` is one user's data: delegations (staked, thawing, realised and unrealised rewards),
+  curation signals and 90 days of rewards history, loaded today from `/api/portfolio` and the rewards
+  route. A "verify it locally" switch there runs the engine in the tab against the visitor's RPC on
+  Arbitrum One. It fetches the visitor's own staking and curation logs by indexed topic, plus the
+  delegation pools of the indexers they are delegated to, which is what turns shares into GRT. The page
+  shows the server's figures and the tab's side by side, each marked where they agree. Needs S4
+  (Arbitrum, the Horizon proxies' ABIs). **Gate**: for a set of real delegator and curator addresses,
+  every figure the tab computes equals `/api/portfolio`'s at the same block, and any that cannot be
+  computed is named, not shown. The change is to the Lodestar repository, made with Chief's go.
+  Binary: unchanged. It is the blog post's worked example.
 
 ## 5. Honest limits
 
@@ -419,8 +431,8 @@ same of offering the module to rotki. If accepted, this wants that line.
 - **No copy calls nuthatch "wasm"** or describes the engine as a new direction. It is the same indexer,
   run another way, for a narrower set of cases.
 - **A thorough blog post** for nuthatch-indexer.com, explaining what the embeddable engine is and how it
-  works, follows once the slices are done, in the same register: a capability beside the binary. It is
-  not written in this RFC's PR.
+  works, follows once the slices are done, in the same register: a capability beside the binary, with
+  S7's Lodestar page as its worked example. It is not written in this RFC's PR.
 
 ## 12. S0 measured outcome, 2026-10-30
 
