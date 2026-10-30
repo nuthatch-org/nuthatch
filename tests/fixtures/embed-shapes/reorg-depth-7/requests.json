@@ -1,0 +1,26 @@
+[
+  {
+    "method": "GET",
+    "path": "/ready"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20count%28%2A%29%20AS%20n%20FROM%20usdc__transfer"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20%2A%20FROM%20usdc__transfer%20ORDER%20BY%20block_number%2C%20log_index%20LIMIT%20200"
+  },
+  {
+    "method": "GET",
+    "path": "/balances?limit=20"
+  },
+  {
+    "method": "GET",
+    "path": "/entities?limit=5"
+  },
+  {
+    "method": "GET",
+    "path": "/derived"
+  }
+]

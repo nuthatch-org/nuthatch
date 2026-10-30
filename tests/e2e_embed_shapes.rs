@@ -39,9 +39,12 @@ struct Shape {
     chain_id: u64,
     /// Where the nest's files are: a directory already in the tree, or written by `write`.
     nest: Nest,
-    eras: Vec<(u64, u64, Vec<(u64, BlockFixture)>)>,
+    eras: Vec<Era>,
     requests: Vec<Value>,
 }
+
+/// One era of a chain: its tip, its finalized block and every block up to the tip.
+type Era = (u64, u64, Vec<(u64, BlockFixture)>);
 
 enum Nest {
     Tree(&'static str),
@@ -91,7 +94,7 @@ fn common_requests(names: &[&str]) -> Vec<Value> {
     r
 }
 
-fn snapshot(tape: &TapeSource) -> (u64, u64, Vec<(u64, BlockFixture)>) {
+fn snapshot(tape: &TapeSource) -> Era {
     tape.snapshot()
 }
 
@@ -379,7 +382,7 @@ fn pair_chain(start: u64, pair: &str) -> TapeSource {
             ),
             _ => empty_block(b, 0, ts),
         };
-        if i % 7 == 0 && i % 2 == 0 {
+        if i.is_multiple_of(14) {
             let t = transfers_block(
                 b,
                 0,
