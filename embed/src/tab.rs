@@ -5,7 +5,6 @@
 use crate::derived::{NestFiles, TabEntity};
 use crate::window::{NoWait, Shelf};
 use anyhow::{ensure, Context, Result};
-use nuthatch_core::restart::{self, DerivedViews, SealedHistory};
 use nuthatch_core::alerts::{AlertRouter, AlertSink};
 use nuthatch_core::cursor::{
     detect_reorg, process_window, rollback_reorg, Nest, Processed, Window,
@@ -15,6 +14,7 @@ use nuthatch_core::exposure::ExposureView;
 use nuthatch_core::labels::LabelSet;
 use nuthatch_core::metrics::{CursorMetrics, UndecodedTally};
 use nuthatch_core::redb_store::Store;
+use nuthatch_core::restart::{self, DerivedViews, SealedHistory};
 use nuthatch_core::seal::Sinks;
 use nuthatch_core::source::Source;
 use nuthatch_core::store::{LAST_BLOCK_KEY, START_BLOCK_KEY};
@@ -163,7 +163,8 @@ impl TabNest {
     /// without a history they stay unavailable, as on a node whose seed did not complete.
     pub fn derive(&mut self, files: &NestFiles) -> Result<()> {
         let through = self.last_block()?;
-        self.entities = crate::derived::start(files, &self.registry, through.is_some(), self.budget)?;
+        self.entities =
+            crate::derived::start(files, &self.registry, through.is_some(), self.budget)?;
         if let (Some(history), Some(through)) = (&self.sealing.history, through) {
             restart::seed_entities(
                 &**history,

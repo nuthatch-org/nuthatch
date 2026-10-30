@@ -24,16 +24,31 @@ try {
   for (const f of ["entities/received.sql", "entities/sent.sql", "views/20-s4.sql"]) {
     files[f] = await text(`s4/${f}`);
   }
+  const open = {
+    nid: "tab-answers", rpc: p.get("rpc"), contract: p.get("contract"),
+    start: p.get("start"), files, pollIntervalSecs: 1,
+    module: new URL(p.get("module"), location.href).href,
+  };
+  // RFC-0077 S3: follow until a segment is sealed and say so; the harness kills the browser there,
+  // then opens this page again with `fresh=0` over the same OPFS.
+  if (p.get("phase") === "die") {
+    const worker = new Worker("./nest-worker.js", { type: "module" });
+    const stopped = await new Promise((resolve, reject) => {
+      worker.onmessage = (m) => {
+        if (m.data.nest === "stopped") resolve(m.data);
+        if (m.data.nest === "failed") reject(new Error(m.data.error));
+      };
+      worker.postMessage({ nest: "open", ...open, stopOnceSealed: true });
+    });
+    await report({ ok: stopped.stopped, stopped, error: stopped.stopped ? undefined : "reached the tip before a segment sealed" });
+    await new Promise(() => {});
+  }
   const t0 = performance.now();
   const opened = await openNest({
     scope: "./",
     swUrl: "./sw.js",
     workerUrl: "./nest-worker.js",
-    open: {
-      nid: "tab-answers", rpc: p.get("rpc"), contract: p.get("contract"),
-      start: p.get("start"), files, pollIntervalSecs: 1,
-      module: new URL(p.get("module"), location.href).href,
-    },
+    open: { ...open, fresh: p.get("fresh") !== "0" },
   });
   const followMs = performance.now() - t0;
 

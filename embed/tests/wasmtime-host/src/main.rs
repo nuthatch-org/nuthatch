@@ -642,7 +642,10 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
                 if r["segments"].as_object().is_some_and(|t| !t.is_empty()) {
                     // With these requests outstanding, as a crash would leave them.
                     let line = json!({"last_block": r["last_block"], "sealed_through": r["sealed_through"], "steps": steps});
-                    std::io::Write::write_all(&mut std::io::stdout(), format!("{line}\n").as_bytes())?;
+                    std::io::Write::write_all(
+                        &mut std::io::stdout(),
+                        format!("{line}\n").as_bytes(),
+                    )?;
                     unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
                 }
             }
@@ -797,7 +800,10 @@ fn kill_mid_follow(
     use std::os::unix::process::ExitStatusExt;
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("run").arg(wasm).arg(rpc).arg(dir).arg(gate);
-    cmd.arg("--die-mid-follow").arg(root).arg("--cache").arg(o.cache());
+    cmd.arg("--die-mid-follow")
+        .arg(root)
+        .arg("--cache")
+        .arg(o.cache());
     if o.winch {
         cmd.arg("--winch");
     }
@@ -808,7 +814,10 @@ fn kill_mid_follow(
         child.status
     );
     let stdout = String::from_utf8_lossy(&child.stdout);
-    let line = stdout.lines().last().context("the killed follow said nothing")?;
+    let line = stdout
+        .lines()
+        .last()
+        .context("the killed follow said nothing")?;
     Ok(serde_json::from_str(line)?)
 }
 
