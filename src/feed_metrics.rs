@@ -290,11 +290,20 @@ impl FeedMetrics {
             return 0;
         }
         let key = (conn, dataset.to_string());
-        // Reports travel concurrently, so one may arrive behind a later one.
-        if v.acked
-            .get(&key)
-            .is_some_and(|p| p.0 == at.0 && p.1 >= at.1)
-        {
+        // Reports travel concurrently, so one may arrive behind a later one. Epochs are not ordered:
+        // a change of epoch is a step forward only onto the one this writer commits now.
+        let current = v
+            .commits
+            .get(dataset)
+            .and_then(|r| r.back())
+            .map(|c| c.epoch);
+        if v.acked.get(&key).is_some_and(|p| {
+            if p.0 == at.0 {
+                p.1 >= at.1
+            } else {
+                current != Some(at.0)
+            }
+        }) {
             return 0;
         }
         let Some(prev) = v.acked.insert(key, at) else {
@@ -553,6 +562,16 @@ mod tests {
             .unwrap();
         let v: f64 = sum.rsplit(' ').next().unwrap().parse().unwrap();
         assert!((v - 0.040).abs() < 1e-9, "50 ms less half of 20: {v}");
+
+        // The dataset's store reopened as epoch 8; a report still on its way from epoch 7 lands late.
+        m.committed(d, 8, 1, t0, Kind::Tip);
+        assert_eq!(m.acked(99, d, (8, 1), rtt, later), 1);
+        assert_eq!(
+            m.acked(99, d, (7, 3), rtt, later),
+            0,
+            "an old epoch is a step back"
+        );
+        assert_eq!(m.acked(99, d, (8, 1), rtt, later), 0, "nor seen twice");
         m.gone(99);
     }
 
