@@ -185,7 +185,8 @@ impl LiveNest {
 
     /// Follow the chain to its tip, then report what the gate compares, in the node's shapes.
     pub async fn follow(&self) -> Result<String, JsError> {
-        self.nest
+        let rolled = self
+            .nest
             .follow(&self.rpc)
             .await
             .map_err(|e| js(format!("{e:#}")))?;
@@ -215,6 +216,7 @@ impl LiveNest {
             "segment_bytes": self.cellar.bytes(),
             "first_rows": self.cellar.first_rows(),
             "hot_rows": self.nest.store.count().map_err(js)?,
+            "resumed_from": rolled,
             "backend": self.backend,
         })
         .to_string())
