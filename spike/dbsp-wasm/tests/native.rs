@@ -118,6 +118,39 @@ fn sql_caps_result_bytes_not_just_rows() {
     assert!(rows.len() < 100, "held {} wide rows", rows.len());
 }
 
+/// Dates and timestamps as the node writes them, on both read paths; a text column is data.
+#[test]
+fn sql_writes_dates_as_the_node_does() {
+    use dbsp_wasm_spike::{budget::TabBudget, cellar::Cellar, derived::NestFiles, query::TabQuery};
+    let db = redb::Database::builder()
+        .create_with_backend(nuthatch_core::backend::Bytes::default())
+        .unwrap();
+    let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
+    let cellar = Cellar::default();
+    let q = futures::executor::block_on(TabQuery::bind(
+        &store,
+        &cellar,
+        &[],
+        &[],
+        &NestFiles::new(),
+        TabBudget::default(),
+    ))
+    .unwrap();
+    let sql = "SELECT CAST('2026-10-05' AS DATE) AS d, \
+               CAST('2026-10-05 12:34:56.25' AS TIMESTAMP) AS ts, 'Date32(1)' AS text";
+    let want = serde_json::json!({
+        "d": "2026-10-05",
+        "ts": "2026-10-05T12:34:56.25Z",
+        "text": "Date32(1)",
+    });
+    let (rows, _, _) = futures::executor::block_on(q.collect(sql, 10)).unwrap();
+    assert_eq!(rows, vec![want.clone()]);
+    assert_eq!(
+        futures::executor::block_on(q.rows(sql)).unwrap(),
+        vec![want]
+    );
+}
+
 /// Burrmill refuses one value past 16 MiB, so the risk is a slice of near-limit rows: ten of 15 MB
 /// are 150 MB in one slice. The cap is met from Arrow lengths a row at a time, so no row that would
 /// cross it is encoded and what is held stays under it.

@@ -5,6 +5,7 @@
 
 use crate::engine::{Collected, Died, Engine, FactWindow, Interrupt, Pools, Session};
 use anyhow::{anyhow, Context, Result};
+use nuthatch_core::answer::{rewrite_temporal, temporal_columns};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -348,100 +349,6 @@ fn engine_err(e: burrmill::BurrmillError) -> anyhow::Error {
 
 /// Rows of one batch turned into JSON before the byte cap is checked again (#1650).
 const ENCODE_ROWS: usize = 32;
-
-/// Burrmill's encoder keeps DuckDB-era nuthatch's `Debug` text for dates and timestamps
-/// (`Date32(20731)`, `Timestamp(Nanosecond, …)`), which no reader can use (#1852). The columns it
-/// applies to are chosen by Arrow type, so a text column that happens to hold such a string is left be.
-#[derive(Clone, Copy)]
-enum Temporal {
-    Date,
-    Timestamp,
-}
-
-fn temporal_columns<'a>(
-    fields: impl Iterator<Item = (&'a String, String)>,
-) -> Vec<(String, Temporal)> {
-    fields
-        .filter_map(|(name, ty)| {
-            let kind = if ty == "Date32" {
-                Temporal::Date
-            } else if ty.starts_with("Timestamp") {
-                Temporal::Timestamp
-            } else {
-                return None;
-            };
-            Some((name.clone(), kind))
-        })
-        .collect()
-}
-
-fn rewrite_temporal(rows: &mut [Value], columns: &[(String, Temporal)]) {
-    if columns.is_empty() {
-        return;
-    }
-    for row in rows {
-        let Some(obj) = row.as_object_mut() else {
-            continue;
-        };
-        for (name, kind) in columns {
-            let Some(Value::String(s)) = obj.get_mut(name) else {
-                continue;
-            };
-            let civil = match kind {
-                Temporal::Date => iso_date(s),
-                Temporal::Timestamp => rfc3339(s),
-            };
-            if let Some(civil) = civil {
-                *s = civil;
-            }
-        }
-    }
-}
-
-/// `Date32(<days since 1970-01-01>)` as `YYYY-MM-DD`.
-fn iso_date(debug: &str) -> Option<String> {
-    let days: i64 = debug
-        .strip_prefix("Date32(")?
-        .strip_suffix(')')?
-        .parse()
-        .ok()?;
-    let (y, m, d) = crate::publish::civil_from_days(days);
-    Some(format!("{y:04}-{m:02}-{d:02}"))
-}
-
-/// `Timestamp(<unit>, <ticks since the epoch, UTC>)` as an RFC 3339 instant in UTC. Arrow stores a
-/// zoned timestamp as UTC ticks too, so one rendering serves both.
-fn rfc3339(debug: &str) -> Option<String> {
-    let (unit, ticks) = debug
-        .strip_prefix("Timestamp(")?
-        .strip_suffix(')')?
-        .split_once(", ")?;
-    let ticks: i64 = ticks.parse().ok()?;
-    let digits = match unit {
-        "Second" => 0,
-        "Millisecond" => 3,
-        "Microsecond" => 6,
-        "Nanosecond" => 9,
-        _ => return None,
-    };
-    let per_sec = 10i64.pow(digits);
-    let (secs, frac) = (ticks.div_euclid(per_sec), ticks.rem_euclid(per_sec));
-    let (y, mo, d) = crate::publish::civil_from_days(secs.div_euclid(86_400));
-    let rem = secs.rem_euclid(86_400);
-    let mut out = format!(
-        "{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    );
-    if frac != 0 {
-        let f = format!("{frac:0width$}", width = digits as usize);
-        out.push('.');
-        out.push_str(f.trim_end_matches('0'));
-    }
-    out.push('Z');
-    Some(out)
-}
 
 #[cfg(test)]
 thread_local! {
@@ -1274,34 +1181,6 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(err.to_string().contains("t__union"), "{err}");
-    }
-
-    #[test]
-    fn timestamps_render_at_every_unit_and_before_the_epoch() {
-        use super::rfc3339;
-        let cases = [
-            ("Timestamp(Second, 1791203696)", "2026-10-05T12:34:56Z"),
-            (
-                "Timestamp(Millisecond, 1791203696007)",
-                "2026-10-05T12:34:56.007Z",
-            ),
-            (
-                "Timestamp(Microsecond, 1791203696250000)",
-                "2026-10-05T12:34:56.25Z",
-            ),
-            (
-                "Timestamp(Nanosecond, -1)",
-                "1969-12-31T23:59:59.999999999Z",
-            ),
-            ("Timestamp(Second, 0)", "1970-01-01T00:00:00Z"),
-        ];
-        for (debug, want) in cases {
-            assert_eq!(rfc3339(debug).as_deref(), Some(want), "{debug}");
-        }
-        assert_eq!(
-            super::iso_date("Date32(-719162)").as_deref(),
-            Some("0001-01-01")
-        );
     }
 
     /// Both read paths rewrite by column type, and a text column holding the same string is data.

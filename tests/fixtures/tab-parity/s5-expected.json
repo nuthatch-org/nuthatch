@@ -201,5 +201,26 @@
     "status": 404,
     "content_type": "application/json",
     "body": "{\"error\":\"no such entity\",\"entity\":\"nope\",\"entities\":[\"received\",\"sent\"]}"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20block_number%2C%20to_timestamp(block_timestamp)%20AS%20at%2C%20CAST(to_timestamp(block_timestamp)%20AS%20DATE)%20AS%20day%20FROM%20tab__transfer%20ORDER%20BY%20block_number%20DESC%2C%20log_index%20DESC%20LIMIT%203",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"count\":3,\"truncated\":false,\"degraded\":false,\"degraded_tables\":[],\"tip_unavailable\":false,\"columns\":[\"block_number\",\"at\",\"day\"],\"rows\":[{\"block_number\":26245870,\"at\":\"2026-10-22T04:49:35Z\",\"day\":\"2026-10-22\"},{\"block_number\":26245870,\"at\":\"2026-10-22T04:49:35Z\",\"day\":\"2026-10-22\"},{\"block_number\":26245869,\"at\":\"2026-10-22T04:49:23Z\",\"day\":\"2026-10-22\"}],\"cached\":false,\"provenance\":{\"as_of\":26245870,\"sealed_through\":26245806,\"source\":\"hot+sealed\",\"registry_hash\":\"0x94ba85b9815a879678bac1e89f20ed71cd246c099fff458967e3398d0f88f4c3\",\"nid\":\"<masked>\",\"entities\":null}}"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20CAST(to_timestamp(block_timestamp)%20AS%20DATE)%20AS%20day%2C%20count(*)%20AS%20transfers%20FROM%20tab__transfer%20GROUP%20BY%201%20ORDER%20BY%201",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"count\":2,\"truncated\":false,\"degraded\":false,\"degraded_tables\":[],\"tip_unavailable\":false,\"columns\":[\"day\",\"transfers\"],\"rows\":[{\"day\":\"2026-10-21\",\"transfers\":2259},{\"day\":\"2026-10-22\",\"transfers\":17}],\"cached\":false,\"provenance\":{\"as_of\":26245870,\"sealed_through\":26245806,\"source\":\"hot+sealed\",\"registry_hash\":\"0x94ba85b9815a879678bac1e89f20ed71cd246c099fff458967e3398d0f88f4c3\",\"nid\":\"<masked>\",\"entities\":null}}"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20to_timestamp_millis(1791203696007)%20AS%20ms%2C%20to_timestamp_micros(1791203696250000)%20AS%20us%2C%20CAST('0001-01-01'%20AS%20DATE)%20AS%20early%2C%20CAST('1969-12-31%2023%3A59%3A59.999999999'%20AS%20TIMESTAMP)%20AS%20before_epoch%2C%20'Date32(1)'%20AS%20text",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"count\":1,\"truncated\":false,\"degraded\":false,\"degraded_tables\":[],\"tip_unavailable\":false,\"columns\":[\"ms\",\"us\",\"early\",\"before_epoch\",\"text\"],\"rows\":[{\"ms\":\"2026-10-05T12:34:56.007Z\",\"us\":\"2026-10-05T12:34:56.25Z\",\"early\":\"0001-01-01\",\"before_epoch\":\"1969-12-31T23:59:59.999999999Z\",\"text\":\"Date32(1)\"}],\"cached\":false,\"provenance\":{\"as_of\":26245870,\"sealed_through\":26245806,\"source\":\"hot+sealed\",\"registry_hash\":\"0x94ba85b9815a879678bac1e89f20ed71cd246c099fff458967e3398d0f88f4c3\",\"nid\":\"<masked>\",\"entities\":null}}"
   }
 ]
