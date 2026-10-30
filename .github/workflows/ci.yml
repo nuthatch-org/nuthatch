@@ -585,12 +585,61 @@ jobs:
   # RFC-0075 S1. `nuthatch-core` must keep building for a tab, on the patched dbsp the spike carries:
   # the patch lives in `spike/dbsp-wasm`'s own `[patch.crates-io]`, so the binary never sees it. The
   # Node run steps the circuits there, the views under the inline driver among them.
+  #
+  # Three runners in parallel, then this name over all of them. As one job it took 18-39 minutes, most
+  # of it compiling the spike once per profile in turn: native release, the tab module, wasm32 release.
   wasm-core:
     name: nuthatch-core (native, wasm32, Node)
+    runs-on: ubuntu-latest
+    needs: [changes, wasm-native, wasm-tab, wasm-chrome]
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: every leg green
+        shell: bash
+        run: |
+          echo "native spike: ${{ needs.wasm-native.result }}"
+          echo "core, tab module, Node, Service Worker: ${{ needs.wasm-tab.result }}"
+          echo "wasm32 in Chrome: ${{ needs.wasm-chrome.result }}"
+          if [ "${{ needs.changes.outputs.full }}" = false ]; then
+            echo "::notice::docs-only change: the nuthatch-core legs were skipped by design"
+            exit 0
+          fi
+          if [ "${{ needs.wasm-native.result }}" != success ] \
+            || [ "${{ needs.wasm-tab.result }}" != success ] \
+            || [ "${{ needs.wasm-chrome.result }}" != success ]; then
+            echo "::error::nuthatch-core needs every leg green (wasm-native, wasm-tab, wasm-chrome)"
+            exit 1
+          fi
+
+  # The native release build of the spike is the longest single compile, so it has a runner to itself.
+  wasm-native:
+    name: nuthatch-core (native spike)
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-on-failure: true
+          workspaces: spike/dbsp-wasm
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: vendor the patched dbsp
+        run: spike/dbsp-wasm/vendor.sh
+      - name: native step test (spike)
+        working-directory: spike/dbsp-wasm
+        run: cargo test --locked --release --test native
+
+  # Every gate here runs the module the tab ships: the `tab` profile, then wasm-opt.
+  wasm-tab:
+    name: nuthatch-core (core, tab module, Node, Service Worker)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
@@ -612,43 +661,39 @@ jobs:
           cargo test --locked --manifest-path core/Cargo.toml --features checkpoint-hash-index
       - name: vendor the patched dbsp
         run: spike/dbsp-wasm/vendor.sh
-      # zstd-sys (via nuthatch-seal) compiles C for the target: the runner's LLVM clang, with an empty
-      # sysroot, as the decode and seal wasm step does.
       - name: C toolchain for wasm32
-        run: |
-          ar=$(command -v llvm-ar || ls /usr/bin/llvm-ar-* | sort -V | tail -1)
-          mkdir -p "$RUNNER_TEMP/no-sysroot"
-          {
-            echo "CC_wasm32_unknown_unknown=clang"
-            echo "AR_wasm32_unknown_unknown=$ar"
-            echo "CFLAGS_wasm32_unknown_unknown=--sysroot=$RUNNER_TEMP/no-sysroot"
-          } >> "$GITHUB_ENV"
+        uses: ./.github/actions/wasm32-c-toolchain
       - name: wasm check (core)
         working-directory: spike/dbsp-wasm
         run: cargo check --locked --target wasm32-unknown-unknown -p nuthatch-core
-      - name: native step test (spike)
-        working-directory: spike/dbsp-wasm
-        run: cargo test --locked --release --test native
-      - name: Node step test (spike)
+      - name: wasm-bindgen and binaryen
+        uses: ./.github/actions/wasm-tools
+      - name: the tab module (spike)
         working-directory: spike/dbsp-wasm
         run: |
-          cargo install --locked wasm-bindgen-cli --version 0.2.129
-          curl -fsSL -o "$RUNNER_TEMP/binaryen.tgz" \
-            https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz
-          echo "2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489  $RUNNER_TEMP/binaryen.tgz" | sha256sum -c
-          tar -xzf "$RUNNER_TEMP/binaryen.tgz" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/binaryen-version_133/bin" >> "$GITHUB_PATH"
-          export PATH="$RUNNER_TEMP/binaryen-version_133/bin:$PATH"
+          cargo build --locked --profile tab --target wasm32-unknown-unknown
+          # One cargo build, two bindings: wasm-opt and size.mjs's brotli each leave cores idle.
+          ./build-tab.sh nodejs pkg > "$RUNNER_TEMP/tab-nodejs.log" 2>&1 &
+          nodejs=$!
+          ./build-tab.sh web pkg-web > "$RUNNER_TEMP/tab-web.log" 2>&1 &
+          web=$!
+          a=0; wait "$nodejs" || a=$?
+          b=0; wait "$web" || b=$?
+          cat "$RUNNER_TEMP/tab-nodejs.log" "$RUNNER_TEMP/tab-web.log"
+          [ "$a" = 0 ] && [ "$b" = 0 ]
           # RFC-0075 S6: every gate below runs this module, whose size goes to the job summary.
-          size=$(./build-tab.sh nodejs pkg | tail -1)
+          size=$(tail -1 "$RUNNER_TEMP/tab-nodejs.log")
           echo "tab module bytes after wasm-bindgen and wasm-opt: \`$size\` (burrmill-wasm: 5.6 MB brotli)" >> "$GITHUB_STEP_SUMMARY"
-          node --stack-trace-limit=60 run-node.mjs pkg
+      - name: Node step test (spike)
+        working-directory: spike/dbsp-wasm
+        run: node --stack-trace-limit=60 run-node.mjs pkg
+      - name: fixture-rpc
+        run: cargo build --locked --release --manifest-path tools/fixture-rpc/Cargo.toml
       # RFC-0075 S3: the tab's live cursor over `fetch`, held to the node's pinned segments and
       # balances for the recorded young contract (`e2e_tab_parity` holds the node to the same file).
       - name: live cursor in Node against the recording (spike)
         working-directory: spike/dbsp-wasm
         run: |
-          cargo build --locked --release --manifest-path ../../tools/fixture-rpc/Cargo.toml
           ../../tools/fixture-rpc/target/release/fixture-rpc recorded --port 8947 \
             --file ../../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8947/ && break; sleep 0.2; done
@@ -679,9 +724,44 @@ jobs:
             --file ../../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8952/ && break; sleep 0.2; done
           node run-budget.mjs pkg http://127.0.0.1:8952/ ../../tests/fixtures/tab-parity
-      # RFC-0075 S2: Node has no OPFS, so the OPFS backend's round trip and its lock run in a
-      # dedicated worker in Chrome for Testing; the 26.04 image ships no chromedriver.
-      - name: OPFS in headless Chrome (spike)
+      # RFC-0075 S5: the same routes through the Service Worker, as plain `fetch`es on the page's
+      # origin, with the scaffolded skill's examples run as written.
+      - name: query routes through a Service Worker in headless Chrome (spike)
+        working-directory: spike/dbsp-wasm
+        run: |
+          chrome=$(npx -y @puppeteer/browsers@2.10.10 install chrome@stable --path "$RUNNER_TEMP/browsers" | tail -1 | cut -d' ' -f2-)
+          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --fork --port 8951 \
+            --file ../../tests/fixtures/tab-parity/chain.json.gz &
+          for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8951/ && break; sleep 0.2; done
+          node run-sw.mjs "$chrome" http://127.0.0.1:8951/ ../../tests/fixtures/tab-parity
+
+  # RFC-0075 S2: Node has no OPFS, so the OPFS backend's round trip and its lock run in a dedicated
+  # worker in Chrome for Testing, with the live cursor beside them; the 26.04 image ships no chromedriver.
+  wasm-chrome:
+    name: nuthatch-core (wasm32 tests in Chrome)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-on-failure: true
+          workspaces: spike/dbsp-wasm
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: vendor the patched dbsp
+        run: spike/dbsp-wasm/vendor.sh
+      - name: C toolchain for wasm32
+        uses: ./.github/actions/wasm32-c-toolchain
+      - name: wasm-bindgen and binaryen
+        uses: ./.github/actions/wasm-tools
+      - name: fixture-rpc
+        run: cargo build --locked --release --manifest-path tools/fixture-rpc/Cargo.toml
+      - name: OPFS and the live cursor in headless Chrome (spike)
         working-directory: spike/dbsp-wasm
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
@@ -695,17 +775,6 @@ jobs:
           CHROMEDRIVER="$driver" WASM_BINDGEN_TEST_WEBDRIVER_JSON="$b/webdriver.json" \
           TAB_PARITY_RPC=http://127.0.0.1:8948/ \
             cargo test --locked --release --target wasm32-unknown-unknown --test opfs --test live -- --nocapture
-      # RFC-0075 S5: the same routes through the Service Worker, as plain `fetch`es on the page's
-      # origin, with the scaffolded skill's examples run as written.
-      - name: query routes through a Service Worker in headless Chrome (spike)
-        working-directory: spike/dbsp-wasm
-        run: |
-          chrome=$(npx -y @puppeteer/browsers@2.10.10 install chrome@stable --path "$RUNNER_TEMP/browsers" | tail -1 | cut -d' ' -f2-)
-          ./build-tab.sh web pkg-web
-          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --fork --port 8951 \
-            --file ../../tests/fixtures/tab-parity/chain.json.gz &
-          for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8951/ && break; sleep 0.2; done
-          node run-sw.mjs "$chrome" http://127.0.0.1:8951/ ../../tests/fixtures/tab-parity
 
   # The parked RFC-0060 replays (network_contract and serve's network_* tests) run nightly in
   # network-contract.yml instead; this filter must stay the complement of that one.

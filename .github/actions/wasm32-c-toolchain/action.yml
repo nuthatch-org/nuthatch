@@ -1,0 +1,17 @@
+name: C toolchain for wasm32
+description: >
+  zstd-sys (via nuthatch-seal) compiles C for wasm32-unknown-unknown: the runner's LLVM clang, with an
+  empty sysroot. Run it after rust-cache, whose key hashes the CC* and CFLAGS* variables it sets.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        ar=$(command -v llvm-ar || ls /usr/bin/llvm-ar-* | sort -V | tail -1)
+        mkdir -p "$RUNNER_TEMP/no-sysroot"
+        {
+          echo "CC_wasm32_unknown_unknown=clang"
+          echo "AR_wasm32_unknown_unknown=$ar"
+          echo "CFLAGS_wasm32_unknown_unknown=--sysroot=$RUNNER_TEMP/no-sysroot"
+        } >> "$GITHUB_ENV"
