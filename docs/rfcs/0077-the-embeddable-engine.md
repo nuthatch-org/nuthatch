@@ -1,4 +1,4 @@
-# RFC-0077: nuthatch as an embeddable engine - one wasm module, one host interface, any host
+# RFC-0077: The embeddable engine - nuthatch's core as an opt-in wasm module, beside the binary
 
 - Status: **Proposed, 2026-10-30.**
 - Author: Pete (cargopete)
@@ -29,10 +29,43 @@ Two days later the question mark has two answers, and they do not share a line o
    host keeps. vitalik.eth over blocks 18,000,000 to 20,000,000 answered every list equal to
    Etherscan. It is `embed/` on its branch, never merged.
 
-This RFC turns the "(?)" into a supported property: **one embeddable nuthatch engine**, a
-`wasm32-unknown-unknown` module with a small, versioned, documented host interface. A browser tab, a
-Node or Electron process, rotki's Python through wasmtime and any other host drive the same module
-the same way. The tab and the rotki embedding stop being two spikes and become two hosts.
+This RFC turns the "(?)" into a supported property, and a secondary one: the binary stays what
+nuthatch is and what it leads with. Beside it, opt-in and off by default, sits **one embeddable
+engine**, a `wasm32-unknown-unknown` module with a small, versioned, documented host interface, for
+the cases where the data belongs to one user on one device. A browser tab, a Node or Electron process,
+rotki's Python through wasmtime and any other host drive the same module the same way. The tab and the
+rotki embedding stop being two spikes and become two hosts.
+
+## 1a. The principle: one indexer, many ways to run it
+
+Chief's line, which every slice below is held to: **nuthatch is one indexer with many ways to run it.
+The native binary is the main path, the delightful core, and it stays as it is. The embeddable engine
+is opt-in**, a separate crate (`embed/`) built only when wanted.
+
+What that means in practice:
+
+- **A default build is unchanged** in behaviour, CLI, config, on-disk layout, dependencies and
+  performance. Building it needs no wasm toolchain, and nothing here adds a runtime cost to it. RFC-0046
+  §1's deletion test applies: delete `embed/` and every embed-only feature from the tree, and a binary
+  user loses nothing.
+- **The wasm32 constraint binds only what the embed shares with the binary**: no threads, no direct file
+  or network access, no C dependency without a wasm build. It applies to the shared modules behind the
+  seams that already exist (`Source` and `Transport`, the store's backend, the clock shim in
+  `nuthatch_core::time`). It does not bind the binary's own code: tokio's multi-threaded runtime, mounts,
+  the admin cockpit, followers and the rest stay native-only. CI builds the shared modules for wasm32 on
+  the PRs that touch them, and on no others.
+- **Where a move into core would make the native path slower or more awkward, the native path wins.**
+  The binary keeps a native implementation behind the trait, as it kept its blocking-pool commit and its
+  threaded view driver in RFC-0075 S1, rather than bending to fit wasm.
+- **One engine, two ways to run it.** Embed it when the data belongs to one user on one device: a
+  wallet, rotki, a dapp's frontend. Run the binary when many users share one view: dashboards, APIs,
+  anything past the memory budget. The two give byte-identical answers, so an app can move from one to
+  the other without its answers changing.
+- **The binary stays the pitch.** In Chief's words: "the binary stays the main pitch, the delightful
+  core, all the things nuthatch is today; the embeddable engine is off by default but is important for
+  some use cases." The README, the site and `llms.txt` keep leading with the binary. The engine is
+  presented as a secondary capability for named cases (personal data on one device: rotki, wallets,
+  dapp frontends, `/play`), never as the headline and never as "nuthatch is now wasm" (§11).
 
 ## 2. What exists, read 2026-10-30
 
@@ -177,7 +210,7 @@ Each ends runnable, and each gate can fail. Sizes are days of focused work, esti
   Recorded: wasmtime's compile time and memory for a 34 MB module, and a precompiled load. RFC-0074
   found Cranelift took about 95 MB to compile a 1.36 MB module; if a 34 MB one cannot be compiled or
   precompiled within a host's reasonable budget, the event build is browser-and-Node only, and §1's
-  promise narrows to say so. About 2 days.
+  promise narrows to say so. Binary: untouched, since S0 changes only the spike. About 2 days.
 - **S1, one codebase.** The binary's modules the spikes include by path move into crates, so nothing
   compiles `src/` by `#[path]`:
   - `entity_bind`, `entity_decl`, `entity_lower` and `sql_errors` into `nuthatch-core`. `entity_bind`
@@ -207,8 +240,10 @@ Each ends runnable, and each gate can fail. Sizes are days of focused work, esti
   dbsp patch to the binary. Instead, S1 adds a check that every crate `embed/` shares with the binary
   resolves to the binary's version.
 
-  **Gate**: no `#[path]` into `src/` anywhere and no `spike/` directory; the binary's tests, benches and
-  budgets unchanged; every RFC-0075 gate (S0's digest, S2's reorg transcript, S3's segment hash, S4's
+  **Gate**: no `#[path]` into `src/` anywhere and no `spike/` directory; the binary unchanged (§1a): its
+  tests, benches and budgets, its CLI help, the config `init` writes, its on-disk layout, and its
+  dependency tree (`cargo tree` before and after, nothing added), with native seal hashes for a pinned
+  range equal before and after; every RFC-0075 gate (S0's digest, S2's reorg transcript, S3's segment hash, S4's
   entities and views, S5's 32 answers, S6's budgets) green against `embed/`'s event build; RFC-0074
   S0's parity re-run against the address build with the same Etherscan files; both builds made for
   wasm32 in CI on every PR that touches core or `embed/`. 6 to 8 days, the largest slice.
@@ -220,7 +255,8 @@ Each ends runnable, and each gate can fail. Sizes are days of focused work, esti
   browser. **Gate**: the same `.wasm` file, unmodified, gives byte-identical answers in the browser host
   (Chrome), the Node host and the wasmtime host for RFC-0075 S5's request set, and equal to the node's
   pinned `s5-expected.json`; the address build gives RFC-0074 S0's lists in the wasmtime host. A change
-  to an export's shape without a version bump fails a pinned-interface test. About 4 days.
+  to an export's shape without a version bump fails a pinned-interface test. Binary: unchanged, and
+  wasmtime appears in no lockfile but `embed/`'s. About 4 days.
 - **S3, survives a restart.** A reopened store comes back with three things missing, not one:
   1. **Sealed history.** The `Cellar` is in memory (§3.3), so the segments are gone while the store
      says `sealed_through` and has pruned those rows.
@@ -242,7 +278,10 @@ Each ends runnable, and each gate can fail. Sizes are days of focused work, esti
   runs them in the module on open. **Gate**: follow S3's recording and S4's fork with entities, kill the
   host mid-follow, reopen from the same storage, finish; `/balances`, `/derived/*`, every view and the
   segment hashes equal the node's at the same head, in the browser host on OPFS and the wasmtime host
-  on files. `/play/live` then stops sweeping its stores. About 4 days.
+  on files. Binary: the rebuilds move behind the segment reader with the node's file-backed reader as
+  its native implementation; `tests/e2e_warm_restart.rs`, `tests/e2e_entity_reorg.rs` and
+  `tests/bench_restart_mounts.rs` unchanged and green, and restart no slower than before on the same
+  bench. `/play/live` then stops sweeping its stores. About 4 days.
 - **S4, any nest.** Today the tab is one ERC-20's `Transfer` on mainnet: the registry is
   `tab.rs`'s `erc20()`, the chain policy three constants in `live.rs` ("Mainnet's policy, as
   `src/chains.rs` gives the node"), no factory and empty labels. S4 takes `nuthatch.toml` and its ABIs
@@ -258,7 +297,11 @@ Each ends runnable, and each gate can fail. Sizes are days of focused work, esti
   RFC-0075 S4's entity nest published to a local mirror, opened in the browser host, answer equal to a
   node seeded from the same mirror at the same head, at the 2 GiB ceiling; a nest that cannot fit at 600 MiB is refused
   before download with its figures. For scale, RFC-0068 §5 has DeFi Pulse's published segments at 128 MB
-  and Lodestar's at 512 MB; neither has been opened this way. About 5 days.
+  and Lodestar's at 512 MB; neither has been opened this way. Binary: config parsing and the chain
+  registry move without changing a byte the binary accepts or writes; its config tests,
+  `tests/e2e_seed_from_mirror.rs` and the CLI's help unchanged. Where a config section only the
+  binary uses (mounts, webhooks, admin) would drag native-only code into core, it stays in the binary
+  and core sees the nest's part alone. About 5 days.
 - **S5, trust, parity, reach.**
   - *The head.* `/play`'s light client is Helios in the page (`web/play/verified.js` in burrmill-wasm,
     RFC-0065 S5): it verifies a finalized block through the beacon sync committee, from one consensus
@@ -281,12 +324,12 @@ Each ends runnable, and each gate can fail. Sizes are days of focused work, esti
 
   **Gate**: with a verified head, a forged header or a log off the verified chain stops sealing by name
   (RFC-0065 S5's cases, re-run against the module); every listed shape equal to the node's; the size
-  gates in CI. About 5 days, Safari excepted.
+  gates in CI. Binary: unchanged; S5 adds nothing to it. About 5 days, Safari excepted.
 - **S6, rotki on the interface. Only if Lefteris asks.** RFC-0074 is parked (#2474); rotki#13342, the
   HTTP adapter its S1 built on, was closed on scope. If rotki asks for embedded indexing, the address
   build replaces `embed/`'s S0 module and rotki's host answers `nh_step`'s requests where it answered
   `rpc_batch`. No rotki PR is opened otherwise. **Gate**: RFC-0074 §5's parity in rotki's host, and
-  rotki's tests and linters.
+  rotki's tests and linters. Binary: unchanged.
 
 ## 5. Honest limits
 
@@ -302,8 +345,13 @@ Each ends runnable, and each gate can fail. Sizes are days of focused work, esti
 
 ## 6. Against the non-negotiables
 
-1. **Single static binary.** Unchanged and primary. S1's gate holds its behaviour, it gains no wasmtime
-   and no WIT, and the module is a separate artefact, as the tab and RFC-0074's module are.
+1. **Single static binary.** Unchanged and primary, the main path and the main pitch (§1a). Every
+   slice's gate holds a default build's behaviour, CLI, config, on-disk layout, dependencies and
+   performance where they are; building it needs no wasm toolchain; it gains no wasmtime and no WIT. The
+   module is opt-in, a separate crate built only when wanted. RFC-0046 §1's deletion test holds: delete
+   `embed/` and the binary user loses nothing. The wasm32 constraint binds only the modules the two
+   share, behind existing traits; where it would cost the native path, the binary keeps a native
+   implementation behind the trait.
 2. **Footprint.** The module enforces the per-cursor budget itself (RFC-0075 §17) whatever the host.
 3. **No phone-home.** The module can reach nothing. Every request it makes is one the host performs, to
    the RPC, mirror or consensus endpoint the host chose. Nothing is sent about anyone.
@@ -360,7 +408,15 @@ where nuthatch runs and what it promises outside the binary. RFC-0065 §8 put th
 ("a new way of running nuthatch's core") to Chief for a line in `CLAUDE.md`, and RFC-0074 §7 said the
 same of offering the module to rotki. If accepted, this wants that line.
 
-## 11. After it lands
+## 11. Docs, site, and after it lands
 
-A thorough blog post for nuthatch-indexer.com, explaining what the embeddable engine is and how it
-works, follows once the slices are done. It is not written in this RFC's PR.
+- **The README, the site and `llms.txt` keep leading with the binary**: `curl | sh`, `nuthatch init`,
+  `nuthatch dev`, the two-minute path, as today. Nothing in their first screen changes.
+- **The engine gets its own page**, linked from the docs and not from the hero: `embed/README.md` for
+  the interface (S2), and a page on the site that opens with the use cases it is for (one user's data on
+  one device: rotki, wallets, dapp frontends, `/play`) and says plainly when to run the binary instead.
+- **No copy calls nuthatch "wasm"** or describes the engine as a new direction. It is the same indexer,
+  run another way, for a narrower set of cases.
+- **A thorough blog post** for nuthatch-indexer.com, explaining what the embeddable engine is and how it
+  works, follows once the slices are done, in the same register: a capability beside the binary. It is
+  not written in this RFC's PR.
