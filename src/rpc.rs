@@ -1386,6 +1386,32 @@ mod tests {
         good_h.abort();
     }
 
+    /// #2525: a refusing endpoint asked again and again, by calls in flight together and as the last
+    /// resort while it cools, begins one cool-down and says so once.
+    #[tokio::test]
+    async fn a_refusing_endpoint_is_cooled_and_logged_once_per_cool_down() {
+        let (bad, bad_h) = unauthorized_rpc().await;
+        let client = RpcClient::new(vec![bad]).unwrap();
+        for _ in 0..3 {
+            client.block_number().await.unwrap_err();
+        }
+        futures::future::join_all((0..8).map(|_| client.block_number())).await;
+        assert_eq!(client.terminal_cooldowns[0].load(Ordering::Relaxed), 1);
+        let remaining = client.health[0]
+            .load(Ordering::Relaxed)
+            .saturating_sub(super::now_millis());
+        assert!(
+            remaining > super::ENDPOINT_COOLDOWN_MS,
+            "still cooling: {remaining}ms"
+        );
+
+        // An answer ends the cool-down, so the next refusal begins and logs another.
+        client.mark_healthy(0);
+        client.block_number().await.unwrap_err();
+        assert_eq!(client.terminal_cooldowns[0].load(Ordering::Relaxed), 2);
+        bad_h.abort();
+    }
+
     /// The other half of the contract: a merely-broken endpoint keeps the short cooldown, so a blip
     /// does not get punished like a credential failure.
     #[tokio::test]
