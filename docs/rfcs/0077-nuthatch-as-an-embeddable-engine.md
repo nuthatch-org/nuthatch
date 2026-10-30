@@ -87,8 +87,9 @@ give the host guest memory.
 | `nh_request(method, target, body)` | one HTTP request as the node's router would answer it: status, content type, body bytes |
 | `nh_export()` | the whole store, in byte-buffer mode |
 
-A request is `{"kind": "rpc", "endpoint": "main" \| "trace", "body": ..., "deadline_ms": n}` or
-`{"kind": "get", "url": ..., "max_bytes": n}`, the second for a mirror (§6). The host returns each body
+A request is `{"kind": "rpc", "endpoint": "main", "body": ..., "deadline_ms": n}` (or `"trace"`, the
+binary's trace RPC) or `{"kind": "get", "url": ..., "max_bytes": n}`, the second for a mirror (§4,
+S4). `nh_request` never yields: everything a query reads is already in storage. The host returns each body
 whole, JSON-RPC errors included, because the RPC client classifies a provider's refusals by their
 words (`classify_rpc_error`, `looks_like_cap`, RFC-0075 §5). Retries across a transport failure are the
 host's; retries the RPC client decides on (a cap, a range split) are the guest's and arrive as new
