@@ -50,7 +50,6 @@ pub use tab::*;
 mod tab {
     use super::Duration;
     use std::future::Future;
-    use wasm_bindgen::{JsCast, JsValue};
 
     pub type Deadline = web_time::Instant;
 
@@ -70,7 +69,9 @@ mod tab {
     }
 
     /// Sound only because a tab's nest runs on one thread (RFC-0075 §4).
+    #[cfg(feature = "js")]
     pub fn sleep(d: Duration) -> impl Future<Output = ()> + Send {
+        use wasm_bindgen::{JsCast, JsValue};
         let ms = d.as_millis().min(i32::MAX as u128) as i32;
         let promise = js_sys::Promise::new(&mut |resolve, _| {
             let set_timeout: js_sys::Function =
@@ -83,6 +84,41 @@ mod tab {
         async move {
             let _ = wait.await;
         }
+    }
+
+    // Without JavaScript there is no timer to call back: a pending sleep leaves its deadline and waker
+    // here, and the embedding's executor tells its host how long to wait (RFC-0077 §3.2).
+    #[cfg(not(feature = "js"))]
+    std::thread_local! {
+        static SLEEPERS: std::cell::RefCell<Vec<(Deadline, std::task::Waker)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[cfg(not(feature = "js"))]
+    pub fn sleep(d: Duration) -> impl Future<Output = ()> + Send {
+        let until = deadline_now() + d;
+        std::future::poll_fn(move |cx| {
+            if deadline_now() >= until {
+                return std::task::Poll::Ready(());
+            }
+            SLEEPERS.with(|s| s.borrow_mut().push((until, cx.waker().clone())));
+            std::task::Poll::Pending
+        })
+    }
+
+    /// Wakes every pending sleep, so each one still alive re-registers on its next poll and a
+    /// dropped one is forgotten.
+    #[cfg(not(feature = "js"))]
+    pub fn wake_sleepers() {
+        for (_, waker) in SLEEPERS.with(|s| std::mem::take(&mut *s.borrow_mut())) {
+            waker.wake();
+        }
+    }
+
+    /// The earliest deadline a pending sleep is waiting for.
+    #[cfg(not(feature = "js"))]
+    pub fn next_wake() -> Option<Deadline> {
+        SLEEPERS.with(|s| s.borrow().iter().map(|(d, _)| *d).min())
     }
 
     pub async fn timeout<F: Future>(d: Duration, f: F) -> Result<F::Output, Elapsed> {

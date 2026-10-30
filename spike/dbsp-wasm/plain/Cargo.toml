@@ -1,0 +1,54 @@
+[package]
+name = "dbsp-wasm-plain"
+version = "0.0.1"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "RFC-0077 S0: the tab's live cursor as a plain core module whose only imports are nuthatch.*."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+test = false
+doctest = false
+
+[dependencies]
+dbsp-wasm-spike = { path = "..", default-features = false }
+nuthatch-core = { path = "../../../core", default-features = false }
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+redb = "2"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# No features: `.cargo/config.toml` selects their custom backend, which `random_fill` answers.
+getrandom03 = { package = "getrandom", version = "0.3" }
+
+# The spike's patched dbsp, and a web-time whose clock is `nuthatch.now_ms` (`vendor.sh`).
+[patch.crates-io]
+dbsp = { path = "../vendor/dbsp" }
+feldera-types = { path = "../vendor/feldera-types" }
+feldera-storage = { path = "../vendor/feldera-storage" }
+feldera-buffer-cache = { path = "../vendor/feldera-buffer-cache" }
+feldera-samply = { path = "../vendor/feldera-samply" }
+feldera-ir = { path = "../vendor/feldera-ir" }
+feldera-macros = { path = "../vendor/feldera-macros" }
+feldera-size-of = { path = "../vendor/feldera-size-of" }
+web-time = { path = "vendor/web-time" }
+chrono = { path = "vendor/chrono" }
+uuid = { path = "vendor/uuid" }
+getrandom = { path = "vendor/getrandom02" }
+
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 16
+
+# As the spike's: the module the gates run.
+[profile.tab]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1

@@ -276,7 +276,7 @@ pub const TRANSFER: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628
 
 /// The `/play` worker's handle on a nest: its store in OPFS under the NID, or in a byte buffer where
 /// the worker has no sync access handles, fed by the recorded chains the page plays to it.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub mod worker {
     use super::{erc20, TabNest, TRANSFER};
     use crate::tape::TapeSource;

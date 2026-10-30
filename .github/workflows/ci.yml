@@ -591,7 +591,7 @@ jobs:
   wasm-core:
     name: nuthatch-core (native, wasm32, Node)
     runs-on: ubuntu-latest
-    needs: [changes, wasm-native, wasm-tab, wasm-chrome]
+    needs: [changes, wasm-native, wasm-tab, wasm-chrome, wasm-plain]
     if: always()
     timeout-minutes: 5
     steps:
@@ -601,14 +601,16 @@ jobs:
           echo "native spike: ${{ needs.wasm-native.result }}"
           echo "core, tab module, Node, Service Worker: ${{ needs.wasm-tab.result }}"
           echo "wasm32 in Chrome: ${{ needs.wasm-chrome.result }}"
+          echo "plain module, Node and wasmtime: ${{ needs.wasm-plain.result }}"
           if [ "${{ needs.changes.outputs.full }}" = false ]; then
             echo "::notice::docs-only change: the nuthatch-core legs were skipped by design"
             exit 0
           fi
           if [ "${{ needs.wasm-native.result }}" != success ] \
             || [ "${{ needs.wasm-tab.result }}" != success ] \
-            || [ "${{ needs.wasm-chrome.result }}" != success ]; then
-            echo "::error::nuthatch-core needs every leg green (wasm-native, wasm-tab, wasm-chrome)"
+            || [ "${{ needs.wasm-chrome.result }}" != success ] \
+            || [ "${{ needs.wasm-plain.result }}" != success ]; then
+            echo "::error::nuthatch-core needs every leg green (wasm-native, wasm-tab, wasm-chrome, wasm-plain)"
             exit 1
           fi
 
@@ -734,6 +736,73 @@ jobs:
             --file ../../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8951/ && break; sleep 0.2; done
           node run-sw.mjs "$chrome" http://127.0.0.1:8951/ ../../tests/fixtures/tab-parity
+
+  # RFC-0077 S0: the tab's live cursor as a plain core module, imports `nuthatch.*` only, driven by
+  # two hosts that perform its requests: Node with no wasm-bindgen glue, and wasmtime from Rust. Both
+  # held to RFC-0075 S3's pinned segment hash and balances, and to each other's query answers.
+  wasm-plain:
+    name: nuthatch-core (plain module, Node and wasmtime)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-on-failure: true
+          workspaces: |
+            spike/dbsp-wasm/plain
+            spike/dbsp-wasm/plain/host
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: vendor the patched dbsp and the four host-neutral crates
+        run: |
+          spike/dbsp-wasm/vendor.sh
+          spike/dbsp-wasm/plain/vendor.sh
+      - name: C toolchain for wasm32
+        uses: ./.github/actions/wasm32-c-toolchain
+      - name: wasm-bindgen and binaryen
+        uses: ./.github/actions/wasm-tools
+      - name: fmt · clippy (plain module, wasmtime host)
+        working-directory: spike/dbsp-wasm/plain
+        run: |
+          cargo fmt --check
+          cargo fmt --check --manifest-path host/Cargo.toml
+          RUSTFLAGS='--cfg getrandom_backend="custom"' cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+          cargo clippy --locked --manifest-path host/Cargo.toml -- -D warnings
+      - name: the plain module, and its imports
+        working-directory: spike/dbsp-wasm/plain
+        run: |
+          ./build.sh "$RUNNER_TEMP/plain.wasm"
+          node imports.mjs "$RUNNER_TEMP/plain.wasm"
+          echo "plain module bytes after wasm-opt: \`$(stat -c %s "$RUNNER_TEMP/plain.wasm")\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: fixture-rpc and the wasmtime host
+        run: |
+          cargo build --locked --release --manifest-path tools/fixture-rpc/Cargo.toml
+          cargo build --locked --release --manifest-path spike/dbsp-wasm/plain/host/Cargo.toml
+      - name: S3's recording in Node and in wasmtime
+        working-directory: spike/dbsp-wasm/plain
+        # `shell: bash` for pipefail: each run is piped into tee.
+        shell: bash
+        run: |
+          ../../../tools/fixture-rpc/target/release/fixture-rpc recorded --port 8953 \
+            --file ../../../tests/fixtures/tab-parity/chain.json.gz &
+          for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8953/ && break; sleep 0.2; done
+          d=../../../tests/fixtures/tab-parity
+          node run-node.mjs "$RUNNER_TEMP/plain.wasm" http://127.0.0.1:8953/ $d | tee "$RUNNER_TEMP/node.log"
+          host/target/release/plain-host compile "$RUNNER_TEMP/plain.wasm" "$RUNNER_TEMP/plain.cwasm" | tee "$RUNNER_TEMP/compile.log"
+          host/target/release/plain-host compile "$RUNNER_TEMP/plain.wasm" "$RUNNER_TEMP/serial.cwasm" --serial | tee -a "$RUNNER_TEMP/compile.log"
+          host/target/release/plain-host run "$RUNNER_TEMP/plain.cwasm" http://127.0.0.1:8953/ $d | tee "$RUNNER_TEMP/wasmtime.log"
+          host/target/release/plain-host run "$RUNNER_TEMP/plain.wasm" http://127.0.0.1:8953/ $d | tee -a "$RUNNER_TEMP/wasmtime.log"
+          # Same module, same chain: every host answers S5's requests with the same bytes.
+          sums=$(cat "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" | grep -o '"answers_sha256":"[0-9a-f]*"' | sort -u)
+          echo "$sums"
+          [ "$(echo "$sums" | wc -l)" = 1 ]
+          { echo '```'; cat "$RUNNER_TEMP/compile.log" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   # RFC-0075 S2: Node has no OPFS, so the OPFS backend's round trip and its lock run in a dedicated
   # worker in Chrome for Testing, with the live cursor beside them; the 26.04 image ships no chromedriver.
