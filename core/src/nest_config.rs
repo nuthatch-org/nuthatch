@@ -491,16 +491,9 @@ pub fn declared(
     }
 }
 
-/// Top-level tables of `nuthatch.toml` that only a node runs: delivery, `eth_call` reads, IPFS,
-/// address history, and the removed screening layer.
-pub const NODE_ONLY_TABLES: &[&str] = &[
-    "webhooks",
-    "alerts",
-    "calls",
-    "ipfs",
-    "address_history",
-    "screening",
-];
+/// Top-level tables of `nuthatch.toml` that only a node runs: delivery, `eth_call` reads, IPFS and
+/// address history.
+pub const NODE_ONLY_TABLES: &[&str] = &["webhooks", "alerts", "calls", "ipfs", "address_history"];
 
 /// The nest's part of a `nuthatch.toml`, as an embedding reads it.
 #[derive(Debug, Deserialize)]

@@ -91,7 +91,7 @@ if (flags.includes("--refused")) {
     console.error(fault ? `refused, but only after ${gets.length} GET(s) to the mirror` : "the nest was not refused");
     finish(1);
   }
-  console.error("refused before anything was downloaded");
+  console.error(pin ? "refused before any segment was downloaded" : "refused before anything was downloaded");
   finish(0);
 }
 
