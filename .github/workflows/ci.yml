@@ -598,8 +598,8 @@ jobs:
       - name: every leg green
         shell: bash
         run: |
-          echo "native: ${{ needs.wasm-native.result }}"
-          echo "tab module, Node, Service Worker: ${{ needs.wasm-tab.result }}"
+          echo "native spike: ${{ needs.wasm-native.result }}"
+          echo "core, tab module, Node, Service Worker: ${{ needs.wasm-tab.result }}"
           echo "wasm32 in Chrome: ${{ needs.wasm-chrome.result }}"
           if [ "${{ needs.changes.outputs.full }}" = false ]; then
             echo "::notice::docs-only change: the nuthatch-core legs were skipped by design"
@@ -612,8 +612,30 @@ jobs:
             exit 1
           fi
 
+  # The native release build of the spike is the longest single compile, so it has a runner to itself.
   wasm-native:
-    name: nuthatch-core (native)
+    name: nuthatch-core (native spike)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-on-failure: true
+          workspaces: spike/dbsp-wasm
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: vendor the patched dbsp
+        run: spike/dbsp-wasm/vendor.sh
+      - name: native step test (spike)
+        working-directory: spike/dbsp-wasm
+        run: cargo test --locked --release --test native
+
+  # Every gate here runs the module the tab ships: the `tab` profile, then wasm-opt.
+  wasm-tab:
+    name: nuthatch-core (core, tab module, Node, Service Worker)
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
@@ -644,31 +666,6 @@ jobs:
       - name: wasm check (core)
         working-directory: spike/dbsp-wasm
         run: cargo check --locked --target wasm32-unknown-unknown -p nuthatch-core
-      - name: native step test (spike)
-        working-directory: spike/dbsp-wasm
-        run: cargo test --locked --release --test native
-
-  # Every gate here runs the module the tab ships: the `tab` profile, then wasm-opt.
-  wasm-tab:
-    name: nuthatch-core (tab module, Node, Service Worker)
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          cache-on-failure: true
-          workspaces: spike/dbsp-wasm
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: vendor the patched dbsp
-        run: spike/dbsp-wasm/vendor.sh
-      - name: C toolchain for wasm32
-        uses: ./.github/actions/wasm32-c-toolchain
       - name: wasm-bindgen and binaryen
         uses: ./.github/actions/wasm-tools
       - name: the tab module (spike)
