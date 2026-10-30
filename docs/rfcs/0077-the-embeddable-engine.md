@@ -704,7 +704,7 @@ answer wrappers, inside a follow that takes 0.5 to 3.8 s.
 
 | | Result |
 |---|---|
-| The same `.wasm`, unmodified, in Chrome, Node and wasmtime, S5's 32 requests equal to `s5-expected.json` | Node and wasmtime: **pass** on the M5 Pro, `tab` module `524e0009…d23b9ec3`, every answer set's digest `22966cee…363febc5`, the pin's digest. Chrome: CI only (below) |
+| The same `.wasm`, unmodified, in Chrome, Node and wasmtime, S5's 32 requests equal to `s5-expected.json` | **pass.** CI (run 41083776606, `wasm-plain`): seven runs of one module, `1a5086f8…ba7187d2`, Chrome on OPFS, Node and wasmtime each over files and in `bytes`; every S5 answer set's digest `22966cee…363febc5`, the pin's. Locally on the M5 Pro, Node and wasmtime gave the same digest for `524e0009…d23b9ec3` |
 | The address build gives RFC-0074 S0's lists in the wasmtime host | **deferred**: there is no address build on main (§13); extracting one needs RFC-0074 S2's store seam and driver-yield decisions, which are not made |
 | A shape change without a version bump fails a pinned-interface test | **pass**: `nh_export(i32)` built into a real module fails `wasmtime-host abi` by name; the table's own unit tests cover a changed, added or removed shape and an unpublished version |
 | Binary unchanged; wasmtime in no lockfile but `embed/`'s | **pass**: nothing outside `embed/`, the workflow, this RFC and one comment in `tests/embed_versions.rs` changed; wasmtime is only in `embed/tests/wasmtime-host/Cargo.lock` |
@@ -725,11 +725,16 @@ module of 33,947,090 bytes.
 | Peak RSS through follow and queries | 283 to 303 MiB | 152 to 161 MiB |
 | Linear memory at the end | 30.2 MiB (S3), 34.3 MiB (S5, files), 37.3 MiB (S5, bytes) | the same |
 
-Storage `host` over files costs about 3 s, because redb syncs every commit and the hosts make that
+On CI's 4-core `ubuntu-latest` runner, the same run's module (34,010,529 bytes): wasmtime compiled it
+in 17,719 ms at a peak of 1,369 MiB, then loaded it from the cache in 30 ms (63 MiB after, 154 to
+164 MiB peak through follow and queries). S5's follow took 2,318 ms over files and 2,082 ms in `bytes`
+in Node, 1,513 and 1,343 ms in wasmtime, and 3,586 ms in Chrome on OPFS, the page's whole open.
+
+Storage `host` over files costs about 3 s on the Mac, because redb syncs every commit and the hosts make that
 a real `fdatasync`; `bytes` syncs nothing. `nh_export` gives 2,641,920 bytes after S5's follow.
 
 **What it does not show.** The Chrome leg has not run on this Mac: Chrome for Testing would not spawn
-here (`spawn` error -88), as before, so the browser host's OPFS and Service Worker run is CI's. Safari
+here (`spawn` error -88), as before, so the browser host's evidence is CI's alone. Safari
 is still untested. The Node and wasmtime hosts take no lock on the store, so opening one nest twice
 from two processes is the host's to prevent, as the README says. Warm reopen is S3's: every gate run
 opens `fresh`.
