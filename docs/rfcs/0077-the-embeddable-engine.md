@@ -1,6 +1,7 @@
 # RFC-0077: The embeddable engine - nuthatch's core as an opt-in wasm module, beside the binary
 
-- Status: **Accepted, 2026-10-30.** S0 to S5 authorised in order; S6 waits for rotki to ask.
+- Status: **Accepted, 2026-10-30.** S0 to S5 authorised in order; S6 waits for rotki to ask. S0 passed
+  2026-10-30 (§12).
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0075 (the whole nest in a tab, S0 to S6 merged), RFC-0074 (address history as a
@@ -420,3 +421,110 @@ same of offering the module to rotki. If accepted, this wants that line.
 - **A thorough blog post** for nuthatch-indexer.com, explaining what the embeddable engine is and how it
   works, follows once the slices are done, in the same register: a capability beside the binary. It is
   not written in this RFC's PR.
+
+## 12. S0 measured outcome, 2026-10-30
+
+**What was built.** `spike/dbsp-wasm/plain/` is RFC-0075 S3's live cursor as a plain core module. It
+compiles the spike's library with nothing changed in decode, the circuits, the sealer, the store or the
+routes. It exports `nh_abi`, `nh_open`, `nh_step`, `nh_resume` and `nh_request` as §3.2 has them, with
+`nh_alloc`, `nh_free` and `nh_output`. It adds two S0 probes that are not part of `abi: 1`: `nh_report`,
+which is what `LiveNest::follow` reports, and `nh_memory_bytes`. It imports `nuthatch.now_ms`,
+`nuthatch.random_fill` and `nuthatch.log`, and nothing else. Storage is `bytes` only, because the
+`store_*` imports are S2's. Two hosts drive the module. `plain/run-node.mjs` is Node with no
+wasm-bindgen glue: `WebAssembly.instantiate`, `fetch` and `crypto.randomFillSync`. `plain/host/` is
+wasmtime 48.0.8 from Rust with ureq, a separate crate with its own lockfile. CI runs both in a fourth
+leg, `wasm-plain`.
+
+**What removing JavaScript took.**
+
+- *Core and the spike.* `nuthatch-core` gains a default-on `js` feature. It gates `fetch`, `opfs` and
+  the `setTimeout` sleep, and its wasm32-only dependencies become optional behind it. With it off, a
+  pending `time::sleep` registers its deadline and waker, and the embedding's executor turns the
+  earliest one into `{"wait_ms": n}`. The spike gains the same feature for its bindings, `LiveNest`
+  and `PlayNest` included. Its young-contract open and report moved into `young.rs`, which `live.rs`
+  and the plain module share.
+- *Four leaf crates, patched.* burrmill's wasm32 section (`crates/burrmill/Cargo.toml` at the pinned
+  `ea8cf40`) turns on `uuid/js`, getrandom 0.3's `wasm_js`, getrandom 0.2's `js` and chrono's
+  `wasmbind` unconditionally. Cargo features are additive, so nothing downstream can turn them off.
+  `plain/vendor.sh` vendors four crates and applies `rfc-0077-plain.patch` (376 lines), under the
+  plain crate's own `[patch.crates-io]`:
+  - web-time 1.1.0's clock becomes `nuthatch.now_ms`.
+  - chrono 0.4.45's `wasmbind` code is compiled out, and `Utc::now` reads web-time.
+  - uuid 1.29.0's `js` means `rng-getrandom`.
+  - getrandom 0.2.17's `js` means `custom`.
+
+  getrandom 0.3 and 0.4 take `--cfg getrandom_backend="custom"`, and one symbol,
+  `__getrandom_v03_custom`, serves both. Once those four were patched, nothing in DataFusion's tree
+  reached JavaScript by any other route. wasm-bindgen is still compiled, but no reachable code calls
+  it.
+- *A trap in the executor.* A no-op waker stalls the cursor at the first batched header fetch
+  (request 1,421 of the recording). The RPC client's `FuturesUnordered` polls only children that were
+  woken. Answers and sleeps now wake the waker they were polled with.
+
+**Gate: passed, both halves.**
+
+- *Imports.* The `tab`-profile module after `wasm-opt -O1` imports `nuthatch.log`,
+  `nuthatch.random_fill` and `nuthatch.now_ms`, three in all. The event build, rebuilt from the same
+  tree, imports 84, every one from `./dbsp_wasm_spike_bg.js`. `plain/imports.mjs` fails on any other
+  module.
+- *Parity.* Under Node and under wasmtime, precompiled and compiled at load, the module follows S3's
+  recording to the pinned `expected.json`: the segment hash `c983470c…479aeae`, `sealed_through`,
+  `last_block` and the 1,000 balances. Beyond the gate, RFC-0075 S5's request set minus `/ready`
+  (31 requests, through `nh_request` and DataFusion) gives byte-identical answers in both hosts. The
+  sha256 over them is `68fd12bc…c5d776a8`.
+- *The wait path.* The recording never refuses, so the gate run makes no waits. In a one-off run, the
+  Node host answered the fourth request with `429` and `Retry-After: 1`. The client rested, `nh_step`
+  returned one `wait_ms`, the follow took 1,501 ms instead of about 480, and every answer was the same.
+
+**Numbers.** Apple M5 Pro, 18 cores, macOS. Node 26.11.1, wasmtime 48.0.8, one run each. The
+second column is CI's `wasm-plain` leg on a 4-core x86_64 `ubuntu-latest` runner (run 41058267885).
+
+| | M5 Pro, macOS | CI, Linux |
+|---|---|---|
+| plain module, raw | 32,667,941 bytes, 5,007,337 brotli (event build today: 34,505,176 and 5,248,083) | 32,681,299 bytes |
+| Node: instantiate; follow (1,433 RPC posts, 1,434 steps, no waits); peak RSS | 32 ms; 480 ms; 339 MiB | 151 ms; 1,536 ms; 397 MiB |
+| wasmtime, Cranelift, compile on every core | 1,702 ms (18 threads), peak RSS 1,772 MiB | 18,193 ms (4 threads), peak RSS 1,275 MiB |
+| wasmtime, Cranelift, compile on one thread | 12,085 ms, peak RSS 1,591 MiB | 42,345 ms, peak RSS 1,272 MiB |
+| wasmtime, Winch, every core / one | 808 ms / 2,956 ms, peak RSS 1,724 / 1,712 MiB | not run |
+| precompiled `.cwasm` | 97,303,216 bytes (Cranelift), 183,224,168 (Winch) | 102,611,896 bytes (Cranelift) |
+| load the precompiled module | 9 ms; peak 119 MiB through the follow and 31 queries | 7 ms; peak 124 MiB |
+| follow in wasmtime, precompiled | 327 ms (Cranelift), 611 ms (Winch) | 902 ms |
+| linear memory at the end | 33.6 MiB in both hosts | 33.6 MiB in both hosts |
+
+**The budget question.** A 34 MB-class module compiles in wasmtime. The compile peaks at 1.3 GiB on
+Linux and 1.8 GiB on macOS, whichever compiler runs and however many threads it has. That makes the
+cost the module's state, not codegen parallelism. It takes 2 s on 18 cores, 18 s on CI's 4 and 42 s
+on one thread. RFC-0074's address build cost about 95 MB for 1.36 MB, so the cost scales roughly with
+size. A precompiled module loads in under 10 ms, and the whole run, follow and queries included,
+stays under 130 MiB.
+
+**Does S1 proceed as written: yes. The promise narrows by one sentence.** The event build runs in a
+non-browser host. That host pays up to 1.8 GiB once, to compile, and should cache the result. From
+then on it loads in under 130 MiB, inside the per-cursor budget. The one-time peak is under the 2 GiB
+ceiling and well over the 600 MiB one. A host that must compile at every start inside phone-sized
+memory, or a 128 MB isolate, cannot run the event build; it gets the address build. §1's "any host"
+should say so when S2 writes the interface down.
+
+What changes for later slices:
+
+- **S1.** The plain build needs its own RUSTFLAGS. Cargo merges `rustflags` across config files, and
+  the spike's `.cargo/config.toml` selects getrandom's `wasm_js`. With both cfgs set, getrandom 0.3
+  does not compile. `plain/build.sh` replaces the flags rather than adding to them, and `embed/`'s two
+  builds will need the same. The four leaf patches belong with the dbsp patch's move to a pinned fork.
+  A burrmill change that put its wasm32 dependencies behind a default-on `js` feature would retire
+  the uuid and getrandom 0.2 patches. Whether chrono's `wasmbind` has another enabler is still to be
+  checked.
+- **S2.** The wasmtime reference host should cache its compiled module (`Module::serialize`, or
+  wasmtime's cache), and `embed/README.md` should state the compile peak. S0 carries RPC bodies as
+  JSON strings inside JSON. S2 decides whether `abi: 1` keeps that or passes bytes. Any host's executor
+  must deliver wakes.
+
+**What it does not show.** The plain module has not run in a browser; the browser host is S2. The
+`host` storage mode and its imports are unbuilt. Nothing was measured on a phone-class device or
+through rotki's Python wasmtime binding, whose wasmtime version will differ. Peak RSS is the
+process's `ru_maxrss`, so it includes wasmtime's own. wasmtime 48 is the newest release whose MSRV is
+the pinned 1.95; 50 needs 1.97.
+
+**The binary.** Unchanged. Its `cargo tree` with features is line-for-line the same as before, except
+that `nuthatch-core` now shows `default,js`, a feature that gates only wasm32 dependencies. No
+lockfile changed; the two new crates carry their own, and wasmtime appears only in `plain/host/Cargo.lock`.

@@ -22,7 +22,7 @@ pub mod entity_lower;
 #[path = "offchain_none.rs"]
 pub mod entity_offchain;
 pub mod http;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub mod live;
 pub mod query;
 pub mod reorg;
@@ -35,6 +35,7 @@ pub mod sql_errors;
 pub mod tab;
 pub mod tape;
 pub mod window;
+pub mod young;
 
 /// Builds a one-worker circuit, feeds it three batches with a retraction in the middle, and
 /// answers the running sum of `doubled` after each step, plus the final `count_by_parity` relation.
@@ -150,7 +151,7 @@ pub fn run_views(driver: nuthatch_core::drive::Driver) -> Result<String, String>
     Ok(format!("{:?}", view.top(10)))
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
 mod wasm {
     use wasm_bindgen::prelude::*;
 

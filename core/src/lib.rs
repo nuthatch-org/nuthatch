@@ -18,13 +18,13 @@ pub mod extra;
 pub mod factory;
 pub mod fault;
 pub mod feed;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub mod fetch;
 pub mod flags;
 pub mod hooks;
 pub mod labels;
 pub mod metrics;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub mod opfs;
 pub mod redb_store;
 pub mod rpc;

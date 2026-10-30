@@ -5,21 +5,16 @@ use crate::cellar::Cellar;
 use crate::derived::NestFiles;
 use crate::query::{sorted, view_names, TabQuery};
 use crate::tab::worker::opfs_db;
-use crate::tab::{erc20, Sealing, TabNest, TRANSFER};
+use crate::tab::TabNest;
+use crate::young::MAINNET_LOG_WINDOW;
 use nuthatch_core::backend::Bytes;
 use nuthatch_core::fetch::Fetch;
 use nuthatch_core::opfs::OpenError;
 use nuthatch_core::rpc::RpcClient;
 use nuthatch_core::store::SEALED_THROUGH_KEY;
-use nuthatch_core::window::Finality;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
-
-// Mainnet's policy, as `src/chains.rs` gives the node.
-const MAINNET_FINALITY: u64 = 64;
-const MAINNET_SEAL_SPAN: u64 = 1_800;
-const MAINNET_LOG_WINDOW: u64 = 20;
 
 #[wasm_bindgen]
 pub struct LiveNest {
@@ -65,14 +60,6 @@ impl HttpAnswer {
     }
 }
 
-/// The binary's version, which `/ready` reports: the tab is built from the same tree.
-fn node_version() -> &'static str {
-    include_str!("../../../Cargo.toml")
-        .lines()
-        .find_map(|l| l.strip_prefix("version = \"")?.strip_suffix('"'))
-        .unwrap_or("unknown")
-}
-
 fn encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
@@ -101,21 +88,7 @@ impl LiveNest {
             ),
             Err(e) => return Err(js(e)),
         };
-        let cellar = Arc::new(Cellar::default());
-        let nest = TabNest::open_sealing(
-            db,
-            erc20(&contract).map_err(js)?,
-            vec![contract],
-            vec![TRANSFER.into()],
-            start,
-            MAINNET_LOG_WINDOW,
-            Sealing {
-                finality: Finality::Depth(MAINNET_FINALITY),
-                seal_span: MAINNET_SEAL_SPAN,
-                sinks: cellar.clone(),
-            },
-        )
-        .map_err(js)?;
+        let (nest, cellar) = crate::young::open(db, &contract, start).map_err(js)?;
         let rpc = RpcClient::new(vec![rpc_url]).map_err(js)?;
         Ok(LiveNest {
             nest,
@@ -150,7 +123,7 @@ impl LiveNest {
             cellar: &self.cellar,
             files: &self.files,
             nid: Some(&self.nid),
-            version: node_version(),
+            version: crate::young::node_version(),
             poll_interval_secs: self.poll_interval_secs,
             log_window: MAINNET_LOG_WINDOW,
         };
@@ -190,36 +163,10 @@ impl LiveNest {
             .follow(&self.rpc)
             .await
             .map_err(|e| js(format!("{e:#}")))?;
-        let sealed_through: Option<u64> = self
-            .nest
-            .store
-            .get_meta(SEALED_THROUGH_KEY)
-            .map_err(js)?
-            .and_then(|v| v.parse().ok());
-        let balances = &self.nest.balances;
-        let items: Vec<_> = balances
-            .top(1000)
-            .into_iter()
-            .map(|(address, balance)| json!({"address": address, "balance": balance.to_string()}))
-            .collect();
-        Ok(json!({
-            "segments": self.cellar.report(),
-            "sealed_through": sealed_through,
-            "last_block": self.nest.last_block().map_err(js)?,
-            "balances": {
-                "holders": balances.holders(),
-                "count": items.len(),
-                "items": items,
-                "dropped_over_i128": balances.dropped_over_i128(),
-            },
-            "rpc_requests": self.rpc.request_count(),
-            "segment_bytes": self.cellar.bytes(),
-            "first_rows": self.cellar.first_rows(),
-            "hot_rows": self.nest.store.count().map_err(js)?,
-            "resumed_from": rolled,
-            "backend": self.backend,
-        })
-        .to_string())
+        let report =
+            crate::young::report(&self.nest, &self.cellar, &self.rpc, rolled, self.backend)
+                .map_err(js)?;
+        Ok(report.to_string())
     }
 
     /// RFC-0075 S4: start the entities a scaffolded nest declares. `files_json` maps each authored
