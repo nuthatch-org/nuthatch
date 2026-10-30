@@ -11373,6 +11373,76 @@ mod tests {
         cursor.shutdown().await.unwrap();
     }
 
+    /// RFC-0073 FR6: a panic in a live mount's catch-up fails that mount, releases its store, and leaves
+    /// the cursor it was joining indexing. It used to unwind the admin task past the release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panic_in_a_live_mounts_catch_up_fails_that_mount_and_its_co_tenant_keeps_indexing() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\nchain = \"ethereum\"\nchain_id = 1\nrpc_urls = []\n",
+        )
+        .unwrap();
+        let (doomed, healthy) = ("fr6-join-panics", "fr6-join-carries-on");
+        let mut nests = two_nests(root.path(), doomed, healthy);
+        let (_, doomed_dir, _) = nests.remove(0);
+        indexer::panic_in_windows_of(&doomed_dir);
+        let chain = Arc::new(RisingChain(std::sync::atomic::AtomicU64::new(1_000)));
+        let mut handles = idle_handles(root.path());
+        handles.health.register(healthy, "ethereum");
+        let cursor = indexer::spawn_runtime(
+            chain.clone(),
+            nests,
+            Some(20),
+            false,
+            1,
+            Some(5),
+            false,
+            None,
+            handles.health.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(indexed_through(&cursor.states, healthy, 1_000).await);
+
+        handles.states = cursor.states.clone();
+        handles
+            .lifecycle
+            .insert("ethereum".into(), cursor.lifecycle.clone());
+        let source: Arc<dyn Source> = chain.clone();
+        handles.mount_ctx.sources.insert("ethereum".into(), source);
+        handles.mount_ctx.backfill = Some(20);
+        handles.mount_ctx.window_override = Some(5);
+        let err = handles
+            .mount_dataset(doomed, None, doomed, None, doomed_dir.clone())
+            .await
+            .expect_err("a mount whose catch-up panicked joined the cursor");
+        assert!(
+            format!("{err:#}").contains("injected window panic"),
+            "{err:#}"
+        );
+        assert!(
+            handles.joining.list().is_empty(),
+            "the mount kept its place"
+        );
+        redb::Database::create(doomed_dir.join(crate::config::DB_FILE))
+            .expect("the failed mount still holds its store");
+
+        chain.0.store(1_040, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            indexed_through(&cursor.states, healthy, 1_040).await,
+            "the co-tenant stopped at {} after the join panicked",
+            last_block(&cursor.states, healthy)
+        );
+        assert!(handles.health.status(healthy).is_none());
+        assert!(!cursor.ingest.is_finished());
+        handles.states.clear();
+        handles.lifecycle.clear();
+        drop(handles);
+        cursor.shutdown().await.unwrap();
+    }
+
     /// RFC-0073 FR6: a query that panics fails its own request. The cursor's shared SQL gate gets its
     /// permit back, so the co-tenant on that gate still answers, and neither nest's ingest is touched.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

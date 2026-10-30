@@ -3006,13 +3006,14 @@ pub async fn build_and_prepare_nest(
         drop(nest);
         return Err(release_refused(e, state, worker).await);
     }
-    let caught_up = match nest
-        .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
-        .await
-    {
-        Ok(next) => nest.catch_up(source.as_ref(), next, window, &join).await,
-        Err(e) => Err(e),
-    };
+    // Contained as on the cursor (RFC-0073 FR6): a panic unwound the admin task past the release below.
+    let caught_up = contained(async {
+        let next = nest
+            .prepare(source.as_ref(), backfill, seal_direct, concurrency, window)
+            .await?;
+        nest.catch_up(source.as_ref(), next, window, &join).await
+    })
+    .await;
     match caught_up {
         Ok(next) => Ok((nest, state, worker, next)),
         Err(e) => {
