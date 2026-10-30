@@ -476,32 +476,34 @@ leg, `wasm-plain`.
   Node host answered the fourth request with `429` and `Retry-After: 1`. The client rested, `nh_step`
   returned one `wait_ms`, the follow took 1,501 ms instead of about 480, and every answer was the same.
 
-**Numbers.** Apple M5 Pro, 18 cores, macOS. Node 26.11.1, wasmtime 48.0.8, one run each. The CI
-leg prints the same lines for its Linux runner into the job summary.
+**Numbers.** Apple M5 Pro, 18 cores, macOS. Node 26.11.1, wasmtime 48.0.8, one run each. The
+second column is CI's `wasm-plain` leg on a 4-core x86_64 `ubuntu-latest` runner (run 41058267885).
 
-| | |
-|---|---|
-| plain module | 32,667,941 bytes raw, 5,007,337 brotli (event build today: 34,505,176 and 5,248,083) |
-| Node: instantiate, follow, peak RSS | 32 ms; 480 ms for 1,433 RPC posts in 1,434 steps, no waits; 339 MiB |
-| wasmtime, Cranelift, compile on 18 threads | 1,702 ms, peak RSS 1,772 MiB |
-| wasmtime, Cranelift, compile on one thread | 12,085 ms, peak RSS 1,591 MiB |
-| wasmtime, Winch, 18 threads / one | 808 ms / 2,956 ms, peak RSS 1,724 / 1,712 MiB |
-| precompiled `.cwasm` | 97,303,216 bytes for Cranelift, 183,224,168 for Winch |
-| load the precompiled module | 9 ms; RSS 93 MiB after load; peak 119 MiB through the follow and 31 queries |
-| follow in wasmtime | 327 ms with Cranelift, 611 ms with Winch |
-| linear memory at the end | 33.6 MiB in both hosts |
+| | M5 Pro, macOS | CI, Linux |
+|---|---|---|
+| plain module, raw | 32,667,941 bytes, 5,007,337 brotli (event build today: 34,505,176 and 5,248,083) | 32,681,299 bytes |
+| Node: instantiate; follow (1,433 RPC posts, 1,434 steps, no waits); peak RSS | 32 ms; 480 ms; 339 MiB | 151 ms; 1,536 ms; 397 MiB |
+| wasmtime, Cranelift, compile on every core | 1,702 ms (18 threads), peak RSS 1,772 MiB | 18,193 ms (4 threads), peak RSS 1,275 MiB |
+| wasmtime, Cranelift, compile on one thread | 12,085 ms, peak RSS 1,591 MiB | 42,345 ms, peak RSS 1,272 MiB |
+| wasmtime, Winch, every core / one | 808 ms / 2,956 ms, peak RSS 1,724 / 1,712 MiB | not run |
+| precompiled `.cwasm` | 97,303,216 bytes (Cranelift), 183,224,168 (Winch) | 102,611,896 bytes (Cranelift) |
+| load the precompiled module | 9 ms; peak 119 MiB through the follow and 31 queries | 7 ms; peak 124 MiB |
+| follow in wasmtime, precompiled | 327 ms (Cranelift), 611 ms (Winch) | 902 ms |
+| linear memory at the end | 33.6 MiB in both hosts | 33.6 MiB in both hosts |
 
-**The budget question.** A 34 MB-class module compiles in wasmtime, and fast. Compiling it costs
-about 1.6 to 1.8 GiB of peak memory whichever compiler runs and however many threads it has, so the
-cost is the module's state, not codegen parallelism. RFC-0074's address build cost about 95 MB for
-1.36 MB, and this scales roughly with size. Loading a precompiled module costs 9 ms and under 100 MiB.
+**The budget question.** A 34 MB-class module compiles in wasmtime. The compile peaks at 1.3 GiB on
+Linux and 1.8 GiB on macOS, whichever compiler runs and however many threads it has. That makes the
+cost the module's state, not codegen parallelism. It takes 2 s on 18 cores, 18 s on CI's 4 and 42 s
+on one thread. RFC-0074's address build cost about 95 MB for 1.36 MB, so the cost scales roughly with
+size. A precompiled module loads in under 10 ms, and the whole run, follow and queries included,
+stays under 130 MiB.
 
 **Does S1 proceed as written: yes. The promise narrows by one sentence.** The event build runs in a
-non-browser host. But that host pays about 1.8 GiB once, to compile the module or to fetch a cached
-precompile of it, before it pays the per-cursor budget. That is under the 2 GiB ceiling and well over
-the 600 MiB one. A host that must compile at every start inside phone-sized memory, or a 128 MB isolate,
-cannot run the event build; it gets the address build. §1's "any host" should say so when the
-interface is written down in S2.
+non-browser host. That host pays up to 1.8 GiB once, to compile, and should cache the result. From
+then on it loads in under 130 MiB, inside the per-cursor budget. The one-time peak is under the 2 GiB
+ceiling and well over the 600 MiB one. A host that must compile at every start inside phone-sized
+memory, or a 128 MB isolate, cannot run the event build; it gets the address build. §1's "any host"
+should say so when S2 writes the interface down.
 
 What changes for later slices:
 
