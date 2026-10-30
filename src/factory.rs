@@ -4,34 +4,17 @@
 //! them out of a nest's config.
 
 use crate::config::Config;
-use nuthatch_core::factory::{Declared, FactoryDecl, TemplateDecl};
+use nuthatch_core::factory::Declared;
 
 pub use nuthatch_core::factory::{ChildEntry, ChildRegistry, FactorySet};
 
 impl From<&Config> for Declared {
     fn from(config: &Config) -> Self {
-        Declared {
-            contracts: config.contracts.iter().map(|c| c.alias.clone()).collect(),
-            templates: config
-                .templates
-                .iter()
-                .map(|t| TemplateDecl {
-                    name: t.name.clone(),
-                    topic0_only: t.filter.as_deref() == Some("topic0"),
-                })
-                .collect(),
-            factories: config
-                .factories
-                .iter()
-                .map(|f| FactoryDecl {
-                    watch: f.watch.clone(),
-                    event: f.event.clone(),
-                    child_param: f.child_param.clone(),
-                    template: f.template.clone(),
-                    start: f.start,
-                })
-                .collect(),
-        }
+        nuthatch_core::nest_config::declared(
+            &config.contracts,
+            &config.templates,
+            &config.factories,
+        )
     }
 }
 

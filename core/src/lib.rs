@@ -7,6 +7,7 @@ pub mod alerts;
 pub mod answer;
 pub mod backend;
 pub mod bind;
+pub mod chains;
 pub mod cursor;
 pub mod drive;
 pub mod entity_bind;
@@ -29,6 +30,8 @@ pub mod flags;
 pub mod hooks;
 pub mod labels;
 pub mod metrics;
+pub mod mirror;
+pub mod nest_config;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub mod opfs;
 pub mod redb_store;

@@ -19,8 +19,9 @@ use crate::blob::Unverified;
 use crate::config::Config;
 use crate::indexer::{LAST_BLOCK_KEY, SEALED_THROUGH_KEY, START_BLOCK_KEY};
 use crate::publish::{self, Mirror, SeedEnvelope};
-use crate::seal::{self, Manifest, Segment, MANIFEST_FILE};
+use crate::seal::{self, Manifest, MANIFEST_FILE};
 use crate::store::Store;
+use nuthatch_core::mirror::{local_catalogue, Wanted};
 
 /// Present from the moment a seed installs a catalogue until it has stamped the store complete. A
 /// store holding it is half-seeded: `dev` refuses it and `seed` finishes it.
@@ -214,125 +215,8 @@ async fn read_snapshot(mirror: &dyn Mirror, dataset: &str) -> Result<(SeedEnvelo
 }
 
 fn check_snapshot(s: &SeedEnvelope, dataset: &str, chain_id: u64, config: &Config) -> Result<()> {
-    if s.layout_version != 1 {
-        bail!(
-            "seed snapshot layout_version is {}, and this binary reads 1",
-            s.layout_version
-        );
-    }
-    if publish::tails_digest(&s.tails) != s.tails_sha256 {
-        return Err(Unverified(
-            "the seed snapshot's tails do not match its own digest: an entry was lost or changed, and \
-             seeding from it would leave a table missing rows"
-                .into(),
-        )
-        .into());
-    }
-    if s.data_identity != dataset {
-        bail!(
-            "the seed snapshot is for dataset {}, not this nest's {dataset}",
-            s.data_identity
-        );
-    }
-    if s.chain_id != chain_id {
-        bail!(
-            "the seed snapshot is for chain {}, and this nest is on {chain_id}",
-            s.chain_id
-        );
-    }
     let declared = config.contracts.iter().filter_map(|c| c.start_block).min();
-    if let Some(declared) = declared.filter(|d| s.indexed_from > *d) {
-        bail!(
-            "the mirror's history begins at block {}, and this nest declares block {declared}. A \
-             nest seeded from it would be missing {} blocks and would not know.",
-            s.indexed_from,
-            s.indexed_from - declared
-        );
-    }
-    Ok(())
-}
-
-/// One file to have on disk: where the mirror keeps it, and the catalogue entry it must hash to.
-struct Wanted {
-    key: String,
-    segment: Segment,
-}
-
-/// The catalogue this nest will hold, and the files behind it. Nothing in the mirror's catalogue
-/// reaches a path: a file's local name is rebuilt from its table and hash, both checked first.
-fn local_catalogue(mut published: Manifest, s: &SeedEnvelope) -> Result<(Manifest, Vec<Wanted>)> {
-    let mut wanted = Vec::new();
-    for (table, segs) in published.tables.iter_mut() {
-        for seg in segs.iter_mut() {
-            if seg.provisional {
-                bail!("the mirror's catalogue lists a provisional segment of {table}");
-            }
-            canonical(table, seg, s.complete_through)?;
-            wanted.push(Wanted {
-                key: publish::parquet_key(table, &seg.hash),
-                segment: seg.clone(),
-            });
-        }
-    }
-    for (table, tail) in &s.tails {
-        let mut tail = tail.clone();
-        if !tail.provisional {
-            bail!("the seed snapshot's tail of {table} is not provisional");
-        }
-        canonical(table, &mut tail, s.complete_through)?;
-        wanted.push(Wanted {
-            key: publish::seed_tail_key(table),
-            segment: tail.clone(),
-        });
-        published
-            .tables
-            .entry(table.clone())
-            .or_default()
-            .push(tail);
-    }
-    for (table, segs) in published.tables.iter_mut() {
-        segs.sort_by_key(|s| (s.from_block, s.to_block));
-        for pair in segs.windows(2) {
-            if pair[1].from_block <= pair[0].to_block {
-                bail!(
-                    "the mirror lists segments of {table} that overlap at blocks {}..={}; seeding it \
-                     would count those rows twice",
-                    pair[1].from_block,
-                    pair[0].to_block
-                );
-            }
-        }
-    }
-    Ok((published, wanted))
-}
-
-fn canonical(table: &str, seg: &mut Segment, complete_through: u64) -> Result<()> {
-    let table_ok = !table.is_empty()
-        && table
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
-    let hash_ok = seg.hash.len() == 64
-        && seg
-            .hash
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if !table_ok || !hash_ok {
-        bail!(
-            "the mirror names a table or hash this binary would not have written: {table:?}, {:?}",
-            seg.hash
-        );
-    }
-    if seg.from_block > seg.to_block || seg.to_block > complete_through {
-        bail!(
-            "the mirror's segment {} of {table} covers blocks {}..={}, outside a snapshot complete \
-             through {complete_through}",
-            seg.hash,
-            seg.from_block,
-            seg.to_block
-        );
-    }
-    seg.file = format!("{table}-{}.parquet", seg.hash);
-    Ok(())
+    nuthatch_core::mirror::check_snapshot(s, dataset, chain_id, declared)
 }
 
 /// Bring every wanted file onto disk, each checked against its hash. Returns how many were fetched
@@ -430,6 +314,8 @@ async fn fetch_one(mirror: &dyn Mirror, segments: &Path, dataset: &str, w: &Want
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::seal::Segment;
+    use nuthatch_core::mirror::canonical;
 
     fn segment(hash: &str, from: u64, to: u64) -> Segment {
         serde_json::from_value(serde_json::json!({
