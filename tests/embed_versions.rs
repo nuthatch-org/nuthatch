@@ -9,8 +9,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-/// The lockfiles that build the engine. `embed/plain/host` is wasmtime driving the module, not part
-/// of it.
+/// The lockfiles that build the engine. `embed/tests/wasmtime-host` is wasmtime driving the module,
+/// not part of it.
 const EMBED_LOCKS: &[&str] = &["embed/Cargo.lock", "embed/plain/Cargo.lock"];
 
 /// Crates allowed to differ, each with the reason it cannot follow the binary.

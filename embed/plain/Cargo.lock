@@ -3621,6 +3621,7 @@ dependencies = [
  "nuthatch-core",
  "nuthatch-embed",
  "redb",
+ "serde",
  "serde_json",
 ]
 

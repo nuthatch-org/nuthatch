@@ -1,23 +1,26 @@
-// RFC-0075 S5's gate in a browser: `hosts/browser/index.html` runs the nest in a dedicated worker
-// and every request as a plain same-origin `fetch`, answered by the Service Worker
-// (`hosts/browser/sw.js`). Its answers must equal the node's pinned bytes, and the scaffolded
-// skill's examples and llms.txt's routes are run as written against the page.
-// Usage: node run-sw.mjs <chrome> <rpc-url> <tab-parity-dir>
-//   (wasm-bindgen --target web into ./pkg-web first; fixture-rpc recorded --fork serving <rpc-url>)
+// RFC-0075 S5's gate in a browser, and RFC-0077 S2's Chrome leg: `hosts/browser/index.html` runs the
+// plain module through `abi: 1` in a dedicated worker, its store in OPFS, and every request as a
+// plain same-origin `fetch`, answered by the Service Worker (`hosts/browser/sw.js`). Its answers must
+// equal the node's pinned bytes, the scaffolded skill's examples and llms.txt's routes are run as
+// written against the page, and the module the page ran must hash to the file given here.
+// Usage: node run-sw.mjs <chrome> <module.wasm> <rpc-url> <tab-parity-dir>
+//   (fixture-rpc recorded --fork serving <rpc-url>)
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { differences, mask, sameTarget } from "./mask.mjs";
+import { createHash } from "node:crypto";
+import { answersDigest, differences, mask, sameTarget } from "./mask.mjs";
 
-const [chrome, rpc, dir] = process.argv.slice(2);
+const [chrome, wasm, rpc, dir] = process.argv.slice(2);
+const module_sha256 = createHash("sha256").update(readFileSync(wasm)).digest("hex");
 const here = path.dirname(new URL(import.meta.url).pathname);
 const chain = JSON.parse(gunzipSync(readFileSync(path.join(dir, "chain.json.gz"))));
 const expected = JSON.parse(readFileSync(path.join(dir, "s5-expected.json")));
 const start = Number(BigInt(chain.headers[0][0])) + 1;
-const roots = { browser: path.join(here, "hosts", "browser"), "pkg-web": path.join(here, "pkg-web"), fixture: dir };
+const roots = { browser: path.join(here, "hosts", "browser"), fixture: dir };
 const types = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm" };
 
 let done;
@@ -31,7 +34,7 @@ const server = createServer((req, res) => {
     return;
   }
   const [, root, ...rest] = url.pathname.split("/");
-  const file = roots[root] && path.join(roots[root], ...rest);
+  const file = root === "module" ? wasm : roots[root] && path.join(roots[root], ...rest);
   try {
     const bytes = readFileSync(file);
     res.writeHead(200, { "content-type": types[path.extname(file)] || "application/octet-stream" });
@@ -43,7 +46,7 @@ const server = createServer((req, res) => {
 });
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const origin = `http://127.0.0.1:${server.address().port}`;
-const page = `${origin}/browser/index.html?rpc=${encodeURIComponent(rpc)}&contract=${chain.contract}&start=${start}`;
+const page = `${origin}/browser/index.html?rpc=${encodeURIComponent(rpc)}&contract=${chain.contract}&start=${start}&module=../module/plain.wasm`;
 
 const profile = mkdtempSync(path.join(tmpdir(), "nest-sw-"));
 const browser = spawn(chrome, [
@@ -66,6 +69,9 @@ if (!r.ok) {
   process.exit(1);
 }
 const failures = differences(r.answers, expected);
+if (r.opened.module_sha256 !== module_sha256) {
+  failures.push(`the page ran a module hashing to ${r.opened.module_sha256}, not ${wasm}'s ${module_sha256}`);
+}
 
 // The skill's examples, as written, must answer what the node answers for the same request.
 const skill = r.examples.filter((e) => e.source === "SKILL.md");
@@ -79,6 +85,8 @@ for (const e of skill) {
 }
 const llms = r.examples.filter((e) => e.source === "llms.txt");
 console.log(JSON.stringify({
+  host: "chrome", gate: "s5", storage: "host", module_sha256: r.opened.module_sha256,
+  answers_sha256: answersDigest(r.answers), pin_sha256: answersDigest(expected, { pinned: true }),
   follow_ms: r.follow_ms,
   opened: r.opened,
   answers: r.answers.length,

@@ -1,3 +1,4 @@
+          ./build-tab.sh nodejs pkg 2>&1 | tee "$RUNNER_TEMP/tab-nodejs.log"
 name: ci
 
 on:
@@ -599,9 +600,9 @@ jobs:
         shell: bash
         run: |
           echo "native embed: ${{ needs.wasm-native.result }}"
-          echo "core, tab module, Node, Service Worker: ${{ needs.wasm-tab.result }}"
+          echo "core, tab module, Node: ${{ needs.wasm-tab.result }}"
           echo "wasm32 in Chrome: ${{ needs.wasm-chrome.result }}"
-          echo "plain module, Node and wasmtime: ${{ needs.wasm-plain.result }}"
+          echo "plain module, Node, wasmtime and Chrome: ${{ needs.wasm-plain.result }}"
           if [ "${{ needs.changes.outputs.full }}" = false ]; then
             echo "::notice::docs-only change: the nuthatch-core legs were skipped by design"
             exit 0
@@ -635,7 +636,7 @@ jobs:
 
   # Every gate here runs the module the tab ships: the `tab` profile, then wasm-opt.
   wasm-tab:
-    name: nuthatch-core (core, tab module, Node, Service Worker)
+    name: nuthatch-core (core, tab module, Node)
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
@@ -669,16 +670,7 @@ jobs:
       - name: the tab module (embed)
         working-directory: embed
         run: |
-          cargo build --locked --profile tab --target wasm32-unknown-unknown
-          # One cargo build, two bindings: wasm-opt and size.mjs's brotli each leave cores idle.
-          ./build-tab.sh nodejs pkg > "$RUNNER_TEMP/tab-nodejs.log" 2>&1 &
-          nodejs=$!
-          ./build-tab.sh web pkg-web > "$RUNNER_TEMP/tab-web.log" 2>&1 &
-          web=$!
-          a=0; wait "$nodejs" || a=$?
-          b=0; wait "$web" || b=$?
-          cat "$RUNNER_TEMP/tab-nodejs.log" "$RUNNER_TEMP/tab-web.log"
-          [ "$a" = 0 ] && [ "$b" = 0 ]
+          ./build-tab.sh nodejs pkg 2>&1 | tee "$RUNNER_TEMP/tab-nodejs.log"
           # RFC-0075 S6: every gate below runs this module, whose size goes to the job summary.
           size=$(tail -1 "$RUNNER_TEMP/tab-nodejs.log")
           echo "tab module bytes after wasm-bindgen and wasm-opt: \`$size\` (burrmill-wasm: 5.6 MB brotli)" >> "$GITHUB_STEP_SUMMARY"
@@ -722,22 +714,16 @@ jobs:
             --file ../tests/fixtures/tab-parity/chain.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8952/ && break; sleep 0.2; done
           node run-budget.mjs pkg http://127.0.0.1:8952/ ../tests/fixtures/tab-parity
-      # RFC-0075 S5: the same routes through the Service Worker, as plain `fetch`es on the page's
-      # origin, with the scaffolded skill's examples run as written.
-      - name: query routes through a Service Worker in headless Chrome (embed)
-        working-directory: embed
-        run: |
-          chrome=$(npx -y @puppeteer/browsers@2.10.10 install chrome@stable --path "$RUNNER_TEMP/browsers" | tail -1 | cut -d' ' -f2-)
-          ../tools/fixture-rpc/target/release/fixture-rpc recorded --fork --port 8951 \
-            --file ../tests/fixtures/tab-parity/chain.json.gz &
-          for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8951/ && break; sleep 0.2; done
-          node run-sw.mjs "$chrome" http://127.0.0.1:8951/ ../tests/fixtures/tab-parity
+      # RFC-0075 S5's Service Worker run moved to `wasm-plain` with RFC-0077 S2: the browser host
+      # drives the plain module there.
 
-  # RFC-0077 S0: the tab's live cursor as a plain core module, imports `nuthatch.*` only, driven by
-  # two hosts that perform its requests: Node with no wasm-bindgen glue, and wasmtime from Rust. Both
-  # held to RFC-0075 S3's pinned segment hash and balances, and to each other's query answers.
+  # RFC-0077 S0 and S2: the event engine as a plain core module, imports `nuthatch.*` only, through
+  # `abi: 1` (embed/README.md). One module file, three reference hosts: the browser host in Chrome
+  # (OPFS) and in Node (files), and wasmtime from Rust (files). Each answers RFC-0075 S5's requests
+  # equal to the node's pin and to each other; Node and wasmtime also hold S3's segment hash and
+  # balances. A shape change without an `abi` bump fails `wasmtime-host abi`.
   wasm-plain:
-    name: nuthatch-core (plain module, Node and wasmtime)
+    name: nuthatch-core (plain module, Node, wasmtime, Chrome)
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
@@ -753,48 +739,56 @@ jobs:
           cache-on-failure: true
           workspaces: |
             embed/plain
-            embed/plain/host
+            embed/tests/wasmtime-host
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: C toolchain for wasm32
         uses: ./.github/actions/wasm32-c-toolchain
       - name: wasm-bindgen and binaryen
         uses: ./.github/actions/wasm-tools
-      - name: fmt · clippy (plain module, wasmtime host)
-        working-directory: embed/plain
+      - name: fmt · clippy · test (plain module, wasmtime host)
+        working-directory: embed
         run: |
-          cargo fmt --check
-          cargo fmt --check --manifest-path host/Cargo.toml
-          RUSTFLAGS='--cfg getrandom_backend="custom"' cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
-          cargo clippy --locked --manifest-path host/Cargo.toml -- -D warnings
-      - name: the plain module, and its imports
-        working-directory: embed/plain
+          cargo fmt --check --manifest-path plain/Cargo.toml
+          cargo fmt --check --manifest-path tests/wasmtime-host/Cargo.toml
+          RUSTFLAGS='--cfg getrandom_backend="custom"' cargo clippy --locked --manifest-path plain/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+          cargo clippy --locked --all-targets --manifest-path tests/wasmtime-host/Cargo.toml -- -D warnings
+          cargo test --locked --release --manifest-path tests/wasmtime-host/Cargo.toml
+          cargo build --locked --release --manifest-path tests/wasmtime-host/Cargo.toml
+      - name: the plain module, its imports, and its pinned interface
+        working-directory: embed
         run: |
-          ./build.sh "$RUNNER_TEMP/plain.wasm"
-          node imports.mjs "$RUNNER_TEMP/plain.wasm"
+          plain/build.sh "$RUNNER_TEMP/plain.wasm"
+          node plain/imports.mjs "$RUNNER_TEMP/plain.wasm"
           echo "plain module bytes after wasm-opt: \`$(stat -c %s "$RUNNER_TEMP/plain.wasm")\`" >> "$GITHUB_STEP_SUMMARY"
-      - name: fixture-rpc and the wasmtime host
-        run: |
-          cargo build --locked --release --manifest-path tools/fixture-rpc/Cargo.toml
-          cargo build --locked --release --manifest-path embed/plain/host/Cargo.toml
-      - name: S3's recording in Node and in wasmtime
-        working-directory: embed/plain
+          tests/wasmtime-host/target/release/wasmtime-host compile "$RUNNER_TEMP/plain.wasm" "$RUNNER_TEMP/plain.cwasm" | tee "$RUNNER_TEMP/compile.log"
+          tests/wasmtime-host/target/release/wasmtime-host abi "$RUNNER_TEMP/plain.wasm" --cache "$RUNNER_TEMP/cwasm" | tail -1
+      - name: fixture-rpc
+        run: cargo build --locked --release --manifest-path tools/fixture-rpc/Cargo.toml
+      - name: the same module in Node, wasmtime and Chrome
+        working-directory: embed
         # `shell: bash` for pipefail: each run is piped into tee.
         shell: bash
         run: |
-          ../../tools/fixture-rpc/target/release/fixture-rpc recorded --port 8953 \
-            --file ../../tests/fixtures/tab-parity/chain.json.gz &
-          for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8953/ && break; sleep 0.2; done
-          d=../../tests/fixtures/tab-parity
-          node run-node.mjs "$RUNNER_TEMP/plain.wasm" http://127.0.0.1:8953/ $d | tee "$RUNNER_TEMP/node.log"
-          host/target/release/plain-host compile "$RUNNER_TEMP/plain.wasm" "$RUNNER_TEMP/plain.cwasm" | tee "$RUNNER_TEMP/compile.log"
-          host/target/release/plain-host compile "$RUNNER_TEMP/plain.wasm" "$RUNNER_TEMP/serial.cwasm" --serial | tee -a "$RUNNER_TEMP/compile.log"
-          host/target/release/plain-host run "$RUNNER_TEMP/plain.cwasm" http://127.0.0.1:8953/ $d | tee "$RUNNER_TEMP/wasmtime.log"
-          host/target/release/plain-host run "$RUNNER_TEMP/plain.wasm" http://127.0.0.1:8953/ $d | tee -a "$RUNNER_TEMP/wasmtime.log"
-          # Same module, same chain: every host answers S5's requests with the same bytes.
-          sums=$(cat "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" | grep -o '"answers_sha256":"[0-9a-f]*"' | sort -u)
-          echo "$sums"
-          [ "$(echo "$sums" | wc -l)" = 1 ]
-          { echo '```'; cat "$RUNNER_TEMP/compile.log" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          rpc=../tools/fixture-rpc/target/release/fixture-rpc
+          $rpc recorded --port 8953 --file ../tests/fixtures/tab-parity/chain.json.gz &
+          $rpc recorded --fork --port 8954 --file ../tests/fixtures/tab-parity/chain.json.gz &
+          for p in 8953 8954; do
+            for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:$p/ && break; sleep 0.2; done
+          done
+          m="$RUNNER_TEMP/plain.wasm" d=../tests/fixtures/tab-parity host=tests/wasmtime-host/target/release/wasmtime-host
+          cache=(--cache "$RUNNER_TEMP/cwasm")
+          node hosts/node/run.mjs "$m" http://127.0.0.1:8953/ $d s3 | tee "$RUNNER_TEMP/node.log"
+          node hosts/node/run.mjs "$m" http://127.0.0.1:8954/ $d s5 | tee -a "$RUNNER_TEMP/node.log"
+          node hosts/node/run.mjs "$m" http://127.0.0.1:8954/ $d s5 --storage bytes | tee -a "$RUNNER_TEMP/node.log"
+          $host run "$m" http://127.0.0.1:8953/ $d s3 "${cache[@]}" | tee "$RUNNER_TEMP/wasmtime.log"
+          $host run "$m" http://127.0.0.1:8954/ $d s5 "${cache[@]}" | tee -a "$RUNNER_TEMP/wasmtime.log"
+          $host run "$m" http://127.0.0.1:8954/ $d s5 --storage bytes "${cache[@]}" | tee -a "$RUNNER_TEMP/wasmtime.log"
+          chrome=$(npx -y @puppeteer/browsers@2.10.10 install chrome@stable --path "$RUNNER_TEMP/browsers" | tail -1 | cut -d' ' -f2-)
+          node run-sw.mjs "$chrome" "$m" http://127.0.0.1:8954/ $d | tee "$RUNNER_TEMP/chrome.log"
+          node hosts/agree.mjs "$m" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" "$RUNNER_TEMP/chrome.log" \
+            --hosts node,wasmtime,chrome | tee "$RUNNER_TEMP/agree.log"
+          { echo '```'; cat "$RUNNER_TEMP/compile.log" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" \
+            "$RUNNER_TEMP/chrome.log" "$RUNNER_TEMP/agree.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   # RFC-0075 S2: Node has no OPFS, so the OPFS backend's round trip and its lock run in a dedicated
   # worker in Chrome for Testing, with the live cursor beside them; the 26.04 image ships no chromedriver.

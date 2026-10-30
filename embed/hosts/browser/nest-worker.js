@@ -1,12 +1,17 @@
-// RFC-0075 S5: the dedicated worker that runs the whole nest (§4) and answers its routes. The page
-// posts `{nest: "open", ...}` once, then `{nest: "request", ...}` with a port for each answer, or
-// `{nest: "call", ...}` for §7's JS API. With `keepFollowing` it follows the tip every poll interval
-// and posts `{nest: "followed", ...}` after each pass. `pkg` is the module's URL, relative to here.
+// RFC-0077 S2: the dedicated worker that runs the plain module through `abi: 1` (`host.js`), with its
+// store in OPFS and its RPC over `fetch`, and answers the node's routes for the Service Worker. The
+// page posts `{nest: "open", ...}` once, then `{nest: "request", ...}` with a port for each answer, or
+// `{nest: "call", ...}` for RFC-0075 §7's JS API. With `keepFollowing` it follows the tip every poll
+// interval and posts `{nest: "followed", ...}` after each pass.
+import { fetchRpc, load } from "./host.js";
+import { opfsStorage } from "./opfs.js";
 
-let nest;
+let engine;
+const enc = new TextEncoder();
 
 async function follow() {
-  const f = JSON.parse(await nest.follow());
+  await engine.run();
+  const f = engine.report();
   return {
     last_block: f.last_block, sealed_through: f.sealed_through, hot_rows: f.hot_rows,
     holders: f.balances.holders, resumed_from: f.resumed_from, backend: f.backend,
@@ -25,31 +30,40 @@ function keepFollowing(secs) {
   setTimeout(pass, secs * 1000);
 }
 
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+
 self.onmessage = async (m) => {
   const d = m.data;
   try {
     if (d.nest === "open") {
-      const { default: init, LiveNest } = await import(d.pkg || "../pkg-web/nuthatch_embed.js");
-      await init();
-      nest = await LiveNest.open(d.nid, d.rpc, d.contract, BigInt(d.start));
-      // Before `derive`, which admits the entities against it (§17).
-      if (d.memoryCeilingMib) nest.setMemoryCeiling(d.memoryCeilingMib);
-      nest.derive(JSON.stringify(d.files));
-      if (d.pollIntervalSecs) nest.setPollInterval(BigInt(d.pollIntervalSecs));
-      self.postMessage({ nest: "opened", ...(await follow()) });
+      const bytes = await (await fetch(d.module)).arrayBuffer();
+      const module_sha256 = hex(await crypto.subtle.digest("SHA-256", bytes));
+      engine = await load(bytes, {
+        storage: await opfsStorage(d.nid),
+        rpc: fetchRpc({ main: d.rpc }),
+        log: (level, s) => console.log(`guest[${level}]: ${s}`),
+      });
+      engine.open({
+        nid: d.nid, contract: d.contract, start: Number(d.start), rpc: ["main"], storage: "host",
+        // A warm reopen is RFC-0077 S3's: until then each open starts from an empty store.
+        fresh: d.fresh ?? true,
+        memory_mib: d.memoryCeilingMib, poll_interval_secs: d.pollIntervalSecs, files: d.files,
+      });
+      self.postMessage({ nest: "opened", module_sha256, abi: engine.abi(), ...(await follow()) });
       if (d.keepFollowing) keepFollowing(d.pollIntervalSecs || 12);
     } else if (d.nest === "request") {
-      const a = await nest.request(d.method, d.target, d.body);
-      const body = a.body;
-      m.ports[0].postMessage({ status: a.status, contentType: a.contentType, body }, [body.buffer]);
+      const a = engine.request(d.method, d.target, d.body);
+      const body = enc.encode(a.body);
+      m.ports[0].postMessage({ status: a.status, contentType: a.content_type, body }, [body.buffer]);
     } else if (d.nest === "call") {
       const [a, b] = d.args;
-      const text = d.fn === "sql" ? await nest.sql(a)
-        : d.fn === "entity" ? await nest.entity(a)
-        : d.fn === "derived" ? await nest.derived(a, b ?? undefined)
+      const e = encodeURIComponent;
+      const target = d.fn === "sql" ? `/sql?q=${e(a)}`
+        : d.fn === "entity" ? `/entity/${e(a)}`
+        : d.fn === "derived" ? `/derived/${e(a)}${b == null ? "" : `/${e(b)}`}`
         : null;
-      if (text === null) throw new Error(`no such call: ${d.fn}`);
-      m.ports[0].postMessage({ text });
+      if (target === null) throw new Error(`no such call: ${d.fn}`);
+      m.ports[0].postMessage({ text: engine.request("GET", target).body });
     }
   } catch (e) {
     const error = String(e && e.message || e);

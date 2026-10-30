@@ -1,9 +1,10 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>nest in a tab: S5 gate</title>
+<title>nest in a tab: S5 and RFC-0077 S2 gate</title>
 <pre id="out">running</pre>
 <script type="module">
-// RFC-0075 S5's browser gate. The nest runs in a worker on this page; every request below is a plain
+// RFC-0075 S5's browser gate, and RFC-0077 S2's: the plain module (`?module=`) runs through
+// `abi: 1` in a worker on this page; every request below is a plain
 // `fetch` on this page's origin, answered by the Service Worker. It runs S5's pinned requests, then
 // the scaffolded skill's examples and llms.txt's routes as written, and posts what it saw to the
 // harness (`run-sw.mjs`), which compares it with the node's.
@@ -31,6 +32,7 @@ try {
     open: {
       nid: "tab-answers", rpc: p.get("rpc"), contract: p.get("contract"),
       start: p.get("start"), files, pollIntervalSecs: 1,
+      module: new URL(p.get("module"), location.href).href,
     },
   });
   const followMs = performance.now() - t0;

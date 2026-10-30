@@ -1,7 +1,8 @@
 # RFC-0077: The embeddable engine - nuthatch's core as an opt-in wasm module, beside the binary
 
 - Status: **Accepted, 2026-10-30.** S0 to S5 and S7 (the Lodestar demo) authorised in order; S6 waits for rotki
-  to ask. S0 passed 2026-10-30 (§12). S1 built in part, 2026-10-30 (§13).
+  to ask. S0 passed 2026-10-30 (§12). S1 built in part, 2026-10-30 (§13). S2 built 2026-10-30, its
+  address-build half deferred (§14).
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0075 (the whole nest in a tab, S0 to S6 merged), RFC-0074 (address history as a
@@ -640,3 +641,98 @@ runs in CI only.
 
 **Also seen.** `tools/rfc-0076-tenants/src/main.rs` still includes `src/fair_share.rs` by `#[path]`.
 It is RFC-0076's bench, not the engine, and out of this slice; the gate's "anywhere" catches it.
+
+## 14. S2 measured outcome, 2026-10-30
+
+**What was built.**
+
+- *The interface, written down.* `embed/README.md` specifies `abi: 1`: every export and import with
+  its signature, the memory ownership rules, the step, resume and request protocol, the `nh_open`
+  config, eleven named faults, the two storage modes, what a host needs, and how versions move.
+- *The guest.* `embed/plain/` implements it. `nh_open` takes the nest's authored files, the memory
+  ceiling, the poll interval and the storage mode. Storage `host` is redb over a file the host holds
+  open (`plain/src/host_file.rs`). `nh_export` gives the store in storage `bytes`. Every error is
+  `{"fault", "message"}`.
+- *The browser host* is `embed/hosts/browser/host.js`, about 170 lines, with no wasm-bindgen. It runs
+  the module through `abi: 1` with OPFS (`opfs.js`) in the worker that answers the Service Worker,
+  and in Node over files (`hosts/node/`). `nuthatch_core::opfs` is no longer reached by this module:
+  the host's JavaScript holds the files.
+- *The wasmtime host* moved from `plain/host/` to `embed/tests/wasmtime-host/`. It caches the compiled
+  module by the module's sha256 and wasmtime's compatibility hash, implements storage `host` over
+  files, and holds the pinned interface.
+- *The pinned interface.* `tests/wasmtime-host/src/abi.rs` holds `abi: 1`'s 33 shapes as wasmtime
+  types them; `wasmtime-host abi <module>` fails a module whose shapes differ from the version it
+  reports, and the version's table is frozen by its sha256 (`59363eb2…f9a11071`). A unit test fails if
+  the README stops naming any of them.
+- *CI.* `wasm-plain` builds the module once and runs every host on that file: the pinned-interface
+  check, S3's gate in Node and wasmtime, S5's in Node and wasmtime in both storage modes and in Chrome
+  on OPFS, then `hosts/agree.mjs`, which fails unless every run loaded the same file and every S5
+  answer set hashes to the pin's digest. RFC-0075 S5's Service Worker run moved there from `wasm-tab`,
+  because the browser host now drives the plain module; the wasm-bindgen module's 32 answers are still
+  gated in Node by `run-answers.mjs`, and `wasm-tab` no longer builds the `web` binding nothing in this
+  tree used.
+
+**Where the interface departs from §3.2.**
+
+- *Opening, removing and listing files are requests, not imports.* §3.2 had eight synchronous
+  `store_*` imports and said every host has a synchronous file. Every host has a synchronous file
+  once it is open, but a browser cannot open one synchronously: `getFileHandle`,
+  `createSyncAccessHandle`, `removeEntry` and `entries` all return promises. So `open`, `remove` and
+  `list` arrive through `nh_step` beside `rpc`, and the imports are the six that act on an open handle:
+  `store_read`, `store_write`, `store_len`, `store_set_len`, `store_sync` and `store_close`, the last
+  new, because closing is what releases OPFS's lock. In storage `host` the store therefore opens on the
+  first `nh_step`, not in `nh_open`.
+- *`log` is not optional.* A core module has no optional imports; a host that wants no log supplies
+  one that does nothing.
+- *`nh_abi` says more*: `{"abi": 1, "capabilities": ["events"], "storage": ["bytes", "host"],
+  "engine": "<version>"}`.
+- *The linker's leftovers are part of the shape.* The module also exports getrandom's two hooks, zstd's
+  eight C shims, `__data_end` and `__heap_base`. A host can see them, so they are pinned and the
+  README names them as not for calling. S0's two probes, `nh_report` and `nh_memory_bytes`, are pinned
+  too; what they report is not promised.
+- *Until S4 the config is the young contract's* (`contract`, `start`), as RFC-0075's tab is; S4 adds
+  `nuthatch.toml`.
+
+**The RPC-body question: strings.** `abi: 1` keeps each RPC body as a JSON string inside the JSON, in
+both directions. A reply must pass whole even when it is a provider's HTML error page, and a string is
+what every host's HTTP client already returns. Bytes would mean base64, a third larger, or a second
+buffer and a framing per answer that every host implements. Measured on S3's recording: 1,901,530
+bytes resumed for 1,687,032 bytes of bodies over 1,433 RPC posts, 12.7% for the escaping and the
+answer wrappers, inside a follow that takes 0.5 to 3.8 s.
+
+**Gate.**
+
+| | Result |
+|---|---|
+| The same `.wasm`, unmodified, in Chrome, Node and wasmtime, S5's 32 requests equal to `s5-expected.json` | Node and wasmtime: **pass** on the M5 Pro, `tab` module `524e0009…d23b9ec3`, every answer set's digest `22966cee…363febc5`, the pin's digest. Chrome: CI only (below) |
+| The address build gives RFC-0074 S0's lists in the wasmtime host | **deferred**: there is no address build on main (§13); extracting one needs RFC-0074 S2's store seam and driver-yield decisions, which are not made |
+| A shape change without a version bump fails a pinned-interface test | **pass**: `nh_export(i32)` built into a real module fails `wasmtime-host abi` by name; the table's own unit tests cover a changed, added or removed shape and an unpublished version |
+| Binary unchanged; wasmtime in no lockfile but `embed/`'s | **pass**: nothing outside `embed/`, the workflow, this RFC and one comment in `tests/embed_versions.rs` changed; wasmtime is only in `embed/tests/wasmtime-host/Cargo.lock` |
+
+The digest is one sha256 over each answer's method, path, status, content type and body, masked as
+`tests/e2e_tab_answers.rs` masks `/ready`; `embed/mask.mjs` and the wasmtime host compute it the same
+way, and the pin's own digest is printed beside it. S3's segment hash and 1,000 balances also hold in
+Node and wasmtime over files.
+
+**Numbers.** Apple M5 Pro, 18 cores, macOS, Node 26.11.1, wasmtime 48.0.8, one run each, the `tab`
+module of 33,947,090 bytes.
+
+| | Node, browser host over files | wasmtime |
+|---|---|---|
+| Load | instantiate 31 ms | compile 1,668 ms, peak RSS 1,896 MiB; from the cache 63 ms, 130 MiB after |
+| Follow of S5's chain, storage `host` (files) | 3,785 ms | 3,359 ms |
+| Follow, storage `bytes` | 689 ms | 500 ms |
+| Peak RSS through follow and queries | 283 to 303 MiB | 152 to 161 MiB |
+| Linear memory at the end | 30.2 MiB (S3), 34.3 MiB (S5, files), 37.3 MiB (S5, bytes) | the same |
+
+Storage `host` over files costs about 3 s, because redb syncs every commit and the hosts make that
+a real `fdatasync`; `bytes` syncs nothing. `nh_export` gives 2,641,920 bytes after S5's follow.
+
+**What it does not show.** The Chrome leg has not run on this Mac: Chrome for Testing would not spawn
+here (`spawn` error -88), as before, so the browser host's OPFS and Service Worker run is CI's. Safari
+is still untested. The Node and wasmtime hosts take no lock on the store, so opening one nest twice
+from two processes is the host's to prevent, as the README says. Warm reopen is S3's: every gate run
+opens `fresh`.
+
+**The binary.** Unchanged. The diff outside `embed/` is `.github/workflows/ci.yml`, this RFC and a
+comment in `tests/embed_versions.rs`; no `Cargo.toml` or `Cargo.lock` of the binary changed.
