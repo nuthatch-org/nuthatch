@@ -23,9 +23,7 @@ use crate::seal::{self, Manifest, MANIFEST_FILE};
 use crate::store::Store;
 use nuthatch_core::mirror::{local_catalogue, Wanted};
 
-/// Present from the moment a seed installs a catalogue until it has stamped the store complete. A
-/// store holding it is half-seeded: `dev` refuses it and `seed` finishes it.
-pub const SEED_PENDING_KEY: &str = "seed_pending";
+pub use nuthatch_core::mirror::SEED_PENDING_KEY;
 const PARALLELISM: usize = 8;
 /// Far above any segment a seal writes; it bounds what a hostile mirror can put on disk (#2202).
 const MAX_SEGMENT_BYTES: u64 = 4 << 30;

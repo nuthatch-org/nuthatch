@@ -19,6 +19,10 @@ pub const SEED_FILE: &str = "_seed/seed.json";
 /// The catalogue, under the dataset prefix.
 pub const CATALOGUE_FILE: &str = "manifest.json";
 
+/// Present from the moment a seed installs a catalogue until it has stamped the store complete. A
+/// store holding it is half-seeded: `dev` refuses it and `seed` finishes it.
+pub const SEED_PENDING_KEY: &str = "seed_pending";
+
 /// A bundle or a mirrored file whose bytes are not the ones claimed: a content address, a file hash,
 /// the decode registry or the NID did not check out. Typed so a caller can report it as such.
 #[derive(Debug)]
