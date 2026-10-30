@@ -874,6 +874,10 @@ pub struct RpcClient<T: Transport> {
     limited: Vec<AtomicU64>,
     /// 429s without a hint in a row per endpoint, which double its rest; cleared by an answer.
     limited_streak: Vec<AtomicU64>,
+    /// Millis-since-epoch until which an endpoint's terminal cool-down runs. `0` = none.
+    terminal: Vec<AtomicU64>,
+    /// Terminal cool-downs begun per endpoint, each logged once.
+    pub terminal_cooldowns: Vec<AtomicU64>,
     /// The highest block each endpoint has reported from `eth_blockNumber`, so a lower bound on its
     /// head. Pool members' heads differ by a block or two, and one behind refuses a `toBlock` it lacks.
     pub heads: Vec<AtomicU64>,
@@ -931,6 +935,8 @@ impl<T: Transport> RpcClient<T> {
             health,
             limited,
             limited_streak,
+            terminal: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            terminal_cooldowns: (0..n).map(|_| AtomicU64::new(0)).collect(),
             heads,
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
@@ -1033,6 +1039,7 @@ impl<T: Transport> RpcClient<T> {
 
     pub fn mark_healthy(&self, j: usize) {
         self.health[j].store(0, Ordering::Relaxed);
+        self.terminal[j].store(0, Ordering::Relaxed);
         self.limited_streak[j].store(0, Ordering::Relaxed);
     }
 
@@ -1138,7 +1145,18 @@ impl<T: Transport> RpcClient<T> {
     /// which is right for a blip and wrong for "your credentials are rejected" - the latter is
     /// actionable, and an operator should not have to raise the log level to discover it.
     fn mark_terminal(&self, j: usize, method: &str, detail: &str) {
-        self.health[j].store(now_millis() + TERMINAL_COOLDOWN_MS, Ordering::Relaxed);
+        let now = now_millis();
+        // Calls in flight are refused together, and a cooling endpoint is still the last resort:
+        // the first refusal starts the cool-down and says so, the rest fall inside it.
+        let begun = self.terminal[j].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+            (t <= now).then_some(now + TERMINAL_COOLDOWN_MS)
+        });
+        let until = begun.map_or_else(|t| t, |_| now + TERMINAL_COOLDOWN_MS);
+        self.health[j].fetch_max(until, Ordering::Relaxed);
+        if begun.is_err() {
+            return;
+        }
+        self.terminal_cooldowns[j].fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             "rpc {} refused us on {method} ({detail}) - not a transient failure; \
              cooling it down for {}s. Check the endpoint's credentials or plan.",
