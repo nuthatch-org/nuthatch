@@ -557,9 +557,13 @@ async fn feed(
 struct AppliedQuery {
     token: Option<String>,
     conn: u64,
-    /// The round trip the follower last measured for one of these reports, in microseconds, which
-    /// visibility lag takes half of.
+    /// The round trip the follower's previous report took, in microseconds: what a 5.14 writer
+    /// takes half of, and a 5.14 follower sends alone.
     rtt_us: Option<u64>,
+    /// This report's number, from a later follower.
+    seq: Option<u64>,
+    /// Earlier reports' round trips, `<seq>:<µs>` comma-separated.
+    rtts: Option<String>,
 }
 
 /// `POST /_admin/feed/applied?conn=<n>`: what a follower has applied, per dataset, as
@@ -577,10 +581,15 @@ async fn applied(
         )
             .into_response();
     }
-    let now = std::time::Instant::now();
-    let rtt = q.rtt_us.map(Duration::from_micros);
+    crate::feed_metrics::metrics().reported(
+        q.conn,
+        &positions,
+        q.seq,
+        q.rtt_us,
+        q.rtts.as_deref(),
+        std::time::Instant::now(),
+    );
     for (dataset, at) in positions {
-        crate::feed_metrics::metrics().acked(q.conn, &dataset, at, rtt, now);
         crate::seal::follower_applied(&s.root.join(dataset), q.conn, at);
     }
     crate::seal::release_retained();
