@@ -131,7 +131,7 @@ pub fn check_snapshot(
 }
 
 /// One file to have: where the mirror keeps it, and the catalogue entry it must hash to.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Wanted {
     pub key: String,
     pub segment: Segment,
@@ -262,4 +262,48 @@ pub fn cut_catalogue(published: &Manifest, cuts: &BTreeMap<String, u64>) -> Mani
         segs.retain(|s| !s.provisional && at.is_some_and(|at| s.to_block <= at));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seg(hash: char, from: u64, to: u64, rows: usize, provisional: bool) -> Segment {
+        serde_json::from_value(serde_json::json!({
+            "hash": hash.to_string().repeat(64), "from_block": from, "to_block": to, "rows": rows,
+            "file": "f", "provisional": provisional,
+        }))
+        .unwrap()
+    }
+
+    /// The digest `/play`'s `postcard.js` computes for the same catalogue, from Node's crypto.
+    #[test]
+    fn a_postcard_digest_is_the_one_play_computes() {
+        let mut m = Manifest::default();
+        m.tables.insert(
+            "a".into(),
+            vec![seg('1', 1, 5, 3, false), seg('3', 6, 9, 1, true)],
+        );
+        m.tables.insert("b".into(), vec![seg('2', 6, 9, 4, false)]);
+        m.tables.insert("c".into(), vec![seg('4', 1, 2, 1, false)]);
+        let mut cuts = BTreeMap::new();
+        cuts.insert("a".to_string(), 9);
+        cuts.insert("b".to_string(), 9);
+        let cut = cut_catalogue(&m, &cuts);
+        assert!(
+            cut.tables["c"].is_empty(),
+            "a table the cut does not name admits nothing"
+        );
+        assert_eq!(
+            cut.tables["a"].len(),
+            1,
+            "a provisional entry is never pinned"
+        );
+        let hex = |c: char| c.to_string().repeat(64);
+        assert_eq!(cut.tables["a"][0].hash, hex('1'));
+        assert_eq!(
+            postcard_digest(br#"{"tables":[]}"#, &cut),
+            "YgaCaHn3ZKtBKPrgoI6mR35KJEtsggDxtkJ80fF1A3A"
+        );
+    }
 }

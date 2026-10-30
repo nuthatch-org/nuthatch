@@ -11,6 +11,7 @@ use nuthatch_core::cursor::{
 };
 use nuthatch_core::drive::Driver;
 use nuthatch_core::exposure::ExposureView;
+use nuthatch_core::factory::{ChildRegistry, FactorySet};
 use nuthatch_core::labels::LabelSet;
 use nuthatch_core::metrics::{CursorMetrics, UndecodedTally};
 use nuthatch_core::redb_store::Store;
@@ -30,6 +31,12 @@ pub struct TabNest {
     registry: DecodeRegistry,
     addresses: Vec<String>,
     topic0s: Vec<String>,
+    /// A factory nest's rules, and the children they have found (RFC-0009).
+    factory: Option<FactorySet>,
+    /// Held through a follow, which awaits the source with it borrowed.
+    children: futures::lock::Mutex<ChildRegistry>,
+    threshold: Option<i128>,
+    velocity_cfg: Option<(i128, u64)>,
     pub balances: BalanceView,
     exposure: ExposureView,
     velocity: VelocityView,
@@ -103,26 +110,18 @@ impl TabNest {
         start: u64,
         window: u64,
     ) -> Result<TabNest> {
-        Self::open_sealing(
-            Store::from_db(db, None)?,
-            registry,
-            addresses,
-            topic0s,
-            start,
-            window,
-            Sealing::never(),
-        )
+        let mut spec = crate::nest::NestSpec::of_registry(registry, addresses, topic0s, start);
+        spec.chain.log_window = window;
+        Self::open_sealing(Store::from_db(db, None)?, spec, start, Sealing::never())
     }
 
-    /// [`Self::open`] over a store already opened, sealing past `sealing.finality` as a node does.
-    /// A warm store's views are rebuilt from `sealing.history` and the hot tail, as a node's are.
+    /// The nest `spec` describes over a store already opened, from `start` unless the store has
+    /// begun already, sealing past `sealing.finality` as a node does. A warm store's views and a
+    /// factory's children are rebuilt from `sealing.history` and the hot tail, as a node's are.
     pub fn open_sealing(
         store: Store,
-        registry: DecodeRegistry,
-        addresses: Vec<String>,
-        topic0s: Vec<String>,
+        spec: crate::nest::NestSpec,
         start: u64,
-        window: u64,
         sealing: Sealing,
     ) -> Result<TabNest> {
         if store.get_meta(START_BLOCK_KEY)?.is_none() {
@@ -130,30 +129,41 @@ impl TabNest {
         }
         let nest = TabNest {
             store,
-            registry,
-            addresses,
-            topic0s,
             balances: BalanceView::start(Driver::Inline)?,
-            exposure: ExposureView::start(Driver::Inline, false)?,
-            velocity: VelocityView::start(Driver::Inline, false)?,
-            labels: LabelSet::default(),
+            exposure: ExposureView::start(Driver::Inline, !spec.labels.is_empty())?,
+            velocity: VelocityView::start(Driver::Inline, spec.velocity.is_some())?,
+            registry: spec.registry,
+            addresses: spec.addresses,
+            topic0s: spec.topic0s,
+            factory: spec.factory,
+            children: futures::lock::Mutex::new(ChildRegistry::new()),
+            threshold: spec.threshold,
+            velocity_cfg: spec.velocity,
+            labels: spec.labels,
             router: AlertRouter::new(Vec::<AlertSink>::new()),
             sealing,
-            window: window.max(1),
+            window: spec.chain.log_window.max(1),
             entities: Vec::new(),
             cursor: Cursor::default(),
             budget: crate::budget::TabBudget::default(),
         };
+        let mut nest = nest;
         if let (Some(history), Some(_)) = (&nest.sealing.history, nest.last_block()?) {
             let views = DerivedViews {
                 labels: &nest.labels,
                 balances: &nest.balances,
                 exposure: &nest.exposure,
                 velocity: &nest.velocity,
-                velocity_cfg: None,
+                velocity_cfg: nest.velocity_cfg,
             };
             restart::rebuild_views(&**history, &nest.store, &nest.registry, &views)
                 .context("rebuilding the views from this nest's stored history")?;
+            if let Some(factory) = &nest.factory {
+                *nest.children.get_mut() =
+                    restart::rebuild_children(&**history, &nest.store, factory).context(
+                        "rebuilding the factory's children from this nest's stored history",
+                    )?;
+            }
         }
         Ok(nest)
     }
@@ -179,6 +189,11 @@ impl TabNest {
         Ok(())
     }
 
+    /// The getLogs span the cursor asks for, which `/ready` reports.
+    pub fn log_window(&self) -> u64 {
+        self.window
+    }
+
     pub fn registry(&self) -> &DecodeRegistry {
         &self.registry
     }
@@ -190,24 +205,33 @@ impl TabNest {
             .and_then(|v| v.parse().ok()))
     }
 
-    /// Follow `tape` until it has nothing new. Returns the block the last rollback resumed from, if
-    /// one ran.
-    pub async fn follow(&self, tape: &dyn Source) -> Result<Option<u64>> {
-        let schema = self.registry.schema();
-        let nest = || Nest {
+    fn cursor_nest<'a>(
+        &'a self,
+        schema: &'a [nuthatch_decode::registry::TableSchema],
+        children: Option<&'a mut ChildRegistry>,
+    ) -> Nest<'a, TabEntity> {
+        Nest {
             name: "tab",
             store: &self.store,
-            schema: &schema,
+            schema,
             balances: &self.balances,
             exposure: &self.exposure,
             velocity: &self.velocity,
             labels: &self.labels,
-            velocity_flag: None,
+            velocity_flag: self.velocity_cfg,
             entities: &self.entities,
-            children: None,
+            children,
             router: &self.router,
             metrics: &self.cursor,
-        };
+        }
+    }
+
+    /// Follow `tape` until it has nothing new. Returns the block the last rollback resumed from, if
+    /// one ran.
+    pub async fn follow(&self, tape: &dyn Source) -> Result<Option<u64>> {
+        let schema = self.registry.schema();
+        let mut children = self.children.lock().await;
+        let factory = self.factory.as_ref();
         let start: u64 = self
             .store
             .get_meta(START_BLOCK_KEY)?
@@ -219,7 +243,10 @@ impl TabNest {
             let mut next = self.last_block()?.map_or(start, |b| b + 1);
             if next > 0 {
                 if let Some(ancestor) = detect_reorg(tape, &self.store, next - 1).await? {
-                    next = rollback_reorg(nest(), ancestor)?;
+                    next = rollback_reorg(
+                        self.cursor_nest(&schema, factory.map(|_| &mut *children)),
+                        ancestor,
+                    )?;
                     rolled = Some(next);
                 }
             }
@@ -240,8 +267,8 @@ impl TabNest {
             let to = (next + self.window - 1).min(tip);
             let wanted = Wanted {
                 registry: &self.registry,
-                factory: None,
-                children: &nuthatch_core::factory::ChildRegistry::new(),
+                factory,
+                children: &children,
                 addresses: &self.addresses,
                 topic0s: &self.topic0s,
                 topic0_refused: &mut topic0_refused,
@@ -250,10 +277,10 @@ impl TabNest {
             // Again once the logs are held, before anything of the window is committed.
             self.budget.check_memory(crate::budget::linear_memory())?;
             let window = Window {
-                nest: nest(),
+                nest: self.cursor_nest(&schema, factory.map(|_| &mut *children)),
                 registry: &self.registry,
-                factory: None,
-                threshold: None,
+                factory,
+                threshold: self.threshold,
                 finality: self.sealing.finality,
                 seal_span: self.sealing.seal_span,
                 sinks: &*self.sealing.sinks,

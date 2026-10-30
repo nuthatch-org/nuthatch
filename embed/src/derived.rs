@@ -209,6 +209,15 @@ impl nuthatch_core::restart::SeedEntity for TabEntity {
     }
 }
 
+/// Each declared entity's `max_rows`, which admission charges.
+pub fn declared_rows(files: &NestFiles) -> Result<Vec<u64>> {
+    let Some(raw) = files.get("entities.toml") else {
+        return Ok(Vec::new());
+    };
+    let decls = entity_decl::parse(raw).context("parse entities.toml")?;
+    Ok(decls.iter().map(|d| d.max_rows as u64).collect())
+}
+
 /// Every entity `files` declares, in declaration order. A nest that has indexed before is `warm`.
 pub fn start(
     files: &NestFiles,

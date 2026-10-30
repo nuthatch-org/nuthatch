@@ -585,3 +585,64 @@ impl NestConfig {
         declared(&self.contracts, &self.templates, &self.factories)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NEST: &str = r#"
+[nest]
+name = "n"
+chain = "arbitrum-one"
+chain_id = 42161
+rpc_urls = []
+
+[[contracts]]
+alias = "token"
+address = "0x9623063377ad1b27544c965ccd7342f7ea7e88c7"
+start_block = 1
+abi = "abis/token.json"
+"#;
+
+    fn refused(raw: &str) -> String {
+        format!("{:#}", NestConfig::parse(raw).expect_err("refused"))
+    }
+
+    #[test]
+    fn the_nests_part_parses_and_builds_its_registry() {
+        let cfg = NestConfig::parse(NEST).unwrap();
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            "abis/token.json".to_string(),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#
+                .to_string(),
+        );
+        let registry = cfg.registry(&files).unwrap();
+        assert_eq!(registry.tables()[0].table, "token__transfer");
+        assert!(format!(
+            "{:#}",
+            cfg.registry(&Default::default()).err().expect("no ABI")
+        )
+        .contains("abis/token.json"));
+    }
+
+    #[test]
+    fn what_only_a_node_runs_is_refused_by_name() {
+        let webhook =
+            format!("{NEST}\n[[webhooks]]\nname = \"w\"\ntable = \"t\"\nurl = \"http://x\"\n");
+        assert!(refused(&webhook).contains("[webhooks]"));
+        let calls = format!("{NEST}\n[[calls]]\nname = \"c\"\n");
+        assert!(refused(&calls).contains("[calls]"));
+        let typo = NEST.replace("start_block", "start_blok");
+        assert!(refused(&typo).contains("contracts.0.start_blok"));
+        let blocks = format!("{NEST}\n[extract]\nblocks = true\n");
+        assert!(refused(&blocks).contains("[extract]"));
+        let alias = NEST.replace("alias = \"token\"", "alias = \"../x\"");
+        assert!(refused(&alias).contains("contract alias"));
+        let graph = NEST.replace("rpc_urls = []", "rpc_urls = []\nschema_version = 3");
+        assert!(refused(&graph).contains("--features graph"));
+    }
+}
