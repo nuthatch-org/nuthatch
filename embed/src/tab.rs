@@ -45,6 +45,9 @@ pub struct TabNest {
     router: AlertRouter,
     sealing: Sealing,
     window: u64,
+    /// RFC-0077 S7: asked in place of `addresses`' `topic0s` when the host narrowed the nest.
+    narrowed: Option<Vec<crate::narrow::Narrowed>>,
+    until: Option<u64>,
     pub entities: Vec<TabEntity>,
     pub cursor: Cursor,
     pub budget: crate::budget::TabBudget,
@@ -152,6 +155,8 @@ impl TabNest {
             router: AlertRouter::new(Vec::<AlertSink>::new()),
             sealing,
             window: spec.chain.log_window.max(1),
+            narrowed: spec.narrowed,
+            until: spec.until,
             entities: Vec::new(),
             cursor: Cursor::default(),
             budget: crate::budget::TabBudget::default(),
@@ -268,6 +273,15 @@ impl TabNest {
         if let Some(v) = verified {
             v.verifier.begin();
         }
+        // One pass ends at the head it first saw. Arbitrum makes four blocks a second, and a nest
+        // that asks many filters a window would otherwise chase the head and never be idle.
+        let mut target: Option<u64> = None;
+        if let (Some(until), Some(last)) = (self.until, self.last_block()?) {
+            ensure!(
+                last <= until,
+                "the store has indexed to block {last}, past `until` {until}; open it fresh"
+            );
+        }
         loop {
             let mut next = self.last_block()?.map_or(start, |b| b + 1);
             if next > 0 {
@@ -285,7 +299,8 @@ impl TabNest {
             let tip = tape.tip().await?;
             self.cursor.tip.store(tip, Relaxed);
             self.cursor.last_poll.store(unix_now(), Relaxed);
-            if next > tip {
+            let target = *target.get_or_insert(self.until.map_or(tip, |u| u.min(tip)));
+            if next > tip.min(target) {
                 self.balances.flush();
                 ensure!(self.balances.is_healthy(), "the balance view died");
                 for e in &self.entities {
@@ -296,7 +311,7 @@ impl TabNest {
                 return Ok(rolled);
             }
             self.budget.check_memory(crate::budget::linear_memory())?;
-            let to = (next + self.window - 1).min(tip);
+            let to = (next + self.window - 1).min(tip.min(target));
             let wanted = Wanted {
                 registry: &self.registry,
                 factory,
@@ -305,7 +320,10 @@ impl TabNest {
                 topic0s: &self.topic0s,
                 topic0_refused: &mut topic0_refused,
             };
-            let logs = fetch_window(wanted, tape, next, to).await?;
+            let logs = match &self.narrowed {
+                Some(n) => crate::narrow::fetch(n, tape, next, to).await?,
+                None => fetch_window(wanted, tape, next, to).await?,
+            };
             // Again once the logs are held, before anything of the window is committed.
             self.budget.check_memory(crate::budget::linear_memory())?;
             let extra: &dyn nuthatch_core::extra::ExtraRows = match (verified, &top) {

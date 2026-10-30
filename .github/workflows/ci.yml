@@ -631,7 +631,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: native step test (embed)
         working-directory: embed
-        run: cargo test --locked --release --test native
+        run: cargo test --locked --release --lib --test native
 
   # Every gate here runs the module the tab ships: the `tab` profile, then wasm-opt.
   wasm-tab:

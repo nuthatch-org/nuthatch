@@ -55,6 +55,12 @@ pub struct NestSpec {
     pub chain: ChainPolicy,
     /// The earliest declared start block, where one is declared.
     pub start: Option<u64>,
+    /// Each contract's declared start block, by alias.
+    pub starts: std::collections::BTreeMap<String, u64>,
+    /// RFC-0077 S7: the filters a narrowed nest asks for in place of its contracts' every log.
+    pub narrowed: Option<Vec<crate::narrow::Narrowed>>,
+    /// RFC-0077 S7: the last block the cursor indexes, so the nest answers as of it.
+    pub until: Option<u64>,
 }
 
 impl NestSpec {
@@ -104,6 +110,13 @@ impl NestSpec {
             velocity: config.flags.velocity(),
             chain: ChainPolicy::of(&config.nest.chain, config.nest.chain_id),
             start: config.contracts.iter().filter_map(|c| c.start_block).min(),
+            starts: config
+                .contracts
+                .iter()
+                .filter_map(|c| Some((c.alias.clone(), c.start_block?)))
+                .collect(),
+            narrowed: None,
+            until: None,
             registry,
         })
     }
@@ -138,6 +151,9 @@ impl NestSpec {
             velocity: None,
             chain: ChainPolicy::of("mainnet", 1),
             start: Some(start),
+            starts: Default::default(),
+            narrowed: None,
+            until: None,
         }
     }
 

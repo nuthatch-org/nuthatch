@@ -21,6 +21,7 @@ pub mod http;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub mod live;
 pub mod mirror;
+pub mod narrow;
 pub mod nest;
 pub mod query;
 pub mod reorg;

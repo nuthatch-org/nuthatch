@@ -2376,8 +2376,22 @@ impl<T: Transport> RpcClient<T> {
         from: u64,
         to: u64,
     ) -> Result<Vec<Log>> {
+        self.get_logs_matching(addresses, topic0s, &Default::default(), from, to)
+            .await
+    }
+
+    async fn get_logs_matching(
+        &self,
+        addresses: &[String],
+        topic0s: &[String],
+        topics: &[Vec<String>; 3],
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<Log>> {
         if addresses.is_empty() {
-            return self.get_logs_once(addresses, topic0s, from, to).await;
+            return self
+                .get_logs_once(addresses, topic0s, topics, from, to)
+                .await;
         }
         let mut logs = Vec::new();
         let mut groups = 0usize;
@@ -2385,7 +2399,7 @@ impl<T: Transport> RpcClient<T> {
         while done < addresses.len() {
             let cap = self.log_address_cap.load(Ordering::Relaxed);
             let group = &addresses[done..addresses.len().min(done.saturating_add(cap))];
-            match self.get_logs_once(group, topic0s, from, to).await {
+            match self.get_logs_once(group, topic0s, topics, from, to).await {
                 Ok(mut l) => {
                     logs.append(&mut l);
                     done += group.len();
@@ -2414,6 +2428,7 @@ impl<T: Transport> RpcClient<T> {
         &self,
         addresses: &[String],
         topic0s: &[String],
+        topics: &[Vec<String>; 3],
         from: u64,
         to: u64,
     ) -> Result<Vec<Log>> {
@@ -2424,8 +2439,8 @@ impl<T: Transport> RpcClient<T> {
         if !addresses.is_empty() {
             filter.insert("address".into(), json!(addresses));
         }
-        if !topic0s.is_empty() {
-            filter.insert("topics".into(), json!([topic0s]));
+        if let Some(t) = getlogs_topics(topic0s, topics) {
+            filter.insert("topics".into(), t);
         }
         filter.insert("fromBlock".into(), json!(format!("0x{from:x}")));
         filter.insert("toBlock".into(), json!(format!("0x{to:x}")));
@@ -2470,6 +2485,20 @@ impl<T: Transport> RpcClient<T> {
             cache.clear();
         }
         cache.extend(found);
+    }
+}
+
+/// `eth_getLogs`' `topics`: one position per topic, `null` where any value matches, and nothing past
+/// the last position that narrows. `None` when nothing does.
+fn getlogs_topics(topic0s: &[String], topics: &[Vec<String>; 3]) -> Option<Value> {
+    let any = |t: &[String]| if t.is_empty() { Value::Null } else { json!(t) };
+    match topics.iter().rposition(|t| !t.is_empty()) {
+        Some(last) => Some(Value::Array(
+            std::iter::once(any(topic0s))
+                .chain(topics[..=last].iter().map(|t| any(t)))
+                .collect(),
+        )),
+        None => (!topic0s.is_empty()).then(|| json!([topic0s])),
     }
 }
 
@@ -2602,7 +2631,37 @@ impl<T: Transport> crate::source::Source for RpcClient<T> {
         from: u64,
         to: u64,
     ) -> Result<Vec<Log>> {
-        self.get_logs(filter.addresses(), filter.topic0s(), from, to)
-            .await
+        self.get_logs_matching(
+            filter.addresses(),
+            filter.topic0s(),
+            filter.topics(),
+            from,
+            to,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod getlogs_topics_tests {
+    use super::getlogs_topics;
+    use serde_json::json;
+
+    #[test]
+    fn positions_stop_at_the_last_one_that_narrows() {
+        let t0 = ["0xaa".to_string()];
+        let none: [Vec<String>; 3] = Default::default();
+        assert_eq!(getlogs_topics(&t0, &none), Some(json!([["0xaa"]])));
+        assert_eq!(getlogs_topics(&[], &none), None);
+        let third = [vec![], vec![], vec!["0xd".to_string()]];
+        assert_eq!(
+            getlogs_topics(&t0, &third),
+            Some(json!([["0xaa"], null, null, ["0xd"]]))
+        );
+        let first = [vec!["0xb".to_string(), "0xc".to_string()], vec![], vec![]];
+        assert_eq!(
+            getlogs_topics(&[], &first),
+            Some(json!([null, ["0xb", "0xc"]]))
+        );
     }
 }

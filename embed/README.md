@@ -126,7 +126,11 @@ host drops the instance.
             "entities.toml": "...", "entities/received.sql": "...", "views/20-s4.sql": "..."},
   "mirror": {"base": "https://..."},
   "follow": true,
-  "verified": true
+  "verified": true,
+  "filters": [{"contract": "staking", "event": "TokensDelegated", "from": 408825706,
+               "args": {"delegator": ["0x..."]}}],
+  "window": 10000000,
+  "until": 519817135
 }
 ```
 
@@ -178,6 +182,29 @@ row names a block hash off the verified chain, sealing stops there and the next 
 says why in `unverified`, by block; the cursor carries on, and its rows stay in the hot store. Rows
 above the verified block are still what the RPC said, and an RPC that leaves a log out is not caught
 (RFC-0065 §6). Without `verified`, the module seals on the chain's own policy, as a node does.
+
+**`filters`** (RFC-0077 S7) narrow the nest to the logs a host names, such as one user's own.
+Each names a contract by its alias, an event by its name (or its signature where the ABI overloads
+the name), optionally the first block to ask from (never before the contract's `start_block`), and
+for any of the event's indexed arguments the values it may take, addresses or 32-byte words. The
+cursor then asks for those logs only: one `eth_getLogs` per filter and value, since an endpoint that
+serves ten million blocks to a filter with one value per topic serves far fewer to one with a list
+(arb1.arbitrum.io: 10,000,000 against 100,000). An event no filter names is not fetched, and its
+table stays empty: a narrowed nest is a selection, not the contract's history, so `filters` and
+`mirror` are refused together, as is a factory. A filter naming an event, argument or value the nest
+cannot mean is refused by name (`bad_config`). Each log the endpoint returns is checked against the
+filter that asked for it, so an endpoint that ignores a topic costs bandwidth, not correctness; a
+range it will not answer whole is halved, and a throttle is asked again after a rest.
+
+**`window`** is the blocks per `eth_getLogs`, in place of the chain's registered window. A narrowed
+nest wants it as wide as its endpoint allows.
+
+**`until`** is the last block the cursor indexes. The nest then answers as of that block, which is
+how a host compares its answers with another source's at the same block. A store already past
+`until` faults the follow rather than answer from later blocks.
+
+A follow pass ends at the head it saw when it began; the host steps again to follow further. On a
+chain that makes several blocks a second a pass would otherwise never be idle.
 
 **Reopening.** Storage `host` without `fresh` opens the store the host kept, and the nest carries on
 from its last block, as a node restarted on its data directory does. Before it answers anything it

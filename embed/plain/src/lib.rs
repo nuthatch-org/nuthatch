@@ -14,6 +14,7 @@ use nuthatch_embed::budget::TabBudget;
 use nuthatch_embed::cellar::Cellar;
 use nuthatch_embed::derived::NestFiles;
 use nuthatch_embed::mirror::{self, Hydrated, MirrorConfig, MirrorHost};
+use nuthatch_embed::narrow::{self, FilterSpec};
 use nuthatch_embed::nest::{NestSpec, CONFIG_FILE};
 use nuthatch_embed::tab::{TabNest, Verified};
 use nuthatch_embed::verified::{VerifiedHead, Verifier};
@@ -145,6 +146,12 @@ struct Config {
     poll_interval_secs: Option<u64>,
     #[serde(default)]
     files: NestFiles,
+    /// RFC-0077 S7: fetch only the logs these name, one `eth_getLogs` per value.
+    filters: Option<Vec<FilterSpec>>,
+    /// Blocks per `eth_getLogs`, in place of the chain's registered window.
+    window: Option<u64>,
+    /// RFC-0077 S7: index no further than this block, so the nest answers as of it.
+    until: Option<u64>,
 }
 
 fn default_nid() -> String {
@@ -427,7 +434,7 @@ fn open(raw: &[u8]) -> Result<Value, Fault> {
 /// host is asked for anything, when the two are mixed or a mode cannot do what is asked.
 fn spec_of(c: &Config) -> Result<NestSpec, Fault> {
     let bad = |m: &str| Err(fault("bad_config", m));
-    let spec = match (c.files.contains_key(CONFIG_FILE), &c.contract, c.start) {
+    let mut spec = match (c.files.contains_key(CONFIG_FILE), &c.contract, c.start) {
         (true, None, None) => {
             NestSpec::from_files(&c.files).map_err(|e| fault_of("bad_config", e))?
         }
@@ -456,6 +463,21 @@ fn spec_of(c: &Config) -> Result<NestSpec, Fault> {
     }
     if c.mirror.is_none() {
         spec.start_block().map_err(|e| fault_of("bad_config", e))?;
+    }
+    if let Some(filters) = &c.filters {
+        if c.mirror.is_some() {
+            return bad("a mirror holds a nest's whole history, and `filters` select part of it");
+        }
+        if c.contract.is_some() {
+            return bad("`filters` name contracts by their alias in a nuthatch.toml");
+        }
+        spec.narrowed = Some(narrow::build(&spec, filters).map_err(|e| fault_of("bad_config", e))?);
+    }
+    spec.until = c.until;
+    match c.window {
+        Some(0) => return bad("`window` is blocks per getLogs, at least one"),
+        Some(w) => spec.chain.log_window = w,
+        None => {}
     }
     Ok(spec)
 }
