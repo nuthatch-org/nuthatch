@@ -8,7 +8,9 @@ use crate::cellar::Cellar;
 use crate::derived::{NestFiles, TabEntity};
 use crate::registry::TableSchema;
 use anyhow::{anyhow, Result};
-use nuthatch_core::answer::{value_bytes, SQL_MAX_RESULT_BYTES};
+use nuthatch_core::answer::{
+    rewrite_temporal, temporal_columns, value_bytes, SQL_MAX_RESULT_BYTES,
+};
 use nuthatch_core::redb_store::Store;
 use nuthatch_core::store::SEALED_THROUGH_KEY;
 use serde_json::Value;
@@ -48,6 +50,20 @@ fn arrow_bytes(part: &arrow_array::RecordBatch) -> usize {
             }
         })
         .fold(0usize, usize::saturating_add)
+}
+
+/// A batch as JSON rows, with dates and timestamps as the node writes them.
+fn encode(batch: &arrow_array::RecordBatch) -> Result<Vec<Value>, burrmill::BurrmillError> {
+    let temporal = temporal_columns(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (f.name(), f.data_type().to_string())),
+    );
+    let mut rows = burrmill::df::encode::rows(batch)?;
+    rewrite_temporal(&mut rows, &temporal);
+    Ok(rows)
 }
 
 fn engine_err(e: burrmill::BurrmillError) -> anyhow::Error {
@@ -158,14 +174,13 @@ impl TabQuery {
         let batches = self.engine.sql_async(sql).await.map_err(engine_err)?;
         let mut out = Vec::new();
         for b in &batches {
-            out.extend(burrmill::df::encode::rows(b).map_err(engine_err)?);
+            out.extend(encode(b).map_err(engine_err)?);
         }
         Ok(out)
     }
 
     /// `/sql`'s rows, columns and whether more than `cap` rows were left out, as
-    /// `engine_burrmill`'s `collect` gives them. Dates are not rewritten to ISO text as the node's
-    /// are; no table a tab nest holds has one.
+    /// `engine_burrmill`'s `collect` gives them.
     pub async fn collect(
         &self,
         sql: &str,
@@ -204,7 +219,7 @@ impl TabQuery {
                         over = true;
                         return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
                     }
-                    for row in burrmill::df::encode::rows(&part)? {
+                    for row in encode(&part)? {
                         bytes += row
                             .as_object()
                             .map(|o| {

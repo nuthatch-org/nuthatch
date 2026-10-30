@@ -544,7 +544,9 @@ node's side, `"returned": items.len() + 1` in `answer::derived_all` fails `e2e_t
 - No Safari run, for S3's reason.
 - The tab has no admission gate, fair share, memo, byte cap on a response, or per-request deadline.
   None of them changes an answer below their limits, and none is reached here.
-- A query naming a date column would differ: the node rewrites dates to ISO text, and the tab does not.
+- Fixed 2026-10-30: a query naming a date column differed, because only the node rewrote dates to ISO
+  text. Both now write them with `nuthatch_core::answer::rewrite_temporal`, and three date requests
+  joined the gate's set.
 - `/ready` reports what a tab knows. A seal-direct pass and its fields are absent, `stalled` is only an
   entity's fault, and the poll interval is the page's.
 - The relay needs the page open, because the Service Worker reaches the nest through it. MCP over HTTP

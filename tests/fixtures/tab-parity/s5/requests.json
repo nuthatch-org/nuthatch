@@ -27,5 +27,8 @@
   {"method": "GET", "path": "/derived/received?limit=5"},
   {"method": "GET", "path": "/derived/received/0x37C9EF5D0801ABDC25D9BBED096A080FA3C54E4C"},
   {"method": "GET", "path": "/derived/sent/0x000000000000000000000000000000000000dead"},
-  {"method": "GET", "path": "/derived/nope"}
+  {"method": "GET", "path": "/derived/nope"},
+  {"method": "GET", "path": "/sql?q=SELECT%20block_number%2C%20to_timestamp(block_timestamp)%20AS%20at%2C%20CAST(to_timestamp(block_timestamp)%20AS%20DATE)%20AS%20day%20FROM%20tab__transfer%20ORDER%20BY%20block_number%20DESC%2C%20log_index%20DESC%20LIMIT%203"},
+  {"method": "GET", "path": "/sql?q=SELECT%20CAST(to_timestamp(block_timestamp)%20AS%20DATE)%20AS%20day%2C%20count(*)%20AS%20transfers%20FROM%20tab__transfer%20GROUP%20BY%201%20ORDER%20BY%201"},
+  {"method": "GET", "path": "/sql?q=SELECT%20to_timestamp_millis(1791203696007)%20AS%20ms%2C%20to_timestamp_micros(1791203696250000)%20AS%20us%2C%20CAST('0001-01-01'%20AS%20DATE)%20AS%20early%2C%20CAST('1969-12-31%2023%3A59%3A59.999999999'%20AS%20TIMESTAMP)%20AS%20before_epoch%2C%20'Date32(1)'%20AS%20text"}
 ]
