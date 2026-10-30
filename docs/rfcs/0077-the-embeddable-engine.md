@@ -1,7 +1,7 @@
 # RFC-0077: The embeddable engine - nuthatch's core as an opt-in wasm module, beside the binary
 
 - Status: **Accepted, 2026-10-30.** S0 to S5 authorised in order; S6 waits for rotki to ask. S0 passed
-  2026-10-30 (§12).
+  2026-10-30 (§12). S1 built in part, 2026-10-30 (§13).
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0075 (the whole nest in a tab, S0 to S6 merged), RFC-0074 (address history as a
@@ -528,3 +528,103 @@ the pinned 1.95; 50 needs 1.97.
 **The binary.** Unchanged. Its `cargo tree` with features is line-for-line the same as before, except
 that `nuthatch-core` now shows `default,js`, a feature that gates only wasm32 dependencies. No
 lockfile changed; the two new crates carry their own, and wasmtime appears only in `plain/host/Cargo.lock`.
+
+## 13. S1 measured outcome, 2026-10-30
+
+**What moved.**
+
+- `entity_bind`, `entity_decl`, `entity_lower` and `sql_errors` are in `nuthatch-core`. The binary
+  re-exports them at their old paths, so nothing that names them changed. Core gains direct edges
+  to `sqlparser`, `toml`, `alloy-primitives` and `nuthatch-scaffold`, all already in the binary's
+  tree with the same features. Tests that need the binary moved beside it: the two offchain-snapshot
+  cases to `src/entity_offchain.rs`, and the nine Burrmill-raised hint cases to
+  `src/engine_burrmill.rs`. None was dropped.
+- Offchain tables are two traits in core, `OffchainTables` and `OffchainSnapshot`. The binary
+  implements them over its snapshot files; an embedding binds through `NoOffchain`, which replaces
+  `offchain_none.rs`.
+- `nuthatch_core::bind` holds what the node and the tab both bind `/sql` with: an entity relation's
+  rows and casting view (`bind_relation`), the column types (`hold_relation_types`), `read_sealed`'s
+  probe and row read, and the walk through views (`expand_through_views`, `referenced_tables`). Both
+  call it.
+- `spike/dbsp-wasm/` is `embed/`, crate `nuthatch-embed`; `plain/` is `nuthatch-embed-plain`; `web/` is
+  `embed/hosts/browser/`. There is no `spike/` directory and no `#[path]` from `embed/` or `core/`
+  into `src/`.
+- `tests/embed_versions.rs`, in the binary's suite, fails when a crate in `embed/Cargo.lock` or
+  `embed/plain/Cargo.lock` resolves to a version the binary's lockfile does not hold on the same
+  semver-compatible line. Only the wasm-bindgen family may differ: it is pinned to the CLI the
+  wasm-tools action installs, and the binary never builds it.
+
+**What it found.** The check failed on its first run with 144 drifted crates in each engine lockfile,
+alloy 1.7.3 against 1.6.0, serde_json 1.0.154 against 1.0.150 and zstd-safe 7.3.0 against 7.2.4 among
+them. Both lockfiles are now aligned. The plain build had patched uuid 1.29.0 and the binary has
+1.23.5; the uuid part of `rfc-0077-plain.patch` applies to 1.23.5 unchanged, so the plain build now
+patches that.
+
+**The forks.** Chief approved forks under nuthatch-org the same day, so the patches left `vendor.sh`.
+Each fork has a branch at the exact rev the crate was published from (the sha1 in its
+`.cargo_vcs_info.json`) carrying two commits: the crates.io manifests, which resolve workspace
+inheritance, and then the patch. Every source file the patches touch was first compared with the git
+file at that rev, and all matched, so `embed/` builds the same sources `vendor.sh` produced.
+
+| Fork | Branch | Base | Head |
+|---|---|---|---|
+| nuthatch-org/feldera | `nuthatch/wasm32-0.320.0` | `9a66270b` | `48131669` (24 files, +499 -89) |
+| nuthatch-org/size-of | `nuthatch/wasm32-0.1.7` | `e6deefbd` | `1181ec2f` |
+| nuthatch-org/web-time | `nuthatch/plain-1.1.0` | `2d200ded` | `d5700e7e` |
+| nuthatch-org/chrono | `nuthatch/plain-0.4.45` | `17033825` | `8a1f8f62` |
+| nuthatch-org/uuid | `nuthatch/plain-1.23.5` | `5dc6b3d1` | `66da8597` |
+| nuthatch-org/getrandom | `nuthatch/plain-0.2.17` | `b625985d` | `48857ee9` |
+
+`embed/` and `plain/` take them by `rev` under `[patch.crates-io]`. `vendor.sh`, `plain/vendor.sh` and
+the two patch files are gone, and so are CI's vendor steps. The manifests commit is what makes this
+pinning rather than porting: the patch's manifest hunks were written against crates.io's flattened
+manifests, and feldera's own use workspace inheritance, which cannot turn a workspace dependency's
+default features off per crate. An upstream PR therefore needs those hunks rewritten against
+feldera's workspace.
+
+**What did not move, and why.**
+
+- *`define_views_bound` as one function over a segment reader.* Only the pure parts moved. The node's
+  version decides what happens to a segment that is missing, corrupt, quarantined, gone on a follower
+  or overtaken by a new catalogue, against files on disk. Putting that behind a reader trait is a design
+  choice about the native path, which §1a says wins, so it is left for the slice that needs it (S3's
+  rebuilds read through the same reader).
+- *Address history.* On main nothing is duplicated: `embed/` with the address build exists only on
+  `pete/rotki-embedded-s0`. The modules are about 12,400 lines (`address_history`,
+  `address_discovery`, `address_residual`) that reach `address_mode` (10,541 lines), the binary's
+  `Store`, `rpc::RpcClient`, `config`, `freshness` and `analytics::QueryBudgetExceeded`. The window
+  driver is tokio inside `address_mode`. Separating them needs RFC-0074 S2's open decisions: the store
+  seam, and how the driver yields to a host. Not mechanical, so not done.
+- *The `events` and `address` features.* With no address build on main, an `address` feature would be
+  empty. They land with the address crate.
+- *The upstream offers.* UPSTREAM.md's issue and PRs are not posted; that needs Chief's word.
+
+**The binary.** Unchanged:
+
+- *Dependencies.* `cargo tree -e features` (default, `--all-features`) and `cargo tree -e normal,build
+  --target all` list the same crate, version and feature nodes before and after: 1,917, 1,998 and 614.
+  The lockfile gains four dependency edges on `nuthatch-core`, and no package.
+- *CLI and config.* Every subcommand's `--help`, two levels deep, is byte-identical. The files
+  `nuthatch init --abi` writes are identical.
+- *Tests.* The whole suite on the M5 Pro: 2,877 passed, none failed, 18 ignored. That
+  includes `e2e_tab_parity`, `e2e_tab_entities` and `e2e_tab_answers`, the node's half of the pinned
+  segment hash and answers. Benches and budgets are CI's.
+
+**The engine.** Run locally on the forks, every gate CI runs outside Chrome passes. `embed/`'s native
+test passes, 14 tests and 1 ignored. The tab module, 34,495,764 bytes after wasm-opt, gives S3's
+segment hash and 1,000 balances, S4's entities and views before and after the reorg, all 32 of S5's
+answers byte-identical, and S6's budgets. The plain module still imports three functions, all
+`nuthatch.*`, and gives the segment hash and balances in Node and in wasmtime. Its 31 answers hash to
+`68fd12bc…c5d776a8` in both, the sha256 S0 recorded.
+
+**For burrmill-wasm.** `scripts/build-play.sh` defaults `NEST_TAB` to `../nuthatch/spike/dbsp-wasm`
+and copies `dbsp_wasm_spike.js` and `dbsp_wasm_spike_bg.wasm`; `web/play/live/live.js` imports
+`./pkg/dbsp_wasm_spike.js`. They become `../nuthatch/embed` and `nuthatch_embed*`. Until that change,
+`/play/live` builds with `NEST_TAB` set and the old names fail loudly at the copy.
+
+**Not covered by S1's gate as written.** RFC-0074 S0's parity re-run against an address build: there
+is no address build on main to run it against. The wasm32 Chrome leg (S2's OPFS and reorg transcript)
+runs in CI only.
+
+**Also seen.** `tools/rfc-0076-tenants/src/main.rs` still includes `src/fair_share.rs` by `#[path]`.
+It is RFC-0076's bench, not the engine, and out of this slice; the gate's "anywhere" catches it.
