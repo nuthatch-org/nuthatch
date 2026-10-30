@@ -272,6 +272,9 @@ impl TabNest {
             let mut next = self.last_block()?.map_or(start, |b| b + 1);
             if next > 0 {
                 if let Some(ancestor) = detect_reorg(tape, &self.store, next - 1).await? {
+                    // As the node does: the timestamp cache is keyed by height, and every block above
+                    // `ancestor` was replaced (RFC-0029 §6d). Found by RFC-0077 S5's reorg shapes.
+                    tape.forget_cached_above(ancestor);
                     next = rollback_reorg(
                         self.cursor_nest(&schema, factory.map(|_| &mut *children)),
                         ancestor,
