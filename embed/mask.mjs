@@ -1,5 +1,7 @@
 // `tests/e2e_tab_answers.rs`'s mask: the same keys, the same replacement, so the tab's bytes are
 // compared with the node's exactly where the node's own pin compares them.
+import { createHash } from "node:crypto";
+
 const MASKED = ["fetch_window_blocks", "version", "last_poll_unixtime", "seconds_since_poll",
   "seconds_since_seal_progress", "seconds_since_progress", "nid"];
 
@@ -46,6 +48,17 @@ export function differences(got, expected) {
     }
   }
   return out;
+}
+
+/// RFC-0077 S2: one sha256 over a list of answers, masked, so hosts compare with each other and with
+/// the pin in one line. The pin is masked already; `embed/tests/wasmtime-host` computes the same.
+export function answersDigest(answers, { pinned = false } = {}) {
+  const h = createHash("sha256");
+  for (const a of answers) {
+    const body = pinned ? a.body : mask(a.body);
+    h.update(`${a.method} ${a.path}\n${a.status}\n${a.content_type ?? ""}\n${body}\n`);
+  }
+  return h.digest("hex");
 }
 
 /// A path with its query, comparable however the query was encoded.

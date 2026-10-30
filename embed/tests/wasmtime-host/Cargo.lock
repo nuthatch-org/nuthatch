@@ -770,6 +770,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
+name = "nuthatch-embed-wasmtime-host"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "libc",
+ "serde_json",
+ "sha2",
+ "ureq",
+ "wasmtime",
+]
+
+[[package]]
 name = "object"
 version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -814,19 +827,6 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
-
-[[package]]
-name = "plain-host"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "flate2",
- "libc",
- "serde_json",
- "sha2",
- "ureq",
- "wasmtime",
-]
 
 [[package]]
 name = "postcard"

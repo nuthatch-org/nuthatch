@@ -1,12 +1,11 @@
-//! RFC-0077 S0: RFC-0075 S3's live cursor as a plain core module. It performs no I/O: `nh_step`
-//! runs the follow until it needs the host, then returns the RPC requests to make or the time to
-//! wait, and `nh_resume` hands back the answers. Its only imports are `nuthatch.now_ms` (through
-//! the vendored web-time), `nuthatch.random_fill` and `nuthatch.log`.
-//!
-//! Every value crosses as JSON at a pointer and a length (§3.2). An export returns its output's
-//! length, negative for an error message, and `nh_output` copies that output out.
+//! RFC-0077: the event engine as a plain core module, `abi: 1`. `embed/README.md` is the interface;
+//! this is its implementation. The module performs no I/O: `nh_step` runs until it needs the host,
+//! then returns the requests to perform or the time to wait, and `nh_resume` hands back the answers.
 #![cfg(target_arch = "wasm32")]
 
+mod host_file;
+
+use host_file::HostFile;
 use nuthatch_core::backend::Bytes;
 use nuthatch_core::rpc::RpcClient;
 use nuthatch_core::transport::{Reply, Transport, TransportError};
@@ -14,6 +13,7 @@ use nuthatch_embed::cellar::Cellar;
 use nuthatch_embed::derived::NestFiles;
 use nuthatch_embed::tab::TabNest;
 use nuthatch_embed::young;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
@@ -23,6 +23,13 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
+
+/// The interface version `nh_abi` reports. Any change to an export's or import's shape bumps it;
+/// `embed/tests/wasmtime-host` holds each version's shapes and fails a module that differs.
+const ABI: u32 = 1;
+
+/// The store's file under the nest's storage, as `data/<nid>/` holds it on a node.
+const STORE_FILE: &str = "nuthatch.redb";
 
 #[link(wasm_import_module = "nuthatch")]
 extern "C" {
@@ -41,7 +48,7 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
     Ok(())
 }
 
-/// getrandom 0.2's, whose `js` feature the vendored copy turns into `custom` (`vendor.sh`).
+/// getrandom 0.2's, whose `js` feature our fork turns into `custom`.
 #[no_mangle]
 unsafe extern "Rust" fn __getrandom_custom(dest: *mut u8, len: usize) -> u32 {
     random_fill(dest, len);
@@ -52,7 +59,85 @@ fn log_line(level: u32, s: &str) {
     unsafe { log(level, s.as_ptr(), s.len()) }
 }
 
+/// Every export's error: `{"fault": name, "message": text}` at a negative length.
+#[derive(Debug)]
+struct Fault {
+    name: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.name, self.message)
+    }
+}
+
+impl std::error::Error for Fault {}
+
+fn fault(name: &'static str, message: impl std::fmt::Display) -> Fault {
+    Fault {
+        name,
+        message: message.to_string(),
+    }
+}
+
+/// `e` as the fault it carries, or as `name` when it carries none.
+fn fault_of(name: &'static str, e: anyhow::Error) -> Fault {
+    match e.downcast::<Fault>() {
+        Ok(f) => f,
+        Err(e) => fault(name, format!("{e:#}")),
+    }
+}
+
+fn not_open() -> Fault {
+    fault(
+        "not_open",
+        "nh_open first, and nh_step until the store is open",
+    )
+}
+
+#[derive(Deserialize, Clone, Copy, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Storage {
+    #[default]
+    Bytes,
+    Host,
+}
+
+impl Storage {
+    fn name(self) -> &'static str {
+        match self {
+            Storage::Bytes => "bytes",
+            Storage::Host => "host",
+        }
+    }
+}
+
+/// `nh_open`'s argument. Unknown keys are refused, so a host never believes a setting took.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    #[serde(default = "default_nid")]
+    nid: String,
+    contract: String,
+    start: u64,
+    rpc: Vec<String>,
+    #[serde(default)]
+    storage: Storage,
+    #[serde(default)]
+    fresh: bool,
+    memory_mib: Option<u32>,
+    poll_interval_secs: Option<u64>,
+    #[serde(default)]
+    files: NestFiles,
+}
+
+fn default_nid() -> String {
+    "embedded".into()
+}
+
 type Follow = Pin<Box<dyn Future<Output = anyhow::Result<Option<u64>>>>>;
+type Opening = Pin<Box<dyn Future<Output = anyhow::Result<Engine>>>>;
 
 struct Engine {
     nest: Arc<TabNest>,
@@ -60,8 +145,17 @@ struct Engine {
     rpc: Arc<RpcClient<HostTransport>>,
     files: NestFiles,
     nid: String,
+    poll_interval_secs: Option<u64>,
+    storage: Storage,
+    bytes: Option<Bytes>,
     follow: Option<Follow>,
     rolled: Option<u64>,
+}
+
+enum State {
+    /// Storage mode `host`: the store opens through requests the host performs.
+    Opening(Opening),
+    Open(Box<Engine>),
 }
 
 /// Requests the guest has made and the host has not answered, and answers not yet taken.
@@ -90,9 +184,34 @@ impl Wake for Woken {
 }
 
 thread_local! {
-    static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
+    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     static EXCHANGE: RefCell<Exchange> = RefCell::new(Exchange::default());
     static OUTPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Hand `request` to the host at the next `nh_step` and wait for its answer.
+async fn ask(mut request: Value) -> Value {
+    let id = EXCHANGE.with(|x| {
+        let mut x = x.borrow_mut();
+        let id = x.next_id;
+        x.next_id += 1;
+        request["id"] = id.into();
+        x.outbox.push(request);
+        id
+    });
+    std::future::poll_fn(|cx| {
+        EXCHANGE.with(|x| {
+            let mut x = x.borrow_mut();
+            match x.answers.remove(&id) {
+                Some(a) => Poll::Ready(a),
+                None => {
+                    x.wakers.insert(id, cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
+    })
+    .await
 }
 
 /// [`Transport`] whose every POST is a request handed to the host.
@@ -126,39 +245,19 @@ impl Transport for HostTransport {
     }
 
     async fn post(&self, url: &str, body: &Value) -> Result<HostReply, TransportError> {
-        let id = EXCHANGE.with(|x| {
-            let mut x = x.borrow_mut();
-            let id = x.next_id;
-            x.next_id += 1;
-            x.outbox.push(json!({
-                "id": id,
-                "kind": "rpc",
-                "endpoint": url,
-                "body": body.to_string(),
-                "deadline_ms": self.deadline_ms,
-            }));
-            id
-        });
-        let answer = std::future::poll_fn(|cx| {
-            EXCHANGE.with(|x| {
-                let mut x = x.borrow_mut();
-                match x.answers.remove(&id) {
-                    Some(a) => Poll::Ready(a),
-                    None => {
-                        x.wakers.insert(id, cx.waker().clone());
-                        Poll::Pending
-                    }
-                }
-            })
-        })
+        let answer = ask(json!({
+            "kind": "rpc",
+            "endpoint": url,
+            "body": body.to_string(),
+            "deadline_ms": self.deadline_ms,
+        }))
         .await;
         if let Some(e) = answer.get("error") {
             let timed_out = answer["timed_out"].as_bool().unwrap_or(false);
             return Err(failed(e.as_str().unwrap_or("transport failed"), timed_out));
         }
-        let status = answer["status"].as_u64().unwrap_or(0) as u16;
         Ok(HostReply {
-            status,
+            status: answer["status"].as_u64().unwrap_or(0) as u16,
             status_text: answer["status_text"].as_str().unwrap_or("").to_string(),
             retry_after: answer["retry_after"].as_str().map(str::to_string),
             body: answer["body"].as_str().unwrap_or("").as_bytes().to_vec(),
@@ -210,17 +309,22 @@ fn input(ptr: *mut u8, len: usize) -> Vec<u8> {
     unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) }.into_vec()
 }
 
-fn output(r: Result<Vec<u8>, String>) -> i32 {
+fn output(r: Result<Vec<u8>, Fault>) -> i32 {
     let (bytes, sign) = match r {
         Ok(b) => (b, 1),
-        Err(e) => (e.into_bytes(), -1),
+        Err(f) => (
+            json!({"fault": f.name, "message": f.message})
+                .to_string()
+                .into_bytes(),
+            -1,
+        ),
     };
     let n = bytes.len() as i32;
     OUTPUT.with(|o| *o.borrow_mut() = bytes);
     sign * n
 }
 
-fn json_out(r: Result<Value, String>) -> i32 {
+fn json_out(r: Result<Value, Fault>) -> i32 {
     output(r.map(|v| v.to_string().into_bytes()))
 }
 
@@ -248,69 +352,122 @@ pub unsafe extern "C" fn nh_output(ptr: *mut u8) {
 
 #[no_mangle]
 pub extern "C" fn nh_abi() -> i32 {
-    json_out(Ok(json!({"abi": 1, "capabilities": ["events"]})))
+    json_out(Ok(json!({
+        "abi": ABI,
+        "capabilities": ["events"],
+        "storage": ["bytes", "host"],
+        "engine": young::node_version(),
+    })))
 }
 
-/// `{"nid", "contract", "start", "rpc": [endpoint names], "memory_mib"?}`. S0 has the byte-buffer
-/// store only.
 #[no_mangle]
 pub extern "C" fn nh_open(ptr: *mut u8, len: usize) -> i32 {
     std::panic::set_hook(Box::new(|info| log_line(0, &format!("panic: {info}"))));
-    json_out(open(&input(ptr, len)).map_err(|e| format!("{e:#}")))
+    json_out(open(&input(ptr, len)))
 }
 
-fn open(config: &[u8]) -> anyhow::Result<Value> {
-    let c: Value = serde_json::from_slice(config)?;
-    let contract = c["contract"].as_str().unwrap_or_default().to_string();
-    let start = c["start"].as_u64().unwrap_or(0);
-    let rpc: Vec<String> = serde_json::from_value(c["rpc"].clone())?;
-    let db = redb::Builder::new().create_with_backend(Bytes::default())?;
-    let (mut nest, cellar) = young::open(db, &contract, start)?;
-    if let Some(mib) = c["memory_mib"].as_u64() {
-        nest.budget = nuthatch_embed::budget::TabBudget::mib(mib as u32);
+fn open(raw: &[u8]) -> Result<Value, Fault> {
+    if STATE.with(|s| s.borrow().is_some()) {
+        return Err(fault(
+            "bad_call",
+            "this instance has a nest already; one instance runs one nest",
+        ));
+    }
+    let c: Config = serde_json::from_slice(raw).map_err(|e| fault("bad_config", e))?;
+    let storage = c.storage;
+    let state = match storage {
+        Storage::Bytes => {
+            if c.fresh {
+                return Err(fault(
+                    "bad_config",
+                    "`fresh` is for storage `host`; a byte buffer starts empty",
+                ));
+            }
+            let bytes = Bytes::default();
+            let db = redb::Builder::new()
+                .create_with_backend(bytes.clone())
+                .map_err(|e| fault("open_failed", e))?;
+            let engine = build(c, db, Some(bytes)).map_err(|e| fault_of("open_failed", e))?;
+            State::Open(Box::new(engine))
+        }
+        Storage::Host => State::Opening(Box::pin(open_host(c))),
+    };
+    STATE.with(|s| *s.borrow_mut() = Some(state));
+    Ok(json!({"storage": storage.name()}))
+}
+
+/// Storage mode `host`: clear the nest's files if asked, then open the store, each through the host.
+async fn open_host(c: Config) -> anyhow::Result<Engine> {
+    if c.fresh {
+        let listed = ask(json!({"kind": "list", "prefix": ""})).await;
+        let names: Vec<String> = match listed.get("error") {
+            Some(e) => return Err(fault("storage", format!("list: {e}")).into()),
+            None => serde_json::from_value(listed["names"].clone())
+                .map_err(|e| fault("storage", format!("list's names: {e}")))?,
+        };
+        for name in names {
+            let removed = ask(json!({"kind": "remove", "name": name})).await;
+            if let Some(e) = removed.get("error") {
+                return Err(fault("storage", format!("remove {name}: {e}")).into());
+            }
+        }
+    }
+    let opened = ask(json!({"kind": "open", "name": STORE_FILE})).await;
+    if let Some(e) = opened.get("error") {
+        let name = if opened["locked"] == true {
+            "locked"
+        } else {
+            "storage"
+        };
+        return Err(fault(name, format!("{STORE_FILE}: {e}")).into());
+    }
+    let handle = opened["handle"]
+        .as_i64()
+        .and_then(|h| i32::try_from(h).ok())
+        .ok_or_else(|| fault("storage", format!("open answered {opened}, not a handle")))?;
+    let db = redb::Builder::new().create_with_backend(HostFile::new(handle, STORE_FILE))?;
+    build(c, db, None)
+}
+
+fn build(c: Config, db: redb::Database, bytes: Option<Bytes>) -> anyhow::Result<Engine> {
+    let (mut nest, cellar) = young::open(db, &c.contract, c.start)?;
+    // Before `derive`, which admits the entities against it (RFC-0075 §17).
+    if let Some(mib) = c.memory_mib {
+        nest.budget = nuthatch_embed::budget::TabBudget::mib(mib);
         nest.budget.enforce();
     }
-    let engine = Engine {
+    if !c.files.is_empty() {
+        nest.derive(&c.files)?;
+    }
+    Ok(Engine {
         nest: Arc::new(nest),
         cellar,
-        rpc: Arc::new(RpcClient::new(rpc)?),
-        files: NestFiles::new(),
-        nid: c["nid"].as_str().unwrap_or("embedded").to_string(),
+        rpc: Arc::new(RpcClient::new(c.rpc)?),
+        files: c.files,
+        nid: c.nid,
+        poll_interval_secs: c.poll_interval_secs,
+        storage: c.storage,
+        bytes,
         follow: None,
         rolled: None,
-    };
-    ENGINE.with(|e| *e.borrow_mut() = Some(engine));
-    Ok(json!({"storage": "bytes"}))
+    })
 }
 
-/// Advance until blocked: `{"idle": true}` once the cursor is at the tip, `{"requests": [...]}`
-/// for the host to perform, or `{"wait_ms": n}`.
-#[no_mangle]
-pub extern "C" fn nh_step() -> i32 {
-    json_out(ENGINE.with(|e| match e.borrow_mut().as_mut() {
-        Some(engine) => step(engine),
-        None => Err("nh_open first".into()),
-    }))
+enum Driven<T> {
+    Done(T),
+    Blocked(Value),
 }
 
-fn step(engine: &mut Engine) -> Result<Value, String> {
-    let follow = engine.follow.get_or_insert_with(|| {
-        let (nest, rpc) = (engine.nest.clone(), engine.rpc.clone());
-        Box::pin(async move { nest.follow(&*rpc).await })
-    });
+/// Poll `fut` until it finishes or needs the host: `{"requests": [...]}` or `{"wait_ms": n}`.
+fn drive<F: Future + ?Sized>(mut fut: Pin<&mut F>) -> Result<Driven<F::Output>, Fault> {
     let woken = Arc::new(Woken::default());
     let waker = Waker::from(woken.clone());
     let mut cx = Context::from_waker(&waker);
     loop {
         nuthatch_core::time::wake_sleepers();
         woken.0.store(false, Relaxed);
-        match follow.as_mut().poll(&mut cx) {
-            Poll::Ready(r) => {
-                engine.follow = None;
-                engine.rolled = r.map_err(|e| format!("{e:#}"))?;
-                return Ok(json!({"idle": true}));
-            }
-            Poll::Pending => {}
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return Ok(Driven::Done(v));
         }
         let out = EXCHANGE.with(|x| {
             let mut x = x.borrow_mut();
@@ -322,10 +479,13 @@ fn step(engine: &mut Engine) -> Result<Value, String> {
             out
         });
         if !out.is_empty() {
-            return Ok(json!({"requests": out}));
+            return Ok(Driven::Blocked(json!({"requests": out})));
         }
         if EXCHANGE.with(|x| !x.borrow().in_flight.is_empty()) {
-            return Err("requests are unanswered: nh_resume first".into());
+            return Err(fault(
+                "unanswered",
+                "requests are unanswered: nh_resume first",
+            ));
         }
         // A yield, or a sleep already due, is polled again at once.
         if woken.0.load(Relaxed) {
@@ -335,30 +495,76 @@ fn step(engine: &mut Engine) -> Result<Value, String> {
             Some(until) => {
                 let left = until.saturating_duration_since(nuthatch_core::time::deadline_now());
                 if !left.is_zero() {
-                    return Ok(json!({"wait_ms": left.as_millis() as u64}));
+                    return Ok(Driven::Blocked(json!({"wait_ms": left.as_millis() as u64})));
                 }
             }
-            None => return Err("the cursor is pending on nothing a host can answer".into()),
+            None => {
+                return Err(fault(
+                    "stalled",
+                    "the engine is pending on nothing a host can answer",
+                ))
+            }
         }
     }
 }
 
-/// Answers to the last `requests`, one per request, in order: `{"status", "body", "status_text"?,
-/// "retry_after"?}`, or `{"error", "timed_out"?}` where the host got no reply.
+/// Advance until blocked: `{"idle": true}` once the cursor is at the tip, `{"requests": [...]}` for
+/// the host to perform, or `{"wait_ms": n}`.
+#[no_mangle]
+pub extern "C" fn nh_step() -> i32 {
+    json_out(STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        if let Some(State::Opening(fut)) = s.as_mut() {
+            match drive(fut.as_mut())? {
+                Driven::Blocked(v) => return Ok(v),
+                Driven::Done(Ok(engine)) => *s = Some(State::Open(Box::new(engine))),
+                Driven::Done(Err(e)) => {
+                    // A failed open leaves no nest, so the host may open again.
+                    *s = None;
+                    return Err(fault_of("open_failed", e));
+                }
+            }
+        }
+        match s.as_mut() {
+            Some(State::Open(engine)) => step(engine),
+            _ => Err(not_open()),
+        }
+    }))
+}
+
+fn step(engine: &mut Engine) -> Result<Value, Fault> {
+    let follow = engine.follow.get_or_insert_with(|| {
+        let (nest, rpc) = (engine.nest.clone(), engine.rpc.clone());
+        Box::pin(async move { nest.follow(&*rpc).await })
+    });
+    match drive(follow.as_mut())? {
+        Driven::Blocked(v) => Ok(v),
+        Driven::Done(r) => {
+            engine.follow = None;
+            engine.rolled = r.map_err(|e| fault_of("follow_failed", e))?;
+            Ok(json!({"idle": true}))
+        }
+    }
+}
+
+/// Answers to the last `requests`, one per request, in order.
 #[no_mangle]
 pub extern "C" fn nh_resume(ptr: *mut u8, len: usize) -> i32 {
     json_out(resume(&input(ptr, len)))
 }
 
-fn resume(answers: &[u8]) -> Result<Value, String> {
-    let answers: Vec<Value> = serde_json::from_slice(answers).map_err(|e| e.to_string())?;
+fn resume(answers: &[u8]) -> Result<Value, Fault> {
+    let answers: Vec<Value> = serde_json::from_slice(answers).map_err(|e| fault("bad_call", e))?;
     let wakers = EXCHANGE.with(|x| {
         let mut x = x.borrow_mut();
         if answers.len() != x.in_flight.len() {
-            return Err(format!(
-                "{} answers for {} requests",
-                answers.len(),
-                x.in_flight.len()
+            return Err(fault(
+                "bad_call",
+                format!(
+                    "{} answers for {} requests",
+                    answers.len(),
+                    x.in_flight.len()
+                ),
             ));
         }
         let mut wakers = Vec::new();
@@ -371,6 +577,13 @@ fn resume(answers: &[u8]) -> Result<Value, String> {
     })?;
     wakers.into_iter().for_each(Waker::wake);
     Ok(json!({}))
+}
+
+fn with_engine<T>(f: impl FnOnce(&Engine) -> Result<T, Fault>) -> Result<T, Fault> {
+    STATE.with(|s| match s.borrow().as_ref() {
+        Some(State::Open(engine)) => f(engine),
+        _ => Err(not_open()),
+    })
 }
 
 /// One request as the node's router answers it: `{"status", "content_type", "body"}`. It never
@@ -387,16 +600,14 @@ pub extern "C" fn nh_request(
     let method = String::from_utf8_lossy(&input(method, method_len)).into_owned();
     let target = String::from_utf8_lossy(&input(target, target_len)).into_owned();
     let body = input(body, body_len);
-    json_out(ENGINE.with(|e| {
-        let e = e.borrow();
-        let engine = e.as_ref().ok_or("nh_open first")?;
+    json_out(with_engine(|engine| {
         let nest = nuthatch_embed::http::Nest {
             nest: &engine.nest,
             cellar: &engine.cellar,
             files: &engine.files,
             nid: Some(&engine.nid),
             version: young::node_version(),
-            poll_interval_secs: None,
+            poll_interval_secs: engine.poll_interval_secs,
             log_window: young::MAINNET_LOG_WINDOW,
         };
         let mut answer =
@@ -411,29 +622,39 @@ pub extern "C" fn nh_request(
                 }));
             }
         }
-        Err("a query yielded a million times".to_string())
+        Err(fault("stalled", "a query yielded a million times"))
     }))
 }
 
-/// S0's probe, not part of the interface: what RFC-0075 S3's gate compares, as `LiveNest::follow`
-/// reports it.
+/// Storage mode `bytes`: the whole store, raw, consistent between write transactions.
+#[no_mangle]
+pub extern "C" fn nh_export() -> i32 {
+    output(with_engine(|engine| match &engine.bytes {
+        Some(b) => Ok(b.snapshot()),
+        None => Err(fault(
+            "unsupported",
+            "storage `host`: the store is the host's file already",
+        )),
+    }))
+}
+
+/// A probe for the gates, outside the interface's promise: what RFC-0075 S3's gate compares, as
+/// `LiveNest::follow` reports it.
 #[no_mangle]
 pub extern "C" fn nh_report() -> i32 {
-    json_out(ENGINE.with(|e| {
-        let e = e.borrow();
-        let engine = e.as_ref().ok_or("nh_open first")?;
+    json_out(with_engine(|engine| {
         young::report(
             &engine.nest,
             &engine.cellar,
             &engine.rpc,
             engine.rolled,
-            "bytes",
+            engine.storage.name(),
         )
-        .map_err(|e| format!("{e:#}"))
+        .map_err(|e| fault("report_failed", format!("{e:#}")))
     }))
 }
 
-/// The module's linear memory in bytes; it never shrinks, so it is the high-water mark.
+/// A probe: the module's linear memory in bytes; it never shrinks, so it is the high-water mark.
 #[no_mangle]
 pub extern "C" fn nh_memory_bytes() -> f64 {
     nuthatch_embed::budget::linear_memory() as f64
