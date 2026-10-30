@@ -121,7 +121,17 @@ export async function load(module, { storage, rpc, log }) {
   // RFC-0077 S4: a mirror's GET. Text comes back whole; with `append`, the body is written at the end of
   // that open file and the answer says where. A body past `max_bytes` is refused, not cut short.
   async function get(r) {
-    const res = await fetch(r.url);
+    // Retries across a transport failure are the host's; a status is an answer and is not retried.
+    let res;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        res = await fetch(r.url);
+        break;
+      } catch (e) {
+        if (attempt >= 3) throw e;
+        await new Promise((ok) => setTimeout(ok, 500 * 2 ** attempt));
+      }
+    }
     if (res.status !== 200) {
       await res.body?.cancel();
       return { status: res.status };
