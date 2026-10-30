@@ -3,6 +3,10 @@
 //!
 //! A node and a tab are pointed at the same recording, so neither can see anything the other did not.
 //! Headers carry no transactions; a block outside the range is an error, not an empty answer.
+//!
+//! A recording may instead hold several eras, as `tests/e2e_embed_shapes.rs` writes the binary's tape
+//! chains out (RFC-0077 S5): `{chain_id, eras: [{tip, finalized, headers, logs}]}`, each served in
+//! turn as `POST /control/fork` moves on.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,34 +24,22 @@ pub struct Recorded {
     /// The chain as served before each `POST /control/fork`, the first being the recording.
     eras: Vec<Era>,
     era: AtomicUsize,
+    /// Whole headers by number (`--headers`), served in place of the hash and timestamp alone where
+    /// their hash is the era's.
+    full: BTreeMap<u64, Value>,
 }
 
 struct Era {
     tip: u64,
+    /// The `finalized` tag: the tip less mainnet's depth unless the era sets it.
+    finalized: Option<u64>,
     /// number -> (hash, timestamp)
     headers: BTreeMap<u64, (String, String)>,
     logs: Vec<Value>,
 }
 
-impl Recorded {
-    /// From a recording on disk, gzipped when its name ends `.gz`.
-    pub fn from_path(path: &std::path::Path) -> Result<Recorded, String> {
-        use std::io::Read;
-        let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut json = String::new();
-        if path.extension().is_some_and(|e| e == "gz") {
-            flate2::read::GzDecoder::new(&raw[..])
-                .read_to_string(&mut json)
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-        } else {
-            json = String::from_utf8(raw).map_err(|e| e.to_string())?;
-        }
-        Self::from_json(&json)
-    }
-
-    /// From the recording's JSON:`{tip, headers: [[number, hash, timestamp]], logs: [log]}`.
-    pub fn from_json(json: &str) -> Result<Recorded, String> {
-        let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+impl Era {
+    fn from_json(v: &Value) -> Result<Era, String> {
         let tip = v["tip"].as_u64().ok_or("no tip")?;
         let mut headers = BTreeMap::new();
         for h in v["headers"].as_array().ok_or("no headers")? {
@@ -59,12 +51,64 @@ impl Recorded {
         if !headers.contains_key(&tip) {
             return Err(format!("the recording stops short of its tip {tip}"));
         }
-        let logs = v["logs"].as_array().ok_or("no logs")?.clone();
-        Ok(Recorded {
-            chain_id: 1,
-            eras: vec![Era { tip, headers, logs }],
-            era: AtomicUsize::new(0),
+        Ok(Era {
+            tip,
+            finalized: v.get("finalized").and_then(Value::as_u64),
+            headers,
+            logs: v["logs"].as_array().ok_or("no logs")?.clone(),
         })
+    }
+}
+
+/// A file's text, gunzipped when its name ends `.gz`.
+fn read(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+    let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if path.extension().is_some_and(|e| e == "gz") {
+        let mut json = String::new();
+        flate2::read::GzDecoder::new(&raw[..])
+            .read_to_string(&mut json)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(json)
+    } else {
+        String::from_utf8(raw).map_err(|e| e.to_string())
+    }
+}
+
+impl Recorded {
+    /// From a recording on disk, gzipped when its name ends `.gz`.
+    pub fn from_path(path: &std::path::Path) -> Result<Recorded, String> {
+        Self::from_json(&read(path)?)
+    }
+
+    /// From the recording's JSON: `{tip, headers: [[number, hash, timestamp]], logs: [log]}`, or
+    /// `{chain_id, eras: [{tip, finalized, headers, logs}]}`.
+    pub fn from_json(json: &str) -> Result<Recorded, String> {
+        let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let eras = match v.get("eras").and_then(Value::as_array) {
+            Some(eras) => eras.iter().map(Era::from_json).collect::<Result<_, _>>()?,
+            None => vec![Era::from_json(&v)?],
+        };
+        if eras.is_empty() {
+            return Err("no eras".into());
+        }
+        Ok(Recorded {
+            chain_id: v.get("chain_id").and_then(Value::as_u64).unwrap_or(1),
+            eras,
+            era: AtomicUsize::new(0),
+            full: BTreeMap::new(),
+        })
+    }
+
+    /// Serve these whole headers (`eth_getBlockByNumber`'s, without transactions) where the era has
+    /// the same hash at that height, so a client can hash them (RFC-0077 S5).
+    pub fn with_headers(mut self, path: &std::path::Path) -> Result<Recorded, String> {
+        let v: Value = serde_json::from_str(&read(path)?).map_err(|e| e.to_string())?;
+        for h in v.as_array().ok_or("headers: not an array")? {
+            let n = hex_u64(&h["number"]).ok_or("a whole header has no number")?;
+            self.full.insert(n, h.clone());
+        }
+        Ok(self)
     }
 
     /// The tip served now.
@@ -95,6 +139,11 @@ impl Recorded {
             .headers
             .get(&n)
             .ok_or_else(|| err(format!("block {n} is outside the recording")))?;
+        if let Some(full) = self.full.get(&n).filter(|h| h["hash"] == json!(hash)) {
+            let mut h = full.clone();
+            h["transactions"] = json!([]);
+            return Ok(h);
+        }
         let parent = match n.checked_sub(1).and_then(|p| era.headers.get(&p)) {
             Some((h, _)) => h.clone(),
             None => format!("0x{:064x}", 0),
@@ -112,7 +161,10 @@ impl Recorded {
         let tip = self.now().tip;
         match tag.as_str() {
             Some("latest") | Some("pending") => Ok(tip),
-            Some("finalized") | Some("safe") => Ok(tip - FINALITY_DEPTH),
+            Some("finalized") | Some("safe") => Ok(self
+                .now()
+                .finalized
+                .unwrap_or(tip.saturating_sub(FINALITY_DEPTH))),
             Some("earliest") => Ok(self.first()),
             _ => hex_u64(tag).ok_or_else(|| err(format!("not a block: {tag}"))),
         }
@@ -181,12 +233,14 @@ impl Recorded {
         let t = base.tip;
         let mut before = Era {
             tip: t,
+            finalized: None,
             headers: base.headers.clone(),
             logs: base.logs.clone(),
         };
         before.logs.extend(tail(&before.headers, t - 9..=t, 0));
         let mut after = Era {
             tip: t + 2,
+            finalized: None,
             headers: base.headers,
             logs: base.logs,
         };
@@ -331,5 +385,46 @@ mod tests {
             n(json!({"fromBlock": "0x1", "toBlock": "0x3", "address": "0xcd"})),
             0
         );
+    }
+
+    #[test]
+    fn eras_move_on_with_their_own_tip_finalized_and_chain_id() {
+        let r = Recorded::from_json(
+            r#"{"chain_id": 42161, "eras": [
+              {"tip": 2, "finalized": 1, "headers": [["0x1","0xa1","0x10"],["0x2","0xa2","0x1c"]], "logs": []},
+              {"tip": 3, "headers": [["0x1","0xa1","0x10"],["0x2","0xb2","0x1c"],["0x3","0xb3","0x28"]], "logs": []}]}"#,
+        )
+        .unwrap();
+        let call = |m: &str, p: Value| r.call(&json!({"method": m, "params": p})).ok().unwrap();
+        assert_eq!(call("eth_chainId", json!([])), "0xa4b1");
+        assert_eq!(
+            call("eth_getBlockByNumber", json!(["finalized", false]))["number"],
+            "0x1"
+        );
+        r.control(&Method::POST, "/control/fork", b"").unwrap();
+        assert_eq!(call("eth_blockNumber", json!([])), "0x3");
+        assert_eq!(
+            call("eth_getBlockByNumber", json!(["0x3", false]))["parentHash"],
+            "0xb2"
+        );
+        assert_eq!(r.tips(), [2, 3]);
+    }
+
+    #[test]
+    fn a_whole_header_is_served_only_where_its_hash_is_the_eras() {
+        let dir = std::env::temp_dir().join(format!("fixture-rpc-headers-{}", std::process::id()));
+        std::fs::write(
+            &dir,
+            r#"[{"number":"0x2","hash":"0xa2","receiptsRoot":"0x77"},{"number":"0x3","hash":"0xff","receiptsRoot":"0x78"}]"#,
+        )
+        .unwrap();
+        let r = Recorded::from_json(CHAIN)
+            .unwrap()
+            .with_headers(&dir)
+            .unwrap();
+        std::fs::remove_file(&dir).unwrap();
+        assert_eq!(r.header(2).ok().unwrap()["receiptsRoot"], "0x77");
+        assert_eq!(r.header(2).ok().unwrap()["transactions"], json!([]));
+        assert!(r.header(3).ok().unwrap().get("receiptsRoot").is_none());
     }
 }

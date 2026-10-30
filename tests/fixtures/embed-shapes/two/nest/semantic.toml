@@ -1,0 +1,274 @@
+# semantic.toml - what this nest's data *means* (RFC-0016). Read by the MCP `schema`
+# tool, the admin UI, and the scaffolded skill. Edit descriptions freely; the
+# `[table.*.footguns]` are DERIVED from the ABI and regenerated - leave them be.
+
+schema_version = 1
+
+[nest]
+description = "The `two` nest on mainnet. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pool__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.pool__approval.columns]
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+spender = "The `spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pool__approval.footguns]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.pool__burn]
+description = "`Burn(address,uint256,uint256,address)` events emitted by the `pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Burn(address,uint256,uint256,address) event"
+
+[table.pool__burn.columns]
+amount0 = "The `amount0` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount1 = "The `amount1` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pool__burn.footguns]
+reserved_words = ["to"]
+big_ints = [
+    "amount0",
+    "amount1",
+]
+overflows_dec = [
+    "amount0",
+    "amount1",
+]
+
+[table.pool__mint]
+description = "`Mint(address,uint256,uint256)` events emitted by the `pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Mint(address,uint256,uint256) event"
+
+[table.pool__mint.columns]
+amount0 = "The `amount0` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount1 = "The `amount1` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pool__mint.footguns]
+big_ints = [
+    "amount0",
+    "amount1",
+]
+overflows_dec = [
+    "amount0",
+    "amount1",
+]
+
+[table.pool__swap]
+description = "`Swap(address,uint256,uint256,uint256,uint256,address)` events emitted by the `pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Swap(address,uint256,uint256,uint256,uint256,address) event"
+
+[table.pool__swap.columns]
+amount0In = "The `amount0In` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount0Out = "The `amount0Out` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount1In = "The `amount1In` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount1Out = "The `amount1Out` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pool__swap.footguns]
+reserved_words = ["to"]
+big_ints = [
+    "amount0In",
+    "amount1In",
+    "amount0Out",
+    "amount1Out",
+]
+overflows_dec = [
+    "amount0In",
+    "amount1In",
+    "amount0Out",
+    "amount1Out",
+]
+
+[table.pool__sync]
+description = "`Sync(uint112,uint112)` events emitted by the `pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Sync(uint112,uint112) event"
+
+[table.pool__sync.columns]
+reserve0 = "The `reserve0` uint112 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+reserve1 = "The `reserve1` uint112 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pool__sync.footguns]
+big_ints = [
+    "reserve0",
+    "reserve1",
+]
+
+[table.pool__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.pool__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.pool__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.usdc__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.usdc__approval.columns]
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+spender = "The `spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__approval.footguns]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.usdc__authorization_canceled]
+description = "`AuthorizationCanceled(address,bytes32)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AuthorizationCanceled(address,bytes32) event"
+
+[table.usdc__authorization_canceled.columns]
+authorizer = "The `authorizer` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+nonce = "The `nonce` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__authorization_used]
+description = "`AuthorizationUsed(address,bytes32)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AuthorizationUsed(address,bytes32) event"
+
+[table.usdc__authorization_used.columns]
+authorizer = "The `authorizer` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+nonce = "The `nonce` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__blacklisted]
+description = "`Blacklisted(address)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Blacklisted(address) event"
+
+[table.usdc__blacklisted.columns]
+_account = "The `_account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__blacklister_changed]
+description = "`BlacklisterChanged(address)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per BlacklisterChanged(address) event"
+
+[table.usdc__blacklister_changed.columns]
+newBlacklister = "The `newBlacklister` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__burn]
+description = "`Burn(address,uint256)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Burn(address,uint256) event"
+
+[table.usdc__burn.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+burner = "The `burner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__burn.footguns]
+big_ints = ["amount"]
+overflows_dec = ["amount"]
+
+[table.usdc__master_minter_changed]
+description = "`MasterMinterChanged(address)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per MasterMinterChanged(address) event"
+
+[table.usdc__master_minter_changed.columns]
+newMasterMinter = "The `newMasterMinter` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__mint]
+description = "`Mint(address,address,uint256)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Mint(address,address,uint256) event"
+
+[table.usdc__mint.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+minter = "The `minter` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__mint.footguns]
+reserved_words = ["to"]
+big_ints = ["amount"]
+overflows_dec = ["amount"]
+
+[table.usdc__minter_configured]
+description = "`MinterConfigured(address,uint256)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per MinterConfigured(address,uint256) event"
+
+[table.usdc__minter_configured.columns]
+minter = "The `minter` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+minterAllowedAmount = "The `minterAllowedAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__minter_configured.footguns]
+big_ints = ["minterAllowedAmount"]
+overflows_dec = ["minterAllowedAmount"]
+
+[table.usdc__minter_removed]
+description = "`MinterRemoved(address)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per MinterRemoved(address) event"
+
+[table.usdc__minter_removed.columns]
+oldMinter = "The `oldMinter` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.usdc__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__pause]
+description = "`Pause()` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Pause() event"
+
+[table.usdc__pauser_changed]
+description = "`PauserChanged(address)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per PauserChanged(address) event"
+
+[table.usdc__pauser_changed.columns]
+newAddress = "The `newAddress` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__rescuer_changed]
+description = "`RescuerChanged(address)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RescuerChanged(address) event"
+
+[table.usdc__rescuer_changed.columns]
+newRescuer = "The `newRescuer` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.usdc__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.usdc__un_blacklisted]
+description = "`UnBlacklisted(address)` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per UnBlacklisted(address) event"
+
+[table.usdc__un_blacklisted.columns]
+_account = "The `_account` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.usdc__unpause]
+description = "`Unpause()` events emitted by the `usdc` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Unpause() event"
+
+[view]
+
+# Authored views (views/*.sql) are described here so the MCP/`/schema` can render them:
+# [view.your_view_name]
+# description = "What this derivation computes."

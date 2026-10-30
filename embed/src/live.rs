@@ -187,6 +187,7 @@ impl LiveNest {
             &self.nest.entities,
             &self.files,
             self.nest.budget,
+            &self.nest.children_views(),
         )
         .await
         .map_err(|e| js(format!("{e:#}")))?;

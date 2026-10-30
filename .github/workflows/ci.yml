@@ -675,6 +675,8 @@ jobs:
           # RFC-0075 S6: every gate below runs this module, whose size goes to the job summary.
           size=$(tail -1 "$RUNNER_TEMP/tab-nodejs.log")
           echo "tab module bytes after wasm-bindgen and wasm-opt: \`$size\` (burrmill-wasm: 5.6 MB brotli)" >> "$GITHUB_STEP_SUMMARY"
+          # RFC-0077 S5: the event build `/play` serves, held to 5.5 MB brotli.
+          node size.mjs pkg/nuthatch_embed_bg.wasm --max-brotli 5500000
       - name: Node step test (embed)
         working-directory: embed
         run: node --stack-trace-limit=60 run-node.mjs pkg
@@ -764,6 +766,10 @@ jobs:
           plain/build.sh "$RUNNER_TEMP/plain.wasm"
           node plain/imports.mjs "$RUNNER_TEMP/plain.wasm"
           echo "plain module bytes after wasm-opt: \`$(stat -c %s "$RUNNER_TEMP/plain.wasm")\`" >> "$GITHUB_STEP_SUMMARY"
+          # RFC-0077 S5: the event build, held to 5.5 MB brotli. The address build's 1.5 MB raw waits
+          # on an address build (RFC-0074 S2).
+          sizes=$(node size.mjs "$RUNNER_TEMP/plain.wasm" --max-brotli 5500000)
+          echo "plain module sizes: \`$sizes\` (budget: 5,500,000 brotli)" >> "$GITHUB_STEP_SUMMARY"
           tests/wasmtime-host/target/release/wasmtime-host compile "$RUNNER_TEMP/plain.wasm" "$RUNNER_TEMP/plain.cwasm" | tee "$RUNNER_TEMP/compile.log"
           tests/wasmtime-host/target/release/wasmtime-host abi "$RUNNER_TEMP/plain.wasm" --cache "$RUNNER_TEMP/cwasm" | tail -1
       - name: fixture-rpc
@@ -810,8 +816,16 @@ jobs:
           node run-sw-mirror.mjs "$chrome" "$m" $n4 $mm --rpc http://127.0.0.1:8953/ --expect $d/s4-mirror-tip.json \
             | tee -a "$RUNNER_TEMP/mirror.log"
           node run-sw-mirror.mjs "$chrome" "$m" $n4 $mm --refused --memory 600 --max-rows 150000 | tee -a "$RUNNER_TEMP/mirror.log"
+          # RFC-0077 S5: with a verified head, a forged or missing header or a log off the verified
+          # chain stops sealing by name, and the honest head seals the node's segment; then every nest
+          # shape `tests/e2e_embed_shapes.rs` writes out of the binary's tests, equal to its pins.
+          $rpc recorded --port 8955 --file $d/chain.json.gz --headers $d/headers.json.gz &
+          for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8955/ && break; sleep 0.2; done
+          node hosts/node/verified.mjs "$m" http://127.0.0.1:8955/ $d | tee "$RUNNER_TEMP/verified.log"
+          node hosts/node/shapes.mjs "$m" $rpc ../tests/fixtures/embed-shapes | tee "$RUNNER_TEMP/shapes.log"
           { echo '```'; cat "$RUNNER_TEMP/compile.log" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" \
-            "$RUNNER_TEMP/chrome.log" "$RUNNER_TEMP/agree.log" "$RUNNER_TEMP/mirror.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            "$RUNNER_TEMP/chrome.log" "$RUNNER_TEMP/agree.log" "$RUNNER_TEMP/mirror.log" \
+            "$RUNNER_TEMP/verified.log" "$RUNNER_TEMP/shapes.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   # RFC-0075 S2: Node has no OPFS, so the OPFS backend's round trip and its lock run in a dedicated
   # worker in Chrome for Testing, with the live cursor beside them; the 26.04 image ships no chromedriver.

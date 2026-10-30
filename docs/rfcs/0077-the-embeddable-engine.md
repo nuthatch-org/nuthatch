@@ -3,7 +3,8 @@
 - Status: **Accepted, 2026-10-30.** S0 to S5 and S7 (the Lodestar demo) authorised in order; S6 waits for rotki
   to ask. S0 passed 2026-10-30 (§12). S1 built in part, 2026-10-30 (§13). S2 built 2026-10-30, its
   address-build half deferred (§14). S3 built 2026-10-30, its Chrome leg CI's (§15). S4 built 2026-10-30,
-  with the cold folds in the module (§16).
+  with the cold folds in the module (§16). S5 built 2026-10-30, Safari waiting on Chief and the address
+  build's size gate deferred (§17).
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0075 (the whole nest in a tab, S0 to S6 merged), RFC-0074 (address history as a
@@ -975,3 +976,100 @@ tree at 0.1.14, and no package. Every subcommand's `--help`, two levels deep (60
 2,878 passed, none failed, 18 ignored; the one new test is `e2e_tab_mirror`. `tests/skill_refs.rs` now
 names `core/src/nest_config.rs` as a config source: without it the config-reference gate would have
 stopped scanning `[nest]`'s and `[[contracts]]`'s keys, silently, once the types left `src/config.rs`.
+
+## 17. S5 measured outcome, 2026-10-30
+
+**What was built.**
+
+- *The verified head.* `nh_open` takes `"verified": true`. Once a follow, the module asks the host for
+  its verified finalized block with a `verified_finalized` request, answered `{number, hash}`; then it
+  fetches every header from the last seal up to that block through the RPC client, hashes each one
+  (`embed/src/verified.rs`: the header's RLP and keccak, no new dependency but a direct edge to
+  `alloy-primitives`), links them by parent hash down from the verified hash and to the last seal's
+  hash, and holds every seal to that block and to rows whose block hash is on that chain. The hold is
+  `ExtraRows::seal_through`, the seam core's window already has for exactly this. A refusal stops
+  sealing, not the cursor: the next `{"idle": true}` carries `unverified` with the reason, and the
+  rows stay hot. Messages are RFC-0065 S5's `chain.rs`'s. The browser host takes a `verified`
+  callback; Helios stays in the page that supplies it (burrmill-wasm's `verifiedFinalized`).
+- *Labels and children in `/sql`.* §16 found the module bound no `labels` table. The rows, and the
+  `{template}__children` views a factory nest gets, are now built in `nuthatch_core::bind`
+  (`label_rows`, `children_views`), moved from `engine_burrmill.rs` and `analytics.rs` with the same
+  strings, and both the node and the module bind them.
+- *The recorder.* `tests/e2e_embed_shapes.rs`, in the binary's suite, builds each shape's chain with
+  `tests/common/tape.rs`'s helpers, era by era, and writes it out as a fixture-rpc recording beside
+  the nest and its requests under `tests/fixtures/embed-shapes/`. fixture-rpc's `recorded` reads
+  several eras (`{chain_id, eras: [{tip, finalized, headers, logs}]}`), moving on at `POST
+  /control/fork`, and `--headers` serves whole headers where their hash is the recording's. The test
+  runs the real binary (`nuthatch dev`) over each recording, settles it after each era (the era's
+  newest row read back with its hash, then the cursor and the seal unmoved over two polls) and pins
+  its answers. Without `NUTHATCH_PIN_EMBED_SHAPES` the recordings, nests and requests must be what the
+  code builds, so a pin cannot drift from the chain that made it. `embed/hosts/node/shapes.mjs` is the
+  module's half over the same recordings.
+- *Size gates.* `size.mjs --max-brotli 5500000` fails the plain module in `wasm-plain` and the
+  wasm-bindgen module `/play` loads in `wasm-tab`.
+
+**`abi` stays 1.** No export or import changed: `wasmtime-host abi` finds the 33 pinned shapes equal.
+`verified` is an optional `nh_open` key, `verified_finalized` a request kind asked for only behind it,
+and `unverified` an optional answer field, which the README's versioning rules allow within a
+version. §4 called it a host input; a request is how a host input reaches a module that yields, and a
+new export would have cost a version for a value the module needs once a follow.
+
+**Found by the shapes, and fixed.** The module's tip loop rolled back a reorg without dropping the
+RPC client's timestamp cache above the fork, as the node does (`forget_cached_above`, RFC-0029 §6d).
+Every reorg shape whose replacement blocks carry new timestamps answered the old ones; RFC-0075 S4's
+fork could not show it, because its replacement blocks keep their timestamps. `TabNest::follow` now
+forgets them where the node does.
+
+**Gate.**
+
+| | Result |
+|---|---|
+| With a verified head, a forged header or a log off the verified chain stops sealing by name | **pass**, `hosts/node/verified.mjs`, six cases on RFC-0075 S3's recording with whole headers to block 26,241,700 (1,894 headers, `headers.json.gz`, 1.1 MB, recorded from publicnode by `record-headers.sh`). The honest block seals through 26,241,700 and its segment is the node's `c983470c…479aeae`, 1,894 headers hashed, the 1,000 balances the node's. No light client: nothing sealed, "the host gave no verified finalized block: out of sync". A hash the chain does not reach: nothing sealed, "block 26241700 is 0xfd12…; the light client verified 0x7777…". Block 26,240,500's receipts root altered: nothing sealed, "block 26240500 hashes to 0xfe06…, not the 0x7bc4… its RPC gave". The same header withheld: nothing sealed, the RPC client's "block_headers: 1/1894 header(s) missing", which does not name the block. Block 26,240,101's logs moved to another block hash: sealed through 26,239,812, below it, "the RPC's logs for block 26240101 are not on the verified chain". The cursor reaches the tip in every case |
+| Every listed shape equal to the node's | **pass**: 13 shapes, 25 eras, 175 answers, every one equal to the node's pin. The scaffold `pair` (2,000 mainnet blocks, a segment cut by the 1,800-block span) and `two`; `factory`, a parent whose `Transfer` recipients are children, reorged to drop one child and find another, `child__children` included; `labels`, `tests/e2e_follower.rs`'s derived nest with flags, a labelled address and an entity, sealed through 2, the `labels` table and a join on it included; `reorg-above-seal`, three eras, sealed through 8 and reorged above it; and `tests/e2e_reorg.rs`'s property at depths 1, 2, 3, 7, 12, 13, 18 and 23, both ends and the middle of each band |
+| The size gates in CI | **pass** for the event build: `wasm-plain` and `wasm-tab` fail past 5,500,000 bytes brotli. The address build's 1.5 MB raw gate is **deferred**: there is no address build on main (§13, §14) |
+| Binary unchanged; S5 adds nothing to it | **pass**, below |
+
+The gates were mutation-checked on the module. Without the header check, the unreachable-hash, forged
+header and off-chain cases go red; without the row check, the off-chain case does; without the labels
+table, `labels` does; without the children views, `factory` does; without `forget_cached_above`, the
+reorg depths do. Each mutant was a different file by sha256 before it ran.
+
+**Numbers.** Apple M5 Pro, macOS, Node 26.11.1, the `tab` module after `wasm-opt`: 34,377,919 bytes,
+8,038,925 gzip, 5,267,248 brotli (S4's: 34,336,230 and 5,259,438), 232,752 bytes under the ceiling.
+
+| | |
+|---|---|
+| The honest verified follow of S3's recording, 1,894 headers hashed, in `bytes` | 936 ms |
+| The missing-header case, the RPC client's eight retry rounds | 7.4 s |
+| All 13 shapes through the module, one process | 3.2 s, peak RSS 577 MiB |
+| The node's half, the real binary over the same 13 recordings, debug build | 186 s, mostly settling |
+| RFC-0075 S3, S5 and S5 restarted, re-run on this module | unchanged: segment and balances, digest `22966cee…363febc5` |
+
+**Where this departs from the slice as written.**
+
+- *Factories.* `tests/e2e_runtime_lifecycle.rs` and `tests/e2e_follower.rs` declare no factory. The
+  factory shape takes `tests/e2e_nest_inspect.rs`'s declaration, a `Transfer`'s `to` as the child.
+- *`two`'s start blocks.* USDC's deploy block is four million blocks before the pool's, which no
+  recording carries; at mainnet's 20-block window it would be 196,000 `getLogs` a run. The shape is
+  the scaffold's nest with both contracts starting at the pool's block, and says so.
+- *What the shapes do not run.* The tests' own windows and spans (`spawn_nest`'s overrides): both
+  halves run each chain's registered policy, so they cut the same segments. The follower's offchain
+  entity: an embedding binds no offchain tables (§13). `reorg_below_finality_halts`: a node and a
+  module both stop, and comparing two halts needs a shape of its own.
+- *The wasmtime host* answers no `verified_finalized`; a non-browser host brings its own light client.
+
+**Not done, and why.**
+
+- *Safari and iPhone.* Waiting on Chief: `safaridriver --enable` needs an administrator, and no run
+  was attempted without it.
+- *The address build's size gate.* Deferred with the address build (RFC-0074 S2's decisions).
+- *MCP.* Deferred, as §4 says.
+
+**The binary.** Unchanged in behaviour. Two files changed, `src/analytics.rs` and
+`src/engine_burrmill.rs`, each calling `nuthatch_core::bind` for what it built in place, with the same
+strings. No `Cargo.toml` or `Cargo.lock` of the binary changed. Every subcommand's `--help`, two levels
+deep (60 pages), and the files `init --abi` writes for mainnet and Arbitrum One are byte-identical
+between this branch and the same tree with main's two files. The whole suite: 2,879 passed, none failed,
+18 ignored; the one new test is `e2e_embed_shapes`. A first run, beside a module build, lost
+`deploy_nest_script::a_failure_only_the_new_binary_has_reverts_after_asking_the_previous_one` to a
+killed script (exit `None`); it passed alone and in the whole suite again.

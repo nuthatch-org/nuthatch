@@ -84,6 +84,7 @@ impl TabQuery {
         entities: &[TabEntity],
         files: &NestFiles,
         budget: TabBudget,
+        children: &[(String, String)],
     ) -> Result<TabQuery> {
         let mut engine = burrmill::Engine::open_empty_within(budget.query_bytes() as usize)
             .map_err(engine_err)?;
@@ -155,6 +156,21 @@ impl TabQuery {
             if path.starts_with("views/") && path.ends_with(".sql") {
                 define_views(&mut engine, text)?;
             }
+        }
+        // As the node binds them after its authored views (RFC-0077 S5), and as best-effort.
+        let labels = nuthatch_core::bind::label_rows(
+            files
+                .iter()
+                .filter(|(p, _)| p.starts_with("labels/") && p.ends_with(".json"))
+                .map(|(p, t)| (p.clone(), t.as_str())),
+        )?;
+        if !labels.is_empty() {
+            engine
+                .register_rows("labels", &labels)
+                .map_err(engine_err)?;
+        }
+        for (_, ddl) in children {
+            define_views(&mut engine, ddl)?;
         }
         Ok(TabQuery { engine })
     }

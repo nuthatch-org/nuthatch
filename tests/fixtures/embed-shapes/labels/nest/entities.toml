@@ -1,0 +1,5 @@
+[[entities]]
+name = "received"
+sql = "entities/received.sql"
+key = ["to"]
+max_rows = 50000

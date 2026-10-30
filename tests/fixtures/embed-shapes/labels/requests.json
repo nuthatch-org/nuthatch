@@ -1,0 +1,46 @@
+[
+  {
+    "method": "GET",
+    "path": "/ready"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20count%28%2A%29%20AS%20n%20FROM%20usdc__transfer"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20%2A%20FROM%20usdc__transfer%20ORDER%20BY%20block_number%2C%20log_index%20LIMIT%20200"
+  },
+  {
+    "method": "GET",
+    "path": "/balances?limit=20"
+  },
+  {
+    "method": "GET",
+    "path": "/entities?limit=5"
+  },
+  {
+    "method": "GET",
+    "path": "/derived"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20%2A%20FROM%20labels%20ORDER%20BY%20address"
+  },
+  {
+    "method": "GET",
+    "path": "/sql?q=SELECT%20l.label%2C%20count%28%2A%29%20AS%20n%20FROM%20usdc__transfer%20t%20JOIN%20labels%20l%20ON%20t.%22to%22%20%3D%20l.address%20GROUP%20BY%201%20ORDER%20BY%201"
+  },
+  {
+    "method": "GET",
+    "path": "/balance/0x0000000000000000000000000000000000000002"
+  },
+  {
+    "method": "GET",
+    "path": "/derived/received?limit=10"
+  },
+  {
+    "method": "GET",
+    "path": "/derived/received/0x0000000000000000000000000000000000000003"
+  }
+]

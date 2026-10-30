@@ -1,0 +1,12 @@
+[nest]
+name = "usdc"
+chain = "arbitrum-one"
+chain_id = 42161
+rpc_urls = []
+
+[[contracts]]
+alias = "usdc"
+address = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+start_block = 1
+abi = "abis/erc20.json"
+events = ["Transfer"]

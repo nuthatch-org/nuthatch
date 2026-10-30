@@ -1,0 +1,1 @@
+SELECT t.to, SUM(t.value) FROM usdc__transfer t GROUP BY t.to

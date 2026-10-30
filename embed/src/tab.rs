@@ -3,6 +3,7 @@
 //! verify the last checkpoint, roll back to the surviving ancestor, index window by window.
 
 use crate::derived::{NestFiles, TabEntity};
+use crate::verified::{VerifiedHead, Verifier};
 use crate::window::{NoWait, Shelf};
 use anyhow::{ensure, Context, Result};
 use nuthatch_core::alerts::{AlertRouter, AlertSink};
@@ -85,6 +86,13 @@ pub struct Sealing {
     pub sinks: std::sync::Arc<dyn Sinks>,
     /// What a warm open rebuilds the views and entities from (RFC-0077 S3).
     pub history: Option<std::sync::Arc<dyn SealedHistory + Send + Sync>>,
+    /// A finalized block the host verified, which every seal is held to (RFC-0077 S5).
+    pub verified: Option<Verified>,
+}
+
+pub struct Verified {
+    pub verifier: std::sync::Arc<Verifier>,
+    pub head: std::sync::Arc<dyn VerifiedHead + Send + Sync>,
 }
 
 impl Sealing {
@@ -95,6 +103,7 @@ impl Sealing {
             seal_span: 1,
             sinks: std::sync::Arc::new(Shelf::default()),
             history: None,
+            verified: None,
         }
     }
 }
@@ -189,6 +198,18 @@ impl TabNest {
         Ok(())
     }
 
+    /// Hold every seal from here on to the finalized block `head` gives (RFC-0077 S5).
+    pub fn verify_with(&mut self, verified: Verified) {
+        self.sealing.verified = Some(verified);
+    }
+
+    /// A factory nest's `{template}__children` views, as the node binds them for `/sql`.
+    pub fn children_views(&self) -> Vec<(String, String)> {
+        self.factory.as_ref().map_or_else(Vec::new, |f| {
+            nuthatch_core::bind::children_views(f, self.registry.timestamps())
+        })
+    }
+
     /// The getLogs span the cursor asks for, which `/ready` reports.
     pub fn log_window(&self) -> u64 {
         self.window
@@ -239,10 +260,21 @@ impl TabNest {
             .unwrap_or(0);
         let mut topic0_refused = false;
         let mut rolled = None;
+        let verified = self.sealing.verified.as_ref();
+        let top = match verified {
+            Some(v) => Some(v.head.finalized().await),
+            None => None,
+        };
+        if let Some(v) = verified {
+            v.verifier.begin();
+        }
         loop {
             let mut next = self.last_block()?.map_or(start, |b| b + 1);
             if next > 0 {
                 if let Some(ancestor) = detect_reorg(tape, &self.store, next - 1).await? {
+                    // As the node does: the timestamp cache is keyed by height, and every block above
+                    // `ancestor` was replaced (RFC-0029 §6d). Found by RFC-0077 S5's reorg shapes.
+                    tape.forget_cached_above(ancestor);
                     next = rollback_reorg(
                         self.cursor_nest(&schema, factory.map(|_| &mut *children)),
                         ancestor,
@@ -276,6 +308,13 @@ impl TabNest {
             let logs = fetch_window(wanted, tape, next, to).await?;
             // Again once the logs are held, before anything of the window is committed.
             self.budget.check_memory(crate::budget::linear_memory())?;
+            let extra: &dyn nuthatch_core::extra::ExtraRows = match (verified, &top) {
+                (Some(v), Some(top)) => {
+                    v.verifier.refresh(top, tape, &self.store).await;
+                    &*v.verifier
+                }
+                _ => &nuthatch_core::extra::NoExtraRows,
+            };
             let window = Window {
                 nest: self.cursor_nest(&schema, factory.map(|_| &mut *children)),
                 registry: &self.registry,
@@ -284,7 +323,7 @@ impl TabNest {
                 finality: self.sealing.finality,
                 seal_span: self.sealing.seal_span,
                 sinks: &*self.sealing.sinks,
-                extra: &nuthatch_core::extra::NoExtraRows,
+                extra,
                 hooks: &nuthatch_core::hooks::NoHooks,
                 faults: &nuthatch_core::fault::NoFaults,
                 clock: &NoWait,

@@ -125,7 +125,8 @@ host drops the instance.
   "files": {"nuthatch.toml": "...", "abis/token.json": "...", "schema.json": "...",
             "entities.toml": "...", "entities/received.sql": "...", "views/20-s4.sql": "..."},
   "mirror": {"base": "https://..."},
-  "follow": true
+  "follow": true,
+  "verified": true
 }
 ```
 
@@ -166,6 +167,18 @@ are read by range, so they are not charged.
 **`follow`** is whether `nh_step` follows the chain past what the store holds; true unless the
 mirror is pinned. False, `nh_step` answers `{"idle": true}` once the store is open.
 
+**`verified`** (RFC-0077 S5) holds every seal to a finalized block the host verified, from a source
+the RPC cannot forge: Helios's beacon light client in a browser (`verifiedFinalized` in
+burrmill-wasm's `web/play/verified.js`), or whatever a non-browser host brings. Once a follow, the
+module asks for it with a `verified_finalized` request; then it fetches every header from the last
+seal up to that block from the RPC, hashes each one itself, links them by parent hash down from the
+verified hash, and seals only at or below it, and only rows whose block hash is on that chain. If
+the host has no verified block, the chain does not reach it, a header is forged or missing, or a
+row names a block hash off the verified chain, sealing stops there and the next `{"idle": true}`
+says why in `unverified`, by block; the cursor carries on, and its rows stay in the hot store. Rows
+above the verified block are still what the RPC said, and an RPC that leaves a log out is not caught
+(RFC-0065 §6). Without `verified`, the module seals on the chain's own policy, as a node does.
+
 **Reopening.** Storage `host` without `fresh` opens the store the host kept, and the nest carries on
 from its last block, as a node restarted on its data directory does. Before it answers anything it
 rebuilds what is derived and not stored, from the sealed segments and the hot rows, with no RPC:
@@ -181,6 +194,7 @@ nh_open(config)
 loop:
   s = nh_step()
   idle      -> at the tip; step again whenever the host wants to follow it
+               (`unverified`, with `verified`: why sealing stopped)
   requests  -> perform each; nh_resume([answer, ...]) in the same order; step again
   wait_ms   -> wait that long; step again
 nh_request(method, target, body)   any time after the store is open
@@ -209,6 +223,7 @@ nh_request(method, target, body)   any time after the store is open
 | `remove` | `{"name"}` | `{}` (also when there was nothing to remove) | `{"error"}` |
 | `list` | `{"prefix"}` | `{"names": [...]}`, every file under the nest whose name starts with `prefix` | `{"error"}` |
 | `get` | `{"url", "max_bytes", "append"?}` | `{"status", "body"}`; with `append`, `{"status", "offset", "length"}` | `{"error"}` |
+| `verified_finalized` | `{}` | `{"number", "hash"}`, the finalized block the host's light client verified | `{"error"}`: none now |
 
 An `rpc` request is one JSON-RPC POST. The host returns every reply whole, whatever its status and
 whether or not it is JSON: the RPC client classifies a provider's refusals by their words. `error`
@@ -279,7 +294,8 @@ the guest faults `locked`. A host with no lock of its own must not open one nest
 - **Durability** in storage `host` is `store_sync`'s. Over files, every commit syncs: on the M5 Pro
   a follow of S3's recording takes 3.5 s over files and 0.7 s in `bytes`.
 - **Trust.** The module reaches nothing. Every request is one the host performs, to an endpoint the
-  host chose. Rows above finality are what the RPC said.
+  host chose. Rows above finality are what the RPC said. Without `verified`, finality is the RPC's
+  word too; with it, what is sealed hashes down to a block the host's light client verified.
 
 ### Versioning
 
@@ -335,4 +351,22 @@ node hosts/node/mirror.mjs /tmp/plain.wasm $d/s4-nest $d/s4-mirror --expect $d/s
 node hosts/node/mirror.mjs /tmp/plain.wasm $d/s4-nest $d/s4-mirror --memory-mib 600 --max-rows 150000 --refused
 node run-mirror-node.mjs ../target/release/nuthatch <nest-dir> <mirror-url> --out /tmp/node.json
 node hosts/node/mirror.mjs /tmp/plain.wasm <nest-dir> <mirror-url> --expect /tmp/node.json
+```
+
+RFC-0077 S5's gates. `hosts/node/verified.mjs` re-runs RFC-0065 S5's cases against the module, over
+RFC-0075 S3's recording with whole headers up to block 26,241,700 (`headers.json.gz`, which
+`record-headers.sh` took from mainnet): the honest verified block seals the node's segment at or below
+it, and an absent verified block, one the chain does not reach, a forged or missing header and a log
+off the verified chain each stop sealing by name. `hosts/node/shapes.mjs` follows every nest shape the
+binary's tests run, which `tests/e2e_embed_shapes.rs` writes out of their code under
+`tests/fixtures/embed-shapes/` (the scaffold fixtures, a factory nest, labels and flags, the reorg
+suites), era by era, and must answer as that test pins the node. CI holds the event build to 5.5 MB
+brotli:
+
+```sh
+d=../tests/fixtures/tab-parity rpc=../tools/fixture-rpc/target/release/fixture-rpc
+$rpc recorded --port 8955 --file $d/chain.json.gz --headers $d/headers.json.gz &
+node hosts/node/verified.mjs /tmp/plain.wasm http://127.0.0.1:8955/ $d
+node hosts/node/shapes.mjs /tmp/plain.wasm $rpc ../tests/fixtures/embed-shapes
+node size.mjs /tmp/plain.wasm --max-brotli 5500000
 ```
