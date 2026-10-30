@@ -330,7 +330,7 @@ Each ends runnable, and each gate can fail. Sizes are days of focused work, esti
   build replaces `embed/`'s S0 module and rotki's host answers `nh_step`'s requests where it answered
   `rpc_batch`. No rotki PR is opened otherwise. **Gate**: RFC-0074 §5's parity in rotki's host, and
   rotki's tests and linters. Binary: unchanged.
-- **S7, the demo: Lodestar's `/profile`, verified locally.** Chief, 2026-10-30. Lodestar's network-wide
+- **S7, the demo: Lodestar's `/profile`, verified locally.** Chief, 2026-10-30. Not started: it is built after S5, in the Lodestar repository, and nothing here implements it. Lodestar's network-wide
   pages are the shared-view case and stay on the hosted `graph-allocations-nest`. Its wallet-connected
   `/profile` is one user's data: delegations (staked, thawing, realised and unrealised rewards),
   curation signals and 90 days of rewards history, loaded today from `/api/portfolio` and the rewards
