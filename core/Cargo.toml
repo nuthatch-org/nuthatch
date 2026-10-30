@@ -12,6 +12,10 @@ publish = false
 checkpoint-hash-index = []
 # The node's tests park an outbox drain by store path.
 test-hooks = []
+# wasm32 only: a JavaScript host (`fetch`, OPFS, `setTimeout`). Off, the module imports nothing but
+# `nuthatch.*` (RFC-0077 S0). Native builds ignore it.
+js = ["dep:js-sys", "dep:send_wrapper", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
+default = ["js"]
 
 [dependencies]
 anyhow = "1"
@@ -43,11 +47,11 @@ tokio = { version = "1", default-features = false, features = ["rt", "time"] }
 # rkyv 0.7 archives `usize` as 64-bit only on 64-bit targets; nothing here persists the archive.
 rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_32", "validation"] }
 # RFC-0075 S2: the OPFS backend.
-js-sys = "0.3"
-send_wrapper = { version = "0.6", features = ["futures"] }
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = [
+js-sys = { version = "0.3", optional = true }
+send_wrapper = { version = "0.6", features = ["futures"], optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
     "AbortSignal",
     "DomException",
     "FileSystemDirectoryHandle",

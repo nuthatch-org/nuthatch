@@ -4,6 +4,21 @@ version = "0.0.1"
 edition = "2021"
 publish = false
 
+[features]
+# The module `/play` loads, bound by wasm-bindgen. Off, `plain/` builds the same nest with no JavaScript
+# (RFC-0077 S0).
+default = ["js"]
+js = [
+    "nuthatch-core/js",
+    "dep:getrandom02",
+    "dep:getrandom03",
+    "dep:getrandom04",
+    "dep:uuid",
+    "dep:wasm-bindgen",
+    "dep:js-sys",
+    "dep:wasm-bindgen-futures",
+]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 # The entity modules are the binary's own files, whose unit tests need the binary; tests/ holds ours.
@@ -13,7 +28,7 @@ doctest = false
 [dependencies]
 dbsp = "=0.320.0"
 # RFC-0075 S1: the crate this build exists to hold to wasm32; the patch below is applied only here.
-nuthatch-core = { path = "../../core" }
+nuthatch-core = { path = "../../core", default-features = false }
 nuthatch-decode = { path = "../../decode" }
 nuthatch-seal = { path = "../../seal" }
 anyhow = "1"
@@ -48,13 +63,13 @@ rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_
 # rkyv 0.7 archives `usize` as 64-bit only on 64-bit targets (see the patch); the layout is in-memory only.
 rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_32", "validation"] }
 # Feature unification only: these give the wasm32 tree a source of randomness.
-getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
-getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
-getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
-uuid = { version = "1", features = ["js"] }
-wasm-bindgen = "0.2"
-js-sys = "0.3"
-wasm-bindgen-futures = "0.4"
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"], optional = true }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"], optional = true }
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"], optional = true }
+uuid = { version = "1", features = ["js"], optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
 
 # RFC-0075 S2: `tests/opfs.rs`, in a dedicated worker in headless Chrome. The second worker it starts
 # stands in for a second tab.
