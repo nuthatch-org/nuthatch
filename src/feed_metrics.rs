@@ -3,9 +3,10 @@
 //! mirror fetches on a follower, and each connection's queue.
 //!
 //! **Visibility never compares two hosts' clocks.** The writer notes when each commit landed. A
-//! follower acknowledges each generation it applies within 10 ms, carrying the round trip it last
-//! measured for an acknowledgement; the writer records arrival minus commit minus half that round
-//! trip, which is when the follower could first answer from it.
+//! follower acknowledges each generation it applies within 10 ms, in a numbered report, and a later
+//! report carries the round trip that one took; the writer then records arrival minus commit minus
+//! half the round trip of the report that carried the acknowledgement, which is when the follower
+//! could first answer from it.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -144,11 +145,45 @@ struct Commit {
 /// The most commits per dataset remembered for an acknowledgement to be matched against.
 const REMEMBERED: usize = 4096;
 
+/// The most acknowledgements per connection waiting for their report's round trip.
+const WAITING: usize = 4096;
+/// The most round trips one report is read for.
+pub const TRIPS_CARRIED: usize = 64;
+
+/// A generation acknowledged in report `seq`, waiting for that report's round trip.
+struct Waiting {
+    seq: u64,
+    dataset: String,
+    kind: Kind,
+    since_commit: Duration,
+}
+
 #[derive(Default)]
 struct Visibility {
     commits: HashMap<String, VecDeque<Commit>>,
     /// Per connection and dataset, the last `(epoch, generation)` acknowledged.
     acked: HashMap<(u64, String), (u64, u64)>,
+    waiting: HashMap<u64, VecDeque<Waiting>>,
+}
+
+/// What an acknowledgement is corrected by for the report's own trip to the writer.
+#[derive(Clone, Copy, Debug)]
+pub enum Trip {
+    /// A follower of 5.14: the round trip its previous report took.
+    Previous(Option<Duration>),
+    /// Report `seq`, whose own round trip a later report carries.
+    Own(u64),
+}
+
+/// `rtts` as a report carries it, `<seq>:<µs>` comma-separated; anything else is skipped.
+pub fn parse_trips(rtts: &str) -> Vec<(u64, Duration)> {
+    rtts.split(',')
+        .filter_map(|t| {
+            let (seq, us) = t.split_once(':')?;
+            Some((seq.parse().ok()?, Duration::from_micros(us.parse().ok()?)))
+        })
+        .take(TRIPS_CARRIED)
+        .collect()
 }
 
 /// Every feed figure this process keeps.
@@ -213,16 +248,40 @@ impl FeedMetrics {
         }
     }
 
-    /// Connection `conn` acknowledged `dataset` at `(epoch, generation)`, received `now`, with the
-    /// follower's last measured round trip. Every generation newly acknowledged is observed once;
-    /// the first acknowledgement on a connection only sets where it stands, since what it covers
-    /// arrived in a snapshot.
+    /// A follower's report on connection `conn`, received `now`: what it has applied, the number
+    /// `seq` a later follower gives it, and the round trips of its earlier reports (`rtts`), or a
+    /// 5.14 follower's previous round trip (`rtt_us`).
+    pub fn reported(
+        &self,
+        conn: u64,
+        positions: &BTreeMap<String, (u64, u64)>,
+        seq: Option<u64>,
+        rtt_us: Option<u64>,
+        rtts: Option<&str>,
+        now: Instant,
+    ) {
+        for (seq, rtt) in parse_trips(rtts.unwrap_or_default()) {
+            self.round_trip(conn, seq, rtt);
+        }
+        let trip = match seq {
+            Some(seq) => Trip::Own(seq),
+            None => Trip::Previous(rtt_us.map(Duration::from_micros)),
+        };
+        for (dataset, at) in positions {
+            self.acked(conn, dataset, *at, trip, now);
+        }
+    }
+
+    /// Connection `conn` acknowledged `dataset` at `(epoch, generation)`, received `now`. Every
+    /// generation newly acknowledged is observed once, now or when `trip`'s round trip arrives; the
+    /// first acknowledgement on a connection only sets where it stands, since what it covers arrived
+    /// in a snapshot. Returns how many generations were newly acknowledged.
     pub fn acked(
         &self,
         conn: u64,
         dataset: &str,
         at: (u64, u64),
-        rtt: Option<Duration>,
+        trip: Trip,
         now: Instant,
     ) -> usize {
         let mut v = self.vis();
@@ -230,10 +289,20 @@ impl FeedMetrics {
         if !v.commits.contains_key(dataset) {
             return 0;
         }
-        let prev = v.acked.insert((conn, dataset.to_string()), at);
-        let (Some(prev), Some(rtt)) = (prev, rtt) else {
+        let key = (conn, dataset.to_string());
+        // Reports travel concurrently, so one may arrive behind a later one.
+        if v.acked
+            .get(&key)
+            .is_some_and(|p| p.0 == at.0 && p.1 >= at.1)
+        {
+            return 0;
+        }
+        let Some(prev) = v.acked.insert(key, at) else {
             return 0;
         };
+        if matches!(trip, Trip::Previous(None)) {
+            return 0;
+        }
         let Some(ring) = v.commits.get(dataset) else {
             return 0;
         };
@@ -243,27 +312,71 @@ impl FeedMetrics {
                 && c.generation <= at.1
                 && (prev.0 != at.0 || c.generation > prev.1);
             if fresh {
-                let lag = now
-                    .saturating_duration_since(c.at)
-                    .saturating_sub(rtt / 2)
-                    .as_secs_f64();
-                seen.push((c.kind, lag));
+                seen.push((c.kind, now.saturating_duration_since(c.at)));
             }
         }
-        drop(v);
         let n = seen.len();
-        for (kind, lag) in seen {
-            self.visibility_seconds.observe(
-                format!("dataset=\"{}\",kind=\"{}\"", label(dataset), kind.label()),
-                lag,
-            );
+        match trip {
+            Trip::Own(seq) => {
+                let waiting = v.waiting.entry(conn).or_default();
+                for (kind, since_commit) in seen {
+                    waiting.push_back(Waiting {
+                        seq,
+                        dataset: dataset.to_string(),
+                        kind,
+                        since_commit,
+                    });
+                }
+                while waiting.len() > WAITING {
+                    waiting.pop_front();
+                }
+            }
+            Trip::Previous(rtt) => {
+                drop(v);
+                let rtt = rtt.unwrap_or_default();
+                for (kind, since_commit) in seen {
+                    self.observe(dataset, kind, since_commit, rtt);
+                }
+            }
         }
         n
     }
 
+    /// Report `seq` on connection `conn` took `rtt` there and back: observe what it acknowledged.
+    pub fn round_trip(&self, conn: u64, seq: u64, rtt: Duration) -> usize {
+        let mut v = self.vis();
+        let Some(waiting) = v.waiting.get_mut(&conn) else {
+            return 0;
+        };
+        let mut done = Vec::new();
+        waiting.retain(|w| {
+            if w.seq == seq {
+                done.push((w.dataset.clone(), w.kind, w.since_commit));
+            }
+            w.seq != seq
+        });
+        drop(v);
+        for (dataset, kind, since_commit) in &done {
+            self.observe(dataset, *kind, *since_commit, rtt);
+        }
+        done.len()
+    }
+
+    // `since_commit` is on the writer's clock and `rtt` is a duration the follower timed, so no two
+    // clocks meet; halving the carrying report's own trip assumes only that its two legs match.
+    fn observe(&self, dataset: &str, kind: Kind, since_commit: Duration, rtt: Duration) {
+        self.visibility_seconds.observe(
+            format!("dataset=\"{}\",kind=\"{}\"", label(dataset), kind.label()),
+            since_commit.saturating_sub(rtt / 2).as_secs_f64(),
+        );
+    }
+
     /// Connection `conn` ended.
     pub fn gone(&self, conn: u64) {
-        self.vis().acked.retain(|(c, _), _| *c != conn);
+        let mut v = self.vis();
+        v.acked.retain(|(c, _), _| *c != conn);
+        v.waiting.remove(&conn);
+        drop(v);
         self.conns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -413,12 +526,19 @@ mod tests {
         m.committed(d, 7, 2, t0, Kind::Tip);
         m.committed(d, 7, 2, t0, Kind::Tip);
         m.committed(d, 7, 3, t0, Kind::Seal);
-        let rtt = Some(Duration::from_millis(20));
+        // A follower of 5.14 sends the round trip its previous report took.
+        let rtt = Trip::Previous(Some(Duration::from_millis(20)));
         // The first acknowledgement only says where the connection stands.
         assert_eq!(m.acked(99, d, (7, 1), rtt, t0), 0);
         let later = t0 + Duration::from_millis(50);
         assert_eq!(m.acked(99, d, (7, 3), rtt, later), 2);
         assert_eq!(m.acked(99, d, (7, 3), rtt, later), 0, "never twice");
+        assert_eq!(
+            m.acked(99, d, (7, 2), rtt, later),
+            0,
+            "a late report is not a step back"
+        );
+        assert_eq!(m.acked(99, d, (7, 3), rtt, later), 0, "nor seen twice");
         assert_eq!(m.visibility_count(d, Kind::Tip), 1);
         assert_eq!(m.visibility_count(d, Kind::Seal), 1);
         let mut s = String::new();
@@ -434,5 +554,56 @@ mod tests {
         let v: f64 = sum.rsplit(' ').next().unwrap().parse().unwrap();
         assert!((v - 0.040).abs() < 1e-9, "50 ms less half of 20: {v}");
         m.gone(99);
+    }
+
+    fn tip_sum(d: &str) -> f64 {
+        let mut s = String::new();
+        metrics().render(&mut s);
+        let head = format!("nuthatch_feed_visibility_seconds_sum{{dataset=\"{d}\",kind=\"tip\"}} ");
+        s.lines()
+            .find_map(|l| l.strip_prefix(&head))
+            .map_or(0.0, |v| v.parse().unwrap())
+    }
+
+    /// #2526: an acknowledgement is corrected by half the round trip of the report that carried it,
+    /// not by whatever the report before it took.
+    #[test]
+    fn visibility_takes_half_the_carrying_reports_own_round_trip() {
+        let m = metrics();
+        let t0 = Instant::now();
+        let d = "data/vis-own-trip";
+        m.committed(d, 3, 1, t0, Kind::Tip);
+        m.committed(d, 3, 2, t0, Kind::Tip);
+        let at = |g| BTreeMap::from([(d.to_string(), (3, g))]);
+        m.reported(98, &at(1), Some(1), None, None, t0);
+        // Report 2 acknowledges generation 2, 50 ms after its commit. The report before it took
+        // 90 ms, which once pinned this observation at 5 ms; its own trip took 20.
+        let ms = Duration::from_millis;
+        m.reported(
+            98,
+            &at(2),
+            Some(2),
+            Some(90_000),
+            Some("1:90000"),
+            t0 + ms(50),
+        );
+        assert_eq!(
+            m.visibility_count(d, Kind::Tip),
+            0,
+            "waits for its own trip"
+        );
+        m.reported(
+            98,
+            &at(2),
+            Some(3),
+            Some(20_000),
+            Some("2:20000,x,4:"),
+            t0 + ms(60),
+        );
+        assert_eq!(m.visibility_count(d, Kind::Tip), 1);
+        let v = tip_sum(d);
+        assert!((v - 0.040).abs() < 1e-9, "50 ms less half of 20: {v}");
+        assert_eq!(m.round_trip(98, 2, ms(20)), 0, "never twice");
+        m.gone(98);
     }
 }

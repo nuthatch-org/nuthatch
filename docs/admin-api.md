@@ -558,10 +558,14 @@ follower holds a delta frame to what its dataset has left twice: its wire bytes 
 read, and its decompressed size and rows before either is allocated.
 
 **What a follower has applied, and how soon.** Every second, and within 10 ms of each delta it
-applies, a follower sends `POST /_admin/feed/applied?conn=<n>&rtt_us=<µs>` (below), `rtt_us` being
-the round trip its last report took. The writer records, for each generation newly acknowledged,
-the time from its commit to the report's arrival less half that round trip: when the follower could
-first answer from it, measured on the writer's clock alone.
+applies, a follower sends `POST /_admin/feed/applied?conn=<n>&seq=<k>&rtts=<k>:<µs>,...` (below),
+up to 8 at once, none waiting for the one before it to be answered. `seq` numbers the report and `rtts`
+carries the round trips of earlier reports, as soon as each is known. The writer records, for each
+generation newly acknowledged, the time from its commit to the arrival of the report that carried
+the acknowledgement less half that report's own round trip: when the follower could first answer
+from it, measured on the writer's clock alone. A follower of 5.14 sends `rtt_us=<µs>`, the round
+trip of its previous report, which the writer takes half of instead; a later follower sends it too,
+for a writer of 5.14, which ignores `seq` and `rtts`.
 
 **Generations.** Each dataset's commits are numbered from its writer's start: generation G+1 follows G
 within one `epoch`, and a restarted writer is a new epoch. A follower that receives anything other

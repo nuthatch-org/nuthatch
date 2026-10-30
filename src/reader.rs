@@ -594,8 +594,6 @@ pub struct Follower {
     feed: u32,
     /// Woken when a delta is applied, so the writer hears of it within 10 ms.
     ack: tokio::sync::Notify,
-    /// The last measured round trip of a report to the writer.
-    rtt: Mutex<Option<Duration>>,
     /// On another host: cached segments no copy names, with when that was first seen.
     unnamed: Mutex<HashMap<String, Instant>>,
 }
@@ -664,7 +662,6 @@ impl Follower {
             remote,
             feed: options.feed,
             ack: tokio::sync::Notify::new(),
-            rtt: Mutex::new(None),
             unnamed: Mutex::default(),
             inner: Mutex::new(Inner {
                 pending: HashMap::new(),
@@ -880,52 +877,20 @@ impl Follower {
         }
     }
 
-    /// Tell the writer, every [`REPORT_EVERY`], what each copy has applied, so it keeps the
-    /// segments a copy may still name until it has moved on. Best effort: unreported, the writer
-    /// keeps them until its grace and most run out, never less.
-    /// Also within 10 ms of each delta applied, carrying the round trip the last report
-    /// took, from which the writer works out visibility lag on its own clock (RFC-0076 FR17).
+    /// Tell the writer, every [`REPORT_EVERY`] and within 10 ms of each delta applied, what each
+    /// copy has applied, as [`report_loop`] does.
     async fn report_applied(self: Arc<Self>, client: reqwest::Client) {
-        let mut every = tokio::time::interval(REPORT_EVERY);
-        loop {
-            tokio::select! {
-                _ = every.tick() => {}
-                _ = self.ack.notified() => {}
-            }
-            let (conn, applied) = {
-                let inner = self.lock();
-                let applied: BTreeMap<String, (u64, u64)> = inner
-                    .datasets
-                    .iter()
-                    .map(|(d, copy)| (d.clone(), copy.store.applied()))
-                    .collect();
-                (inner.link.conn, applied)
-            };
-            let Some(conn) = conn else {
-                continue;
-            };
-            let rtt = *self.rtt.lock().unwrap_or_else(|e| e.into_inner());
-            let mut query = vec![("conn", conn)];
-            if let Some(rtt) = rtt {
-                query.push(("rtt_us", rtt.as_micros() as u64));
-            }
-            let started = Instant::now();
-            let sent = client
-                .post(format!("{}/_admin/feed/applied", self.writer))
-                .query(&query)
-                .bearer_auth(&self.token)
-                .timeout(REPORT_EVERY)
-                .json(&applied)
-                .send()
-                .await;
-            match sent {
-                Ok(resp) if resp.status().is_success() => {
-                    *self.rtt.lock().unwrap_or_else(|e| e.into_inner()) = Some(started.elapsed());
-                }
-                Ok(_) => {}
-                Err(e) => tracing::debug!("reporting what is applied: {}", e.without_url()),
-            }
-        }
+        let url = format!("{}/_admin/feed/applied", self.writer);
+        report_loop(&client, &url, &self.token, &self.ack, REPORT_EVERY, || {
+            let inner = self.lock();
+            let applied = inner
+                .datasets
+                .iter()
+                .map(|(d, copy)| (d.clone(), copy.store.applied()))
+                .collect();
+            Some((inner.link.conn?, applied))
+        })
+        .await
     }
 
     async fn follow_once(self: &Arc<Self>, client: &reqwest::Client) -> Result<()> {
@@ -2284,6 +2249,97 @@ fn guarded(
     ))
 }
 
+/// Most reports in flight at once, so a report waiting on the writer never holds the next back.
+const REPORTS_IN_FLIGHT: usize = 8;
+
+/// Each copy's applied `(epoch, generation)`, by dataset.
+type Positions = BTreeMap<String, (u64, u64)>;
+/// A report's connection and positions.
+type Said = (u64, Positions);
+
+/// Report `positions` to the writer at `url` on each tick of `every` and each `ack`, so it keeps the
+/// segments a copy may still name until it has moved on. Best effort: unreported, the writer keeps
+/// them until its grace and most run out, never less.
+///
+/// Reports are numbered and go concurrently, and each carries the round trips of the reports that
+/// finished since the last, from which the writer works out visibility lag on its own clock
+/// (RFC-0076 FR17). `rtt_us`, the last round trip, is for a writer of 5.14.
+async fn report_loop(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    ack: &tokio::sync::Notify,
+    every: Duration,
+    positions: impl Fn() -> Option<Said>,
+) {
+    use futures::StreamExt;
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut in_flight = futures::stream::FuturesUnordered::new();
+    let mut seq = 0u64;
+    let mut trips = std::collections::VecDeque::<(u64, Duration)>::new();
+    let mut last: Option<Duration> = None;
+    // What the writer last answered a report of: a report saying anything else may be first with news.
+    let mut answered: Option<Said> = None;
+    loop {
+        let room = in_flight.len() < REPORTS_IN_FLIGHT;
+        tokio::select! {
+            _ = tick.tick(), if room => {}
+            _ = ack.notified(), if room => {}
+            Some((n, said, news, took)) = in_flight.next() => {
+                if let Some(took) = took {
+                    trips.push_back((n, took));
+                    last = Some(took);
+                    answered = Some(said);
+                    // Its trip is carried back now rather than on the next tick.
+                    if news {
+                        ack.notify_one();
+                    }
+                }
+                continue;
+            }
+        }
+        let Some(said) = positions() else {
+            continue;
+        };
+        seq += 1;
+        while trips.len() > crate::feed_metrics::TRIPS_CARRIED {
+            trips.pop_front();
+        }
+        let mut query = vec![("conn", said.0.to_string()), ("seq", seq.to_string())];
+        if let Some(last) = last {
+            query.push(("rtt_us", last.as_micros().to_string()));
+        }
+        if !trips.is_empty() {
+            let carried: Vec<String> = trips
+                .drain(..)
+                .map(|(n, t)| format!("{n}:{}", t.as_micros()))
+                .collect();
+            query.push(("rtts", carried.join(",")));
+        }
+        let news = answered.as_ref() != Some(&said);
+        let sent = client
+            .post(url)
+            .query(&query)
+            .bearer_auth(token)
+            .timeout(every)
+            .json(&said.1);
+        let n = seq;
+        in_flight.push(async move {
+            let started = Instant::now();
+            let took = match sent.send().await {
+                Ok(resp) if resp.status().is_success() => Some(started.elapsed()),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::debug!("reporting what is applied: {}", e.without_url());
+                    None
+                }
+            };
+            (n, said, news, took)
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2443,5 +2499,112 @@ mod tests {
         ] {
             assert!(!writer_only(p), "{p}");
         }
+    }
+
+    type Arrived = tokio::sync::mpsc::UnboundedReceiver<(HashMap<String, String>, Positions)>;
+
+    /// The query of the first report to arrive that `f` accepts.
+    async fn report_where(
+        arrived: &mut Arrived,
+        what: &str,
+        f: impl Fn(&HashMap<String, String>, &Positions) -> bool,
+    ) -> HashMap<String, String> {
+        loop {
+            let (q, body) = tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no report {what}"))
+                .unwrap();
+            if f(&q, &body) {
+                return q;
+            }
+        }
+    }
+
+    /// #2527: a report the writer is slow to answer does not hold back the next one, and its own
+    /// round trip is carried back as soon as it is known.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_report_waiting_on_the_writer_never_holds_the_next_back() {
+        use axum::extract::{Query, State};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        #[derive(Clone)]
+        struct Writer {
+            arrived: tokio::sync::mpsc::UnboundedSender<(HashMap<String, String>, Positions)>,
+            release: Arc<tokio::sync::Notify>,
+            holding: Arc<AtomicBool>,
+            held: Arc<Mutex<Option<Duration>>>,
+        }
+        async fn applied(
+            State(w): State<Writer>,
+            Query(mut q): Query<HashMap<String, String>>,
+            Json(body): Json<Positions>,
+        ) -> StatusCode {
+            let hold = body.keys().eq(["a"]) && !w.holding.swap(true, Ordering::SeqCst);
+            if hold {
+                q.insert("held".into(), String::new());
+            }
+            w.arrived.send((q, body)).unwrap();
+            if hold {
+                let started = Instant::now();
+                let _ = tokio::time::timeout(Duration::from_secs(10), w.release.notified()).await;
+                *w.held.lock().unwrap() = Some(started.elapsed());
+            }
+            StatusCode::NO_CONTENT
+        }
+        let (tx, mut arrived) = tokio::sync::mpsc::unbounded_channel();
+        let writer = Writer {
+            arrived: tx,
+            release: Arc::default(),
+            holding: Arc::default(),
+            held: Arc::default(),
+        };
+        let app = axum::Router::new()
+            .route("/applied", axum::routing::post(applied))
+            .with_state(writer.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/applied", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let positions: Arc<Mutex<Positions>> = Arc::default();
+        let ack = Arc::new(tokio::sync::Notify::new());
+        let (p, a) = (positions.clone(), ack.clone());
+        let reporter = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let every = Duration::from_secs(3600);
+            report_loop(&client, &url, "t", &a, every, || {
+                Some((1, p.lock().unwrap().clone()))
+            })
+            .await
+        });
+
+        positions.lock().unwrap().insert("a".into(), (1, 1));
+        ack.notify_one();
+        let first = report_where(&mut arrived, "for a", |q, _| q.contains_key("held")).await;
+        positions.lock().unwrap().insert("b".into(), (1, 1));
+        ack.notify_one();
+        report_where(&mut arrived, "for b while a's waits", |_, b| {
+            b.contains_key("b")
+        })
+        .await;
+        assert!(
+            writer.held.lock().unwrap().is_none(),
+            "a's report was answered"
+        );
+
+        writer.release.notify_one();
+        let trip = format!("{}:", first["seq"]);
+        let carried = report_where(&mut arrived, "carrying a's round trip", |q, _| {
+            q.get("rtts")
+                .is_some_and(|t| t.split(',').any(|t| t.starts_with(&trip)))
+        })
+        .await;
+        let held = writer.held.lock().unwrap().unwrap();
+        let us: u128 = carried["rtts"]
+            .split(',')
+            .find_map(|t| t.strip_prefix(&trip))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(us >= held.as_micros(), "{us} µs against {held:?} held");
+        reporter.abort();
     }
 }

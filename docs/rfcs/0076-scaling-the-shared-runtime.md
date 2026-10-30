@@ -672,6 +672,13 @@ publisher, which the test runs after the seal commits, so each first fetch misse
 100 ms backoff (`nuthatch_follower_seal_wait_seconds` mean 120 ms). That is the shape §3.3 predicted:
 tip visibility is the feed's, seal visibility is the mirror's.
 
+Two corrections after measuring 5.14.0 over a 43 ms link (2026-10-30). Its follower sent one report
+at a time, so with two mounts committing on one block the second dataset's acknowledgement queued
+behind the first's round trip (tip p50 73 ms against 20 ms, #2527); reports now go concurrently.
+And it took half the *previous* report's round trip, which on a jittery link pinned 131 of 755 tip
+observations under 0.5 ms against a 4 ms ping floor (#2526); each report is now numbered, and the
+writer waits for that report's own round trip, carried by a later one, before observing.
+
 **Gates.** `tests/e2e_remote_follower.rs`: a remote follower answers as a local one on `/sql`,
 `/tables`, `/entities`, `/schema` and `/ready`, `as_of`, `sealed_through` and `nid` included, through
 the snapshot, tip deltas, a seal, a fold and a seal published only where a final segment goes while
