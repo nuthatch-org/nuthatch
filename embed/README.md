@@ -78,7 +78,7 @@ pinned with the rest, because a host can see them.
 |---|---|---|
 | `now_ms` | `() -> f64` | wall clock in ms since the epoch: `/ready`, entity sampling, the RPC client's rests |
 | `random_fill` | `(ptr, len)` | fill guest memory with random bytes; seeds hash maps only, and no answer depends on it |
-| `log` | `(level, ptr, len)` | one UTF-8 line; level 0 is a panic, 1 a host-storage failure |
+| `log` | `(level, ptr, len)` | one UTF-8 line; level 0 is a panic, 1 a host-storage failure, 2 information (a hydration's summary) |
 | `store_read` | `(handle, offset: i64, ptr, len) -> i32` | read up to `len` bytes at `offset`; bytes read, 0 at the end |
 | `store_write` | `(handle, offset: i64, ptr, len) -> i32` | write `len` bytes at `offset`, growing the file; bytes written |
 | `store_len` | `(handle) -> i64` | the file's length |
@@ -117,26 +117,54 @@ host drops the instance.
 ```json
 {
   "nid": "my-nest",
-  "contract": "0x...",
-  "start": 26239000,
   "rpc": ["main"],
   "storage": "host",
   "fresh": true,
   "memory_mib": 2048,
   "poll_interval_secs": 12,
-  "files": {"entities.toml": "...", "entities/received.sql": "...", "views/20-s4.sql": "..."}
+  "files": {"nuthatch.toml": "...", "abis/token.json": "...", "schema.json": "...",
+            "entities.toml": "...", "entities/received.sql": "...", "views/20-s4.sql": "..."},
+  "mirror": {"base": "https://..."},
+  "follow": true
 }
 ```
 
-`contract`, `start` and `rpc` are required. `rpc` names endpoints; the host maps each name to a URL,
-so no URL or key enters the module. `storage` is `bytes` (the default) or `host`. `fresh` (storage
-`host` only) removes the nest's files before opening. `memory_mib` is the ceiling RFC-0075 §17 holds
-the module to, 2,048 unless set; a phone's is 600. `poll_interval_secs` is what `/ready` reports as
-the node's `--poll-interval`. `files` are a nest's authored files, `entities.toml`, `entities/*.sql`
-and `views/*.sql`, by path. Unknown keys are refused, so a host never believes a setting took.
+`rpc` is required. It names endpoints; the host maps each name to a URL, so no URL or key enters the
+module. `storage` is `bytes` (the default) or `host`. `fresh` (storage `host` only) removes the
+nest's files before opening. `memory_mib` is the ceiling RFC-0075 §17 holds the module to, 2,048
+unless set; a phone's is 600. `poll_interval_secs` is what `/ready` reports as the node's
+`--poll-interval`. Unknown keys are refused, so a host never believes a setting took.
 
-Until RFC-0077 S4 the nest is one ERC-20's `Transfer` on mainnet from `start`, as RFC-0075's tab is;
-S4 adds `nuthatch.toml`.
+**The nest** is `files`, a nest directory's files by path, as text (RFC-0077 S4): `nuthatch.toml`,
+the ABIs it names, `schema.json`, `labels/*.json`, `entities.toml` and its SQL, `views/*.sql`. The
+module reads `nuthatch.toml` through the binary's own parsing and indexes it on the chain registry
+the binary ships: its contracts and their events, templates and factories, labels, and flags. What
+only a node runs is refused by name rather than ignored: `[[webhooks]]`, `[[alerts]]`, `[[calls]]`,
+`[[ipfs]]`, `[address_history]`, `[extract]`, a key nothing reads, and a config schema past 2.
+Without a mirror, a contract must declare its `start_block`. A host that leaves `nuthatch.toml` out
+and gives `contract` and `start` instead gets RFC-0075's young contract: one ERC-20's `Transfer` on
+mainnet from `start`.
+
+**`mirror`** (storage `host` only) hydrates the nest's sealed history from a published directory
+before it follows the chain, as `nuthatch seed` fills a node's (RFC-0052 §8). The module computes the
+nest's data identity from `files` as a node does from its directory, which names the dataset under
+`base`; reads the seed snapshot and the catalogue it completes; checks them as `nuthatch seed` does;
+and asks for every segment and seed tail, each appended to the pack and read back against its content
+address before the catalogue names it. Every file the host gives that a node would hash into the
+identity must be there, `schema.json` included. A hydration that does not finish leaves the store
+marked, and the next open hydrates again from nothing. `mirror.postcard` (`{"cuts": {table: block},
+"digest": "..."}`) pins the catalogue as an RFC-0068 postcard does: cut at each table's block, it must
+hash with the mirror's `schema.json` to `digest`, no seed tail is read, and the nest is what the
+publisher had sealed through the highest cut. A pinned nest does not follow.
+
+Before it asks the mirror for anything, the module adds up what the nest declares against the
+ceiling, as RFC-0075 §17 charges it: each entity 8 MiB plus 3,200 bytes per `max_rows`, against the
+three quarters of `memory_mib` a statement leaves. A nest that cannot fit is refused (`open_failed`)
+with its figures, and nothing is downloaded. The segments themselves go to the host's storage and
+are read by range, so they are not charged.
+
+**`follow`** is whether `nh_step` follows the chain past what the store holds; true unless the
+mirror is pinned. False, `nh_step` answers `{"idle": true}` once the store is open.
 
 **Reopening.** Storage `host` without `fresh` opens the store the host kept, and the nest carries on
 from its last block, as a node restarted on its data directory does. Before it answers anything it
@@ -180,6 +208,7 @@ nh_request(method, target, body)   any time after the store is open
 | `open` | `{"name"}` | `{"handle": n}` | `{"error", "locked": bool}` |
 | `remove` | `{"name"}` | `{}` (also when there was nothing to remove) | `{"error"}` |
 | `list` | `{"prefix"}` | `{"names": [...]}`, every file under the nest whose name starts with `prefix` | `{"error"}` |
+| `get` | `{"url", "max_bytes", "append"?}` | `{"status", "body"}`; with `append`, `{"status", "offset", "length"}` | `{"error"}` |
 
 An `rpc` request is one JSON-RPC POST. The host returns every reply whole, whatever its status and
 whether or not it is JSON: the RPC client classifies a provider's refusals by their words. `error`
@@ -187,6 +216,13 @@ means no reply came; `timed_out` says it was the deadline. Retries across a tran
 host's; retries the RPC client decides on, a cap or a range split, arrive as new requests. A host
 answers a `kind` it does not know with `{"error"}`. A new kind is only ever asked for behind an
 `nh_open` option the host has to set.
+
+A `get` is asked for only behind `mirror`. It is one GET of `url`, a file under the mirror's base.
+Any status but 200 is answered as `{"status"}` alone, and the guest reads a 404 as an absence. A body
+past `max_bytes` is an `error`, never cut short. Without `append` the body comes back as text; with
+it, the host writes the body at the end of the open file `append` names (the pack, below) and answers
+where it went, so a segment never crosses the interface as JSON. A host may perform several at once:
+each lands whole, and the guest checks every one against its content address.
 
 **RPC bodies are JSON strings, in both directions.** `body` is the request's JSON text in a string,
 and so is the reply's. Passing bytes would mean base64, a third larger, or a second buffer and a
@@ -212,12 +248,15 @@ Chosen at `nh_open`:
 Names are relative, `/`-separated, with no empty, `.` or `..` part; a host refuses any other. The
 host keeps one directory per nest, as the node keeps `data/<nid>/`: the browser host uses an OPFS
 directory named for the `nid`, the Node and wasmtime hosts a directory they are given. The guest
-opens one file, `nuthatch.redb`. Sealed segments and their catalogue live inside it, in tables beside
+opens `nuthatch.redb`, and with `mirror` also `mirror.pack`. Sealed segments and their catalogue live inside the store, in tables beside
 the hot rows, not as `segments/<hash>.parquet` files as on a node: a seal happens inside a window's
 commit, which is synchronous, and a browser can open a new file only asynchronously, so a file per
 segment could only be written after the seal had pruned the rows it holds. In the store they commit
 before the prune, as the node's `manifest.json` does. The segment bytes are the node's, hash for
-hash. In storage `bytes` they are part of what `nh_export` returns.
+hash. In storage `bytes` they are part of what `nh_export` returns. History hydrated from a mirror is the
+exception: those segments are appended to `mirror.pack` before the cursor runs, and the store records
+each one's offset and length, so a query reads them by range. The pack only grows; a seed tail a later
+seal folds in leaves its bytes behind.
 
 The single-writer lock is the host's. In a browser a second `createSyncAccessHandle` on the same
 file throws `NoModificationAllowedError`, which the browser host answers as `"locked": true`, and
@@ -233,7 +272,10 @@ the guest faults `locked`. A host with no lock of its own must not open one nest
   `tests/wasmtime-host` caches by the module's sha256 and wasmtime's compatibility hash; a browser
   caches compiled modules itself.
 - **Memory.** Linear memory never shrinks: a statement's high-water mark stays until the instance
-  is dropped. The module holds itself to `memory_mib`.
+  is dropped. The module holds itself to `memory_mib`. A reopened or mirrored nest's views are
+  rebuilt from one pre-summed row per key that Burrmill folds from the sealed segments, as a node's
+  are, not by replaying every sealed transfer: GRT's 2.96 million mainnet transfers open in 233 MiB
+  that way, and in 1,519 MiB by replay (RFC-0077 §16).
 - **Durability** in storage `host` is `store_sync`'s. Over files, every commit syncs: on the M5 Pro
   a follow of S3's recording takes 3.5 s over files and 0.7 s in `bytes`.
 - **Trust.** The module reaches nothing. Every request is one the host performs, to an endpoint the
@@ -278,3 +320,19 @@ store until a segment is sealed, is killed there with requests outstanding (SIGK
 for Node and wasmtime, the whole browser for Chrome), then reopens the same files and finishes. The
 answers must still equal the pin, and the segments those of a run that was never killed;
 `hosts/agree.mjs` holds every host to both.
+
+RFC-0077 S4's gate is a nest opened from a mirror. `run-mirror-node.mjs` seeds a copy of a nest
+directory from a mirror with `nuthatch seed`, serves it, or with `--rpc` follows it to the tip, and
+writes what it answers to `mirror-answers.mjs`'s requests: every authored view, each table's count and
+range, each entity, the balances. `hosts/node/mirror.mjs` (Node) and `run-sw-mirror.mjs` (Chrome)
+open the same directory and mirror in the module and must answer the same. CI holds the module to
+the node's pins for RFC-0075 S4's entity nest, `tests/fixtures/tab-parity/s4-mirror-{seed,tip}.json`,
+which `tests/e2e_tab_mirror.rs` holds the node to:
+
+```sh
+d=../tests/fixtures/tab-parity
+node hosts/node/mirror.mjs /tmp/plain.wasm $d/s4-nest $d/s4-mirror --expect $d/s4-mirror-seed.json
+node hosts/node/mirror.mjs /tmp/plain.wasm $d/s4-nest $d/s4-mirror --memory-mib 600 --max-rows 150000 --refused
+node run-mirror-node.mjs ../target/release/nuthatch <nest-dir> <mirror-url> --out /tmp/node.json
+node hosts/node/mirror.mjs /tmp/plain.wasm <nest-dir> <mirror-url> --expect /tmp/node.json
+```

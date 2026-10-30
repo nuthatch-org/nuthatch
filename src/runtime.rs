@@ -493,21 +493,7 @@ pub struct RuntimeMeta {
     pub isolation: crate::isolation::Isolation,
 }
 
-/// SEC-10: anything that becomes a filesystem path segment *and* a route segment gets this charset.
-///
-/// Tenants and aliases are both. A tenant being **opaque** to nuthatch (RFC-0032 §6) means we never
-/// interpret it, not that it may contain `..` or a separator - opacity is about meaning, not about
-/// what a path resolver will do with it.
-pub(crate) fn safe_segment(value: &str, what: &str) -> Result<()> {
-    if value.is_empty()
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        bail!("{what} '{value}' is invalid (allowed: letters, digits, '_', '-')");
-    }
-    Ok(())
-}
+pub(crate) use nuthatch_core::nest_config::safe_segment;
 
 /// What a move appends to a name while the new nest catches up. Valid under [`safe_segment`], so a
 /// restart mid-move boots, and reserved: an operator's own names may not end in it.

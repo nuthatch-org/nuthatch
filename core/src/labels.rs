@@ -63,6 +63,17 @@ impl LabelSet {
         self.by_address.iter()
     }
 
+    /// Merge one snapshot's text, as [`load`] merges each file; `false` when it is not one.
+    pub fn merge_snapshot(&mut self, text: &str) -> bool {
+        let Ok(entries) = serde_json::from_str::<Vec<LabelEntry>>(text) else {
+            return false;
+        };
+        for e in entries {
+            self.insert(e.address, e.label);
+        }
+        true
+    }
+
     fn insert(&mut self, address: String, label: String) {
         let labels = self.by_address.entry(address).or_default();
         if !labels.contains(&label) {
@@ -119,16 +130,9 @@ pub fn load(dir: &Path) -> LabelSet {
         if path.extension().is_none_or(|x| x != "json") {
             continue;
         }
-        match std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Vec<LabelEntry>>(&s).ok())
-        {
-            Some(entries) => {
-                for e in entries {
-                    set.insert(e.address, e.label);
-                }
-            }
-            None => tracing::warn!("skipping unreadable label snapshot {}", path.display()),
+        let read = std::fs::read_to_string(&path).is_ok_and(|s| set.merge_snapshot(&s));
+        if !read {
+            tracing::warn!("skipping unreadable label snapshot {}", path.display());
         }
     }
     set

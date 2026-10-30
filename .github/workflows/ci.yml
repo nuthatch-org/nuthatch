@@ -796,8 +796,22 @@ jobs:
           node run-sw.mjs "$chrome" "$m" http://127.0.0.1:8954/ $d --restart | tee -a "$RUNNER_TEMP/chrome.log"
           node hosts/agree.mjs "$m" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" "$RUNNER_TEMP/chrome.log" \
             --hosts node,wasmtime,chrome | tee "$RUNNER_TEMP/agree.log"
+          # RFC-0077 S4: S4's entity nest hydrated from a published directory, at the seed's head and
+          # followed to the tip, equal to the node's pins (`tests/e2e_tab_mirror.rs`); refused at
+          # 600 MiB before any download; a postcard checked, and an altered one refused.
+          n4=$d/s4-nest mm=$d/s4-mirror ds=6eb46815c819ffdf1a6e06e870394eb5a4173fb55471fdfd9e3c83d79da8fdaa
+          node hosts/node/mirror.mjs "$m" $n4 $mm --expect $d/s4-mirror-seed.json | tee "$RUNNER_TEMP/mirror.log"
+          node hosts/node/mirror.mjs "$m" $n4 $mm --follow --rpc http://127.0.0.1:8953/ --expect $d/s4-mirror-tip.json \
+            | tee -a "$RUNNER_TEMP/mirror.log"
+          node hosts/node/mirror.mjs "$m" $n4 $mm --memory-mib 600 --max-rows 150000 --refused | tee -a "$RUNNER_TEMP/mirror.log"
+          node hosts/node/mirror.mjs "$m" $n4 $mm --postcard made --dataset $ds | tee -a "$RUNNER_TEMP/mirror.log"
+          node hosts/node/mirror.mjs "$m" $n4 $mm --postcard altered --dataset $ds --refused | tee -a "$RUNNER_TEMP/mirror.log"
+          node run-sw-mirror.mjs "$chrome" "$m" $n4 $mm --expect $d/s4-mirror-seed.json | tee -a "$RUNNER_TEMP/mirror.log"
+          node run-sw-mirror.mjs "$chrome" "$m" $n4 $mm --rpc http://127.0.0.1:8953/ --expect $d/s4-mirror-tip.json \
+            | tee -a "$RUNNER_TEMP/mirror.log"
+          node run-sw-mirror.mjs "$chrome" "$m" $n4 $mm --refused --memory 600 --max-rows 150000 | tee -a "$RUNNER_TEMP/mirror.log"
           { echo '```'; cat "$RUNNER_TEMP/compile.log" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" \
-            "$RUNNER_TEMP/chrome.log" "$RUNNER_TEMP/agree.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            "$RUNNER_TEMP/chrome.log" "$RUNNER_TEMP/agree.log" "$RUNNER_TEMP/mirror.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   # RFC-0075 S2: Node has no OPFS, so the OPFS backend's round trip and its lock run in a dedicated
   # worker in Chrome for Testing, with the live cursor beside them; the 26.04 image ships no chromedriver.

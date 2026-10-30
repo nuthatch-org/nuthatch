@@ -1,0 +1,13 @@
+[nest]
+name = "nest"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["http://127.0.0.1:1"]
+schema_version = 1
+block_timestamps = true
+
+[[contracts]]
+alias = "tab"
+address = "0x0c26fe5e579c3b007ba16d921ba8204a47c05f1a"
+start_block = 26239807
+abi = "abis/tab.json"

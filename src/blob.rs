@@ -636,16 +636,7 @@ pub(crate) fn extract_bundle(bundle_file: &Path, dest: &Path) -> Result<()> {
 
 /// A bundle whose bytes are not the nest they claim to be: a content address, a file hash, the
 /// decode registry or the NID did not check out. Typed so a mount job can report it as such.
-#[derive(Debug)]
-pub struct Unverified(pub String);
-
-impl std::fmt::Display for Unverified {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Unverified {}
+pub use nuthatch_core::mirror::Unverified;
 
 macro_rules! unverified {
     ($($arg:tt)*) => {

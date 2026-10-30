@@ -2,7 +2,8 @@
 
 - Status: **Accepted, 2026-10-30.** S0 to S5 and S7 (the Lodestar demo) authorised in order; S6 waits for rotki
   to ask. S0 passed 2026-10-30 (§12). S1 built in part, 2026-10-30 (§13). S2 built 2026-10-30, its
-  address-build half deferred (§14). S3 built 2026-10-30, its Chrome leg CI's (§15).
+  address-build half deferred (§14). S3 built 2026-10-30, its Chrome leg CI's (§15). S4 built 2026-10-30,
+  with the cold folds in the module (§16).
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0075 (the whole nest in a tab, S0 to S6 merged), RFC-0074 (address history as a
@@ -854,3 +855,123 @@ views' cold folds are the same Burrmill queries, and only the unavailable reason
 refusal's last sentence read differently (#2534). `cargo tree` and `Cargo.lock` unchanged. Every
 subcommand's `--help`, two levels deep (60 files), and the files `init --abi` writes are
 byte-identical before and after. The whole suite: 2,877 passed, none failed, 18 ignored.
+
+## 16. S4 measured outcome, 2026-10-30
+
+**What was built.**
+
+- *The nest's part of `nuthatch.toml`, in core.* `nuthatch_core::nest_config` holds `[nest]`, the
+  contracts, templates, factories, flags and `[extract]` as the binary's `Config` declares them, the
+  schema-version gates, the path-segment check, the decode registry they build and the factory rules
+  they declare. The binary's `Config` takes those types from core and keeps webhooks, alerts, calls,
+  IPFS and address history, which only a node runs. `NestConfig::parse` is how the module reads a
+  `nuthatch.toml`: the same types and gates, and a refusal by name of what only a node runs, of a key
+  nothing reads and of `[extract]`.
+- *The chain registry, in core.* `nuthatch_core::chains` holds every registered chain and its policy,
+  Arbitrum One's included. What reaches an RPC or parses a URL (`resolve`, the `arb1` caveat and
+  header cap) stays in the binary's `chains.rs`, which re-exports the rest.
+- *The seed's checks, in core.* `nuthatch_core::mirror` holds the seed snapshot's envelope, the keys a
+  published directory uses, and the checks `nuthatch seed` makes before it trusts a catalogue
+  (`check_snapshot`, `local_catalogue`, `canonical`), with RFC-0068 §3's postcard cut and digest beside
+  them. `src/seed.rs` and `src/publish.rs` call them where they defined them.
+- *The views' cold folds, in core.* The four Burrmill queries a node's `ColdFolds` runs, and the reading
+  of their rows, are in `nuthatch_core::restart`; `src/analytics.rs` calls them.
+- *Any nest in the module.* `nh_open` takes a nest's files with its `nuthatch.toml` (`NestSpec`), on the
+  chain's registered policy, with its factories (children rebuilt on a warm open, as a node rebuilds
+  them), labels and flags. RFC-0075's young contract stays, as `contract` and `start` with no
+  `nuthatch.toml`.
+- *Mirror hydration.* `nh_open`'s `mirror` makes the module compute the nest's data identity from its
+  files, read the dataset's seed snapshot and catalogue, check them as `nuthatch seed` does, and ask
+  the host for every segment and seed tail. Optionally a postcard pins the catalogue. Then the views,
+  children and entities are rebuilt from the hydrated history, and the cursor follows the tip from
+  `complete_through + 1` unless `follow` is false.
+- *The cold folds in the module.* `embed/src/folds.rs` answers `ColdFolds` with the node's queries, run
+  by Burrmill over the cellar's segments, read by range. A warm or mirrored nest's views are rebuilt
+  from one row per key, as on a node.
+- *Hosts.* The browser host answers `get` (`host.js`, so in Node and in a browser alike); the nest
+  worker opens any `nh_open` config; `hosts/browser/mirror.html` and `run-sw-mirror.mjs` are the
+  browser gate, `hosts/node/mirror.mjs` the Node one, `run-mirror-node.mjs` the node's half.
+
+**`abi` stays 1.** No export or import changed shape: `wasmtime-host abi` finds the 33 pinned shapes
+equal. What was added is what the README's versioning rules allow within a version: optional `nh_open`
+keys (`mirror`, `follow`; `contract` and `start` optional once `files` holds a `nuthatch.toml`), the
+`get` request kind, asked for only behind `mirror`, an answer field (`nh_report`'s `mirror`, a probe)
+and log level 2.
+
+**Where this departs from the RFC.**
+
+- *The segments go to one pack, not `segments/<hash>.parquet`.* §15 left S4 free to write a file per
+  segment for mirrored history. A host file is a sync access handle in a browser, and DeFi Pulse has
+  1,529 segments: 1,529 `open` requests at every warm open, and as many handles held. The module
+  instead has the host append each segment to `mirror.pack`, one file, and records each one's offset
+  and length in the store, in a table beside S3's. A query reads a segment by range from the pack
+  (`cellar::Segments`, an `ObjectStore` over the cellar), so Burrmill reads footers and row groups,
+  not whole files. The bytes are the node's: each is read back and hashed before the catalogue names
+  it.
+- *The budget charges declared entity state, not catalogue sizes.* The catalogue carries no byte
+  sizes, so knowing them before a download is a HEAD per segment (1,529 for DeFi Pulse, 2,297 for GRT
+  on mainnet), and the segments do not sit in linear memory anyway: they are on the host's storage,
+  read by range. DeFi Pulse's 138 MB of segments open at 17 MiB of linear memory. What a mirrored
+  nest declares that does live in memory is its entities, so admission is RFC-0075 §17's charge
+  against the ceiling, made before the first `get`. A mirror needs storage `host`: in storage `bytes`
+  the segments would be in memory, and that is refused by name.
+- *The cold folds were needed, and are built.* S3's rebuild replays every sealed transfer and holds
+  every delta until it applies them. On GRT's mainnet transfers that took the module to 1,519 MiB of
+  linear memory, over what a 600 MiB ceiling leaves and close to the 2 GiB wall.
+
+**Gate.** The node's half is `run-mirror-node.mjs` on a debug build of this branch: a copy of the nest
+seeded with `nuthatch seed` and served with `nuthatch serve`, or with `--rpc` followed by `nuthatch
+dev`. Both halves answer `embed/mirror-answers.mjs`'s requests: every authored view whole and by
+count, each table's count, block range and `log_index` sum, each entity's first thousand rows, the
+balances and the hot rows. Rows are compared as multisets, with the NID and the node's `cached` flag
+left out. Two DeFi Pulse views cannot be compared row by row between any two engines and are compared
+by shape: `stablecoin_supply_events` is capped at 50,000 rows, so which rows fill the cap is the
+engine's order (the tables under it are compared whole); `largest_supply_moves_7d` ends `ORDER BY
+abs(usd) DESC LIMIT 25` with 18 rows tied at 50,000,000.06 for 9 places, so it is asked again with
+every column appended to the order, and that answer is compared whole.
+
+| | Result |
+|---|---|
+| defi-pulse-nest from the public mirror, browser host, 2 GiB, equal to a node seeded from the same mirror at the same head | **pass.** Dataset `0a643352…b2e48f`, catalogue `8ba65fb0…5822e0` unchanged before and after the runs, head 26,306,829, all 33 answers equal (digest `73bfaf00…700799`) in the browser host in Node and in Brave (Chromium) on OPFS. Chrome for Testing still does not launch on this Mac; Brave does, so this is a real Chromium run. CI's Chrome leg runs the local-mirror gate |
+| RFC-0075 S4's entity nest published to a local mirror, browser host, equal to the node at the same head | **pass**, Node and Brave on OPFS: at the seed's head 26,245,806 (digest `26882c7a…b8a69a`), and followed by both to the recording's tip 26,245,870 (`d943c23d…2911e8`), entities and views included. CI runs both in Node and in Chrome against the node's pins, which `tests/e2e_tab_mirror.rs` holds the node to |
+| A nest that cannot fit at 600 MiB is refused before download, with its figures | **pass**, Node and Brave: the same nest declaring 150,000 rows per entity is refused (`open_failed`, "~932 MiB against the 450 MiB its 600 MiB ceiling leaves") with no GET made. At 2 GiB it opens and equals the node |
+| A postcard pins the catalogue | **pass**: one made from the mirror's catalogue opens through the cut; an altered digest is refused before any segment is fetched |
+| Binary: config parsing and the chain registry move without changing a byte accepted or written | **pass**, below |
+
+**Numbers.** Apple M5 Pro, macOS, Node 26.11.1, the `tab` module after `wasm-opt`: 34,336,230 bytes,
+5,259,438 brotli (S3's: 34,017,235). S5's ceiling of 5.5 MB brotli holds. One run each, over the public
+mirror's Worker URL except where said:
+
+| | DeFi Pulse | GRT supply, mainnet (a local copy of its published dataset) |
+|---|---|---|
+| Segments hydrated | 1,529, 138,128,890 bytes | 2,297, 286,028,654 bytes |
+| Open, Node host | 46.4 s (40.7 s at 600 MiB); 0.86 s from a local copy | 5.5 s; 26.7 s by replay |
+| Open, Brave on OPFS | 44.5 s | not run |
+| Linear memory after open | 17 MiB | 242 MiB (232 at 600 MiB); 1,519 MiB by replay |
+| Linear memory after the gate's queries | 171 MiB, the high-water of a 50,000-row answer | 242 MiB |
+| Process peak RSS, Node | 616 MiB | 564 MiB |
+| The gate's queries | 33 in 7.6 s | 9 in 2.6 s, equal to the node at 2 GiB and at 600 MiB |
+
+Every statement binds every segment's footer, read by range from the pack: 1,529 per `/sql` on DeFi
+Pulse, about 0.2 s each. An engine kept between statements would remove that; it is left for when a
+page needs it.
+
+**What it does not show.** Chrome for Testing and Safari: the browser evidence here is Brave, and CI's
+Chrome leg runs the local mirror only, since a public download does not belong in CI. The wasmtime host
+answers no `get`, so it opens no mirror. No Arbitrum One nest was opened from a mirror: the published
+`grt-supply-arbitrum-one` comes from a commit the local checkout has moved past, so its data identity
+no longer matches, and Arbitrum is shown by its registry entry and a parse test only; S7 will exercise
+it. A host's RPC URLs never enter the module, so the `arb1` header-batch cap is the host's to apply. A
+warm reopen does not check that the files given hash to the identity the store was hydrated under, as
+the node's registry guard does. Labels reach the views but not `/sql`'s `labels` table, which the
+module does not bind. A transient fetch failure once failed a public run in Brave; the browser host now
+retries a `get`'s transport failure three times, as the README makes retries the host's.
+
+**The binary.** Unchanged in behaviour. The moved code is the same code: `Config` reads
+`nuthatch.toml` through the same types, and `registry::from_nest`, `seed` and the cold folds call core
+with the same messages. `Cargo.lock` gains one edge, `nuthatch-core` to `serde_ignored`, already in the
+tree at 0.1.14, and no package. Every subcommand's `--help`, two levels deep (60 files), and the files
+`init --abi` writes for mainnet and for Arbitrum One are byte-identical to main's. The whole suite:
+2,878 passed, none failed, 18 ignored; the one new test is `e2e_tab_mirror`. `tests/skill_refs.rs` now
+names `core/src/nest_config.rs` as a config source: without it the config-reference gate would have
+stopped scanning `[nest]`'s and `[[contracts]]`'s keys, silently, once the types left `src/config.rs`.

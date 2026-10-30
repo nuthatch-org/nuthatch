@@ -4,7 +4,7 @@
 //! in its cellar and not files.
 
 use crate::budget::TabBudget;
-use crate::cellar::Cellar;
+use crate::cellar::{Cellar, Segments, SEGMENTS_PREFIX};
 use crate::derived::{NestFiles, TabEntity};
 use crate::registry::TableSchema;
 use anyhow::{anyhow, Result};
@@ -79,7 +79,7 @@ impl TabQuery {
     /// a statement at the store's current watermark, its working memory held to `budget`'s share.
     pub async fn bind(
         store: &Store,
-        cellar: &Cellar,
+        cellar: &Arc<Cellar>,
         schema: &[TableSchema],
         entities: &[TabEntity],
         files: &NestFiles,
@@ -92,18 +92,8 @@ impl TabQuery {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         let manifest = cellar.manifest();
-        let segments = object_store::memory::InMemory::new();
-        for segs in manifest.tables.values() {
-            for s in segs {
-                let bytes = cellar
-                    .file(&s.file)
-                    .ok_or_else(|| anyhow!("segment {} is not in the cellar", s.file))?;
-                object_store::ObjectStoreExt::put(&segments, &key(&s.file).into(), bytes.into())
-                    .await?;
-            }
-        }
         engine
-            .attach_store(Arc::new(segments))
+            .attach_store(Arc::new(Segments(cellar.clone())))
             .map_err(engine_err)?;
 
         let hot = store.hot_rows_by_table()?;
@@ -127,13 +117,16 @@ impl TabQuery {
             let sealed: Vec<(String, u64)> = manifest
                 .tables
                 .get(table)
-                .map(|segs| {
-                    segs.iter()
-                        .filter(|s| s.to_block <= sealed_through)
-                        .filter_map(|s| Some((key(&s.file), cellar.file(&s.file)?.len() as u64)))
-                        .collect()
+                .into_iter()
+                .flatten()
+                .filter(|s| s.to_block <= sealed_through)
+                .map(|s| {
+                    let len = cellar
+                        .len_of(&s.file)?
+                        .ok_or_else(|| anyhow!("segment {} is not in the cellar", s.file))?;
+                    Ok((key(&s.file), len))
                 })
-                .unwrap_or_default();
+                .collect::<Result<_>>()?;
             // COR-1, as the node: hot rows past the watermark only where cold covers something.
             let hot_rows: Vec<Value> = hot
                 .get(table)
@@ -332,7 +325,7 @@ pub fn view_names(files: &NestFiles) -> Result<Vec<String>> {
 }
 
 fn key(file: &str) -> String {
-    format!("segments/{file}")
+    format!("{SEGMENTS_PREFIX}{file}")
 }
 
 /// An entity's relation, bound as the node's `BurrmillSession::bind_relation` binds it.

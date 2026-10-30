@@ -36,6 +36,7 @@ serde = { version = "1", features = ["derive"] }
 # `preserve_order` as nuthatch-decode has it, so a hash over JSON here is the one the binary computes.
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 sha2 = "0.10"
+serde_ignored = "0.1"
 # RFC-0077 S1: `entities.toml` and its SQL, parsed here so a node and an embedding lower it alike.
 sqlparser = { version = "0.62", features = ["visitor"] }
 toml = "0.8"

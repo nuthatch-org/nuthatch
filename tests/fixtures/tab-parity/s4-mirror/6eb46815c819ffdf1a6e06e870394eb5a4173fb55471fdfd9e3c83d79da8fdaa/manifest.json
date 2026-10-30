@@ -1,0 +1,16 @@
+{
+  "manifest_version": 1,
+  "tables": {
+    "tab__transfer": [
+      {
+        "hash": "c983470cccac988c040c547f42d857a4a4644c64e37313255685c6895479aeae",
+        "from_block": 26239813,
+        "to_block": 26241612,
+        "rows": 2259,
+        "file": "tab__transfer-c983470cccac988c040c547f42d857a4a4644c64e37313255685c6895479aeae.parquet",
+        "writer_profile": "zstd-bloom-v1",
+        "input_hash": "c983470cccac988c040c547f42d857a4a4644c64e37313255685c6895479aeae"
+      }
+    ]
+  }
+}
