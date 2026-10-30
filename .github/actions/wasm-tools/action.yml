@@ -1,0 +1,22 @@
+name: wasm-bindgen and binaryen
+description: >
+  wasm-bindgen, wasm-bindgen-test-runner and wasm-opt on PATH, from their release tarballs pinned by
+  sha256. wasm-bindgen must match the version in spike/dbsp-wasm/Cargo.lock.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        wb=wasm-bindgen-0.2.129-x86_64-unknown-linux-musl
+        curl -fsSL -o "$RUNNER_TEMP/wasm-bindgen.tgz" \
+          "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.129/$wb.tar.gz"
+        echo "82d12bb940e2d4e72e0d5605387fc1b8ca179044e012b620f0ce4e7440e8320e  $RUNNER_TEMP/wasm-bindgen.tgz" | sha256sum -c
+        tar -xzf "$RUNNER_TEMP/wasm-bindgen.tgz" -C "$RUNNER_TEMP"
+        echo "$RUNNER_TEMP/$wb" >> "$GITHUB_PATH"
+        curl -fsSL -o "$RUNNER_TEMP/binaryen.tgz" \
+          https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz
+        echo "2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489  $RUNNER_TEMP/binaryen.tgz" | sha256sum -c
+        tar -xzf "$RUNNER_TEMP/binaryen.tgz" -C "$RUNNER_TEMP"
+        echo "$RUNNER_TEMP/binaryen-version_133/bin" >> "$GITHUB_PATH"

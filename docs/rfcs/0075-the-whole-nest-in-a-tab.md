@@ -353,7 +353,7 @@ it was written again here. `opfs::OpfsBackend` implements redb's five methods ov
   keeps its meta, rows and checkpoint. A second `OpfsBackend::open` of a held store is
   `OpenError::Locked`. A second worker's `createSyncAccessHandle` on the held file is refused with
   `NoModificationAllowedError` and succeeds once the handle drops. CI runs the three tests in
-  `wasm-core` on Chrome for Testing.
+  `wasm-chrome` on Chrome for Testing.
 - *Both mutations fail.* Dropping the balance retraction in `rollback_reorg` fails the property at
   the first case. Mapping the DOM error to anything but `Locked` fails the lock test.
 
@@ -598,7 +598,7 @@ parquet are about half the code directly, and most of the generic half besides. 
 DataFusion crates whole (`datafusion` feature, including `functions-nested`), and the tab must answer
 what the node answers, so they are not trimmed here. Removing panic locations (`-Zlocation-detail=none`)
 and `panic_immediate_abort` need a nightly `build-std`, and they were not tried. `build-tab.sh` builds
-the module. CI's `wasm-core` job builds it once with binaryen 133 (pinned by sha256), runs every Node
+the module. CI's `wasm-tab` job builds it once with binaryen 133 (pinned by sha256), runs every Node
 gate and the Service Worker gate against it, and writes its size to the job summary.
 
 **The budgets.** `TabBudget` (`spike/dbsp-wasm/src/budget.rs`) holds a ceiling of 2,048 MiB, or 600 MiB
