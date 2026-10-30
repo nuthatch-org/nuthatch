@@ -1,6 +1,6 @@
 # RFC-0077: The embeddable engine - nuthatch's core as an opt-in wasm module, beside the binary
 
-- Status: **Proposed, 2026-10-30.**
+- Status: **Accepted, 2026-10-30.** S0 to S5 authorised in order; S6 waits for rotki to ask.
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0075 (the whole nest in a tab, S0 to S6 merged), RFC-0074 (address history as a
