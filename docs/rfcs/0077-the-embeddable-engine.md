@@ -4,7 +4,8 @@
   to ask. S0 passed 2026-10-30 (§12). S1 built in part, 2026-10-30 (§13). S2 built 2026-10-30, its
   address-build half deferred (§14). S3 built 2026-10-30, its Chrome leg CI's (§15). S4 built 2026-10-30,
   with the cold folds in the module (§16). S5 built 2026-10-30, Safari waiting on Chief and the address
-  build's size gate deferred (§17).
+  build's size gate deferred (§17). S7 built 2026-10-31, every figure the tab computes equal to the
+  server's at its block, the Lodestar branch unpushed until Chief says (§18).
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0075 (the whole nest in a tab, S0 to S6 merged), RFC-0074 (address history as a
@@ -334,7 +335,7 @@ Each ends runnable, and each gate can fail. Sizes are days of focused work, esti
   build replaces `embed/`'s S0 module and rotki's host answers `nh_step`'s requests where it answered
   `rpc_batch`. No rotki PR is opened otherwise. **Gate**: RFC-0074 §5's parity in rotki's host, and
   rotki's tests and linters. Binary: unchanged.
-- **S7, the demo: Lodestar's `/profile`, verified locally.** Chief, 2026-10-30. Not started: it is built after S5, in the Lodestar repository, and nothing here implements it. Lodestar's network-wide
+- **S7, the demo: Lodestar's `/profile`, verified locally.** Chief, 2026-10-30. Built 2026-10-31 (§18): the page in the Lodestar repository, and in the engine the narrowed nests, `window` and `until` it needed. Lodestar's network-wide
   pages are the shared-view case and stay on the hosted `graph-allocations-nest`. Its wallet-connected
   `/profile` is one user's data: delegations (staked, thawing, realised and unrealised rewards),
   curation signals and 90 days of rewards history, loaded today from `/api/portfolio` and the rewards
@@ -1073,3 +1074,122 @@ between this branch and the same tree with main's two files. The whole suite: 2,
 18 ignored; the one new test is `e2e_embed_shapes`. A first run, beside a module build, lost
 `deploy_nest_script::a_failure_only_the_new_binary_has_reverts_after_asking_the_previous_one` to a
 killed script (exit `None`); it passed alone and in the whole suite again.
+
+
+## 18. S7 measured outcome, 2026-10-31
+
+**What was built.** The page is in Lodestar, on a local branch (`pete/verify-locally`) that has not
+been pushed: Chief has not given the go for Lodestar. The engine needed four things it did not have,
+and they are here.
+
+- *Narrowed nests.* `nh_open` takes `filters`: per declared event, the values its indexed arguments may
+  take (`embed/src/narrow.rs`). The cursor asks for those logs only, one `eth_getLogs` per filter and
+  value, each log checked against the filter that asked, deduplicated by block and log index. A range
+  the endpoint will not answer whole is halved, as is one that fails twice: arb1 answers a 10,000,000-
+  block query for a large indexer's `StakeDelegated` with "log query timed out". A throttle is asked
+  again after a rest. `nuthatch_core::source::LogFilter` gains topics 1 to 3 and the RPC client sends
+  them; a node never sets them. One value per topic is the shape that matters: arb1.arbitrum.io serves
+  10,000,000 blocks to it and 100,000 to a filter with a list (measured 2026-10-31). An event no filter
+  names is not fetched, so a narrowed nest is refused with `mirror` and with a factory.
+- *`window`*, blocks per `eth_getLogs`: 10,000,000 here, against Arbitrum's registered 2,000. History
+  from block 42,449,585 is 48 windows per filter, not 239,000.
+- *`until`*, the last block the cursor indexes. The tab indexes to `/api/portfolio`'s
+  `provenance.as_of` and no further, so both sides are compared at one block. A store past `until`
+  faults the follow. The first design bounded every table in the SQL instead; the stakes query came to
+  17,724 bytes against `/sql`'s 16,384, and `until` is the honest form anyway.
+- *One head per follow pass.* `TabNest::follow` read the tip again every window and stopped only when
+  it had caught up. Arbitrum makes four blocks a second, and a nest asking forty filters a window never
+  caught up: it ran past the tip it started at, 2,443 requests in, with no `{"idle": true}`. A pass now
+  ends at the head it first saw, and the host steps again. Every earlier gate is unchanged by it
+  (below).
+
+**The page.** `/profile` gets a "Verify it locally" card, off by default; without it the page renders
+and fetches what it did before. On, a worker loads the plain module (34,408,073 bytes, gzipped in the
+repository, vendored by `scripts/vendor-nuthatch-engine.sh` from this branch's `f79c3612`, with
+`host.js` and `opfs.js` unmodified and the commit in `ENGINE.json`), and:
+
+1. reads `/api/portfolio` for the delegator and the curator, again until both name the same `as_of`;
+2. opens the wallet's nest (`public/verify-locally/nest/wallet.toml`: graph-allocations-nest's
+   aliases, ABIs and start blocks at 36bd3de, so every table has the server's name and columns), its
+   delegations, undelegations, withdrawals and signal filtered by the wallet as `delegator` or
+   `curator`, Horizon's events from the proxies' upgrade at 408,825,706, with block times, `until` the
+   server's block;
+3. opens the pools nest (`pools.toml`) for every indexer the wallet holds shares in or has GRT thawing
+   with: sixteen events by `serviceProvider` or `indexer`, and **no block times**. No pool figure reads
+   one, and a large indexer's pool is tens of thousands of blocks, each a header from an endpoint that
+   sends no timestamp on its logs and answers ten headers to a batch. With them, 0xd7d7…d076's pool
+   (74 million shares, every delegation since 2022) had not finished in 30 minutes;
+4. runs kittiwake's four portfolio queries with graph-allocations-nest's view SQL as CTEs, the pools
+   nest's pool rows and thaw requests passed to the wallet nest's queries as typed literal rows, and
+   compares every column both sides fold, as strings, wei for wei.
+
+The SQL is the server's with these differences, each forced by two nests of one wallet rather than one
+of the network, and written at the top of `src/lib/verify/sql.ts`: `horizon_start` is the chain's
+first `HorizonStakeDeposited`, block 408,847,369, where the view takes a `MIN` that over a few indexers
+would be later; the pools nest reads NULL for `block_timestamp`; arms reading contracts the tab does not
+fetch are gone with the columns they made; and the pool and thaw rows reach the positions as literals
+where the server joins views. The engine does every sum, cast and division. It refused the first cut of
+those literals: a wide integer written bare "would be read as a float", so they go in quoted and cast.
+
+Stores live in OPFS under a name for the wallet, the pool set, the module's hash and the nest's files,
+so a second run fetches only what is new (in Node, the wallet's nest reopened in 0.4 to 2.7 s, 2 to 18
+requests). The page's host sends a long header batch to arb1 as tens, one after another, waiting out a
+throttled part, and carries a `follow_failed` on from the store.
+
+**Gate.** Brave headless (Chrome for Testing does not start on this Mac) on `next dev`, through the
+page itself: `scripts/verify-locally-gate.mjs` connects a read-only stand-in wallet that answers with
+the address under test, turns the switch on, and reads back what the page rendered. Each address ran
+in a fresh browser context, so a fresh OPFS and a full fetch, against `https://arb1.arbitrum.io/rpc`.
+
+| Address | What it holds | Block | Figures | Differ | Pools | RPC requests | Time |
+|---|---|---|---|---|---|---|---|
+| 0xcdb9…b2c3 | delegator, Horizon era, 6 positions, 2 open | 519,858,740 | 81 | 0 | 2 | 2,342 | 220 s |
+| 0x3a35…bb3c | delegator since 2023, 110,000 GRT thawing | 519,856,323 | 43 | 0 | 1 | 4,453 | 662 s |
+| 0xe3af…2ac2 | delegator since February 2025 | 519,859,400 | 32 | 0 | 1 | 3,744 | 529 s |
+| 0xd7d7…d076 | delegator, 2 positions thawing, 1 in a pool of 74 million shares | 519,861,750 | 53 | 0 | 3 | 11,566 | 1,995 s |
+| 0x96a3…65b2 | curator, 9 signals | 519,852,240 | 50 | 0 | 0 | 765 | 89 s |
+| 0x6d64…24bc | curator, 9 signals, 2 open | 519,852,447 | 50 | 0 | 0 | 748 | 73 s |
+| 0xacbd…0db5 | curator, 19 signals | 519,852,874 | 100 | 0 | 0 | 1,030 | 178 s |
+
+0xd7d7…d076's third pool is one of the network's largest, every delegation and reward since 2022. In Node
+over files the same comparison gave 53 of 53 at the same block; that nest, reopened warm, followed to
+the next head in 2 s and 54 requests, and its pools nest held 240 MiB of linear memory at the end.
+
+An earlier cut, with block times in one nest for everything, gave the same agreement for the first six
+(and 0xd7d7…d076 never finished): 0xcdb9…b2c3 in 453 s and 3,445 requests, 0x3a35…bb3c in 1,065 s and
+6,651. Dropping the pools' block times took a third to a half off.
+
+Figures compared: the delegator's totals (delegated and undelegated all time, realised rewards,
+positions, open positions); per position, the value of its shares now, their cost, the shares, GRT
+thawing and until when, realised rewards, delegated and undelegated all time, whether open, first
+delegation and last undelegation; per fetched pool, its tokens, tokens thawing, shares and both cuts;
+the curator's totals (signalled and unsignalled all time, name signal through GNS included, realised
+rewards, signal positions, open ones); per signal, GRT in and out, curation shares, last change and
+realised rewards. The position values go through the server's `DOUBLE` arithmetic for the fractional
+share and the weighted average price, and the engine reproduces them to the wei: the same SQL on the
+same Burrmill.
+
+**Not computed, and named on the page rather than shown.**
+
+- *The 90-day rewards history.* kittiwake builds it from `indexer_snapshots`, each indexer's exchange
+  rate as Lodestar's own cron sampled it into Postgres. The moment a sample was taken is not on the
+  chain, so the tab has nothing to reproduce it from.
+- *An indexer's own stake, allocation count, URL and geohash*, and *a deployment's total signal, query
+  fees and allocated stake.* Folded from provisions, allocations, service registrations and every
+  curator's signal: the network's history, not the wallet's. `/profile` shows none of them.
+- *Pool figures for a closed position.* With no shares and nothing thawing its value is zero whatever
+  the pool holds, so that pool is not fetched; the page lists each such indexer.
+
+**What it does not show.** The tab trusts its RPC. S5's verified head is Helios on mainnet's beacon
+chain, and Arbitrum's finality is an L1 batch; nothing here verifies a block, and an RPC that leaves a
+log out is not caught (the page says so). It is slow from cold on a keyless RPC, and slowest for a
+wallet in a large pool, almost all of it arb1's throttle: the table's times are the cost of a public
+endpoint, and a keyed one or a warm store is the difference. Safari, Firefox and a phone are not run.
+The page has not been deployed, and Lodestar's CSP admits `https:` RPCs only.
+
+**The binary.** Unchanged in behaviour: `LogFilter` gains a field it never sets and the RPC client
+sends topics only when set, so every request a node makes is the same JSON. `cargo check --all-targets`
+of the root, and core's tests (186) and clippy, pass. The module's earlier gates on this branch's
+module: S5's 32 answers (`22966cee…363febc5`) fresh and after a kill, S3's segment and 1,000 balances,
+the six verified-head cases, and all 13 shapes equal to the node's. `embed`'s unit tests now run in CI
+beside `native`, which they did not before.
