@@ -66,14 +66,19 @@ pub struct Plan {
 /// A grouped result: key row to aggregate row, ordered by key.
 pub type Relation = BTreeMap<Row, Row>;
 
-/// Running state for one group. `Avg` carries its sum and count separately (§3.3) so retraction is a
-/// subtraction on both rather than an irreversible division.
-#[derive(Debug, Default, Clone)]
+/// Running state for one group: its row count, and one slot per declared aggregate in order.
+#[derive(Debug, Clone)]
 struct Acc {
     count: i128,
+    slots: Vec<Slot>,
+}
+
+/// One aggregate's running value. `Avg` carries its sum and count separately (§3.3) so retraction is
+/// a subtraction on both rather than an irreversible division.
+#[derive(Debug, Default, Clone)]
+struct Slot {
     sum: Option<i128>,
-    min: Option<Scalar>,
-    max: Option<Scalar>,
+    extreme: Option<Scalar>,
     avg_sum: i128,
     avg_count: i128,
 }
@@ -142,9 +147,12 @@ impl Plan {
         for e in &self.key {
             key.push(e.eval(row)?);
         }
-        let acc = groups.entry(Row(key)).or_default();
+        let acc = groups.entry(Row(key)).or_insert_with(|| Acc {
+            count: 0,
+            slots: vec![Slot::default(); self.aggregates.len()],
+        });
         acc.count += 1;
-        for a in &self.aggregates {
+        for (a, slot) in self.aggregates.iter().zip(&mut acc.slots) {
             match a {
                 Agg::Count => {}
                 Agg::Sum(e) | Agg::Avg(e) => {
@@ -152,11 +160,11 @@ impl Plan {
                     // SQL: SUM ignores NULLs, and SUM over no non-null rows is NULL, not 0.
                     if let Some(i) = v.as_int() {
                         if matches!(a, Agg::Sum(_)) {
-                            let base = acc.sum.unwrap_or(0);
-                            acc.sum = Some(checked(base.checked_add(i), base, i)?);
+                            let base = slot.sum.unwrap_or(0);
+                            slot.sum = Some(checked(base.checked_add(i), base, i)?);
                         } else {
-                            acc.avg_sum = checked(acc.avg_sum.checked_add(i), acc.avg_sum, i)?;
-                            acc.avg_count += 1;
+                            slot.avg_sum = checked(slot.avg_sum.checked_add(i), slot.avg_sum, i)?;
+                            slot.avg_count += 1;
                         }
                     } else if !v.is_null() {
                         bail!("sum/avg over a non-integer value {v:?}")
@@ -164,14 +172,14 @@ impl Plan {
                 }
                 Agg::Min(e) => {
                     let v = e.eval(row)?;
-                    if !v.is_null() && acc.min.as_ref().is_none_or(|m| &v < m) {
-                        acc.min = Some(v);
+                    if !v.is_null() && slot.extreme.as_ref().is_none_or(|m| &v < m) {
+                        slot.extreme = Some(v);
                     }
                 }
                 Agg::Max(e) => {
                     let v = e.eval(row)?;
-                    if !v.is_null() && acc.max.as_ref().is_none_or(|m| &v > m) {
-                        acc.max = Some(v);
+                    if !v.is_null() && slot.extreme.as_ref().is_none_or(|m| &v > m) {
+                        slot.extreme = Some(v);
                     }
                 }
             }
@@ -181,20 +189,19 @@ impl Plan {
 
     fn finish(&self, acc: &Acc) -> Result<Row> {
         let mut out = Vec::with_capacity(self.aggregates.len());
-        for a in &self.aggregates {
+        for (a, slot) in self.aggregates.iter().zip(&acc.slots) {
             out.push(match a {
                 Agg::Count => Scalar::Int(acc.count),
-                Agg::Sum(_) => acc.sum.map_or(Scalar::Null, Scalar::Int),
-                Agg::Min(_) => acc.min.clone().unwrap_or(Scalar::Null),
-                Agg::Max(_) => acc.max.clone().unwrap_or(Scalar::Null),
+                Agg::Sum(_) => slot.sum.map_or(Scalar::Null, Scalar::Int),
+                Agg::Min(_) | Agg::Max(_) => slot.extreme.clone().unwrap_or(Scalar::Null),
                 // Integer division truncating toward zero: the entity's contract (RFC-0041 §3.3), not
                 // the SQL engine's, whose `avg` over integers is fractional. Carrying
                 // sum and count to the end is what makes this exact rather than a drifting mean.
                 Agg::Avg(_) => {
-                    if acc.avg_count == 0 {
+                    if slot.avg_count == 0 {
                         Scalar::Null
                     } else {
-                        Scalar::Int(acc.avg_sum / acc.avg_count)
+                        Scalar::Int(slot.avg_sum / slot.avg_count)
                     }
                 }
             });

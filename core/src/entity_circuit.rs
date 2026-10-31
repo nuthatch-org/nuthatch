@@ -867,6 +867,52 @@ mod tests {
         assert_eq!(got, plan.evaluate(&left, &[]).unwrap());
     }
 
+    /// Two aggregates of one kind over different columns are two answers. Every other plan here
+    /// declares each kind at most once, which is how the oracle came to fold them together (#2485).
+    #[test]
+    fn two_aggregates_of_one_kind_over_different_columns_are_kept_apart() {
+        let plan = Plan {
+            left: src("trades", &["who", "qty", "fee"]),
+            left_filter: None,
+            join: None,
+            key: vec![col(0)],
+            aggregates: vec![
+                Agg::Sum(col(1)),
+                Agg::Sum(col(2)),
+                Agg::Min(col(1)),
+                Agg::Min(col(2)),
+                Agg::Max(col(1)),
+                Agg::Max(col(2)),
+                Agg::Avg(col(1)),
+                Agg::Avg(col(2)),
+            ],
+        };
+        let left = [
+            Row(vec![s("a"), Scalar::Int(10), Scalar::Int(1)]),
+            Row(vec![s("a"), Scalar::Int(30), Scalar::Null]),
+            Row(vec![s("a"), Scalar::Int(20), Scalar::Int(3)]),
+        ];
+        let want = Row(vec![
+            Scalar::Int(60),
+            Scalar::Int(4),
+            Scalar::Int(10),
+            Scalar::Int(1),
+            Scalar::Int(30),
+            Scalar::Int(3),
+            Scalar::Int(20),
+            Scalar::Int(2),
+        ]);
+
+        let got = evaluate_incrementally(&plan, &left, &[]).unwrap();
+        assert_eq!(got.get(&Row(vec![s("a")])), Some(&want), "the circuit");
+        assert_eq!(
+            plan.evaluate(&left, &[]).unwrap().get(&Row(vec![s("a")])),
+            Some(&want),
+            "the oracle"
+        );
+        assert_eq!(got, plan.evaluate(&left, &[]).unwrap());
+    }
+
     /// SQL's MIN and MAX ignore NULLs. `Scalar::Null` sorts *first* by design, so a MIN that does
     /// not exclude them reads NULL for every group that has one - the failure that looks like a
     /// missing value rather than like a bug.
