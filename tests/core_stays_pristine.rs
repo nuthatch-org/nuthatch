@@ -190,9 +190,10 @@ fn the_graph_lane_reads_through_the_same_sql_path() {
          the lane still goes through admission. If you replaced it, do not - one set of data underneath \
          is the property this gate exists for.\n\n{body}"
     );
-    let wrapper = src.split_once("async fn run_sql_query(").unwrap().1;
-    let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap()];
-    assert!(wrapper.contains("run_sql_query_at(s, sql_text, requested_max_rows, None, None).await"));
+    // `/sql`'s own lane, JSON or Arrow (RFC-0079), reaches the same shared function.
+    let lane = src.split_once("async fn sql_answer(").unwrap().1;
+    let lane = &lane[..lane.find("\n}\n").unwrap()];
+    assert!(lane.contains("run_sql_query_at(s, q.q, q.max_rows, None, None, arrow).await"));
     let shared = src.split_once("async fn run_sql_query_at(").unwrap().1;
     let shared = &shared[..shared.find("\n}\n").unwrap()];
     assert!(
@@ -255,7 +256,7 @@ fn the_golden_path_routes_are_all_still_mounted() {
         r#".route("/schema", get(schema_doc))"#,
         r#".route("/entities", get(entities))"#,
         r#".route("/entity/{id}", get(entity))"#,
-        r#".route("/sql", get(sql)"#,
+        r#".route("/sql", get(sql_get)"#,
     ] {
         assert!(
             src.contains(route),

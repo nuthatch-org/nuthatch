@@ -331,6 +331,9 @@ pub struct SqlRequest {
     /// The row cap for this request, clamped by the route; absent is the nest's cap.
     #[serde(default)]
     pub max_rows: Option<usize>,
+    /// `arrow` for an Arrow IPC stream (RFC-0079), as `Accept` can ask; absent is JSON.
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 /// A POST body as a [`SqlRequest`], or the 400 refusing it in the route's own envelope.

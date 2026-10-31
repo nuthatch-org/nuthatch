@@ -375,6 +375,8 @@ pub struct QueryGuard {
     /// RFC-0073 FR3: how much of the dataset's analytics pool may be held while this statement
     /// runs. Polled, so exact only to [`MEMORY_POLL`], and it counts every statement on the pool.
     pub memory_bytes: Option<u64>,
+    /// Answer as an Arrow IPC stream rather than JSON rows (RFC-0079), under the same caps.
+    pub arrow: bool,
 }
 
 impl Default for QueryGuard {
@@ -384,6 +386,7 @@ impl Default for QueryGuard {
             max_rows: crate::serve::SQL_MAX_ROWS,
             max_result_bytes: crate::engine::SQL_MAX_RESULT_BYTES,
             memory_bytes: None,
+            arrow: false,
         }
     }
 }
@@ -446,6 +449,8 @@ pub struct QueryOutput {
     pub offchain: Option<std::collections::BTreeMap<String, Vec<String>>>,
     /// The bound a declared query was admitted against; `None` on every other path.
     pub scan_bound: Option<ScanBound>,
+    /// The answer as an Arrow IPC stream, in place of `rows`, when [`QueryGuard::arrow`] asked.
+    pub ipc: Option<crate::engine::Ipc>,
 }
 
 impl QueryOutput {
@@ -460,6 +465,7 @@ impl QueryOutput {
             referenced_tables: self.referenced_tables.clone(),
             offchain: self.offchain.clone(),
             scan_bound: self.scan_bound.clone(),
+            ipc: None,
         }
     }
 
@@ -974,6 +980,7 @@ fn write_copy(
         rows: Vec::new(),
         columns: Vec::new(),
         truncated: false,
+        ipc: None,
     })
 }
 
@@ -1739,6 +1746,7 @@ fn attempt(
         let cap = guard.map(|g| (g.max_rows, g.max_result_bytes));
         let _live = LiveQuery::register(dir, session.interrupt_handle());
         let outcome = evaluate.then(|| match want {
+            Want::Rows if guard.is_some_and(|g| g.arrow) => session.collect_ipc(sql, cap),
             Want::Rows => session.collect(sql, cap),
             Want::Plan => session
                 .describe(sql)
@@ -1746,6 +1754,7 @@ fn attempt(
                     rows: Vec::new(),
                     columns: columns.into_iter().map(|(name, _)| name).collect(),
                     truncated: false,
+                    ipc: None,
                 })
                 .map_err(Died::Binding),
             Want::Write { view, id, to } => write_copy(
@@ -1805,6 +1814,7 @@ fn attempt(
         mut rows,
         columns,
         truncated: over_cap,
+        ipc,
     } = match outcome {
         Ok(v) => v,
         // #529: the watchdog's `interrupt()` stops whatever phase is running, not just an in-flight
@@ -1860,6 +1870,7 @@ fn attempt(
         referenced_tables: referenced,
         scan_bound: scan,
         offchain,
+        ipc,
     }))
 }
 

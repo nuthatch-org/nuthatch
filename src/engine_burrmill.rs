@@ -523,6 +523,89 @@ impl Session for BurrmillSession {
             rows: out,
             columns,
             truncated,
+            ipc: None,
+        })
+    }
+
+    fn collect_ipc(&self, sql: &str, cap: Option<(usize, usize)>) -> Result<Collected, Died> {
+        use arrow::ipc::writer::StreamWriter;
+        let (max_rows, max_bytes) = cap.unwrap_or((usize::MAX, usize::MAX));
+        let engine = self.reader();
+        let mut cost = crate::cost::asked().then(burrmill::QueryMetrics::default);
+        let mut writer: Option<StreamWriter<Vec<u8>>> = None;
+        let mut columns: Vec<String> = Vec::new();
+        let mut failed: Option<anyhow::Error> = None;
+        let (mut written, mut over) = (0usize, false);
+        let r = engine.sql_for_each_metered(sql, cost.as_mut(), |batch| {
+            let w = match &mut writer {
+                Some(w) => w,
+                None => match StreamWriter::try_new(Vec::new(), &batch.schema()) {
+                    Ok(w) => {
+                        columns = batch
+                            .schema()
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().clone())
+                            .collect();
+                        writer.insert(w)
+                    }
+                    Err(e) => {
+                        failed = Some(e.into());
+                        return Err(burrmill::BurrmillError::Cancelled);
+                    }
+                },
+            };
+            let mut start = 0;
+            while start < batch.num_rows() {
+                // A row past either cap exists, so the answer is truncated, exactly as JSON's is.
+                if written >= max_rows || w.get_ref().len() >= max_bytes {
+                    over = true;
+                    return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
+                }
+                let n = (batch.num_rows() - start)
+                    .min(ENCODE_ROWS)
+                    .min(max_rows - written);
+                if let Err(e) = w.write(&batch.slice(start, n)) {
+                    failed = Some(e.into());
+                    return Err(burrmill::BurrmillError::Cancelled);
+                }
+                start += n;
+                written += n;
+            }
+            Ok(())
+        });
+        if let Some(cost) = &cost {
+            crate::cost::engine(cost);
+        }
+        if let Some(e) = failed {
+            return Err(Died::Executing(e));
+        }
+        let truncated = match r {
+            Ok(()) => false,
+            Err(_) if over => true,
+            Err(e) => return Err(died(e)),
+        };
+        // No batch came: the plan's schema names the columns and opens the stream.
+        let mut w = match writer {
+            Some(w) => w,
+            None => {
+                let schema = engine
+                    .result_schema(sql)
+                    .map_err(|e| Died::Binding(engine_err(e)))?;
+                columns = schema.fields().iter().map(|f| f.name().clone()).collect();
+                StreamWriter::try_new(Vec::new(), &schema).map_err(|e| Died::Executing(e.into()))?
+            }
+        };
+        w.finish().map_err(|e| Died::Executing(e.into()))?;
+        let ipc = w.into_inner().map_err(|e| Died::Executing(e.into()))?;
+        Ok(Collected {
+            rows: Vec::new(),
+            columns,
+            truncated,
+            ipc: Some(crate::engine::Ipc {
+                bytes: ipc,
+                rows: written,
+            }),
         })
     }
 

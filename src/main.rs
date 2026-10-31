@@ -1156,6 +1156,7 @@ impl SqlBackend {
                     referenced_tables: None,
                     offchain: None,
                     scan_bound: None,
+                    ipc: None,
                 })
             }
         }
@@ -1382,6 +1383,7 @@ mod tests {
             referenced_tables: None,
             offchain: None,
             scan_bound: None,
+            ipc: None,
         }
     }
 
