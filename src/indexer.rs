@@ -27574,6 +27574,40 @@ rpc_urls = ["https://rpc.example"]
         );
     }
 
+    /// #2539: a seed that fails after it has fed an entity some of its history leaves that entity
+    /// unavailable, not available with part of an answer. Here the chain rows go in and the offchain
+    /// snapshot after them cannot be read.
+    #[test]
+    fn a_seed_that_fails_part_way_leaves_its_entity_unavailable() {
+        const ALICE: &str = "0x1111111111111111111111111111111111111111";
+        const BOB: &str = "0x2222222222222222222222222222222222222222";
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        drop_tiers(dir.path(), "first", BOB, "gold");
+        entity_fixture::write(dir.path(), BY_TIER_AND_TOTALS).unwrap();
+        let stored = vec![(
+            Store::entity_key(10, 0),
+            transfer_row(10, 0, ALICE, Some(BOB), "100"),
+        )];
+        store.commit_window(&stored, Some((11, "aa")), 11).unwrap();
+
+        let mut views = start_entities(dir.path(), &registry, true).unwrap();
+        // Bound against the snapshot as it was, then unreadable by the time the seed reaches it.
+        let catalogue = crate::offchain::load(dir.path()).unwrap();
+        std::fs::write(
+            crate::offchain::segment_path(dir.path(), &catalogue.tables["tiers"][0]),
+            b"not parquet",
+        )
+        .unwrap();
+        assert!(seed_entities(dir.path(), &store, &registry, &mut views, 11).is_err());
+        assert!(
+            view(&views, "by_tier").unavailable().is_some(),
+            "the entity whose seed failed must hold no answer rather than part of one"
+        );
+        assert!(view(&views, "totals").unavailable().is_some());
+    }
+
     const TOTALS: &str = "[[entities]]\nname='totals'\nkey=['to']\nmax_rows=100\n\
          query='SELECT \"to\", sum(value) AS v FROM usdc__transfer GROUP BY \"to\"'\n";
 
