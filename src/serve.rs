@@ -3598,6 +3598,7 @@ async fn graph_rows(
         None,
         historical_block,
         Some(graph_remaining(s.limits.timeout, started)),
+        false,
     )
     .await;
     let body = axum::body::to_bytes(resp.into_response().into_body(), byte_budget)
