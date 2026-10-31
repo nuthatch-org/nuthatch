@@ -412,3 +412,16 @@ numbered 3. Delivery across a failover is therefore at-least-once: a delivery th
 whose removal had not reached the follower is made again. Compatibility: an older follower cannot
 read the two ops, which is safe under the upgrade order the rolling-upgrade gate enforces, followers
 before the writer.
+
+**The parity run (§7), built.** `a_promoted_follower_ends_where_an_uninterrupted_writer_does` cuts a
+writer at three points (every row hot; just after a reorg; just after a seal), promotes its
+follower's copy into a fresh runtime, and lets the chain go on: whatever the old writer never saw,
+the reorg and the seal included, the promoted writer meets on its own. Each promoted store starts at
+the cut block (8, 9, 10), not block 0, and each ends with the same rows and count as a writer that
+indexed the whole chain uninterrupted. `promote_warm` now finds each segment with
+`seal::segment_path`, so it promotes a follower beside the writer as well as one on another host.
+
+Not done: the cut points are three chosen phases, not random generations, and the nest is a plain
+ERC-20, not a factory. A factory's child registry is a fold over stored factory events and a warm
+start rebuilds it (`rebuild_children`), so promotion carries what it needs; that is reasoned, not
+yet run.

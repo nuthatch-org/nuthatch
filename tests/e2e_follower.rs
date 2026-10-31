@@ -1646,3 +1646,116 @@ async fn torn_derived_state_is_not_served_until_rebuilt() {
     assert_eq!(ready["derived"]["state"], "ready", "{ready}");
     writer.stop(&root);
 }
+
+/// RFC-0078 S2's parity run: a writer killed at any point of a chain's life is replaced by one
+/// promoted from its follower's copy, and the replacement ends with exactly the rows a writer that
+/// was never interrupted ends with. Cut while every row is hot, just after a reorg, and just after
+/// a seal; whatever the chain does after the cut, the promoted writer meets on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_promoted_follower_ends_where_an_uninterrupted_writer_does() {
+    for cut in ["hot", "after a reorg", "after a seal"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let nest = |name: &str| {
+            let root = tmp.path().join(name);
+            let dir = root.join("data").join(ROUTE);
+            std::fs::create_dir_all(&dir).unwrap();
+            scaffold_nest(&dir, ROUTE, USDC);
+            root
+        };
+        let (old, promoted, reference) = (nest("old"), nest("promoted"), nest("reference"));
+        let via = tmp.path().join("follower-view");
+        std::os::unix::fs::symlink(&old, &via).unwrap();
+
+        let tape = Arc::new(TapeSource::new());
+        for b in 1..=8u64 {
+            let mut fx = block(b, 0, 100 * b as u128);
+            if b == 2 {
+                pad_address_to_seal(&mut fx, USDC, 1);
+            }
+            tape.insert_block(b, fx);
+        }
+        tape.advance_tip_to(8);
+        let reorg = |tape: &TapeSource| {
+            tape.reorg(
+                6,
+                vec![block(7, 1, 7_777), block(8, 1, 8_888), block(9, 1, 9_999)],
+            )
+        };
+        let seal = |tape: &TapeSource| {
+            tape.advance_finalized_to(2);
+            tape.insert_block(10, block(10, 0, 1_000));
+            tape.advance_tip_to(10);
+        };
+
+        let writer = Writer::start(&old, tape.clone(), 0);
+        writer.reaches(8).await;
+        let (follower, fbase) = bind_follower(&via, &writer).await;
+        agree(&writer, &fbase, ROWS, "before the cut").await;
+        if cut != "hot" {
+            reorg(&tape);
+            writer.reaches(9).await;
+        }
+        if cut == "after a seal" {
+            seal(&tape);
+            assert!(
+                wait_until(SEAL_POLL_TIMEOUT, || writer.store.sealed_through() >= 2).await,
+                "the writer seals"
+            );
+            writer.reaches(10).await;
+        }
+        agree(&writer, &fbase, ROWS, "at the cut").await;
+        writer.stop(&old);
+
+        let data = promoted.join("data").join(ROUTE);
+        assert!(
+            nuthatch::runtime::promote_warm(&follower, &promoted, &data, ROUTE).unwrap(),
+            "{cut}: the follower's copy is promoted"
+        );
+        follower.stop();
+        let at_cut = match cut {
+            "hot" => "8",
+            "after a reorg" => "9",
+            _ => "10",
+        };
+        {
+            let store = nuthatch::store::Store::open(&data.join("nuthatch.redb")).unwrap();
+            assert_eq!(
+                store.get_meta("last_block").unwrap().as_deref(),
+                Some(at_cut),
+                "{cut}: the promoted store starts where the old writer stopped, not at block 0"
+            );
+        }
+
+        // The chain goes on without anyone watching: what the old writer never saw, the promoted
+        // one must meet on its own, reorgs and seals included.
+        if cut == "hot" {
+            reorg(&tape);
+        }
+        if cut != "after a seal" {
+            seal(&tape);
+        }
+        for b in 11..=12u64 {
+            tape.insert_block(b, block(b, 0, 100 * b as u128));
+        }
+        tape.advance_tip_to(12);
+
+        let resumed = Writer::start(&promoted, tape.clone(), 0);
+        resumed.reaches(12).await;
+        let never_cut = Writer::start(&reference, tape.clone(), 0);
+        never_cut.reaches(12).await;
+        let (rbase, nbase) = (
+            format!("http://{}", resumed.addr),
+            format!("http://{}", never_cut.addr),
+        );
+        for q in [ROWS, COUNT] {
+            let (sa, a) = sql(&rbase, q).await;
+            let (sb, b) = sql(&nbase, q).await;
+            assert_eq!((sa, sb), (200, 200), "{cut}: {a} / {b}");
+            assert_eq!(answer(&a)["rows"], answer(&b)["rows"], "{cut}: {q}");
+        }
+        let rows = answer(&sql(&rbase, ROWS).await.1)["rows"].clone();
+        assert_eq!(rows.as_array().unwrap().len(), 12, "{cut}: {rows}");
+        resumed.stop(&promoted);
+        never_cut.stop(&reference);
+    }
+}

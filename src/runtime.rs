@@ -1883,7 +1883,7 @@ fn start_warm_standby(
 /// segments are the ones the follower verified, its catalogue and rows come from one applied
 /// generation, and the cursor resumes from the block after it. `false` when there is no copy, or the
 /// dataset already holds data of its own.
-fn promote_warm(
+pub fn promote_warm(
     follower: &crate::reader::Follower,
     dir: &Path,
     data: &Path,
@@ -1905,11 +1905,13 @@ fn promote_warm(
     if let Some(catalogue) = catalogue.as_deref() {
         let manifest: crate::seal::Manifest =
             serde_json::from_str(catalogue).context("the followed catalogue")?;
-        let from = follower.root().join(crate::seal::SEGMENTS_DIR);
+        // The follower's copy of the dataset: its cache on another host, the writer's own directory
+        // beside it. `segment_path` finds a segment in either.
+        let followed = follower.root().join(&key);
         let to = data.join(crate::seal::SEGMENTS_DIR);
         std::fs::create_dir_all(&to).with_context(|| format!("creating {}", to.display()))?;
         for segment in manifest.tables.values().flatten() {
-            let src = from.join(format!("{}.parquet", segment.hash));
+            let src = crate::seal::segment_path(&followed, &segment.file, &segment.hash);
             std::fs::copy(&src, to.join(&segment.file)).with_context(|| {
                 format!(
                     "copying the followed segment {} for mount '{route}'",
