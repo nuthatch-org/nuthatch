@@ -228,4 +228,12 @@ Otherwise JSON, as before, byte for byte.
 encoder equal to the JSON answer's rows, columns in order and envelope. `format=arrow` and `POST`
 answer it; a refusal is JSON. Every target, core, clippy and fmt pass.
 
-**Not yet.** `/q/{name}`, which runs its own admission and payment path; and `/explain`'s sample.
+**`/q/{name}`, built.** A declared query answers in Arrow by `Accept` alone: its query string carries
+the query's own parameters, and one may well be called `format`. `named_scan` passes the choice to
+the guard on the executing run only; the quote a paid query is offered plans without answering, so
+it is unchanged. `a_declared_query_answers_in_arrow_as_it_does_in_json` holds it over sealed and hot
+rows.
+
+**`/explain`, nothing to do.** §7's S1 row named "`/explain`'s result sample"; there is none.
+`/explain` plans the statement and answers with the plan and its columns, and materialises no row
+(`Want::Plan`), so it has nothing for Arrow to carry. S1 is complete with `/sql` and `/q/{name}`.
