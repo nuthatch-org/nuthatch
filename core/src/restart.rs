@@ -104,6 +104,18 @@ pub trait SeedEntity {
     fn seed_begin(&mut self);
     fn seed_chunk(&self, rows: &[DecodedRow], through: u64) -> Result<()>;
     fn seed_end(&self) -> Result<()>;
+    /// A seed failed after `begin`: whatever it folded is part of an answer, so it holds none again.
+    fn seed_abandon(&mut self);
+}
+
+/// Why a warm-started entity holds no answer until its seed completes.
+pub fn not_rebuilt(name: &str) -> String {
+    format!(
+        "entity `{name}` was not rebuilt after a restart: its state is derived and not persisted, \
+         and seeding it from this nest's sealed segments and hot tail (RFC-0041 §5.3) did not \
+         complete, so it holds no answer rather than part of one. The log says why; the next \
+         restart seeds it again."
+    )
 }
 
 /// Seed every warm-started entity from the nest's own stored history (RFC-0041 §5.3, #865).
@@ -132,35 +144,41 @@ pub fn seed_entities<E: SeedEntity>(
 
     for entity in entities.iter_mut() {
         entity.seed_begin();
-        // One sealed segment at a time, never the whole history at once (`tests/seed_scale.rs`:
-        // per segment held 694 MB against 993 MB for one window).
-        let mut sealed = 0usize;
-        for table in entity.chain_tables() {
-            let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
-                anyhow::bail!(TerminalFault(format!(
-                    "entity `{}` reads `{table}`, which this nest's registry does not describe",
-                    entity.name()
-                )))
-            };
-            rows_by_segment(
-                history,
-                &manifest,
-                table_schema,
-                sealed_through,
-                &mut |rows| {
-                    sealed += rows.len();
-                    entity.seed_chunk(&rows, through)
-                },
-            )?;
+        let seeded = (|| {
+            // One sealed segment at a time, never the whole history at once (`tests/seed_scale.rs`:
+            // per segment held 694 MB against 993 MB for one window).
+            let mut sealed = 0usize;
+            for table in entity.chain_tables() {
+                let Some(table_schema) = schema.iter().find(|t| t.table == table) else {
+                    anyhow::bail!(TerminalFault(format!(
+                        "entity `{}` reads `{table}`, which this nest's registry does not describe",
+                        entity.name()
+                    )))
+                };
+                rows_by_segment(
+                    history,
+                    &manifest,
+                    table_schema,
+                    sealed_through,
+                    &mut |rows| {
+                        sealed += rows.len();
+                        entity.seed_chunk(&rows, through)
+                    },
+                )?;
+            }
+            entity.seed_chunk(&hot, through)?;
+            offchain(entity)?;
+            tracing::info!(
+                "entity `{}` seeding from {sealed} sealed and {} hot row(s) through block {through}",
+                entity.name(),
+                hot.len(),
+            );
+            entity.seed_end()
+        })();
+        if seeded.is_err() {
+            entity.seed_abandon();
         }
-        entity.seed_chunk(&hot, through)?;
-        offchain(entity)?;
-        tracing::info!(
-            "entity `{}` seeding from {sealed} sealed and {} hot row(s) through block {through}",
-            entity.name(),
-            hot.len(),
-        );
-        entity.seed_end()?;
+        seeded?;
     }
     Ok(())
 }

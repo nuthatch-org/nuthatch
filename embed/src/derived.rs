@@ -57,16 +57,8 @@ impl TabEntity {
                 decl.name
             ));
         }
-        // The node's reason, as `EntityView::start_bound` gives it, until a seed clears it.
-        let unavailable = warm.then(|| {
-            format!(
-                "entity `{}` was not rebuilt after a restart: its state is derived and not \
-                 persisted, and seeding it from this nest's sealed segments and hot tail (RFC-0041 \
-                 §5.3) did not complete, so it holds no answer rather than part of one. The log \
-                 says why; the next restart seeds it again.",
-                decl.name
-            )
-        });
+        // The node's reason, until a seed clears it.
+        let unavailable = warm.then(|| nuthatch_core::restart::not_rebuilt(&decl.name));
         // The node's allowance and its default sampling interval (`entity_view::state_sample_interval`).
         let limits = Limits {
             max_rows: decl.max_rows,
@@ -206,6 +198,10 @@ impl nuthatch_core::restart::SeedEntity for TabEntity {
             return Err(anyhow!("seeding entity `{}` faulted: {why}", self.name));
         }
         Ok(())
+    }
+
+    fn seed_abandon(&mut self) {
+        self.unavailable = Some(nuthatch_core::restart::not_rebuilt(&self.name));
     }
 }
 
