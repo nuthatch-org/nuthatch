@@ -20135,6 +20135,72 @@ template = "pool"
         }
     }
 
+    /// A nest that seals every finalized block, and two transfers at block 10 for it to seal.
+    async fn a_sealing_nest(
+        d: &std::path::Path,
+    ) -> (NestIngest, Arc<dyn Source>, Vec<crate::rpc::Log>) {
+        let mut nest = build_test_nest(d, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
+        nest.seal_span = 1;
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        (nest, source, vec![transfer_log(10, 0), transfer_log(10, 1)])
+    }
+
+    /// #2508, the per-window publish alone: a request between a window's commit and its seal reads
+    /// that window. The seal-time and idle republishes both come later, so neither can stand in.
+    #[tokio::test]
+    async fn a_window_is_published_before_its_seal() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut nest, source, logs) = a_sealing_nest(d.path()).await;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let (snapshots, during) = (nest.publisher.snapshots.clone(), seen.clone());
+        probe_before_the_next_prune(move || {
+            let rows = snapshots
+                .load_full()
+                .map(|s| s.store.entities_in_range(10, 10).unwrap().len());
+            *during.lock().unwrap() = Some(rows);
+        });
+        nest.process_window(source.as_ref(), &logs, 10, 10, 10_000)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+
+        let seen = seen.lock().unwrap().take();
+        assert!(seen.is_some(), "premise: the window sealed");
+        assert_eq!(
+            seen.flatten(),
+            Some(2),
+            "between the commit and the seal, requests must read the committed window"
+        );
+    }
+
+    /// #2508, the seal-time republish alone: once a window's seal returns, requests read the store
+    /// it left, before the nest is next idle. Read from the pin taken at the commit, the sealed rows
+    /// are still hot beside the segment that now holds them.
+    #[tokio::test]
+    async fn a_seal_is_published_before_the_nest_is_next_idle() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut nest, source, logs) = a_sealing_nest(d.path()).await;
+        nest.process_window(source.as_ref(), &logs, 10, 10, 10_000)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        assert!(
+            nest.store.sealed_through() >= 10,
+            "premise: the window sealed"
+        );
+
+        let snap = nest.publisher.snapshots.load_full().expect("a snapshot");
+        assert_eq!(
+            snap.store.sealed_through(),
+            nest.store.sealed_through(),
+            "requests must read the seal's watermark"
+        );
+        assert!(
+            snap.store.entities_in_range(10, 10).unwrap().is_empty(),
+            "requests must not read sealed rows as hot"
+        );
+    }
+
     /// The checkpoint hash is a second call, after the logs. If `to` was replaced between them,
     /// the fork's rows must not commit under the hash the chain has now.
     struct MovedTip {
