@@ -106,6 +106,27 @@ pub fn feed_subscribe(store: &Store) -> Result<crate::feed::Subscription> {
     Ok(crate::feed::Subscription { snapshot, deltas })
 }
 
+/// RFC-0078 §5.4: write a follower's copy into a store that holds nothing, in one transaction, so a
+/// promoted standby's store holds exactly the rows the writer had committed when the copy was taken.
+pub fn import_mirrored(store: &Store, tables: &crate::feed::MirroredTables) -> Result<()> {
+    let wtx = store.database().begin_write()?;
+    {
+        let [entities, meta, blocks] = FEED_TABLES;
+        for ((_, table, _), rows) in [
+            (entities, &tables.entities),
+            (meta, &tables.meta),
+            (blocks, &tables.blocks),
+        ] {
+            let mut t = wtx.open_table(table)?;
+            for (k, v) in rows {
+                t.insert(k.as_str(), v.as_str())?;
+            }
+        }
+    }
+    wtx.commit()?;
+    Ok(())
+}
+
 /// [`feed_subscribe`] writing the snapshot to `out` as JSON while its read transaction iterates, so
 /// no copy of it, decoded or encoded, is ever whole. The same bytes as serialising
 /// [`feed_subscribe`]'s snapshot.
@@ -167,5 +188,41 @@ fn feed_begin(store: &Store) -> Result<(FeedDeltas, redb::ReadTransaction, crate
             ..Default::default()
         };
         return Ok((deltas, rtx, snapshot));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC-0078 §5.4: a promoted standby's store holds the same mirrored rows as the writer's.
+    #[test]
+    fn importing_a_followed_copy_reproduces_the_writers_tables() {
+        let a = tempfile::tempdir().unwrap();
+        let writer = Store::open(&a.path().join("w.redb")).unwrap();
+        let rows: Vec<(String, String)> = (1..=5)
+            .map(|n| {
+                (
+                    Store::entity_key(n, 0),
+                    format!(r#"{{"table":"t","block_number":{n}}}"#),
+                )
+            })
+            .collect();
+        writer.commit_window(&rows, Some((5, "0xaa")), 5).unwrap();
+        writer.set_meta("sealed_through", "0").unwrap();
+        writer.claim("old-writer").unwrap();
+        let copy = crate::feed::MirroredTables::of(&feed_subscribe(&writer).unwrap().snapshot);
+
+        let b = tempfile::tempdir().unwrap();
+        let promoted = Store::open(&b.path().join("p.redb")).unwrap();
+        import_mirrored(&promoted, &copy).unwrap();
+        let again = crate::feed::MirroredTables::of(&feed_subscribe(&promoted).unwrap().snapshot);
+        assert_eq!(again, copy);
+        assert_eq!(promoted.count().unwrap(), 5);
+        assert_eq!(
+            promoted.current_fence().unwrap(),
+            0,
+            "the old writer's fence is not carried"
+        );
     }
 }

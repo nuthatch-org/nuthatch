@@ -13,6 +13,8 @@
 #      mirror's lease must still be B's.
 #   5. C, configured `standby = true`, waits while B holds the lease. B is killed with SIGKILL, and C
 #      takes the lease at fence 3 and answers the transfers with no operator action (RFC-0078 S2).
+#   6. D, a standby that follows C's feed while it waits, is promoted from C's hot state when C is
+#      killed: it takes fence 4 and answers from the copy it held, not from the chain.
 #
 # Exit 0 PASS; 1 FAIL; 2 setup fault. The run's logs stay in FAILOVER_OUT (default: a temp dir).
 set -euo pipefail
@@ -103,13 +105,34 @@ cat >>"$rt/mounts.toml" <<EOF
 [runtime.publish]
 target = "$mirror"
 interval = "1s"
+followers = true
 
 [runtime.publish.failover]
 term = "${TERM_SECS}s"
 EOF
+registry=$out/registry
+nid=$(ls "$rt/data" | head -n 1)
+[ -n "$nid" ] || die "migrate left no dataset under $rt/data"
+"$bin" nest bundle "$rt/data/$nid" --out "$out/gate.bundle" >"$out/bundle.log" 2>&1 \
+  || die "bundle failed: $(tail -n 5 "$out/bundle.log")"
+"$bin" nest publish "$out/gate.bundle" --registry "$registry" >"$out/publish.log" 2>&1 \
+  || die "nest publish failed: $(tail -n 5 "$out/publish.log")"
+NUTHATCH_ADMIN_TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+export NUTHATCH_ADMIN_TOKEN
+
+a_port=$(free_port)
+b_port=$(free_port)
+c_port=$(free_port)
+d_port=$(free_port)
 cp -R "$rt" "$out/b"
 cp -R "$rt" "$out/c"
 echo "standby = true" >>"$out/c/mounts.toml"
+cp -R "$rt" "$out/d"
+{
+  echo "standby = true"
+  echo "follow = \"http://127.0.0.1:$c_port\""
+  echo "registry = \"$registry\""
+} >>"$out/d/mounts.toml"
 
 start_writer() { # <dir> <port> <log>
   "$bin" dev --dir "$1" --listen "127.0.0.1:$2" --poll-interval 1s >>"$out/$3.log" 2>&1 &
@@ -124,7 +147,6 @@ lease_field() { # <field>
   grep -Eo "\"$1\":(\"[^\"]*\"|[0-9]+|null)" "$f" | head -n 1 | cut -d: -f2- | tr -d '"'
 }
 
-a_port=$(free_port)
 a=$(start_writer "$rt" "$a_port" writer-a)
 pids="$pids $a"
 a_ready() { json_get "http://127.0.0.1:$a_port/ready" >/dev/null; }
@@ -143,7 +165,6 @@ a_owner=$(lease_field owner)
 say "ok: writer A holds the lease at fence 1 as $a_owner"
 
 # 2. A second writer while A renews: refused, naming A.
-b_port=$(free_port)
 b=$(start_writer "$out/b" "$b_port" writer-b-refused)
 t=0
 while kill -0 "$b" 2>/dev/null; do
@@ -183,7 +204,6 @@ sleep $((TERM_SECS * 2))
   || fail "the lease moved after A resumed: $(cat "$(lease_file)")"
 
 # 5. A standby waits while B holds the lease, and takes over when B is killed.
-c_port=$(free_port)
 c=$(start_writer "$out/c" "$c_port" writer-c)
 pids="$pids $c"
 sleep $((TERM_SECS * 3))
@@ -203,4 +223,27 @@ c_answers() {
 }
 wait_for "standby C answers $TRANSFERS transfers" c_answers
 say "takeover: $(($(date +%s) - killed_at))s from SIGKILL to the standby's first full answer (term ${TERM_SECS}s)"
-say "PASS: one writer at every fence, the paused one stopped on waking, and a standby took over from a killed one"
+
+# 6. A standby that follows C while it waits is promoted from C's hot state when C is killed.
+d=$(start_writer "$out/d" "$d_port" writer-d)
+pids="$pids $d"
+d_following() { grep -q "standby: following" "$out/writer-d.log"; }
+wait_for "standby D follows C" d_following
+sleep $((TERM_SECS * 3))
+kill -0 "$d" 2>/dev/null || fail "standby D exited while C held the lease: $(tail -n 5 "$out/writer-d.log")"
+killed_at=$(date +%s)
+kill -9 "$c"
+say "writer C killed"
+d_holds() { [ "$(lease_field fence)" = 4 ]; }
+wait_for "standby D takes the lease at fence 4" d_holds
+d_answers() {
+  local n
+  n=$(json_get "http://127.0.0.1:$d_port/gate/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20$table" \
+    | sed -n 's/.*"rows":\[{"n":\([0-9]*\)}\].*/\1/p')
+  [ "$n" = "$TRANSFERS" ]
+}
+wait_for "standby D answers $TRANSFERS transfers" d_answers
+grep -q "promoted the followed copy" "$out/writer-d.log" \
+  || fail "D answered but was not promoted from C's copy: $(grep -E 'seeded|promoted|lease' "$out/writer-d.log" | tail -n 5)"
+say "warm takeover: $(($(date +%s) - killed_at))s from SIGKILL to the promoted standby's first full answer"
+say "PASS: one writer at every fence, the paused one stopped on waking, and standbys took over from killed writers, cold and warm"

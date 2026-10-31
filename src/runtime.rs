@@ -233,6 +233,14 @@ pub struct Failover {
     /// lapses (RFC-0078 S2). Every host may carry the same `mounts.toml`: the first writes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub standby: bool,
+    /// With `standby`: the writer to follow while waiting, so a takeover starts from its hot state
+    /// rather than the mirror's last seal (RFC-0078 §5.4). Needs `registry`, and the writer's
+    /// `followers = true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow: Option<String>,
+    /// The registry the writer's nests are published to, which the following standby installs from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<String>,
 }
 
 fn default_lease_term() -> String {
@@ -1756,6 +1764,7 @@ pub async fn take_writer_leases(
     default_tenant: &str,
 ) -> Result<Vec<WriterLease>> {
     use crate::lease;
+    let warm = start_warm_standby(dir, mounts, default)?;
     let mut out = Vec::new();
     for m in mounts {
         let canonical = mounts.iter().find(|first| first.nid == m.nid).unwrap_or(m);
@@ -1816,19 +1825,113 @@ pub async fn take_writer_leases(
             .await
             .with_context(|| format!("taking the writer lease for mount '{route}'"))?;
         tracing::info!("mount {route}: took the writer lease at fence {fence}");
-        seed_if_empty(
-            &MountTable::data_dir(dir, &m.nid),
-            &publish.target,
-            &identity,
-            &route,
-        )
-        .await?;
+        let data = MountTable::data_dir(dir, &m.nid);
+        let promoted = match &warm {
+            Some(follower) => promote_warm(follower, dir, &data, &route)?,
+            None => false,
+        };
+        if !promoted {
+            seed_if_empty(&data, &publish.target, &identity, &route).await?;
+        }
         out.push(WriterLease {
             route,
             lease: writer,
         });
     }
+    if let Some(follower) = warm {
+        follower.stop();
+        // Its segments were copied into each promoted dataset; the cache is now only disk.
+        let _ = std::fs::remove_dir_all(dir.join(".standby"));
+    }
     Ok(out)
+}
+
+/// The follower a waiting standby keeps beside it, when its failover names a writer to follow.
+fn start_warm_standby(
+    dir: &Path,
+    mounts: &[Mount],
+    default: Option<&MountPublish>,
+) -> Result<Option<Arc<crate::reader::Follower>>> {
+    let found = mounts.iter().find_map(|m| {
+        let publish = m.publish.as_ref().or(default)?;
+        let f = publish.failover.as_ref()?;
+        let follow = f.follow.as_ref().filter(|_| f.standby)?;
+        Some((publish, follow, f.registry.as_ref()))
+    });
+    let Some((publish, follow, registry)) = found else {
+        return Ok(None);
+    };
+    let registry = registry.context(
+        "a failover that follows the writer needs `registry`, where the writer's nests are published",
+    )?;
+    let token = std::env::var("NUTHATCH_ADMIN_TOKEN")
+        .context("a following standby reads the writer's feed with NUTHATCH_ADMIN_TOKEN")?;
+    let remote = crate::remote_follow::Remote::open(&publish.target, registry, DEFAULT_MAX_RSS_MB)?;
+    let cache = dir.join(".standby");
+    std::fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
+    tracing::info!("standby: following {follow} while the writer lease is held");
+    Ok(Some(crate::reader::Follower::start_remote(
+        cache,
+        follow.clone(),
+        token,
+        Arc::new(remote),
+        crate::reader::Options::default(),
+    )))
+}
+
+/// RFC-0078 §5.4's warm path: install the follower's copy of `data` as this writer's store. Its
+/// segments are the ones the follower verified, its catalogue and rows come from one applied
+/// generation, and the cursor resumes from the block after it. `false` when there is no copy, or the
+/// dataset already holds data of its own.
+fn promote_warm(
+    follower: &crate::reader::Follower,
+    dir: &Path,
+    data: &Path,
+    route: &str,
+) -> Result<bool> {
+    let db = data.join(crate::config::DB_FILE);
+    if crate::seed::holds_indexed_data(&db)? {
+        return Ok(false);
+    }
+    let key = crate::feed_http::dataset_key(dir, data);
+    let Some(crate::reader::PromotionCopy {
+        tables,
+        catalogue,
+        applied,
+    }) = follower.promotion_copy(&key)
+    else {
+        return Ok(false);
+    };
+    if let Some(catalogue) = catalogue.as_deref() {
+        let manifest: crate::seal::Manifest =
+            serde_json::from_str(catalogue).context("the followed catalogue")?;
+        let from = follower.root().join(crate::seal::SEGMENTS_DIR);
+        let to = data.join(crate::seal::SEGMENTS_DIR);
+        std::fs::create_dir_all(&to).with_context(|| format!("creating {}", to.display()))?;
+        for segment in manifest.tables.values().flatten() {
+            let src = from.join(format!("{}.parquet", segment.hash));
+            std::fs::copy(&src, to.join(&segment.file)).with_context(|| {
+                format!(
+                    "copying the followed segment {} for mount '{route}'",
+                    src.display()
+                )
+            })?;
+        }
+        crate::seal::install_manifest(data, &manifest)?;
+    }
+    let store = crate::store::Store::open(&db)?;
+    crate::store::import_mirrored(&store, &tables)?;
+    drop(store);
+    tracing::info!(
+        "mount {route}: promoted the followed copy at generation {}.{}, through block {}",
+        applied.0,
+        applied.1,
+        tables
+            .meta
+            .get(crate::indexer::LAST_BLOCK_KEY)
+            .map_or("none", String::as_str)
+    );
+    Ok(true)
 }
 
 /// Claim each leased route's store and renew its lease until it is lost, then fence the store off
@@ -7878,6 +7981,8 @@ mod tests {
             failover: Some(Failover {
                 term: "3s".into(),
                 standby: false,
+                follow: None,
+                registry: None,
             }),
         });
 

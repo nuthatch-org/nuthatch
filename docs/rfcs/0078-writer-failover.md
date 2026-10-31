@@ -379,3 +379,24 @@ blocks; on a real chain the replay of the unsealed gap adds to it, which is what
 **Not yet.** A waiting standby has no HTTP listener until it takes over, so `/ready` cannot say
 "standby"; a load balancer sees it as down, which is the truth for a writer that serves nothing yet.
 Warm promotion from a follower's hot state (§5.4), and the outbox on the feed (§5.5), are next.
+
+**Warm promotion, built.** A standby whose failover names `follow` (the writer's URL) and `registry`
+runs a remote follower while it waits, with the writer publishing `followers = true`. On taking the
+lease it installs the follower's copy as its own store: the segments the follower verified, copied
+into the dataset; the catalogue and the three mirrored tables, read from one applied version so rows
+and catalogue cannot come from different generations (`MemStore::promotion_copy`); the tables
+written in one transaction (`store::import_mirrored`). The follower is then stopped (`Follower::stop`,
+new: it had no way to end) and its cache removed. A dataset with no copy falls back to the cold seed.
+The old writer's fence and lease keys are not mirrored, so the promoted store starts unclaimed and is
+claimed at the new fence.
+
+**Measured.** `importing_a_followed_copy_reproduces_the_writers_tables`: a fresh store given a
+writer's copy subscribes to the same tables, with the writer's fence left behind. The gate's sixth
+step: D follows C, C is killed with SIGKILL, D takes fence 4, logs "promoted the followed copy ...
+through block 9", and is at the tip at block 9 at once, with no reindex. SIGKILL to D's first full
+answer: 5 s, as for the cold path, because the fixture chain is nine blocks and leaves nothing to
+replay. The difference shows only on a chain with an unsealed gap, which the gate does not have.
+
+**Still open in S2.** The outbox (§5.5): webhooks committed and not delivered when the writer dies
+are lost on takeover, cold or warm, because the outbox is not on the feed. And the randomised kill
+parity run of §7.

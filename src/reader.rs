@@ -580,6 +580,14 @@ impl std::io::Read for ChunkReader {
     }
 }
 
+/// What a standby promotes (RFC-0078 §5.4): the mirrored tables, the catalogue they pair with, and
+/// the `(epoch, generation)` they were applied at.
+pub struct PromotionCopy {
+    pub tables: crate::feed::MirroredTables,
+    pub catalogue: Option<std::sync::Arc<str>>,
+    pub applied: (u64, u64),
+}
+
 /// A running follower: its state, and the composition it serves.
 pub struct Follower {
     root: PathBuf,
@@ -605,6 +613,8 @@ pub struct Follower {
     unnamed: Mutex<HashMap<String, Instant>>,
     /// `--standby`: watch each dataset's writer lease and report when it could be taken over.
     standby: bool,
+    /// The follow and offchain loops, which [`Follower::stop`] ends.
+    tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
 /// How a follower is started.
@@ -676,6 +686,7 @@ impl Follower {
             ack: tokio::sync::Notify::new(),
             unnamed: Mutex::default(),
             standby: options.standby,
+            tasks: Default::default(),
             inner: Mutex::new(Inner {
                 pending: HashMap::new(),
                 fences: HashMap::new(),
@@ -708,11 +719,40 @@ impl Follower {
             resnapshot: Default::default(),
         });
         follower.recompose();
-        tokio::spawn(follower.clone().run());
+        let mut tasks = vec![tokio::spawn(follower.clone().run()).abort_handle()];
         if follower.remote.is_some() {
-            tokio::spawn(follower.clone().keep_offchain());
+            tasks.push(tokio::spawn(follower.clone().keep_offchain()).abort_handle());
         }
+        *follower.tasks.lock().unwrap() = tasks;
         follower
+    }
+
+    /// Stop following and let every copy go. A standby promoted to writer (RFC-0078 §5.4) must not
+    /// keep a second copy of the hot state, nor keep reconnecting to the writer it replaced.
+    pub fn stop(&self) {
+        for task in self.tasks.lock().unwrap().drain(..) {
+            task.abort();
+        }
+        let mut inner = self.lock();
+        inner.datasets.clear();
+        inner.pending.clear();
+    }
+
+    /// `dataset`'s copy as of one applied generation, for a standby to promote. `None` when nothing
+    /// has been applied.
+    pub fn promotion_copy(&self, dataset: &str) -> Option<PromotionCopy> {
+        let store = self.lock().datasets.get(dataset)?.store.clone();
+        let (tables, catalogue) = store.promotion_copy();
+        Some(PromotionCopy {
+            tables,
+            catalogue,
+            applied: store.applied(),
+        })
+    }
+
+    /// This follower's own directory, where a remote follower caches the segments it verified.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
     }
 
     /// The per-cursor budget in MiB: the runtime's `mounts.toml` beside the writer, the follower's

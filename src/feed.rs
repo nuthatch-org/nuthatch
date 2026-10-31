@@ -1280,6 +1280,19 @@ impl MemStore {
         Ok(out)
     }
 
+    /// The mirrored tables and the catalogue they pair with, read from one version, so a standby
+    /// promoting them never pairs rows with a catalogue from another generation (RFC-0078 §5.4).
+    pub fn promotion_copy(&self) -> (MirroredTables, Option<Arc<str>>) {
+        let m = self.read();
+        let all = |t: &Table| t.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let tables = MirroredTables {
+            entities: all(&m.entities),
+            meta: all(&m.meta),
+            blocks: all(&m.blocks),
+        };
+        (tables, m.catalogue.clone())
+    }
+
     /// Every mirrored table, for comparing a copy against the store it follows.
     pub fn tables(&self) -> MirroredTables {
         let m = self.read();
