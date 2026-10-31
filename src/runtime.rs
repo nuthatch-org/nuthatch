@@ -2412,6 +2412,7 @@ pub async fn dev(
     cors: Vec<String>,
     registry: Option<String>,
     max_bundle_mb: usize,
+    flight: Option<String>,
 ) -> Result<()> {
     // Before the mount table is even read: a malformed origin should fail the command, not the
     // fifteenth minute of a backfill.
@@ -2908,8 +2909,10 @@ pub async fn dev(
                 ..Default::default()
             },
         ));
+    let flight_app = service.clone();
     let result = tokio::select! {
         r = crate::serve::bind_and_serve(&listen, service, cors) => r,
+        r = crate::serve::flight_beside(flight, flight_app) => r,
         r = supervise_cursors(&mut ingests, &mut cursor_intake, &health, fail_fast) => r,
     };
     for (_, h) in &ingests {
@@ -11605,6 +11608,7 @@ mod tests {
                 Vec::new(),
                 None,
                 DEFAULT_MAX_BUNDLE_MB,
+                None,
             ),
         )
         .await
@@ -11645,6 +11649,7 @@ mod tests {
                 Vec::new(),
                 None,
                 DEFAULT_MAX_BUNDLE_MB,
+                None,
             ),
         )
         .await

@@ -187,6 +187,11 @@ url = { version = "2", optional = true }
 # RFC-0069: `nuthatch watch` draws with ratatui. MIT, as is every crate it adds.
 ratatui = { version = "0.30.2", optional = true, default-features = false, features = ["crossterm", "layout-cache"] }
 
+# RFC-0079 S2's Flight SQL, behind the `flight` feature.
+arrow-flight = { version = "59", features = ["flight-sql"], optional = true }
+tonic = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true }
+
 [features]
 # The S3 registry ships **on**. It was off by default until 2026-07-28, which meant the released
 # binary and the container image answered `--registry s3://…` with "needs a build with
@@ -198,6 +203,9 @@ default = ["object-store", "watch"]
 # RFC-0069: `nuthatch watch`, a read-only view of a running nest. On by default, so the binary the
 # README shows is the one that ships; `--no-default-features` removes it and nothing else.
 watch = ["dep:ratatui"]
+# RFC-0079 S2: Arrow Flight SQL beside the HTTP API (`dev --flight <addr>`). Off by default: it is a
+# second port and a gRPC stack, about 0.9 MB and eight crates; without it the binary is unchanged.
+flight = ["dep:arrow-flight", "dep:tonic", "dep:prost"]
 # Object-store (S3-compatible) nest-registry backend (RFC-0019 slice 2). Kept as a named feature so a
 # build that genuinely wants it gone can `--no-default-features`.
 object-store = ["dep:object_store", "dep:url"]

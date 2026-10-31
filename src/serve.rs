@@ -663,6 +663,21 @@ pub async fn run(
     run_shared(listen, SharedNest::new(state), cors).await
 }
 
+/// Serve Arrow Flight SQL over `app` on `listen` (RFC-0079 S2), beside the HTTP API; with no address,
+/// a future that never resolves, so it can sit in the same `select!` as the listener.
+pub async fn flight_beside(listen: Option<String>, app: Router) -> Result<()> {
+    match listen {
+        #[cfg(feature = "flight")]
+        Some(addr) => crate::flight::Service::new(app).serve(&addr).await,
+        #[cfg(not(feature = "flight"))]
+        Some(_) => {
+            let _ = app;
+            anyhow::bail!("--flight needs a build with the `flight` feature")
+        }
+        None => std::future::pending().await,
+    }
+}
+
 /// Serve a caller-held [`SharedNest`] - the variant a hot upgrade uses so it can keep the handle and
 /// atomically flip the backing (RFC-0020 slice 2b) while serving stays up on the same listener.
 pub async fn run_shared(
@@ -10576,6 +10591,64 @@ mod tests {
             o.remove("cached");
         }
         assert_eq!(envelope, expected);
+    }
+
+    /// RFC-0079 S2: a Flight SQL client gets `/sql`'s rows, through `/sql`'s own handler, and a
+    /// statement `/sql` refuses is refused, not answered.
+    #[cfg(feature = "flight")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flight_sql_client_gets_the_rows_sql_answers() {
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = table_fixture(tmp.path(), 1..=3, 4..=6);
+        state.store.set_meta("sealed_through", "3").unwrap();
+        let addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let service = crate::flight::Service::new(router(SharedNest::new(state.clone())));
+        tokio::spawn(async move { service.serve(&addr.to_string()).await });
+        let channel = loop {
+            match tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+                .unwrap()
+                .connect()
+                .await
+            {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let mut client = FlightSqlServiceClient::new(channel);
+
+        let q = "SELECT block_number, v FROM t ORDER BY block_number";
+        let info = client.execute(q.to_string(), None).await.unwrap();
+        let ticket = info.endpoint[0].ticket.clone().unwrap();
+        let batches: Vec<_> =
+            futures::TryStreamExt::try_collect(client.do_get(ticket).await.unwrap())
+                .await
+                .unwrap();
+        let mut rows = Vec::new();
+        for batch in &batches {
+            rows.extend(burrmill::df::encode::rows(batch).unwrap());
+        }
+        let (_, json_body) = send(&state, &format!("/sql?q={}", url_encode(q)), None).await;
+        let json: Value = serde_json::from_slice(&json_body).unwrap();
+        assert_eq!(json["count"], 6, "premise: sealed and hot rows: {json}");
+        assert_eq!(json!(rows), json["rows"]);
+
+        let refused = client
+            .execute("SELECT no_such_column FROM t".to_string(), None)
+            .await
+            .unwrap();
+        let ticket = refused.endpoint[0].ticket.clone().unwrap();
+        let err = match client.do_get(ticket).await {
+            Ok(stream) => futures::TryStreamExt::try_collect::<Vec<_>>(stream)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+        assert!(err.is_some_and(|e| e.contains("no_such_column")));
     }
 
     /// A refusal is decided before any batch, and stays in the JSON envelope every client handles.

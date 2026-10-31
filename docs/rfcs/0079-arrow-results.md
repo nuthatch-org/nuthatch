@@ -237,3 +237,36 @@ rows.
 **`/explain`, nothing to do.** §7's S1 row named "`/explain`'s result sample"; there is none.
 `/explain` plans the statement and answers with the plan and its columns, and materialises no row
 (`Want::Plan`), so it has nothing for Arrow to carry. S1 is complete with `/sql` and `/q/{name}`.
+
+## 14. S2 built (2026-10-31): Flight SQL behind `flight`
+
+`cargo build --features flight` gives `dev --flight <addr>`, a Flight SQL service beside the HTTP API,
+on a runtime and on a single nest alike. Without the feature the binary is the binary before: no
+flag in `dev --help`, the CLI reference unchanged (`tests/skill_refs.rs`), nothing new linked.
+
+**One door, not two.** `DoGet` answers a statement by sending it through the same composed router as
+`POST /<route>/sql`, asking for Arrow, with the caller's `authorization` passed on. Admission, the
+caps, strict isolation, the cost meter and the response-bytes accounting are `/sql`'s own, and so is
+every refusal, which comes back as a gRPC status carrying `/sql`'s JSON error. The envelope rides as
+the `x-nuthatch-answer` response header, as on HTTP. A router layer `bind_and_serve` adds was checked:
+it adds CORS and a shutdown marker, neither of which `/sql` relies on.
+
+**Departures from §5.2.**
+
+1. *The route is a request header*, `x-nuthatch-route`, and absent means `/sql` at the root. A Flight
+   SQL statement has no catalogue field, so §5.2's "one catalog per route" would have needed
+   `GetCatalogs` and a client that sets one; a header works with every client that can set metadata.
+2. *`GetFlightInfo` runs nothing and its schema is empty.* The ticket carries the route and the
+   statement, so nothing is held between the two calls, as §5.2 asked. Filling the schema would mean
+   running the statement there and keeping its answer until `DoGet`; the stream's own schema is the
+   answer's.
+3. *`GetCatalogs`, `GetDbSchemas`, `GetTables` and `GetSqlInfo` answer `Unimplemented`* in this slice.
+   Statements are what a client needs to query; the catalogue calls are for a browsing client such as
+   DBeaver, and follow.
+
+**Tested.** `a_flight_sql_client_gets_the_rows_sql_answers` (with `--features flight`): arrow-flight's
+own `FlightSqlServiceClient` against an in-process service over the serve fixture, sealed and hot
+rows. Its batches, encoded as `/sql` encodes rows, equal `/sql`'s JSON rows; a statement naming a
+missing column is refused with that column named. Every target with and without `flight`, clippy on
+the default build, on `flight` and on the nightly's features, fmt, and `cargo deny --all-features`
+(bans, licences) pass. Not run: ADBC, JDBC, DBeaver and `pyarrow.flight` against it, which §8 names.

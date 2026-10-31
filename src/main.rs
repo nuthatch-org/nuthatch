@@ -141,6 +141,7 @@ async fn main() -> Result<()> {
                 if !args.trace_rpc.is_empty() {
                     anyhow::bail!("--trace-rpc serves an address-history nest, which runs alone, not in a runtime");
                 }
+                let flight = args.flight();
                 runtime::dev(
                     dir,
                     args.listen,
@@ -162,6 +163,7 @@ async fn main() -> Result<()> {
                     args.cors,
                     args.registry,
                     args.max_bundle_mb,
+                    flight,
                 )
                 .await
             } else {
