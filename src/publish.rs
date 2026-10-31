@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::seal::{self, Manifest, Segment, MANIFEST_FILE};
@@ -603,6 +603,39 @@ fn fs_exclusive_lock(path: &Path) -> Result<FsExclusiveLock> {
         }
     }
     Ok(FsExclusiveLock { _file: file })
+}
+
+/// The first table `local` has sealed through fewer blocks than `remote`, as a sentence. Coverage, not
+/// hashes: two writers cut their seals at different blocks, so the same rows make different segments.
+fn behind_the_mirror(remote: Option<&[u8]>, local: &[u8]) -> Result<Option<String>> {
+    let Some(remote) = remote else {
+        return Ok(None);
+    };
+    let through = |m: &Manifest| -> BTreeMap<String, u64> {
+        m.tables
+            .iter()
+            .filter_map(|(t, segs)| {
+                let max = segs
+                    .iter()
+                    .filter(|s| !s.provisional)
+                    .map(|s| s.to_block)
+                    .max()?;
+                Some((t.clone(), max))
+            })
+            .collect()
+    };
+    let remote: Manifest = serde_json::from_slice(remote).context("corrupt remote catalogue")?;
+    let local: Manifest = serde_json::from_slice(local).context("corrupt local catalogue")?;
+    let mine = through(&local);
+    Ok(through(&remote).into_iter().find_map(|(table, theirs)| {
+        let have = mine.get(&table).copied();
+        (have < Some(theirs)).then(|| match have {
+            Some(have) => format!(
+                "this writer has sealed {table} through block {have} and the mirror through {theirs}"
+            ),
+            None => format!("this writer has sealed none of {table} and the mirror through {theirs}"),
+        })
+    }))
 }
 
 /// Refuse to move the catalogue unless the mirror's lease is still at `fence`. A writer that lost
@@ -1259,6 +1292,19 @@ async fn sync_pass(
             fence,
         )
         .await?;
+        // A writer that took over from behind must not shrink what the mirror has sealed.
+        if let Some(why) = behind_the_mirror(remote_bytes.as_deref(), &catalogue)? {
+            tracing::info!(
+                "publishing {data_identity}: {why}, so the catalogue waits until it catches up"
+            );
+            return Ok(SyncReport {
+                dataset: data_identity,
+                sealed_through: None,
+                uploaded,
+                uploaded_bytes,
+                skipped,
+            });
+        }
     }
     if remote_bytes.as_deref() != Some(catalogue.as_slice()) {
         mirror
@@ -2817,6 +2863,63 @@ abi = "abis/usdc.json"
             .await
             .unwrap();
         assert!(mirror.get(&catalogue).await.unwrap().is_some());
+    }
+
+    /// RFC-0078: a writer that took over from behind holds its catalogue until it covers what the
+    /// mirror has sealed. Without failover nothing changes: the publisher's catalogue is the mirror's.
+    #[tokio::test]
+    async fn a_failover_writer_behind_the_mirror_does_not_shrink_its_catalogue() {
+        let nest = sealed_nest();
+        let mirror_dir = tempfile::tempdir().unwrap();
+        let target = mirror_dir.path().display().to_string();
+        let (identity, ..) = identity_of(nest.path()).unwrap();
+        let mirror = open_mirror(&target).unwrap();
+        let lease = crate::lease::LeaseDoc {
+            owner: Some("taker".into()),
+            fence: 2,
+            term_secs: 10,
+            renewal: 1,
+        };
+        mirror
+            .put(
+                &crate::lease::lease_key(&identity),
+                &serde_json::to_vec(&lease).unwrap(),
+            )
+            .await
+            .unwrap();
+        let (_, local) = read_local(nest.path()).unwrap();
+        let mut ahead = local.clone();
+        for segs in ahead.tables.values_mut() {
+            for seg in segs.iter_mut() {
+                seg.to_block += 1_000;
+            }
+        }
+        let ahead = serde_json::to_vec_pretty(&ahead).unwrap();
+        let catalogue = format!("{identity}/{MANIFEST_FILE}");
+        mirror.put(&catalogue, &ahead).await.unwrap();
+
+        let mut taker = Present {
+            fence: Some(2),
+            ..Present::default()
+        };
+        sync_pass(nest.path(), &target, false, 1, None, &mut taker)
+            .await
+            .unwrap();
+        assert_eq!(
+            mirror.get(&catalogue).await.unwrap().unwrap(),
+            ahead,
+            "the mirror's coverage is kept"
+        );
+
+        let mut plain = Present::default();
+        sync_pass(nest.path(), &target, false, 1, None, &mut plain)
+            .await
+            .unwrap();
+        assert_ne!(
+            mirror.get(&catalogue).await.unwrap().unwrap(),
+            ahead,
+            "without failover the publisher's catalogue is the mirror's, as before"
+        );
     }
 
     #[tokio::test]

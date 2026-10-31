@@ -345,3 +345,15 @@ the mirror is a directory by default; `FAILOVER_MIRROR=s3://...` runs it against
 run found one thing the unit tests had not: a publisher that lost its lease kept retrying and
 dead-lettered itself. A lost lease is now `LostLease` at the mirror as well, and the publisher stops
 on it.
+
+**The §5.3 window, settled.** Working through it found a larger fault around it. A writer that takes
+over from behind (in S1 one indexes from scratch) published a catalogue smaller than the mirror's, and
+`put_if` accepted it, so the mirror's sealed history went backwards on every such takeover. A failover
+publisher now holds its catalogue until, for every table, it has sealed through at least the block the
+mirror's catalogue has (`a_failover_writer_behind_the_mirror_does_not_shrink_its_catalogue`). The
+comparison is coverage, not segment hashes, because two writers cut their seals at different blocks.
+Without failover nothing changes. With the guard the window is harmless. A lapsed writer that moves
+the catalogue between its lease read and its put publishes only rows it sealed past finality while
+it held the lease, which are the new writer's rows too. The new writer cannot shrink that coverage,
+and replaces those segments with its own once it has covered them. The one case left is a seal that
+a reorg later contradicts, which is a finality violation the cursor already quarantines.
