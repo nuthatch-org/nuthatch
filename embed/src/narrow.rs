@@ -202,8 +202,8 @@ pub async fn fetch(
     Ok(logs)
 }
 
-/// One filter's logs over `from..=to`. A range the endpoint will not answer whole is halved, and a
-/// throttle or a failed request is asked again after a rest, as the node's backfill does. A cursor
+/// One filter's logs over `from..=to`. A range the endpoint will not answer whole is halved, as is
+/// one that fails twice, and a throttle is asked again after a rest. A cursor
 /// window fails whole otherwise, and a narrowed nest asks for many filters a window.
 fn logs_of<'a>(
     source: &'a dyn Source,
@@ -218,8 +218,14 @@ fn logs_of<'a>(
                 Ok(logs) => return Ok(logs),
                 Err(e) => e,
             };
-            match class_of(&err) {
-                Some(FailureClass::Narrowable { .. }) if from < to => {
+            let class = class_of(&err);
+            // A failure that is not a throttle, asked again and failed again, is taken as the range
+            // being too much: arb1 answers a wide getLogs by an indexed argument with "log query
+            // timed out", and the same request over half the blocks with its logs.
+            let too_much = matches!(class, Some(FailureClass::Narrowable { .. }))
+                || (matches!(class, Some(FailureClass::Transient)) && tries >= 1);
+            match class {
+                _ if too_much && from < to => {
                     let mid = from + (to - from) / 2;
                     let mut logs = logs_of(source, filter, from, mid).await?;
                     logs.extend(logs_of(source, filter, mid + 1, to).await?);
