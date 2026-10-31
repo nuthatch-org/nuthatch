@@ -89,12 +89,13 @@ fn offline_passes_but_says_it_compared_nothing() {
     );
 }
 
+/// #2550: while the Jules reviewer is disabled its context is not required, so a list without it
+/// passes offline.
 #[test]
-fn a_file_missing_the_jules_context_fails_before_any_network() {
+fn a_file_without_the_jules_context_passes_offline() {
     let root = root_with("fmt · clippy · test\nbuild release\n");
     let (code, out) = run(root.path(), &["--offline"]);
-    assert_eq!(code, 1, "the external review gate is not optional:\n{out}");
-    assert!(out.contains("Jules approval"), "{out}");
+    assert_eq!(code, 0, "{out}");
 }
 
 /// The retired gate, asserted in the negative. Re-adding the context without re-adding the workflow
@@ -137,7 +138,7 @@ fn a_context_found_early_in_a_long_list_is_not_reported_missing() {
 /// The committed script and the committed list are the ones CI runs, so assert against them rather
 /// than only against fixtures - a fixture-only suite cannot see the real file drifting.
 #[test]
-fn the_committed_list_names_jules_and_not_the_retired_signature_context() {
+fn the_committed_list_does_not_name_the_retired_signature_context() {
     let listed: Vec<String> =
         std::fs::read_to_string(manifest().join(".github/required-checks.txt"))
             .expect("required-checks.txt")
@@ -151,7 +152,6 @@ fn the_committed_list_names_jules_and_not_the_retired_signature_context() {
         "the signature gate was retired and its workflow deleted; a required context with no job \
          behind it blocks every PR forever: {listed:?}"
     );
-    assert!(listed.iter().any(|l| l == "Jules approval"), "{listed:?}");
     let _: PathBuf = manifest().to_path_buf();
 }
 
