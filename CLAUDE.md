@@ -312,6 +312,12 @@ unconfigured.
 > `/profile`; S6 (rotki) waits for Lefteris to ask. A
 > blog post on what it is and how it works follows completion.
 >
+> **RFC-0081 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
+> [RFC-0081](docs/rfcs/0081-the-engine-in-use.md) (the engine in use) on 2026-10-31: what S7 had to
+> work round, fixed in the engine, plus `verify` for a hosted `/sql` answer. **Not started**: no slice
+> begins until Chief says, and S0 goes first. RFC-0077 §1a binds every slice, the binary is unchanged
+> in each, and no slice raises the module's size ceiling on its own.
+>
 > **RFC-0076 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
 > [RFC-0076](docs/rfcs/0076-scaling-the-shared-runtime.md) (scaling the shared runtime) on 2026-10-29,
 > GraphOps's follow-up requests: "yes. letsgooo". FR17 to FR19 are new capability in the default binary:
