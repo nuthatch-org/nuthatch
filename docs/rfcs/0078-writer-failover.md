@@ -357,3 +357,25 @@ the catalogue between its lease read and its put publishes only rows it sealed p
 it held the lease, which are the new writer's rows too. The new writer cannot shrink that coverage,
 and replaces those segments with its own once it has covered them. The one case left is a seal that
 a reorg later contradicts, which is a finality violation the cursor already quarantines.
+
+## 14. S2 in progress (2026-10-31): cold promotion
+
+**Built.** `[mounts.publish.failover] standby = true` makes a writer that finds the lease held wait
+for it, rather than refuse to start, and take it when it lapses. Every host may carry the same
+`mounts.toml`; the first to boot writes. A writer that takes a lease over a dataset it has never
+indexed seeds it from the mirror's seed snapshot first (§5.4's cold path, `seed_dataset`), so it
+follows on from the old writer's sealed history and the `_seed/` tail instead of block 0. A mirror
+with no snapshot is indexed from the start, as any new nest is. Seeding applies to every failover
+boot, standby or not.
+
+**Measured.** `a_standby_that_takes_a_dead_writers_lease_seeds_from_the_mirror`: a dead writer's
+lease is taken at fence 2 after its term and margin, and the standby then holds the old writer's
+sealed transfers, row for row. The gate's fifth step: C, a standby, waits while B renews, and once B
+is killed with SIGKILL it takes fence 3 and answers every transfer. From SIGKILL to C's first full
+answer: **5 s, both runs**, at a 3-second term, so the term plus margin of 4.5 s and a boot. At the
+default 10-second term that is about 16 s, inside goal 1's 30 s target. The fixture chain is nine
+blocks; on a real chain the replay of the unsealed gap adds to it, which is what warm promotion is for.
+
+**Not yet.** A waiting standby has no HTTP listener until it takes over, so `/ready` cannot say
+"standby"; a load balancer sees it as down, which is the truth for a writer that serves nothing yet.
+Warm promotion from a follower's hot state (§5.4), and the outbox on the feed (§5.5), are next.

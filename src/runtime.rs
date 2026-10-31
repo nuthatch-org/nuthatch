@@ -229,6 +229,10 @@ pub struct Failover {
     /// How long a lease lasts without a renewal; a standby takes over half as long again after.
     #[serde(default = "default_lease_term")]
     pub term: String,
+    /// Wait for a lease another writer holds, rather than refuse to start, and take it when it
+    /// lapses (RFC-0078 S2). Every host may carry the same `mounts.toml`: the first writes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub standby: bool,
 }
 
 fn default_lease_term() -> String {
@@ -1773,34 +1777,52 @@ pub async fn take_writer_leases(
         let key = lease::lease_key(&identity);
         let margin = term / 2;
         let poll = std::time::Duration::from_secs(1);
-        // A lease left by this writer's own last run lapses within the wait; one still renewed
-        // belongs to a live writer, and this host should be its standby instead.
-        let seen = match tokio::time::timeout(
-            term + margin + poll * 2,
-            lease::await_takeable(&*mirror, &key, margin, poll),
-        )
-        .await
-        {
-            Ok(seen) => seen,
-            Err(_) => {
-                let holder = lease::observe(&*mirror, &key).await.ok();
-                let by = holder
-                    .as_ref()
-                    .and_then(|o| o.doc())
-                    .and_then(|d| d.owner.clone())
-                    .unwrap_or_default();
-                bail!(
-                    "mount '{route}': the writer lease at {key} is held by {by}, who is still \
-                     renewing it. Start this host as a follower, or stop that writer first"
+        if failover.standby {
+            let held = lease::observe(&*mirror, &key).await?;
+            if let Some(by) = held.doc().and_then(|d| d.owner.clone()) {
+                tracing::info!(
+                    "mount {route}: standing by for the writer lease at {key}, held by {by}"
                 );
             }
+        }
+        // A lease left by this writer's own last run lapses within the wait; one still renewed
+        // belongs to a live writer, and this host should be its standby instead.
+        let wait = if failover.standby {
+            std::time::Duration::MAX
+        } else {
+            term + margin + poll * 2
         };
+        let seen =
+            match tokio::time::timeout(wait, lease::await_takeable(&*mirror, &key, margin, poll))
+                .await
+            {
+                Ok(seen) => seen,
+                Err(_) => {
+                    let holder = lease::observe(&*mirror, &key).await.ok();
+                    let by = holder
+                        .as_ref()
+                        .and_then(|o| o.doc())
+                        .and_then(|d| d.owner.clone())
+                        .unwrap_or_default();
+                    bail!(
+                        "mount '{route}': the writer lease at {key} is held by {by}, who is still \
+                     renewing it. Start this host as a follower, or stop that writer first"
+                    );
+                }
+            };
         let mut writer = lease::Lease::new(mirror, key, writer_id(), term);
         let fence = writer
             .take(&seen)
             .await
             .with_context(|| format!("taking the writer lease for mount '{route}'"))?;
         tracing::info!("mount {route}: took the writer lease at fence {fence}");
+        seed_if_empty(
+            &MountTable::data_dir(dir, &m.nid),
+            &publish.target,
+            &identity,
+            &route,
+        )
+        .await?;
         out.push(WriterLease {
             route,
             lease: writer,
@@ -1830,6 +1852,32 @@ pub fn hold_writer_leases(
             health.quarantine_nest(&route, stopped.to_string(), 0, None);
         });
     }
+    Ok(())
+}
+
+/// RFC-0078 §5.4: a writer that takes a lease over a dataset it has never indexed starts from the
+/// mirror's seed snapshot, not from the chain's first block. One the mirror holds no snapshot for
+/// indexes from the start, as any new nest does.
+async fn seed_if_empty(data: &Path, target: &str, identity: &str, route: &str) -> Result<()> {
+    if crate::seed::holds_indexed_data(&data.join(crate::config::DB_FILE))? {
+        return Ok(());
+    }
+    let mirror = crate::publish::open_mirror(target)?;
+    let snapshot = format!("{identity}/{}", crate::publish::SEED_FILE);
+    if mirror.get(&snapshot).await?.is_none() {
+        return Ok(());
+    }
+    let r = crate::seed::seed_dataset(data, target, &|_| {})
+        .await
+        .with_context(|| {
+            format!("seeding mount '{route}' from the mirror after taking its lease")
+        })?;
+    tracing::info!(
+        "mount {route}: seeded from the mirror through block {} ({} segments, {} fetched)",
+        r.complete_through,
+        r.segments,
+        r.fetched
+    );
     Ok(())
 }
 
@@ -7827,7 +7875,10 @@ mod tests {
             interval: "1h".into(),
             parallelism: 2,
             followers: false,
-            failover: Some(Failover { term: "3s".into() }),
+            failover: Some(Failover {
+                term: "3s".into(),
+                standby: false,
+            }),
         });
 
         let mut first = take_writer_leases(root.path(), &table.mounts, None, "default")

@@ -11,6 +11,8 @@
 #   3. A is frozen with SIGSTOP. B boots again, waits the lease out, and takes it at fence 2.
 #   4. A is resumed. It must find the lease taken, fence its store off and say so on /ready, and the
 #      mirror's lease must still be B's.
+#   5. C, configured `standby = true`, waits while B holds the lease. B is killed with SIGKILL, and C
+#      takes the lease at fence 3 and answers the transfers with no operator action (RFC-0078 S2).
 #
 # Exit 0 PASS; 1 FAIL; 2 setup fault. The run's logs stay in FAILOVER_OUT (default: a temp dir).
 set -euo pipefail
@@ -106,6 +108,8 @@ interval = "1s"
 term = "${TERM_SECS}s"
 EOF
 cp -R "$rt" "$out/b"
+cp -R "$rt" "$out/c"
+echo "standby = true" >>"$out/c/mounts.toml"
 
 start_writer() { # <dir> <port> <log>
   "$bin" dev --dir "$1" --listen "127.0.0.1:$2" --poll-interval 1s >>"$out/$3.log" 2>&1 &
@@ -177,4 +181,26 @@ wait_for "writer A's publisher stops" a_publisher_stopped
 sleep $((TERM_SECS * 2))
 [ "$(lease_field owner)" = "$b_owner" ] && [ "$(lease_field fence)" = 2 ] \
   || fail "the lease moved after A resumed: $(cat "$(lease_file)")"
-say "PASS: one writer at every fence, and the paused one stopped on waking"
+
+# 5. A standby waits while B holds the lease, and takes over when B is killed.
+c_port=$(free_port)
+c=$(start_writer "$out/c" "$c_port" writer-c)
+pids="$pids $c"
+sleep $((TERM_SECS * 3))
+kill -0 "$c" 2>/dev/null || fail "standby C exited while B held the lease: $(tail -n 5 "$out/writer-c.log")"
+grep -q "standing by for the writer lease" "$out/writer-c.log" || fail "C does not say it is standing by"
+[ "$(lease_field owner)" = "$b_owner" ] || fail "C took the lease while B renewed it"
+killed_at=$(date +%s)
+kill -9 "$b"
+say "writer B killed"
+c_holds() { [ "$(lease_field fence)" = 3 ]; }
+wait_for "standby C takes the lease at fence 3" c_holds
+c_answers() {
+  local n
+  n=$(json_get "http://127.0.0.1:$c_port/gate/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20$table" \
+    | sed -n 's/.*"rows":\[{"n":\([0-9]*\)}\].*/\1/p')
+  [ "$n" = "$TRANSFERS" ]
+}
+wait_for "standby C answers $TRANSFERS transfers" c_answers
+say "takeover: $(($(date +%s) - killed_at))s from SIGKILL to the standby's first full answer (term ${TERM_SECS}s)"
+say "PASS: one writer at every fence, the paused one stopped on waking, and a standby took over from a killed one"
