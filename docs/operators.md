@@ -1228,7 +1228,8 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
   `served_through`: per action family, the block up to which every watched account is answered
   without waiting, `null` before any is.
 - **A directory of chains**: `--dir` pointing at a directory of address-history nests, one per chain,
-  serves them all at one `/api`, routed by `chainid`.
+  serves them all at one `/api`, routed by `chainid`. `POST /api/watch` and `/api/unwatch` change every
+  chain, or only the one a `"chainid"` in the body names.
 - **What leaves the machine**: the RPC provider sees the watched addresses in its filters. History
   stays local; the provider's view of it does not.
 
