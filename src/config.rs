@@ -1275,6 +1275,20 @@ schema_version = 2
         assert!(err.contains("checksum"), "{err}");
     }
 
+    /// #2471: a nest whose RPCs come from the environment (`NUTHATCH_RPC_<chain id>`) leaves
+    /// `rpc_urls` out, and loads with none.
+    #[test]
+    fn a_nest_without_rpc_urls_loads_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[nest]\nname = \"base\"\nchain = \"base\"\nchain_id = 8453\n\n[address_history]\naddresses = []\n",
+        )
+        .unwrap();
+        let cfg = Config::load(dir.path()).unwrap();
+        assert!(cfg.nest.rpc_urls.is_empty());
+    }
+
     /// A pre-slice-4 nest - no `schema_version`, no `block_timestamps` - still loads as v1 with
     /// timestamps on. This is every nest in existence today, so it had better keep working.
     #[test]

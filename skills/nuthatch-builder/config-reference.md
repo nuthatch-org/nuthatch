@@ -18,7 +18,8 @@ name = "usdc"                 # nest name (also the default mount alias)
 chain = "mainnet"             # a registry name: mainnet | arbitrum-one | base | bsc | polygon |
                               #   gnosis | optimism | monad | robinhood
 chain_id = 1
-rpc_urls = ["https://…"]      # tried in order, then round-robin failover
+rpc_urls = ["https://…"]      # tried in order, then round-robin failover; optional when the run
+                              #   supplies them (--rpc, or NUTHATCH_RPC_<chain id>)
 schema_version = 1            # config/data layout version (managed by nuthatch)
 block_timestamps = true       # init-time only; false drops block_timestamp from every table
 
@@ -239,7 +240,8 @@ nest serves answers `NUTHATCH_UNSUPPORTED`. `POST /api/watch` and `/api/unwatch`
 `validator` only Ethereum's); one chain refusing does not stop the others, and the answer, failed if any
 chain refused, lists each chain's result, so a repeat converges them. `GET /api/watch` lists the union and, under `chains`, each chain's own list, `/ready` lists `chain_ids` and each
 chain's state, and `/metrics` labels each sample with `chain_id`. Each chain reads its RPCs from
-`NUTHATCH_RPC_<chain id>` and `NUTHATCH_TRACE_RPC_<chain id>`, else from its nest's `rpc_urls`;
+`NUTHATCH_RPC_<chain id>` and `NUTHATCH_TRACE_RPC_<chain id>`, else from its nest's `rpc_urls`, which a
+nest reading the environment can leave out; a chain with neither is refused at start, by name.
 `--rpc`, `--trace-rpc` and `--rpc-fallback` are refused there, because each names one chain's.
 
 `nuthatch diff` reads these rows too (RFC-0071 §19): the watched addresses' native value and internal
