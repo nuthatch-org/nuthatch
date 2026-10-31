@@ -930,6 +930,11 @@ pub(crate) mod tests {
     /// An RPC for the made-up chain `[0, head]`, finalized throughout, with empty block bodies.
     pub(crate) fn chain_rpc(head: u64) -> Fake {
         let chain = synthetic(0, head);
+        // Hashed once: rehashing the chain on every lookup made the mirror test take up to 900 s on CI (#2509).
+        let by_hash: std::collections::HashMap<B256, u64> = chain
+            .iter()
+            .map(|(h, _)| (h.hash_slow(), h.number))
+            .collect();
         Fake::new(move |m, p| {
             let block = |n: u64| {
                 let (h, ws) = &chain[n as usize];
@@ -948,10 +953,7 @@ pub(crate) mod tests {
                 },
                 "eth_getBlockByHash" => {
                     let want: B256 = serde_json::from_value(p[0].clone())?;
-                    chain
-                        .iter()
-                        .position(|(h, _)| h.hash_slow() == want)
-                        .map_or(Value::Null, |n| block(n as u64))
+                    by_hash.get(&want).map_or(Value::Null, |n| block(*n))
                 }
                 "eth_getBlockReceipts" => json!([]),
                 other => bail!("unexpected {other}"),
