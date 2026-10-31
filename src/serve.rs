@@ -4245,8 +4245,6 @@ async fn named_query_answer(
     args: std::collections::HashMap<String, String>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
-    #[cfg(not(feature = "counter"))]
-    let _ = &headers;
     use crate::metrics::METRICS;
     let Some(q) = s.surface.get(&name) else {
         METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Admission);
@@ -4279,7 +4277,7 @@ async fn named_query_answer(
         let resource = format!("/q/{name}");
         if !crate::counter::payment_verifies(counter, &headers) {
             // Unpaid: quote what the answer would read, or refuse a query that could not be served.
-            return match named_scan(&s, sql.clone(), None, false).await {
+            return match named_scan(&s, sql.clone(), None, false, false).await {
                 Ok(planned) => crate::counter::challenge(
                     counter,
                     &resource,
@@ -4304,7 +4302,9 @@ async fn named_query_answer(
             }
         }
     }
-    let run = match named_scan(&s, sql.clone(), pin, true).await {
+    // `Accept` alone asks for Arrow here: the query string carries the query's own parameters.
+    let arrow = wants_arrow(&headers, None);
+    let mut run = match named_scan(&s, sql.clone(), pin, true, arrow).await {
         Ok(run) => run,
         Err(failure) => {
             #[cfg(feature = "counter")]
@@ -4313,7 +4313,7 @@ async fn named_query_answer(
                     e.downcast_ref()
                 {
                     crate::metrics::METRICS.inc_named_scan_refused();
-                    let fresh = named_scan(&s, sql.clone(), None, false)
+                    let fresh = named_scan(&s, sql.clone(), None, false, false)
                         .await
                         .ok()
                         .map(|planned| planned.quote(counter));
@@ -4346,6 +4346,9 @@ async fn named_query_answer(
     if let Some(bound) = &run.out.scan_bound {
         crate::metrics::METRICS
             .observe_named_scan(bound.cold_bytes.saturating_add(bound.hot_bytes));
+    }
+    if let Some(ipc) = run.out.ipc.take() {
+        return arrow_response(&s, &run.out, ipc, &run.watermarks, run.provenance);
     }
     sql_response(
         &s,
@@ -4396,6 +4399,7 @@ async fn named_scan(
     sql: String,
     pin: Option<(Option<String>, u64)>,
     execute: bool,
+    arrow: bool,
 ) -> Result<NamedRun, NamedFailure> {
     use crate::analytics::{AdmissionRefusal, NamedAdmission, QueryGuard, ScanBound};
     let permit = s
@@ -4409,7 +4413,10 @@ async fn named_scan(
     let entities = s.entities.clone();
     let cap = s.limits.max_named_scan_bytes;
     let max_hot_rows = s.limits.max_hot_rows;
-    let guard = s.query_guard(s.limits.timeout, s.limits.max_rows);
+    let guard = QueryGuard {
+        arrow,
+        ..s.query_guard(s.limits.timeout, s.limits.max_rows)
+    };
     let hot_charge = s.hot_charge();
     let tenant = s.isolation.clone();
     crate::cost::spawn_blocking(move || -> anyhow::Result<NamedRun> {
@@ -10523,6 +10530,52 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         assert_eq!(headers["content-type"], ARROW_STREAM);
         assert_eq!(json!(arrow_rows(&ipc).0), json["rows"]);
+    }
+
+    /// `/q/{name}` answers in Arrow by `Accept` as `/sql` does: the declared query's rows and envelope.
+    #[tokio::test]
+    async fn a_declared_query_answers_in_arrow_as_it_does_in_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = table_fixture(tmp.path(), 1..=3, 4..=6);
+        state.store.set_meta("sealed_through", "3").unwrap();
+        state.surface = Arc::new(crate::allowlist::Surface {
+            access: crate::allowlist::SqlAccess::Allowlist,
+            queries: vec![crate::allowlist::NamedQuery {
+                name: "since".into(),
+                sql: "SELECT block_number, v FROM t WHERE block_number >= {from} ORDER BY block_number"
+                    .into(),
+                params: [("from".to_string(), crate::allowlist::ParamType::Int)].into(),
+            }],
+        });
+        let uri = "/q/since?from=2";
+        let (code, json_body) = send(&state, uri, None).await;
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&json_body)
+        );
+        let json: Value = serde_json::from_slice(&json_body).unwrap();
+        assert_eq!(
+            json["count"], 5,
+            "premise: sealed and hot rows from block 2: {json}"
+        );
+
+        let (code, headers, ipc) = send_accepting(&state, uri, None, ARROW_STREAM).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(headers["content-type"], ARROW_STREAM);
+        let (rows, columns) = arrow_rows(&ipc);
+        assert_eq!(json!(rows), json["rows"]);
+        assert_eq!(json!(columns), json["columns"]);
+        let mut envelope: Value =
+            serde_json::from_str(headers[ANSWER_HEADER].to_str().unwrap()).unwrap();
+        let mut expected = json.clone();
+        for v in [&mut envelope, &mut expected] {
+            let o = v.as_object_mut().unwrap();
+            o.remove("rows");
+            o.remove("cached");
+        }
+        assert_eq!(envelope, expected);
     }
 
     /// A refusal is decided before any batch, and stays in the JSON envelope every client handles.
