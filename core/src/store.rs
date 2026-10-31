@@ -304,6 +304,12 @@ pub trait HotStore: Send + Sync {
     /// The fence *this handle* believes it holds; `0` when it has never claimed.
     fn held_fence(&self) -> u64;
 
+    /// Move the store's fence past the one every handle holds, so each later write is refused with
+    /// `LostOwnership`. How a writer that lost a lease held elsewhere stops itself (RFC-0078 §5.2).
+    fn fence_off(&self) -> Result<()> {
+        anyhow::bail!("this store cannot fence itself off")
+    }
+
     // ---- delivery outbox --------------------------------------------------------------------
     fn outbox_push(&self, payload: &str) -> Result<u64>;
     fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>>;
@@ -510,6 +516,9 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     }
     fn held_fence(&self) -> u64 {
         (**self).held_fence()
+    }
+    fn fence_off(&self) -> Result<()> {
+        (**self).fence_off()
     }
     fn outbox_push(&self, payload: &str) -> Result<u64> {
         (**self).outbox_push(payload)

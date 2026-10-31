@@ -321,6 +321,7 @@ async fn a_running_nest_publishes_a_snapshot_another_can_seed_from() {
             interval: std::time::Duration::from_millis(200),
             parallelism: 2,
             followers: false,
+            writer_fence: None,
         },
     )
     .expect("the publisher starts");

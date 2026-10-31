@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::seal::{self, Manifest, Segment, MANIFEST_FILE};
@@ -443,26 +443,20 @@ impl Mirror for ObjMirror {
                 )
                 .await
                 .map_err(|e| match e {
-                    object_store::Error::AlreadyExists { .. } => anyhow::anyhow!(
-                        "refusing to publish {key}: it already exists (another publisher holds this dataset)"
-                    ),
+                    object_store::Error::AlreadyExists { .. } => cas_conflict(format!("refusing to publish {key}: it already exists (another publisher holds this dataset)")),
                     other => anyhow::Error::new(other).context(key.to_string()),
                 })
                 .map(|_| ()),
             Some(exp) => {
                 let got = self.inner.get(&loc).await.map_err(|e| match e {
-                    object_store::Error::NotFound { .. } => anyhow::anyhow!(
-                        "refusing to publish {key}: expected an existing catalogue and found none"
-                    ),
+                    object_store::Error::NotFound { .. } => cas_conflict(format!("refusing to publish {key}: expected an existing catalogue and found none")),
                     other => anyhow::Error::new(other).context(key.to_string()),
                 })?;
                 let etag = got.meta.e_tag.clone();
                 let version = got.meta.version.clone();
                 let body = got.bytes().await.context("reading catalogue for CAS")?;
                 if body.as_ref() != exp {
-                    bail!(
-                        "refusing to publish {key}: the remote catalogue changed since this run started"
-                    );
+                    return Err(cas_conflict(format!("refusing to publish {key}: the remote catalogue changed since this run started")));
                 }
                 self.inner
                     .put_opts(
@@ -478,9 +472,7 @@ impl Mirror for ObjMirror {
                     )
                     .await
                     .map_err(|e| match e {
-                        object_store::Error::Precondition { .. } => anyhow::anyhow!(
-                            "refusing to publish {key}: the remote catalogue changed since this run started"
-                        ),
+                        object_store::Error::Precondition { .. } => cas_conflict(format!("refusing to publish {key}: the remote catalogue changed since this run started")),
                         other => anyhow::Error::new(other).context(key.to_string()),
                     })
                     .map(|_| ())
@@ -613,19 +605,80 @@ fn fs_exclusive_lock(path: &Path) -> Result<FsExclusiveLock> {
     Ok(FsExclusiveLock { _file: file })
 }
 
-fn cas_bytes(current: Option<Vec<u8>>, expected: Option<&[u8]>, key: &str) -> Result<()> {
-    match (expected, current.as_deref()) {
-        (None, Some(_)) => bail!(
-            "refusing to publish {key}: it already exists (another publisher holds this dataset)"
-        ),
-        (Some(exp), Some(got)) if exp != got => {
-            bail!("refusing to publish {key}: the remote catalogue changed since this run started")
-        }
-        (Some(_), None) => {
-            bail!("refusing to publish {key}: expected an existing catalogue and found none")
-        }
-        _ => Ok(()),
+/// The first table `local` has sealed through fewer blocks than `remote`, as a sentence. Coverage, not
+/// hashes: two writers cut their seals at different blocks, so the same rows make different segments.
+fn behind_the_mirror(remote: Option<&[u8]>, local: &[u8]) -> Result<Option<String>> {
+    let Some(remote) = remote else {
+        return Ok(None);
+    };
+    let through = |m: &Manifest| -> BTreeMap<String, u64> {
+        m.tables
+            .iter()
+            .filter_map(|(t, segs)| {
+                let max = segs
+                    .iter()
+                    .filter(|s| !s.provisional)
+                    .map(|s| s.to_block)
+                    .max()?;
+                Some((t.clone(), max))
+            })
+            .collect()
+    };
+    let remote: Manifest = serde_json::from_slice(remote).context("corrupt remote catalogue")?;
+    let local: Manifest = serde_json::from_slice(local).context("corrupt local catalogue")?;
+    let mine = through(&local);
+    Ok(through(&remote).into_iter().find_map(|(table, theirs)| {
+        let have = mine.get(&table).copied();
+        (have < Some(theirs)).then(|| match have {
+            Some(have) => format!(
+                "this writer has sealed {table} through block {have} and the mirror through {theirs}"
+            ),
+            None => format!("this writer has sealed none of {table} and the mirror through {theirs}"),
+        })
+    }))
+}
+
+/// Refuse to move the catalogue unless the mirror's lease is still at `fence`. A writer that lost
+/// the lease has stopped committing, so what it would publish is rows the new writer also has; what
+/// must not happen is its catalogue replacing one the new writer published.
+async fn current_writer(mirror: &dyn Mirror, key: &str, fence: u64) -> Result<()> {
+    let seen = crate::lease::observe(mirror, key).await?;
+    let why = match seen.doc() {
+        Some(d) if d.fence == fence && d.owner.is_some() => return Ok(()),
+        Some(d) => format!("{key} is at fence {}", d.fence),
+        None => format!("{key} is missing"),
+    };
+    Err(anyhow::Error::new(crate::lease::LostLease { fence })
+        .context(format!("refusing to publish: {why}")))
+}
+
+/// A conditional put refused because the object is not what the caller expected: another writer
+/// has it. Typed, so a caller can tell a lost race from a failed request (RFC-0078 §5.1).
+#[derive(Debug)]
+pub(crate) struct CasConflict(pub(crate) String);
+
+impl std::fmt::Display for CasConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
+}
+
+impl std::error::Error for CasConflict {}
+
+fn cas_conflict(message: String) -> anyhow::Error {
+    anyhow::Error::new(CasConflict(message))
+}
+
+fn cas_bytes(current: Option<Vec<u8>>, expected: Option<&[u8]>, key: &str) -> Result<()> {
+    let why = match (expected, current.as_deref()) {
+        (None, Some(_)) => "it already exists (another publisher holds this dataset)",
+        (Some(exp), Some(got)) if exp != got => {
+            "the remote catalogue changed since this run started"
+        }
+        (Some(_), None) => "expected an existing catalogue and found none",
+        _ => return Ok(()),
+    };
+    Err(cas_conflict(format!("refusing to publish {key}: {why}")))
 }
 
 #[cfg(feature = "object-store")]
@@ -756,6 +809,8 @@ pub(crate) struct Present {
     marked: bool,
     /// `followers = true`: publish what a follower on another host reads. Never cleared by [`Present::of`].
     followers: bool,
+    /// [`Settings::writer_fence`]. Never cleared by [`Present::of`].
+    fence: Option<u64>,
 }
 
 impl Present {
@@ -1185,6 +1240,27 @@ async fn sync_pass(
     }
 
     let cat_key = prefix(MANIFEST_FILE);
+    if let Some(fence) = present.fence {
+        current_writer(
+            mirror.as_ref(),
+            &crate::lease::lease_key(&data_identity),
+            fence,
+        )
+        .await?;
+        // A writer that took over from behind must not shrink what the mirror has sealed.
+        if let Some(why) = behind_the_mirror(remote_bytes.as_deref(), &catalogue)? {
+            tracing::info!(
+                "publishing {data_identity}: {why}, so the catalogue waits until it catches up"
+            );
+            return Ok(SyncReport {
+                dataset: data_identity,
+                sealed_through: None,
+                uploaded,
+                uploaded_bytes,
+                skipped,
+            });
+        }
+    }
     if remote_bytes.as_deref() != Some(catalogue.as_slice()) {
         mirror
             .put_if(&cat_key, &catalogue, remote_bytes.as_deref())
@@ -1612,6 +1688,9 @@ pub struct Settings {
     /// Also publish what a follower on another host reads (RFC-0076 FR17). Off, a pass uploads and
     /// deletes exactly what it did before followers existed.
     pub followers: bool,
+    /// The writer lease's fence this process holds (RFC-0078 §5.3): the catalogue is not moved while
+    /// the mirror's lease names another. `None` when failover is off.
+    pub writer_fence: Option<u64>,
 }
 
 /// A running mirror. Dropping it stops the reconciler and cancels any upload in flight.
@@ -1664,6 +1743,7 @@ async fn reconcile(
     let mut failures = Failures::default();
     let mut present = Present {
         followers: settings.followers,
+        fence: settings.writer_fence,
         ..Present::default()
     };
     loop {
@@ -1681,6 +1761,11 @@ async fn reconcile(
                 Ok(report) => {
                     metrics.publish_succeeded(report.sealed_through);
                     failures.succeeded();
+                }
+                // Permanent: the writer has fenced itself off, and another publishes this dataset now.
+                Err(e) if e.downcast_ref::<crate::lease::LostLease>().is_some() => {
+                    tracing::warn!("publishing {nest} stopped: {e:#}");
+                    return;
                 }
                 Err(e) => {
                     let dead = failures.failed(&e);
@@ -1987,6 +2072,7 @@ mod tests {
             interval,
             parallelism,
             followers: false,
+            writer_fence: None,
         }
     }
 
@@ -2680,6 +2766,114 @@ abi = "abis/usdc.json"
         assert!(
             err.to_string().contains("changed"),
             "wanted a changed-catalogue refusal, got {err}"
+        );
+    }
+
+    /// RFC-0078 §5.3: a writer that lost its lease must not move the catalogue, and the holder may.
+    #[tokio::test]
+    async fn a_writer_below_the_mirrors_lease_does_not_move_the_catalogue() {
+        let nest = sealed_nest();
+        let mirror_dir = tempfile::tempdir().unwrap();
+        let target = mirror_dir.path().display().to_string();
+        let (identity, ..) = identity_of(nest.path()).unwrap();
+        let mirror = open_mirror(&target).unwrap();
+        let lease = crate::lease::LeaseDoc {
+            owner: Some("new".into()),
+            fence: 2,
+            term_secs: 10,
+            renewal: 1,
+        };
+        mirror
+            .put(
+                &crate::lease::lease_key(&identity),
+                &serde_json::to_vec(&lease).unwrap(),
+            )
+            .await
+            .unwrap();
+        let catalogue = format!("{identity}/{MANIFEST_FILE}");
+
+        let mut stale = Present {
+            fence: Some(1),
+            ..Present::default()
+        };
+        let e = sync_pass(nest.path(), &target, false, 1, None, &mut stale)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<crate::lease::LostLease>(),
+            Some(&crate::lease::LostLease { fence: 1 }),
+            "{e:#}"
+        );
+        assert!(format!("{e:#}").contains("fence 2"), "{e:#}");
+        assert!(
+            mirror.get(&catalogue).await.unwrap().is_none(),
+            "no catalogue moved"
+        );
+
+        let mut holder = Present {
+            fence: Some(2),
+            ..Present::default()
+        };
+        sync_pass(nest.path(), &target, false, 1, None, &mut holder)
+            .await
+            .unwrap();
+        assert!(mirror.get(&catalogue).await.unwrap().is_some());
+    }
+
+    /// RFC-0078: a writer that took over from behind holds its catalogue until it covers what the
+    /// mirror has sealed. Without failover nothing changes: the publisher's catalogue is the mirror's.
+    #[tokio::test]
+    async fn a_failover_writer_behind_the_mirror_does_not_shrink_its_catalogue() {
+        let nest = sealed_nest();
+        let mirror_dir = tempfile::tempdir().unwrap();
+        let target = mirror_dir.path().display().to_string();
+        let (identity, ..) = identity_of(nest.path()).unwrap();
+        let mirror = open_mirror(&target).unwrap();
+        let lease = crate::lease::LeaseDoc {
+            owner: Some("taker".into()),
+            fence: 2,
+            term_secs: 10,
+            renewal: 1,
+        };
+        mirror
+            .put(
+                &crate::lease::lease_key(&identity),
+                &serde_json::to_vec(&lease).unwrap(),
+            )
+            .await
+            .unwrap();
+        let (_, local) = read_local(nest.path()).unwrap();
+        let mut ahead = local.clone();
+        for segs in ahead.tables.values_mut() {
+            for seg in segs.iter_mut() {
+                seg.to_block += 1_000;
+            }
+        }
+        let ahead = serde_json::to_vec_pretty(&ahead).unwrap();
+        let catalogue = format!("{identity}/{MANIFEST_FILE}");
+        mirror.put(&catalogue, &ahead).await.unwrap();
+
+        let mut taker = Present {
+            fence: Some(2),
+            ..Present::default()
+        };
+        sync_pass(nest.path(), &target, false, 1, None, &mut taker)
+            .await
+            .unwrap();
+        assert_eq!(
+            mirror.get(&catalogue).await.unwrap().unwrap(),
+            ahead,
+            "the mirror's coverage is kept"
+        );
+
+        let mut plain = Present::default();
+        sync_pass(nest.path(), &target, false, 1, None, &mut plain)
+            .await
+            .unwrap();
+        assert_ne!(
+            mirror.get(&catalogue).await.unwrap().unwrap(),
+            ahead,
+            "without failover the publisher's catalogue is the mirror's, as before"
         );
     }
 

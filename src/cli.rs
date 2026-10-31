@@ -1520,6 +1520,11 @@ pub struct ServeArgs {
     #[arg(long, value_name = "MB", requires = "mirror")]
     pub max_rss_mb: Option<u64>,
 
+    /// With `--mirror`: watch each dataset's writer lease and report on `/ready` whether it has
+    /// lapsed and this follower could take over (RFC-0078). Reports only; it takes nothing yet.
+    #[arg(long, requires = "mirror")]
+    pub standby: bool,
+
     /// The feed format a follower asks the writer for: 2, framed with Arrow batches, or 1,
     /// newline-delimited JSON.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=2), hide = true)]

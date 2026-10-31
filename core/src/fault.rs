@@ -18,10 +18,13 @@ impl std::fmt::Display for TerminalFault {
 
 impl std::error::Error for TerminalFault {}
 
-/// Whether any link in the error chain is a [`TerminalFault`] - i.e. a retry is pointless. Everything
-/// else is assumed retryable: a transient store/RPC/webhook error that a later window may well survive.
+/// Whether any link in the error chain is a [`TerminalFault`] or a lost store - i.e. a retry is
+/// pointless. A store that another holder has claimed refuses every later write, so readmitting the
+/// nest would busy-loop exactly as a terminal fault does (RFC-0078 §5.2). Everything else is assumed
+/// retryable: a transient store/RPC/webhook error that a later window may well survive.
 pub fn is_terminal(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.is::<TerminalFault>())
+    e.chain()
+        .any(|c| c.is::<TerminalFault>() || c.is::<crate::redb_store::LostOwnership>())
 }
 
 /// The points in the window path where the node's tests inject a failure. Every method defaults to
@@ -43,3 +46,19 @@ pub trait FaultPoints: Send + Sync {
 pub struct NoFaults;
 
 impl FaultPoints for NoFaults {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lost_store_is_terminal_however_deep_in_the_chain() {
+        let lost = anyhow::Error::new(crate::redb_store::LostOwnership {
+            held: 1,
+            current: 2,
+        })
+        .context("committing window 10..=20");
+        assert!(is_terminal(&lost));
+        assert!(!is_terminal(&anyhow::anyhow!("connection reset")));
+    }
+}

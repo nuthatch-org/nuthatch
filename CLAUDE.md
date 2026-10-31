@@ -327,6 +327,18 @@ unconfigured.
 > writer processes per chain, is accepted as direction only**: nothing of it is built, and the
 > single-cursor law above is not amended, until FR18 and FR19 have shipped and a chain is shown to
 > exceed one machine after them.
+>
+> **RFC-0078 to RFC-0080 are accepted, and this line is the record RFC-0044 §8 asks for.** Chief
+> accepted [RFC-0078](docs/rfcs/0078-writer-failover.md) (writer failover),
+> [RFC-0079](docs/rfcs/0079-arrow-results.md) (Arrow results) and
+> [RFC-0080](docs/rfcs/0080-partial-sync.md) (partial sync) on 2026-10-30, after GraphOps's "this is
+> fundamentally not HA" on FR20 and their Electric SQL suggestion: "ok letsgoooo with the wave of rfcs".
+> Built in that order, HA first. RFC-0078 keeps the single-cursor law as written: one writer per chain
+> at any moment, a standby taking over through a lease in the operator's mirror, opt-in, embedded mode
+> unchanged. RFC-0079's IPC answer is default-binary and adds no dependency; Flight SQL is behind an
+> off-by-default `flight` feature. RFC-0080's server half is opt-in per mount and served by followers;
+> its client half is an off-by-default `sync` feature of the engine crate. The gateway's `pin` header
+> keeps identity out of nuthatch. Each S0 can stop its RFC.
 
 >
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.

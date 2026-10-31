@@ -633,6 +633,11 @@ pub enum Line {
         /// which a follower with no shared disk fetches its segments from (RFC-0076 FR17).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data_identity: Option<String>,
+        /// The writer lease's fence the writer holds this dataset's store at (RFC-0078 §5.3). A
+        /// follower refuses a writer below the highest it has accepted, so one that was paused and
+        /// woke after a takeover cannot feed it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fence: Option<u64>,
     },
     /// Every route mounted when the connection opened has been sent: a route not named by now does
     /// not exist, rather than not having arrived yet.

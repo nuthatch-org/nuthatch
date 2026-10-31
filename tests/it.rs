@@ -64,6 +64,8 @@ mod e2e_follower;
 mod e2e_l1_blocks;
 #[path = "e2e_migrate_parity.rs"]
 mod e2e_migrate_parity;
+#[path = "e2e_minio_lease.rs"]
+mod e2e_minio_lease;
 #[path = "e2e_minio_publish.rs"]
 mod e2e_minio_publish;
 #[path = "e2e_nest_inspect.rs"]

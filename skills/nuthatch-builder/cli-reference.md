@@ -480,6 +480,7 @@ Serve a nest without indexing it (RFC-0022 slice 3)
 - `--registry <REGISTRY>` - With `--mirror`: the registry the writer's nests are published to, each fetched by its NID and verified as `nest load` verifies it
 - `--cache <CACHE>` - With `--mirror`: this follower's own directory, for the nests and segments it fetches
 - `--max-rss-mb <MAX_RSS_MB>` - With `--mirror`: the per-cursor budget in MiB, which beside the writer comes from its `mounts.toml`
+- `--standby` - With `--mirror`: watch each dataset's writer lease and report on `/ready` whether it has lapsed and this follower could take over (RFC-0078). Reports only; it takes nothing yet
 
 ## `nuthatch settle`
 

@@ -258,6 +258,7 @@ async fn bind_follower_on(root: &Path, writer: &Writer, feed: u32) -> (Arc<Follo
         nuthatch::reader::Options {
             feed,
             paused: false,
+            standby: false,
         },
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

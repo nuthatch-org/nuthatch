@@ -335,3 +335,33 @@ fn an_expired_lease_still_reports_who_held_it() {
     assert_eq!(seen.owner, "worker-a");
     assert!(seen.expires_in_secs <= 0, "and it reads as expired");
 }
+
+/// RFC-0078 §5.2: a writer that loses a lease held in the mirror stops itself by fencing off its own
+/// store, so the cursor's next commit fails the way a rival's claim would make it fail.
+#[test]
+fn fencing_off_refuses_every_handle_and_keeps_the_fence_monotonic() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("t.redb")).unwrap();
+    let held = store.claim("writer").unwrap();
+    store.commit_window(&row(1), None, 1).unwrap();
+
+    store.fence_off().unwrap();
+    assert_eq!(
+        store.held_fence(),
+        held,
+        "fencing off leaves the held fence stale"
+    );
+    assert_eq!(store.current_fence().unwrap(), held + 1);
+    let e = store.commit_window(&row(2), None, 2).unwrap_err();
+    let lost = e
+        .downcast_ref::<LostOwnership>()
+        .expect("a fenced-off write is LostOwnership");
+    assert_eq!((lost.held, lost.current), (held, held + 1));
+    assert_eq!(store.count().unwrap(), 1, "nothing after the fence landed");
+
+    assert_eq!(
+        store.claim("standby").unwrap(),
+        held + 2,
+        "a later claim still rises past it"
+    );
+}
