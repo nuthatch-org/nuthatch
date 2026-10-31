@@ -202,3 +202,30 @@ not already have (`arrow-flight`, `tonic`, `tonic-prost`, `prost`, `prost-derive
 question of a second port rather than of size.
 
 **S0 stops nothing.** S1 (IPC on `/sql`, in `collect`) and S2 (Flight SQL behind `flight`) go ahead.
+
+## 13. S1 built (2026-10-31): `/sql`
+
+`GET` and `POST /sql` answer as an Arrow IPC stream when `Accept` names
+`application/vnd.apache.arrow.stream`, or `format=arrow` is in the query string or the body.
+Otherwise JSON, as before, byte for byte.
+
+- **Where it is written.** `Session::collect_ipc`, beside `collect`, in the same per-batch closure, so
+  the row cap, the byte cap and the cost meter apply unchanged; `QueryGuard::arrow` chooses it. The cap
+  is exact: at most `max_rows` rows are written and `truncated` says another existed, where JSON
+  collects one row more and trims. The byte cap counts the stream's own bytes.
+- **An empty answer** still opens with its schema, from the plan: `Engine::result_schema`, made public
+  in burrmill#124 for this.
+- **The envelope.** Departure from §5.1: provenance does not ride in the schema's metadata. It is read
+  after the statement runs (#932), and the schema is the first thing written. The answer is bounded by
+  the byte cap and so is buffered, so the envelope, the JSON one less its rows, travels as the
+  `x-nuthatch-answer` header, ASCII-escaped. That settles open question 1: a header, visible to
+  `fetch()`, rather than a trailer. The body is reserved against `sql_response_bytes` as JSON's is.
+- **Unchanged.** A refusal is decided before any batch and stays JSON. An Arrow request does not read
+  or write the memo, which holds JSON answers.
+
+**Tested.** `an_arrow_answer_is_the_json_answer_row_for_row`: four statements over sealed and hot rows
+(every row, an aggregate, an empty answer, a capped one), each Arrow answer decoded through the JSON
+encoder equal to the JSON answer's rows, columns in order and envelope. `format=arrow` and `POST`
+answer it; a refusal is JSON. Every target, core, clippy and fmt pass.
+
+**Not yet.** `/q/{name}`, which runs its own admission and payment path; and `/explain`'s sample.

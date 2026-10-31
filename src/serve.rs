@@ -452,6 +452,7 @@ impl AppState {
             max_rows,
             max_result_bytes: self.limits.max_result_bytes,
             memory_bytes: self.limits.analytics_memory_bytes,
+            arrow: false,
         }
     }
 }
@@ -562,7 +563,7 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
             .route("/entities", get(entities))
             .route("/ipfs/gave-up", get(ipfs_gave_up))
             .route("/entity/{id}", get(entity))
-            .route("/sql", get(sql).post(sql_post))
+            .route("/sql", get(sql_get).post(sql_post))
             .route("/diff", get(diff_route))
             .route("/explain", get(explain).post(explain_post))
             .route("/queries", get(queries))
@@ -3597,6 +3598,7 @@ async fn graph_rows(
         None,
         historical_block,
         Some(graph_remaining(s.limits.timeout, started)),
+        false,
     )
     .await;
     let body = axum::body::to_bytes(resp.into_response().into_body(), byte_budget)
@@ -4756,15 +4758,51 @@ fn copy_reachable_entities(
 /// **Bounded surfaces (RFC-0034).** What the guards above cannot express is *which* queries a nest
 /// will answer at all. A mount may set `sql = "deny"` or `sql = "allowlist"`, and this route then
 /// refuses free-form text and points at `/q/{name}` instead.
+/// `/sql`'s JSON answer, as the tests call it.
+#[cfg(test)]
 async fn sql(State(s): State<AppState>, Query(q): Query<SqlQuery>) -> axum::response::Response {
-    sql_answer(s, q).await
+    sql_answer(s, q, false).await
+}
+
+/// `GET /sql`, answered as JSON or, when the request asks, as an Arrow IPC stream.
+async fn sql_get(
+    State(s): State<AppState>,
+    Query(q): Query<SqlQuery>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let arrow = wants_arrow(&headers, q.format.as_deref());
+    sql_answer(s, q, arrow).await
+}
+
+/// The content type an Arrow IPC stream is answered with (RFC-0079 §5.1).
+pub(crate) const ARROW_STREAM: &str = "application/vnd.apache.arrow.stream";
+
+/// Whether a request asks for its answer as an Arrow IPC stream: `Accept` names it, or a URL in a
+/// browser, which cannot set `Accept`, says `format=arrow`.
+fn wants_arrow(headers: &axum::http::HeaderMap, format: Option<&str>) -> bool {
+    format.is_some_and(|f| f.eq_ignore_ascii_case("arrow"))
+        || headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|accept| {
+                accept
+                    .split(',')
+                    .any(|t| t.split(';').next().map(str::trim) == Some(ARROW_STREAM))
+            })
 }
 
 /// `POST /sql` with `{"q": "…", "max_rows": n}` (RFC-0073 FR11): the GET form for a statement too
 /// long for a URL, answered by the same code. The body is read as JSON whatever its content type.
-async fn sql_post(State(s): State<AppState>, body: axum::body::Bytes) -> axum::response::Response {
+async fn sql_post(
+    State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
     match sql_body(&body, false) {
-        Ok(q) => sql_answer(s, q).await,
+        Ok(q) => {
+            let arrow = wants_arrow(&headers, q.format.as_deref());
+            sql_answer(s, q, arrow).await
+        }
         Err(refusal) => *refusal,
     }
 }
@@ -4777,7 +4815,7 @@ fn sql_body(body: &[u8], explain: bool) -> Result<SqlQuery, Box<axum::response::
     })
 }
 
-async fn sql_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
+async fn sql_answer(s: AppState, q: SqlQuery, arrow: bool) -> axum::response::Response {
     use crate::metrics::METRICS;
     if !s.surface.free_form_allowed() {
         return refuse_free_form(&s.surface);
@@ -4786,20 +4824,7 @@ async fn sql_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
         METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Invalid);
         return respond(answer::sql_too_long(q.q.len(), SQL_MAX_QUERY_LEN));
     }
-    run_sql_query(s, q.q, q.max_rows).await
-}
-
-/// Execute SQL and shape the response - shared by `/sql` (caller-supplied text, only when the
-/// surface is open) and `/q/{name}` (a declared query, rendered from typed arguments).
-///
-/// **Every node guard lives here**, so a declared query is bounded exactly as free-form SQL is. A
-/// name on the allowlist says the operator is willing to answer it, not that it is cheap.
-async fn run_sql_query(
-    s: AppState,
-    sql_text: String,
-    requested_max_rows: Option<usize>,
-) -> axum::response::Response {
-    run_sql_query_at(s, sql_text, requested_max_rows, None, None).await
+    run_sql_query_at(s, q.q, q.max_rows, None, None, arrow).await
 }
 
 /// The memo key for `sql` against the nest as it stands, with the rows generation, served segments
@@ -4914,17 +4939,25 @@ fn remembered(
     Err(memo)
 }
 
+/// Execute SQL and shape the response - shared by `/sql` (caller-supplied text, only when the
+/// surface is open), `/q/{name}` (a declared query, rendered from typed arguments) and the GraphQL
+/// roots, as JSON or, when `arrow`, as an Arrow IPC stream (RFC-0079).
+///
+/// **Every node guard lives here**, so a declared query is bounded exactly as free-form SQL is. A
+/// name on the allowlist says the operator is willing to answer it, not that it is cheap.
 async fn run_sql_query_at(
     s: AppState,
     sql_text: String,
     requested_max_rows: Option<usize>,
     historical_block: Option<u64>,
     operation_timeout: Option<Duration>,
+    arrow: bool,
 ) -> axum::response::Response {
     use crate::metrics::METRICS;
     let q = SqlQuery {
         q: sql_text,
         max_rows: requested_max_rows,
+        format: None,
     };
     // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
     // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
@@ -4941,7 +4974,8 @@ async fn run_sql_query_at(
     // executor, a few at a time per nest, before this request may queue for a permit (#2213).
     // The memo is per dataset and its key has no byte cap, so a mount that lowers one neither reads
     // nor writes it: a co-tenant's remembered answer may be larger than this mount allows.
-    let memo = if historical_block.is_none()
+    let memo = if !arrow
+        && historical_block.is_none()
         && s.limits.max_result_bytes == crate::limits::Limits::process().max_result_bytes
         && s.store.rows_generation().is_some()
         && crate::sqlmemo::is_deterministic(&q.q)
@@ -5021,7 +5055,10 @@ async fn run_sql_query_at(
     // empty typed view instead of the whole nest view failing to bind on a missing table (#663).
     let tables = s.tables.clone();
     let declared_entities = s.entities.clone();
-    let guard = s.query_guard(sql_timeout, max_rows);
+    let guard = analytics::QueryGuard {
+        arrow,
+        ..s.query_guard(sql_timeout, max_rows)
+    };
     let hot_charge = s.hot_charge();
     let tenant = s.isolation.clone();
     let result = crate::cost::spawn_blocking(move || {
@@ -5130,8 +5167,11 @@ async fn run_sql_query_at(
     match result {
         // Provenance stamp (RFC-0016 §4): an agent can cite its answer against content-addressed data -
         // as of which block, what's sealed, and the registry it decoded with.
-        Ok(Ok((out, watermarks, after, as_of))) => {
+        Ok(Ok((mut out, watermarks, after, as_of))) => {
             let provenance = (as_of, after.1);
+            if let Some(ipc) = out.ipc.take() {
+                return arrow_response(&s, &out, ipc, &watermarks, provenance);
+            }
             if let Some((key, generation, sealed, before)) = memo {
                 if after.0 == Some(generation) && after.2 == Some(sealed) && watermarks == before {
                     let segments =
@@ -5705,14 +5745,17 @@ fn dataset_head(s: &AppState) -> u64 {
 /// case has no basis to make.
 /// The `/sql` response for an answer, computed or remembered. One place, so a memo hit and a fresh
 /// computation cannot drift apart in shape or provenance (#1186).
-fn sql_response(
+/// `/sql`'s envelope for `out`, with `rows` in place: the JSON answer's body, and the Arrow answer's
+/// header less its rows.
+fn sql_facts_envelope(
     s: &AppState,
     out: &crate::analytics::QueryOutput,
-    rows: SqlRows<'_>,
+    count: usize,
     watermarks: &crate::entity_view::Watermarks,
     (as_of, sealed_through): (Option<u64>, u64),
     cached: bool,
-) -> axum::response::Response {
+    rows: Value,
+) -> Value {
     // #1437, RFC-0045 stage 1's "provenance visible in the result": an answer that read an offchain
     // table, directly or through an entity, is reproducible by snapshot and says which snapshots.
     let read = out.offchain.as_ref().and_then(read_offchain_json);
@@ -5721,9 +5764,9 @@ fn sql_response(
             names.contains(&e.name().to_ascii_lowercase()) && !e.offchain_tables().is_empty()
         })
     });
-    let response = answer::sql_envelope(
+    answer::sql_envelope(
         &answer::SqlFacts {
-            count: rows.count(),
+            count,
             truncated: out.truncated,
             degraded_tables: &out.degraded_tables,
             tip_unavailable: out.tip_unavailable,
@@ -5740,6 +5783,75 @@ fn sql_response(
             reproducible_by_snapshot: read.is_some() || through_entity,
             offchain: read,
         },
+        rows,
+    )
+}
+
+/// The header an Arrow answer's envelope travels in: its facts, less the rows, which are the body.
+pub(crate) const ANSWER_HEADER: &str = "x-nuthatch-answer";
+
+/// RFC-0079 §5.1: the answer as an Arrow IPC stream, its envelope in [`ANSWER_HEADER`]. Provenance
+/// is read after the statement ran (#932), when the stream's schema is already written, so it cannot
+/// ride in the schema; and the body is bounded by the byte cap, so the header is known before it.
+fn arrow_response(
+    s: &AppState,
+    out: &crate::analytics::QueryOutput,
+    ipc: crate::engine::Ipc,
+    watermarks: &crate::entity_view::Watermarks,
+    provenance: (Option<u64>, u64),
+) -> axum::response::Response {
+    let mut envelope =
+        sql_facts_envelope(s, out, ipc.rows, watermarks, provenance, false, Value::Null);
+    if let Some(o) = envelope.as_object_mut() {
+        o.remove("rows");
+    }
+    let header = match axum::http::HeaderValue::from_str(&ascii_json(&envelope)) {
+        Ok(h) => h,
+        Err(e) => return error(format!("an Arrow answer's envelope: {e}")),
+    };
+    let mut response = match s
+        .sql_response_bytes
+        .reserve(ipc.bytes.len(), s.tenant_label())
+    {
+        Ok(permit) => held_body_as(ipc.bytes, permit, ARROW_STREAM),
+        Err(why) => return refused(s, why, "SQL response bytes in flight"),
+    };
+    response.headers_mut().insert(ANSWER_HEADER, header);
+    response
+}
+
+/// `v` as JSON in ASCII alone, as a header must be: anything else escaped as a `\u` sequence.
+fn ascii_json(v: &Value) -> String {
+    let text = v.to_string();
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_ascii() && !c.is_ascii_control() {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for u in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{u:04x}"));
+            }
+        }
+    }
+    out
+}
+
+fn sql_response(
+    s: &AppState,
+    out: &crate::analytics::QueryOutput,
+    rows: SqlRows<'_>,
+    watermarks: &crate::entity_view::Watermarks,
+    (as_of, sealed_through): (Option<u64>, u64),
+    cached: bool,
+) -> axum::response::Response {
+    let response = sql_facts_envelope(
+        s,
+        out,
+        rows.count(),
+        watermarks,
+        (as_of, sealed_through),
+        cached,
         match rows {
             SqlRows::Values(v) => json!(v),
             // Written in place when the body is serialized, below.
@@ -5785,6 +5897,15 @@ fn sql_response(
 
 /// `body` as a JSON response that holds `permit` until its last chunk has been taken to be sent.
 fn held_body(body: Vec<u8>, permit: crate::fair_share::BytePermit) -> axum::response::Response {
+    held_body_as(body, permit, "application/json")
+}
+
+/// [`held_body`] with its content type.
+fn held_body_as(
+    body: Vec<u8>,
+    permit: crate::fair_share::BytePermit,
+    content_type: &str,
+) -> axum::response::Response {
     use futures::StreamExt;
     const CHUNK: usize = 64 * 1024;
     let len = body.len();
@@ -5798,10 +5919,7 @@ fn held_body(body: Vec<u8>, permit: crate::fair_share::BytePermit) -> axum::resp
     });
     (
         [
-            (
-                axum::http::header::CONTENT_TYPE,
-                "application/json".to_string(),
-            ),
+            (axum::http::header::CONTENT_TYPE, content_type.to_string()),
             (axum::http::header::CONTENT_LENGTH, len.to_string()),
         ],
         axum::body::Body::from_stream(stream),
@@ -9001,6 +9119,7 @@ mod tests {
             Query(SqlQuery {
                 q: "SELECT 1".into(),
                 max_rows: None,
+                format: None,
             }),
         )
         .await
@@ -9746,6 +9865,7 @@ mod tests {
             Query(SqlQuery {
                 q: "SELECT 1319 AS n".into(),
                 max_rows: None,
+                format: None,
             }),
         )
         .await
@@ -10248,6 +10368,184 @@ mod tests {
         (status, body.to_vec())
     }
 
+    /// One request through `router()` with `accept`, and the raw status, headers and body.
+    async fn send_accepting(
+        state: &AppState,
+        uri: &str,
+        body: Option<String>,
+        accept: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        use tower::ServiceExt;
+        let req = match body {
+            Some(b) => axum::http::Request::post(uri)
+                .header("content-type", "application/json")
+                .header("accept", accept)
+                .body(axum::body::Body::from(b)),
+            None => axum::http::Request::get(uri)
+                .header("accept", accept)
+                .body(axum::body::Body::empty()),
+        }
+        .unwrap();
+        let resp = router(SharedNest::new(state.clone()))
+            .oneshot(req)
+            .await
+            .unwrap();
+        let (status, headers) = (resp.status(), resp.headers().clone());
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, body.to_vec())
+    }
+
+    /// An Arrow answer's rows, encoded as `/sql`'s JSON encodes them, and its column names.
+    fn arrow_rows(ipc: &[u8]) -> (Vec<Value>, Vec<String>) {
+        let reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None).unwrap();
+        let columns = reader
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let mut rows = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let temporal = nuthatch_core::answer::temporal_columns(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| (f.name(), f.data_type().to_string())),
+            );
+            let mut part = burrmill::df::encode::rows(&batch).unwrap();
+            nuthatch_core::answer::rewrite_temporal(&mut part, &temporal);
+            rows.extend(part);
+        }
+        (rows, columns)
+    }
+
+    /// RFC-0079 S1's gate: for each statement, the Arrow answer holds the JSON answer's rows in its
+    /// order, and its envelope is the JSON envelope less the rows. An empty answer still carries its
+    /// schema, and a capped one says it was truncated, as JSON does.
+    #[tokio::test]
+    async fn an_arrow_answer_is_the_json_answer_row_for_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = table_fixture(tmp.path(), 1..=3, 4..=6);
+        // Sealed through 3, so the answers read the segment as well as the hot rows.
+        state.store.set_meta("sealed_through", "3").unwrap();
+        let (_, all) = send(
+            &state,
+            &format!("/sql?q={}", url_encode("SELECT * FROM t")),
+            None,
+        )
+        .await;
+        let all: Value = serde_json::from_slice(&all).unwrap();
+        assert_eq!(
+            all["count"], 6,
+            "premise: sealed and hot rows both answer: {all}"
+        );
+        let cases = [
+            ("SELECT * FROM t ORDER BY block_number", None),
+            (
+                "SELECT count(*) AS n, max(block_number) AS top FROM t",
+                None,
+            ),
+            (
+                "SELECT block_number, v FROM t WHERE block_number > 100",
+                None,
+            ),
+            (
+                "SELECT block_number FROM t ORDER BY block_number DESC",
+                Some(2),
+            ),
+        ];
+        for (q, max_rows) in cases {
+            let cap = max_rows.map_or(String::new(), |n| format!("&max_rows={n}"));
+            let uri = format!("/sql?q={}{cap}", url_encode(q));
+            let (code, json_body) = send(&state, &uri, None).await;
+            assert_eq!(code, StatusCode::OK, "{q}");
+            let json: Value = serde_json::from_slice(&json_body).unwrap();
+
+            let (code, headers, ipc) = send_accepting(&state, &uri, None, ARROW_STREAM).await;
+            assert_eq!(code, StatusCode::OK, "{q}");
+            assert_eq!(headers["content-type"], ARROW_STREAM, "{q}");
+            let (rows, columns) = arrow_rows(&ipc);
+            assert_eq!(json!(rows), json["rows"], "{q}: the rows");
+            assert_eq!(
+                json!(columns),
+                json["columns"],
+                "{q}: the columns, in order"
+            );
+
+            let mut envelope: Value =
+                serde_json::from_str(headers[ANSWER_HEADER].to_str().unwrap()).unwrap();
+            let mut expected = json.clone();
+            for v in [&mut envelope, &mut expected] {
+                let o = v.as_object_mut().unwrap();
+                o.remove("rows");
+                // A JSON answer may come from the memo, which an Arrow one never reads.
+                o.remove("cached");
+            }
+            assert_eq!(envelope, expected, "{q}: the envelope");
+            if max_rows.is_some() {
+                assert_eq!(envelope["truncated"], true, "{q}");
+                assert_eq!(rows.len(), 2, "{q}");
+            }
+        }
+    }
+
+    /// `format=arrow` asks for it where `Accept` cannot be set, and `POST` answers it as `GET` does.
+    #[tokio::test]
+    async fn an_arrow_answer_is_asked_for_by_format_or_by_post() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = table_fixture(tmp.path(), 1..=2, 3..=3);
+        let q = "SELECT block_number FROM t ORDER BY block_number";
+        let (code, headers, ipc) = send_accepting(
+            &state,
+            &format!("/sql?q={}&format=arrow", url_encode(q)),
+            None,
+            "*/*",
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(headers["content-type"], ARROW_STREAM);
+        let (_, json_body) = send(&state, &format!("/sql?q={}", url_encode(q)), None).await;
+        let json: Value = serde_json::from_slice(&json_body).unwrap();
+        assert_eq!(json!(arrow_rows(&ipc).0), json["rows"]);
+
+        let (code, headers, ipc) = send_accepting(
+            &state,
+            "/sql",
+            Some(json!({ "q": q }).to_string()),
+            ARROW_STREAM,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(headers["content-type"], ARROW_STREAM);
+        assert_eq!(json!(arrow_rows(&ipc).0), json["rows"]);
+    }
+
+    /// A refusal is decided before any batch, and stays in the JSON envelope every client handles.
+    #[tokio::test]
+    async fn a_refused_arrow_request_is_answered_in_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = table_fixture(tmp.path(), 1..=2, 3..=3);
+        let (code, headers, body) = send_accepting(
+            &state,
+            &format!("/sql?q={}", url_encode("SELECT no_such_column FROM t")),
+            None,
+            ARROW_STREAM,
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json"));
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"].is_string(), "{v}");
+    }
+
     /// GET then POST of one statement. The GET runs twice first so both compared answers come from
     /// the warmed memo and `cached` cannot differ for a reason that is not the route.
     async fn get_and_post(
@@ -10436,6 +10734,7 @@ mod tests {
             Query(SqlQuery {
                 q: "SELECT 1".into(),
                 max_rows: None,
+                format: None,
             }),
         )
         .await
@@ -10820,7 +11119,15 @@ mod tests {
             )
             .unwrap();
         // Warm the ordinary-query memo with the same statement. A hit must not evade admission.
-        let warm = run_sql_query(state.clone(), "SELECT 1 AS answer".into(), None).await;
+        let warm = run_sql_query_at(
+            state.clone(),
+            "SELECT 1 AS answer".into(),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await;
         assert_eq!(warm.status(), StatusCode::OK);
         state.surface = named_surface("SELECT 1 AS answer");
         let app = router(SharedNest::new(state));
@@ -11228,6 +11535,7 @@ mod tests {
             Query(SqlQuery {
                 q: long,
                 max_rows: None,
+                format: None,
             }),
         )
         .await
@@ -11245,6 +11553,7 @@ mod tests {
             Query(SqlQuery {
                 q: "SELECT 1 AS n".into(),
                 max_rows: None,
+                format: None,
             }),
         )
         .await
@@ -11289,6 +11598,7 @@ mod tests {
             Query(SqlQuery {
                 q: "SELECT 1 AS n".into(),
                 max_rows: None,
+                format: None,
             })
         };
         for (name, resp) in [
@@ -11338,6 +11648,7 @@ mod tests {
             Query(SqlQuery {
                 q: "SELECT 1 AS n".into(),
                 max_rows: None,
+                format: None,
             })
         };
 
@@ -11396,6 +11707,7 @@ mod tests {
             Query(SqlQuery {
                 q: statement.into(),
                 max_rows: None,
+                format: None,
             })
         };
         // What /sql runs, called below the handler: its memo is process-global, and an answer left
@@ -11423,6 +11735,7 @@ mod tests {
             Query(SqlQuery {
                 q: "SELECT CAST(who AS INTEGER) AS n FROM t".into(),
                 max_rows: None,
+                format: None,
             })
         };
         let resp = sql(State(state.clone()), dies()).await.into_response();
@@ -12141,6 +12454,7 @@ mod tests {
             Query(SqlQuery {
                 q: q.into(),
                 max_rows: None,
+                format: None,
             }),
         )
         .await
@@ -12407,6 +12721,7 @@ mod tests {
                 Query(SqlQuery {
                     q: q.into(),
                     max_rows: None,
+                    format: None,
                 }),
             )
             .await

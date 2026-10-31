@@ -88,6 +88,15 @@ pub(crate) struct Collected {
     pub columns: Vec<String>,
     /// More rows were available than the cap allowed.
     pub truncated: bool,
+    /// The result as an Arrow IPC stream, in place of `rows`, when it was asked for (RFC-0079).
+    pub ipc: Option<Ipc>,
+}
+
+/// An answer as an Arrow IPC stream, and how many rows it holds.
+#[derive(Debug, Clone, Default)]
+pub struct Ipc {
+    pub bytes: Vec<u8>,
+    pub rows: usize,
 }
 
 /// One engine instance over one nest: a catalogue being built up and statements run against it.
@@ -103,6 +112,14 @@ pub(crate) trait Session: Send {
     /// (`truncated` is true when that extra row existed), and also caps cumulative result bytes;
     /// `cap = None` materialises every row. The cap is `(rows, bytes)`.
     fn collect(&self, sql: &str, cap: Option<(usize, usize)>) -> Result<Collected, Died>;
+
+    /// [`Session::collect`] as an Arrow IPC stream in `Collected::ipc`, under the same cap. Here
+    /// the cap is exact: at most `rows` rows are written, and `truncated` says more existed.
+    fn collect_ipc(&self, _sql: &str, _cap: Option<(usize, usize)>) -> Result<Collected, Died> {
+        Err(Died::Binding(anyhow::anyhow!(
+            "this engine does not answer in Arrow"
+        )))
+    }
 
     /// Stream a result row by row, each as its cells in column order, so a large result is never
     /// held whole.
