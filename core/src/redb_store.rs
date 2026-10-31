@@ -1935,6 +1935,18 @@ impl<F: Feed> HotStore for Store<F> {
         Ok(next)
     }
 
+    fn fence_off(&self) -> Result<()> {
+        // Unfenced, like `claim`, and `held` is left alone: every handle now holds a stale fence.
+        let wtx = self.db.begin_write()?;
+        let next = Self::fence_in_txn(&wtx)? + 1;
+        {
+            let mut t = wtx.open_table(META)?;
+            t.insert(OWNER_FENCE, next.to_string().as_str())?;
+        }
+        self.commit(wtx)?;
+        Ok(())
+    }
+
     fn current_fence(&self) -> Result<u64> {
         Ok(Store::get_meta(self, OWNER_FENCE)?
             .and_then(|v| v.parse().ok())

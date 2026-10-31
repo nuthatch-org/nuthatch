@@ -139,6 +139,7 @@ pub async fn serve(args: crate::cli::ServeArgs) -> Result<()> {
     let options = Options {
         feed: args.feed_version,
         paused: false,
+        standby: args.standby,
     };
     let follower = match &args.mirror {
         Some(mirror) => {
@@ -363,6 +364,12 @@ struct Inner {
     /// A follower on another host: per dataset, what waits on the mirror for files its catalogue
     /// names, and everything that arrived for the dataset behind it, in order.
     pending: HashMap<String, Pending>,
+    /// The highest writer fence accepted per dataset, kept across connections (RFC-0078 §5.3).
+    fences: HashMap<String, u64>,
+    /// With `--standby`: per dataset, the writer lease as last read, for `/ready`.
+    standby: HashMap<String, serde_json::Value>,
+    /// Datasets whose lease a standby task is watching.
+    watching: BTreeSet<String>,
 }
 
 /// A dataset's lines held while the files the first one names are fetched.
@@ -596,6 +603,8 @@ pub struct Follower {
     ack: tokio::sync::Notify,
     /// On another host: cached segments no copy names, with when that was first seen.
     unnamed: Mutex<HashMap<String, Instant>>,
+    /// `--standby`: watch each dataset's writer lease and report when it could be taken over.
+    standby: bool,
 }
 
 /// How a follower is started.
@@ -605,6 +614,8 @@ pub struct Options {
     pub feed: u32,
     /// Apply nothing the feed sends until [`Follower::pause`] lets it go.
     pub paused: bool,
+    /// Watch each dataset's writer lease in the mirror and report it (RFC-0078 S1). Takes nothing.
+    pub standby: bool,
 }
 
 impl Default for Options {
@@ -612,6 +623,7 @@ impl Default for Options {
         Options {
             feed: crate::feed_wire::FEED_V2,
             paused: false,
+            standby: false,
         }
     }
 }
@@ -663,8 +675,12 @@ impl Follower {
             feed: options.feed,
             ack: tokio::sync::Notify::new(),
             unnamed: Mutex::default(),
+            standby: options.standby,
             inner: Mutex::new(Inner {
                 pending: HashMap::new(),
+                fences: HashMap::new(),
+                standby: HashMap::new(),
+                watching: BTreeSet::new(),
                 routes: BTreeMap::new(),
                 datasets: HashMap::new(),
                 positions: HashMap::new(),
@@ -1224,7 +1240,30 @@ impl Follower {
                 chain,
                 isolation,
                 data_identity,
+                fence,
             } => {
+                if let Some(fence) = fence {
+                    let key = data_identity.clone().unwrap_or_else(|| dataset.clone());
+                    let mut inner = self.lock();
+                    let seen = inner.fences.entry(key.clone()).or_insert(fence);
+                    if fence < *seen {
+                        bail!(
+                            "the writer holds {key} at fence {fence}, below the {} this follower has \
+                             already followed: it lost the writer lease and must not be followed",
+                            *seen
+                        );
+                    }
+                    *seen = fence;
+                }
+                if let (true, Some(identity)) = (self.standby, &data_identity) {
+                    if self.remote.is_some() && self.lock().watching.insert(dataset.clone()) {
+                        tokio::spawn(Follower::watch_lease(
+                            Arc::downgrade(self),
+                            dataset.clone(),
+                            identity.clone(),
+                        ));
+                    }
+                }
                 let spec = Spec {
                     dataset,
                     nid,
@@ -1994,6 +2033,46 @@ impl Follower {
     }
 
     /// How far this route's dataset trails the writer, as `/ready` reports it.
+    /// RFC-0078 S1: read `dataset`'s writer lease every second and record what a standby would do.
+    /// It takes nothing: promotion is S2.
+    async fn watch_lease(me: std::sync::Weak<Follower>, dataset: String, identity: String) {
+        let key = crate::lease::lease_key(&identity);
+        let mut watch = crate::lease::Watch::new();
+        let mut lapsed = false;
+        loop {
+            let Some(follower) = me.upgrade() else { return };
+            let Some(remote) = follower.remote.clone() else {
+                return;
+            };
+            let view = match crate::lease::observe(remote.mirror(), &key).await {
+                Ok(seen) => {
+                    watch.see(&seen);
+                    let doc = seen.doc();
+                    let term = std::time::Duration::from_secs(doc.map_or(0, |d| d.term_secs));
+                    let takeable = watch.takeable(term / 2);
+                    let next = doc.map_or(1, |d| d.fence + 1);
+                    if takeable && !lapsed {
+                        tracing::warn!(
+                            "standby: the writer lease for {identity} is free or has lapsed; this \
+                             follower would take it at fence {next}"
+                        );
+                    }
+                    lapsed = takeable;
+                    serde_json::json!({
+                        "holder": doc.and_then(|d| d.owner.clone()),
+                        "fence": doc.map(|d| d.fence),
+                        "takeable": takeable,
+                        "would_take_fence": takeable.then_some(next),
+                    })
+                }
+                Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+            };
+            follower.lock().standby.insert(dataset.clone(), view);
+            drop(follower);
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
     fn lag(&self, inner: &Inner, dataset: &str) -> serde_json::Value {
         let applied = inner.datasets.get(dataset).map(|d| d.store.applied());
         let writer = inner.positions.get(dataset).copied();
@@ -2029,6 +2108,9 @@ impl Follower {
             .filter(|r| !r.is_empty())
         {
             out["cache_refused"] = refused.into();
+        }
+        if let Some(view) = inner.standby.get(dataset) {
+            out["standby"] = view.clone();
         }
         out
     }
@@ -2364,6 +2446,131 @@ mod tests {
     /// #2467: what versions of a dataset's derived state still being read hold is charged to its
     /// cursor: in what the dataset holds, and in the room left for its next delta and for every other
     /// dataset on the cursor.
+    /// RFC-0078 S1: a standby reports the lease's holder, and that it could take over only once the
+    /// lease has gone unrenewed for its term and half again.
+    #[tokio::test(start_paused = true)]
+    async fn a_standby_reports_the_holder_and_then_the_lapse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror = tmp.path().join("mirror");
+        let registry = tmp.path().join("registry");
+        std::fs::create_dir_all(&mirror).unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        let doc = crate::lease::LeaseDoc {
+            owner: Some("writer-a".into()),
+            fence: 2,
+            term_secs: 10,
+            renewal: 7,
+        };
+        let at = mirror.join(crate::lease::lease_key("ident"));
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::fs::write(&at, serde_json::to_vec(&doc).unwrap()).unwrap();
+        let remote = crate::remote_follow::Remote::open(
+            mirror.to_str().unwrap(),
+            registry.to_str().unwrap(),
+            2048,
+        )
+        .unwrap();
+        let follower = Follower::start_remote(
+            tmp.path().join("cache"),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+            Arc::new(remote),
+            Options {
+                standby: true,
+                ..Options::default()
+            },
+        );
+        let (ready, _) = tokio::sync::mpsc::channel(1);
+        let mut cx = Cx {
+            fresh: Default::default(),
+            ready,
+            fetches: Vec::new(),
+            feed: crate::feed_wire::FEED_V2,
+        };
+        let _ = follower
+            .handle(
+                Line::Mount {
+                    route: "/default/ds".into(),
+                    dataset: "data/ds".into(),
+                    nid: None,
+                    sql: Default::default(),
+                    queries: Vec::new(),
+                    tenant: None,
+                    share: None,
+                    limits: None,
+                    chain: Some("mainnet".into()),
+                    isolation: None,
+                    data_identity: Some("ident".into()),
+                    fence: Some(2),
+                },
+                &mut cx,
+            )
+            .await;
+        let view = |f: &Arc<Follower>| f.lock().standby.get("data/ds").cloned().unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let live = view(&follower);
+        assert_eq!(live["holder"], "writer-a");
+        assert_eq!(live["fence"], 2);
+        assert_eq!(live["takeable"], false, "{live}");
+        tokio::time::sleep(std::time::Duration::from_secs(14)).await;
+        let lapsed = view(&follower);
+        assert_eq!(lapsed["takeable"], true, "{lapsed}");
+        assert_eq!(lapsed["would_take_fence"], 3);
+    }
+
+    /// RFC-0078 §5.3: once a follower has followed a dataset at fence N it refuses any writer below
+    /// N, so a writer paused through a takeover cannot feed it when it wakes.
+    #[tokio::test]
+    async fn a_follower_refuses_a_writer_below_the_highest_fence_it_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        follower.pause(false);
+        let (ready, _) = tokio::sync::mpsc::channel(1);
+        let mut cx = Cx {
+            fresh: Default::default(),
+            ready,
+            fetches: Vec::new(),
+            feed: crate::feed::FEED_VERSION,
+        };
+        let mount = |fence: u64| Line::Mount {
+            route: "/default/ds".into(),
+            dataset: "data/ds".into(),
+            nid: None,
+            sql: Default::default(),
+            queries: Vec::new(),
+            tenant: None,
+            share: None,
+            limits: None,
+            chain: Some("mainnet".into()),
+            isolation: None,
+            data_identity: Some("ident".into()),
+            fence: Some(fence),
+        };
+        let fenced = |r: Result<()>| r.err().is_some_and(|e| format!("{e:#}").contains("fence"));
+        assert!(!fenced(follower.handle(mount(2), &mut cx).await));
+        let refused = follower.handle(mount(1), &mut cx).await.unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("below the 2"),
+            "{refused:#}"
+        );
+        assert!(
+            !fenced(follower.handle(mount(2), &mut cx).await),
+            "the holder again is fine"
+        );
+        assert!(
+            !fenced(follower.handle(mount(3), &mut cx).await),
+            "a later holder is followed"
+        );
+        assert!(
+            fenced(follower.handle(mount(2), &mut cx).await),
+            "and then 2 is stale too"
+        );
+    }
+
     #[tokio::test]
     async fn derived_versions_still_read_are_charged_to_the_cursor() {
         let tmp = tempfile::tempdir().unwrap();

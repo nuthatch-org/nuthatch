@@ -141,6 +141,7 @@ async fn start_fe_on(
         cache: None,
         max_rss_mb: None,
         feed_version: 2,
+        standby: false,
     };
     let task = tokio::spawn(async move {
         // Runs until the process is signalled; the test aborts it instead.

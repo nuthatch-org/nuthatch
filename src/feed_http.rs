@@ -712,6 +712,7 @@ async fn serve_connection(
                         chain: Some(m.chain.clone()),
                         isolation: m.isolation.clone(),
                         data_identity: identities.get(&m.dir).cloned().flatten(),
+                        fence: Some(m.store.held_fence()).filter(|f| *f > 0),
                     }, v2);
                     if routes.get(route).is_some_and(|sent| sent[..] == mount[..]) {
                         continue;

@@ -1014,6 +1014,7 @@ async fn one_run(
                 interval: std::time::Duration::from_secs(60),
                 parallelism: crate::publish::DEFAULT_PARALLELISM,
                 followers: false,
+                writer_fence: None,
             };
             Some((
                 crate::publish::spawn(work.clone(), name.clone(), settings)?,

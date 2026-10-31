@@ -110,6 +110,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
             interval: args.publish_interval,
             parallelism: args.publish_parallelism as usize,
             followers: false,
+            writer_fence: None,
         });
     let audit = match &args.audit_rpc {
         Some(url) => {
@@ -3795,6 +3796,7 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
                     interval: args.publish_interval,
                     parallelism: args.publish_parallelism as usize,
                     followers: false,
+                    writer_fence: None,
                 },
             )
         })
@@ -16991,6 +16993,39 @@ template = "pool"
             .unwrap()
             .is_empty());
         assert_eq!(sup.live(), vec![1]);
+    }
+
+    /// RFC-0078 §5.2: a writer that lost its lease fences its store off, and the nest on it must stop
+    /// for good rather than be readmitted on a backoff that would fail the same way for ever.
+    #[tokio::test]
+    async fn a_fenced_off_store_quarantines_its_nest_terminally_and_spares_its_co_tenant() {
+        let da = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let fenced = build_test_nest(da.path(), "0x0000000000000000000000000000000000000001").await;
+        let healthy =
+            build_test_nest(db.path(), "0x0000000000000000000000000000000000000002").await;
+        seed_blocks(&fenced, &[10, 20, 30, 40, 50, 60]);
+        seed_blocks(&healthy, &[10, 20, 30, 40, 50, 60]);
+        fenced.store.claim("writer").unwrap();
+        fenced.store.fence_off().unwrap();
+
+        let mut nests = vec![Some(fenced), Some(healthy)];
+        let mut nexts = vec![61u64, 61];
+        let mut sup = test_supervisor(2);
+        fan_out_rollback(&mut nests, &mut nexts, &mut sup, &[0, 1], 50)
+            .await
+            .unwrap();
+
+        match &sup.states[0] {
+            NestState::Quarantined { reason, retry_at } => {
+                assert!(retry_at.is_none(), "a lost store must not be retried");
+                assert!(reason.contains("lost ownership"), "{reason}");
+            }
+            other => panic!("the fenced nest must quarantine, got {other:?}"),
+        }
+        assert_eq!(nexts[0], 61, "it claims nothing it did not commit");
+        assert!(matches!(sup.states[1], NestState::Live));
+        assert_eq!(nexts[1], 51);
     }
 
     /// A fork deeper than every stored checkpoint yields `Some(0)` - roll back the whole hot store and

@@ -217,6 +217,33 @@ pub struct MountPublish {
     /// offchain snapshots may be data an operator never meant to publish.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub followers: bool,
+    /// RFC-0078: hold the dataset's writer lease in this mirror. A writer that cannot take it does
+    /// not start, and one that loses it stops committing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover: Option<Failover>,
+}
+
+/// `[mounts.publish.failover]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Failover {
+    /// How long a lease lasts without a renewal; a standby takes over half as long again after.
+    #[serde(default = "default_lease_term")]
+    pub term: String,
+}
+
+fn default_lease_term() -> String {
+    "10s".to_string()
+}
+
+impl Failover {
+    pub fn term(&self) -> Result<std::time::Duration> {
+        let term = crate::freshness::parse_span(&self.term)
+            .map_err(|e| anyhow::anyhow!("failover term {:?}: {e}", self.term))?;
+        if term < std::time::Duration::from_secs(3) {
+            bail!("the failover term must be at least 3s, for three renewals inside it");
+        }
+        Ok(term)
+    }
 }
 
 fn default_publish_interval() -> String {
@@ -248,6 +275,7 @@ impl MountPublish {
             interval,
             parallelism: self.parallelism,
             followers: self.followers,
+            writer_fence: None,
         })
     }
 }
@@ -1642,6 +1670,7 @@ pub fn spawn_publishers(
     mounts: &[Mount],
     default: Option<&MountPublish>,
     default_tenant: &str,
+    leases: &[WriterLease],
 ) -> Result<Vec<(String, crate::publish::Publisher)>> {
     let mut out = Vec::new();
     for m in mounts {
@@ -1650,12 +1679,17 @@ pub fn spawn_publishers(
         let first = std::ptr::eq(canonical, m);
         if let Some(publish) = mirror_of(m, mounts, default, first) {
             let cursor_key = mount_route(canonical, default_tenant);
+            let fence = leases
+                .iter()
+                .find(|l| l.route == cursor_key)
+                .and_then(WriterLease::fence);
             out.push(spawn_publisher(
                 dir,
                 m,
                 publish,
                 default_tenant,
                 &cursor_key,
+                fence,
             )?);
         }
     }
@@ -1692,12 +1726,132 @@ fn spawn_publisher(
     publish: &MountPublish,
     default_tenant: &str,
     cursor_key: &str,
+    writer_fence: Option<u64>,
 ) -> Result<(String, crate::publish::Publisher)> {
     let key = mount_route(m, default_tenant);
+    if publish.failover.is_some() && writer_fence.is_none() {
+        bail!(
+            "mount '{key}' asks for failover, and the writer lease is only taken at boot: restart \
+             the runtime to publish it with failover"
+        );
+    }
     let dataset = MountTable::data_dir(dir, &m.nid);
-    let publisher = crate::publish::spawn(dataset, cursor_key.to_string(), publish.settings()?)
+    let settings = crate::publish::Settings {
+        writer_fence,
+        ..publish.settings()?
+    };
+    let publisher = crate::publish::spawn(dataset, cursor_key.to_string(), settings)
         .with_context(|| format!("publishing mount '{key}'"))?;
     Ok((key, publisher))
+}
+
+/// A writer lease taken at boot, for the route whose store it will guard.
+pub struct WriterLease {
+    route: String,
+    lease: crate::lease::Lease,
+}
+
+impl WriterLease {
+    pub fn fence(&self) -> Option<u64> {
+        self.lease.fence()
+    }
+}
+
+/// RFC-0078 §5.2: take every failover dataset's lease before its cursor exists, so nothing is
+/// committed by a writer that does not hold it. A lease held by a live writer refuses the boot.
+pub async fn take_writer_leases(
+    dir: &Path,
+    mounts: &[Mount],
+    default: Option<&MountPublish>,
+    default_tenant: &str,
+) -> Result<Vec<WriterLease>> {
+    use crate::lease;
+    let mut out = Vec::new();
+    for m in mounts {
+        let canonical = mounts.iter().find(|first| first.nid == m.nid).unwrap_or(m);
+        if !std::ptr::eq(canonical, m) {
+            continue;
+        }
+        let Some(publish) = mirror_of(m, mounts, default, true) else {
+            continue;
+        };
+        let Some(failover) = &publish.failover else {
+            continue;
+        };
+        let route = mount_route(m, default_tenant);
+        let term = failover.term()?;
+        let (identity, ..) = crate::publish::identity_of(&MountTable::data_dir(dir, &m.nid))
+            .with_context(|| format!("the data identity of mount '{route}'"))?;
+        let mirror: Arc<dyn crate::publish::Mirror> =
+            crate::publish::open_mirror(&publish.target)?.into();
+        let key = lease::lease_key(&identity);
+        let margin = term / 2;
+        let poll = std::time::Duration::from_secs(1);
+        // A lease left by this writer's own last run lapses within the wait; one still renewed
+        // belongs to a live writer, and this host should be its standby instead.
+        let seen = match tokio::time::timeout(
+            term + margin + poll * 2,
+            lease::await_takeable(&*mirror, &key, margin, poll),
+        )
+        .await
+        {
+            Ok(seen) => seen,
+            Err(_) => {
+                let holder = lease::observe(&*mirror, &key).await.ok();
+                let by = holder
+                    .as_ref()
+                    .and_then(|o| o.doc())
+                    .and_then(|d| d.owner.clone())
+                    .unwrap_or_default();
+                bail!(
+                    "mount '{route}': the writer lease at {key} is held by {by}, who is still \
+                     renewing it. Start this host as a follower, or stop that writer first"
+                );
+            }
+        };
+        let mut writer = lease::Lease::new(mirror, key, writer_id(), term);
+        let fence = writer
+            .take(&seen)
+            .await
+            .with_context(|| format!("taking the writer lease for mount '{route}'"))?;
+        tracing::info!("mount {route}: took the writer lease at fence {fence}");
+        out.push(WriterLease {
+            route,
+            lease: writer,
+        });
+    }
+    Ok(out)
+}
+
+/// Claim each leased route's store and renew its lease until it is lost, then fence the store off
+/// and quarantine the nest, so `/ready` says why it stopped.
+pub fn hold_writer_leases(
+    leases: Vec<WriterLease>,
+    states: &[(String, crate::serve::AppState)],
+    health: &Arc<crate::health::RuntimeHealth>,
+) -> Result<()> {
+    for WriterLease { route, lease } in leases {
+        let Some((_, state)) = states.iter().find(|(k, _)| *k == route) else {
+            continue;
+        };
+        let store = state.store.clone();
+        store
+            .claim(lease.owner())
+            .with_context(|| format!("claiming the store of mount '{route}'"))?;
+        let health = health.clone();
+        tokio::spawn(async move {
+            let stopped = crate::lease::hold(lease, move || store.fence_off()).await;
+            health.quarantine_nest(&route, stopped.to_string(), 0, None);
+        });
+    }
+    Ok(())
+}
+
+fn writer_id() -> String {
+    let mut bytes = [0u8; 6];
+    let _ = getrandom::fill(&mut bytes);
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "writer".to_string());
+    format!("{host}/{}", hex::encode(bytes))
 }
 
 /// The identity of the dataset serving `route_key`, for the provenance stamp (RFC-0035 §3).
@@ -2277,6 +2431,9 @@ pub async fn dev(
     let mut failed: std::collections::BTreeMap<String, String> = Default::default();
     let mut failed_chain: std::collections::HashMap<String, String> = Default::default();
 
+    let writer_leases =
+        take_writer_leases(&dir, &mounts.mounts, meta.publish.as_ref(), default_tenant).await?;
+
     for mut group in groups {
         let rpc_urls = rpc::select_rpcs(&rpc_override, group.endpoint.rpc_urls.clone());
         if rpc_urls.is_empty() {
@@ -2468,7 +2625,14 @@ pub async fn dev(
         meta.isolation,
     )?;
     let all_states = all_states;
-    let publishers = spawn_publishers(&dir, &mounts.mounts, meta.publish.as_ref(), default_tenant)?;
+    let publishers = spawn_publishers(
+        &dir,
+        &mounts.mounts,
+        meta.publish.as_ref(),
+        default_tenant,
+        &writer_leases,
+    )?;
+    hold_writer_leases(writer_leases, &all_states, &health)?;
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // mounts's real resident set alongside the projection so operators can calibrate.
@@ -6884,6 +7048,7 @@ impl RuntimeHandles {
                     publish,
                     &self.default_tenant,
                     cursor_key,
+                    None,
                 ) {
                     Ok((_, publisher)) => self.publishers.push((name.to_string(), publisher)),
                     Err(e) => {
@@ -6949,6 +7114,7 @@ impl RuntimeHandles {
             publish,
             &default_tenant,
             &cursor_key,
+            None,
         )?;
         self.publishers.push((name.to_string(), publisher));
         Ok(())
@@ -7648,6 +7814,64 @@ mod tests {
         assert_eq!(target(3, false), Some("/own"));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_failover_mount_takes_the_lease_and_a_second_writer_is_refused_while_it_renews() {
+        let root = tempfile::tempdir().unwrap();
+        let nid = "c".repeat(64);
+        let dataset = MountTable::data_dir(root.path(), &nid);
+        std::fs::create_dir_all(dataset.join("abis")).unwrap();
+        std::fs::write(
+            dataset.join(CONFIG_FILE),
+            "[nest]\nname = \"leased\"\nchain = \"ethereum\"\nchain_id = 1\n\
+             rpc_urls = [\"http://127.0.0.1:1\"]\nschema_version = 1\n\n\
+             [[contracts]]\nalias = \"usdc\"\n\
+             address = \"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48\"\nabi = \"abis/usdc.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dataset.join("abis/usdc.json"),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        let mirror = tempfile::tempdir().unwrap();
+        let mut table = mounts_with("");
+        table.mounts[0].nid = nid.clone();
+        table.mounts[0].publish = Some(MountPublish {
+            target: mirror.path().to_str().unwrap().to_string(),
+            interval: "1h".into(),
+            parallelism: 2,
+            followers: false,
+            failover: Some(Failover { term: "3s".into() }),
+        });
+
+        let mut first = take_writer_leases(root.path(), &table.mounts, None, "default")
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let WriterLease { lease, .. } = first.pop().unwrap();
+        assert_eq!(lease.fence(), Some(1));
+        let holder = tokio::spawn(crate::lease::hold(lease, || Ok(())));
+
+        let refused = take_writer_leases(root.path(), &table.mounts, None, "default")
+            .await
+            .err()
+            .expect("a live writer's lease refuses a second");
+        assert!(
+            refused.to_string().contains("still renewing"),
+            "{refused:#}"
+        );
+
+        holder.abort();
+        let mut next = take_writer_leases(root.path(), &table.mounts, None, "default")
+            .await
+            .unwrap();
+        assert_eq!(
+            next.pop().unwrap().lease.fence(),
+            Some(2),
+            "taken over once it lapsed"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_publishers_mirrors_each_mount_that_asks_and_skips_the_rest() {
         let root = tempfile::tempdir().unwrap();
@@ -7699,6 +7923,7 @@ mod tests {
             interval: "1h".into(),
             parallelism: 2,
             followers: false,
+            failover: None,
         });
         let mut quiet = table.mounts[0].clone();
         quiet.alias = "quiet".into();
@@ -7706,7 +7931,8 @@ mod tests {
         // First, so `quiet` is the route the dataset's cursor records under (#1415).
         table.mounts.insert(0, quiet);
 
-        let publishers = spawn_publishers(root.path(), &table.mounts, None, "default").unwrap();
+        let publishers =
+            spawn_publishers(root.path(), &table.mounts, None, "default", &[]).unwrap();
         let keys: Vec<&str> = publishers.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["usdc"]);
 

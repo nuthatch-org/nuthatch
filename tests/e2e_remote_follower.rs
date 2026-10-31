@@ -300,6 +300,7 @@ impl Rig {
             Options {
                 feed,
                 paused: false,
+                standby: false,
             },
         );
         let base = bind(f.clone()).await;

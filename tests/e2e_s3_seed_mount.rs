@@ -92,7 +92,7 @@ async fn mirror_from_a_publishing_mount(
     )
     .unwrap();
     let table = runtime::MountTable::load(roost).unwrap();
-    let publishers = runtime::spawn_publishers(roost, &table.mounts, None, "default").unwrap();
+    let publishers = runtime::spawn_publishers(roost, &table.mounts, None, "default", &[]).unwrap();
     assert_eq!(publishers.len(), 1, "the mount must publish");
 
     let deadline = std::time::Instant::now() + POLL_TIMEOUT;

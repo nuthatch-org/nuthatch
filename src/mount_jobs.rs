@@ -401,6 +401,7 @@ mod tests {
             interval: "60s".into(),
             parallelism: 4,
             followers: false,
+            failover: None,
         });
         let job = jobs.claim(job).unwrap();
         jobs.advance_if_owned("a", job.generation, MountPhase::Seeding, None)

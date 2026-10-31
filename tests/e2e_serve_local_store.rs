@@ -80,6 +80,7 @@ async fn serve_without_hot_store_refuses_a_nest_with_no_store_rather_than_creati
         cache: None,
         max_rss_mb: None,
         feed_version: 2,
+        standby: false,
     };
     let err = refusal(args).await;
 
@@ -124,6 +125,7 @@ async fn serve_without_hot_store_refuses_a_store_a_live_handle_holds() {
         cache: None,
         max_rss_mb: None,
         feed_version: 2,
+        standby: false,
     };
     let err = refusal(args).await;
 
@@ -163,6 +165,7 @@ async fn serve_without_hot_store_serves_a_store_the_writer_left_behind() {
         cache: None,
         max_rss_mb: None,
         feed_version: 2,
+        standby: false,
     };
     let task = tokio::spawn(async move {
         let _ = nuthatch::indexer::serve_role(args).await;

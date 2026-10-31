@@ -999,7 +999,7 @@ jobs:
           aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_MINIO_BUCKET"
           aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_REGISTRY_BUCKET"
       - name: publish, registry, seed and remote follower suites against a real S3 server
-        run: cargo test --locked --test it -- e2e_minio_publish e2e_s3_registry e2e_s3_seed_mount e2e_remote_follower
+        run: cargo test --locked --test it -- e2e_minio_publish e2e_minio_lease e2e_s3_registry e2e_s3_seed_mount e2e_remote_follower
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
         uses: ./.github/actions/timeout-or-cancel
@@ -1389,6 +1389,27 @@ jobs:
         run: |
           chmod +x bin/nuthatch bin/fixture-rpc
           bash scripts/rolling-upgrade.sh bin/nuthatch
+
+  failover:
+    name: writer failover (two writers, one lease)
+    needs: [changes, build-release]
+    if: ${{ !cancelled() && needs.build-release.result == 'success' && needs.changes.outputs.slow != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: download binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nuthatch-release
+          path: bin
+      - name: refuse a second writer, take over from a frozen one, stop the one that wakes
+        # RFC-0078 S1: two processes against one mirror; the holder is frozen with SIGSTOP.
+        env:
+          FIXTURE_RPC: bin/fixture-rpc
+        run: |
+          chmod +x bin/nuthatch bin/fixture-rpc
+          bash scripts/failover-gate.sh bin/nuthatch
 
   point-read:
     name: point-read latency

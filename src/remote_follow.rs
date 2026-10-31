@@ -177,6 +177,10 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 impl Remote {
+    pub(crate) fn mirror(&self) -> &dyn Mirror {
+        self.mirror.as_ref()
+    }
+
     pub fn open(mirror: &str, registry: &str, max_rss_mb: u64) -> Result<Remote> {
         Ok(Remote {
             mirror: crate::publish::open_mirror(mirror)

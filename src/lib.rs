@@ -95,6 +95,7 @@ pub mod inspect;
 pub mod ipfs;
 pub mod ipfs_resolve;
 pub mod isolation;
+pub(crate) mod lease;
 pub mod lifecycle;
 pub mod limits;
 pub mod lists;
