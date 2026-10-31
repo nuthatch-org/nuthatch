@@ -871,6 +871,96 @@ mod tests {
         s
     }
 
+    /// RFC-0079 S0: one statement's answer as `/sql`'s JSON rows and as an Arrow IPC stream of the
+    /// same batches, both taken through the guarded per-batch path. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn rfc_0079_s0_json_against_ipc() {
+        use crate::engine::{FactWindow, Session};
+        let dir = tempfile::tempdir().unwrap();
+        let s = super::BurrmillSession::new(Some((dir.path(), None))).unwrap();
+        const N: u64 = 100_000;
+        let rows: Vec<serde_json::Value> = (0..N)
+            .map(|i| {
+                serde_json::json!({
+                    "block_number": 21_000_000 + i / 4,
+                    "log_index": i % 4,
+                    "address": format!("0x{:040x}", i % 97),
+                    "value_dec": format!("{}", u128::MAX - i as u128 * 7_919),
+                    "tx_hash": format!("0x{:064x}", i),
+                })
+            })
+            .collect();
+        let refs: Vec<&serde_json::Value> = rows.iter().collect();
+        s.load_hot("t", &refs).unwrap();
+        assert!(s
+            .bind_facts("t", &[], &[], true, FactWindow::default())
+            .unwrap());
+
+        let shapes = [
+            (
+                "point read",
+                "SELECT * FROM t WHERE block_number = 21012345 AND log_index = 1",
+            ),
+            (
+                "panel",
+                "SELECT address, count(*) AS n, max(block_number) AS last FROM t GROUP BY address ORDER BY address",
+            ),
+            ("export", "SELECT * FROM t ORDER BY block_number, log_index"),
+        ];
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        for (name, sql) in shapes {
+            let (mut je, mut jd, mut ie, mut id) = (vec![], vec![], vec![], vec![]);
+            let (mut jbytes, mut ibytes, mut nrows) = (0, 0, 0);
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                let out = s.collect(sql, None).unwrap();
+                let body = serde_json::to_vec(&out.rows).unwrap();
+                je.push(t.elapsed().as_secs_f64() * 1e3);
+                jbytes = body.len();
+                nrows = out.rows.len();
+                let t = std::time::Instant::now();
+                let back: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+                jd.push(t.elapsed().as_secs_f64() * 1e3);
+                assert_eq!(back.len(), nrows);
+
+                let t = std::time::Instant::now();
+                let mut writer: Option<arrow::ipc::writer::StreamWriter<Vec<u8>>> = None;
+                s.reader()
+                    .sql_for_each_metered(sql, None, |batch| {
+                        let w = writer.get_or_insert_with(|| {
+                            arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &batch.schema())
+                                .unwrap()
+                        });
+                        w.write(&batch).unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+                let ipc = writer.unwrap().into_inner().unwrap();
+                ie.push(t.elapsed().as_secs_f64() * 1e3);
+                ibytes = ipc.len();
+                let t = std::time::Instant::now();
+                let read: usize =
+                    arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&ipc), None)
+                        .unwrap()
+                        .map(|b| b.unwrap().num_rows())
+                        .sum();
+                id.push(t.elapsed().as_secs_f64() * 1e3);
+                assert_eq!(read, nrows);
+            }
+            println!(
+                "RFC0079S0 | {name} | rows {nrows} | json {jbytes} B, encode {:.3} ms, decode {:.3} ms | ipc {ibytes} B, encode {:.3} ms, decode {:.3} ms",
+                median(je),
+                median(jd),
+                median(ie),
+                median(id)
+            );
+        }
+    }
+
     fn pool_of(dir: &std::path::Path) -> crate::engine::PoolUse {
         super::pools().by_dir.get(dir).copied().unwrap_or_default()
     }

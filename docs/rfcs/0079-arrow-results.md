@@ -160,3 +160,45 @@ side in RFC-0080, so fuzzing extends to the answer stream.
    above it, and document both.
 2. Whether `flight` should be on by default once S0 has the size figure.
 3. Whether declared queries should be Flight SQL prepared statements, if a client asks.
+
+## 12. S0 measured (2026-10-31)
+
+On a MacBook, release build, against `main` at `b7d1a2f6`. Nothing here has run on a CI runner.
+
+**§2's [VERIFY], answered.** Burrmill's arrow is nuthatch's: the lock holds one `arrow`, 59.3.0, and
+a batch from `sql_for_each_metered` assigns to `arrow::record_batch::RecordBatch` without conversion
+(checked by compiling it). The comment "its arrow is not ours" in `engine_burrmill.rs`, and the IPC
+round trip in `query_arrow` that rests on it, are out of date. So the IPC answer is written in
+nuthatch, inside `collect`'s per-batch closure, where the row cap, the byte cap and the cost meter
+already run. Burrmill's `sql_ipc` is not the path: it collects every batch before writing, with no
+cap and no meter. And the temporal rewrite `collect` applies (#1852) is a fix to JSON text, so an
+Arrow answer, which keeps `Date32` and `Timestamp` as types, needs none.
+
+**JSON against IPC.** `engine_burrmill::tests::rfc_0079_s0_json_against_ipc` (ignored; run with
+`--release -- --ignored --nocapture`): 100,000 transfer-shaped rows, each a block, a log index, a
+42-character address, a 78-digit decimal as text and a 66-character hash, through the real session.
+Each figure is the median of five; encode includes running the statement, so the difference between
+the two is the encoding. Decode is in Rust (`serde_json` against Arrow's `StreamReader`), standing in
+for a client: pyarrow was not installed, so the RFC's pyarrow and browser figures are not measured.
+
+| Answer | Rows | JSON | IPC | JSON encode, decode | IPC encode, decode |
+|---|---|---|---|---|---|
+| A point read | 1 | 229 B | 1,736 B | 1.69 ms, 0.003 ms | 1.64 ms, 0.008 ms |
+| A panel (`GROUP BY address`) | 97 | 7,955 B | 8,200 B | 1.71 ms, 0.021 ms | 1.71 ms, 0.006 ms |
+| An export | 100,000 | 22.8 MB | 21.2 MB | 41.8 ms, 36.8 ms | 8.0 ms, 2.3 ms |
+
+Arrow pays off on large answers and only there. An export encodes about 5 times faster and decodes
+about 16 times faster. A point read's answer is seven times larger in IPC, because the schema travels
+with it, and its time is the statement's either way. The bytes barely move, because a nest's columns
+are mostly text; Arrow saves size on numeric columns, and these rows have two. So IPC is opt-in by
+`Accept`, as §5.1 has it, and JSON stays the default.
+
+**Flight SQL's cost.** Two throwaway programs over arrow 59 and tokio, release and stripped: one
+writes an IPC stream (1.46 MB), the other serves a minimal Flight SQL service (2.35 MB), so
+`arrow-flight` and `tonic` add about 0.9 MB. Against nuthatch's own tree they bring eight crates it does
+not already have (`arrow-flight`, `tonic`, `tonic-prost`, `prost`, `prost-derive`, `prost-types`,
+`tokio-stream`, `hyper-timeout`); hyper and h2 are already in it. The 5.16.0 release archives are 41 to
+47 MB. That does not stop S2. Whether `flight` should be on by default, open question 2, is now a
+question of a second port rather than of size.
+
+**S0 stops nothing.** S1 (IPC on `/sql`, in `collect`) and S2 (Flight SQL behind `flight`) go ahead.
