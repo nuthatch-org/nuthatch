@@ -509,7 +509,7 @@ dependencies = [
  "alloy-serde",
  "alloy-sol-types",
  "alloy-trie",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "serde",
  "serde_json",
  "serde_with",
@@ -1582,7 +1582,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "burrmill"
 version = "0.0.1"
-source = "git+https://github.com/nuthatch-org/burrmill?rev=ea8cf40c74b4e9da61983c4658d50d2d18217b7f#ea8cf40c74b4e9da61983c4658d50d2d18217b7f"
+source = "git+https://github.com/nuthatch-org/burrmill?rev=de9e2b89aa39ac43bc56cde8b31a520319f7494b#de9e2b89aa39ac43bc56cde8b31a520319f7494b"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.0",
@@ -4005,7 +4005,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -5761,7 +5761,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5799,7 +5799,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
