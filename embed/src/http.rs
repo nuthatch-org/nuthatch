@@ -64,7 +64,16 @@ pub async fn answer(n: &Nest<'_>, method: &str, target: &str, body: &[u8]) -> An
             ("GET", ["sql"]) | ("GET", ["explain"]) => {
                 let q = param("q").ok_or_else(|| rejected("missing field `q`"))?;
                 let max_rows = number("max_rows")?;
-                route_sql(n, segs[0] == "explain", answer::SqlRequest { q, max_rows }).await
+                route_sql(
+                    n,
+                    segs[0] == "explain",
+                    answer::SqlRequest {
+                        q,
+                        max_rows,
+                        format: None,
+                    },
+                )
+                .await
             }
             ("POST", ["sql"]) | ("POST", ["explain"]) => {
                 let explain = segs[0] == "explain";
