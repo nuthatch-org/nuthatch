@@ -100,7 +100,7 @@ fn sql_caps_result_bytes_not_just_rows() {
         .create_with_backend(nuthatch_core::backend::Bytes::default())
         .unwrap();
     let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
-    let cellar = Cellar::default();
+    let cellar = std::sync::Arc::new(Cellar::default());
     let q = futures::executor::block_on(TabQuery::bind(
         &store,
         &cellar,
@@ -108,6 +108,7 @@ fn sql_caps_result_bytes_not_just_rows() {
         &[],
         &NestFiles::new(),
         TabBudget::default(),
+        &[],
     ))
     .unwrap();
     let (rows, _, truncated) = futures::executor::block_on(
@@ -126,7 +127,7 @@ fn sql_writes_dates_as_the_node_does() {
         .create_with_backend(nuthatch_core::backend::Bytes::default())
         .unwrap();
     let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
-    let cellar = Cellar::default();
+    let cellar = std::sync::Arc::new(Cellar::default());
     let q = futures::executor::block_on(TabQuery::bind(
         &store,
         &cellar,
@@ -134,6 +135,7 @@ fn sql_writes_dates_as_the_node_does() {
         &[],
         &NestFiles::new(),
         TabBudget::default(),
+        &[],
     ))
     .unwrap();
     let sql = "SELECT CAST('2026-10-05' AS DATE) AS d, \
@@ -161,7 +163,7 @@ fn sql_does_not_encode_the_row_that_would_cross_the_cap() {
         .create_with_backend(nuthatch_core::backend::Bytes::default())
         .unwrap();
     let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
-    let cellar = Cellar::default();
+    let cellar = std::sync::Arc::new(Cellar::default());
     let q = futures::executor::block_on(TabQuery::bind(
         &store,
         &cellar,
@@ -169,6 +171,7 @@ fn sql_does_not_encode_the_row_that_would_cross_the_cap() {
         &[],
         &NestFiles::new(),
         TabBudget::default(),
+        &[],
     ))
     .unwrap();
     let (rows, _, truncated) = futures::executor::block_on(
@@ -193,7 +196,7 @@ fn sql_sizes_nested_values_before_encoding_them() {
         .create_with_backend(nuthatch_core::backend::Bytes::default())
         .unwrap();
     let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
-    let cellar = Cellar::default();
+    let cellar = std::sync::Arc::new(Cellar::default());
     let q = futures::executor::block_on(TabQuery::bind(
         &store,
         &cellar,
@@ -201,6 +204,7 @@ fn sql_sizes_nested_values_before_encoding_them() {
         &[],
         &NestFiles::new(),
         TabBudget::default(),
+        &[],
     ))
     .unwrap();
     let (rows, _, truncated) = futures::executor::block_on(
@@ -267,7 +271,7 @@ fn a_statement_over_the_phone_share_is_refused() {
         .create_with_backend(nuthatch_core::backend::Bytes::default())
         .unwrap();
     let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
-    let cellar = Cellar::default();
+    let cellar = std::sync::Arc::new(Cellar::default());
     let phone = TabBudget::mib(PHONE_CEILING_MIB);
     let q = futures::executor::block_on(TabQuery::bind(
         &store,
@@ -276,6 +280,7 @@ fn a_statement_over_the_phone_share_is_refused() {
         &[],
         &NestFiles::new(),
         phone,
+        &[],
     ))
     .unwrap();
     let err = futures::executor::block_on(q.collect(LODESTAR_CLASS, 10)).unwrap_err();

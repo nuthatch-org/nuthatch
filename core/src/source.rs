@@ -38,6 +38,9 @@ pub use nuthatch_decode::rpc::Log;
 pub struct LogFilter {
     addresses: Vec<String>,
     topic0s: Vec<String>,
+    /// Topics 1 to 3, each matching any of its values, or anything when empty. Only an embedded
+    /// nest narrowed to a user's own logs sets them (RFC-0077 S7); a node never does.
+    topics: [Vec<String>; 3],
 }
 
 impl LogFilter {
@@ -50,7 +53,29 @@ impl LogFilter {
         (!addresses.is_empty() || !topic0s.is_empty()).then(|| Self {
             addresses: addresses.to_vec(),
             topic0s: topic0s.to_vec(),
+            topics: Default::default(),
         })
+    }
+
+    /// The same filter, also matching only logs whose topics 1 to 3 are among `topics`' values.
+    pub fn with_topics(mut self, topics: [Vec<String>; 3]) -> Self {
+        self.topics = topics;
+        self
+    }
+
+    /// Topics 1 to 3; an empty position matches anything.
+    pub fn topics(&self) -> &[Vec<String>; 3] {
+        &self.topics
+    }
+
+    /// Whether `log` is one this filter asks for, so a source that ignores part of it is caught.
+    pub fn matches(&self, log: &Log) -> bool {
+        let any = |want: &[String], got: Option<&String>| {
+            want.is_empty() || got.is_some_and(|g| want.iter().any(|w| w.eq_ignore_ascii_case(g)))
+        };
+        any(&self.addresses, Some(&log.address))
+            && any(&self.topic0s, log.topics.first())
+            && (0..3).all(|i| any(&self.topics[i], log.topics.get(i + 1)))
     }
 
     /// The addresses to match. Possibly empty - a factory nest matches on topic0 alone.
@@ -238,5 +263,30 @@ mod log_filter_tests {
         let f = LogFilter::new(&addr, &topic).unwrap();
         assert_eq!(f.addresses(), addr);
         assert_eq!(f.topic0s(), topic);
+    }
+
+    #[test]
+    fn a_log_matches_only_the_topics_a_filter_names() {
+        let log = |t1: &str| super::Log {
+            address: "0xABC".into(),
+            topics: vec!["0xddf2".into(), t1.into()],
+            data: "0x".into(),
+            block_number: 1,
+            block_hash: "0x01".into(),
+            tx_hash: "0x02".into(),
+            log_index: 0,
+        };
+        let plain = LogFilter::new(&["0xabc".to_string()], &["0xddf2".to_string()]).unwrap();
+        assert!(plain.matches(&log("0x01")));
+        let narrowed = plain.with_topics([vec!["0x01".into()], vec![], vec![]]);
+        assert!(narrowed.matches(&log("0x01")));
+        assert!(!narrowed.matches(&log("0x02")));
+        let third = LogFilter::new(&[], &["0xddf2".to_string()])
+            .unwrap()
+            .with_topics([vec![], vec![], vec!["0x03".into()]]);
+        assert!(
+            !third.matches(&log("0x01")),
+            "a log with no third topic is not a match"
+        );
     }
 }

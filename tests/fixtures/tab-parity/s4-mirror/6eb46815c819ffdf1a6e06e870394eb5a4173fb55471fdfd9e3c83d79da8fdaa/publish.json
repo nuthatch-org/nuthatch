@@ -1,0 +1,15 @@
+{
+  "layout_version": 1,
+  "nuthatch_version": "5.14.1",
+  "chain_id": 1,
+  "data_identity": "6eb46815c819ffdf1a6e06e870394eb5a4173fb55471fdfd9e3c83d79da8fdaa",
+  "nid": "6224ea6c53937ad0eca8bb3cb7be73547e98a92ed415068a151333bc61097ac8",
+  "bundle_hash": "3c87ef643a43d00f34505a64fcd3d5bc401a4c880689e0acf7ee30573821f582",
+  "sealed_through": 26241612,
+  "published_at": "2026-10-30T19:00:43Z",
+  "catalogue_sha256": "33a42e113fc8359810630da37fd9fb540425485131c4fd6c10bb2fe3e420bcea",
+  "schema_sha256": "92e90415d99cbe497d12101e4684f05519ffe5fd0d15a1824c27c2e42b05c6f1",
+  "tables": [
+    "tab__transfer"
+  ]
+}

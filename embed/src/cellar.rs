@@ -5,32 +5,46 @@
 //! tables beside the hot rows, so a reopened nest has its sealed history. A seal is synchronous
 //! inside the window's commit, and a browser opens a file only asynchronously, so a file per
 //! segment could only be written behind the seal, after the hot rows it holds were pruned.
+//!
+//! RFC-0077 S4: history hydrated from a mirror sits in a pack, one host file the segments are
+//! appended to, and is read by range; the store records where each one starts and ends.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use nuthatch_core::redb_store::Store;
 use nuthatch_core::restart::SealedHistory;
 use nuthatch_core::seal::{Manifest, SegmentSink, Sinks};
 use nuthatch_core::store::SEALED_THROUGH_KEY;
 use nuthatch_decode::registry::{DecodedRow, TableSchema};
 use nuthatch_seal::cut::{Segment, SEAL_TABLE_FLOOR};
-use redb::{ReadableTable, TableDefinition};
+use redb::{ReadableTable, ReadableTableMetadata, StorageBackend, TableDefinition};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
 /// Each segment's bytes by its file name, as `segments/` holds them on a node.
 const SEGMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("cellar_segments");
 /// The catalogue, as `manifest.json` on a node.
 const CATALOGUE: TableDefinition<&str, &str> = TableDefinition::new("cellar_manifest");
+/// A mirrored segment's place in the pack: its offset and length.
+const PACKED: TableDefinition<&str, (u64, u64)> = TableDefinition::new("cellar_packed");
 const MANIFEST: &str = "manifest.json";
 
 #[derive(Default)]
 pub struct Cellar {
     /// Where segments are kept; none holds them in memory only.
     store: Option<Store>,
+    /// The host file mirrored segments were appended to.
+    pack: Option<Arc<dyn StorageBackend>>,
     manifest: Mutex<Manifest>,
     /// Every file without a store; with one, those published and not yet installed.
     files: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl std::fmt::Debug for Cellar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Cellar")
+    }
 }
 
 struct Open<'a>(&'a Cellar);
@@ -111,6 +125,16 @@ impl SegmentSink for Open<'_> {
                     for file in stale.iter().filter(|f| !named.contains(f)) {
                         segments.remove(file.as_str())?;
                     }
+                    // A mirrored tail the seal folded in is no longer named; its bytes stay in the
+                    // pack, which only grows.
+                    let mut packed = wtx.open_table(PACKED)?;
+                    let stale: Vec<String> = packed
+                        .iter()?
+                        .map(|r| r.map(|(k, _)| k.value().to_string()))
+                        .collect::<Result<_, _>>()?;
+                    for file in stale.iter().filter(|f| !named.contains(f)) {
+                        packed.remove(file.as_str())?;
+                    }
                     wtx.open_table(CATALOGUE)?
                         .insert(MANIFEST, serde_json::to_string(manifest)?.as_str())?;
                 }
@@ -169,9 +193,22 @@ impl Cellar {
     /// The segments `store` holds, which survive it being closed and opened again. A store that
     /// sealed before its segments were kept there has lost them, and is refused.
     pub fn over(store: Store) -> Result<Cellar> {
+        Self::over_with_pack(store, None)
+    }
+
+    /// [`Self::over`], with mirrored history read from `pack`. A store whose catalogue places
+    /// segments in a pack is refused without one.
+    pub fn over_with_pack(store: Store, pack: Option<Arc<dyn StorageBackend>>) -> Result<Cellar> {
         let wtx = store.database().begin_write()?;
         let manifest = {
             wtx.open_table(SEGMENTS)?;
+            let packed = wtx.open_table(PACKED)?.len()?;
+            if packed > 0 && pack.is_none() {
+                bail!(
+                    "this nest's sealed history was hydrated from a mirror into a pack beside its \
+                     store, and it was opened without one: open it with the same `mirror`"
+                );
+            }
             let mut catalogue = wtx.open_table(CATALOGUE)?;
             let held = catalogue.get(MANIFEST)?.map(|v| v.value().to_string());
             match held {
@@ -192,9 +229,26 @@ impl Cellar {
         wtx.commit()?;
         Ok(Cellar {
             store: Some(store),
+            pack,
             manifest: Mutex::new(manifest),
             files: Mutex::default(),
         })
+    }
+
+    fn packed(&self, name: &str) -> Result<Option<(u64, u64)>> {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let rtx = store.database().begin_read()?;
+        let table = rtx.open_table(PACKED)?;
+        let at = table.get(name)?.map(|v| v.value());
+        Ok(at)
+    }
+
+    fn pack(&self) -> Result<&Arc<dyn StorageBackend>> {
+        self.pack
+            .as_ref()
+            .ok_or_else(|| anyhow!("a mirrored segment is named, and no pack is open"))
     }
 
     fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
@@ -206,8 +260,103 @@ impl Cellar {
         };
         let rtx = store.database().begin_read()?;
         let table = rtx.open_table(SEGMENTS)?;
-        let bytes = table.get(name)?.map(|v| v.value().to_vec());
-        Ok(bytes)
+        if let Some(v) = table.get(name)? {
+            return Ok(Some(v.value().to_vec()));
+        }
+        drop(table);
+        drop(rtx);
+        match self.packed(name)? {
+            Some((at, len)) => Ok(Some(self.pack()?.read(at, len as usize)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// A segment's length, without reading it where it is packed.
+    pub fn len_of(&self, name: &str) -> Result<Option<u64>> {
+        if let Some((_, len)) = self.packed(name)? {
+            return Ok(Some(len));
+        }
+        Ok(self.read(name)?.map(|b| b.len() as u64))
+    }
+
+    /// `range` of a segment's bytes, read by range from the pack where it is packed.
+    pub fn read_range(&self, name: &str, range: Range<u64>) -> Result<Option<Vec<u8>>> {
+        if let Some((at, len)) = self.packed(name)? {
+            if range.end > len || range.start > range.end {
+                bail!("{name}: bytes {range:?} of {len}");
+            }
+            let n = (range.end - range.start) as usize;
+            return Ok(Some(self.pack()?.read(at + range.start, n)?));
+        }
+        Ok(self
+            .read(name)?
+            .map(|b| b[range.start as usize..(range.end as usize).min(b.len())].to_vec()))
+    }
+
+    /// Forget what a hydration that did not finish placed, so it can start again.
+    pub fn reset_packed(&self) -> Result<()> {
+        let store = self.store.as_ref().context("a pack needs a store")?;
+        let wtx = store.database().begin_write()?;
+        {
+            let mut packed = wtx.open_table(PACKED)?;
+            let names: Vec<String> = packed
+                .iter()?
+                .map(|r| r.map(|(k, _)| k.value().to_string()))
+                .collect::<Result<_, _>>()?;
+            for n in names {
+                packed.remove(n.as_str())?;
+            }
+            wtx.open_table(CATALOGUE)?.insert(
+                MANIFEST,
+                serde_json::to_string(&Manifest::default())?.as_str(),
+            )?;
+        }
+        wtx.commit()?;
+        self.pack()?.set_len(0)?;
+        *self.manifest.lock().unwrap() = Manifest::default();
+        Ok(())
+    }
+
+    /// Append `bytes` to the pack; where it went.
+    pub fn append(&self, bytes: &[u8]) -> Result<(u64, u64)> {
+        let pack = self.pack()?;
+        let at = pack.len()?;
+        pack.write(at, bytes)?;
+        Ok((at, bytes.len() as u64))
+    }
+
+    /// The SHA-256 of `len` bytes of the pack at `at`, read a slice at a time.
+    pub fn pack_hash(&self, at: u64, len: u64) -> Result<String> {
+        use sha2::Digest;
+        const SLICE: u64 = 4 << 20;
+        let pack = self.pack()?;
+        let mut h = sha2::Sha256::new();
+        let mut done = 0;
+        while done < len {
+            let n = (len - done).min(SLICE);
+            h.update(pack.read(at + done, n as usize)?);
+            done += n;
+        }
+        Ok(hex::encode(h.finalize()))
+    }
+
+    /// Make the pack durable, then install `manifest` naming the segments `placed` put in it, in one
+    /// transaction.
+    pub fn install_packed(&self, manifest: &Manifest, placed: &[(String, u64, u64)]) -> Result<()> {
+        self.pack()?.sync_data(false)?;
+        let store = self.store.as_ref().context("a pack needs a store")?;
+        let wtx = store.database().begin_write()?;
+        {
+            let mut packed = wtx.open_table(PACKED)?;
+            for (name, at, len) in placed {
+                packed.insert(name.as_str(), (*at, *len))?;
+            }
+            wtx.open_table(CATALOGUE)?
+                .insert(MANIFEST, serde_json::to_string(manifest)?.as_str())?;
+        }
+        wtx.commit()?;
+        *self.manifest.lock().unwrap() = manifest.clone();
+        Ok(())
     }
 
     pub fn manifest(&self) -> Manifest {
@@ -263,13 +412,154 @@ impl Cellar {
     }
 
     /// The bytes of every segment the catalogue names.
-    pub fn bytes(&self) -> usize {
+    pub fn bytes(&self) -> u64 {
         self.manifest()
             .tables
             .values()
             .flatten()
-            .filter_map(|s| self.file(&s.file))
-            .map(|b| b.len())
+            .filter_map(|s| self.len_of(&s.file).ok().flatten())
             .sum()
+    }
+}
+
+/// The cellar as the object store Burrmill reads segments from, by range, under `segments/`.
+#[derive(Debug, Clone)]
+pub struct Segments(pub Arc<Cellar>);
+
+impl std::fmt::Display for Segments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cellar")
+    }
+}
+
+pub const SEGMENTS_PREFIX: &str = "segments/";
+
+fn store_err(e: impl std::fmt::Display) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "cellar",
+        source: e.to_string().into(),
+    }
+}
+
+impl Segments {
+    fn name(location: &object_store::path::Path) -> object_store::Result<&str> {
+        location
+            .as_ref()
+            .strip_prefix(SEGMENTS_PREFIX)
+            .ok_or_else(|| object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "not a segment".into(),
+            })
+    }
+
+    fn meta(
+        &self,
+        location: &object_store::path::Path,
+    ) -> object_store::Result<object_store::ObjectMeta> {
+        let name = Self::name(location)?;
+        let size = self.0.len_of(name).map_err(store_err)?.ok_or_else(|| {
+            object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "not in the cellar".into(),
+            }
+        })?;
+        Ok(object_store::ObjectMeta {
+            location: location.clone(),
+            last_modified: Default::default(),
+            size,
+            e_tag: None,
+            version: None,
+        })
+    }
+
+    fn unsupported(operation: &str) -> object_store::Error {
+        object_store::Error::NotImplemented {
+            operation: operation.into(),
+            implementer: "cellar".into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for Segments {
+    async fn put_opts(
+        &self,
+        _: &object_store::path::Path,
+        _: object_store::PutPayload,
+        _: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        Err(Self::unsupported("put"))
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        _: &object_store::path::Path,
+        _: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        Err(Self::unsupported("put_multipart"))
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let meta = self.meta(location)?;
+        let range = match &options.range {
+            Some(r) => r.as_range(meta.size).map_err(store_err)?,
+            None => 0..meta.size,
+        };
+        let bytes = if options.head {
+            bytes::Bytes::new()
+        } else {
+            self.0
+                .read_range(Self::name(location)?, range.clone())
+                .map_err(store_err)?
+                .map(bytes::Bytes::from)
+                .unwrap_or_default()
+        };
+        Ok(object_store::GetResult {
+            payload: object_store::GetResultPayload::Stream(Box::pin(futures::stream::once(
+                async move { Ok(bytes) },
+            ))),
+            meta,
+            range,
+            attributes: Default::default(),
+        })
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        use futures::StreamExt;
+        locations.map(|_| Err(Self::unsupported("delete"))).boxed()
+    }
+
+    fn list(
+        &self,
+        _: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        use futures::StreamExt;
+        futures::stream::once(async { Err(Self::unsupported("list")) }).boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        _: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        Err(Self::unsupported("list_with_delimiter"))
+    }
+
+    async fn copy_opts(
+        &self,
+        _: &object_store::path::Path,
+        _: &object_store::path::Path,
+        _: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        Err(Self::unsupported("copy"))
     }
 }

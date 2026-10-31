@@ -2492,69 +2492,18 @@ pub fn oversized_transfers(
     value_col: &str,
     sealed_through: u64,
 ) -> Result<u64> {
-    Ok(
-        query_cold(dir, &oversized_sql(table, value_col), sealed_through)?
-            .first()
-            .and_then(|r| r["n"].as_str())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0),
-    )
+    Ok(oversized_rows(&query_cold(
+        dir,
+        &oversized_sql(table, value_col),
+        sealed_through,
+    )?))
 }
 
-fn oversized_sql(table: &str, value_col: &str) -> String {
-    format!(
-        "SELECT COUNT(*)::VARCHAR AS n FROM \"{table}\"          WHERE \"{value_col}\" IS NOT NULL AND TRY_CAST(\"{value_col}\" AS DECIMAL(38,0)) IS NULL"
-    )
-}
-
-/// `expr` as `ty` when it has at most 38 digits, else NULL: the nest's `DECIMAL(38,0)` line (COR-8),
-/// spelled so the drop is visible to an engine that refuses to sum a `TRY_CAST` (Burrmill's checked
-/// rule). [`crate::views::transfer_value`] draws the same line for the live views.
-pub(crate) fn exact_or_null(expr: &str, ty: &str) -> String {
-    format!("CASE WHEN TRY_CAST({expr} AS DECIMAL(38,0)) IS NOT NULL THEN CAST({expr} AS {ty}) END")
-}
-
-fn net_balances_sql(table: &str, from_col: &str, to_col: &str, value_col: &str) -> String {
-    // `to` receives (+value), `from` sends (−value); a value past 38 digits is NULL (skipped),
-    // mirroring the live views' `transfer_value`.
-    let d = exact_or_null(&format!("\"{value_col}\""), "HUGEINT");
-    format!(
-        "SELECT addr, SUM(d)::VARCHAR AS net FROM (\
-           SELECT \"{to_col}\" AS addr, {d} AS d FROM \"{table}\" \
-           UNION ALL \
-           SELECT \"{from_col}\" AS addr, -{d} AS d FROM \"{table}\"\
-         ) GROUP BY addr HAVING SUM(d) <> 0"
-    )
-}
-
-fn cold_exposure_sql(table: &str, from_col: &str, to_col: &str, value_col: &str) -> String {
-    // Outbound: the sender has exposure to the labels of a labeled recipient. Inbound: the recipient
-    // has exposure from the labels of a labeled sender. COUNT/SUM per (address, label, direction).
-    let d = exact_or_null(&format!("t.\"{value_col}\""), "HUGEINT");
-    format!(
-        "SELECT addr, label, dir, SUM(d)::VARCHAR AS amount, COUNT(*) AS cnt FROM (\
-           SELECT lower(t.\"{from_col}\") AS addr, l.label AS label, 'out' AS dir, \
-                  {d} AS d \
-           FROM \"{table}\" t JOIN labels l ON lower(t.\"{to_col}\") = l.address \
-           UNION ALL \
-           SELECT lower(t.\"{to_col}\") AS addr, l.label, 'in', \
-                  {d} AS d \
-           FROM \"{table}\" t JOIN labels l ON lower(t.\"{from_col}\") = l.address\
-         ) WHERE d IS NOT NULL GROUP BY addr, label, dir"
-    )
-}
-
-fn cold_velocity_sql(table: &str, from_col: &str, value_col: &str, window: u64) -> String {
-    let w = window.max(1);
-    // window_start = (block // W) * W; sum outbound volume + count per (sender, window). A value
-    // past 38 digits leaves the count too, as the hot replay never feeds that transfer at all.
-    let d = exact_or_null(&format!("\"{value_col}\""), "HUGEINT");
-    format!(
-        "SELECT lower(\"{from_col}\") AS addr, (block_number // {w}) * {w} AS ws, \
-                SUM({d})::VARCHAR AS vol, COUNT(*) AS cnt \
-         FROM \"{table}\" WHERE {d} IS NOT NULL GROUP BY addr, ws"
-    )
-}
+pub(crate) use nuthatch_core::restart::exact_or_null;
+use nuthatch_core::restart::{
+    cold_exposure_rows, cold_exposure_sql, cold_velocity_rows, cold_velocity_sql,
+    net_balances_rows, net_balances_sql, oversized_rows, oversized_sql,
+};
 
 pub fn net_balances(
     dir: &Path,
@@ -2564,19 +2513,11 @@ pub fn net_balances(
     value_col: &str,
     sealed_through: u64,
 ) -> Result<Vec<(String, i128)>> {
-    let mut out = Vec::new();
-    for r in query_cold(
+    Ok(net_balances_rows(&query_cold(
         dir,
         &net_balances_sql(table, from_col, to_col, value_col),
         sealed_through,
-    )? {
-        if let (Some(addr), Some(net)) = (r["addr"].as_str(), r["net"].as_str()) {
-            if let Ok(n) = net.parse::<i128>() {
-                out.push((addr.to_string(), n));
-            }
-        }
-    }
-    Ok(out)
+    )?))
 }
 
 /// Cold exposure fold (RFC-0008 C1): direct counterparty exposure to the labeled set for one sealed
@@ -2593,28 +2534,11 @@ pub fn cold_exposure(
     value_col: &str,
     sealed_through: u64,
 ) -> Result<Vec<(String, i128, i128)>> {
-    let mut out = Vec::new();
-    for r in query_cold(
+    Ok(cold_exposure_rows(&query_cold(
         dir,
         &cold_exposure_sql(table, from_col, to_col, value_col),
         sealed_through,
-    )? {
-        let (Some(addr), Some(label), Some(dir_s), Some(cnt)) = (
-            r["addr"].as_str(),
-            r["label"].as_str(),
-            r["dir"].as_str(),
-            r["cnt"].as_i64(),
-        ) else {
-            continue;
-        };
-        let amount = r["amount"]
-            .as_str()
-            .and_then(|s| s.parse::<i128>().ok())
-            .unwrap_or(0);
-        let key = format!("{addr}\u{1f}{label}\u{1f}{dir_s}");
-        out.push((key, amount, cnt as i128));
-    }
-    Ok(out)
+    )?))
 }
 
 /// Cold velocity fold (RFC-0008 C3): per-address outbound volume + count per tumbling block-window,
@@ -2629,24 +2553,11 @@ pub fn cold_velocity(
     window: u64,
     sealed_through: u64,
 ) -> Result<Vec<(String, i128, i128)>> {
-    let mut out = Vec::new();
-    for r in query_cold(
+    Ok(cold_velocity_rows(&query_cold(
         dir,
         &cold_velocity_sql(table, from_col, value_col, window),
         sealed_through,
-    )? {
-        let (Some(addr), Some(ws), Some(cnt)) =
-            (r["addr"].as_str(), r["ws"].as_u64(), r["cnt"].as_i64())
-        else {
-            continue;
-        };
-        let vol = r["vol"]
-            .as_str()
-            .and_then(|s| s.parse::<i128>().ok())
-            .unwrap_or(0);
-        out.push((format!("{addr}\u{1f}{ws}"), vol, cnt as i128));
-    }
-    Ok(out)
+    )?))
 }
 
 /// Define a read-only `labels` view over the content-addressed snapshots in `dir/labels/*.json`
@@ -2693,45 +2604,9 @@ fn define_children_views(session: &dyn Session, dir: &Path) {
     // `debug!` below, so a factory nest would silently lose `{template}__children` entirely. Omitted
     // rather than `0 AS discovered_timestamp` for the same reason the column itself is omitted: a
     // zero that looks like a timestamp is worse than an error.
-    let (ts, cols) = if config.nest.block_timestamps {
-        (
-            "block_timestamp AS discovered_timestamp, ",
-            "discovered_timestamp, ",
-        )
-    } else {
-        ("", "")
-    };
-
-    let mut by_template: std::collections::BTreeMap<String, Vec<(String, String)>> =
-        std::collections::BTreeMap::new();
-    for (template, table, child_param) in fs.view_sources() {
-        by_template
-            .entry(template)
-            .or_default()
-            .push((table, child_param));
-    }
-
-    for (template, sources) in by_template {
-        // `child_param`/`table` are registry-derived (never user text) → no injection surface.
-        let selects: Vec<String> = sources
-            .iter()
-            .map(|(table, cp)| {
-                format!(
-                    "SELECT lower(\"{cp}\") AS address, block_number AS discovered_block, \
-                     log_index AS discovered_log_index, {ts}\
-                     lower(address) AS parent_address FROM \"{table}\""
-                )
-            })
-            .collect();
-        let union = selects.join(" UNION ALL ");
-        let ddl = format!(
-            "CREATE OR REPLACE VIEW \"{template}__children\" AS \
-             SELECT address, discovered_block, discovered_log_index, {cols}parent_address \
-             FROM ({union}) \
-             QUALIFY row_number() OVER (PARTITION BY address ORDER BY discovered_block, discovered_log_index) = 1"
-        );
+    for (name, ddl) in nuthatch_core::bind::children_views(&fs, config.nest.block_timestamps) {
         if let Err(e) = session.execute(&ddl) {
-            tracing::debug!("children view {template}__children skipped: {e}");
+            tracing::debug!("children view {name} skipped: {e}");
         }
     }
 }

@@ -78,7 +78,7 @@ pinned with the rest, because a host can see them.
 |---|---|---|
 | `now_ms` | `() -> f64` | wall clock in ms since the epoch: `/ready`, entity sampling, the RPC client's rests |
 | `random_fill` | `(ptr, len)` | fill guest memory with random bytes; seeds hash maps only, and no answer depends on it |
-| `log` | `(level, ptr, len)` | one UTF-8 line; level 0 is a panic, 1 a host-storage failure |
+| `log` | `(level, ptr, len)` | one UTF-8 line; level 0 is a panic, 1 a host-storage failure, 2 information (a hydration's summary) |
 | `store_read` | `(handle, offset: i64, ptr, len) -> i32` | read up to `len` bytes at `offset`; bytes read, 0 at the end |
 | `store_write` | `(handle, offset: i64, ptr, len) -> i32` | write `len` bytes at `offset`, growing the file; bytes written |
 | `store_len` | `(handle) -> i64` | the file's length |
@@ -117,26 +117,94 @@ host drops the instance.
 ```json
 {
   "nid": "my-nest",
-  "contract": "0x...",
-  "start": 26239000,
   "rpc": ["main"],
   "storage": "host",
   "fresh": true,
   "memory_mib": 2048,
   "poll_interval_secs": 12,
-  "files": {"entities.toml": "...", "entities/received.sql": "...", "views/20-s4.sql": "..."}
+  "files": {"nuthatch.toml": "...", "abis/token.json": "...", "schema.json": "...",
+            "entities.toml": "...", "entities/received.sql": "...", "views/20-s4.sql": "..."},
+  "mirror": {"base": "https://..."},
+  "follow": true,
+  "verified": true,
+  "filters": [{"contract": "staking", "event": "TokensDelegated", "from": 408825706,
+               "args": {"delegator": ["0x..."]}}],
+  "window": 10000000,
+  "until": 519817135
 }
 ```
 
-`contract`, `start` and `rpc` are required. `rpc` names endpoints; the host maps each name to a URL,
-so no URL or key enters the module. `storage` is `bytes` (the default) or `host`. `fresh` (storage
-`host` only) removes the nest's files before opening. `memory_mib` is the ceiling RFC-0075 §17 holds
-the module to, 2,048 unless set; a phone's is 600. `poll_interval_secs` is what `/ready` reports as
-the node's `--poll-interval`. `files` are a nest's authored files, `entities.toml`, `entities/*.sql`
-and `views/*.sql`, by path. Unknown keys are refused, so a host never believes a setting took.
+`rpc` is required. It names endpoints; the host maps each name to a URL, so no URL or key enters the
+module. `storage` is `bytes` (the default) or `host`. `fresh` (storage `host` only) removes the
+nest's files before opening. `memory_mib` is the ceiling RFC-0075 §17 holds the module to, 2,048
+unless set; a phone's is 600. `poll_interval_secs` is what `/ready` reports as the node's
+`--poll-interval`. Unknown keys are refused, so a host never believes a setting took.
 
-Until RFC-0077 S4 the nest is one ERC-20's `Transfer` on mainnet from `start`, as RFC-0075's tab is;
-S4 adds `nuthatch.toml`.
+**The nest** is `files`, a nest directory's files by path, as text (RFC-0077 S4): `nuthatch.toml`,
+the ABIs it names, `schema.json`, `labels/*.json`, `entities.toml` and its SQL, `views/*.sql`. The
+module reads `nuthatch.toml` through the binary's own parsing and indexes it on the chain registry
+the binary ships: its contracts and their events, templates and factories, labels, and flags. What
+only a node runs is refused by name rather than ignored: `[[webhooks]]`, `[[alerts]]`, `[[calls]]`,
+`[[ipfs]]`, `[address_history]`, `[extract]`, a key nothing reads, and a config schema past 2.
+Without a mirror, a contract must declare its `start_block`. A host that leaves `nuthatch.toml` out
+and gives `contract` and `start` instead gets RFC-0075's young contract: one ERC-20's `Transfer` on
+mainnet from `start`.
+
+**`mirror`** (storage `host` only) hydrates the nest's sealed history from a published directory
+before it follows the chain, as `nuthatch seed` fills a node's (RFC-0052 §8). The module computes the
+nest's data identity from `files` as a node does from its directory, which names the dataset under
+`base`; reads the seed snapshot and the catalogue it completes; checks them as `nuthatch seed` does;
+and asks for every segment and seed tail, each appended to the pack and read back against its content
+address before the catalogue names it. Every file the host gives that a node would hash into the
+identity must be there, `schema.json` included. A hydration that does not finish leaves the store
+marked, and the next open hydrates again from nothing. `mirror.postcard` (`{"cuts": {table: block},
+"digest": "..."}`) pins the catalogue as an RFC-0068 postcard does: cut at each table's block, it must
+hash with the mirror's `schema.json` to `digest`, no seed tail is read, and the nest is what the
+publisher had sealed through the highest cut. A pinned nest does not follow.
+
+Before it asks the mirror for anything, the module adds up what the nest declares against the
+ceiling, as RFC-0075 §17 charges it: each entity 8 MiB plus 3,200 bytes per `max_rows`, against the
+three quarters of `memory_mib` a statement leaves. A nest that cannot fit is refused (`open_failed`)
+with its figures, and nothing is downloaded. The segments themselves go to the host's storage and
+are read by range, so they are not charged.
+
+**`follow`** is whether `nh_step` follows the chain past what the store holds; true unless the
+mirror is pinned. False, `nh_step` answers `{"idle": true}` once the store is open.
+
+**`verified`** (RFC-0077 S5) holds every seal to a finalized block the host verified, from a source
+the RPC cannot forge: Helios's beacon light client in a browser (`verifiedFinalized` in
+burrmill-wasm's `web/play/verified.js`), or whatever a non-browser host brings. Once a follow, the
+module asks for it with a `verified_finalized` request; then it fetches every header from the last
+seal up to that block from the RPC, hashes each one itself, links them by parent hash down from the
+verified hash, and seals only at or below it, and only rows whose block hash is on that chain. If
+the host has no verified block, the chain does not reach it, a header is forged or missing, or a
+row names a block hash off the verified chain, sealing stops there and the next `{"idle": true}`
+says why in `unverified`, by block; the cursor carries on, and its rows stay in the hot store. Rows
+above the verified block are still what the RPC said, and an RPC that leaves a log out is not caught
+(RFC-0065 §6). Without `verified`, the module seals on the chain's own policy, as a node does.
+
+**`filters`** (RFC-0077 S7) narrow the nest to the logs a host names, such as one user's own.
+Each names a contract by its alias, an event by its name (or its signature where the ABI overloads
+the name), optionally the first block to ask from (never before the contract's `start_block`), and
+for any of the event's indexed arguments the values it may take, addresses or 32-byte words. The
+cursor then asks for those logs only: one `eth_getLogs` per filter and value, since an endpoint that
+serves ten million blocks to a filter with one value per topic serves far fewer to one with a list
+(arb1.arbitrum.io: 10,000,000 against 100,000). An event no filter names is not fetched, and its
+table stays empty: a narrowed nest is a selection, not the contract's history, so `filters` and
+`mirror` are refused together, as is a factory. A filter naming an event, argument or value the nest
+cannot mean is refused by name (`bad_config`). Each log the endpoint returns is checked against the
+filter that asked for it, so an endpoint that ignores a topic costs bandwidth, not correctness; a
+range it will not answer whole is halved, and a throttle is asked again after a rest.
+
+**`window`** is the blocks per `eth_getLogs`, in place of the chain's registered window. A narrowed
+nest wants it as wide as its endpoint allows.
+
+**`until`** is the last block the cursor indexes. The nest then answers as of that block, which is
+how a host compares its answers with another source's at the same block. A store already past
+`until` faults the follow rather than answer from later blocks.
+
+A follow pass ends at the head it saw when it began; the host steps again to follow further. On a
+chain that makes several blocks a second a pass would otherwise never be idle.
 
 **Reopening.** Storage `host` without `fresh` opens the store the host kept, and the nest carries on
 from its last block, as a node restarted on its data directory does. Before it answers anything it
@@ -153,6 +221,7 @@ nh_open(config)
 loop:
   s = nh_step()
   idle      -> at the tip; step again whenever the host wants to follow it
+               (`unverified`, with `verified`: why sealing stopped)
   requests  -> perform each; nh_resume([answer, ...]) in the same order; step again
   wait_ms   -> wait that long; step again
 nh_request(method, target, body)   any time after the store is open
@@ -180,6 +249,8 @@ nh_request(method, target, body)   any time after the store is open
 | `open` | `{"name"}` | `{"handle": n}` | `{"error", "locked": bool}` |
 | `remove` | `{"name"}` | `{}` (also when there was nothing to remove) | `{"error"}` |
 | `list` | `{"prefix"}` | `{"names": [...]}`, every file under the nest whose name starts with `prefix` | `{"error"}` |
+| `get` | `{"url", "max_bytes", "append"?}` | `{"status", "body"}`; with `append`, `{"status", "offset", "length"}` | `{"error"}` |
+| `verified_finalized` | `{}` | `{"number", "hash"}`, the finalized block the host's light client verified | `{"error"}`: none now |
 
 An `rpc` request is one JSON-RPC POST. The host returns every reply whole, whatever its status and
 whether or not it is JSON: the RPC client classifies a provider's refusals by their words. `error`
@@ -187,6 +258,13 @@ means no reply came; `timed_out` says it was the deadline. Retries across a tran
 host's; retries the RPC client decides on, a cap or a range split, arrive as new requests. A host
 answers a `kind` it does not know with `{"error"}`. A new kind is only ever asked for behind an
 `nh_open` option the host has to set.
+
+A `get` is asked for only behind `mirror`. It is one GET of `url`, a file under the mirror's base.
+Any status but 200 is answered as `{"status"}` alone, and the guest reads a 404 as an absence. A body
+past `max_bytes` is an `error`, never cut short. Without `append` the body comes back as text; with
+it, the host writes the body at the end of the open file `append` names (the pack, below) and answers
+where it went, so a segment never crosses the interface as JSON. A host may perform several at once:
+each lands whole, and the guest checks every one against its content address.
 
 **RPC bodies are JSON strings, in both directions.** `body` is the request's JSON text in a string,
 and so is the reply's. Passing bytes would mean base64, a third larger, or a second buffer and a
@@ -212,12 +290,15 @@ Chosen at `nh_open`:
 Names are relative, `/`-separated, with no empty, `.` or `..` part; a host refuses any other. The
 host keeps one directory per nest, as the node keeps `data/<nid>/`: the browser host uses an OPFS
 directory named for the `nid`, the Node and wasmtime hosts a directory they are given. The guest
-opens one file, `nuthatch.redb`. Sealed segments and their catalogue live inside it, in tables beside
+opens `nuthatch.redb`, and with `mirror` also `mirror.pack`. Sealed segments and their catalogue live inside the store, in tables beside
 the hot rows, not as `segments/<hash>.parquet` files as on a node: a seal happens inside a window's
 commit, which is synchronous, and a browser can open a new file only asynchronously, so a file per
 segment could only be written after the seal had pruned the rows it holds. In the store they commit
 before the prune, as the node's `manifest.json` does. The segment bytes are the node's, hash for
-hash. In storage `bytes` they are part of what `nh_export` returns.
+hash. In storage `bytes` they are part of what `nh_export` returns. History hydrated from a mirror is the
+exception: those segments are appended to `mirror.pack` before the cursor runs, and the store records
+each one's offset and length, so a query reads them by range. The pack only grows; a seed tail a later
+seal folds in leaves its bytes behind.
 
 The single-writer lock is the host's. In a browser a second `createSyncAccessHandle` on the same
 file throws `NoModificationAllowedError`, which the browser host answers as `"locked": true`, and
@@ -233,11 +314,15 @@ the guest faults `locked`. A host with no lock of its own must not open one nest
   `tests/wasmtime-host` caches by the module's sha256 and wasmtime's compatibility hash; a browser
   caches compiled modules itself.
 - **Memory.** Linear memory never shrinks: a statement's high-water mark stays until the instance
-  is dropped. The module holds itself to `memory_mib`.
+  is dropped. The module holds itself to `memory_mib`. A reopened or mirrored nest's views are
+  rebuilt from one pre-summed row per key that Burrmill folds from the sealed segments, as a node's
+  are, not by replaying every sealed transfer: GRT's 2.96 million mainnet transfers open in 233 MiB
+  that way, and in 1,519 MiB by replay (RFC-0077 §16).
 - **Durability** in storage `host` is `store_sync`'s. Over files, every commit syncs: on the M5 Pro
   a follow of S3's recording takes 3.5 s over files and 0.7 s in `bytes`.
 - **Trust.** The module reaches nothing. Every request is one the host performs, to an endpoint the
-  host chose. Rows above finality are what the RPC said.
+  host chose. Rows above finality are what the RPC said. Without `verified`, finality is the RPC's
+  word too; with it, what is sealed hashes down to a block the host's light client verified.
 
 ### Versioning
 
@@ -278,3 +363,37 @@ store until a segment is sealed, is killed there with requests outstanding (SIGK
 for Node and wasmtime, the whole browser for Chrome), then reopens the same files and finishes. The
 answers must still equal the pin, and the segments those of a run that was never killed;
 `hosts/agree.mjs` holds every host to both.
+
+RFC-0077 S4's gate is a nest opened from a mirror. `run-mirror-node.mjs` seeds a copy of a nest
+directory from a mirror with `nuthatch seed`, serves it, or with `--rpc` follows it to the tip, and
+writes what it answers to `mirror-answers.mjs`'s requests: every authored view, each table's count and
+range, each entity, the balances. `hosts/node/mirror.mjs` (Node) and `run-sw-mirror.mjs` (Chrome)
+open the same directory and mirror in the module and must answer the same. CI holds the module to
+the node's pins for RFC-0075 S4's entity nest, `tests/fixtures/tab-parity/s4-mirror-{seed,tip}.json`,
+which `tests/e2e_tab_mirror.rs` holds the node to:
+
+```sh
+d=../tests/fixtures/tab-parity
+node hosts/node/mirror.mjs /tmp/plain.wasm $d/s4-nest $d/s4-mirror --expect $d/s4-mirror-seed.json
+node hosts/node/mirror.mjs /tmp/plain.wasm $d/s4-nest $d/s4-mirror --memory-mib 600 --max-rows 150000 --refused
+node run-mirror-node.mjs ../target/release/nuthatch <nest-dir> <mirror-url> --out /tmp/node.json
+node hosts/node/mirror.mjs /tmp/plain.wasm <nest-dir> <mirror-url> --expect /tmp/node.json
+```
+
+RFC-0077 S5's gates. `hosts/node/verified.mjs` re-runs RFC-0065 S5's cases against the module, over
+RFC-0075 S3's recording with whole headers up to block 26,241,700 (`headers.json.gz`, which
+`record-headers.sh` took from mainnet): the honest verified block seals the node's segment at or below
+it, and an absent verified block, one the chain does not reach, a forged or missing header and a log
+off the verified chain each stop sealing by name. `hosts/node/shapes.mjs` follows every nest shape the
+binary's tests run, which `tests/e2e_embed_shapes.rs` writes out of their code under
+`tests/fixtures/embed-shapes/` (the scaffold fixtures, a factory nest, labels and flags, the reorg
+suites), era by era, and must answer as that test pins the node. CI holds the event build to 5.5 MB
+brotli:
+
+```sh
+d=../tests/fixtures/tab-parity rpc=../tools/fixture-rpc/target/release/fixture-rpc
+$rpc recorded --port 8955 --file $d/chain.json.gz --headers $d/headers.json.gz &
+node hosts/node/verified.mjs /tmp/plain.wasm http://127.0.0.1:8955/ $d
+node hosts/node/shapes.mjs /tmp/plain.wasm $rpc ../tests/fixtures/embed-shapes
+node size.mjs /tmp/plain.wasm --max-brotli 5500000
+```

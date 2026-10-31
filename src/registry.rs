@@ -7,70 +7,33 @@
 pub use nuthatch_decode::registry::*;
 
 use crate::config::Config;
-use alloy_json_abi::JsonAbi;
-use alloy_primitives::Address;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::path::Path;
-
-fn parse_address_local(s: &str) -> Result<Address> {
-    let bytes = hex::decode(s.trim_start_matches("0x")).context("bad address hex")?;
-    if bytes.len() != 20 {
-        return Err(anyhow!("address is not 20 bytes"));
-    }
-    Ok(Address::from_slice(&bytes))
-}
 
 /// Build from a nest's config: load each contract's vendored ABI and register its events.
 ///
-/// Lives here rather than in `nuthatch-decode` because it depends on [`Config`] and
-/// [`crate::blob::checked_join`], both of which are main-crate concerns. The decode logic
-/// itself (all pure, no dbsp, no I/O) is in `nuthatch-decode::registry`.
+/// The construction is `nuthatch_core::nest_config::build_registry`, which an embedding shares; what
+/// stays here is reading the ABIs through [`crate::blob::checked_join`].
 pub fn from_nest(dir: &Path, config: &Config) -> Result<DecodeRegistry> {
-    let mut specs = Vec::with_capacity(config.contracts.len());
-    for c in &config.contracts {
-        let abi_path = crate::blob::checked_join(dir, &c.abi)?;
-        let raw = std::fs::read_to_string(&abi_path)
-            .with_context(|| format!("reading ABI {}", abi_path.display()))?;
-        let abi: JsonAbi = nuthatch_decode::abi::parse_str(&raw)
-            .with_context(|| format!("parsing ABI {}", abi_path.display()))?;
-        let address = parse_address_local(&c.address)?;
-        // A parse that always returns zero used to hang the mutants job: indexer tests wait for a
-        // head that never moves (#1281).
-        if address.is_zero() {
-            return Err(anyhow!(
-                "contract `{}` is the zero address, which is not a contract nuthatch will index",
-                c.alias
-            ));
-        }
-        specs.push(ContractSpec {
-            alias: c.alias.clone(),
-            address,
-            abi,
-            events: c.events.clone(),
-        });
-    }
-    let mut templates = Vec::with_capacity(config.templates.len());
-    for t in &config.templates {
-        let abi_path = crate::blob::checked_join(dir, &t.abi)?;
-        let raw = std::fs::read_to_string(&abi_path)
-            .with_context(|| format!("reading template ABI {}", abi_path.display()))?;
-        let abi: JsonAbi = nuthatch_decode::abi::parse_str(&raw)
-            .with_context(|| format!("parsing template ABI {}", abi_path.display()))?;
-        templates.push(TemplateSpec {
-            name: t.name.clone(),
-            abi,
-            events: t.events.clone(),
-        });
-    }
-    Ok(DecodeRegistry::build_with_templates(specs, templates)?
-        .with_timestamps(config.nest.block_timestamps)
-        .with_blocks(config.extract.blocks)
-        .with_l1_blocks(config.extract.l1_blocks))
+    nuthatch_core::nest_config::build_registry(
+        &config.nest,
+        &config.contracts,
+        &config.templates,
+        &config.extract,
+        &mut |path, what| {
+            let abi_path = crate::blob::checked_join(dir, path)?;
+            let raw = std::fs::read_to_string(&abi_path)
+                .with_context(|| format!("reading {what} {}", abi_path.display()))?;
+            Ok((abi_path.display().to_string(), raw))
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::Address;
+    use nuthatch_core::nest_config::parse_address as parse_address_local;
 
     #[test]
     fn parse_address_local_returns_the_decoded_bytes() {

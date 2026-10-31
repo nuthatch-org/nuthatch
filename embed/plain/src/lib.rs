@@ -7,11 +7,17 @@ mod host_file;
 
 use host_file::HostFile;
 use nuthatch_core::backend::Bytes;
+use nuthatch_core::redb_store::Store;
 use nuthatch_core::rpc::RpcClient;
 use nuthatch_core::transport::{Reply, Transport, TransportError};
+use nuthatch_embed::budget::TabBudget;
 use nuthatch_embed::cellar::Cellar;
 use nuthatch_embed::derived::NestFiles;
-use nuthatch_embed::tab::TabNest;
+use nuthatch_embed::mirror::{self, Hydrated, MirrorConfig, MirrorHost};
+use nuthatch_embed::narrow::{self, FilterSpec};
+use nuthatch_embed::nest::{NestSpec, CONFIG_FILE};
+use nuthatch_embed::tab::{TabNest, Verified};
+use nuthatch_embed::verified::{VerifiedHead, Verifier};
 use nuthatch_embed::young;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -30,6 +36,8 @@ const ABI: u32 = 1;
 
 /// The store's file under the nest's storage, as `data/<nid>/` holds it on a node.
 const STORE_FILE: &str = "nuthatch.redb";
+/// Where a mirror's segments are appended (RFC-0077 S4).
+const PACK_FILE: &str = "mirror.pack";
 
 #[link(wasm_import_module = "nuthatch")]
 extern "C" {
@@ -119,9 +127,17 @@ impl Storage {
 struct Config {
     #[serde(default = "default_nid")]
     nid: String,
-    contract: String,
-    start: u64,
+    /// RFC-0075's young contract, when `files` holds no `nuthatch.toml`.
+    contract: Option<String>,
+    start: Option<u64>,
     rpc: Vec<String>,
+    /// RFC-0077 S4: hydrate the nest's sealed history from a published mirror first.
+    mirror: Option<MirrorConfig>,
+    /// Whether `nh_step` follows the chain past what the store holds; true unless set.
+    follow: Option<bool>,
+    /// RFC-0077 S5: seal only under a finalized block the host verified, asked for by request.
+    #[serde(default)]
+    verified: bool,
     #[serde(default)]
     storage: Storage,
     #[serde(default)]
@@ -130,6 +146,12 @@ struct Config {
     poll_interval_secs: Option<u64>,
     #[serde(default)]
     files: NestFiles,
+    /// RFC-0077 S7: fetch only the logs these name, one `eth_getLogs` per value.
+    filters: Option<Vec<FilterSpec>>,
+    /// Blocks per `eth_getLogs`, in place of the chain's registered window.
+    window: Option<u64>,
+    /// RFC-0077 S7: index no further than this block, so the nest answers as of it.
+    until: Option<u64>,
 }
 
 fn default_nid() -> String {
@@ -141,6 +163,9 @@ type Opening = Pin<Box<dyn Future<Output = anyhow::Result<Engine>>>>;
 
 struct Engine {
     nest: Arc<TabNest>,
+    verifier: Option<Arc<Verifier>>,
+    follows: bool,
+    hydrated: Option<Hydrated>,
     cellar: Arc<Cellar>,
     rpc: Arc<RpcClient<HostTransport>>,
     files: NestFiles,
@@ -374,6 +399,12 @@ fn open(raw: &[u8]) -> Result<Value, Fault> {
         ));
     }
     let c: Config = serde_json::from_slice(raw).map_err(|e| fault("bad_config", e))?;
+    let spec = spec_of(&c)?;
+    let budget = c.memory_mib.map(TabBudget::mib).unwrap_or_default();
+    budget.enforce();
+    if c.mirror.is_some() {
+        mirror::admit(&c.files, budget).map_err(|e| fault_of("open_failed", e))?;
+    }
     let storage = c.storage;
     let state = match storage {
         Storage::Bytes => {
@@ -387,17 +418,147 @@ fn open(raw: &[u8]) -> Result<Value, Fault> {
             let db = redb::Builder::new()
                 .create_with_backend(bytes.clone())
                 .map_err(|e| fault("open_failed", e))?;
-            let engine = build(c, db, Some(bytes)).map_err(|e| fault_of("open_failed", e))?;
+            let store = Store::from_db(db, None).map_err(|e| fault("open_failed", e))?;
+            let cellar = Cellar::over(store.clone()).map_err(|e| fault_of("open_failed", e))?;
+            let engine = build(c, spec, store, Arc::new(cellar), Some(bytes), None)
+                .map_err(|e| fault_of("open_failed", e))?;
             State::Open(Box::new(engine))
         }
-        Storage::Host => State::Opening(Box::pin(open_host(c))),
+        Storage::Host => State::Opening(Box::pin(open_host(c, spec))),
     };
     STATE.with(|s| *s.borrow_mut() = Some(state));
     Ok(json!({"storage": storage.name()}))
 }
 
+/// The nest `c` opens: its `nuthatch.toml`, or RFC-0075's young contract. Refused here, before the
+/// host is asked for anything, when the two are mixed or a mode cannot do what is asked.
+fn spec_of(c: &Config) -> Result<NestSpec, Fault> {
+    let bad = |m: &str| Err(fault("bad_config", m));
+    let mut spec = match (c.files.contains_key(CONFIG_FILE), &c.contract, c.start) {
+        (true, None, None) => {
+            NestSpec::from_files(&c.files).map_err(|e| fault_of("bad_config", e))?
+        }
+        (false, Some(contract), Some(start)) => {
+            NestSpec::erc20(contract, start).map_err(|e| fault_of("bad_config", e))?
+        }
+        (true, ..) => return bad("`contract` and `start` are for a nest with no nuthatch.toml"),
+        (false, ..) => {
+            return bad("a nest needs `files` with a nuthatch.toml, or `contract` and `start`")
+        }
+    };
+    if let Some(m) = &c.mirror {
+        if c.storage != Storage::Host {
+            return bad(
+                "a mirror's history goes to the host's storage: `mirror` needs storage `host`",
+            );
+        }
+        if c.contract.is_some() {
+            return bad("`mirror` hydrates a nest from its nuthatch.toml, and this one has none");
+        }
+        if m.postcard.is_some() && c.follow == Some(true) {
+            return bad(
+                "a postcard pins what the publisher had sealed, so a pinned nest does not follow",
+            );
+        }
+    }
+    if c.mirror.is_none() {
+        spec.start_block().map_err(|e| fault_of("bad_config", e))?;
+    }
+    if let Some(filters) = &c.filters {
+        if c.mirror.is_some() {
+            return bad("a mirror holds a nest's whole history, and `filters` select part of it");
+        }
+        if c.contract.is_some() {
+            return bad("`filters` name contracts by their alias in a nuthatch.toml");
+        }
+        spec.narrowed = Some(narrow::build(&spec, filters).map_err(|e| fault_of("bad_config", e))?);
+    }
+    spec.until = c.until;
+    match c.window {
+        Some(0) => return bad("`window` is blocks per getLogs, at least one"),
+        Some(w) => spec.chain.log_window = w,
+        None => {}
+    }
+    Ok(spec)
+}
+
+/// A file opened through the host, as a handle.
+async fn open_file(name: &str) -> anyhow::Result<i32> {
+    let opened = ask(json!({"kind": "open", "name": name})).await;
+    if let Some(e) = opened.get("error") {
+        let fault_name = if opened["locked"] == true {
+            "locked"
+        } else {
+            "storage"
+        };
+        return Err(fault(fault_name, format!("{name}: {e}")).into());
+    }
+    Ok(opened["handle"]
+        .as_i64()
+        .and_then(|h| i32::try_from(h).ok())
+        .ok_or_else(|| fault("storage", format!("open answered {opened}, not a handle")))?)
+}
+
+/// A mirror's GETs, performed by the host: text answered whole, segments appended to the pack.
+struct HostMirror {
+    pack: i32,
+}
+
+fn got(answer: &Value, url: &str) -> anyhow::Result<Option<()>> {
+    if let Some(e) = answer.get("error") {
+        anyhow::bail!("GET {url}: {}", e.as_str().unwrap_or("failed"));
+    }
+    match answer["status"].as_u64() {
+        Some(200) => Ok(Some(())),
+        Some(404) => Ok(None),
+        status => anyhow::bail!("GET {url}: status {}", status.unwrap_or(0)),
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl MirrorHost for HostMirror {
+    async fn text(&self, url: &str, max_bytes: u64) -> anyhow::Result<Option<String>> {
+        let a = ask(json!({"kind": "get", "url": url, "max_bytes": max_bytes})).await;
+        Ok(got(&a, url)?.map(|()| a["body"].as_str().unwrap_or("").to_string()))
+    }
+
+    async fn append(&self, url: &str, max_bytes: u64) -> anyhow::Result<Option<(u64, u64)>> {
+        let a =
+            ask(json!({"kind": "get", "url": url, "max_bytes": max_bytes, "append": self.pack}))
+                .await;
+        if got(&a, url)?.is_none() {
+            return Ok(None);
+        }
+        match (a["offset"].as_u64(), a["length"].as_u64()) {
+            (Some(at), Some(len)) => Ok(Some((at, len))),
+            _ => anyhow::bail!("GET {url} into the pack answered {a}, not an offset and a length"),
+        }
+    }
+
+    async fn rest(&self, ms: u64) {
+        nuthatch_core::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+
+/// The host's verified finalized block, asked for once a follow (RFC-0077 S5).
+struct HostHead;
+
+#[async_trait::async_trait(?Send)]
+impl VerifiedHead for HostHead {
+    async fn finalized(&self) -> anyhow::Result<(u64, String)> {
+        let a = ask(json!({"kind": "verified_finalized"})).await;
+        if let Some(e) = a.get("error") {
+            anyhow::bail!("{}", e.as_str().unwrap_or("failed"));
+        }
+        match (a["number"].as_u64(), a["hash"].as_str()) {
+            (Some(n), Some(h)) => Ok((n, h.to_string())),
+            _ => anyhow::bail!("verified_finalized answered {a}, not a number and a hash"),
+        }
+    }
+}
+
 /// Storage mode `host`: clear the nest's files if asked, then open the store, each through the host.
-async fn open_host(c: Config) -> anyhow::Result<Engine> {
+async fn open_host(c: Config, spec: NestSpec) -> anyhow::Result<Engine> {
     if c.fresh {
         let listed = ask(json!({"kind": "list", "prefix": ""})).await;
         let names: Vec<String> = match listed.get("error") {
@@ -412,35 +573,58 @@ async fn open_host(c: Config) -> anyhow::Result<Engine> {
             }
         }
     }
-    let opened = ask(json!({"kind": "open", "name": STORE_FILE})).await;
-    if let Some(e) = opened.get("error") {
-        let name = if opened["locked"] == true {
-            "locked"
-        } else {
-            "storage"
-        };
-        return Err(fault(name, format!("{STORE_FILE}: {e}")).into());
-    }
-    let handle = opened["handle"]
-        .as_i64()
-        .and_then(|h| i32::try_from(h).ok())
-        .ok_or_else(|| fault("storage", format!("open answered {opened}, not a handle")))?;
+    let handle = open_file(STORE_FILE).await?;
     let db = redb::Builder::new().create_with_backend(HostFile::new(handle, STORE_FILE))?;
-    build(c, db, None)
+    let store = Store::from_db(db, None)?;
+    let Some(m) = c.mirror.clone() else {
+        let cellar = Arc::new(Cellar::over(store.clone())?);
+        return build(c, spec, store, cellar, None, None);
+    };
+    let pack = open_file(PACK_FILE).await?;
+    let cellar = Arc::new(Cellar::over_with_pack(
+        store.clone(),
+        Some(Arc::new(HostFile::new(pack, PACK_FILE))),
+    )?);
+    let hydrated = if mirror::indexed(&store)? {
+        None
+    } else {
+        let h = mirror::hydrate(&HostMirror { pack }, &store, &cellar, &spec, &c.files, &m).await?;
+        log_line(2, &format!("hydrated from the mirror: {}", h.to_json()));
+        Some(h)
+    };
+    build(c, spec, store, cellar, None, hydrated)
 }
 
-fn build(c: Config, db: redb::Database, bytes: Option<Bytes>) -> anyhow::Result<Engine> {
-    let (mut nest, cellar) = young::open(db, &c.contract, c.start)?;
+fn build(
+    c: Config,
+    spec: NestSpec,
+    store: Store,
+    cellar: Arc<Cellar>,
+    bytes: Option<Bytes>,
+    hydrated: Option<Hydrated>,
+) -> anyhow::Result<Engine> {
+    let start = spec.start.unwrap_or_default();
+    let budget = c.memory_mib.map(TabBudget::mib).unwrap_or_default();
+    let mut nest = young::open_nest(store, cellar.clone(), spec, start, budget)?;
     // Before `derive`, which admits the entities against it (RFC-0075 §17).
-    if let Some(mib) = c.memory_mib {
-        nest.budget = nuthatch_embed::budget::TabBudget::mib(mib);
-        nest.budget.enforce();
-    }
+    nest.budget = budget;
     if !c.files.is_empty() {
         nest.derive(&c.files)?;
     }
+    let verifier = c.verified.then(|| Arc::new(Verifier::new()));
+    if let Some(v) = &verifier {
+        nest.verify_with(Verified {
+            verifier: v.clone(),
+            head: Arc::new(HostHead),
+        });
+    }
     Ok(Engine {
         nest: Arc::new(nest),
+        verifier,
+        follows: c
+            .follow
+            .unwrap_or(c.mirror.as_ref().is_none_or(|m| m.postcard.is_none())),
+        hydrated,
         cellar,
         rpc: Arc::new(RpcClient::new(c.rpc)?),
         files: c.files,
@@ -533,6 +717,9 @@ pub extern "C" fn nh_step() -> i32 {
 }
 
 fn step(engine: &mut Engine) -> Result<Value, Fault> {
+    if !engine.follows {
+        return Ok(json!({"idle": true}));
+    }
     let follow = engine.follow.get_or_insert_with(|| {
         let (nest, rpc) = (engine.nest.clone(), engine.rpc.clone());
         Box::pin(async move { nest.follow(&*rpc).await })
@@ -542,7 +729,10 @@ fn step(engine: &mut Engine) -> Result<Value, Fault> {
         Driven::Done(r) => {
             engine.follow = None;
             engine.rolled = r.map_err(|e| fault_of("follow_failed", e))?;
-            Ok(json!({"idle": true}))
+            match engine.verifier.as_ref().and_then(|v| v.unverified()) {
+                Some(why) => Ok(json!({"idle": true, "unverified": why})),
+                None => Ok(json!({"idle": true})),
+            }
         }
     }
 }
@@ -608,7 +798,7 @@ pub extern "C" fn nh_request(
             nid: Some(&engine.nid),
             version: young::node_version(),
             poll_interval_secs: engine.poll_interval_secs,
-            log_window: young::MAINNET_LOG_WINDOW,
+            log_window: engine.nest.log_window(),
         };
         let mut answer =
             std::pin::pin!(nuthatch_embed::http::answer(&nest, &method, &target, &body));
@@ -650,6 +840,11 @@ pub extern "C" fn nh_report() -> i32 {
             engine.rolled,
             engine.storage.name(),
         )
+        .map(|mut r| {
+            r["mirror"] = engine.hydrated.as_ref().map(Hydrated::to_json).into();
+            r["verified"] = engine.verifier.as_ref().map(|v| v.report()).into();
+            r
+        })
         .map_err(|e| fault("report_failed", format!("{e:#}")))
     }))
 }

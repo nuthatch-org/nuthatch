@@ -775,9 +775,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-pub(crate) fn parquet_key(table: &str, hash: &str) -> String {
-    format!("{table}/{hash}.parquet")
-}
+pub(crate) use nuthatch_core::mirror::parquet_key;
 
 fn want_entries(manifest: &Manifest) -> Vec<(String, &Segment)> {
     let mut out = Vec::new();
@@ -980,79 +978,36 @@ fn published_catalogue(local_bytes: &[u8], local: &Manifest) -> Result<Vec<u8>> 
     Ok(serde_json::to_string_pretty(&published)?.into_bytes())
 }
 
-/// The seed snapshot's envelope, under the dataset prefix.
-pub(crate) const SEED_FILE: &str = "_seed/seed.json";
+pub(crate) use nuthatch_core::mirror::{seed_tail_key, tails_digest, SeedEnvelope, SEED_FILE};
 
-/// Where a table's provisional tail sits in the seed snapshot. Keyed by table, not by hash: the tail
-/// is rewritten at every seal, and a hash-keyed object per rewrite would never stop accumulating.
-/// Not named `.parquet`, so no reader's glob over the dataset can count a tail as a segment.
-pub(crate) fn seed_tail_key(table: &str) -> String {
-    format!("_seed/{table}.tail")
-}
-
-/// What `nuthatch seed` needs beyond the mirror itself: each table's provisional tail, which the
-/// mirror withholds, and the block the whole of it is complete through. Outside the reader contract;
-/// `_seed/` is rewritten in place and only this envelope says which bytes it should hold.
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct SeedEnvelope {
-    pub(crate) layout_version: u32,
-    pub(crate) chain_id: u64,
-    pub(crate) data_identity: String,
-    /// The block the publisher's history begins at, so a `--backfill N` mirror cannot pass for a
-    /// full one.
-    pub(crate) indexed_from: u64,
-    /// No row at or below this block is missing from the catalogue plus `tails`.
-    pub(crate) complete_through: u64,
-    /// SHA-256 of the `manifest.json` these tails complete. A seeder that reads another retries.
-    pub(crate) catalogue_sha256: String,
-    /// [`tails_digest`] of `tails`, so a snapshot that lost an entry on the way is refused rather than
-    /// seeding a nest that silently lacks that table's tail. Not authentication: an editor can recompute it.
-    pub(crate) tails_sha256: String,
-    pub(crate) tails: std::collections::BTreeMap<String, Segment>,
-}
-
-impl SeedEnvelope {
-    /// `None` when nothing is sealed yet.
-    fn of(
-        local: &Manifest,
-        catalogue: &[u8],
-        data_identity: &str,
-        chain_id: u64,
-        indexed_from: u64,
-        watermark: u64,
-    ) -> Option<Self> {
-        // Every row at or below the publisher's seal watermark is in the catalogue, so a quiet nest
-        // is complete far past its last row, and a seeder need not scan the gap again.
-        let last_row = local.tables.values().flatten().map(|s| s.to_block).max()?;
-        let complete_through = last_row.max(watermark);
-        let tails: std::collections::BTreeMap<_, _> = local
-            .tables
-            .iter()
-            .filter_map(|(t, segs)| Some((t.clone(), segs.iter().find(|s| s.provisional)?.clone())))
-            .collect();
-        Some(Self {
-            layout_version: 1,
-            chain_id,
-            data_identity: data_identity.to_string(),
-            indexed_from,
-            complete_through,
-            catalogue_sha256: sha256_hex(catalogue),
-            tails_sha256: tails_digest(&tails),
-            tails,
-        })
-    }
-}
-
-/// Each tail's table, hash and range, in table order.
-pub(crate) fn tails_digest(tails: &std::collections::BTreeMap<String, Segment>) -> String {
-    let mut h = Sha256::new();
-    for (table, s) in tails {
-        h.update(format!(
-            "{table}\0{}\0{}\0{}\0{}\n",
-            s.hash, s.from_block, s.to_block, s.rows
-        ));
-    }
-    hex::encode(h.finalize())
+/// The envelope a publisher writes, `None` when nothing is sealed yet.
+fn seed_envelope(
+    local: &Manifest,
+    catalogue: &[u8],
+    data_identity: &str,
+    chain_id: u64,
+    indexed_from: u64,
+    watermark: u64,
+) -> Option<SeedEnvelope> {
+    // Every row at or below the publisher's seal watermark is in the catalogue, so a quiet nest
+    // is complete far past its last row, and a seeder need not scan the gap again.
+    let last_row = local.tables.values().flatten().map(|s| s.to_block).max()?;
+    let complete_through = last_row.max(watermark);
+    let tails: std::collections::BTreeMap<_, _> = local
+        .tables
+        .iter()
+        .filter_map(|(t, segs)| Some((t.clone(), segs.iter().find(|s| s.provisional)?.clone())))
+        .collect();
+    Some(SeedEnvelope {
+        layout_version: 1,
+        chain_id,
+        data_identity: data_identity.to_string(),
+        indexed_from,
+        complete_through,
+        catalogue_sha256: sha256_hex(catalogue),
+        tails_sha256: tails_digest(&tails),
+        tails,
+    })
 }
 
 /// The publisher's start block and seal watermark, read from its store. Only a stopped nest's can be
@@ -1338,7 +1293,7 @@ async fn sync_pass(
 
     // Last, so a seed snapshot never names a catalogue the mirror does not hold yet.
     if let Some(indexed_from) = indexed_from {
-        let seed = SeedEnvelope::of(
+        let seed = seed_envelope(
             &local,
             &catalogue,
             &data_identity,

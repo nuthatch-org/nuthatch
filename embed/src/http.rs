@@ -20,7 +20,7 @@ const IPFS_GAVE_UP_PREFIX: &str = "ipfs_gave_up:";
 /// The nest a request is answered over, and what the page says of it.
 pub struct Nest<'a> {
     pub nest: &'a TabNest,
-    pub cellar: &'a Cellar,
+    pub cellar: &'a std::sync::Arc<Cellar>,
     pub files: &'a NestFiles,
     pub nid: Option<&'a str>,
     pub version: &'a str,
@@ -171,6 +171,7 @@ async fn bind(n: &Nest<'_>) -> anyhow::Result<TabQuery> {
         &n.nest.entities,
         n.files,
         n.nest.budget,
+        &n.nest.children_views(),
     )
     .await
 }

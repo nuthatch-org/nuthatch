@@ -2,7 +2,10 @@
 
 - Status: **Accepted, 2026-10-30.** S0 to S5 and S7 (the Lodestar demo) authorised in order; S6 waits for rotki
   to ask. S0 passed 2026-10-30 (§12). S1 built in part, 2026-10-30 (§13). S2 built 2026-10-30, its
-  address-build half deferred (§14). S3 built 2026-10-30, its Chrome leg CI's (§15).
+  address-build half deferred (§14). S3 built 2026-10-30, its Chrome leg CI's (§15). S4 built 2026-10-30,
+  with the cold folds in the module (§16). S5 built 2026-10-30, Safari waiting on Chief and the address
+  build's size gate deferred (§17). S7 built 2026-10-31, every figure the tab computes equal to the
+  server's at its block, the Lodestar branch unpushed until Chief says (§18).
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0075 (the whole nest in a tab, S0 to S6 merged), RFC-0074 (address history as a
@@ -332,7 +335,7 @@ Each ends runnable, and each gate can fail. Sizes are days of focused work, esti
   build replaces `embed/`'s S0 module and rotki's host answers `nh_step`'s requests where it answered
   `rpc_batch`. No rotki PR is opened otherwise. **Gate**: RFC-0074 §5's parity in rotki's host, and
   rotki's tests and linters. Binary: unchanged.
-- **S7, the demo: Lodestar's `/profile`, verified locally.** Chief, 2026-10-30. Not started: it is built after S5, in the Lodestar repository, and nothing here implements it. Lodestar's network-wide
+- **S7, the demo: Lodestar's `/profile`, verified locally.** Chief, 2026-10-30. Built 2026-10-31 (§18): the page in the Lodestar repository, and in the engine the narrowed nests, `window` and `until` it needed. Lodestar's network-wide
   pages are the shared-view case and stay on the hosted `graph-allocations-nest`. Its wallet-connected
   `/profile` is one user's data: delegations (staked, thawing, realised and unrealised rewards),
   curation signals and 90 days of rewards history, loaded today from `/api/portfolio` and the rewards
@@ -854,3 +857,339 @@ views' cold folds are the same Burrmill queries, and only the unavailable reason
 refusal's last sentence read differently (#2534). `cargo tree` and `Cargo.lock` unchanged. Every
 subcommand's `--help`, two levels deep (60 files), and the files `init --abi` writes are
 byte-identical before and after. The whole suite: 2,877 passed, none failed, 18 ignored.
+
+## 16. S4 measured outcome, 2026-10-30
+
+**What was built.**
+
+- *The nest's part of `nuthatch.toml`, in core.* `nuthatch_core::nest_config` holds `[nest]`, the
+  contracts, templates, factories, flags and `[extract]` as the binary's `Config` declares them, the
+  schema-version gates, the path-segment check, the decode registry they build and the factory rules
+  they declare. The binary's `Config` takes those types from core and keeps webhooks, alerts, calls,
+  IPFS and address history, which only a node runs. `NestConfig::parse` is how the module reads a
+  `nuthatch.toml`: the same types and gates, and a refusal by name of what only a node runs, of a key
+  nothing reads and of `[extract]`.
+- *The chain registry, in core.* `nuthatch_core::chains` holds every registered chain and its policy,
+  Arbitrum One's included. What reaches an RPC or parses a URL (`resolve`, the `arb1` caveat and
+  header cap) stays in the binary's `chains.rs`, which re-exports the rest.
+- *The seed's checks, in core.* `nuthatch_core::mirror` holds the seed snapshot's envelope, the keys a
+  published directory uses, and the checks `nuthatch seed` makes before it trusts a catalogue
+  (`check_snapshot`, `local_catalogue`, `canonical`), with RFC-0068 §3's postcard cut and digest beside
+  them. `src/seed.rs` and `src/publish.rs` call them where they defined them.
+- *The views' cold folds, in core.* The four Burrmill queries a node's `ColdFolds` runs, and the reading
+  of their rows, are in `nuthatch_core::restart`; `src/analytics.rs` calls them.
+- *Any nest in the module.* `nh_open` takes a nest's files with its `nuthatch.toml` (`NestSpec`), on the
+  chain's registered policy, with its factories (children rebuilt on a warm open, as a node rebuilds
+  them), labels and flags. RFC-0075's young contract stays, as `contract` and `start` with no
+  `nuthatch.toml`.
+- *Mirror hydration.* `nh_open`'s `mirror` makes the module compute the nest's data identity from its
+  files, read the dataset's seed snapshot and catalogue, check them as `nuthatch seed` does, and ask
+  the host for every segment and seed tail. Optionally a postcard pins the catalogue. Then the views,
+  children and entities are rebuilt from the hydrated history, and the cursor follows the tip from
+  `complete_through + 1` unless `follow` is false.
+- *The cold folds in the module.* `embed/src/folds.rs` answers `ColdFolds` with the node's queries, run
+  by Burrmill over the cellar's segments, read by range. A warm or mirrored nest's views are rebuilt
+  from one row per key, as on a node.
+- *Hosts.* The browser host answers `get` (`host.js`, so in Node and in a browser alike); the nest
+  worker opens any `nh_open` config; `hosts/browser/mirror.html` and `run-sw-mirror.mjs` are the
+  browser gate, `hosts/node/mirror.mjs` the Node one, `run-mirror-node.mjs` the node's half.
+
+**`abi` stays 1.** No export or import changed shape: `wasmtime-host abi` finds the 33 pinned shapes
+equal. What was added is what the README's versioning rules allow within a version: optional `nh_open`
+keys (`mirror`, `follow`; `contract` and `start` optional once `files` holds a `nuthatch.toml`), the
+`get` request kind, asked for only behind `mirror`, an answer field (`nh_report`'s `mirror`, a probe)
+and log level 2.
+
+**Where this departs from the RFC.**
+
+- *The segments go to one pack, not `segments/<hash>.parquet`.* §15 left S4 free to write a file per
+  segment for mirrored history. A host file is a sync access handle in a browser, and DeFi Pulse has
+  1,529 segments: 1,529 `open` requests at every warm open, and as many handles held. The module
+  instead has the host append each segment to `mirror.pack`, one file, and records each one's offset
+  and length in the store, in a table beside S3's. A query reads a segment by range from the pack
+  (`cellar::Segments`, an `ObjectStore` over the cellar), so Burrmill reads footers and row groups,
+  not whole files. The bytes are the node's: each is read back and hashed before the catalogue names
+  it.
+- *The budget charges declared entity state, not catalogue sizes.* The catalogue carries no byte
+  sizes, so knowing them before a download is a HEAD per segment (1,529 for DeFi Pulse, 2,297 for GRT
+  on mainnet), and the segments do not sit in linear memory anyway: they are on the host's storage,
+  read by range. DeFi Pulse's 138 MB of segments open at 17 MiB of linear memory. What a mirrored
+  nest declares that does live in memory is its entities, so admission is RFC-0075 §17's charge
+  against the ceiling, made before the first `get`. A mirror needs storage `host`: in storage `bytes`
+  the segments would be in memory, and that is refused by name.
+- *The cold folds were needed, and are built.* S3's rebuild replays every sealed transfer and holds
+  every delta until it applies them. On GRT's mainnet transfers that took the module to 1,519 MiB of
+  linear memory, over what a 600 MiB ceiling leaves and close to the 2 GiB wall.
+
+**Gate.** The node's half is `run-mirror-node.mjs` on a debug build of this branch: a copy of the nest
+seeded with `nuthatch seed` and served with `nuthatch serve`, or with `--rpc` followed by `nuthatch
+dev`. Both halves answer `embed/mirror-answers.mjs`'s requests: every authored view whole and by
+count, each table's count, block range and `log_index` sum, each entity's first thousand rows, the
+balances and the hot rows. Rows are compared as multisets, with the NID and the node's `cached` flag
+left out. Two DeFi Pulse views cannot be compared row by row between any two engines and are compared
+by shape: `stablecoin_supply_events` is capped at 50,000 rows, so which rows fill the cap is the
+engine's order (the tables under it are compared whole); `largest_supply_moves_7d` ends `ORDER BY
+abs(usd) DESC LIMIT 25` with 18 rows tied at 50,000,000.06 for 9 places, so it is asked again with
+every column appended to the order, and that answer is compared whole.
+
+| | Result |
+|---|---|
+| defi-pulse-nest from the public mirror, browser host, 2 GiB, equal to a node seeded from the same mirror at the same head | **pass.** Dataset `0a643352…b2e48f`, catalogue `8ba65fb0…5822e0` unchanged before and after the runs, head 26,306,829, all 33 answers equal (digest `73bfaf00…700799`) in the browser host in Node and in Brave (Chromium) on OPFS. Chrome for Testing still does not launch on this Mac; Brave does, so this is a real Chromium run. CI's Chrome leg runs the local-mirror gate |
+| RFC-0075 S4's entity nest published to a local mirror, browser host, equal to the node at the same head | **pass**, Node and Brave on OPFS: at the seed's head 26,245,806 (digest `26882c7a…b8a69a`), and followed by both to the recording's tip 26,245,870 (`d943c23d…2911e8`), entities and views included. CI runs both in Node and in Chrome against the node's pins, which `tests/e2e_tab_mirror.rs` holds the node to |
+| A nest that cannot fit at 600 MiB is refused before download, with its figures | **pass**, Node and Brave: the same nest declaring 150,000 rows per entity is refused (`open_failed`, "~932 MiB against the 450 MiB its 600 MiB ceiling leaves") with no GET made. At 2 GiB it opens and equals the node |
+| A postcard pins the catalogue | **pass**: one made from the mirror's catalogue opens through the cut; an altered digest is refused before any segment is fetched |
+| Binary: config parsing and the chain registry move without changing a byte accepted or written | **pass**, below |
+
+**Numbers.** Apple M5 Pro, macOS, Node 26.11.1, the `tab` module after `wasm-opt`: 34,336,230 bytes,
+5,259,438 brotli (S3's: 34,017,235). S5's ceiling of 5.5 MB brotli holds. One run each, over the public
+mirror's Worker URL except where said:
+
+| | DeFi Pulse | GRT supply, mainnet (a local copy of its published dataset) |
+|---|---|---|
+| Segments hydrated | 1,529, 138,128,890 bytes | 2,297, 286,028,654 bytes |
+| Open, Node host | 46.4 s (40.7 s at 600 MiB); 0.86 s from a local copy | 5.5 s; 26.7 s by replay |
+| Open, Brave on OPFS | 44.5 s | not run |
+| Linear memory after open | 17 MiB | 242 MiB (232 at 600 MiB); 1,519 MiB by replay |
+| Linear memory after the gate's queries | 171 MiB, the high-water of a 50,000-row answer | 242 MiB |
+| Process peak RSS, Node | 616 MiB | 564 MiB |
+| The gate's queries | 33 in 7.6 s | 9 in 2.6 s, equal to the node at 2 GiB and at 600 MiB |
+
+Every statement binds every segment's footer, read by range from the pack: 1,529 per `/sql` on DeFi
+Pulse, about 0.2 s each. An engine kept between statements would remove that; it is left for when a
+page needs it.
+
+**What it does not show.** Chrome for Testing and Safari: the browser evidence here is Brave, and CI's
+Chrome leg runs the local mirror only, since a public download does not belong in CI. The wasmtime host
+answers no `get`, so it opens no mirror. No Arbitrum One nest was opened from a mirror: the published
+`grt-supply-arbitrum-one` comes from a commit the local checkout has moved past, so its data identity
+no longer matches, and Arbitrum is shown by its registry entry and a parse test only; S7 will exercise
+it. A host's RPC URLs never enter the module, so the `arb1` header-batch cap is the host's to apply. A
+warm reopen does not check that the files given hash to the identity the store was hydrated under, as
+the node's registry guard does. Labels reach the views but not `/sql`'s `labels` table, which the
+module does not bind. A transient fetch failure once failed a public run in Brave; the browser host now
+retries a `get`'s transport failure three times, as the README makes retries the host's.
+
+**The binary.** Unchanged in behaviour. The moved code is the same code: `Config` reads
+`nuthatch.toml` through the same types, and `registry::from_nest`, `seed` and the cold folds call core
+with the same messages. `Cargo.lock` gains one edge, `nuthatch-core` to `serde_ignored`, already in the
+tree at 0.1.14, and no package. Every subcommand's `--help`, two levels deep (60 files), and the files
+`init --abi` writes for mainnet and for Arbitrum One are byte-identical to main's. The whole suite:
+2,878 passed, none failed, 18 ignored; the one new test is `e2e_tab_mirror`. `tests/skill_refs.rs` now
+names `core/src/nest_config.rs` as a config source: without it the config-reference gate would have
+stopped scanning `[nest]`'s and `[[contracts]]`'s keys, silently, once the types left `src/config.rs`.
+
+## 17. S5 measured outcome, 2026-10-30
+
+**What was built.**
+
+- *The verified head.* `nh_open` takes `"verified": true`. Once a follow, the module asks the host for
+  its verified finalized block with a `verified_finalized` request, answered `{number, hash}`; then it
+  fetches every header from the last seal up to that block through the RPC client, hashes each one
+  (`embed/src/verified.rs`: the header's RLP and keccak, no new dependency but a direct edge to
+  `alloy-primitives`), links them by parent hash down from the verified hash and to the last seal's
+  hash, and holds every seal to that block and to rows whose block hash is on that chain. The hold is
+  `ExtraRows::seal_through`, the seam core's window already has for exactly this. A refusal stops
+  sealing, not the cursor: the next `{"idle": true}` carries `unverified` with the reason, and the
+  rows stay hot. Messages are RFC-0065 S5's `chain.rs`'s. The browser host takes a `verified`
+  callback; Helios stays in the page that supplies it (burrmill-wasm's `verifiedFinalized`).
+- *Labels and children in `/sql`.* §16 found the module bound no `labels` table. The rows, and the
+  `{template}__children` views a factory nest gets, are now built in `nuthatch_core::bind`
+  (`label_rows`, `children_views`), moved from `engine_burrmill.rs` and `analytics.rs` with the same
+  strings, and both the node and the module bind them.
+- *The recorder.* `tests/e2e_embed_shapes.rs`, in the binary's suite, builds each shape's chain with
+  `tests/common/tape.rs`'s helpers, era by era, and writes it out as a fixture-rpc recording beside
+  the nest and its requests under `tests/fixtures/embed-shapes/`. fixture-rpc's `recorded` reads
+  several eras (`{chain_id, eras: [{tip, finalized, headers, logs}]}`), moving on at `POST
+  /control/fork`, and `--headers` serves whole headers where their hash is the recording's. The test
+  runs the real binary (`nuthatch dev`) over each recording, settles it after each era (the era's
+  newest row read back with its hash, then the cursor and the seal unmoved over two polls) and pins
+  its answers. Without `NUTHATCH_PIN_EMBED_SHAPES` the recordings, nests and requests must be what the
+  code builds, so a pin cannot drift from the chain that made it. `embed/hosts/node/shapes.mjs` is the
+  module's half over the same recordings.
+- *Size gates.* `size.mjs --max-brotli 5500000` fails the plain module in `wasm-plain` and the
+  wasm-bindgen module `/play` loads in `wasm-tab`.
+
+**`abi` stays 1.** No export or import changed: `wasmtime-host abi` finds the 33 pinned shapes equal.
+`verified` is an optional `nh_open` key, `verified_finalized` a request kind asked for only behind it,
+and `unverified` an optional answer field, which the README's versioning rules allow within a
+version. §4 called it a host input; a request is how a host input reaches a module that yields, and a
+new export would have cost a version for a value the module needs once a follow.
+
+**Found by the shapes, and fixed.** The module's tip loop rolled back a reorg without dropping the
+RPC client's timestamp cache above the fork, as the node does (`forget_cached_above`, RFC-0029 §6d).
+Every reorg shape whose replacement blocks carry new timestamps answered the old ones; RFC-0075 S4's
+fork could not show it, because its replacement blocks keep their timestamps. `TabNest::follow` now
+forgets them where the node does.
+
+**Gate.**
+
+| | Result |
+|---|---|
+| With a verified head, a forged header or a log off the verified chain stops sealing by name | **pass**, `hosts/node/verified.mjs`, six cases on RFC-0075 S3's recording with whole headers to block 26,241,700 (1,894 headers, `headers.json.gz`, 1.1 MB, recorded from publicnode by `record-headers.sh`). The honest block seals through 26,241,700 and its segment is the node's `c983470c…479aeae`, 1,894 headers hashed, the 1,000 balances the node's. No light client: nothing sealed, "the host gave no verified finalized block: out of sync". A hash the chain does not reach: nothing sealed, "block 26241700 is 0xfd12…; the light client verified 0x7777…". Block 26,240,500's receipts root altered: nothing sealed, "block 26240500 hashes to 0xfe06…, not the 0x7bc4… its RPC gave". The same header withheld: nothing sealed, the RPC client's "block_headers: 1/1894 header(s) missing", which does not name the block. Block 26,240,101's logs moved to another block hash: sealed through 26,239,812, below it, "the RPC's logs for block 26240101 are not on the verified chain". The cursor reaches the tip in every case |
+| Every listed shape equal to the node's | **pass**: 13 shapes, 25 eras, 175 answers, every one equal to the node's pin. The scaffold `pair` (2,000 mainnet blocks, a segment cut by the 1,800-block span) and `two`; `factory`, a parent whose `Transfer` recipients are children, reorged to drop one child and find another, `child__children` included; `labels`, `tests/e2e_follower.rs`'s derived nest with flags, a labelled address and an entity, sealed through 2, the `labels` table and a join on it included; `reorg-above-seal`, three eras, sealed through 8 and reorged above it; and `tests/e2e_reorg.rs`'s property at depths 1, 2, 3, 7, 12, 13, 18 and 23, both ends and the middle of each band |
+| The size gates in CI | **pass** for the event build: `wasm-plain` and `wasm-tab` fail past 5,500,000 bytes brotli. The address build's 1.5 MB raw gate is **deferred**: there is no address build on main (§13, §14) |
+| Binary unchanged; S5 adds nothing to it | **pass**, below |
+
+The gates were mutation-checked on the module. Without the header check, the unreachable-hash, forged
+header and off-chain cases go red; without the row check, the off-chain case does; without the labels
+table, `labels` does; without the children views, `factory` does; without `forget_cached_above`, the
+reorg depths do. Each mutant was a different file by sha256 before it ran.
+
+**Numbers.** Apple M5 Pro, macOS, Node 26.11.1, the `tab` module after `wasm-opt`: 34,377,919 bytes,
+8,038,925 gzip, 5,267,248 brotli (S4's: 34,336,230 and 5,259,438), 232,752 bytes under the ceiling.
+
+| | |
+|---|---|
+| The honest verified follow of S3's recording, 1,894 headers hashed, in `bytes` | 936 ms |
+| The missing-header case, the RPC client's eight retry rounds | 7.4 s |
+| All 13 shapes through the module, one process | 3.2 s, peak RSS 577 MiB |
+| The node's half, the real binary over the same 13 recordings, debug build | 186 s, mostly settling |
+| RFC-0075 S3, S5 and S5 restarted, re-run on this module | unchanged: segment and balances, digest `22966cee…363febc5` |
+
+**Where this departs from the slice as written.**
+
+- *Factories.* `tests/e2e_runtime_lifecycle.rs` and `tests/e2e_follower.rs` declare no factory. The
+  factory shape takes `tests/e2e_nest_inspect.rs`'s declaration, a `Transfer`'s `to` as the child.
+- *`two`'s start blocks.* USDC's deploy block is four million blocks before the pool's, which no
+  recording carries; at mainnet's 20-block window it would be 196,000 `getLogs` a run. The shape is
+  the scaffold's nest with both contracts starting at the pool's block, and says so.
+- *What the shapes do not run.* The tests' own windows and spans (`spawn_nest`'s overrides): both
+  halves run each chain's registered policy, so they cut the same segments. The follower's offchain
+  entity: an embedding binds no offchain tables (§13). `reorg_below_finality_halts`: a node and a
+  module both stop, and comparing two halts needs a shape of its own.
+- *The wasmtime host* answers no `verified_finalized`; a non-browser host brings its own light client.
+
+**Not done, and why.**
+
+- *Safari and iPhone.* Waiting on Chief: `safaridriver --enable` needs an administrator, and no run
+  was attempted without it.
+- *The address build's size gate.* Deferred with the address build (RFC-0074 S2's decisions).
+- *MCP.* Deferred, as §4 says.
+
+**The binary.** Unchanged in behaviour. Two files changed, `src/analytics.rs` and
+`src/engine_burrmill.rs`, each calling `nuthatch_core::bind` for what it built in place, with the same
+strings. No `Cargo.toml` or `Cargo.lock` of the binary changed. Every subcommand's `--help`, two levels
+deep (60 pages), and the files `init --abi` writes for mainnet and Arbitrum One are byte-identical
+between this branch and the same tree with main's two files. The whole suite: 2,879 passed, none failed,
+18 ignored; the one new test is `e2e_embed_shapes`. A first run, beside a module build, lost
+`deploy_nest_script::a_failure_only_the_new_binary_has_reverts_after_asking_the_previous_one` to a
+killed script (exit `None`); it passed alone and in the whole suite again.
+
+
+## 18. S7 measured outcome, 2026-10-31
+
+**What was built.** The page is in Lodestar, on a local branch (`pete/verify-locally`) that has not
+been pushed: Chief has not given the go for Lodestar. The engine needed four things it did not have,
+and they are here.
+
+- *Narrowed nests.* `nh_open` takes `filters`: per declared event, the values its indexed arguments may
+  take (`embed/src/narrow.rs`). The cursor asks for those logs only, one `eth_getLogs` per filter and
+  value, each log checked against the filter that asked, deduplicated by block and log index. A range
+  the endpoint will not answer whole is halved, as is one that fails twice: arb1 answers a 10,000,000-
+  block query for a large indexer's `StakeDelegated` with "log query timed out". A throttle is asked
+  again after a rest. `nuthatch_core::source::LogFilter` gains topics 1 to 3 and the RPC client sends
+  them; a node never sets them. One value per topic is the shape that matters: arb1.arbitrum.io serves
+  10,000,000 blocks to it and 100,000 to a filter with a list (measured 2026-10-31). An event no filter
+  names is not fetched, so a narrowed nest is refused with `mirror` and with a factory.
+- *`window`*, blocks per `eth_getLogs`: 10,000,000 here, against Arbitrum's registered 2,000. History
+  from block 42,449,585 is 48 windows per filter, not 239,000.
+- *`until`*, the last block the cursor indexes. The tab indexes to `/api/portfolio`'s
+  `provenance.as_of` and no further, so both sides are compared at one block. A store past `until`
+  faults the follow. The first design bounded every table in the SQL instead; the stakes query came to
+  17,724 bytes against `/sql`'s 16,384, and `until` is the honest form anyway.
+- *One head per follow pass.* `TabNest::follow` read the tip again every window and stopped only when
+  it had caught up. Arbitrum makes four blocks a second, and a nest asking forty filters a window never
+  caught up: it ran past the tip it started at, 2,443 requests in, with no `{"idle": true}`. A pass now
+  ends at the head it first saw, and the host steps again. Every earlier gate is unchanged by it
+  (below).
+
+**The page.** `/profile` gets a "Verify it locally" card, off by default; without it the page renders
+and fetches what it did before. On, a worker loads the plain module (34,408,073 bytes, gzipped in the
+repository, vendored by `scripts/vendor-nuthatch-engine.sh` from this branch's `f79c3612`, with
+`host.js` and `opfs.js` unmodified and the commit in `ENGINE.json`), and:
+
+1. reads `/api/portfolio` for the delegator and the curator, again until both name the same `as_of`;
+2. opens the wallet's nest (`public/verify-locally/nest/wallet.toml`: graph-allocations-nest's
+   aliases, ABIs and start blocks at 36bd3de, so every table has the server's name and columns), its
+   delegations, undelegations, withdrawals and signal filtered by the wallet as `delegator` or
+   `curator`, Horizon's events from the proxies' upgrade at 408,825,706, with block times, `until` the
+   server's block;
+3. opens the pools nest (`pools.toml`) for every indexer the wallet holds shares in or has GRT thawing
+   with: sixteen events by `serviceProvider` or `indexer`, and **no block times**. No pool figure reads
+   one, and a large indexer's pool is tens of thousands of blocks, each a header from an endpoint that
+   sends no timestamp on its logs and answers ten headers to a batch. With them, 0xd7d7…d076's pool
+   (74 million shares, every delegation since 2022) had not finished in 30 minutes;
+4. runs kittiwake's four portfolio queries with graph-allocations-nest's view SQL as CTEs, the pools
+   nest's pool rows and thaw requests passed to the wallet nest's queries as typed literal rows, and
+   compares every column both sides fold, as strings, wei for wei.
+
+The SQL is the server's with these differences, each forced by two nests of one wallet rather than one
+of the network, and written at the top of `src/lib/verify/sql.ts`: `horizon_start` is the chain's
+first `HorizonStakeDeposited`, block 408,847,369, where the view takes a `MIN` that over a few indexers
+would be later; the pools nest reads NULL for `block_timestamp`; arms reading contracts the tab does not
+fetch are gone with the columns they made; and the pool and thaw rows reach the positions as literals
+where the server joins views. The engine does every sum, cast and division. It refused the first cut of
+those literals: a wide integer written bare "would be read as a float", so they go in quoted and cast.
+
+Stores live in OPFS under a name for the wallet, the pool set, the module's hash and the nest's files,
+so a second run fetches only what is new (in Node, the wallet's nest reopened in 0.4 to 2.7 s, 2 to 18
+requests). The page's host sends a long header batch to arb1 as tens, one after another, waiting out a
+throttled part, and carries a `follow_failed` on from the store.
+
+**Gate.** Brave headless (Chrome for Testing does not start on this Mac) on `next dev`, through the
+page itself: `scripts/verify-locally-gate.mjs` connects a read-only stand-in wallet that answers with
+the address under test, turns the switch on, and reads back what the page rendered. Each address ran
+in a fresh browser context, so a fresh OPFS and a full fetch, against `https://arb1.arbitrum.io/rpc`.
+
+| Address | What it holds | Block | Figures | Differ | Pools | RPC requests | Time |
+|---|---|---|---|---|---|---|---|
+| 0xcdb9…b2c3 | delegator, Horizon era, 6 positions, 2 open | 519,858,740 | 81 | 0 | 2 | 2,342 | 220 s |
+| 0x3a35…bb3c | delegator since 2023, 110,000 GRT thawing | 519,856,323 | 43 | 0 | 1 | 4,453 | 662 s |
+| 0xe3af…2ac2 | delegator since February 2025 | 519,859,400 | 32 | 0 | 1 | 3,744 | 529 s |
+| 0xd7d7…d076 | delegator, 2 positions thawing, 1 in a pool of 74 million shares | 519,861,750 | 53 | 0 | 3 | 11,566 | 1,995 s |
+| 0x96a3…65b2 | curator, 9 signals | 519,852,240 | 50 | 0 | 0 | 765 | 89 s |
+| 0x6d64…24bc | curator, 9 signals, 2 open | 519,852,447 | 50 | 0 | 0 | 748 | 73 s |
+| 0xacbd…0db5 | curator, 19 signals | 519,852,874 | 100 | 0 | 0 | 1,030 | 178 s |
+
+0xd7d7…d076's third pool is one of the network's largest, every delegation and reward since 2022. In Node
+over files the same comparison gave 53 of 53 at the same block; that nest, reopened warm, followed to
+the next head in 2 s and 54 requests, and its pools nest held 240 MiB of linear memory at the end.
+
+An earlier cut, with block times in one nest for everything, gave the same agreement for the first six
+(and 0xd7d7…d076 never finished): 0xcdb9…b2c3 in 453 s and 3,445 requests, 0x3a35…bb3c in 1,065 s and
+6,651. Dropping the pools' block times took a third to a half off.
+
+Figures compared: the delegator's totals (delegated and undelegated all time, realised rewards,
+positions, open positions); per position, the value of its shares now, their cost, the shares, GRT
+thawing and until when, realised rewards, delegated and undelegated all time, whether open, first
+delegation and last undelegation; per fetched pool, its tokens, tokens thawing, shares and both cuts;
+the curator's totals (signalled and unsignalled all time, name signal through GNS included, realised
+rewards, signal positions, open ones); per signal, GRT in and out, curation shares, last change and
+realised rewards. The position values go through the server's `DOUBLE` arithmetic for the fractional
+share and the weighted average price, and the engine reproduces them to the wei: the same SQL on the
+same Burrmill.
+
+**Not computed, and named on the page rather than shown.**
+
+- *The 90-day rewards history.* kittiwake builds it from `indexer_snapshots`, each indexer's exchange
+  rate as Lodestar's own cron sampled it into Postgres. The moment a sample was taken is not on the
+  chain, so the tab has nothing to reproduce it from.
+- *An indexer's own stake, allocation count, URL and geohash*, and *a deployment's total signal, query
+  fees and allocated stake.* Folded from provisions, allocations, service registrations and every
+  curator's signal: the network's history, not the wallet's. `/profile` shows none of them.
+- *Pool figures for a closed position.* With no shares and nothing thawing its value is zero whatever
+  the pool holds, so that pool is not fetched; the page lists each such indexer.
+
+**What it does not show.** The tab trusts its RPC. S5's verified head is Helios on mainnet's beacon
+chain, and Arbitrum's finality is an L1 batch; nothing here verifies a block, and an RPC that leaves a
+log out is not caught (the page says so). It is slow from cold on a keyless RPC, and slowest for a
+wallet in a large pool, almost all of it arb1's throttle: the table's times are the cost of a public
+endpoint, and a keyed one or a warm store is the difference. Safari, Firefox and a phone are not run.
+The page has not been deployed, and Lodestar's CSP admits `https:` RPCs only.
+
+**The binary.** Unchanged in behaviour: `LogFilter` gains a field it never sets and the RPC client
+sends topics only when set, so every request a node makes is the same JSON. `cargo check --all-targets`
+of the root, and core's tests (186) and clippy, pass. The module's earlier gates on this branch's
+module: S5's 32 answers (`22966cee…363febc5`) fresh and after a kill, S3's segment and 1,000 balances,
+the six verified-head cases, and all 13 shapes equal to the node's. `embed`'s unit tests now run in CI
+beside `native`, which they did not before.

@@ -302,6 +302,13 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     ("src/address_history.rs", Some(&["AddressHistoryConfig"])),
     // `[[alerts]] format`'s values, in nuthatch-core since RFC-0075 S1.
     ("core/src/alerts.rs", Some(&["AlertFormat"])),
+    // The nest's part of `nuthatch.toml`, in nuthatch-core since RFC-0077 S4.
+    (
+        "core/src/nest_config.rs",
+        Some(&[
+            "Nest", "Contract", "Template", "Factory", "Flags", "Extract",
+        ]),
+    ),
 ];
 
 /// `src/*.rs` files that derive `Deserialize` for wire formats, snapshots, or HTTP bodies - not
@@ -328,6 +335,7 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "the value of `[runtime] isolation`, which RuntimeMeta carries; it has no keys of its own",
     ),
     ("core/src/redb_store.rs", "the table tag of a hot row, not nest config"),
+    ("core/src/mirror.rs", "the seed snapshot a publisher writes, not nest config"),
     ("core/src/tap.rs", "the hot-state feed's ops (RFC-0073 FR1), not nest config"),
     (
         "src/mount_jobs.rs",

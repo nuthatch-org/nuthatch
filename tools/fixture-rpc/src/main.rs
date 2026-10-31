@@ -26,6 +26,9 @@ enum Chain {
         /// Carry RFC-0075 S4's scripted reorg, taken by `POST /control/fork`
         #[arg(long)]
         fork: bool,
+        /// Whole headers to serve where their hash is the recording's (RFC-0077 S5)
+        #[arg(long)]
+        headers: Option<PathBuf>,
     },
     /// One Transfer a block over blocks 1..=8, switchable through /control/mode to zero logs
     Scripted {
@@ -83,10 +86,18 @@ enum Chain {
 
 fn main() {
     match Cli::parse().chain {
-        Chain::Recorded { port, file, fork } => {
+        Chain::Recorded {
+            port,
+            file,
+            fork,
+            headers,
+        } => {
             let mut fx = Recorded::from_path(&file).unwrap_or_else(|e| die(&e));
             if fork {
                 fx = fx.with_fork();
+            }
+            if let Some(h) = headers {
+                fx = fx.with_headers(&h).unwrap_or_else(|e| die(&e));
             }
             let banner = format!(
                 "fixture-rpc listening on http://127.0.0.1:{port}/ recorded {}..={}",

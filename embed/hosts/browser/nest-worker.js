@@ -17,7 +17,7 @@ async function follow(stop) {
   return {
     last_block: f.last_block, sealed_through: f.sealed_through, hot_rows: f.hot_rows,
     holders: f.balances.holders, resumed_from: f.resumed_from, backend: f.backend,
-    segments: f.segments, stopped: s.stopped ?? false,
+    segments: f.segments, stopped: s.stopped ?? false, mirror: f.mirror,
   };
 }
 
@@ -46,7 +46,8 @@ self.onmessage = async (m) => {
         rpc: fetchRpc({ main: d.rpc }),
         log: (level, s) => console.log(`guest[${level}]: ${s}`),
       });
-      engine.open({
+      // `config` is a whole `nh_open` config, as a page opening a mirrored nest sends one (RFC-0077 S4).
+      engine.open(d.config ?? {
         nid: d.nid, contract: d.contract, start: Number(d.start), rpc: ["main"], storage: "host",
         fresh: d.fresh ?? true,
         memory_mib: d.memoryCeilingMib, poll_interval_secs: d.pollIntervalSecs, files: d.files,

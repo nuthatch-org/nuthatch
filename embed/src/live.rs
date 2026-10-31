@@ -6,7 +6,6 @@ use crate::derived::NestFiles;
 use crate::query::{sorted, view_names, TabQuery};
 use crate::tab::worker::opfs_db;
 use crate::tab::TabNest;
-use crate::young::MAINNET_LOG_WINDOW;
 use nuthatch_core::backend::Bytes;
 use nuthatch_core::fetch::Fetch;
 use nuthatch_core::opfs::OpenError;
@@ -125,7 +124,7 @@ impl LiveNest {
             nid: Some(&self.nid),
             version: crate::young::node_version(),
             poll_interval_secs: self.poll_interval_secs,
-            log_window: MAINNET_LOG_WINDOW,
+            log_window: self.nest.log_window(),
         };
         let a = crate::http::answer(&nest, &method, &target, &body).await;
         HttpAnswer {
@@ -188,6 +187,7 @@ impl LiveNest {
             &self.nest.entities,
             &self.files,
             self.nest.budget,
+            &self.nest.children_views(),
         )
         .await
         .map_err(|e| js(format!("{e:#}")))?;

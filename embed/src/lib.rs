@@ -16,13 +16,18 @@ pub mod budget;
 pub mod cellar;
 pub mod derived;
 pub mod entity;
+pub mod folds;
 pub mod http;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub mod live;
+pub mod mirror;
+pub mod narrow;
+pub mod nest;
 pub mod query;
 pub mod reorg;
 pub mod tab;
 pub mod tape;
+pub mod verified;
 pub mod window;
 pub mod young;
 

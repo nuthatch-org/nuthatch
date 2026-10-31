@@ -49,6 +49,8 @@ mod e2e_crash_safety;
 mod e2e_cursor_death_isolation;
 #[path = "e2e_early_cutoff.rs"]
 mod e2e_early_cutoff;
+#[path = "e2e_embed_shapes.rs"]
+mod e2e_embed_shapes;
 #[path = "e2e_entity_reorg.rs"]
 mod e2e_entity_reorg;
 #[path = "e2e_fencing.rs"]
@@ -116,6 +118,8 @@ mod e2e_stop_releases_store;
 mod e2e_tab_answers;
 #[path = "e2e_tab_entities.rs"]
 mod e2e_tab_entities;
+#[path = "e2e_tab_mirror.rs"]
+mod e2e_tab_mirror;
 #[path = "e2e_tab_parity.rs"]
 mod e2e_tab_parity;
 #[path = "e2e_trino_contract.rs"]

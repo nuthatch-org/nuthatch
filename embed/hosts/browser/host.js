@@ -52,7 +52,9 @@ export const onceSealed = (engine) => (stats) =>
 
 /// Instantiate `module` (bytes or a `WebAssembly.Module`). `storage` is `{open, remove, list}`, whose
 /// `open` resolves to a file with the sync access handle's methods; `rpc` performs an `rpc` request.
-export async function load(module, { storage, rpc, log }) {
+/// `verified`, for a nest opened with `verified: true`, resolves to the finalized block `{number,
+/// hash}` a light client verified (in a page, Helios: burrmill-wasm's `verifiedFinalized`).
+export async function load(module, { storage, rpc, log, verified }) {
   const files = new Map();
   let nextHandle = 1;
   let mem;
@@ -118,11 +120,50 @@ export async function load(module, { storage, rpc, log }) {
   };
   const call = (name, ...args) => JSON.parse(dec.decode(take(g[name](...args))));
 
+  // RFC-0077 S4: a mirror's GET. Text comes back whole; with `append`, the body is written at the end of
+  // that open file and the answer says where. A body past `max_bytes` is refused, not cut short.
+  async function get(r) {
+    // Retries across a transport failure are the host's; a status is an answer and is not retried.
+    let res;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        res = await fetch(r.url);
+        break;
+      } catch (e) {
+        if (attempt >= 3) throw e;
+        await new Promise((ok) => setTimeout(ok, 500 * 2 ** attempt));
+      }
+    }
+    if (res.status !== 200) {
+      await res.body?.cancel();
+      return { status: res.status };
+    }
+    const declared = Number(res.headers.get("content-length") ?? 0);
+    if (declared > r.max_bytes) {
+      await res.body?.cancel();
+      return { error: `${r.url} is ${declared} bytes, past the ${r.max_bytes} asked for` };
+    }
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (bytes.length > r.max_bytes) return { error: `${r.url} is ${bytes.length} bytes, past the ${r.max_bytes} asked for` };
+    if (r.append === undefined) return { status: 200, body: dec.decode(bytes) };
+    const f = file(r.append);
+    const at = f.getSize();
+    for (let done = 0; done < bytes.length;) done += f.write(bytes.subarray(done), { at: at + done });
+    return { status: 200, offset: at, length: bytes.length };
+  }
+
   async function perform(r) {
     try {
       switch (r.kind) {
         case "rpc":
           return await rpc(r);
+        case "get":
+          return await get(r);
+        case "verified_finalized": {
+          if (!verified) return { error: "this host has no light client" };
+          const { number, hash } = await verified();
+          return { number, hash };
+        }
         case "open": {
           const f = await storage.open(checkName(r.name));
           const h = nextHandle++;
@@ -156,7 +197,7 @@ export async function load(module, { storage, rpc, log }) {
       for (;;) {
         stats.steps += 1;
         const s = call("nh_step");
-        if (s.idle) return stats;
+        if (s.idle) return { ...stats, ...(s.unverified ? { unverified: s.unverified } : {}) };
         if (s.requests && stop?.(stats)) return { ...stats, stopped: true };
         if (s.requests) {
           const answers = await Promise.all(s.requests.map(perform));

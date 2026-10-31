@@ -1,0 +1,50 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nest in a tab: RFC-0077 S4 gate</title>
+<pre id="out">running</pre>
+<script type="module">
+// RFC-0077 S4's browser gate: a nest opened from its `nuthatch.toml` and hydrated from a mirror on this
+// origin, in OPFS, through `abi: 1` in a worker; then `mirror-answers.mjs`'s requests as plain
+// `fetch`es the Service Worker answers. Posts what it saw to `run-sw-mirror.mjs`, which compares it
+// with a node seeded from the same mirror.
+import { openNest } from "./page.js";
+import { answersOf } from "../embed/mirror-answers.mjs";
+
+const out = document.getElementById("out");
+const p = new URLSearchParams(location.search);
+const report = async (r) => {
+  out.textContent = JSON.stringify(r, null, 1);
+  await fetch("../result", { method: "POST", body: JSON.stringify(r) });
+};
+
+try {
+  const files = await (await fetch("../nestfiles.json")).json();
+  const rpc = p.get("rpc");
+  const config = {
+    nid: "mirror-gate", rpc: ["main"], storage: "host", fresh: true, files,
+    mirror: { base: p.get("base") ?? new URL("../mirror", location.href).href },
+    follow: Boolean(rpc),
+    ...(p.get("memory") ? { memory_mib: Number(p.get("memory")) } : {}),
+  };
+  const t0 = performance.now();
+  let opened;
+  try {
+    opened = await openNest({
+      scope: "./", swUrl: "./sw.js", workerUrl: "./nest-worker.js",
+      open: { module: new URL(p.get("module"), location.href).href, rpc: rpc ?? "http://127.0.0.1:1/", config },
+    });
+  } catch (e) {
+    await report({ ok: true, refused: String(e && e.message || e) });
+    await new Promise(() => {});
+  }
+  const openMs = performance.now() - t0;
+  const base = new URL("./", location.href);
+  const answers = await answersOf(files, async (t) => {
+    const r = await fetch(new URL(t.slice(1), base));
+    return { status: r.status, body: await r.text() };
+  });
+  await report({ ok: true, opened, open_ms: openMs, answers });
+} catch (e) {
+  await report({ ok: false, error: String(e && e.stack || e) });
+}
+</script>

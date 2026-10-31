@@ -117,6 +117,77 @@ pub fn through_views(
     out
 }
 
+/// The `labels` table's rows from `labels/*.json` snapshots, each `(name, text)` a flat JSON array of
+/// `{address, label}`, in the order given. Addresses are lower-cased for a clean join with decoded hex.
+pub fn label_rows<'a>(
+    snapshots: impl IntoIterator<Item = (String, &'a str)>,
+) -> anyhow::Result<Vec<Value>> {
+    use anyhow::Context;
+    let mut rows = Vec::new();
+    for (name, text) in snapshots {
+        let doc: Value =
+            serde_json::from_str(text).with_context(|| format!("{name} is not JSON"))?;
+        for item in doc.as_array().into_iter().flatten() {
+            let address = item
+                .get("address")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase);
+            let label = item.get("label").cloned().unwrap_or(Value::Null);
+            rows.push(serde_json::json!({ "address": address, "label": label }));
+        }
+    }
+    Ok(rows)
+}
+
+/// A factory nest's `{template}__children` views (RFC-0009 §Serving), each `(name, DDL)`: the children
+/// every factory producing the template discovered, with their provenance, the earliest discovery
+/// per address. A nest without block timestamps has no `discovered_timestamp` to project.
+pub fn children_views(
+    factories: &crate::factory::FactorySet,
+    block_timestamps: bool,
+) -> Vec<(String, String)> {
+    let (ts, cols) = if block_timestamps {
+        (
+            "block_timestamp AS discovered_timestamp, ",
+            "discovered_timestamp, ",
+        )
+    } else {
+        ("", "")
+    };
+    let mut by_template: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    for (template, table, child_param) in factories.view_sources() {
+        by_template
+            .entry(template)
+            .or_default()
+            .push((table, child_param));
+    }
+    by_template
+        .into_iter()
+        .map(|(template, sources)| {
+            // `child_param`/`table` are registry-derived (never user text) → no injection surface.
+            let selects: Vec<String> = sources
+                .iter()
+                .map(|(table, cp)| {
+                    format!(
+                        "SELECT lower(\"{cp}\") AS address, block_number AS discovered_block, \
+                         log_index AS discovered_log_index, {ts}\
+                         lower(address) AS parent_address FROM \"{table}\""
+                    )
+                })
+                .collect();
+            let union = selects.join(" UNION ALL ");
+            let ddl = format!(
+                "CREATE OR REPLACE VIEW \"{template}__children\" AS \
+                 SELECT address, discovered_block, discovered_log_index, {cols}parent_address \
+                 FROM ({union}) \
+                 QUALIFY row_number() OVER (PARTITION BY address ORDER BY discovered_block, discovered_log_index) = 1"
+            );
+            (format!("{template}__children"), ddl)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

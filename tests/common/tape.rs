@@ -348,6 +348,18 @@ impl TapeSource {
         }
     }
 
+    /// The chain as served now, for `tests/e2e_embed_shapes.rs` to write out: tip, finalized, and every
+    /// block up to the tip.
+    pub fn snapshot(&self) -> (u64, u64, Vec<(u64, BlockFixture)>) {
+        let t = self.inner.lock().unwrap();
+        let blocks = t
+            .blocks
+            .range(..=t.tip)
+            .map(|(n, b)| (*n, b.clone()))
+            .collect();
+        (t.tip, t.finalized, blocks)
+    }
+
     /// Set the chain tip (the highest block the source will serve).
     pub fn advance_tip_to(&self, n: u64) {
         self.inner.lock().unwrap().tip = n;
