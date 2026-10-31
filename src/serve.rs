@@ -9042,12 +9042,12 @@ mod tests {
     async fn entity_cold_read_uses_the_query_guard() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(tmp.path(), 1);
-        let before = crate::analytics::entity_guarded_reads();
+        let dir = state.dir.clone();
         let resp = entity(State(state), Path("1-1".into()))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert_eq!(crate::analytics::entity_guarded_reads(), before + 1);
+        assert_eq!(crate::analytics::entity_guarded_reads(&dir), 1);
     }
 
     /// `table` sealed at `sealed`, hot at `hot`, one row per block, served through `router()`.
