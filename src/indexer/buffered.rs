@@ -239,6 +239,9 @@ struct BufferedWindow {
     /// The addresses the fetch asked for, lowercased; `None` when it asked by topic0 alone, which
     /// already covers any child a nest discovers later.
     asked: Option<HashSet<String>>,
+    /// The topic0s it asked for without an address beside `asked`: a child of a template whose
+    /// events are all here is covered too (#2410).
+    wide: Vec<String>,
     /// Hash and timestamp of `to`, read by extraction after the logs, as a window's checkpoint is.
     header: Option<(String, Option<u64>)>,
     /// One block over the provider's cap: no logs, and each nest asks for it by its own filter.
@@ -821,20 +824,6 @@ struct ExtractInputs {
     factory: Option<(Arc<DecodeRegistry>, Arc<FactorySet>, ChildRegistry)>,
 }
 
-impl ExtractInputs {
-    fn narrowed(&self) -> Vec<String> {
-        match &self.factory {
-            Some((reg, _, children)) => reg
-                .addresses()
-                .iter()
-                .map(|a| format!("0x{}", hex::encode(a)))
-                .chain(children.addresses().iter().map(|c| c.to_string()))
-                .collect(),
-            None => self.addresses.clone(),
-        }
-    }
-}
-
 struct Extraction<'a> {
     source: &'a dyn Source,
     shared: &'a BufferShared,
@@ -1005,7 +994,7 @@ impl Extraction<'_> {
                 .iter()
                 .for_each(|m| m.set_fetch_window(chunker.window()));
             match self.fetch(&inputs, next, to).await {
-                Ok((logs, asked)) => {
+                Ok((logs, asked, wide)) => {
                     chunker.observed(logs.len() as u64);
                     // After the logs, as a window's checkpoint is read, so its hash is of the chain
                     // they came from or later.
@@ -1059,6 +1048,7 @@ impl Extraction<'_> {
                         tip,
                         logs: WindowLogs::Memory(logs),
                         asked,
+                        wide,
                         header,
                         over_cap: false,
                         bytes,
@@ -1082,6 +1072,7 @@ impl Extraction<'_> {
                             tip,
                             logs: WindowLogs::Memory(Vec::new()),
                             asked: None,
+                            wide: Vec::new(),
                             header: None,
                             over_cap: true,
                             bytes: window_bytes(&[], &None),
@@ -1110,7 +1101,7 @@ impl Extraction<'_> {
         inputs: &[ExtractInputs],
         next: u64,
         to: u64,
-    ) -> Result<(Vec<crate::rpc::Log>, Option<HashSet<String>>)> {
+    ) -> Result<(Vec<crate::rpc::Log>, Option<HashSet<String>>, Vec<String>)> {
         let (u_addrs, u_topics) = union_filter(
             inputs
                 .iter()
@@ -1124,45 +1115,38 @@ impl Extraction<'_> {
                 .min()
                 .unwrap_or(0),
         );
-        let factories = inputs.iter().filter(|n| n.factory.is_some()).count();
-        let narrowed = if factories == 0 {
-            None
-        } else {
-            let mut addrs: Vec<String> = Vec::new();
-            for a in inputs.iter().flat_map(ExtractInputs::narrowed) {
-                if !addr_in(&addrs, &a) {
-                    addrs.push(a);
-                }
-            }
-            let wide = !self.topic0_refused
-                && (addrs.len() > FACTORY_FLIP_THRESHOLD
-                    || inputs
-                        .iter()
-                        .filter_map(|n| n.factory.as_ref())
-                        .any(|(_, f, _)| f.force_topic0()));
-            (!addrs.is_empty() && !wide).then_some(addrs)
-        };
+        let factories: Vec<UnionFactory<'_>> = inputs
+            .iter()
+            .filter_map(|n| n.factory.as_ref())
+            .map(|(reg, fs, children)| (reg.as_ref(), fs.as_ref(), children))
+            .collect();
+        let statics: Vec<String> = inputs
+            .iter()
+            .filter(|n| n.factory.is_none())
+            .flat_map(|n| n.addresses.iter().cloned())
+            .collect();
+        let plan = (!factories.is_empty())
+            .then(|| UnionPlan::new(&statics, &factories, self.topic0_refused))
+            .filter(|p| !p.pinned.is_empty() || factories.iter().any(|(_, _, c)| !c.is_empty()));
         let lower = |a: &String| a.to_ascii_lowercase();
-        match (&narrowed, LogFilter::new(&u_addrs, &u_topics)) {
-            (Some(addrs), _) => {
-                let mut asked: HashSet<String> = addrs.iter().map(lower).collect();
-                let logs =
-                    fetch_discovering(self.source, addrs, &u_topics, fetch_from, to, |logs| {
-                        let mut known = Vec::new();
-                        for (reg, fs, children) in inputs.iter().filter_map(|n| n.factory.as_ref())
-                        {
-                            known.extend(discover_children(reg, fs, children, logs));
-                        }
-                        asked.extend(known.iter().map(lower));
-                        known
-                    })
-                    .await?;
-                Ok((logs, Some(asked)))
+        match (plan, LogFilter::new(&u_addrs, &u_topics)) {
+            (Some(mut plan), _) => {
+                let f = fetch_union_by_template(
+                    self.source,
+                    &mut plan,
+                    &factories,
+                    &u_topics,
+                    fetch_from,
+                    to,
+                    &mut self.topic0_refused,
+                )
+                .await?;
+                Ok((f.logs, Some(f.asked), f.wide_topic0s))
             }
             (None, Some(f)) => match self.source.logs(&f, fetch_from, to).await {
                 Ok(logs) => {
                     let asked = (!u_addrs.is_empty()).then(|| u_addrs.iter().map(lower).collect());
-                    Ok((logs, asked))
+                    Ok((logs, asked, Vec::new()))
                 }
                 Err(e) if u_addrs.is_empty() && crate::rpc::filter_refused(&e) => {
                     tracing::warn!(
@@ -1174,7 +1158,7 @@ impl Extraction<'_> {
                 }
                 Err(e) => Err(e),
             },
-            (None, None) => Ok((Vec::new(), None)),
+            (None, None) => Ok((Vec::new(), None, Vec::new())),
         }
     }
 
@@ -1413,14 +1397,24 @@ async fn window_logs(
     stats: &BufferStats,
 ) -> Result<NestLogs> {
     let from = overlap_from(next, nest.start_block.unwrap_or(0));
-    let refetch = match (nest.factory.as_deref(), &w.asked) {
-        (Some(_), Some(asked)) => nest
+    let asked_for = |c: &str, children: &ChildRegistry| {
+        w.asked
+            .as_ref()
+            .is_none_or(|a| a.contains(&c.to_ascii_lowercase()))
+            || children.template_of(c).is_some_and(|t| {
+                let topics = nest.registry.template_topic0s(t);
+                !topics.is_empty()
+                    && topics
+                        .iter()
+                        .all(|t| addr_in(&w.wide, &format!("0x{}", hex::encode(t))))
+            })
+    };
+    let refetch = nest.factory.is_some()
+        && nest
             .children
             .addresses()
             .into_iter()
-            .any(|c| !asked.contains(&c.to_ascii_lowercase())),
-        _ => false,
-    };
+            .any(|c| !asked_for(c, &nest.children));
     if let WindowLogs::Memory(all) = &w.logs {
         if !refetch && all.iter().all(|l| l.block_number >= from && nest.owns(l)) {
             return Ok(NestLogs::Window(w));
@@ -1432,14 +1426,14 @@ async fn window_logs(
         .filter(|l| l.block_number >= from && nest.owns(l))
         .cloned()
         .collect();
-    let (Some(fs), Some(asked)) = (nest.factory.as_deref(), &w.asked) else {
+    let Some(fs) = nest.factory.as_deref() else {
         return Ok(NestLogs::Own(logs));
     };
     let missing: Vec<String> = nest
         .children
         .addresses()
         .into_iter()
-        .filter(|c| !asked.contains(&c.to_ascii_lowercase()))
+        .filter(|c| !asked_for(c, &nest.children))
         .map(str::to_string)
         .collect();
     if missing.is_empty() {
@@ -1449,7 +1443,7 @@ async fn window_logs(
     let extra = fetch_discovering(source, &missing, &nest.topic0s, from, w.to, |seen| {
         discover_children(&nest.registry, fs, &nest.children, seen)
             .into_iter()
-            .filter(|c| !asked.contains(&c.to_ascii_lowercase()))
+            .filter(|c| !asked_for(c, &nest.children))
             .collect()
     })
     .await?;
