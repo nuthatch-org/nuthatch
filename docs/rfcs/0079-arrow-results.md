@@ -234,4 +234,6 @@ the guard on the executing run only; the quote a paid query is offered plans wit
 it is unchanged. `a_declared_query_answers_in_arrow_as_it_does_in_json` holds it over sealed and hot
 rows.
 
-**Not yet.** `/explain`'s result sample.
+**`/explain`, nothing to do.** §7's S1 row named "`/explain`'s result sample"; there is none.
+`/explain` plans the statement and answers with the plan and its columns, and materialises no row
+(`Want::Plan`), so it has nothing for Arrow to carry. S1 is complete with `/sql` and `/q/{name}`.
