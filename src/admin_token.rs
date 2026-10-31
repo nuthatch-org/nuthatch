@@ -11,6 +11,12 @@ use anyhow::{anyhow, bail, Context, Result};
 /// Left out of every nest's inputs (`blob::EXCLUDE`), so it moves no NID and is never bundled.
 pub const FILE: &str = ".admin-token";
 
+/// The token, or the private name it is written under before it is linked into place (#2530).
+pub fn is_own(name: &str) -> bool {
+    name.strip_prefix(FILE)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
 pub fn path(dir: &Path) -> PathBuf {
     dir.join(FILE)
 }

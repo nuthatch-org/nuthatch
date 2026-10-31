@@ -46,6 +46,7 @@ const EXCLUDE: &[&str] = &[
 /// Whether a file or directory of this name is left out of a nest's inputs, at any depth.
 pub(crate) fn is_excluded(name: &std::ffi::OsStr) -> bool {
     EXCLUDE.iter().any(|x| name == std::ffi::OsStr::new(x))
+        || name.to_str().is_some_and(crate::admin_token::is_own)
 }
 
 /// The **derived state** a dataset accumulates by indexing: the hot store and the sealed segments.
@@ -71,11 +72,11 @@ pub(crate) fn collect_files(root: &Path, skip: Option<&Path>) -> Result<Vec<Path
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if EXCLUDE.iter().any(|x| *x == name) {
+            if is_excluded(&entry.file_name()) {
                 continue;
             }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
             // RFC-0062's copies and quarantined segments sit beside `segments/`. Only those, at the root,
             // so a deeper authored directory of either name keeps its place in the identity.
             if dir == root
@@ -797,9 +798,10 @@ fn names_derived_state(rel: &str) -> bool {
     let first = rel.split('/').next().unwrap_or_default();
     let root_only = [crate::maintained::COPIES_DIR, crate::seal::QUARANTINE_DIR];
     root_only.iter().any(|d| first.eq_ignore_ascii_case(d))
-        || rel
-            .split('/')
-            .any(|part| EXCLUDE.iter().any(|x| part.eq_ignore_ascii_case(x)))
+        || rel.split('/').any(|part| {
+            EXCLUDE.iter().any(|x| part.eq_ignore_ascii_case(x))
+                || crate::admin_token::is_own(&part.to_ascii_lowercase())
+        })
 }
 
 /// Whether `path`, below `base`, is reached through no link and is no device or directory. A missing
@@ -1281,6 +1283,25 @@ abi = "abis/c.json"
             .files
             .iter()
             .all(|f| f.path != crate::admin_token::FILE));
+    }
+
+    /// #2530: `dev` writes the token under a private name before linking it into place, and a
+    /// `nest nid` or `nest inspect` listing the directory in that moment hashed the private name.
+    #[test]
+    fn the_admin_token_being_written_is_not_an_input() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        let before = build_manifest(a.path(), None).unwrap();
+        std::fs::write(
+            a.path().join(format!(
+                "{}.{}",
+                crate::admin_token::FILE,
+                std::process::id()
+            )),
+            "0".repeat(64),
+        )
+        .unwrap();
+        assert_eq!(build_manifest(a.path(), None).unwrap().nid(), before.nid());
     }
 
     /// The committed fixture nests keep the NID and data identity they had before the 2026-10-23
