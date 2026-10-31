@@ -1942,7 +1942,8 @@ pub fn hold_writer_leases(
     leases: Vec<WriterLease>,
     states: &[(String, crate::serve::AppState)],
     health: &Arc<crate::health::RuntimeHealth>,
-) -> Result<()> {
+) -> Result<BTreeMap<String, tokio::sync::mpsc::Sender<crate::lease::Handover>>> {
+    let mut handovers = BTreeMap::new();
     for WriterLease { route, lease } in leases {
         let Some((_, state)) = states.iter().find(|(k, _)| *k == route) else {
             continue;
@@ -1952,12 +1953,36 @@ pub fn hold_writer_leases(
             .claim(lease.owner())
             .with_context(|| format!("claiming the store of mount '{route}'"))?;
         let health = health.clone();
+        let (ask, asked) = tokio::sync::mpsc::channel(1);
+        handovers.insert(route.clone(), ask);
+        let drained = store.clone();
+        let nest = route.clone();
         tokio::spawn(async move {
-            let stopped = crate::lease::hold(lease, move || store.fence_off()).await;
+            let fenced = store.clone();
+            let stopped = crate::lease::hold_with(
+                lease,
+                move || fenced.fence_off(),
+                asked,
+                move || published(nest.clone(), drained.clone()),
+                Some(crate::metrics::METRICS.nest(&route)),
+            )
+            .await;
             health.quarantine_nest(&route, stopped.to_string(), 0, None);
         });
     }
-    Ok(())
+    Ok(handovers)
+}
+
+/// A handover's drain: wait, up to a minute, until the publisher has mirrored everything the store
+/// sealed, so the standby that takes the lease finds it on the mirror.
+async fn published(route: String, store: Arc<dyn crate::store::HotStore>) {
+    let metrics = crate::metrics::METRICS.nest(&route);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    while metrics.publish_sealed_through() < store.sealed_through()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 /// RFC-0078 §5.4: a writer that takes a lease over a dataset it has never indexed starts from the
@@ -2771,7 +2796,7 @@ pub async fn dev(
         default_tenant,
         &writer_leases,
     )?;
-    hold_writer_leases(writer_leases, &all_states, &health)?;
+    let handovers = hold_writer_leases(writer_leases, &all_states, &health)?;
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // mounts's real resident set alongside the projection so operators can calibrate.
@@ -2806,6 +2831,7 @@ pub async fn dev(
         estimates: estimates.clone(),
         default_tenant: default_tenant_owned.clone(),
         suspended,
+        handovers,
         failed,
         joining: Default::default(),
         tenant_shares: all_mounts.tenants.clone(),
@@ -3621,6 +3647,57 @@ pub fn lifecycle_routes(
         (StatusCode::OK, Json(record_json(&record)))
     }
 
+    /// RFC-0078 §5.6: hand every lease this runtime holds to a standby. Each holder stops
+    /// committing, waits for the mirror to have what it sealed, and releases its lease; a standby
+    /// takes it at once. The runtime keeps serving its last answers, labelled as such.
+    async fn handover(
+        State((handles, _jobs, required)): State<Shared>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let asks: Vec<(String, tokio::sync::mpsc::Sender<crate::lease::Handover>)> = {
+            let h = handles.lock().await;
+            h.handovers
+                .iter()
+                .map(|(r, a)| (r.clone(), a.clone()))
+                .collect()
+        };
+        if asks.is_empty() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "this runtime holds no writer lease"})),
+            );
+        }
+        let mut out = serde_json::Map::new();
+        let mut failed = false;
+        for (route, ask) in asks {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let done = match ask.send(reply).await {
+                Ok(()) => answer
+                    .await
+                    .unwrap_or_else(|_| Err("the lease holder had already stopped".into())),
+                Err(_) => Err("the lease holder had already stopped".into()),
+            };
+            failed |= done.is_err();
+            out.insert(
+                route,
+                match done {
+                    Ok(fence) => serde_json::json!({"released_at_fence": fence}),
+                    Err(e) => serde_json::json!({"error": e}),
+                },
+            );
+        }
+        let status = if failed {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::OK
+        };
+        (status, Json(serde_json::Value::Object(out)))
+    }
+
     async fn suspend_nest(
         State((handles, jobs, required)): State<Shared>,
         AxPath(name): AxPath<String>,
@@ -3939,6 +4016,7 @@ pub fn lifecycle_routes(
         .route("/_admin/mounts", get(list_mounts))
         .route("/_admin/mounts/{*name}", get(get_mount).patch(patch_mount))
         .route("/_admin/suspend/{*name}", post(suspend_nest))
+        .route("/_admin/failover/handover", post(handover))
         .route("/_admin/resume/{*name}", post(resume_nest))
         .route("/_admin/move/{*name}", post(move_nest))
         .route("/_admin/datasets/{nid}", delete(reclaim_dataset))
@@ -4850,6 +4928,8 @@ pub struct RuntimeHandles {
     /// What a mount needs that an unmount does not: where nests live, how to reach each chain, and the
     /// settings a new nest must be built with so it behaves identically to one mounted at boot.
     pub mount_ctx: MountContext,
+    /// Per leased route, the way to ask its lease holder for a planned handover (RFC-0078 §5.6).
+    pub handovers: BTreeMap<String, tokio::sync::mpsc::Sender<crate::lease::Handover>>,
 }
 
 /// The operator's run-time settings, stamped onto every mounted config at boot and at a hot mount alike.
@@ -9017,6 +9097,7 @@ mod tests {
             estimates: std::collections::HashMap::new(),
             default_tenant: DEFAULT_TENANT.to_string(),
             suspended: std::collections::BTreeMap::from([("usdc".to_string(), nid.clone())]),
+            handovers: Default::default(),
             failed: Default::default(),
             joining: Default::default(),
             tenant_shares: Default::default(),
@@ -9782,6 +9863,7 @@ mod tests {
             estimates: std::collections::HashMap::new(),
             default_tenant: DEFAULT_TENANT.to_string(),
             suspended: std::collections::BTreeMap::new(),
+            handovers: Default::default(),
             failed: Default::default(),
             joining: Default::default(),
             tenant_shares: Default::default(),
@@ -10544,6 +10626,7 @@ mod tests {
             estimates: std::collections::HashMap::new(),
             default_tenant: DEFAULT_TENANT.to_string(),
             suspended: std::collections::BTreeMap::new(),
+            handovers: Default::default(),
             failed: Default::default(),
             joining: Default::default(),
             tenant_shares: Default::default(),
@@ -12016,6 +12099,7 @@ mod fr5_tests {
             default_tenant: DEFAULT_TENANT.to_string(),
             tenant_shares: Default::default(),
             suspended: std::collections::BTreeMap::new(),
+            handovers: Default::default(),
             failed: Default::default(),
             joining: Default::default(),
             mount_ctx: MountContext {

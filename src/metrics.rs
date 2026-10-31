@@ -86,6 +86,12 @@ pub struct NestMetrics {
     /// Unix seconds of the last pass that succeeded, `0` until one has.
     publish_last_success: AtomicU64,
     publish_sealed_through: AtomicU64,
+    /// RFC-0078: the writer lease's fence this nest's store was taken at, `0` without failover.
+    lease_fence: AtomicU64,
+    /// Whether that lease is still held; false once it is lost, lapses or is handed over.
+    lease_held: AtomicBool,
+    lease_renewals: AtomicU64,
+    lease_renew_failures: AtomicU64,
     /// Blocks spanned by the final local segments the mirror lacked when the publisher last compared
     /// catalogues (#1927). Not an endpoint difference: a quiet table's provisional tail never folds,
     /// and a hole below the newest segment must count.
@@ -400,6 +406,25 @@ impl NestMetrics {
     }
     pub fn publish_sealed_through(&self) -> u64 {
         self.publish_sealed_through.load(Relaxed)
+    }
+    /// The writer lease taken, or let go of, at `fence` (RFC-0078).
+    pub fn set_lease(&self, fence: u64, held: bool) {
+        self.lease_fence.store(fence, Relaxed);
+        self.lease_held.store(held, Relaxed);
+    }
+    /// `(fence, held)` as [`NestMetrics::set_lease`] last set them.
+    pub fn lease(&self) -> (u64, bool) {
+        (
+            self.lease_fence.load(Relaxed),
+            self.lease_held.load(Relaxed),
+        )
+    }
+    pub fn lease_renewed(&self, ok: bool) {
+        if ok {
+            self.lease_renewals.fetch_add(1, Relaxed);
+        } else {
+            self.lease_renew_failures.fetch_add(1, Relaxed);
+        }
     }
     pub fn publish_lag_blocks(&self) -> u64 {
         self.publish_lag_blocks.load(Relaxed)
@@ -1963,6 +1988,44 @@ impl Metrics {
                 .filter(|(_, m)| m.publish_enabled.load(Relaxed))
                 .collect();
             if !publishing.is_empty() {
+                let leased: Vec<_> = publishing
+                    .iter()
+                    .filter(|(_, m)| m.lease_fence.load(Relaxed) > 0)
+                    .collect();
+                let mut lease =
+                    |name: &str, help: &str, typ: &str, get: &dyn Fn(&NestMetrics) -> u64| {
+                        if leased.is_empty() {
+                            return;
+                        }
+                        s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {typ}\n"));
+                        for (nest, m) in &leased {
+                            s.push_str(&format!("{name}{{nest=\"{nest}\"}} {}\n", get(m)));
+                        }
+                    };
+                lease(
+                    "nuthatch_lease_fence",
+                    "The writer lease's fence this nest's store was taken at (RFC-0078).",
+                    "gauge",
+                    &|m| m.lease_fence.load(Relaxed),
+                );
+                lease(
+                    "nuthatch_lease_held",
+                    "1 while this writer holds the lease, 0 once it is lost, lapsed or handed over.",
+                    "gauge",
+                    &|m| u64::from(m.lease_held.load(Relaxed)),
+                );
+                lease(
+                    "nuthatch_lease_renewals_total",
+                    "Lease renewals that succeeded.",
+                    "counter",
+                    &|m| m.lease_renewals.load(Relaxed),
+                );
+                lease(
+                    "nuthatch_lease_renew_failures_total",
+                    "Lease renewals that failed without losing the lease: the mirror was unreachable.",
+                    "counter",
+                    &|m| m.lease_renew_failures.load(Relaxed),
+                );
                 let mut series =
                     |name: &str, help: &str, typ: &str, get: &dyn Fn(&NestMetrics) -> u64| {
                         s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {typ}\n"));

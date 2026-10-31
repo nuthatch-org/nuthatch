@@ -425,3 +425,46 @@ Not done: the cut points are three chosen phases, not random generations, and th
 ERC-20, not a factory. A factory's child registry is a fold over stored factory events and a warm
 start rebuilds it (`rebuild_children`), so promotion carries what it needs; that is reasoned, not
 yet run.
+
+## 15. S3 built (2026-10-31): handover, metrics, docs
+
+**Planned handover (§5.6).** `POST /_admin/failover/handover` asks each lease holder in the runtime,
+through a channel the runtime keeps per route, to hand over. The holder fences its store off first,
+so nothing more is committed, then waits up to a minute for the publisher to have mirrored
+everything the store sealed, then releases the lease (`owner: null` at the same fence) and answers
+with that fence. A standby takes a released lease at once. Fencing before the drain, rather than
+waiting for a sealed boundary as §5.6 had it, needs no boundary at all: a standby resumes from
+whatever was committed, and the promoted copy or the seed carries the rest.
+`a_handover_fences_drains_and_releases_for_a_standby_to_take_at_once` holds the order: fenced, then
+drained, then released, then taken at fence 2.
+
+**Metrics.** Per nest, only where failover is on: `nuthatch_lease_fence`, `nuthatch_lease_held`,
+`nuthatch_lease_renewals_total`, `nuthatch_lease_renew_failures_total`.
+
+**Docs.** `docs/operators.md` gains "Failover", with the configuration, what the mirror must
+enforce, what a losing writer does, cold against warm takeover, webhook delivery and the measured
+times; `docs/admin-api.md` gains the handover route; the metrics list gains the four series.
+
+**Measured: the gate's seventh step.** E follows D; the handover request to D answers
+`released_at_fence: 4`; E takes fence 5 and answers every transfer **1 to 2 s** after the request;
+D's `/ready` says it handed over; E's metrics read fence 5 held and D's read not held.
+
+**Goal 1, against the target.** At the gate's 3-second term a crash is covered in 5 to 6 s from
+SIGKILL to the standby's first full answer, cold or warm. The term and its margin are most of it, so
+at the default 10-second term a crash costs about 16 s, inside the 30 s target. These are a laptop and
+a nine-block fixture; a real chain adds the replay of whatever was unsealed on the cold path, which
+warm promotion removes.
+
+## 16. Where the RFC stands
+
+S0 to S3 are built. What a reader should know is not done:
+
+1. **GraphOps's own object store is untested.** The lease is only as good as the store's refusal of a
+   stale conditional write. Run `the_store_enforces_conditional_writes` against it.
+2. **A waiting standby has no listener**, so it cannot report itself on `/ready`; it reads as down.
+   `serve --follow --standby` reports the lease from a follower instead.
+3. **The parity run is three chosen cuts over an ERC-20 nest**, not random generations over a factory
+   nest; the factory case is reasoned (`rebuild_children`), not run.
+4. **Nothing has run in CI yet** beyond what #2545 carries; the `failover` job is not a required check.
+5. **One standby is elected by the conditional put alone**; with several, the first to see the lapse
+   wins, and none is preferred.

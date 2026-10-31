@@ -380,6 +380,56 @@ A writer's restart, measured in-process on one cursor at 1, 10, 100 and 500 smal
 ([docs/bench/rfc-0073-fr7-restart-to-ready.md](bench/rfc-0073-fr7-restart-to-ready.md)), took 9 ms,
 95 ms, 1.0 s and 10.2 s to answer `/ready`. It grows faster than linearly past 100 mounts.
 
+### Failover: a standby that takes over when the writer dies (RFC-0078)
+
+Followers keep answering when the writer stops, but at the `as_of` they last saw: nothing indexes
+until a writer runs again. Failover makes that automatic. Every host runs `nuthatch dev` over the
+same `mounts.toml`, publishing to one mirror, and holds the dataset's **writer lease** in that mirror
+before it writes. The first host to boot takes it and writes; the others wait as standbys and take
+it when it lapses.
+
+```toml
+[runtime.publish]
+target = "s3://bucket/prefix"
+interval = "10s"
+followers = true          # what a following standby reads
+
+[runtime.publish.failover]
+term = "10s"              # a lease unrenewed this long, and half again, may be taken
+standby = true            # wait for a held lease rather than refuse to start
+follow = "http://writer.internal:8288"   # optional: follow the writer while waiting
+registry = "s3://bucket/registry"        # needed with follow
+```
+
+`NUTHATCH_ADMIN_TOKEN` must be the writer's on a host that follows.
+
+- **The lease** is `<data_identity>/lease.json` beside the catalogue: an owner, a fence and a renewal
+  count. Every change is a conditional put on the bytes last seen, so two hosts racing for one lease
+  produce one holder. **The mirror must refuse a stale conditional write.** versitygw, the store CI
+  runs, does; Garage and Zenko CloudServer accept it, and cannot hold a lease. Run
+  `tests/e2e_minio_publish.rs::the_store_enforces_conditional_writes` against yours first.
+- **Expiry never compares clocks.** A standby counts how long the lease's bytes have not changed on
+  its own clock; a holder counts how long since its last renewal on its own. A holder that cannot
+  renew within the term stops committing, which is always before a standby may take the lease.
+- **A writer that loses the lease stops.** Its store is fenced off, so its next commit fails; the
+  nest is quarantined with the reason on `/<route>/ready`; its publisher stops; and a follower that
+  has followed the new writer refuses it. It keeps answering at its last `as_of`.
+- **Taking over.** A standby with `follow` installs the copy it followed (rows, catalogue and
+  verified segments from one generation, and the alert outbox) and resumes from the next block. One
+  without, or with no copy yet, seeds an empty dataset from the mirror's seed snapshot and replays
+  the unsealed gap from the chain. Either way the rows are the same; the copy is faster.
+- **Webhooks** survive a takeover at least once: a delivery the old writer made whose removal had
+  not reached the standby is made again, so a receiver should treat a repeat as harmless.
+- **A planned move** is `POST /_admin/failover/handover` on the writer
+  ([admin-api.md](admin-api.md#failover)): it stops committing, waits for the mirror to have what it
+  sealed, and releases the lease, which a standby takes at once.
+- **A waiting standby serves nothing**: its listener starts when it takes the lease, so a load
+  balancer sees it as down until then. Put followers behind the load balancer for reads.
+
+Measured by `scripts/failover-gate.sh` on a laptop at a 3-second term: about 5 s from `SIGKILL` of
+the writer to the standby's first full answer, cold or warm, and 1 to 2 s for a planned handover. At
+the default 10-second term, expect about 16 s for a crash.
+
 ### Scaled mode: a fleet across machines (RFC-0022)
 
 Everything above is **embedded mode**, and it is still the primary deliverable: one binary, no
@@ -1561,6 +1611,10 @@ A nest that mirrors itself (RFC-0052, `--publish-target`) also carries, per nest
 `nuthatch_publish_sealed_through` (what the published catalogue covers),
 `nuthatch_publish_lag_blocks` (blocks spanned by the final local segments the mirror does not hold, summed over tables; a quiet table's provisional tail is not owed, so a fully published nest reads 0), `nuthatch_publish_pending_segments`,
 `nuthatch_publish_bytes_total`, `nuthatch_publish_errors_total` and `nuthatch_publish_dead_letter`.
+With failover on (RFC-0078), also: `nuthatch_lease_fence` (the fence the store was taken at),
+`nuthatch_lease_held` (1 while held; 0 once lost, lapsed or handed over, which is the one to alert
+on), `nuthatch_lease_renewals_total` and `nuthatch_lease_renew_failures_total` (renewals that could
+not reach the mirror; a rising count is a writer about to fence itself off).
 
 ### What to alert on
 
