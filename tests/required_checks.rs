@@ -10,24 +10,24 @@ fn names() -> Vec<String> {
 }
 
 #[test]
-fn required_checks_file_names_the_ten_including_jules() {
+fn required_checks_file_names_the_nine_while_jules_is_disabled() {
     let n = names();
     assert!(n.iter().any(|s| s == "fmt · clippy · test"), "{n:?}");
     assert!(
-        n.iter().any(|s| s == "Jules approval"),
-        "the external review gate is not optional, and since the human `reviewed-by signature` gate \
-         was retired it is the only thing standing between a red review and a merge: {n:?}"
+        !n.iter().any(|s| s == "Jules approval"),
+        "the Jules reviewer is disabled (2026-10-31), so requiring its approval blocks every PR on a \
+         check that never reports (#2550); restore it here with the reviewer: {n:?}"
     );
     assert!(
         !n.iter().any(|s| s == "reviewed-by signature"),
-        "the reviewed-by signature gate was retired: a PR is admitted by CI and Jules, not by a \
+        "the reviewed-by signature gate was retired: a PR is admitted by CI and review, not by a \
          line of text a party could type about themselves. Re-adding the context here without \
          re-adding the workflow leaves every PR blocked on a check that can never report: {n:?}"
     );
     assert_eq!(
         n.len(),
-        10,
-        "ten contexts on main after the signature gate was retired: {n:?}"
+        9,
+        "nine contexts on main while Jules is disabled: {n:?}"
     );
 }
 

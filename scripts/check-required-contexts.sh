@@ -106,17 +106,15 @@ if grep -qx 'reviewed-by signature' <<< "$expected"; then
   echo "required-checks.txt names the retired 'reviewed-by signature' context, whose workflow no longer exists" >&2
   exit 1
 fi
-# A here-string, not `echo | grep -q`: grep -q exits at its match, the echo's next write takes
-# SIGPIPE, and pipefail turns a found context into a missing one (#2280).
-if ! grep -qx 'Jules approval' <<< "$expected"; then
-  echo "required-checks.txt is missing 'Jules approval'" >&2
-  exit 1
-fi
+# `Jules approval` is not required while the Jules reviewer is disabled (2026-10-31, out of OpenAI
+# credits): requiring it then would block every PR on a check that never reports (#2550). When Jules
+# returns, restore the line in required-checks.txt and apply it; a guard that it is present can come
+# back with it, as a here-string, not `echo | grep -q` (#2280).
 
 token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 
 if [ "$offline" -eq 1 ]; then
-  echo "offline: file lists $(echo "$expected" | wc -l | tr -d ' ') contexts including Jules approval."
+  echo "offline: file lists $(echo "$expected" | wc -l | tr -d ' ') contexts."
   echo "offline: NOT compared against live protection - this is not a drift check."
   exit 0
 fi
