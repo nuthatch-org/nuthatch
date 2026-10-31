@@ -12,4 +12,4 @@ cargo-deny (vulns · licences · bans)
 point-read latency
 per-cursor RAM budget (dense multi-nest)
 fuzz smoke (decode path)
-# "Jules approval" left with the Jules reviewer, disabled 2026-10-31 (out of OpenAI credits).
+Jules approval
