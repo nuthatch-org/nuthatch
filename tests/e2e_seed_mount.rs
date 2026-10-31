@@ -365,3 +365,69 @@ async fn a_mount_seeds_from_another_runtimes_mount_and_keeps_its_nid() {
         "the seeded rows are not the publisher's"
     );
 }
+
+/// RFC-0078 S2: a standby that takes the lease from a dead writer over a dataset it has never indexed
+/// seeds it from the mirror, so it follows on from the old writer's history instead of block 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_standby_that_takes_a_dead_writers_lease_seeds_from_the_mirror() {
+    let src = tempfile::tempdir().unwrap();
+    bare_inputs(src.path());
+    let nid = nuthatch::blob::nest_nid(src.path()).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let publisher = runtime::MountTable::data_dir(other.path(), &nid);
+    std::fs::create_dir_all(&publisher).unwrap();
+    bare_inputs(&publisher);
+    stopped_publisher(&publisher).await;
+    let mirror = tempfile::tempdir().unwrap();
+    nuthatch::publish::sync(&publisher, mirror.path().to_str().unwrap(), false)
+        .await
+        .unwrap();
+    let identity = std::fs::read_dir(mirror.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .find(|n| !n.starts_with('.'))
+        .expect("the mirror holds the dataset");
+    std::fs::write(
+        mirror.path().join(&identity).join("lease.json"),
+        r#"{"owner":"dead-writer","fence":1,"term_secs":3,"renewal":9}"#,
+    )
+    .unwrap();
+
+    let roost = tempfile::tempdir().unwrap();
+    let data = runtime::MountTable::data_dir(roost.path(), &nid);
+    std::fs::create_dir_all(&data).unwrap();
+    bare_inputs(&data);
+    let table: runtime::MountTable = toml::from_str(&format!(
+        "[runtime]\nname = \"t\"\nchain = \"ethereum\"\nchain_id = 1\n\n\
+         [[mounts]]\nalias = \"usdc\"\nnid = \"{nid}\"\n\n\
+         [mounts.publish]\ntarget = \"{}\"\n\n\
+         [mounts.publish.failover]\nterm = \"3s\"\nstandby = true\n",
+        mirror.path().display()
+    ))
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let leases = runtime::take_writer_leases(roost.path(), &table.mounts, None, "default")
+        .await
+        .expect("the standby takes the lapsed lease");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(4_500),
+        "taken before the dead writer's term and margin: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(leases[0].fence(), Some(2));
+    let old = transfers_through(&publisher, 5);
+    assert!(
+        old.as_array().is_some_and(|rows| !rows.is_empty())
+            || old
+                .get("rows")
+                .and_then(|r| r.as_array())
+                .is_some_and(|r| !r.is_empty()),
+        "premise: the old writer sealed transfers by block 5: {old}"
+    );
+    assert_eq!(
+        transfers_through(&data, 5),
+        transfers_through(&publisher, 5),
+        "the standby holds the old writer's sealed rows"
+    );
+}

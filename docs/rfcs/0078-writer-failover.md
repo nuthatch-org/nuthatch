@@ -357,3 +357,114 @@ the catalogue between its lease read and its put publishes only rows it sealed p
 it held the lease, which are the new writer's rows too. The new writer cannot shrink that coverage,
 and replaces those segments with its own once it has covered them. The one case left is a seal that
 a reorg later contradicts, which is a finality violation the cursor already quarantines.
+
+## 14. S2 in progress (2026-10-31): cold promotion
+
+**Built.** `[mounts.publish.failover] standby = true` makes a writer that finds the lease held wait
+for it, rather than refuse to start, and take it when it lapses. Every host may carry the same
+`mounts.toml`; the first to boot writes. A writer that takes a lease over a dataset it has never
+indexed seeds it from the mirror's seed snapshot first (§5.4's cold path, `seed_dataset`), so it
+follows on from the old writer's sealed history and the `_seed/` tail instead of block 0. A mirror
+with no snapshot is indexed from the start, as any new nest is. Seeding applies to every failover
+boot, standby or not.
+
+**Measured.** `a_standby_that_takes_a_dead_writers_lease_seeds_from_the_mirror`: a dead writer's
+lease is taken at fence 2 after its term and margin, and the standby then holds the old writer's
+sealed transfers, row for row. The gate's fifth step: C, a standby, waits while B renews, and once B
+is killed with SIGKILL it takes fence 3 and answers every transfer. From SIGKILL to C's first full
+answer: **5 s, both runs**, at a 3-second term, so the term plus margin of 4.5 s and a boot. At the
+default 10-second term that is about 16 s, inside goal 1's 30 s target. The fixture chain is nine
+blocks; on a real chain the replay of the unsealed gap adds to it, which is what warm promotion is for.
+
+**Not yet.** A waiting standby has no HTTP listener until it takes over, so `/ready` cannot say
+"standby"; a load balancer sees it as down, which is the truth for a writer that serves nothing yet.
+Warm promotion from a follower's hot state (§5.4), and the outbox on the feed (§5.5), are next.
+
+**Warm promotion, built.** A standby whose failover names `follow` (the writer's URL) and `registry`
+runs a remote follower while it waits, with the writer publishing `followers = true`. On taking the
+lease it installs the follower's copy as its own store: the segments the follower verified, copied
+into the dataset; the catalogue and the three mirrored tables, read from one applied version so rows
+and catalogue cannot come from different generations (`MemStore::promotion_copy`); the tables
+written in one transaction (`store::import_mirrored`). The follower is then stopped (`Follower::stop`,
+new: it had no way to end) and its cache removed. A dataset with no copy falls back to the cold seed.
+The old writer's fence and lease keys are not mirrored, so the promoted store starts unclaimed and is
+claimed at the new fence.
+
+**Measured.** `importing_a_followed_copy_reproduces_the_writers_tables`: a fresh store given a
+writer's copy subscribes to the same tables, with the writer's fence left behind. The gate's sixth
+step: D follows C, C is killed with SIGKILL, D takes fence 4, logs "promoted the followed copy ...
+through block 9", and is at the tip at block 9 at once, with no reindex. SIGKILL to D's first full
+answer: 5 s, as for the cold path, because the fixture chain is nine blocks and leaves nothing to
+replay. The difference shows only on a chain with an unsealed gap, which the gate does not have.
+
+**Still open in S2.** The outbox (§5.5): webhooks committed and not delivered when the writer dies
+are lost on takeover, cold or warm, because the outbox is not on the feed. And the randomised kill
+parity run of §7.
+
+**The outbox, built (§5.5).** Two ops on the feed, `outbox` and `unoutbox`, recorded on every
+outbox write: an enqueue alone or inside a window or a rollback, a delivery, a trim. The snapshot
+carries the table (absent from an older writer, read as empty), the follower holds and charges it as
+it does the others, the v2 wire codes them `O` and `o`, and a promotion imports it, with the
+writer's unmirrored `outbox_next_seq` restored to one past the last imported key so a new delivery
+never lands on an old one. `the_outbox_is_followed_and_promoted` follows three enqueues and a
+delivery through snapshot and deltas, then promotes them: the two undelivered remain and the next is
+numbered 3. Delivery across a failover is therefore at-least-once: a delivery the old writer made
+whose removal had not reached the follower is made again. Compatibility: an older follower cannot
+read the two ops, which is safe under the upgrade order the rolling-upgrade gate enforces, followers
+before the writer.
+
+**The parity run (§7), built.** `a_promoted_follower_ends_where_an_uninterrupted_writer_does` cuts a
+writer at three points (every row hot; just after a reorg; just after a seal), promotes its
+follower's copy into a fresh runtime, and lets the chain go on: whatever the old writer never saw,
+the reorg and the seal included, the promoted writer meets on its own. Each promoted store starts at
+the cut block (8, 9, 10), not block 0, and each ends with the same rows and count as a writer that
+indexed the whole chain uninterrupted. `promote_warm` now finds each segment with
+`seal::segment_path`, so it promotes a follower beside the writer as well as one on another host.
+
+Not done: the cut points are three chosen phases, not random generations, and the nest is a plain
+ERC-20, not a factory. A factory's child registry is a fold over stored factory events and a warm
+start rebuilds it (`rebuild_children`), so promotion carries what it needs; that is reasoned, not
+yet run.
+
+## 15. S3 built (2026-10-31): handover, metrics, docs
+
+**Planned handover (§5.6).** `POST /_admin/failover/handover` asks each lease holder in the runtime,
+through a channel the runtime keeps per route, to hand over. The holder fences its store off first,
+so nothing more is committed, then waits up to a minute for the publisher to have mirrored
+everything the store sealed, then releases the lease (`owner: null` at the same fence) and answers
+with that fence. A standby takes a released lease at once. Fencing before the drain, rather than
+waiting for a sealed boundary as §5.6 had it, needs no boundary at all: a standby resumes from
+whatever was committed, and the promoted copy or the seed carries the rest.
+`a_handover_fences_drains_and_releases_for_a_standby_to_take_at_once` holds the order: fenced, then
+drained, then released, then taken at fence 2.
+
+**Metrics.** Per nest, only where failover is on: `nuthatch_lease_fence`, `nuthatch_lease_held`,
+`nuthatch_lease_renewals_total`, `nuthatch_lease_renew_failures_total`.
+
+**Docs.** `docs/operators.md` gains "Failover", with the configuration, what the mirror must
+enforce, what a losing writer does, cold against warm takeover, webhook delivery and the measured
+times; `docs/admin-api.md` gains the handover route; the metrics list gains the four series.
+
+**Measured: the gate's seventh step.** E follows D; the handover request to D answers
+`released_at_fence: 4`; E takes fence 5 and answers every transfer **1 to 2 s** after the request;
+D's `/ready` says it handed over; E's metrics read fence 5 held and D's read not held.
+
+**Goal 1, against the target.** At the gate's 3-second term a crash is covered in 5 to 6 s from
+SIGKILL to the standby's first full answer, cold or warm. The term and its margin are most of it, so
+at the default 10-second term a crash costs about 16 s, inside the 30 s target. These are a laptop and
+a nine-block fixture; a real chain adds the replay of whatever was unsealed on the cold path, which
+warm promotion removes.
+
+## 16. Where the RFC stands
+
+S0 to S3 are built. What a reader should know is not done:
+
+1. **GraphOps's own object store is untested.** The lease is only as good as the store's refusal of a
+   stale conditional write. Run `the_store_enforces_conditional_writes` against it.
+2. **A waiting standby has no listener**, so it cannot report itself on `/ready`; it reads as down.
+   `serve --follow --standby` reports the lease from a follower instead.
+3. **The parity run is three chosen cuts over an ERC-20 nest**, not random generations over a factory
+   nest; the factory case is reasoned (`rebuild_children`), not run.
+4. **Nothing has run in CI yet** beyond what #2545 carries; the `failover` job is not a required check.
+5. **One standby is elected by the conditional put alone**; with several, the first to see the lapse
+   wins, and none is preferred.

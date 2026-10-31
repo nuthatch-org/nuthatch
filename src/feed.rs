@@ -66,6 +66,8 @@ impl Delta {
                 Op::Drop { from, to } => (from.len(), to.as_ref().map_or(0, String::len)),
                 Op::Meta { key, value } => (key.len(), value.len()),
                 Op::Block { key, record } => (key.len(), record.len()),
+                Op::Outbox { key, payload } => (key.len(), payload.len()),
+                Op::Unoutbox { key } => (key.len(), 0),
                 Op::Unmeta { key } | Op::Unblock { key } | Op::UnblockFrom { key } => {
                     (key.len(), 0)
                 }
@@ -84,6 +86,9 @@ pub struct Snapshot {
     pub entities: Rows,
     pub meta: Rows,
     pub blocks: Rows,
+    /// Alert deliveries not yet made (RFC-0078 §5.5). Absent from a writer that predates it.
+    #[serde(default)]
+    pub outbox: Rows,
     /// The catalogue's raw bytes, `None` where the dataset has never sealed.
     #[serde(default, deserialize_with = "bounded_catalogue")]
     pub catalogue: Option<String>,
@@ -97,7 +102,7 @@ impl Snapshot {
     /// What a follower is charged for holding this snapshot, by [`row_bytes`] and the catalogue's
     /// length.
     pub fn bytes(&self) -> u64 {
-        [&self.entities, &self.meta, &self.blocks]
+        [&self.entities, &self.meta, &self.blocks, &self.outbox]
             .iter()
             .flat_map(|r| r.map.iter())
             .map(|(k, v)| row_bytes(k, v))
@@ -842,6 +847,7 @@ struct Mirror {
     entities: Table,
     meta: Table,
     blocks: Table,
+    outbox: Table,
     epoch: u64,
     generation: u64,
     /// What the three tables are charged, by [`row_bytes`], and the catalogue's length.
@@ -874,6 +880,7 @@ impl crate::versioned::Footprint for Mirror {
         self.entities.footprint(out);
         self.meta.footprint(out);
         self.blocks.footprint(out);
+        self.outbox.footprint(out);
         if let Some(c) = &self.catalogue {
             out.push((Arc::as_ptr(c) as *const u8 as usize, self.catalogue_bytes));
         }
@@ -960,6 +967,14 @@ impl Mirror {
                 let gone = self.blocks.split_off(key.as_str());
                 self.bytes -= gone.iter().map(|(k, v)| row_bytes(k, v)).sum::<u64>();
             }
+            Op::Outbox { key, payload } => {
+                put(&mut self.outbox, &mut self.bytes, key, payload);
+            }
+            Op::Unoutbox { key } => {
+                if let Some(v) = self.outbox.remove(key) {
+                    self.bytes -= row_bytes(key, &v);
+                }
+            }
         }
     }
 }
@@ -1029,12 +1044,18 @@ impl MemStore {
             .filter(|(k, _)| mirrored_meta(k))
             .collect();
         let blocks = snapshot.blocks.map;
+        let outbox = snapshot.outbox.map;
         let catalogue_bytes = snapshot.catalogue.as_ref().map_or(0, |c| c.len() as u64);
         let mirror = Mirror {
-            bytes: charge(&entities) + charge(&meta) + charge(&blocks) + catalogue_bytes,
+            bytes: charge(&entities)
+                + charge(&meta)
+                + charge(&blocks)
+                + charge(&outbox)
+                + catalogue_bytes,
             entities: table(entities),
             meta: table(meta),
             blocks: table(blocks),
+            outbox: table(outbox),
             epoch: snapshot.epoch,
             generation: snapshot.generation,
             catalogue_bytes,
@@ -1102,7 +1123,12 @@ impl MemStore {
             }
         }
         let m = self.read();
-        let (mut entities, mut meta, mut blocks) = (Touched::new(), Touched::new(), Touched::new());
+        let (mut entities, mut meta, mut blocks, mut outbox) = (
+            Touched::new(),
+            Touched::new(),
+            Touched::new(),
+            Touched::new(),
+        );
         // Versions requests still read are charged beside the latest throughout (#2467).
         let mut held = i128::from(m.bytes + self.copy.mirror.retained());
         let mut peak = held;
@@ -1135,6 +1161,14 @@ impl MemStore {
                 ),
                 Op::Unblock { key } => set(&m.blocks, &mut blocks, &mut held, key, None),
                 Op::UnblockFrom { key } => drop_range(&m.blocks, &mut blocks, &mut held, key, None),
+                Op::Outbox { key, payload } => set(
+                    &m.outbox,
+                    &mut outbox,
+                    &mut held,
+                    key,
+                    Some(row_bytes(key, payload)),
+                ),
+                Op::Unoutbox { key } => set(&m.outbox, &mut outbox, &mut held, key, None),
             }
             peak = peak.max(held);
         }
@@ -1280,6 +1314,20 @@ impl MemStore {
         Ok(out)
     }
 
+    /// The mirrored tables and the catalogue they pair with, read from one version, so a standby
+    /// promoting them never pairs rows with a catalogue from another generation (RFC-0078 §5.4).
+    pub fn promotion_copy(&self) -> (MirroredTables, Option<Arc<str>>) {
+        let m = self.read();
+        let all = |t: &Table| t.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let tables = MirroredTables {
+            entities: all(&m.entities),
+            meta: all(&m.meta),
+            blocks: all(&m.blocks),
+            outbox: all(&m.outbox),
+        };
+        (tables, m.catalogue.clone())
+    }
+
     /// Every mirrored table, for comparing a copy against the store it follows.
     pub fn tables(&self) -> MirroredTables {
         let m = self.read();
@@ -1288,16 +1336,18 @@ impl MemStore {
             entities: all(&m.entities),
             meta: all(&m.meta),
             blocks: all(&m.blocks),
+            outbox: all(&m.outbox),
         }
     }
 }
 
-/// The three mirrored tables, in key order.
+/// The mirrored tables, in key order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MirroredTables {
     pub entities: BTreeMap<String, String>,
     pub meta: BTreeMap<String, String>,
     pub blocks: BTreeMap<String, String>,
+    pub outbox: BTreeMap<String, String>,
 }
 
 impl MirroredTables {
@@ -1312,6 +1362,7 @@ impl MirroredTables {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             blocks: snapshot.blocks.map.clone(),
+            outbox: snapshot.outbox.map.clone(),
         }
     }
 }

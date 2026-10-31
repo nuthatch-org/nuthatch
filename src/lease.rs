@@ -188,7 +188,6 @@ impl Lease {
     }
 
     /// Give the lease up at its current fence, for a planned handover (RFC-0078 §5.6).
-    #[allow(dead_code)] // called by S3's handover route
     pub async fn release(&mut self) -> Result<()> {
         let held = self
             .held
@@ -248,13 +247,15 @@ impl Lease {
     }
 }
 
-/// Why [`hold`] returned. Either way the store has been fenced off before it returns.
+/// Why [`hold`] returned. Every way, the store has been fenced off before it returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stopped {
     /// A renewal found another writer's lease.
     Lost(LostLease),
     /// No renewal succeeded within the term, so a standby may already hold it.
     Lapsed { fence: u64 },
+    /// Released on purpose for a standby to take at once (RFC-0078 §5.6).
+    HandedOver { fence: u64 },
 }
 
 impl std::fmt::Display for Stopped {
@@ -266,9 +267,17 @@ impl std::fmt::Display for Stopped {
                 "the writer lease held at fence {fence} lapsed without a renewal, so a standby may \
                  hold it: this writer has stopped committing"
             ),
+            Stopped::HandedOver { fence } => write!(
+                f,
+                "the writer lease held at fence {fence} was handed over: this writer has stopped \
+                 committing, and a standby takes it from here"
+            ),
         }
     }
 }
+
+/// A planned handover asked of a holder, answered with the fence it released once it has.
+pub type Handover = tokio::sync::oneshot::Sender<std::result::Result<u64, String>>;
 
 /// How often a holder renews: three tries per term. A holder therefore notices a lapse at most a
 /// third of a term late, which is why a standby's margin must exceed this.
@@ -278,12 +287,59 @@ pub fn renew_every(term: Duration) -> Duration {
 
 /// Renew `lease` until it is lost or lapses, then call `fence_off` so the cursor's next commit is
 /// refused. A failed request is retried at the next tick; only the term decides when to give up.
-pub async fn hold(mut lease: Lease, fence_off: impl Fn() -> Result<()>) -> Stopped {
+#[cfg(test)]
+pub async fn hold(lease: Lease, fence_off: impl Fn() -> Result<()>) -> Stopped {
+    let (_keep, handovers) = tokio::sync::mpsc::channel(1);
+    hold_with(lease, fence_off, handovers, || async {}, None).await
+}
+
+/// [`hold`], also answering planned handovers: fence the store off, wait for `drain` (what was
+/// committed reaching the mirror), then release the lease so a standby need not wait out the term.
+pub async fn hold_with<D, F>(
+    mut lease: Lease,
+    fence_off: impl Fn() -> Result<()>,
+    mut handovers: tokio::sync::mpsc::Receiver<Handover>,
+    drain: D,
+    metrics: Option<std::sync::Arc<crate::metrics::NestMetrics>>,
+) -> Stopped
+where
+    D: Fn() -> F,
+    F: std::future::Future<Output = ()>,
+{
     let every = renew_every(lease.term());
     let fence = lease.fence().unwrap_or(0);
+    if let Some(m) = &metrics {
+        m.set_lease(fence, true);
+    }
+    let let_go = |metrics: &Option<std::sync::Arc<crate::metrics::NestMetrics>>| {
+        if let Some(m) = metrics {
+            m.set_lease(fence, false);
+        }
+    };
+    let mut open = true;
     let stopped = loop {
-        tokio::time::sleep(every).await;
-        match lease.renew().await {
+        tokio::select! {
+            _ = tokio::time::sleep(every) => {}
+            asked = handovers.recv(), if open => {
+                let Some(reply) = asked else {
+                    open = false;
+                    continue;
+                };
+                fence_until_done(&fence_off, fence).await;
+                drain().await;
+                let released = lease.release().await.map(|()| fence).map_err(|e| format!("{e:#}"));
+                // Fenced off either way: a release that failed lapses within the term instead.
+                let _ = reply.send(released);
+                let_go(&metrics);
+                tracing::warn!("{}", Stopped::HandedOver { fence });
+                return Stopped::HandedOver { fence };
+            }
+        }
+        let renewed = lease.renew().await;
+        if let Some(m) = &metrics {
+            m.lease_renewed(renewed.is_ok());
+        }
+        match renewed {
             Ok(()) => continue,
             Err(e) => {
                 if let Some(lost) = e.downcast_ref::<LostLease>() {
@@ -296,14 +352,18 @@ pub async fn hold(mut lease: Lease, fence_off: impl Fn() -> Result<()>) -> Stopp
             break Stopped::Lapsed { fence };
         }
     };
-    // Retried until it lands: a writer that cannot fence itself off must not keep committing, and
-    // there is nothing else useful for this task to do.
-    while let Err(e) = fence_off() {
-        tracing::error!("fencing off the store after losing the writer lease: {e:#}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    fence_until_done(&fence_off, fence).await;
+    let_go(&metrics);
     tracing::warn!("{stopped}");
     stopped
+}
+
+/// Retried until it lands: a writer that cannot fence itself off must not keep committing.
+async fn fence_until_done(fence_off: &impl Fn() -> Result<()>, fence: u64) {
+    while let Err(e) = fence_off() {
+        tracing::error!("fencing off the store at fence {fence}: {e:#}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Poll the lease until a standby may take it, and return what it last saw, to take from.
@@ -554,6 +614,58 @@ mod tests {
         );
         let mut b = Lease::new(m.clone(), KEY, "b", TERM);
         assert_eq!(b.take(&seen).await.unwrap(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_handover_fences_drains_and_releases_for_a_standby_to_take_at_once() {
+        let (_d, m) = fs_mirror();
+        let mut a = Lease::new(m.clone(), KEY, "a", TERM);
+        a.take(&Observed::Absent).await.unwrap();
+        let (fenced, fence_off) = counter();
+        let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ask, handovers) = tokio::sync::mpsc::channel(1);
+        let metrics = Arc::new(crate::metrics::NestMetrics::default());
+        let seen_fenced = fenced.clone();
+        let d = drained.clone();
+        let held = tokio::spawn(hold_with(
+            a,
+            fence_off,
+            handovers,
+            move || {
+                let (d, seen_fenced) = (d.clone(), seen_fenced.clone());
+                async move {
+                    assert_eq!(
+                        seen_fenced.load(std::sync::atomic::Ordering::SeqCst),
+                        1,
+                        "fenced first"
+                    );
+                    d.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+            Some(metrics.clone()),
+        ));
+        let (reply, released) = tokio::sync::oneshot::channel();
+        ask.send(reply).await.unwrap();
+        assert_eq!(released.await.unwrap(), Ok(1));
+        assert_eq!(held.await.unwrap(), Stopped::HandedOver { fence: 1 });
+        assert_eq!(
+            metrics.lease(),
+            (1, false),
+            "the gauge says the lease was let go"
+        );
+        assert!(drained.load(std::sync::atomic::Ordering::SeqCst));
+        let seen = observe(&*m, KEY).await.unwrap();
+        assert_eq!(seen.doc().unwrap().owner, None);
+        let mut w = Watch::new();
+        w.see(&seen);
+        assert!(w.takeable(MARGIN), "a released lease is takeable at once");
+        assert_eq!(
+            Lease::new(m.clone(), KEY, "b", TERM)
+                .take(&seen)
+                .await
+                .unwrap(),
+            2
+        );
     }
 
     /// A filesystem mirror whose requests can be made to fail.

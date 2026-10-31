@@ -665,13 +665,18 @@ impl<F: Feed> Store<F> {
     pub fn outbox_push(&self, payload: &str) -> Result<u64> {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
-        let seq = Self::outbox_push_in(&wtx, &[payload.to_string()])?;
-        self.commit(wtx)?;
+        let mut rec = self.tap.recorder();
+        let seq = Self::outbox_push_in(&wtx, &[payload.to_string()], &mut rec)?;
+        self.commit_fed(wtx, false, rec)?;
         Ok(seq)
     }
 
     /// Push `payloads` inside `wtx`; returns the first one's sequence number.
-    fn outbox_push_in(wtx: &redb::WriteTransaction, payloads: &[String]) -> Result<u64> {
+    fn outbox_push_in(
+        wtx: &redb::WriteTransaction,
+        payloads: &[String],
+        rec: &mut crate::tap::Recorder,
+    ) -> Result<u64> {
         let mut meta = wtx.open_table(META)?;
         let first = meta
             .get(OUTBOX_SEQ)?
@@ -683,7 +688,12 @@ impl<F: Feed> Store<F> {
         )?;
         let mut ob = wtx.open_table(OUTBOX)?;
         for (seq, payload) in (first..).zip(payloads) {
-            ob.insert(Self::outbox_key(seq).as_str(), payload.as_str())?;
+            let key = Self::outbox_key(seq);
+            ob.insert(key.as_str(), payload.as_str())?;
+            rec.push(|| crate::tap::Op::Outbox {
+                key,
+                payload: payload.clone(),
+            });
         }
         Ok(first)
     }
@@ -712,11 +722,14 @@ impl<F: Feed> Store<F> {
     pub fn outbox_remove(&self, seq: u64) -> Result<()> {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
+        let mut rec = self.tap.recorder();
         {
             let mut t = wtx.open_table(OUTBOX)?;
-            t.remove(Self::outbox_key(seq).as_str())?;
+            let key = Self::outbox_key(seq);
+            t.remove(key.as_str())?;
+            rec.push(|| crate::tap::Op::Unoutbox { key });
         }
-        self.commit(wtx)?;
+        self.commit_fed(wtx, false, rec)?;
         Ok(())
     }
 
@@ -741,6 +754,7 @@ impl<F: Feed> Store<F> {
         let drop = len - max;
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
+        let mut rec = self.tap.recorder();
         let mut dropped = 0u64;
         {
             let mut t = wtx.open_table(OUTBOX)?;
@@ -750,12 +764,13 @@ impl<F: Feed> Store<F> {
                 .take(drop as usize)
                 .map(|(k, _)| k.value().to_string())
                 .collect();
-            for k in doomed {
-                t.remove(k.as_str())?;
+            for key in doomed {
+                t.remove(key.as_str())?;
                 dropped += 1;
+                rec.push(|| crate::tap::Op::Unoutbox { key });
             }
         }
-        self.commit(wtx)?;
+        self.commit_fed(wtx, false, rec)?;
         Ok(dropped)
     }
 
@@ -859,10 +874,10 @@ impl<F: Feed> Store<F> {
     ) -> Result<()> {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
-        if !outbox.is_empty() {
-            Self::outbox_push_in(&wtx, outbox)?;
-        }
         let mut rec = self.tap.recorder();
+        if !outbox.is_empty() {
+            Self::outbox_push_in(&wtx, outbox, &mut rec)?;
+        }
         {
             let mut t = wtx.open_table(ENTITIES)?;
             for (k, v) in entities {
@@ -1516,8 +1531,9 @@ impl<F: Feed> Store<F> {
     ) -> Result<u64> {
         let wtx = self.db.begin_write()?;
         self.guard_fence(&wtx)?;
+        let mut queued = self.tap.recorder();
         if !outbox.is_empty() {
-            Self::outbox_push_in(&wtx, outbox)?;
+            Self::outbox_push_in(&wtx, outbox, &mut queued)?;
         }
         let mut removed = 0u64;
         {
@@ -1556,7 +1572,10 @@ impl<F: Feed> Store<F> {
             let mut m = wtx.open_table(META)?;
             m.insert(meta_key, meta_val)?;
         }
-        let rec = self.rollback_ops(block, Some((meta_key, meta_val)));
+        let mut rec = self.rollback_ops(block, Some((meta_key, meta_val)));
+        for op in queued.into_ops().into_iter().flatten() {
+            rec.push(|| op);
+        }
         self.commit_fed(wtx, removed > 0, rec)?;
         Ok(removed)
     }

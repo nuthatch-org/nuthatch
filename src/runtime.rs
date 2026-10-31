@@ -229,6 +229,18 @@ pub struct Failover {
     /// How long a lease lasts without a renewal; a standby takes over half as long again after.
     #[serde(default = "default_lease_term")]
     pub term: String,
+    /// Wait for a lease another writer holds, rather than refuse to start, and take it when it
+    /// lapses (RFC-0078 S2). Every host may carry the same `mounts.toml`: the first writes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub standby: bool,
+    /// With `standby`: the writer to follow while waiting, so a takeover starts from its hot state
+    /// rather than the mirror's last seal (RFC-0078 §5.4). Needs `registry`, and the writer's
+    /// `followers = true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow: Option<String>,
+    /// The registry the writer's nests are published to, which the following standby installs from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<String>,
 }
 
 fn default_lease_term() -> String {
@@ -1752,6 +1764,7 @@ pub async fn take_writer_leases(
     default_tenant: &str,
 ) -> Result<Vec<WriterLease>> {
     use crate::lease;
+    let warm = start_warm_standby(dir, mounts, default)?;
     let mut out = Vec::new();
     for m in mounts {
         let canonical = mounts.iter().find(|first| first.nid == m.nid).unwrap_or(m);
@@ -1773,40 +1786,154 @@ pub async fn take_writer_leases(
         let key = lease::lease_key(&identity);
         let margin = term / 2;
         let poll = std::time::Duration::from_secs(1);
-        // A lease left by this writer's own last run lapses within the wait; one still renewed
-        // belongs to a live writer, and this host should be its standby instead.
-        let seen = match tokio::time::timeout(
-            term + margin + poll * 2,
-            lease::await_takeable(&*mirror, &key, margin, poll),
-        )
-        .await
-        {
-            Ok(seen) => seen,
-            Err(_) => {
-                let holder = lease::observe(&*mirror, &key).await.ok();
-                let by = holder
-                    .as_ref()
-                    .and_then(|o| o.doc())
-                    .and_then(|d| d.owner.clone())
-                    .unwrap_or_default();
-                bail!(
-                    "mount '{route}': the writer lease at {key} is held by {by}, who is still \
-                     renewing it. Start this host as a follower, or stop that writer first"
+        if failover.standby {
+            let held = lease::observe(&*mirror, &key).await?;
+            if let Some(by) = held.doc().and_then(|d| d.owner.clone()) {
+                tracing::info!(
+                    "mount {route}: standing by for the writer lease at {key}, held by {by}"
                 );
             }
+        }
+        // A lease left by this writer's own last run lapses within the wait; one still renewed
+        // belongs to a live writer, and this host should be its standby instead.
+        let wait = if failover.standby {
+            std::time::Duration::MAX
+        } else {
+            term + margin + poll * 2
         };
+        let seen =
+            match tokio::time::timeout(wait, lease::await_takeable(&*mirror, &key, margin, poll))
+                .await
+            {
+                Ok(seen) => seen,
+                Err(_) => {
+                    let holder = lease::observe(&*mirror, &key).await.ok();
+                    let by = holder
+                        .as_ref()
+                        .and_then(|o| o.doc())
+                        .and_then(|d| d.owner.clone())
+                        .unwrap_or_default();
+                    bail!(
+                        "mount '{route}': the writer lease at {key} is held by {by}, who is still \
+                     renewing it. Start this host as a follower, or stop that writer first"
+                    );
+                }
+            };
         let mut writer = lease::Lease::new(mirror, key, writer_id(), term);
         let fence = writer
             .take(&seen)
             .await
             .with_context(|| format!("taking the writer lease for mount '{route}'"))?;
         tracing::info!("mount {route}: took the writer lease at fence {fence}");
+        let data = MountTable::data_dir(dir, &m.nid);
+        let promoted = match &warm {
+            Some(follower) => promote_warm(follower, dir, &data, &route)?,
+            None => false,
+        };
+        if !promoted {
+            seed_if_empty(&data, &publish.target, &identity, &route).await?;
+        }
         out.push(WriterLease {
             route,
             lease: writer,
         });
     }
+    if let Some(follower) = warm {
+        follower.stop();
+        // Its segments were copied into each promoted dataset; the cache is now only disk.
+        let _ = std::fs::remove_dir_all(dir.join(".standby"));
+    }
     Ok(out)
+}
+
+/// The follower a waiting standby keeps beside it, when its failover names a writer to follow.
+fn start_warm_standby(
+    dir: &Path,
+    mounts: &[Mount],
+    default: Option<&MountPublish>,
+) -> Result<Option<Arc<crate::reader::Follower>>> {
+    let found = mounts.iter().find_map(|m| {
+        let publish = m.publish.as_ref().or(default)?;
+        let f = publish.failover.as_ref()?;
+        let follow = f.follow.as_ref().filter(|_| f.standby)?;
+        Some((publish, follow, f.registry.as_ref()))
+    });
+    let Some((publish, follow, registry)) = found else {
+        return Ok(None);
+    };
+    let registry = registry.context(
+        "a failover that follows the writer needs `registry`, where the writer's nests are published",
+    )?;
+    let token = std::env::var("NUTHATCH_ADMIN_TOKEN")
+        .context("a following standby reads the writer's feed with NUTHATCH_ADMIN_TOKEN")?;
+    let remote = crate::remote_follow::Remote::open(&publish.target, registry, DEFAULT_MAX_RSS_MB)?;
+    let cache = dir.join(".standby");
+    std::fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
+    tracing::info!("standby: following {follow} while the writer lease is held");
+    Ok(Some(crate::reader::Follower::start_remote(
+        cache,
+        follow.clone(),
+        token,
+        Arc::new(remote),
+        crate::reader::Options::default(),
+    )))
+}
+
+/// RFC-0078 §5.4's warm path: install the follower's copy of `data` as this writer's store. Its
+/// segments are the ones the follower verified, its catalogue and rows come from one applied
+/// generation, and the cursor resumes from the block after it. `false` when there is no copy, or the
+/// dataset already holds data of its own.
+pub fn promote_warm(
+    follower: &crate::reader::Follower,
+    dir: &Path,
+    data: &Path,
+    route: &str,
+) -> Result<bool> {
+    let db = data.join(crate::config::DB_FILE);
+    if crate::seed::holds_indexed_data(&db)? {
+        return Ok(false);
+    }
+    let key = crate::feed_http::dataset_key(dir, data);
+    let Some(crate::reader::PromotionCopy {
+        tables,
+        catalogue,
+        applied,
+    }) = follower.promotion_copy(&key)
+    else {
+        return Ok(false);
+    };
+    if let Some(catalogue) = catalogue.as_deref() {
+        let manifest: crate::seal::Manifest =
+            serde_json::from_str(catalogue).context("the followed catalogue")?;
+        // The follower's copy of the dataset: its cache on another host, the writer's own directory
+        // beside it. `segment_path` finds a segment in either.
+        let followed = follower.root().join(&key);
+        let to = data.join(crate::seal::SEGMENTS_DIR);
+        std::fs::create_dir_all(&to).with_context(|| format!("creating {}", to.display()))?;
+        for segment in manifest.tables.values().flatten() {
+            let src = crate::seal::segment_path(&followed, &segment.file, &segment.hash);
+            std::fs::copy(&src, to.join(&segment.file)).with_context(|| {
+                format!(
+                    "copying the followed segment {} for mount '{route}'",
+                    src.display()
+                )
+            })?;
+        }
+        crate::seal::install_manifest(data, &manifest)?;
+    }
+    let store = crate::store::Store::open(&db)?;
+    crate::store::import_mirrored(&store, &tables)?;
+    drop(store);
+    tracing::info!(
+        "mount {route}: promoted the followed copy at generation {}.{}, through block {}",
+        applied.0,
+        applied.1,
+        tables
+            .meta
+            .get(crate::indexer::LAST_BLOCK_KEY)
+            .map_or("none", String::as_str)
+    );
+    Ok(true)
 }
 
 /// Claim each leased route's store and renew its lease until it is lost, then fence the store off
@@ -1815,7 +1942,8 @@ pub fn hold_writer_leases(
     leases: Vec<WriterLease>,
     states: &[(String, crate::serve::AppState)],
     health: &Arc<crate::health::RuntimeHealth>,
-) -> Result<()> {
+) -> Result<BTreeMap<String, tokio::sync::mpsc::Sender<crate::lease::Handover>>> {
+    let mut handovers = BTreeMap::new();
     for WriterLease { route, lease } in leases {
         let Some((_, state)) = states.iter().find(|(k, _)| *k == route) else {
             continue;
@@ -1825,11 +1953,61 @@ pub fn hold_writer_leases(
             .claim(lease.owner())
             .with_context(|| format!("claiming the store of mount '{route}'"))?;
         let health = health.clone();
+        let (ask, asked) = tokio::sync::mpsc::channel(1);
+        handovers.insert(route.clone(), ask);
+        let drained = store.clone();
+        let nest = route.clone();
         tokio::spawn(async move {
-            let stopped = crate::lease::hold(lease, move || store.fence_off()).await;
+            let fenced = store.clone();
+            let stopped = crate::lease::hold_with(
+                lease,
+                move || fenced.fence_off(),
+                asked,
+                move || published(nest.clone(), drained.clone()),
+                Some(crate::metrics::METRICS.nest(&route)),
+            )
+            .await;
             health.quarantine_nest(&route, stopped.to_string(), 0, None);
         });
     }
+    Ok(handovers)
+}
+
+/// A handover's drain: wait, up to a minute, until the publisher has mirrored everything the store
+/// sealed, so the standby that takes the lease finds it on the mirror.
+async fn published(route: String, store: Arc<dyn crate::store::HotStore>) {
+    let metrics = crate::metrics::METRICS.nest(&route);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    while metrics.publish_sealed_through() < store.sealed_through()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// RFC-0078 §5.4: a writer that takes a lease over a dataset it has never indexed starts from the
+/// mirror's seed snapshot, not from the chain's first block. One the mirror holds no snapshot for
+/// indexes from the start, as any new nest does.
+async fn seed_if_empty(data: &Path, target: &str, identity: &str, route: &str) -> Result<()> {
+    if crate::seed::holds_indexed_data(&data.join(crate::config::DB_FILE))? {
+        return Ok(());
+    }
+    let mirror = crate::publish::open_mirror(target)?;
+    let snapshot = format!("{identity}/{}", crate::publish::SEED_FILE);
+    if mirror.get(&snapshot).await?.is_none() {
+        return Ok(());
+    }
+    let r = crate::seed::seed_dataset(data, target, &|_| {})
+        .await
+        .with_context(|| {
+            format!("seeding mount '{route}' from the mirror after taking its lease")
+        })?;
+    tracing::info!(
+        "mount {route}: seeded from the mirror through block {} ({} segments, {} fetched)",
+        r.complete_through,
+        r.segments,
+        r.fetched
+    );
     Ok(())
 }
 
@@ -2618,7 +2796,7 @@ pub async fn dev(
         default_tenant,
         &writer_leases,
     )?;
-    hold_writer_leases(writer_leases, &all_states, &health)?;
+    let handovers = hold_writer_leases(writer_leases, &all_states, &health)?;
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // mounts's real resident set alongside the projection so operators can calibrate.
@@ -2653,6 +2831,7 @@ pub async fn dev(
         estimates: estimates.clone(),
         default_tenant: default_tenant_owned.clone(),
         suspended,
+        handovers,
         failed,
         joining: Default::default(),
         tenant_shares: all_mounts.tenants.clone(),
@@ -3468,6 +3647,57 @@ pub fn lifecycle_routes(
         (StatusCode::OK, Json(record_json(&record)))
     }
 
+    /// RFC-0078 §5.6: hand every lease this runtime holds to a standby. Each holder stops
+    /// committing, waits for the mirror to have what it sealed, and releases its lease; a standby
+    /// takes it at once. The runtime keeps serving its last answers, labelled as such.
+    async fn handover(
+        State((handles, _jobs, required)): State<Shared>,
+        Query(q): Query<TokenQuery>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        if !crate::serve::token_ok(required.as_deref(), q.token.as_deref(), &headers) {
+            return unauthorized();
+        }
+        let asks: Vec<(String, tokio::sync::mpsc::Sender<crate::lease::Handover>)> = {
+            let h = handles.lock().await;
+            h.handovers
+                .iter()
+                .map(|(r, a)| (r.clone(), a.clone()))
+                .collect()
+        };
+        if asks.is_empty() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "this runtime holds no writer lease"})),
+            );
+        }
+        let mut out = serde_json::Map::new();
+        let mut failed = false;
+        for (route, ask) in asks {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let done = match ask.send(reply).await {
+                Ok(()) => answer
+                    .await
+                    .unwrap_or_else(|_| Err("the lease holder had already stopped".into())),
+                Err(_) => Err("the lease holder had already stopped".into()),
+            };
+            failed |= done.is_err();
+            out.insert(
+                route,
+                match done {
+                    Ok(fence) => serde_json::json!({"released_at_fence": fence}),
+                    Err(e) => serde_json::json!({"error": e}),
+                },
+            );
+        }
+        let status = if failed {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::OK
+        };
+        (status, Json(serde_json::Value::Object(out)))
+    }
+
     async fn suspend_nest(
         State((handles, jobs, required)): State<Shared>,
         AxPath(name): AxPath<String>,
@@ -3786,6 +4016,7 @@ pub fn lifecycle_routes(
         .route("/_admin/mounts", get(list_mounts))
         .route("/_admin/mounts/{*name}", get(get_mount).patch(patch_mount))
         .route("/_admin/suspend/{*name}", post(suspend_nest))
+        .route("/_admin/failover/handover", post(handover))
         .route("/_admin/resume/{*name}", post(resume_nest))
         .route("/_admin/move/{*name}", post(move_nest))
         .route("/_admin/datasets/{nid}", delete(reclaim_dataset))
@@ -4697,6 +4928,8 @@ pub struct RuntimeHandles {
     /// What a mount needs that an unmount does not: where nests live, how to reach each chain, and the
     /// settings a new nest must be built with so it behaves identically to one mounted at boot.
     pub mount_ctx: MountContext,
+    /// Per leased route, the way to ask its lease holder for a planned handover (RFC-0078 §5.6).
+    pub handovers: BTreeMap<String, tokio::sync::mpsc::Sender<crate::lease::Handover>>,
 }
 
 /// The operator's run-time settings, stamped onto every mounted config at boot and at a hot mount alike.
@@ -7827,7 +8060,12 @@ mod tests {
             interval: "1h".into(),
             parallelism: 2,
             followers: false,
-            failover: Some(Failover { term: "3s".into() }),
+            failover: Some(Failover {
+                term: "3s".into(),
+                standby: false,
+                follow: None,
+                registry: None,
+            }),
         });
 
         let mut first = take_writer_leases(root.path(), &table.mounts, None, "default")
@@ -8859,6 +9097,7 @@ mod tests {
             estimates: std::collections::HashMap::new(),
             default_tenant: DEFAULT_TENANT.to_string(),
             suspended: std::collections::BTreeMap::from([("usdc".to_string(), nid.clone())]),
+            handovers: Default::default(),
             failed: Default::default(),
             joining: Default::default(),
             tenant_shares: Default::default(),
@@ -9624,6 +9863,7 @@ mod tests {
             estimates: std::collections::HashMap::new(),
             default_tenant: DEFAULT_TENANT.to_string(),
             suspended: std::collections::BTreeMap::new(),
+            handovers: Default::default(),
             failed: Default::default(),
             joining: Default::default(),
             tenant_shares: Default::default(),
@@ -10386,6 +10626,7 @@ mod tests {
             estimates: std::collections::HashMap::new(),
             default_tenant: DEFAULT_TENANT.to_string(),
             suspended: std::collections::BTreeMap::new(),
+            handovers: Default::default(),
             failed: Default::default(),
             joining: Default::default(),
             tenant_shares: Default::default(),
@@ -11858,6 +12099,7 @@ mod fr5_tests {
             default_tenant: DEFAULT_TENANT.to_string(),
             tenant_shares: Default::default(),
             suspended: std::collections::BTreeMap::new(),
+            handovers: Default::default(),
             failed: Default::default(),
             joining: Default::default(),
             mount_ctx: MountContext {

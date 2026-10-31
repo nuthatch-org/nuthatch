@@ -286,6 +286,22 @@ place of its routes. Its data and record stay, and it stays suspended across a r
 mount is released by suspending it, then resuming it; resume answers `404` for a mount that is not
 suspended.
 
+### Failover
+
+`POST /_admin/failover/handover` hands every writer lease the runtime holds to a standby (RFC-0078,
+[operators.md](operators.md#failover-a-standby-that-takes-over-when-the-writer-dies-rfc-0078)).
+Each holder fences its store off, so nothing more is committed, waits up to a minute for the
+publisher to mirror everything sealed, and releases its lease; a standby takes it at once rather
+than waiting out the term. The answer names the fence each route released at:
+
+```json
+{"gate": {"released_at_fence": 4}}
+```
+
+`404` when the runtime holds no lease, `409` when a holder had already stopped. After a handover the
+runtime keeps answering at its last `as_of`, and each mount's `/ready` says it was handed over;
+restart it, as a standby, to have it take part again.
+
 ### Moving a name
 
 `POST /_admin/move/<name>` mounts the new NID beside the old one, catches it up, then switches the
