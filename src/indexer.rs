@@ -17024,10 +17024,17 @@ template = "pool"
             // Poll rather than sleep a fixed time: the loop is a real tip-follower and this is the only
             // honest way to wait for it. A dead cursor fails here on the deadline.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            // Each nest commits from its own task, so the co-tenant's window can land after the
+            // factory's: wait for both before asserting either.
             let mut fact_rows = Vec::new();
             while std::time::Instant::now() < deadline {
                 fact_rows = fact_store.entities_in_range(7, 7).unwrap();
-                if fact_rows.iter().any(|r| r.contains("child__ping")) {
+                let stat_done = stat_store
+                    .entities_in_range(7, 7)
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.contains("tok__transfer"));
+                if stat_done && fact_rows.iter().any(|r| r.contains("child__ping")) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
