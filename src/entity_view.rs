@@ -123,14 +123,7 @@ impl EntityView {
                  bites, not one that forbids the entity outright"
             ));
         }
-        let unavailable = warm.then(|| {
-            format!(
-                "entity `{name}` was not rebuilt after a restart: its state is derived and not \
-                 persisted, and seeding it from this nest's sealed segments and hot tail (RFC-0041 \
-                 §5.3) did not complete, so it holds no answer rather than part of one. The log \
-                 says why; the next restart seeds it again."
-            )
-        });
+        let unavailable = warm.then(|| nuthatch_core::restart::not_rebuilt(name));
         let limits = Limits {
             max_rows,
             allowance_bytes: crate::runtime::entity_allowance_bytes(
@@ -241,8 +234,13 @@ impl EntityView {
     /// correct answer, since it could not have been running in the first place.
     pub fn seed(&mut self, rows: &[DecodedRow], through: u64) -> Result<()> {
         self.seed_begin();
-        self.seed_chunk(rows, through)?;
-        self.seed_end()
+        let seeded = self
+            .seed_chunk(rows, through)
+            .and_then(|()| self.seed_end());
+        if seeded.is_err() {
+            self.seed_abandon();
+        }
+        seeded
     }
 
     /// Open a seed. Split from [`Self::seed`] so a caller holding a very large history can feed it
@@ -252,6 +250,11 @@ impl EntityView {
     /// then `end`.
     pub fn seed_begin(&mut self) {
         self.unavailable = None;
+    }
+
+    /// Undo [`Self::seed_begin`] for a seed that did not complete (#2539).
+    pub fn seed_abandon(&mut self) {
+        self.unavailable = Some(nuthatch_core::restart::not_rebuilt(&self.name));
     }
 
     /// Feed one piece of stored history at `+1`. Ordering across chunks does not matter and
@@ -634,6 +637,9 @@ impl nuthatch_core::restart::SeedEntity for EntityView {
     }
     fn seed_end(&self) -> Result<()> {
         EntityView::seed_end(self)
+    }
+    fn seed_abandon(&mut self) {
+        EntityView::seed_abandon(self)
     }
 }
 

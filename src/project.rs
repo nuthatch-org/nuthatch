@@ -936,6 +936,17 @@ pub fn decode_identity(
     Ok(hash)
 }
 
+/// Write a derived file only when its bytes change, and say whether it did (#2530). Rewriting the
+/// same bytes truncates a file a concurrent `nest nid` may be hashing.
+pub(crate) fn write_if_changed(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<bool> {
+    let bytes = bytes.as_ref();
+    if std::fs::read(path).is_ok_and(|old| old == bytes) {
+        return Ok(false);
+    }
+    std::fs::write(path, bytes)?;
+    Ok(true)
+}
+
 fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result<usize> {
     let registry = crate::registry::from_nest(dir, config)?;
     let mut schema = registry.schema();
@@ -951,11 +962,17 @@ fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result
     }
     crate::indexer::refuse_duplicate_tables(&schema)?;
     let hash = decode_identity(dir, config, &registry)?;
-    std::fs::write(
-        dir.join("schema.json"),
-        nuthatch_scaffold::schema_json(hash, &schema)?,
-    )
-    .context("failed to write schema.json")?;
+    let schema_path = dir.join("schema.json");
+    if !write_if_changed(&schema_path, nuthatch_scaffold::schema_json(hash, &schema)?)
+        .context("failed to write schema.json")?
+    {
+        // Unchanged, but now current: `refresh_stale_artifacts` judges it by its mtime.
+        std::fs::File::options()
+            .write(true)
+            .open(&schema_path)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+            .context("failed to touch schema.json")?;
+    }
     scaffold_ai_surface(dir, chain_name, &config.contracts, &schema)?;
 
     // The logic layer (RFC-0018 §1): scaffold `views/` with a commented, ready-to-uncomment starter so
@@ -1850,15 +1867,15 @@ pub(crate) fn scaffold_ai_surface(
         .iter()
         .map(|c| (c.alias.as_str(), c.address.as_str()))
         .collect();
-    std::fs::write(
-        dir.join("llms.txt"),
+    write_if_changed(
+        &dir.join("llms.txt"),
         nuthatch_scaffold::llms_txt(chain, &contracts, schema),
     )
     .context("failed to write llms.txt")?;
     let skill_dir = dir.join(".claude/skills/nuthatch");
     std::fs::create_dir_all(&skill_dir).context("failed to create skill dir")?;
-    std::fs::write(
-        skill_dir.join("SKILL.md"),
+    write_if_changed(
+        &skill_dir.join("SKILL.md"),
         nuthatch_scaffold::skill_md(chain, &contracts, schema),
     )
     .context("failed to write SKILL.md")?;
@@ -2809,6 +2826,43 @@ mod tests {
         assert!(
             what.as_deref().unwrap_or("").contains("older than"),
             "a stale schema must be refreshed, not just a missing one: {what:?}"
+        );
+    }
+
+    /// #2530: a stale-by-mtime nest whose derived bytes are unchanged is not rewritten. Truncating
+    /// and rewriting a hashed file is a window in which a concurrent `nest nid` sees it partial.
+    #[test]
+    fn a_refresh_that_changes_nothing_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hand_authored_nest(dir.path());
+        let cfg = Config::load(dir.path()).unwrap();
+        refresh_stale_artifacts(dir.path(), &cfg).unwrap();
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let derived = [
+            "schema.json",
+            "llms.txt",
+            "semantic.toml",
+            ".claude/skills/nuthatch/SKILL.md",
+        ];
+        for f in derived {
+            let file = std::fs::File::options()
+                .write(true)
+                .open(dir.path().join(f))
+                .unwrap();
+            file.set_modified(earlier).unwrap();
+        }
+        assert!(refresh_stale_artifacts(dir.path(), &cfg).unwrap().is_some());
+        for f in &derived[1..] {
+            let at = std::fs::metadata(dir.path().join(f))
+                .unwrap()
+                .modified()
+                .unwrap();
+            assert_eq!(at, earlier, "{f} was rewritten with the bytes it had");
+        }
+        assert_eq!(
+            refresh_stale_artifacts(dir.path(), &cfg).unwrap(),
+            None,
+            "an unchanged schema still counts as refreshed"
         );
     }
 

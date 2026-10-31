@@ -149,7 +149,7 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  ghcr.io/nuthatch-org/nuthatch:5.15.0
+  ghcr.io/nuthatch-org/nuthatch:5.16.0
 ```
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
@@ -187,7 +187,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nuthatch-org/nuthatch:5.15.0-scaled worker --help
+docker run --rm ghcr.io/nuthatch-org/nuthatch:5.16.0-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
@@ -1230,7 +1230,8 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
 - **A directory of chains**: `--dir` pointing at a directory of address-history nests, one per chain,
   serves them all at one `/api`, routed by `chainid`. Each chain's RPCs come from
   `NUTHATCH_RPC_<chain id>` and `NUTHATCH_TRACE_RPC_<chain id>`, else from its `rpc_urls`, which such a
-  nest can leave out.
+  nest can leave out. `POST /api/watch` and `/api/unwatch` change every chain, or only the one a
+  `"chainid"` in the body names.
 - **What leaves the machine**: the RPC provider sees the watched addresses in its filters. History
   stays local; the provider's view of it does not.
 

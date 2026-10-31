@@ -4038,6 +4038,9 @@ struct AddressBody {
     /// Many addresses at once, added in one transaction (RFC-0064). Added only: a deposit set grows.
     #[serde(default)]
     addresses: Option<Vec<String>>,
+    /// The one chain to change on a directory of chains; absent, every chain.
+    #[serde(default)]
+    chainid: Option<u64>,
 }
 
 fn watch_list(s: &ModeState, addresses: Vec<String>) -> Result<Value> {
@@ -4077,6 +4080,15 @@ async fn dispatch(s: Arc<ModeState>, b: AddressBody, add: bool) -> (StatusCode, 
         return failed(
             StatusCode::FORBIDDEN,
             "the watched set changes only on a loopback bind",
+        );
+    }
+    if let Some(id) = b.chainid.filter(|id| *id != s.chain_id) {
+        return failed(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "chainid {id} is not served here; this nest serves chain {}",
+                s.chain_id
+            ),
         );
     }
     match (b.address, b.validator, b.addresses) {
@@ -4818,19 +4830,34 @@ async fn chains_watched(State(c): State<Chains>) -> (StatusCode, Json<Value>) {
     )
 }
 
-/// A body for every chain, or a validator's for Ethereum alone. Every chain is asked even when one
-/// fails, because separate stores cannot change atomically: the answer reports each chain, fails if
-/// any did, and a repeat (watch and unwatch are idempotent) converges the rest.
+/// A body for every chain, the chain its `chainid` names, or a validator's for Ethereum alone. Every
+/// chain is asked even when one fails, because separate stores cannot change atomically: the answer
+/// reports each chain, fails if any did, and a repeat (watch and unwatch are idempotent) converges the
+/// rest.
 async fn chains_dispatch(c: Chains, b: AddressBody, add: bool) -> (StatusCode, Json<Value>) {
-    let targets: Vec<(u64, Arc<ModeState>)> = if b.validator.is_some() {
-        c.get(&1).map(|s| (1, s.clone())).into_iter().collect()
-    } else {
-        c.iter().map(|(id, s)| (*id, s.clone())).collect()
-    };
+    if let Some(id) = b.chainid.filter(|id| !c.contains_key(id)) {
+        return failed(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "chainid {id} is not served here; this endpoint serves chains {}",
+                chain_list(&c)
+            ),
+        );
+    }
+    let targets: Vec<(u64, Arc<ModeState>)> = c
+        .iter()
+        .filter(|(id, _)| b.chainid.is_none_or(|named| named == **id))
+        .filter(|(id, _)| b.validator.is_none() || **id == 1)
+        .map(|(id, s)| (*id, s.clone()))
+        .collect();
     if targets.is_empty() {
         return failed(
             StatusCode::BAD_REQUEST,
-            "validators are watched on Ethereum, which this endpoint does not serve",
+            if b.chainid.is_some() && c.contains_key(&1) {
+                "validators are watched on Ethereum alone, chainid 1"
+            } else {
+                "validators are watched on Ethereum, which this endpoint does not serve"
+            },
         );
     }
     let mut per_chain = serde_json::Map::new();
@@ -5989,6 +6016,95 @@ mod tests {
             err.contains("NUTHATCH_RPC_8453") && err.contains("rpc_urls"),
             "{err}"
         );
+    }
+
+    /// #2470: a body naming `chainid` changes that chain alone, the bare form still reaches every
+    /// chain, and a chain the endpoint does not serve is refused with nothing changed.
+    #[tokio::test]
+    async fn a_watch_naming_a_chain_changes_that_chain_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains: Chains = Arc::new(
+            [56, 8453]
+                .into_iter()
+                .map(|id| (id, chain_state(dir.path(), id)))
+                .collect(),
+        );
+        let app = || chains_router(chains.clone());
+        let watches = |id: u64, a: &str| chains[&id].history.watched().unwrap().contains(&a.into());
+        let bob = "0x0000000000000000000000000000000000000b0b";
+        let (code, v) = call(
+            app(),
+            "POST",
+            "/api/watch",
+            Some(json!({ "address": bob, "chainid": 8453 })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert!(watches(8453, bob) && !watches(56, bob), "{v}");
+        let (_, v) = call(app(), "GET", "/api/watch", None).await;
+        assert!(
+            !v["chains"]["56"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == bob),
+            "{v}"
+        );
+
+        let carol = "0x0000000000000000000000000000000000000ca1";
+        let (code, v) = call(
+            app(),
+            "POST",
+            "/api/watch",
+            Some(json!({ "address": carol, "chainid": 10 })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+        let error = v["error"].as_str().unwrap();
+        assert!(
+            error.contains("chainid 10") && error.contains("56, 8453"),
+            "{error}"
+        );
+        assert!(!watches(56, carol) && !watches(8453, carol));
+
+        let (code, v) = call(
+            app(),
+            "POST",
+            "/api/watch",
+            Some(json!({ "address": carol })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert!(watches(56, carol) && watches(8453, carol));
+        let (code, v) = call(
+            app(),
+            "POST",
+            "/api/unwatch",
+            Some(json!({ "address": carol, "chainid": 56 })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert!(!watches(56, carol) && watches(8453, carol));
+
+        // A solo nest takes its own chain id and refuses another's.
+        let solo = || router(chains[&56].clone());
+        let (code, _) = call(
+            solo(),
+            "POST",
+            "/api/watch",
+            Some(json!({ "address": bob, "chainid": 56 })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, v) = call(
+            solo(),
+            "POST",
+            "/api/unwatch",
+            Some(json!({ "address": bob, "chainid": 8453 })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+        assert!(watches(56, bob), "the refused unwatch changed nothing");
     }
 
     /// A watch that one chain refuses still reaches the others, and the answer names each chain:

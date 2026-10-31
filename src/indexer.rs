@@ -34,8 +34,8 @@ use nuthatch_core::seal::pin_checkpoint;
 pub(crate) use nuthatch_core::window::fetch_window_block_data;
 use nuthatch_core::window::{
     apply_row_timestamps, blocks_needing_timestamps, decode_window, dedup_logs, fetch_discovering,
-    l1_block_rows, note_undecoded, seal_ceiling, wide_templates, Undecoded, WindowForked,
-    FACTORY_FLIP_THRESHOLD,
+    l1_block_rows, note_undecoded, seal_ceiling, wide_templates, Undecoded, WideTemplates,
+    WindowForked, FACTORY_FLIP_THRESHOLD,
 };
 use nuthatch_seal::cut::CutScan;
 pub use nuthatch_seal::cut::{SEAL_DIRECT_BATCH, SEAL_DIRECT_BYTES};
@@ -1254,6 +1254,174 @@ async fn fetch_discovering_union(
         known
     })
     .await
+}
+
+/// A live factory nest's part of a union fetch.
+type UnionFactory<'a> = (&'a DecodeRegistry, &'a FactorySet, &'a ChildRegistry);
+
+/// What [`fetch_union_by_template`] asked for and got.
+struct UnionFetch {
+    logs: Vec<crate::rpc::Log>,
+    /// Every address asked for, lowercased, discovered children included.
+    asked: std::collections::HashSet<String>,
+    /// The topic0s asked for without an address; empty when nothing went wide.
+    wide_topic0s: Vec<String>,
+}
+
+/// How a union with a live factory nest is asked for (#2410): `wide_templates`'s rule across the
+/// co-tenants. Each nest's wide templates by their own topic0s alone, and static contracts, factory
+/// bases and small templates' children by address.
+struct UnionPlan {
+    /// Static contracts and factory bases, asked by address whatever goes wide.
+    pinned: Vec<String>,
+    /// Per factory nest, in the order given.
+    wide: Vec<Option<WideTemplates>>,
+}
+
+impl UnionPlan {
+    fn new(statics: &[String], factories: &[UnionFactory<'_>], topic0_refused: bool) -> Self {
+        let bases = factories.iter().flat_map(|(reg, _, _)| {
+            reg.addresses()
+                .iter()
+                .map(|a| format!("0x{}", hex::encode(a)))
+                .collect::<Vec<_>>()
+        });
+        let mut pinned: Vec<String> = Vec::new();
+        for a in statics.iter().cloned().chain(bases) {
+            if !addr_in(&pinned, &a) {
+                pinned.push(a);
+            }
+        }
+        if topic0_refused {
+            let wide = factories.iter().map(|_| None).collect();
+            return UnionPlan { pinned, wide };
+        }
+        // What each nest flips by alone, then what the rest of the union, less what that already
+        // covers, adds as its base: with one nest this is `fetch_window`'s rule exactly.
+        let alone: Vec<Option<WideTemplates>> = factories
+            .iter()
+            .map(|(reg, fs, children)| wide_templates(reg, fs, children, 0, fs.force_topic0()))
+            .collect();
+        let uncovered: Vec<usize> = factories
+            .iter()
+            .zip(&alone)
+            .map(|((_, _, children), w)| {
+                children
+                    .addresses()
+                    .into_iter()
+                    .filter(|c| {
+                        !w.as_ref()
+                            .is_some_and(|w| w.covers(children.template_of(c)))
+                    })
+                    .count()
+            })
+            .collect();
+        let all: usize = uncovered.iter().sum();
+        let wide = factories
+            .iter()
+            .zip(alone)
+            .zip(&uncovered)
+            .map(|(((reg, fs, children), alone), own)| {
+                alone.or_else(|| {
+                    let base = pinned.len() + all - own;
+                    wide_templates(reg, fs, children, base, fs.force_topic0())
+                })
+            })
+            .collect();
+        UnionPlan { pinned, wide }
+    }
+
+    fn narrow_only(&self) -> bool {
+        self.wide.iter().all(Option::is_none)
+    }
+}
+
+/// [`UnionPlan`]'s fetch: the wide topic0s address-less, then everything else by address with
+/// in-window discovery, as `fetch_window` does for one nest. A refused wide fetch clears the plan.
+async fn fetch_union_by_template(
+    source: &dyn Source,
+    plan: &mut UnionPlan,
+    factories: &[UnionFactory<'_>],
+    topics: &[String],
+    from: u64,
+    to: u64,
+    topic0_refused: &mut bool,
+) -> Result<UnionFetch> {
+    let mut wide_topic0s: Vec<String> = plan
+        .wide
+        .iter()
+        .flatten()
+        .flat_map(|w| w.topic0s.iter().cloned())
+        .collect();
+    wide_topic0s.sort();
+    wide_topic0s.dedup();
+    let mut wide_logs = Vec::new();
+    if !wide_topic0s.is_empty() {
+        let f =
+            LogFilter::new(&[], &wide_topic0s).expect("a wide template decodes at least one event");
+        match source.logs(&f, from, to).await {
+            Err(e) if crate::rpc::filter_refused(&e) => {
+                tracing::warn!(
+                    "the endpoint refuses getLogs without an address list ({e:#}); this cursor \
+                     asks by factory and child address from now on"
+                );
+                *topic0_refused = true;
+                plan.wide.iter_mut().for_each(|w| *w = None);
+                wide_topic0s.clear();
+            }
+            r => wide_logs = r?,
+        }
+    }
+    let wide = &plan.wide;
+    let covered = |i: usize, c: &str, reg: &ChildRegistry| {
+        wide[i]
+            .as_ref()
+            .is_some_and(|w| w.covers(reg.template_of(c)))
+    };
+    let mut narrow = plan.pinned.clone();
+    for (i, (_, _, children)) in factories.iter().enumerate() {
+        for c in children.addresses() {
+            if !covered(i, c, children) && !addr_in(&narrow, c) {
+                narrow.push(c.to_string());
+            }
+        }
+    }
+    let mut asked: std::collections::HashSet<String> =
+        narrow.iter().map(|a| a.to_ascii_lowercase()).collect();
+    let mut logs = fetch_discovering(source, &narrow, topics, from, to, |logs| {
+        let mut seen = wide_logs.clone();
+        seen.extend_from_slice(logs);
+        let mut known = Vec::new();
+        for (i, (reg, fs, children)) in factories.iter().enumerate() {
+            let (_, found, _) = decode_window(
+                reg,
+                Some(fs),
+                children,
+                &seen,
+                &std::collections::HashMap::new(),
+            );
+            known.extend(
+                children
+                    .addresses()
+                    .into_iter()
+                    .chain(found.addresses())
+                    .filter(|c| !covered(i, c, children) && !covered(i, c, &found))
+                    .map(str::to_string),
+            );
+        }
+        asked.extend(known.iter().map(|c| c.to_ascii_lowercase()));
+        known
+    })
+    .await?;
+    if !wide_logs.is_empty() {
+        logs.extend(wide_logs);
+        dedup_logs(&mut logs);
+    }
+    Ok(UnionFetch {
+        logs,
+        asked,
+        wide_topic0s,
+    })
 }
 
 /// Every child known once `logs` are decoded. Nothing is registered: `process_window` does that
@@ -2504,49 +2672,60 @@ async fn runtime_index_loop(
             .min()
             .unwrap_or(global_next);
         // A live factory nest makes `union_filter` clear `u_addrs`, static co-tenants included.
-        // Below the flip threshold the cursor asks every live nest's `base ∪ children` instead,
-        // with discovery, the rule `backfill_direct_factory` uses (#1941).
-        let factories: Vec<&FactorySet> = live
-            .iter()
-            .filter_map(|&i| live_ref(&nests, i).factory.as_deref())
-            .collect();
-        let narrowed = if factories.is_empty() {
-            None
-        } else {
-            let narrowed = narrowed_union_addresses(live.iter().map(|&i| live_ref(&nests, i)));
-            let wide = !topic0_refused
-                && (narrowed.len() > FACTORY_FLIP_THRESHOLD
-                    || factories.iter().any(|f| f.force_topic0()));
-            (!narrowed.is_empty() && !wide).then_some(narrowed)
-        };
-        let fetched = match (&narrowed, LogFilter::new(&u_addrs, &u_topics)) {
-            (Some(addrs), _) => {
-                fetch_discovering_union(
-                    source.as_ref(),
-                    &mut nests,
-                    &live,
-                    addrs,
-                    &u_topics,
-                    fetch_from,
-                    to,
-                )
-                .await
-            }
-            // Same tail as the solo loop (#1144). A short answer is filled in on the next window.
-            (None, Some(f)) => match source.logs(&f, fetch_from, to).await {
-                Err(e) if u_addrs.is_empty() && crate::rpc::filter_refused(&e) => {
-                    tracing::warn!(
-                        "the endpoint refuses getLogs without an address list ({e:#}); this \
-                         cursor asks by factory and child address from now on"
-                    );
-                    topic0_refused = true;
-                    // Through the retry arm and its pause, so a cursor with nothing to narrow
-                    // to cannot spin on the refusal.
-                    Err(e)
+        // The cursor asks by `UnionPlan` instead: by address, with discovery, and past the flip
+        // threshold each nest's wide templates by their own topic0s (#1941, #2410).
+        let (fetched, narrow_only) = {
+            let factories: Vec<UnionFactory<'_>> = live
+                .iter()
+                .filter_map(|&i| {
+                    let n = live_ref(&nests, i);
+                    n.factory
+                        .as_deref()
+                        .map(|fs| (n.registry.as_ref(), fs, &n.children))
+                })
+                .collect();
+            let statics: Vec<String> = live
+                .iter()
+                .map(|&i| live_ref(&nests, i))
+                .filter(|n| n.factory.is_none())
+                .flat_map(|n| n.addresses.iter().cloned())
+                .collect();
+            let plan = (!factories.is_empty())
+                .then(|| UnionPlan::new(&statics, &factories, topic0_refused))
+                .filter(|p| {
+                    !p.pinned.is_empty() || factories.iter().any(|(_, _, c)| !c.is_empty())
+                });
+            match (plan, LogFilter::new(&u_addrs, &u_topics)) {
+                (Some(mut plan), _) => {
+                    let r = fetch_union_by_template(
+                        source.as_ref(),
+                        &mut plan,
+                        &factories,
+                        &u_topics,
+                        fetch_from,
+                        to,
+                        &mut topic0_refused,
+                    )
+                    .await
+                    .map(|f| f.logs);
+                    (r, plan.narrow_only())
                 }
-                r => r,
-            },
-            (None, None) => Ok(Vec::new()),
+                // Same tail as the solo loop (#1144). A short answer is filled in on the next window.
+                (None, Some(f)) => match source.logs(&f, fetch_from, to).await {
+                    Err(e) if u_addrs.is_empty() && crate::rpc::filter_refused(&e) => {
+                        tracing::warn!(
+                            "the endpoint refuses getLogs without an address list ({e:#}); this \
+                             cursor asks by factory and child address from now on"
+                        );
+                        topic0_refused = true;
+                        // Through the retry arm and its pause, so a cursor with nothing to narrow
+                        // to cannot spin on the refusal.
+                        (Err(e), false)
+                    }
+                    r => (r, false),
+                },
+                (None, None) => (Ok(Vec::new()), false),
+            }
         };
         match fetched {
             Ok(logs) => {
@@ -2616,7 +2795,7 @@ async fn runtime_index_loop(
                         global_next,
                         tip,
                         &e,
-                        narrowed.is_some(),
+                        narrow_only,
                     )
                     .await?;
                     continue;
@@ -14114,6 +14293,191 @@ template = "pool"
         }
     }
 
+    /// #2410 on either cursor: a wide factory co-tenant flips only its template. The static
+    /// contract's generic `Transfer` is asked by address, the template by its own topic0 alone, and
+    /// each nest stores exactly the rows it stores solo.
+    #[tokio::test]
+    async fn a_wide_factory_co_tenant_leaves_a_static_contract_asked_by_address() {
+        let stat_addr = "0x0000000000000000000000000000000000000011";
+        let chain = |stat: &NestIngest, fact: &NestIngest| {
+            let mut logs = factory_child_logs(fact);
+            let mut transfer = transfer_log(7, 2);
+            transfer.address = stat_addr.into();
+            transfer.topics[0] = nest_topic0(stat, "tok__transfer");
+            let mut stranger_transfer = transfer.clone();
+            stranger_transfer.address = "0x0000000000000000000000000000000000000099".into();
+            stranger_transfer.log_index = 3;
+            let mut stranger_ping = logs[1].clone();
+            stranger_ping.address = "0x0000000000000000000000000000000000000098".into();
+            stranger_ping.log_index = 4;
+            logs.extend([transfer, stranger_transfer, stranger_ping]);
+            for l in &mut logs {
+                l.block_hash = format!("0x{:064x}", l.block_number);
+            }
+            logs
+        };
+        let rows_at_seven = |store: Arc<dyn crate::store::HotStore>, want: usize| async move {
+            wait_for("block 7's rows", std::time::Duration::from_secs(20), || {
+                store.entities_in_range(7, 7).unwrap().len() >= want
+            })
+            .await;
+            store.entities_in_range(0, 7).unwrap()
+        };
+        let solo = |nest: NestIngest, logs: Vec<crate::rpc::Log>, want: usize| async move {
+            let store = nest.store.clone();
+            let source = Arc::new(OpenSource {
+                logs,
+                calls: std::sync::Mutex::new(Vec::new()),
+            });
+            let task = tokio::spawn(index_loop(source, nest, Some(5), false, 1, 50));
+            let rows = rows_at_seven(store, want).await;
+            task.abort();
+            rows
+        };
+        let (ds, df) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let stat = build_test_nest(ds.path(), stat_addr).await;
+        let fact = build_factory_test_nest_with(df.path(), "filter = \"topic0\"\n").await;
+        let logs = chain(&stat, &fact);
+        let ping = nest_topic0(&fact, "child__ping");
+        let solo_stat = solo(stat, logs.clone(), 1).await;
+        let solo_fact = solo(fact, logs.clone(), 2).await;
+        assert_eq!((solo_stat.len(), solo_fact.len()), (1, 2), "premise");
+        for kind in BOTH_CURSORS {
+            let (ds, df) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let stat = build_test_nest(ds.path(), stat_addr).await;
+            let fact = build_factory_test_nest_with(df.path(), "filter = \"topic0\"\n").await;
+            let (stat_store, fact_store) = (stat.store.clone(), fact.store.clone());
+            let source = Arc::new(OpenSource {
+                logs: logs.clone(),
+                calls: std::sync::Mutex::new(Vec::new()),
+            });
+            let task = spawn_test_cursor(
+                kind,
+                source.clone() as Arc<dyn Source>,
+                vec![stat, fact],
+                Some(5),
+                50,
+                Arc::new(crate::health::RuntimeHealth::new()),
+                false,
+                None,
+            );
+            let union_fact = rows_at_seven(fact_store, 2).await;
+            let union_stat = rows_at_seven(stat_store, 1).await;
+            task.abort();
+            assert_eq!(union_stat, solo_stat, "{kind:?}");
+            assert_eq!(union_fact, solo_fact, "{kind:?}");
+            let calls = source.calls.lock().unwrap().clone();
+            assert!(
+                calls
+                    .iter()
+                    .any(|(a, t)| a.is_empty() && t == &vec![ping.clone()]),
+                "{kind:?}: the template is asked by its topic0 alone: {calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .all(|(a, t)| !a.is_empty() || t == &vec![ping.clone()]),
+                "{kind:?}: nothing else goes out without an address: {calls:?}"
+            );
+            assert!(
+                calls.iter().any(|(a, _)| a.iter().any(|x| x == stat_addr)),
+                "{kind:?}: the static contract is asked by address: {calls:?}"
+            );
+        }
+    }
+
+    /// The union flips where it did, past the threshold in all, but per template (#2410): a big
+    /// template alone goes wide, and co-tenants' small templates go wide only once they cross it
+    /// together. Static contracts and factory bases are always pinned by address.
+    #[test]
+    fn a_union_plan_widens_templates_never_statics() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("abis")).unwrap();
+        std::fs::write(
+            d.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"w\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"fac\"\naddress = \"0x0000000000000000000000000000000000000022\"\n\
+             abi = \"abis/fac.json\"\n\n\
+             [[templates]]\nname = \"child\"\nabi = \"abis/child.json\"\n\n\
+             [[factories]]\nwatch = \"fac\"\nevent = \"ChildCreated\"\nchild_param = \"child\"\ntemplate = \"child\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("abis/fac.json"),
+            r#"[{"type":"event","name":"ChildCreated","inputs":[{"name":"child","type":"address","indexed":true}],"anonymous":false}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("abis/child.json"),
+            r#"[{"type":"event","name":"Ping","inputs":[],"anonymous":false}]"#,
+        )
+        .unwrap();
+        let config = Config::load(d).unwrap();
+        let registry = crate::registry::from_nest(d, &config).unwrap();
+        let factory = FactorySet::resolved(&config, &registry).unwrap();
+        let children = |n: usize, offset: usize| {
+            let mut c = ChildRegistry::new();
+            for i in 0..n {
+                c.insert(crate::factory::ChildEntry {
+                    template: "child".into(),
+                    address: format!("0x{:040x}", 0x10_0000 + offset + i),
+                    discovered_block: 1,
+                    discovered_log_index: i as u64,
+                    discovered_timestamp: 0,
+                    parent_address: "0x0000000000000000000000000000000000000022".into(),
+                    depth: 1,
+                });
+            }
+            c
+        };
+        let statics = vec!["0x0000000000000000000000000000000000000011".to_string()];
+        let widened = |plan: &UnionPlan| {
+            plan.wide
+                .iter()
+                .map(|w| w.as_ref().map(|w| w.topic0s.clone()))
+                .collect::<Vec<_>>()
+        };
+        let ping = registry
+            .template_topic0s("child")
+            .iter()
+            .map(|t| format!("0x{}", hex::encode(t)))
+            .collect::<Vec<_>>();
+
+        let (big, small) = (children(FACTORY_FLIP_THRESHOLD + 1, 0), children(3, 5000));
+        let plan = UnionPlan::new(
+            &statics,
+            &[(&registry, &factory, &big), (&registry, &factory, &small)],
+            false,
+        );
+        assert_eq!(
+            plan.pinned,
+            vec![
+                "0x0000000000000000000000000000000000000011".to_string(),
+                "0x0000000000000000000000000000000000000022".to_string()
+            ]
+        );
+        assert_eq!(
+            widened(&plan),
+            vec![Some(ping.clone()), None],
+            "the big template's children no longer count against the small one"
+        );
+
+        let (a, b) = (children(300, 0), children(300, 5000));
+        let pair = [(&registry, &factory, &a), (&registry, &factory, &b)];
+        let plan = UnionPlan::new(&statics, &pair, false);
+        assert_eq!(
+            widened(&plan),
+            vec![Some(ping.clone()), Some(ping.clone())],
+            "600 children across two nests cross the threshold together"
+        );
+        assert!(UnionPlan::new(&statics, &pair[..1], false).narrow_only());
+        assert!(
+            UnionPlan::new(&statics, &pair, true).narrow_only(),
+            "a refused topic0-only fetch keeps every address"
+        );
+    }
+
     /// #2162 end to end, on either cursor: the nest whose own filter is over the cap at a block is
     /// the one terminally faulted, and its co-tenant indexes the block.
     #[tokio::test]
@@ -16660,10 +17024,17 @@ template = "pool"
             // Poll rather than sleep a fixed time: the loop is a real tip-follower and this is the only
             // honest way to wait for it. A dead cursor fails here on the deadline.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            // Each nest commits from its own task, so the co-tenant's window can land after the
+            // factory's: wait for both before asserting either.
             let mut fact_rows = Vec::new();
             while std::time::Instant::now() < deadline {
                 fact_rows = fact_store.entities_in_range(7, 7).unwrap();
-                if fact_rows.iter().any(|r| r.contains("child__ping")) {
+                let stat_done = stat_store
+                    .entities_in_range(7, 7)
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.contains("tok__transfer"));
+                if stat_done && fact_rows.iter().any(|r| r.contains("child__ping")) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -20133,6 +20504,72 @@ template = "pool"
             tx_hash: "0xtx".into(),
             log_index: li,
         }
+    }
+
+    /// A nest that seals every finalized block, and two transfers at block 10 for it to seal.
+    async fn a_sealing_nest(
+        d: &std::path::Path,
+    ) -> (NestIngest, Arc<dyn Source>, Vec<crate::rpc::Log>) {
+        let mut nest = build_test_nest(d, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
+        nest.seal_span = 1;
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        (nest, source, vec![transfer_log(10, 0), transfer_log(10, 1)])
+    }
+
+    /// #2508, the per-window publish alone: a request between a window's commit and its seal reads
+    /// that window. The seal-time and idle republishes both come later, so neither can stand in.
+    #[tokio::test]
+    async fn a_window_is_published_before_its_seal() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut nest, source, logs) = a_sealing_nest(d.path()).await;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let (snapshots, during) = (nest.publisher.snapshots.clone(), seen.clone());
+        probe_before_the_next_prune(move || {
+            let rows = snapshots
+                .load_full()
+                .map(|s| s.store.entities_in_range(10, 10).unwrap().len());
+            *during.lock().unwrap() = Some(rows);
+        });
+        nest.process_window(source.as_ref(), &logs, 10, 10, 10_000)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+
+        let seen = seen.lock().unwrap().take();
+        assert!(seen.is_some(), "premise: the window sealed");
+        assert_eq!(
+            seen.flatten(),
+            Some(2),
+            "between the commit and the seal, requests must read the committed window"
+        );
+    }
+
+    /// #2508, the seal-time republish alone: once a window's seal returns, requests read the store
+    /// it left, before the nest is next idle. Read from the pin taken at the commit, the sealed rows
+    /// are still hot beside the segment that now holds them.
+    #[tokio::test]
+    async fn a_seal_is_published_before_the_nest_is_next_idle() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut nest, source, logs) = a_sealing_nest(d.path()).await;
+        nest.process_window(source.as_ref(), &logs, 10, 10, 10_000)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        assert!(
+            nest.store.sealed_through() >= 10,
+            "premise: the window sealed"
+        );
+
+        let snap = nest.publisher.snapshots.load_full().expect("a snapshot");
+        assert_eq!(
+            snap.store.sealed_through(),
+            nest.store.sealed_through(),
+            "requests must read the seal's watermark"
+        );
+        assert!(
+            snap.store.entities_in_range(10, 10).unwrap().is_empty(),
+            "requests must not read sealed rows as hot"
+        );
     }
 
     /// The checkpoint hash is a second call, after the logs. If `to` was replaced between them,
@@ -27506,6 +27943,40 @@ rpc_urls = ["https://rpc.example"]
             (applied.through, applied.offchain["tiers"].snapshots),
             (11, 1)
         );
+    }
+
+    /// #2539: a seed that fails after it has fed an entity some of its history leaves that entity
+    /// unavailable, not available with part of an answer. Here the chain rows go in and the offchain
+    /// snapshot after them cannot be read.
+    #[test]
+    fn a_seed_that_fails_part_way_leaves_its_entity_unavailable() {
+        const ALICE: &str = "0x1111111111111111111111111111111111111111";
+        const BOB: &str = "0x2222222222222222222222222222222222222222";
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(erc20_registry());
+        let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
+        drop_tiers(dir.path(), "first", BOB, "gold");
+        entity_fixture::write(dir.path(), BY_TIER_AND_TOTALS).unwrap();
+        let stored = vec![(
+            Store::entity_key(10, 0),
+            transfer_row(10, 0, ALICE, Some(BOB), "100"),
+        )];
+        store.commit_window(&stored, Some((11, "aa")), 11).unwrap();
+
+        let mut views = start_entities(dir.path(), &registry, true).unwrap();
+        // Bound against the snapshot as it was, then unreadable by the time the seed reaches it.
+        let catalogue = crate::offchain::load(dir.path()).unwrap();
+        std::fs::write(
+            crate::offchain::segment_path(dir.path(), &catalogue.tables["tiers"][0]),
+            b"not parquet",
+        )
+        .unwrap();
+        assert!(seed_entities(dir.path(), &store, &registry, &mut views, 11).is_err());
+        assert!(
+            view(&views, "by_tier").unavailable().is_some(),
+            "the entity whose seed failed must hold no answer rather than part of one"
+        );
+        assert!(view(&views, "totals").unavailable().is_some());
     }
 
     const TOTALS: &str = "[[entities]]\nname='totals'\nkey=['to']\nmax_rows=100\n\

@@ -2626,16 +2626,29 @@ pub fn get_row_guarded(
     guard: QueryGuard,
 ) -> Result<Option<Value>> {
     #[cfg(test)]
-    ENTITY_GUARDED.fetch_add(1, Ordering::Relaxed);
+    {
+        *ENTITY_GUARDED
+            .lock()
+            .unwrap()
+            .entry(dir.to_path_buf())
+            .or_default() += 1;
+    }
     read_sealed(dir, block, log_index, Some(guard))
 }
 
+/// Guarded reads per dataset directory, so one test does not count another's running beside it.
 #[cfg(test)]
-static ENTITY_GUARDED: AtomicUsize = AtomicUsize::new(0);
+static ENTITY_GUARDED: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 #[cfg(test)]
-pub(crate) fn entity_guarded_reads() -> usize {
-    ENTITY_GUARDED.load(Ordering::Relaxed)
+pub(crate) fn entity_guarded_reads(dir: &Path) -> usize {
+    ENTITY_GUARDED
+        .lock()
+        .unwrap()
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
 }
 
 fn read_sealed(

@@ -40,7 +40,8 @@ pub fn load(dir: &std::path::Path) -> Result<Option<Semantic>> {
 
 /// Write a `Semantic` to `semantic.toml` in a nest directory (what `init` calls).
 pub fn save(dir: &std::path::Path, sem: &Semantic) -> Result<()> {
-    std::fs::write(dir.join("semantic.toml"), render(sem)?).context("write semantic.toml")?;
+    crate::project::write_if_changed(&dir.join("semantic.toml"), render(sem)?)
+        .context("write semantic.toml")?;
     Ok(())
 }
 
