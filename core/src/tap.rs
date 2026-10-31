@@ -38,6 +38,16 @@ pub enum Op {
     UnblockFrom {
         key: String,
     },
+    /// An alert delivery enqueued under its sequence key, so a standby promoted after the writer
+    /// dies delivers what it had not (RFC-0078 §5.5).
+    Outbox {
+        key: String,
+        payload: String,
+    },
+    /// A delivery made or shed.
+    Unoutbox {
+        key: String,
+    },
 }
 
 /// Meta keys that describe the writer's own process rather than the data: its outbox counter and its

@@ -147,6 +147,8 @@ const OP_UNMETA: u8 = b'U';
 const OP_BLOCK: u8 = b'B';
 const OP_UNBLOCK: u8 = b'b';
 const OP_UNBLOCK_FROM: u8 = b'F';
+const OP_OUTBOX: u8 = b'O';
+const OP_UNOUTBOX: u8 = b'o';
 
 /// A row's fields in the order its text has them, borrowed from it; `None` when the row is not an
 /// object of plainly written keys, which then travels whole.
@@ -444,6 +446,15 @@ pub fn encode_delta(delta: &Delta) -> Result<Vec<u8>> {
                 out.push(OP_UNBLOCK_FROM);
                 string(&mut out, key);
             }
+            Op::Outbox { key, payload } => {
+                out.push(OP_OUTBOX);
+                string(&mut out, key);
+                string(&mut out, payload);
+            }
+            Op::Unoutbox { key } => {
+                out.push(OP_UNOUTBOX);
+                string(&mut out, key);
+            }
         }
     }
     Ok(out)
@@ -612,6 +623,13 @@ pub fn decode_delta(body: &[u8], limit: Option<u64>) -> Result<Delta> {
             OP_UNBLOCK_FROM => Op::UnblockFrom {
                 key: c.owned(&mut allow)?,
             },
+            OP_OUTBOX => Op::Outbox {
+                key: c.owned(&mut allow)?,
+                payload: c.owned(&mut allow)?,
+            },
+            OP_UNOUTBOX => Op::Unoutbox {
+                key: c.owned(&mut allow)?,
+            },
             other => bail!("unknown op {other} in a delta frame"),
         };
         allow.take(std::mem::size_of::<Op>() as u64)?;
@@ -707,6 +725,13 @@ mod tests {
             key: "000000000011".into(),
         });
         ops.push(Op::Unmeta { key: "gone".into() });
+        ops.push(Op::Outbox {
+            key: "00000000000000000007".into(),
+            payload: r#"{"alert":"x"}"#.into(),
+        });
+        ops.push(Op::Unoutbox {
+            key: "00000000000000000006".into(),
+        });
         ops.push(Op::Drop {
             from: "000000000001-000000".into(),
             to: Some("000000000002-999999".into()),

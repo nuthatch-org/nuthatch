@@ -400,3 +400,15 @@ replay. The difference shows only on a chain with an unsealed gap, which the gat
 **Still open in S2.** The outbox (§5.5): webhooks committed and not delivered when the writer dies
 are lost on takeover, cold or warm, because the outbox is not on the feed. And the randomised kill
 parity run of §7.
+
+**The outbox, built (§5.5).** Two ops on the feed, `outbox` and `unoutbox`, recorded on every
+outbox write: an enqueue alone or inside a window or a rollback, a delivery, a trim. The snapshot
+carries the table (absent from an older writer, read as empty), the follower holds and charges it as
+it does the others, the v2 wire codes them `O` and `o`, and a promotion imports it, with the
+writer's unmirrored `outbox_next_seq` restored to one past the last imported key so a new delivery
+never lands on an old one. `the_outbox_is_followed_and_promoted` follows three enqueues and a
+delivery through snapshot and deltas, then promotes them: the two undelivered remain and the next is
+numbered 3. Delivery across a failover is therefore at-least-once: a delivery the old writer made
+whose removal had not reached the follower is made again. Compatibility: an older follower cannot
+read the two ops, which is safe under the upgrade order the rolling-upgrade gate enforces, followers
+before the writer.

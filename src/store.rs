@@ -21,10 +21,11 @@ type FeedTable = (
     TableDefinition<'static, &'static str, &'static str>,
     fn(&str) -> bool,
 );
-const FEED_TABLES: [FeedTable; 3] = [
+const FEED_TABLES: [FeedTable; 4] = [
     ("entities", ENTITIES, |_| true),
     ("meta", META, crate::feed::mirrored_meta),
     ("blocks", BLOCKS, |_| true),
+    ("outbox", OUTBOX, |_| true),
 ];
 
 /// The hot store as the node serves it: `nuthatch-core`'s contract, which the cursor writes through,
@@ -88,11 +89,12 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
 /// The feed's snapshot of the mirrored tables and a receiver for every commit after it.
 pub fn feed_subscribe(store: &Store) -> Result<crate::feed::Subscription> {
     let (deltas, rtx, mut snapshot) = feed_begin(store)?;
-    let [entities, meta, blocks] = FEED_TABLES;
+    let [entities, meta, blocks, outbox] = FEED_TABLES;
     let tables = [
         (entities, &mut snapshot.entities),
         (meta, &mut snapshot.meta),
         (blocks, &mut snapshot.blocks),
+        (outbox, &mut snapshot.outbox),
     ];
     for ((_, table, keep), rows) in tables {
         for row in rtx.open_table(table)?.iter()? {
@@ -111,17 +113,28 @@ pub fn feed_subscribe(store: &Store) -> Result<crate::feed::Subscription> {
 pub fn import_mirrored(store: &Store, tables: &crate::feed::MirroredTables) -> Result<()> {
     let wtx = store.database().begin_write()?;
     {
-        let [entities, meta, blocks] = FEED_TABLES;
+        let [entities, meta, blocks, outbox] = FEED_TABLES;
         for ((_, table, _), rows) in [
             (entities, &tables.entities),
             (meta, &tables.meta),
             (blocks, &tables.blocks),
+            (outbox, &tables.outbox),
         ] {
             let mut t = wtx.open_table(table)?;
             for (k, v) in rows {
                 t.insert(k.as_str(), v.as_str())?;
             }
         }
+        // The writer's counter is its own and not mirrored; deliveries after promotion number on
+        // from the last one imported, not over it.
+        let next = tables
+            .outbox
+            .keys()
+            .filter_map(|k| k.parse::<u64>().ok())
+            .max()
+            .map_or(0, |last| last + 1);
+        wtx.open_table(META)?
+            .insert("outbox_next_seq", next.to_string().as_str())?;
     }
     wtx.commit()?;
     Ok(())
@@ -223,6 +236,46 @@ mod tests {
             promoted.current_fence().unwrap(),
             0,
             "the old writer's fence is not carried"
+        );
+    }
+
+    /// RFC-0078 §5.5: deliveries the writer had not made reach a follower, by snapshot and by delta,
+    /// and a store promoted from it delivers them and numbers the next one after them.
+    #[test]
+    fn the_outbox_is_followed_and_promoted() {
+        let a = tempfile::tempdir().unwrap();
+        let writer = Store::open(&a.path().join("w.redb")).unwrap();
+        writer.outbox_push(r#"{"alert":1}"#).unwrap();
+        let sub = feed_subscribe(&writer).unwrap();
+        let copy = crate::feed::MemStore::from_snapshot(a.path(), sub.snapshot);
+        let mut deltas = sub.deltas;
+        writer.outbox_push(r#"{"alert":2}"#).unwrap();
+        writer.outbox_push(r#"{"alert":3}"#).unwrap();
+        writer.outbox_remove(0).unwrap();
+        while let Ok(delta) = deltas.try_recv() {
+            copy.apply(&delta).unwrap();
+        }
+        let followed = copy.tables();
+        assert_eq!(
+            followed,
+            crate::feed::MirroredTables::of(&feed_subscribe(&writer).unwrap().snapshot)
+        );
+        assert_eq!(followed.outbox.len(), 2, "{:?}", followed.outbox);
+
+        let b = tempfile::tempdir().unwrap();
+        let promoted = Store::open(&b.path().join("p.redb")).unwrap();
+        import_mirrored(&promoted, &followed).unwrap();
+        let pending: Vec<u64> = promoted
+            .outbox_pending(10)
+            .unwrap()
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect();
+        assert_eq!(pending, vec![1, 2]);
+        assert_eq!(
+            promoted.outbox_push(r#"{"alert":4}"#).unwrap(),
+            3,
+            "numbered after the imported deliveries"
         );
     }
 }
