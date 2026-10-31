@@ -6,6 +6,8 @@ name: release
 on:
   push:
     tags: ['v*']
+  # Builds and gates the embeddable engine only (`engine` below); every other job runs on a tag.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -33,6 +35,7 @@ jobs:
   # so attaching files afterward can't blank out what this job wrote.
   release-notes:
     name: release notes
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -192,6 +195,109 @@ jobs:
           path: target/${{ matrix.target }}/dist/nuthatch
           retention-days: 1
 
+  # RFC-0077: the embeddable engine, an opt-in artefact beside the binaries, which this job neither
+  # builds nor changes. Built as CI's `wasm-plain` leg builds it, then gated again on the exact file
+  # that ships: its imports, the 5.5 MB brotli ceiling, `abi`'s pinned shapes, and RFC-0075 S3's and
+  # S5's answers in Node and wasmtime, fresh and killed mid-follow. `nh_abi`'s `engine` must name the
+  # version released. A `workflow_dispatch` run keeps the module as a workflow artifact and attaches
+  # nothing.
+  engine:
+    name: embeddable engine (wasm)
+    needs: release-notes
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.release-notes.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release-engine
+          workspaces: |
+            embed/plain
+            embed/tests/wasmtime-host
+            tools/fixture-rpc
+          save-if: false
+      - name: C toolchain for wasm32
+        uses: ./.github/actions/wasm32-c-toolchain
+      - name: wasm-bindgen and binaryen
+        uses: ./.github/actions/wasm-tools
+      - name: build the module and its test hosts
+        working-directory: embed
+        run: |
+          set -euo pipefail
+          plain/build.sh "$GITHUB_WORKSPACE/nuthatch-events.wasm"
+          cargo build --locked --release --manifest-path tests/wasmtime-host/Cargo.toml
+          cargo build --locked --release --manifest-path ../tools/fixture-rpc/Cargo.toml
+      - name: gate the module that ships
+        working-directory: embed
+        # `shell: bash` for pipefail: every run is piped into tee.
+        shell: bash
+        run: |
+          set -euo pipefail
+          m="$GITHUB_WORKSPACE/nuthatch-events.wasm" d=../tests/fixtures/tab-parity
+          host=tests/wasmtime-host/target/release/wasmtime-host rpc=../tools/fixture-rpc/target/release/fixture-rpc
+          cache=(--cache "$RUNNER_TEMP/cwasm")
+          node plain/imports.mjs "$m"
+          node size.mjs "$m" --max-brotli 5500000
+          $host abi "$m" "${cache[@]}" | tee "$RUNNER_TEMP/abi.log"
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' ../Cargo.toml | head -1)
+          engine=$(head -1 "$RUNNER_TEMP/abi.log" | jq -r '.nh_abi.engine')
+          if [ "$engine" != "$version" ]; then
+            echo "::error::nh_abi reports engine $engine, Cargo.toml says $version"
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not name Cargo.toml's version $version"
+            exit 1
+          fi
+          $rpc recorded --port 8953 --file $d/chain.json.gz &
+          $rpc recorded --fork --port 8954 --file $d/chain.json.gz &
+          for p in 8953 8954; do
+            for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:$p/ && break; sleep 0.2; done
+          done
+          node hosts/node/run.mjs "$m" http://127.0.0.1:8953/ $d s3 | tee "$RUNNER_TEMP/node.log"
+          node hosts/node/run.mjs "$m" http://127.0.0.1:8954/ $d s5 | tee -a "$RUNNER_TEMP/node.log"
+          node hosts/node/run.mjs "$m" http://127.0.0.1:8954/ $d s5 --restart | tee -a "$RUNNER_TEMP/node.log"
+          $host run "$m" http://127.0.0.1:8954/ $d s5 "${cache[@]}" | tee "$RUNNER_TEMP/wasmtime.log"
+          $host run "$m" http://127.0.0.1:8954/ $d s5 --restart "${cache[@]}" | tee -a "$RUNNER_TEMP/wasmtime.log"
+          node hosts/agree.mjs "$m" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" --hosts node,wasmtime
+      - name: package
+        run: |
+          set -euo pipefail
+          shasum -a 256 nuthatch-events.wasm > nuthatch-events.wasm.sha256
+          cp embed/README.md nuthatch-events-README.md
+          cat nuthatch-events.wasm.sha256
+          ls -l nuthatch-events.wasm
+      - name: keep the module (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nuthatch-events
+          path: |
+            nuthatch-events.wasm
+            nuthatch-events.wasm.sha256
+            nuthatch-events-README.md
+          retention-days: 7
+      - name: attach to release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            nuthatch-events.wasm
+            nuthatch-events.wasm.sha256
+            nuthatch-events-README.md
+          fail_on_unmatched_files: true
+      - name: attest the built module
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: nuthatch-events.wasm
+
   # Publish the container image (RFC-0005 release engineering). "Build it yourself from this Dockerfile"
   # is not a deployment story for a platform team, which is what this closes.
   container:
@@ -254,8 +360,8 @@ jobs:
 
   # The release goes public here and nowhere else (#626). Everything above builds against a draft:
   # three binary targets with their scaled and graph variants, and two container images that are
-  # smoke-tested before they are pushed. Only when all of that has succeeded does the release stop
-  # being a draft.
+  # smoke-tested before they are pushed, and the embeddable engine's module, gated on the file that
+  # ships. Only when all of that has succeeded does the release stop being a draft.
   #
   # `needs: container` rather than `needs: build`, and that is a deliberate choice rather than an
   # oversight: an image is part of what a release promises (RFC-0005), so a green matrix with a failed
@@ -270,7 +376,7 @@ jobs:
   # anyway" is the exact behaviour the issue was filed about.
   publish:
     name: publish the release
-    needs: container
+    needs: [container, engine]
     runs-on: ubuntu-latest
     steps:
       # #830 asks the workflow to verify artifact identity **before publishing**, which is the half
@@ -287,13 +393,18 @@ jobs:
           set -euo pipefail
           mkdir -p verify && cd verify
           gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --pattern '*.tar.gz' --clobber
+            --pattern '*.tar.gz' --pattern 'nuthatch-events.wasm' --clobber
           shopt -s nullglob
           files=(*.tar.gz)
           if [ ${#files[@]} -eq 0 ]; then
             echo "::error::no tarballs on the release to verify - the build matrix attached nothing"
             exit 1
           fi
+          if [ ! -f nuthatch-events.wasm ]; then
+            echo "::error::no nuthatch-events.wasm on the release - the engine job attached nothing"
+            exit 1
+          fi
+          files+=(nuthatch-events.wasm)
           for f in "${files[@]}"; do
             echo "--- $f ---"
             gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"
