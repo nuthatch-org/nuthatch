@@ -308,6 +308,8 @@ pub struct Nest {
     pub name: String,
     pub chain: String,
     pub chain_id: u64,
+    /// Absent → none here; the run supplies them (`--rpc`, or `NUTHATCH_RPC_<chain id>` on a directory of chains).
+    #[serde(default)]
     pub rpc_urls: Vec<String>,
     /// Config schema version (see `CURRENT_SCHEMA_VERSION`). Absent in older nests → treated as 1.
     #[serde(default = "default_schema_version")]
@@ -637,5 +639,11 @@ abi = "abis/token.json"
         assert!(refused(&alias).contains("contract alias"));
         let graph = NEST.replace("rpc_urls = []", "rpc_urls = []\nschema_version = 3");
         assert!(refused(&graph).contains("--features graph"));
+    }
+
+    #[test]
+    fn a_nest_may_leave_its_rpc_urls_to_the_run() {
+        let cfg = NestConfig::parse(&NEST.replace("rpc_urls = []\n", "")).unwrap();
+        assert!(cfg.nest.rpc_urls.is_empty());
     }
 }
