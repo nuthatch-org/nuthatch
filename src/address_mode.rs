@@ -4578,6 +4578,12 @@ pub async fn dev(
     let poll_interval = poll_interval(args.poll_interval, ah)?;
     let (listener, loopback) = bind(&args.listen).await?;
     let urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
+    if urls.is_empty() {
+        bail!(
+            "chain {} has no RPC: pass --rpc, or set rpc_urls in nuthatch.toml",
+            config.nest.chain_id
+        );
+    }
     let trace = if args.trace_rpc.is_empty() {
         urls.clone()
     } else {
@@ -4632,6 +4638,26 @@ pub fn chain_dirs(dir: &Path) -> Result<Option<Vec<(std::path::PathBuf, Config)>
     Ok(Some(chains))
 }
 
+/// A chain's main and trace RPCs: `NUTHATCH_RPC_<id>` and `NUTHATCH_TRACE_RPC_<id>` from `env`, so a
+/// keyed URL stays out of nuthatch.toml, else the nest's `rpc_urls`; the trace RPC falls back to the main.
+fn chain_rpcs(
+    id: u64,
+    configured: &[String],
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let read = |name: &str| {
+        env(&format!("{name}_{id}"))
+            .filter(|v| !v.is_empty())
+            .map(|v| v.split(',').map(str::to_string).collect::<Vec<_>>())
+    };
+    let main = read("NUTHATCH_RPC").unwrap_or_else(|| configured.to_vec());
+    if main.is_empty() {
+        bail!("chain {id} has no RPC: set NUTHATCH_RPC_{id}, or rpc_urls in its nuthatch.toml");
+    }
+    let trace = read("NUTHATCH_TRACE_RPC").unwrap_or_else(|| main.clone());
+    Ok((main, trace))
+}
+
 /// `nuthatch dev` on a directory of chain nests: each runs its own cursor, as it would solo, and one
 /// listener serves them all, `/api` by `chainid`.
 pub async fn dev_chains(
@@ -4648,18 +4674,19 @@ pub async fn dev_chains(
         );
     }
     let (listener, loopback) = bind(&args.listen).await?;
-    let mut nests: BTreeMap<u64, Nest> = BTreeMap::new();
+    // Every chain's RPCs before any cursor starts: a chain without one is refused with nothing running.
+    let mut pools = Vec::with_capacity(chains.len());
     for (sub, config) in &chains {
+        pools.push(
+            chain_rpcs(config.nest.chain_id, &config.nest.rpc_urls, |name| {
+                std::env::var(name).ok()
+            })
+            .with_context(|| format!("starting {}", sub.display()))?,
+        );
+    }
+    let mut nests: BTreeMap<u64, Nest> = BTreeMap::new();
+    for ((sub, config), (main, trace)) in chains.iter().zip(pools) {
         let id = config.nest.chain_id;
-        // From the environment, so a keyed URL stays out of nuthatch.toml.
-        let env = |name: &str| {
-            std::env::var(format!("{name}_{id}"))
-                .ok()
-                .filter(|v| !v.is_empty())
-                .map(|v| v.split(',').map(str::to_string).collect::<Vec<_>>())
-        };
-        let main = env("NUTHATCH_RPC").unwrap_or_else(|| config.nest.rpc_urls.clone());
-        let trace = env("NUTHATCH_TRACE_RPC").unwrap_or_else(|| main.clone());
         let ah = config
             .address_history
             .as_ref()
@@ -5947,6 +5974,48 @@ mod tests {
             Duration::from_secs(300),
             true,
         ))
+    }
+
+    /// #2471: a chain's RPCs come from its environment variables, else its `rpc_urls`, and a chain
+    /// with neither is refused by name rather than as an empty pool.
+    #[test]
+    fn a_chains_rpcs_come_from_the_environment_else_the_nest() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let set = env(&[("NUTHATCH_RPC_8453", "https://a,https://b")]);
+        assert_eq!(
+            chain_rpcs(8453, &[], set).unwrap(),
+            (
+                vec!["https://a".to_string(), "https://b".to_string()],
+                vec!["https://a".to_string(), "https://b".to_string()]
+            )
+        );
+        let traced = env(&[
+            ("NUTHATCH_RPC_56", "https://main"),
+            ("NUTHATCH_TRACE_RPC_56", "https://trace"),
+        ]);
+        assert_eq!(
+            chain_rpcs(56, &["https://toml".into()], traced).unwrap(),
+            (vec!["https://main".into()], vec!["https://trace".into()])
+        );
+        assert_eq!(
+            chain_rpcs(56, &["https://toml".into()], env(&[]))
+                .unwrap()
+                .0,
+            vec!["https://toml".to_string()]
+        );
+        let err = chain_rpcs(8453, &[], env(&[("NUTHATCH_RPC_8453", "")]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("NUTHATCH_RPC_8453") && err.contains("rpc_urls"),
+            "{err}"
+        );
     }
 
     /// #2470: a body naming `chainid` changes that chain alone, the bare form still reaches every
