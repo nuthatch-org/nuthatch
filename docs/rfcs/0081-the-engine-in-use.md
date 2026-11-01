@@ -3,7 +3,8 @@
 - Status: **Accepted, 2026-10-31 (Chief). S0 measured 2026-11-01 (§11): narrow.** Row-group reads are not
   selective; a hybrid open of whole tables passes every gate but the 64 MiB one. S1 accepted on those
   narrowed terms 2026-11-01 (Chief): whole segments of the named tables, 200 MiB from the mirror, cold
-  under 300 s. **S1 measured 2026-11-01 (§12).** No later slice is begun until Chief says.
+  under 300 s. **S1 measured 2026-11-01 (§12).** S2 begun on Chief's word the same day; **S2 measured
+  2026-11-01 (§13).** No later slice is begun until Chief says.
 - Author: Pete (cargopete)
 - Date: 2026-10-31
 - Depends on: RFC-0077 (the embeddable engine, S0 to S5 and S7 built, shipped as
@@ -478,3 +479,93 @@ pack is not yet reused between visits, so a second visit fetches the 179 MiB aga
 built-in views of a `mirror+rpc` nest fold the hydrated history whole, not through the filters; read the
 named tables through `/sql`. The JavaScript tab build (`/play`) answers Arrow too but does not expose the
 envelope; the plain module is the engine this RFC builds on.
+
+## 13. S2 measured, 2026-11-01
+
+**Verdict: the gate passes.** Chief said go to S2 the same day.
+
+**What was built.**
+
+- **`nuthatch-engine.js`**, `embed/hosts/package/`: `engine.js` and `build.mjs`, which joins it with
+  `host.js`, `opfs.js` and `fs-storage.mjs` into one ES module, their code copied unchanged, and names
+  each source's sha256 in its header. 29,298 bytes (9,895 gzip), no dependency, no top-level await: a
+  `node:` import becomes `process.getBuiltinModule`, which a browser and a bundler never reach. The
+  API is §3.3's: `Engine.open({module, nest, rpc, storage, ...})`, `follow()`, `sql(q, {attach})`,
+  `arrow(q)`, `request()`, `close()`, with every other key `nh_open`'s, so `source`, `filters` with
+  `privacy`, `mirror` and `attach` pass through. In a page each nest runs in the package's own worker,
+  one per page, started from the package's URL; in a worker or in Node, in place. It owns the store
+  (OPFS, memory, or a directory in Node), names it by module, files and what the store holds when the
+  caller does not, retries a POST that got no reply, splits a batch past its endpoint's cap (10 for
+  arb1, Lodestar's figure) and paces the parts through a throttle, and carries `follow_failed` as
+  S7's worker did. It refuses a module that is not `abi: 1`. `embed/README.md` documents it.
+- **The pack reused between visits**, S1's first gap. The module already reopened a hydrated store
+  without asking the mirror; nothing checked it. Now hydration records the dataset in the store, and a
+  reopen requires the files to name that dataset and every packed segment to hash to its content
+  address, or fails `open_failed` ending "open it fresh", which the package does once. What is new
+  comes from the RPC, from the store's last block, as for any reopened nest. The report's `mirror`
+  gains `reused`. No export changes; `abi` stays 1.
+- **Release.** The engine job builds the package at the released version, runs both package gates on
+  the module that ships, and attaches `nuthatch-engine.js` and its `.sha256` beside the module, attested
+  and checked before publishing like it. No npm (§9).
+
+**The gate.**
+
+| Gate | Result |
+|---|---|
+| Lodestar's `/profile` on the package, its vendored worker and batching deleted, S7's seven addresses | **pass**: 409 figures, 0 differing, headless Brave on OPFS (below) |
+| A `docs/` example under 40 lines: defi-pulse-nest from the public mirror, one `/sql` equal to a node | **pass**: `docs/examples/engine-defi-pulse.mjs`, 29 lines. 1,573 segments through block 26,319,435 in 34.7 s; 145,574 USDC mints and 31,712,233,655,307,092 minted to block 24,500,000, the same from the 5.16.0 binary seeded from the same mirror (`nuthatch seed`, `nuthatch sql`) |
+| The package's Node half runs S5's 32 answers to `22966cee…363febc5` | **pass**, `hosts/package/run.mjs s5`: opened fresh (1,433 RPC requests, 4.2 s) and again from its kept store (2 requests, 0.1 s), both `22966cee…363febc5` |
+| Binary unchanged; size gate held | **pass**: nothing outside `embed/`, `docs/` and the two workflows is touched. 5,322,991 bytes brotli, 219 fewer than `main`'s module and 177,009 under the gate |
+
+**Lodestar** (`pete/engine-package`): `verify-worker.js`, the vendored `host.js` and `opfs.js`, the
+header batching and `pools.toml` are gone. The page imports the package from
+`public/verify-locally/engine/`, runs the wallet nest `rpc` with private filters and `attach: pools`,
+and, when the wallet is in a pool, the pools nest as graph-allocations-nest at `7795a33` opened
+`mirror+rpc` with public filters, its two answers attached as Arrow. `literalRows` is gone; a wallet in
+no pool opens no pools nest and its statements read two empty relations. The lines that host the
+engine fell from 233 (the worker and `browser.ts`) to 132 (`engine.ts` and `browser.ts`); with
+`run.ts` and the vendor script the four files went from 450 lines to 386, the vendor script now also
+writing the pools nest. Apple M5 Pro, `next dev`, headless Brave, fresh profile per address, the public
+Worker and `https://arb1.arbitrum.io/rpc`:
+
+| Wallet | Block | Figures | Differ | Pools | RPC requests | Cold |
+|---|---|---|---|---|---|---|
+| 0xcdb9…b2c3 | 520,276,680 | 81 | 0 | 2 | 708 | 104 s |
+| 0x3a35…bb3c | 520,276,896 | 43 | 0 | 1 | 777 | 122 s |
+| 0xe3af…2ac2 | 520,277,318 | 32 | 0 | 1 | 943 | 166 s |
+| 0xd7d7…d076 | 520,277,938 | 53 | 0 | 3 | 691 | 107 s |
+| 0x96a3…65b2 | 520,278,374 | 50 | 0 | 0 | 659 | 73 s |
+| 0x6d64…24bc | 520,278,574 | 50 | 0 | 0 | 670 | 70 s |
+| 0xacbd…0db5 | 520,278,782 | 100 | 0 | 0 | 798 | 107 s |
+
+Lodestar's lint (0 errors), typecheck and 1,314 tests pass. Its `scripts/verify-locally-node.mjs` runs
+the page's own `verify` on the package over files, which is how the Node figures below were taken.
+
+**The second visit, 0xd7d7…d076.**
+
+| | Mirror GETs | Mirror bytes | RPC requests | Time | Figures |
+|---|---|---|---|---|---|
+| Brave on OPFS, first visit | 2,002 | 188,066,801 | 690 | 107 s | 53, 0 differ |
+| Brave on OPFS, second visit, same profile | 0 | 0 | 4 | 6 s | 53, 0 differ |
+| Node over files, first visit | 2,002 | 188,066,801 | 700 | 115.6 s | 53, 0 differ |
+| Node, second visit | 0 | 0 | 4 | 4.6 s | 53, 0 differ |
+| Node, a later visit, 4,203 blocks on | 0 | 0 | 72 | 8.1 s | 53, 0 differ |
+
+The two second visits were at the server's same block, which its cache held. The pools nest's reopen,
+the 2,000 packed segments (185,432,974 bytes) hashed against their addresses included, took 1.7 s in
+Node. **Mutation**: the hash comparison in `Cellar::check_packed` disabled, `run.mjs reuse` goes red
+on its altered pack ("an altered pack was opened, not fetched again", the rebuild failing on the bytes
+the check let through), and passes again restored.
+
+**What does not match the RFC, or is left.**
+
+- **Reuse is per store, and a store is per pool set.** A different wallet, or the same wallet in a new
+  pool, is a new store and fetches the 179 MiB again. The RPC tail is filtered by the pools, so a
+  store cannot be shared across pool sets; sharing the pack alone between stores is not built.
+- **The page ships the pools nest's data files**, 1,744,203 bytes of JSON (720,000 gzip), because the
+  identity hashes every data file, and graph-allocations-nest's include `verification/` id lists and a
+  check script that no indexing reads.
+- **Stores are not cleaned up.** A new module names new stores; the old ones stay in OPFS.
+- `embed/hosts/node/hybrid.mjs`, S1's driver, reads Lodestar's `literalRows` and two-config
+  `nestFiles`, which the Lodestar branch removes; it runs against Lodestar's `main` as it stood for S1.
+- Firefox, Safari and a phone are S5's; no browser but Brave ran the package.
