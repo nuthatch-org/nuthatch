@@ -1,5 +1,5 @@
 // RFC-0081 S2's gates for the host package's Node half, run on the bundle as released:
-//   s5     RFC-0075 S5's 32 answers through `Engine.open`, `follow` and `request`, equal to the node's
+//   s5     RFC-0075 S5's 33 answers through `Engine.open`, `follow` and `request`, equal to the node's
 //          pin; then the same nest opened again from the store it kept, the same answers again.
 //   reuse  RFC-0077 S4's entity nest from its local mirror, closed and opened again: the second open
 //          asks the mirror for nothing and answers the same; a pack with one byte altered is refused

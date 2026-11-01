@@ -1,7 +1,7 @@
 // RFC-0077 S2: the browser host (`../browser/host.js`) in Node, over files, driving the plain module
 // through `abi: 1`. Two gates, by the chain fixture-rpc serves:
 //   s3  RFC-0075 S3's recording: the segment hashes and 1,000 balances equal `expected.json`.
-//   s5  the same with `--fork` and S4's entities and views: all 32 of RFC-0075 S5's answers equal
+//   s5  the same with `--fork` and S4's entities and views: all 33 of RFC-0075 S5's answers equal
 //       `s5-expected.json`, masked as `tests/e2e_tab_answers.rs` masks.
 // `--restart` is RFC-0077 S3's: a child process follows from an empty store until a segment is
 // sealed and is killed with requests outstanding, then this one reopens the same files and finishes.

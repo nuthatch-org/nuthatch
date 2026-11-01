@@ -49,6 +49,13 @@
     "body": "{\"count\":2,\"truncated\":true,\"degraded\":false,\"degraded_tables\":[],\"tip_unavailable\":false,\"columns\":[\"block_number\"],\"rows\":[{\"block_number\":26239813},{\"block_number\":26239813}],\"cached\":false,\"provenance\":{\"as_of\":26245870,\"sealed_through\":26245806,\"source\":\"hot+sealed\",\"registry_hash\":\"0x94ba85b9815a879678bac1e89f20ed71cd246c099fff458967e3398d0f88f4c3\",\"nid\":\"<masked>\",\"entities\":null}}"
   },
   {
+    "method": "POST",
+    "path": "/sql",
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"count\":5,\"truncated\":false,\"degraded\":false,\"degraded_tables\":[],\"tip_unavailable\":false,\"columns\":[\"kind\",\"block_number\",\"log_index\"],\"rows\":[{\"kind\":\"a\",\"block_number\":26245861,\"log_index\":0},{\"kind\":\"a\",\"block_number\":26245861,\"log_index\":1},{\"kind\":\"a\",\"block_number\":26245862,\"log_index\":0},{\"kind\":\"a\",\"block_number\":26245862,\"log_index\":1},{\"kind\":\"a\",\"block_number\":26245863,\"log_index\":0}],\"cached\":false,\"provenance\":{\"as_of\":26245870,\"sealed_through\":26245806,\"source\":\"hot+sealed\",\"registry_hash\":\"0x94ba85b9815a879678bac1e89f20ed71cd246c099fff458967e3398d0f88f4c3\",\"nid\":\"<masked>\",\"entities\":null}}"
+  },
+  {
     "method": "GET",
     "path": "/sql?q=SELECT%20nope%20FROM%20tab__transfer",
     "status": 400,
