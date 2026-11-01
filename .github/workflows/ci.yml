@@ -897,6 +897,34 @@ jobs:
           filter: not (binary(network_contract) | (binary_id(nuthatch) & test(/^serve::tests::.*network/)))
           name: features-${{ matrix.shard }}
 
+  # RFC-0079 §16: `nuthatch dev --flight` against Apache Arrow ADBC's Flight SQL driver, the Go
+  # implementation every ADBC binding loads, as well as arrow-flight's own client. The features shards
+  # run the same test without the Go half.
+  flight-clients:
+    name: Flight SQL clients (ADBC, arrow-flight)
+    needs: check-features
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NUTHATCH_FLIGHT_GO_CLIENT: ${{ github.workspace }}/flight-client
+      NUTHATCH_REQUIRE_FLIGHT_GO: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: tools/flight-client/go.mod
+          cache-dependency-path: tools/flight-client/go.sum
+      - name: build the ADBC client
+        working-directory: tools/flight-client
+        run: go build -o "$NUTHATCH_FLIGHT_GO_CLIENT" .
+      - uses: ./.github/actions/nextest-shard
+        with:
+          archive: nextest-features
+          shard: 1
+          of: 1
+          filter: test(e2e_flight_clients)
+          name: flight-clients
+
   pg-parity:
     name: scaled mode (parity · control plane · reconcile)
     needs: changes

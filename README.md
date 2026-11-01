@@ -253,7 +253,8 @@ curl 'localhost:8288/sql?q=SELECT%20count(*)%20FROM%20weth__transfer'
   (or `format=arrow`) to `/sql`, or the `Accept` header to `/q/{name}`, and the rows come back as an
   Arrow IPC stream that pyarrow, Polars, DuckDB or Arrow JS read directly, with the envelope in the
   `x-nuthatch-answer` header. Same rows as the JSON answer, same caps; worth it for exports, not
-  point reads. A build with `--features flight` also serves Arrow Flight SQL (`dev --flight`). See
+  point reads. The flight build (`nuthatch-flight-<target>.tar.gz` on a release, or `--features
+  flight`) also serves Arrow Flight SQL (`dev --flight`), proven with ADBC's Flight SQL driver. See
   [operators.md](docs/operators.md) (RFC-0079).
 - **What happened, and where did the tokens go.** `nuthatch diff --from X --to Y` (or `--block`,
   `--tx`, `--since-last`) tells a range in fixed sentences with exact amounts: every ownership,

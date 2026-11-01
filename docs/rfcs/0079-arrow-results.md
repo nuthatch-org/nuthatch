@@ -1,6 +1,6 @@
 # RFC-0079: Arrow results - `/sql` in Arrow IPC, and Flight SQL for native clients
 
-- Status: **Complete (2026-11-01): S0 to S3 built (§12 to §15).** **Accepted (2026-10-30, Chief): "ok letsgoooo with the wave of rfcs".** Built in the order 0078, 0079, 0080, each slice on its own gate; an S0 that fails stops its RFC. Chief, the same day, on GraphOps's
+- Status: **Complete (2026-11-01): S0 to S3 built (§12 to §15); the flight build released and proven with ADBC (§16).** **Accepted (2026-10-30, Chief): "ok letsgoooo with the wave of rfcs".** Built in the order 0078, 0079, 0080, each slice on its own gate; an S0 that fails stops its RFC. Chief, the same day, on GraphOps's
   five suggestions: "lets do ALL that, 1-5 !!!!! but HA first", so this follows RFC-0078 in build order.
 - Author: Pete (cargopete)
 - Date: 2026-10-30
