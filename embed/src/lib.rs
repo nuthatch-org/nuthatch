@@ -15,6 +15,7 @@ pub use nuthatch_core::{entity_bind, entity_decl, entity_lower, sql_errors};
 pub mod attach;
 pub mod budget;
 pub mod cellar;
+pub mod complete;
 pub mod derived;
 pub mod entity;
 pub mod folds;
