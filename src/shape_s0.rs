@@ -577,7 +577,7 @@ impl Drop for Detach {
 mod tests {
     use super::*;
     use crate::feed::MemStore;
-    use crate::store::{HotStore, Store};
+    use crate::store::Store;
     use proptest::prelude::*;
     use std::collections::BTreeSet;
 
