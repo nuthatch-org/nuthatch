@@ -170,13 +170,11 @@ pub async fn hydrate(
     let base = mirror.base.as_str();
     let (mut snapshot, mut published, _) = read_snapshot(host, base, &dataset).await?;
     check_snapshot(&snapshot, &dataset, spec.chain.chain_id, spec.start)?;
-    // RFC-0081 S0's hybrid open: only the tables the filters name, each whole. A segment's hash
-    // covers the whole file, so a part of one could not be checked against it.
-    if let Some(narrowed) = &spec.narrowed {
-        let keep: std::collections::BTreeSet<&str> =
-            narrowed.iter().map(|n| n.table.as_str()).collect();
-        published.tables.retain(|t, _| keep.contains(t.as_str()));
-        snapshot.tails.retain(|t, _| keep.contains(t.as_str()));
+    // RFC-0081 S1's hybrid open: only the tables the filters' events decode into, each segment whole,
+    // since its hash covers the whole file. Which ones depends on no filter's value.
+    if let Some(keep) = &spec.hydrate {
+        published.tables.retain(|t, _| keep.contains(t));
+        snapshot.tails.retain(|t, _| keep.contains(t));
     }
     let indexed_from = snapshot.indexed_from;
     let (catalogue, wanted, complete_through) = match &mirror.postcard {
