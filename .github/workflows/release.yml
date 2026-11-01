@@ -270,6 +270,7 @@ jobs:
           node hosts/package/build.mjs "$p" --version "$version"
           node hosts/package/run.mjs "$p" "$m" s5 http://127.0.0.1:8954/ $d
           node hosts/package/run.mjs "$p" "$m" reuse $d/s4-nest $d/s4-mirror
+          node hosts/package/verify-fixture.mjs "$p" "$m" $d/s4-nest $d/s4-mirror http://127.0.0.1:8953/
       - name: package
         run: |
           set -euo pipefail
