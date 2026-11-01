@@ -435,6 +435,9 @@ fn open(raw: &[u8]) -> Result<Value, Fault> {
 fn spec_of(c: &Config) -> Result<NestSpec, Fault> {
     let bad = |m: &str| Err(fault("bad_config", m));
     let mut spec = match (c.files.contains_key(CONFIG_FILE), &c.contract, c.start) {
+        (true, None, None) if hybrid(c) => {
+            NestSpec::from_files(&without_calls(&c.files)).map_err(|e| fault_of("bad_config", e))?
+        }
         (true, None, None) => {
             NestSpec::from_files(&c.files).map_err(|e| fault_of("bad_config", e))?
         }
@@ -465,9 +468,6 @@ fn spec_of(c: &Config) -> Result<NestSpec, Fault> {
         spec.start_block().map_err(|e| fault_of("bad_config", e))?;
     }
     if let Some(filters) = &c.filters {
-        if c.mirror.is_some() {
-            return bad("a mirror holds a nest's whole history, and `filters` select part of it");
-        }
         if c.contract.is_some() {
             return bad("`filters` name contracts by their alias in a nuthatch.toml");
         }
@@ -480,6 +480,35 @@ fn spec_of(c: &Config) -> Result<NestSpec, Fault> {
         None => {}
     }
     Ok(spec)
+}
+
+/// RFC-0081 S0's hybrid open, a spike: `mirror` and `filters` together hydrate the tables the
+/// filters name and then ask the RPC for the filters' logs from where the mirror ends.
+fn hybrid(c: &Config) -> bool {
+    c.mirror.is_some() && c.filters.is_some()
+}
+
+/// The nest's files with `[[calls]]` cut from its `nuthatch.toml`. The dataset names the whole
+/// directory, so the identity is computed from the files as given; the calls' tables are not hydrated
+/// and no call is made.
+fn without_calls(files: &NestFiles) -> NestFiles {
+    let mut out = files.clone();
+    if let Some(raw) = files.get(CONFIG_FILE) {
+        let mut kept = String::new();
+        let mut in_calls = false;
+        for line in raw.lines() {
+            let t = line.trim_start();
+            if t.starts_with('[') {
+                in_calls = t.starts_with("[[calls]]");
+            }
+            if !in_calls {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+        out.insert(CONFIG_FILE.to_string(), kept);
+    }
+    out
 }
 
 /// A file opened through the host, as a handle.
@@ -603,6 +632,11 @@ fn build(
     bytes: Option<Bytes>,
     hydrated: Option<Hydrated>,
 ) -> anyhow::Result<Engine> {
+    let mut c = c;
+    if hybrid(&c) {
+        // The dataset's views read the whole network, and a hybrid nest holds part of it.
+        c.files.retain(|p, _| !p.starts_with("views/"));
+    }
     let start = spec.start.unwrap_or_default();
     let budget = c.memory_mib.map(TabBudget::mib).unwrap_or_default();
     let mut nest = young::open_nest(store, cellar.clone(), spec, start, budget)?;

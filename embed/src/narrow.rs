@@ -4,7 +4,8 @@
 //! serves a hundred thousand to one with a list (arb1.arbitrum.io, measured 2026-10-31).
 //!
 //! A narrowed nest is not the contract's history: an event no filter names is not fetched at all, and
-//! its table stays empty. It is a selection the host made, so it is never hydrated from a mirror.
+//! its table stays empty. RFC-0081 S0 spikes the one exception, a hybrid open: the named tables
+//! hydrated from a mirror, the filters then asked of the RPC from where the mirror ends.
 
 use crate::nest::NestSpec;
 use anyhow::{anyhow, bail, ensure, Result};
@@ -35,6 +36,8 @@ pub struct FilterSpec {
 pub struct Narrowed {
     pub filter: LogFilter,
     pub from: u64,
+    /// The table its logs decode into, which a hybrid open (RFC-0081 S0) hydrates whole.
+    pub table: String,
 }
 
 /// At most this many filters' requests are with the host at once.
@@ -154,7 +157,11 @@ pub fn build(spec: &NestSpec, specs: &[FilterSpec]) -> Result<Vec<Narrowed>> {
             )
             .expect("an address and a topic0")
             .with_topics(topics);
-            out.push(Narrowed { filter, from });
+            out.push(Narrowed {
+                filter,
+                from,
+                table: decoder.table.clone(),
+            });
         }
     }
     Ok(out)

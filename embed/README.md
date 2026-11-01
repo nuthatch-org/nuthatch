@@ -191,7 +191,9 @@ cursor then asks for those logs only: one `eth_getLogs` per filter and value, si
 serves ten million blocks to a filter with one value per topic serves far fewer to one with a list
 (arb1.arbitrum.io: 10,000,000 against 100,000). An event no filter names is not fetched, and its
 table stays empty: a narrowed nest is a selection, not the contract's history, so `filters` and
-`mirror` are refused together, as is a factory. A filter naming an event, argument or value the nest
+`mirror` are refused together, as is a factory. The exception is RFC-0081 S0's spike of a hybrid open,
+not a supported shape: given both, the module hydrates the tables the filters name, whole, from the
+mirror, then asks the RPC for the filters' logs from where the mirror ends. A filter naming an event, argument or value the nest
 cannot mean is refused by name (`bad_config`). Each log the endpoint returns is checked against the
 filter that asked for it, so an endpoint that ignores a topic costs bandwidth, not correctness; a
 range it will not answer whole is halved, and a throttle is asked again after a rest.
