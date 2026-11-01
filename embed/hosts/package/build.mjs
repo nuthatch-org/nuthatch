@@ -1,7 +1,8 @@
 // RFC-0081 S2: bundles the host package into one ES module, `nuthatch-engine.js`, from `engine.js` and
 // the reference hosts it imports, their code copied as it is. Nothing is fetched and no dependency is
 // installed: the files are joined in order, their relative imports dropped and their exports made
-// local, and a `node:` default import becomes a lazy one so a browser never asks for it. The output
+// local, and a `node:` default import becomes `process.getBuiltinModule`, synchronous and asked only
+// in Node, so a browser or a bundler never sees it and the module needs no top-level await. The output
 // names the version and the sha256 of every source, and is the same bytes on every machine.
 // Usage: node build.mjs <out.js> [--version x.y.z]
 import { readFileSync, writeFileSync } from "node:fs";
@@ -30,7 +31,7 @@ const parts = SOURCES.map((rel) => {
     if (/^import .* from "\.\.?\/.*";$/.test(line)) return null;
     const node = line.match(/^import (\w+) from "(node:[\w/]+)";$/);
     if (node) {
-      return `const ${node[1]} = ON_NODE_ ? (await import(/* webpackIgnore: true */ /* @vite-ignore */ "${node[2]}")).default : undefined;`;
+      return `const ${node[1]} = ON_NODE_ ? process.getBuiltinModule("${node[2]}") : undefined;`;
     }
     if (/^import /.test(line)) throw new Error(`${rel}: an import the bundle cannot place: ${line}`);
     if (entry) return line;

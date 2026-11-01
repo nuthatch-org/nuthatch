@@ -86,7 +86,7 @@ async function moduleBytes(m) {
   const name = String(m);
   let body;
   if (ON_NODE && !/^(https?|data|blob):/i.test(name)) {
-    const { readFile } = await import(/* webpackIgnore: true */ /* @vite-ignore */ "node:fs/promises");
+    const { readFile } = process.getBuiltinModule("node:fs/promises");
     const file = /^file:/i.test(name) ? new URL(name) : name;
     body = new Response(await readFile(file)).body;
   } else {
@@ -116,7 +116,7 @@ function compile(m) {
 async function filesOf(nest) {
   if (nest === undefined || typeof nest === "object") return nest;
   if (!ON_NODE) throw new Error("`nest` is a nest's files by path; a directory is read in Node only");
-  const { readdirSync, readFileSync } = await import(/* webpackIgnore: true */ /* @vite-ignore */ "node:fs");
+  const { readdirSync, readFileSync } = process.getBuiltinModule("node:fs");
   const out = {};
   const walk = (rel) => {
     for (const e of readdirSync(rel ? `${nest}/${rel}` : nest, { withFileTypes: true })) {
