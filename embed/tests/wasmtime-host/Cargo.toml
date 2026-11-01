@@ -21,5 +21,8 @@ ureq = "3"
 # The last release whose MSRV is the pinned 1.95. Apache-2.0 WITH LLVM-exception. Never a dependency
 # of the binary: this crate has its own lockfile, and RFC-0077 §1a's gate checks the binary's.
 wasmtime = { version = "48", features = ["winch"] }
+# RFC-0081 S5: `verified_finalized` from Helios's beacon light client, its verification core only (MIT,
+# no networking or async runtime). Helios publishes no crates; 0.12.0 is pinned by its tag and the lockfile.
+helios-consensus-core = { git = "https://github.com/a16z/helios", tag = "0.12.0" }
 
 [workspace]

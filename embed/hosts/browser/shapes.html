@@ -1,0 +1,76 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nest in a tab: RFC-0077 S5's shapes</title>
+<pre id="out">running</pre>
+<script type="module">
+// RFC-0077 S5's shapes in a browser (RFC-0081 S5): each nest shape `tests/e2e_embed_shapes.rs` writes,
+// opened in its own nest worker on OPFS against its own fixture-rpc, followed era by era, answering its
+// requests after each. The harness (`run-sw.mjs --shapes`) serves the list and compares with the pins.
+const out = document.getElementById("out");
+const p = new URLSearchParams(location.search);
+const report = async (r) => {
+  out.textContent = JSON.stringify(r, null, 1).slice(0, 20000);
+  await fetch("../result", { method: "POST", body: JSON.stringify(r) });
+};
+
+function nest(open) {
+  const worker = new Worker("./nest-worker.js", { type: "module" });
+  let next;
+  worker.onmessage = (m) => next?.(m.data);
+  const reply = (want) => new Promise((resolve, reject) => {
+    next = (d) => (d.nest === "failed" ? reject(new Error(d.error)) : d.nest === want && resolve(d));
+  });
+  const ask = (req) => new Promise((resolve) => {
+    const { port1, port2 } = new MessageChannel();
+    port1.onmessage = (m) => resolve(m.data);
+    worker.postMessage({ nest: "request", method: req.method, target: req.path, body: req.body ?? "" }, [port2]);
+  });
+  return {
+    opened: (() => { const r = reply("opened"); worker.postMessage({ nest: "open", ...open }); return r; })(),
+    follow: () => { const r = reply("followed"); worker.postMessage({ nest: "follow" }); return r; },
+    ask,
+    close: () => worker.terminate(),
+  };
+}
+
+try {
+  const shapes = await (await fetch("../shapes")).json();
+  const module = new URL(p.get("module"), location.href).href;
+  const results = [];
+  const dec = new TextDecoder();
+  for (const s of shapes) {
+    const t = performance.now();
+    const n = nest({
+      nid: `shape-${s.name}`, rpc: s.rpc, module,
+      config: { nid: `shape-${s.name}`, rpc: ["main"], storage: "host", fresh: true, files: s.files, poll_interval_secs: 1 },
+    });
+    const eras = [];
+    let module_sha256;
+    try {
+      ({ module_sha256 } = await n.opened);
+      for (let era = 0; era < s.eras; era++) {
+        if (era > 0) {
+          await fetch(`${s.rpc}control/fork`, { method: "POST" });
+          const f = await n.follow();
+          if (f.error) throw new Error(f.error);
+        }
+        const answers = [];
+        for (const req of s.requests) {
+          const a = await n.ask(req);
+          if (a.error) throw new Error(a.error);
+          answers.push({ method: req.method, path: req.path, status: a.status, content_type: a.contentType, body: dec.decode(a.body) });
+        }
+        eras.push(answers);
+      }
+      results.push({ shape: s.name, module_sha256, eras, ms: Math.round(performance.now() - t) });
+    } catch (e) {
+      results.push({ shape: s.name, module_sha256, eras, error: String(e && e.stack || e) });
+    } finally {
+      n.close();
+    }
+  }
+  await report({ ok: true, results });
+} catch (e) {
+  await report({ ok: false, error: String(e && e.stack || e) });
+}
+</script>

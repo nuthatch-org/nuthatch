@@ -1,17 +1,27 @@
 //! RFC-0077 S2: the reference non-browser host for `abi: 1` (`embed/README.md`), and the test
-//! harness that holds the plain module to it. wasmtime from Rust, the RPC over ureq, storage mode
-//! `host` over files, the clock and randomness from the OS.
+//! harness that holds the plain module to it. wasmtime from Rust, the RPC and a mirror's GETs over
+//! ureq, storage mode `host` over files, the clock and randomness from the OS, and the verified head
+//! from Helios's light client (RFC-0081 S5).
 //!
 //!   wasmtime-host abi <module.wasm> [--cache <dir>]
 //!   wasmtime-host run <module.wasm> <rpc-url> <tab-parity-dir> <s3|s5> [--storage bytes|host]
-//!                     [--cache <dir>] [--winch]
+//!                     [--cache <dir>] [--winch] [--restart] [--helios <run.json.gz> [--forge]]
+//!   wasmtime-host open <module.wasm> <config.json> [--rpc <url>] [--cache <dir>] [--answer]
+//!                     [--helios <run.json.gz> | --beacon <url> --checkpoint <root>]
+//!   wasmtime-host helios <beacon-url> <checkpoint> [--until-period <n>] [--out <run.json>]
 //!   wasmtime-host compile <module.wasm> <out.cwasm> [--serial] [--winch]
 //!
 //! `abi` fails a module whose shapes differ from its version's pinned table. `run` is the gate
-//! `hosts/node/run.mjs` runs in Node, and prints the same fields. `compile` measures a cold compile.
+//! `hosts/node/run.mjs` runs in Node, and prints the same fields; with `--helios`, S3's nest is opened
+//! `verified` and must seal under the head Helios verifies from that recorded run, or, with `--forge`,
+//! must seal nothing once the run's last finalized block is altered. `open` opens any `nh_open`
+//! config and follows it, then with `--answer` answers one request a line from stdin, for
+//! `hosts/node/mirror.mjs --wasmtime`. `helios` records a light client run from a beacon endpoint and
+//! prints the head it verifies. `compile` measures a cold compile.
 //! Each prints one JSON line of what it measured.
 
 mod abi;
+mod helios;
 mod mask;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -54,6 +64,16 @@ struct Opts {
     restart: bool,
     /// The child's half of `--restart`: the directory to follow into, then die.
     die_mid_follow: Option<PathBuf>,
+    /// A recorded light client run, verified for each `verified_finalized`.
+    helios: Option<PathBuf>,
+    /// Alter the recorded run's last finalized block before verifying it.
+    forge: bool,
+    beacon: Option<String>,
+    checkpoint: Option<String>,
+    until_period: Option<u64>,
+    out: Option<PathBuf>,
+    rpc: Option<String>,
+    answer: bool,
 }
 
 impl Opts {
@@ -68,6 +88,14 @@ impl Opts {
                 "--cache" => o.cache = it.next().map(PathBuf::from),
                 "--restart" => o.restart = true,
                 "--die-mid-follow" => o.die_mid_follow = it.next().map(PathBuf::from),
+                "--helios" => o.helios = it.next().map(PathBuf::from),
+                "--forge" => o.forge = true,
+                "--beacon" => o.beacon = it.next().map(|s| s.to_string()),
+                "--checkpoint" => o.checkpoint = it.next().map(|s| s.to_string()),
+                "--until-period" => o.until_period = it.next().and_then(|s| s.parse().ok()),
+                "--out" => o.out = it.next().map(PathBuf::from),
+                "--rpc" => o.rpc = it.next().map(|s| s.to_string()),
+                "--answer" => o.answer = true,
                 _ => bail!("unknown flag {f}"),
             }
         }
@@ -86,6 +114,53 @@ impl Opts {
         self.cache
             .clone()
             .unwrap_or_else(|| std::env::temp_dir().join("nuthatch-embed-cwasm"))
+    }
+
+    fn light(&self) -> Result<Light> {
+        let mut light = Light::default();
+        if let Some(p) = &self.helios {
+            let mut run = read_json(p)?;
+            if self.forge {
+                helios::forge(&mut run)?;
+            }
+            light.run = Some(run);
+        } else if let (Some(b), Some(c)) = (&self.beacon, &self.checkpoint) {
+            light.live = Some((b.clone(), c.clone()));
+        }
+        Ok(light)
+    }
+}
+
+/// A JSON file, gunzipped first when its name ends in `.gz`.
+fn read_json(path: &Path) -> Result<Value> {
+    let mut text = String::new();
+    let f = File::open(path).with_context(|| path.display().to_string())?;
+    if path.extension().is_some_and(|e| e == "gz") {
+        flate2::read::GzDecoder::new(f).read_to_string(&mut text)?;
+    } else {
+        std::io::BufReader::new(f).read_to_string(&mut text)?;
+    }
+    Ok(serde_json::from_str(&text)?)
+}
+
+/// Where `verified_finalized` comes from: a recorded light client run, or a beacon endpoint asked
+/// once, at the first request.
+#[derive(Default)]
+struct Light {
+    run: Option<Value>,
+    live: Option<(String, String)>,
+}
+
+impl Light {
+    fn head(&mut self) -> Result<Value> {
+        if self.run.is_none() {
+            let (beacon, checkpoint) = self
+                .live
+                .as_ref()
+                .context("this host has no light client")?;
+            self.run = Some(helios::fetch(beacon, checkpoint, None)?);
+        }
+        helios::verify(self.run.as_ref().context("no light client run")?)
     }
 }
 
@@ -121,14 +196,66 @@ fn load(engine: &Engine, wasm: &[u8], cache: &Path) -> Result<(Module, &'static 
     Ok((module, "miss"))
 }
 
-/// Storage mode `host`: the nest's files under `root`, and the ones the guest holds open.
+/// Storage mode `host`: the nest's files under `root`, and the ones the guest holds open; the
+/// mirror's GETs; and the light client.
 struct Host {
     root: PathBuf,
     files: HashMap<i32, File>,
     next: i32,
+    web: ureq::Agent,
+    gets: u64,
+    light: Light,
 }
 
 impl Host {
+    /// One `get`, as the browser host performs it: any status but 200 answered alone, a body past
+    /// `max_bytes` refused, and with `append` the body written at the end of that open file.
+    fn get(&mut self, r: &Value) -> Result<Value> {
+        let url = r["url"].as_str().context("a get without a url")?;
+        let max = r["max_bytes"].as_u64().context("a get without max_bytes")?;
+        self.gets += 1;
+        // Retries across a transport failure are the host's; a status is an answer.
+        let mut attempt = 0;
+        let mut res = loop {
+            match self.web.get(url).call() {
+                Ok(res) => break res,
+                Err(_) if attempt < 3 => {
+                    std::thread::sleep(Duration::from_millis(500 << attempt));
+                    attempt += 1;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let status = res.status().as_u16();
+        if status != 200 {
+            return Ok(json!({"status": status}));
+        }
+        let past =
+            |n: u64| json!({"error": format!("{url} is {n} bytes, past the {max} asked for")});
+        let declared = res
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+        if let Some(n) = declared.filter(|n| *n > max) {
+            return Ok(past(n));
+        }
+        let bytes = match res.body_mut().with_config().limit(max).read_to_vec() {
+            Ok(b) => b,
+            Err(ureq::Error::BodyExceedsLimit(n)) => return Ok(past(n)),
+            Err(e) => return Err(e.into()),
+        };
+        let Some(h) = r["append"].as_i64() else {
+            return Ok(json!({"status": 200, "body": String::from_utf8_lossy(&bytes)}));
+        };
+        let f = self
+            .files
+            .get(&(h as i32))
+            .context("append: no such handle")?;
+        let at = f.metadata()?.len();
+        f.write_all_at(&bytes, at)?;
+        Ok(json!({"status": 200, "offset": at, "length": bytes.len()}))
+    }
+
     fn path(&self, name: &str) -> Result<PathBuf> {
         ensure!(
             !name
@@ -458,11 +585,16 @@ fn perform(
         "list" => host
             .list(r["prefix"].as_str().unwrap_or_default())
             .map_or_else(failed, |names| json!({"names": names})),
+        "get" => host.get(r).unwrap_or_else(failed),
+        "verified_finalized" => host.light.head().map_or_else(
+            failed,
+            |h| json!({"number": h["number"], "hash": h["hash"]}),
+        ),
         kind => json!({"error": format!("unsupported request kind: {kind}")}),
     }
 }
 
-fn instantiate(engine: &Engine, module: &Module, root: PathBuf) -> Result<Guest> {
+fn instantiate(engine: &Engine, module: &Module, root: PathBuf, light: Light) -> Result<Guest> {
     std::fs::create_dir_all(&root)?;
     let mut store = Store::new(
         engine,
@@ -470,6 +602,13 @@ fn instantiate(engine: &Engine, module: &Module, root: PathBuf) -> Result<Guest>
             root,
             files: HashMap::new(),
             next: 0,
+            web: ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .timeout_global(Some(Duration::from_secs(300)))
+                .build()
+                .into(),
+            gets: 0,
+            light,
         },
     );
     let instance = link(engine)?.instantiate(&mut store, module)?;
@@ -609,7 +748,9 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
         None
     };
     let t = Instant::now();
-    let mut g = instantiate(&engine, &module, root.clone())?;
+    let verified = o.helios.is_some();
+    ensure!(!verified || gate == "s3", "--helios runs S3's nest");
+    let mut g = instantiate(&engine, &module, root.clone(), o.light()?)?;
     let ms_instantiate = t.elapsed().as_millis();
 
     eprintln!("{}", g.call0("nh_abi")?);
@@ -624,17 +765,20 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
         config["poll_interval_secs"] = 1.into();
         config["files"] = nest_files(dir)?.into();
     }
+    if verified {
+        config["verified"] = true.into();
+    }
     g.call1("nh_open", config.to_string().as_bytes())?;
 
     let endpoints = HashMap::from([("main", rpc_url)]);
     let mut agents = HashMap::new();
     let (mut steps, mut waits, mut requests) = (0u64, 0u64, 0u64);
     let t = Instant::now();
-    loop {
+    let unverified = loop {
         steps += 1;
         let s = g.call0("nh_step")?;
         if s["idle"] == true {
-            break;
+            break s["unverified"].clone();
         }
         if let Some(reqs) = s["requests"].as_array() {
             if o.die_mid_follow.is_some() && steps % 20 == 0 {
@@ -663,7 +807,7 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
         } else {
             bail!("nh_step answered {s}");
         }
-    }
+    };
     ensure!(
         o.die_mid_follow.is_none(),
         "the follow reached the tip before anything sealed"
@@ -704,7 +848,23 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
     let mut failures = Vec::new();
     if gate == "s3" {
         let expected: Value = serde_json::from_slice(&std::fs::read(dir.join("expected.json"))?)?;
+        if verified {
+            out["unverified"] = unverified.clone();
+            out["verified"] = got["verified"].clone();
+            let checked = VerifiedRun {
+                got: &got,
+                unverified: &unverified,
+                start,
+                forge: o.forge,
+                expected: &expected,
+            };
+            checked.check(&mut g.store.data_mut().light, &mut out, &mut failures);
+        }
         for (k, v) in expected.as_object().context("expected.json")? {
+            // Under a verified head the seal and its segments are held to the head, checked above.
+            if verified && (k == "sealed_through" || k == "segments") {
+                continue;
+            }
             if got[k.as_str()] != *v {
                 failures.push(format!(
                     "report's {k}\n got: {}\nwant: {v}",
@@ -771,7 +931,23 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
             k["last_block"], k["sealed_through"]
         )
     });
-    if gate == "s3" {
+    if verified && o.forge {
+        println!(
+            "gate: a forged light client run is refused ({}) and nothing is sealed; the cursor carried on to {}",
+            out["refused"].as_str().unwrap_or_default(),
+            got["last_block"]
+        );
+    } else if verified {
+        println!(
+            "gate: sealed through {} under the head Helios verified, block {} ({}), {} headers hashed down to it; {} segment hashes and {} balances equal the node's",
+            got["sealed_through"],
+            out["head"]["number"],
+            out["head"]["hash"].as_str().unwrap_or_default(),
+            got["verified"]["headers"],
+            segs.len(),
+            got["balances"]["count"]
+        );
+    } else if gate == "s3" {
         println!(
             "gate: {} segment hashes and {} balances equal the node's{after}",
             segs.len(),
@@ -785,6 +961,173 @@ fn run(wasm_path: &Path, rpc_url: &str, dir: &Path, gate: &str, o: &Opts) -> Res
         );
     }
     Ok(())
+}
+
+/// RFC-0081 S5: any `nh_open` config, opened in storage `host` under a fresh directory and stepped
+/// until idle; then, with `--answer`, one `{method, target, body}` a line from stdin answered as one
+/// line of `nh_request`'s answer, until stdin closes. This is what `hosts/node/mirror.mjs --wasmtime`
+/// drives, so the mirror gates judge this host exactly as they judge the Node one.
+fn open_nest(wasm_path: &Path, config_path: &Path, o: &Opts) -> Result<()> {
+    let engine = engine(o)?;
+    let wasm = std::fs::read(wasm_path)?;
+    let (module, cache) = load(&engine, &wasm, &o.cache())?;
+    let root = std::env::temp_dir().join(format!("nest-wasmtime-open-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut g = instantiate(&engine, &module, root.clone(), o.light()?)?;
+    let config = read_json(config_path)?;
+    let t = Instant::now();
+    g.call1("nh_open", config.to_string().as_bytes())?;
+    let rpc = o.rpc.as_deref().unwrap_or("http://127.0.0.1:1/");
+    let endpoints = HashMap::from([("main", rpc)]);
+    let mut agents = HashMap::new();
+    let (mut steps, mut requests) = (0u64, 0u64);
+    let unverified = loop {
+        steps += 1;
+        let s = g.call0("nh_step")?;
+        if s["idle"] == true {
+            break s["unverified"].clone();
+        }
+        if let Some(reqs) = s["requests"].as_array() {
+            requests += reqs.len() as u64;
+            let answers: Vec<Value> = reqs
+                .iter()
+                .map(|r| perform(g.store.data_mut(), &mut agents, &endpoints, r))
+                .collect();
+            g.call1("nh_resume", Value::Array(answers).to_string().as_bytes())?;
+        } else if let Some(ms) = s["wait_ms"].as_u64() {
+            std::thread::sleep(Duration::from_millis(ms));
+        } else {
+            bail!("nh_step answered {s}");
+        }
+    };
+    let ms_open = t.elapsed().as_millis();
+    let report = g.call0("nh_report")?;
+    let memory_bytes = g
+        .instance
+        .get_typed_func::<(), f64>(&mut g.store, "nh_memory_bytes")?
+        .call(&mut g.store, ())?;
+    println!(
+        "{}",
+        json!({
+            "host": "wasmtime", "module_sha256": sha256_hex(&wasm), "cache": cache,
+            "report": report, "unverified": unverified, "steps": steps, "requests": requests,
+            "gets": g.store.data().gets, "ms_open": ms_open,
+            "wasm_memory_mib": mib(memory_bytes), "peak_rss_mib": peak_rss_mib(),
+        })
+    );
+    if o.answer {
+        use std::io::{BufRead, Write};
+        let mut stdout = std::io::stdout().lock();
+        for line in std::io::stdin().lock().lines() {
+            let req: Value = serde_json::from_str(&line?)?;
+            let s = |k: &str| req[k].as_str().unwrap_or_default().to_string();
+            let a = g
+                .request(&s("method"), &s("target"), &s("body"))
+                .unwrap_or_else(|e| json!({"fault": format!("{e:#}")}));
+            writeln!(stdout, "{a}")?;
+            stdout.flush()?;
+        }
+    }
+    drop(g);
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+/// A light client run recorded from `beacon`, written to `--out`, and the head it verifies.
+fn record_helios(beacon: &str, checkpoint: &str, o: &Opts) -> Result<()> {
+    let run = helios::fetch(beacon, checkpoint, o.until_period)?;
+    if let Some(out) = &o.out {
+        std::fs::write(out, serde_json::to_string(&run)?)?;
+    }
+    let t = Instant::now();
+    let head = helios::verify(&run)?;
+    println!(
+        "{}",
+        json!({"head": head, "updates": run["updates"].as_array().map_or(0, Vec::len),
+               "finality_update": !run["finality_update"].is_null(), "ms_verify": t.elapsed().as_millis()})
+    );
+    Ok(())
+}
+
+/// RFC-0081 S5: S3's nest followed `verified`, judged against the head the light client gives.
+struct VerifiedRun<'a> {
+    got: &'a Value,
+    unverified: &'a Value,
+    start: u64,
+    forge: bool,
+    expected: &'a Value,
+}
+
+impl VerifiedRun<'_> {
+    fn check(&self, light: &mut Light, out: &mut Value, failures: &mut Vec<String>) {
+        let mut fail = |ok: bool, why: String| {
+            if !ok {
+                failures.push(why);
+            }
+        };
+        let (got, sealed) = (self.got, &self.got["sealed_through"]);
+        let segments = |s: &Value, under: u64| -> Vec<Value> {
+            s.as_object()
+                .into_iter()
+                .flat_map(|t| t.values())
+                .flat_map(|v| v.as_array().into_iter().flatten())
+                .filter(|x| x["to_block"].as_u64().is_some_and(|b| b <= under))
+                .map(|x| x["hash"].clone())
+                .collect()
+        };
+        match (light.head(), self.forge) {
+            (Err(e), true) => {
+                out["refused"] = format!("{e:#}").into();
+                let says = self
+                    .unverified
+                    .as_str()
+                    .is_some_and(|u| u.contains("no verified finalized block"));
+                fail(
+                    says,
+                    format!(
+                        "sealing did not stop on the refused head: unverified {}",
+                        self.unverified
+                    ),
+                );
+                fail(
+                    sealed.is_null(),
+                    format!("sealed through {sealed} with no verified head"),
+                );
+                fail(
+                    segments(&got["segments"], u64::MAX).is_empty(),
+                    "a segment was sealed".into(),
+                );
+            }
+            (Ok(head), true) => fail(false, format!("the forged run verified, to {head}")),
+            (Err(e), false) => fail(false, format!("the light client gave no head: {e:#}")),
+            (Ok(head), false) => {
+                let top = head["number"].as_u64().unwrap_or_default();
+                fail(
+                    self.unverified.is_null(),
+                    format!("sealing stopped: {}", self.unverified),
+                );
+                fail(
+                    sealed.as_u64().is_some_and(|s| s <= top),
+                    format!("sealed through {sealed}, against the verified {top}"),
+                );
+                let ours = segments(&got["segments"], u64::MAX);
+                let node = segments(&self.expected["segments"], top);
+                fail(
+                    !ours.is_empty() && ours == node,
+                    format!("segments {ours:?} against the node's {node:?}"),
+                );
+                fail(
+                    got["verified"]["headers"].as_u64() == Some(top - self.start + 1),
+                    format!(
+                        "{} headers hashed for {}",
+                        got["verified"]["headers"],
+                        top - self.start + 1
+                    ),
+                );
+                out["head"] = head;
+            }
+        }
+    }
 }
 
 /// RFC-0077 S3: this host run again as a child that follows into `root` from an empty store until
@@ -836,8 +1179,14 @@ fn main() -> Result<()> {
         ["compile", wasm, out, flags @ ..] => {
             compile(Path::new(wasm), Path::new(out), &Opts::parse(flags)?)
         }
+        ["open", wasm, config, flags @ ..] => {
+            open_nest(Path::new(wasm), Path::new(config), &Opts::parse(flags)?)
+        }
+        ["helios", beacon, checkpoint, flags @ ..] => {
+            record_helios(beacon, checkpoint, &Opts::parse(flags)?)
+        }
         _ => bail!(
-            "usage: wasmtime-host abi <module.wasm> | run <module.wasm> <rpc> <dir> <s3|s5> | compile <in.wasm> <out.cwasm>, then flags"
+            "usage: wasmtime-host abi <module.wasm> | run <module.wasm> <rpc> <dir> <s3|s5> | open <module.wasm> <config.json> | helios <beacon> <checkpoint> | compile <in.wasm> <out.cwasm>, then flags"
         ),
     }
 }

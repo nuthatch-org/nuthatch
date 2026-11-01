@@ -182,8 +182,9 @@ mirror is pinned. False, `nh_step` answers `{"idle": true}` once the store is op
 
 **`verified`** (RFC-0077 S5) holds every seal to a finalized block the host verified, from a source
 the RPC cannot forge: Helios's beacon light client in a browser (`verifiedFinalized` in
-burrmill-wasm's `web/play/verified.js`), or whatever a non-browser host brings. Once a follow, the
-module asks for it with a `verified_finalized` request; then it fetches every header from the last
+burrmill-wasm's `web/play/verified.js`), or Helios's consensus core from Rust in the wasmtime host
+(RFC-0081 S5). Once a follow, the module asks for it with a `verified_finalized` request; then it
+fetches every header from the last
 seal up to that block from the RPC, hashes each one itself, links them by parent hash down from the
 verified hash, and seals only at or below it, and only rows whose block hash is on that chain. If
 the host has no verified block, the chain does not reach it, a header is forged or missing, or a
@@ -489,7 +490,7 @@ RFC-0077 S7's seven wallets against a hosted nest.
 
 | Host | Where | Storage | Runs as |
 |---|---|---|---|
-| browser | `hosts/browser/`: `host.js` the interface, `opfs.js`, `nest-worker.js`, `page.js`, `sw.js` | OPFS | `run-sw.mjs` in headless Chrome |
+| browser | `hosts/browser/`: `host.js` the interface, `opfs.js`, `nest-worker.js`, `page.js`, `sw.js` | OPFS | `run-sw.mjs` in headless Chrome, or Firefox under geckodriver |
 | Node | `hosts/node/run.mjs`: the same `host.js`, over `fs-storage.mjs` | files | `node` |
 | wasmtime | `tests/wasmtime-host/` | files | `cargo build --release`, then `wasmtime-host` |
 
@@ -568,4 +569,28 @@ $rpc recorded --port 8957 $r4 --drop-log 26239830:315 &
 $rpc recorded --port 8958 $r4 --drop-log 26239830:315 --forge-receipts 26239830 &
 node hosts/node/complete.mjs /tmp/plain.wasm $d http://127.0.0.1:8956/ http://127.0.0.1:8957/ \
   http://127.0.0.1:8958/ 26239830 --until 26239840
+```
+
+RFC-0081 S5's gates. The browser legs run in Firefox as well as Chrome, by the same script under
+geckodriver (`--geckodriver <path>`, with Firefox's binary in place of Chrome's), and `run-sw.mjs`'s
+`shapes` mode follows `hosts/node/shapes.mjs`'s nest shapes in the browser, each in its own nest
+worker on OPFS against its own fixture-rpc. The wasmtime host answers `get`, so it opens a mirror and
+a `mirror+rpc` nest: `hosts/node/mirror.mjs --wasmtime <wasmtime-host>` drives `wasmtime-host open
+--answer` through the same requests and comparison as the Node host. It answers `verified_finalized`
+from Helios's consensus core (`helios-consensus-core`, MIT, a dependency of that crate alone): a
+bootstrap at a checkpoint, then each sync-committee update and the finality update, verified as
+Helios's own client does. `--beacon <url> --checkpoint <root>` asks a beacon endpoint;
+`--helios <run.json.gz>` verifies a recorded run, and `wasmtime-host helios` records one. CI's is
+`tests/fixtures/tab-parity/helios.json.gz`, which finalizes block 26,243,710; `helios-headers.json.gz`
+extends `headers.json.gz` to it:
+
+```sh
+d=../tests/fixtures/tab-parity host=tests/wasmtime-host/target/release/wasmtime-host
+node run-sw.mjs <firefox> /tmp/plain.wasm http://127.0.0.1:8954/ $d --restart --geckodriver <geckodriver>
+node run-sw.mjs <firefox> /tmp/plain.wasm shapes $rpc ../tests/fixtures/embed-shapes --geckodriver <geckodriver>
+node hosts/node/mirror.mjs /tmp/plain.wasm $d/s4-nest $d/s4-mirror --expect $d/s4-mirror-seed.json --wasmtime $host
+gunzip -c $d/headers.json.gz $d/helios-headers.json.gz | jq -c -s add | gzip -c > /tmp/helios-headers.json.gz
+$rpc recorded --port 8960 --file $d/chain.json.gz --headers /tmp/helios-headers.json.gz &
+$host run /tmp/plain.wasm http://127.0.0.1:8960/ $d s3 --helios $d/helios.json.gz
+$host run /tmp/plain.wasm http://127.0.0.1:8960/ $d s3 --helios $d/helios.json.gz --forge
 ```
