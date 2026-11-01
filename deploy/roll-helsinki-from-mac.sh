@@ -40,8 +40,8 @@ if sha=$(gh api "repos/$repo/commits/v$v" --jq .sha) &&
     nest=$(gate_of "$u")
     if [ -z "$nest" ]; then refusals+=("$u: no release gate covers this unit"); continue; fi
     ctx=release-gate/$nest
-    state=$(printf '%s\n' "$statuses" | awk -F'\t' -v c="$ctx" '$1 == c { print $2; exit }')
-    detail=$(printf '%s\n' "$statuses" | awk -F'\t' -v c="$ctx" '$1 == c { print "\"" $3 "\" " $4; exit }')
+    state=$(awk -F'\t' -v c="$ctx" '$1 == c { print $2; exit }' <<<"$statuses")
+    detail=$(awk -F'\t' -v c="$ctx" '$1 == c { print "\"" $3 "\" " $4; exit }' <<<"$statuses")
     case "$state" in
       success) ;;
       "") refusals+=("$ctx ($u): no status on v$v ($sha)") ;;
