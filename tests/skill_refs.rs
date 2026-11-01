@@ -420,6 +420,7 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "HTTP request bodies for the control plane",
     ),
     ("src/serve.rs", "HTTP request bodies for the query API"),
+    ("src/shape_s0.rs", "the RFC-0080 S0 spike's shapes file and stream lines, not nest config"),
     (
         // The decoded `X-PAYMENT` header a caller presents (RFC-0046 S1, #1218). It arrives on a
         // request and is never read from a nest's TOML - and must not become a config key, because
