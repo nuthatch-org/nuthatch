@@ -200,6 +200,12 @@ The release also attaches `nuthatch-graph-<target>.tar.gz` for Linux and macOS, 
 `--features graph`. It is the binary for serving a nest's Graph-dialect GraphQL, as a
 [subgraph stopgap](subgraph-stopgap.md) does; the default binary has no `/graphql` route.
 
+From 5.17.0 it also attaches `nuthatch-flight-<target>.tar.gz` for Linux and macOS, built with
+`--features flight`, and publishes `:<version>-flight`, the same image with that binary. It is the
+binary for serving Arrow Flight SQL beside the HTTP API; see [Arrow Flight SQL](#the-service-surface)
+under the service surface. Run the image with `dev --dir /nest --listen 0.0.0.0:8288 --flight
+0.0.0.0:8815` and publish both ports.
+
 > **Do not use `:0.7.0`.** It is published but cannot start (`GLIBC_2.38 not found`) - the release job
 > pushed before it smoke-tested, so the failing test failed the job without unpublishing the image.
 > `0.7.1` is the first working tag, and the job now tests before it pushes. `:latest` was broken for the
@@ -1200,15 +1206,56 @@ so `cached` is always false. On a small answer the schema makes IPC the larger o
 export of 100,000 rows it encoded about 5 times and decoded about 16 times faster than JSON (RFC-0079
 §12).
 
-**Arrow Flight SQL** (RFC-0079), in a build with `--features flight` (release artifacts do not
-include it): `nuthatch dev --flight 127.0.0.1:8815` serves Flight SQL beside the HTTP API. A statement is answered by the same handler as
-`POST /<route>/sql`, under the same guards, with the caller's `authorization` passed on; a client
-names the mount with the `x-nuthatch-route` request header (absent, `/sql` at the root), and the
-answer's envelope arrives as the `x-nuthatch-answer` response header. A refusal is a gRPC status carrying `/sql`'s JSON error.
-`GetFlightInfo` runs nothing, so its schema is empty and `total_records` is `-1`; the `DoGet` stream's
-schema is the answer's. Statements only so far: the catalogue calls (`GetCatalogs`, `GetTables` and
-the rest) answer `Unimplemented`, so a browsing client such as DBeaver cannot list tables yet. It is a
-second port, so a gateway in front of the node has to route it.
+**Arrow Flight SQL** (RFC-0079) is in the **flight build**, not the default binary. From 5.17.0 each
+release attaches `nuthatch-flight-<target>.tar.gz` (with its `.sha256` and a provenance attestation that
+`gh attestation verify` checks, as for the default binary) for the same targets, and publishes the image
+`ghcr.io/nuthatch-org/nuthatch:<version>-flight`, never tagged `latest`. From source it is
+`cargo build --features flight`. In it, `nuthatch dev --flight 127.0.0.1:8815` serves Flight SQL
+beside the HTTP API, for a single nest and a runtime alike.
+
+A statement is answered by the same handler as `POST /<route>/sql`, under the same guards, with the
+caller's `authorization` passed on (nuthatch checks no credential on `/sql`; a gateway in front of it
+may); a client names the mount with the `x-nuthatch-route` request header (absent, `/sql` at the
+root, which a runtime does not serve), and the answer's envelope arrives as the `x-nuthatch-answer`
+response header. `GetFlightInfo` runs nothing, so its schema is empty and `total_records` is `-1`; the
+`DoGet` stream's schema is the answer's. A refusal is a gRPC status whose message is `/sql`'s JSON
+error:
+
+| `/sql` answers | Flight SQL status |
+|---|---|
+| `400`, `422` | `InvalidArgument` |
+| `401` | `Unauthenticated` |
+| `403` | `PermissionDenied` |
+| `404` (no such mount) | `NotFound` |
+| `429`, `503` | `ResourceExhausted` |
+| `504` | `DeadlineExceeded` |
+
+The catalogue calls `GetCatalogs`, `GetDbSchemas`, `GetTables` (with each table's schema when asked)
+and `GetTableTypes` list what `information_schema.tables` holds on that route, through `/sql` like a
+statement, so a bounded mount refuses them as it refuses SQL; `GetSqlInfo` names the server and says
+it is read-only. Prepared statements, updates and the key and type-info calls answer
+`Unimplemented`. It is a second port, so a gateway in front of the node has to route it.
+
+**Proven with** Apache Arrow ADBC's Flight SQL driver (the Go implementation that ADBC's C, Python,
+R and Java bindings load) and arrow-flight's Rust client, in CI, against the real binary serving a
+runtime of two mounts: a statement's rows equal `/sql`'s value for value, the route header picks the
+mount, refusals come back as above, and `GetObjects` lists each table with the columns a statement
+returns (`tests/e2e_flight_clients.rs`, `tools/flight-client`). From Go:
+
+```go
+db, _ := flightsql.NewDriver(memory.DefaultAllocator).NewDatabase(map[string]string{
+    adbc.OptionKeyURI: "grpc://127.0.0.1:8815",
+    flightsql.OptionRPCCallHeaderPrefix + "x-nuthatch-route": "usdc",
+})
+cnxn, _ := db.Open(ctx)
+stmt, _ := cnxn.NewStatement()
+stmt.SetSqlQuery("SELECT block_number, value FROM usdc__transfer ORDER BY block_number DESC LIMIT 10")
+rows, _, _ := stmt.ExecuteQuery(ctx) // an arrow RecordReader
+```
+
+Any ADBC binding takes the same two options, and a JDBC client such as DBeaver takes the header as
+a URL parameter (`jdbc:arrow-flight-sql://127.0.0.1:8815?useEncryption=false&x-nuthatch-route=usdc`);
+neither JDBC nor DBeaver has been run against it.
 
 **Cost header:** a request to `/sql`, `/q/{name}`, GraphQL or a typed route that sends
 `Nuthatch-Cost: 1` is answered with a `Nuthatch-Cost` header, a report of what it read and held;

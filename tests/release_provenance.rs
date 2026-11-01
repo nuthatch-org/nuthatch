@@ -199,3 +199,57 @@ fn show_what_the_parser_sees() {
     println!("attached: {:#?}", attached());
     println!("attested: {:#?}", attested());
 }
+
+/// The release workflow's `workflow_dispatch` is a dry run (RFC-0079 §16): it may build every binary,
+/// and must never create, attach to, attest for or publish a release, or push an image. Every step
+/// that would is gated on a tag push, by its own `if:` or its job's.
+#[test]
+fn a_dispatch_never_releases() {
+    const RELEASING: [&str; 4] = [
+        "softprops/action-gh-release",
+        "attest-build-provenance",
+        "docker push",
+        "gh release edit",
+    ];
+    let s = release_yml();
+    let jobs = s.split_once("\njobs:\n").expect("release.yml has jobs").1;
+    let mut checked = 0;
+    let mut ungated = Vec::new();
+    let mut close = |job: &(String, bool), step: &mut Vec<&str>| {
+        if RELEASING.iter().any(|r| step.iter().any(|l| l.contains(r))) {
+            checked += 1;
+            let own = step
+                .iter()
+                .any(|l| l.starts_with("        if:") && l.contains("github.event_name == 'push'"));
+            if !own && !job.1 {
+                ungated.push(format!("{} {}", job.0, step[0].trim()));
+            }
+        }
+        step.clear();
+    };
+    let mut job = (String::new(), false);
+    let mut step: Vec<&str> = Vec::new();
+    for line in jobs.lines() {
+        if line.starts_with("  ") && !line.starts_with("   ") && line.ends_with(':') {
+            close(&job, &mut step);
+            job = (line.trim().to_string(), false);
+        } else if line.starts_with("    if:") {
+            job.1 =
+                line.contains("github.event_name == 'push'") && !line.contains("workflow_dispatch");
+        } else if line.starts_with("      - ") {
+            close(&job, &mut step);
+            step.push(line);
+        } else if !step.is_empty() {
+            step.push(line);
+        }
+    }
+    close(&job, &mut step);
+    assert!(
+        checked >= 6,
+        "found only {checked} releasing steps; the scan has stopped matching release.yml"
+    );
+    assert!(
+        ungated.is_empty(),
+        "these steps would release from a workflow_dispatch dry run: {ungated:?}"
+    );
+}

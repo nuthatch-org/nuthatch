@@ -14,6 +14,7 @@ use nuthatch_core::transport::{Reply, Transport, TransportError};
 use nuthatch_embed::attach;
 use nuthatch_embed::budget::TabBudget;
 use nuthatch_embed::cellar::Cellar;
+use nuthatch_embed::complete::{Completeness, Receipts};
 use nuthatch_embed::derived::NestFiles;
 use nuthatch_embed::http::Scope;
 use nuthatch_embed::mirror::{self, Hydrated, MirrorConfig, MirrorHost};
@@ -41,6 +42,8 @@ const ABI: u32 = 1;
 const STORE_FILE: &str = "nuthatch.redb";
 /// Where a mirror's segments are appended (RFC-0077 S4).
 const PACK_FILE: &str = "mirror.pack";
+/// `max_headers` unless the host sets it: RFC-0077 S5 hashed 1,894 in under a second.
+const MAX_HEADERS: u64 = 10_000;
 
 #[link(wasm_import_module = "nuthatch")]
 extern "C" {
@@ -141,6 +144,11 @@ struct Config {
     /// RFC-0077 S5: seal only under a finalized block the host verified, asked for by request.
     #[serde(default)]
     verified: bool,
+    /// RFC-0081 S4: under `verified`, check that the RPC left out no log a filter asks for.
+    #[serde(default)]
+    complete: bool,
+    /// The most headers a follow with `complete` may hash and test.
+    max_headers: Option<u64>,
     #[serde(default)]
     storage: Storage,
     #[serde(default)]
@@ -159,6 +167,8 @@ struct Config {
     source: Option<Source>,
     /// RFC-0081 §3.2: other instances' answers a `POST /sql` may bind, each under its own name.
     attach: Option<Vec<attach::Declared>>,
+    /// RFC-0081 S3: the NID `files` must compute, refused by name before the host is asked for anything.
+    expect_nid: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -205,6 +215,8 @@ struct Engine {
     verifier: Option<Arc<Verifier>>,
     follows: bool,
     hydrated: Option<Hydrated>,
+    /// The NID and data identity `files` compute, as a node would from the same directory.
+    identity: Value,
     cellar: Arc<Cellar>,
     rpc: Arc<RpcClient<HostTransport>>,
     files: NestFiles,
@@ -440,6 +452,20 @@ fn open(raw: &[u8]) -> Result<Value, Fault> {
     }
     let c: Config = serde_json::from_slice(raw).map_err(|e| fault("bad_config", e))?;
     let spec = spec_of(&c)?;
+    if let Some(want) = &c.expect_nid {
+        let (nid, dataset) = spec
+            .identity(&c.files)
+            .map_err(|e| fault_of("bad_config", e))?;
+        if !want.eq_ignore_ascii_case(&nid) {
+            return Err(fault(
+                "bad_config",
+                format!(
+                    "these files compute NID {nid} (data identity {dataset}), and the answer names \
+                     {want}: they are not the nest that answered"
+                ),
+            ));
+        }
+    }
     let budget = c.memory_mib.map(TabBudget::mib).unwrap_or_default();
     budget.enforce();
     if c.mirror.is_some() {
@@ -566,6 +592,31 @@ fn spec_of(c: &Config) -> Result<NestSpec, Fault> {
             narrow::predicates(&spec, filters).map_err(|e| fault_of("bad_config", e))?;
         }
     }
+    if c.complete {
+        if !c.verified {
+            return bad("`complete` checks blocks against a verified head, and needs `verified`");
+        }
+        if spec.narrowed.is_none() {
+            return bad("`complete` checks a narrowed nest's filters, and no `filters` are given");
+        }
+        // A fresh store hashes from its start to at least `until`: refused here, before any request.
+        let fresh = c.storage == Storage::Bytes || c.fresh;
+        if let (true, None, Some(until), Some(start)) = (fresh, &c.mirror, c.until, spec.start) {
+            let need = (until + 1).saturating_sub(start);
+            let max = c.max_headers.unwrap_or(MAX_HEADERS);
+            if need > max {
+                return Err(fault(
+                    "bad_config",
+                    format!(
+                        "`complete` would hash and test at least {need} headers, blocks \
+                         {start}..={until}, past the host's ceiling of {max} (`max_headers`)"
+                    ),
+                ));
+            }
+        }
+    } else if c.max_headers.is_some() {
+        return bad("`max_headers` is the ceiling of `complete`, which is not set");
+    }
     spec.until = c.until;
     match c.window {
         Some(0) => return bad("`window` is blocks per getLogs, at least one"),
@@ -677,6 +728,18 @@ impl VerifiedHead for HostHead {
     }
 }
 
+/// A block's receipts from the nest's own RPC, for `complete` (RFC-0081 S4).
+struct HostReceipts(Arc<RpcClient<HostTransport>>);
+
+#[async_trait::async_trait(?Send)]
+impl Receipts for HostReceipts {
+    async fn block_receipts(&self, block: u64) -> anyhow::Result<Value> {
+        self.0
+            .call("eth_getBlockReceipts", json!([format!("0x{block:x}")]))
+            .await
+    }
+}
+
 /// Storage mode `host`: clear the nest's files if asked, then open the store, each through the host.
 async fn open_host(c: Config, spec: NestSpec) -> anyhow::Result<Engine> {
     if c.fresh {
@@ -730,6 +793,10 @@ fn build(
 ) -> anyhow::Result<Engine> {
     let files = bound_files(&c);
     let mut scope = Scope::default();
+    if let Some(filters) = &c.filters {
+        scope.filtered =
+            Some(narrow::tables(&spec, filters).map_err(|e| fault_of("bad_config", e))?);
+    }
     if c.source() == Source::MirrorRpc {
         let filters = c.filters.as_deref().unwrap_or_default();
         scope.predicates =
@@ -742,7 +809,12 @@ fn build(
         .into_iter()
         .map(|t| t.table.to_ascii_lowercase())
         .collect();
+    let identity = match spec.identity(&c.files) {
+        Ok((nid, dataset)) => json!({"nid": nid, "dataset": dataset}),
+        Err(e) => json!({"error": format!("{e:#}")}),
+    };
     let start = spec.start.unwrap_or_default();
+    let narrowed = spec.narrowed.clone().unwrap_or_default();
     let budget = c.memory_mib.map(TabBudget::mib).unwrap_or_default();
     let mut nest = young::open_nest(store, cellar.clone(), spec, start, budget)?;
     // Before `derive`, which admits the entities against it (RFC-0075 §17).
@@ -756,7 +828,18 @@ fn build(
         attach::check(declared, &own).map_err(|e| fault_of("bad_config", e))?;
         scope.attach = declared.clone();
     }
-    let verifier = c.verified.then(|| Arc::new(Verifier::new()));
+    let rpc = Arc::new(RpcClient::new(c.rpc)?);
+    let verifier = c.verified.then(|| {
+        let v = Verifier::new();
+        Arc::new(match c.complete {
+            true => v.completing(Completeness {
+                filters: narrowed,
+                max_headers: c.max_headers.unwrap_or(MAX_HEADERS),
+                receipts: Arc::new(HostReceipts(rpc.clone())),
+            }),
+            false => v,
+        })
+    });
     if let Some(v) = &verifier {
         nest.verify_with(Verified {
             verifier: v.clone(),
@@ -770,8 +853,9 @@ fn build(
             .follow
             .unwrap_or(c.mirror.as_ref().is_none_or(|m| m.postcard.is_none())),
         hydrated,
+        identity,
         cellar,
-        rpc: Arc::new(RpcClient::new(c.rpc)?),
+        rpc,
         files,
         scope,
         nid: c.nid,
@@ -999,6 +1083,7 @@ pub extern "C" fn nh_report() -> i32 {
         )
         .map(|mut r| {
             r["mirror"] = engine.hydrated.as_ref().map(Hydrated::to_json).into();
+            r["identity"] = engine.identity.clone();
             r["verified"] = engine.verifier.as_ref().map(|v| v.report()).into();
             r
         })

@@ -163,10 +163,13 @@ with `WHERE block_number > …` rather than raising `max_rows`. 256-bit values a
 in Arrow, so the `_dec` rules still hold. A refusal is JSON either way. For a point read or a small
 panel stay on JSON: the schema makes the Arrow answer larger.
 
-Arrow Flight SQL exists only in a binary built with the `flight` cargo feature, where `dev` gains a
-flag for its listen address. The release binaries have neither, and `cli-reference.md` documents
-the default build, so don't suggest Flight to someone who installed a release. It answers
-statements, not catalogue calls, and names a runtime's mount with the `x-nuthatch-route` header.
+Arrow Flight SQL exists only in the flight build, where `dev` gains a flag for its listen address:
+the `nuthatch-flight-<target>.tar.gz` release artefact from 5.17.0, the `<version>-flight` image, or
+a source build with the `flight` cargo feature. The default binary has neither the feature nor the flag, and
+`cli-reference.md` documents the default build, so point someone at the flight build before
+suggesting Flight. It answers statements and the catalogue calls (catalogs, schemas, tables, table
+types), so a client can list a route's tables, and names a runtime's mount with the
+`x-nuthatch-route` header. ADBC's Flight SQL driver is the client it is tested with.
 
 ## Wire an AI client to a running nest
 

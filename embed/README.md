@@ -128,6 +128,8 @@ host drops the instance.
   "mirror": {"base": "https://..."},
   "follow": true,
   "verified": true,
+  "complete": true,
+  "max_headers": 10000,
   "filters": [{"contract": "staking", "event": "TokensDelegated", "from": 408825706,
                "args": {"delegator": ["0x..."]}}],
   "window": 10000000,
@@ -187,8 +189,25 @@ verified hash, and seals only at or below it, and only rows whose block hash is 
 the host has no verified block, the chain does not reach it, a header is forged or missing, or a
 row names a block hash off the verified chain, sealing stops there and the next `{"idle": true}`
 says why in `unverified`, by block; the cursor carries on, and its rows stay in the hot store. Rows
-above the verified block are still what the RPC said, and an RPC that leaves a log out is not caught
-(RFC-0065 §6). Without `verified`, the module seals on the chain's own policy, as a node does.
+above the verified block are still what the RPC said, and an RPC that leaves a log out is caught only
+with `complete` (RFC-0065 §6). Without `verified`, the module seals on the chain's own policy, as a node does.
+
+**`complete`** (RFC-0081 S4, with `verified` and `filters`) catches an RPC that leaves a log out. For
+each block under the verified head, the module tests the verified header's `logsBloom` for each
+filter's address and topics; where the bloom admits a filter and the RPC returned no log of it, it
+asks for the block's receipts (`eth_getBlockReceipts`, an `rpc` request like any other), hashes them
+into the receipt trie, and takes the filter's logs from them only if the root is the header's
+`receiptsRoot`. A bloom false positive costs that one fetch and changes nothing; a receipts list that
+does not hash to the root holds the seal below its block, and `unverified` names it. A block is sealed
+only once it is checked against the header on the verified chain, so what an earlier follow indexed
+above the head it then had, or before a reopen, is indexed again once the head passes it. A log's
+address, topics, data, index and block are what the root covers; its transaction hash is the RPC's,
+as it is for every log. The cost is the receipts: on mainnet a block's bloom has about three quarters
+of its bits set, so a filter on one contract's address admits about half the blocks it never logged
+in, each a receipts list of about a megabyte. **`max_headers`** (10,000 unless set) is the most
+headers one follow may hash and test: a fresh store whose `until` puts more past its start is refused
+at `nh_open` (`bad_config`) before any request, and a follow whose verified head is more past what is
+hashed fails (`follow_failed`) before any RPC request, each with the figure.
 
 **`filters`** (RFC-0077 S7) narrow the nest to the logs a host names, such as one user's own.
 Each names a contract by its alias, an event by its name (or its signature where the ABI overloads
@@ -233,6 +252,19 @@ and the module keeps nothing between statements and follows nothing. A table the
 the request does not supply, a bare name of an attached table, an answer that was truncated, and an
 answer whose `provenance.as_of` is not this nest's are each refused by name. An attached table may
 not share a name with the nest's tables, views or entities, or with another attachment's.
+
+**What a narrowed nest read** (RFC-0081 S3). A nest opened with `filters` adds `narrowed` to each
+`/sql` answer's `provenance`: `filtered`, the tables the filters' events decode into; `read`, the
+nest's tables the statement names (null where the module's parser cannot read it); and `unfiltered`,
+those of them no filter covers, of which the nest holds no row. A `POST /sql` body may carry
+`"whole": true` on a `mirror+rpc` nest: the hydrated tables are then read without the filters'
+predicate, every row the published dataset holds through its end plus the filters' own rows after
+it. On any other nest it is refused by name.
+
+**`expect_nid`** (RFC-0081 S3) is the NID the files must compute, as a node computes it from the same
+directory (RFC-0032 §3, hidden files included). A nest whose files compute another is refused by name
+(`bad_config`, both NIDs and the files' data identity in the message) before the host is asked for
+anything. The report (`nh_report`) carries `identity`, `{"nid", "dataset"}`, for any nest.
 
 **`window`** is the blocks per `eth_getLogs`, in place of the chain's registered window. A narrowed
 nest wants it as wide as its endpoint allows.
@@ -426,6 +458,33 @@ The first is S5's 32 answers through the package, opened fresh and then from its
 second a mirrored nest closed and reopened with no GET and the same answers, then reopened over a pack
 with one byte altered, which must be fetched again.
 
+### Checking a hosted answer
+
+`Engine.verifier(options).verify(answer, statement, filters)` (RFC-0081 §3.4) checks a hosted nest's
+`/sql` answer. `options` are `open`'s, with `nest` the nest's files and `mirror` the mirror to read.
+`answer` is the hosted answer, a node's envelope or one with its rows under `data`, carrying
+`provenance.nid` and `provenance.as_of`; `filters` say which logs the statement is about, each
+`public` or `private`. `answer` may instead be a list of `{name, answer, statement}`, all from one nest
+at one block, which one open answers.
+
+It opens the nest the answer names: the files must compute its NID (`expect_nid`), or the check is
+refused before anything is fetched. It follows to `as_of` and no further, `mirror+rpc` when every
+filter is public and a mirror is given, `rpc` otherwise, and runs each statement there. A statement
+is then one of:
+
+- **outside the filters**, when it names a table no filter covers, or, on a `mirror+rpc` nest, its
+  answer read `whole` differs from its answer through the filters: it depends on rows the filters do
+  not select. Nothing is compared. The second rule sees the network only through the mirror's end.
+- **not computable**, with the reason: this nest refused the statement, or answered at another block.
+- **equal** or **differs**, column by column, the rows compared as text in one order whatever order
+  either side gave them. A differing column lists each row's two values; a column only one side has
+  is named as not computable and never shown.
+
+The result names the NID, block, source, filters, the mirror's dataset and end, and the RPC's host,
+and says the head is the RPC's unless `verified` was given. Equality says the server and this RPC
+agree, nothing more. `hosts/package/verify-fixture.mjs` is its gate in CI; `verify-gate.mjs` runs
+RFC-0077 S7's seven wallets against a hosted nest.
+
 ## The reference hosts and the gate
 
 | Host | Where | Storage | Runs as |
@@ -490,4 +549,23 @@ $rpc recorded --port 8955 --file $d/chain.json.gz --headers $d/headers.json.gz &
 node hosts/node/verified.mjs /tmp/plain.wasm http://127.0.0.1:8955/ $d
 node hosts/node/shapes.mjs /tmp/plain.wasm $rpc ../tests/fixtures/embed-shapes
 node size.mjs /tmp/plain.wasm --max-brotli 5500000
+```
+
+RFC-0081 S4's gate. `hosts/node/complete.mjs` opens S4's nest narrowed to every Transfer with
+`verified` and `complete`, against three fixture-rpcs serving the recording with whole headers and the
+receipts `record-receipts.sh` took from mainnet: honest, one leaving block 26,239,830's log out of every
+`eth_getLogs` answer, and one also forging that block's receipts. The log must be found from the
+receipts with every row the same, the forged list must stop sealing by name, and a range past
+`max_headers` must be refused with the figure. CI runs it to block 26,239,840 on the nine blocks of
+receipts that range needs (`receipts.json.gz`). Without `--until` it follows to the tip and must seal the
+node's segment, which needs every bloom-admitted block's receipts, 968 blocks and 56 MB gzipped, recorded
+with `record-receipts.sh` and kept out of the repository:
+
+```sh
+r4="--file $d/chain.json.gz --headers $d/headers.json.gz --receipts $d/receipts.json.gz"
+$rpc recorded --port 8956 $r4 &
+$rpc recorded --port 8957 $r4 --drop-log 26239830:315 &
+$rpc recorded --port 8958 $r4 --drop-log 26239830:315 --forge-receipts 26239830 &
+node hosts/node/complete.mjs /tmp/plain.wasm $d http://127.0.0.1:8956/ http://127.0.0.1:8957/ \
+  http://127.0.0.1:8958/ 26239830 --until 26239840
 ```

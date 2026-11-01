@@ -4,7 +4,10 @@
   selective; a hybrid open of whole tables passes every gate but the 64 MiB one. S1 accepted on those
   narrowed terms 2026-11-01 (Chief): whole segments of the named tables, 200 MiB from the mirror, cold
   under 300 s. **S1 measured 2026-11-01 (§12).** S2 begun on Chief's word the same day; **S2 measured
-  2026-11-01 (§13).** No later slice is begun until Chief says.
+  2026-11-01 (§13).** S3 begun on Chief's word the same day; **S3 measured 2026-11-01 (§14)**, against a
+  stand-in host, since Lodestar's public route cannot answer the gate. S4 begun on Chief's word the same
+  day; **S4 measured 2026-11-01 (§15)**: the gate passes, and §3.5's cost on mainnet is receipts, not
+  headers. No later slice is begun until Chief says.
 - Author: Pete (cargopete)
 - Date: 2026-10-31
 - Depends on: RFC-0077 (the embeddable engine, S0 to S5 and S7 built, shipped as
@@ -213,7 +216,8 @@ two gates of §5. Sizes are days of focused work, estimated.
   hybrid open on an iPhone with its peak memory recorded; the wasmtime host opens defi-pulse-nest from
   a local mirror and seals under a Helios-verified head. Safari needs Chief's administrator step. About
   3 days.
-- **S6, Arbitrum's verified head.** Only if Chief says it is worth a week-old head (§3.6). Its own S0
+- **S6, Arbitrum's verified head. Declined 2026-11-01 by Chief: "a week old thing is not worth it". Not built.**
+  What it would have been, kept for the record: only if Chief says it is worth a week-old head (§3.6). Its own S0
   first: one confirmed assertion's L2 hash proven against a Helios-verified L1 state root, in Node.
   **Gate**: S7's slowest delegator sealed under a verified Arbitrum head, a forged proof refused by
   name. About 5 days after its S0.
@@ -571,3 +575,231 @@ the check let through), and passes again restored.
 - `embed/hosts/node/hybrid.mjs`, S1's driver, reads Lodestar's `literalRows` and two-config
   `nestFiles`, which the Lodestar branch removes; it runs against Lodestar's `main` as it stood for S1.
 - Firefox, Safari and a phone are S5's; no browser but Brave ran the package.
+
+## 14. S3 measured, 2026-11-01
+
+**Verdict: the gate passes, against a stand-in for the hosted nest.** Chief said go to S3 the same day.
+Lodestar's public SQL route cannot answer the gate as written, for two reasons recorded below, so the
+hosted nest in every figure here is the 5.16.0 release binary running graph-allocations-nest, seeded
+from the public mirror and following arb1 to the tip, answering `POST /sql` as any operator's node
+does. That is a departure, and the first thing to read.
+
+**Lodestar's route, tried first.** `https://api.lodestar-dashboard.com/api/sql/query` with dataset
+`staking` is kittiwake's free-form tier in front of the allocations nest. It returns the nest's rows and
+`provenance` with `nid` and `as_of`, re-wrapped as `{data: {rows}, provenance}`, which `verify` reads.
+
+- **It refuses two of the four statements.** The delegator and stakes statements fold each position
+  with `list_reduce(..., lambda acc, e: ...)`; kittiwake screens every statement with sqlparser's generic
+  dialect, which cannot parse a lambda, and answers 400 ("Expected: ), found: acc"). The curator and
+  signals statements are answered.
+- **Its NID is the NID of no published files.** It answers as `e82e8cf6…93c1`. The files that name the
+  public dataset, graph-allocations-nest at `7795a33`, compute `c24c60af…3092` (hidden files included,
+  as a node counts them); `36bd3de`, `680cedb`, `c313d08` and `1730f70` compute four others, and the
+  dataset's own `publish.json` names a fifth, `cb768e49…7ec6`. Production's directory differs from every
+  commit tried, in files that do not touch the data. `verify` refuses the curator answer by name, before any request:
+
+  > these files compute NID c24c60af… (data identity d6fd43c8…6e8b), and the answer names e82e8cf6…:
+  > they are not the nest that answered
+
+  That refusal is the design working, and it is why no figure here is from Lodestar's host. Its registry
+  hash, `0x916324e2…0449`, is the stand-in's, and both answered 2,707 delegations to the same query.
+
+**What was built**, under `embed/` only, `abi` still 1 (an optional `nh_open` key, a request body key
+and optional answer fields):
+
+- **`Engine.verifier(options).verify(answer, statement, filters)`** in the host package, `answer` also a
+  list of `{name, answer, statement}` at one block. It reads `provenance.nid` and `as_of`, refuses a
+  truncated answer or one naming no block, and opens the nest by NID: the caller's files must compute it
+  (`expect_nid` below), the dataset under the mirror is the one they name, as S4 resolves it.
+  `mirror+rpc` when every filter is public, `rpc` otherwise; `until` the answer's block, and a nest that
+  reaches another block is refused rather than compared. Each statement is run there and compared column
+  by column as text, rows in one order whatever order either side gave. A column is equal, differs (every
+  differing row's two values, up to 20), or not computable (named, never shown: a column only one side
+  has, or a statement this nest refused). The result names the NID, block, source, filters, mirror
+  dataset and end, the RPC's host, and that the head is the RPC's.
+- **`expect_nid`** on `nh_open`: the NID the files must compute, refused by name before the host is asked
+  for anything. `nh_report` carries `identity`, `{nid, dataset}`, and `follow()` returns it.
+- **`narrowed`** in a narrowed nest's `/sql` provenance (the tables its filters name, the tables the
+  statement read, those no filter covers) and **`"whole": true`** in a `/sql` body, which reads a
+  `mirror+rpc` nest's hydrated tables without the filters' predicate. Both are the module's own fields;
+  `sql_envelope` in core is untouched.
+- The package's `nest` directory is now read as a node reads it for a NID: hidden files count, `.git`,
+  `.DS_Store`, `.admin-token`, `nuthatch.redb` and `segments` do not. Before, it skipped every hidden
+  file, so a nest with `.claude/` computed a NID no node gives. A default store name changes with it.
+- A `follow_failed` ending "open it fresh" (a kept store past `until`) is opened fresh once, as an
+  `open_failed` one was.
+
+**The rule for "outside the filters".** A statement is outside them when either holds, and then nothing
+is compared:
+
+1. **It names a table no filter covers.** The nest holds no row of it. Read from the module's own parser
+   (`narrowed.unfiltered`); it parsed all four portfolio statements, lambdas included.
+2. **Its answer depends on rows the filters do not select.** On a `mirror+rpc` nest each hydrated table
+   holds the published dataset's every row, and the filters are a predicate over it (§12). The statement
+   is run twice, through the filters and `whole`; if the answers differ, it reads outside them.
+
+Neither needs the server's cooperation, so a lying server cannot turn a mismatch into "outside" by what
+it answers. The limits: rule 2 sees the network only through the mirror's end, so a row outside the
+filters that arrived after it is not seen; and on an `rpc` nest only rule 1 applies, since nothing
+outside the filters was ever fetched. The caller still declares the filters, and the result says which.
+
+**The gate.** `embed/hosts/package/verify-gate.mjs`, with the four statements copied from Lodestar's
+`src/lib/verify/sql.ts` into `embed/hosts/package/fixtures/portfolio.mjs`. Where Lodestar wrote pools
+and thaw requests in as literal rows, these read the nest's own tables, limited to the wallet and its
+pools (found from the host's own stakes answer, as S7's page finds them), so one statement goes to the
+host and runs in the narrowed nest unchanged. The filters are Lodestar's wallet and pool filters, marked
+public: the wallet's address is already in the statement sent to the host, and a `mirror+rpc` GET is
+chosen by events, never values (§12). Apple M5 Pro, Node 26.11.1, files, a fresh store per wallet, the
+public Worker and `https://arb1.arbitrum.io/rpc`; the host at `c24c60af…3092`:
+
+| Wallet | Block | Pools | Statements | Columns equal | Rows | RPC requests | Cold |
+|---|---|---|---|---|---|---|---|
+| 0xcdb9…b2c3 | 520,303,534 | 2 | 4 equal | 38 of 38 | 7 | 50 | 57.6 s |
+| 0x3a35…bb3c | 520,303,534 | 1 | 4 equal | 38 of 38 | 4 | 34 | 55.6 s |
+| 0xe3af…2ac2 | 520,303,534 | 1 | 4 equal | 38 of 38 | 3 | 32 | 57.2 s |
+| 0xd7d7…d076 | 520,304,615 | 3 | 4 equal | 38 of 38 | 4 | 66 | 54.6 s |
+| 0x96a3…e5b2 | 520,304,615 | 0 | 4 equal | 38 of 38 | 10 | 32 | 49.1 s |
+| 0x6d64…24bc | 520,304,615 | 0 | 4 equal | 38 of 38 | 10 | 32 | 47.4 s |
+| 0xacbd…0db5 | 520,304,615 | 0 | 4 equal | 38 of 38 | 20 | 32 | 51.4 s |
+
+28 statements, 266 columns over 58 rows, every one equal, none named. Each open hydrated 2,236 segments,
+204,949,749 bytes (195.5 MiB, under S1's 200), more than S1's 179.4 MiB because the wallet's curation and
+GNS tables now come from the mirror too; 2,238 GETs, none naming a wallet. The RPC tail ran from the
+mirror's end, 520,219,931, about 84,000 blocks.
+
+| Check | Result |
+|---|---|
+| A network-wide statement (every delegation's tokens) | **outside the filters**: "its answer changes when the rows outside the filters (the published dataset's, through block 520219931) are read" |
+| A table no filter names (`epochs__epoch_run`) | **outside the filters**: "it reads epochs__epoch_run, which no filter covers" |
+| One value altered by a proxy in front of the host | **differs** on that column alone: `total_signalled_tokens`, host `23491697265158386461000001`, here `2349169726515838646100000`; for 0xd7d7 alone, `total_staked_tokens`, `2735450000000000000000001` against `273545000000000000000000` |
+| An answer naming another NID | **refused** by name, 0 GETs |
+
+**In CI**, `hosts/package/verify-fixture.mjs` in the `wasm-plain` leg and the release's engine job, on
+RFC-0077 S4's nest and mirror followed on RFC-0075 S3's recording: one receiver's statement equal on
+every column, 147 transfers at block 26,245,870; every transfer's sum outside the filters; one value
+altered, differing on that column with both values; another NID refused before any GET. The "host" is
+the same nest opened whole through the package, its answers named by the NID the module computes for the
+files, which the stand-in above shows a node gives too.
+
+**Mutations**, each run against that script and reverted: the `whole` probe dropped from `verify`, and
+separately `whole` ignored in the module, each turns the network-wide check red ("differs") and nothing
+else; the value comparison disabled turns the altered check red; the `expect_nid` refusal removed turns
+the other-NID check red.
+
+**Unchanged.** S5's 32 answers through the package fresh and kept, the pack reuse, and S1's hybrid gates
+pass on the S3 module. The event build is 5,326,406 bytes brotli against the 5,500,000 gate, 1,590 more
+than `main`'s module built here: 173,594 bytes of headroom. The package is 38,397 bytes (12,632 gzip).
+The binary is unchanged: nothing outside `embed/`, `docs/` and the two workflows is touched.
+
+**What does not match the RFC, or is left.**
+
+- **No Lodestar host in the figures.** Its route cannot parse half the statements and its NID names
+  files nobody has. For a hosted operator to say "check this yourself", `verify` needs the operator's
+  exact files published beside the dataset, or the files whose NID the node reports to be the ones the
+  repository holds. Which, and whether the mirror should carry a nest's files, is a question for Chief;
+  nothing here changes the binary or the publisher.
+- **"Opens by NID" means the caller brings the files.** The mirror is keyed by data identity and its
+  `publish.json` names one NID per dataset, so a NID cannot be looked up there; the files are checked
+  against it instead, and the dataset they name is hydrated.
+- **Rule 2's horizon** is the mirror's end, and on an `rpc` nest only rule 1 applies, as above.
+- **Rows are compared as a set,** in one canonical order, so a host that answers the right rows in the
+  wrong `ORDER BY` order is not caught; the values are.
+- Node only. The verifier runs in a page through the package's worker unchanged, but no browser ran it.
+- `embed/hosts/node/hybrid.mjs`, S1's driver, is deleted: Lodestar #389 removed the `literalRows` and
+  two-config `nestFiles` it imported. Its job is covered by `hybrid-gates.mjs` (the hybrid open, the
+  privacy rule and `attach`, in CI), the package's `run.mjs`, Lodestar's own `verify-locally-node.mjs` on
+  the package (§13), and now `verify-gate.mjs` for the seven wallets live.
+
+## 15. S4 measured, 2026-11-01
+
+**Verdict: the gate passes; §3.5's cost model does not hold on mainnet.** Chief said go to S4 the same day.
+
+**What was built**, in `embed/` and `tools/fixture-rpc/`, the interface still `abi: 1` (two optional
+`nh_open` keys and an optional report field):
+
+- **`complete: true`**, with `verified` and `filters`, refused by name without either. For each block on
+  the verified chain, `embed/src/complete.rs` tests the header's `logsBloom` for each filter's address,
+  topic0 and named topics. Where the bloom admits a filter and the RPC returned no log of it, the block's
+  receipts are asked for (`eth_getBlockReceipts`, an ordinary `rpc` request), each receipt RLP-encoded
+  with its type byte and its bloom recomputed from its logs, the receipt trie built and its root compared
+  with the header's `receiptsRoot`. Only then are the filter's logs taken, indexed through the block as
+  `eth_getLogs` gives them. The trie is written here, about 120 lines, with no new dependency: alloy's
+  trie crate is not in the tree, and keccak and the RLP helpers S5 wrote already were.
+- **Sealing is held to what was checked.** A block seals only once it was checked against the header the
+  verified chain holds for it; a failure holds the seal below it, and `unverified` names it. A block the
+  cursor indexed above the verified head it then had, or before a reopen, is rolled back and indexed again
+  once a later head covers it, by the reorg path the cursor already has.
+- **`max_headers`**, 10,000 unless the host sets it. A fresh store whose `until` puts more headers past
+  its start is refused at `nh_open` (`bad_config`) before any request; a follow whose verified head is
+  further past what is hashed fails (`follow_failed`) after the host's `verified_finalized` and before
+  any RPC request. Both carry the figure.
+- **fixture-rpc**: `recorded --receipts <file>` answers `eth_getBlockReceipts`; `--drop-log BLOCK:INDEX`
+  leaves that log out of every `eth_getLogs` answer; `--forge-receipts BLOCK` serves that block's
+  receipts without the recorded contract's logs.
+
+**The receipts**, recorded from `https://ethereum-rpc.publicnode.com` by
+`tests/fixtures/tab-parity/record-receipts.sh` for every block the bloom admits and the recording holds no
+log for, up to the verified head, and for the dropped log's block: 968 blocks, 306,973 receipts. Each
+receipt keeps what its root covers less its bloom, and a transaction hash only where it holds a log of the
+contract. That is 417 MB of JSON, 56 MB gzipped, 24 MB as zstd: too large for the repository, so the full
+file is not committed. The committed `receipts.json.gz` (469,088 bytes) is the nine blocks a run to block
+26,239,840 needs.
+
+**The gate, `embed/hosts/node/complete.mjs`**, S4's nest (`s4-nest`) narrowed to every Transfer, under
+S5's verified head 26,241,700, against three fixture-rpcs: honest, one dropping block 26,239,830's only
+log (index 315), and one doing that and forging the same block's receipts. Apple M5 Pro, Node 26.11.1,
+followed to the tip on the full receipts:
+
+| Case | Result |
+|---|---|
+| Verified, no `complete` | 2,259 rows, sealed through 26,241,700, segment `c983470c…479aeae`, 1,238 RPC requests, 1.4 s |
+| Honest, `complete` | the same rows, segment and 1,000 balances; 966 receipts lists fetched, every one hashing to its root, 0 logs found; 2,204 RPC requests, 17.4 s |
+| Log dropped, no `complete` | 2,258 rows, segment `82115f96…`: what the gate guards against |
+| Log dropped, `complete` | **pass**: the log found from block 26,239,830's receipts, 2,259 rows, segment `c983470c…479aeae`, balances the node's; 967 receipts lists, 17.5 s |
+| Log dropped, receipts forged | **pass**: sealed through 26,239,812, below the block: "block 26239830's receipts hash to 0xa73a…d095, not the receiptsRoot 0x34ec…ab2d its verified header gives" |
+| `until` 26,241,700, `max_headers` 1,000 | **pass**: `bad_config`, "at least 1894 headers, blocks 26239807..=26241700, past the host's ceiling of 1000", 0 RPC requests and 0 host requests |
+| No `until`, `max_headers` 1,000 | **pass**: `follow_failed`, "1894 headers ... past the host's ceiling of 1000", 0 RPC requests |
+
+CI's `wasm-plain` leg runs the same script with `--until 26239840` on the committed nine blocks: the same
+seven cases, rows compared in place of the segment, which a run that short does not seal. 135 rows; 8
+receipts lists honest, 9 with the log dropped, 1 log found; the forged case stops by the same message.
+
+**Mutations**, each built into the module and run against the CI form, then reverted: `admits` answering
+false turns three cases red (honest: "no bloom admitted a block"; dropped: "134 rows, not the 135";
+forged: no `unverified`), the log no longer found; the root comparison disabled turns the forged case red
+and nothing else, the forged list accepted. `complete.rs`'s unit tests check the trie against mainnet
+block 20,000,000 (receipt types 0 to 3), block 46,147 (a pre-Byzantium state root) and the empty trie.
+
+**The cost, which §3.5 had wrong.** It said the check "costs headers, not receipts". On mainnet a
+header's bloom has 1,515 of its 2,048 bits set on average over these 1,894 blocks, so the contract's
+three address bits are all set in most blocks it never logged in: the filter admitted 1,213 blocks, 247
+with a log and 966 without. Half the range needs its receipts, and a real `eth_getBlockReceipts` answer
+here is about a megabyte (1.24 MB and 0.80 MB for the two sampled), so the honest run asks about 1 GB of
+an RPC for 1,894 blocks; the fixture's trimmed lists are 417 MB of it. A filter with an indexed value
+adds three more bits to test and admits fewer, Arbitrum's sparse blooms far fewer, but the verified head
+exists only on mainnet (S6 is declined). `max_headers` bounds headers, as §3.5 asked; nothing bounds
+receipts before they are asked for, since which blocks need them is known only from the headers.
+
+**Size and the binary.** The event build is 5,332,459 bytes brotli, 9,468 more than S2's 5,322,991 and
+167,541 under the gate. One intermediate build of the same source measured 5,405,124: brotli of this
+module moves by tens of kilobytes with code layout alone. The binary is unchanged: nothing outside
+`embed/`, `tools/fixture-rpc/src/`, `tests/fixtures/tab-parity/`, `docs/` and CI's `wasm-plain` step is
+touched; the root `Cargo.toml` and `Cargo.lock`, `src/`, `core/` and fixture-rpc's manifest and lock are
+`main`'s, so its `cargo tree` and `--help` are too.
+
+**Unchanged**, run on the S4 module: S5's 13 shapes, S5's six verified-head cases, S3's restart and S5's
+answers in Node (fresh, bytes, killed), S4's mirror gates and postcards, S1's hybrid gates, and S2's
+package gates.
+
+**What does not match the RFC, or is left.**
+
+- **The full gate is not in CI.** It needs 56 MB of receipts; CI runs the same cases to block 26,239,840.
+  Committing the full file (24 MB as zstd, with a zstd reader in fixture-rpc) is Chief's call.
+- **One log of several is not caught.** As §3.5 says, receipts are fetched where the RPC returned *no*
+  log for a filter; an RPC that drops one of a block's two matching logs passes. Catching it costs
+  receipts for every block with a log.
+- **A found log's transaction hash is the RPC's.** The receipts root covers a log's address, topics,
+  data and position, not the transaction hash, which the transactions trie holds. Every other log's is
+  the RPC's word too.
+- **The check is at the window.** Blocks indexed above the verified head are rolled back and indexed
+  again when a later head covers them, so a following nest re-fetches its unverified tail's logs once.
