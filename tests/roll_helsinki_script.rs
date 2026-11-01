@@ -164,6 +164,28 @@ fn an_error_status_refuses_too() {
     assert!(out.contains("release-gate/dips-nest"), "{out}");
 }
 
+/// The gate lookup stops at the first matching context. Fed through a pipe, that left the writer to
+/// die of SIGPIPE, and `pipefail` with `set -e` ended the roll silently with nothing said.
+/// Past a pipe's buffer the race becomes a certainty.
+#[test]
+fn a_long_status_list_refuses_with_its_reason() {
+    let r = rig();
+    statuses(&r, &[("dips-nest", Some("error"))]);
+    let path = r.state.join("status-sha-4.3.1");
+    let mut list = std::fs::read_to_string(&path).unwrap();
+    for i in 0..2000 {
+        list.push_str(&format!(
+            "ci/other-{i}\tsuccess\t{:>100}\thttps://example.invalid\n",
+            i
+        ));
+    }
+    std::fs::write(&path, list).unwrap();
+    let (ok, out) = roll(&r, &[]);
+    assert!(!ok, "a release in error on dips-nest rolled:\n{out}");
+    assert!(reached_the_box(&r).is_none(), "the box was touched:\n{out}");
+    assert!(out.contains("release-gate/dips-nest"), "{out}");
+}
+
 #[test]
 fn a_missing_status_refuses_the_roll() {
     let r = rig();

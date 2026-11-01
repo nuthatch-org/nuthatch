@@ -164,7 +164,7 @@ if [ "$rolling" = only ]; then
     # is what --poll did to the nests on 2026-10-03.
     listed=$(gh release list -R "$repo" -L 20 --json tagName,isDraft \
       --jq '.[] | select(.isDraft | not) | .tagName') || die "could not list the releases of $repo"
-    newest=$(printf '%s\n' "$listed" | head -n 1)
+    newest=$(head -n 1 <<<"$listed")
     [ -n "$newest" ] || exit 0
     c=$(commit_of "$newest")
     ! has_status "$c" || exit 0
