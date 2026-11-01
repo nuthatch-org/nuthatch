@@ -1179,12 +1179,36 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /shape` | capability probe: what this nest can answer (drives adaptive MCP) |
 | `GET /_admin/`, `/_admin/events`, `/_admin/config`, `/_admin/storage`, `/_admin/requests` | admin UI (eight tabs since 4.2.1), its event stream, the authored files and limits as JSON with every URL cut to scheme and host and every secret withheld, the sealed catalogue per table (`?table=` for one table's segments), and the last 256 requests served (`?since=<seq>` for those after one): route template, the declared query or entity name when the nest knows it, status, milliseconds and bytes, never SQL text, a query string, a path value or a client address, and not the monitoring reads (`/`, `/health`, `/ready`, `/metrics`, `/_admin*`). Token-gated off-localhost; removable with `--no-admin` |
 
-**Arrow Flight SQL** (RFC-0079), in a build with `--features flight`: `nuthatch dev --flight
-127.0.0.1:8815` serves Flight SQL beside the HTTP API. A statement is answered by the same handler as
-`POST /<route>/sql`, under the same guards; a client names the mount with the `x-nuthatch-route`
-request header (absent, `/sql` at the root), and the answer's envelope arrives as the
-`x-nuthatch-answer` response header. Statements only so far: the catalogue calls answer
-`Unimplemented`. It is a second port, so a gateway in front of the node has to route it.
+**Answers in Arrow** (RFC-0079). JSON is the default and is unchanged; Arrow is asked for:
+
+```sh
+curl -G localhost:8288/sql --data-urlencode 'q=SELECT * FROM weth__transfer' \
+  -H 'Accept: application/vnd.apache.arrow.stream' -D head.txt -o answer.arrows
+```
+
+The body is one Arrow IPC stream (`application/vnd.apache.arrow.stream`): the schema, then the
+batches, readable by pyarrow, Polars, DuckDB, DataFusion or Arrow JS. The `x-nuthatch-answer` header
+is the JSON envelope less `rows`, escaped to ASCII: `columns`, `count`, `truncated`, `degraded`,
+`degraded_tables`, `tip_unavailable`, `cached` and `provenance`, as the JSON answer carries them. The rows are
+the JSON answer's, in the same order: decoded and encoded as `/sql` encodes JSON, an Arrow answer
+equals the JSON one row for row, and a test holds that over sealed and hot rows on `/sql` and
+`/q/{name}`. What differs is type, not value: 256-bit integers are the same decimal text (`Utf8`),
+`bool` columns the same `'true'`/`'false'` text, and dates and timestamps keep their Arrow types where
+JSON writes them as text. The caps are `/sql`'s: at most `max_rows` rows, `truncated` when another
+existed, and the byte cap counts the stream. An Arrow answer neither reads nor fills the answer memo,
+so `cached` is always false. On a small answer the schema makes IPC the larger of the two; on an
+export of 100,000 rows it encoded about 5 times and decoded about 16 times faster than JSON (RFC-0079
+§12).
+
+**Arrow Flight SQL** (RFC-0079), in a build with `--features flight` (release artifacts do not
+include it): `nuthatch dev --flight 127.0.0.1:8815` serves Flight SQL beside the HTTP API. A statement is answered by the same handler as
+`POST /<route>/sql`, under the same guards, with the caller's `authorization` passed on; a client
+names the mount with the `x-nuthatch-route` request header (absent, `/sql` at the root), and the
+answer's envelope arrives as the `x-nuthatch-answer` response header. A refusal is a gRPC status carrying `/sql`'s JSON error.
+`GetFlightInfo` runs nothing, so its schema is empty and `total_records` is `-1`; the `DoGet` stream's
+schema is the answer's. Statements only so far: the catalogue calls (`GetCatalogs`, `GetTables` and
+the rest) answer `Unimplemented`, so a browsing client such as DBeaver cannot list tables yet. It is a
+second port, so a gateway in front of the node has to route it.
 
 **Cost header:** a request to `/sql`, `/q/{name}`, GraphQL or a typed route that sends
 `Nuthatch-Cost: 1` is answered with a `Nuthatch-Cost` header, a report of what it read and held;

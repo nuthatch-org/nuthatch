@@ -249,6 +249,12 @@ curl 'localhost:8288/sql?q=SELECT%20count(*)%20FROM%20weth__transfer'
   `{col}_dec` DECIMAL view. `SUM(value_dec)` is those values: a full-width word is NULL and is not a
   term. `WHERE NOT {col}_overflow` writes the same sum out. Ids, nonces and hashes stay on the raw
   column.
+- **Columns, not objects, when you want them.** Send `Accept: application/vnd.apache.arrow.stream`
+  (or `format=arrow`) to `/sql`, or the `Accept` header to `/q/{name}`, and the rows come back as an
+  Arrow IPC stream that pyarrow, Polars, DuckDB or Arrow JS read directly, with the envelope in the
+  `x-nuthatch-answer` header. Same rows as the JSON answer, same caps; worth it for exports, not
+  point reads. A build with `--features flight` also serves Arrow Flight SQL (`dev --flight`). See
+  [operators.md](docs/operators.md) (RFC-0079).
 - **What happened, and where did the tokens go.** `nuthatch diff --from X --to Y` (or `--block`,
   `--tx`, `--since-last`) tells a range in fixed sentences with exact amounts: every ownership,
   pause, upgrade and role change, the largest movements per token, new holders, approvals with
