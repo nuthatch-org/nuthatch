@@ -163,10 +163,6 @@ impl Service {
                 else {
                     continue;
                 };
-                // The REPL's `.tables` hides these too: the hot half of a union, not a relation.
-                if name.starts_with("__hot_") {
-                    continue;
-                }
                 out.push(Relation {
                     catalog,
                     schema,
