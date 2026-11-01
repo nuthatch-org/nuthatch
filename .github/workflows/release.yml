@@ -6,8 +6,16 @@ name: release
 on:
   push:
     tags: ['v*']
-  # Builds and gates the embeddable engine only (`engine` below); every other job runs on a tag.
+  # A dry run. It builds and gates the embeddable engine (`engine` below), and with `binaries` every
+  # binary in the matrix, kept as workflow artifacts. It never creates, attaches to or publishes a
+  # release and pushes no image: every step that would is gated on a tag push
+  # (tests/release_provenance.rs holds it to that).
   workflow_dispatch:
+    inputs:
+      binaries:
+        description: Also build every binary tarball in the matrix
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -76,12 +84,13 @@ jobs:
   build:
     name: ${{ matrix.target }} ${{ matrix.variant }}
     needs: release-notes
+    if: ${{ !cancelled() && (needs.release-notes.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.binaries)) }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [macos-15, ubuntu-22.04, ubuntu-22.04-arm]
-        variant: [default, scaled, graph]
+        variant: [default, scaled, graph, flight]
         include:
           # Apple Silicon. #2037: off `macos-14`, which GitHub retires on 2 November 2026. macOS swaps
           # on its own, so the Linux swap step below has no counterpart here.
@@ -121,7 +130,13 @@ jobs:
           - variant: graph
             prefix: 'graph-'
             features: '--features graph'
-        # Scaled, and the container image, stay x86_64 Linux.
+          # The **flight** binary: `--features flight`, which adds `dev --flight <addr>`, Arrow Flight
+          # SQL beside the HTTP API (RFC-0079). Off by default like `graph`, shipped for the same
+          # reason: an operator whose clients speak Flight SQL should not have to build from source.
+          - variant: flight
+            prefix: 'flight-'
+            features: '--features flight'
+        # Scaled, and the container images, stay x86_64 Linux.
         exclude:
           - os: macos-15
             variant: scaled
@@ -159,7 +174,17 @@ jobs:
           tar czf "$TARBALL" -C "target/${{ matrix.target }}/dist" nuthatch
           shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
           ls -lh "$TARBALL"
+      - name: keep the tarball (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nuthatch-${{ matrix.prefix }}${{ matrix.target }}
+          path: |
+            nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz
+            nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz.sha256
+          retention-days: 7
       - name: attach to release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
@@ -182,16 +207,17 @@ jobs:
       # downloaded back from the release would certify only that we successfully downloaded whatever
       # is sitting there.
       - name: attest the built artifact
+        if: github.event_name == 'push'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz
-      # Hand the x86_64 Linux default and scaled binaries to the container job, so the images ship the
-      # same artifacts attached to the release rather than a second build nobody diffed.
+      # Hand the x86_64 Linux default, scaled and flight binaries to the container job, so the images
+      # ship the same artifacts attached to the release rather than a second build nobody diffed.
       - name: keep the binary for the image
-        if: matrix.target == 'x86_64-unknown-linux-gnu' && matrix.variant != 'graph'
+        if: github.event_name == 'push' && matrix.target == 'x86_64-unknown-linux-gnu' && matrix.variant != 'graph'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ matrix.variant == 'scaled' && 'nuthatch-scaled-binary' || 'nuthatch-linux-binary' }}
+          name: ${{ matrix.variant == 'default' && 'nuthatch-linux-binary' || format('nuthatch-{0}-binary', matrix.variant) }}
           path: target/${{ matrix.target }}/dist/nuthatch
           retention-days: 1
 
@@ -317,6 +343,7 @@ jobs:
   container:
     name: container image
     needs: build
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -371,9 +398,24 @@ jobs:
           docker run --rm nuthatch:scaled control --help > /dev/null
           docker tag nuthatch:scaled "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-scaled"
           docker push "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-scaled"
+      # The flight image, tagged `-flight` and never `latest`, for the same reason as `-scaled`. Its
+      # command is the default image's: an operator adds `--flight 0.0.0.0:8815` and publishes that port.
+      - name: fetch the flight binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nuthatch-flight-binary
+          path: flight
+      - name: build, test and push the flight image
+        run: |
+          cp flight/nuthatch ./nuthatch
+          docker build --platform linux/amd64 -t nuthatch:flight .
+          docker run --rm nuthatch:flight --version
+          docker run --rm nuthatch:flight dev --help | grep -q -- '--flight'
+          docker tag nuthatch:flight "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-flight"
+          docker push "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-flight"
 
   # The release goes public here and nowhere else (#626). Everything above builds against a draft:
-  # three binary targets with their scaled and graph variants, and two container images that are
+  # three binary targets with their scaled, graph and flight variants, and three container images that are
   # smoke-tested before they are pushed, and the embeddable engine's module, gated on the file that
   # ships. Only when all of that has succeeded does the release stop being a draft.
   #
@@ -391,6 +433,7 @@ jobs:
   publish:
     name: publish the release
     needs: [container, engine]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       # #830 asks the workflow to verify artifact identity **before publishing**, which is the half
