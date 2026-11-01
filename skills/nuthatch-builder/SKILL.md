@@ -47,7 +47,7 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT valu
   Author nests in plain `nuthatch.toml`; a directory holding a `nest.star` is refused at load. Read
   this only to port a legacy `nest.star` you've inherited - don't write new ones.
 - **[workflows.md](workflows.md)** - the recipes: init→dev→sql, add a contract, factories, publish a
-  nest (bundle/load), run several nests in one runtime, wire an AI client.
+  nest (bundle/load), run several nests in one runtime, export rows as Arrow, wire an AI client.
 - **[views.md](views.md)** - a nest's logic layer: authoring `views/*.sql` derivations, describing them
   in `semantic.toml`, and the reserved-word / big-int / hot∪cold footguns. Also `maintained.toml`,
   which answers an expensive view from a stored copy of its own evaluation (RFC-0062).

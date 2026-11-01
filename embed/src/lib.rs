@@ -12,6 +12,7 @@ pub use nuthatch_core::{entity_circuit, entity_expr, entity_plan, entity_row};
 pub use nuthatch_decode::registry;
 // RFC-0077 S1: the binary's entity builder and SQL hints, from `nuthatch-core` as the binary takes them.
 pub use nuthatch_core::{entity_bind, entity_decl, entity_lower, sql_errors};
+pub mod attach;
 pub mod budget;
 pub mod cellar;
 pub mod derived;

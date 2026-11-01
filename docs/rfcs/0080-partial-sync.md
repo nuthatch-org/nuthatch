@@ -259,6 +259,10 @@ Chief's call.
 
 ### What was built
 
+The spike's code is not on `main`: S0 stopped the RFC, and a stopped spike does not belong in the
+default binary's follower path. It is kept on the branch `pete/rfc-0080-s0` (#2570, closed unmerged)
+for a second S0, and the paths below are on that branch.
+
 `src/shape_s0.rs`, read only when `NUTHATCH_SHAPES_S0` names a shapes file on a follower
 (`nuthatch serve --follow`). Unset, nothing is loaded, no listener is bound, and `apply_delta`
 takes no lock; what it adds is four clock reads. The CLI is untouched, so every `--help` is
