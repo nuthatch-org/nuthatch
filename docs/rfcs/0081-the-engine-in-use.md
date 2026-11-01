@@ -1,8 +1,9 @@
 # RFC-0081: The engine in use - fast cold opens, one statement over two nests, answers a client can check
 
 - Status: **Accepted, 2026-10-31 (Chief). S0 measured 2026-11-01 (§11): narrow.** Row-group reads are not
-  selective; a hybrid open of whole tables passes every gate but the 64 MiB one. No later slice is begun
-  until Chief says.
+  selective; a hybrid open of whole tables passes every gate but the 64 MiB one. S1 accepted on those
+  narrowed terms 2026-11-01 (Chief): whole segments of the named tables, 200 MiB from the mirror, cold
+  under 300 s. **S1 measured 2026-11-01 (§12).** No later slice is begun until Chief says.
 - Author: Pete (cargopete)
 - Date: 2026-10-31
 - Depends on: RFC-0077 (the embeddable engine, S0 to S5 and S7 built, shipped as
@@ -379,3 +380,101 @@ built by nothing in CI.
 4. The pools nest pinned to the dataset the publisher holds: Lodestar would ship graph-allocations-nest
    at the publisher's commit (or a postcard of it), since its own `pools.toml` names no dataset.
 5. The browser measurement this spike did not make: Brave on OPFS and a phone, with peak memory.
+
+## 12. S1 measured, 2026-11-01
+
+**Verdict: the narrowed gate passes.** Chief accepted S1 on S0's terms the same day: whole segments of
+the tables the public filters name, 200 MiB from the mirror in place of 64, cold under 300 s.
+
+**What was built**, all in `embed/`, the interface still `abi: 1` (only optional keys, an optional answer
+field and a request body key were added, as its versioning rules allow):
+
+- `nh_open`'s **`source`**: `rpc`, `mirror` or `mirror+rpc`; absent, what it was before. `mirror+rpc`
+  needs `mirror` and `filters`, and refuses a postcard, which pins a nest that does not follow.
+- **`privacy`** on each filter, `private` by default. A private filter on a `mirror` or `mirror+rpc` nest
+  is refused by name before anything is fetched. The hydrated tables are computed from the filters'
+  events alone (`narrow::tables`, which reads no value), so no `get` names a value or is chosen by one.
+- **The filters as a predicate.** §3.1 says the filter "applies to what was hydrated as a query
+  predicate, not a fetch"; S0 did not do that, so its pool tables held the network's whole history up to
+  the mirror's end and the filters' rows after it. S1 reads each hydrated table through the filters
+  (`LOWER(col) IN (...)` on address and hash arguments, `block_number >= from`), so a `mirror+rpc` nest
+  answers as an `rpc` nest under the same filters would. An argument whose stored form a predicate cannot
+  compare (an indexed integer) is refused by name with `mirror+rpc`.
+- **`[[calls]]`** accepted with `mirror+rpc` by parsing `nuthatch.toml` as TOML and dropping the table,
+  in place of S0's line cutting; the identity is still computed from the files as given. **The dataset's
+  views and entities are not bound** in a `mirror+rpc` nest, since each reads every row; a statement
+  naming one of the views is refused by name. `[[calls]]` stays refused with `mirror`, whose call tables
+  would stop at the mirror's end while its events carried on.
+- **`attach`** (§3.2): `nh_open` declares `{name, tables}`; a `POST /sql` supplies each table as the
+  other instance's Arrow IPC answer, base64, with its `x-nuthatch-answer` envelope. Bound under its own
+  name for that statement, each column cast back to the type the answer carried (a `HUGEINT` stays a
+  `DECIMAL(38,0)`). Refused by name: an answer whose `provenance.as_of` is not this nest's, a truncated
+  answer, a bare name for an attached table, a table not supplied, and a name colliding with the nest's.
+- **`/sql` answers Arrow** in the module, as RFC-0079 S1 made the node do: `format=arrow` in the query or
+  body; `nh_request` answers `body_base64` and `headers["x-nuthatch-answer"]` for it. The browser worker
+  and Service Worker pass both through.
+- Burrmill moved from `ea8cf40` to `fc2dd16`, the binary's own pin, for the public `result_schema` an
+  empty Arrow answer opens with.
+
+Burrmill exposes no way to bind Arrow batches, and this slice changes no other repository, so an
+attachment's cells cross into it as text and are cast back. Every type an attachment carries reads back
+exactly that way; a timestamp, a list or a binary column is refused by name rather than approximated.
+
+**The pools nest** is graph-allocations-nest at `7795a33`, the commit its publisher sealed from, whose
+identity names the public dataset `d6fd43c8…6e8b`; the driver fails a run whose hydrated dataset is not
+that one. Lodestar shipping those files in place of its `pools.toml` is S2's page change.
+
+**The gate, `embed/hosts/node/hybrid.mjs`**, run with Lodestar's tsx: per wallet, the server's portfolio
+at one block; the wallet nest `rpc` with its private filters and `attach: pools`; the pools found by
+S7's own stakes statement (whose two relations are still the empty ones here, holding no value); the
+pools nest `mirror+rpc` with S7's pool filters marked public (a wallet in no pool names the zero address,
+which selects no row: the tables are read either way); the pools' two answers (`lodestar_indexers`'
+figures in their own types, and the wallet's thaw requests) taken as Arrow and attached; then S7's four
+statements with both literal relations replaced by `pools.indexers` and `pools.thaws`. The driver refuses
+a statement still holding `VALUES` or an empty relation. Apple M5 Pro, Node 26.11.1, files, fresh
+storage, the public Worker, `https://arb1.arbitrum.io/rpc`, one process for all seven:
+
+| Wallet | Block | Figures | Differ | Pools | Cold | Wallet nest (s, RPC) | Pools nest (s, RPC) | Mirror |
+|---|---|---|---|---|---|---|---|---|
+| 0xcdb9…b2c3 | 520,262,313 | 81 | 0 | 2 | 109.9 s | 64.1, 674 | 40.0, 40 | 179.4 MiB |
+| 0x3a35…bb3c | 520,262,557 | 43 | 0 | 1 | 129.8 s | 82.1, 764 | 42.9, 22 | 179.4 MiB |
+| 0xe3af…2ac2 | 520,263,307 | 32 | 0 | 1 | 151.1 s | 108.6, 925 | 38.7, 22 | 179.4 MiB |
+| 0xd7d7…d076 | 520,263,796 | 53 | 0 | 3 | 112.9 s | 61.6, 643 | 45.6, 56 | 179.4 MiB |
+| 0x96a3…65b2 | 520,264,288 | 50 | 0 | 0 | 118.8 s | 74.5, 669 | 41.9, 22 | 179.4 MiB |
+| 0x6d64…24bc | 520,264,803 | 50 | 0 | 0 | 115.1 s | 69.4, 678 | 43.4, 22 | 179.4 MiB |
+| 0xacbd…0db5 | 520,265,243 | 100 | 0 | 0 | 151.2 s | 103.5, 805 | 45.2, 22 | 179.4 MiB |
+
+409 figures, 0 differing. The mirror half is the same for every wallet: 2,002 GETs, 188,066,801 bytes
+(179.4 MiB, under 200), the dataset since grown to 2,000 segments complete through 520,219,931. No GET
+named the wallet or any of its indexers. The pools nest's linear memory was 26.1 MiB; the process's peak
+RSS reached 738 MiB over all seven. The stakes statement is 5,726 bytes, where S7's hit the 16,384-byte
+cap once with its literal rows; an earlier run of 0xd7d7 alone gave the same 53 figures in 111.7 s.
+
+**The fixture gates, `embed/hosts/node/hybrid-gates.mjs`**, on RFC-0077 S4's nest and mirror followed
+on RFC-0075 S3's recording, in CI's `wasm-plain` leg:
+
+| Gate | Result |
+|---|---|
+| `mirror+rpc` under public filters equals `rpc` under the same filters | **pass**: the same 147 rows at block 26,245,870 |
+| No GET names a filter's value; two opens differing only in value fetch the same URLs | **pass** |
+| A private filter on a `mirror` and on a `mirror+rpc` nest, refused by name before any GET | **pass**, both |
+| Another nest's Arrow answers attached, a `HUGEINT` sum included | **pass**: 147 and 7,350,000,000,000,000,001, `DECIMAL(38,0)` |
+| An attachment from another block, refused by name | **pass**: "`other.moved` is the other nest's answer as of block 26245820, and this nest answers as of block 26245870" |
+
+**Mutations**, each built and run against that script, then reverted: a `get` chosen by a filter's
+value (one extra fetch when the value ends in `c`) turns the same-URLs check red and nothing else; a
+filter's value in a `get`'s query string turns both privacy checks red; the private-filter refusal
+removed turns both refusal checks red. The first form tried, dropping the segments outright, failed the
+open instead and was discarded as red for the wrong reason.
+
+**Unchanged.** S5's 13 shapes (`shapes.mjs`), S3's restart and S5's 32 answers in Node, fresh and killed
+(`run.mjs`), S4's mirror gates and postcards, and S5's six verified cases all pass on the S1 module. The
+event build is 5,321,484 bytes brotli against the 5,500,000 gate, 41,626 more than S0's 5,279,858:
+178,516 bytes of headroom. The binary is unchanged: nothing outside `embed/`, `docs/` and CI's
+`wasm-plain` step is touched, so its `Cargo.lock`, `cargo tree` and `--help` are `main`'s.
+
+**What it does not show.** Node only: no browser, OPFS or phone (S5's). One cold open per wallet: the
+pack is not yet reused between visits, so a second visit fetches the 179 MiB again. `/balances` and the
+built-in views of a `mirror+rpc` nest fold the hydrated history whole, not through the filters; read the
+named tables through `/sql`. The JavaScript tab build (`/play`) answers Arrow too but does not expose the
+envelope; the plain module is the engine this RFC builds on.
