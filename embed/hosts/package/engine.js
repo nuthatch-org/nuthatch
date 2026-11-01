@@ -112,7 +112,12 @@ function compile(m) {
   return p;
 }
 
-/// A nest's files: given by path, or in Node a directory read as `nuthatch` reads one.
+/// What a node leaves out of a nest's inputs (`src/blob.rs`), by name at any depth and at the root.
+const NOT_INPUT = ["nuthatch.redb", "segments", ".git", ".DS_Store"];
+const NOT_INPUT_AT_ROOT = ["maintained", "quarantine"];
+
+/// A nest's files: given by path, or in Node a directory read as a node reads one for its NID, so
+/// the files name the nest a node's `/sql` names (hidden files included).
 async function filesOf(nest) {
   if (nest === undefined || typeof nest === "object") return nest;
   if (!ON_NODE) throw new Error("`nest` is a nest's files by path; a directory is read in Node only");
@@ -120,9 +125,10 @@ async function filesOf(nest) {
   const out = {};
   const walk = (rel) => {
     for (const e of readdirSync(rel ? `${nest}/${rel}` : nest, { withFileTypes: true })) {
-      if (e.name.startsWith(".")) continue;
+      if (NOT_INPUT.includes(e.name) || e.name === ".admin-token" || e.name.startsWith(".admin-token.")) continue;
       const p = rel ? `${rel}/${e.name}` : e.name;
-      if (!rel && ["nuthatch.redb", "segments"].includes(e.name)) continue;
+      if (!rel && NOT_INPUT_AT_ROOT.includes(e.name) && e.isDirectory()) continue;
+      if (e.isSymbolicLink()) throw new Error(`${nest}/${p} is a symbolic link; a node refuses one in a nest`);
       if (e.isDirectory()) walk(p);
       else if (e.isFile()) out[p] = readFileSync(`${nest}/${p}`, "utf8");
     }
@@ -237,18 +243,22 @@ class Nest {
         const s = await this.engine.run(progress);
         const r = this.ready();
         let mirror = null;
+        let identity = null;
         try {
-          mirror = this.engine.report().mirror ?? null;
+          const report = this.engine.report();
+          mirror = report.mirror ?? null;
+          identity = report.identity ?? null;
         } catch {
           // A probe; a nest that cannot report still answers.
         }
         return {
           nid: this.nid, storage: this.mode === "host" ? "kept" : "memory", block: r.last_block ?? null,
           tip: r.tip ?? null, requests: this.requests, ms: Math.round(performance.now() - started), mirror,
+          identity,
           ...(s.unverified ? { unverified: s.unverified } : {}),
         };
       } catch (e) {
-        if (!reopened && this.mode === "host" && !this.fresh && e?.fault === "open_failed" && /open it fresh/.test(e.message)) {
+        if (!reopened && this.mode === "host" && !this.fresh && ["open_failed", "follow_failed"].includes(e?.fault) && /open it fresh/.test(e.message)) {
           this.log(2, `${e.message}; opening it fresh`);
           this.engine.close();
           await this.start(true);
@@ -424,12 +434,183 @@ function serve() {
   };
 }
 
+/// A value as the wire carries it, compared as text, as RFC-0077 S7's page compares a figure.
+const asText = (v) => (v == null ? null : typeof v === "string" ? v : typeof v === "object" ? JSON.stringify(v) : String(v));
+
+/// A `/sql` answer as a node or a gateway in front of one sends it: `{rows, provenance}`, or with the
+/// rows under `data`. Columns are the answer's own order where it kept one.
+function answerOf(a) {
+  const body = typeof a === "string" ? JSON.parse(a) : a;
+  const rows = body?.rows ?? body?.data?.rows;
+  const p = body?.provenance ?? {};
+  if (!Array.isArray(rows)) throw new Error("not a /sql answer: it has no rows");
+  if (typeof p.nid !== "string" || !/^[0-9a-f]{64}$/i.test(p.nid)) {
+    throw new Error("the answer names no nest (`provenance.nid`), so there is no nest to open");
+  }
+  if (!Number.isSafeInteger(p.as_of)) {
+    throw new Error("the answer names no block (`provenance.as_of`), so there is no block to compare at");
+  }
+  if (body.truncated || p.truncated) throw new Error("the answer was truncated, so it cannot be compared whole");
+  const columns = Array.isArray(body.columns) ? body.columns : Object.keys(rows[0] ?? {});
+  return { rows, columns, nid: p.nid.toLowerCase(), as_of: p.as_of };
+}
+
+/// Rows in one order whatever order each side listed them in, so a comparison is of the rows.
+const ordered = (rows, columns) => rows
+  .map((r) => columns.map((c) => asText(r[c])))
+  .sort((a, b) => (JSON.stringify(a) < JSON.stringify(b) ? -1 : JSON.stringify(a) > JSON.stringify(b) ? 1 : 0));
+
+/// Column by column: equal, differs with the values on each side, or not computable here, named.
+function compare(server, here) {
+  const both = server.columns.filter((c) => here.columns.includes(c));
+  const s = ordered(server.rows, both);
+  const h = ordered(here.rows, both);
+  const columns = both.map((column, k) => {
+    const differs = [];
+    for (let i = 0; i < Math.max(s.length, h.length); i++) {
+      const a = s[i]?.[k] ?? null;
+      const b = h[i]?.[k] ?? null;
+      if (a !== b || !s[i] !== !h[i]) differs.push({ row: i, server: a, here: b });
+    }
+    return differs.length ? { column, verdict: "differs", values: differs.slice(0, 20), rows_differing: differs.length } : { column, verdict: "equal" };
+  });
+  for (const column of server.columns.filter((c) => !both.includes(c))) {
+    columns.push({ column, verdict: "not computable", reason: "this nest's answer has no such column" });
+  }
+  for (const column of here.columns.filter((c) => !both.includes(c))) {
+    columns.push({ column, verdict: "not computable", reason: "the server's answer has no such column" });
+  }
+  return { rows: { server: server.rows.length, here: here.rows.length }, columns };
+}
+
+/// What a check ran under, for the result to say every time (RFC-0081 §7.2).
+const hostsOf = (rpc) => Object.values(endpointsOf(rpc)).filter(Boolean).map((u) => {
+  try {
+    return new URL(u).host;
+  } catch {
+    return "(given)";
+  }
+});
+
+/// RFC-0081 S3: hosted answers checked by opening the nest that answered, by its NID, at the block it
+/// answered as of, narrowed by the caller's filters. Equality says the server and this RPC agree.
+class Verifier {
+  constructor(options) {
+    if (options.nest === undefined) throw new Error("a verifier needs the nest's files (`nest`), to open the nest an answer names");
+    this.options = options;
+    this.open = null;
+  }
+
+  /// The nest at `as_of` under `filters`, opened once and kept for the next check at that block.
+  async nest(nid, as_of, filters) {
+    const key = JSON.stringify([nid, as_of, filters]);
+    if (this.open?.key === key) return this.open;
+    this.close();
+    const { module, nest, mirror, rpc, storage, headerBatch, verified, log, onProgress, window, memory_mib, worker, workerUrl } = this.options;
+    const source = mirror && filters.every((f) => f.privacy === "public") ? "mirror+rpc" : "rpc";
+    const opened = await Engine.open({
+      module, nest, rpc, storage, headerBatch, verified, log, onProgress, window, memory_mib, worker, workerUrl,
+      filters, until: as_of, expect_nid: nid, source, ...(source === "mirror+rpc" ? { mirror } : {}),
+    });
+    try {
+      const followed = await opened.follow();
+      if (followed.block !== as_of) {
+        throw new Error(`the nest reached block ${followed.block} and the answer is as of block ${as_of}: the RPC is behind the server`);
+      }
+      this.open = { key, nest: opened, followed, source };
+      return this.open;
+    } catch (e) {
+      opened.close();
+      throw e;
+    }
+  }
+
+  async sql(nest, q, whole) {
+    const r = await nest.request("POST", "/sql", JSON.stringify(whole ? { q, whole } : { q }));
+    const body = JSON.parse(r.body);
+    if (r.status !== 200) return { error: body.error ?? r.body };
+    return { rows: body.rows, columns: body.columns, provenance: body.provenance };
+  }
+
+  /// One statement or several, each `{answer, statement, name}`, all as of one block of one nest.
+  async verify(answer, statement, filters) {
+    const items = Array.isArray(answer) ? answer : [{ answer, statement }];
+    if (!Array.isArray(filters) || !filters.length) {
+      throw new Error("verify needs the filters the statements are about: a narrowed nest answers only what they cover");
+    }
+    const parsed = items.map((i) => ({ ...i, server: answerOf(i.answer) }));
+    const { nid, as_of } = parsed[0].server;
+    for (const p of parsed) {
+      if (p.server.nid !== nid || p.server.as_of !== as_of) {
+        throw new Error(`answers from nest ${p.server.nid} at block ${p.server.as_of} and ${nid} at ${as_of}: check each nest and block apart`);
+      }
+    }
+    const { nest, followed, source } = await this.nest(nid, as_of, filters);
+    const results = [];
+    for (const [k, p] of parsed.entries()) {
+      const name = p.name ?? `statement ${k + 1}`;
+      const here = await this.sql(nest, p.statement);
+      if (here.error) {
+        results.push({ name, verdict: "not computable", reason: `this nest refused the statement: ${here.error}` });
+        continue;
+      }
+      if (here.provenance?.as_of !== as_of) {
+        results.push({ name, verdict: "not computable", reason: `this nest answered as of ${here.provenance?.as_of}, not ${as_of}` });
+        continue;
+      }
+      const outside = await this.outside(nest, p.statement, here, followed);
+      if (outside) {
+        results.push({ name, verdict: "outside the filters", reason: outside });
+        continue;
+      }
+      const c = compare(p.server, { rows: here.rows, columns: here.columns ?? Object.keys(here.rows[0] ?? {}) });
+      const verdict = c.columns.some((x) => x.verdict === "differs") || c.rows.server !== c.rows.here ? "differs" : "equal";
+      results.push({ name, verdict, read: here.provenance?.narrowed?.read ?? null, ...c });
+    }
+    return {
+      nid, as_of, source, filters, dataset: followed.identity?.dataset ?? null,
+      rpc: hostsOf(this.options.rpc),
+      head: this.options.verified ? "verified" : "the RPC's, unverified",
+      mirror: followed.mirror
+        ? { base: this.options.mirror.base, ...followed.mirror }
+        : null,
+      requests: followed.requests,
+      statements: results,
+    };
+  }
+
+  /// Why a statement reads outside the filters, or null. Two rules: it names a table no filter
+  /// covers, which this nest holds none of; or, where the tables came whole from a mirror, its answer
+  /// over every hydrated row differs from its answer through the filters.
+  async outside(nest, q, here, followed) {
+    const n = here.provenance?.narrowed;
+    if (n?.unfiltered?.length) return `it reads ${n.unfiltered.join(", ")}, which no filter covers`;
+    if (!followed.mirror) return null;
+    const whole = await this.sql(nest, q, true);
+    if (whole.error) return `its answer over the whole hydrated tables could not be read: ${whole.error}`;
+    const cols = here.columns ?? Object.keys(here.rows[0] ?? {});
+    if (JSON.stringify(ordered(whole.rows, cols)) !== JSON.stringify(ordered(here.rows, cols))) {
+      return `its answer changes when the rows outside the filters (the published dataset's, through block ${followed.mirror.complete_through}) are read`;
+    }
+    return null;
+  }
+
+  close() {
+    this.open?.nest.close();
+    this.open = null;
+  }
+}
+
 export const Engine = {
   /// Open a nest. In a page it runs in the package's worker; in a worker or in Node, here.
   open(options) {
     const page = !ON_NODE && typeof document !== "undefined";
     const inWorker = page && options.worker !== false && typeof options.storage !== "object";
     return inWorker ? WorkerNest.open(options) : Nest.open(options);
+  },
+  /// A checker of hosted answers (RFC-0081 §3.4): `verifier(options).verify(answer, statement, filters)`.
+  verifier(options) {
+    return new Verifier(options);
   },
 };
 
