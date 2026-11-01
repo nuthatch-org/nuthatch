@@ -15,6 +15,7 @@ is the design; this file is the interface it promises.
 | `plain/` | `nuthatch-embed-plain`: the same nest as a plain core module, the one this interface describes |
 | `hosts/browser/` | the reference browser host: `host.js`, OPFS, a worker, the Service Worker |
 | `hosts/node/` | the browser host run in Node over files, as CI runs it |
+| `hosts/package/` | the host package, `nuthatch-engine.js`, built from both (RFC-0081 S2) |
 | `tests/wasmtime-host/` | the reference non-browser host on wasmtime, and the pinned-interface check |
 
 Build the module with `plain/build.sh <out.wasm>`. It needs the `wasm32-unknown-unknown` target,
@@ -159,7 +160,11 @@ nest's data identity from `files` as a node does from its directory, which names
 and asks for every segment and seed tail, each appended to the pack and read back against its content
 address before the catalogue names it. Every file the host gives that a node would hash into the
 identity must be there, `schema.json` included. A hydration that does not finish leaves the store
-marked, and the next open hydrates again from nothing. `mirror.postcard` (`{"cuts": {table: block},
+marked, and the next open hydrates again from nothing. A store that finished is reopened from its pack
+with nothing fetched (RFC-0081 S2): the dataset its files name must be the one it was hydrated from,
+and every segment in the pack must still hash to its content address, or the open fails
+(`open_failed`, ending "open it fresh"). The chain past it comes from the RPC, as for any reopened
+nest. The report's `mirror` says `"reused": true` for such an open. `mirror.postcard` (`{"cuts": {table: block},
 "digest": "..."}`) pins the catalogue as an RFC-0068 postcard does: cut at each table's block, it must
 hash with the mirror's `schema.json` to `digest`, no seed tail is read, and the nest is what the
 publisher had sealed through the highest cut. A pinned nest does not follow.
@@ -367,6 +372,59 @@ the guest faults `locked`. A host with no lock of its own must not open one nest
 fails a module that differs from the version it reports; a published version's table is frozen by
 its hash. Within a version, the JSON may gain an optional `nh_open` key, an optional answer field or
 a request kind behind an option, and nothing a host of that version would read differently.
+
+## The host package
+
+`nuthatch-engine.js` (RFC-0081 S2) is the host a page or a Node program uses instead of writing its
+own: one ES module, released beside `nuthatch-events.wasm` with its own sha256 and versioned with it.
+`hosts/package/build.mjs` makes it from `hosts/package/engine.js` and the reference hosts below, whose
+code it carries unchanged. It refuses a module that does not speak `abi: 1`.
+
+```js
+import { Engine } from "./nuthatch-engine.js";
+const nest = await Engine.open({ module: "nuthatch-events.wasm", nest: files, rpc: url, storage: "opfs", until });
+await nest.follow();                       // steps until idle, answering every request
+const env = await nest.sql("SELECT ...");  // /sql's envelope; `{attach}` binds other nests' answers
+const answer = await nest.arrow("SELECT ..."); // an Arrow answer, as another nest's `attach` takes it
+nest.close();
+```
+
+| Option | |
+|---|---|
+| `module` | the `.wasm` (a URL, a path in Node, bytes, or a compiled `WebAssembly.Module`); a `.gz` name is inflated |
+| `nest` | the nest's files by path; in Node, also a directory |
+| `rpc` | a URL, or `{name: url}`: the module sees only the names |
+| `storage` | `"opfs"` (a page's default; memory where OPFS is missing), `"memory"` (Node's default), or in Node a directory, each nest kept under `<dir>/<nid>` |
+| `nid` | the store's name; by default one per module, files and what the store holds (filters, source, mirror), so a second open reuses the first and a store is never reopened under other files or filters |
+| `fresh` | open the store empty |
+| `headerBatch` | the longest JSON-RPC batch an endpoint takes, a number or `{name: n}`; `arb1.arbitrum.io` is 10 unless said |
+| `verified` | the page's light client, `() => ({number, hash})`; sets `verified` |
+| `log`, `onProgress` | `(level, line)`, and `({block, tip, requests})` at most twice a second while following |
+| `worker`, `workerUrl` | in a page, nests run in the package's own worker (one per page, ended when its last nest closes), started from the package's URL; `worker: false` runs them in the calling context |
+
+Every other key is `nh_open`'s, passed as given: `filters`, `source`, `mirror`, `attach`, `until`,
+`window`, `follow`, `memory_mib`, `poll_interval_secs`, `contract`, `start`.
+
+What it owns: the worker, the store, retries across a transport failure (a POST that got no reply is
+sent again, up to three times; a deadline that passed is the module's to judge), splitting a batch
+longer than its endpoint takes and pacing the parts through a throttle, and the `follow_failed`
+carry (up to five times, resting 2 s doubling). A kept store the module will not reopen, a pack that
+fails its check or files that name another dataset, is opened fresh once. What it does not own: RPC
+URLs, keys and a light client, which are the caller's. It reaches nothing the caller did not name.
+
+`follow()` answers `{nid, storage, block, tip, requests, ms, mirror}`; `request(method, target, body)`
+is `nh_request`, for any route. `docs/examples/engine-defi-pulse.mjs` opens defi-pulse-nest from the
+public mirror in 29 lines. Its gates, in CI's `wasm-plain` leg and the release's engine job:
+
+```sh
+node hosts/package/build.mjs /tmp/nuthatch-engine.js
+node hosts/package/run.mjs /tmp/nuthatch-engine.js /tmp/plain.wasm s5 http://127.0.0.1:8954/ ../tests/fixtures/tab-parity
+node hosts/package/run.mjs /tmp/nuthatch-engine.js /tmp/plain.wasm reuse $d/s4-nest $d/s4-mirror
+```
+
+The first is S5's 32 answers through the package, opened fresh and then from its kept store; the
+second a mirrored nest closed and reopened with no GET and the same answers, then reopened over a pack
+with one byte altered, which must be fetched again.
 
 ## The reference hosts and the gate
 

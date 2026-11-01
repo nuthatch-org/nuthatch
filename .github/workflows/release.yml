@@ -199,8 +199,10 @@ jobs:
   # builds nor changes. Built as CI's `wasm-plain` leg builds it, then gated again on the exact file
   # that ships: its imports, the 5.5 MB brotli ceiling, `abi`'s pinned shapes, and RFC-0075 S3's and
   # S5's answers in Node and wasmtime, fresh and killed mid-follow. `nh_abi`'s `engine` must name the
-  # version released. A `workflow_dispatch` run keeps the module as a workflow artifact and attaches
-  # nothing.
+  # version released. RFC-0081 S2: the host package, `nuthatch-engine.js`, is built beside it and gated
+  # on the same module: S5's answers through the package, fresh and from its kept store, and a mirrored
+  # nest reopened from its pack. A `workflow_dispatch` run keeps both as a workflow artifact and
+  # attaches nothing.
   engine:
     name: embeddable engine (wasm)
     needs: release-notes
@@ -264,13 +266,18 @@ jobs:
           $host run "$m" http://127.0.0.1:8954/ $d s5 "${cache[@]}" | tee "$RUNNER_TEMP/wasmtime.log"
           $host run "$m" http://127.0.0.1:8954/ $d s5 --restart "${cache[@]}" | tee -a "$RUNNER_TEMP/wasmtime.log"
           node hosts/agree.mjs "$m" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" --hosts node,wasmtime
+          p="$GITHUB_WORKSPACE/nuthatch-engine.js"
+          node hosts/package/build.mjs "$p" --version "$version"
+          node hosts/package/run.mjs "$p" "$m" s5 http://127.0.0.1:8954/ $d
+          node hosts/package/run.mjs "$p" "$m" reuse $d/s4-nest $d/s4-mirror
       - name: package
         run: |
           set -euo pipefail
           shasum -a 256 nuthatch-events.wasm > nuthatch-events.wasm.sha256
+          shasum -a 256 nuthatch-engine.js > nuthatch-engine.js.sha256
           cp embed/README.md nuthatch-events-README.md
-          cat nuthatch-events.wasm.sha256
-          ls -l nuthatch-events.wasm
+          cat nuthatch-events.wasm.sha256 nuthatch-engine.js.sha256
+          ls -l nuthatch-events.wasm nuthatch-engine.js
       - name: keep the module (dispatch)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -279,6 +286,8 @@ jobs:
           path: |
             nuthatch-events.wasm
             nuthatch-events.wasm.sha256
+            nuthatch-engine.js
+            nuthatch-engine.js.sha256
             nuthatch-events-README.md
           retention-days: 7
       - name: attach to release
@@ -290,13 +299,17 @@ jobs:
           files: |
             nuthatch-events.wasm
             nuthatch-events.wasm.sha256
+            nuthatch-engine.js
+            nuthatch-engine.js.sha256
             nuthatch-events-README.md
           fail_on_unmatched_files: true
       - name: attest the built module
         if: github.event_name == 'push'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: nuthatch-events.wasm
+          subject-path: |
+            nuthatch-events.wasm
+            nuthatch-engine.js
 
   # Publish the container image (RFC-0005 release engineering). "Build it yourself from this Dockerfile"
   # is not a deployment story for a platform team, which is what this closes.
@@ -393,7 +406,7 @@ jobs:
           set -euo pipefail
           mkdir -p verify && cd verify
           gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --pattern '*.tar.gz' --pattern 'nuthatch-events.wasm' --clobber
+            --pattern '*.tar.gz' --pattern 'nuthatch-events.wasm' --pattern 'nuthatch-engine.js' --clobber
           shopt -s nullglob
           files=(*.tar.gz)
           if [ ${#files[@]} -eq 0 ]; then
@@ -404,7 +417,11 @@ jobs:
             echo "::error::no nuthatch-events.wasm on the release - the engine job attached nothing"
             exit 1
           fi
-          files+=(nuthatch-events.wasm)
+          if [ ! -f nuthatch-engine.js ]; then
+            echo "::error::no nuthatch-engine.js on the release - the engine job attached no host package"
+            exit 1
+          fi
+          files+=(nuthatch-events.wasm nuthatch-engine.js)
           for f in "${files[@]}"; do
             echo "--- $f ---"
             gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"

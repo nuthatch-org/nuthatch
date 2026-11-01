@@ -90,11 +90,16 @@ if (gate === "s5") {
   byte[0] ^= 0xff;
   writeSync(fd, byte, 0, 1, 1000);
   closeSync(fd);
-  const third = await opened(options, "altered");
-  const after = await answer(third.nest);
-  third.nest.close();
-  if (third.followed.mirror?.reused !== false || third.gets === 0) failures.push("an altered pack was not fetched again");
-  if (after !== want) failures.push(`after an altered pack the nest answered ${after}, before ${want}`);
+  let third;
+  try {
+    third = await opened(options, "altered");
+    const after = await answer(third.nest);
+    third.nest.close();
+    if (third.followed.mirror?.reused !== false || third.gets === 0) failures.push("an altered pack was not fetched again");
+    if (after !== want) failures.push(`after an altered pack the nest answered ${after}, before ${want}`);
+  } catch (e) {
+    failures.push(`an altered pack was opened, not fetched again: ${e.message}`);
+  }
   server.close();
   if (!failures.length) {
     console.log(`gate: reopened from its pack with no GET and the same answers (${want}); an altered pack fetched again (${third.gets} GETs)`);
