@@ -61,6 +61,8 @@ pub struct NestSpec {
     pub narrowed: Option<Vec<crate::narrow::Narrowed>>,
     /// RFC-0077 S7: the last block the cursor indexes, so the nest answers as of it.
     pub until: Option<u64>,
+    /// RFC-0081 S1: a hybrid open hydrates only these tables from its mirror, each whole.
+    pub hydrate: Option<std::collections::BTreeSet<String>>,
 }
 
 impl NestSpec {
@@ -117,6 +119,7 @@ impl NestSpec {
                 .collect(),
             narrowed: None,
             until: None,
+            hydrate: None,
             registry,
         })
     }
@@ -154,6 +157,7 @@ impl NestSpec {
             starts: Default::default(),
             narrowed: None,
             until: None,
+            hydrate: None,
         }
     }
 

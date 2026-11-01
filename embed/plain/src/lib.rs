@@ -5,16 +5,19 @@
 
 mod host_file;
 
+use base64::Engine as _;
 use host_file::HostFile;
 use nuthatch_core::backend::Bytes;
 use nuthatch_core::redb_store::Store;
 use nuthatch_core::rpc::RpcClient;
 use nuthatch_core::transport::{Reply, Transport, TransportError};
+use nuthatch_embed::attach;
 use nuthatch_embed::budget::TabBudget;
 use nuthatch_embed::cellar::Cellar;
 use nuthatch_embed::derived::NestFiles;
+use nuthatch_embed::http::Scope;
 use nuthatch_embed::mirror::{self, Hydrated, MirrorConfig, MirrorHost};
-use nuthatch_embed::narrow::{self, FilterSpec};
+use nuthatch_embed::narrow::{self, FilterSpec, Privacy};
 use nuthatch_embed::nest::{NestSpec, CONFIG_FILE};
 use nuthatch_embed::tab::{TabNest, Verified};
 use nuthatch_embed::verified::{VerifiedHead, Verifier};
@@ -22,7 +25,7 @@ use nuthatch_embed::young;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -152,6 +155,42 @@ struct Config {
     window: Option<u64>,
     /// RFC-0077 S7: index no further than this block, so the nest answers as of it.
     until: Option<u64>,
+    /// RFC-0081 S1: where the nest's history comes from; absent, `mirror` with a mirror, else `rpc`.
+    source: Option<Source>,
+    /// RFC-0081 §3.2: other instances' answers a `POST /sql` may bind, each under its own name.
+    attach: Option<Vec<attach::Declared>>,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Debug)]
+enum Source {
+    #[serde(rename = "rpc")]
+    Rpc,
+    #[serde(rename = "mirror")]
+    Mirror,
+    /// The tables the filters' events decode into from a mirror, whole, then the filters' logs from
+    /// the RPC from where the mirror ends.
+    #[serde(rename = "mirror+rpc")]
+    MirrorRpc,
+}
+
+impl Source {
+    fn name(self) -> &'static str {
+        match self {
+            Source::Rpc => "rpc",
+            Source::Mirror => "mirror",
+            Source::MirrorRpc => "mirror+rpc",
+        }
+    }
+}
+
+impl Config {
+    fn source(&self) -> Source {
+        match (self.source, &self.mirror) {
+            (Some(s), _) => s,
+            (None, Some(_)) => Source::Mirror,
+            (None, None) => Source::Rpc,
+        }
+    }
 }
 
 fn default_nid() -> String {
@@ -169,6 +208,7 @@ struct Engine {
     cellar: Arc<Cellar>,
     rpc: Arc<RpcClient<HostTransport>>,
     files: NestFiles,
+    scope: Scope,
     nid: String,
     poll_interval_secs: Option<u64>,
     storage: Storage,
@@ -403,7 +443,7 @@ fn open(raw: &[u8]) -> Result<Value, Fault> {
     let budget = c.memory_mib.map(TabBudget::mib).unwrap_or_default();
     budget.enforce();
     if c.mirror.is_some() {
-        mirror::admit(&c.files, budget).map_err(|e| fault_of("open_failed", e))?;
+        mirror::admit(&bound_files(&c), budget).map_err(|e| fault_of("open_failed", e))?;
     }
     let storage = c.storage;
     let state = match storage {
@@ -434,9 +474,56 @@ fn open(raw: &[u8]) -> Result<Value, Fault> {
 /// host is asked for anything, when the two are mixed or a mode cannot do what is asked.
 fn spec_of(c: &Config) -> Result<NestSpec, Fault> {
     let bad = |m: &str| Err(fault("bad_config", m));
+    let source = c.source();
+    match (source, &c.mirror) {
+        (Source::Rpc, Some(_)) => {
+            return bad("source `rpc` reads no mirror, and `mirror` is given")
+        }
+        (Source::Mirror | Source::MirrorRpc, None) => {
+            return Err(fault(
+                "bad_config",
+                format!("source `{}` needs `mirror`", source.name()),
+            ))
+        }
+        _ => {}
+    }
+    // RFC-0081 §3.1: no value a private filter holds may decide what is asked of a mirror.
+    if source != Source::Rpc {
+        if let Some(f) = c
+            .filters
+            .iter()
+            .flatten()
+            .find(|f| f.privacy == Privacy::Private)
+        {
+            return Err(fault(
+                "bad_config",
+                format!(
+                    "filter on `{}.{}` is private, and a `{}` nest's tables come from a mirror: \
+                     a private value never narrows one. Mark the filter public, or open the nest \
+                     with source `rpc`",
+                    f.contract,
+                    f.event,
+                    source.name()
+                ),
+            ));
+        }
+    }
+    match (source, &c.filters) {
+        (Source::Mirror, Some(_)) => {
+            return bad(
+                "a `mirror` nest holds a nest's whole history, and `filters` select part of it: \
+                 source `mirror+rpc` hydrates the tables they name and asks the RPC for the rest",
+            )
+        }
+        (Source::MirrorRpc, None) => {
+            return bad("source `mirror+rpc` is narrowed by `filters`, and none are given")
+        }
+        _ => {}
+    }
     let mut spec = match (c.files.contains_key(CONFIG_FILE), &c.contract, c.start) {
-        (true, None, None) if hybrid(c) => {
-            NestSpec::from_files(&without_calls(&c.files)).map_err(|e| fault_of("bad_config", e))?
+        (true, None, None) if source == Source::MirrorRpc => {
+            NestSpec::from_files(&without_calls(&c.files)?)
+                .map_err(|e| fault_of("bad_config", e))?
         }
         (true, None, None) => {
             NestSpec::from_files(&c.files).map_err(|e| fault_of("bad_config", e))?
@@ -458,7 +545,7 @@ fn spec_of(c: &Config) -> Result<NestSpec, Fault> {
         if c.contract.is_some() {
             return bad("`mirror` hydrates a nest from its nuthatch.toml, and this one has none");
         }
-        if m.postcard.is_some() && c.follow == Some(true) {
+        if m.postcard.is_some() && (c.follow == Some(true) || source == Source::MirrorRpc) {
             return bad(
                 "a postcard pins what the publisher had sealed, so a pinned nest does not follow",
             );
@@ -472,6 +559,12 @@ fn spec_of(c: &Config) -> Result<NestSpec, Fault> {
             return bad("`filters` name contracts by their alias in a nuthatch.toml");
         }
         spec.narrowed = Some(narrow::build(&spec, filters).map_err(|e| fault_of("bad_config", e))?);
+        if source == Source::MirrorRpc {
+            spec.hydrate =
+                Some(narrow::tables(&spec, filters).map_err(|e| fault_of("bad_config", e))?);
+            // Refused here, before the host is asked for anything, rather than once the store opens.
+            narrow::predicates(&spec, filters).map_err(|e| fault_of("bad_config", e))?;
+        }
     }
     spec.until = c.until;
     match c.window {
@@ -482,33 +575,31 @@ fn spec_of(c: &Config) -> Result<NestSpec, Fault> {
     Ok(spec)
 }
 
-/// RFC-0081 S0's hybrid open, a spike: `mirror` and `filters` together hydrate the tables the
-/// filters name and then ask the RPC for the filters' logs from where the mirror ends.
-fn hybrid(c: &Config) -> bool {
-    c.mirror.is_some() && c.filters.is_some()
-}
-
-/// The nest's files with `[[calls]]` cut from its `nuthatch.toml`. The dataset names the whole
-/// directory, so the identity is computed from the files as given; the calls' tables are not hydrated
-/// and no call is made.
-fn without_calls(files: &NestFiles) -> NestFiles {
+/// What a `mirror+rpc` nest is opened from: its `nuthatch.toml` without `[[calls]]`, which only a
+/// node runs. Their tables are no filter's, so none is hydrated and no call is made. The identity is
+/// still computed from the files as given, since the dataset names the whole directory.
+fn without_calls(files: &NestFiles) -> Result<NestFiles, Fault> {
     let mut out = files.clone();
     if let Some(raw) = files.get(CONFIG_FILE) {
-        let mut kept = String::new();
-        let mut in_calls = false;
-        for line in raw.lines() {
-            let t = line.trim_start();
-            if t.starts_with('[') {
-                in_calls = t.starts_with("[[calls]]");
-            }
-            if !in_calls {
-                kept.push_str(line);
-                kept.push('\n');
-            }
+        let mut table: toml::Table =
+            toml::from_str(raw).map_err(|e| fault("bad_config", format!("nuthatch.toml: {e}")))?;
+        if table.remove("calls").is_some() {
+            out.insert(CONFIG_FILE.to_string(), table.to_string());
         }
-        out.insert(CONFIG_FILE.to_string(), kept);
     }
-    out
+    Ok(out)
+}
+
+/// The files a nest binds. A `mirror+rpc` nest holds the rows its filters select, and the dataset's
+/// views and entities read every row, so it binds neither.
+fn bound_files(c: &Config) -> NestFiles {
+    let mut files = c.files.clone();
+    if c.source() == Source::MirrorRpc {
+        files.retain(|p, _| {
+            !(p.starts_with("views/") || p.starts_with("entities/") || p == "entities.toml")
+        });
+    }
+    files
 }
 
 /// A file opened through the host, as a handle.
@@ -632,18 +723,33 @@ fn build(
     bytes: Option<Bytes>,
     hydrated: Option<Hydrated>,
 ) -> anyhow::Result<Engine> {
-    let mut c = c;
-    if hybrid(&c) {
-        // The dataset's views read the whole network, and a hybrid nest holds part of it.
-        c.files.retain(|p, _| !p.starts_with("views/"));
+    let files = bound_files(&c);
+    let mut scope = Scope::default();
+    if c.source() == Source::MirrorRpc {
+        let filters = c.filters.as_deref().unwrap_or_default();
+        scope.predicates =
+            narrow::predicates(&spec, filters).map_err(|e| fault_of("bad_config", e))?;
+        scope.unbound_views = nuthatch_embed::query::view_names(&c.files)?;
     }
+    let mut own: BTreeSet<String> = spec
+        .registry
+        .schema()
+        .into_iter()
+        .map(|t| t.table.to_ascii_lowercase())
+        .collect();
     let start = spec.start.unwrap_or_default();
     let budget = c.memory_mib.map(TabBudget::mib).unwrap_or_default();
     let mut nest = young::open_nest(store, cellar.clone(), spec, start, budget)?;
     // Before `derive`, which admits the entities against it (RFC-0075 §17).
     nest.budget = budget;
-    if !c.files.is_empty() {
-        nest.derive(&c.files)?;
+    if !files.is_empty() {
+        nest.derive(&files)?;
+    }
+    if let Some(declared) = &c.attach {
+        own.extend(nuthatch_embed::query::view_names(&c.files)?);
+        own.extend(nest.entities.iter().map(|e| e.name_lower()));
+        attach::check(declared, &own).map_err(|e| fault_of("bad_config", e))?;
+        scope.attach = declared.clone();
     }
     let verifier = c.verified.then(|| Arc::new(Verifier::new()));
     if let Some(v) = &verifier {
@@ -661,7 +767,8 @@ fn build(
         hydrated,
         cellar,
         rpc: Arc::new(RpcClient::new(c.rpc)?),
-        files: c.files,
+        files,
+        scope,
         nid: c.nid,
         poll_interval_secs: c.poll_interval_secs,
         storage: c.storage,
@@ -833,17 +940,28 @@ pub extern "C" fn nh_request(
             version: young::node_version(),
             poll_interval_secs: engine.poll_interval_secs,
             log_window: engine.nest.log_window(),
+            scope: Some(&engine.scope),
         };
         let mut answer =
-            std::pin::pin!(nuthatch_embed::http::answer(&nest, &method, &target, &body));
+            std::pin::pin!(nuthatch_embed::http::reply(&nest, &method, &target, &body));
         let mut cx = Context::from_waker(Waker::noop());
         for _ in 0..1_000_000 {
-            if let Poll::Ready(a) = answer.as_mut().poll(&mut cx) {
-                return Ok(json!({
-                    "status": a.status,
-                    "content_type": nuthatch_embed::http::content_type(&a),
-                    "body": String::from_utf8_lossy(&a.body),
-                }));
+            if let Poll::Ready(r) = answer.as_mut().poll(&mut cx) {
+                let content_type = r.content_type();
+                // An Arrow stream is bytes, so it crosses as base64, its envelope as the node's header.
+                return Ok(match r.arrow {
+                    None => json!({
+                        "status": r.answer.status,
+                        "content_type": content_type,
+                        "body": String::from_utf8_lossy(&r.answer.body),
+                    }),
+                    Some(envelope) => json!({
+                        "status": r.answer.status,
+                        "content_type": content_type,
+                        "body_base64": base64::engine::general_purpose::STANDARD.encode(&r.answer.body),
+                        "headers": {"x-nuthatch-answer": envelope},
+                    }),
+                });
             }
         }
         Err(fault("stalled", "a query yielded a million times"))

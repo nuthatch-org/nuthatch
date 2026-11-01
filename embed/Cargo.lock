@@ -1053,7 +1053,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "burrmill"
 version = "0.0.1"
-source = "git+https://github.com/nuthatch-org/burrmill?rev=ea8cf40c74b4e9da61983c4658d50d2d18217b7f#ea8cf40c74b4e9da61983c4658d50d2d18217b7f"
+source = "git+https://github.com/nuthatch-org/burrmill?rev=fc2dd1601aaa041faf776dd1d3cfbcf263cf9600#fc2dd1601aaa041faf776dd1d3cfbcf263cf9600"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.0",
@@ -2364,7 +2364,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3628,7 +3628,10 @@ dependencies = [
  "alloy-primitives",
  "anyhow",
  "arrow-array",
+ "arrow-ipc",
+ "arrow-schema 59.3.0",
  "async-trait",
+ "base64 0.22.1",
  "burrmill",
  "bytes",
  "dbsp",
@@ -3653,6 +3656,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlparser",
+ "toml",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -4589,7 +4593,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5092,7 +5096,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5696,7 +5700,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
