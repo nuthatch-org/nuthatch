@@ -506,7 +506,9 @@ envelope; the plain module is the engine this RFC builds on.
   gains `reused`. No export changes; `abi` stays 1.
 - **Release.** The engine job builds the package at the released version, runs both package gates on
   the module that ships, and attaches `nuthatch-engine.js` and its `.sha256` beside the module, attested
-  and checked before publishing like it. No npm (§9).
+  and checked before publishing like it. No npm (§9). Its `workflow_dispatch` dry run on this branch
+  (run 41307875395) passed and kept both as an artifact: the package's sha256 there,
+  `9cab0a9f…7793ae25`, is the one this Mac builds, so the bundle is the same bytes on both.
 
 **The gate.**
 
