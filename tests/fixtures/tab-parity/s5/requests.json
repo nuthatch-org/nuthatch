@@ -6,6 +6,7 @@
   {"method": "GET", "path": "/sql?q=SELECT%20block_number%2C%20log_index%2C%20%22from%22%2C%20%22to%22%2C%20value%20FROM%20tab__transfer%20ORDER%20BY%20block_number%20DESC%2C%20log_index%20DESC%20LIMIT%205"},
   {"method": "GET", "path": "/sql?q=SELECT%20%22to%22%2C%20n%2C%20total%20FROM%20received%20ORDER%20BY%20n%20DESC%2C%20%22to%22%20LIMIT%203"},
   {"method": "POST", "path": "/sql", "body": "{\"q\": \"SELECT block_number FROM tab__transfer ORDER BY block_number, log_index LIMIT 4\", \"max_rows\": 2}"},
+  {"method": "POST", "path": "/sql", "body": "{\"q\": \"SELECT kind, block_number, log_index FROM (SELECT 'b' AS kind, block_number, log_index FROM tab__transfer WHERE block_number < 26242000 UNION ALL SELECT 'a', block_number, log_index FROM tab__transfer WHERE block_number >= 26242000) AS t ORDER BY kind, block_number, log_index LIMIT 5\"}"},
   {"method": "GET", "path": "/sql?q=SELECT%20nope%20FROM%20tab__transfer"},
   {"method": "POST", "path": "/sql", "body": "SELECT 1"},
   {"method": "GET", "path": "/explain?q=SELECT%20count(*)%20FROM%20tab__transfer"},
