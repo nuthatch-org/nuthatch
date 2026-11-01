@@ -1,7 +1,8 @@
 # RFC-0081: The engine in use - fast cold opens, one statement over two nests, answers a client can check
 
-- Status: **Accepted, 2026-10-31 (Chief). Not started:** no slice is begun until Chief says. S0 goes first
-  and can stop the first half.
+- Status: **Accepted, 2026-10-31 (Chief). S0 measured 2026-11-01 (§11): narrow.** Row-group reads are not
+  selective; a hybrid open of whole tables passes every gate but the 64 MiB one. No later slice is begun
+  until Chief says.
 - Author: Pete (cargopete)
 - Date: 2026-10-31
 - Depends on: RFC-0077 (the embeddable engine, S0 to S5 and S7 built, shipped as
@@ -275,3 +276,106 @@ build and rotki (RFC-0077 S6 waits). RFC-0080's shapes, which are that RFC's.
 
 The host package (§3.3) and `verify` (§3.4) are new supported surface outside the binary, of the kind
 RFC-0077 §10 recorded a line for. If accepted, this wants its own line in `CLAUDE.md`.
+
+## 11. S0 measured outcome, 2026-11-01
+
+**Verdict: narrow.** The kill condition is met: the pool tables' row groups are not selective, so a
+hybrid open reads whole segments, as §4 says it then must. Read that way, a hybrid open of the tables
+the filters name, whole, passes every gate except the 64 MiB one: the same 53 figures at one block, in
+109 s from cold against S7's 1,995 s, and no GET naming the wallet. It fetches 179 MiB, every time
+and for every wallet. §3.1 narrows to that shape; whether 179 MiB is acceptable for a cold open is
+Chief's call, since the 64 MiB figure cannot be met without changing sealed bytes (§7.1, §8).
+
+**The dataset.** graph-allocations-nest's published dataset on the public mirror's Worker is
+`d6fd43c8…6e8b`, written by 5.12.0, sealed through block 520,131,075, its seed complete through
+520,131,917. A clean copy of the nest at `7795a33` computes that identity; its `main` (`36bd3de`)
+computes `545c3113…0006`, which differs only in files the pool tables do not read (the `nuthatch.toml`
+and ABIs are byte-identical). Nothing was published, locally or to R2: the pools nest *is*
+graph-allocations-nest at `7795a33`, narrowed by Lodestar's `poolFilters`, rather than Lodestar's own
+`pools.toml`, whose identity no mirror holds.
+
+**Is a hybrid open small? No.** The fifteen pool tables the filters name (a sixteenth,
+`staking__delegation_slashed`, has no rows) are 1,995 segments, 185,382,371 bytes. Measured by
+`embed/rowgroups/` from each segment's footer, read by HTTP range:
+
+| | Segments | Row groups | Admitted by min/max | Bytes | Admitted bytes | Segments holding a row of the three indexers |
+|---|---|---|---|---|---|---|
+| Fifteen pool tables | 1,995 | 1,995 | 1,949 (97.7%) | 185,382,371 | 172,389,148 | 1,891 (94.8%) |
+
+- **One row group per segment.** A segment is about a thousand rows; the writer's row-group size is far
+  above that. Row-group pruning is segment pruning.
+- **Min/max admits almost all of them.** The indexer column holds random hex, so any segment with a few
+  dozen indexers spans nearly the whole range. Three indexers' values fall inside 1,949 of 1,995.
+- **No bloom filter on the indexer columns.** `zstd-bloom-v1` blooms `address`, `from`, `to`, `owner`,
+  `spender`, `topic0` and hashes; `indexer` and `serviceProvider` are none of them.
+- **A perfect index would not save it either.** The last column is the oracle: the segments that hold a
+  row of the wallet's three indexers at all, counted in the engine after the run. 1,891 of 1,995. Three
+  active indexers appear in almost every block range, because the segments are ordered by block, as §7.1
+  feared. Only reordering sealed data by indexer would make reads selective, and this RFC does not
+  propose that.
+
+Reading the footers alone took 1,995 range requests and 29 s.
+
+**What was run instead, as §4 prescribes for this outcome: whole segments of the named tables.** A
+spike in the plain module (`embed/plain/src/lib.rs`, `embed/src/mirror.rs`, `embed/src/narrow.rs`):
+`mirror` and `filters` together, refused until now, hydrate only the tables the filters name, each
+segment whole and checked against its content address as S4 does, then follow the filters from the
+RPC to `until`. The identity is computed from the nest's files as given; `[[calls]]` is cut from the
+`nuthatch.toml` the module parses, as no call is made and no call table hydrated, and the dataset's
+views are not bound, since they read the whole network. The driver is `embed/hosts/node/hybrid.mjs`,
+which runs Lodestar's own `verify` (`src/lib/verify/run.ts`) with the wallet nest as `rpc` and the
+pools nest as `mirror+rpc`, logs every GET with its bytes, and fails on any GET that names the wallet.
+
+Apple M5 Pro, Node 26.11.1, the browser host over files, fresh storage, the public Worker and
+`https://arb1.arbitrum.io/rpc`, wallet 0xd7d7…d076:
+
+| Gate | Result |
+|---|---|
+| The same 53 figures equal to `/api/portfolio` at one block | **pass**: 53 of 53 at block 520,229,965, pools `0x089f…4774`, `0xe9e2…cf59`, `0xf92f…a6d4` |
+| Bytes from the mirror recorded, under 64 MiB | **fail**: 188,006,752 bytes (179.3 MiB) in 1,997 GETs |
+| Cold under 300 s against arb1's public RPC | **pass**: 109.0 s and 699 RPC requests, against S7's 1,995 s and 11,566 |
+| Every GET logged, none containing the wallet's address | **pass**: 1,999 GETs, none naming it outside the two `/api/portfolio` reads that do by design |
+| Kill condition: row groups selective | **met**: 1,949 of 1,995 admitted |
+
+| Nest | Source | Time | RPC requests | Mirror | Linear memory |
+|---|---|---|---|---|---|
+| Wallet | `rpc`, 10 filters | 61.1 s | 643 | none | 18.9 MiB |
+| Pools | `mirror+rpc`, 16 filters | 45.4 s | 56, blocks 520,131,918 to 520,229,965 | 1,997 GETs: `manifest.json`, `_seed/seed.json`, 1,995 segments; 188,006,752 bytes | 26.4 MiB |
+
+Process peak RSS 610 MiB. An earlier run gave the same shape (wallet 60.5 s and 642 requests, pools
+47.2 s and 56, the same bytes) and stopped in the driver's own oracle query before printing, so its
+comparison is not counted. The pool tables have no seed tails: the 98,048 blocks after the mirror's
+`complete_through` came from the RPC in 56 requests.
+
+**Two findings that change §3.1 beyond its size.**
+
+- **Row-group reads would have broken the privacy rule.** The indexers are public, but *which* indexers
+  a visitor's open selects is derived from the wallet: it is the wallet's set of pools. A fetch pattern
+  over row groups chosen by those values tells the mirror that set. Whole-table reads tell it only the
+  dataset and the tables, which the nest's filter shape fixes and no value changes. The privacy rule
+  needs a second clause: no wallet-derived value in a `get`, **and no `get` chosen by one**.
+- **A range read cannot be checked.** A segment's content address covers the whole file, so part of one
+  can be trusted only as far as the mirror is. Whole segments keep S4's check, segment by segment.
+
+**What it does not show.** Only Node: no browser, no OPFS, no phone, where 179 MiB through 1,997 GETs
+and 610 MiB of process RSS are the questions. One wallet; the bytes are the same for any wallet, since
+the tables are whole, but the RPC half grows with the pools. The Worker answers a range with
+`Content-Range: bytes NaN-NaN/<size>`; the size is right and a suffix range works, but a reader that
+trusts the start would not. It no longer matters to this design.
+
+**The binary.** Unchanged: the change is under `embed/` and `docs/` only, and no file the binary
+builds from is touched, so its `Cargo.lock`, `cargo tree` and `--help` are those of `main`.
+`embed/rowgroups/` is its own workspace with one dependency, `parquet` 59.3.0 (MIT OR Apache-2.0),
+built by nothing in CI.
+
+**If Chief takes the narrowed §3.1, S1 needs:**
+
+1. The 64 MiB gate replaced by a figure Chief sets for a whole-table open: 179 MiB here, cached by
+   the Worker and, in a tab, kept in the pack, so a second visit fetches only new segments.
+2. `source: "mirror+rpc"` as a key of its own rather than `mirror` beside `filters`, with the tables to
+   hydrate named by the filters' events, and `private` and `public` filters as §3.1 has them.
+3. A nest with `[[calls]]` accepted when hydrated, its calls never run, in the module's parsing rather
+   than by cutting text; and a decision on the dataset's views.
+4. The pools nest pinned to the dataset the publisher holds: Lodestar would ship graph-allocations-nest
+   at the publisher's commit (or a postcard of it), since its own `pools.toml` names no dataset.
+5. The browser measurement this spike did not make: Brave on OPFS and a phone, with peak memory.

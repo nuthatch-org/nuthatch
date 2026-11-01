@@ -1,0 +1,12 @@
+[package]
+name = "rowgroups"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "RFC-0081 S0: which row groups of a published dataset's pool tables an indexer filter admits."
+
+[dependencies]
+parquet = { version = "=59.3.0", default-features = false }
+
+[workspace]
