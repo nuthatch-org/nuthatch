@@ -5,7 +5,9 @@
   narrowed terms 2026-11-01 (Chief): whole segments of the named tables, 200 MiB from the mirror, cold
   under 300 s. **S1 measured 2026-11-01 (§12).** S2 begun on Chief's word the same day; **S2 measured
   2026-11-01 (§13).** S3 begun on Chief's word the same day; **S3 measured 2026-11-01 (§14)**, against a
-  stand-in host, since Lodestar's public route cannot answer the gate. No later slice is begun until
+  stand-in host, since Lodestar's public route cannot answer the gate. S5 begun on Chief's word,
+  Safari and the iPhone skipped for now; **S5 measured 2026-11-01 (§16)** for Firefox and the wasmtime
+  host, Safari and the iPhone waiting on Chief's administrator step. No later slice is begun until
   Chief says.
 - Author: Pete (cargopete)
 - Date: 2026-10-31
@@ -708,3 +710,100 @@ The binary is unchanged: nothing outside `embed/`, `docs/` and the two workflows
   two-config `nestFiles` it imported. Its job is covered by `hybrid-gates.mjs` (the hybrid open, the
   privacy rule and `attach`, in CI), the package's `run.mjs`, Lodestar's own `verify-locally-node.mjs` on
   the package (§13), and now `verify-gate.mjs` for the seven wallets live.
+
+## 16. S5 measured, 2026-11-01
+
+**Verdict: Firefox and the wasmtime host pass; Safari and the iPhone wait.** Chief said go to S5 the
+same day and skipped Safari and the iPhone for now, so §4's gate is met for the two parts that need no
+administrator step. Safari's half (S5's 13 shapes and S3's kill-and-reopen under `safaridriver`) and the
+iPhone's (a hybrid open on its own network, peak memory from Web Inspector) wait on `safaridriver
+--enable`, §9.4. Nothing here touches the binary or `embed/`'s own lockfile.
+
+**What was built**, under `embed/` and the `wasm-plain` leg only:
+
+- **Firefox by the same script.** `run-sw.mjs` takes `--geckodriver <path>` and then drives Firefox
+  through a WebDriver session on the profile itself, not a copy, so the restart's second launch reopens
+  the first one's OPFS; the kill is SIGKILL to the browser's own process (`moz:processID`). Chrome is
+  launched as before. CI pins Firefox 159.0 (`@puppeteer/browsers`) and geckodriver 0.37.1.
+- **S5's 13 shapes in a browser.** Until now they ran in Node only. `run-sw.mjs <browser> <module>
+  shapes <fixture-rpc> <embed-shapes-dir>` starts one fixture-rpc per shape and opens
+  `hosts/browser/shapes.html`, which follows each shape in its own nest worker on OPFS, forks its
+  recording between eras and answers its requests; the harness compares every era with the node's pin,
+  as `shapes.mjs` does. CI runs it in Chrome and Firefox.
+- **`get` in the wasmtime host**, as the browser host performs it: any status but 200 answered alone, a
+  body past `max_bytes` refused, and with `append` the body written at the end of that open file;
+  transport failures retried three times. `abi: 1`'s `get` has no range field, so there is no range to
+  support: the module reads segments by range from the pack on the host's storage, not over HTTP.
+- **`verified_finalized` in the wasmtime host** from `helios-consensus-core`, Helios's verification
+  core: a bootstrap at a checkpoint, each sync-committee update, then the finality update, verified as
+  Helios's own client does in `sync`, with mainnet's forks and genesis root. `--beacon <url>
+  --checkpoint <root>` asks a beacon endpoint; `--helios <run.json.gz>` verifies a recorded run;
+  `wasmtime-host helios` records one.
+- **`wasmtime-host open`**, any `nh_open` config followed and then asked one request a line, and
+  `hosts/node/mirror.mjs --wasmtime`, which drives it through the same requests and comparison as the
+  Node host. `--hybrid <address>` opens the nest `mirror+rpc` under one public filter, in either host.
+
+**The dependency.** Helios publishes no crates (`helios-ethereum` and `helios-core` on crates.io are
+empty placeholders), so it is a git dependency pinned to tag 0.12.0, commit `2af9b418…73f8`, in the
+lockfile. The crate's manifest names no licence; the repository's `LICENSE` is MIT, a16z. Only the
+consensus core is used, which has no networking and no async runtime: the host fetches with the `ureq`
+it already had. It adds 277 packages to `embed/tests/wasmtime-host/Cargo.lock` (206 to 483), alloy's
+consensus types and `bls12_381` among them; none is GPL or AGPL, and the one MPL-2.0 package,
+`fastrlp`, is already in the binary's own tree. `Cargo.lock` and `embed/Cargo.lock` are unchanged.
+
+**The recorded run.** CI needs no beacon endpoint. `tests/fixtures/tab-parity/helios.json.gz` (93,651
+bytes) is what `lodestar-mainnet.chainsafe.io` answered on 2026-11-01: the bootstrap for checkpoint
+`0x6ccf27f0…1fb4a` (slot 15,476,192, block 26,237,036, before RFC-0075 S3's recording begins) and the
+best updates for sync-committee periods 1,889 and 1,890. The second is signed by the committee the
+first proves, and finalizes slot 15,482,880, block 26,243,710, `0x24be5c10…196c`, which is the
+recording's own hash at that height. `helios-headers.json.gz` extends `headers.json.gz` from 26,241,701
+to that block, 2,010 headers from `record-headers.sh`, every hash checked against the recording.
+Verifying the run takes 9 ms.
+
+| Gate | Result |
+|---|---|
+| S5's 32 answers in Firefox on OPFS | **pass**, locally (Firefox 159.0, geckodriver 0.37.1, macOS): digest `22966cee…363febc5`, the pin's, segments `68db3e3e…bf37`, Chrome's; the skill's examples equal |
+| S3's kill-and-reopen in Firefox | **pass**, locally: SIGKILL at block 26,241,666, sealed through 26,241,666; reopened on the same profile, the same 32 answers and segments |
+| S5's 13 shapes in Firefox | **pass**, locally, every era of every shape equal to the node's pin, 6.5 s for all 13. In Brave (Chromium) the same, 6.5 s |
+| wasmtime opens a mirror | **pass**, locally: RFC-0077 S4's nest from its published directory at the seed's head and followed to the tip, equal to the node's pins (`26882c7a…a69a`, `d943c23d…11e8`); `mirror+rpc` under one receiver's filter equal to the Node host's 13 answers (`4f981382…bb66`) |
+| wasmtime opens defi-pulse-nest from a local mirror, equal to a node seeded from the same mirror | **pass with one statement named**, below |
+| wasmtime seals under a Helios-verified head | **pass**, locally: S3's nest opened `verified` seals through 26,243,710 under that head, 3,904 headers hashed down to it, its segment `c983470c…aeae` and 1,000 balances the node's |
+| A forged light client run is refused | **pass**: the same run with the finalized block's hash altered is refused by Helios ("update 1: invalid execution payload proof"), the module reports "the host gave no verified finalized block", nothing is sealed, and the cursor carries on to 26,245,870 |
+
+**defi-pulse-nest.** Seeded by the 5.16.0 release binary from the public mirror (dataset
+`0a643352…b2e48f`, 1,573 segments, 139,365,112 bytes, through block 26,319,435), then published with
+`nuthatch publish sync` to a local directory, served on loopback. Nothing was published to R2. The node's
+half is `run-mirror-node.mjs` with the same binary, seeded from that directory. The wasmtime host opened
+it in 2.5 s from a cached compile, 1,575 GETs, 24 MiB of linear memory and 145 MiB peak RSS at open,
+and answered `mirror-answers.mjs`'s 33 requests in 7.3 s. **All 33 equal the Node host's** on the same
+module (`3adc6f04…e122`). **32 of 33 equal the node's.** The 33rd is the tie-broken
+`largest_supply_moves_7d`, `ORDER BY abs(usd) DESC, 1, 2, 3, 4, 5, 6 LIMIT 25`: fifteen USDC burns of
+50,000,000.06 tie on the first key, and the node returns all fifteen; the module returns thirteen and
+two mints, though `kind` sorts `burn` first. The released `nuthatch-events.wasm` 5.16.0 gives the same
+answer, so it is the module's, not either host's, and it predates this slice. RFC-0077 S4's run passed
+this statement on 2026-10-30, before the two missing burns (blocks 26,312,797 and 26,318,668) existed.
+It is a sort that orders wrongly on a tie in the module and wants its own issue; this slice does not
+touch it.
+
+**Mutations**, each run and reverted: the shapes page with its fork removed turns 11 of 13 shapes red
+(the two single-era shapes cannot see it); Helios's update verification ignored turns the forged run
+red ("the forged run verified"); the `get` append written one byte past the offset it answers turns the
+mirror gate red by name ("does not hash to its content address"). Writing at half the file's length
+stayed green, because the pack is empty at the first append; that mutation could not have applied.
+
+**In CI** the `wasm-plain` leg now also runs, on the same module: Firefox's S5 run, its restart, and
+the shapes in Chrome and Firefox; `hosts/agree.mjs` over node, wasmtime, Chrome and Firefox; the
+wasmtime mirror at the seed's head, followed, and hybrid against the Node host; and the Helios gate and
+its forgery. The defi-pulse run is local only, as RFC-0077 S4's public downloads were.
+
+**What is left, or does not match the RFC.**
+
+- **Safari and the iPhone**, waiting on Chief (§9.4).
+- **No live Helios run sealed defi-pulse.** Opened from the local mirror with `verified` against a live
+  beacon endpoint, the follow behind it did not finish: publicnode refused the range without an archive
+  token, Tenderly rate-limited the Node host's identical run, and the wasmtime run spent seven minutes
+  of guest CPU after hydration without logging a step before it was stopped. Why is not yet known. The verified head's gate rests
+  on the recorded run, as §4 allows; a live seal of a mirrored nest under a verified head is not shown.
+- **The recorded run is not fresh.** Helios refuses a checkpoint older than 14 days; the recording is
+  verified against today's clock only for the order of its slots. It proves the verification on real
+  signed data, not that a checkpoint is current.
