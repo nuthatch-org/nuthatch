@@ -9,7 +9,7 @@ set -uo pipefail
 OUT="${1:?usage: ab.sh <out-dir> [sets...]}"
 shift
 SETS=("$@")
-[ ${#SETS[@]} -gt 0 ] || SETS=(none uniform skew hot:100 hot:1000 all-tables stall)
+[ ${#SETS[@]} -gt 0 ] || SETS=(none uniform skew hot:100 hot:1000 all-tables stall-ctl stall)
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$OUT"
 
@@ -19,7 +19,8 @@ run() {
   case "$set" in
     none) shapes=0 mode=uniform ;;
     hot:*) blocks=150 ;;
-    stall) mode=hot:100 blocks=150 stall=50 ;;
+    stall) mode=hot:100 blocks=400 stall=50 ;;
+    stall-ctl) mode=hot:100 blocks=400 ;;
   esac
   local dir="$OUT/${set//:/-}-$name"
   echo "== $set $name $(uptime)"
@@ -28,8 +29,8 @@ run() {
 }
 
 for set in "${SETS[@]}"; do
-  if [ "$set" = stall ]; then
-    run stall new columns task
+  if [ "$set" = stall ] || [ "$set" = stall-ctl ]; then
+    run "$set" new columns task
     continue
   fi
   run "$set" old json inline

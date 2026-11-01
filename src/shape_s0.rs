@@ -1419,6 +1419,7 @@ mod tests {
             })
             .collect();
         let mut times = [Vec::new(), Vec::new()];
+        let mut split = [Vec::new(), Vec::new()];
         let mut frames = [0u64; 2];
         for d in 0..300usize {
             let mut added: Vec<String> = Vec::with_capacity(200);
@@ -1435,6 +1436,23 @@ mod tests {
                 added: puts_of(&delta),
                 ..Default::default()
             };
+            // The columns route split in two: the probe alone, and encoding its matched rows.
+            let t = std::time::Instant::now();
+            let mut matched = Vec::new();
+            hubs[1].index.matching_columns(
+                delta.columns.as_deref().unwrap(),
+                &changes.added,
+                &mut matched,
+            );
+            split[0].push(t.elapsed().as_nanos() as u64);
+            let mut rows: Vec<u32> = matched.iter().map(|(o, _)| *o).collect();
+            rows.sort_unstable();
+            rows.dedup();
+            let t = std::time::Instant::now();
+            for o in &rows {
+                std::hint::black_box(frame(1, true, &changes.added[*o as usize]));
+            }
+            split[1].push(t.elapsed().as_nanos() as u64);
             for (k, hub) in hubs.iter_mut().enumerate() {
                 let t = std::time::Instant::now();
                 frames[k] += u64::from(hub.route_delta((0, d as u64 + 1), &delta, &changes));
@@ -1457,6 +1475,14 @@ mod tests {
                 t[t.len() * 99 / 100] / 1000,
                 frames[k] / t.len() as u64
             );
+        }
+        for (k, name) in ["columns probe alone", "encoding its rows' frames"]
+            .iter()
+            .enumerate()
+        {
+            let t = &mut split[k];
+            t.sort_unstable();
+            println!("{name}: p50 {} us", t[t.len() / 2] / 1000);
         }
         assert_eq!(frames[0], frames[1], "both filters route the same frames");
     }
