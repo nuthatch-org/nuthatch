@@ -20,6 +20,8 @@ bytes = "1"
 redb = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+base64 = "0.22"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # No features: `.cargo/config.toml` selects their custom backend, which `random_fill` answers.

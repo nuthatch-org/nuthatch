@@ -125,12 +125,13 @@ impl LiveNest {
             version: crate::young::node_version(),
             poll_interval_secs: self.poll_interval_secs,
             log_window: self.nest.log_window(),
+            scope: None,
         };
-        let a = crate::http::answer(&nest, &method, &target, &body).await;
+        let r = crate::http::reply(&nest, &method, &target, &body).await;
         HttpAnswer {
-            status: a.status,
-            content_type: crate::http::content_type(&a),
-            body: a.body,
+            status: r.answer.status,
+            content_type: r.content_type(),
+            body: r.answer.body,
         }
     }
 

@@ -818,6 +818,9 @@ jobs:
           node run-sw-mirror.mjs "$chrome" "$m" $n4 $mm --rpc http://127.0.0.1:8953/ --expect $d/s4-mirror-tip.json \
             | tee -a "$RUNNER_TEMP/mirror.log"
           node run-sw-mirror.mjs "$chrome" "$m" $n4 $mm --refused --memory 600 --max-rows 150000 | tee -a "$RUNNER_TEMP/mirror.log"
+          # RFC-0081 S1: the same nest `mirror+rpc`, equal to `rpc` under the same filters; no GET names
+          # or is chosen by a filter's value; a private filter refused; another nest's answers attached.
+          node hosts/node/hybrid-gates.mjs "$m" $n4 $mm http://127.0.0.1:8953/ | tee -a "$RUNNER_TEMP/mirror.log"
           # RFC-0077 S5: with a verified head, a forged or missing header or a log off the verified
           # chain stops sealing by name, and the honest head seals the node's segment; then every nest
           # shape `tests/e2e_embed_shapes.rs` writes out of the binary's tests, equal to its pins.

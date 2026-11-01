@@ -28,11 +28,52 @@ pub struct Nest<'a> {
     pub poll_interval_secs: Option<u64>,
     /// The getLogs span the cursor asks for.
     pub log_window: u64,
+    /// RFC-0081 S1: a hybrid open's predicates and unbound views, and the declared attachments.
+    pub scope: Option<&'a Scope>,
+}
+
+/// What RFC-0081 S1 changes about a statement: a hybrid open's filters read as predicates over the
+/// tables it hydrated, the dataset's views it does not bind, and other nests' answers attached.
+#[derive(Default)]
+pub struct Scope {
+    pub predicates: std::collections::BTreeMap<String, String>,
+    pub unbound_views: Vec<String>,
+    pub attach: Vec<crate::attach::Declared>,
+}
+
+/// The media type of an Arrow IPC stream, as the node answers it (RFC-0079).
+pub const ARROW_STREAM: &str = "application/vnd.apache.arrow.stream";
+
+/// An answer, and for an Arrow one the envelope the node sends in `x-nuthatch-answer`.
+pub struct Reply {
+    pub answer: Answer,
+    pub arrow: Option<String>,
+}
+
+impl Reply {
+    fn of(answer: Answer) -> Reply {
+        Reply {
+            answer,
+            arrow: None,
+        }
+    }
+
+    pub fn content_type(&self) -> &'static str {
+        match self.arrow {
+            Some(_) => ARROW_STREAM,
+            None => content_type(&self.answer),
+        }
+    }
 }
 
 /// `method` and `target` (a path with its query) as the node's router would answer them; a path it
 /// does not route is a 404 with no body, as axum gives one.
 pub async fn answer(n: &Nest<'_>, method: &str, target: &str, body: &[u8]) -> Answer {
+    reply(n, method, target, body).await.answer
+}
+
+/// As [`answer`], with an Arrow answer's envelope beside it.
+pub async fn reply(n: &Nest<'_>, method: &str, target: &str, body: &[u8]) -> Reply {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let params: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
         .into_owned()
@@ -59,25 +100,32 @@ pub async fn answer(n: &Nest<'_>, method: &str, target: &str, body: &[u8]) -> An
     let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
     let store = &n.nest.store;
     let routed = async {
-        Ok(match (method, segs.as_slice()) {
+        Ok(Reply::of(match (method, segs.as_slice()) {
             ("GET", ["ready"]) => ready(n),
             ("GET", ["sql"]) | ("GET", ["explain"]) => {
                 let q = param("q").ok_or_else(|| rejected("missing field `q`"))?;
                 let max_rows = number("max_rows")?;
-                route_sql(
+                let format = param("format");
+                return Ok(route_sql(
                     n,
                     segs[0] == "explain",
                     answer::SqlRequest {
                         q,
                         max_rows,
-                        format: None,
+                        format,
                     },
+                    None,
                 )
-                .await
+                .await);
             }
             ("POST", ["sql"]) | ("POST", ["explain"]) => {
                 let explain = segs[0] == "explain";
-                route_sql(n, explain, answer::sql_request(body, explain)?).await
+                let request = answer::sql_request(body, explain)?;
+                // `attach` rides beside the node's keys, which the node's parser ignores.
+                let attach = serde_json::from_slice::<Value>(body)
+                    .ok()
+                    .and_then(|mut v| v.get_mut("attach").map(Value::take));
+                return Ok(route_sql(n, explain, request, attach).await);
             }
             ("GET", ["entity", id]) => entity(n, id).await,
             ("GET", ["entities"]) => {
@@ -107,9 +155,12 @@ pub async fn answer(n: &Nest<'_>, method: &str, target: &str, body: &[u8]) -> An
                 status: 404,
                 body: Vec::new(),
             },
-        })
+        }))
     };
-    routed.await.unwrap_or_else(|refused: Answer| refused)
+    match routed.await {
+        Ok(reply) => reply,
+        Err(refused) => Reply::of(refused),
+    }
 }
 
 /// axum's refusal of a query string its extractor cannot read: plain text, not JSON.
@@ -198,41 +249,105 @@ fn engine_error(e: &burrmill::BurrmillError, sql: &str, n: &Nest) -> String {
 /// and hold its own `SQL_MAX_RESULT_BYTES` beside the first's.
 static SQL_ONE_AT_A_TIME: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
 
-async fn route_sql(n: &Nest<'_>, explain: bool, q: answer::SqlRequest) -> Answer {
+async fn route_sql(
+    n: &Nest<'_>,
+    explain: bool,
+    q: answer::SqlRequest,
+    attach: Option<Value>,
+) -> Reply {
     let _one = SQL_ONE_AT_A_TIME.lock().await;
     if q.q.len() > SQL_MAX_QUERY_LEN {
-        return if explain {
+        return Reply::of(if explain {
             answer::explain_too_long()
         } else {
             answer::sql_too_long(q.q.len(), SQL_MAX_QUERY_LEN)
-        };
+        });
     }
     let refuse = |msg: String| {
-        if explain {
+        Reply::of(if explain {
             answer::explain_invalid(&msg)
         } else {
             Answer::json(400, &json!({ "error": msg }))
-        }
+        })
     };
     let referenced = match referenced_tables(&q.q, n.files) {
         None => None,
         Some(Ok(tables)) => Some(tables),
         Some(Err(e)) => return refuse(engine_error(&e, &q.q, n)),
     };
-    let engine = match bind(n).await {
-        Ok(engine) => engine,
-        Err(e) => return answer::internal_error(&format!("{e:#}")),
+    let scope = n.scope.unwrap_or(&NO_SCOPE);
+    let unbound = (!scope.unbound_views.is_empty())
+        .then(|| crate::attach::bare_tables(&q.q))
+        .flatten()
+        .unwrap_or_default();
+    if let Some(view) = unbound.iter().find(|t| {
+        scope
+            .unbound_views
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case(t))
+    }) {
+        return refuse(format!(
+            "`{view}` is a view of the published dataset, and reads the whole of it: this nest \
+             was opened `mirror+rpc`, holds the rows its filters select, and binds none of the \
+             dataset's views"
+        ));
+    }
+    let as_of = n.nest.last_block().ok().flatten();
+    let attached = match attach {
+        None => Vec::new(),
+        Some(given) => match crate::attach::supplied(&scope.attach, &given, as_of) {
+            Ok(t) => t,
+            Err(why) => return refuse(why),
+        },
     };
+    match crate::attach::references(&q.q, &scope.attach) {
+        Some(Err(why)) => return refuse(why),
+        Some(Ok(named)) => {
+            if let Some((a, t)) = named
+                .iter()
+                .find(|(a, t)| !attached.iter().any(|s| &s.attachment == a && &s.name == t))
+            {
+                return refuse(format!(
+                    "`{a}.{t}` is attached at nh_open, and this statement supplies no answer for it"
+                ));
+            }
+        }
+        None => {}
+    }
+    let mut engine = match bind(n).await {
+        Ok(engine) => engine,
+        Err(e) => return Reply::of(answer::internal_error(&format!("{e:#}"))),
+    };
+    if let Err(e) = engine.narrow(&scope.predicates) {
+        return Reply::of(answer::internal_error(&format!("{e:#}")));
+    }
+    if let Err(e) = engine.attach(&attached) {
+        return refuse(format!("{e:#}"));
+    }
     if explain {
         return match engine.plan(&q.q) {
-            Ok(()) => answer::explain_valid(false),
+            Ok(()) => Reply::of(answer::explain_valid(false)),
             Err(e) => refuse(engine_error(&e, &q.q, n)),
         };
     }
     let cap = q.max_rows.unwrap_or(SQL_MAX_ROWS).clamp(1, SQL_MAX_ROWS);
-    let (rows, columns, truncated) = match engine.collect(&q.q, cap).await {
-        Ok(out) => out,
-        Err(e) => return refuse(engine_error(&e, &q.q, n)),
+    let arrow = q.format.as_deref() == Some("arrow");
+    let (rows, ipc, columns, count, truncated) = if arrow {
+        match engine
+            .collect_ipc(&q.q, cap, answer::SQL_MAX_RESULT_BYTES)
+            .await
+        {
+            Ok((ipc, columns, count, truncated)) => (Vec::new(), ipc, columns, count, truncated),
+            Err(e) => return refuse(engine_error(&e, &q.q, n)),
+        }
+    } else {
+        match engine.collect(&q.q, cap).await {
+            Ok((rows, columns, truncated)) => {
+                let count = rows.len();
+                (rows, Vec::new(), columns, count, truncated)
+            }
+            Err(e) => return refuse(engine_error(&e, &q.q, n)),
+        }
     };
     let head = dataset_head(n);
     let entities = match &referenced {
@@ -256,15 +371,15 @@ async fn route_sql(n: &Nest<'_>, explain: bool, q: answer::SqlRequest) -> Answer
         }
     };
     let registry_hash = format!("0x{}", hex::encode(n.nest.registry().hash()));
-    let envelope = answer::sql_envelope(
+    let mut envelope = answer::sql_envelope(
         &answer::SqlFacts {
-            count: rows.len(),
+            count,
             truncated,
             degraded_tables: &Default::default(),
             tip_unavailable: false,
             columns: &columns,
             cached: false,
-            as_of: n.nest.last_block().ok().flatten(),
+            as_of,
             sealed_through: sealed_through(n),
             registry_hash: Some(&registry_hash),
             nid: n.nid,
@@ -274,14 +389,33 @@ async fn route_sql(n: &Nest<'_>, explain: bool, q: answer::SqlRequest) -> Answer
         },
         Value::Array(rows),
     );
-    match answer::sql_bytes(&envelope, None) {
+    if arrow {
+        // As the node's: the envelope less its rows, which are the stream.
+        if let Some(o) = envelope.as_object_mut() {
+            o.remove("rows");
+        }
+        return Reply {
+            answer: Answer {
+                status: 200,
+                body: ipc,
+            },
+            arrow: Some(envelope.to_string()),
+        };
+    }
+    Reply::of(match answer::sql_bytes(&envelope, None) {
         Ok(body) => Answer { status: 200, body },
         Err(e) => Answer::json(
             500,
             &json!({ "error": format!("serializing an answer: {e}") }),
         ),
-    }
+    })
 }
+
+static NO_SCOPE: Scope = Scope {
+    predicates: std::collections::BTreeMap::new(),
+    unbound_views: Vec::new(),
+    attach: Vec::new(),
+};
 
 /// A hot hit, else the sealed segments: probe each table for the id, then read the row from the one
 /// that has it, in the shape a single-table query gives, as the node's `read_sealed` does.

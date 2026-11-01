@@ -130,7 +130,9 @@ host drops the instance.
   "filters": [{"contract": "staking", "event": "TokensDelegated", "from": 408825706,
                "args": {"delegator": ["0x..."]}}],
   "window": 10000000,
-  "until": 519817135
+  "until": 519817135,
+  "source": "rpc",
+  "attach": [{"name": "pools", "tables": ["indexers"]}]
 }
 ```
 
@@ -144,7 +146,7 @@ unless set; a phone's is 600. `poll_interval_secs` is what `/ready` reports as t
 the ABIs it names, `schema.json`, `labels/*.json`, `entities.toml` and its SQL, `views/*.sql`. The
 module reads `nuthatch.toml` through the binary's own parsing and indexes it on the chain registry
 the binary ships: its contracts and their events, templates and factories, labels, and flags. What
-only a node runs is refused by name rather than ignored: `[[webhooks]]`, `[[alerts]]`, `[[calls]]`,
+only a node runs is refused by name rather than ignored: `[[webhooks]]`, `[[alerts]]`, `[[calls]]` (accepted with source `mirror+rpc`, below),
 `[[ipfs]]`, `[address_history]`, `[extract]`, a key nothing reads, and a config schema past 2.
 Without a mirror, a contract must declare its `start_block`. A host that leaves `nuthatch.toml` out
 and gives `contract` and `start` instead gets RFC-0075's young contract: one ERC-20's `Transfer` on
@@ -190,13 +192,42 @@ for any of the event's indexed arguments the values it may take, addresses or 32
 cursor then asks for those logs only: one `eth_getLogs` per filter and value, since an endpoint that
 serves ten million blocks to a filter with one value per topic serves far fewer to one with a list
 (arb1.arbitrum.io: 10,000,000 against 100,000). An event no filter names is not fetched, and its
-table stays empty: a narrowed nest is a selection, not the contract's history, so `filters` and
-`mirror` are refused together, as is a factory. The exception is RFC-0081 S0's spike of a hybrid open,
-not a supported shape: given both, the module hydrates the tables the filters name, whole, from the
-mirror, then asks the RPC for the filters' logs from where the mirror ends. A filter naming an event, argument or value the nest
-cannot mean is refused by name (`bad_config`). Each log the endpoint returns is checked against the
+table stays empty: a narrowed nest is a selection, not the contract's history, so `filters` are
+refused with source `mirror`, as is a factory. Source `mirror+rpc` is how a narrowed nest reads a
+mirror (below). A filter naming an event, argument or value the nest cannot mean is refused by name
+(`bad_config`). Each log the endpoint returns is checked against the
 filter that asked for it, so an endpoint that ignores a topic costs bandwidth, not correctness; a
 range it will not answer whole is halved, and a throttle is asked again after a rest.
+
+A filter's `privacy` is `private` (the default) or `public`. A private filter's values came from the
+user, and only ever narrow a nest read from the RPC: source `mirror` or `mirror+rpc` with a private
+filter is refused by name before anything is asked of the mirror.
+
+**`source`** (RFC-0081 S1) is where the nest's history comes from: `rpc`, `mirror`, or
+`mirror+rpc`. Absent, it is `mirror` when `mirror` is given and `rpc` otherwise, as before. With
+`mirror+rpc`, `mirror` and `filters` are both required and every filter must be public. The module
+hydrates, from the dataset the files name, the tables the filters' events decode into, each segment
+whole and checked against its content address, then asks the RPC for the filters' logs from where the
+dataset ends to `until`. Which tables and segments are fetched follows from the filters' events alone,
+so no `get` carries a filter's value or is chosen by one: the mirror learns which dataset and which
+tables, never whose. Every statement over a hydrated table reads it through the filters as a
+predicate, so it holds the rows an `rpc` nest under the same filters would, whichever side brought
+them; a value a predicate cannot compare to a stored row (an indexed argument that is not an address
+or a 32-byte hash) is refused by name. The dataset's views and entities read every row and are not
+bound: a statement naming one of its views is refused by name. `[[calls]]` is accepted, never run,
+and its tables are not hydrated; the identity is still computed from the files as given. A postcard
+pins a nest that does not follow, so it is refused with `mirror+rpc`. `/balances` and the built-in
+views fold what the store holds, the hydrated history whole; read the named tables through `/sql`.
+
+**`attach`** (RFC-0081 §3.2) is a list of `{"name", "tables"}`: other instances' answers a statement
+may bind. A `POST /sql` supplies them beside `q` as
+`"attach": {"<name>": {"<table>": {"arrow": "<base64>", "answer": "<x-nuthatch-answer>"}}}`: the other
+instance's `/sql` answer with `format=arrow`, and its envelope, as text or as an object. The statement
+names each as `<name>.<table>`; it is bound with the types the answer carried, for that statement only,
+and the module keeps nothing between statements and follows nothing. A table the statement names and
+the request does not supply, a bare name of an attached table, an answer that was truncated, and an
+answer whose `provenance.as_of` is not this nest's are each refused by name. An attached table may
+not share a name with the nest's tables, views or entities, or with another attachment's.
 
 **`window`** is the blocks per `eth_getLogs`, in place of the chain's registered window. A narrowed
 nest wants it as wide as its endpoint allows.
@@ -240,7 +271,10 @@ nh_request(method, target, body)   any time after the store is open
 - `nh_request` never yields: everything a query reads is in storage. It routes `/ready`, `/sql`,
   `/explain`, `/entity/{id}`, `/entities`, `/balances`, `/balance/{address}` and `/derived/*` as the
   node does, from the same `nuthatch_core::answer` functions; any other path is a 404 with no body.
-  `content_type` is empty where the node sends none. A host that wants HTTP maps it one to one, as
+  `content_type` is empty where the node sends none. `/sql` with `format=arrow` (in the query or a
+  `POST` body) answers an Arrow IPC stream, as the node does (RFC-0079): its bytes come back as
+  `body_base64` in place of `body`, and its envelope in `headers["x-nuthatch-answer"]`, the node's
+  header. A host that wants HTTP maps it one to one, as
   `hosts/browser/sw.js` does; a host that wants a function calls it with a target.
 
 ### Requests and answers

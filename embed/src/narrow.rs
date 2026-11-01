@@ -4,16 +4,18 @@
 //! serves a hundred thousand to one with a list (arb1.arbitrum.io, measured 2026-10-31).
 //!
 //! A narrowed nest is not the contract's history: an event no filter names is not fetched at all, and
-//! its table stays empty. RFC-0081 S0 spikes the one exception, a hybrid open: the named tables
-//! hydrated from a mirror, the filters then asked of the RPC from where the mirror ends.
+//! its table stays empty. RFC-0081 S1's hybrid open is the one exception: the tables the filters'
+//! events decode into hydrated whole from a mirror, the filters asked of the RPC from where the mirror
+//! ends, and the filters applied to every statement over those tables as a predicate.
 
 use crate::nest::NestSpec;
 use anyhow::{anyhow, bail, ensure, Result};
 use futures::{StreamExt, TryStreamExt};
 use nuthatch_core::rpc::{class_of, FailureClass};
 use nuthatch_core::source::{Log, LogFilter, Source};
+use nuthatch_decode::registry::{Column, EventDecoder, StorageKind};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One filter as `nh_open`'s `filters` gives it.
 #[derive(Deserialize, Clone, Debug)]
@@ -29,6 +31,18 @@ pub struct FilterSpec {
     /// Indexed argument by name, and the values it may take: addresses or 32-byte words.
     #[serde(default)]
     pub args: BTreeMap<String, Vec<String>>,
+    /// RFC-0081 §3.1: whether the values may narrow a nest whose tables come from a mirror.
+    #[serde(default)]
+    pub privacy: Privacy,
+}
+
+/// A private filter's values came from the user, so they narrow only a nest read from the RPC.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Privacy {
+    #[default]
+    Private,
+    Public,
 }
 
 /// One `eth_getLogs` filter the cursor asks for every window, from `from`.
@@ -36,8 +50,6 @@ pub struct FilterSpec {
 pub struct Narrowed {
     pub filter: LogFilter,
     pub from: u64,
-    /// The table its logs decode into, which a hybrid open (RFC-0081 S0) hydrates whole.
-    pub table: String,
 }
 
 /// At most this many filters' requests are with the host at once.
@@ -45,6 +57,127 @@ const IN_FLIGHT: usize = 8;
 
 /// A throttled or failed request is asked again this many times, resting longer each time.
 const RETRIES: u32 = 6;
+
+/// The event `f` names, refused by name where the nest declares no such contract or event.
+fn decoder_of<'a>(spec: &'a NestSpec, f: &FilterSpec) -> Result<&'a EventDecoder> {
+    ensure!(
+        spec.starts.contains_key(&f.contract),
+        "filter on `{}`: no contract has that alias in nuthatch.toml",
+        f.contract
+    );
+    let matching: Vec<_> = spec
+        .registry
+        .tables()
+        .into_iter()
+        .filter(|d| d.alias == f.contract)
+        .filter(|d| {
+            if f.event.contains('(') {
+                d.signature == f.event
+            } else {
+                d.signature.split('(').next() == Some(f.event.as_str())
+            }
+        })
+        .collect();
+    match matching.as_slice() {
+        [d] => Ok(*d),
+        [] => bail!(
+            "filter on `{}.{}`: the contract declares no such event",
+            f.contract,
+            f.event
+        ),
+        _ => bail!(
+            "filter on `{}.{}`: the name is overloaded; give the signature, one of {}",
+            f.contract,
+            f.event,
+            matching
+                .iter()
+                .map(|d| d.signature.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The first block `f` asks from.
+fn from_of(spec: &NestSpec, f: &FilterSpec) -> Result<u64> {
+    let start = spec.starts[&f.contract];
+    match f.from {
+        Some(b) if b < start => bail!(
+            "filter on `{}.{}` starts at block {b}, before the contract's start_block {start}",
+            f.contract,
+            f.event
+        ),
+        Some(b) => Ok(b),
+        None => Ok(start),
+    }
+}
+
+/// The tables a hybrid open hydrates: those the filters' events decode into. It reads no value, so
+/// which tables are asked of a mirror cannot depend on one (RFC-0081 §3.1).
+pub fn tables(spec: &NestSpec, specs: &[FilterSpec]) -> Result<BTreeSet<String>> {
+    specs
+        .iter()
+        .map(|f| Ok(decoder_of(spec, f)?.table.clone()))
+        .collect()
+}
+
+/// Each hydrated table's filters as a SQL predicate, so a statement over it reads the rows the
+/// filters select, whether they came from the mirror or the RPC. Filters on one table are OR'ed;
+/// within one, each argument's values are OR'ed and the arguments AND'ed.
+pub fn predicates(spec: &NestSpec, specs: &[FilterSpec]) -> Result<BTreeMap<String, String>> {
+    let mut per_table: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for f in specs {
+        let decoder = decoder_of(spec, f)?;
+        let mut terms = vec![format!("block_number >= {}", from_of(spec, f)?)];
+        for (arg, values) in &f.args {
+            let column = decoder
+                .columns
+                .iter()
+                .find(|c| c.indexed && &c.name == arg)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "filter on `{}.{}`: `{arg}` is not one of its indexed arguments",
+                        f.contract,
+                        f.event
+                    )
+                })?;
+            let stored = values
+                .iter()
+                .map(|v| stored_form(column, v))
+                .collect::<Result<Vec<_>>>()
+                .map_err(|e| anyhow!("filter on `{}.{}`: `{arg}`: {e}", f.contract, f.event))?;
+            let name = column.name.replace('"', "\"\"");
+            terms.push(format!("LOWER(\"{name}\") IN ({})", stored.join(", ")));
+        }
+        per_table
+            .entry(decoder.table.clone())
+            .or_default()
+            .push(format!("({})", terms.join(" AND ")));
+    }
+    Ok(per_table
+        .into_iter()
+        .map(|(t, any)| (t, any.join(" OR ")))
+        .collect())
+}
+
+/// A topic value as the column stores it, quoted: an address as its 20 bytes, a hash as its 32, in
+/// lower-case hex. Other kinds store a decoding of the word that a predicate would have to repeat.
+fn stored_form(column: &Column, v: &str) -> Result<String> {
+    let word = topic_word(v)?;
+    let hex = &word[2..];
+    let text = match column.kind {
+        StorageKind::Address if hex.starts_with(&"0".repeat(24)) => format!("0x{}", &hex[24..]),
+        StorageKind::Address => bail!("`{v}` is not an address"),
+        StorageKind::Hash32 => word.clone(),
+        StorageKind::FixedBytes if column.sol_type == "bytes32" => word.clone(),
+        other => bail!(
+            "a {} argument cannot narrow a nest hydrated from a mirror, which applies the filter to \
+             stored rows; open it with source `rpc`",
+            other.as_str()
+        ),
+    };
+    Ok(format!("'{text}'"))
+}
 
 /// The filters `specs` describe over `spec`'s contracts, refused by name where one names an event
 /// the nest does not declare, an argument the event does not index, or a value that is not a topic.
@@ -57,53 +190,10 @@ pub fn build(spec: &NestSpec, specs: &[FilterSpec]) -> Result<Vec<Narrowed>> {
         !specs.is_empty(),
         "`filters` is empty, which would index nothing"
     );
-    let tables = spec.registry.tables();
     let mut out = Vec::new();
     for f in specs {
-        let start = *spec.starts.get(&f.contract).ok_or_else(|| {
-            anyhow!(
-                "filter on `{}`: no contract has that alias in nuthatch.toml",
-                f.contract
-            )
-        })?;
-        let matching: Vec<_> = tables
-            .iter()
-            .filter(|d| d.alias == f.contract)
-            .filter(|d| {
-                if f.event.contains('(') {
-                    d.signature == f.event
-                } else {
-                    d.signature.split('(').next() == Some(f.event.as_str())
-                }
-            })
-            .collect();
-        let decoder = match matching.as_slice() {
-            [d] => *d,
-            [] => bail!(
-                "filter on `{}.{}`: the contract declares no such event",
-                f.contract,
-                f.event
-            ),
-            _ => bail!(
-                "filter on `{}.{}`: the name is overloaded; give the signature, one of {}",
-                f.contract,
-                f.event,
-                matching
-                    .iter()
-                    .map(|d| d.signature.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        };
-        let from = match f.from {
-            Some(b) if b < start => bail!(
-                "filter on `{}.{}` starts at block {b}, before the contract's start_block {start}",
-                f.contract,
-                f.event
-            ),
-            Some(b) => b,
-            None => start,
-        };
+        let decoder = decoder_of(spec, f)?;
+        let from = from_of(spec, f)?;
         let indexed: Vec<&str> = decoder
             .columns
             .iter()
@@ -157,11 +247,7 @@ pub fn build(spec: &NestSpec, specs: &[FilterSpec]) -> Result<Vec<Narrowed>> {
             )
             .expect("an address and a topic0")
             .with_topics(topics);
-            out.push(Narrowed {
-                filter,
-                from,
-                table: decoder.table.clone(),
-            });
+            out.push(Narrowed { filter, from });
         }
     }
     Ok(out)
@@ -183,7 +269,6 @@ fn topic_word(v: &str) -> Result<String> {
     }
 }
 
-/// The window's logs every filter names, in chain order, each once however many filters name it.
 pub async fn fetch(
     filters: &[Narrowed],
     source: &dyn Source,
@@ -299,6 +384,7 @@ abi = "abis/token.json"
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
                 .collect(),
+            privacy: Privacy::Public,
         }
     }
 
@@ -353,5 +439,42 @@ abi = "abis/token.json"
             1,
             "a signature picks one of an overloaded name"
         );
+    }
+
+    #[test]
+    fn the_tables_a_hybrid_open_hydrates_follow_from_the_events_not_the_values() {
+        let a = [one("token", "Moved", None, &[("to", &[A])])];
+        let b = [one(
+            "token",
+            "Moved",
+            None,
+            &[("to", &[B]), ("from", &[A, B])],
+        )];
+        assert_eq!(tables(&spec(), &a).unwrap(), tables(&spec(), &b).unwrap());
+        assert_eq!(
+            tables(&spec(), &a).unwrap().into_iter().collect::<Vec<_>>(),
+            vec!["token__moved".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_hybrid_filter_is_a_predicate_over_the_stored_rows() {
+        let p = predicates(
+            &spec(),
+            &[
+                one("token", "Moved", Some(150), &[("to", &[A, B])]),
+                one("token", "Moved", None, &[("from", &[A])]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            p["token__moved"],
+            "(block_number >= 150 AND LOWER(\"to\") IN ('0x00000000000000000000000000000000000000a1', \
+             '0x00000000000000000000000000000000000000b2')) OR (block_number >= 100 AND \
+             LOWER(\"from\") IN ('0x00000000000000000000000000000000000000a1'))"
+        );
+        let word = format!("0x{}", "f".repeat(64));
+        let refused = predicates(&spec(), &[one("token", "Moved", None, &[("to", &[&word])])]);
+        assert!(format!("{:#}", refused.unwrap_err()).contains("is not an address"));
     }
 }
