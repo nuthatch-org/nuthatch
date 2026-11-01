@@ -128,6 +128,8 @@ host drops the instance.
   "mirror": {"base": "https://..."},
   "follow": true,
   "verified": true,
+  "complete": true,
+  "max_headers": 10000,
   "filters": [{"contract": "staking", "event": "TokensDelegated", "from": 408825706,
                "args": {"delegator": ["0x..."]}}],
   "window": 10000000,
@@ -187,8 +189,25 @@ verified hash, and seals only at or below it, and only rows whose block hash is 
 the host has no verified block, the chain does not reach it, a header is forged or missing, or a
 row names a block hash off the verified chain, sealing stops there and the next `{"idle": true}`
 says why in `unverified`, by block; the cursor carries on, and its rows stay in the hot store. Rows
-above the verified block are still what the RPC said, and an RPC that leaves a log out is not caught
-(RFC-0065 §6). Without `verified`, the module seals on the chain's own policy, as a node does.
+above the verified block are still what the RPC said, and an RPC that leaves a log out is caught only
+with `complete` (RFC-0065 §6). Without `verified`, the module seals on the chain's own policy, as a node does.
+
+**`complete`** (RFC-0081 S4, with `verified` and `filters`) catches an RPC that leaves a log out. For
+each block under the verified head, the module tests the verified header's `logsBloom` for each
+filter's address and topics; where the bloom admits a filter and the RPC returned no log of it, it
+asks for the block's receipts (`eth_getBlockReceipts`, an `rpc` request like any other), hashes them
+into the receipt trie, and takes the filter's logs from them only if the root is the header's
+`receiptsRoot`. A bloom false positive costs that one fetch and changes nothing; a receipts list that
+does not hash to the root holds the seal below its block, and `unverified` names it. A block is sealed
+only once it is checked against the header on the verified chain, so what an earlier follow indexed
+above the head it then had, or before a reopen, is indexed again once the head passes it. A log's
+address, topics, data, index and block are what the root covers; its transaction hash is the RPC's,
+as it is for every log. The cost is the receipts: on mainnet a block's bloom has about three quarters
+of its bits set, so a filter on one contract's address admits about half the blocks it never logged
+in, each a receipts list of about a megabyte. **`max_headers`** (10,000 unless set) is the most
+headers one follow may hash and test: a fresh store whose `until` puts more past its start is refused
+at `nh_open` (`bad_config`) before any request, and a follow whose verified head is more past what is
+hashed fails (`follow_failed`) before any RPC request, each with the figure.
 
 **`filters`** (RFC-0077 S7) narrow the nest to the logs a host names, such as one user's own.
 Each names a contract by its alias, an event by its name (or its signature where the ABI overloads

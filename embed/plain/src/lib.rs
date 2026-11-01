@@ -14,6 +14,7 @@ use nuthatch_core::transport::{Reply, Transport, TransportError};
 use nuthatch_embed::attach;
 use nuthatch_embed::budget::TabBudget;
 use nuthatch_embed::cellar::Cellar;
+use nuthatch_embed::complete::{Completeness, Receipts};
 use nuthatch_embed::derived::NestFiles;
 use nuthatch_embed::http::Scope;
 use nuthatch_embed::mirror::{self, Hydrated, MirrorConfig, MirrorHost};
@@ -41,6 +42,8 @@ const ABI: u32 = 1;
 const STORE_FILE: &str = "nuthatch.redb";
 /// Where a mirror's segments are appended (RFC-0077 S4).
 const PACK_FILE: &str = "mirror.pack";
+/// `max_headers` unless the host sets it: RFC-0077 S5 hashed 1,894 in under a second.
+const MAX_HEADERS: u64 = 10_000;
 
 #[link(wasm_import_module = "nuthatch")]
 extern "C" {
@@ -141,6 +144,11 @@ struct Config {
     /// RFC-0077 S5: seal only under a finalized block the host verified, asked for by request.
     #[serde(default)]
     verified: bool,
+    /// RFC-0081 S4: under `verified`, check that the RPC left out no log a filter asks for.
+    #[serde(default)]
+    complete: bool,
+    /// The most headers a follow with `complete` may hash and test.
+    max_headers: Option<u64>,
     #[serde(default)]
     storage: Storage,
     #[serde(default)]
@@ -566,6 +574,31 @@ fn spec_of(c: &Config) -> Result<NestSpec, Fault> {
             narrow::predicates(&spec, filters).map_err(|e| fault_of("bad_config", e))?;
         }
     }
+    if c.complete {
+        if !c.verified {
+            return bad("`complete` checks blocks against a verified head, and needs `verified`");
+        }
+        if spec.narrowed.is_none() {
+            return bad("`complete` checks a narrowed nest's filters, and no `filters` are given");
+        }
+        // A fresh store hashes from its start to at least `until`: refused here, before any request.
+        let fresh = c.storage == Storage::Bytes || c.fresh;
+        if let (true, None, Some(until), Some(start)) = (fresh, &c.mirror, c.until, spec.start) {
+            let need = (until + 1).saturating_sub(start);
+            let max = c.max_headers.unwrap_or(MAX_HEADERS);
+            if need > max {
+                return Err(fault(
+                    "bad_config",
+                    format!(
+                        "`complete` would hash and test at least {need} headers, blocks \
+                         {start}..={until}, past the host's ceiling of {max} (`max_headers`)"
+                    ),
+                ));
+            }
+        }
+    } else if c.max_headers.is_some() {
+        return bad("`max_headers` is the ceiling of `complete`, which is not set");
+    }
     spec.until = c.until;
     match c.window {
         Some(0) => return bad("`window` is blocks per getLogs, at least one"),
@@ -677,6 +710,18 @@ impl VerifiedHead for HostHead {
     }
 }
 
+/// A block's receipts from the nest's own RPC, for `complete` (RFC-0081 S4).
+struct HostReceipts(Arc<RpcClient<HostTransport>>);
+
+#[async_trait::async_trait(?Send)]
+impl Receipts for HostReceipts {
+    async fn block_receipts(&self, block: u64) -> anyhow::Result<Value> {
+        self.0
+            .call("eth_getBlockReceipts", json!([format!("0x{block:x}")]))
+            .await
+    }
+}
+
 /// Storage mode `host`: clear the nest's files if asked, then open the store, each through the host.
 async fn open_host(c: Config, spec: NestSpec) -> anyhow::Result<Engine> {
     if c.fresh {
@@ -743,6 +788,7 @@ fn build(
         .map(|t| t.table.to_ascii_lowercase())
         .collect();
     let start = spec.start.unwrap_or_default();
+    let narrowed = spec.narrowed.clone().unwrap_or_default();
     let budget = c.memory_mib.map(TabBudget::mib).unwrap_or_default();
     let mut nest = young::open_nest(store, cellar.clone(), spec, start, budget)?;
     // Before `derive`, which admits the entities against it (RFC-0075 §17).
@@ -756,7 +802,18 @@ fn build(
         attach::check(declared, &own).map_err(|e| fault_of("bad_config", e))?;
         scope.attach = declared.clone();
     }
-    let verifier = c.verified.then(|| Arc::new(Verifier::new()));
+    let rpc = Arc::new(RpcClient::new(c.rpc)?);
+    let verifier = c.verified.then(|| {
+        let v = Verifier::new();
+        Arc::new(match c.complete {
+            true => v.completing(Completeness {
+                filters: narrowed,
+                max_headers: c.max_headers.unwrap_or(MAX_HEADERS),
+                receipts: Arc::new(HostReceipts(rpc.clone())),
+            }),
+            false => v,
+        })
+    });
     if let Some(v) = &verifier {
         nest.verify_with(Verified {
             verifier: v.clone(),
@@ -771,7 +828,7 @@ fn build(
             .unwrap_or(c.mirror.as_ref().is_none_or(|m| m.postcard.is_none())),
         hydrated,
         cellar,
-        rpc: Arc::new(RpcClient::new(c.rpc)?),
+        rpc,
         files,
         scope,
         nid: c.nid,

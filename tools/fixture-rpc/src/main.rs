@@ -29,6 +29,15 @@ enum Chain {
         /// Whole headers to serve where their hash is the recording's (RFC-0077 S5)
         #[arg(long)]
         headers: Option<PathBuf>,
+        /// Blocks' receipts to serve to eth_getBlockReceipts (RFC-0081 S4)
+        #[arg(long)]
+        receipts: Option<PathBuf>,
+        /// Leave one log out of every eth_getLogs answer: BLOCK:LOG_INDEX
+        #[arg(long, value_parser = block_and_index)]
+        drop_log: Option<(u64, u64)>,
+        /// Serve this block's receipts without the recorded contract's logs
+        #[arg(long)]
+        forge_receipts: Option<u64>,
     },
     /// One Transfer a block over blocks 1..=8, switchable through /control/mode to zero logs
     Scripted {
@@ -91,6 +100,9 @@ fn main() {
             file,
             fork,
             headers,
+            receipts,
+            drop_log,
+            forge_receipts,
         } => {
             let mut fx = Recorded::from_path(&file).unwrap_or_else(|e| die(&e));
             if fork {
@@ -98,6 +110,15 @@ fn main() {
             }
             if let Some(h) = headers {
                 fx = fx.with_headers(&h).unwrap_or_else(|e| die(&e));
+            }
+            if let Some(r) = receipts {
+                fx = fx.with_receipts(&r).unwrap_or_else(|e| die(&e));
+            }
+            if let Some((block, index)) = drop_log {
+                fx = fx.dropping_log(block, index);
+            }
+            if let Some(block) = forge_receipts {
+                fx = fx.forging_receipts(block);
             }
             let banner = format!(
                 "fixture-rpc listening on http://127.0.0.1:{port}/ recorded {}..={}",
@@ -175,6 +196,14 @@ fn run<F: Fixture>(bind: &str, port: u16, fixture: F, banner: Option<String>) {
         }
         serve(listener, Arc::new(fixture)).await;
     });
+}
+
+fn block_and_index(s: &str) -> Result<(u64, u64), String> {
+    let (b, i) = s.split_once(':').ok_or("BLOCK:LOG_INDEX")?;
+    Ok((
+        b.parse().map_err(|_| format!("`{b}` is not a block"))?,
+        i.parse().map_err(|_| format!("`{i}` is not a log index"))?,
+    ))
 }
 
 fn die(msg: &str) -> ! {

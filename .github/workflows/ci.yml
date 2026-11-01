@@ -832,6 +832,17 @@ jobs:
           $rpc recorded --port 8955 --file $d/chain.json.gz --headers $d/headers.json.gz &
           for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8955/ && break; sleep 0.2; done
           node hosts/node/verified.mjs "$m" http://127.0.0.1:8955/ $d | tee "$RUNNER_TEMP/verified.log"
+          # RFC-0081 S4: completeness to block 26,239,840 on the receipts that range needs. A log left
+          # out by the RPC is found from its block's receipts; forged receipts stop sealing by name.
+          r4="--file $d/chain.json.gz --headers $d/headers.json.gz --receipts $d/receipts.json.gz"
+          $rpc recorded --port 8956 $r4 &
+          $rpc recorded --port 8957 $r4 --drop-log 26239830:315 &
+          $rpc recorded --port 8958 $r4 --drop-log 26239830:315 --forge-receipts 26239830 &
+          for p in 8956 8957 8958; do
+            for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:$p/ && break; sleep 0.2; done
+          done
+          node hosts/node/complete.mjs "$m" $d http://127.0.0.1:8956/ http://127.0.0.1:8957/ http://127.0.0.1:8958/ \
+            26239830 --until 26239840 | tee -a "$RUNNER_TEMP/verified.log"
           node hosts/node/shapes.mjs "$m" $rpc ../tests/fixtures/embed-shapes | tee "$RUNNER_TEMP/shapes.log"
           { echo '```'; cat "$RUNNER_TEMP/compile.log" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" \
             "$RUNNER_TEMP/chrome.log" "$RUNNER_TEMP/agree.log" "$RUNNER_TEMP/mirror.log" \
