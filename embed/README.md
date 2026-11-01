@@ -234,6 +234,19 @@ the request does not supply, a bare name of an attached table, an answer that wa
 answer whose `provenance.as_of` is not this nest's are each refused by name. An attached table may
 not share a name with the nest's tables, views or entities, or with another attachment's.
 
+**What a narrowed nest read** (RFC-0081 S3). A nest opened with `filters` adds `narrowed` to each
+`/sql` answer's `provenance`: `filtered`, the tables the filters' events decode into; `read`, the
+nest's tables the statement names (null where the module's parser cannot read it); and `unfiltered`,
+those of them no filter covers, of which the nest holds no row. A `POST /sql` body may carry
+`"whole": true` on a `mirror+rpc` nest: the hydrated tables are then read without the filters'
+predicate, every row the published dataset holds through its end plus the filters' own rows after
+it. On any other nest it is refused by name.
+
+**`expect_nid`** (RFC-0081 S3) is the NID the files must compute, as a node computes it from the same
+directory (RFC-0032 §3, hidden files included). A nest whose files compute another is refused by name
+(`bad_config`, both NIDs and the files' data identity in the message) before the host is asked for
+anything. The report (`nh_report`) carries `identity`, `{"nid", "dataset"}`, for any nest.
+
 **`window`** is the blocks per `eth_getLogs`, in place of the chain's registered window. A narrowed
 nest wants it as wide as its endpoint allows.
 
@@ -425,6 +438,33 @@ node hosts/package/run.mjs /tmp/nuthatch-engine.js /tmp/plain.wasm reuse $d/s4-n
 The first is S5's 32 answers through the package, opened fresh and then from its kept store; the
 second a mirrored nest closed and reopened with no GET and the same answers, then reopened over a pack
 with one byte altered, which must be fetched again.
+
+### Checking a hosted answer
+
+`Engine.verifier(options).verify(answer, statement, filters)` (RFC-0081 §3.4) checks a hosted nest's
+`/sql` answer. `options` are `open`'s, with `nest` the nest's files and `mirror` the mirror to read.
+`answer` is the hosted answer, a node's envelope or one with its rows under `data`, carrying
+`provenance.nid` and `provenance.as_of`; `filters` say which logs the statement is about, each
+`public` or `private`. `answer` may instead be a list of `{name, answer, statement}`, all from one nest
+at one block, which one open answers.
+
+It opens the nest the answer names: the files must compute its NID (`expect_nid`), or the check is
+refused before anything is fetched. It follows to `as_of` and no further, `mirror+rpc` when every
+filter is public and a mirror is given, `rpc` otherwise, and runs each statement there. A statement
+is then one of:
+
+- **outside the filters**, when it names a table no filter covers, or, on a `mirror+rpc` nest, its
+  answer read `whole` differs from its answer through the filters: it depends on rows the filters do
+  not select. Nothing is compared. The second rule sees the network only through the mirror's end.
+- **not computable**, with the reason: this nest refused the statement, or answered at another block.
+- **equal** or **differs**, column by column, the rows compared as text in one order whatever order
+  either side gave them. A differing column lists each row's two values; a column only one side has
+  is named as not computable and never shown.
+
+The result names the NID, block, source, filters, the mirror's dataset and end, and the RPC's host,
+and says the head is the RPC's unless `verified` was given. Equality says the server and this RPC
+agree, nothing more. `hosts/package/verify-fixture.mjs` is its gate in CI; `verify-gate.mjs` runs
+RFC-0077 S7's seven wallets against a hosted nest.
 
 ## The reference hosts and the gate
 

@@ -4,7 +4,9 @@
   selective; a hybrid open of whole tables passes every gate but the 64 MiB one. S1 accepted on those
   narrowed terms 2026-11-01 (Chief): whole segments of the named tables, 200 MiB from the mirror, cold
   under 300 s. **S1 measured 2026-11-01 (§12).** S2 begun on Chief's word the same day; **S2 measured
-  2026-11-01 (§13).** No later slice is begun until Chief says.
+  2026-11-01 (§13).** S3 begun on Chief's word the same day; **S3 measured 2026-11-01 (§14)**, against a
+  stand-in host, since Lodestar's public route cannot answer the gate. No later slice is begun until
+  Chief says.
 - Author: Pete (cargopete)
 - Date: 2026-10-31
 - Depends on: RFC-0077 (the embeddable engine, S0 to S5 and S7 built, shipped as
@@ -572,3 +574,137 @@ the check let through), and passes again restored.
 - `embed/hosts/node/hybrid.mjs`, S1's driver, reads Lodestar's `literalRows` and two-config
   `nestFiles`, which the Lodestar branch removes; it runs against Lodestar's `main` as it stood for S1.
 - Firefox, Safari and a phone are S5's; no browser but Brave ran the package.
+
+## 14. S3 measured, 2026-11-01
+
+**Verdict: the gate passes, against a stand-in for the hosted nest.** Chief said go to S3 the same day.
+Lodestar's public SQL route cannot answer the gate as written, for two reasons recorded below, so the
+hosted nest in every figure here is the 5.16.0 release binary running graph-allocations-nest, seeded
+from the public mirror and following arb1 to the tip, answering `POST /sql` as any operator's node
+does. That is a departure, and the first thing to read.
+
+**Lodestar's route, tried first.** `https://api.lodestar-dashboard.com/api/sql/query` with dataset
+`staking` is kittiwake's free-form tier in front of the allocations nest. It returns the nest's rows and
+`provenance` with `nid` and `as_of`, re-wrapped as `{data: {rows}, provenance}`, which `verify` reads.
+
+- **It refuses two of the four statements.** The delegator and stakes statements fold each position
+  with `list_reduce(..., lambda acc, e: ...)`; kittiwake screens every statement with sqlparser's generic
+  dialect, which cannot parse a lambda, and answers 400 ("Expected: ), found: acc"). The curator and
+  signals statements are answered.
+- **Its NID is the NID of no published files.** It answers as `e82e8cf6…93c1`. The files that name the
+  public dataset, graph-allocations-nest at `7795a33`, compute `c24c60af…3092` (hidden files included,
+  as a node counts them); `36bd3de`, `680cedb`, `c313d08` and `1730f70` compute four others, and the
+  dataset's own `publish.json` names a fifth, `cb768e49…7ec6`. Production's directory differs from every
+  commit tried, in files that do not touch the data. `verify` refuses the curator answer by name, before any request:
+
+  > these files compute NID c24c60af… (data identity d6fd43c8…6e8b), and the answer names e82e8cf6…:
+  > they are not the nest that answered
+
+  That refusal is the design working, and it is why no figure here is from Lodestar's host. Its registry
+  hash, `0x916324e2…0449`, is the stand-in's, and both answered 2,707 delegations to the same query.
+
+**What was built**, under `embed/` only, `abi` still 1 (an optional `nh_open` key, a request body key
+and optional answer fields):
+
+- **`Engine.verifier(options).verify(answer, statement, filters)`** in the host package, `answer` also a
+  list of `{name, answer, statement}` at one block. It reads `provenance.nid` and `as_of`, refuses a
+  truncated answer or one naming no block, and opens the nest by NID: the caller's files must compute it
+  (`expect_nid` below), the dataset under the mirror is the one they name, as S4 resolves it.
+  `mirror+rpc` when every filter is public, `rpc` otherwise; `until` the answer's block, and a nest that
+  reaches another block is refused rather than compared. Each statement is run there and compared column
+  by column as text, rows in one order whatever order either side gave. A column is equal, differs (every
+  differing row's two values, up to 20), or not computable (named, never shown: a column only one side
+  has, or a statement this nest refused). The result names the NID, block, source, filters, mirror
+  dataset and end, the RPC's host, and that the head is the RPC's.
+- **`expect_nid`** on `nh_open`: the NID the files must compute, refused by name before the host is asked
+  for anything. `nh_report` carries `identity`, `{nid, dataset}`, and `follow()` returns it.
+- **`narrowed`** in a narrowed nest's `/sql` provenance (the tables its filters name, the tables the
+  statement read, those no filter covers) and **`"whole": true`** in a `/sql` body, which reads a
+  `mirror+rpc` nest's hydrated tables without the filters' predicate. Both are the module's own fields;
+  `sql_envelope` in core is untouched.
+- The package's `nest` directory is now read as a node reads it for a NID: hidden files count, `.git`,
+  `.DS_Store`, `.admin-token`, `nuthatch.redb` and `segments` do not. Before, it skipped every hidden
+  file, so a nest with `.claude/` computed a NID no node gives. A default store name changes with it.
+- A `follow_failed` ending "open it fresh" (a kept store past `until`) is opened fresh once, as an
+  `open_failed` one was.
+
+**The rule for "outside the filters".** A statement is outside them when either holds, and then nothing
+is compared:
+
+1. **It names a table no filter covers.** The nest holds no row of it. Read from the module's own parser
+   (`narrowed.unfiltered`); it parsed all four portfolio statements, lambdas included.
+2. **Its answer depends on rows the filters do not select.** On a `mirror+rpc` nest each hydrated table
+   holds the published dataset's every row, and the filters are a predicate over it (§12). The statement
+   is run twice, through the filters and `whole`; if the answers differ, it reads outside them.
+
+Neither needs the server's cooperation, so a lying server cannot turn a mismatch into "outside" by what
+it answers. The limits: rule 2 sees the network only through the mirror's end, so a row outside the
+filters that arrived after it is not seen; and on an `rpc` nest only rule 1 applies, since nothing
+outside the filters was ever fetched. The caller still declares the filters, and the result says which.
+
+**The gate.** `embed/hosts/package/verify-gate.mjs`, with the four statements copied from Lodestar's
+`src/lib/verify/sql.ts` into `embed/hosts/package/fixtures/portfolio.mjs`. Where Lodestar wrote pools
+and thaw requests in as literal rows, these read the nest's own tables, limited to the wallet and its
+pools (found from the host's own stakes answer, as S7's page finds them), so one statement goes to the
+host and runs in the narrowed nest unchanged. The filters are Lodestar's wallet and pool filters, marked
+public: the wallet's address is already in the statement sent to the host, and a `mirror+rpc` GET is
+chosen by events, never values (§12). Apple M5 Pro, Node 26.11.1, files, a fresh store per wallet, the
+public Worker and `https://arb1.arbitrum.io/rpc`; the host at `c24c60af…3092`:
+
+| Wallet | Block | Pools | Statements | Columns equal | Rows | RPC requests | Cold |
+|---|---|---|---|---|---|---|---|
+| 0xcdb9…b2c3 | 520,303,534 | 2 | 4 equal | 38 of 38 | 7 | 50 | 57.6 s |
+| 0x3a35…bb3c | 520,303,534 | 1 | 4 equal | 38 of 38 | 4 | 34 | 55.6 s |
+| 0xe3af…2ac2 | 520,303,534 | 1 | 4 equal | 38 of 38 | 3 | 32 | 57.2 s |
+| 0xd7d7…d076 | 520,304,615 | 3 | 4 equal | 38 of 38 | 4 | 66 | 54.6 s |
+| 0x96a3…e5b2 | 520,304,615 | 0 | 4 equal | 38 of 38 | 10 | 32 | 49.1 s |
+| 0x6d64…24bc | 520,304,615 | 0 | 4 equal | 38 of 38 | 10 | 32 | 47.4 s |
+| 0xacbd…0db5 | 520,304,615 | 0 | 4 equal | 38 of 38 | 20 | 32 | 51.4 s |
+
+28 statements, 266 columns over 58 rows, every one equal, none named. Each open hydrated 2,236 segments,
+204,949,749 bytes (195.5 MiB, under S1's 200), more than S1's 179.4 MiB because the wallet's curation and
+GNS tables now come from the mirror too; 2,238 GETs, none naming a wallet. The RPC tail ran from the
+mirror's end, 520,219,931, about 84,000 blocks.
+
+| Check | Result |
+|---|---|
+| A network-wide statement (every delegation's tokens) | **outside the filters**: "its answer changes when the rows outside the filters (the published dataset's, through block 520219931) are read" |
+| A table no filter names (`epochs__epoch_run`) | **outside the filters**: "it reads epochs__epoch_run, which no filter covers" |
+| One value altered by a proxy in front of the host | **differs** on that column alone: `total_signalled_tokens`, host `23491697265158386461000001`, here `2349169726515838646100000`; for 0xd7d7 alone, `total_staked_tokens`, `2735450000000000000000001` against `273545000000000000000000` |
+| An answer naming another NID | **refused** by name, 0 GETs |
+
+**In CI**, `hosts/package/verify-fixture.mjs` in the `wasm-plain` leg and the release's engine job, on
+RFC-0077 S4's nest and mirror followed on RFC-0075 S3's recording: one receiver's statement equal on
+every column, 147 transfers at block 26,245,870; every transfer's sum outside the filters; one value
+altered, differing on that column with both values; another NID refused before any GET. The "host" is
+the same nest opened whole through the package, its answers named by the NID the module computes for the
+files, which the stand-in above shows a node gives too.
+
+**Mutations**, each run against that script and reverted: the `whole` probe dropped from `verify`, and
+separately `whole` ignored in the module, each turns the network-wide check red ("differs") and nothing
+else; the value comparison disabled turns the altered check red; the `expect_nid` refusal removed turns
+the other-NID check red.
+
+**Unchanged.** S5's 32 answers through the package fresh and kept, the pack reuse, and S1's hybrid gates
+pass on the S3 module. The event build is 5,326,406 bytes brotli against the 5,500,000 gate, 1,590 more
+than `main`'s module built here: 173,594 bytes of headroom. The package is 38,397 bytes (12,632 gzip).
+The binary is unchanged: nothing outside `embed/`, `docs/` and the two workflows is touched.
+
+**What does not match the RFC, or is left.**
+
+- **No Lodestar host in the figures.** Its route cannot parse half the statements and its NID names
+  files nobody has. For a hosted operator to say "check this yourself", `verify` needs the operator's
+  exact files published beside the dataset, or the files whose NID the node reports to be the ones the
+  repository holds. Which, and whether the mirror should carry a nest's files, is a question for Chief;
+  nothing here changes the binary or the publisher.
+- **"Opens by NID" means the caller brings the files.** The mirror is keyed by data identity and its
+  `publish.json` names one NID per dataset, so a NID cannot be looked up there; the files are checked
+  against it instead, and the dataset they name is hydrated.
+- **Rule 2's horizon** is the mirror's end, and on an `rpc` nest only rule 1 applies, as above.
+- **Rows are compared as a set,** in one canonical order, so a host that answers the right rows in the
+  wrong `ORDER BY` order is not caught; the values are.
+- Node only. The verifier runs in a page through the package's worker unchanged, but no browser ran it.
+- `embed/hosts/node/hybrid.mjs`, S1's driver, is deleted: Lodestar #389 removed the `literalRows` and
+  two-config `nestFiles` it imported. Its job is covered by `hybrid-gates.mjs` (the hybrid open, the
+  privacy rule and `attach`, in CI), the package's `run.mjs`, Lodestar's own `verify-locally-node.mjs` on
+  the package (§13), and now `verify-gate.mjs` for the seven wallets live.

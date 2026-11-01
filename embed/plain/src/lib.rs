@@ -159,6 +159,8 @@ struct Config {
     source: Option<Source>,
     /// RFC-0081 §3.2: other instances' answers a `POST /sql` may bind, each under its own name.
     attach: Option<Vec<attach::Declared>>,
+    /// RFC-0081 S3: the NID `files` must compute, refused by name before the host is asked for anything.
+    expect_nid: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -205,6 +207,8 @@ struct Engine {
     verifier: Option<Arc<Verifier>>,
     follows: bool,
     hydrated: Option<Hydrated>,
+    /// The NID and data identity `files` compute, as a node would from the same directory.
+    identity: Value,
     cellar: Arc<Cellar>,
     rpc: Arc<RpcClient<HostTransport>>,
     files: NestFiles,
@@ -440,6 +444,20 @@ fn open(raw: &[u8]) -> Result<Value, Fault> {
     }
     let c: Config = serde_json::from_slice(raw).map_err(|e| fault("bad_config", e))?;
     let spec = spec_of(&c)?;
+    if let Some(want) = &c.expect_nid {
+        let (nid, dataset) = spec
+            .identity(&c.files)
+            .map_err(|e| fault_of("bad_config", e))?;
+        if !want.eq_ignore_ascii_case(&nid) {
+            return Err(fault(
+                "bad_config",
+                format!(
+                    "these files compute NID {nid} (data identity {dataset}), and the answer names \
+                     {want}: they are not the nest that answered"
+                ),
+            ));
+        }
+    }
     let budget = c.memory_mib.map(TabBudget::mib).unwrap_or_default();
     budget.enforce();
     if c.mirror.is_some() {
@@ -730,6 +748,10 @@ fn build(
 ) -> anyhow::Result<Engine> {
     let files = bound_files(&c);
     let mut scope = Scope::default();
+    if let Some(filters) = &c.filters {
+        scope.filtered =
+            Some(narrow::tables(&spec, filters).map_err(|e| fault_of("bad_config", e))?);
+    }
     if c.source() == Source::MirrorRpc {
         let filters = c.filters.as_deref().unwrap_or_default();
         scope.predicates =
@@ -742,6 +764,10 @@ fn build(
         .into_iter()
         .map(|t| t.table.to_ascii_lowercase())
         .collect();
+    let identity = match spec.identity(&c.files) {
+        Ok((nid, dataset)) => json!({"nid": nid, "dataset": dataset}),
+        Err(e) => json!({"error": format!("{e:#}")}),
+    };
     let start = spec.start.unwrap_or_default();
     let budget = c.memory_mib.map(TabBudget::mib).unwrap_or_default();
     let mut nest = young::open_nest(store, cellar.clone(), spec, start, budget)?;
@@ -770,6 +796,7 @@ fn build(
             .follow
             .unwrap_or(c.mirror.as_ref().is_none_or(|m| m.postcard.is_none())),
         hydrated,
+        identity,
         cellar,
         rpc: Arc::new(RpcClient::new(c.rpc)?),
         files,
@@ -999,6 +1026,7 @@ pub extern "C" fn nh_report() -> i32 {
         )
         .map(|mut r| {
             r["mirror"] = engine.hydrated.as_ref().map(Hydrated::to_json).into();
+            r["identity"] = engine.identity.clone();
             r["verified"] = engine.verifier.as_ref().map(|v| v.report()).into();
             r
         })

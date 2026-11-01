@@ -9,6 +9,7 @@ use crate::tab::{unix_now, TabNest};
 use nuthatch_core::answer::{self, Answer};
 use nuthatch_core::store::SEALED_THROUGH_KEY;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::sync::atomic::Ordering::Relaxed;
 
 // The node's, from `src/serve.rs` and `src/ipfs_resolve.rs`.
@@ -39,6 +40,9 @@ pub struct Scope {
     pub predicates: std::collections::BTreeMap<String, String>,
     pub unbound_views: Vec<String>,
     pub attach: Vec<crate::attach::Declared>,
+    /// RFC-0081 S3: the tables a narrowed nest's filters name, so an answer can say which tables it
+    /// read that no filter covers.
+    pub filtered: Option<BTreeSet<String>>,
 }
 
 /// The media type of an Arrow IPC stream, as the node answers it (RFC-0079).
@@ -115,17 +119,18 @@ pub async fn reply(n: &Nest<'_>, method: &str, target: &str, body: &[u8]) -> Rep
                         format,
                     },
                     None,
+                    false,
                 )
                 .await);
             }
             ("POST", ["sql"]) | ("POST", ["explain"]) => {
                 let explain = segs[0] == "explain";
                 let request = answer::sql_request(body, explain)?;
-                // `attach` rides beside the node's keys, which the node's parser ignores.
-                let attach = serde_json::from_slice::<Value>(body)
-                    .ok()
-                    .and_then(|mut v| v.get_mut("attach").map(Value::take));
-                return Ok(route_sql(n, explain, request, attach).await);
+                // `attach` and `whole` ride beside the node's keys, which the node's parser ignores.
+                let mut extra = serde_json::from_slice::<Value>(body).unwrap_or_default();
+                let whole = extra.get("whole") == Some(&Value::Bool(true));
+                let attach = extra.get_mut("attach").map(Value::take);
+                return Ok(route_sql(n, explain, request, attach, whole).await);
             }
             ("GET", ["entity", id]) => entity(n, id).await,
             ("GET", ["entities"]) => {
@@ -254,6 +259,7 @@ async fn route_sql(
     explain: bool,
     q: answer::SqlRequest,
     attach: Option<Value>,
+    whole: bool,
 ) -> Reply {
     let _one = SQL_ONE_AT_A_TIME.lock().await;
     if q.q.len() > SQL_MAX_QUERY_LEN {
@@ -318,8 +324,17 @@ async fn route_sql(
         Ok(engine) => engine,
         Err(e) => return Reply::of(answer::internal_error(&format!("{e:#}"))),
     };
-    if let Err(e) = engine.narrow(&scope.predicates) {
-        return Reply::of(answer::internal_error(&format!("{e:#}")));
+    if whole && scope.predicates.is_empty() {
+        return refuse(
+            "`whole` reads a `mirror+rpc` nest's hydrated tables without its filters, and this \
+             nest was not opened `mirror+rpc`"
+                .into(),
+        );
+    }
+    if !whole {
+        if let Err(e) = engine.narrow(&scope.predicates) {
+            return Reply::of(answer::internal_error(&format!("{e:#}")));
+        }
     }
     if let Err(e) = engine.attach(&attached) {
         return refuse(format!("{e:#}"));
@@ -389,6 +404,9 @@ async fn route_sql(
         },
         Value::Array(rows),
     );
+    if let (Some(filtered), Some(p)) = (&scope.filtered, envelope["provenance"].as_object_mut()) {
+        p.insert("narrowed".into(), narrowed(&q.q, n, filtered, whole));
+    }
     if arrow {
         // As the node's: the envelope less its rows, which are the stream.
         if let Some(o) = envelope.as_object_mut() {
@@ -411,10 +429,29 @@ async fn route_sql(
     })
 }
 
+/// RFC-0081 S3: what a narrowed nest's answer read. `read` is the nest's tables the statement names
+/// (null where it does not parse here), and `unfiltered` those of them no filter covers, which the
+/// nest holds none of.
+fn narrowed(sql: &str, n: &Nest, filtered: &BTreeSet<String>, whole: bool) -> Value {
+    let own: BTreeSet<String> = n
+        .nest
+        .registry()
+        .schema()
+        .into_iter()
+        .map(|t| t.table.to_ascii_lowercase())
+        .collect();
+    let read = crate::attach::bare_tables(sql).map(|t| own.intersection(&t).cloned().collect());
+    let unfiltered = read
+        .as_ref()
+        .map(|r: &BTreeSet<String>| r.difference(filtered).cloned().collect::<Vec<_>>());
+    json!({ "filtered": filtered, "read": read, "unfiltered": unfiltered, "whole": whole })
+}
+
 static NO_SCOPE: Scope = Scope {
     predicates: std::collections::BTreeMap::new(),
     unbound_views: Vec::new(),
     attach: Vec::new(),
+    filtered: None,
 };
 
 /// A hot hit, else the sealed segments: probe each table for the id, then read the row from the one
