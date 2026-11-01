@@ -149,7 +149,7 @@ story line is the way to turn that list into sentences; see config-reference.md.
 For a large export, or when the next step is a dataframe, ask `/sql` for Arrow instead of JSON:
 
 ```sh
-curl -G localhost:8288/sql --data-urlencode 'q=SELECT * FROM usdc__transfer' \
+curl 'localhost:8288/sql?q=SELECT%20*%20FROM%20usdc__transfer' \
   -H 'Accept: application/vnd.apache.arrow.stream' -D head.txt -o transfers.arrows
 ```
 
@@ -163,10 +163,10 @@ with `WHERE block_number > …` rather than raising `max_rows`. 256-bit values a
 in Arrow, so the `_dec` rules still hold. A refusal is JSON either way. For a point read or a small
 panel stay on JSON: the schema makes the Arrow answer larger.
 
-Arrow Flight SQL exists only in a build with `--features flight` (`nuthatch dev --flight <addr>`);
-the release binaries do not have the flag, so don't suggest it to someone who installed one. It
-answers statements, not catalogue calls, and names a runtime's mount with the `x-nuthatch-route`
-header.
+Arrow Flight SQL exists only in a binary built with the `flight` cargo feature, where `dev` gains a
+flag for its listen address. The release binaries have neither, and `cli-reference.md` documents
+the default build, so don't suggest Flight to someone who installed a release. It answers
+statements, not catalogue calls, and names a runtime's mount with the `x-nuthatch-route` header.
 
 ## Wire an AI client to a running nest
 

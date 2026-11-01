@@ -1200,9 +1200,8 @@ so `cached` is always false. On a small answer the schema makes IPC the larger o
 export of 100,000 rows it encoded about 5 times and decoded about 16 times faster than JSON (RFC-0079
 §12).
 
-**Arrow Flight SQL** (RFC-0079), in a build with `--features flight` (`cargo build --release
---features flight`; release artifacts do not include it): `nuthatch dev --flight 127.0.0.1:8815`
-serves Flight SQL beside the HTTP API. A statement is answered by the same handler as
+**Arrow Flight SQL** (RFC-0079), in a build with `--features flight` (release artifacts do not
+include it): `nuthatch dev --flight 127.0.0.1:8815` serves Flight SQL beside the HTTP API. A statement is answered by the same handler as
 `POST /<route>/sql`, under the same guards, with the caller's `authorization` passed on; a client
 names the mount with the `x-nuthatch-route` request header (absent, `/sql` at the root), and the
 answer's envelope arrives as the `x-nuthatch-answer` response header. A refusal is a gRPC status carrying `/sql`'s JSON error.
