@@ -4,7 +4,10 @@
   five suggestions: "lets do ALL that, 1-5 !!!!! but HA first". Third in build order, after RFC-0078
   and RFC-0079. **S0 measured 2026-11-01 (§11): the gate is not met, 11.4% of the follower's apply
   on the fixture and 30.6% with every row in a shaped table, so by that rule it stops.** Copies were
-  exact through the reorg suite and 10,000 live streams; reopening on a second S0 is Chief's call.
+  exact through the reorg suite and 10,000 live streams. **Reopened by Chief the same day; the second
+  S0 (§12) narrows it: the gate is met for address-shaped shapes over the busy table (uniform 6.1% and
+  5.1% on two boxes), not under fan-out or with every row shaped (hot:100 12.9%, all-tables 12.8 to
+  14.6%).** What remains is per-frame work on the apply; S1 or a third S0 is Chief's call.
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0079 (Arrow results, the columnar wire), RFC-0077 (the embeddable engine and its
@@ -408,3 +411,144 @@ Then, before S1's protocol: initial answers taken from a pinned version outside 
 by key, the watermark rule above, several shapes on one connection (§5.6's
 `max_shapes_per_connection`) so 35 KiB is not paid per shape, a connect rate limit beside the shape
 limits, and `[mounts.sync]` in place of the variable.
+
+## 12. Second S0 measured (2026-11-01)
+
+Chief reopened S0 the same day: "lets revisit the partial sync, cant be that bad?". The second S0
+made exactly the two changes §11 named, against the same gate, fixture and shape sets.
+
+**Verdict: narrow.** The gate is met for the shapes the slice names, address-shaped terms over the
+busy table: uniform at 6.1% of apply on the Mac and 5.1% on the ThinkPad, against 12.7% and 11.0%
+for the first S0's filter in the same sessions, and skew at 6.2% and 5.2%. It is not met when every
+row is in a shaped table (all-tables, 14.6% and 12.8%) or under fan-out (hot:100 12.9% on both,
+hot:1000 24.1% and 65.8%). Reading rows is no longer the cost: what remains is per-frame work still
+on the apply path, encoding each matched row's frame and pushing it to every matching queue, and
+this S0 was not allowed to move it. Copies were exact in every run, the reorg suite passes on the
+column path, memory is about a quarter of the budget, and a stalled client does not slow the
+follower. Whether S1 proceeds on the narrowed claim, or a third S0 moves the per-frame work first,
+is Chief's call.
+
+### What changed
+
+The code is on `pete/rfc-0080-s0b` (#2576, a draft, not for merging), built on the first spike.
+
+1. **The filter probes the delta's columns.** A feed v2 follower keeps a decoded delta's Arrow
+   batches on the `Delta`, with each row's place among the puts, when shapes are on.
+   `Index::matching_columns` passes over a table no shape names a batch at a time, and in a shaped
+   table probes each probe column's values, as the JSON text the column carries, in one hash lookup
+   a row, checking a shape's other terms against the same row's columns. Escaped values are
+   unescaped first. Retractions, rows a batch sent whole and batches sent as rows are read as JSON,
+   as before. The probe is used only when every put changed a row, so `Changes::added` lines up
+   with the puts; otherwise the delta is read as JSON. A differential test checks the probe finds
+   exactly the `(put, shape)` pairs the JSON read does.
+2. **Readers are woken by a delivery task.** Each shape's queue has its own lock and wake-up. The
+   apply pushes a frame and, the first time a delta touches a stream, owes it one wake-up; after the
+   delta it hands the owed ids to a delivery task and signals once. Delivery wakes the streams. The
+   apply never waits on delivery or on a reader, and a reader no longer takes the hub's lock.
+
+Both filters stay in the binary, selected by `NUTHATCH_SHAPES_S0_FILTER=json|columns` and
+`NUTHATCH_SHAPES_S0_DELIVERY=inline|task`, so the A/B runs one binary. Unset, nothing is loaded and
+no column is kept, as in §11. Full CI, with the RAM, point-read and tip-lag gates, is green on the
+branch.
+
+### The boxes
+
+Two, each running the old and the new filter interleaved, shape set by shape set, in one session
+(`tools/rfc-0080-s0/ab.sh`), the same release build on both:
+
+- **Mac**: Apple M5 Pro, 18 cores, 48 GiB. Load average 2 to 4 for most runs, 9.5 at the start of
+  the first and 14.8 at the start of one stall control, with other sessions' builds on the box.
+- **ThinkPad**: Intel i9-13980HX, 32 threads, 62 GiB, Debian 13. Not idle: its own services hold a
+  steady 3 to 4 cores. The runs went at `nice 10` and the load average stayed 2.5 to 8.6.
+
+### Filter against apply
+
+Filter as a share of the follower's apply, summed over every delta after the clients attached, with
+the per-delta p50 and p99. §11's figure is the first S0's own run.
+
+| Run | §11 | Old, Mac | New, Mac | Old, ThinkPad | New, ThinkPad |
+|---|---|---|---|---|---|
+| Hook on, no shapes | 0.7% | 0.7% (0.8, 1.1) | 0.3% (0.2, 0.7) | 0.7% (0.7, 1.0) | 0.2% (0.2, 0.4) |
+| uniform | 11.4% | 12.7% (12.8, 22.2) | **6.1%** (6.1, 9.8) | 11.0% (11.0, 17.2) | **5.1%** (5.1, 7.9) |
+| skew | 11.3% | 12.8% (12.1, 42.2) | **6.2%** (5.8, 14.8) | 11.4% (10.6, 35.8) | **5.2%** (4.9, 15.6) |
+| hot:100 | 13.2% | 30.4% (33.1, 61.1) | 12.9% (12.5, 17.4) | 20.2% (20.1, 59.6) | 12.9% (12.9, 17.0) |
+| hot:1000 | 14.3% | 60.4% (77.2, 179.8) | 24.1% (30.0, 42.7) | 93.1% (102.1, 135.4) | 65.8% (64.1, 91.2) |
+| all-tables | 30.6% | 38.1% (39.2, 57.7) | 14.6% (15.4, 22.0) | 28.6% (29.1, 47.2) | 12.8% (12.8, 19.5) |
+
+Frames a delta: 102 uniform, 104 to 106 skew, 2,100 hot:100, 20,091 hot:1000, 83 all-tables, the
+same for both filters. Apply p50 was 0.8 to 1.5 ms in the 10,000-shape runs, except hot:1000 with the
+new filter: 2.6 ms on the Mac and 2.0 ms on the ThinkPad, against 1.7 and 1.5 ms with the old. The
+lowest, 0.8 ms, was the new all-tables run on the Mac, which raises its ratio.
+Skew's p99 is over the gate on both boxes; its sum and p50 are not.
+
+The old filter's hot rows are worse than §11's. §11 said its 7 ms apply in hot:1000 flattered the
+ratio, and on these quieter runs it was flattered: the same filter at a 1.7 ms apply is 60%, not
+14%. So the first S0's hot figures understated the problem, and the second S0's improvement there is
+against the higher number.
+
+**Where the new filter's time goes.** `s0_route_cost` (ignored) now times both filters on the same
+decoded deltas, then the column probe alone and the encoding of its matched rows' frames alone, on
+the Mac:
+
+| Shapes | Frames a delta | Old route p50 | New route p50 | Probe alone | Encoding frames |
+|---|---|---|---|---|---|
+| uniform | 101 | 37 µs | 15 µs | 5 µs | 11 µs |
+| all-tables | 246 | 224 µs | 108 µs | 29 µs | 92 µs |
+
+The probe is about 0.15 µs a row in a shaped table, against §11's 1.1 µs to parse one, so reading
+the delta is solved. Encoding a frame, the stored row escaped into a JSON string, is about 0.4 to 0.5 µs a
+matched row, and pushing a frame to a queue about 40 ns: hot:1000's 20,091 pushes are most of its
+818 µs. Both are fan-out, and both still run on the apply.
+
+### Delivery, and a stalled client
+
+Delivery's lag, from the apply handing over a delta's streams to the last of them woken: p50 56 to
+218 µs and p99 138 to 552 µs on the Mac, p50 119 to 214 µs and p99 224 to 393 µs on the ThinkPad,
+highest in hot:1000. It runs beside the apply and is not counted in the gated figure.
+
+A stalled client was measured as a pair over 400 blocks: hot:100 with every client reading, then the
+same with 50 of the 100 whole-pool streams reading their initial answer and never reading again.
+
+| | Filter / apply | Apply p50 | Apply p99 | Follower at the end | Stalled streams closed |
+|---|---|---|---|---|---|
+| Mac, control | 11.6% | 1,390 µs | 4,339 µs | generation 452, the writer's tip | n/a |
+| Mac, 50 stalled | 12.4% | 662 µs | 3,988 µs | generation 452, the writer's tip | 17 |
+| ThinkPad, control | 12.9% | 1,446 µs | 1,721 µs | generation 452, the writer's tip | n/a |
+| ThinkPad, 50 stalled | 13.3% | 1,460 µs | 2,005 µs | generation 452, the writer's tip | 0 |
+
+The follower kept to the writer's tip with stalled clients, at the same apply cost; the other 9,950
+copies were exact. A stalled stream's frames first fill its socket buffers: on the Mac 17 of the 50
+passed the 4,096-frame bound and were closed for refetch, and on the ThinkPad, whose localhost
+buffers are larger, none reached it in 400 blocks. `a_stalled_reader_never_delays_routing` checks the
+bound itself: routing past it closes the reader and owes it one wake-up, and nothing waits.
+
+### Copies and the reorg suite
+
+Every copy in every run equalled the writer's canonical rows, under §11's watermark rule: 0 wrong of
+10,000 in each of the 20 A/B runs and the two stall controls, and 0 of 9,950 in each of the four
+runs with stalled clients. The randomised reorg suite now
+runs twice, as in §11 and again with deltas sent through feed v2's encoder and decoder, probed by
+columns and woken by delivery, with blocks of up to 13 rows so a table reaches a batch of columns
+(`every_client_copy_is_its_canonical_rows_through_random_reorgs_by_columns`, 256 cases). Both pass.
+Two mutations turn the column suite red: skipping the check of a shape's other terms, and routing no
+retractions; the first also fails the differential test.
+
+### Memory
+
+The follower's RSS median while following was 430 to 523 MiB on the Mac and 532 to 547 MiB on the
+ThinkPad with 10,000 live streams, against the 2,048 MiB per-cursor budget, as in §11. Keeping a
+delta's Arrow batches until it is applied is not charged to the dataset's budget in the spike; S1
+must charge it.
+
+### What S1 would need
+
+If Chief takes the narrowed claim, S1 adds to §11's list:
+
+1. **Fan-out off the apply.** The apply records each delta's matched `(row, shape)` pairs once, by
+   reference to the decoded delta, and delivery encodes each row's frame once and appends it to
+   the matching queues. The apply's cost is then per matched row, not per frame, which is the
+   change hot:k and all-tables need. A third S0 can measure it against this gate before S1, and is
+   the cheaper way to know.
+2. **The kept batches charged** to the dataset's budget beside the decoded rows.
+3. **A bound a stalled client reaches**: by bytes as well as frames, since socket buffers hold
+   thousands of frames before the queue sees any.
