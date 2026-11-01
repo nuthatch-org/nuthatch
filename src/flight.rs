@@ -322,7 +322,7 @@ impl FlightSqlService for Service {
         query: CommandGetCatalogs,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let schema = query.clone().into_builder().schema();
+        let schema = query.into_builder().schema();
         command_info(query, &schema, request.into_inner())
     }
 
