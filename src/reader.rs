@@ -136,6 +136,7 @@ pub async fn serve(args: crate::cli::ServeArgs) -> Result<()> {
         .clone()
         .context("a follower needs --follow <writer-url>")?;
     let cors = crate::serve::cors_layer(&args.cors)?;
+    crate::shape_s0::start_from_env().await?;
     let options = Options {
         feed: args.feed_version,
         paused: false,
@@ -1673,6 +1674,11 @@ impl Follower {
         })
         .await
         .context("building a snapshot's store")??;
+        if let Some(hub) = crate::shape_s0::hub(&dataset) {
+            hub.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset(data.store.clone());
+        }
         let lifted = {
             let mut inner = self.lock();
             if let Some(old) = inner.datasets.insert(dataset.clone(), data) {
@@ -1717,10 +1723,25 @@ impl Follower {
             return Ok(());
         }
         // The old state keeps serving while a new connection takes fresh snapshots.
-        let changes = data
-            .store
-            .apply(&delta)
-            .with_context(|| format!("{dataset}: resnapshotting"))?;
+        let shapes = crate::shape_s0::hub(&dataset);
+        let (changes, store_apply, filtered) = {
+            let mut hub = shapes
+                .as_ref()
+                .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()));
+            let store_started = Instant::now();
+            let changes = data
+                .store
+                .apply(&delta)
+                .with_context(|| format!("{dataset}: resnapshotting"))?;
+            let store_apply = store_started.elapsed();
+            let filtered = hub.as_mut().map(|hub| {
+                let t = Instant::now();
+                let frames = hub.route(data.store.applied(), &changes);
+                (t.elapsed(), frames)
+            });
+            (changes, store_apply, filtered)
+        };
+        let changes_rows = changes.removed.len() + changes.added.len();
         self.lock().note_peak(&dataset);
         if let Some(delay) = crate::indexer::feed_delay(&self.root.join(&dataset)) {
             tokio::time::sleep(delay).await;
@@ -1755,6 +1776,19 @@ impl Follower {
         data.publish()
             .with_context(|| format!("{dataset}: publishing a delta"))?;
         crate::feed_metrics::metrics().applied(started.elapsed());
+        if let (Some(hub), Some((filter, frames))) = (&shapes, filtered) {
+            hub.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .costs
+                .push(crate::shape_s0::DeltaCost {
+                    generation: delta.generation,
+                    rows: changes_rows as u32,
+                    frames,
+                    filter_ns: filter.as_nanos() as u64,
+                    store_apply_ns: store_apply.as_nanos() as u64,
+                    apply_ns: started.elapsed().saturating_sub(filter).as_nanos() as u64,
+                });
+        }
         self.ack.notify_one();
         if let Some(why) = torn {
             let store = data.store.clone();

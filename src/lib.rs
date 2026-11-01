@@ -140,6 +140,7 @@ pub mod serve;
 /// RFC-0046 S3: drain and settle recorded authorisations, outside the nest.
 #[cfg(feature = "counter")]
 pub mod settle;
+pub mod shape_s0;
 pub mod skill;
 pub mod source;
 pub(crate) mod spill;
