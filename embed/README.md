@@ -455,7 +455,7 @@ node hosts/package/run.mjs /tmp/nuthatch-engine.js /tmp/plain.wasm s5 http://127
 node hosts/package/run.mjs /tmp/nuthatch-engine.js /tmp/plain.wasm reuse $d/s4-nest $d/s4-mirror
 ```
 
-The first is S5's 32 answers through the package, opened fresh and then from its kept store; the
+The first is S5's 33 answers through the package, opened fresh and then from its kept store; the
 second a mirrored nest closed and reopened with no GET and the same answers, then reopened over a pack
 with one byte altered, which must be fetched again.
 
@@ -494,7 +494,7 @@ RFC-0077 S7's seven wallets against a hosted nest.
 | Node | `hosts/node/run.mjs`: the same `host.js`, over `fs-storage.mjs` | files | `node` |
 | wasmtime | `tests/wasmtime-host/` | files | `cargo build --release`, then `wasmtime-host` |
 
-The gate: the same `.wasm` file, unmodified, answers RFC-0075 S5's 32 requests in all three hosts
+The gate: the same `.wasm` file, unmodified, answers RFC-0075 S5's 33 requests in all three hosts
 equal to the node's pin, `tests/fixtures/tab-parity/s5-expected.json`. Each host prints the module's
 sha256 and one digest over its answers, masked as `tests/e2e_tab_answers.rs` masks them, beside the
 same digest over the pin; all of them must agree. CI's `wasm-plain` leg runs it on every PR that
