@@ -110,7 +110,7 @@ if [ "$SHAPES" -gt 0 ]; then
     >"$OUT/client.log" 2>&1 &
   CPID=$!
   pids="$pids $CPID"
-  for _ in $(seq 1 600); do [ -f "$OUT/ready" ] && break; sleep 0.5; done
+  for _ in $(seq 1 1800); do [ -f "$OUT/ready" ] && break; sleep 0.5; done
   [ -f "$OUT/ready" ] || { tail -20 "$OUT/client.log"; echo "FAIL: clients never attached"; exit 1; }
 fi
 G0="$(curl -fsS "127.0.0.1:$S_PORT/datasets" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s)[0].generation))')"

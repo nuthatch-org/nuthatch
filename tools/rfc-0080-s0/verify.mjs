@@ -18,7 +18,7 @@ const text = (v) => (typeof v === "string" ? v : JSON.stringify(v));
 const key = (r) => `${r.block_number}:${r.log_index}`;
 
 if (fs.existsSync(`${out}/copies.json`)) {
-  const { frames, copies } = JSON.parse(fs.readFileSync(`${out}/copies.json`, "utf8"));
+  const { frames, retries, copies } = JSON.parse(fs.readFileSync(`${out}/copies.json`, "utf8"));
   const floor = Math.min(...Object.values(copies).map((c) => c.sealed_through ?? 0));
   const byTable = {};
   for (const t of new Set(Object.values(copies).map((c) => c.shape.table))) {
@@ -67,6 +67,8 @@ if (fs.existsSync(`${out}/copies.json`)) {
     rows_held: held,
     writer_rows_checked: checked,
     frames_applied: frames,
+    connect_retries: retries,
+    attached_all_in_ms: Number(fs.readFileSync(`${out}/ready`, "utf8")),
     refetched,
     max_generation: maxG,
   };
@@ -87,6 +89,7 @@ report.costs = {
   apply_us_p50: pct(tip.map((c) => c.apply_ns), 50) / 1000,
   apply_us_p99: pct(tip.map((c) => c.apply_ns), 99) / 1000,
   store_apply_us_p50: pct(tip.map((c) => c.store_apply_ns), 50) / 1000,
+  lock_wait_us_max: Math.max(...tip.map((c) => c.lock_wait_ns)) / 1000,
   filter_over_apply_total: sum((c) => c.filter_ns) / sum((c) => c.apply_ns),
   filter_over_apply_p50: pct(tip.map((c) => c.filter_ns / c.apply_ns), 50),
   filter_over_apply_p99: pct(tip.map((c) => c.filter_ns / c.apply_ns), 99),

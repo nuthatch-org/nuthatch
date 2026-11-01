@@ -1724,10 +1724,12 @@ impl Follower {
         }
         // The old state keeps serving while a new connection takes fresh snapshots.
         let shapes = crate::shape_s0::hub(&dataset);
-        let (changes, store_apply, filtered) = {
+        let (changes, store_apply, filtered, lock_wait) = {
+            let locking = Instant::now();
             let mut hub = shapes
                 .as_ref()
                 .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()));
+            let lock_wait = locking.elapsed();
             let store_started = Instant::now();
             let changes = data
                 .store
@@ -1739,7 +1741,7 @@ impl Follower {
                 let frames = hub.route(data.store.applied(), &changes);
                 (t.elapsed(), frames)
             });
-            (changes, store_apply, filtered)
+            (changes, store_apply, filtered, lock_wait)
         };
         let changes_rows = changes.removed.len() + changes.added.len();
         self.lock().note_peak(&dataset);
@@ -1786,7 +1788,9 @@ impl Follower {
                     frames,
                     filter_ns: filter.as_nanos() as u64,
                     store_apply_ns: store_apply.as_nanos() as u64,
-                    apply_ns: started.elapsed().saturating_sub(filter).as_nanos() as u64,
+                    apply_ns: (started.elapsed().saturating_sub(filter + lock_wait)).as_nanos()
+                        as u64,
+                    lock_wait_ns: lock_wait.as_nanos() as u64,
                 });
         }
         self.ack.notify_one();

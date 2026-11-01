@@ -34,6 +34,17 @@ impl<'a> Fields<'a> {
         wanted: &dyn Fn(&str) -> bool,
     ) -> Option<Fields<'a>> {
         use serde::de::DeserializeSeed;
+        // A row opening with an unescaped table name is refused without starting a parser.
+        if let Some(name) = row
+            .strip_prefix("{\"table\":\"")
+            .and_then(|r| r.split_once('"'))
+            .map(|(name, _)| name)
+            .filter(|name| !name.contains('\\'))
+        {
+            if !table(name) {
+                return None;
+            }
+        }
         let mut de = serde_json::Deserializer::from_str(row);
         Seed { table, wanted }.deserialize(&mut de).ok()
     }
@@ -224,6 +235,8 @@ struct Queue {
     reader: u64,
     /// The reader fell behind; it is sent a refetch and closed.
     closed: bool,
+    /// Its reader's own wake-up, so a delta wakes only the streams it touched.
+    notify: Arc<tokio::sync::Notify>,
 }
 
 /// What one filtered delta cost.
@@ -236,6 +249,8 @@ pub struct DeltaCost {
     pub store_apply_ns: u64,
     /// The follower's whole apply of the delta, as `feed_metrics` times it, filter excluded.
     pub apply_ns: u64,
+    /// Waiting for the hub while a client attached, excluded from both.
+    pub lock_wait_ns: u64,
 }
 
 /// One dataset's shapes on one follower: their queues, and the copy they are answered from.
@@ -246,7 +261,6 @@ pub struct Hub {
     store: Option<Arc<crate::feed::MemStore>>,
     attachments: u64,
     pub costs: Vec<DeltaCost>,
-    notify: Arc<tokio::sync::Notify>,
     scratch: Vec<u32>,
 }
 
@@ -268,7 +282,6 @@ impl Hub {
             store: None,
             attachments: 0,
             costs: Vec::new(),
-            notify: Arc::new(tokio::sync::Notify::new()),
             scratch: Vec::new(),
         }
     }
@@ -281,9 +294,9 @@ impl Hub {
             q.frames.clear();
             if q.reader != 0 {
                 q.closed = true;
+                q.notify.notify_one();
             }
         }
-        self.notify.notify_waiters();
     }
 
     /// Route one applied delta's changes to every shape they touch; the frames appended.
@@ -313,32 +326,45 @@ impl Hub {
                         continue;
                     }
                     q.frames.push_back(frame.clone());
+                    if q.reader != 0 {
+                        q.notify.notify_one();
+                    }
                     frames += 1;
                 }
             }
         }
         self.scratch = ids;
-        if frames > 0 {
-            self.notify.notify_waiters();
-        }
         frames
     }
 
     /// Start reading shape `id`: its rows now, at the generation every later frame follows.
-    pub fn attach(&mut self, id: usize) -> Result<(u64, Initial)> {
+    pub fn attach(&mut self, id: usize) -> Result<(u64, Initial, Arc<tokio::sync::Notify>)> {
         let shape = self.index.shapes.get(id).context("no such shape")?.clone();
         let store = self.store.clone().context("no copy yet")?;
         let tables = store.tables();
-        let rows = tables
-            .entities
-            .values()
-            .filter(|r| shape.matches(r))
-            .cloned()
-            .collect();
-        let sealed_through = tables
+        let sealed_through: Option<u64> = tables
             .meta
             .get("sealed_through")
             .and_then(|v| v.parse().ok());
+        // `/sql` withholds a hot row at or under the watermark once its table has a segment, since
+        // the segment holds that range; a hot copy can still carry one.
+        let sealed = store
+            .copy()
+            .upgrade()
+            .and_then(|c| c.catalogue())
+            .and_then(|raw| serde_json::from_str::<crate::seal::Manifest>(&raw).ok())
+            .is_some_and(|m| m.tables.get(&shape.table).is_some_and(|s| !s.is_empty()));
+        let floor = sealed_through.filter(|_| sealed).unwrap_or(0);
+        let rows = tables
+            .entities
+            .iter()
+            .filter(|(key, _)| {
+                !sealed || key.get(..12).and_then(|b| b.parse::<u64>().ok()) > Some(floor)
+            })
+            .map(|(_, r)| r)
+            .filter(|r| shape.matches(r))
+            .cloned()
+            .collect();
         self.attachments += 1;
         let q = &mut self.queues[id];
         q.frames.clear();
@@ -351,6 +377,7 @@ impl Hub {
                 sealed_through,
                 rows,
             },
+            q.notify.clone(),
         ))
     }
 
@@ -481,7 +508,7 @@ async fn stream(
     let (reader, initial, notify) = {
         let mut h = hub.lock().unwrap_or_else(|e| e.into_inner());
         match h.attach(id) {
-            Ok((reader, initial)) => (reader, initial, h.notify.clone()),
+            Ok(attached) => attached,
             Err(e) => return (axum::http::StatusCode::CONFLICT, e.to_string()).into_response(),
         }
     };
@@ -591,7 +618,7 @@ mod tests {
 
     impl Client {
         fn attach(hub: &mut Hub, id: usize) -> Client {
-            let (reader, initial) = hub.attach(id).unwrap();
+            let (reader, initial, _) = hub.attach(id).unwrap();
             Client {
                 reader,
                 rows: initial.rows.into_iter().map(|r| (r, 1)).collect(),
@@ -794,7 +821,7 @@ mod tests {
         let copy = Arc::new(MemStore::from_snapshot(tmp.path(), sub.snapshot.clone()));
         let mut hub = Hub::new(Arc::new(Index::new(vec![shape(&[1], None)]).unwrap()));
         hub.reset(copy.clone());
-        let (reader, _) = hub.attach(0).unwrap();
+        let (reader, _, _) = hub.attach(0).unwrap();
         for b in 1..=(ATTACHED_QUEUE as u64 + 1) {
             store
                 .commit_window(&[row(b, 0, 1, 0, TABLE)], None, b)
