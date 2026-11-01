@@ -802,8 +802,18 @@ jobs:
           chrome=$(npx -y @puppeteer/browsers@2.10.10 install chrome@stable --path "$RUNNER_TEMP/browsers" | tail -1 | cut -d' ' -f2-)
           node run-sw.mjs "$chrome" "$m" http://127.0.0.1:8954/ $d | tee "$RUNNER_TEMP/chrome.log"
           node run-sw.mjs "$chrome" "$m" http://127.0.0.1:8954/ $d --restart | tee -a "$RUNNER_TEMP/chrome.log"
+          # RFC-0081 S5: the same legs in Firefox under geckodriver, both pinned; then RFC-0077 S5's nest
+          # shapes in both browsers, each in a nest worker on OPFS.
+          firefox=$(npx -y @puppeteer/browsers@2.10.10 install firefox@stable_159.0 --path "$RUNNER_TEMP/browsers" | tail -1 | cut -d' ' -f2-)
+          curl -sfL https://github.com/mozilla/geckodriver/releases/download/v0.37.1/geckodriver-v0.37.1-linux64.tar.gz \
+            | tar xz -C "$RUNNER_TEMP"
+          gecko=(--geckodriver "$RUNNER_TEMP/geckodriver")
+          node run-sw.mjs "$firefox" "$m" http://127.0.0.1:8954/ $d "${gecko[@]}" | tee "$RUNNER_TEMP/firefox.log"
+          node run-sw.mjs "$firefox" "$m" http://127.0.0.1:8954/ $d --restart "${gecko[@]}" | tee -a "$RUNNER_TEMP/firefox.log"
+          node run-sw.mjs "$chrome" "$m" shapes $rpc ../tests/fixtures/embed-shapes | tee -a "$RUNNER_TEMP/chrome.log"
+          node run-sw.mjs "$firefox" "$m" shapes $rpc ../tests/fixtures/embed-shapes "${gecko[@]}" | tee -a "$RUNNER_TEMP/firefox.log"
           node hosts/agree.mjs "$m" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" "$RUNNER_TEMP/chrome.log" \
-            --hosts node,wasmtime,chrome | tee "$RUNNER_TEMP/agree.log"
+            "$RUNNER_TEMP/firefox.log" --hosts node,wasmtime,chrome,firefox | tee "$RUNNER_TEMP/agree.log"
           # RFC-0077 S4: S4's entity nest hydrated from a published directory, at the seed's head and
           # followed to the tip, equal to the node's pins (`tests/e2e_tab_mirror.rs`); refused at
           # 600 MiB before any download; a postcard checked, and an altered one refused.
@@ -821,6 +831,15 @@ jobs:
           # RFC-0081 S1: the same nest `mirror+rpc`, equal to `rpc` under the same filters; no GET names
           # or is chosen by a filter's value; a private filter refused; another nest's answers attached.
           node hosts/node/hybrid-gates.mjs "$m" $n4 $mm http://127.0.0.1:8953/ | tee -a "$RUNNER_TEMP/mirror.log"
+          # RFC-0081 S5: the wasmtime host's `get`: the same nest from the same mirror, at the seed's head
+          # and followed, equal to the node's pins; and `mirror+rpc`, equal to the Node host's answers.
+          wt=(--wasmtime $host "${cache[@]}") hy=(--follow --rpc http://127.0.0.1:8953/ --hybrid 0x37c9ef5d0801abdc25d9bbed096a080fa3c54e4c)
+          node hosts/node/mirror.mjs "$m" $n4 $mm --expect $d/s4-mirror-seed.json "${wt[@]}" | tee -a "$RUNNER_TEMP/mirror.log"
+          node hosts/node/mirror.mjs "$m" $n4 $mm --follow --rpc http://127.0.0.1:8953/ --expect $d/s4-mirror-tip.json "${wt[@]}" \
+            | tee -a "$RUNNER_TEMP/mirror.log"
+          node hosts/node/mirror.mjs "$m" $n4 $mm "${hy[@]}" --out "$RUNNER_TEMP/hybrid-node.json" | tee -a "$RUNNER_TEMP/mirror.log"
+          node hosts/node/mirror.mjs "$m" $n4 $mm "${hy[@]}" --expect "$RUNNER_TEMP/hybrid-node.json" "${wt[@]}" \
+            | tee -a "$RUNNER_TEMP/mirror.log"
           # RFC-0081 S2: the host package as released, on the same module: S5's answers fresh and from
           # its kept store; a mirrored nest reopened from its pack with no GET, an altered pack fetched again.
           node hosts/package/build.mjs "$RUNNER_TEMP/nuthatch-engine.js" | tee -a "$RUNNER_TEMP/mirror.log"
@@ -830,6 +849,14 @@ jobs:
           # named, a statement over the whole table outside the filters, another NID refused before any GET.
           node hosts/package/verify-fixture.mjs "$RUNNER_TEMP/nuthatch-engine.js" "$m" $n4 $mm http://127.0.0.1:8953/ \
             | tee -a "$RUNNER_TEMP/mirror.log"
+          # RFC-0081 S5: the wasmtime host's verified head from Helios's consensus core, on a recorded
+          # light client run that finalizes block 26,243,710: S3's nest seals under it as the node does,
+          # and the same run with its finalized block altered is refused and seals nothing.
+          gunzip -c $d/headers.json.gz $d/helios-headers.json.gz | jq -c -s add | gzip -c > "$RUNNER_TEMP/helios-headers.json.gz"
+          $rpc recorded --port 8960 --file $d/chain.json.gz --headers "$RUNNER_TEMP/helios-headers.json.gz" &
+          for _ in $(seq 50); do curl -sf -X POST -d '{"id":1,"method":"eth_chainId"}' http://127.0.0.1:8960/ && break; sleep 0.2; done
+          $host run "$m" http://127.0.0.1:8960/ $d s3 --helios $d/helios.json.gz "${cache[@]}" | tee "$RUNNER_TEMP/helios.log"
+          $host run "$m" http://127.0.0.1:8960/ $d s3 --helios $d/helios.json.gz --forge "${cache[@]}" | tee -a "$RUNNER_TEMP/helios.log"
           # RFC-0077 S5: with a verified head, a forged or missing header or a log off the verified
           # chain stops sealing by name, and the honest head seals the node's segment; then every nest
           # shape `tests/e2e_embed_shapes.rs` writes out of the binary's tests, equal to its pins.
@@ -838,8 +865,8 @@ jobs:
           node hosts/node/verified.mjs "$m" http://127.0.0.1:8955/ $d | tee "$RUNNER_TEMP/verified.log"
           node hosts/node/shapes.mjs "$m" $rpc ../tests/fixtures/embed-shapes | tee "$RUNNER_TEMP/shapes.log"
           { echo '```'; cat "$RUNNER_TEMP/compile.log" "$RUNNER_TEMP/node.log" "$RUNNER_TEMP/wasmtime.log" \
-            "$RUNNER_TEMP/chrome.log" "$RUNNER_TEMP/agree.log" "$RUNNER_TEMP/mirror.log" \
-            "$RUNNER_TEMP/verified.log" "$RUNNER_TEMP/shapes.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            "$RUNNER_TEMP/chrome.log" "$RUNNER_TEMP/firefox.log" "$RUNNER_TEMP/agree.log" "$RUNNER_TEMP/mirror.log" \
+            "$RUNNER_TEMP/helios.log" "$RUNNER_TEMP/verified.log" "$RUNNER_TEMP/shapes.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   # RFC-0075 S2: Node has no OPFS, so the OPFS backend's round trip and its lock run in a dedicated
   # worker in Chrome for Testing, with the live cursor beside them; the 26.04 image ships no chromedriver.
