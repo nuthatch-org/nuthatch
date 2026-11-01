@@ -128,6 +128,8 @@ host drops the instance.
   "mirror": {"base": "https://..."},
   "follow": true,
   "verified": true,
+  "complete": true,
+  "max_headers": 10000,
   "filters": [{"contract": "staking", "event": "TokensDelegated", "from": 408825706,
                "args": {"delegator": ["0x..."]}}],
   "window": 10000000,
@@ -188,8 +190,25 @@ verified hash, and seals only at or below it, and only rows whose block hash is 
 the host has no verified block, the chain does not reach it, a header is forged or missing, or a
 row names a block hash off the verified chain, sealing stops there and the next `{"idle": true}`
 says why in `unverified`, by block; the cursor carries on, and its rows stay in the hot store. Rows
-above the verified block are still what the RPC said, and an RPC that leaves a log out is not caught
-(RFC-0065 §6). Without `verified`, the module seals on the chain's own policy, as a node does.
+above the verified block are still what the RPC said, and an RPC that leaves a log out is caught only
+with `complete` (RFC-0065 §6). Without `verified`, the module seals on the chain's own policy, as a node does.
+
+**`complete`** (RFC-0081 S4, with `verified` and `filters`) catches an RPC that leaves a log out. For
+each block under the verified head, the module tests the verified header's `logsBloom` for each
+filter's address and topics; where the bloom admits a filter and the RPC returned no log of it, it
+asks for the block's receipts (`eth_getBlockReceipts`, an `rpc` request like any other), hashes them
+into the receipt trie, and takes the filter's logs from them only if the root is the header's
+`receiptsRoot`. A bloom false positive costs that one fetch and changes nothing; a receipts list that
+does not hash to the root holds the seal below its block, and `unverified` names it. A block is sealed
+only once it is checked against the header on the verified chain, so what an earlier follow indexed
+above the head it then had, or before a reopen, is indexed again once the head passes it. A log's
+address, topics, data, index and block are what the root covers; its transaction hash is the RPC's,
+as it is for every log. The cost is the receipts: on mainnet a block's bloom has about three quarters
+of its bits set, so a filter on one contract's address admits about half the blocks it never logged
+in, each a receipts list of about a megabyte. **`max_headers`** (10,000 unless set) is the most
+headers one follow may hash and test: a fresh store whose `until` puts more past its start is refused
+at `nh_open` (`bad_config`) before any request, and a follow whose verified head is more past what is
+hashed fails (`follow_failed`) before any RPC request, each with the figure.
 
 **`filters`** (RFC-0077 S7) narrow the nest to the logs a host names, such as one user's own.
 Each names a contract by its alias, an event by its name (or its signature where the ABI overloads
@@ -531,6 +550,25 @@ $rpc recorded --port 8955 --file $d/chain.json.gz --headers $d/headers.json.gz &
 node hosts/node/verified.mjs /tmp/plain.wasm http://127.0.0.1:8955/ $d
 node hosts/node/shapes.mjs /tmp/plain.wasm $rpc ../tests/fixtures/embed-shapes
 node size.mjs /tmp/plain.wasm --max-brotli 5500000
+```
+
+RFC-0081 S4's gate. `hosts/node/complete.mjs` opens S4's nest narrowed to every Transfer with
+`verified` and `complete`, against three fixture-rpcs serving the recording with whole headers and the
+receipts `record-receipts.sh` took from mainnet: honest, one leaving block 26,239,830's log out of every
+`eth_getLogs` answer, and one also forging that block's receipts. The log must be found from the
+receipts with every row the same, the forged list must stop sealing by name, and a range past
+`max_headers` must be refused with the figure. CI runs it to block 26,239,840 on the nine blocks of
+receipts that range needs (`receipts.json.gz`). Without `--until` it follows to the tip and must seal the
+node's segment, which needs every bloom-admitted block's receipts, 968 blocks and 56 MB gzipped, recorded
+with `record-receipts.sh` and kept out of the repository:
+
+```sh
+r4="--file $d/chain.json.gz --headers $d/headers.json.gz --receipts $d/receipts.json.gz"
+$rpc recorded --port 8956 $r4 &
+$rpc recorded --port 8957 $r4 --drop-log 26239830:315 &
+$rpc recorded --port 8958 $r4 --drop-log 26239830:315 --forge-receipts 26239830 &
+node hosts/node/complete.mjs /tmp/plain.wasm $d http://127.0.0.1:8956/ http://127.0.0.1:8957/ \
+  http://127.0.0.1:8958/ 26239830 --until 26239840
 ```
 
 RFC-0081 S5's gates. The browser legs run in Firefox as well as Chrome, by the same script under

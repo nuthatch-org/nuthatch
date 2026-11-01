@@ -272,6 +272,29 @@ impl TabNest {
         };
         if let Some(v) = verified {
             v.verifier.begin();
+            if let (true, Some(top)) = (v.verifier.completes(), &top) {
+                if let Ok((n, _)) = top {
+                    v.verifier.within_ceiling(*n, &self.store)?;
+                }
+                // RFC-0081 S4: what an earlier follow indexed above the verified head it then had, or
+                // before a reopen, is indexed again now that it can be checked.
+                v.verifier.refresh(top, tape, &self.store).await;
+                let through = match (self.last_block()?, top) {
+                    (Some(last), Ok((n, _))) => Some(last.min(*n)),
+                    _ => None,
+                };
+                if let Some(b) =
+                    through.and_then(|t| v.verifier.unchecked(&self.store, t).transpose())
+                {
+                    let ancestor = b? - 1;
+                    tape.forget_cached_above(ancestor);
+                    v.verifier.forget_above(ancestor);
+                    rolled = Some(rollback_reorg(
+                        self.cursor_nest(&schema, factory.map(|_| &mut *children)),
+                        ancestor,
+                    )?);
+                }
+            }
         }
         // One pass ends at the head it first saw. Arbitrum makes four blocks a second, and a nest
         // that asks many filters a window would otherwise chase the head and never be idle.
@@ -289,6 +312,9 @@ impl TabNest {
                     // As the node does: the timestamp cache is keyed by height, and every block above
                     // `ancestor` was replaced (RFC-0029 §6d). Found by RFC-0077 S5's reorg shapes.
                     tape.forget_cached_above(ancestor);
+                    if let Some(v) = verified {
+                        v.verifier.forget_above(ancestor);
+                    }
                     next = rollback_reorg(
                         self.cursor_nest(&schema, factory.map(|_| &mut *children)),
                         ancestor,
@@ -320,7 +346,7 @@ impl TabNest {
                 topic0s: &self.topic0s,
                 topic0_refused: &mut topic0_refused,
             };
-            let logs = match &self.narrowed {
+            let mut logs = match &self.narrowed {
                 Some(n) => crate::narrow::fetch(n, tape, next, to).await?,
                 None => fetch_window(wanted, tape, next, to).await?,
             };
@@ -329,6 +355,7 @@ impl TabNest {
             let extra: &dyn nuthatch_core::extra::ExtraRows = match (verified, &top) {
                 (Some(v), Some(top)) => {
                     v.verifier.refresh(top, tape, &self.store).await;
+                    v.verifier.complete(&mut logs, next, to).await;
                     &*v.verifier
                 }
                 _ => &nuthatch_core::extra::NoExtraRows,
