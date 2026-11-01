@@ -460,13 +460,13 @@ pub fn encode_delta(delta: &Delta) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// A batch's rows as `(key, row)`, and the Arrow batches they were read from.
+type Decoded = (Vec<(String, String)>, Vec<RecordBatch>);
+
 /// One batch's rows, back as `(key, row)` in the order they were put. What decoding holds at its
 /// peak, the decompressed stream, its Arrow buffers and the rows, is taken from `allow` before any
 /// of it is allocated.
-fn rows_of(
-    bytes: &[u8],
-    allow: &mut Allowance,
-) -> Result<(Vec<(String, String)>, Vec<RecordBatch>)> {
+fn rows_of(bytes: &[u8], allow: &mut Allowance) -> Result<Decoded> {
     let (size, _) = lz4_flex::block::uncompressed_size(bytes)
         .map_err(|e| anyhow::anyhow!("a delta batch with no size: {e}"))?;
     // The decompressed stream and the Arrow buffers read from it, about its size again, are alive
@@ -479,10 +479,7 @@ fn rows_of(
     out
 }
 
-fn batch_rows(
-    bytes: &[u8],
-    allow: &mut Allowance,
-) -> Result<(Vec<(String, String)>, Vec<RecordBatch>)> {
+fn batch_rows(bytes: &[u8], allow: &mut Allowance) -> Result<Decoded> {
     let ipc = lz4_flex::block::decompress_size_prepended(bytes)
         .map_err(|e| anyhow::anyhow!("a delta batch that does not decompress: {e}"))?;
     let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)?;
