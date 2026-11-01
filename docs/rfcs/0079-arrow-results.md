@@ -1,6 +1,6 @@
 # RFC-0079: Arrow results - `/sql` in Arrow IPC, and Flight SQL for native clients
 
-- Status: **Accepted (2026-10-30, Chief): "ok letsgoooo with the wave of rfcs".** Built in the order 0078, 0079, 0080, each slice on its own gate; an S0 that fails stops its RFC. Chief, the same day, on GraphOps's
+- Status: **Complete (2026-11-01): S0 to S3 built (§12 to §15).** **Accepted (2026-10-30, Chief): "ok letsgoooo with the wave of rfcs".** Built in the order 0078, 0079, 0080, each slice on its own gate; an S0 that fails stops its RFC. Chief, the same day, on GraphOps's
   five suggestions: "lets do ALL that, 1-5 !!!!! but HA first", so this follows RFC-0078 in build order.
 - Author: Pete (cargopete)
 - Date: 2026-10-30
@@ -270,3 +270,29 @@ rows. Its batches, encoded as `/sql` encodes rows, equal `/sql`'s JSON rows; a s
 missing column is refused with that column named. Every target with and without `flight`, clippy on
 the default build, on `flight` and on the nightly's features, fmt, and `cargo deny --all-features`
 (bans, licences) pass. Not run: ADBC, JDBC, DBeaver and `pyarrow.flight` against it, which §8 names.
+
+## 15. S3 built (2026-11-01): docs and the builder skill
+
+- **Docs.** `docs/operators.md` says how to ask for an Arrow answer (`Accept`, or `format=arrow` on
+  `/sql` only), what comes back (the IPC body, the envelope less `rows` in `x-nuthatch-answer`), the
+  parity guarantee and where the types differ from JSON, the caps and the memo, and Flight SQL as
+  built: the build flag, `x-nuthatch-route`, refusals as gRPC statuses, the empty `GetFlightInfo`
+  schema, and the catalogue calls not yet answered. `README.md` has a line on it, and the `llms.txt`
+  `init` scaffolds names `format=arrow` and the header beside `GET /sql`. `llms.txt` is outside the
+  data identity, so a nest's data is unaffected; a nest scaffolded after this has a different NID
+  from one scaffolded before, as after any change to the scaffold.
+- **The builder skill.** `workflows.md` has an "Export rows as Arrow" recipe: when to ask for it
+  (exports, dataframes) and when not (point reads), where the envelope is, `truncated` before
+  trusting an export, and that a release binary has no `--flight`.
+- **`nuthatch watch`'s SQL pane: nothing to build.** It has none. RFC-0069 §4 took `/sql` out of the
+  watcher on purpose, because the old client's `count(*)` per refresh spent the nest's query budget on
+  watching it, and §17, its S2 record, settles it as decision 8: "`/sql` is never read". A pane
+  reading Arrow would add the `/sql` reader that RFC decided against, a change a user would see, so it
+  is not built here.
+
+**What stays unrun.** §8's clients, ADBC, JDBC, DBeaver and `pyarrow.flight`, have not been run
+against `--flight` (§14). `pyarrow.flight` and ADBC's Python bindings cannot go into CI under the
+org's no-Python rule; a non-Python ADBC driver manager, or DBeaver by hand, is what would close it,
+and DBeaver needs the catalogue calls first.
+
+**Complete.** S0 to S3 are built. Flight SQL's catalogue calls follow when a browsing client asks.
