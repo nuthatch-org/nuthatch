@@ -4,7 +4,9 @@
   selective; a hybrid open of whole tables passes every gate but the 64 MiB one. S1 accepted on those
   narrowed terms 2026-11-01 (Chief): whole segments of the named tables, 200 MiB from the mirror, cold
   under 300 s. **S1 measured 2026-11-01 (§12).** S2 begun on Chief's word the same day; **S2 measured
-  2026-11-01 (§13).** No later slice is begun until Chief says.
+  2026-11-01 (§13).** S4 begun on Chief's word the same day; **S4 measured 2026-11-01 (§14)**: the
+  gate passes, and §3.5's cost on mainnet is receipts, not headers. No later slice is begun until Chief
+  says.
 - Author: Pete (cargopete)
 - Date: 2026-10-31
 - Depends on: RFC-0077 (the embeddable engine, S0 to S5 and S7 built, shipped as
@@ -572,3 +574,97 @@ the check let through), and passes again restored.
 - `embed/hosts/node/hybrid.mjs`, S1's driver, reads Lodestar's `literalRows` and two-config
   `nestFiles`, which the Lodestar branch removes; it runs against Lodestar's `main` as it stood for S1.
 - Firefox, Safari and a phone are S5's; no browser but Brave ran the package.
+
+## 14. S4 measured, 2026-11-01
+
+**Verdict: the gate passes; §3.5's cost model does not hold on mainnet.** Chief said go to S4 the same day.
+
+**What was built**, in `embed/` and `tools/fixture-rpc/`, the interface still `abi: 1` (two optional
+`nh_open` keys and an optional report field):
+
+- **`complete: true`**, with `verified` and `filters`, refused by name without either. For each block on
+  the verified chain, `embed/src/complete.rs` tests the header's `logsBloom` for each filter's address,
+  topic0 and named topics. Where the bloom admits a filter and the RPC returned no log of it, the block's
+  receipts are asked for (`eth_getBlockReceipts`, an ordinary `rpc` request), each receipt RLP-encoded
+  with its type byte and its bloom recomputed from its logs, the receipt trie built and its root compared
+  with the header's `receiptsRoot`. Only then are the filter's logs taken, indexed through the block as
+  `eth_getLogs` gives them. The trie is written here, about 120 lines, with no new dependency: alloy's
+  trie crate is not in the tree, and keccak and the RLP helpers S5 wrote already were.
+- **Sealing is held to what was checked.** A block seals only once it was checked against the header the
+  verified chain holds for it; a failure holds the seal below it, and `unverified` names it. A block the
+  cursor indexed above the verified head it then had, or before a reopen, is rolled back and indexed again
+  once a later head covers it, by the reorg path the cursor already has.
+- **`max_headers`**, 10,000 unless the host sets it. A fresh store whose `until` puts more headers past
+  its start is refused at `nh_open` (`bad_config`) before any request; a follow whose verified head is
+  further past what is hashed fails (`follow_failed`) after the host's `verified_finalized` and before
+  any RPC request. Both carry the figure.
+- **fixture-rpc**: `recorded --receipts <file>` answers `eth_getBlockReceipts`; `--drop-log BLOCK:INDEX`
+  leaves that log out of every `eth_getLogs` answer; `--forge-receipts BLOCK` serves that block's
+  receipts without the recorded contract's logs.
+
+**The receipts**, recorded from `https://ethereum-rpc.publicnode.com` by
+`tests/fixtures/tab-parity/record-receipts.sh` for every block the bloom admits and the recording holds no
+log for, up to the verified head, and for the dropped log's block: 968 blocks, 306,973 receipts. Each
+receipt keeps what its root covers less its bloom, and a transaction hash only where it holds a log of the
+contract. That is 417 MB of JSON, 56 MB gzipped, 24 MB as zstd: too large for the repository, so the full
+file is not committed. The committed `receipts.json.gz` (469,088 bytes) is the nine blocks a run to block
+26,239,840 needs.
+
+**The gate, `embed/hosts/node/complete.mjs`**, S4's nest (`s4-nest`) narrowed to every Transfer, under
+S5's verified head 26,241,700, against three fixture-rpcs: honest, one dropping block 26,239,830's only
+log (index 315), and one doing that and forging the same block's receipts. Apple M5 Pro, Node 26.11.1,
+followed to the tip on the full receipts:
+
+| Case | Result |
+|---|---|
+| Verified, no `complete` | 2,259 rows, sealed through 26,241,700, segment `c983470c…479aeae`, 1,238 RPC requests, 1.4 s |
+| Honest, `complete` | the same rows, segment and 1,000 balances; 966 receipts lists fetched, every one hashing to its root, 0 logs found; 2,204 RPC requests, 17.4 s |
+| Log dropped, no `complete` | 2,258 rows, segment `82115f96…`: what the gate guards against |
+| Log dropped, `complete` | **pass**: the log found from block 26,239,830's receipts, 2,259 rows, segment `c983470c…479aeae`, balances the node's; 967 receipts lists, 17.5 s |
+| Log dropped, receipts forged | **pass**: sealed through 26,239,812, below the block: "block 26239830's receipts hash to 0xa73a…d095, not the receiptsRoot 0x34ec…ab2d its verified header gives" |
+| `until` 26,241,700, `max_headers` 1,000 | **pass**: `bad_config`, "at least 1894 headers, blocks 26239807..=26241700, past the host's ceiling of 1000", 0 RPC requests and 0 host requests |
+| No `until`, `max_headers` 1,000 | **pass**: `follow_failed`, "1894 headers ... past the host's ceiling of 1000", 0 RPC requests |
+
+CI's `wasm-plain` leg runs the same script with `--until 26239840` on the committed nine blocks: the same
+seven cases, rows compared in place of the segment, which a run that short does not seal. 135 rows; 8
+receipts lists honest, 9 with the log dropped, 1 log found; the forged case stops by the same message.
+
+**Mutations**, each built into the module and run against the CI form, then reverted: `admits` answering
+false turns three cases red (honest: "no bloom admitted a block"; dropped: "134 rows, not the 135";
+forged: no `unverified`), the log no longer found; the root comparison disabled turns the forged case red
+and nothing else, the forged list accepted. `complete.rs`'s unit tests check the trie against mainnet
+block 20,000,000 (receipt types 0 to 3), block 46,147 (a pre-Byzantium state root) and the empty trie.
+
+**The cost, which §3.5 had wrong.** It said the check "costs headers, not receipts". On mainnet a
+header's bloom has 1,515 of its 2,048 bits set on average over these 1,894 blocks, so the contract's
+three address bits are all set in most blocks it never logged in: the filter admitted 1,213 blocks, 247
+with a log and 966 without. Half the range needs its receipts, and a real `eth_getBlockReceipts` answer
+here is about a megabyte (1.24 MB and 0.80 MB for the two sampled), so the honest run asks about 1 GB of
+an RPC for 1,894 blocks; the fixture's trimmed lists are 417 MB of it. A filter with an indexed value
+adds three more bits to test and admits fewer, Arbitrum's sparse blooms far fewer, but the verified head
+exists only on mainnet (S6 is declined). `max_headers` bounds headers, as §3.5 asked; nothing bounds
+receipts before they are asked for, since which blocks need them is known only from the headers.
+
+**Size and the binary.** The event build is 5,332,459 bytes brotli, 9,468 more than S2's 5,322,991 and
+167,541 under the gate. One intermediate build of the same source measured 5,405,124: brotli of this
+module moves by tens of kilobytes with code layout alone. The binary is unchanged: nothing outside
+`embed/`, `tools/fixture-rpc/src/`, `tests/fixtures/tab-parity/`, `docs/` and CI's `wasm-plain` step is
+touched; the root `Cargo.toml` and `Cargo.lock`, `src/`, `core/` and fixture-rpc's manifest and lock are
+`main`'s, so its `cargo tree` and `--help` are too.
+
+**Unchanged**, run on the S4 module: S5's 13 shapes, S5's six verified-head cases, S3's restart and S5's
+answers in Node (fresh, bytes, killed), S4's mirror gates and postcards, S1's hybrid gates, and S2's
+package gates.
+
+**What does not match the RFC, or is left.**
+
+- **The full gate is not in CI.** It needs 56 MB of receipts; CI runs the same cases to block 26,239,840.
+  Committing the full file (24 MB as zstd, with a zstd reader in fixture-rpc) is Chief's call.
+- **One log of several is not caught.** As §3.5 says, receipts are fetched where the RPC returned *no*
+  log for a filter; an RPC that drops one of a block's two matching logs passes. Catching it costs
+  receipts for every block with a log.
+- **A found log's transaction hash is the RPC's.** The receipts root covers a log's address, topics,
+  data and position, not the transaction hash, which the transactions trie holds. Every other log's is
+  the RPC's word too.
+- **The check is at the window.** Blocks indexed above the verified head are rolled back and indexed
+  again when a later head covers them, so a following nest re-fetches its unverified tail's logs once.

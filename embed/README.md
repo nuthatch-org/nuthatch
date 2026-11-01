@@ -510,3 +510,22 @@ node hosts/node/verified.mjs /tmp/plain.wasm http://127.0.0.1:8955/ $d
 node hosts/node/shapes.mjs /tmp/plain.wasm $rpc ../tests/fixtures/embed-shapes
 node size.mjs /tmp/plain.wasm --max-brotli 5500000
 ```
+
+RFC-0081 S4's gate. `hosts/node/complete.mjs` opens S4's nest narrowed to every Transfer with
+`verified` and `complete`, against three fixture-rpcs serving the recording with whole headers and the
+receipts `record-receipts.sh` took from mainnet: honest, one leaving block 26,239,830's log out of every
+`eth_getLogs` answer, and one also forging that block's receipts. The log must be found from the
+receipts with every row the same, the forged list must stop sealing by name, and a range past
+`max_headers` must be refused with the figure. CI runs it to block 26,239,840 on the nine blocks of
+receipts that range needs (`receipts.json.gz`). Without `--until` it follows to the tip and must seal the
+node's segment, which needs every bloom-admitted block's receipts, 968 blocks and 56 MB gzipped, recorded
+with `record-receipts.sh` and kept out of the repository:
+
+```sh
+r4="--file $d/chain.json.gz --headers $d/headers.json.gz --receipts $d/receipts.json.gz"
+$rpc recorded --port 8956 $r4 &
+$rpc recorded --port 8957 $r4 --drop-log 26239830:315 &
+$rpc recorded --port 8958 $r4 --drop-log 26239830:315 --forge-receipts 26239830 &
+node hosts/node/complete.mjs /tmp/plain.wasm $d http://127.0.0.1:8956/ http://127.0.0.1:8957/ \
+  http://127.0.0.1:8958/ 26239830 --until 26239840
+```
