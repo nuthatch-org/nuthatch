@@ -213,7 +213,8 @@ two gates of §5. Sizes are days of focused work, estimated.
   hybrid open on an iPhone with its peak memory recorded; the wasmtime host opens defi-pulse-nest from
   a local mirror and seals under a Helios-verified head. Safari needs Chief's administrator step. About
   3 days.
-- **S6, Arbitrum's verified head.** Only if Chief says it is worth a week-old head (§3.6). Its own S0
+- **S6, Arbitrum's verified head. Declined 2026-11-01 by Chief: "a week old thing is not worth it". Not built.**
+  What it would have been, kept for the record: only if Chief says it is worth a week-old head (§3.6). Its own S0
   first: one confirmed assertion's L2 hash proven against a Helios-verified L1 state root, in Node.
   **Gate**: S7's slowest delegator sealed under a verified Arbitrum head, a forged proof refused by
   name. About 5 days after its S0.
