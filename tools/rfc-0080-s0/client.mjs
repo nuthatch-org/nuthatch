@@ -17,6 +17,9 @@ const [base, dataset, shapesPath, firstArg, countArg, readyFile, doneFile, outPa
 const first = Number(firstArg);
 const count = Number(countArg);
 const RAMP = Number(process.env.RAMP ?? 64);
+// The first STALL streams stop reading once they hold their initial answer, as a stalled client
+// would; the follower must close them without waiting on them.
+const STALL = Number(process.env.STALL ?? 0);
 const shapes = JSON.parse(fs.readFileSync(shapesPath, "utf8"));
 const agent = new http.Agent({ keepAlive: false, maxSockets: Infinity });
 
@@ -67,6 +70,10 @@ function open(id) {
           c.attached = true;
           opening -= 1;
           next();
+          if (id < first + STALL) {
+            c.stalled = true;
+            res.pause();
+          }
           continue;
         }
         if (v.refetch) {
@@ -118,6 +125,7 @@ const tick = setInterval(() => {
         g: c.g,
         sealed_through: c.sealed_through,
         refetched: c.refetched,
+        stalled: !!c.stalled,
         rows: [...c.rows.entries()],
       };
       fs.writeSync(fd, JSON.stringify(copy) + "\n");

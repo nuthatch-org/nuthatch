@@ -54,6 +54,9 @@ pub struct Delta {
     /// Its v2 body, encoded once however many followers it is sent to.
     #[serde(skip)]
     pub wire: std::sync::OnceLock<bytes::Bytes>,
+    /// RFC-0080 S0 spike: its puts' Arrow columns as decoded, kept only while shapes are on.
+    #[serde(skip)]
+    pub columns: Option<Arc<crate::feed_wire::PutColumns>>,
 }
 
 impl Delta {

@@ -1738,7 +1738,7 @@ impl Follower {
             let store_apply = store_started.elapsed();
             let filtered = hub.as_mut().map(|hub| {
                 let t = Instant::now();
-                let frames = hub.route(data.store.applied(), &changes);
+                let frames = hub.route_delta(data.store.applied(), &delta, &changes);
                 (t.elapsed(), frames)
             });
             (changes, store_apply, filtered, lock_wait)

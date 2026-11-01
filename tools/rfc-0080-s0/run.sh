@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # RFC-0080 S0: N shapes on one follower at tip load on the multinest (Uniswap V4) fixture.
 #
-#   BIN=target/release/nuthatch SHAPES=10000 bash tools/rfc-0080-s0/run.sh <out-dir>
+#   BIN=target/release/nuthatch SHAPES=10000 [FILTER=json|columns] [DELIVERY=inline|task] [STALL=n] \
+#     bash tools/rfc-0080-s0/run.sh <out-dir>
 #
 # A writer backfills 200 blocks of the point-read gate's chain (one contract, the ten-event V4
 # `PoolManager` ABI, 200 logs a block), then follows TIP_BLOCKS more one block a poll. A follower
@@ -25,7 +26,8 @@ ROOT="$HERE/../.."
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
-rm -rf "$OUT/rt" "$OUT"/ready "$OUT"/done "$OUT"/copies.json
+rm -rf "$OUT/rt" "$OUT"/ready "$OUT"/done "$OUT"/copies.json "$OUT"/delivery.json "$OUT"/datasets.json
+echo "start $(uptime)" >"$OUT/load.txt"
 
 free_port() { node -e 'const s=require("net").createServer();s.listen(0,()=>{console.log(s.address().port);s.close()})'; }
 RPC_PORT=$(free_port); W_PORT=$(free_port); F_PORT=$(free_port); S_PORT=$(free_port)
@@ -90,6 +92,7 @@ echo "writer at $(last_block) (backfill to $TIP done)"
 
 node "$HERE/shapes.mjs" "$SHAPES" "$MODE" >"$OUT/shapes.json"
 NUTHATCH_SHAPES_S0="$OUT/shapes.json" NUTHATCH_SHAPES_S0_LISTEN="127.0.0.1:$S_PORT" \
+  NUTHATCH_SHAPES_S0_FILTER="${FILTER:-columns}" NUTHATCH_SHAPES_S0_DELIVERY="${DELIVERY:-task}" \
   "$BIN" serve --runtime "$RT" --follow "http://127.0.0.1:$W_PORT" --listen "127.0.0.1:$F_PORT" \
   >"$OUT/follower.log" 2>&1 &
 FPID=$!
@@ -135,6 +138,9 @@ done
 echo "writer at $(last_block), follower at generation $prev"
 
 curl -fsS "127.0.0.1:$S_PORT/stats/$DATASET" >"$OUT/stats.json"
+curl -fsS "127.0.0.1:$S_PORT/delivery/$DATASET" >"$OUT/delivery.json"
+curl -fsS "127.0.0.1:$S_PORT/datasets" >"$OUT/datasets.json"
+echo "end   $(uptime)" >>"$OUT/load.txt"
 if [ "$SHAPES" -gt 0 ]; then
   touch "$OUT/done"
   wait "$CPID"

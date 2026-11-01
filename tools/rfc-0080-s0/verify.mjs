@@ -51,12 +51,17 @@ if (fs.existsSync(`${out}/copies.json`)) {
   let wrong = 0;
   let held = 0;
   let refetched = 0;
+  let stalled = 0;
   let maxG = 0;
   const firstWrong = [];
   let first = true;
   for await (const c of copiesOf(path)) {
     if (first) {
       first = false;
+      continue;
+    }
+    if (c.stalled) {
+      stalled += 1;
       continue;
     }
     clients += 1;
@@ -86,6 +91,7 @@ if (fs.existsSync(`${out}/copies.json`)) {
   }
   report.copies = {
     clients,
+    stalled,
     wrong,
     first_wrong: firstWrong,
     rows_held: held,
@@ -126,4 +132,19 @@ const rss = fs
   .map((l) => Number(l.trim().split(/\s+/)[1]) / 1024)
   .filter((x) => x > 0);
 report.follower_rss_mib = { median: pct(rss, 50), max: Math.max(...rss) };
+if (fs.existsSync(`${out}/delivery.json`)) {
+  const d = JSON.parse(fs.readFileSync(`${out}/delivery.json`, "utf8"));
+  report.delivery = {
+    rounds: d.length,
+    streams_woken: d.reduce((a, c) => a + c.streams, 0),
+    wake_us_p50: d.length ? pct(d.map((c) => c.wake_ns), 50) / 1000 : 0,
+    wake_us_p99: d.length ? pct(d.map((c) => c.wake_ns), 99) / 1000 : 0,
+    lag_us_p50: d.length ? pct(d.map((c) => c.lag_ns), 50) / 1000 : 0,
+    lag_us_p99: d.length ? pct(d.map((c) => c.lag_ns), 99) / 1000 : 0,
+  };
+}
+if (fs.existsSync(`${out}/datasets.json`)) {
+  report.follower = JSON.parse(fs.readFileSync(`${out}/datasets.json`, "utf8"))[0];
+}
+if (fs.existsSync(`${out}/load.txt`)) report.load = fs.readFileSync(`${out}/load.txt`, "utf8").trim().split("\n");
 console.log(JSON.stringify(report, null, 2));

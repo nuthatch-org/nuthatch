@@ -463,7 +463,10 @@ pub fn encode_delta(delta: &Delta) -> Result<Vec<u8>> {
 /// One batch's rows, back as `(key, row)` in the order they were put. What decoding holds at its
 /// peak, the decompressed stream, its Arrow buffers and the rows, is taken from `allow` before any
 /// of it is allocated.
-fn rows_of(bytes: &[u8], allow: &mut Allowance) -> Result<Vec<(String, String)>> {
+fn rows_of(
+    bytes: &[u8],
+    allow: &mut Allowance,
+) -> Result<(Vec<(String, String)>, Vec<RecordBatch>)> {
     let (size, _) = lz4_flex::block::uncompressed_size(bytes)
         .map_err(|e| anyhow::anyhow!("a delta batch with no size: {e}"))?;
     // The decompressed stream and the Arrow buffers read from it, about its size again, are alive
@@ -476,11 +479,15 @@ fn rows_of(bytes: &[u8], allow: &mut Allowance) -> Result<Vec<(String, String)>>
     out
 }
 
-fn batch_rows(bytes: &[u8], allow: &mut Allowance) -> Result<Vec<(String, String)>> {
+fn batch_rows(
+    bytes: &[u8],
+    allow: &mut Allowance,
+) -> Result<(Vec<(String, String)>, Vec<RecordBatch>)> {
     let ipc = lz4_flex::block::decompress_size_prepended(bytes)
         .map_err(|e| anyhow::anyhow!("a delta batch that does not decompress: {e}"))?;
     let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)?;
     let mut out = Vec::new();
+    let mut kept = Vec::new();
     for batch in reader {
         let batch = batch?;
         let col = |i: usize| -> Result<&StringArray> {
@@ -535,13 +542,29 @@ fn batch_rows(bytes: &[u8], allow: &mut Allowance) -> Result<Vec<(String, String
             };
             out.push((keys.value(r).to_string(), row));
         }
+        kept.push(batch);
     }
-    Ok(out)
+    Ok((out, kept))
+}
+
+/// RFC-0080 S0 spike: a decoded delta's Arrow batches, and which put each of their rows is.
+#[derive(Debug, Default)]
+pub struct PutColumns {
+    /// Per table batch in wire order; `None` for one sent as rows.
+    pub batches: Vec<Option<RecordBatch>>,
+    /// Per table batch, the ordinal among the delta's puts of each of its rows, in row order.
+    pub rows: Vec<Vec<u32>>,
+    pub puts: u32,
 }
 
 /// [`encode_delta`] undone, allocating for its rows no more than `limit` bytes past what the body
 /// itself holds, or failing with [`TooLarge`] before it would.
 pub fn decode_delta(body: &[u8], limit: Option<u64>) -> Result<Delta> {
+    decode_delta_keeping(body, limit, crate::shape_s0::keeps_columns())
+}
+
+/// [`decode_delta`], keeping its Arrow batches on the delta when `keep`.
+pub fn decode_delta_keeping(body: &[u8], limit: Option<u64>, keep: bool) -> Result<Delta> {
     let mut allow = Allowance {
         left: limit,
         limit: limit.unwrap_or(u64::MAX),
@@ -567,11 +590,17 @@ pub fn decode_delta(body: &[u8], limit: Option<u64>) -> Result<Delta> {
     };
     let tables = c.varint()? as usize;
     let mut batches = Vec::with_capacity(tables.min(1024));
+    let mut columns = PutColumns::default();
     for _ in 0..tables {
         let rows = match c.u8()? {
             BATCH_ARROW => {
                 let n = c.varint()? as usize;
-                rows_of(c.take(n)?, &mut allow)?
+                let (rows, mut kept) = rows_of(c.take(n)?, &mut allow)?;
+                let last = kept.pop();
+                columns
+                    .batches
+                    .push(if keep && kept.is_empty() { last } else { None });
+                rows
             }
             BATCH_RAW => {
                 let n = c.varint()? as usize;
@@ -584,6 +613,10 @@ pub fn decode_delta(body: &[u8], limit: Option<u64>) -> Result<Delta> {
             }
             other => bail!("unknown batch kind {other} in a delta frame"),
         };
+        if columns.batches.len() < batches.len() + 1 {
+            columns.batches.push(None);
+        }
+        columns.rows.push(Vec::new());
         batches.push(rows.into_iter());
     }
     let n = c.varint()? as usize;
@@ -592,6 +625,10 @@ pub fn decode_delta(body: &[u8], limit: Option<u64>) -> Result<Delta> {
         let op = match c.u8()? {
             OP_PUT => {
                 let at = c.varint()? as usize;
+                if let Some(rows) = columns.rows.get_mut(at) {
+                    rows.push(columns.puts);
+                }
+                columns.puts += 1;
                 let (key, row) = batches
                     .get_mut(at)
                     .and_then(Iterator::next)
@@ -646,6 +683,7 @@ pub fn decode_delta(body: &[u8], limit: Option<u64>) -> Result<Delta> {
         ops,
         catalogue,
         resync: flags & RESYNC != 0,
+        columns: keep.then(|| Arc::new(columns)),
         ..Delta::default()
     })
 }
