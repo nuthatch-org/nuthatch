@@ -277,10 +277,10 @@ the default build, on `flight` and on the nightly's features, fmt, and `cargo de
   `/sql` only), what comes back (the IPC body, the envelope less `rows` in `x-nuthatch-answer`), the
   parity guarantee and where the types differ from JSON, the caps and the memo, and Flight SQL as
   built: the build flag, `x-nuthatch-route`, refusals as gRPC statuses, the empty `GetFlightInfo`
-  schema, and the catalogue calls not yet answered. `README.md` has a line on it, and the `llms.txt`
-  `init` scaffolds names `format=arrow` and the header beside `GET /sql`. `llms.txt` is outside the
-  data identity, so a nest's data is unaffected; a nest scaffolded after this has a different NID
-  from one scaffolded before, as after any change to the scaffold.
+  schema, and the catalogue calls not yet answered. `README.md` has a line on it. The `llms.txt`
+  `init` scaffolds is unchanged: it is in the package NID, and `the_fixture_nests_keep_their_identities`
+  pins the NIDs of the scaffolded fixtures, so a line there would move every pin. That is a decision
+  about the scaffold, not a doc fix, and is left for one.
 - **The builder skill.** `workflows.md` has an "Export rows as Arrow" recipe: when to ask for it
   (exports, dataframes) and when not (point reads), where the envelope is, `truncated` before
   trusting an export, and that a release binary has no `--flight`.

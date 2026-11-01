@@ -257,9 +257,7 @@ pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
          - `GET /table/{{name}}?limit=N` recent rows of one table (hot + sealed)\n\
          - `GET /entity/{{id}}`         one row by id (`{{block:012}}-{{logindex:06}}`)\n\
          - `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{{alias}}__{{event}}`, and each\n\
-         \x20                            authored view (`views/*.sql`) answers by its own name.\n\
-         \x20                            Add `&format=arrow` (or `Accept: application/vnd.apache.arrow.stream`) for the same\n\
-         \x20                            rows as an Arrow IPC stream, the envelope in the `x-nuthatch-answer` header\n\
+         \x20                            authored view (`views/*.sql`) answers by its own name\n\
          - `GET /balances?limit=N`    top holder balances (when an ERC-20 Transfer table is present)\n\
          - `GET /balance/{{address}}`   one address's derived balance\n\
          - `GET /queries`             the mount's SQL mode and the queries its operator declared in\n\
