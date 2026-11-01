@@ -1,12 +1,15 @@
 // RFC-0080 S0: N shapes over the multinest fixture, seeded, so every run asks the same.
 //
-//   node shapes.mjs <n> [uniform|skew|all-tables] > shapes.json
+//   node shapes.mjs <n> [uniform|skew|hot:<k>|all-tables] > shapes.json
 //
 // uniform     Over the swap table. The fixture draws `sender` from 4,096 addresses
 //             (`seed % 4096 + 1`); each shape names one to four of them, and one in five also names
 //             `id` values, so the follower checks a second term.
 // skew        As uniform, but half the shapes include one of eight hot senders: a popular token's
 //             fan-out, about 600 shapes for each of those senders' swaps.
+//             The fixture draws those senders as rarely as any other, so this is a tail, not a load.
+// hot:<k>     As uniform, but k of the shapes are the whole pool's swaps (`address` is the one
+//             contract), so every swap row matches k shapes: a popular token's fan-out under load.
 // all-tables  Spread over all ten tables, each naming one to four `tx_hash`es of its table from the
 //             blocks the run follows. Every row the writer commits is then in a shaped table and is
 //             read in full, the filter's worst case for parsing; each hash matches one row.
@@ -47,6 +50,10 @@ for (let i = 0; i < Number(n); i++) {
     const t = rand(TABLES.length);
     const hashes = Array.from({ length: 1 + rand(4) }, () => word((20000 + rand(300)) * 200 + t + 10 * rand(20)));
     shapes.push({ table: TABLES[t], where: { tx_hash: hashes } });
+    continue;
+  }
+  if (mode.startsWith("hot:") && i < Number(mode.slice(4))) {
+    shapes.push({ table: "pool_manager__swap", where: { address: [addr(1)] } });
     continue;
   }
   const senders = new Set();

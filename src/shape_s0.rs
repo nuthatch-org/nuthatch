@@ -834,4 +834,58 @@ mod tests {
             "closed, not blocking the follower"
         );
     }
+
+    /// RFC-0080 S0, a measurement: `route` alone over the fixture's deltas, every shape attached and
+    /// no task waiting, so what it times is the parse, the probe, the frames and the queue pushes and
+    /// not the wake-ups. `S0_SHAPES` is a shapes file and `S0_ROWS` stored rows, one a line; each
+    /// delta is 20 swap rows and 180 of other tables, as the fixture commits a block.
+    #[test]
+    #[ignore]
+    fn s0_route_cost() {
+        let shapes: Vec<Shape> = serde_json::from_str(
+            &std::fs::read_to_string(std::env::var("S0_SHAPES").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let rows = std::fs::read_to_string(std::env::var("S0_ROWS").unwrap()).unwrap();
+        let (swaps, others): (Vec<&str>, Vec<&str>) = rows
+            .lines()
+            .partition(|r| r.starts_with("{\"table\":\"pool_manager__swap\""));
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
+        let sub = crate::store::feed_subscribe(&store).unwrap();
+        let copy = Arc::new(MemStore::from_snapshot(tmp.path(), sub.snapshot));
+        let n = shapes.len();
+        let mut hub = Hub::new(Arc::new(Index::new(shapes).unwrap()));
+        hub.reset(copy);
+        let readers: Vec<u64> = (0..n).map(|i| hub.attach(i).unwrap().0).collect();
+        let mut times = Vec::new();
+        let mut frames = 0u64;
+        for d in 0..300usize {
+            let mut added: Vec<String> = Vec::with_capacity(200);
+            for i in 0..20 {
+                added.push(swaps[(d * 20 + i) % swaps.len()].to_string());
+            }
+            for i in 0..180 {
+                added.push(others[(d * 180 + i) % others.len()].to_string());
+            }
+            let changes = crate::feed::Changes {
+                added,
+                ..Default::default()
+            };
+            let t = std::time::Instant::now();
+            frames += u64::from(hub.route((0, d as u64 + 1), &changes));
+            times.push(t.elapsed().as_nanos() as u64);
+            for (i, r) in readers.iter().enumerate() {
+                hub.take(i, *r);
+            }
+        }
+        times.sort_unstable();
+        println!(
+            "route over {} deltas: p50 {} us, p99 {} us, {} frames a delta",
+            times.len(),
+            times[times.len() / 2] / 1000,
+            times[times.len() * 99 / 100] / 1000,
+            frames / times.len() as u64
+        );
+    }
 }
