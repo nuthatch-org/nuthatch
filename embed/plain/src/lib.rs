@@ -706,7 +706,12 @@ async fn open_host(c: Config, spec: NestSpec) -> anyhow::Result<Engine> {
         Some(Arc::new(HostFile::new(pack, PACK_FILE))),
     )?);
     let hydrated = if mirror::indexed(&store)? {
-        None
+        let h = mirror::reuse(&store, &cellar, &spec, &c.files, &m)?;
+        log_line(
+            2,
+            &format!("reopened what the mirror hydrated: {}", h.to_json()),
+        );
+        Some(h)
     } else {
         let h = mirror::hydrate(&HostMirror { pack }, &store, &cellar, &spec, &c.files, &m).await?;
         log_line(2, &format!("hydrated from the mirror: {}", h.to_json()));

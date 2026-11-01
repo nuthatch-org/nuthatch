@@ -50,7 +50,10 @@ pub struct Postcard {
     pub digest: String,
 }
 
-/// What a hydration did, for `nh_open`'s caller to see.
+/// What a store was hydrated from, as JSON, so a reopen can tell whether its files still name it.
+const HYDRATED_KEY: &str = "mirror_hydrated";
+
+/// What a hydration did, or what a reopen found already hydrated, for `nh_open`'s caller to see.
 #[derive(Debug, Clone)]
 pub struct Hydrated {
     pub dataset: String,
@@ -59,6 +62,8 @@ pub struct Hydrated {
     pub indexed_from: u64,
     pub complete_through: u64,
     pub pinned: bool,
+    /// Reopened from the pack in storage: nothing was fetched.
+    pub reused: bool,
 }
 
 impl Hydrated {
@@ -70,8 +75,47 @@ impl Hydrated {
             "indexed_from": self.indexed_from,
             "complete_through": self.complete_through,
             "pinned": self.pinned,
+            "reused": self.reused,
         })
     }
+}
+
+/// A reopened store's hydrated history, reused rather than fetched again: the dataset it came from
+/// must be the one `files` name, and every segment in the pack must still hash to its content
+/// address. The chain past it comes from the RPC, as any reopened nest's does.
+pub fn reuse(
+    store: &Store,
+    cellar: &Cellar,
+    spec: &NestSpec,
+    files: &NestFiles,
+    mirror: &MirrorConfig,
+) -> Result<Hydrated> {
+    let dataset = spec.data_identity(files)?;
+    let Some(held) = store.get_meta(HYDRATED_KEY)? else {
+        bail!(
+            "this store records no dataset it was hydrated from, so its pack cannot be checked: open \
+             it fresh"
+        );
+    };
+    let held: Value = serde_json::from_str(&held).context("the store's hydration record")?;
+    if held["dataset"] != dataset.as_str() {
+        bail!(
+            "this store was hydrated from dataset {}, and these files name {dataset}: open it fresh",
+            held["dataset"]
+        );
+    }
+    let (segments, bytes) = cellar
+        .check_packed()
+        .map_err(|e| anyhow!("{e}: open it fresh"))?;
+    Ok(Hydrated {
+        dataset,
+        segments,
+        bytes,
+        indexed_from: held["indexed_from"].as_u64().unwrap_or_default(),
+        complete_through: held["complete_through"].as_u64().unwrap_or_default(),
+        pinned: mirror.postcard.is_some(),
+        reused: true,
+    })
 }
 
 /// A host's GETs. `text` answers `None` for a 404; `append` writes the body at the pack's end and
@@ -215,11 +259,18 @@ pub async fn hydrate(
     cellar.install_packed(&catalogue, &placed)?;
     let through = complete_through.to_string();
     let from = indexed_from.to_string();
+    let record = json!({
+        "dataset": dataset,
+        "indexed_from": indexed_from,
+        "complete_through": complete_through,
+    })
+    .to_string();
     store.set_metas(
         &[
             (START_BLOCK_KEY, &from),
             (SEALED_THROUGH_KEY, &through),
             (LAST_BLOCK_KEY, &through),
+            (HYDRATED_KEY, &record),
         ],
         &[SEED_PENDING_KEY],
     )?;
@@ -230,6 +281,7 @@ pub async fn hydrate(
         indexed_from,
         complete_through,
         pinned: mirror.postcard.is_some(),
+        reused: false,
     })
 }
 
