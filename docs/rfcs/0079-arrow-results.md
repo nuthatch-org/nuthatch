@@ -296,3 +296,52 @@ org's no-Python rule; a non-Python ADBC driver manager, or DBeaver by hand, is w
 and DBeaver needs the catalogue calls first.
 
 **Complete.** S0 to S3 are built. Flight SQL's catalogue calls follow when a browsing client asks.
+
+## 16. Release and client tested (2026-11-01)
+
+GraphOps asked to move from the JSON interface to Flight. Two things stood between that and a user:
+no release carried `--flight`, and no client but our own crate had spoken to it.
+
+- **Released.** The release matrix has a fourth variant, `flight`, built `--features flight` for the
+  default binary's three targets: `nuthatch-flight-aarch64-apple-darwin.tar.gz`,
+  `nuthatch-flight-x86_64-unknown-linux-gnu.tar.gz` and `nuthatch-flight-aarch64-unknown-linux-gnu.tar.gz`,
+  each with its `.sha256`, attested on the runner that built it and verified in `publish` with the
+  rest. The default binary is unchanged and `flight` stays off by default; this is an extra artefact,
+  as `graph` and `scaled` are. The container job publishes `:<version>-flight`, never `latest`, smoke
+  tested for the flag before it is pushed: the operator who asked deploys containers, and the image is
+  the default one with a different binary, so it costs a build and a push.
+- **A dry run that cannot release.** `workflow_dispatch` takes `binaries: true` to build every tarball
+  in the matrix and keep it as a workflow artifact. Every step that attaches, attests, pushes or
+  undrafts is gated on a tag push, by its own `if:` or its job's, and
+  `release_provenance::a_dispatch_never_releases` fails if one is not. Dry run: run 41320217634.
+- **The catalogue calls.** `GetCatalogs`, `GetDbSchemas`, `GetTables` (with each table's schema when
+  asked), `GetTableTypes` and `GetSqlInfo` are answered, which departure 3 of §14 left out. They are
+  statements through the same door: `information_schema.tables` on the route, and a table's schema is
+  its own `SELECT * … LIMIT 0`, so they list what `/sql` on that route answers and a bounded mount
+  refuses them as it refuses SQL. The filter patterns are matched before a schema is asked for, so a
+  client asking for one table costs one statement, not one per table. About 300 lines in `src/flight.rs`.
+- **Refusals.** `401` now answers `Unauthenticated` and `404` `NotFound`, where both were
+  `PermissionDenied` and `InvalidArgument`; `docs/operators.md` has the table.
+- **The client.** Apache Arrow ADBC's Flight SQL driver, v1.12.0, in Go (`tools/flight-client`). It is
+  the driver ADBC's C, Python, R and Java bindings load, so it is what a pandas, Polars or DuckDB user
+  reaching for ADBC actually runs, and it shares no code with arrow-rs. JDBC was the alternative: it is
+  what DBeaver uses, but it needs a JVM in CI for a driver fewer of the people asking would run.
+  `tests/e2e_flight_clients.rs` runs the real binary with `--flight` over a runtime of two mounts of
+  the recorded tab-parity contract, differing only in a view, and puts both clients to it:
+  arrow-flight's own every time (the features test leg), ADBC in the `flight-clients` CI job. Each:
+  1. runs `SELECT block_number, log_index, tx_hash, "from", "to", value, value_dec, value_overflow`
+     over 2,259 rows and compares it with `POST /a/sql`'s JSON, value for value;
+  2. reads `which_nest` on each route by `x-nuthatch-route` and gets that mount's answer;
+  3. sends no route to the runtime and gets `NotFound`, and a missing column and gets
+     `InvalidArgument` whose message is `/sql`'s JSON error naming it;
+  4. lists the route's tables: ADBC's `GetObjects` at full depth, `GetTableSchema` and
+     `GetTableTypes`; arrow-flight's `GetTables` with a pattern and the schema.
+  Auth pass-through is in `flight::tests`: nuthatch checks no credential on `/sql`, so a router that
+  demands one stands in for the gateway, and the bearer token reaches it while its `401` comes back as
+  `Unauthenticated` with its JSON. Each check was mutated and goes red: the route ignored, `404` mapped to `InvalidArgument`, the
+  schema left out of `GetTables`, the token dropped, `401` unmapped; the ADBC client on its own
+  catches the first against the binary. A `__hot_` filter copied from the REPL survived its mutation
+  because `/sql` never lists such a table, and was removed.
+
+**What stays unrun.** JDBC, DBeaver and `pyarrow.flight`. A JDBC URL takes the route header as a
+parameter, and DBeaver now has the calls it lists tables with, but neither has been run here.
