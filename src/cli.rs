@@ -1707,6 +1707,22 @@ pub struct DevArgs {
     /// body is answered `413`.
     #[arg(long, default_value_t = crate::runtime::DEFAULT_MAX_BUNDLE_MB)]
     pub max_bundle_mb: usize,
+
+    /// Also serve Arrow Flight SQL on this address, e.g. `127.0.0.1:8815` (RFC-0079). A statement
+    /// names its mount with the `x-nuthatch-route` header and is answered as `/sql` answers it.
+    #[cfg(feature = "flight")]
+    #[arg(long, value_name = "ADDR")]
+    pub flight: Option<String>,
+}
+
+impl DevArgs {
+    /// `--flight`, which only a build with the `flight` feature has.
+    pub fn flight(&self) -> Option<String> {
+        #[cfg(feature = "flight")]
+        return self.flight.clone();
+        #[cfg(not(feature = "flight"))]
+        None
+    }
 }
 
 #[derive(Args)]

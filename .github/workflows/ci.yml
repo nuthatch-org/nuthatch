@@ -555,6 +555,8 @@ jobs:
         run: cargo clippy --locked --features counter --all-targets -- -D warnings
       - name: clippy (crash-points)
         run: cargo clippy --locked --features crash-points --all-targets -- -D warnings
+      - name: clippy (flight)
+        run: cargo clippy --locked --features flight --all-targets -- -D warnings
       # tests/parity_*.rs run scripts/lodestar-parity.sh, which runs this; the shards have no cargo.
       - name: build the parity comparison into the test archive
         run: |
@@ -563,9 +565,9 @@ jobs:
           mkdir -p "$t/parity-bin" && cp "$t/lodestar-parity/debug/lodestar-parity-compare" "$t/parity-bin/"
       - uses: ./.github/actions/install-nextest
       - name: build the test archive
-        run: cargo nextest archive --locked --features graph,counter,crash-points --archive-file "$RUNNER_TEMP/nextest-features.tar.zst"
+        run: cargo nextest archive --locked --features graph,counter,crash-points,flight --archive-file "$RUNNER_TEMP/nextest-features.tar.zst"
       - name: doctests
-        run: cargo test --doc --locked --features graph,counter,crash-points
+        run: cargo test --doc --locked --features graph,counter,crash-points,flight
       - name: upload the test archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

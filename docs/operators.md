@@ -1179,6 +1179,13 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /shape` | capability probe: what this nest can answer (drives adaptive MCP) |
 | `GET /_admin/`, `/_admin/events`, `/_admin/config`, `/_admin/storage`, `/_admin/requests` | admin UI (eight tabs since 4.2.1), its event stream, the authored files and limits as JSON with every URL cut to scheme and host and every secret withheld, the sealed catalogue per table (`?table=` for one table's segments), and the last 256 requests served (`?since=<seq>` for those after one): route template, the declared query or entity name when the nest knows it, status, milliseconds and bytes, never SQL text, a query string, a path value or a client address, and not the monitoring reads (`/`, `/health`, `/ready`, `/metrics`, `/_admin*`). Token-gated off-localhost; removable with `--no-admin` |
 
+**Arrow Flight SQL** (RFC-0079), in a build with `--features flight`: `nuthatch dev --flight
+127.0.0.1:8815` serves Flight SQL beside the HTTP API. A statement is answered by the same handler as
+`POST /<route>/sql`, under the same guards; a client names the mount with the `x-nuthatch-route`
+request header (absent, `/sql` at the root), and the answer's envelope arrives as the
+`x-nuthatch-answer` response header. Statements only so far: the catalogue calls answer
+`Unimplemented`. It is a second port, so a gateway in front of the node has to route it.
+
 **Cost header:** a request to `/sql`, `/q/{name}`, GraphQL or a typed route that sends
 `Nuthatch-Cost: 1` is answered with a `Nuthatch-Cost` header, a report of what it read and held;
 [The cost header](#the-cost-header) has its format. Without the request header nothing is sent.

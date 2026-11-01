@@ -43,6 +43,11 @@ fn collect_skill_md(dir: &Path, out: &mut Vec<(String, PathBuf)>) {
 
 #[test]
 fn committed_cli_reference_is_not_stale() {
+    // The reference documents the default build; `flight` adds `--flight`, so its leg leaves this
+    // to the default one.
+    if cfg!(feature = "flight") {
+        return;
+    }
     let committed = std::fs::read_to_string(skill_dir().join("cli-reference.md"))
         .expect("cli-reference.md must be committed");
     let fresh = nuthatch::skill::generate_cli_reference();
@@ -329,6 +334,7 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
     ("core/src/answer.rs", "the /sql and /explain request body, not nest config"),
     ("src/feed.rs", "the hot-state feed's wire format (RFC-0073 FR1), not nest config"),
     ("src/lease.rs", "the writer lease the mirror holds (RFC-0078), not nest config"),
+    ("src/flight.rs", "a Flight SQL ticket (RFC-0079), not nest config"),
     ("src/feed_wire.rs", "feed v2's frames (RFC-0076 FR17), not nest config"),
     ("src/feed_http.rs", "the feed route's token query, not nest config"),
     (
