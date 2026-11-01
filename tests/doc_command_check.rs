@@ -54,6 +54,14 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
          faster than code. Naming the incident is the point, so this is a fact about a past release \
          rather than an instruction. Fittingly, this check caught it in the very page that cites it",
     ),
+    (
+        "docs/operators.md",
+        "--flight",
+        // A real flag in a `flight` build, so only the default build sees it as unresolved.
+        if cfg!(feature = "flight") { 0 } else { 1 },
+        "Flight SQL (RFC-0079 S2) is behind the off-by-default `flight` feature, and the page says \
+         so in the sentence that names the flag",
+    ),
 ];
 
 /// A finding: an unresolved subcommand word or flag, where it was found, and what was wrong.
