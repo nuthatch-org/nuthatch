@@ -4,12 +4,17 @@
 // Prints one JSON line of what it measured; with `--expect`, compares every answer with a report
 // `run-mirror-node.mjs` wrote from a node seeded from the same mirror, and exits non-zero on a
 // difference. `--refused` instead expects `nh_open` or the first step to refuse the nest, and passes
-// only if it did so before asking the mirror for anything.
+// only if it did so before asking the mirror for anything. With `--wasmtime <wasmtime-host>`, the nest
+// is opened and asked in the wasmtime host instead (RFC-0081 S5), its `get`s performed there.
 // Usage: node mirror.mjs <module.wasm> <nest-dir> <mirror: url or directory> [--rpc <url>]
 //          [--memory-mib n] [--follow] [--postcard <cuts.json>] [--expect <report.json>]
 //          [--out <report.json>] [--refused] [--max-rows n] [--postcard made|altered --dataset <id>]
+//          [--wasmtime <wasmtime-host> [--cache <dir>]]
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 import { createHash } from "node:crypto";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fetchRpc, load } from "../browser/host.js";
@@ -43,12 +48,72 @@ globalThis.fetch = (url, init) => {
   return realFetch(url, init);
 };
 
+// `--hybrid <address>` opens the nest `mirror+rpc`, narrowed by one public filter on its receivers, as
+// RFC-0081 S1's gates do. fixture-rpc refuses a topic past topic0, so its RPC is put behind an endpoint
+// that drops them, as one that ignores them would; the module keeps only the logs it asked for.
+const hybrid = flag("--hybrid");
+let rpcUrl = flag("--rpc") ?? "http://127.0.0.1:1/";
+let blind;
+if (hybrid) {
+  const upstream = rpcUrl;
+  blind = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", async () => {
+      const calls = JSON.parse(body);
+      for (const call of Array.isArray(calls) ? calls : [calls]) {
+        if (call.method === "eth_getLogs") for (const f of call.params) f.topics = f.topics?.slice(0, 1);
+      }
+      const r = await realFetch(upstream, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(calls) });
+      res.writeHead(r.status, { "content-type": "application/json" }).end(await r.text());
+    });
+  });
+  await new Promise((r) => blind.listen(0, "127.0.0.1", r));
+  rpcUrl = `http://127.0.0.1:${blind.address().port}/`;
+}
+
+/// The calls this script makes of the Node host, answered by `wasmtime-host open --answer`: it opens
+/// the config and follows it, prints what it opened, then answers one request a line.
+function wasmtimeEngine(bin) {
+  let config, child, lines, opened;
+  return {
+    open: (c) => { config = c; },
+    async run() {
+      const file = path.join(mkdtempSync(path.join(tmpdir(), "nest-mirror-wasmtime-")), "config.json");
+      writeFileSync(file, JSON.stringify(config));
+      const cache = flag("--cache") ? ["--cache", flag("--cache")] : [];
+      child = spawn(bin, ["open", wasm, file, "--rpc", rpcUrl, "--answer", ...cache],
+        { stdio: ["pipe", "pipe", "inherit"] });
+      lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+      const first = await lines.next();
+      if (first.done) throw new Error("wasmtime-host ended before the nest was open");
+      opened = JSON.parse(first.value);
+      gets.length = opened.gets;
+      return { steps: opened.steps, requests: opened.requests };
+    },
+    report: () => opened.report,
+    memoryBytes: () => opened.wasm_memory_mib * 2 ** 20,
+    peakRssMibAtOpen: () => opened.peak_rss_mib,
+    async request(method, target) {
+      child.stdin.write(`${JSON.stringify({ method, target })}\n`);
+      const a = JSON.parse((await lines.next()).value);
+      if (a.fault) throw new Error(a.fault);
+      return a;
+    },
+    close: () => child?.stdin.end(),
+  };
+}
+
 const bytes = readFileSync(wasm);
 const root = mkdtempSync(path.join(tmpdir(), "nest-mirror-"));
 const t0 = performance.now();
-const engine = await load(bytes, {
+if (flag("--wasmtime") && flags.includes("--refused")) {
+  console.error("--refused counts the GETs this process makes, so it runs in the Node host only");
+  process.exit(2);
+}
+const engine = flag("--wasmtime") ? wasmtimeEngine(flag("--wasmtime")) : await load(bytes, {
   storage: fsStorage(root),
-  rpc: fetchRpc({ main: flag("--rpc") ?? "http://127.0.0.1:1/" }),
+  rpc: fetchRpc({ main: rpcUrl }),
   log: (level, s) => console.error(`guest[${level}]: ${s}`),
 });
 // `--postcard <file>`, or `made` for one made from the mirror's catalogue as it stands, or `altered` for
@@ -67,9 +132,15 @@ const config = {
   mirror: { base, ...(postcard ? { postcard } : {}) },
   ...(flag("--memory-mib") ? { memory_mib: Number(flag("--memory-mib")) } : {}),
   ...(postcard ? {} : { follow: flags.includes("--follow") }),
+  ...(hybrid ? {
+    source: "mirror+rpc",
+    filters: [{ contract: "tab", event: "Transfer", args: { to: [hybrid] }, privacy: "public" }],
+  } : {}),
 };
 
 const finish = (code) => {
+  engine.close?.();
+  blind?.close();
   served?.server.close();
   process.exit(code);
 };
@@ -105,6 +176,7 @@ const t2 = performance.now();
 const answers = await answersOf(files, async (target) => engine.request("GET", target));
 const ms_queries = performance.now() - t2;
 const line = {
+  host: flag("--wasmtime") ? "wasmtime" : "node",
   module_sha256: createHash("sha256").update(bytes).digest("hex"),
   mirror: report.mirror,
   last_block: report.last_block,
@@ -121,6 +193,7 @@ const line = {
   linear_memory_open_mib: Math.round(linear_open / 2 ** 20),
   linear_memory_mib: Math.round(engine.memoryBytes() / 2 ** 20),
   peak_rss_mib: Math.round(process.resourceUsage().maxRSS / 1024),
+  ...(engine.peakRssMibAtOpen ? { wasmtime_peak_rss_mib_at_open: engine.peakRssMibAtOpen() } : {}),
 };
 console.log(JSON.stringify(line));
 if (flag("--out")) writeFileSync(flag("--out"), JSON.stringify({ head: line.last_block, answers }, null, 1));
