@@ -8,6 +8,7 @@
 // g0, when every client was attached.
 
 import fs from "node:fs";
+import readline from "node:readline";
 
 const [out, writer, g0Arg] = process.argv.slice(2);
 const g0 = Number(g0Arg);
@@ -17,11 +18,27 @@ const report = {};
 const text = (v) => (typeof v === "string" ? v : JSON.stringify(v));
 const key = (r) => `${r.block_number}:${r.log_index}`;
 
+// copies.json is one header line, then one copy a line, read twice so no pass holds them all.
+async function* copiesOf(path) {
+  const lines = readline.createInterface({ input: fs.createReadStream(path), crlfDelay: Infinity });
+  for await (const line of lines) if (line) yield JSON.parse(line);
+}
+
 if (fs.existsSync(`${out}/copies.json`)) {
-  const { frames, retries, copies } = JSON.parse(fs.readFileSync(`${out}/copies.json`, "utf8"));
-  const floor = Math.min(...Object.values(copies).map((c) => c.sealed_through ?? 0));
+  const path = `${out}/copies.json`;
+  let header = null;
+  let floor = Infinity;
+  const tables = new Set();
+  for await (const c of copiesOf(path)) {
+    if (!header) {
+      header = c;
+      continue;
+    }
+    floor = Math.min(floor, c.sealed_through ?? 0);
+    tables.add(c.shape.table);
+  }
   const byTable = {};
-  for (const t of new Set(Object.values(copies).map((c) => c.shape.table))) {
+  for (const t of tables) {
     const q = `SELECT * FROM ${t} WHERE block_number > ${floor}`;
     const res = await fetch(`${writer}/sql?q=${encodeURIComponent(q)}`);
     const body = await res.json();
@@ -30,12 +47,19 @@ if (fs.existsSync(`${out}/copies.json`)) {
     byTable[t] = body.rows;
   }
   const checked = Object.values(byTable).reduce((a, r) => a + r.length, 0);
+  let clients = 0;
   let wrong = 0;
   let held = 0;
   let refetched = 0;
   let maxG = 0;
   const firstWrong = [];
-  for (const [id, c] of Object.entries(copies)) {
+  let first = true;
+  for await (const c of copiesOf(path)) {
+    if (first) {
+      first = false;
+      continue;
+    }
+    clients += 1;
     refetched += c.refetched;
     maxG = Math.max(maxG, c.g);
     const want = new Set(
@@ -57,17 +81,17 @@ if (fs.existsSync(`${out}/copies.json`)) {
     if (!same) {
       wrong += 1;
       if (firstWrong.length < 5)
-        firstWrong.push({ id, once, got: got.size, want: want.size, sealed: c.sealed_through });
+        firstWrong.push({ id: c.id, once, got: got.size, want: want.size, sealed: c.sealed_through });
     }
   }
   report.copies = {
-    clients: Object.keys(copies).length,
+    clients,
     wrong,
     first_wrong: firstWrong,
     rows_held: held,
     writer_rows_checked: checked,
-    frames_applied: frames,
-    connect_retries: retries,
+    frames_applied: header.frames,
+    connect_retries: header.retries,
     attached_all_in_ms: Number(fs.readFileSync(`${out}/ready`, "utf8")),
     refetched,
     max_generation: maxG,

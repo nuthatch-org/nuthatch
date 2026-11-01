@@ -106,19 +106,23 @@ const tick = setInterval(() => {
   }
   if (fs.existsSync(doneFile)) {
     clearInterval(tick);
-    const out = {};
+    // One copy a line: a thousand whole-pool copies come to more than one JS string can hold.
+    const fd = fs.openSync(outPath, "w");
     let retries = 0;
+    for (const c of copies.values()) retries += c.retries;
+    fs.writeSync(fd, JSON.stringify({ frames, retries }) + "\n");
     for (const [id, c] of copies) {
-      retries += c.retries;
-      out[id] = {
+      const copy = {
+        id,
         shape: shapes[id],
         g: c.g,
         sealed_through: c.sealed_through,
         refetched: c.refetched,
         rows: [...c.rows.entries()],
       };
+      fs.writeSync(fd, JSON.stringify(copy) + "\n");
     }
-    fs.writeFileSync(outPath, JSON.stringify({ frames, retries, copies: out }));
+    fs.closeSync(fd);
     console.error(`client: ${frames} frames applied, ${retries} connects retried; copies written`);
     process.exit(0);
   }

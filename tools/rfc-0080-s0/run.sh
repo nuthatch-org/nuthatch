@@ -134,9 +134,9 @@ for _ in $(seq 1 1800); do
 done
 echo "writer at $(last_block), follower at generation $prev"
 
+curl -fsS "127.0.0.1:$S_PORT/stats/$DATASET" >"$OUT/stats.json"
 if [ "$SHAPES" -gt 0 ]; then
   touch "$OUT/done"
   wait "$CPID"
 fi
-curl -fsS "127.0.0.1:$S_PORT/stats/$DATASET" >"$OUT/stats.json"
 node "$HERE/verify.mjs" "$OUT" "http://127.0.0.1:$W_PORT/s0" "$G0" | tee "$OUT/report.json"
