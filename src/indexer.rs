@@ -129,6 +129,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
         }
         None => None,
     };
+    let flight = args.flight();
     let result = run(
         source,
         dir,
@@ -141,6 +142,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
         args.no_admin,
         publish,
         cors,
+        flight,
     )
     .await;
     if let Some(audit) = audit {
@@ -770,6 +772,7 @@ pub async fn run(
     no_admin: bool,
     publish: Option<crate::publish::Settings>,
     cors: Option<tower_http::cors::CorsLayer>,
+    flight: Option<String>,
 ) -> Result<()> {
     // Admin UI (RFC-0010 Part A): on by default on localhost. Off-localhost it needs an explicit token
     // (auth is the operator's gateway's job, but the local UI should never appear unguarded on a public
@@ -799,8 +802,12 @@ pub async fn run(
     // The indexer and the API share a fate. If indexing dies (an error or a panic) the process must
     // not keep serving stale data as if healthy - a silent failure (deadlock-review finding C1). Select
     // over both: whichever ends first decides the exit, and an indexing error/panic propagates out.
+    let flight_app = flight
+        .is_some()
+        .then(|| serve::router(serve::SharedNest::new(state.clone())));
     let result = tokio::select! {
         r = serve::run(&listen, state, cors) => r,
+        r = serve::flight_beside(flight, flight_app.unwrap_or_default()) => r,
         joined = &mut ingest => match joined {
             Ok(inner) => inner,
             Err(e) if e.is_panic() => Err(anyhow::anyhow!("indexing loop panicked")),

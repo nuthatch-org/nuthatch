@@ -72,6 +72,8 @@ pub mod feed;
 pub mod feed_http;
 pub mod feed_metrics;
 pub mod feed_wire;
+#[cfg(feature = "flight")]
+pub mod flight;
 /// RFC-0059 checkpointed folds, behind the off-by-default `folds` feature.
 #[cfg(feature = "folds")]
 pub mod folds;
