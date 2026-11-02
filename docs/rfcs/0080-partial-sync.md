@@ -563,7 +563,17 @@ retraction; the route's layer; the end of the stream on a fresh snapshot. Unit t
    decimals and anything the engine renders differently from the stored text are untested, and a
    disagreement would put a row in one and not the other.
 4. **Ranges on non-numeric columns** are compared as numbers by the engine; untested.
-5. **Cost of the live conversion**, a session of the engine per frame and table, which is unmeasured and
-   is the first thing to measure at a busy tip.
+5. ~~Cost of the live conversion~~ Measured (`showing_a_frames_rows_costs_what_it_costs`, ignored,
+   release): the engine over a batch of stored rows takes about 2.1 ms a call whatever the batch (2.5 ms
+   for one row, 2.1 ms for five, 2.2 ms for fifty, 3.0 ms for five hundred), so a fixed cost of the
+   session and about 1.7 µs a row beyond it. The first build paid that for every live connection and
+   every frame, which at 10,000 subscribers is twenty seconds of engine a delta. It now pays it **once a
+   delta per subscribed table, however many subscribers**: `Follower::show_changes` runs the delta's
+   final rows through the engine and keys them, checks the keys against the store's, and hands the hub a
+   map from key to shown row, so a frame holds shared text and a stream only encodes it. Two costs
+   remain: it runs on the apply path, under the hub's lock, as a blocking call of 2 to 3 ms (not on a
+   blocking thread, since the apply is already serial per dataset), and it runs only where a subscriber
+   exists. If it cannot run (no route of the dataset has a state) or the keys do not hold, the hub is
+   dropped and every stream ends, so nobody is sent rows in a form their first answer did not use.
 6. Still open from §14: no token check, the live stream's own limits, the one-shape stub of
    `max_shapes_per_connection`, JSON lines and not Arrow, and an offset that is the copy's generation.

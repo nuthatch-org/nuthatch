@@ -1731,7 +1731,20 @@ impl Follower {
                 .store
                 .apply(&delta)
                 .with_context(|| format!("{dataset}: resnapshotting"))?;
-            shapes.apply(delta.epoch, delta.generation, &changes.log);
+            if !shapes.is_empty() {
+                // Each row is shown as `/sql` shows it once for the delta, not once a subscriber.
+                match self.show_changes(&dataset, &shapes, &changes.log) {
+                    Ok(shown) => {
+                        shapes.apply(delta.epoch, delta.generation, &changes.log, Some(&shown))
+                    }
+                    Err(e) => {
+                        // Told of nothing rather than told wrongly: their streams end and they fetch
+                        // again.
+                        tracing::error!("{dataset}: shape subscribers dropped: {e:#}");
+                        *shapes = Default::default();
+                    }
+                }
+            }
             changes
         };
         self.lock().note_peak(&dataset);
@@ -2097,6 +2110,69 @@ impl Follower {
         Some((at, shapes.subscribe(shape, queue)))
     }
 
+    /// The rows `log` leaves in the tables some subscriber follows, as `/sql` shows them, by the key
+    /// the store holds each under. One run of the engine per table for the whole delta. It is an error
+    /// if the shown rows are not keyed as the store keys them.
+    fn show_changes(
+        &self,
+        dataset: &str,
+        shapes: &crate::shape_feed::ShapeHub,
+        log: &[crate::feed::Touch],
+    ) -> Result<HashMap<String, Arc<str>>> {
+        use crate::shape::{row_key, table_of};
+        let state = {
+            let inner = self.lock();
+            inner.routes.values().find_map(|r| match &r.served {
+                Some(Ok(shared)) if r.spec.dataset == dataset => Some(shared.current()),
+                _ => None,
+            })
+        }
+        .context("no route of the dataset has a state to show rows with")?;
+        // Where each key ends up: its last touch.
+        let mut ends: BTreeMap<&str, &str> = BTreeMap::new();
+        for touch in log {
+            match touch.new.as_deref() {
+                Some(row) => ends.insert(&touch.key, row),
+                None => ends.remove(touch.key.as_str()),
+            };
+        }
+        let mut by_table: BTreeMap<&str, Vec<(&str, serde_json::Value)>> = BTreeMap::new();
+        for table in shapes.tables() {
+            by_table.entry(table).or_default();
+        }
+        for (key, row) in ends {
+            let Some(table) = table_of(row) else { continue };
+            if let Some(rows) = by_table.get_mut(table) {
+                rows.push((key, serde_json::from_str(row).context("a stored row")?));
+            }
+        }
+        let mut shown = HashMap::new();
+        for (table, rows) in by_table {
+            if rows.is_empty() {
+                continue;
+            }
+            let (keys, rows): (Vec<&str>, Vec<serde_json::Value>) = rows.into_iter().unzip();
+            let projected = crate::serve::project_rows(&state, table, rows)?;
+            let mut got: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            for row in projected {
+                let key = row_key(&row).context("a shown row with no key")?;
+                got.insert(key, row);
+            }
+            let stored: std::collections::BTreeSet<&str> = keys.iter().copied().collect();
+            let derived: std::collections::BTreeSet<&str> =
+                got.keys().map(String::as_str).collect();
+            anyhow::ensure!(
+                stored == derived,
+                "the rows of `{table}` are not keyed by block_number and log_index here: the store \
+                 holds {stored:?} and the shown rows come to {derived:?}"
+            );
+            for (key, row) in got {
+                shown.insert(key, Arc::from(row.to_string()));
+            }
+        }
+        Ok(shown)
+    }
+
     /// `GET /<route>/sync?s=<shape>[&live=1]` (RFC-0080 §5.2), answered from this follower's copy.
     ///
     /// A stream of JSON lines: a header `{"offset":[e,g],"scope":"hot"}`, the rows of the copy the
@@ -2250,29 +2326,16 @@ impl Follower {
                 let line = lines.next()?;
                 Some((Ok::<_, std::convert::Infallible>(line), (lines, room)))
             });
-        let table = shape.table.clone();
         let body = match frames {
             Some(frames) => head
-                .chain(futures::stream::unfold(
-                    (frames, state.clone(), table),
-                    |(mut frames, state, table)| async move {
-                        let frame = frames.recv().await?;
-                        // A delta's rows reach the subscriber as `/sql` shows them. A row that cannot
-                        // be shown, or keyed, ends the stream, and the subscriber fetches again.
-                        let ops = match project_frame(&state, &table, &frame.ops).await {
-                            Ok(ops) => ops,
-                            Err(e) => {
-                                tracing::error!("/sync: a live row could not be shown: {e:#}");
-                                return None;
-                            }
-                        };
-                        let line = crate::shape_feed::ops_line(
-                            Some((frame.epoch, frame.generation)),
-                            &ops,
-                        );
-                        Some((Ok(bytes::Bytes::from(line)), (frames, state, table)))
-                    },
-                ))
+                .chain(futures::stream::unfold(frames, |mut frames| async move {
+                    let frame = frames.recv().await?;
+                    let line = crate::shape_feed::ops_line(
+                        Some((frame.epoch, frame.generation)),
+                        &frame.ops,
+                    );
+                    Some((Ok(bytes::Bytes::from(line)), frames))
+                }))
                 .boxed(),
             None => head.boxed(),
         };
@@ -2591,62 +2654,6 @@ fn guarded(
             }
         },
     ))
-}
-
-/// A frame's ops with each put's stored row shown as `/sql` shows it, and keyed as the first answer
-/// keys its rows.
-async fn project_frame(
-    state: &Arc<AppState>,
-    table: &str,
-    ops: &[crate::shape_feed::ShapeOp],
-) -> Result<Vec<crate::shape_feed::ShapeOp>> {
-    use crate::shape_feed::ShapeOp;
-    let stored: Vec<serde_json::Value> = ops
-        .iter()
-        .filter_map(|op| match op {
-            ShapeOp::Put { row, .. } => Some(serde_json::from_str(row).context("a stored row")),
-            ShapeOp::Retract { .. } => None,
-        })
-        .collect::<Result<_>>()?;
-    let mut out: Vec<ShapeOp> = ops
-        .iter()
-        .filter(|op| matches!(op, ShapeOp::Retract { .. }))
-        .cloned()
-        .collect();
-    // The keys the store holds these rows under, which the keys derived from the shown rows must be.
-    let stored_keys: std::collections::BTreeSet<&str> = ops
-        .iter()
-        .filter_map(|op| match op {
-            ShapeOp::Put { key, .. } => Some(&**key),
-            ShapeOp::Retract { .. } => None,
-        })
-        .collect();
-    if !stored.is_empty() {
-        let (state, owned) = (state.clone(), table.to_string());
-        let shown =
-            tokio::task::spawn_blocking(move || crate::serve::project_rows(&state, &owned, stored))
-                .await??;
-        for row in shown {
-            let key = crate::shape::row_key(&row).context("a shown row with no key")?;
-            out.push(ShapeOp::Put {
-                key: key.into(),
-                row: row.to_string().into(),
-            });
-        }
-        let shown_keys: std::collections::BTreeSet<&str> = out
-            .iter()
-            .filter_map(|op| match op {
-                ShapeOp::Put { key, .. } => Some(&**key),
-                ShapeOp::Retract { .. } => None,
-            })
-            .collect();
-        anyhow::ensure!(
-            shown_keys == stored_keys,
-            "the rows of `{table}` are not keyed by block_number and log_index here: the store holds \
-             {stored_keys:?} and the shown rows come to {shown_keys:?}"
-        );
-    }
-    Ok(out)
 }
 
 /// Frames a `/sync` subscriber may have waiting before it is closed, and rows in each of the first
@@ -3187,12 +3194,12 @@ mod tests {
         reporter.abort();
     }
 
-    /// RFC-0080 S1: a subscriber's frames are the deltas applied after the offset it was given, and
-    /// a fresh snapshot, which builds a new copy, ends them.
+    /// RFC-0080 S1: a subscriber starts at the offset it is given, and when the follower has no state
+    /// to show a delta's rows with it is ended, not sent rows in a form its first answer did not use.
+    /// (`/sync`'s tests, which have a state, cover the frames themselves.)
     #[tokio::test]
-    async fn a_shape_subscriber_follows_the_deltas_after_its_offset() {
+    async fn a_shape_subscriber_is_ended_where_its_rows_cannot_be_shown() {
         use crate::feed::{Delta, Op, Snapshot};
-        use crate::shape_feed::ShapeOp;
         use tokio::sync::mpsc::error::TryRecvError;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("ds");
@@ -3230,31 +3237,25 @@ mod tests {
             key: key.into(),
             row: format!(r#"{{"table":"swaps","pool":"{pool}"}}"#),
         };
-        for (generation, op) in [(1, put("k1", "0xa")), (2, put("k2", "0xb"))] {
-            let delta = Delta {
-                epoch: 1,
-                generation,
-                ops: vec![op],
-                ..Default::default()
-            };
-            follower.apply_delta("ds", delta).await.unwrap();
-        }
-        let frame = frames.try_recv().unwrap();
-        assert_eq!((frame.epoch, frame.generation), (1, 1));
-        assert_eq!(
-            &*frame.ops,
-            [ShapeOp::Put {
-                key: "k1".into(),
-                row: r#"{"table":"swaps","pool":"0xa"}"#.into()
-            }]
-        );
+        let delta = Delta {
+            epoch: 1,
+            generation: 1,
+            ops: vec![put("k1", "0xa")],
+            ..Default::default()
+        };
+        follower.apply_delta("ds", delta).await.unwrap();
         assert!(
-            matches!(frames.try_recv(), Err(TryRecvError::Empty)),
-            "the second delta put a row it does not select"
+            matches!(frames.try_recv(), Err(TryRecvError::Disconnected)),
+            "no route of the dataset has a state to show the row with"
         );
-
-        follower.apply_snapshot("ds", fresh(2)).await.unwrap();
-        assert!(matches!(frames.try_recv(), Err(TryRecvError::Disconnected)));
+        assert_eq!(
+            follower.lock().datasets["ds"]
+                .shapes
+                .lock()
+                .unwrap()
+                .subscribers(),
+            0
+        );
     }
 
     /// RFC-0080 §5.2: `/sync` answers a shape as `/sql` would, sealed and hot together, refuses what
@@ -3757,5 +3758,108 @@ mod tests {
             .await
             .expect("the stream ends within five seconds");
         assert!(ended.is_none(), "a mis-keyed row ends the stream");
+    }
+
+    /// What showing stored rows as `/sql` shows them costs, which every live frame pays: the engine
+    /// run over the rows alone. Run in release with `--ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn showing_a_frames_rows_costs_what_it_costs() {
+        use std::time::Instant;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ds");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"ds\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"t\"\naddress = \"0x0000000000000000000000000000000000000001\"\n\
+             abi = \"abi.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abi.json"),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        {
+            let mut inner = follower.lock();
+            inner.routes.insert(
+                "ds".into(),
+                Route {
+                    spec: Spec {
+                        dataset: "ds".into(),
+                        nid: None,
+                        surface: Default::default(),
+                        tenant: None,
+                        share: None,
+                        limits: None,
+                        chain: Some("mainnet".into()),
+                        isolation: None,
+                        data_identity: None,
+                        sync: None,
+                    },
+                    served: None,
+                },
+            );
+            inner.datasets.insert(
+                "ds".into(),
+                Data {
+                    store: Arc::new(MemStore::from_snapshot(
+                        &dir,
+                        crate::feed::Snapshot {
+                            epoch: 1,
+                            ..Default::default()
+                        },
+                    )),
+                    snapshots: Default::default(),
+                    shapes: Default::default(),
+                    derived: Err(Refused {
+                        why: "not built here".into(),
+                        entities: Arc::default(),
+                        gone: false,
+                    }),
+                    building: None,
+                },
+            );
+        }
+        follower.realise();
+        let state = match &follower.lock().routes["ds"].served {
+            Some(Ok(shared)) => shared.current(),
+            _ => panic!("the route's state is built"),
+        };
+        let rows = |n: u64| -> Vec<serde_json::Value> {
+            (0..n)
+                .map(|i| {
+                    serde_json::json!({
+                        "table": "t__transfer",
+                        "from": format!("0x{i:040x}"),
+                        "to": format!("0x{:040x}", i + 1),
+                        "value": "123456789",
+                        "block_number": 1,
+                        "tx_hash": format!("0x{i:064x}"),
+                        "log_index": i,
+                    })
+                })
+                .collect()
+        };
+        for n in [1u64, 5, 50, 500] {
+            let batch = rows(n);
+            crate::serve::project_rows(&state, "t__transfer", batch.clone()).unwrap();
+            let runs = 30;
+            let started = Instant::now();
+            for _ in 0..runs {
+                crate::serve::project_rows(&state, "t__transfer", batch.clone()).unwrap();
+            }
+            let each = started.elapsed() / runs;
+            println!("{n:>4} rows: {each:?} a call, {:?} a row", each / n as u32);
+        }
     }
 }

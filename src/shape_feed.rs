@@ -163,6 +163,11 @@ impl ShapeHub {
         rx
     }
 
+    /// The tables some subscriber's shape names.
+    pub fn tables(&self) -> impl Iterator<Item = &str> {
+        self.tables.keys().map(String::as_str)
+    }
+
     /// Subscribers now, counting each of those that share a shape.
     pub fn subscribers(&self) -> usize {
         self.tables
@@ -174,7 +179,17 @@ impl ShapeHub {
 
     /// Tells every subscriber what the delta at `(epoch, generation)` did to its copy. `log` is the
     /// delta's [`crate::feed::Changes::log`]. Never waits: a subscriber whose queue is full is closed.
-    pub fn apply(&mut self, epoch: u64, generation: u64, log: &[Touch]) {
+    ///
+    /// `shown` is each put's row as subscribers are to see it, by the key it is stored under, worked
+    /// out once for the delta; `None` sends the stored rows as they are. A put with no entry in it is
+    /// not sent.
+    pub fn apply(
+        &mut self,
+        epoch: u64,
+        generation: u64,
+        log: &[Touch],
+        shown: Option<&HashMap<String, Arc<str>>>,
+    ) {
         if self.tables.is_empty() || log.is_empty() {
             return;
         }
@@ -206,12 +221,23 @@ impl ShapeHub {
                     table.index.matching_text(row, &mut found);
                     for &id in &found {
                         holds.push((name, id));
-                        let key = key_text.get_or_insert_with(|| Arc::from(key)).clone();
-                        let row = row_text.get_or_insert_with(|| Arc::from(row)).clone();
-                        pending
-                            .entry((name, id))
-                            .or_default()
-                            .push(ShapeOp::Put { key, row });
+                    }
+                    if !found.is_empty() {
+                        match shown {
+                            None => row_text = Some(Arc::from(row)),
+                            Some(shown) => row_text = shown.get(key).cloned(),
+                        }
+                        if let Some(row) = &row_text {
+                            let key = key_text.get_or_insert_with(|| Arc::from(key)).clone();
+                            for &id in &found {
+                                pending.entry((name, id)).or_default().push(ShapeOp::Put {
+                                    key: key.clone(),
+                                    row: row.clone(),
+                                });
+                            }
+                        } else {
+                            tracing::error!("a row of {name} changed and was not shown: not sent");
+                        }
                     }
                 }
             }
@@ -333,7 +359,7 @@ mod tests {
                 ..Default::default()
             };
             let changes = self.store.apply(&delta).unwrap();
-            self.hub.apply(1, self.generation, &changes.log);
+            self.hub.apply(1, self.generation, &changes.log, None);
         }
     }
 
@@ -684,7 +710,7 @@ mod tests {
                 let changes = store.apply(&delta).unwrap();
                 t += started.elapsed();
                 let started = Instant::now();
-                hub.apply(delta.epoch, delta.generation, &changes.log);
+                hub.apply(delta.epoch, delta.generation, &changes.log, None);
                 h += started.elapsed();
             }
             best(&mut decode, d);
