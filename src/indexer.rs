@@ -3823,6 +3823,7 @@ async fn build_nest(
         address_history: None,
         snapshots: Some(nest.publisher.snapshots.clone()),
         isolation: None,
+        sync: None,
         admin_enabled,
         admin_token,
         nest_info: Arc::new(nest_info),

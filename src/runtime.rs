@@ -6152,6 +6152,7 @@ fn overlay_mount_record(
         r.limits.resolve(&format!("{}/{}", r.tenant, r.alias))
     });
     state.isolation = query_partition(seating.isolation, name, seating.default_tenant);
+    state.sync = record.and_then(|r| r.sync.clone()).map(Arc::new);
     // A state cloned from a co-tenant's arrives in that tenant's seat; it takes its own.
     let tenant = split_route_key(name).0.unwrap_or(seating.default_tenant);
     let share = seating.shares.get(tenant).copied().unwrap_or_default();
@@ -9199,6 +9200,45 @@ mod tests {
         assert_eq!(p(Isolation::Shared, "acme/usdc"), None);
     }
 
+    /// RFC-0080 §5.6: a mount's `[mounts.sync]` reaches the state it is served from, and the feed's
+    /// `mount` line, which is how a follower learns it; a state with no record has none.
+    #[test]
+    fn a_mounts_sync_reaches_its_state_and_the_feed_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+             chain_id = 42161\nrpc_urls = []\n",
+        )
+        .unwrap();
+        let h = idle_handles(dir.path());
+        let nid = "a".repeat(64);
+        let table: MountTable = toml::from_str(&format!(
+            "[runtime]\nname = \"r\"\nchain = \"x\"\nchain_id = 1\n\n\
+             [[mounts]]\ntenant = \"default\"\nalias = \"swaps\"\nnid = \"{nid}\"\n\
+             [mounts.sync.tables]\nswaps = [\"pool\"]\n"
+        ))
+        .unwrap();
+        let record = &table.mounts[0];
+        let at = dir.path().join("ds");
+        std::fs::create_dir_all(&at).unwrap();
+        let mut state = nest_state(&at, "arbitrum-one");
+        let surface = crate::allowlist::Surface::default;
+        overlay_mount_record(
+            &mut state,
+            None,
+            Some(record),
+            surface(),
+            "swaps",
+            h.seating(),
+        );
+        assert_eq!(state.sync.as_deref(), record.sync.as_ref());
+        let served = crate::feed_http::Served::of("swaps", &state, &Default::default());
+        assert_eq!(served.sync, record.sync);
+        overlay_mount_record(&mut state, None, None, surface(), "swaps", h.seating());
+        assert!(state.sync.is_none());
+    }
+
     /// RFC-0080 §5.6: `[mounts.sync]` is read per mount, checked on load, written back, and absent
     /// from a mount that does not set it.
     #[test]
@@ -10319,6 +10359,7 @@ mod tests {
             address_history: None,
             snapshots: None,
             isolation: None,
+            sync: None,
         }
     }
 

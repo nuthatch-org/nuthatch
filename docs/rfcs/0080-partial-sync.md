@@ -416,3 +416,20 @@ follower's layer (the follower already intercepts a route's requests before its 
 `reader.rs`'s `service`), then the initial answer. The initial answer is the part with the most left to
 read: it joins the follower's hot rows with the sealed segments its catalogue names at one offset, and
 `Follower::subscribe_shape`'s offset is the copy's generation, which still has to be made a block.
+
+**The route name is agreed (Chief, 2026-11-01): `GET /<route>/sync`.** §5.2 and §5.6 above still say
+`/shape` and are read as `/sync`.
+
+**Step 1, a follower learns `[mounts.sync]`, is built.** A mount's `sync` rides the feed's `mount` line
+as an optional field, skipped when absent: `overlay_mount_record` puts it on the `AppState` a mount is
+served from (`AppState::sync`, so boot, mount, resume and move all carry it), `Served::of` reads it
+there, the writer's `mount` line sends it, and the follower keeps it on the route's `Spec`. A changed
+`sync` changes the `Spec`, so the route is rebuilt as a changed limit would. No feed version bump: the
+field is additive with a default, `Line` ignores a key it does not know, and a follower that predates it
+reads no `sync` and so would refuse every shape, which is the safe side. Three tests:
+`a_mount_line_carries_sync_and_reads_without_it` (absent, present, and a later writer's extra key),
+`a_mounts_sync_reaches_its_state_and_the_feed_line` and
+`a_follower_takes_a_routes_sync_from_the_mount_line` (set, changed, cleared). Not tested: a real old
+binary against a new writer, which the line test stands in for.
+
+Next: the route in the follower's layer, answering `admit` and `subscribe_shape`, then the initial answer.

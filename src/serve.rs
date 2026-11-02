@@ -372,6 +372,9 @@ pub struct AppState {
     /// The tenant this mount's queries are isolated to under `[runtime] isolation = "strict"`
     /// (RFC-0073 FR8); `None` shares the dataset's session, pool and memo with every mount of it.
     pub isolation: Option<Arc<str>>,
+    /// `[mounts.sync]`: the shapes a client may subscribe to on this mount (RFC-0080 §5.6). `None`
+    /// refuses every one.
+    pub sync: Option<Arc<crate::mount_sync::MountSync>>,
     /// This nest's name and the runtime health surface it should answer `/ready` from (RFC-0026 §5).
     /// `None` for a solo `dev` nest, which has no mounts around it and falls back to the global
     /// poll-freshness check.
@@ -7172,6 +7175,7 @@ mod tests {
             address_history: None,
             snapshots: None,
             isolation: None,
+            sync: None,
         }
     }
 

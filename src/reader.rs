@@ -197,6 +197,7 @@ struct Spec {
     chain: Option<String>,
     isolation: Option<String>,
     data_identity: Option<String>,
+    sync: Option<crate::mount_sync::MountSync>,
 }
 
 struct Route {
@@ -1284,6 +1285,7 @@ impl Follower {
                 chain,
                 isolation,
                 data_identity,
+                sync,
                 fence,
             } => {
                 if let Some(fence) = fence {
@@ -1321,6 +1323,7 @@ impl Follower {
                     chain,
                     isolation,
                     data_identity,
+                    sync,
                 };
                 // A reconnect repeats every mount; only a changed one is rebuilt, or one that could
                 // not be installed, which is tried again.
@@ -1989,6 +1992,7 @@ impl Follower {
             counter: None,
             nid: r.nid.as_deref().map(Arc::from),
             isolation: r.isolation.as_deref().map(Arc::from),
+            sync: r.sync.clone().map(Arc::new),
             runtime_health: Some((route.to_string(), health)),
             address_history: None,
             snapshots: None,
@@ -2567,6 +2571,7 @@ mod tests {
                     limits: None,
                     chain: Some("mainnet".into()),
                     isolation: None,
+                    sync: None,
                     data_identity: Some("ident".into()),
                     fence: Some(2),
                 },
@@ -2583,6 +2588,50 @@ mod tests {
         let lapsed = view(&follower);
         assert_eq!(lapsed["takeable"], true, "{lapsed}");
         assert_eq!(lapsed["would_take_fence"], 3);
+    }
+
+    /// RFC-0080 §5.6: the follower serves a route under the `[mounts.sync]` the writer's `mount`
+    /// line names, and a changed one rebuilds the route.
+    #[tokio::test]
+    async fn a_follower_takes_a_routes_sync_from_the_mount_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        follower.pause(false);
+        let (ready, _) = tokio::sync::mpsc::channel(1);
+        let mut cx = Cx {
+            fresh: Default::default(),
+            ready,
+            fetches: Vec::new(),
+            feed: crate::feed::FEED_VERSION,
+        };
+        let mount = |sync: Option<&str>| Line::Mount {
+            route: "ds".into(),
+            dataset: "data/ds".into(),
+            nid: None,
+            sql: Default::default(),
+            queries: Vec::new(),
+            tenant: None,
+            share: None,
+            limits: None,
+            chain: Some("mainnet".into()),
+            isolation: None,
+            sync: sync.map(|t| toml::from_str(t).unwrap()),
+            data_identity: None,
+            fence: None,
+        };
+        let held = |f: &Arc<Follower>| f.lock().routes["ds"].spec.sync.clone();
+        follower.handle(mount(None), &mut cx).await.unwrap();
+        assert_eq!(held(&follower), None);
+        let tables = "[tables]\nswaps = [\"pool\"]\n";
+        follower.handle(mount(Some(tables)), &mut cx).await.unwrap();
+        assert_eq!(held(&follower).unwrap().tables["swaps"], ["pool"]);
+        let wider = "max_shapes_per_connection = 2\n[tables]\nswaps = [\"pool\"]\n";
+        follower.handle(mount(Some(wider)), &mut cx).await.unwrap();
+        assert_eq!(held(&follower).unwrap().max_shapes_per_connection, 2);
     }
 
     /// RFC-0078 §5.3: once a follower has followed a dataset at fence N it refuses any writer below
@@ -2614,6 +2663,7 @@ mod tests {
             limits: None,
             chain: Some("mainnet".into()),
             isolation: None,
+            sync: None,
             data_identity: Some("ident".into()),
             fence: Some(fence),
         };
@@ -2685,6 +2735,7 @@ mod tests {
                         limits: None,
                         chain: Some("mainnet".into()),
                         isolation: None,
+                        sync: None,
                         data_identity: None,
                     },
                     served: None,

@@ -634,6 +634,10 @@ pub enum Line {
         /// (RFC-0073 FR8), which a follower isolates them to as well.
         #[serde(default)]
         isolation: Option<String>,
+        /// `[mounts.sync]` (RFC-0080 §5.6), which a follower enforces on the shapes it serves. A
+        /// follower that does not know the field reads none and refuses every shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sync: Option<crate::mount_sync::MountSync>,
         /// The dataset's data identity, the prefix its `[runtime.publish]` mirror holds it under,
         /// which a follower with no shared disk fetches its segments from (RFC-0076 FR17).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1844,6 +1848,45 @@ mod tests {
         assert!(
             ratio < 0.10,
             "the filter costs {ratio:.3} of decode and apply"
+        );
+    }
+
+    /// RFC-0080 §5.6: a `mount` line carries `[mounts.sync]`, reads without it from a writer that
+    /// does not send it, and reads past a field a later writer adds.
+    #[test]
+    fn a_mount_line_carries_sync_and_reads_without_it() {
+        let sync_of = |text: &str| match serde_json::from_str::<Line>(text).unwrap() {
+            Line::Mount { sync, .. } => sync,
+            other => panic!("not a mount: {other:?}"),
+        };
+        assert_eq!(
+            sync_of(r#"{"mount":{"route":"r","dataset":"d","nid":null}}"#),
+            None
+        );
+        let with = r#"{"mount":{"route":"r","dataset":"d","nid":null,
+            "sync":{"tables":{"swaps":["pool"]}},"from_a_later_writer":1}}"#;
+        let sync = sync_of(with).expect("sync is read");
+        assert_eq!(sync.tables["swaps"], ["pool"]);
+        assert_eq!(sync.max_shapes_per_connection, 16);
+        let sent = serde_json::to_string(&Line::Mount {
+            route: "r".into(),
+            dataset: "d".into(),
+            nid: None,
+            sql: Default::default(),
+            queries: Vec::new(),
+            tenant: None,
+            share: None,
+            limits: None,
+            chain: None,
+            isolation: None,
+            sync: None,
+            data_identity: None,
+            fence: None,
+        })
+        .unwrap();
+        assert!(
+            !sent.contains("sync"),
+            "a mount with none sends none: {sent}"
         );
     }
 
