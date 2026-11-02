@@ -295,7 +295,6 @@ pub fn renew_every(term: Duration) -> Duration {
 /// Renew `lease` until it is lost or lapses, then call `fence_off` so the cursor's next commit is
 /// refused. A failed request is retried at the next tick; only the term decides when to give up,
 /// and a request still unanswered when it runs out counts as a lapse.
-
 #[cfg(test)]
 pub async fn hold(lease: Lease, fence_off: impl Fn() -> Result<()>) -> Stopped {
     let (_keep, handovers) = tokio::sync::mpsc::channel(1);
