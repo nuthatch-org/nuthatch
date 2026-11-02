@@ -309,6 +309,20 @@ fn engine_err(e: burrmill::BurrmillError) -> anyhow::Error {
 /// Rows of one batch turned into JSON before the byte cap is checked again (#1650).
 const ENCODE_ROWS: usize = 32;
 
+/// What `part` takes in an IPC stream, near enough to decide whether to write it whole. A type whose
+/// slice cannot be sized counts its whole buffers, which only errs toward writing fewer rows at once.
+fn slice_bytes(part: &arrow::record_batch::RecordBatch) -> usize {
+    use arrow::array::Array;
+    part.columns()
+        .iter()
+        .map(|c| {
+            let data = c.to_data();
+            data.get_slice_memory_size()
+                .unwrap_or_else(|_| data.get_buffer_memory_size())
+        })
+        .sum()
+}
+
 #[cfg(test)]
 thread_local! {
     static ENCODED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -565,12 +579,23 @@ impl Session for BurrmillSession {
                 let n = (batch.num_rows() - start)
                     .min(ENCODE_ROWS)
                     .min(max_rows - written);
-                if let Err(e) = w.write(&batch.slice(start, n)) {
+                let mut part = batch.slice(start, n);
+                // A slice that would carry the answer past the byte cap is written a row at a time,
+                // so the answer ends at the row that crosses it, as JSON's does (#2589).
+                if slice_bytes(&part) > max_bytes - w.get_ref().len() {
+                    part = part.slice(0, 1);
+                }
+                let n = part.num_rows();
+                if let Err(e) = w.write(&part) {
                     failed = Some(e.into());
                     return Err(burrmill::BurrmillError::Cancelled);
                 }
                 start += n;
                 written += n;
+                if w.get_ref().len() >= max_bytes {
+                    over = true;
+                    return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
+                }
             }
             Ok(())
         });

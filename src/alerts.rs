@@ -104,6 +104,7 @@ pub async fn deliver_pending(
                 let mut req = client
                     .post(url)
                     .header("content-type", "application/json")
+                    .header("X-Nuthatch-Delivery", seq.to_string())
                     .body(body.clone());
                 if let Some(secret) = payload
                     .get("webhook")
@@ -533,6 +534,55 @@ mod tests {
         );
         // No secret → no signature header.
         assert_eq!(plain_row.0, None, "an unsecreted webhook is not signed");
+    }
+
+    /// RFC-0078 §5.5: each delivery names its outbox sequence, the key a receiver dedupes on.
+    #[tokio::test]
+    async fn each_delivery_names_its_outbox_sequence() {
+        use axum::{http::HeaderMap, routing::post, Router};
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let app = Router::new().route(
+            "/hook",
+            post(move |headers: HeaderMap| {
+                let sink = sink.clone();
+                async move {
+                    let id = headers
+                        .get("x-nuthatch-delivery")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    sink.lock().unwrap().push(id);
+                    "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let url = format!("http://{addr}/hook");
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let payload = json!({ "event": "rows", "url": url, "rows": [1] }).to_string();
+        store.outbox_push(&payload).unwrap();
+        store.outbox_push(&payload).unwrap();
+
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap();
+        assert_eq!(
+            deliver_pending(&store, &client, &std::collections::HashMap::new()).await,
+            2
+        );
+        let mut ids = seen.lock().unwrap().clone();
+        ids.sort();
+        assert_eq!(ids, ["0", "1"].map(str::to_string).to_vec());
     }
 
     /// A dead endpoint leaves the alert in the outbox for retry - at-least-once, never dropped on the

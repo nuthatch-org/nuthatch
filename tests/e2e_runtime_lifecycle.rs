@@ -296,6 +296,7 @@ async fn a_live_mount_applies_the_recorded_surface_and_shares_the_sql_gate() {
         sql: SqlAccess::Deny,
         queries: Vec::new(),
         publish: None,
+        sync: None,
         limits: Default::default(),
         #[cfg(feature = "counter")]
         counter: None,
@@ -390,6 +391,7 @@ async fn a_second_alias_serves_its_own_recorded_surface() {
         sql: narrow.access,
         queries: narrow.queries.clone(),
         publish: None,
+        sync: None,
         limits: Default::default(),
         #[cfg(feature = "counter")]
         counter: None,
@@ -417,6 +419,7 @@ async fn a_strict_runtimes_live_mount_queries_in_its_tenants_partition() {
         sql: Default::default(),
         queries: Vec::new(),
         publish: None,
+        sync: None,
         limits: Default::default(),
         #[cfg(feature = "counter")]
         counter: None,
@@ -1013,6 +1016,7 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
                 sql: Default::default(),
                 queries: Vec::new(),
                 publish: None,
+                sync: None,
                 limits: Default::default(),
                 #[cfg(feature = "counter")]
                 counter: None,
@@ -1200,6 +1204,7 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
                 sql: Default::default(),
                 queries: Vec::new(),
                 publish: None,
+                sync: None,
                 limits: Default::default(),
                 #[cfg(feature = "counter")]
                 counter: None,
@@ -1591,6 +1596,7 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
                 sql: Default::default(),
                 queries: Vec::new(),
                 publish: None,
+                sync: None,
                 limits: Default::default(),
                 #[cfg(feature = "counter")]
                 counter: None,
@@ -1747,6 +1753,7 @@ pub(crate) async fn empty_runtime(
                 sql: Default::default(),
                 queries: Vec::new(),
                 publish: None,
+                sync: None,
                 limits: Default::default(),
                 #[cfg(feature = "counter")]
                 counter: None,
@@ -2931,6 +2938,7 @@ async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it(
                 sql: Default::default(),
                 queries: Vec::new(),
                 publish: None,
+                sync: None,
                 limits: Default::default(),
                 #[cfg(feature = "counter")]
                 counter: None,

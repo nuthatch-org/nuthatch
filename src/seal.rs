@@ -1734,28 +1734,8 @@ fn segment_intact(dir: &Path, s: &Segment) -> bool {
 /// An error when a segment the finish would leave as the only copy of its rows is missing or does
 /// not hash to its entry: the prune would then lose the hot copy too.
 pub fn unpruned_fold(dir: &Path, sealed_through: u64) -> Result<Option<(u64, u64)>> {
-    let manifest = load_manifest(dir)?;
-    let segments = || manifest.tables.values().flatten();
-    let Some((from, cut)) = segments()
-        .filter(|s| s.from_block <= sealed_through && s.to_block > sealed_through)
-        .fold(None, |acc, s| match acc {
-            None => Some((s.from_block, s.to_block)),
-            Some((from, cut)) => Some((from.min(s.from_block), cut.max(s.to_block))),
-        })
-    else {
-        return Ok(None);
-    };
-    for s in segments().filter(|s| s.to_block > sealed_through && s.to_block <= cut) {
-        if !segment_intact(dir, s) {
-            anyhow::bail!(
-                "segment {} (blocks {}..={}) is missing or does not hash to its catalogue entry",
-                s.file,
-                s.from_block,
-                s.to_block
-            );
-        }
-    }
-    Ok(Some((from, cut)))
+    use nuthatch_core::seal::Sinks;
+    nuthatch_core::seal::unpruned_fold(&mut *FsSinks(dir).open(), sealed_through)
 }
 
 /// What [`check_catalogue`] found. Diagnostic: it does not move files. Startup quarantine is

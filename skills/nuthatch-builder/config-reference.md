@@ -755,6 +755,29 @@ it is held to the process value at boot, with a warning, rather than refusing th
 
 **This is mount config, not manifest**, so changing it moves neither the NID nor the data.
 
+### `[mounts.sync]` - letting clients hold part of a table (RFC-0080)
+
+Off unless written. A follower serves `GET /<route>/sync?s=<shape>` for a mount that has it: the rows
+of one table that match a shape (value terms, and `gte`/`lte` ranges on integer columns), then a live
+stream of what changes them. The writer serves none of it.
+
+```toml
+[[mounts]]
+alias = "usdc"
+nid = "9f2c…"
+
+[mounts.sync]
+tables = { transfers = ["from", "to", "block_number"] }   # required: table = the columns a shape may constrain
+max_shapes_per_connection = 16                           # optional, 1 to 1024
+max_values_per_term = 1000                               # optional, 1 to 100000
+```
+
+Only a listed table can be named, and only its listed columns constrained; a table listed with no
+columns can be named with no terms, which is the whole table. A request outside that is refused with
+the part at fault. An unknown key is refused at load, and so is `pin`, which RFC-0080 describes and
+this build does not honour, rather than being ignored. This is a first cut: the route does not check
+a bearer token, and a request holds one shape, so `max_shapes_per_connection` is not yet reached.
+
 ### `[mounts.counter]` - charging at your own endpoint (RFC-0046 S2)
 
 **Absent from an ordinary build.** The counter is behind the off-by-default `counter` Cargo feature,

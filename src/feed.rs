@@ -634,6 +634,10 @@ pub enum Line {
         /// (RFC-0073 FR8), which a follower isolates them to as well.
         #[serde(default)]
         isolation: Option<String>,
+        /// `[mounts.sync]` (RFC-0080 §5.6), which a follower enforces on the shapes it serves. A
+        /// follower that does not know the field reads none and refuses every shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sync: Option<crate::mount_sync::MountSync>,
         /// The dataset's data identity, the prefix its `[runtime.publish]` mirror holds it under,
         /// which a follower with no shared disk fetches its segments from (RFC-0076 FR17).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -872,6 +876,21 @@ pub struct Changes {
     /// The catalogue grew by rows that never passed through hot, as `--seal-direct` writes them:
     /// nothing derived from the deltas has seen them.
     pub sealed_unseen: bool,
+    /// Whether to record `log`, which only a store with shape subscribers pays for.
+    pub track: bool,
+    /// Each stored row a put or a rollback changed, in the order it happened: what a subscriber to
+    /// part of the table needs to be told. Empty unless `track`.
+    pub log: Vec<Touch>,
+}
+
+/// One stored row's change within a delta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Touch {
+    pub key: String,
+    /// The row that was there, if one was.
+    pub old: Option<String>,
+    /// The row there now, `None` after a rollback dropped it.
+    pub new: Option<String>,
 }
 
 /// Rows a catalogue holds across its segments.
@@ -914,10 +933,26 @@ impl Mirror {
             Op::Put { key, row } => match put(&mut self.entities, &mut self.bytes, key, row) {
                 Some(old) if &old == row => {}
                 Some(old) => {
+                    if changes.track {
+                        changes.log.push(Touch {
+                            key: key.clone(),
+                            old: Some(old.clone()),
+                            new: Some(row.clone()),
+                        });
+                    }
                     changes.removed.push(old);
                     changes.added.push(row.clone());
                 }
-                None => changes.added.push(row.clone()),
+                None => {
+                    if changes.track {
+                        changes.log.push(Touch {
+                            key: key.clone(),
+                            old: None,
+                            new: Some(row.clone()),
+                        });
+                    }
+                    changes.added.push(row.clone());
+                }
             },
             // A rollback is the only open-ended drop; a seal's prune is always a bounded one.
             Op::Drop { from, to } => {
@@ -939,6 +974,13 @@ impl Mirror {
                         if to.is_some() {
                             changes.pruned += 1;
                         } else {
+                            if changes.track {
+                                changes.log.push(Touch {
+                                    key: k.clone(),
+                                    old: Some(row.clone()),
+                                    new: None,
+                                });
+                            }
                             changes.removed.push(row);
                         }
                     }
@@ -1008,6 +1050,8 @@ pub struct MemCopy {
     /// Set when a request served from this copy found a segment it names missing: its follower,
     /// and no other, takes a fresh snapshot.
     missing: std::sync::atomic::AtomicBool,
+    /// Set once a shape subscriber exists: applies then record what each put and rollback changed.
+    tracking: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for MemCopy {
@@ -1071,6 +1115,7 @@ impl MemStore {
                 rows: AtomicU64::new(rows_epoch()),
                 dir: dir.to_path_buf(),
                 missing: Default::default(),
+                tracking: Default::default(),
             }),
             at: None,
         }
@@ -1179,6 +1224,21 @@ impl MemStore {
         peak.max(0) as u64
     }
 
+    /// The stored rows `keep` selects, with their keys, in key order, as this copy has them now.
+    pub fn rows_where(&self, mut keep: impl FnMut(&str) -> bool) -> Vec<(String, String)> {
+        let m = self.read();
+        m.entities
+            .iter()
+            .filter(|(_, row)| keep(row))
+            .map(|(key, row)| (key.clone(), row.clone()))
+            .collect()
+    }
+
+    /// From now on [`MemStore::apply`] records each row it changes in [`Changes::log`].
+    pub fn track_changes(&self) {
+        self.copy.tracking.store(true, Ordering::SeqCst);
+    }
+
     /// `(epoch, generation)` of the last delta applied.
     /// Whether a request found a segment this copy names missing since this was last asked.
     pub fn take_missing(&self) -> bool {
@@ -1216,7 +1276,10 @@ impl MemStore {
         if changes_rows {
             self.copy.rows.fetch_add(1, Ordering::SeqCst);
         }
-        let mut changes = Changes::default();
+        let mut changes = Changes {
+            track: self.copy.tracking.load(Ordering::SeqCst),
+            ..Changes::default()
+        };
         for op in &delta.ops {
             m.apply(op, &mut changes);
         }
@@ -1689,6 +1752,153 @@ impl nuthatch_core::store::HotStore for MemStore {
 mod tests {
     use super::*;
     use crate::store::Store;
+
+    /// RFC-0080 S0's cost gate: what a shape filter adds to a follower's work on the same deltas,
+    /// against what the follower does to them today (decode the v2 frame, apply it to the mirror),
+    /// at 10,000 shapes. Run in release with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn a_shape_filter_costs_under_a_tenth_of_the_follower_apply() {
+        use std::time::{Duration, Instant};
+        const POOLS: u64 = 2_000;
+        const BLOCKS: u64 = 500;
+        const PER_BLOCK: u64 = 200;
+        let address = |n: u64| format!("0x{n:040x}");
+        let mut index = crate::shape::ShapeIndex::default();
+        for s in 0..10_000 {
+            index.insert(crate::shape::Shape {
+                table: "swaps".into(),
+                terms: BTreeMap::from([(
+                    "pool".to_string(),
+                    std::collections::BTreeSet::from([address(s % POOLS)]),
+                )]),
+                ..Default::default()
+            });
+        }
+        // One delta per block, as a follower at the tip receives them, each as its v2 body.
+        let bodies: Vec<Vec<u8>> = (1..=BLOCKS)
+            .map(|block| {
+                let ops = (0..PER_BLOCK)
+                    .map(|log| {
+                        let i = block * PER_BLOCK + log;
+                        Op::Put {
+                            key: Store::entity_key(block, log),
+                            row: serde_json::json!({
+                                "table": "swaps",
+                                "pool": address(i * 7919 % POOLS),
+                                "block_number": block,
+                                "log_index": log,
+                                "tx": format!("0x{i:064x}"),
+                                "sender": address(i),
+                                "amount0": "123456789",
+                                "amount1": "987654321",
+                            })
+                            .to_string(),
+                        }
+                    })
+                    .collect();
+                let delta = Delta {
+                    epoch: 1,
+                    generation: block,
+                    ops,
+                    ..Default::default()
+                };
+                crate::feed_wire::encode_delta(&delta).unwrap()
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut decode, mut apply) = (Duration::MAX, Duration::MAX);
+        let (mut parsed, mut text) = (Duration::MAX, Duration::MAX);
+        for _ in 0..5 {
+            let store = MemStore::from_snapshot(
+                dir.path(),
+                Snapshot {
+                    epoch: 1,
+                    ..Default::default()
+                },
+            );
+            let (mut d, mut a) = (Duration::ZERO, Duration::ZERO);
+            let (mut p, mut t) = (Duration::ZERO, Duration::ZERO);
+            let (mut hits, mut text_hits) = (0usize, 0usize);
+            let mut found = Vec::new();
+            for body in &bodies {
+                let started = Instant::now();
+                let delta = crate::feed_wire::decode_delta(body, None).unwrap();
+                d += started.elapsed();
+                let started = Instant::now();
+                let changes = store.apply(&delta).unwrap();
+                a += started.elapsed();
+                let started = Instant::now();
+                for raw in &changes.added {
+                    let row: serde_json::Value = serde_json::from_str(raw).unwrap();
+                    hits += index.matching(&row).len();
+                }
+                p += started.elapsed();
+                let started = Instant::now();
+                for raw in &changes.added {
+                    index.matching_text(raw, &mut found);
+                    text_hits += found.len();
+                }
+                t += started.elapsed();
+            }
+            assert_eq!(hits, text_hits, "the two paths find the same shapes");
+            std::hint::black_box(hits);
+            (decode, apply) = (decode.min(d), apply.min(a));
+            (parsed, text) = (parsed.min(p), text.min(t));
+        }
+        let follower = (decode + apply).as_secs_f64();
+        println!(
+            "{} rows: decode {decode:?}, apply {apply:?}; filter parsing each row {parsed:?} ({:.3}), \
+         reading the indexed columns off the text {text:?} ({:.3})",
+            BLOCKS * PER_BLOCK,
+            parsed.as_secs_f64() / follower,
+            text.as_secs_f64() / follower,
+        );
+        let ratio = text.as_secs_f64() / follower;
+        assert!(
+            ratio < 0.10,
+            "the filter costs {ratio:.3} of decode and apply"
+        );
+    }
+
+    /// RFC-0080 §5.6: a `mount` line carries `[mounts.sync]`, reads without it from a writer that
+    /// does not send it, and reads past a field a later writer adds.
+    #[test]
+    fn a_mount_line_carries_sync_and_reads_without_it() {
+        let sync_of = |text: &str| match serde_json::from_str::<Line>(text).unwrap() {
+            Line::Mount { sync, .. } => sync,
+            other => panic!("not a mount: {other:?}"),
+        };
+        assert_eq!(
+            sync_of(r#"{"mount":{"route":"r","dataset":"d","nid":null}}"#),
+            None
+        );
+        let with = r#"{"mount":{"route":"r","dataset":"d","nid":null,
+            "sync":{"tables":{"swaps":["pool"]}},"from_a_later_writer":1}}"#;
+        let sync = sync_of(with).expect("sync is read");
+        assert_eq!(sync.tables["swaps"], ["pool"]);
+        assert_eq!(sync.max_shapes_per_connection, 16);
+        let sent = serde_json::to_string(&Line::Mount {
+            route: "r".into(),
+            dataset: "d".into(),
+            nid: None,
+            sql: Default::default(),
+            queries: Vec::new(),
+            tenant: None,
+            share: None,
+            limits: None,
+            chain: None,
+            isolation: None,
+            sync: None,
+            data_identity: None,
+            fence: None,
+        })
+        .unwrap();
+        assert!(
+            !sent.contains("sync"),
+            "a mount with none sends none: {sent}"
+        );
+    }
 
     fn row(block: u64, log: u64, table: &str) -> (String, String) {
         (

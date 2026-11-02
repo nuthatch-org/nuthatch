@@ -370,6 +370,7 @@ pub struct Served {
     pub limits: crate::limits::Limits,
     pub chain: String,
     pub isolation: Option<String>,
+    pub sync: Option<crate::mount_sync::MountSync>,
     pub store: Arc<dyn HotStore>,
 }
 
@@ -391,6 +392,7 @@ impl Served {
             limits: state.limits,
             chain: state.chain.clone(),
             isolation: state.isolation.as_deref().map(str::to_string),
+            sync: state.sync.as_deref().cloned(),
             store: state.store.clone(),
         }
     }
@@ -711,6 +713,7 @@ async fn serve_connection(
                         limits: Some((&m.limits).into()),
                         chain: Some(m.chain.clone()),
                         isolation: m.isolation.clone(),
+                        sync: m.sync.clone(),
                         data_identity: identities.get(&m.dir).cloned().flatten(),
                         fence: Some(m.store.held_fence()).filter(|f| *f > 0),
                     }, v2);

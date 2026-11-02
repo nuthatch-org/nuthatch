@@ -283,6 +283,8 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
     ("src/allowlist.rs", Some(&["Ceiling", "NamedQuery"])),
     // RFC-0073 FR3: `[mounts.limits]` under a mount record.
     ("src/limits.rs", Some(&["MountLimits"])),
+    // RFC-0080: `[mounts.sync]`, the tables and columns a mount's shapes are admitted within.
+    ("src/mount_sync.rs", Some(&["MountSync"])),
     // Nested under `nuthatch.toml` but defined in their own files. Missing here is how a new
     // `[[calls]]` key ships undocumented, the same hole #713 is for `allowlist.rs`.
     ("src/calls.rs", Some(&["CallDecl"])),
@@ -335,6 +337,7 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
     ("src/feed.rs", "the hot-state feed's wire format (RFC-0073 FR1), not nest config"),
     ("src/lease.rs", "the writer lease the mirror holds (RFC-0078), not nest config"),
     ("src/flight.rs", "a Flight SQL ticket (RFC-0079), not nest config"),
+    ("src/shape.rs", "the shape a client sends to `/<route>/sync` (RFC-0080), not nest config"),
     ("src/feed_wire.rs", "feed v2's frames (RFC-0076 FR17), not nest config"),
     ("src/feed_http.rs", "the feed route's token query, not nest config"),
     (

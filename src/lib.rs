@@ -107,6 +107,8 @@ pub mod metadata;
 pub mod metrics;
 pub mod migrate;
 pub mod mount_jobs;
+/// RFC-0080 §5.6: `[mounts.sync]`, what a client may ask of a mount's shapes.
+pub mod mount_sync;
 pub mod offchain;
 pub mod pack;
 /// The Postgres hot store (RFC-0022 slice 2). Feature-gated so the default build stays a single
@@ -140,6 +142,10 @@ pub mod serve;
 /// RFC-0046 S3: drain and settle recorded authorisations, outside the nest.
 #[cfg(feature = "counter")]
 pub mod settle;
+/// RFC-0080 S0: value-term shapes and their per-delta filter, a spike that nothing serves yet.
+pub mod shape;
+/// RFC-0080 S1: shape subscribers fed from a follower's applied deltas.
+pub mod shape_feed;
 pub mod skill;
 pub mod source;
 pub(crate) mod spill;

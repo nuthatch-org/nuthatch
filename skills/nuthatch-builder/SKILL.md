@@ -37,6 +37,14 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT valu
 - `sum(value_dec)` is the amounts that fit. A full-width word is NULL and is not a term, so
   `WHERE NOT value_overflow` is that same sum. Ids, nonces and hashes stay on the raw column.
 
+## Reading answers from code
+
+- `POST /sql` and `GET /q/{name}` answer JSON by default. Send `Accept: application/vnd.apache.arrow.stream`
+  (or `format=arrow` in the query or body) for the rows as an Arrow IPC stream, with the rest of the
+  envelope (`provenance`, `truncated`, `degraded`) as JSON in the `x-nuthatch-answer` header. A refusal
+  is still JSON. Prefer this for exports and columnar clients; the values are the same as JSON's.
+- A binary built with `--features flight` can serve Flight SQL beside the HTTP API; see the flight build in `docs/operators.md`.
+
 ## When to read what
 
 - **[cli-reference.md](cli-reference.md)** - GENERATED from the binary. The authoritative list of every

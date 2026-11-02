@@ -162,6 +162,10 @@ impl TabNest {
             budget: crate::budget::TabBudget::default(),
         };
         let mut nest = nest;
+        // A tip seal installs a fold's catalogue and prunes hot in two commits; a crash between
+        // them leaves the folded rows in neither read, and the next cut would seal them again.
+        nuthatch_core::seal::finish_unpruned_fold(&*nest.sealing.sinks, &nest.store)
+            .context("finishing a seal that stopped before its prune")?;
         if let (Some(history), Some(_)) = (&nest.sealing.history, nest.last_block()?) {
             let views = DerivedViews {
                 labels: &nest.labels,

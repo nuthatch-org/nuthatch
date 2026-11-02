@@ -130,6 +130,7 @@ async fn write_upgrade_fixture() {
         sql: Default::default(),
         queries: Vec::new(),
         publish: None,
+        sync: None,
         limits: Default::default(),
         #[cfg(feature = "counter")]
         counter: None,

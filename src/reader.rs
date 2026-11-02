@@ -197,6 +197,7 @@ struct Spec {
     chain: Option<String>,
     isolation: Option<String>,
     data_identity: Option<String>,
+    sync: Option<crate::mount_sync::MountSync>,
 }
 
 struct Route {
@@ -222,6 +223,10 @@ struct Data {
     derived: std::result::Result<Arc<crate::indexer::FollowerDerived>, Refused>,
     /// Why the derived state is being rebuilt, while it is: it is not served until it is whole.
     building: Option<String>,
+    /// The subscribers to shapes of this copy (RFC-0080). Held while a delta is applied, so a
+    /// subscriber's starting point and the deltas after it never overlap or leave a gap. A fresh
+    /// snapshot builds a new copy and a new hub, which ends every subscriber of the old one.
+    shapes: Arc<Mutex<crate::shape_feed::ShapeHub>>,
 }
 
 /// Derived state that could not be built, with its own empty entity list so a swap can tell it apart.
@@ -1280,6 +1285,7 @@ impl Follower {
                 chain,
                 isolation,
                 data_identity,
+                sync,
                 fence,
             } => {
                 if let Some(fence) = fence {
@@ -1317,6 +1323,7 @@ impl Follower {
                     chain,
                     isolation,
                     data_identity,
+                    sync,
                 };
                 // A reconnect repeats every mount; only a changed one is rebuilt, or one that could
                 // not be installed, which is tried again.
@@ -1667,6 +1674,7 @@ impl Follower {
                 building: rebuilding(&derived),
                 store,
                 snapshots: Default::default(),
+                shapes: Default::default(),
                 derived,
             };
             data.publish().map(|()| data)
@@ -1717,10 +1725,28 @@ impl Follower {
             return Ok(());
         }
         // The old state keeps serving while a new connection takes fresh snapshots.
-        let changes = data
-            .store
-            .apply(&delta)
-            .with_context(|| format!("{dataset}: resnapshotting"))?;
+        let changes = {
+            let mut shapes = data.shapes.lock().unwrap_or_else(|e| e.into_inner());
+            let changes = data
+                .store
+                .apply(&delta)
+                .with_context(|| format!("{dataset}: resnapshotting"))?;
+            if !shapes.is_empty() {
+                // Each row is shown as `/sql` shows it once for the delta, not once a subscriber.
+                match self.show_changes(&dataset, &shapes, &changes.log) {
+                    Ok(shown) => {
+                        shapes.apply(delta.epoch, delta.generation, &changes.log, Some(&shown))
+                    }
+                    Err(e) => {
+                        // Told of nothing rather than told wrongly: their streams end and they fetch
+                        // again.
+                        tracing::error!("{dataset}: shape subscribers dropped: {e:#}");
+                        *shapes = Default::default();
+                    }
+                }
+            }
+            changes
+        };
         self.lock().note_peak(&dataset);
         if let Some(delay) = crate::indexer::feed_delay(&self.root.join(&dataset)) {
             tokio::time::sleep(delay).await;
@@ -1979,6 +2005,7 @@ impl Follower {
             counter: None,
             nid: r.nid.as_deref().map(Arc::from),
             isolation: r.isolation.as_deref().map(Arc::from),
+            sync: r.sync.clone().map(Arc::new),
             runtime_health: Some((route.to_string(), health)),
             address_history: None,
             snapshots: None,
@@ -2064,6 +2091,261 @@ impl Follower {
             ));
         }
         self.live.swap(app);
+    }
+
+    /// Subscribes to `shape` on `dataset`'s copy: the `(epoch, generation)` the copy is at, and the
+    /// frames each delta applied after that adds. `None` where the dataset has no copy yet. The
+    /// frames end when the queue fills or the copy is replaced by a fresh snapshot, and the
+    /// subscriber then takes its answer again.
+    pub fn subscribe_shape(
+        &self,
+        dataset: &str,
+        shape: crate::shape::Shape,
+        queue: usize,
+    ) -> Option<((u64, u64), crate::shape_feed::Frames)> {
+        let data = self.lock().datasets.get(dataset).cloned()?;
+        let mut shapes = data.shapes.lock().unwrap_or_else(|e| e.into_inner());
+        data.store.track_changes();
+        let at = data.store.applied();
+        Some((at, shapes.subscribe(shape, queue)))
+    }
+
+    /// The rows `log` leaves in the tables some subscriber follows, as `/sql` shows them, by the key
+    /// the store holds each under. One run of the engine per table for the whole delta. It is an error
+    /// if the shown rows are not keyed as the store keys them.
+    fn show_changes(
+        &self,
+        dataset: &str,
+        shapes: &crate::shape_feed::ShapeHub,
+        log: &[crate::feed::Touch],
+    ) -> Result<HashMap<String, Arc<str>>> {
+        use crate::shape::{row_key, table_of};
+        let state = {
+            let inner = self.lock();
+            inner.routes.values().find_map(|r| match &r.served {
+                Some(Ok(shared)) if r.spec.dataset == dataset => Some(shared.current()),
+                _ => None,
+            })
+        }
+        .context("no route of the dataset has a state to show rows with")?;
+        // Where each key ends up: its last touch.
+        let mut ends: BTreeMap<&str, &str> = BTreeMap::new();
+        for touch in log {
+            match touch.new.as_deref() {
+                Some(row) => ends.insert(&touch.key, row),
+                None => ends.remove(touch.key.as_str()),
+            };
+        }
+        let mut by_table: BTreeMap<&str, Vec<(&str, serde_json::Value)>> = BTreeMap::new();
+        for table in shapes.tables() {
+            by_table.entry(table).or_default();
+        }
+        for (key, row) in ends {
+            let Some(table) = table_of(row) else { continue };
+            if let Some(rows) = by_table.get_mut(table) {
+                rows.push((key, serde_json::from_str(row).context("a stored row")?));
+            }
+        }
+        let mut shown = HashMap::new();
+        for (table, rows) in by_table {
+            if rows.is_empty() {
+                continue;
+            }
+            let (keys, rows): (Vec<&str>, Vec<serde_json::Value>) = rows.into_iter().unzip();
+            let projected = crate::serve::project_rows(&state, table, rows)?;
+            let mut got: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            for row in projected {
+                let key = row_key(&row).context("a shown row with no key")?;
+                got.insert(key, row);
+            }
+            let stored: std::collections::BTreeSet<&str> = keys.iter().copied().collect();
+            let derived: std::collections::BTreeSet<&str> =
+                got.keys().map(String::as_str).collect();
+            anyhow::ensure!(
+                stored == derived,
+                "the rows of `{table}` are not keyed by block_number and log_index here: the store \
+                 holds {stored:?} and the shown rows come to {derived:?}"
+            );
+            for (key, row) in got {
+                shown.insert(key, Arc::from(row.to_string()));
+            }
+        }
+        Ok(shown)
+    }
+
+    /// `GET /<route>/sync?s=<shape>[&live=1]` (RFC-0080 §5.2), answered from this follower's copy.
+    ///
+    /// A stream of JSON lines: a header `{"offset":[e,g],"scope":"hot"}`, the rows of the copy the
+    /// shape selects as `{"ops":[{"put":..}]}` chunks, `{"up_to_date":true}`, and with `live=1`
+    /// a line for each delta that changes the selection until the stream ends. It ends when the queue
+    /// fills or the copy is replaced, and the client takes its answer again.
+    ///
+    /// The first answer is worked out under `/sql`'s guards: a permit on the SQL gate while the copy
+    /// is scanned, the route's row and byte caps and its timeout, and room in the response-bytes
+    /// budget until the answer has been sent.
+    ///
+    /// Not yet built: the sealed rows, so `scope` is `hot` and the answer is the copy's hot window only;
+    /// resuming from an offset, so any `offset` is `409 must_refetch`; and Arrow.
+    async fn serve_sync(self: &Arc<Self>, route: &str, uri: &axum::http::Uri) -> Response {
+        use futures::StreamExt;
+        let refuse = |status: StatusCode, error: &str, why: String| {
+            (
+                status,
+                Json(serde_json::json!({ "error": error, "why": why })),
+            )
+                .into_response()
+        };
+        let found = {
+            let inner = self.lock();
+            inner.routes.get(route).map(|r| {
+                let shared = match &r.served {
+                    Some(Ok(shared)) => Some(shared.clone()),
+                    _ => None,
+                };
+                (r.spec.dataset.clone(), r.spec.sync.clone(), shared)
+            })
+        };
+        let Some((dataset, Some(sync), shared)) = found else {
+            return refuse(
+                StatusCode::NOT_FOUND,
+                "sync_off",
+                "this mount does not serve shapes".into(),
+            );
+        };
+        let query: HashMap<String, String> = match axum::extract::Query::try_from_uri(uri) {
+            Ok(axum::extract::Query(q)) => q,
+            Err(e) => return refuse(StatusCode::BAD_REQUEST, "bad_query", e.to_string()),
+        };
+        if query.contains_key("offset") {
+            return refuse(
+                StatusCode::CONFLICT,
+                "must_refetch",
+                "this follower keeps no history to resume from; take the shape's answer again"
+                    .into(),
+            );
+        }
+        let shape: crate::shape::Shape = match query.get("s").map(|s| serde_json::from_str(s)) {
+            Some(Ok(shape)) => shape,
+            Some(Err(e)) => return refuse(StatusCode::BAD_REQUEST, "bad_shape", e.to_string()),
+            None => {
+                return refuse(
+                    StatusCode::BAD_REQUEST,
+                    "bad_shape",
+                    "the shape is the `s` parameter".into(),
+                )
+            }
+        };
+        // A request is one connection holding one shape, so none is held yet.
+        if let Err(refusal) = sync.admit(0, &shape) {
+            return refuse(StatusCode::FORBIDDEN, "refused", refusal.to_string());
+        }
+        let (Some(shared), Some(data)) = (shared, self.lock().datasets.get(&dataset).cloned())
+        else {
+            return refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "catching_up",
+                "this follower has not taken the dataset's snapshot yet".into(),
+            );
+        };
+        let live = query.get("live").is_some_and(|v| v == "1");
+        // Subscribed before the rows are read, so a delta between the two is in both: a put read
+        // twice or a retraction of a row never held, which a copy takes in its stride. A row sealed
+        // in between is in the sealed side, and a prune from hot is not a retraction.
+        let (at, frames) = if live {
+            match self.subscribe_shape(&dataset, shape.clone(), SYNC_QUEUE) {
+                Some((at, frames)) => (at, Some(frames)),
+                None => {
+                    return refuse(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "catching_up",
+                        String::new(),
+                    )
+                }
+            }
+        } else {
+            (data.store.applied(), None)
+        };
+        // The first answer is `/sql`'s own, sealed and hot together, under all of its guards.
+        let state = shared.current();
+        let sql = shape.select_sql();
+        let answered = crate::serve::within_pin(shared.clone(), |pinned| async move {
+            crate::serve::sync_query((*pinned).clone(), sql).await
+        })
+        .await;
+        let (rows, truncated, provenance) = match answered {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(refused)) => return *refused,
+            Err(gone) => return *gone,
+        };
+        if truncated {
+            return refuse(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "shape_too_large",
+                format!(
+                    "the shape selects more than this route answers at once ({} rows); narrow it",
+                    state.limits.max_rows
+                ),
+            );
+        }
+        let mut puts: Vec<crate::shape_feed::ShapeOp> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(key) = crate::shape::row_key(row) else {
+                return refuse(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "no_key",
+                    format!(
+                        "a row of `{}` has no block_number and log_index to key it by",
+                        shape.table
+                    ),
+                );
+            };
+            puts.push(crate::shape_feed::ShapeOp::Put {
+                key: key.into(),
+                row: row.to_string().into(),
+            });
+        }
+        let mut lines: Vec<bytes::Bytes> = vec![bytes::Bytes::from(format!(
+            "{}\n",
+            serde_json::json!({
+                "offset": [at.0, at.1],
+                "scope": "full",
+                "provenance": provenance,
+            })
+        ))];
+        for chunk in puts.chunks(SYNC_CHUNK) {
+            lines.push(crate::shape_feed::ops_line(None, chunk).into());
+        }
+        lines.push(bytes::Bytes::from_static(b"{\"up_to_date\":true}\n"));
+        // Room for the first answer is taken before it is sent and kept until its last line has been.
+        let room = match crate::serve::reserve_answer(&state, lines.iter().map(|l| l.len()).sum()) {
+            Ok(room) => room,
+            Err(refused) => return *refused,
+        };
+        let head =
+            futures::stream::unfold((lines.into_iter(), room), |(mut lines, room)| async move {
+                let line = lines.next()?;
+                Some((Ok::<_, std::convert::Infallible>(line), (lines, room)))
+            });
+        let body = match frames {
+            Some(frames) => head
+                .chain(futures::stream::unfold(frames, |mut frames| async move {
+                    let frame = frames.recv().await?;
+                    let line = crate::shape_feed::ops_line(
+                        Some((frame.epoch, frame.generation)),
+                        &frame.ops,
+                    );
+                    Some((Ok(bytes::Bytes::from(line)), frames))
+                }))
+                .boxed(),
+            None => head.boxed(),
+        };
+        Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
+            .header(axum::http::header::CACHE_CONTROL, "no-store")
+            .body(axum::body::Body::from_stream(body))
+            .unwrap_or_else(|e| {
+                refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+            })
     }
 
     fn data(&self, route: &str) -> Option<Data> {
@@ -2324,6 +2606,9 @@ fn guarded(
                 if path == "/ready" {
                     return follower.route_ready(&route);
                 }
+                if path == "/sync" {
+                    return follower.serve_sync(&route, req.uri()).await;
+                }
                 // Derived state being rebuilt, or that could not be built, is never served in part.
                 let refusal = match follower.data(&route) {
                     Some(Data {
@@ -2370,6 +2655,11 @@ fn guarded(
         },
     ))
 }
+
+/// Frames a `/sync` subscriber may have waiting before it is closed, and rows in each of the first
+/// answer's lines.
+const SYNC_QUEUE: usize = 256;
+const SYNC_CHUNK: usize = 500;
 
 /// Most reports in flight at once, so a report waiting on the writer never holds the next back.
 const REPORTS_IN_FLIGHT: usize = 8;
@@ -2540,6 +2830,7 @@ mod tests {
                     limits: None,
                     chain: Some("mainnet".into()),
                     isolation: None,
+                    sync: None,
                     data_identity: Some("ident".into()),
                     fence: Some(2),
                 },
@@ -2556,6 +2847,50 @@ mod tests {
         let lapsed = view(&follower);
         assert_eq!(lapsed["takeable"], true, "{lapsed}");
         assert_eq!(lapsed["would_take_fence"], 3);
+    }
+
+    /// RFC-0080 §5.6: the follower serves a route under the `[mounts.sync]` the writer's `mount`
+    /// line names, and a changed one rebuilds the route.
+    #[tokio::test]
+    async fn a_follower_takes_a_routes_sync_from_the_mount_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        follower.pause(false);
+        let (ready, _) = tokio::sync::mpsc::channel(1);
+        let mut cx = Cx {
+            fresh: Default::default(),
+            ready,
+            fetches: Vec::new(),
+            feed: crate::feed::FEED_VERSION,
+        };
+        let mount = |sync: Option<&str>| Line::Mount {
+            route: "ds".into(),
+            dataset: "data/ds".into(),
+            nid: None,
+            sql: Default::default(),
+            queries: Vec::new(),
+            tenant: None,
+            share: None,
+            limits: None,
+            chain: Some("mainnet".into()),
+            isolation: None,
+            sync: sync.map(|t| toml::from_str(t).unwrap()),
+            data_identity: None,
+            fence: None,
+        };
+        let held = |f: &Arc<Follower>| f.lock().routes["ds"].spec.sync.clone();
+        follower.handle(mount(None), &mut cx).await.unwrap();
+        assert_eq!(held(&follower), None);
+        let tables = "[tables]\nswaps = [\"pool\"]\n";
+        follower.handle(mount(Some(tables)), &mut cx).await.unwrap();
+        assert_eq!(held(&follower).unwrap().tables["swaps"], ["pool"]);
+        let wider = "max_shapes_per_connection = 2\n[tables]\nswaps = [\"pool\"]\n";
+        follower.handle(mount(Some(wider)), &mut cx).await.unwrap();
+        assert_eq!(held(&follower).unwrap().max_shapes_per_connection, 2);
     }
 
     /// RFC-0078 §5.3: once a follower has followed a dataset at fence N it refuses any writer below
@@ -2587,6 +2922,7 @@ mod tests {
             limits: None,
             chain: Some("mainnet".into()),
             isolation: None,
+            sync: None,
             data_identity: Some("ident".into()),
             fence: Some(fence),
         };
@@ -2658,6 +2994,7 @@ mod tests {
                         limits: None,
                         chain: Some("mainnet".into()),
                         isolation: None,
+                        sync: None,
                         data_identity: None,
                     },
                     served: None,
@@ -2677,6 +3014,7 @@ mod tests {
                 Data {
                     store: store.clone(),
                     snapshots: Default::default(),
+                    shapes: Default::default(),
                     derived: Err(Refused {
                         why: "not built here".into(),
                         entities: Arc::default(),
@@ -2690,6 +3028,7 @@ mod tests {
                 Data {
                     store,
                     snapshots: Default::default(),
+                    shapes: Default::default(),
                     derived: Ok(derived.clone()),
                     building: None,
                 },
@@ -2853,5 +3192,674 @@ mod tests {
             .unwrap();
         assert!(us >= held.as_micros(), "{us} µs against {held:?} held");
         reporter.abort();
+    }
+
+    /// RFC-0080 S1: a subscriber starts at the offset it is given, and when the follower has no state
+    /// to show a delta's rows with it is ended, not sent rows in a form its first answer did not use.
+    /// (`/sync`'s tests, which have a state, cover the frames themselves.)
+    #[tokio::test]
+    async fn a_shape_subscriber_is_ended_where_its_rows_cannot_be_shown() {
+        use crate::feed::{Delta, Op, Snapshot};
+        use tokio::sync::mpsc::error::TryRecvError;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = |epoch| Snapshot {
+            epoch,
+            ..Default::default()
+        };
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        follower.lock().datasets.insert(
+            "ds".into(),
+            Data {
+                store: Arc::new(MemStore::from_snapshot(&dir, fresh(1))),
+                snapshots: Default::default(),
+                shapes: Default::default(),
+                derived: Err(Refused {
+                    why: "not built here".into(),
+                    entities: Arc::default(),
+                    gone: false,
+                }),
+                building: None,
+            },
+        );
+        let shape = serde_json::from_str(r#"{"table":"swaps","where":{"pool":["0xa"]}}"#).unwrap();
+        assert!(follower.subscribe_shape("absent", shape, 8).is_none());
+        let shape = serde_json::from_str(r#"{"table":"swaps","where":{"pool":["0xa"]}}"#).unwrap();
+        let (at, mut frames) = follower.subscribe_shape("ds", shape, 8).unwrap();
+        assert_eq!(at, (1, 0));
+
+        let put = |key: &str, pool: &str| Op::Put {
+            key: key.into(),
+            row: format!(r#"{{"table":"swaps","pool":"{pool}"}}"#),
+        };
+        let delta = Delta {
+            epoch: 1,
+            generation: 1,
+            ops: vec![put("k1", "0xa")],
+            ..Default::default()
+        };
+        follower.apply_delta("ds", delta).await.unwrap();
+        assert!(
+            matches!(frames.try_recv(), Err(TryRecvError::Disconnected)),
+            "no route of the dataset has a state to show the row with"
+        );
+        assert_eq!(
+            follower.lock().datasets["ds"]
+                .shapes
+                .lock()
+                .unwrap()
+                .subscribers(),
+            0
+        );
+    }
+
+    /// RFC-0080 §5.2: `/sync` answers a shape as `/sql` would, sealed and hot together, refuses what
+    /// the mount's `[mounts.sync]` and `/sql`'s guards do not allow, and with `live=1` streams what
+    /// each later delta does to the selection, each row as `/sql` shows it, until the copy is replaced.
+    #[tokio::test]
+    async fn sync_answers_a_shape_as_sql_does_and_streams_what_changes_it() {
+        use crate::feed::{Delta, Op, Snapshot};
+        use crate::store::Store;
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ds");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"ds\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"t\"\naddress = \"0x0000000000000000000000000000000000000001\"\n\
+             abi = \"abi.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abi.json"),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        // Two rows an answer may hold and no wait for a permit, so each guard can be met.
+        let mut limits: crate::feed::WireLimits = (&crate::limits::Limits::process()).into();
+        limits.max_rows = 2;
+        limits.max_queued = 0;
+        let fresh = |epoch| Snapshot {
+            epoch,
+            ..Default::default()
+        };
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        let spec = |sync: Option<&str>| Spec {
+            dataset: "ds".into(),
+            nid: None,
+            surface: Default::default(),
+            tenant: None,
+            share: None,
+            limits: Some(limits),
+            chain: Some("mainnet".into()),
+            isolation: None,
+            data_identity: None,
+            sync: sync.map(|t| toml::from_str(t).unwrap()),
+        };
+        {
+            let mut inner = follower.lock();
+            for (route, sync) in [
+                (
+                    "ds",
+                    Some("[tables]\nt__transfer = [\"from\", \"to\", \"block_number\"]\n"),
+                ),
+                ("closed", None),
+            ] {
+                inner.routes.insert(
+                    route.into(),
+                    Route {
+                        spec: spec(sync),
+                        served: None,
+                    },
+                );
+            }
+            inner.datasets.insert(
+                "ds".into(),
+                Data {
+                    store: Arc::new(MemStore::from_snapshot(&dir, fresh(1))),
+                    snapshots: Default::default(),
+                    shapes: Default::default(),
+                    derived: Err(Refused {
+                        why: "not built here".into(),
+                        entities: Arc::default(),
+                        gone: false,
+                    }),
+                    building: None,
+                },
+            );
+        }
+        follower.realise();
+        let shared = {
+            let inner = follower.lock();
+            match &inner.routes["ds"].served {
+                Some(Ok(shared)) => shared.clone(),
+                _ => panic!("the route's state is built"),
+            }
+        };
+        let encode = |s: &str| -> String {
+            s.bytes()
+                .map(|b| match b {
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => (b as char).to_string(),
+                    _ => format!("%{b:02X}"),
+                })
+                .collect()
+        };
+        let uri = |query: &str| -> axum::http::Uri { format!("/sync?{query}").parse().unwrap() };
+        let from = |who: &str| {
+            let shape = format!(r#"{{"table":"t__transfer","where":{{"from":["{who}"]}}}}"#);
+            format!("s={}", encode(&shape))
+        };
+
+        let status = |r: &Response| r.status();
+        assert_eq!(
+            status(&follower.serve_sync("closed", &uri(&from("0xa"))).await),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(&follower.serve_sync("ds", &uri("s=not-json")).await),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(&follower.serve_sync("ds", &uri("")).await),
+            StatusCode::BAD_REQUEST
+        );
+        let offset = format!("{}&offset=1,5", from("0xa"));
+        assert_eq!(
+            status(&follower.serve_sync("ds", &uri(&offset)).await),
+            StatusCode::CONFLICT
+        );
+        let other = encode(r#"{"table":"t__transfer","where":{"value":["1"]}}"#);
+        assert_eq!(
+            status(&follower.serve_sync("ds", &uri(&format!("s={other}"))).await),
+            StatusCode::FORBIDDEN,
+            "a column the mount does not list"
+        );
+
+        let apply = |generation: u64, ops: Vec<Op>| {
+            let follower = follower.clone();
+            async move {
+                let delta = Delta {
+                    epoch: 1,
+                    generation,
+                    ops,
+                    ..Default::default()
+                };
+                follower.apply_delta("ds", delta).await.unwrap();
+            }
+        };
+        let transfer = |block: u64, log: u64, from: &str, to: &str| Op::Put {
+            key: Store::entity_key(block, log),
+            row: format!(
+                r#"{{"table":"t__transfer","from":"{from}","to":"{to}","value":"7","block_number":{block},"tx_hash":"0xt{block}","log_index":{log}}}"#
+            ),
+        };
+        apply(
+            1,
+            vec![
+                transfer(1, 0, "0xa", "0xb"),
+                transfer(1, 1, "0xc", "0xb"),
+                transfer(2, 0, "0xa", "0xc"),
+            ],
+        )
+        .await;
+
+        // The guards `/sql` answers under: a row cap, and the gate.
+        let whole = encode(r#"{"table":"t__transfer"}"#);
+        let too_big = follower.serve_sync("ds", &uri(&format!("s={whole}"))).await;
+        let too_big_status = too_big.status();
+        let too_big_body = axum::body::to_bytes(too_big.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            too_big_status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "three rows, two allowed: {}",
+            String::from_utf8_lossy(&too_big_body)
+        );
+        let gate = follower.gate("mainnet");
+        let mut held = Vec::new();
+        while let Ok(permit) = gate.try_admit(None) {
+            held.push(permit);
+        }
+        let busy = follower.serve_sync("ds", &uri(&from("0xa"))).await;
+        assert_eq!(
+            busy.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no permit free"
+        );
+        drop(held);
+
+        // Without `live`: the header, the selected rows keyed as the store keys them, the end.
+        let resp = follower.serve_sync("ds", &uri(&from("0xa"))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let lines: Vec<serde_json::Value> = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0]["offset"], serde_json::json!([1, 1]));
+        assert_eq!(lines[0]["scope"], "full");
+        assert!(lines[0]["provenance"].is_object(), "{}", lines[0]);
+        let keys: Vec<&str> = lines[1]["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|op| op["put"]["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, [Store::entity_key(1, 0), Store::entity_key(2, 0)]);
+        assert_eq!(lines[1]["ops"][0]["put"]["row"]["from"], "0xa");
+        assert_eq!(lines[2], serde_json::json!({ "up_to_date": true }));
+
+        // With `live`: the same, then a line for each delta that changes the selection.
+        let resp = follower
+            .serve_sync("ds", &uri(&format!("{}&live=1", from("0xa"))))
+            .await;
+        let mut stream = resp.into_body().into_data_stream();
+        let mut pending = String::new();
+        let mut next_line =
+            async |stream: &mut axum::body::BodyDataStream| -> Option<serde_json::Value> {
+                loop {
+                    if let Some(at) = pending.find('\n') {
+                        let line: String = pending.drain(..=at).collect();
+                        return Some(serde_json::from_str(&line).unwrap());
+                    }
+                    let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                        .await
+                        .expect("a line within five seconds")?;
+                    pending.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+                }
+            };
+        for _ in 0..3 {
+            next_line(&mut stream).await.unwrap();
+        }
+        apply(
+            2,
+            vec![transfer(3, 0, "0xa", "0xb"), transfer(3, 1, "0xc", "0xc")],
+        )
+        .await;
+        let line = next_line(&mut stream).await.unwrap();
+        assert_eq!(line["offset"], serde_json::json!([1, 2]));
+        assert_eq!(line["ops"].as_array().unwrap().len(), 1);
+        assert_eq!(line["ops"][0]["put"]["key"], Store::entity_key(3, 0));
+        // The live row is the row `/sql` answers for it: one representation, whichever way it came.
+        let sql = "SELECT * FROM t__transfer WHERE block_number = 3 AND log_index = 0";
+        let (sql_rows, _, _) = crate::serve::within_pin(shared.clone(), |pinned| async move {
+            crate::serve::sync_query((*pinned).clone(), sql.into()).await
+        })
+        .await
+        .unwrap_or_else(|r| panic!("gone: {}", r.status()))
+        .unwrap_or_else(|r| panic!("/sql refused: {}", r.status()));
+        assert_eq!(sql_rows.len(), 1);
+        assert_eq!(line["ops"][0]["put"]["row"], sql_rows[0]);
+
+        apply(3, vec![transfer(1, 0, "0xc", "0xb")]).await;
+        let line = next_line(&mut stream).await.unwrap();
+        assert_eq!(line["offset"], serde_json::json!([1, 3]));
+        assert_eq!(
+            line["ops"][0],
+            serde_json::json!({ "retract": { "key": Store::entity_key(1, 0) } })
+        );
+
+        // The route's own layer answers it, ahead of the nest's router.
+        let routed = {
+            use tower::ServiceExt;
+            let layered = guarded(
+                follower.clone(),
+                "ds".into(),
+                Arc::default(),
+                axum::Router::new(),
+            );
+            let req = Request::get(uri(&from("0xa")))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            layered.oneshot(req).await.unwrap()
+        };
+        assert_eq!(routed.status(), StatusCode::OK);
+        assert_eq!(
+            routed.headers()[axum::http::header::CONTENT_TYPE],
+            "application/x-ndjson"
+        );
+
+        follower.apply_snapshot("ds", fresh(2)).await.unwrap();
+        assert!(
+            next_line(&mut stream).await.is_none(),
+            "the stream ends when the copy is replaced"
+        );
+    }
+
+    /// RFC-0080 §16: a shape's answer includes the rows already sealed, and keeps following across the
+    /// seal. The catalogue and segments are real: `seal_range` writes them, and the copy's snapshot
+    /// carries the catalogue as a follower's would.
+    #[tokio::test]
+    async fn sync_answers_sealed_rows_with_the_hot_ones() {
+        use crate::feed::{Delta, Op, Rows, Snapshot};
+        use crate::store::Store;
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ds");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"ds\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"t\"\naddress = \"0x0000000000000000000000000000000000000001\"\n\
+             abi = \"abi.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abi.json"),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        let row = |block: u64, log: u64, from: &str, to: &str| {
+            format!(
+                r#"{{"table":"t__transfer","from":"{from}","to":"{to}","value":"7","block_number":{block},"tx_hash":"0xt{block}","log_index":{log}}}"#
+            )
+        };
+        // Blocks 1 and 2 are sealed; the copy's catalogue names them.
+        let sealed = vec![
+            row(1, 0, "0xa", "0xb"),
+            row(1, 1, "0xc", "0xb"),
+            row(2, 0, "0xa", "0xc"),
+        ];
+        crate::seal::seal_range(&dir, &sealed, 1, 2).unwrap();
+        let catalogue = std::fs::read_to_string(
+            dir.join(crate::seal::SEGMENTS_DIR)
+                .join(crate::seal::MANIFEST_FILE),
+        )
+        .unwrap();
+        let snapshot = Snapshot {
+            epoch: 1,
+            meta: Rows {
+                map: std::collections::BTreeMap::from([("sealed_through".into(), "2".into())]),
+            },
+            catalogue: Some(catalogue),
+            ..Default::default()
+        };
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        {
+            let mut inner = follower.lock();
+            inner.routes.insert(
+                "ds".into(),
+                Route {
+                    spec: Spec {
+                        dataset: "ds".into(),
+                        nid: None,
+                        surface: Default::default(),
+                        tenant: None,
+                        share: None,
+                        limits: None,
+                        chain: Some("mainnet".into()),
+                        isolation: None,
+                        data_identity: None,
+                        sync: Some(
+                            toml::from_str(
+                                "[tables]\nt__transfer = [\"from\", \"to\", \"block_number\"]\n",
+                            )
+                            .unwrap(),
+                        ),
+                    },
+                    served: None,
+                },
+            );
+            inner.datasets.insert(
+                "ds".into(),
+                Data {
+                    store: Arc::new(MemStore::from_snapshot(&dir, snapshot)),
+                    snapshots: Default::default(),
+                    shapes: Default::default(),
+                    derived: Err(Refused {
+                        why: "not built here".into(),
+                        entities: Arc::default(),
+                        gone: false,
+                    }),
+                    building: None,
+                },
+            );
+        }
+        follower.realise();
+        let delta = |generation: u64, ops: Vec<Op>| Delta {
+            epoch: 1,
+            generation,
+            ops,
+            ..Default::default()
+        };
+        let put = |block: u64, log: u64, from: &str, to: &str| Op::Put {
+            key: Store::entity_key(block, log),
+            row: row(block, log, from, to),
+        };
+        follower
+            .apply_delta("ds", delta(1, vec![put(3, 0, "0xa", "0xc")]))
+            .await
+            .unwrap();
+
+        let encode = |s: &str| -> String {
+            s.bytes()
+                .map(|b| match b {
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => (b as char).to_string(),
+                    _ => format!("%{b:02X}"),
+                })
+                .collect()
+        };
+        let ask = |shape: &str, live: bool| {
+            let follower = follower.clone();
+            let uri: axum::http::Uri = format!(
+                "/sync?s={}{}",
+                encode(shape),
+                if live { "&live=1" } else { "" }
+            )
+            .parse()
+            .unwrap();
+            async move { follower.serve_sync("ds", &uri).await }
+        };
+        let keys_of = |lines: &[serde_json::Value]| -> Vec<String> {
+            lines
+                .iter()
+                .flat_map(|l| l["ops"].as_array().cloned().unwrap_or_default())
+                .map(|op| op["put"]["key"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let read = |resp: Response| async move {
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            std::str::from_utf8(&body)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        // A term: the sealed rows and the hot one, in chain order.
+        let lines =
+            read(ask(r#"{"table":"t__transfer","where":{"from":["0xa"]}}"#, false).await).await;
+        assert_eq!(
+            keys_of(&lines),
+            [
+                Store::entity_key(1, 0),
+                Store::entity_key(2, 0),
+                Store::entity_key(3, 0)
+            ],
+            "{lines:?}"
+        );
+        // A range, answered from sealed rows alone.
+        let lines = read(
+            ask(
+                r#"{"table":"t__transfer","where":{"block_number":{"gte":1,"lte":1}}}"#,
+                false,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            keys_of(&lines),
+            [Store::entity_key(1, 0), Store::entity_key(1, 1)]
+        );
+
+        // Live: what follows the sealed and hot rows is a frame for the next delta.
+        let resp = ask(r#"{"table":"t__transfer","where":{"from":["0xa"]}}"#, true).await;
+        let mut stream = resp.into_body().into_data_stream();
+        let mut seen = String::new();
+        while !seen.contains("up_to_date") {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("the first answer within five seconds")
+                .expect("a body")
+                .unwrap();
+            seen.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        follower
+            .apply_delta("ds", delta(2, vec![put(4, 0, "0xa", "0xb")]))
+            .await
+            .unwrap();
+        let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a frame within five seconds")
+            .expect("a body")
+            .unwrap();
+        let frame: serde_json::Value = serde_json::from_slice(&chunk).unwrap();
+        assert_eq!(frame["ops"][0]["put"]["key"], Store::entity_key(4, 0));
+
+        // A row the store holds under a key its own block and log do not give is not sent under the
+        // key they do give: the stream ends, and the subscriber fetches again.
+        let wrong = Op::Put {
+            key: "zz-not-its-key".into(),
+            row: row(5, 0, "0xa", "0xb"),
+        };
+        follower
+            .apply_delta("ds", delta(3, vec![wrong]))
+            .await
+            .unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the stream ends within five seconds");
+        assert!(ended.is_none(), "a mis-keyed row ends the stream");
+    }
+
+    /// What showing stored rows as `/sql` shows them costs, which every live frame pays: the engine
+    /// run over the rows alone. Run in release with `--ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn showing_a_frames_rows_costs_what_it_costs() {
+        use std::time::Instant;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ds");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"ds\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"t\"\naddress = \"0x0000000000000000000000000000000000000001\"\n\
+             abi = \"abi.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abi.json"),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        {
+            let mut inner = follower.lock();
+            inner.routes.insert(
+                "ds".into(),
+                Route {
+                    spec: Spec {
+                        dataset: "ds".into(),
+                        nid: None,
+                        surface: Default::default(),
+                        tenant: None,
+                        share: None,
+                        limits: None,
+                        chain: Some("mainnet".into()),
+                        isolation: None,
+                        data_identity: None,
+                        sync: None,
+                    },
+                    served: None,
+                },
+            );
+            inner.datasets.insert(
+                "ds".into(),
+                Data {
+                    store: Arc::new(MemStore::from_snapshot(
+                        &dir,
+                        crate::feed::Snapshot {
+                            epoch: 1,
+                            ..Default::default()
+                        },
+                    )),
+                    snapshots: Default::default(),
+                    shapes: Default::default(),
+                    derived: Err(Refused {
+                        why: "not built here".into(),
+                        entities: Arc::default(),
+                        gone: false,
+                    }),
+                    building: None,
+                },
+            );
+        }
+        follower.realise();
+        let state = match &follower.lock().routes["ds"].served {
+            Some(Ok(shared)) => shared.current(),
+            _ => panic!("the route's state is built"),
+        };
+        let rows = |n: u64| -> Vec<serde_json::Value> {
+            (0..n)
+                .map(|i| {
+                    serde_json::json!({
+                        "table": "t__transfer",
+                        "from": format!("0x{i:040x}"),
+                        "to": format!("0x{:040x}", i + 1),
+                        "value": "123456789",
+                        "block_number": 1,
+                        "tx_hash": format!("0x{i:064x}"),
+                        "log_index": i,
+                    })
+                })
+                .collect()
+        };
+        for n in [1u64, 5, 50, 500] {
+            let batch = rows(n);
+            crate::serve::project_rows(&state, "t__transfer", batch.clone()).unwrap();
+            let runs = 30;
+            let started = Instant::now();
+            for _ in 0..runs {
+                crate::serve::project_rows(&state, "t__transfer", batch.clone()).unwrap();
+            }
+            let each = started.elapsed() / runs;
+            println!("{n:>4} rows: {each:?} a call, {:?} a row", each / n as u32);
+        }
     }
 }

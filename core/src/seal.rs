@@ -187,6 +187,65 @@ pub fn seal_range(
     Ok(Some(summary))
 }
 
+/// `(from, cut)` when a seal catalogued a fold through `cut` and stopped before its prune (#2169).
+/// The folded segment starts at or below `sealed_through` and ends past it, so the watermark admits
+/// it to no read, and the provisional rows it absorbed are no longer in hot either. Every table's
+/// rows through `cut` went into that one catalogue install, so the seal can be finished from here.
+///
+/// An error when a segment the finish would leave as the only copy of its rows is missing or does
+/// not hash to its entry: the prune would then lose the hot copy too.
+pub fn unpruned_fold(
+    sink: &mut dyn SegmentSink,
+    sealed_through: u64,
+) -> Result<Option<(u64, u64)>> {
+    let manifest = sink.manifest()?;
+    let segments = || manifest.tables.values().flatten();
+    let Some((from, cut)) = segments()
+        .filter(|s| s.from_block <= sealed_through && s.to_block > sealed_through)
+        .fold(None, |acc, s| match acc {
+            None => Some((s.from_block, s.to_block)),
+            Some((from, cut)) => Some((from.min(s.from_block), cut.max(s.to_block))),
+        })
+    else {
+        return Ok(None);
+    };
+    for s in segments().filter(|s| s.to_block > sealed_through && s.to_block <= cut) {
+        if !sink.intact(s) {
+            anyhow::bail!(
+                "segment {} (blocks {}..={}) is missing or does not hash to its catalogue entry",
+                s.file,
+                s.from_block,
+                s.to_block
+            );
+        }
+    }
+    Ok(Some((from, cut)))
+}
+
+/// Finish a seal that installed a fold's catalogue and died before its prune (#2169): the prune and
+/// watermark it would have committed next. Until then the folded rows were in no read at all. A fold
+/// that cannot be finished is logged and left, hot rows kept, rather than refusing the open.
+pub fn finish_unpruned_fold(sinks: &dyn Sinks, store: &dyn HotStore) -> Result<()> {
+    let watermark = store.sealed_through();
+    let (from, cut) = match unpruned_fold(&mut *sinks.open(), watermark) {
+        Ok(Some(window)) => window,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::error!(
+                "a seal past block {watermark} stopped before its prune, and it cannot be finished: \
+                 {e:#}. Hot rows are kept and the watermark stays; restore the segment from a copy \
+                 and restart, or re-index the nest"
+            );
+            return Ok(());
+        }
+    };
+    let pruned = store.prune_and_set_meta(from, cut, SEALED_THROUGH_KEY, &cut.to_string())?;
+    tracing::info!(
+        "finished a seal through block {cut} that stopped before its prune: pruned {pruned} rows from hot"
+    );
+    Ok(())
+}
+
 /// `block:hash` of the checkpoint `maybe_seal` last pinned while holding rows (#1495).
 pub const SEAL_PIN_KEY: &str = "seal_pin";
 
@@ -420,5 +479,177 @@ async fn try_seal(
         from = cut + 1;
         // Sealing is synchronous; yielding between segments lets an aborted ingest stop here.
         crate::time::yield_now().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::redb_store::Store;
+    use crate::store::entity_key;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// Segments and a catalogue in memory. `install` drops what the catalogue no longer names, as a
+    /// store-backed catalogue does in its one commit.
+    #[derive(Default)]
+    struct Mem {
+        manifest: Mutex<Manifest>,
+        files: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    struct MemSink<'a>(&'a Mem);
+
+    impl SegmentSink for MemSink<'_> {
+        fn manifest(&mut self) -> Result<Manifest> {
+            Ok(self.0.manifest.lock().unwrap().clone())
+        }
+        fn intact(&self, s: &Segment) -> bool {
+            let files = self.0.files.lock().unwrap();
+            files
+                .get(&s.file)
+                .is_some_and(|b| hex::encode(Sha256::digest(b)) == s.hash)
+        }
+        fn restore(&mut self, _: &Segment, _: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+        fn rows(&self, s: &Segment) -> Result<Vec<Value>> {
+            let files = self.0.files.lock().unwrap();
+            nuthatch_seal::segment_rows(files[&s.file].clone().into())
+        }
+        fn table_floor(&self) -> usize {
+            1000
+        }
+        fn publish(
+            &mut self,
+            file: &str,
+            _: &str,
+            bytes: &[u8],
+            _: Option<&Segment>,
+        ) -> Result<()> {
+            self.0
+                .files
+                .lock()
+                .unwrap()
+                .insert(file.into(), bytes.to_vec());
+            Ok(())
+        }
+        fn install(&mut self, manifest: &Manifest) -> Result<()> {
+            let named: Vec<&String> = manifest
+                .tables
+                .values()
+                .flatten()
+                .map(|s| &s.file)
+                .collect();
+            self.0
+                .files
+                .lock()
+                .unwrap()
+                .retain(|f, _| named.contains(&f));
+            *self.0.manifest.lock().unwrap() = manifest.clone();
+            Ok(())
+        }
+    }
+
+    impl Sinks for Mem {
+        fn open(&self) -> Box<dyn SegmentSink + '_> {
+            Box::new(MemSink(self))
+        }
+    }
+
+    fn store_with_blocks(blocks: std::ops::RangeInclusive<u64>) -> Store {
+        let db = redb::Builder::new()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .unwrap();
+        let store = Store::from_db(db, None).unwrap();
+        let rows: Vec<(String, String)> = blocks
+            .clone()
+            .map(|n| {
+                let row = json!({"table": "t", "block_number": n, "log_index": 0});
+                (entity_key(n, 0), row.to_string())
+            })
+            .collect();
+        store.commit_window(&rows, None, *blocks.end()).unwrap();
+        store
+    }
+
+    /// Seal `from..=to` as a tip seal does, up to but not including its prune.
+    fn seal_without_prune(sinks: &Mem, store: &Store, from: u64, to: u64) {
+        let rows = store.entities_in_range(from, to).unwrap();
+        seal_range(&mut *sinks.open(), &rows, from, to, None)
+            .unwrap()
+            .expect("rows to seal");
+    }
+
+    fn prune(store: &Store, from: u64, to: u64) {
+        store
+            .prune_and_set_meta(from, to, SEALED_THROUGH_KEY, &to.to_string())
+            .unwrap();
+    }
+
+    fn spans(sinks: &Mem) -> Vec<(u64, u64, usize)> {
+        let manifest = sinks.manifest.lock().unwrap();
+        manifest
+            .tables
+            .values()
+            .flatten()
+            .map(|s| (s.from_block, s.to_block, s.rows))
+            .collect()
+    }
+
+    /// #2594: a crash after a fold's catalogue install and before its prune.
+    #[test]
+    fn a_fold_installed_and_not_pruned_is_finished() {
+        let store = store_with_blocks(1..=4);
+        let sinks = Mem::default();
+        seal_without_prune(&sinks, &store, 1, 2);
+        prune(&store, 1, 2);
+        seal_without_prune(&sinks, &store, 3, 4);
+        assert_eq!(
+            spans(&sinks),
+            vec![(1, 4, 4)],
+            "premise: the fold replaced the tail"
+        );
+        assert_eq!(
+            store.sealed_through(),
+            2,
+            "premise: the watermark did not move"
+        );
+
+        finish_unpruned_fold(&sinks, &store).unwrap();
+
+        assert_eq!(store.sealed_through(), 4);
+        assert!(store.entities_in_range(1, 4).unwrap().is_empty());
+        assert_eq!(spans(&sinks), vec![(1, 4, 4)]);
+        finish_unpruned_fold(&sinks, &store).unwrap();
+        assert_eq!(store.sealed_through(), 4, "finishing again changes nothing");
+    }
+
+    #[test]
+    fn a_seal_wholly_past_the_watermark_is_left_to_be_sealed_again() {
+        let store = store_with_blocks(1..=2);
+        let sinks = Mem::default();
+        seal_without_prune(&sinks, &store, 1, 2);
+
+        finish_unpruned_fold(&sinks, &store).unwrap();
+
+        assert_eq!(store.sealed_through(), 0);
+        assert_eq!(store.entities_in_range(1, 2).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_fold_whose_segment_is_gone_keeps_the_hot_rows() {
+        let store = store_with_blocks(1..=4);
+        let sinks = Mem::default();
+        seal_without_prune(&sinks, &store, 1, 2);
+        prune(&store, 1, 2);
+        seal_without_prune(&sinks, &store, 3, 4);
+        sinks.files.lock().unwrap().clear();
+
+        finish_unpruned_fold(&sinks, &store).unwrap();
+
+        assert_eq!(store.sealed_through(), 2);
+        assert_eq!(store.entities_in_range(3, 4).unwrap().len(), 2);
     }
 }

@@ -182,6 +182,10 @@ pub struct Mount {
     /// moves neither the NID nor the data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<MountPublish>,
+    /// `[mounts.sync]`: the shapes a client may subscribe to on this mount (RFC-0080 §5.6). Off unless
+    /// written. Mount config, so it moves neither the NID nor the data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<crate::mount_sync::MountSync>,
     /// `[mounts.limits]`: this mount's `/sql` guards, each at most the process value (RFC-0073 FR3).
     /// Mount config like `sql`, so it moves neither the NID nor the data.
     #[serde(default, skip_serializing_if = "crate::limits::MountLimits::is_unset")]
@@ -933,6 +937,10 @@ impl MountTable {
                 publish
                     .settings()
                     .with_context(|| format!("mount '{}': invalid [mounts.publish]", m.alias))?;
+            }
+            if let Some(sync) = &m.sync {
+                sync.validate()
+                    .with_context(|| format!("mount '{}': invalid [mounts.sync]", m.alias))?;
             }
             if !seen.insert((&m.tenant, &m.alias)) {
                 bail!("tenant '{}' mounts '{}' more than once", m.tenant, m.alias);
@@ -6144,6 +6152,7 @@ fn overlay_mount_record(
         r.limits.resolve(&format!("{}/{}", r.tenant, r.alias))
     });
     state.isolation = query_partition(seating.isolation, name, seating.default_tenant);
+    state.sync = record.and_then(|r| r.sync.clone()).map(Arc::new);
     // A state cloned from a co-tenant's arrives in that tenant's seat; it takes its own.
     let tenant = split_route_key(name).0.unwrap_or(seating.default_tenant);
     let share = seating.shares.get(tenant).copied().unwrap_or_default();
@@ -7239,6 +7248,7 @@ impl RuntimeHandles {
                     sql: Default::default(),
                     queries: Vec::new(),
                     publish: None,
+                    sync: None,
                     limits: Default::default(),
                     #[cfg(feature = "counter")]
                     counter: None,
@@ -7628,6 +7638,7 @@ impl RuntimeHandles {
                     sql: Default::default(),
                     queries: Vec::new(),
                     publish: None,
+                    sync: None,
                     limits: Default::default(),
                     #[cfg(feature = "counter")]
                     counter: None,
@@ -9189,6 +9200,83 @@ mod tests {
         assert_eq!(p(Isolation::Shared, "acme/usdc"), None);
     }
 
+    /// RFC-0080 §5.6: a mount's `[mounts.sync]` reaches the state it is served from, and the feed's
+    /// `mount` line, which is how a follower learns it; a state with no record has none.
+    #[test]
+    fn a_mounts_sync_reaches_its_state_and_the_feed_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+             chain_id = 42161\nrpc_urls = []\n",
+        )
+        .unwrap();
+        let h = idle_handles(dir.path());
+        let nid = "a".repeat(64);
+        let table: MountTable = toml::from_str(&format!(
+            "[runtime]\nname = \"r\"\nchain = \"x\"\nchain_id = 1\n\n\
+             [[mounts]]\ntenant = \"default\"\nalias = \"swaps\"\nnid = \"{nid}\"\n\
+             [mounts.sync.tables]\nswaps = [\"pool\"]\n"
+        ))
+        .unwrap();
+        let record = &table.mounts[0];
+        let at = dir.path().join("ds");
+        std::fs::create_dir_all(&at).unwrap();
+        let mut state = nest_state(&at, "arbitrum-one");
+        let surface = crate::allowlist::Surface::default;
+        overlay_mount_record(
+            &mut state,
+            None,
+            Some(record),
+            surface(),
+            "swaps",
+            h.seating(),
+        );
+        assert_eq!(state.sync.as_deref(), record.sync.as_ref());
+        let served = crate::feed_http::Served::of("swaps", &state, &Default::default());
+        assert_eq!(served.sync, record.sync);
+        overlay_mount_record(&mut state, None, None, surface(), "swaps", h.seating());
+        assert!(state.sync.is_none());
+    }
+
+    /// RFC-0080 §5.6: `[mounts.sync]` is read per mount, checked on load, written back, and absent
+    /// from a mount that does not set it.
+    #[test]
+    fn mounts_sync_is_read_per_mount_checked_and_written_back() {
+        let nid = "a".repeat(64);
+        let head = format!(
+            "[runtime]\nname = \"r\"\nchain = \"x\"\nchain_id = 1\n\n\
+             [[mounts]]\ntenant = \"default\"\nalias = \"swaps\"\nnid = \"{nid}\"\n"
+        );
+        let good = format!(
+            "{head}[mounts.sync]\nmax_shapes_per_connection = 4\n\
+             [mounts.sync.tables]\nswaps = [\"pool\"]\n"
+        );
+        let table: MountTable = toml::from_str(&good).unwrap();
+        table.validate_mounts().unwrap();
+        let sync = table.mounts[0].sync.as_ref().unwrap();
+        assert_eq!(sync.max_shapes_per_connection, 4);
+        assert_eq!(sync.max_values_per_term, 1000, "the default");
+        let written = toml::to_string(&table).unwrap();
+        let again: MountTable = toml::from_str(&written).unwrap();
+        assert_eq!(again.mounts[0].sync, table.mounts[0].sync);
+
+        let plain: MountTable = toml::from_str(&head).unwrap();
+        assert!(plain.mounts[0].sync.is_none());
+        assert!(!toml::to_string(&plain).unwrap().contains("sync"));
+
+        let empty: MountTable =
+            toml::from_str(&format!("{head}[mounts.sync]\n[mounts.sync.tables]\n")).unwrap();
+        let err = format!("{:#}", empty.validate_mounts().unwrap_err());
+        assert!(err.contains("invalid [mounts.sync]"), "{err}");
+
+        let pinned = format!(
+            "{head}[mounts.sync]\npin = {{ header = \"x-nuthatch-pin\", column = \"owner\" }}\n\
+             [mounts.sync.tables]\nswaps = []\n"
+        );
+        assert!(toml::from_str::<MountTable>(&pinned).is_err());
+    }
+
     /// #1565, and the 3.13.0 tyre-kick: a mount's route key depends on its own tenant alone, so it
     /// is the same before and after a restart whatever else is mounted, and a suspended
     /// `tenant/alias` is still found suspended when the table is read back.
@@ -10271,6 +10359,7 @@ mod tests {
             address_history: None,
             snapshots: None,
             isolation: None,
+            sync: None,
         }
     }
 
@@ -10292,6 +10381,7 @@ mod tests {
             sql,
             queries: Vec::new(),
             publish: None,
+            sync: None,
             limits: Default::default(),
             #[cfg(feature = "counter")]
             counter: None,
