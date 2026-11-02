@@ -3725,18 +3725,18 @@ async fn admit(s: &AppState) -> std::result::Result<GatePermit, axum::response::
 /// held for as long as the answer is worked out.
 pub(crate) async fn admit_scan(
     s: &AppState,
-) -> std::result::Result<GatePermit, axum::response::Response> {
-    admit(s).await
+) -> std::result::Result<GatePermit, Box<axum::response::Response>> {
+    admit(s).await.map_err(Box::new)
 }
 
 /// Room in the response-bytes budget for `bytes`, held until it is dropped.
 pub(crate) fn reserve_answer(
     s: &AppState,
     bytes: usize,
-) -> std::result::Result<crate::fair_share::BytePermit, axum::response::Response> {
+) -> std::result::Result<crate::fair_share::BytePermit, Box<axum::response::Response>> {
     s.sql_response_bytes
         .reserve(bytes, s.tenant_label())
-        .map_err(|why| refused(s, why, "SQL response bytes in flight"))
+        .map_err(|why| Box::new(refused(s, why, "SQL response bytes in flight")))
 }
 
 /// The gate's admission under this mount's tenant label: a free permit, or a wait bounded in time

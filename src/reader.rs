@@ -2172,7 +2172,7 @@ impl Follower {
         };
         let permit = match crate::serve::admit_scan(&state).await {
             Ok(permit) => permit,
-            Err(refused) => return refused,
+            Err(refused) => return *refused,
         };
         let live = query.get("live").is_some_and(|v| v == "1");
         // Subscribed before the rows are read, so a delta between the two is in both: a put read
@@ -2252,7 +2252,7 @@ impl Follower {
         // Room for the first answer is taken before it is sent and kept until its last line has been.
         let room = match crate::serve::reserve_answer(&state, lines.iter().map(|l| l.len()).sum()) {
             Ok(room) => room,
-            Err(refused) => return refused,
+            Err(refused) => return *refused,
         };
         let head =
             futures::stream::unfold((lines.into_iter(), room), |(mut lines, room)| async move {
