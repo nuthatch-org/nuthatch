@@ -390,3 +390,29 @@ apply, from 1.28, at 112 ns a delivery. Tracking is +0.012. That is a smaller co
 it is not profiled: what is left is likely the per-subscriber frame (a list built, then copied into a
 shared slice), the map that gathers them, and the channel send. The figure is still for five
 subscribers a row.
+
+## 13. Reading the endpoint's ground before building it (2026-11-01)
+
+Two things in the tree decide the endpoint's shape, and §5.2 and §5.6 as written get both wrong.
+
+1. **`/shape` is taken.** Every nest already answers `GET /shape` (RFC-0025): `{"transfers": ..,
+   "compliance": ..}`, the capability shape that `nuthatch mcp` reads to decide which tools to offer
+   (`src/serve.rs`, `src/mcp.rs`). §5.2's `GET /<route>/shape?s=<shape>` would be the same path with a
+   different meaning, and the word is the RFC's own, so the clash is in the RFC and not in the code.
+   **Proposed: `GET /<route>/sync`**, with the shape as `s` and the offset and `live` as in §5.2. It
+   matches `[mounts.sync]`, and nothing answers it today. §5.2 and §5.6 are not rewritten until Chief
+   agrees the name.
+2. **A follower does not know a mount's `[mounts.sync]`.** It learns a route from the writer's `mount`
+   line, which becomes `Spec` in `src/reader.rs`: dataset, nid, SQL surface, tenant, share, limits,
+   chain, isolation, data identity. Config the follower is to enforce has to ride that line the way
+   `limits` does, so `admit` can run on the follower that serves the shape (§3 goal 4 puts shapes on
+   followers, not the writer). That is an addition to the feed's `mount` line. A follower that does not
+   know the field ignores it and so refuses every shape, which is the safe default, and a writer that
+   predates it sends none. It needs the same care as `limits` got: a test that an old follower still
+   reads the line, and a bump to whatever the rolling-upgrade gate checks.
+
+Neither is built. The order is: the field on the `mount` line and `Spec`, then the route in the
+follower's layer (the follower already intercepts a route's requests before its router sees them, in
+`reader.rs`'s `service`), then the initial answer. The initial answer is the part with the most left to
+read: it joins the follower's hot rows with the sealed segments its catalogue names at one offset, and
+`Follower::subscribe_shape`'s offset is the copy's generation, which still has to be made a block.
