@@ -336,8 +336,7 @@ safe where under-telling is not.
 
 **Not built, and so S1 is not done.**
 
-1. Nothing calls the hub. `Reader::apply_delta` has not been wired to it, and no follower turns
-   `track_changes` on.
+1. ~~Nothing calls the hub.~~ Built, below.
 2. The protocol of §5.2: `GET /<route>/shape`, the initial Arrow answer with its offset, the live stream,
    and the `409 must-refetch`.
 3. `[mounts.sync]` (§5.6): the table and column allow-list, `max_shapes_per_connection`,
@@ -345,3 +344,15 @@ safe where under-telling is not.
 4. Measurement. The cost gate of §11 does not cover this code: the per-delta sweep of every entry, the
    frame cloned for each subscriber, and the settle step are not timed, and the benchmark has no range
    shapes.
+
+**The hub is wired in.** Each dataset's copy on a follower (`Data` in `src/reader.rs`) holds a hub.
+`apply_delta` applies the delta and feeds the hub under the hub's lock, and
+`Follower::subscribe_shape(dataset, shape, queue)` takes the copy's `(epoch, generation)` and subscribes
+under the same lock, so no delta falls between a subscriber's starting point and its frames and none is
+told twice. The first subscription turns `track_changes` on for that copy; a follower nobody subscribes
+to is as it was. A fresh snapshot builds a new copy and a new hub, which ends every subscriber of the old
+one. `a_shape_subscriber_follows_the_deltas_after_its_offset` applies two deltas through
+`Follower::apply_delta`, one the shape selects and one it does not, and then a fresh snapshot.
+
+Still to do: the endpoint (2), the config (3) and the measurement (4) above. The offset a subscriber
+gets is the copy's, not yet the nest's block for it, which the endpoint's initial answer needs.

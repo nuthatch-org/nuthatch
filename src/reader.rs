@@ -222,6 +222,10 @@ struct Data {
     derived: std::result::Result<Arc<crate::indexer::FollowerDerived>, Refused>,
     /// Why the derived state is being rebuilt, while it is: it is not served until it is whole.
     building: Option<String>,
+    /// The subscribers to shapes of this copy (RFC-0080). Held while a delta is applied, so a
+    /// subscriber's starting point and the deltas after it never overlap or leave a gap. A fresh
+    /// snapshot builds a new copy and a new hub, which ends every subscriber of the old one.
+    shapes: Arc<Mutex<crate::shape_feed::ShapeHub>>,
 }
 
 /// Derived state that could not be built, with its own empty entity list so a swap can tell it apart.
@@ -1667,6 +1671,7 @@ impl Follower {
                 building: rebuilding(&derived),
                 store,
                 snapshots: Default::default(),
+                shapes: Default::default(),
                 derived,
             };
             data.publish().map(|()| data)
@@ -1717,10 +1722,15 @@ impl Follower {
             return Ok(());
         }
         // The old state keeps serving while a new connection takes fresh snapshots.
-        let changes = data
-            .store
-            .apply(&delta)
-            .with_context(|| format!("{dataset}: resnapshotting"))?;
+        let changes = {
+            let mut shapes = data.shapes.lock().unwrap_or_else(|e| e.into_inner());
+            let changes = data
+                .store
+                .apply(&delta)
+                .with_context(|| format!("{dataset}: resnapshotting"))?;
+            shapes.apply(delta.epoch, delta.generation, &changes.log);
+            changes
+        };
         self.lock().note_peak(&dataset);
         if let Some(delay) = crate::indexer::feed_delay(&self.root.join(&dataset)) {
             tokio::time::sleep(delay).await;
@@ -2064,6 +2074,23 @@ impl Follower {
             ));
         }
         self.live.swap(app);
+    }
+
+    /// Subscribes to `shape` on `dataset`'s copy: the `(epoch, generation)` the copy is at, and the
+    /// frames each delta applied after that adds. `None` where the dataset has no copy yet. The
+    /// frames end when the queue fills or the copy is replaced by a fresh snapshot, and the
+    /// subscriber then takes its answer again.
+    pub fn subscribe_shape(
+        &self,
+        dataset: &str,
+        shape: crate::shape::Shape,
+        queue: usize,
+    ) -> Option<((u64, u64), crate::shape_feed::Frames)> {
+        let data = self.lock().datasets.get(dataset).cloned()?;
+        let mut shapes = data.shapes.lock().unwrap_or_else(|e| e.into_inner());
+        data.store.track_changes();
+        let at = data.store.applied();
+        Some((at, shapes.subscribe(shape, queue)))
     }
 
     fn data(&self, route: &str) -> Option<Data> {
@@ -2677,6 +2704,7 @@ mod tests {
                 Data {
                     store: store.clone(),
                     snapshots: Default::default(),
+                    shapes: Default::default(),
                     derived: Err(Refused {
                         why: "not built here".into(),
                         entities: Arc::default(),
@@ -2690,6 +2718,7 @@ mod tests {
                 Data {
                     store,
                     snapshots: Default::default(),
+                    shapes: Default::default(),
                     derived: Ok(derived.clone()),
                     building: None,
                 },
@@ -2853,5 +2882,75 @@ mod tests {
             .unwrap();
         assert!(us >= held.as_micros(), "{us} µs against {held:?} held");
         reporter.abort();
+    }
+
+    /// RFC-0080 S1: a subscriber's frames are the deltas applied after the offset it was given, and
+    /// a fresh snapshot, which builds a new copy, ends them.
+    #[tokio::test]
+    async fn a_shape_subscriber_follows_the_deltas_after_its_offset() {
+        use crate::feed::{Delta, Op, Snapshot};
+        use crate::shape_feed::ShapeOp;
+        use tokio::sync::mpsc::error::TryRecvError;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = |epoch| Snapshot {
+            epoch,
+            ..Default::default()
+        };
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        follower.lock().datasets.insert(
+            "ds".into(),
+            Data {
+                store: Arc::new(MemStore::from_snapshot(&dir, fresh(1))),
+                snapshots: Default::default(),
+                shapes: Default::default(),
+                derived: Err(Refused {
+                    why: "not built here".into(),
+                    entities: Arc::default(),
+                    gone: false,
+                }),
+                building: None,
+            },
+        );
+        let shape = serde_json::from_str(r#"{"table":"swaps","where":{"pool":["0xa"]}}"#).unwrap();
+        assert!(follower.subscribe_shape("absent", shape, 8).is_none());
+        let shape = serde_json::from_str(r#"{"table":"swaps","where":{"pool":["0xa"]}}"#).unwrap();
+        let (at, mut frames) = follower.subscribe_shape("ds", shape, 8).unwrap();
+        assert_eq!(at, (1, 0));
+
+        let put = |key: &str, pool: &str| Op::Put {
+            key: key.into(),
+            row: format!(r#"{{"table":"swaps","pool":"{pool}"}}"#),
+        };
+        for (generation, op) in [(1, put("k1", "0xa")), (2, put("k2", "0xb"))] {
+            let delta = Delta {
+                epoch: 1,
+                generation,
+                ops: vec![op],
+                ..Default::default()
+            };
+            follower.apply_delta("ds", delta).await.unwrap();
+        }
+        let frame = frames.try_recv().unwrap();
+        assert_eq!((frame.epoch, frame.generation), (1, 1));
+        assert_eq!(
+            frame.ops,
+            [ShapeOp::Put {
+                key: "k1".into(),
+                row: r#"{"table":"swaps","pool":"0xa"}"#.into()
+            }]
+        );
+        assert!(
+            matches!(frames.try_recv(), Err(TryRecvError::Empty)),
+            "the second delta put a row it does not select"
+        );
+
+        follower.apply_snapshot("ds", fresh(2)).await.unwrap();
+        assert!(matches!(frames.try_recv(), Err(TryRecvError::Disconnected)));
     }
 }
