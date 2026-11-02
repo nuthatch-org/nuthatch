@@ -419,7 +419,8 @@ registry = "s3://bucket/registry"        # needed with follow
   without, or with no copy yet, seeds an empty dataset from the mirror's seed snapshot and replays
   the unsealed gap from the chain. Either way the rows are the same; the copy is faster.
 - **Webhooks** survive a takeover at least once: a delivery the old writer made whose removal had
-  not reached the standby is made again, so a receiver should treat a repeat as harmless.
+  not reached the standby is made again. Each delivery carries `X-Nuthatch-Delivery`, its outbox
+  sequence, which survives a takeover; a receiver should dedupe on it and treat a repeat as harmless.
 - **A planned move** is `POST /_admin/failover/handover` on the writer
   ([admin-api.md](admin-api.md#failover)): it stops committing, waits for the mirror to have what it
   sealed, and releases the lease, which a standby takes at once.

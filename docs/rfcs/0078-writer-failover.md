@@ -413,6 +413,11 @@ whose removal had not reached the follower is made again. Compatibility: an olde
 read the two ops, which is safe under the upgrade order the rolling-upgrade gate enforces, followers
 before the writer.
 
+**The delivery id, built.** Every webhook delivery carries `X-Nuthatch-Delivery`, its outbox sequence.
+The sequence survives a takeover, so a delivery made again by the new writer carries the id the old
+writer's did, and a receiver can dedupe on it. `each_delivery_names_its_outbox_sequence` checks the
+header against two queued alerts. A receiver that ignores it sees what it saw before.
+
 **The parity run (§7), built.** `a_promoted_follower_ends_where_an_uninterrupted_writer_does` cuts a
 writer at three points (every row hot; just after a reorg; just after a seal), promotes its
 follower's copy into a fresh runtime, and lets the chain go on: whatever the old writer never saw,
