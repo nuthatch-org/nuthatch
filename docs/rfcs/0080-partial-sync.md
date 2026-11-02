@@ -339,8 +339,7 @@ safe where under-telling is not.
 1. ~~Nothing calls the hub.~~ Built, below.
 2. The protocol of §5.2: `GET /<route>/shape`, the initial Arrow answer with its offset, the live stream,
    and the `409 must-refetch`.
-3. `[mounts.sync]` (§5.6): the table and column allow-list, `max_shapes_per_connection`,
-   `max_values_per_term`.
+3. ~~`[mounts.sync]` (§5.6)~~ Built, below.
 4. Measurement. The cost gate of §11 does not cover this code: the per-delta sweep of every entry, the
    frame cloned for each subscriber, and the settle step are not timed, and the benchmark has no range
    shapes.
@@ -354,5 +353,16 @@ to is as it was. A fresh snapshot builds a new copy and a new hub, which ends ev
 one. `a_shape_subscriber_follows_the_deltas_after_its_offset` applies two deltas through
 `Follower::apply_delta`, one the shape selects and one it does not, and then a fresh snapshot.
 
-Still to do: the endpoint (2), the config (3) and the measurement (4) above. The offset a subscriber
+**`[mounts.sync]` is read and checked (§5.6), and nothing serves it yet.** `src/mount_sync.rs`: the
+tables a shape may name with the columns it may constrain, `max_shapes_per_connection` (16) and
+`max_values_per_term` (1000), each held to a ceiling so a typo cannot lift it past what a follower holds.
+`MountSync::admit(held, shape)` is what the endpoint will call, and refuses with the part at fault: an
+unlisted table or column (a range names a column as a term does), an empty term, a term over the value
+bound, a connection over its shape bound. It is read per `[[mounts]]` record, checked when the table is
+validated, and written back. Three choices: a table listed with no columns may be named with no terms,
+which is the whole table; an empty value list is refused rather than selecting nothing; and `pin` is
+not accepted, so a `mounts.toml` that asks for one fails to load instead of being ignored, until S6
+builds it. Nothing documents it for operators yet, since there is nothing for them to turn on.
+
+Still to do: the endpoint (2) and the measurement (4) above. The offset a subscriber
 gets is the copy's, not yet the nest's block for it, which the endpoint's initial answer needs.

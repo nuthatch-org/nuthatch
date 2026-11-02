@@ -151,6 +151,7 @@ fn remount(root: &Path, nid: &str) {
         sql: Default::default(),
         queries: Vec::new(),
         publish: None,
+        sync: None,
         limits: Default::default(),
         #[cfg(feature = "counter")]
         counter: None,

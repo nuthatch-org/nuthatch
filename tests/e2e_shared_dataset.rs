@@ -56,6 +56,7 @@ fn two_mounts_one_nest(root: &Path) -> String {
         sql: Default::default(),
         queries: Vec::new(),
         publish: None,
+        sync: None,
         limits: Default::default(),
         #[cfg(feature = "counter")]
         counter: None,
@@ -372,6 +373,7 @@ async fn two_tenants_mounting_one_nest_share_it() {
             sql: Default::default(),
             queries: Vec::new(),
             publish: None,
+            sync: None,
             limits: Default::default(),
             #[cfg(feature = "counter")]
             counter: None,
@@ -383,6 +385,7 @@ async fn two_tenants_mounting_one_nest_share_it() {
             sql: Default::default(),
             queries: Vec::new(),
             publish: None,
+            sync: None,
             limits: Default::default(),
             #[cfg(feature = "counter")]
             counter: None,

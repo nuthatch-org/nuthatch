@@ -107,6 +107,8 @@ pub mod metadata;
 pub mod metrics;
 pub mod migrate;
 pub mod mount_jobs;
+/// RFC-0080 §5.6: `[mounts.sync]`, what a client may ask of a mount's shapes.
+pub mod mount_sync;
 pub mod offchain;
 pub mod pack;
 /// The Postgres hot store (RFC-0022 slice 2). Feature-gated so the default build stays a single

@@ -182,6 +182,10 @@ pub struct Mount {
     /// moves neither the NID nor the data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<MountPublish>,
+    /// `[mounts.sync]`: the shapes a client may subscribe to on this mount (RFC-0080 §5.6). Off unless
+    /// written. Mount config, so it moves neither the NID nor the data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<crate::mount_sync::MountSync>,
     /// `[mounts.limits]`: this mount's `/sql` guards, each at most the process value (RFC-0073 FR3).
     /// Mount config like `sql`, so it moves neither the NID nor the data.
     #[serde(default, skip_serializing_if = "crate::limits::MountLimits::is_unset")]
@@ -933,6 +937,10 @@ impl MountTable {
                 publish
                     .settings()
                     .with_context(|| format!("mount '{}': invalid [mounts.publish]", m.alias))?;
+            }
+            if let Some(sync) = &m.sync {
+                sync.validate()
+                    .with_context(|| format!("mount '{}': invalid [mounts.sync]", m.alias))?;
             }
             if !seen.insert((&m.tenant, &m.alias)) {
                 bail!("tenant '{}' mounts '{}' more than once", m.tenant, m.alias);
@@ -7239,6 +7247,7 @@ impl RuntimeHandles {
                     sql: Default::default(),
                     queries: Vec::new(),
                     publish: None,
+                    sync: None,
                     limits: Default::default(),
                     #[cfg(feature = "counter")]
                     counter: None,
@@ -7628,6 +7637,7 @@ impl RuntimeHandles {
                     sql: Default::default(),
                     queries: Vec::new(),
                     publish: None,
+                    sync: None,
                     limits: Default::default(),
                     #[cfg(feature = "counter")]
                     counter: None,
@@ -9189,6 +9199,44 @@ mod tests {
         assert_eq!(p(Isolation::Shared, "acme/usdc"), None);
     }
 
+    /// RFC-0080 §5.6: `[mounts.sync]` is read per mount, checked on load, written back, and absent
+    /// from a mount that does not set it.
+    #[test]
+    fn mounts_sync_is_read_per_mount_checked_and_written_back() {
+        let nid = "a".repeat(64);
+        let head = format!(
+            "[runtime]\nname = \"r\"\nchain = \"x\"\nchain_id = 1\n\n\
+             [[mounts]]\ntenant = \"default\"\nalias = \"swaps\"\nnid = \"{nid}\"\n"
+        );
+        let good = format!(
+            "{head}[mounts.sync]\nmax_shapes_per_connection = 4\n\
+             [mounts.sync.tables]\nswaps = [\"pool\"]\n"
+        );
+        let table: MountTable = toml::from_str(&good).unwrap();
+        table.validate_mounts().unwrap();
+        let sync = table.mounts[0].sync.as_ref().unwrap();
+        assert_eq!(sync.max_shapes_per_connection, 4);
+        assert_eq!(sync.max_values_per_term, 1000, "the default");
+        let written = toml::to_string(&table).unwrap();
+        let again: MountTable = toml::from_str(&written).unwrap();
+        assert_eq!(again.mounts[0].sync, table.mounts[0].sync);
+
+        let plain: MountTable = toml::from_str(&head).unwrap();
+        assert!(plain.mounts[0].sync.is_none());
+        assert!(!toml::to_string(&plain).unwrap().contains("sync"));
+
+        let empty: MountTable =
+            toml::from_str(&format!("{head}[mounts.sync]\n[mounts.sync.tables]\n")).unwrap();
+        let err = format!("{:#}", empty.validate_mounts().unwrap_err());
+        assert!(err.contains("invalid [mounts.sync]"), "{err}");
+
+        let pinned = format!(
+            "{head}[mounts.sync]\npin = {{ header = \"x-nuthatch-pin\", column = \"owner\" }}\n\
+             [mounts.sync.tables]\nswaps = []\n"
+        );
+        assert!(toml::from_str::<MountTable>(&pinned).is_err());
+    }
+
     /// #1565, and the 3.13.0 tyre-kick: a mount's route key depends on its own tenant alone, so it
     /// is the same before and after a restart whatever else is mounted, and a suspended
     /// `tenant/alias` is still found suspended when the table is read back.
@@ -10292,6 +10340,7 @@ mod tests {
             sql,
             queries: Vec::new(),
             publish: None,
+            sync: None,
             limits: Default::default(),
             #[cfg(feature = "counter")]
             counter: None,
