@@ -314,8 +314,10 @@ unconfigured.
 >
 > **RFC-0081 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
 > [RFC-0081](docs/rfcs/0081-the-engine-in-use.md) (the engine in use) on 2026-10-31: what S7 had to
-> work round, fixed in the engine, plus `verify` for a hosted `/sql` answer. **Not started**: no slice
-> begins until Chief says, and S0 goes first. RFC-0077 §1a binds every slice, the binary is unchanged
+> work round, fixed in the engine, plus `verify` for a hosted `/sql` answer. Each slice begins only when
+> Chief says. S0 to S2 are built (S0 narrowed the hybrid open to whole pool tables, 179 MiB once); S3 and
+> S4 are authorised; S5 waits (Safari skipped for now); **S6, Arbitrum's verified head, is declined**
+> (Chief, 2026-11-01: "a week old thing is not worth it"), so the engine trusts its RPC on Arbitrum. RFC-0077 §1a binds every slice, the binary is unchanged
 > in each, and no slice raises the module's size ceiling on its own.
 >
 > **RFC-0076 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted

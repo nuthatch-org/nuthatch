@@ -175,6 +175,149 @@ impl TabQuery {
         Ok(TabQuery { engine })
     }
 
+    /// RFC-0081 S1: each hydrated table read through its filters' predicate, so a statement sees the
+    /// rows the filters select whether the mirror or the RPC brought them.
+    pub fn narrow(
+        &mut self,
+        predicates: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        for (table, predicate) in predicates {
+            if self.engine.has_table(table) {
+                let t = table.replace('"', "\"\"");
+                self.engine
+                    .register_view(table, &format!("SELECT * FROM \"{t}\" WHERE {predicate}"))
+                    .map_err(engine_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// RFC-0081 §3.2: another instance's answers bound under their own names for this statement, each
+    /// column cast back to the type the answer carried. The cells pass as text, which every carried
+    /// type reads back exactly: a decimal as its digits, an integer as its own.
+    pub fn attach(&mut self, tables: &[crate::attach::Table]) -> Result<()> {
+        for t in tables {
+            let mut casts = Vec::new();
+            for f in t.schema.fields() {
+                let ty = crate::attach::sql_type(f.data_type()).map_err(|e| {
+                    anyhow!("`{}.{}` column `{}` is {e}", t.attachment, t.name, f.name())
+                })?;
+                casts.push((f.name().replace('"', "\"\""), ty));
+            }
+            let mut rows = Vec::new();
+            for b in &t.batches {
+                for row in burrmill::df::encode::rows(b).map_err(engine_err)? {
+                    let Value::Object(o) = row else { continue };
+                    rows.push(Value::Object(
+                        o.into_iter()
+                            .map(|(k, v)| {
+                                let v = match v {
+                                    Value::Null | Value::String(_) => v,
+                                    other => Value::String(other.to_string()),
+                                };
+                                (k, v)
+                            })
+                            .collect(),
+                    ));
+                }
+            }
+            let body = if rows.is_empty() {
+                let nulls: Vec<String> = casts
+                    .iter()
+                    .map(|(c, ty)| format!("CAST(NULL AS {ty}) AS \"{c}\""))
+                    .collect();
+                format!("SELECT {} WHERE false", nulls.join(", "))
+            } else {
+                let raw = format!("{}__raw", t.name);
+                self.engine.register_rows(&raw, &rows).map_err(engine_err)?;
+                let cast: Vec<String> = casts
+                    .iter()
+                    .map(|(c, ty)| format!("CAST(\"{c}\" AS {ty}) AS \"{c}\""))
+                    .collect();
+                format!("SELECT {} FROM \"{raw}\"", cast.join(", "))
+            };
+            self.engine
+                .register_view(&t.name, &body)
+                .map_err(engine_err)?;
+        }
+        Ok(())
+    }
+
+    /// `/sql`'s answer as an Arrow IPC stream (RFC-0079), as the node's `collect_ipc` writes it: at
+    /// most `cap` rows and `max_bytes` of stream, and the plan's schema when no batch comes. Answers
+    /// the stream, its columns, the rows written and whether more existed.
+    pub async fn collect_ipc(
+        &self,
+        sql: &str,
+        cap: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, Vec<String>, usize, bool), burrmill::BurrmillError> {
+        use arrow_ipc::writer::StreamWriter;
+        let io = |e: arrow_schema::ArrowError| burrmill::BurrmillError::Substrate(e.to_string());
+        let names = |s: &arrow_schema::Schema| -> Vec<String> {
+            s.fields().iter().map(|f| f.name().clone()).collect()
+        };
+        let mut writer: Option<StreamWriter<Vec<u8>>> = None;
+        let mut columns = Vec::new();
+        let mut failed = None;
+        let (mut written, mut over) = (0usize, false);
+        let mut take = |batch: arrow_array::RecordBatch| {
+            let w = match &mut writer {
+                Some(w) => w,
+                None => match StreamWriter::try_new(Vec::new(), &batch.schema()) {
+                    Ok(w) => {
+                        columns = names(&batch.schema());
+                        writer.insert(w)
+                    }
+                    Err(e) => {
+                        failed = Some(io(e));
+                        return Err(burrmill::BurrmillError::Cancelled);
+                    }
+                },
+            };
+            let mut start = 0;
+            while start < batch.num_rows() {
+                if written >= cap || w.get_ref().len() >= max_bytes {
+                    over = true;
+                    return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
+                }
+                let n = (batch.num_rows() - start)
+                    .min(ENCODE_ROWS)
+                    .min(cap - written);
+                if let Err(e) = w.write(&batch.slice(start, n)) {
+                    failed = Some(io(e));
+                    return Err(burrmill::BurrmillError::Cancelled);
+                }
+                start += n;
+                written += n;
+            }
+            Ok(())
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let r = self.engine.sql_for_each(sql, &mut take);
+        #[cfg(target_arch = "wasm32")]
+        let r = self.engine.sql_async_for_each(sql, &mut take).await;
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        let truncated = match r {
+            Ok(()) => false,
+            Err(_) if over => true,
+            Err(e) => return Err(e),
+        };
+        let mut w = match writer {
+            Some(w) => w,
+            None => {
+                // No batch came: the plan's schema names the columns and opens the stream.
+                let schema = self.engine.result_schema(sql)?;
+                columns = names(&schema);
+                StreamWriter::try_new(Vec::new(), &schema).map_err(io)?
+            }
+        };
+        w.finish().map_err(io)?;
+        Ok((w.into_inner().map_err(io)?, columns, written, truncated))
+    }
+
     /// The rows `/sql` answers `sql` with.
     pub async fn rows(&self, sql: &str) -> Result<Vec<Value>> {
         #[cfg(not(target_arch = "wasm32"))]

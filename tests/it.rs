@@ -55,6 +55,8 @@ mod e2e_embed_shapes;
 mod e2e_entity_reorg;
 #[path = "e2e_fencing.rs"]
 mod e2e_fencing;
+#[path = "e2e_flight_clients.rs"]
+mod e2e_flight_clients;
 #[cfg(feature = "folds")]
 #[path = "e2e_fold_writer.rs"]
 mod e2e_fold_writer;

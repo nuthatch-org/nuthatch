@@ -2,15 +2,21 @@
 //! The host gives `{number, hash}` (Helios in a browser, its own light client elsewhere); the module
 //! fetches every header from the last seal up to it from the untrusted RPC, hashes each one, links
 //! them by parent hash down from the verified block, and seals no row whose block hash is not on
-//! that chain. Rows above it are still what the RPC said, and completeness is not checked (RFC-0065 §6).
+//! that chain. Rows above it are still what the RPC said. Completeness is checked only with
+//! `complete` (RFC-0081 S4, `complete.rs`).
 
+use crate::complete::{self, Completeness};
 use anyhow::{anyhow, bail, Result};
+use futures::StreamExt;
 use nuthatch_core::extra::ExtraRows;
-use nuthatch_core::source::Source;
-use nuthatch_core::store::{HotStore, SEALED_THROUGH_KEY, START_BLOCK_KEY};
+use nuthatch_core::source::{Log, Source};
+use nuthatch_core::store::{HotStore, LAST_BLOCK_KEY, SEALED_THROUGH_KEY, START_BLOCK_KEY};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+
+/// At most this many blocks' receipts are with the host at once.
+const RECEIPTS_IN_FLIGHT: usize = 8;
 
 /// What the host says is final, from a source the RPC cannot forge; an error when it has none now.
 #[async_trait::async_trait(?Send)]
@@ -31,10 +37,21 @@ struct State {
     /// The last time a row held the seal below its block, and why.
     held: Option<String>,
     headers: u64,
+    /// RFC-0081 S4: each linked block's logsBloom and receiptsRoot, while `complete` is on.
+    roots: BTreeMap<u64, (Vec<u8>, String)>,
+    /// The hash of the header each block's completeness was checked against.
+    checked: BTreeMap<u64, String>,
+    /// Why a block's check failed.
+    incomplete: BTreeMap<u64, String>,
+    receipts: u64,
+    found: u64,
+    /// The highest block checked, kept once the seal passes it and its mark is dropped.
+    checked_top: Option<u64>,
 }
 
 pub struct Verifier {
     state: Mutex<State>,
+    complete: Option<Completeness>,
 }
 
 impl Default for Verifier {
@@ -47,7 +64,137 @@ impl Verifier {
     pub fn new() -> Verifier {
         Verifier {
             state: Mutex::new(State::default()),
+            complete: None,
         }
+    }
+
+    /// Also check, for every block under the verified head, that the RPC left out no log a filter
+    /// asks for (RFC-0081 S4).
+    pub fn completing(mut self, c: Completeness) -> Verifier {
+        self.complete = Some(c);
+        self
+    }
+
+    pub fn completes(&self) -> bool {
+        self.complete.is_some()
+    }
+
+    /// Refuse a follow whose verified head is further past what is hashed than the host allows,
+    /// before the RPC is asked for anything.
+    pub fn within_ceiling(&self, top: u64, store: &dyn HotStore) -> Result<()> {
+        let Some(c) = &self.complete else {
+            return Ok(());
+        };
+        let floor = floor(store)?;
+        let s = self.state();
+        let have = match s.chain.last_key_value() {
+            Some((&n, _)) if s.chain.contains_key(&(floor + 1)) => n,
+            _ => floor,
+        };
+        let need = top.saturating_sub(have);
+        if need > c.max_headers {
+            bail!(
+                "`complete` would hash and test {need} headers, blocks {}..={top}, past the host's \
+                 ceiling of {} (`max_headers`)",
+                have + 1,
+                c.max_headers
+            );
+        }
+        Ok(())
+    }
+
+    /// The first block through `through` the cursor indexed that is on the verified chain and was
+    /// not checked against it, which the cursor indexes again.
+    pub fn unchecked(&self, store: &dyn HotStore, through: u64) -> Result<Option<u64>> {
+        if self.complete.is_none() {
+            return Ok(None);
+        }
+        let floor = floor(store)?;
+        let s = self.state();
+        Ok((floor + 1..=through)
+            .find(|b| s.chain.get(b).is_some_and(|h| s.checked.get(b) != Some(h))))
+    }
+
+    /// The cursor rolled back to `block`: what it checked above it no longer stands.
+    pub fn forget_above(&self, block: u64) {
+        let mut s = self.state();
+        s.checked.split_off(&(block + 1));
+        s.checked_top = s.checked_top.map(|t| t.min(block));
+        s.incomplete.split_off(&(block + 1));
+    }
+
+    /// Check `from..=to` for completeness where the verified chain reaches, adding to `logs` any the
+    /// RPC left out. A block whose receipts cannot be had or do not hash to its root stays unchecked,
+    /// which holds the seal below it, by name.
+    pub async fn complete(&self, logs: &mut Vec<Log>, from: u64, to: u64) {
+        let Some(c) = &self.complete else {
+            return;
+        };
+        let mut plan = Vec::new();
+        {
+            let mut s = self.state();
+            for b in from..=to {
+                let (Some(hash), Some((bloom, root))) = (s.chain.get(&b), s.roots.get(&b)) else {
+                    continue;
+                };
+                let (hash, root) = (hash.clone(), root.clone());
+                let here: Vec<&Log> = logs.iter().filter(|l| l.block_number == b).collect();
+                let mut wanted = Vec::new();
+                let mut failed = None;
+                for n in c.filters.iter().filter(|n| n.from <= b) {
+                    if here.iter().any(|l| n.filter.matches(l)) {
+                        continue;
+                    }
+                    match complete::admits(bloom, &n.filter) {
+                        Ok(true) => wanted.push(&n.filter),
+                        Ok(false) => {}
+                        Err(e) => failed = Some(format!("block {b}'s bloom: {e:#}")),
+                    }
+                }
+                match (failed, wanted.is_empty()) {
+                    (Some(why), _) => {
+                        s.checked.remove(&b);
+                        s.incomplete.insert(b, why);
+                    }
+                    (None, true) => {
+                        s.checked.insert(b, hash);
+                        s.checked_top = s.checked_top.max(Some(b));
+                    }
+                    (None, false) => plan.push((b, hash, root, wanted)),
+                }
+            }
+        }
+        let answers: Vec<_> = futures::stream::iter(plan)
+            .map(|(b, hash, root, wanted)| async move {
+                let found = match c.receipts.block_receipts(b).await {
+                    Ok(answer) => complete::checked(&answer, b, &root)
+                        .and_then(|r| complete::logs_of(r, b, &hash, &wanted)),
+                    Err(e) => Err(e.context(format!("eth_getBlockReceipts for block {b}"))),
+                };
+                (b, hash, found)
+            })
+            .buffered(RECEIPTS_IN_FLIGHT)
+            .collect()
+            .await;
+        let mut s = self.state();
+        for (b, hash, found) in answers {
+            s.receipts += 1;
+            match found {
+                Ok(found) => {
+                    s.found += found.len() as u64;
+                    logs.extend(found);
+                    s.incomplete.remove(&b);
+                    s.checked.insert(b, hash);
+                    s.checked_top = s.checked_top.max(Some(b));
+                }
+                Err(e) => {
+                    s.checked.remove(&b);
+                    s.incomplete.insert(b, format!("{e:#}"));
+                }
+            }
+        }
+        logs.sort_by_key(|l| (l.block_number, l.log_index));
+        logs.dedup_by_key(|l| (l.block_number, l.log_index));
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -68,6 +215,12 @@ impl Verifier {
             "headers": s.headers,
             "refused": s.refused,
             "held": s.held,
+            "complete": self.complete.as_ref().map(|c| serde_json::json!({
+                "highest_checked": s.checked_top,
+                "receipts": s.receipts,
+                "found": s.found,
+                "max_headers": c.max_headers,
+            })),
         })
     }
 
@@ -99,6 +252,9 @@ impl Verifier {
         let top = {
             let mut s = self.state();
             s.chain = s.chain.split_off(&(floor + 1));
+            s.roots = s.roots.split_off(&(floor + 1));
+            s.checked = s.checked.split_off(&(floor + 1));
+            s.incomplete = s.incomplete.split_off(&(floor + 1));
             let asked = top.as_ref().ok().cloned();
             if s.asked.is_some() && s.asked == asked {
                 return Ok(());
@@ -124,6 +280,7 @@ impl Verifier {
                 }
                 _ => {
                     s.chain.clear();
+                    s.roots.clear();
                     (floor + 1, None)
                 }
             }
@@ -149,15 +306,34 @@ impl Verifier {
                 bail!("block {}'s parent is {parent}, but block {n} is {h}", n + 1);
             }
         }
+        let roots = match self.complete {
+            Some(_) => list
+                .iter()
+                .map(|h| {
+                    let root = h.get("receiptsRoot").and_then(Value::as_str);
+                    Ok((
+                        quantity(h, "number")?,
+                        (
+                            data(h, "logsBloom")?,
+                            root.ok_or_else(|| anyhow!("a header has no receiptsRoot"))?
+                                .to_ascii_lowercase(),
+                        ),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
         let mut s = self.state();
         s.headers += list.len() as u64;
         s.chain.extend(chain);
+        s.roots.extend(roots);
         Ok(())
     }
 
     fn refuse(&self, why: String) {
         let mut s = self.state();
         s.chain.clear();
+        s.roots.clear();
         s.top = None;
         s.refused = Some(why);
     }
@@ -207,6 +383,22 @@ impl ExtraRows for Verifier {
             ceiling = b - 1;
             format!("the RPC's logs for block {b} are not on the verified chain")
         });
+        if self.complete.is_some() {
+            // Nothing past the last block indexed is sealed, so none of it goes unchecked.
+            let last = store
+                .get_meta(LAST_BLOCK_KEY)?
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(floor);
+            ceiling = ceiling.min(last.max(floor));
+            let gap = (floor + 1..=ceiling)
+                .find(|b| s.chain.get(b).is_none_or(|h| s.checked.get(b) != Some(h)));
+            if let Some(b) = gap {
+                ceiling = b - 1;
+                s.held = Some(s.incomplete.get(&b).cloned().unwrap_or_else(|| {
+                    format!("block {b} is not checked for completeness against its verified header")
+                }));
+            }
+        }
         Ok(Some(ceiling))
     }
 }
@@ -308,7 +500,7 @@ pub fn header_hash(v: &Value) -> Result<String> {
     Ok(hex(alloy_primitives::keccak256(&out).as_slice()))
 }
 
-fn rlp_bytes(out: &mut Vec<u8>, b: &[u8]) {
+pub(crate) fn rlp_bytes(out: &mut Vec<u8>, b: &[u8]) {
     if b.len() == 1 && b[0] < 0x80 {
         out.push(b[0]);
     } else {
@@ -317,7 +509,7 @@ fn rlp_bytes(out: &mut Vec<u8>, b: &[u8]) {
     }
 }
 
-fn rlp_len(out: &mut Vec<u8>, len: usize, base: u8) {
+pub(crate) fn rlp_len(out: &mut Vec<u8>, len: usize, base: u8) {
     if len <= 55 {
         out.push(base + len as u8);
     } else {
@@ -328,7 +520,7 @@ fn rlp_len(out: &mut Vec<u8>, len: usize, base: u8) {
     }
 }
 
-fn data(v: &Value, name: &str) -> Result<Vec<u8>> {
+pub(crate) fn data(v: &Value, name: &str) -> Result<Vec<u8>> {
     let s = v
         .get(name)
         .and_then(Value::as_str)
@@ -350,7 +542,7 @@ fn quantity(v: &Value, name: &str) -> Result<u64> {
     Ok(b.iter().fold(0u64, |n, &x| (n << 8) | x as u64))
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     format!("0x{}", hex::encode(b))
 }
 

@@ -28,6 +28,6 @@ async function relay(event, target) {
   if (a.error) return new Response(a.error, { status: 503 });
   return new Response(a.status === 204 ? null : a.body, {
     status: a.status,
-    headers: a.contentType ? { "content-type": a.contentType } : {},
+    headers: { ...a.headers, ...(a.contentType ? { "content-type": a.contentType } : {}) },
   });
 }

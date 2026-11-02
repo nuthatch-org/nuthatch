@@ -61,6 +61,8 @@ pub struct NestSpec {
     pub narrowed: Option<Vec<crate::narrow::Narrowed>>,
     /// RFC-0077 S7: the last block the cursor indexes, so the nest answers as of it.
     pub until: Option<u64>,
+    /// RFC-0081 S1: a hybrid open hydrates only these tables from its mirror, each whole.
+    pub hydrate: Option<std::collections::BTreeSet<String>>,
 }
 
 impl NestSpec {
@@ -117,6 +119,7 @@ impl NestSpec {
                 .collect(),
             narrowed: None,
             until: None,
+            hydrate: None,
             registry,
         })
     }
@@ -154,13 +157,25 @@ impl NestSpec {
             starts: Default::default(),
             narrowed: None,
             until: None,
+            hydrate: None,
         }
     }
 
     /// The nest's data identity (RFC-0033 §5), computed from `files` as a node computes it from its
     /// directory: the registry it builds, and every file that can change a stored byte.
     pub fn data_identity(&self, files: &NestFiles) -> Result<String> {
-        let manifest = nuthatch_identity::manifest(
+        Ok(self.manifest(files)?.data_identity())
+    }
+
+    /// The nest's NID (RFC-0032 §3), the one a node's `/sql` names in `provenance.nid`, and its data
+    /// identity, both from `files` as given.
+    pub fn identity(&self, files: &NestFiles) -> Result<(String, String)> {
+        let manifest = self.manifest(files)?;
+        Ok((manifest.nid(), manifest.data_identity()))
+    }
+
+    fn manifest(&self, files: &NestFiles) -> Result<nuthatch_identity::Manifest> {
+        nuthatch_identity::manifest(
             self.name.clone(),
             self.schema_version,
             crate::young::node_version().to_string(),
@@ -169,8 +184,7 @@ impl NestSpec {
                 .iter()
                 .map(|(p, text)| (p.clone(), text.as_bytes().to_vec())),
         )
-        .context("computing the nest's identity from its files")?;
-        Ok(manifest.data_identity())
+        .context("computing the nest's identity from its files")
     }
 
     /// Where a nest that has not indexed starts, refused when it declares nowhere.

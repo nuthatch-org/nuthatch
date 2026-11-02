@@ -218,5 +218,9 @@ export async function load(module, { storage, rpc, log, verified }) {
     export: () => take(g.nh_export()),
     report: () => call("nh_report"),
     memoryBytes: () => g.nh_memory_bytes(),
+    /// Release every file the guest opened, and with them their locks; the instance is not used again.
+    close() {
+      for (const h of [...files.keys()]) imports.nuthatch.store_close(h);
+    },
   };
 }

@@ -144,6 +144,33 @@ to the range's total. A table with a `story` line in `semantic.toml` is told one
 and for each indexed parameter the distinct count and the three values on the most rows. Writing a
 story line is the way to turn that list into sentences; see config-reference.md.
 
+## Export rows as Arrow (RFC-0079)
+
+For a large export, or when the next step is a dataframe, ask `/sql` for Arrow instead of JSON:
+
+```sh
+curl 'localhost:8288/sql?q=SELECT%20*%20FROM%20usdc__transfer' \
+  -H 'Accept: application/vnd.apache.arrow.stream' -D head.txt -o transfers.arrows
+```
+
+`format=arrow` in the query string (or the `POST` body) does the same where a header cannot be set;
+`/q/{name}` takes the `Accept` header only, since its query string is the query's parameters. The
+body is one Arrow IPC stream, which pyarrow (`pa.ipc.open_stream`), Polars, DuckDB and Arrow JS read
+as is. The envelope (`count`, `truncated`, `degraded`, `provenance`) is JSON in the
+`x-nuthatch-answer` header, so read it there: there is no `rows` key to find. The rows are the JSON
+answer's, same order, same caps; check `truncated` before treating an export as complete, and page
+with `WHERE block_number > …` rather than raising `max_rows`. 256-bit values are still decimal text
+in Arrow, so the `_dec` rules still hold. A refusal is JSON either way. For a point read or a small
+panel stay on JSON: the schema makes the Arrow answer larger.
+
+Arrow Flight SQL exists only in the flight build, where `dev` gains a flag for its listen address:
+the `nuthatch-flight-<target>.tar.gz` release artefact from 5.17.0, the `<version>-flight` image, or
+a source build with the `flight` cargo feature. The default binary has neither the feature nor the flag, and
+`cli-reference.md` documents the default build, so point someone at the flight build before
+suggesting Flight. It answers statements and the catalogue calls (catalogs, schemas, tables, table
+types), so a client can list a route's tables, and names a runtime's mount with the
+`x-nuthatch-route` header. ADBC's Flight SQL driver is the client it is tested with.
+
 ## Wire an AI client to a running nest
 
 ```sh

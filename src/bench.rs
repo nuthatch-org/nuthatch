@@ -276,7 +276,7 @@ fn total_ram_gb() -> Option<u64> {
             .nth(1)?
             .parse()
             .ok()?;
-        return Some((kb + 512 * 1024) / (1024 * 1024));
+        return Some(gib_of_mem_total_kb(kb));
     }
     #[cfg(target_os = "macos")]
     {
@@ -289,6 +289,12 @@ fn total_ram_gb() -> Option<u64> {
     }
     #[allow(unreachable_code)]
     None
+}
+
+// MemTotal is installed RAM less a kernel share that varies by host; ceil keeps one class one label.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn gib_of_mem_total_kb(kb: u64) -> u64 {
+    kb.div_ceil(1024 * 1024)
 }
 
 /// Resolve `--keep`, refusing the one path a caller is most likely to type by mistake.
@@ -1642,6 +1648,18 @@ mod tests {
     fn hardware_is_reported_or_omitted_never_guessed() {
         let h = hardware_summary().expect("this platform reports core count");
         assert!(h.contains("cores"), "got {h}");
+    }
+
+    /// The point-read gate compares this label exactly, and 16 GiB runners report MemTotal from about
+    /// 15.4 to 15.7 GiB; rounding read some as 15.
+    #[test]
+    fn mem_total_rounds_up_to_whole_gib() {
+        assert_eq!(gib_of_mem_total_kb(16_146_916), 16);
+        assert_eq!(gib_of_mem_total_kb(16_377_948), 16);
+        assert_eq!(gib_of_mem_total_kb(16 * 1024 * 1024), 16);
+        assert_eq!(gib_of_mem_total_kb(16 * 1024 * 1024 + 1), 17);
+        assert_eq!(gib_of_mem_total_kb(8_131_000), 8);
+        assert_eq!(gib_of_mem_total_kb(0), 0);
     }
 
     /// #781: the default work dir must not be `temp_dir()`. On the publishing box that is tmpfs.

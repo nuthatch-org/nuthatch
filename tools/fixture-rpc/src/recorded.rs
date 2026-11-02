@@ -27,6 +27,13 @@ pub struct Recorded {
     /// Whole headers by number (`--headers`), served in place of the hash and timestamp alone where
     /// their hash is the era's.
     full: BTreeMap<u64, Value>,
+    /// Blocks' receipts by number (`--receipts`), each `{type, status, cumulativeGasUsed,
+    /// transactionHash?, logs: [[address, topics, data]]}` (RFC-0081 S4).
+    receipts: BTreeMap<u64, Value>,
+    /// RFC-0081 S4's faults: one log left out of every `eth_getLogs` answer, by block and index,
+    /// and one block whose receipts are served without the recorded contract's logs.
+    drop_log: Option<(u64, u64)>,
+    forge_receipts: Option<u64>,
 }
 
 struct Era {
@@ -97,6 +104,9 @@ impl Recorded {
             eras,
             era: AtomicUsize::new(0),
             full: BTreeMap::new(),
+            receipts: BTreeMap::new(),
+            drop_log: None,
+            forge_receipts: None,
         })
     }
 
@@ -109,6 +119,61 @@ impl Recorded {
             self.full.insert(n, h.clone());
         }
         Ok(self)
+    }
+
+    /// Serve these blocks' receipts to `eth_getBlockReceipts`: `{"<number>": [receipt]}`, as
+    /// `record-receipts.sh` writes them.
+    pub fn with_receipts(mut self, path: &std::path::Path) -> Result<Recorded, String> {
+        let v: Value = serde_json::from_str(&read(path)?).map_err(|e| e.to_string())?;
+        for (n, r) in v.as_object().ok_or("receipts: not an object")? {
+            let n = n
+                .parse()
+                .map_err(|_| format!("receipts: `{n}` is not a block"))?;
+            self.receipts.insert(n, r.clone());
+        }
+        Ok(self)
+    }
+
+    /// Leave the log at `(block, log index)` out of every `eth_getLogs` answer.
+    pub fn dropping_log(mut self, block: u64, index: u64) -> Recorded {
+        self.drop_log = Some((block, index));
+        self
+    }
+
+    /// Serve `block`'s receipts with the recorded contract's logs taken out of them.
+    pub fn forging_receipts(mut self, block: u64) -> Recorded {
+        self.forge_receipts = Some(block);
+        self
+    }
+
+    fn block_receipts(&self, n: u64) -> Result<Value, Fault> {
+        let recorded = self
+            .receipts
+            .get(&n)
+            .and_then(Value::as_array)
+            .ok_or_else(|| err(format!("block {n}'s receipts are not recorded")))?;
+        let forged = self.forge_receipts == Some(n);
+        let out = recorded
+            .iter()
+            .map(|r| {
+                let logs: Vec<Value> = r["logs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|l| {
+                        !(forged
+                            && l[0]
+                                .as_str()
+                                .is_some_and(|a| a.eq_ignore_ascii_case(CONTRACT)))
+                    })
+                    .map(|l| json!({"address": l[0], "topics": l[1], "data": l[2]}))
+                    .collect();
+                let mut r = r.clone();
+                r["logs"] = Value::Array(logs);
+                r
+            })
+            .collect();
+        Ok(Value::Array(out))
     }
 
     /// The tip served now.
@@ -219,6 +284,7 @@ impl Recorded {
                 (from..=to).contains(&n)
                     && addresses.as_ref().is_none_or(|a| a.contains(&addr))
                     && topic0s.as_ref().is_none_or(|t| t.contains(&t0))
+                    && self.drop_log != Some((n, hex_u64(&l["logIndex"]).unwrap_or(u64::MAX)))
             })
             .cloned()
             .collect();
@@ -340,6 +406,7 @@ impl Fixture for Recorded {
             Some("eth_blockNumber") => Ok(json!(hex(self.now().tip))),
             Some("eth_getBlockByNumber") => self.header(self.resolve(first()?)?),
             Some("eth_getLogs") => self.get_logs(first()?),
+            Some("eth_getBlockReceipts") => self.block_receipts(self.resolve(first()?)?),
             other => Err(err(format!("unsupported method {other:?}"))),
         }
     }
@@ -426,5 +493,53 @@ mod tests {
         assert_eq!(r.header(2).ok().unwrap()["receiptsRoot"], "0x77");
         assert_eq!(r.header(2).ok().unwrap()["transactions"], json!([]));
         assert!(r.header(3).ok().unwrap().get("receiptsRoot").is_none());
+    }
+
+    #[test]
+    fn receipts_are_served_and_the_two_faults_leave_out_what_they_name() {
+        let path =
+            std::env::temp_dir().join(format!("fixture-rpc-receipts-{}", std::process::id()));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"2": [{{"type": "0x2", "status": "0x1", "cumulativeGasUsed": "0x5208",
+                "logs": [["{CONTRACT}", ["0xT0"], "0x"], ["0xcc", [], "0x01"]]}}]}}"#
+            ),
+        )
+        .unwrap();
+        let chain = CHAIN.replace("0xAB", CONTRACT);
+        let honest = Recorded::from_json(&chain)
+            .unwrap()
+            .with_receipts(&path)
+            .unwrap();
+        let faulty = Recorded::from_json(&chain)
+            .unwrap()
+            .with_receipts(&path)
+            .unwrap()
+            .dropping_log(2, 0)
+            .forging_receipts(2);
+        std::fs::remove_file(&path).unwrap();
+        let receipts =
+            |r: &Recorded| r.call(&json!({"method": "eth_getBlockReceipts", "params": ["0x2"]}));
+        let logs = |r: &Recorded| {
+            r.get_logs(&json!({"fromBlock": "0x1", "toBlock": "0x3"}))
+                .ok()
+                .unwrap()
+        };
+        let served = receipts(&honest).ok().unwrap();
+        assert_eq!(served[0]["logs"][0]["address"], CONTRACT);
+        assert_eq!(served[0]["logs"].as_array().unwrap().len(), 2);
+        assert_eq!(logs(&honest).as_array().unwrap().len(), 1);
+        let forged = receipts(&faulty).ok().unwrap();
+        assert_eq!(forged[0]["logs"].as_array().unwrap().len(), 1);
+        assert_eq!(forged[0]["logs"][0]["address"], "0xcc");
+        assert!(logs(&faulty).as_array().unwrap().is_empty());
+        assert!(
+            receipts(&honest)
+                .and_then(
+                    |_| honest.call(&json!({"method": "eth_getBlockReceipts", "params": ["0x3"]}))
+                )
+                .is_err()
+        );
     }
 }

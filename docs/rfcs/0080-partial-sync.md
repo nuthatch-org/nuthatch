@@ -2,7 +2,12 @@
 
 - Status: **Accepted (2026-10-30, Chief): "ok letsgoooo with the wave of rfcs".** Built in the order 0078, 0079, 0080, each slice on its own gate; an S0 that fails stops its RFC. Chief, the same day, on GraphOps's
   five suggestions: "lets do ALL that, 1-5 !!!!! but HA first". Third in build order, after RFC-0078
-  and RFC-0079.
+  and RFC-0079. **S0 measured 2026-11-01 (§11): the gate is not met, 11.4% of the follower's apply
+  on the fixture and 30.6% with every row in a shaped table, so by that rule it stops.** Copies were
+  exact through the reorg suite and 10,000 live streams. **Reopened by Chief the same day; the second
+  S0 (§12) narrows it: the gate is met for address-shaped shapes over the busy table (uniform 6.1% and
+  5.1% on two boxes), not under fan-out or with every row shaped (hot:100 12.9%, all-tables 12.8 to
+  14.6%).** What remains is per-frame work on the apply; S1 or a third S0 is Chief's call.
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0079 (Arrow results, the columnar wire), RFC-0077 (the embeddable engine and its
@@ -243,7 +248,317 @@ binary today, and the engine without `sync` is the engine today, which is RFC-00
 4. Whether a writer with no followers should be allowed to serve shapes itself, for a small operator.
    Proposed: no, a local follower costs a process and keeps goal 4 true by construction.
 
-## 11. S0 measured (2026-11-01): the gate is met
+## 11. S0 measured (2026-11-01)
+
+On a MacBook (Apple M5 Pro, 18 cores, 48 GiB), release build off `main` at `4b2804b8`, with other
+sessions' builds on the same machine (load average 5 to 41 across the runs). Nothing here has run
+on a CI runner.
+
+**Verdict: stop.** The gate is not met. The filter cost 11.4% of the follower's apply on the fixture
+the slice names, and 30.6% when every row lands in a shaped table. The status line's rule is that a
+failed S0 stops its RFC. Correctness and memory both held, and the overage comes from two costs the
+measurement can name, so a second S0 with those two changed is the case for reopening it. That is
+Chief's call.
+
+### What was built
+
+The spike's code is not on `main`: S0 stopped the RFC, and a stopped spike does not belong in the
+default binary's follower path. It is kept on the branch `pete/rfc-0080-s0` (#2570, closed unmerged)
+for a second S0, and the paths below are on that branch.
+
+`src/shape_s0.rs`, read only when `NUTHATCH_SHAPES_S0` names a shapes file on a follower
+(`nuthatch serve --follow`). Unset, nothing is loaded, no listener is bound, and `apply_delta`
+takes no lock; what it adds is four clock reads. The CLI is untouched, so every `--help` is
+unchanged.
+
+- **The filter** (§5.4, value terms only). Each shape is indexed under the values of its first term.
+  For each row in a delta's `Changes`, removed then added, the row is read once: a row that opens
+  with an unescaped table name no shape names is refused before a parser starts, and otherwise the
+  fields no shape names are skipped as they are scanned. Its columns are probed, and the shapes found
+  are checked against their remaining terms. Each matching row is encoded once and its frame pushed
+  to every matching shape's queue.
+- **The stream** (§5.2's shape, not its protocol). On `NUTHATCH_SHAPES_S0_LISTEN`,
+  `GET /shape/<nid>/<id>` answers NDJSON: one line with the shape's hot rows, the generation and the
+  watermark, then `{"g", "put"|"del": <stored row>}` frames. A reader 4,096 frames behind is closed
+  with `{"refetch": true}`. No offsets, no resume, no ranges.
+- **The hook.** The hub is locked across `MemStore::apply` and the filter, so an attach reads the copy
+  at exactly the generation its next frame follows. Each delta records its filter time, the
+  `MemStore::apply` time and the follower's whole apply as `feed_metrics` times it, with the filter
+  and any wait for the hub taken out.
+- **The client**, `tools/rfc-0080-s0/client.mjs`: Node, one stream a shape, a count per stored row (a
+  `del` is -1), so a delta's removals and puts apply in either order. `run.sh` drives a run and
+  `verify.mjs` checks every copy against the writer's own `/sql`, with the terms evaluated again in
+  JavaScript, independently of the index.
+
+### The fixture
+
+The point-read gate's chain: `fixture-rpc multinest`, one contract with the ten-event Uniswap V4
+`PoolManager` ABI at 200 logs a block, served locally. A writer backfills 200 blocks, then follows
+300 more one block a poll, so each delta at tip is one block of 200 rows across ten tables. The
+follower attaches after the backfill; costs count only deltas after every client has its initial
+answer. Ten thousand shapes, all attached and read live by one Node process.
+
+Shape sets (`shapes.mjs`, seeded):
+
+- **uniform**: over `pool_manager__swap`, one to four of the fixture's 4,096 senders each; one in
+  five adds a second term on `id`.
+- **skew**: as uniform, but half the shapes add one of eight hot senders. The fixture draws those
+  senders as rarely as any other, so it is a tail.
+- **hot:k**: as uniform, but k shapes are the whole pool's swaps, so every swap row matches k shapes.
+  This is the popular-token case of §8. Run over 150 blocks, not 300.
+- **all-tables**: spread over all ten tables, each naming `tx_hash`es of its table. Every row is in
+  a shaped table and is read in full.
+
+### Filter against apply
+
+| Run | Frames a delta | Filter p50 | Apply p50 | Filter / apply, all deltas | p50 | p99 | Copies wrong |
+|---|---|---|---|---|---|---|---|
+| Hook on, no shapes | 0 | 8 µs | 1,030 µs | 0.7% | 0.8% | 1.5% | n/a |
+| uniform | 102 | 179 µs | 1,595 µs | **11.4%** | 11.7% | 16.9% | 0 of 10,000 |
+| skew | 105 | 108 µs | 1,087 µs | 11.3% | 10.9% | 27.3% | 0 of 10,000 |
+| hot:100 | 2,099 | 156 µs | 1,032 µs | 13.2% | 14.7% | 22.0% | 0 of 10,000 |
+| hot:1000 | 20,091 | 859 µs | 6,987 µs | 14.3% | 17.0% | 29.1% | 0 of 10,000 |
+| all-tables | 83 | 487 µs | 1,574 µs | **30.6%** | 31.5% | 40.9% | 0 of 10,000 |
+
+Apply is the denominator the gate names: the follower's whole apply of the delta, its copy, its
+derived state and its publish. Against `MemStore::apply` alone (105 to 157 µs p50) the filter costs
+more than the apply in every loaded run: 1.1 times in uniform, 3.1 times in all-tables. Apply moved
+between runs with the machine's load (1,030 to 1,595 µs p50 for the same shape of delta), and in hot:1000 the
+delivery of two million frames on the same runtime slowed it to 7 ms, which flatters that ratio.
+
+**Where the filter's time goes.** `shape_s0::tests::s0_route_cost` (ignored; `S0_SHAPES` and
+`S0_ROWS`) times `route` alone over the same shapes and real stored rows, 20 swap rows and 180 others
+a delta, every shape attached and no task waiting:
+
+| Shapes | Frames a delta | `route` p50 |
+|---|---|---|
+| uniform | 108 | 36 µs |
+| skew | 92 | 40 µs |
+| all-tables | 230 | 231 µs |
+
+Two costs, then. **Waking the readers** is most of the loaded figure: uniform's 179 µs is 36 µs of
+filtering, and the rest is mostly a `notify_one` per stream touched, each unparking a task, on a
+loaded machine. It scales with the
+number of distinct readers a delta touches, not with frames: hot:100 pushed twenty times uniform's
+frames for less time. **Reading a row** costs about 1.1 µs for one of these rows of about 600 bytes
+in a shaped table, so a nest whose shapes cover its busy table pays about a fifth of apply before a
+single frame.
+That answers §5.4's [VERIFY]: the parse dominates as soon as the shaped table is the busy one.
+
+Two versions came before these figures, and both were worse. One parsed each row into a map of
+every field: 29% with 100 shapes. Another woke every stream on every delta through one shared
+`Notify`: 2.0 ms a delta at 10,000 shapes, with the apply slowed to 11 ms by the stampede.
+
+### Memory
+
+The follower's RSS, median while following, against the 2,048 MiB per-cursor budget:
+
+| | RSS |
+|---|---|
+| Hook on, no shapes | 74 MiB |
+| 10,000 shapes indexed, before any client | 67 to 70 MiB, against 51 MiB without shapes: about 17 MiB of index |
+| uniform, skew and all-tables, 10,000 live streams | 418 to 423 MiB |
+| hot:100 | 464 MiB |
+| hot:1000 | 498 MiB |
+
+About 35 KiB a live stream, most of it the connection rather than the shape. 10,000 streams fit in a
+fifth of the budget; about 50,000 would take the rest.
+
+### Copies
+
+Every copy in every loaded run equalled the writer's canonical rows: 0 of 10,000 wrong in each, up to
+5,042,992 rows held across the copies (hot:1000), each exactly once, with no refetch.
+
+The first uniform run found 162 copies each holding one row too many: hot rows at block 19,798 under a
+`sealed_through` of 19,899. `/sql` withholds a hot row at or under the watermark once its table has a
+segment, and the follower's copy still carries such rows. The initial answer now applies the same
+rule. Any server half must, and S1's protocol must say so.
+
+**The randomised reorg suite**, `shape_s0::tests::every_client_copy_is_its_canonical_rows_through_random_reorgs`:
+a proptest of 256 cases, each up to 40 steps of windows, reorgs of depth 1 to 5 clamped at the
+watermark, seals that prune hot, and clients detaching and reattaching. It drives a real redb `Store`
+through its feed into a `MemStore`, routes each delta's `Changes`, and compares all seven shapes'
+copies against the writer's hot and sealed rows after every step. It passes. Two mutations turn it
+red: routing puts and not retractions, and skipping the check of a shape's remaining terms. The fixture
+chain never reorgs, so the loaded runs test fan-out and delivery, and the suite tests retraction.
+
+### What S0 did not do
+
+Retraction by key: frames carry the stored row, and the client keys its copy by it. Offsets, resume
+and the 409. Ranges. Sealed answers: the initial answer is hot rows only, and a copy is checked above
+the watermark it attached at. Config, limits, the bearer token and `pin`. The client in the engine:
+Node stands in for it.
+
+Three costs of the spike's own plumbing are not in the gated figure but would bind S1. An attach scans
+the whole hot copy under the hub's lock: 3.4 ms each, so 10,000 attached in 33 to 54 s, with deltas
+held behind them. Ten thousand connects at once overflowed macOS's listen backlog of 128: up to 6,411
+connects were retried at a ramp of 64. And the frames, written to 10,000 sockets on the follower's
+runtime, slow its apply.
+
+### What reopening would take
+
+A second S0 against this gate on these shape sets, with two changes:
+
+1. **Probe the delta's columns, not its rows.** Feed v2 already sends a delta's puts as one Arrow Utf8
+   column per field (`src/feed_wire.rs`), and the follower rebuilds each row from them. Probing the
+   shapeable columns there costs a hash lookup per row, not a parse. Retractions still need the
+   removed rows read, and those are rare.
+2. **Wake readers off the apply path.** The apply appends to queues and signals one delivery task,
+   which wakes the streams. The wake-ups are then delivery's cost, budgeted and measured as delivery,
+   not hidden.
+
+Then, before S1's protocol: initial answers taken from a pinned version outside the lock, retraction
+by key, the watermark rule above, several shapes on one connection (§5.6's
+`max_shapes_per_connection`) so 35 KiB is not paid per shape, a connect rate limit beside the shape
+limits, and `[mounts.sync]` in place of the variable.
+
+## 12. Second S0 measured (2026-11-01)
+
+Chief reopened S0 the same day: "lets revisit the partial sync, cant be that bad?". The second S0
+made exactly the two changes §11 named, against the same gate, fixture and shape sets.
+
+**Verdict: narrow.** The gate is met for the shapes the slice names, address-shaped terms over the
+busy table: uniform at 6.1% of apply on the Mac and 5.1% on the ThinkPad, against 12.7% and 11.0%
+for the first S0's filter in the same sessions, and skew at 6.2% and 5.2%. It is not met when every
+row is in a shaped table (all-tables, 14.6% and 12.8%) or under fan-out (hot:100 12.9% on both,
+hot:1000 24.1% and 65.8%). Reading rows is no longer the cost: what remains is per-frame work still
+on the apply path, encoding each matched row's frame and pushing it to every matching queue, and
+this S0 was not allowed to move it. Copies were exact in every run, the reorg suite passes on the
+column path, memory is about a quarter of the budget, and a stalled client does not slow the
+follower. Whether S1 proceeds on the narrowed claim, or a third S0 moves the per-frame work first,
+is Chief's call.
+
+### What changed
+
+The code is on `pete/rfc-0080-s0b` (#2576, a draft, not for merging), built on the first spike.
+
+1. **The filter probes the delta's columns.** A feed v2 follower keeps a decoded delta's Arrow
+   batches on the `Delta`, with each row's place among the puts, when shapes are on.
+   `Index::matching_columns` passes over a table no shape names a batch at a time, and in a shaped
+   table probes each probe column's values, as the JSON text the column carries, in one hash lookup
+   a row, checking a shape's other terms against the same row's columns. Escaped values are
+   unescaped first. Retractions, rows a batch sent whole and batches sent as rows are read as JSON,
+   as before. The probe is used only when every put changed a row, so `Changes::added` lines up
+   with the puts; otherwise the delta is read as JSON. A differential test checks the probe finds
+   exactly the `(put, shape)` pairs the JSON read does.
+2. **Readers are woken by a delivery task.** Each shape's queue has its own lock and wake-up. The
+   apply pushes a frame and, the first time a delta touches a stream, owes it one wake-up; after the
+   delta it hands the owed ids to a delivery task and signals once. Delivery wakes the streams. The
+   apply never waits on delivery or on a reader, and a reader no longer takes the hub's lock.
+
+Both filters stay in the binary, selected by `NUTHATCH_SHAPES_S0_FILTER=json|columns` and
+`NUTHATCH_SHAPES_S0_DELIVERY=inline|task`, so the A/B runs one binary. Unset, nothing is loaded and
+no column is kept, as in §11. Full CI, with the RAM, point-read and tip-lag gates, is green on the
+branch.
+
+### The boxes
+
+Two, each running the old and the new filter interleaved, shape set by shape set, in one session
+(`tools/rfc-0080-s0/ab.sh`), the same release build on both:
+
+- **Mac**: Apple M5 Pro, 18 cores, 48 GiB. Load average 2 to 4 for most runs, 9.5 at the start of
+  the first and 14.8 at the start of one stall control, with other sessions' builds on the box.
+- **ThinkPad**: Intel i9-13980HX, 32 threads, 62 GiB, Debian 13. Not idle: its own services hold a
+  steady 3 to 4 cores. The runs went at `nice 10` and the load average stayed 2.5 to 8.6.
+
+### Filter against apply
+
+Filter as a share of the follower's apply, summed over every delta after the clients attached, with
+the per-delta p50 and p99. §11's figure is the first S0's own run.
+
+| Run | §11 | Old, Mac | New, Mac | Old, ThinkPad | New, ThinkPad |
+|---|---|---|---|---|---|
+| Hook on, no shapes | 0.7% | 0.7% (0.8, 1.1) | 0.3% (0.2, 0.7) | 0.7% (0.7, 1.0) | 0.2% (0.2, 0.4) |
+| uniform | 11.4% | 12.7% (12.8, 22.2) | **6.1%** (6.1, 9.8) | 11.0% (11.0, 17.2) | **5.1%** (5.1, 7.9) |
+| skew | 11.3% | 12.8% (12.1, 42.2) | **6.2%** (5.8, 14.8) | 11.4% (10.6, 35.8) | **5.2%** (4.9, 15.6) |
+| hot:100 | 13.2% | 30.4% (33.1, 61.1) | 12.9% (12.5, 17.4) | 20.2% (20.1, 59.6) | 12.9% (12.9, 17.0) |
+| hot:1000 | 14.3% | 60.4% (77.2, 179.8) | 24.1% (30.0, 42.7) | 93.1% (102.1, 135.4) | 65.8% (64.1, 91.2) |
+| all-tables | 30.6% | 38.1% (39.2, 57.7) | 14.6% (15.4, 22.0) | 28.6% (29.1, 47.2) | 12.8% (12.8, 19.5) |
+
+Frames a delta: 102 uniform, 104 to 106 skew, 2,100 hot:100, 20,091 hot:1000, 83 all-tables, the
+same for both filters. Apply p50 was 0.8 to 1.5 ms in the 10,000-shape runs, except hot:1000 with the
+new filter: 2.6 ms on the Mac and 2.0 ms on the ThinkPad, against 1.7 and 1.5 ms with the old. The
+lowest, 0.8 ms, was the new all-tables run on the Mac, which raises its ratio.
+Skew's p99 is over the gate on both boxes; its sum and p50 are not.
+
+The old filter's hot rows are worse than §11's. §11 said its 7 ms apply in hot:1000 flattered the
+ratio, and on these quieter runs it was flattered: the same filter at a 1.7 ms apply is 60%, not
+14%. So the first S0's hot figures understated the problem, and the second S0's improvement there is
+against the higher number.
+
+**Where the new filter's time goes.** `s0_route_cost` (ignored) now times both filters on the same
+decoded deltas, then the column probe alone and the encoding of its matched rows' frames alone, on
+the Mac:
+
+| Shapes | Frames a delta | Old route p50 | New route p50 | Probe alone | Encoding frames |
+|---|---|---|---|---|---|
+| uniform | 101 | 37 µs | 15 µs | 5 µs | 11 µs |
+| all-tables | 246 | 224 µs | 108 µs | 29 µs | 92 µs |
+
+The probe is about 0.15 µs a row in a shaped table, against §11's 1.1 µs to parse one, so reading
+the delta is solved. Encoding a frame, the stored row escaped into a JSON string, is about 0.4 to 0.5 µs a
+matched row, and pushing a frame to a queue about 40 ns: hot:1000's 20,091 pushes are most of its
+818 µs. Both are fan-out, and both still run on the apply.
+
+### Delivery, and a stalled client
+
+Delivery's lag, from the apply handing over a delta's streams to the last of them woken: p50 56 to
+218 µs and p99 138 to 552 µs on the Mac, p50 119 to 214 µs and p99 224 to 393 µs on the ThinkPad,
+highest in hot:1000. It runs beside the apply and is not counted in the gated figure.
+
+A stalled client was measured as a pair over 400 blocks: hot:100 with every client reading, then the
+same with 50 of the 100 whole-pool streams reading their initial answer and never reading again.
+
+| | Filter / apply | Apply p50 | Apply p99 | Follower at the end | Stalled streams closed |
+|---|---|---|---|---|---|
+| Mac, control | 11.6% | 1,390 µs | 4,339 µs | generation 452, the writer's tip | n/a |
+| Mac, 50 stalled | 12.4% | 662 µs | 3,988 µs | generation 452, the writer's tip | 17 |
+| ThinkPad, control | 12.9% | 1,446 µs | 1,721 µs | generation 452, the writer's tip | n/a |
+| ThinkPad, 50 stalled | 13.3% | 1,460 µs | 2,005 µs | generation 452, the writer's tip | 0 |
+
+The follower kept to the writer's tip with stalled clients, at the same apply cost; the other 9,950
+copies were exact. A stalled stream's frames first fill its socket buffers: on the Mac 17 of the 50
+passed the 4,096-frame bound and were closed for refetch, and on the ThinkPad, whose localhost
+buffers are larger, none reached it in 400 blocks. `a_stalled_reader_never_delays_routing` checks the
+bound itself: routing past it closes the reader and owes it one wake-up, and nothing waits.
+
+### Copies and the reorg suite
+
+Every copy in every run equalled the writer's canonical rows, under §11's watermark rule: 0 wrong of
+10,000 in each of the 20 A/B runs and the two stall controls, and 0 of 9,950 in each of the four
+runs with stalled clients. The randomised reorg suite now
+runs twice, as in §11 and again with deltas sent through feed v2's encoder and decoder, probed by
+columns and woken by delivery, with blocks of up to 13 rows so a table reaches a batch of columns
+(`every_client_copy_is_its_canonical_rows_through_random_reorgs_by_columns`, 256 cases). Both pass.
+Two mutations turn the column suite red: skipping the check of a shape's other terms, and routing no
+retractions; the first also fails the differential test.
+
+### Memory
+
+The follower's RSS median while following was 430 to 523 MiB on the Mac and 532 to 547 MiB on the
+ThinkPad with 10,000 live streams, against the 2,048 MiB per-cursor budget, as in §11. Keeping a
+delta's Arrow batches until it is applied is not charged to the dataset's budget in the spike; S1
+must charge it.
+
+### What S1 would need
+
+If Chief takes the narrowed claim, S1 adds to §11's list:
+
+1. **Fan-out off the apply.** The apply records each delta's matched `(row, shape)` pairs once, by
+   reference to the decoded delta, and delivery encodes each row's frame once and appends it to
+   the matching queues. The apply's cost is then per matched row, not per frame, which is the
+   change hot:k and all-tables need. A third S0 can measure it against this gate before S1, and is
+   the cheaper way to know.
+2. **The kept batches charged** to the dataset's budget beside the decoded rows.
+3. **A bound a stalled client reaches**: by bytes as well as frames, since socket buffers hold
+   thousands of frames before the queue sees any.
+
+## 13. S0 on this branch (2026-11-01): the gate is met
+
+§11 and §12 record the spike on `pete/rfc-0080-s0` and `pete/rfc-0080-s0b`, which is not on `main`.
+This section and those after it are the filter and hub built on this branch, in `src/shape.rs` and
+`src/shape_feed.rs`, measured by a different benchmark (the filter alone, against decode and apply
+over `MemStore`, fed v2 bodies), so its figures are not comparable with §11's and §12's.
 
 **Built, nothing served.** `src/shape.rs`: a shape (a table and value terms, hashed by its canonical
 JSON), an index from each `(column, value)` to the shapes naming it, and a `Table` that applies puts,
@@ -297,7 +612,7 @@ the tree. S1 filters `Changes.added` and `Changes.removed`, which leaves the wir
 
 S0's gate is met on both halves and S1 is next.
 
-## 12. S1 in progress (2026-11-01): the follower's half of the filter
+## 14. S1 in progress (2026-11-01): the follower's half of the filter
 
 **Built.**
 
@@ -391,7 +706,7 @@ it is not profiled: what is left is likely the per-subscriber frame (a list buil
 shared slice), the map that gathers them, and the channel send. The figure is still for five
 subscribers a row.
 
-## 13. Reading the endpoint's ground before building it (2026-11-01)
+## 15. Reading the endpoint's ground before building it (2026-11-01)
 
 Two things in the tree decide the endpoint's shape, and §5.2 and §5.6 as written get both wrong.
 
@@ -434,7 +749,7 @@ binary against a new writer, which the line test stands in for.
 
 Next: the route in the follower's layer, answering `admit` and `subscribe_shape`, then the initial answer.
 
-## 14. The route, first cut (2026-11-01): `GET /<route>/sync`
+## 16. The route, first cut (2026-11-01): `GET /<route>/sync`
 
 **Built.** `Follower::serve_sync`, answered in the follower's own layer for a route ahead of the nest's
 router. JSON lines, `application/x-ndjson`, `Cache-Control: no-store`:
@@ -483,9 +798,9 @@ and ends when a fresh snapshot replaces the copy.
 
 Item 1 decides whether this can be turned on for anyone; the live streams' own limits and the rest are S1's remaining protocol.
 
-## 15. The sealed half: what reading `/sql` showed (2026-11-01)
+## 17. The sealed half: what reading `/sql` showed (2026-11-01)
 
-§14 item 1 is the sealed rows. §5.3 says to answer them as "the shape as a query over the sealed
+§16 item 1 is the sealed rows. §5.3 says to answer them as "the shape as a query over the sealed
 segments", and S2's gate is "sealed answers byte-equal to the `/sql` of the same predicate". Reading how
 `/sql` is built shows that is not one decision but three, and the first answer cannot be finished
 without them.
@@ -493,7 +808,7 @@ without them.
 1. **Two representations of a row.** A hot row is stored JSON, and `/sql` ingests it as such under the
    table's registry schema (`charged_hot_rows`, then `query_hot_cold`). A sealed row is Parquet, typed.
    Both reach a client of `/sql` as the schema's columns, which can include columns no stored row has
-   (the RFC-0061 `value_dec` and `value_overflow` pair is derived in SQL). The live frames of §14 carry
+   (the RFC-0061 `value_dec` and `value_overflow` pair is derived in SQL). The live frames of §16 carry
    the *stored* row. A client that takes its first answer from the sealed query and its updates from the
    frames would hold rows of two shapes under one key. Either the frames are converted to the SQL
    projection, or the sealed rows are written back out as stored JSON, which is not byte-exact from
@@ -503,19 +818,19 @@ without them.
    reconstruct from its columns. The answer has to carry a key per row, so the query selects whatever
    the key is made of, and the rule from a row to its key becomes part of the protocol.
 3. **Where the two meet.** The first answer would be `/sql`'s own, sealed and hot together, read after
-   the subscription as §14's convergence argument allows (a row sealed in between is in the sealed side
+   the subscription as §16's convergence argument allows (a row sealed in between is in the sealed side
    and its hot copy was never retracted, since a prune is not a retraction). That means running the
    shape as a statement through `run_sql_query_at`, with its own memo and guards, rather than scanning
-   the copy, which is the better reuse and also what makes the §14 guards redundant for the first answer.
+   the copy, which is the better reuse and also what makes the §16 guards redundant for the first answer.
 
 Nothing here is built. The choice in (1) decides the rest, and is Chief's: **the shape's wire row is the
 `/sql` projection, with a key column**, or it is the stored row and sealed history is out of a shape's
 reach (a shape then covers the hot window only, which is Electric-like for a live tail and not for
 "huge nests"). I would take the first.
 
-## 16. Option A, built (2026-11-01): a shape's rows are `/sql`'s, keyed
+## 18. Option A, built (2026-11-01): a shape's rows are `/sql`'s, keyed
 
-Chief took A in §15: the wire row is the `/sql` projection, and each op carries a key.
+Chief took A in §17: the wire row is the `/sql` projection, and each op carries a key.
 
 **What changed.**
 
@@ -524,7 +839,7 @@ Chief took A in §15: the wire row is the `/sql` projection, and each op carries
   name and value quoted). `serve::sync_query` runs it through `run_sql_query_at`, so it has the gate,
   caps, timeout, memo and response-bytes budget of `/sql` and reads the sealed segments with the hot
   copy as `/sql` does, and `serve::within_pin` gives it the pinned copy a follower's catalogue is only
-  read from. §14's own scan, caps and timeout are gone, replaced by those. The header line says
+  read from. §16's own scan, caps and timeout are gone, replaced by those. The header line says
   `"scope":"full"` and carries the answer's `provenance`. A statement cut at the row cap is `413
   shape_too_large`. A route whose mount is `sql = "allowlist"` still answers shapes: `[mounts.sync]` is
   the control for that, not the SQL surface.
@@ -575,5 +890,5 @@ retraction; the route's layer; the end of the stream on a fresh snapshot. Unit t
    blocking thread, since the apply is already serial per dataset), and it runs only where a subscriber
    exists. If it cannot run (no route of the dataset has a state) or the keys do not hold, the hub is
    dropped and every stream ends, so nobody is sent rows in a form their first answer did not use.
-6. Still open from §14: no token check, the live stream's own limits, the one-shape stub of
+6. Still open from §16: no token check, the live stream's own limits, the one-shape stub of
    `max_shapes_per_connection`, JSON lines and not Arrow, and an offset that is the copy's generation.

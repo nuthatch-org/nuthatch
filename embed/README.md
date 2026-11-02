@@ -15,6 +15,7 @@ is the design; this file is the interface it promises.
 | `plain/` | `nuthatch-embed-plain`: the same nest as a plain core module, the one this interface describes |
 | `hosts/browser/` | the reference browser host: `host.js`, OPFS, a worker, the Service Worker |
 | `hosts/node/` | the browser host run in Node over files, as CI runs it |
+| `hosts/package/` | the host package, `nuthatch-engine.js`, built from both (RFC-0081 S2) |
 | `tests/wasmtime-host/` | the reference non-browser host on wasmtime, and the pinned-interface check |
 
 Build the module with `plain/build.sh <out.wasm>`. It needs the `wasm32-unknown-unknown` target,
@@ -127,10 +128,14 @@ host drops the instance.
   "mirror": {"base": "https://..."},
   "follow": true,
   "verified": true,
+  "complete": true,
+  "max_headers": 10000,
   "filters": [{"contract": "staking", "event": "TokensDelegated", "from": 408825706,
                "args": {"delegator": ["0x..."]}}],
   "window": 10000000,
-  "until": 519817135
+  "until": 519817135,
+  "source": "rpc",
+  "attach": [{"name": "pools", "tables": ["indexers"]}]
 }
 ```
 
@@ -144,7 +149,7 @@ unless set; a phone's is 600. `poll_interval_secs` is what `/ready` reports as t
 the ABIs it names, `schema.json`, `labels/*.json`, `entities.toml` and its SQL, `views/*.sql`. The
 module reads `nuthatch.toml` through the binary's own parsing and indexes it on the chain registry
 the binary ships: its contracts and their events, templates and factories, labels, and flags. What
-only a node runs is refused by name rather than ignored: `[[webhooks]]`, `[[alerts]]`, `[[calls]]`,
+only a node runs is refused by name rather than ignored: `[[webhooks]]`, `[[alerts]]`, `[[calls]]` (accepted with source `mirror+rpc`, below),
 `[[ipfs]]`, `[address_history]`, `[extract]`, a key nothing reads, and a config schema past 2.
 Without a mirror, a contract must declare its `start_block`. A host that leaves `nuthatch.toml` out
 and gives `contract` and `start` instead gets RFC-0075's young contract: one ERC-20's `Transfer` on
@@ -157,7 +162,11 @@ nest's data identity from `files` as a node does from its directory, which names
 and asks for every segment and seed tail, each appended to the pack and read back against its content
 address before the catalogue names it. Every file the host gives that a node would hash into the
 identity must be there, `schema.json` included. A hydration that does not finish leaves the store
-marked, and the next open hydrates again from nothing. `mirror.postcard` (`{"cuts": {table: block},
+marked, and the next open hydrates again from nothing. A store that finished is reopened from its pack
+with nothing fetched (RFC-0081 S2): the dataset its files name must be the one it was hydrated from,
+and every segment in the pack must still hash to its content address, or the open fails
+(`open_failed`, ending "open it fresh"). The chain past it comes from the RPC, as for any reopened
+nest. The report's `mirror` says `"reused": true` for such an open. `mirror.postcard` (`{"cuts": {table: block},
 "digest": "..."}`) pins the catalogue as an RFC-0068 postcard does: cut at each table's block, it must
 hash with the mirror's `schema.json` to `digest`, no seed tail is read, and the nest is what the
 publisher had sealed through the highest cut. A pinned nest does not follow.
@@ -173,15 +182,33 @@ mirror is pinned. False, `nh_step` answers `{"idle": true}` once the store is op
 
 **`verified`** (RFC-0077 S5) holds every seal to a finalized block the host verified, from a source
 the RPC cannot forge: Helios's beacon light client in a browser (`verifiedFinalized` in
-burrmill-wasm's `web/play/verified.js`), or whatever a non-browser host brings. Once a follow, the
-module asks for it with a `verified_finalized` request; then it fetches every header from the last
+burrmill-wasm's `web/play/verified.js`), or Helios's consensus core from Rust in the wasmtime host
+(RFC-0081 S5). Once a follow, the module asks for it with a `verified_finalized` request; then it
+fetches every header from the last
 seal up to that block from the RPC, hashes each one itself, links them by parent hash down from the
 verified hash, and seals only at or below it, and only rows whose block hash is on that chain. If
 the host has no verified block, the chain does not reach it, a header is forged or missing, or a
 row names a block hash off the verified chain, sealing stops there and the next `{"idle": true}`
 says why in `unverified`, by block; the cursor carries on, and its rows stay in the hot store. Rows
-above the verified block are still what the RPC said, and an RPC that leaves a log out is not caught
-(RFC-0065 §6). Without `verified`, the module seals on the chain's own policy, as a node does.
+above the verified block are still what the RPC said, and an RPC that leaves a log out is caught only
+with `complete` (RFC-0065 §6). Without `verified`, the module seals on the chain's own policy, as a node does.
+
+**`complete`** (RFC-0081 S4, with `verified` and `filters`) catches an RPC that leaves a log out. For
+each block under the verified head, the module tests the verified header's `logsBloom` for each
+filter's address and topics; where the bloom admits a filter and the RPC returned no log of it, it
+asks for the block's receipts (`eth_getBlockReceipts`, an `rpc` request like any other), hashes them
+into the receipt trie, and takes the filter's logs from them only if the root is the header's
+`receiptsRoot`. A bloom false positive costs that one fetch and changes nothing; a receipts list that
+does not hash to the root holds the seal below its block, and `unverified` names it. A block is sealed
+only once it is checked against the header on the verified chain, so what an earlier follow indexed
+above the head it then had, or before a reopen, is indexed again once the head passes it. A log's
+address, topics, data, index and block are what the root covers; its transaction hash is the RPC's,
+as it is for every log. The cost is the receipts: on mainnet a block's bloom has about three quarters
+of its bits set, so a filter on one contract's address admits about half the blocks it never logged
+in, each a receipts list of about a megabyte. **`max_headers`** (10,000 unless set) is the most
+headers one follow may hash and test: a fresh store whose `until` puts more past its start is refused
+at `nh_open` (`bad_config`) before any request, and a follow whose verified head is more past what is
+hashed fails (`follow_failed`) before any RPC request, each with the figure.
 
 **`filters`** (RFC-0077 S7) narrow the nest to the logs a host names, such as one user's own.
 Each names a contract by its alias, an event by its name (or its signature where the ABI overloads
@@ -190,11 +217,55 @@ for any of the event's indexed arguments the values it may take, addresses or 32
 cursor then asks for those logs only: one `eth_getLogs` per filter and value, since an endpoint that
 serves ten million blocks to a filter with one value per topic serves far fewer to one with a list
 (arb1.arbitrum.io: 10,000,000 against 100,000). An event no filter names is not fetched, and its
-table stays empty: a narrowed nest is a selection, not the contract's history, so `filters` and
-`mirror` are refused together, as is a factory. A filter naming an event, argument or value the nest
-cannot mean is refused by name (`bad_config`). Each log the endpoint returns is checked against the
+table stays empty: a narrowed nest is a selection, not the contract's history, so `filters` are
+refused with source `mirror`, as is a factory. Source `mirror+rpc` is how a narrowed nest reads a
+mirror (below). A filter naming an event, argument or value the nest cannot mean is refused by name
+(`bad_config`). Each log the endpoint returns is checked against the
 filter that asked for it, so an endpoint that ignores a topic costs bandwidth, not correctness; a
 range it will not answer whole is halved, and a throttle is asked again after a rest.
+
+A filter's `privacy` is `private` (the default) or `public`. A private filter's values came from the
+user, and only ever narrow a nest read from the RPC: source `mirror` or `mirror+rpc` with a private
+filter is refused by name before anything is asked of the mirror.
+
+**`source`** (RFC-0081 S1) is where the nest's history comes from: `rpc`, `mirror`, or
+`mirror+rpc`. Absent, it is `mirror` when `mirror` is given and `rpc` otherwise, as before. With
+`mirror+rpc`, `mirror` and `filters` are both required and every filter must be public. The module
+hydrates, from the dataset the files name, the tables the filters' events decode into, each segment
+whole and checked against its content address, then asks the RPC for the filters' logs from where the
+dataset ends to `until`. Which tables and segments are fetched follows from the filters' events alone,
+so no `get` carries a filter's value or is chosen by one: the mirror learns which dataset and which
+tables, never whose. Every statement over a hydrated table reads it through the filters as a
+predicate, so it holds the rows an `rpc` nest under the same filters would, whichever side brought
+them; a value a predicate cannot compare to a stored row (an indexed argument that is not an address
+or a 32-byte hash) is refused by name. The dataset's views and entities read every row and are not
+bound: a statement naming one of its views is refused by name. `[[calls]]` is accepted, never run,
+and its tables are not hydrated; the identity is still computed from the files as given. A postcard
+pins a nest that does not follow, so it is refused with `mirror+rpc`. `/balances` and the built-in
+views fold what the store holds, the hydrated history whole; read the named tables through `/sql`.
+
+**`attach`** (RFC-0081 §3.2) is a list of `{"name", "tables"}`: other instances' answers a statement
+may bind. A `POST /sql` supplies them beside `q` as
+`"attach": {"<name>": {"<table>": {"arrow": "<base64>", "answer": "<x-nuthatch-answer>"}}}`: the other
+instance's `/sql` answer with `format=arrow`, and its envelope, as text or as an object. The statement
+names each as `<name>.<table>`; it is bound with the types the answer carried, for that statement only,
+and the module keeps nothing between statements and follows nothing. A table the statement names and
+the request does not supply, a bare name of an attached table, an answer that was truncated, and an
+answer whose `provenance.as_of` is not this nest's are each refused by name. An attached table may
+not share a name with the nest's tables, views or entities, or with another attachment's.
+
+**What a narrowed nest read** (RFC-0081 S3). A nest opened with `filters` adds `narrowed` to each
+`/sql` answer's `provenance`: `filtered`, the tables the filters' events decode into; `read`, the
+nest's tables the statement names (null where the module's parser cannot read it); and `unfiltered`,
+those of them no filter covers, of which the nest holds no row. A `POST /sql` body may carry
+`"whole": true` on a `mirror+rpc` nest: the hydrated tables are then read without the filters'
+predicate, every row the published dataset holds through its end plus the filters' own rows after
+it. On any other nest it is refused by name.
+
+**`expect_nid`** (RFC-0081 S3) is the NID the files must compute, as a node computes it from the same
+directory (RFC-0032 §3, hidden files included). A nest whose files compute another is refused by name
+(`bad_config`, both NIDs and the files' data identity in the message) before the host is asked for
+anything. The report (`nh_report`) carries `identity`, `{"nid", "dataset"}`, for any nest.
 
 **`window`** is the blocks per `eth_getLogs`, in place of the chain's registered window. A narrowed
 nest wants it as wide as its endpoint allows.
@@ -238,7 +309,10 @@ nh_request(method, target, body)   any time after the store is open
 - `nh_request` never yields: everything a query reads is in storage. It routes `/ready`, `/sql`,
   `/explain`, `/entity/{id}`, `/entities`, `/balances`, `/balance/{address}` and `/derived/*` as the
   node does, from the same `nuthatch_core::answer` functions; any other path is a 404 with no body.
-  `content_type` is empty where the node sends none. A host that wants HTTP maps it one to one, as
+  `content_type` is empty where the node sends none. `/sql` with `format=arrow` (in the query or a
+  `POST` body) answers an Arrow IPC stream, as the node does (RFC-0079): its bytes come back as
+  `body_base64` in place of `body`, and its envelope in `headers["x-nuthatch-answer"]`, the node's
+  header. A host that wants HTTP maps it one to one, as
   `hosts/browser/sw.js` does; a host that wants a function calls it with a target.
 
 ### Requests and answers
@@ -332,15 +406,95 @@ fails a module that differs from the version it reports; a published version's t
 its hash. Within a version, the JSON may gain an optional `nh_open` key, an optional answer field or
 a request kind behind an option, and nothing a host of that version would read differently.
 
+## The host package
+
+`nuthatch-engine.js` (RFC-0081 S2) is the host a page or a Node program uses instead of writing its
+own: one ES module, released beside `nuthatch-events.wasm` with its own sha256 and versioned with it.
+`hosts/package/build.mjs` makes it from `hosts/package/engine.js` and the reference hosts below, whose
+code it carries unchanged. It refuses a module that does not speak `abi: 1`.
+
+```js
+import { Engine } from "./nuthatch-engine.js";
+const nest = await Engine.open({ module: "nuthatch-events.wasm", nest: files, rpc: url, storage: "opfs", until });
+await nest.follow();                       // steps until idle, answering every request
+const env = await nest.sql("SELECT ...");  // /sql's envelope; `{attach}` binds other nests' answers
+const answer = await nest.arrow("SELECT ..."); // an Arrow answer, as another nest's `attach` takes it
+nest.close();
+```
+
+| Option | |
+|---|---|
+| `module` | the `.wasm` (a URL, a path in Node, bytes, or a compiled `WebAssembly.Module`); a `.gz` name is inflated |
+| `nest` | the nest's files by path; in Node, also a directory |
+| `rpc` | a URL, or `{name: url}`: the module sees only the names |
+| `storage` | `"opfs"` (a page's default; memory where OPFS is missing), `"memory"` (Node's default), or in Node a directory, each nest kept under `<dir>/<nid>` |
+| `nid` | the store's name; by default one per module, files and what the store holds (filters, source, mirror), so a second open reuses the first and a store is never reopened under other files or filters |
+| `fresh` | open the store empty |
+| `headerBatch` | the longest JSON-RPC batch an endpoint takes, a number or `{name: n}`; `arb1.arbitrum.io` is 10 unless said |
+| `verified` | the page's light client, `() => ({number, hash})`; sets `verified` |
+| `log`, `onProgress` | `(level, line)`, and `({block, tip, requests})` at most twice a second while following |
+| `worker`, `workerUrl` | in a page, nests run in the package's own worker (one per page, ended when its last nest closes), started from the package's URL; `worker: false` runs them in the calling context |
+
+Every other key is `nh_open`'s, passed as given: `filters`, `source`, `mirror`, `attach`, `until`,
+`window`, `follow`, `memory_mib`, `poll_interval_secs`, `contract`, `start`.
+
+What it owns: the worker, the store, retries across a transport failure (a POST that got no reply is
+sent again, up to three times; a deadline that passed is the module's to judge), splitting a batch
+longer than its endpoint takes and pacing the parts through a throttle, and the `follow_failed`
+carry (up to five times, resting 2 s doubling). A kept store the module will not reopen, a pack that
+fails its check or files that name another dataset, is opened fresh once. What it does not own: RPC
+URLs, keys and a light client, which are the caller's. It reaches nothing the caller did not name.
+
+`follow()` answers `{nid, storage, block, tip, requests, ms, mirror}`; `request(method, target, body)`
+is `nh_request`, for any route. `docs/examples/engine-defi-pulse.mjs` opens defi-pulse-nest from the
+public mirror in 29 lines. Its gates, in CI's `wasm-plain` leg and the release's engine job:
+
+```sh
+node hosts/package/build.mjs /tmp/nuthatch-engine.js
+node hosts/package/run.mjs /tmp/nuthatch-engine.js /tmp/plain.wasm s5 http://127.0.0.1:8954/ ../tests/fixtures/tab-parity
+node hosts/package/run.mjs /tmp/nuthatch-engine.js /tmp/plain.wasm reuse $d/s4-nest $d/s4-mirror
+```
+
+The first is S5's 33 answers through the package, opened fresh and then from its kept store; the
+second a mirrored nest closed and reopened with no GET and the same answers, then reopened over a pack
+with one byte altered, which must be fetched again.
+
+### Checking a hosted answer
+
+`Engine.verifier(options).verify(answer, statement, filters)` (RFC-0081 §3.4) checks a hosted nest's
+`/sql` answer. `options` are `open`'s, with `nest` the nest's files and `mirror` the mirror to read.
+`answer` is the hosted answer, a node's envelope or one with its rows under `data`, carrying
+`provenance.nid` and `provenance.as_of`; `filters` say which logs the statement is about, each
+`public` or `private`. `answer` may instead be a list of `{name, answer, statement}`, all from one nest
+at one block, which one open answers.
+
+It opens the nest the answer names: the files must compute its NID (`expect_nid`), or the check is
+refused before anything is fetched. It follows to `as_of` and no further, `mirror+rpc` when every
+filter is public and a mirror is given, `rpc` otherwise, and runs each statement there. A statement
+is then one of:
+
+- **outside the filters**, when it names a table no filter covers, or, on a `mirror+rpc` nest, its
+  answer read `whole` differs from its answer through the filters: it depends on rows the filters do
+  not select. Nothing is compared. The second rule sees the network only through the mirror's end.
+- **not computable**, with the reason: this nest refused the statement, or answered at another block.
+- **equal** or **differs**, column by column, the rows compared as text in one order whatever order
+  either side gave them. A differing column lists each row's two values; a column only one side has
+  is named as not computable and never shown.
+
+The result names the NID, block, source, filters, the mirror's dataset and end, and the RPC's host,
+and says the head is the RPC's unless `verified` was given. Equality says the server and this RPC
+agree, nothing more. `hosts/package/verify-fixture.mjs` is its gate in CI; `verify-gate.mjs` runs
+RFC-0077 S7's seven wallets against a hosted nest.
+
 ## The reference hosts and the gate
 
 | Host | Where | Storage | Runs as |
 |---|---|---|---|
-| browser | `hosts/browser/`: `host.js` the interface, `opfs.js`, `nest-worker.js`, `page.js`, `sw.js` | OPFS | `run-sw.mjs` in headless Chrome |
+| browser | `hosts/browser/`: `host.js` the interface, `opfs.js`, `nest-worker.js`, `page.js`, `sw.js` | OPFS | `run-sw.mjs` in headless Chrome, or Firefox under geckodriver |
 | Node | `hosts/node/run.mjs`: the same `host.js`, over `fs-storage.mjs` | files | `node` |
 | wasmtime | `tests/wasmtime-host/` | files | `cargo build --release`, then `wasmtime-host` |
 
-The gate: the same `.wasm` file, unmodified, answers RFC-0075 S5's 32 requests in all three hosts
+The gate: the same `.wasm` file, unmodified, answers RFC-0075 S5's 33 requests in all three hosts
 equal to the node's pin, `tests/fixtures/tab-parity/s5-expected.json`. Each host prints the module's
 sha256 and one digest over its answers, masked as `tests/e2e_tab_answers.rs` masks them, beside the
 same digest over the pin; all of them must agree. CI's `wasm-plain` leg runs it on every PR that
@@ -396,4 +550,47 @@ $rpc recorded --port 8955 --file $d/chain.json.gz --headers $d/headers.json.gz &
 node hosts/node/verified.mjs /tmp/plain.wasm http://127.0.0.1:8955/ $d
 node hosts/node/shapes.mjs /tmp/plain.wasm $rpc ../tests/fixtures/embed-shapes
 node size.mjs /tmp/plain.wasm --max-brotli 5500000
+```
+
+RFC-0081 S4's gate. `hosts/node/complete.mjs` opens S4's nest narrowed to every Transfer with
+`verified` and `complete`, against three fixture-rpcs serving the recording with whole headers and the
+receipts `record-receipts.sh` took from mainnet: honest, one leaving block 26,239,830's log out of every
+`eth_getLogs` answer, and one also forging that block's receipts. The log must be found from the
+receipts with every row the same, the forged list must stop sealing by name, and a range past
+`max_headers` must be refused with the figure. CI runs it to block 26,239,840 on the nine blocks of
+receipts that range needs (`receipts.json.gz`). Without `--until` it follows to the tip and must seal the
+node's segment, which needs every bloom-admitted block's receipts, 968 blocks and 56 MB gzipped, recorded
+with `record-receipts.sh` and kept out of the repository:
+
+```sh
+r4="--file $d/chain.json.gz --headers $d/headers.json.gz --receipts $d/receipts.json.gz"
+$rpc recorded --port 8956 $r4 &
+$rpc recorded --port 8957 $r4 --drop-log 26239830:315 &
+$rpc recorded --port 8958 $r4 --drop-log 26239830:315 --forge-receipts 26239830 &
+node hosts/node/complete.mjs /tmp/plain.wasm $d http://127.0.0.1:8956/ http://127.0.0.1:8957/ \
+  http://127.0.0.1:8958/ 26239830 --until 26239840
+```
+
+RFC-0081 S5's gates. The browser legs run in Firefox as well as Chrome, by the same script under
+geckodriver (`--geckodriver <path>`, with Firefox's binary in place of Chrome's), and `run-sw.mjs`'s
+`shapes` mode follows `hosts/node/shapes.mjs`'s nest shapes in the browser, each in its own nest
+worker on OPFS against its own fixture-rpc. The wasmtime host answers `get`, so it opens a mirror and
+a `mirror+rpc` nest: `hosts/node/mirror.mjs --wasmtime <wasmtime-host>` drives `wasmtime-host open
+--answer` through the same requests and comparison as the Node host. It answers `verified_finalized`
+from Helios's consensus core (`helios-consensus-core`, MIT, a dependency of that crate alone): a
+bootstrap at a checkpoint, then each sync-committee update and the finality update, verified as
+Helios's own client does. `--beacon <url> --checkpoint <root>` asks a beacon endpoint;
+`--helios <run.json.gz>` verifies a recorded run, and `wasmtime-host helios` records one. CI's is
+`tests/fixtures/tab-parity/helios.json.gz`, which finalizes block 26,243,710; `helios-headers.json.gz`
+extends `headers.json.gz` to it:
+
+```sh
+d=../tests/fixtures/tab-parity host=tests/wasmtime-host/target/release/wasmtime-host
+node run-sw.mjs <firefox> /tmp/plain.wasm http://127.0.0.1:8954/ $d --restart --geckodriver <geckodriver>
+node run-sw.mjs <firefox> /tmp/plain.wasm shapes $rpc ../tests/fixtures/embed-shapes --geckodriver <geckodriver>
+node hosts/node/mirror.mjs /tmp/plain.wasm $d/s4-nest $d/s4-mirror --expect $d/s4-mirror-seed.json --wasmtime $host
+gunzip -c $d/headers.json.gz $d/helios-headers.json.gz | jq -c -s add | gzip -c > /tmp/helios-headers.json.gz
+$rpc recorded --port 8960 --file $d/chain.json.gz --headers /tmp/helios-headers.json.gz &
+$host run /tmp/plain.wasm http://127.0.0.1:8960/ $d s3 --helios $d/helios.json.gz
+$host run /tmp/plain.wasm http://127.0.0.1:8960/ $d s3 --helios $d/helios.json.gz --forge
 ```

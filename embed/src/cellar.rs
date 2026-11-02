@@ -340,6 +340,23 @@ impl Cellar {
         Ok(hex::encode(h.finalize()))
     }
 
+    /// Every segment the catalogue places in the pack, read back against its content address: how
+    /// many, and their bytes.
+    pub fn check_packed(&self) -> Result<(usize, u64)> {
+        let (mut count, mut bytes) = (0, 0);
+        for s in self.manifest().tables.values().flatten() {
+            let Some((at, len)) = self.packed(&s.file)? else {
+                continue;
+            };
+            if self.pack_hash(at, len)? != s.hash {
+                bail!("{} in the pack does not hash to its content address", s.file);
+            }
+            count += 1;
+            bytes += len;
+        }
+        Ok((count, bytes))
+    }
+
     /// Make the pack durable, then install `manifest` naming the segments `placed` put in it, in one
     /// transaction.
     pub fn install_packed(&self, manifest: &Manifest, placed: &[(String, u64, u64)]) -> Result<()> {
