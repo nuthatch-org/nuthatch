@@ -2199,7 +2199,7 @@ impl Follower {
         let (rows, truncated, provenance) = match answered {
             Ok(Ok(answer)) => answer,
             Ok(Err(refused)) => return *refused,
-            Err(gone) => return gone,
+            Err(gone) => return *gone,
         };
         if truncated {
             return refuse(

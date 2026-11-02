@@ -668,7 +668,7 @@ fn segment_gone() -> axum::response::Response {
 pub(crate) async fn within_pin<T, Fut>(
     backing: SharedNest,
     work: impl FnOnce(Arc<AppState>) -> Fut,
-) -> std::result::Result<T, axum::response::Response>
+) -> std::result::Result<T, Box<axum::response::Response>>
 where
     Fut: std::future::Future<Output = T>,
 {
@@ -677,7 +677,7 @@ where
     let served = crate::seal::serving(dir, store, work(state.clone()));
     let (out, missing) = PINNED.scope((backing, state), served).await;
     if missing {
-        return Err(segment_gone());
+        return Err(Box::new(segment_gone()));
     }
     Ok(out)
 }
