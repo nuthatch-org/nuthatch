@@ -2097,6 +2097,136 @@ impl Follower {
         Some((at, shapes.subscribe(shape, queue)))
     }
 
+    /// `GET /<route>/sync?s=<shape>[&live=1]` (RFC-0080 §5.2), answered from this follower's copy.
+    ///
+    /// A stream of JSON lines: a header `{"offset":[e,g],"scope":"hot"}`, the rows of the copy the
+    /// shape selects as `{"ops":[{"put":..}]}` chunks, `{"up_to_date":true}`, and with `live=1`
+    /// a line for each delta that changes the selection until the stream ends. It ends when the queue
+    /// fills or the copy is replaced, and the client takes its answer again.
+    ///
+    /// Not yet built: the sealed rows, so `scope` is `hot` and the answer is the copy's hot window only;
+    /// resuming from an offset, so any `offset` is `409 must_refetch`; and Arrow.
+    async fn serve_sync(self: &Arc<Self>, route: &str, uri: &axum::http::Uri) -> Response {
+        use futures::StreamExt;
+        let refuse = |status: StatusCode, error: &str, why: String| {
+            (
+                status,
+                Json(serde_json::json!({ "error": error, "why": why })),
+            )
+                .into_response()
+        };
+        let found = {
+            let inner = self.lock();
+            inner
+                .routes
+                .get(route)
+                .map(|r| (r.spec.dataset.clone(), r.spec.sync.clone()))
+        };
+        let Some((dataset, Some(sync))) = found else {
+            return refuse(
+                StatusCode::NOT_FOUND,
+                "sync_off",
+                "this mount does not serve shapes".into(),
+            );
+        };
+        let query: HashMap<String, String> = match axum::extract::Query::try_from_uri(uri) {
+            Ok(axum::extract::Query(q)) => q,
+            Err(e) => return refuse(StatusCode::BAD_REQUEST, "bad_query", e.to_string()),
+        };
+        if query.contains_key("offset") {
+            return refuse(
+                StatusCode::CONFLICT,
+                "must_refetch",
+                "this follower keeps no history to resume from; take the shape's answer again"
+                    .into(),
+            );
+        }
+        let shape: crate::shape::Shape = match query.get("s").map(|s| serde_json::from_str(s)) {
+            Some(Ok(shape)) => shape,
+            Some(Err(e)) => return refuse(StatusCode::BAD_REQUEST, "bad_shape", e.to_string()),
+            None => {
+                return refuse(
+                    StatusCode::BAD_REQUEST,
+                    "bad_shape",
+                    "the shape is the `s` parameter".into(),
+                )
+            }
+        };
+        // A request is one connection holding one shape, so none is held yet.
+        if let Err(refusal) = sync.admit(0, &shape) {
+            return refuse(StatusCode::FORBIDDEN, "refused", refusal.to_string());
+        }
+        let Some(data) = self.lock().datasets.get(&dataset).cloned() else {
+            return refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "catching_up",
+                "this follower has not taken the dataset's snapshot yet".into(),
+            );
+        };
+        let live = query.get("live").is_some_and(|v| v == "1");
+        // Subscribed before the rows are read, so a delta between the two is in both: a put read
+        // twice or a retraction of a row never held, which a copy takes in its stride.
+        let (at, frames) = if live {
+            match self.subscribe_shape(&dataset, shape.clone(), SYNC_QUEUE) {
+                Some((at, frames)) => (at, Some(frames)),
+                None => {
+                    return refuse(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "catching_up",
+                        String::new(),
+                    )
+                }
+            }
+        } else {
+            (data.store.applied(), None)
+        };
+        let store = data.store.clone();
+        let picked = shape.clone();
+        let rows = tokio::task::spawn_blocking(move || {
+            store.rows_where(|row| {
+                serde_json::from_str::<serde_json::Value>(row).is_ok_and(|row| picked.matches(&row))
+            })
+        })
+        .await
+        .unwrap_or_default();
+        let mut lines: Vec<bytes::Bytes> = vec![bytes::Bytes::from(format!(
+            "{}\n",
+            serde_json::json!({ "offset": [at.0, at.1], "scope": "hot" })
+        ))];
+        for chunk in rows.chunks(SYNC_CHUNK) {
+            let ops: Vec<crate::shape_feed::ShapeOp> = chunk
+                .iter()
+                .map(|(key, row)| crate::shape_feed::ShapeOp::Put {
+                    key: key.as_str().into(),
+                    row: row.as_str().into(),
+                })
+                .collect();
+            lines.push(crate::shape_feed::ops_line(None, &ops).into());
+        }
+        lines.push(bytes::Bytes::from_static(b"{\"up_to_date\":true}\n"));
+        let head = futures::stream::iter(lines.into_iter().map(Ok::<_, std::convert::Infallible>));
+        let body = match frames {
+            Some(frames) => head
+                .chain(futures::stream::unfold(frames, |mut frames| async move {
+                    let frame = frames.recv().await?;
+                    let line = crate::shape_feed::ops_line(
+                        Some((frame.epoch, frame.generation)),
+                        &frame.ops,
+                    );
+                    Some((Ok(bytes::Bytes::from(line)), frames))
+                }))
+                .boxed(),
+            None => head.boxed(),
+        };
+        Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
+            .header(axum::http::header::CACHE_CONTROL, "no-store")
+            .body(axum::body::Body::from_stream(body))
+            .unwrap_or_else(|e| {
+                refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+            })
+    }
+
     fn data(&self, route: &str) -> Option<Data> {
         let inner = self.lock();
         let dataset = &inner.routes.get(route)?.spec.dataset;
@@ -2355,6 +2485,9 @@ fn guarded(
                 if path == "/ready" {
                     return follower.route_ready(&route);
                 }
+                if path == "/sync" {
+                    return follower.serve_sync(&route, req.uri()).await;
+                }
                 // Derived state being rebuilt, or that could not be built, is never served in part.
                 let refusal = match follower.data(&route) {
                     Some(Data {
@@ -2401,6 +2534,11 @@ fn guarded(
         },
     ))
 }
+
+/// Frames a `/sync` subscriber may have waiting before it is closed, and rows in each of the first
+/// answer's lines.
+const SYNC_QUEUE: usize = 256;
+const SYNC_CHUNK: usize = 500;
 
 /// Most reports in flight at once, so a report waiting on the writer never holds the next back.
 const REPORTS_IN_FLIGHT: usize = 8;
@@ -3003,5 +3141,214 @@ mod tests {
 
         follower.apply_snapshot("ds", fresh(2)).await.unwrap();
         assert!(matches!(frames.try_recv(), Err(TryRecvError::Disconnected)));
+    }
+
+    /// RFC-0080 §5.2: `/sync` answers a shape from the copy, refuses what the mount's `[mounts.sync]`
+    /// does not allow, and with `live=1` streams what each later delta does to the selection until
+    /// the copy is replaced.
+    #[tokio::test]
+    async fn sync_answers_a_shape_from_the_copy_and_streams_what_changes_it() {
+        use crate::feed::{Delta, Op, Snapshot};
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = |epoch| Snapshot {
+            epoch,
+            ..Default::default()
+        };
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        let spec = |sync: Option<&str>| Spec {
+            dataset: "ds".into(),
+            nid: None,
+            surface: Default::default(),
+            tenant: None,
+            share: None,
+            limits: None,
+            chain: Some("mainnet".into()),
+            isolation: None,
+            data_identity: None,
+            sync: sync.map(|t| toml::from_str(t).unwrap()),
+        };
+        {
+            let mut inner = follower.lock();
+            for (route, sync) in [
+                ("ds", Some("[tables]\nswaps = [\"pool\"]\n")),
+                ("closed", None),
+            ] {
+                inner.routes.insert(
+                    route.into(),
+                    Route {
+                        spec: spec(sync),
+                        served: None,
+                    },
+                );
+            }
+            inner.datasets.insert(
+                "ds".into(),
+                Data {
+                    store: Arc::new(MemStore::from_snapshot(&dir, fresh(1))),
+                    snapshots: Default::default(),
+                    shapes: Default::default(),
+                    derived: Err(Refused {
+                        why: "not built here".into(),
+                        entities: Arc::default(),
+                        gone: false,
+                    }),
+                    building: None,
+                },
+            );
+        }
+        let encode = |s: &str| -> String {
+            s.bytes()
+                .map(|b| match b {
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => (b as char).to_string(),
+                    _ => format!("%{b:02X}"),
+                })
+                .collect()
+        };
+        let uri = |query: &str| -> axum::http::Uri { format!("/sync?{query}").parse().unwrap() };
+        let pool = |p: &str| {
+            let shape = format!(r#"{{"table":"swaps","where":{{"pool":["{p}"]}}}}"#);
+            format!("s={}", encode(&shape))
+        };
+        let status = |r: &Response| r.status();
+
+        assert_eq!(
+            status(&follower.serve_sync("closed", &uri(&pool("0xa"))).await),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(&follower.serve_sync("ds", &uri("s=not-json")).await),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(&follower.serve_sync("ds", &uri("")).await),
+            StatusCode::BAD_REQUEST
+        );
+        let offset = format!("{}&offset=1,5", pool("0xa"));
+        assert_eq!(
+            status(&follower.serve_sync("ds", &uri(&offset)).await),
+            StatusCode::CONFLICT
+        );
+        let other = encode(r#"{"table":"swaps","where":{"sender":["0xa"]}}"#);
+        assert_eq!(
+            status(&follower.serve_sync("ds", &uri(&format!("s={other}"))).await),
+            StatusCode::FORBIDDEN,
+            "a column the mount does not list"
+        );
+
+        let apply = |generation: u64, ops: Vec<Op>| {
+            let follower = follower.clone();
+            async move {
+                let delta = Delta {
+                    epoch: 1,
+                    generation,
+                    ops,
+                    ..Default::default()
+                };
+                follower.apply_delta("ds", delta).await.unwrap();
+            }
+        };
+        let put = |key: &str, pool: &str| Op::Put {
+            key: key.into(),
+            row: format!(r#"{{"table":"swaps","pool":"{pool}"}}"#),
+        };
+        apply(
+            1,
+            vec![put("k1", "0xa"), put("k2", "0xb"), put("k3", "0xa")],
+        )
+        .await;
+
+        // Without `live`: the header, the selected rows, and the end of the answer.
+        let resp = follower.serve_sync("ds", &uri(&pool("0xa"))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let lines: Vec<serde_json::Value> = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            serde_json::json!({ "offset": [1, 1], "scope": "hot" })
+        );
+        let keys: Vec<&str> = lines[1]["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|op| op["put"]["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, ["k1", "k3"]);
+        assert_eq!(lines[1]["ops"][0]["put"]["row"]["pool"], "0xa");
+        assert_eq!(lines[2], serde_json::json!({ "up_to_date": true }));
+
+        // With `live`: the same, then a line for each delta that changes the selection.
+        let resp = follower
+            .serve_sync("ds", &uri(&format!("{}&live=1", pool("0xa"))))
+            .await;
+        let mut stream = resp.into_body().into_data_stream();
+        let mut pending = String::new();
+        let mut next_line =
+            async |stream: &mut axum::body::BodyDataStream| -> Option<serde_json::Value> {
+                loop {
+                    if let Some(at) = pending.find('\n') {
+                        let line: String = pending.drain(..=at).collect();
+                        return Some(serde_json::from_str(&line).unwrap());
+                    }
+                    let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                        .await
+                        .expect("a line within five seconds")?;
+                    pending.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+                }
+            };
+        for _ in 0..3 {
+            next_line(&mut stream).await.unwrap();
+        }
+        apply(2, vec![put("k4", "0xa"), put("k5", "0xb")]).await;
+        let line = next_line(&mut stream).await.unwrap();
+        assert_eq!(line["offset"], serde_json::json!([1, 2]));
+        assert_eq!(line["ops"].as_array().unwrap().len(), 1);
+        assert_eq!(line["ops"][0]["put"]["key"], "k4");
+        apply(3, vec![put("k1", "0xb")]).await;
+        let line = next_line(&mut stream).await.unwrap();
+        assert_eq!(line["offset"], serde_json::json!([1, 3]));
+        assert_eq!(
+            line["ops"][0],
+            serde_json::json!({ "retract": { "key": "k1" } })
+        );
+
+        // The route's own layer answers it, ahead of the nest's router.
+        let routed = {
+            use tower::ServiceExt;
+            let layered = guarded(
+                follower.clone(),
+                "ds".into(),
+                Arc::default(),
+                axum::Router::new(),
+            );
+            let req = Request::get(uri(&pool("0xa")))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            layered.oneshot(req).await.unwrap()
+        };
+        assert_eq!(routed.status(), StatusCode::OK);
+        assert_eq!(
+            routed.headers()[axum::http::header::CONTENT_TYPE],
+            "application/x-ndjson"
+        );
+
+        follower.apply_snapshot("ds", fresh(2)).await.unwrap();
+        assert!(
+            next_line(&mut stream).await.is_none(),
+            "the stream ends when the copy is replaced"
+        );
     }
 }

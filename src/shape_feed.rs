@@ -29,6 +29,54 @@ pub struct Frame {
     pub ops: Arc<[ShapeOp]>,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireOp<'a> {
+    Put {
+        key: &'a str,
+        row: &'a serde_json::value::RawValue,
+    },
+    Retract {
+        key: &'a str,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct WireLine<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<(u64, u64)>,
+    ops: Vec<WireOp<'a>>,
+}
+
+/// One line of a `/sync` stream: the ops, as `{"offset":[e,g],"ops":[{"put":{"key","row"}},
+/// {"retract":{"key"}}]}`, newline-ended. A row goes out as the JSON it was stored as.
+pub fn ops_line(offset: Option<(u64, u64)>, ops: &[ShapeOp]) -> Vec<u8> {
+    use serde_json::value::{to_raw_value, RawValue};
+    // Held beside the line so the borrowed ops outlive it; a stored row that is not JSON goes as text.
+    let rows: Vec<Option<Box<RawValue>>> = ops
+        .iter()
+        .map(|op| match op {
+            ShapeOp::Put { row, .. } => Some(
+                serde_json::from_str::<Box<RawValue>>(row)
+                    .or_else(|_| to_raw_value(&**row))
+                    .expect("a string is JSON"),
+            ),
+            ShapeOp::Retract { .. } => None,
+        })
+        .collect();
+    let wire = ops.iter().zip(&rows).map(|(op, row)| match (op, row) {
+        (ShapeOp::Put { key, .. }, Some(row)) => WireOp::Put { key, row },
+        (ShapeOp::Retract { key }, _) | (ShapeOp::Put { key, .. }, None) => WireOp::Retract { key },
+    });
+    let mut line = serde_json::to_vec(&WireLine {
+        offset,
+        ops: wire.collect(),
+    })
+    .expect("ops serialise");
+    line.push(b'\n');
+    line
+}
+
 /// A subscriber's end. When it ends, because its queue filled or the hub went, the copy is stale
 /// and must be fetched again.
 pub type Frames = mpsc::Receiver<Frame>;
@@ -298,6 +346,25 @@ mod tests {
                 Err(mpsc::error::TryRecvError::Disconnected) => return (out, true),
             }
         }
+    }
+
+    #[test]
+    fn a_line_carries_the_offset_and_rows_as_the_json_they_were_stored_as() {
+        let ops = [
+            ShapeOp::Put {
+                key: "k1".into(),
+                row: r#"{"pool":"0xa","n":1}"#.into(),
+            },
+            ShapeOp::Retract { key: "k2".into() },
+        ];
+        let line = String::from_utf8(ops_line(Some((1, 7)), &ops)).unwrap();
+        assert_eq!(
+            line,
+            "{\"offset\":[1,7],\"ops\":[{\"put\":{\"key\":\"k1\",\"row\":{\"pool\":\"0xa\",\"n\":1}}},\
+             {\"retract\":{\"key\":\"k2\"}}]}\n"
+        );
+        let bare = String::from_utf8(ops_line(None, &ops[1..])).unwrap();
+        assert_eq!(bare, "{\"ops\":[{\"retract\":{\"key\":\"k2\"}}]}\n");
     }
 
     #[test]

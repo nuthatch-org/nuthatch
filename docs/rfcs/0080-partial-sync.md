@@ -433,3 +433,48 @@ reads no `sync` and so would refuse every shape, which is the safe side. Three t
 binary against a new writer, which the line test stands in for.
 
 Next: the route in the follower's layer, answering `admit` and `subscribe_shape`, then the initial answer.
+
+## 14. The route, first cut (2026-11-01): `GET /<route>/sync`
+
+**Built.** `Follower::serve_sync`, answered in the follower's own layer for a route ahead of the nest's
+router. JSON lines, `application/x-ndjson`, `Cache-Control: no-store`:
+
+```
+{"offset":[epoch,generation],"scope":"hot"}
+{"ops":[{"put":{"key":"..","row":{..}}}, ..]}        # the copy's rows the shape selects, 500 a line
+{"up_to_date":true}
+{"offset":[e,g],"ops":[{"put":..},{"retract":{"key":".."}}]}   # with live=1, one per delta, until the stream ends
+```
+
+The request is `?s=<shape JSON>`, with `live=1` for the stream. It refuses with a JSON `{"error","why"}`:
+404 `sync_off` where the mount has no `[mounts.sync]`; 400 for a shape that does not parse or a missing
+`s`; 403 `refused` with `MountSync::admit`'s reason; 503 `catching_up` before the copy's snapshot; and
+409 `must_refetch` for any `offset`, which is always true, since a follower keeps no history to resume
+from. A live stream ends when its queue (256 frames) fills or the copy is replaced by a fresh snapshot,
+and the client asks again. The shape is subscribed before the rows are read, so a delta between the two
+is in both: a put read twice, or a retraction of a row never held, either of which a copy takes in its
+stride, and replaying a key's operations from any state at or after the offset reaches the same end.
+
+`sync_answers_a_shape_from_the_copy_and_streams_what_changes_it` drives it through the route's own
+layer: the refusals, an answer without `live` (header, only the selected rows, end), a live stream that
+gets a put for a new row, a retraction for a row that left the shape and nothing for a row outside it,
+and ends when a fresh snapshot replaces the copy.
+
+**What this is not, and what is wrong with it as it stands.**
+
+1. **Hot rows only.** `scope` says `hot`. A nest with sealed history gets an answer missing every sealed
+   row that matches, which is §5.3's whole sealed half. A client must not treat this as the shape's
+   rows until that is built.
+2. **No limits on the answer.** The hot window is scanned and every row parsed for each request, with no
+   cap on rows or bytes and none of `/sql`'s admission, response-byte accounting or cost meter. The
+   scan runs off the async threads, but nothing bounds how many run at once. Before this is exposed it
+   needs `/sql`'s guards, which §6 and §5.6's "RFC-0073's strict isolation applies" assumed.
+3. **No token check.** §5.6 says FR12's bearer token applies. This route does not check one, and I have
+   not checked what a follower's other read routes do about it.
+4. **`max_shapes_per_connection` is a stub.** A request holds one shape, so `admit` is called with none
+   held. The limit means something once a connection can hold several, which needs a protocol §5.2 does
+   not have (one request per shape).
+5. **JSON lines, not Arrow** (§5.2 asks for Arrow IPC for the first answer), and no resize (§5.5).
+6. **Offset is the copy's generation**, not a block, as before.
+
+Items 1 and 2 decide whether this can be turned on for anyone; the rest are S1's remaining protocol.

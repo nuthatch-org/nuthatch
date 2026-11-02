@@ -1224,6 +1224,16 @@ impl MemStore {
         peak.max(0) as u64
     }
 
+    /// The stored rows `keep` selects, with their keys, in key order, as this copy has them now.
+    pub fn rows_where(&self, mut keep: impl FnMut(&str) -> bool) -> Vec<(String, String)> {
+        let m = self.read();
+        m.entities
+            .iter()
+            .filter(|(_, row)| keep(row))
+            .map(|(key, row)| (key.clone(), row.clone()))
+            .collect()
+    }
+
     /// From now on [`MemStore::apply`] records each row it changes in [`Changes::log`].
     pub fn track_changes(&self) {
         self.copy.tracking.store(true, Ordering::SeqCst);
