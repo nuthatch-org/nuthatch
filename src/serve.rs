@@ -646,16 +646,40 @@ async fn pin_request(
     let (resp, missing) = PINNED.scope((backing, state), served).await;
     if missing {
         // Whatever the route made of it, an answer missing a segment's rows is not one.
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": "a sealed segment this copy names is gone from disk; taking a fresh snapshot",
-                "reason": "catching_up",
-            })),
-        )
-            .into_response();
+        return segment_gone();
     }
     resp
+}
+
+fn segment_gone() -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "a sealed segment this copy names is gone from disk; taking a fresh snapshot",
+            "reason": "catching_up",
+        })),
+    )
+        .into_response()
+}
+
+/// Runs `work` as `pin_request` runs a request: against one version of the nest's state and of the
+/// copy it reads, which a follower's catalogue is only read from (RFC-0080's `/sync` is answered
+/// outside the nest's router, so it takes the pin itself). An answer missing a segment is a `503`.
+pub(crate) async fn within_pin<T, Fut>(
+    backing: SharedNest,
+    work: impl FnOnce(Arc<AppState>) -> Fut,
+) -> std::result::Result<T, axum::response::Response>
+where
+    Fut: std::future::Future<Output = T>,
+{
+    let state = pin_snapshot(backing.current());
+    let (dir, store) = (state.dir.clone(), state.store.clone());
+    let served = crate::seal::serving(dir, store, work(state.clone()));
+    let (out, missing) = PINNED.scope((backing, state), served).await;
+    if missing {
+        return Err(segment_gone());
+    }
+    Ok(out)
 }
 
 pub async fn run(
@@ -3721,12 +3745,42 @@ async fn admit(s: &AppState) -> std::result::Result<GatePermit, axum::response::
         .map_err(|why| refused(s, why, "concurrent SQL queries"))
 }
 
-/// The guards `/sql` answers under, for a follower's `/sync` (RFC-0080): a permit on the SQL gate,
-/// held for as long as the answer is worked out.
-pub(crate) async fn admit_scan(
-    s: &AppState,
-) -> std::result::Result<GatePermit, Box<axum::response::Response>> {
-    admit(s).await.map_err(Box::new)
+/// `sql` answered as `/sql` answers it, for a follower's `/sync` (RFC-0080): its gate, caps, timeout,
+/// memo and response-bytes budget, and its rows, with whether they were cut at the cap and the
+/// answer's provenance. A refusal comes back as the response `/sql` would have sent.
+pub(crate) async fn sync_query(
+    s: AppState,
+    sql: String,
+) -> std::result::Result<(Vec<Value>, bool, Value), Box<axum::response::Response>> {
+    let response = run_sql_query_at(s, sql, None, None, None, false).await;
+    if response.status() != StatusCode::OK {
+        return Err(Box::new(response));
+    }
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|e| Box::new(error(format!("reading an answer: {e}"))))?;
+    let mut answer: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| Box::new(error(format!("an answer that is not JSON: {e}"))))?;
+    let rows = match answer["rows"].take() {
+        Value::Array(rows) => rows,
+        _ => Vec::new(),
+    };
+    let truncated = answer["truncated"].as_bool().unwrap_or(false);
+    Ok((rows, truncated, answer["provenance"].take()))
+}
+
+/// Stored `rows` of `table` as `/sql` shows them: the same engine, over those rows alone, so a row
+/// that reaches a subscriber live has the columns of one that came from the first answer.
+pub(crate) fn project_rows(s: &AppState, table: &str, rows: Vec<Value>) -> Result<Vec<Value>> {
+    let dir = tempfile::tempdir()?;
+    let mut hot = analytics::HotRows::new();
+    hot.insert(table.to_string(), rows);
+    let sql = format!(
+        "SELECT * FROM \"{}\" ORDER BY \"block_number\", \"log_index\"",
+        table.replace('"', "\"\"")
+    );
+    let guard = s.query_guard(s.limits.timeout, s.limits.max_rows);
+    Ok(analytics::query_hot_cold(dir.path(), &sql, guard, &hot, 0, &s.tables)?.rows)
 }
 
 /// Room in the response-bytes budget for `bytes`, held until it is dropped.

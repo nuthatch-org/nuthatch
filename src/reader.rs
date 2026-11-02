@@ -2122,14 +2122,14 @@ impl Follower {
         let found = {
             let inner = self.lock();
             inner.routes.get(route).map(|r| {
-                let state = match &r.served {
-                    Some(Ok(shared)) => Some(shared.current()),
+                let shared = match &r.served {
+                    Some(Ok(shared)) => Some(shared.clone()),
                     _ => None,
                 };
-                (r.spec.dataset.clone(), r.spec.sync.clone(), state)
+                (r.spec.dataset.clone(), r.spec.sync.clone(), shared)
             })
         };
-        let Some((dataset, Some(sync), state)) = found else {
+        let Some((dataset, Some(sync), shared)) = found else {
             return refuse(
                 StatusCode::NOT_FOUND,
                 "sync_off",
@@ -2163,20 +2163,18 @@ impl Follower {
         if let Err(refusal) = sync.admit(0, &shape) {
             return refuse(StatusCode::FORBIDDEN, "refused", refusal.to_string());
         }
-        let (Some(state), Some(data)) = (state, self.lock().datasets.get(&dataset).cloned()) else {
+        let (Some(shared), Some(data)) = (shared, self.lock().datasets.get(&dataset).cloned())
+        else {
             return refuse(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "catching_up",
                 "this follower has not taken the dataset's snapshot yet".into(),
             );
         };
-        let permit = match crate::serve::admit_scan(&state).await {
-            Ok(permit) => permit,
-            Err(refused) => return *refused,
-        };
         let live = query.get("live").is_some_and(|v| v == "1");
         // Subscribed before the rows are read, so a delta between the two is in both: a put read
-        // twice or a retraction of a row never held, which a copy takes in its stride.
+        // twice or a retraction of a row never held, which a copy takes in its stride. A row sealed
+        // in between is in the sealed side, and a prune from hot is not a retraction.
         let (at, frames) = if live {
             match self.subscribe_shape(&dataset, shape.clone(), SYNC_QUEUE) {
                 Some((at, frames)) => (at, Some(frames)),
@@ -2191,62 +2189,55 @@ impl Follower {
         } else {
             (data.store.applied(), None)
         };
-        let (max_rows, max_bytes) = (state.limits.max_rows, state.limits.max_result_bytes);
-        let store = data.store.clone();
-        let picked = shape.clone();
-        let scan = tokio::task::spawn_blocking(move || {
-            let (mut rows, mut bytes, mut over) = (0usize, 0usize, false);
-            let found = store.rows_where(|row| {
-                let held = !over
-                    && serde_json::from_str::<serde_json::Value>(row)
-                        .is_ok_and(|row| picked.matches(&row));
-                if held {
-                    rows += 1;
-                    bytes += row.len();
-                    over = rows > max_rows || bytes > max_bytes;
-                }
-                held && !over
-            });
-            // Held to here: the gate counts the scan, not the sending.
-            drop(permit);
-            (found, over)
-        });
-        let (rows, over) = match tokio::time::timeout(state.limits.timeout, scan).await {
-            Ok(Ok(done)) => done,
-            Ok(Err(e)) => {
-                return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
-            }
-            Err(_) => {
-                return refuse(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "timeout",
-                    "scanning the copy for the shape took longer than this route allows".into(),
-                )
-            }
+        // The first answer is `/sql`'s own, sealed and hot together, under all of its guards.
+        let state = shared.current();
+        let sql = shape.select_sql();
+        let answered = crate::serve::within_pin(shared.clone(), |pinned| async move {
+            crate::serve::sync_query((*pinned).clone(), sql).await
+        })
+        .await;
+        let (rows, truncated, provenance) = match answered {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(refused)) => return *refused,
+            Err(gone) => return gone,
         };
-        if over {
+        if truncated {
             return refuse(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "shape_too_large",
                 format!(
-                    "the shape selects more than this route answers at once ({max_rows} rows, \
-                     {max_bytes} bytes); narrow it"
+                    "the shape selects more than this route answers at once ({} rows); narrow it",
+                    state.limits.max_rows
                 ),
             );
         }
+        let mut puts: Vec<crate::shape_feed::ShapeOp> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(key) = crate::shape::row_key(row) else {
+                return refuse(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "no_key",
+                    format!(
+                        "a row of `{}` has no block_number and log_index to key it by",
+                        shape.table
+                    ),
+                );
+            };
+            puts.push(crate::shape_feed::ShapeOp::Put {
+                key: key.into(),
+                row: row.to_string().into(),
+            });
+        }
         let mut lines: Vec<bytes::Bytes> = vec![bytes::Bytes::from(format!(
             "{}\n",
-            serde_json::json!({ "offset": [at.0, at.1], "scope": "hot" })
+            serde_json::json!({
+                "offset": [at.0, at.1],
+                "scope": "full",
+                "provenance": provenance,
+            })
         ))];
-        for chunk in rows.chunks(SYNC_CHUNK) {
-            let ops: Vec<crate::shape_feed::ShapeOp> = chunk
-                .iter()
-                .map(|(key, row)| crate::shape_feed::ShapeOp::Put {
-                    key: key.as_str().into(),
-                    row: row.as_str().into(),
-                })
-                .collect();
-            lines.push(crate::shape_feed::ops_line(None, &ops).into());
+        for chunk in puts.chunks(SYNC_CHUNK) {
+            lines.push(crate::shape_feed::ops_line(None, chunk).into());
         }
         lines.push(bytes::Bytes::from_static(b"{\"up_to_date\":true}\n"));
         // Room for the first answer is taken before it is sent and kept until its last line has been.
@@ -2259,16 +2250,29 @@ impl Follower {
                 let line = lines.next()?;
                 Some((Ok::<_, std::convert::Infallible>(line), (lines, room)))
             });
+        let table = shape.table.clone();
         let body = match frames {
             Some(frames) => head
-                .chain(futures::stream::unfold(frames, |mut frames| async move {
-                    let frame = frames.recv().await?;
-                    let line = crate::shape_feed::ops_line(
-                        Some((frame.epoch, frame.generation)),
-                        &frame.ops,
-                    );
-                    Some((Ok(bytes::Bytes::from(line)), frames))
-                }))
+                .chain(futures::stream::unfold(
+                    (frames, state.clone(), table),
+                    |(mut frames, state, table)| async move {
+                        let frame = frames.recv().await?;
+                        // A delta's rows reach the subscriber as `/sql` shows them. A row that cannot
+                        // be shown, or keyed, ends the stream, and the subscriber fetches again.
+                        let ops = match project_frame(&state, &table, &frame.ops).await {
+                            Ok(ops) => ops,
+                            Err(e) => {
+                                tracing::error!("/sync: a live row could not be shown: {e:#}");
+                                return None;
+                            }
+                        };
+                        let line = crate::shape_feed::ops_line(
+                            Some((frame.epoch, frame.generation)),
+                            &ops,
+                        );
+                        Some((Ok(bytes::Bytes::from(line)), (frames, state, table)))
+                    },
+                ))
                 .boxed(),
             None => head.boxed(),
         };
@@ -2587,6 +2591,42 @@ fn guarded(
             }
         },
     ))
+}
+
+/// A frame's ops with each put's stored row shown as `/sql` shows it, and keyed as the first answer
+/// keys its rows.
+async fn project_frame(
+    state: &Arc<AppState>,
+    table: &str,
+    ops: &[crate::shape_feed::ShapeOp],
+) -> Result<Vec<crate::shape_feed::ShapeOp>> {
+    use crate::shape_feed::ShapeOp;
+    let stored: Vec<serde_json::Value> = ops
+        .iter()
+        .filter_map(|op| match op {
+            ShapeOp::Put { row, .. } => Some(serde_json::from_str(row).context("a stored row")),
+            ShapeOp::Retract { .. } => None,
+        })
+        .collect::<Result<_>>()?;
+    let mut out: Vec<ShapeOp> = ops
+        .iter()
+        .filter(|op| matches!(op, ShapeOp::Retract { .. }))
+        .cloned()
+        .collect();
+    if !stored.is_empty() {
+        let (state, table) = (state.clone(), table.to_string());
+        let shown =
+            tokio::task::spawn_blocking(move || crate::serve::project_rows(&state, &table, stored))
+                .await??;
+        for row in shown {
+            let key = crate::shape::row_key(&row).context("a shown row with no key")?;
+            out.push(ShapeOp::Put {
+                key: key.into(),
+                row: row.to_string().into(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Frames a `/sync` subscriber may have waiting before it is closed, and rows in each of the first
@@ -3197,12 +3237,13 @@ mod tests {
         assert!(matches!(frames.try_recv(), Err(TryRecvError::Disconnected)));
     }
 
-    /// RFC-0080 §5.2: `/sync` answers a shape from the copy, refuses what the mount's `[mounts.sync]`
-    /// does not allow, and with `live=1` streams what each later delta does to the selection until
-    /// the copy is replaced.
+    /// RFC-0080 §5.2: `/sync` answers a shape as `/sql` would, sealed and hot together, refuses what
+    /// the mount's `[mounts.sync]` and `/sql`'s guards do not allow, and with `live=1` streams what
+    /// each later delta does to the selection, each row as `/sql` shows it, until the copy is replaced.
     #[tokio::test]
-    async fn sync_answers_a_shape_from_the_copy_and_streams_what_changes_it() {
+    async fn sync_answers_a_shape_as_sql_does_and_streams_what_changes_it() {
         use crate::feed::{Delta, Op, Snapshot};
+        use crate::store::Store;
         use futures::StreamExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("ds");
@@ -3214,7 +3255,14 @@ mod tests {
              abi = \"abi.json\"\n",
         )
         .unwrap();
-        std::fs::write(dir.join("abi.json"), "[]").unwrap();
+        std::fs::write(
+            dir.join("abi.json"),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
         // Two rows an answer may hold and no wait for a permit, so each guard can be met.
         let mut limits: crate::feed::WireLimits = (&crate::limits::Limits::process()).into();
         limits.max_rows = 2;
@@ -3243,7 +3291,10 @@ mod tests {
         {
             let mut inner = follower.lock();
             for (route, sync) in [
-                ("ds", Some("[tables]\nswaps = [\"pool\"]\n")),
+                (
+                    "ds",
+                    Some("[tables]\nt__transfer = [\"from\", \"to\", \"block_number\"]\n"),
+                ),
                 ("closed", None),
             ] {
                 inner.routes.insert(
@@ -3270,10 +3321,13 @@ mod tests {
             );
         }
         follower.realise();
-        assert!(
-            matches!(follower.lock().routes["ds"].served, Some(Ok(_))),
-            "the route's state is built, which the guards are read from"
-        );
+        let shared = {
+            let inner = follower.lock();
+            match &inner.routes["ds"].served {
+                Some(Ok(shared)) => shared.clone(),
+                _ => panic!("the route's state is built"),
+            }
+        };
         let encode = |s: &str| -> String {
             s.bytes()
                 .map(|b| match b {
@@ -3283,14 +3337,14 @@ mod tests {
                 .collect()
         };
         let uri = |query: &str| -> axum::http::Uri { format!("/sync?{query}").parse().unwrap() };
-        let pool = |p: &str| {
-            let shape = format!(r#"{{"table":"swaps","where":{{"pool":["{p}"]}}}}"#);
+        let from = |who: &str| {
+            let shape = format!(r#"{{"table":"t__transfer","where":{{"from":["{who}"]}}}}"#);
             format!("s={}", encode(&shape))
         };
-        let status = |r: &Response| r.status();
 
+        let status = |r: &Response| r.status();
         assert_eq!(
-            status(&follower.serve_sync("closed", &uri(&pool("0xa"))).await),
+            status(&follower.serve_sync("closed", &uri(&from("0xa"))).await),
             StatusCode::NOT_FOUND
         );
         assert_eq!(
@@ -3301,12 +3355,12 @@ mod tests {
             status(&follower.serve_sync("ds", &uri("")).await),
             StatusCode::BAD_REQUEST
         );
-        let offset = format!("{}&offset=1,5", pool("0xa"));
+        let offset = format!("{}&offset=1,5", from("0xa"));
         assert_eq!(
             status(&follower.serve_sync("ds", &uri(&offset)).await),
             StatusCode::CONFLICT
         );
-        let other = encode(r#"{"table":"swaps","where":{"sender":["0xa"]}}"#);
+        let other = encode(r#"{"table":"t__transfer","where":{"value":["1"]}}"#);
         assert_eq!(
             status(&follower.serve_sync("ds", &uri(&format!("s={other}"))).await),
             StatusCode::FORBIDDEN,
@@ -3325,30 +3379,41 @@ mod tests {
                 follower.apply_delta("ds", delta).await.unwrap();
             }
         };
-        let put = |key: &str, pool: &str| Op::Put {
-            key: key.into(),
-            row: format!(r#"{{"table":"swaps","pool":"{pool}"}}"#),
+        let transfer = |block: u64, log: u64, from: &str, to: &str| Op::Put {
+            key: Store::entity_key(block, log),
+            row: format!(
+                r#"{{"table":"t__transfer","from":"{from}","to":"{to}","value":"7","block_number":{block},"tx_hash":"0xt{block}","log_index":{log}}}"#
+            ),
         };
         apply(
             1,
-            vec![put("k1", "0xa"), put("k2", "0xb"), put("k3", "0xa")],
+            vec![
+                transfer(1, 0, "0xa", "0xb"),
+                transfer(1, 1, "0xc", "0xb"),
+                transfer(2, 0, "0xa", "0xc"),
+            ],
         )
         .await;
 
         // The guards `/sql` answers under: a row cap, and the gate.
-        let whole = encode(r#"{"table":"swaps"}"#);
+        let whole = encode(r#"{"table":"t__transfer"}"#);
         let too_big = follower.serve_sync("ds", &uri(&format!("s={whole}"))).await;
+        let too_big_status = too_big.status();
+        let too_big_body = axum::body::to_bytes(too_big.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
-            too_big.status(),
+            too_big_status,
             StatusCode::PAYLOAD_TOO_LARGE,
-            "three rows, two allowed"
+            "three rows, two allowed: {}",
+            String::from_utf8_lossy(&too_big_body)
         );
         let gate = follower.gate("mainnet");
         let mut held = Vec::new();
         while let Ok(permit) = gate.try_admit(None) {
             held.push(permit);
         }
-        let busy = follower.serve_sync("ds", &uri(&pool("0xa"))).await;
+        let busy = follower.serve_sync("ds", &uri(&from("0xa"))).await;
         assert_eq!(
             busy.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3356,8 +3421,8 @@ mod tests {
         );
         drop(held);
 
-        // Without `live`: the header, the selected rows, and the end of the answer.
-        let resp = follower.serve_sync("ds", &uri(&pool("0xa"))).await;
+        // Without `live`: the header, the selected rows keyed as the store keys them, the end.
+        let resp = follower.serve_sync("ds", &uri(&from("0xa"))).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -3368,23 +3433,22 @@ mod tests {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         assert_eq!(lines.len(), 3, "{lines:?}");
-        assert_eq!(
-            lines[0],
-            serde_json::json!({ "offset": [1, 1], "scope": "hot" })
-        );
+        assert_eq!(lines[0]["offset"], serde_json::json!([1, 1]));
+        assert_eq!(lines[0]["scope"], "full");
+        assert!(lines[0]["provenance"].is_object(), "{}", lines[0]);
         let keys: Vec<&str> = lines[1]["ops"]
             .as_array()
             .unwrap()
             .iter()
             .map(|op| op["put"]["key"].as_str().unwrap())
             .collect();
-        assert_eq!(keys, ["k1", "k3"]);
-        assert_eq!(lines[1]["ops"][0]["put"]["row"]["pool"], "0xa");
+        assert_eq!(keys, [Store::entity_key(1, 0), Store::entity_key(2, 0)]);
+        assert_eq!(lines[1]["ops"][0]["put"]["row"]["from"], "0xa");
         assert_eq!(lines[2], serde_json::json!({ "up_to_date": true }));
 
         // With `live`: the same, then a line for each delta that changes the selection.
         let resp = follower
-            .serve_sync("ds", &uri(&format!("{}&live=1", pool("0xa"))))
+            .serve_sync("ds", &uri(&format!("{}&live=1", from("0xa"))))
             .await;
         let mut stream = resp.into_body().into_data_stream();
         let mut pending = String::new();
@@ -3404,17 +3468,32 @@ mod tests {
         for _ in 0..3 {
             next_line(&mut stream).await.unwrap();
         }
-        apply(2, vec![put("k4", "0xa"), put("k5", "0xb")]).await;
+        apply(
+            2,
+            vec![transfer(3, 0, "0xa", "0xb"), transfer(3, 1, "0xc", "0xc")],
+        )
+        .await;
         let line = next_line(&mut stream).await.unwrap();
         assert_eq!(line["offset"], serde_json::json!([1, 2]));
         assert_eq!(line["ops"].as_array().unwrap().len(), 1);
-        assert_eq!(line["ops"][0]["put"]["key"], "k4");
-        apply(3, vec![put("k1", "0xb")]).await;
+        assert_eq!(line["ops"][0]["put"]["key"], Store::entity_key(3, 0));
+        // The live row is the row `/sql` answers for it: one representation, whichever way it came.
+        let sql = "SELECT * FROM t__transfer WHERE block_number = 3 AND log_index = 0";
+        let (sql_rows, _, _) = crate::serve::within_pin(shared.clone(), |pinned| async move {
+            crate::serve::sync_query((*pinned).clone(), sql.into()).await
+        })
+        .await
+        .unwrap_or_else(|r| panic!("gone: {}", r.status()))
+        .unwrap_or_else(|r| panic!("/sql refused: {}", r.status()));
+        assert_eq!(sql_rows.len(), 1);
+        assert_eq!(line["ops"][0]["put"]["row"], sql_rows[0]);
+
+        apply(3, vec![transfer(1, 0, "0xc", "0xb")]).await;
         let line = next_line(&mut stream).await.unwrap();
         assert_eq!(line["offset"], serde_json::json!([1, 3]));
         assert_eq!(
             line["ops"][0],
-            serde_json::json!({ "retract": { "key": "k1" } })
+            serde_json::json!({ "retract": { "key": Store::entity_key(1, 0) } })
         );
 
         // The route's own layer answers it, ahead of the nest's router.
@@ -3426,7 +3505,7 @@ mod tests {
                 Arc::default(),
                 axum::Router::new(),
             );
-            let req = Request::get(uri(&pool("0xa")))
+            let req = Request::get(uri(&from("0xa")))
                 .body(axum::body::Body::empty())
                 .unwrap();
             layered.oneshot(req).await.unwrap()

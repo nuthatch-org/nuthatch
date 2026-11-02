@@ -512,3 +512,48 @@ Nothing here is built. The choice in (1) decides the rest, and is Chief's: **the
 `/sql` projection, with a key column**, or it is the stored row and sealed history is out of a shape's
 reach (a shape then covers the hot window only, which is Electric-like for a live tail and not for
 "huge nests"). I would take the first.
+
+## 16. Option A, built (2026-11-01): a shape's rows are `/sql`'s, keyed
+
+Chief took A in §15: the wire row is the `/sql` projection, and each op carries a key.
+
+**What changed.**
+
+- **The first answer is `/sql`'s own.** `Shape::select_sql` writes the shape as a statement (terms as
+  `CAST(col AS VARCHAR) IN (..)`, ranges as numeric bounds, `ORDER BY block_number, log_index`, every
+  name and value quoted). `serve::sync_query` runs it through `run_sql_query_at`, so it has the gate,
+  caps, timeout, memo and response-bytes budget of `/sql` and reads the sealed segments with the hot
+  copy as `/sql` does, and `serve::within_pin` gives it the pinned copy a follower's catalogue is only
+  read from. §14's own scan, caps and timeout are gone, replaced by those. The header line says
+  `"scope":"full"` and carries the answer's `provenance`. A statement cut at the row cap is `413
+  shape_too_large`. A route whose mount is `sql = "allowlist"` still answers shapes: `[mounts.sync]` is
+  the control for that, not the SQL surface.
+- **A key per row** is `Store::entity_key(block_number, log_index)` of the row (`shape::row_key`). A row
+  that has no such pair is `500 no_key` in the first answer, and ends a live stream.
+- **Live rows are shown as `/sql` shows them.** A frame's stored rows go through `serve::project_rows`,
+  the same engine over those rows alone, before they are sent, so a put has the columns of a row from the
+  first answer. Retractions go by the store's key.
+
+**Tested** (`sync_answers_a_shape_as_sql_does_and_streams_what_changes_it`, over an ERC-20 `Transfer`
+nest): the first answer's rows and keys; the row cap, and the busy gate, now through `/sql`'s code; a
+live put whose row **equals what `/sql` answers for that row**, which is S2's gate for the hot half; a
+retraction; the route's layer; the end of the stream on a fresh snapshot. Unit tests for `row_key` and
+`select_sql`, including quotes in names and values.
+
+**Not tested, and where to look first.**
+
+1. **Sealed rows.** The test has hot rows only. The sealed half is `/sql`'s own, so it should hold, but
+   nothing here has run a shape over a sealed segment.
+2. **The key rule against every writer.** Checked on log rows. A table whose rows are keyed some other
+   way (call or trace tables, factory children, offchain rows) is not checked, and fails loudly as
+   `no_key` where its rows lack the pair, but a row that has the pair and is keyed otherwise would be
+   keyed wrongly without a sound.
+3. **Terms by two rules.** The first answer filters in the engine on `CAST(col AS VARCHAR)`; the live
+   path filters stored JSON by `Shape::matches`. For addresses and integers they agree. Booleans,
+   decimals and anything the engine renders differently from the stored text are untested, and a
+   disagreement would put a row in one and not the other.
+4. **Ranges on non-numeric columns** are compared as numbers by the engine; untested.
+5. **Cost of the live conversion**, a session of the engine per frame and table, which is unmeasured and
+   is the first thing to measure at a busy tip.
+6. Still open from §14: no token check, the live stream's own limits, the one-shape stub of
+   `max_shapes_per_connection`, JSON lines and not Arrow, and an offset that is the copy's generation.

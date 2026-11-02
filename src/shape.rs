@@ -95,6 +95,50 @@ impl Shape {
     }
 }
 
+/// The key a stored row is under: `{block:012}-{log:06}` from its `block_number` and `log_index`,
+/// which is how the indexer keys every row it writes. `None` for a row without both, which a shape's
+/// answer has no key to put or retract by.
+pub fn row_key(row: &Value) -> Option<String> {
+    let block = number(row.get("block_number")?)?;
+    let log = number(row.get("log_index")?)?;
+    Some(crate::store::Store::entity_key(block, log))
+}
+
+impl Shape {
+    /// The statement that selects this shape's rows from `/sql`'s relations, in chain order.
+    /// Terms compare as text, as [`Shape::matches`] does; ranges compare as the numbers they bound.
+    pub fn select_sql(&self) -> String {
+        let name = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let text = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let mut wheres: Vec<String> = Vec::new();
+        for (column, values) in &self.terms {
+            let listed: Vec<String> = values.iter().map(|v| text(v)).collect();
+            wheres.push(format!(
+                "CAST({} AS VARCHAR) IN ({})",
+                name(column),
+                listed.join(", ")
+            ));
+        }
+        for (column, range) in &self.ranges {
+            if let Some(gte) = range.gte {
+                wheres.push(format!("{} >= {gte}", name(column)));
+            }
+            if let Some(lte) = range.lte {
+                wheres.push(format!("{} <= {lte}", name(column)));
+            }
+        }
+        let filter = if wheres.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", wheres.join(" AND "))
+        };
+        format!(
+            "SELECT * FROM {}{filter} ORDER BY \"block_number\", \"log_index\"",
+            name(&self.table)
+        )
+    }
+}
+
 /// A column's value as the integer a range bounds, if it is one.
 fn number(v: &Value) -> Option<u64> {
     match v {
@@ -675,5 +719,54 @@ mod tests {
         }
         index.matching_text(r#"{"pool":"0xa","block":12}"#, &mut out);
         assert_eq!(out, [0, 1, 3, 4]);
+    }
+
+    #[test]
+    fn a_row_is_keyed_by_its_block_and_log_index_as_the_store_keys_it() {
+        let key = |row: Value| row_key(&row);
+        let expected = Some(crate::store::Store::entity_key(7, 3));
+        assert_eq!(key(json!({ "block_number": 7, "log_index": 3 })), expected);
+        assert_eq!(
+            key(json!({ "block_number": "7", "log_index": "3" })),
+            expected
+        );
+        assert_eq!(key(json!({ "block_number": 7 })), None);
+        assert_eq!(key(json!({ "block_number": 7, "log_index": -1 })), None);
+        assert_eq!(key(json!({ "block_number": 7.5, "log_index": 3 })), None);
+    }
+
+    #[test]
+    fn a_shape_selects_its_rows_as_text_terms_and_numeric_bounds_in_chain_order() {
+        let shape: Shape = serde_json::from_str(
+            r#"{"table":"t__transfer","where":{"block_number":{"gte":10,"lte":20},"from":["0xa","0xb"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            shape.select_sql(),
+            "SELECT * FROM \"t__transfer\" WHERE CAST(\"from\" AS VARCHAR) IN ('0xa', '0xb') \
+             AND \"block_number\" >= 10 AND \"block_number\" <= 20 \
+             ORDER BY \"block_number\", \"log_index\""
+        );
+        let open = Shape {
+            table: "t__transfer".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            open.select_sql(),
+            "SELECT * FROM \"t__transfer\" ORDER BY \"block_number\", \"log_index\""
+        );
+        // A value cannot leave its quotes, nor a name its own.
+        let hostile = Shape {
+            table: "t\"; DROP".into(),
+            terms: BTreeMap::from([(
+                "from\"".to_string(),
+                BTreeSet::from(["a' OR '1'='1".to_string()]),
+            )]),
+            ..Default::default()
+        };
+        let sql = hostile.select_sql();
+        assert!(sql.contains("\"t\"\"; DROP\""), "{sql}");
+        assert!(sql.contains("\"from\"\"\""), "{sql}");
+        assert!(sql.contains("'a'' OR ''1''=''1'"), "{sql}");
     }
 }
