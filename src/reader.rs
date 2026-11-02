@@ -2613,10 +2613,18 @@ async fn project_frame(
         .filter(|op| matches!(op, ShapeOp::Retract { .. }))
         .cloned()
         .collect();
+    // The keys the store holds these rows under, which the keys derived from the shown rows must be.
+    let stored_keys: std::collections::BTreeSet<&str> = ops
+        .iter()
+        .filter_map(|op| match op {
+            ShapeOp::Put { key, .. } => Some(&**key),
+            ShapeOp::Retract { .. } => None,
+        })
+        .collect();
     if !stored.is_empty() {
-        let (state, table) = (state.clone(), table.to_string());
+        let (state, owned) = (state.clone(), table.to_string());
         let shown =
-            tokio::task::spawn_blocking(move || crate::serve::project_rows(&state, &table, stored))
+            tokio::task::spawn_blocking(move || crate::serve::project_rows(&state, &owned, stored))
                 .await??;
         for row in shown {
             let key = crate::shape::row_key(&row).context("a shown row with no key")?;
@@ -2625,6 +2633,18 @@ async fn project_frame(
                 row: row.to_string().into(),
             });
         }
+        let shown_keys: std::collections::BTreeSet<&str> = out
+            .iter()
+            .filter_map(|op| match op {
+                ShapeOp::Put { key, .. } => Some(&**key),
+                ShapeOp::Retract { .. } => None,
+            })
+            .collect();
+        anyhow::ensure!(
+            shown_keys == stored_keys,
+            "the rows of `{table}` are not keyed by block_number and log_index here: the store holds \
+             {stored_keys:?} and the shown rows come to {shown_keys:?}"
+        );
     }
     Ok(out)
 }
@@ -3722,5 +3742,20 @@ mod tests {
             .unwrap();
         let frame: serde_json::Value = serde_json::from_slice(&chunk).unwrap();
         assert_eq!(frame["ops"][0]["put"]["key"], Store::entity_key(4, 0));
+
+        // A row the store holds under a key its own block and log do not give is not sent under the
+        // key they do give: the stream ends, and the subscriber fetches again.
+        let wrong = Op::Put {
+            key: "zz-not-its-key".into(),
+            row: row(5, 0, "0xa", "0xb"),
+        };
+        follower
+            .apply_delta("ds", delta(3, vec![wrong]))
+            .await
+            .unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the stream ends within five seconds");
+        assert!(ended.is_none(), "a mis-keyed row ends the stream");
     }
 }

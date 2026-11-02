@@ -735,6 +735,38 @@ mod tests {
         assert_eq!(key(json!({ "block_number": 7.5, "log_index": 3 })), None);
     }
 
+    /// The key rule is the store's own: every row the cursor writes is stored under
+    /// `entity_key(row.block_number, row.log_index)` and its JSON carries both, whichever kind of row
+    /// it is, so the key can be taken back out of the row, in the band reserved for rows that descend
+    /// from no log too.
+    #[test]
+    fn the_key_of_a_decoded_rows_json_is_the_key_the_cursor_stores_it_under() {
+        for log_index in [0, 7, 499_999, 500_000, 999_999] {
+            let row = nuthatch_decode::registry::DecodedRow {
+                table: "t__transfer".into(),
+                params: vec![(
+                    "from".into(),
+                    nuthatch_decode::registry::Value::Address([1; 20]),
+                )],
+                block_number: 12_345,
+                block_hash: "0xbh".into(),
+                block_timestamp: 1,
+                timestamps: true,
+                log_index,
+                tx_hash: "0xt".into(),
+                address: "0xa".into(),
+            };
+            assert_eq!(
+                row_key(&row.to_json()),
+                Some(crate::store::Store::entity_key(
+                    row.block_number,
+                    row.log_index
+                )),
+                "log_index {log_index}"
+            );
+        }
+    }
+
     #[test]
     fn a_shape_selects_its_rows_as_text_terms_and_numeric_bounds_in_chain_order() {
         let shape: Shape = serde_json::from_str(

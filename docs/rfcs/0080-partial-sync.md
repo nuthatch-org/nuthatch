@@ -548,10 +548,16 @@ retraction; the route's layer; the end of the stream on a fresh snapshot. Unit t
    sealed rows alone (so a range on a numeric column is tested against Parquet, item 4's good case),
    and a live stream gets the frame for the next delta. Not yet tested: a seal that happens while a
    stream is open (the hot rows moving to a segment under a subscriber).
-2. **The key rule against every writer.** Checked on log rows. A table whose rows are keyed some other
-   way (call or trace tables, factory children, offchain rows) is not checked, and fails loudly as
-   `no_key` where its rows lack the pair, but a row that has the pair and is keyed otherwise would be
-   keyed wrongly without a sound.
+2. ~~The key rule against every writer.~~ Read, and checked. The cursor stores every decoded row under
+   `entity_key(row.block_number, row.log_index)` (`core/src/cursor.rs`), and `DecodedRow::to_json` writes
+   both fields into the row, for logs and for rows that descend from no log (blocks, call results, which
+   take the reserved `log_index` band), so the rule holds by construction;
+   `the_key_of_a_decoded_rows_json_is_the_key_the_cursor_stores_it_under` checks it across that band. A
+   row the store keys some other way would break it, so the live path also compares the keys of the rows
+   it shows with the keys the store holds them under and ends the stream if they differ (tested with a
+   row put under a key its own block and log do not give). Not checked: IPFS document rows, whose key is
+   `IPFS_ROW_LOG_INDEX_BASE + slot` and whose row `log_index` I did not read, and the first answer's
+   hot rows, which have no store key to compare with.
 3. **Terms by two rules.** The first answer filters in the engine on `CAST(col AS VARCHAR)`; the live
    path filters stored JSON by `Shape::matches`. For addresses and integers they agree. Booleans,
    decimals and anything the engine renders differently from the stored text are untested, and a
