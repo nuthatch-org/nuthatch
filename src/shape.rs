@@ -45,6 +45,15 @@ enum Read<'a> {
     Complex,
 }
 
+/// The table a stored row is in, from its `table` field; `None` for a row with none, or one a
+/// plain read cannot take it from, which no shape selects.
+pub fn table_of(row: &str) -> Option<&str> {
+    match scalar_in(row, "\"table\":") {
+        Read::Scalar(table) => Some(table),
+        _ => None,
+    }
+}
+
 /// `needle` is the column's key as the writer spells it, `"name":`. Rows come from `serde_json` and
 /// plain column names are never escaped there, so a key found is the row's own.
 fn scalar_in<'a>(row: &'a str, needle: &str) -> Read<'a> {

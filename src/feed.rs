@@ -872,6 +872,21 @@ pub struct Changes {
     /// The catalogue grew by rows that never passed through hot, as `--seal-direct` writes them:
     /// nothing derived from the deltas has seen them.
     pub sealed_unseen: bool,
+    /// Whether to record `log`, which only a store with shape subscribers pays for.
+    pub track: bool,
+    /// Each stored row a put or a rollback changed, in the order it happened: what a subscriber to
+    /// part of the table needs to be told. Empty unless `track`.
+    pub log: Vec<Touch>,
+}
+
+/// One stored row's change within a delta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Touch {
+    pub key: String,
+    /// The row that was there, if one was.
+    pub old: Option<String>,
+    /// The row there now, `None` after a rollback dropped it.
+    pub new: Option<String>,
 }
 
 /// Rows a catalogue holds across its segments.
@@ -914,10 +929,26 @@ impl Mirror {
             Op::Put { key, row } => match put(&mut self.entities, &mut self.bytes, key, row) {
                 Some(old) if &old == row => {}
                 Some(old) => {
+                    if changes.track {
+                        changes.log.push(Touch {
+                            key: key.clone(),
+                            old: Some(old.clone()),
+                            new: Some(row.clone()),
+                        });
+                    }
                     changes.removed.push(old);
                     changes.added.push(row.clone());
                 }
-                None => changes.added.push(row.clone()),
+                None => {
+                    if changes.track {
+                        changes.log.push(Touch {
+                            key: key.clone(),
+                            old: None,
+                            new: Some(row.clone()),
+                        });
+                    }
+                    changes.added.push(row.clone());
+                }
             },
             // A rollback is the only open-ended drop; a seal's prune is always a bounded one.
             Op::Drop { from, to } => {
@@ -939,6 +970,13 @@ impl Mirror {
                         if to.is_some() {
                             changes.pruned += 1;
                         } else {
+                            if changes.track {
+                                changes.log.push(Touch {
+                                    key: k.clone(),
+                                    old: Some(row.clone()),
+                                    new: None,
+                                });
+                            }
                             changes.removed.push(row);
                         }
                     }
@@ -1008,6 +1046,8 @@ pub struct MemCopy {
     /// Set when a request served from this copy found a segment it names missing: its follower,
     /// and no other, takes a fresh snapshot.
     missing: std::sync::atomic::AtomicBool,
+    /// Set once a shape subscriber exists: applies then record what each put and rollback changed.
+    tracking: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for MemCopy {
@@ -1071,6 +1111,7 @@ impl MemStore {
                 rows: AtomicU64::new(rows_epoch()),
                 dir: dir.to_path_buf(),
                 missing: Default::default(),
+                tracking: Default::default(),
             }),
             at: None,
         }
@@ -1179,6 +1220,11 @@ impl MemStore {
         peak.max(0) as u64
     }
 
+    /// From now on [`MemStore::apply`] records each row it changes in [`Changes::log`].
+    pub fn track_changes(&self) {
+        self.copy.tracking.store(true, Ordering::SeqCst);
+    }
+
     /// `(epoch, generation)` of the last delta applied.
     /// Whether a request found a segment this copy names missing since this was last asked.
     pub fn take_missing(&self) -> bool {
@@ -1216,7 +1262,10 @@ impl MemStore {
         if changes_rows {
             self.copy.rows.fetch_add(1, Ordering::SeqCst);
         }
-        let mut changes = Changes::default();
+        let mut changes = Changes {
+            track: self.copy.tracking.load(Ordering::SeqCst),
+            ..Changes::default()
+        };
         for op in &delta.ops {
             m.apply(op, &mut changes);
         }
