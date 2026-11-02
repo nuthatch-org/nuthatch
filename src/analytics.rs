@@ -7220,6 +7220,34 @@ template="pool"
         }
     }
 
+    /// #2589: a Arrow answer stops at the row that crosses the byte cap, as JSON's does, rather than
+    /// writing the whole 32-row slice and reporting it complete.
+    #[test]
+    fn an_arrow_answer_stops_at_the_byte_cap_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(30),
+            max_rows: 50_000,
+            max_result_bytes: 1 << 20,
+            arrow: true,
+            ..Default::default()
+        };
+        let out = query_guarded(
+            dir.path(),
+            "SELECT repeat('A', 100000) AS x FROM range(32)",
+            guard,
+        )
+        .unwrap();
+        let ipc = out.ipc.expect("an Arrow answer");
+        assert!(out.truncated, "the cap was crossed");
+        assert!(ipc.rows < 32, "kept {} rows", ipc.rows);
+        assert!(
+            ipc.bytes.len() < (1 << 20) + 200_000,
+            "{} bytes written",
+            ipc.bytes.len()
+        );
+    }
+
     /// #1650: one DataFusion batch of 8,192 cells, 100 KB each, before the 64 MiB cap runs.
     /// Ignored because the point is the resident size, and the suite should not allocate it.
     #[test]
