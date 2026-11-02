@@ -524,4 +524,100 @@ mod tests {
         let holding = clients.iter().filter(|c| !c.copy.is_empty()).count();
         assert!(holding > 4, "the shapes select something: {holding}");
     }
+
+    /// What the hub adds to a follower's work on deltas it has just decoded and applied, at 10,000
+    /// single-term shapes over 2,000 pools, so each row goes to five subscribers. Run in release
+    /// with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn the_hub_costs_what_it_costs() {
+        use std::time::{Duration, Instant};
+        const POOLS: u64 = 2_000;
+        const BLOCKS: u64 = 100;
+        const PER_BLOCK: u64 = 200;
+        let address = |n: u64| format!("0x{n:040x}");
+        let bodies: Vec<Vec<u8>> = (1..=BLOCKS)
+            .map(|block| {
+                let ops = (0..PER_BLOCK)
+                    .map(|log| {
+                        let i = block * PER_BLOCK + log;
+                        Op::Put {
+                            key: Store::entity_key(block, log),
+                            row: json!({
+                                "table": "swaps",
+                                "pool": address(i * 7919 % POOLS),
+                                "block_number": block,
+                                "log_index": log,
+                                "tx": format!("0x{i:064x}"),
+                                "sender": address(i),
+                                "amount0": "123456789",
+                                "amount1": "987654321",
+                            })
+                            .to_string(),
+                        }
+                    })
+                    .collect();
+                let delta = Delta {
+                    epoch: 1,
+                    generation: block,
+                    ops,
+                    ..Default::default()
+                };
+                crate::feed_wire::encode_delta(&delta).unwrap()
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = || {
+            MemStore::from_snapshot(
+                dir.path(),
+                Snapshot {
+                    epoch: 1,
+                    ..Default::default()
+                },
+            )
+        };
+        let best = |a: &mut Duration, b: Duration| *a = (*a).min(b);
+        let (mut decode, mut plain, mut tracked, mut hub_time) =
+            (Duration::MAX, Duration::MAX, Duration::MAX, Duration::MAX);
+        for _ in 0..5 {
+            let (store, untracked) = (fresh(), fresh());
+            store.track_changes();
+            let mut hub = ShapeHub::default();
+            let _frames: Vec<Frames> = (0..10_000u64)
+                .map(|s| hub.subscribe(shape_of(&[address(s % POOLS).as_str()]), 1000))
+                .collect();
+            let (mut d, mut p, mut t, mut h) = (
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            for body in &bodies {
+                let started = Instant::now();
+                let delta = crate::feed_wire::decode_delta(body, None).unwrap();
+                d += started.elapsed();
+                let started = Instant::now();
+                untracked.apply(&delta).unwrap();
+                p += started.elapsed();
+                let started = Instant::now();
+                let changes = store.apply(&delta).unwrap();
+                t += started.elapsed();
+                let started = Instant::now();
+                hub.apply(delta.epoch, delta.generation, &changes.log);
+                h += started.elapsed();
+            }
+            best(&mut decode, d);
+            best(&mut plain, p);
+            best(&mut tracked, t);
+            best(&mut hub_time, h);
+        }
+        let follower = (decode + plain).as_secs_f64();
+        println!(
+            "{} rows: decode {decode:?}, apply {plain:?}, apply while tracking {tracked:?} ({:+.3} of \
+             decode and apply), hub {hub_time:?} ({:.3})",
+            BLOCKS * PER_BLOCK,
+            (tracked.as_secs_f64() - plain.as_secs_f64()) / follower,
+            hub_time.as_secs_f64() / follower,
+        );
+    }
 }

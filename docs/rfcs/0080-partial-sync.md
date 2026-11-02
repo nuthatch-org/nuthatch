@@ -340,9 +340,7 @@ safe where under-telling is not.
 2. The protocol of §5.2: `GET /<route>/shape`, the initial Arrow answer with its offset, the live stream,
    and the `409 must-refetch`.
 3. ~~`[mounts.sync]` (§5.6)~~ Built, below.
-4. Measurement. The cost gate of §11 does not cover this code: the per-delta sweep of every entry, the
-   frame cloned for each subscriber, and the settle step are not timed, and the benchmark has no range
-   shapes.
+4. ~~Measurement~~ Done for the hub at five shapes a row; see below.
 
 **The hub is wired in.** Each dataset's copy on a follower (`Data` in `src/reader.rs`) holds a hub.
 `apply_delta` applies the delta and feeds the hub under the hub's lock, and
@@ -366,3 +364,24 @@ builds it. Nothing documents it for operators yet, since there is nothing for th
 
 Still to do: the endpoint (2) and the measurement (4) above. The offset a subscriber
 gets is the copy's, not yet the nest's block for it, which the endpoint's initial answer needs.
+
+**The hub measured (`the_hub_costs_what_it_costs`, ignored, release).** Twenty thousand rows as 100 v2
+bodies, through `decode_delta`, `MemStore::apply` and the hub, with 10,000 single-term shapes over 2,000
+pools, so every row is in five shapes and goes to five subscribers. Best of five:
+
+| | time | against decode + apply |
+|---|---|---|
+| decode | 12.2 ms | |
+| apply | 3.2 ms | |
+| apply while tracking changes | 3.5 ms | +0.017 |
+| the hub | 19.6 ms | 1.28 |
+
+Tracking is cheap. The hub is not, and the S0 gate did not promise it would be: the filter found the
+shapes at 0.078 of the follower's work, and delivering to them costs about 1 µs a row at five
+subscribers a row, 200 ns a delivery, which is more than the follower's decode and apply together. It
+scales with deliveries, as §8 said it would, so a popular table matched by thousands of shapes is the
+case to size against, and this figure is for five.
+
+The likely cost is that every delivery copies the row's text twice: once building the subscriber's ops
+and once cloning the frame for each sender on the shape. That is a guess, not a profile. The obvious
+change, holding a row once as shared text so a delivery is a pointer, is not made.
