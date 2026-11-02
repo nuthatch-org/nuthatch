@@ -212,7 +212,6 @@ impl ShapeHub {
             let touches = &by_key[key];
             // Each held once however many subscribers are told of it.
             let mut key_text: Option<Arc<str>> = None;
-            let mut row_text: Option<Arc<str>> = None;
             let mut holds: Vec<(&str, usize)> = Vec::new();
             if let Some(row) = touches.last().and_then(|t| t.new.as_deref()) {
                 if let Some((name, table)) =
@@ -223,10 +222,10 @@ impl ShapeHub {
                         holds.push((name, id));
                     }
                     if !found.is_empty() {
-                        match shown {
-                            None => row_text = Some(Arc::from(row)),
-                            Some(shown) => row_text = shown.get(key).cloned(),
-                        }
+                        let row_text: Option<Arc<str>> = match shown {
+                            None => Some(Arc::from(row)),
+                            Some(shown) => shown.get(key).cloned(),
+                        };
                         if let Some(row) = &row_text {
                             let key = key_text.get_or_insert_with(|| Arc::from(key)).clone();
                             for &id in &found {
