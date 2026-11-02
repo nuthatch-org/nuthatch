@@ -212,6 +212,13 @@ impl Lease {
             .is_some_and(|h| h.doc.owner.is_some() && h.renewed_at.elapsed() < self.term)
     }
 
+    /// How much longer [`Lease::valid`] stays true without a renewal; zero when it is not held.
+    pub fn remaining(&self) -> Duration {
+        self.held.as_ref().map_or(Duration::ZERO, |h| {
+            self.term.saturating_sub(h.renewed_at.elapsed())
+        })
+    }
+
     pub fn fence(&self) -> Option<u64> {
         self.held.as_ref().map(|h| h.doc.fence)
     }
@@ -286,7 +293,9 @@ pub fn renew_every(term: Duration) -> Duration {
 }
 
 /// Renew `lease` until it is lost or lapses, then call `fence_off` so the cursor's next commit is
-/// refused. A failed request is retried at the next tick; only the term decides when to give up.
+/// refused. A failed request is retried at the next tick; only the term decides when to give up,
+/// and a request still unanswered when it runs out counts as a lapse.
+
 #[cfg(test)]
 pub async fn hold(lease: Lease, fence_off: impl Fn() -> Result<()>) -> Stopped {
     let (_keep, handovers) = tokio::sync::mpsc::channel(1);
@@ -335,10 +344,15 @@ where
                 return Stopped::HandedOver { fence };
             }
         }
-        let renewed = lease.renew().await;
+        // A request that never returns must not outlive the lease: the term is the deadline.
+        let renewed = tokio::time::timeout(lease.remaining(), lease.renew()).await;
         if let Some(m) = &metrics {
-            m.lease_renewed(renewed.is_ok());
+            m.lease_renewed(matches!(renewed, Ok(Ok(()))));
         }
+        let Ok(renewed) = renewed else {
+            tracing::warn!("renewing the writer lease at fence {fence} did not return in time");
+            break Stopped::Lapsed { fence };
+        };
         match renewed {
             Ok(()) => continue,
             Err(e) => {
@@ -586,6 +600,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_holder_whose_renewal_never_returns_fences_off_before_a_standby_may_take() {
+        let dir = tempfile::tempdir().unwrap();
+        let flaky = Arc::new(Flaky::new(dir.path()));
+        let m: Arc<dyn Mirror> = flaky.clone();
+        let mut a = Lease::new(m.clone(), KEY, "a", TERM);
+        a.take(&Observed::Absent).await.unwrap();
+        let mut w = Watch::new();
+        w.see(&observe(&*m, KEY).await.unwrap());
+        flaky.stall();
+        let start = Instant::now();
+        let (fenced, fence_off) = counter();
+        let stopped = hold(a, fence_off).await;
+        assert_eq!(stopped, Stopped::Lapsed { fence: 1 });
+        assert_eq!(fenced.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(start.elapsed() <= TERM, "{:?}", start.elapsed());
+        assert!(
+            !w.takeable(MARGIN),
+            "the holder stopped before a standby could take"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_standby_waits_out_a_live_holder_and_takes_once_it_dies() {
         let (_d, m) = fs_mirror();
         let mut a = Lease::new(m.clone(), KEY, "a", TERM);
@@ -672,6 +708,7 @@ mod tests {
     struct Flaky {
         inner: Box<dyn Mirror>,
         down: std::sync::atomic::AtomicBool,
+        stalled: std::sync::atomic::AtomicBool,
     }
 
     impl Flaky {
@@ -679,10 +716,16 @@ mod tests {
             Self {
                 inner: open_mirror(root.to_str().unwrap()).unwrap(),
                 down: Default::default(),
+                stalled: Default::default(),
             }
         }
         fn cut(&self) {
             self.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        /// Conditional puts are accepted and then never answered.
+        fn stall(&self) {
+            self.stalled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         fn up(&self) -> Result<()> {
             if self.down.load(std::sync::atomic::Ordering::SeqCst) {
@@ -708,6 +751,9 @@ mod tests {
         }
         async fn put_if(&self, k: &str, b: &[u8], e: Option<&[u8]>) -> Result<()> {
             self.up()?;
+            if self.stalled.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             self.inner.put_if(k, b, e).await
         }
         async fn head(&self, k: &str) -> Result<Option<crate::publish::Head>> {
