@@ -243,47 +243,56 @@ binary today, and the engine without `sync` is the engine today, which is RFC-00
 4. Whether a writer with no followers should be allowed to serve shapes itself, for a small operator.
    Proposed: no, a local follower costs a process and keeps goal 4 true by construction.
 
-## 11. S0 measured (2026-11-01): the gate is not met
+## 11. S0 measured (2026-11-01): the gate is met
 
 **Built, nothing served.** `src/shape.rs`: a shape (a table and value terms, hashed by its canonical
 JSON), an index from each `(column, value)` to the shapes naming it, and a `Table` that applies puts,
 replacements, retractions and rollbacks to each subscriber's copy. It is a spike: no endpoint, no queue,
-no sealed part.
+no sealed part, and none of the S0 row's live stream or Node client. Those are S1's.
 
 **The correctness half of the gate passes.**
 `overwrites_and_rollbacks_keep_every_copy_equal_to_the_filtered_canonical_rows` runs 3,000 randomised
 puts, overwrites, retractions and multi-step rollbacks against 12 shapes and checks every copy against
 the filtered canonical rows after every step.
 
-**The cost half does not.** `a_shape_filter_costs_under_a_tenth_of_the_follower_apply` (ignored; run it
+**The cost half passes.** `a_shape_filter_costs_under_a_tenth_of_the_follower_apply` (ignored; run it
 in release with `--ignored --nocapture`) sends 500 blocks of 200 rows as v2 bodies through what a
 follower does today, `decode_delta` then `MemStore::apply`, and times a filter over the rows each
-delta added, with 10,000 shapes over 2,000 pools, so every row is in five shapes. Best of five, 100,000
-rows, release:
+delta added, with 10,000 single-term shapes over 2,000 pools, so every row is in five shapes. Best of
+five, 100,000 rows, release, on one laptop:
 
 | | time | against decode + apply |
 |---|---|---|
-| decode | 62 to 65 ms | |
-| apply | 20 to 21 ms | |
-| filter, each row parsed to JSON | 95 to 126 ms | 1.2 to 1.5 |
-| filter, indexed columns read off the row's text | 10.1 to 10.2 ms | 0.118 to 0.124 |
+| decode | 60 ms | |
+| apply | 19 ms | |
+| filter, each row parsed to JSON | 86 ms | 1.10 |
+| filter, indexed columns read off the row's text | 6.2 ms | 0.078 |
 
-The gate is under 0.10. The first measurement, against a bare in-memory insert, gave 5.3; that baseline
-left out the frame decode and was too small to mean anything, which is why it was replaced.
+The gate is under 0.10, so it is met, at 62 ns a row. Three earlier measurements are worth keeping:
 
-**What this answers in §5.4's `[VERIFY]`.** The parse is the cost: about nine tenths of the filter.
-Reading only the indexed columns off the row's text, with no parse, removes it and leaves the probe
-and the fan-out, 100 ns a row at five shapes a row. That is 0.12 of the follower's own work, over the
-gate by a fifth. A sort-free single-column path was tried and moved nothing. The remaining cost was
-not broken down; its parts are the substring search for the column, one hash of a 42-byte value, and
-five candidate pushes.
+1. Against a bare in-memory insert as the baseline the filter cost 5.3 times the apply. That baseline
+   left out the frame decode and meant nothing, so the test now runs the real path.
+2. With the real baseline, parsing each row cost 1.1 to 1.5, so §5.4's `[VERIFY]` is answered: the
+   parse dominates, and the shapeable columns must be read without it. Reading them off the row's
+   text did that and measured 0.12, a near miss.
+3. The rest was not the search for the column, as first guessed. Each of the five candidates was
+   being re-checked against its other terms, which for a shape with one term is a walk of a map that
+   finds nothing. Keeping single-term shapes apart from the rest (`Candidates::solo`, copied in as they
+   are) took 0.12 to 0.078.
 
-**Not done, and what would move it.** The v2 frame already carries `pool` as an Arrow column before the
-decoder reassembles each row as text. Probing there would skip the search, the one part of the
-remaining cost that is not the hash or the fan-out, and the decoder is where the follower's own 62 ms
-goes. That is a change to `feed_wire`, not a spike, and its saving is a guess until it is built. Fan-out is also real work that grows with shapes per row, not a constant: the 10,000-shape
-figure holds at five shapes a row and says nothing about a token in five hundred.
+**A probe in the decoder was built and dropped.** The v2 frame carries `pool` as an Arrow column
+before each row is put back together as text, so the filter was also tried there (a `RowProbe` hook in
+`decode_delta`, reading the column with no search). It measured 0.156 before the fix above and 0.080
+after: no better than reading the text, at the price of a hook in the follower's decoder. It is not in
+the tree. S1 filters `Changes.added` and `Changes.removed`, which leaves the wire format alone.
 
-**Decision for Chief.** The RFC says an S0 that fails stops it. This fails by a fifth, on a baseline
-that is now the real one, with a clear unbuilt step that removes the search. Either spend a few days on
-that step and re-measure, or hold the RFC here.
+**What this does not show.**
+- Fan-out is real work beyond the filter. This puts a row in five shapes and counts them; appending the
+  row to five subscribers' queues is not measured. The figure holds at five shapes a row and says
+  nothing about a token in five hundred.
+- Only single-term shapes are in the benchmark. A shape with several terms takes the slower
+  check, which the equivalence test covers for correctness and nothing times.
+- One machine, one row shape (eight fields, about 300 bytes).
+- Ranges (§5.1) are not built; they are S1.
+
+S0's gate is met on both halves and S1 is next.

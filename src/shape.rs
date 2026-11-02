@@ -77,7 +77,16 @@ fn scalar_in<'a>(row: &'a str, needle: &str) -> Read<'a> {
 
 struct Column {
     needle: String,
-    by_value: HashMap<String, Vec<usize>>,
+    by_value: HashMap<String, Candidates>,
+}
+
+/// The shapes that name one value of one column.
+#[derive(Default)]
+struct Candidates {
+    /// Shapes whose only term is this column's: the value is the whole answer. Ascending.
+    solo: Vec<usize>,
+    /// Shapes with other terms, which must be checked as well. Ascending.
+    multi: Vec<usize>,
 }
 
 /// Shapes indexed by their value terms: a row probes once per shapeable column, and each candidate
@@ -105,7 +114,12 @@ impl ShapeIndex {
                     by_value: HashMap::new(),
                 });
             for value in values {
-                indexed.by_value.entry(value.clone()).or_default().push(id);
+                let found = indexed.by_value.entry(value.clone()).or_default();
+                if shape.terms.len() == 1 {
+                    found.solo.push(id);
+                } else {
+                    found.multi.push(id);
+                }
             }
         }
         self.shapes.push(shape);
@@ -121,9 +135,12 @@ impl ShapeIndex {
         let mut out = self.open.clone();
         for (column, indexed) in &self.by_column {
             let Some(v) = row.get(column) else { continue };
-            if let Some(ids) = indexed.by_value.get(text(v).as_ref()) {
+            if let Some(found) = indexed.by_value.get(text(v).as_ref()) {
                 out.extend(
-                    ids.iter()
+                    found
+                        .solo
+                        .iter()
+                        .chain(&found.multi)
                         .copied()
                         .filter(|&id| self.shapes[id].matches(row)),
                 );
@@ -148,7 +165,7 @@ impl ShapeIndex {
     fn read_text(&self, row: &str, out: &mut Vec<usize>) -> Option<()> {
         out.clear();
         out.extend_from_slice(&self.open);
-        // Ids within one column's value are ascending and unique, so one source needs no sort.
+        // Ids within one list are ascending and unique, so a single list needs no sort.
         let mut sources = usize::from(!self.open.is_empty());
         for (column, indexed) in &self.by_column {
             let value = match scalar_in(row, &indexed.needle) {
@@ -156,11 +173,14 @@ impl ShapeIndex {
                 Read::Scalar(value) => value,
                 Read::Complex => return None,
             };
-            let Some(ids) = indexed.by_value.get(value) else {
+            let Some(found) = indexed.by_value.get(value) else {
                 continue;
             };
             let held = out.len();
-            for &id in ids {
+            out.extend_from_slice(&found.solo);
+            sources += usize::from(out.len() > held);
+            let held = out.len();
+            for &id in &found.multi {
                 // The probed term holds; the rest of the shape's terms are read the same way.
                 let mut all = true;
                 for (other, values) in &self.shapes[id].terms {
