@@ -3721,6 +3721,24 @@ async fn admit(s: &AppState) -> std::result::Result<GatePermit, axum::response::
         .map_err(|why| refused(s, why, "concurrent SQL queries"))
 }
 
+/// The guards `/sql` answers under, for a follower's `/sync` (RFC-0080): a permit on the SQL gate,
+/// held for as long as the answer is worked out.
+pub(crate) async fn admit_scan(
+    s: &AppState,
+) -> std::result::Result<GatePermit, axum::response::Response> {
+    admit(s).await
+}
+
+/// Room in the response-bytes budget for `bytes`, held until it is dropped.
+pub(crate) fn reserve_answer(
+    s: &AppState,
+    bytes: usize,
+) -> std::result::Result<crate::fair_share::BytePermit, axum::response::Response> {
+    s.sql_response_bytes
+        .reserve(bytes, s.tenant_label())
+        .map_err(|why| refused(s, why, "SQL response bytes in flight"))
+}
+
 /// The gate's admission under this mount's tenant label: a free permit, or a wait bounded in time
 /// and in how many wait.
 async fn gate_admit(s: &AppState) -> std::result::Result<GatePermit, Refusal> {

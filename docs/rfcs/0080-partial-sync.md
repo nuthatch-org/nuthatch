@@ -465,10 +465,14 @@ and ends when a fresh snapshot replaces the copy.
 1. **Hot rows only.** `scope` says `hot`. A nest with sealed history gets an answer missing every sealed
    row that matches, which is §5.3's whole sealed half. A client must not treat this as the shape's
    rows until that is built.
-2. **No limits on the answer.** The hot window is scanned and every row parsed for each request, with no
-   cap on rows or bytes and none of `/sql`'s admission, response-byte accounting or cost meter. The
-   scan runs off the async threads, but nothing bounds how many run at once. Before this is exposed it
-   needs `/sql`'s guards, which §6 and §5.6's "RFC-0073's strict isolation applies" assumed.
+2. ~~No limits on the answer.~~ The first answer now runs under `/sql`'s guards, read from the route's
+   own `AppState`: a permit on the SQL gate while the copy is scanned (`503` busy, `429` for a tenant at
+   its share, as `/sql` refuses), the route's `max_rows` and `max_result_bytes` (`413
+   shape_too_large`, the scan stopping its collecting past either), its timeout (`504`), and room in the
+   response-bytes budget, taken before the answer is sent and kept until its last line has been.
+   Tested: the row cap and the busy gate. Not tested: the timeout, and a response-bytes budget that is
+   full. Not covered: the live stream, whose lines are not counted against the bytes budget, and how many
+   streams a follower holds open, which is bounded by nothing but memory and the 256-frame queue each.
 3. **No token check.** §5.6 says FR12's bearer token applies. This route does not check one, and I have
    not checked what a follower's other read routes do about it.
 4. **`max_shapes_per_connection` is a stub.** A request holds one shape, so `admit` is called with none
@@ -477,4 +481,4 @@ and ends when a fresh snapshot replaces the copy.
 5. **JSON lines, not Arrow** (§5.2 asks for Arrow IPC for the first answer), and no resize (§5.5).
 6. **Offset is the copy's generation**, not a block, as before.
 
-Items 1 and 2 decide whether this can be turned on for anyone; the rest are S1's remaining protocol.
+Item 1 decides whether this can be turned on for anyone; the live streams' own limits and the rest are S1's remaining protocol.

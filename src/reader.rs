@@ -2104,6 +2104,10 @@ impl Follower {
     /// a line for each delta that changes the selection until the stream ends. It ends when the queue
     /// fills or the copy is replaced, and the client takes its answer again.
     ///
+    /// The first answer is worked out under `/sql`'s guards: a permit on the SQL gate while the copy
+    /// is scanned, the route's row and byte caps and its timeout, and room in the response-bytes
+    /// budget until the answer has been sent.
+    ///
     /// Not yet built: the sealed rows, so `scope` is `hot` and the answer is the copy's hot window only;
     /// resuming from an offset, so any `offset` is `409 must_refetch`; and Arrow.
     async fn serve_sync(self: &Arc<Self>, route: &str, uri: &axum::http::Uri) -> Response {
@@ -2117,12 +2121,15 @@ impl Follower {
         };
         let found = {
             let inner = self.lock();
-            inner
-                .routes
-                .get(route)
-                .map(|r| (r.spec.dataset.clone(), r.spec.sync.clone()))
+            inner.routes.get(route).map(|r| {
+                let state = match &r.served {
+                    Some(Ok(shared)) => Some(shared.current()),
+                    _ => None,
+                };
+                (r.spec.dataset.clone(), r.spec.sync.clone(), state)
+            })
         };
-        let Some((dataset, Some(sync))) = found else {
+        let Some((dataset, Some(sync), state)) = found else {
             return refuse(
                 StatusCode::NOT_FOUND,
                 "sync_off",
@@ -2156,12 +2163,16 @@ impl Follower {
         if let Err(refusal) = sync.admit(0, &shape) {
             return refuse(StatusCode::FORBIDDEN, "refused", refusal.to_string());
         }
-        let Some(data) = self.lock().datasets.get(&dataset).cloned() else {
+        let (Some(state), Some(data)) = (state, self.lock().datasets.get(&dataset).cloned()) else {
             return refuse(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "catching_up",
                 "this follower has not taken the dataset's snapshot yet".into(),
             );
+        };
+        let permit = match crate::serve::admit_scan(&state).await {
+            Ok(permit) => permit,
+            Err(refused) => return refused,
         };
         let live = query.get("live").is_some_and(|v| v == "1");
         // Subscribed before the rows are read, so a delta between the two is in both: a put read
@@ -2180,15 +2191,49 @@ impl Follower {
         } else {
             (data.store.applied(), None)
         };
+        let (max_rows, max_bytes) = (state.limits.max_rows, state.limits.max_result_bytes);
         let store = data.store.clone();
         let picked = shape.clone();
-        let rows = tokio::task::spawn_blocking(move || {
-            store.rows_where(|row| {
-                serde_json::from_str::<serde_json::Value>(row).is_ok_and(|row| picked.matches(&row))
-            })
-        })
-        .await
-        .unwrap_or_default();
+        let scan = tokio::task::spawn_blocking(move || {
+            let (mut rows, mut bytes, mut over) = (0usize, 0usize, false);
+            let found = store.rows_where(|row| {
+                let held = !over
+                    && serde_json::from_str::<serde_json::Value>(row)
+                        .is_ok_and(|row| picked.matches(&row));
+                if held {
+                    rows += 1;
+                    bytes += row.len();
+                    over = rows > max_rows || bytes > max_bytes;
+                }
+                held && !over
+            });
+            // Held to here: the gate counts the scan, not the sending.
+            drop(permit);
+            (found, over)
+        });
+        let (rows, over) = match tokio::time::timeout(state.limits.timeout, scan).await {
+            Ok(Ok(done)) => done,
+            Ok(Err(e)) => {
+                return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+            }
+            Err(_) => {
+                return refuse(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout",
+                    "scanning the copy for the shape took longer than this route allows".into(),
+                )
+            }
+        };
+        if over {
+            return refuse(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "shape_too_large",
+                format!(
+                    "the shape selects more than this route answers at once ({max_rows} rows, \
+                     {max_bytes} bytes); narrow it"
+                ),
+            );
+        }
         let mut lines: Vec<bytes::Bytes> = vec![bytes::Bytes::from(format!(
             "{}\n",
             serde_json::json!({ "offset": [at.0, at.1], "scope": "hot" })
@@ -2204,7 +2249,16 @@ impl Follower {
             lines.push(crate::shape_feed::ops_line(None, &ops).into());
         }
         lines.push(bytes::Bytes::from_static(b"{\"up_to_date\":true}\n"));
-        let head = futures::stream::iter(lines.into_iter().map(Ok::<_, std::convert::Infallible>));
+        // Room for the first answer is taken before it is sent and kept until its last line has been.
+        let room = match crate::serve::reserve_answer(&state, lines.iter().map(|l| l.len()).sum()) {
+            Ok(room) => room,
+            Err(refused) => return refused,
+        };
+        let head =
+            futures::stream::unfold((lines.into_iter(), room), |(mut lines, room)| async move {
+                let line = lines.next()?;
+                Some((Ok::<_, std::convert::Infallible>(line), (lines, room)))
+            });
         let body = match frames {
             Some(frames) => head
                 .chain(futures::stream::unfold(frames, |mut frames| async move {
@@ -3153,6 +3207,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("ds");
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"ds\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"t\"\naddress = \"0x0000000000000000000000000000000000000001\"\n\
+             abi = \"abi.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("abi.json"), "[]").unwrap();
+        // Two rows an answer may hold and no wait for a permit, so each guard can be met.
+        let mut limits: crate::feed::WireLimits = (&crate::limits::Limits::process()).into();
+        limits.max_rows = 2;
+        limits.max_queued = 0;
         let fresh = |epoch| Snapshot {
             epoch,
             ..Default::default()
@@ -3168,7 +3234,7 @@ mod tests {
             surface: Default::default(),
             tenant: None,
             share: None,
-            limits: None,
+            limits: Some(limits),
             chain: Some("mainnet".into()),
             isolation: None,
             data_identity: None,
@@ -3203,6 +3269,11 @@ mod tests {
                 },
             );
         }
+        follower.realise();
+        assert!(
+            matches!(follower.lock().routes["ds"].served, Some(Ok(_))),
+            "the route's state is built, which the guards are read from"
+        );
         let encode = |s: &str| -> String {
             s.bytes()
                 .map(|b| match b {
@@ -3263,6 +3334,27 @@ mod tests {
             vec![put("k1", "0xa"), put("k2", "0xb"), put("k3", "0xa")],
         )
         .await;
+
+        // The guards `/sql` answers under: a row cap, and the gate.
+        let whole = encode(r#"{"table":"swaps"}"#);
+        let too_big = follower.serve_sync("ds", &uri(&format!("s={whole}"))).await;
+        assert_eq!(
+            too_big.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "three rows, two allowed"
+        );
+        let gate = follower.gate("mainnet");
+        let mut held = Vec::new();
+        while let Ok(permit) = gate.try_admit(None) {
+            held.push(permit);
+        }
+        let busy = follower.serve_sync("ds", &uri(&pool("0xa"))).await;
+        assert_eq!(
+            busy.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no permit free"
+        );
+        drop(held);
 
         // Without `live`: the header, the selected rows, and the end of the answer.
         let resp = follower.serve_sync("ds", &uri(&pool("0xa"))).await;
