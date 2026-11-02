@@ -296,3 +296,52 @@ the tree. S1 filters `Changes.added` and `Changes.removed`, which leaves the wir
 - Ranges (§5.1) are not built; they are S1.
 
 S0's gate is met on both halves and S1 is next.
+
+## 12. S1 in progress (2026-11-01): the follower's half of the filter
+
+**Built.**
+
+- `src/shape_feed.rs`: `ShapeHub`, the subscribers to shapes. A follower's applied delta becomes at most
+  one `Frame` per subscriber, `(epoch, generation)` and a list of puts and retractions by key. Subscribers
+  to the same shape share one entry and one index slot. Each queue is bounded and fed with `try_send`,
+  so the follower never waits; one that is full is closed, which its receiver sees as the end of the
+  stream after what fitted, and is the signal to fetch again. Entries nobody listens to are dropped from
+  the index when more than half are dead.
+- `Changes::log` (`src/feed.rs`), the ordered record of each stored row a put or a rollback changed. It
+  is off until `MemStore::track_changes` is called, so a follower with no shape subscribers pays
+  nothing, and a seal's prune is not in it, because a pruned row is still in the nest's history.
+- Ranges (§5.1) on an unsigned-integer column, `gte` and `lte`, in the shape's JSON as the RFC shows it.
+  A shape with no range hashes to the bytes it did before, so no identity moved. A range with any other
+  key (`gt`, say) is refused. A shape with a range and no value term cannot be found by a lookup, so
+  each such shape is checked against every row.
+
+**How a key is settled.** A delta may touch a key several times. The hub takes the last touch as where
+the row ends up, and every row the key had on the way as a copy that may hold it: a subscriber whose
+shape selects the final row gets a put, and one whose shape selected an earlier row and not the final
+one gets a retraction. A retraction of a key a copy does not hold changes nothing, so over-telling is
+safe where under-telling is not.
+
+**Tested.**
+
+- `every_copy_equals_the_filtered_canonical_rows_after_overwrites_and_reorgs`: 1,500 randomised steps
+  of new blocks, overwrites and reorgs (a rollback and a different chain in one delta), against a real
+  `MemStore` applying real deltas, with twelve subscribers that join at different points, three kinds
+  of shape (value terms; a window of blocks with a pool; an open-ended range), and some sharing a shape.
+  After every step each copy, built from its first answer and the frames since, equals the canonical
+  rows its shape selects. With retractions switched off the suite fails, so it does test them.
+- `a_stalled_subscriber_is_closed_and_delays_no_one`: a queue of two, ten deltas; the other subscriber,
+  on the same shape, gets all ten.
+- Ranges agree between the parsed row and its text, over rows in range, out of it, absent, negative,
+  fractional, hex, boolean and null.
+
+**Not built, and so S1 is not done.**
+
+1. Nothing calls the hub. `Reader::apply_delta` has not been wired to it, and no follower turns
+   `track_changes` on.
+2. The protocol of §5.2: `GET /<route>/shape`, the initial Arrow answer with its offset, the live stream,
+   and the `409 must-refetch`.
+3. `[mounts.sync]` (§5.6): the table and column allow-list, `max_shapes_per_connection`,
+   `max_values_per_term`.
+4. Measurement. The cost gate of §11 does not cover this code: the per-delta sweep of every entry, the
+   frame cloned for each subscriber, and the settle step are not timed, and the benchmark has no range
+   shapes.

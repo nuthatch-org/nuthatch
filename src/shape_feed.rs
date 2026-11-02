@@ -205,6 +205,7 @@ impl ShapeHub {
 mod tests {
     use super::*;
     use crate::feed::{Delta, MemStore, Op, Snapshot};
+    use crate::shape::Range;
     use crate::store::Store;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -216,6 +217,7 @@ mod tests {
                 "pool".to_string(),
                 pools.iter().map(|p| p.to_string()).collect::<BTreeSet<_>>(),
             )]),
+            ..Default::default()
         }
     }
 
@@ -412,10 +414,31 @@ mod tests {
             // Clients arrive through the run, each starting from the matching rows as they are then.
             if step % 100 == 0 && clients.len() < 12 {
                 let chosen: Vec<&str> = pools.iter().copied().filter(|_| next(2) == 0).collect();
-                let shape = if clients.len() % 4 == 3 {
-                    clients[0].shape.clone()
-                } else {
-                    shape_of(&chosen)
+                let shape = match clients.len() % 4 {
+                    3 => clients[0].shape.clone(),
+                    // A window of blocks, with and without a choice of pools.
+                    2 => Shape {
+                        ranges: BTreeMap::from([(
+                            "block_number".to_string(),
+                            Range {
+                                gte: Some(10),
+                                lte: Some(60),
+                            },
+                        )]),
+                        ..shape_of(&[pools[step / 100 % 4]])
+                    },
+                    1 => Shape {
+                        ranges: BTreeMap::from([(
+                            "block_number".to_string(),
+                            Range {
+                                gte: Some(5),
+                                lte: None,
+                            },
+                        )]),
+                        table: "swaps".into(),
+                        ..Default::default()
+                    },
+                    _ => shape_of(&chosen),
                 };
                 let copy = model
                     .iter()
@@ -498,5 +521,7 @@ mod tests {
             }
         }
         assert!(clients.len() > 4 && !model.is_empty());
+        let holding = clients.iter().filter(|c| !c.copy.is_empty()).count();
+        assert!(holding > 4, "the shapes select something: {holding}");
     }
 }

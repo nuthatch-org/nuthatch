@@ -6,12 +6,74 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// One table's rows, every column in `terms` equal to one of its listed values (RFC-0080 §5.1).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A bound on an ordered column, read as an unsigned integer: a row is in it when its value is at
+/// least `gte` and at most `lte`. A value that is not an unsigned integer is in no range.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Range {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gte: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lte: Option<u64>,
+}
+
+impl Range {
+    pub fn contains(&self, n: u64) -> bool {
+        self.gte.is_none_or(|g| n >= g) && self.lte.is_none_or(|l| n <= l)
+    }
+}
+
+/// One table's rows: every column in `terms` equal to one of its listed values, and every column in
+/// `ranges` within its bound (RFC-0080 §5.1). A column has one or the other.
+///
+/// On the wire `where` holds both: a list of values, or a range object.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "Wire", into = "Wire")]
 pub struct Shape {
     pub table: String,
-    #[serde(rename = "where", default)]
     pub terms: BTreeMap<String, BTreeSet<String>>,
+    pub ranges: BTreeMap<String, Range>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Term {
+    Values(BTreeSet<String>),
+    Range(Range),
+}
+
+#[derive(Serialize, Deserialize)]
+struct Wire {
+    table: String,
+    #[serde(rename = "where", default)]
+    terms: BTreeMap<String, Term>,
+}
+
+impl From<Wire> for Shape {
+    fn from(wire: Wire) -> Shape {
+        let mut shape = Shape {
+            table: wire.table,
+            ..Shape::default()
+        };
+        for (column, term) in wire.terms {
+            match term {
+                Term::Values(values) => shape.terms.insert(column, values).map(drop),
+                Term::Range(range) => shape.ranges.insert(column, range).map(drop),
+            };
+        }
+        shape
+    }
+}
+
+impl From<Shape> for Wire {
+    fn from(shape: Shape) -> Wire {
+        let ranges = shape.ranges.into_iter().map(|(c, r)| (c, Term::Range(r)));
+        let values = shape.terms.into_iter().map(|(c, v)| (c, Term::Values(v)));
+        Wire {
+            table: shape.table,
+            terms: ranges.chain(values).collect(),
+        }
+    }
 }
 
 impl Shape {
@@ -25,7 +87,20 @@ impl Shape {
         self.terms.iter().all(|(column, values)| {
             row.get(column)
                 .is_some_and(|v| values.contains(text(v).as_ref()))
+        }) && self.ranges.iter().all(|(column, range)| {
+            row.get(column)
+                .and_then(number)
+                .is_some_and(|n| range.contains(n))
         })
+    }
+}
+
+/// A column's value as the integer a range bounds, if it is one.
+fn number(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
     }
 }
 
@@ -104,27 +179,44 @@ struct Candidates {
 pub struct ShapeIndex {
     shapes: Vec<Shape>,
     by_column: HashMap<String, Column>,
-    /// Shapes with no terms: every row is in them.
+    /// Each range's column's key as a row's text spells it, `"name":`.
+    range_needles: HashMap<String, String>,
+    /// Shapes with no terms and no ranges: every row is in them.
     open: Vec<usize>,
+    /// Shapes with ranges and no value terms, which nothing finds a row by: each is checked.
+    ranged: Vec<usize>,
+}
+
+fn needle(column: &str) -> String {
+    format!("{}:", Value::String(column.to_string()))
 }
 
 impl ShapeIndex {
     pub fn insert(&mut self, shape: Shape) -> usize {
         let id = self.shapes.len();
         if shape.terms.is_empty() {
-            self.open.push(id);
+            if shape.ranges.is_empty() {
+                self.open.push(id);
+            } else {
+                self.ranged.push(id);
+            }
+        }
+        for column in shape.ranges.keys() {
+            self.range_needles
+                .entry(column.clone())
+                .or_insert_with(|| needle(column));
         }
         for (column, values) in &shape.terms {
             let indexed = self
                 .by_column
                 .entry(column.clone())
                 .or_insert_with(|| Column {
-                    needle: format!("{}:", Value::String(column.clone())),
+                    needle: needle(column),
                     by_value: HashMap::new(),
                 });
             for value in values {
                 let found = indexed.by_value.entry(value.clone()).or_default();
-                if shape.terms.len() == 1 {
+                if shape.terms.len() == 1 && shape.ranges.is_empty() {
                     found.solo.push(id);
                 } else {
                     found.multi.push(id);
@@ -142,6 +234,12 @@ impl ShapeIndex {
     /// The shapes `row` is in, in id order.
     pub fn matching(&self, row: &Value) -> Vec<usize> {
         let mut out = self.open.clone();
+        out.extend(
+            self.ranged
+                .iter()
+                .copied()
+                .filter(|&id| self.shapes[id].matches(row)),
+        );
         for (column, indexed) in &self.by_column {
             let Some(v) = row.get(column) else { continue };
             if let Some(found) = indexed.by_value.get(text(v).as_ref()) {
@@ -171,11 +269,35 @@ impl ShapeIndex {
         }
     }
 
+    /// Whether a row's text is within every range of shape `id`; `None` where a column needs a
+    /// parse to be read.
+    fn ranges_hold(&self, row: &str, id: usize) -> Option<bool> {
+        for (column, range) in &self.shapes[id].ranges {
+            match scalar_in(row, &self.range_needles[column]) {
+                Read::Absent => return Some(false),
+                Read::Complex => return None,
+                Read::Scalar(v) => {
+                    if !v.parse::<u64>().is_ok_and(|n| range.contains(n)) {
+                        return Some(false);
+                    }
+                }
+            }
+        }
+        Some(true)
+    }
+
     fn read_text(&self, row: &str, out: &mut Vec<usize>) -> Option<()> {
         out.clear();
         out.extend_from_slice(&self.open);
         // Ids within one list are ascending and unique, so a single list needs no sort.
         let mut sources = usize::from(!self.open.is_empty());
+        let held = out.len();
+        for &id in &self.ranged {
+            if self.ranges_hold(row, id)? {
+                out.push(id);
+            }
+        }
+        sources += usize::from(out.len() > held);
         for (column, indexed) in &self.by_column {
             let value = match scalar_in(row, &indexed.needle) {
                 Read::Absent => continue,
@@ -203,6 +325,7 @@ impl ShapeIndex {
                         Read::Complex => return None,
                     }
                 }
+                all &= self.ranges_hold(row, id)?;
                 if all {
                     out.push(id);
                 }
@@ -306,6 +429,7 @@ mod tests {
                 "pool".to_string(),
                 pools.iter().map(|p| p.to_string()).collect(),
             )]),
+            ..Default::default()
         }
     }
 
@@ -340,6 +464,7 @@ mod tests {
         let all = t.subscribe(Shape {
             table: "swaps".into(),
             terms: BTreeMap::new(),
+            ..Default::default()
         });
         t.put("1:0", swap("0xa", 1));
         t.put("1:1", swap("0xb", 1));
@@ -428,14 +553,17 @@ mod tests {
                 ("pool".to_string(), BTreeSet::from(["0xa".to_string()])),
                 ("block".to_string(), BTreeSet::from(["7".to_string()])),
             ]),
+            ..Default::default()
         });
         index.insert(Shape {
             table: "swaps".into(),
             terms: BTreeMap::from([("memo".to_string(), BTreeSet::from(["a\"b".to_string()]))]),
+            ..Default::default()
         });
         index.insert(Shape {
             table: "swaps".into(),
             terms: BTreeMap::new(),
+            ..Default::default()
         });
         let rows = [
             json!({ "pool": "0xa", "block": 7 }),
@@ -457,5 +585,95 @@ mod tests {
         }
         index.matching_text("not json", &mut out);
         assert_eq!(out, [3], "only the open shape holds a row nothing reads");
+    }
+
+    fn ranged(column: &str, range: Range, pools: &[&str]) -> Shape {
+        let base = if pools.is_empty() {
+            Shape {
+                table: "swaps".into(),
+                ..Default::default()
+            }
+        } else {
+            swaps_in(pools)
+        };
+        Shape {
+            ranges: BTreeMap::from([(column.to_string(), range)]),
+            ..base
+        }
+    }
+
+    #[test]
+    fn a_shape_reads_from_and_writes_to_the_json_the_rfc_shows() {
+        let text =
+            r#"{"table":"swaps","where":{"block":{"gte":10,"lte":20},"pool":["0xa","0xb"]}}"#;
+        let shape: Shape = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            shape.ranges["block"],
+            Range {
+                gte: Some(10),
+                lte: Some(20)
+            }
+        );
+        assert_eq!(shape.terms["pool"].len(), 2);
+        assert_eq!(serde_json::to_string(&shape).unwrap(), text);
+        // A shape with no range is the bytes it was before ranges, so its identity did not move.
+        let plain = r#"{"table":"swaps","where":{"pool":["0xa"]}}"#;
+        assert_eq!(
+            swaps_in(&["0xa"]).hash(),
+            format!("{:x}", Sha256::digest(plain.as_bytes()))
+        );
+        let unknown = r#"{"table":"swaps","where":{"block":{"gt":10}}}"#;
+        assert!(serde_json::from_str::<Shape>(unknown).is_err());
+    }
+
+    /// Ranges agree between the parsed row and its text, for rows in a range, out of it, with no
+    /// such column, and with a value that is not an unsigned integer.
+    #[test]
+    fn ranges_agree_between_the_parsed_row_and_its_text() {
+        let between = Range {
+            gte: Some(10),
+            lte: Some(20),
+        };
+        let mut index = ShapeIndex::default();
+        index.insert(ranged("block", between, &[]));
+        index.insert(ranged("block", between, &["0xa"]));
+        index.insert(ranged(
+            "block",
+            Range {
+                gte: Some(15),
+                lte: None,
+            },
+            &["0xa", "0xb"],
+        ));
+        index.insert(ranged(
+            "block",
+            Range {
+                gte: None,
+                lte: Some(12),
+            },
+            &[],
+        ));
+        index.insert(swaps_in(&["0xa"]));
+        let rows = [
+            json!({ "pool": "0xa", "block": 10 }),
+            json!({ "pool": "0xa", "block": 20 }),
+            json!({ "pool": "0xa", "block": 21 }),
+            json!({ "pool": "0xb", "block": "16" }),
+            json!({ "pool": "0xb", "block": 9 }),
+            json!({ "pool": "0xa" }),
+            json!({ "block": 12 }),
+            json!({ "block": -3 }),
+            json!({ "block": 12.5 }),
+            json!({ "block": "0x10" }),
+            json!({ "block": true }),
+            json!({ "pool": "0xa", "block": null }),
+        ];
+        let mut out = Vec::new();
+        for row in rows {
+            index.matching_text(&row.to_string(), &mut out);
+            assert_eq!(out, index.matching(&row), "row {row}");
+        }
+        index.matching_text(r#"{"pool":"0xa","block":12}"#, &mut out);
+        assert_eq!(out, [0, 1, 3, 4]);
     }
 }

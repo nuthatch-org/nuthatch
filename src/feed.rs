@@ -1758,6 +1758,7 @@ mod tests {
                     "pool".to_string(),
                     std::collections::BTreeSet::from([address(s % POOLS)]),
                 )]),
+                ..Default::default()
             });
         }
         // One delta per block, as a follower at the tip receives them, each as its v2 body.
