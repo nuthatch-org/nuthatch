@@ -482,3 +482,33 @@ and ends when a fresh snapshot replaces the copy.
 6. **Offset is the copy's generation**, not a block, as before.
 
 Item 1 decides whether this can be turned on for anyone; the live streams' own limits and the rest are S1's remaining protocol.
+
+## 15. The sealed half: what reading `/sql` showed (2026-11-01)
+
+§14 item 1 is the sealed rows. §5.3 says to answer them as "the shape as a query over the sealed
+segments", and S2's gate is "sealed answers byte-equal to the `/sql` of the same predicate". Reading how
+`/sql` is built shows that is not one decision but three, and the first answer cannot be finished
+without them.
+
+1. **Two representations of a row.** A hot row is stored JSON, and `/sql` ingests it as such under the
+   table's registry schema (`charged_hot_rows`, then `query_hot_cold`). A sealed row is Parquet, typed.
+   Both reach a client of `/sql` as the schema's columns, which can include columns no stored row has
+   (the RFC-0061 `value_dec` and `value_overflow` pair is derived in SQL). The live frames of §14 carry
+   the *stored* row. A client that takes its first answer from the sealed query and its updates from the
+   frames would hold rows of two shapes under one key. Either the frames are converted to the SQL
+   projection, or the sealed rows are written back out as stored JSON, which is not byte-exact from
+   Parquet. The first is the only one that can meet S2's gate, and costs a conversion on the live path.
+2. **Keys.** A put and a retraction are by key (`Store::entity_key(block, log)` for a log table), and
+   the sealed query's rows carry none. A table that is not log-shaped may have no key a client can
+   reconstruct from its columns. The answer has to carry a key per row, so the query selects whatever
+   the key is made of, and the rule from a row to its key becomes part of the protocol.
+3. **Where the two meet.** The first answer would be `/sql`'s own, sealed and hot together, read after
+   the subscription as §14's convergence argument allows (a row sealed in between is in the sealed side
+   and its hot copy was never retracted, since a prune is not a retraction). That means running the
+   shape as a statement through `run_sql_query_at`, with its own memo and guards, rather than scanning
+   the copy, which is the better reuse and also what makes the §14 guards redundant for the first answer.
+
+Nothing here is built. The choice in (1) decides the rest, and is Chief's: **the shape's wire row is the
+`/sql` projection, with a key column**, or it is the stored row and sealed history is out of a shape's
+reach (a shape then covers the hot window only, which is Electric-like for a live tail and not for
+"huge nests"). I would take the first.
