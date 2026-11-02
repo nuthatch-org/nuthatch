@@ -242,3 +242,48 @@ binary today, and the engine without `sync` is the engine today, which is RFC-00
 3. Whether `pin` should allow several columns, or one is enough for "the local user".
 4. Whether a writer with no followers should be allowed to serve shapes itself, for a small operator.
    Proposed: no, a local follower costs a process and keeps goal 4 true by construction.
+
+## 11. S0 measured (2026-11-01): the gate is not met
+
+**Built, nothing served.** `src/shape.rs`: a shape (a table and value terms, hashed by its canonical
+JSON), an index from each `(column, value)` to the shapes naming it, and a `Table` that applies puts,
+replacements, retractions and rollbacks to each subscriber's copy. It is a spike: no endpoint, no queue,
+no sealed part.
+
+**The correctness half of the gate passes.**
+`overwrites_and_rollbacks_keep_every_copy_equal_to_the_filtered_canonical_rows` runs 3,000 randomised
+puts, overwrites, retractions and multi-step rollbacks against 12 shapes and checks every copy against
+the filtered canonical rows after every step.
+
+**The cost half does not.** `a_shape_filter_costs_under_a_tenth_of_the_follower_apply` (ignored; run it
+in release with `--ignored --nocapture`) sends 500 blocks of 200 rows as v2 bodies through what a
+follower does today, `decode_delta` then `MemStore::apply`, and times a filter over the rows each
+delta added, with 10,000 shapes over 2,000 pools, so every row is in five shapes. Best of five, 100,000
+rows, release:
+
+| | time | against decode + apply |
+|---|---|---|
+| decode | 62 to 65 ms | |
+| apply | 20 to 21 ms | |
+| filter, each row parsed to JSON | 95 to 126 ms | 1.2 to 1.5 |
+| filter, indexed columns read off the row's text | 10.1 to 10.2 ms | 0.118 to 0.124 |
+
+The gate is under 0.10. The first measurement, against a bare in-memory insert, gave 5.3; that baseline
+left out the frame decode and was too small to mean anything, which is why it was replaced.
+
+**What this answers in §5.4's `[VERIFY]`.** The parse is the cost: about nine tenths of the filter.
+Reading only the indexed columns off the row's text, with no parse, removes it and leaves the probe
+and the fan-out, 100 ns a row at five shapes a row. That is 0.12 of the follower's own work, over the
+gate by a fifth. A sort-free single-column path was tried and moved nothing. The remaining cost was
+not broken down; its parts are the substring search for the column, one hash of a 42-byte value, and
+five candidate pushes.
+
+**Not done, and what would move it.** The v2 frame already carries `pool` as an Arrow column before the
+decoder reassembles each row as text. Probing there would skip the search, the one part of the
+remaining cost that is not the hash or the fan-out, and the decoder is where the follower's own 62 ms
+goes. That is a change to `feed_wire`, not a spike, and its saving is a guess until it is built. Fan-out is also real work that grows with shapes per row, not a constant: the 10,000-shape
+figure holds at five shapes a row and says nothing about a token in five hundred.
+
+**Decision for Chief.** The RFC says an S0 that fails stops it. This fails by a fifth, on a baseline
+that is now the real one, with a clear unbuilt step that removes the search. Either spend a few days on
+that step and re-measure, or hold the RFC here.

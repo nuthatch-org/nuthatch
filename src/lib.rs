@@ -140,6 +140,8 @@ pub mod serve;
 /// RFC-0046 S3: drain and settle recorded authorisations, outside the nest.
 #[cfg(feature = "counter")]
 pub mod settle;
+/// RFC-0080 S0: value-term shapes and their per-delta filter, a spike that nothing serves yet.
+pub mod shape;
 pub mod skill;
 pub mod source;
 pub(crate) mod spill;

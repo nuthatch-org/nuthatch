@@ -1690,6 +1690,113 @@ mod tests {
     use super::*;
     use crate::store::Store;
 
+    /// RFC-0080 S0's cost gate: what a shape filter adds to a follower's work on the same deltas,
+    /// against what the follower does to them today (decode the v2 frame, apply it to the mirror),
+    /// at 10,000 shapes. Run in release with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn a_shape_filter_costs_under_a_tenth_of_the_follower_apply() {
+        use std::time::{Duration, Instant};
+        const POOLS: u64 = 2_000;
+        const BLOCKS: u64 = 500;
+        const PER_BLOCK: u64 = 200;
+        let address = |n: u64| format!("0x{n:040x}");
+        let mut index = crate::shape::ShapeIndex::default();
+        for s in 0..10_000 {
+            index.insert(crate::shape::Shape {
+                table: "swaps".into(),
+                terms: BTreeMap::from([(
+                    "pool".to_string(),
+                    std::collections::BTreeSet::from([address(s % POOLS)]),
+                )]),
+            });
+        }
+        // One delta per block, as a follower at the tip receives them, each as its v2 body.
+        let bodies: Vec<Vec<u8>> = (1..=BLOCKS)
+            .map(|block| {
+                let ops = (0..PER_BLOCK)
+                    .map(|log| {
+                        let i = block * PER_BLOCK + log;
+                        Op::Put {
+                            key: Store::entity_key(block, log),
+                            row: serde_json::json!({
+                                "table": "swaps",
+                                "pool": address(i * 7919 % POOLS),
+                                "block_number": block,
+                                "log_index": log,
+                                "tx": format!("0x{i:064x}"),
+                                "sender": address(i),
+                                "amount0": "123456789",
+                                "amount1": "987654321",
+                            })
+                            .to_string(),
+                        }
+                    })
+                    .collect();
+                let delta = Delta {
+                    epoch: 1,
+                    generation: block,
+                    ops,
+                    ..Default::default()
+                };
+                crate::feed_wire::encode_delta(&delta).unwrap()
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut decode, mut apply) = (Duration::MAX, Duration::MAX);
+        let (mut parsed, mut text) = (Duration::MAX, Duration::MAX);
+        for _ in 0..5 {
+            let store = MemStore::from_snapshot(
+                dir.path(),
+                Snapshot {
+                    epoch: 1,
+                    ..Default::default()
+                },
+            );
+            let (mut d, mut a) = (Duration::ZERO, Duration::ZERO);
+            let (mut p, mut t) = (Duration::ZERO, Duration::ZERO);
+            let (mut hits, mut text_hits) = (0usize, 0usize);
+            let mut found = Vec::new();
+            for body in &bodies {
+                let started = Instant::now();
+                let delta = crate::feed_wire::decode_delta(body, None).unwrap();
+                d += started.elapsed();
+                let started = Instant::now();
+                let changes = store.apply(&delta).unwrap();
+                a += started.elapsed();
+                let started = Instant::now();
+                for raw in &changes.added {
+                    let row: serde_json::Value = serde_json::from_str(raw).unwrap();
+                    hits += index.matching(&row).len();
+                }
+                p += started.elapsed();
+                let started = Instant::now();
+                for raw in &changes.added {
+                    index.matching_text(raw, &mut found);
+                    text_hits += found.len();
+                }
+                t += started.elapsed();
+            }
+            assert_eq!(hits, text_hits, "the two paths find the same shapes");
+            std::hint::black_box(hits);
+            (decode, apply) = (decode.min(d), apply.min(a));
+            (parsed, text) = (parsed.min(p), text.min(t));
+        }
+        let follower = (decode + apply).as_secs_f64();
+        println!(
+            "{} rows: decode {decode:?}, apply {apply:?}; filter parsing each row {parsed:?} ({:.3}), \
+         reading the indexed columns off the text {text:?} ({:.3})",
+            BLOCKS * PER_BLOCK,
+            parsed.as_secs_f64() / follower,
+            text.as_secs_f64() / follower,
+        );
+        let ratio = text.as_secs_f64() / follower;
+        assert!(
+            ratio < 0.10,
+            "the filter costs {ratio:.3} of decode and apply"
+        );
+    }
+
     fn row(block: u64, log: u64, table: &str) -> (String, String) {
         (
             Store::entity_key(block, log),
