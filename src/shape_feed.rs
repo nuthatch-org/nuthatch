@@ -7,16 +7,17 @@
 use crate::feed::Touch;
 use crate::shape::{table_of, Shape, ShapeIndex};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// A change to a subscriber's copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShapeOp {
     /// The row stored under `key`, new or replaced.
-    Put { key: String, row: String },
+    Put { key: Arc<str>, row: Arc<str> },
     /// The row under `key` is no longer in the shape: a rollback dropped it, or a put replaced it
     /// with one that does not match. Retracting a key a copy does not hold changes nothing.
-    Retract { key: String },
+    Retract { key: Arc<str> },
 }
 
 /// What one applied delta did to a subscriber's copy, as of the `(epoch, generation)` it left.
@@ -24,7 +25,8 @@ pub enum ShapeOp {
 pub struct Frame {
     pub epoch: u64,
     pub generation: u64,
-    pub ops: Vec<ShapeOp>,
+    /// Shared, so a frame sent to every subscriber of a shape is one copy of it.
+    pub ops: Arc<[ShapeOp]>,
 }
 
 /// A subscriber's end. When it ends, because its queue filled or the hub went, the copy is stale
@@ -145,6 +147,9 @@ impl ShapeHub {
         let mut found = Vec::new();
         for key in order {
             let touches = &by_key[key];
+            // Each held once however many subscribers are told of it.
+            let mut key_text: Option<Arc<str>> = None;
+            let mut row_text: Option<Arc<str>> = None;
             let mut holds: Vec<(&str, usize)> = Vec::new();
             if let Some(row) = touches.last().and_then(|t| t.new.as_deref()) {
                 if let Some((name, table)) =
@@ -153,10 +158,12 @@ impl ShapeHub {
                     table.index.matching_text(row, &mut found);
                     for &id in &found {
                         holds.push((name, id));
-                        pending.entry((name, id)).or_default().push(ShapeOp::Put {
-                            key: key.to_string(),
-                            row: row.to_string(),
-                        });
+                        let key = key_text.get_or_insert_with(|| Arc::from(key)).clone();
+                        let row = row_text.get_or_insert_with(|| Arc::from(row)).clone();
+                        pending
+                            .entry((name, id))
+                            .or_default()
+                            .push(ShapeOp::Put { key, row });
                     }
                 }
             }
@@ -174,9 +181,11 @@ impl ShapeHub {
                         continue;
                     }
                     retracted.push(slot);
-                    pending.entry(slot).or_default().push(ShapeOp::Retract {
-                        key: key.to_string(),
-                    });
+                    let key = key_text.get_or_insert_with(|| Arc::from(key)).clone();
+                    pending
+                        .entry(slot)
+                        .or_default()
+                        .push(ShapeOp::Retract { key });
                 }
             }
         }
@@ -186,7 +195,7 @@ impl ShapeHub {
             let frame = Frame {
                 epoch,
                 generation,
-                ops,
+                ops: ops.into(),
             };
             let before = entry.senders.len();
             // A full queue is a client that is not reading: it is closed, and fetches again.
@@ -304,9 +313,10 @@ mod tests {
                 epoch: 1,
                 generation: 1,
                 ops: vec![ShapeOp::Put {
-                    key: Store::entity_key(1, 0),
-                    row: row("0xa", 1, 0)
+                    key: Store::entity_key(1, 0).into(),
+                    row: row("0xa", 1, 0).into()
                 }]
+                .into()
             }]
         );
         assert!(drain(&mut b).0.is_empty(), "nothing it selects changed");
@@ -319,9 +329,9 @@ mod tests {
         let mut a = f.hub.subscribe(shape_of(&["0xa"]), 8);
         f.apply(vec![put(1, 0, "0xb")]);
         assert_eq!(
-            drain(&mut a).0[0].ops,
+            &*drain(&mut a).0[0].ops,
             [ShapeOp::Retract {
-                key: Store::entity_key(1, 0)
+                key: Store::entity_key(1, 0).into()
             }]
         );
     }
@@ -333,9 +343,9 @@ mod tests {
         let mut a = f.hub.subscribe(shape_of(&["0xa"]), 8);
         f.apply(vec![rollback_to(1)]);
         assert_eq!(
-            drain(&mut a).0[0].ops,
+            &*drain(&mut a).0[0].ops,
             [ShapeOp::Retract {
-                key: Store::entity_key(2, 0)
+                key: Store::entity_key(2, 0).into()
             }]
         );
     }
@@ -345,7 +355,11 @@ mod tests {
         let mut f = Follower::new();
         let mut a = f.hub.subscribe(shape_of(&["0xa"]), 8);
         f.apply(vec![put(3, 0, "0xa"), rollback_to(2)]);
-        let ops = drain(&mut a).0.pop().map(|f| f.ops).unwrap_or_default();
+        let ops = drain(&mut a)
+            .0
+            .pop()
+            .map(|f| f.ops)
+            .unwrap_or_else(|| Arc::from([]));
         assert!(
             ops.iter().all(|op| matches!(op, ShapeOp::Retract { .. })),
             "{ops:?}"
@@ -497,13 +511,13 @@ mod tests {
                 let (frames, closed) = drain(&mut client.frames);
                 assert!(!closed);
                 for frame in frames {
-                    for op in frame.ops {
+                    for op in frame.ops.iter() {
                         match op {
                             ShapeOp::Put { key, row } => {
-                                client.copy.insert(key, row);
+                                client.copy.insert(key.to_string(), row.to_string());
                             }
                             ShapeOp::Retract { key } => {
-                                client.copy.remove(&key);
+                                client.copy.remove(&**key);
                             }
                         }
                     }

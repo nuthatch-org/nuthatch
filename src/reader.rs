@@ -2939,7 +2939,7 @@ mod tests {
         let frame = frames.try_recv().unwrap();
         assert_eq!((frame.epoch, frame.generation), (1, 1));
         assert_eq!(
-            frame.ops,
+            &*frame.ops,
             [ShapeOp::Put {
                 key: "k1".into(),
                 row: r#"{"table":"swaps","pool":"0xa"}"#.into()

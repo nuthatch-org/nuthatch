@@ -382,6 +382,11 @@ subscribers a row, 200 ns a delivery, which is more than the follower's decode a
 scales with deliveries, as §8 said it would, so a popular table matched by thousands of shapes is the
 case to size against, and this figure is for five.
 
-The likely cost is that every delivery copies the row's text twice: once building the subscriber's ops
-and once cloning the frame for each sender on the shape. That is a guess, not a profile. The obvious
-change, holding a row once as shared text so a delivery is a pointer, is not made.
+**Rows held once.** The guess was that every delivery copied the row's text twice, once building the
+subscriber's ops and once cloning the frame for each sender on the shape. A `ShapeOp` now holds its key
+and row as shared text and a `Frame` its ops as a shared slice, so a row is copied once however many
+subscribers it goes to. Measured again, the hub took 11.2 ms against 19.6 before: 0.72 of decode and
+apply, from 1.28, at 112 ns a delivery. Tracking is +0.012. That is a smaller cost, not a small one, and
+it is not profiled: what is left is likely the per-subscriber frame (a list built, then copied into a
+shared slice), the map that gathers them, and the channel send. The figure is still for five
+subscribers a row.
