@@ -76,10 +76,13 @@ ignore = [
   # reads one. dbsp 0.320 requires zip ^6; 0.366 moves to ^9. Drop these on the dbsp bump.
   # The advisories landed 2026-10-17 as the three below, all in `extract()`; rechecked that day:
   # dbsp 0.320 and feldera-ir 0.320 import only `ZipWriter`, and nothing in this tree imports zip.
+  # RUSTSEC-2026-0429 (extract() aborts on a symlink entry with a large declared size) landed
+  # 2026-11-02, also in `extract()`; rechecked that day, same imports. Its fix is zip >=9.0.0.
   { crate = "zip@6.0.0", reason = "yanked for extraction flaws; dbsp only writes zips" },
   "RUSTSEC-2026-0367", # zip: SUID/SGID bits kept on extraction
   "RUSTSEC-2026-0368", # zip: extract() follows symlinks out of the destination
   "RUSTSEC-2026-0369", # zip: extract() applies permissions through symlinks
+  "RUSTSEC-2026-0429", # zip: extract() aborts on a symlink entry with a large declared size
   #
   # crypto-bigint 0.5.5 (transitive: alloy-primitives 1.6 → k256 0.13 → elliptic-curve 0.13). A timing
   # leak matters only where a secret scalar is computed on, and nuthatch holds no secp256k1 key: the
