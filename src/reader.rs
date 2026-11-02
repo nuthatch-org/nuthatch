@@ -3522,4 +3522,205 @@ mod tests {
             "the stream ends when the copy is replaced"
         );
     }
+
+    /// RFC-0080 §16: a shape's answer includes the rows already sealed, and keeps following across the
+    /// seal. The catalogue and segments are real: `seal_range` writes them, and the copy's snapshot
+    /// carries the catalogue as a follower's would.
+    #[tokio::test]
+    async fn sync_answers_sealed_rows_with_the_hot_ones() {
+        use crate::feed::{Delta, Op, Rows, Snapshot};
+        use crate::store::Store;
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ds");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"ds\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"t\"\naddress = \"0x0000000000000000000000000000000000000001\"\n\
+             abi = \"abi.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abi.json"),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        let row = |block: u64, log: u64, from: &str, to: &str| {
+            format!(
+                r#"{{"table":"t__transfer","from":"{from}","to":"{to}","value":"7","block_number":{block},"tx_hash":"0xt{block}","log_index":{log}}}"#
+            )
+        };
+        // Blocks 1 and 2 are sealed; the copy's catalogue names them.
+        let sealed = vec![
+            row(1, 0, "0xa", "0xb"),
+            row(1, 1, "0xc", "0xb"),
+            row(2, 0, "0xa", "0xc"),
+        ];
+        crate::seal::seal_range(&dir, &sealed, 1, 2).unwrap();
+        let catalogue = std::fs::read_to_string(
+            dir.join(crate::seal::SEGMENTS_DIR)
+                .join(crate::seal::MANIFEST_FILE),
+        )
+        .unwrap();
+        let snapshot = Snapshot {
+            epoch: 1,
+            meta: Rows {
+                map: std::collections::BTreeMap::from([("sealed_through".into(), "2".into())]),
+            },
+            catalogue: Some(catalogue),
+            ..Default::default()
+        };
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        {
+            let mut inner = follower.lock();
+            inner.routes.insert(
+                "ds".into(),
+                Route {
+                    spec: Spec {
+                        dataset: "ds".into(),
+                        nid: None,
+                        surface: Default::default(),
+                        tenant: None,
+                        share: None,
+                        limits: None,
+                        chain: Some("mainnet".into()),
+                        isolation: None,
+                        data_identity: None,
+                        sync: Some(
+                            toml::from_str(
+                                "[tables]\nt__transfer = [\"from\", \"to\", \"block_number\"]\n",
+                            )
+                            .unwrap(),
+                        ),
+                    },
+                    served: None,
+                },
+            );
+            inner.datasets.insert(
+                "ds".into(),
+                Data {
+                    store: Arc::new(MemStore::from_snapshot(&dir, snapshot)),
+                    snapshots: Default::default(),
+                    shapes: Default::default(),
+                    derived: Err(Refused {
+                        why: "not built here".into(),
+                        entities: Arc::default(),
+                        gone: false,
+                    }),
+                    building: None,
+                },
+            );
+        }
+        follower.realise();
+        let delta = |generation: u64, ops: Vec<Op>| Delta {
+            epoch: 1,
+            generation,
+            ops,
+            ..Default::default()
+        };
+        let put = |block: u64, log: u64, from: &str, to: &str| Op::Put {
+            key: Store::entity_key(block, log),
+            row: row(block, log, from, to),
+        };
+        follower
+            .apply_delta("ds", delta(1, vec![put(3, 0, "0xa", "0xc")]))
+            .await
+            .unwrap();
+
+        let encode = |s: &str| -> String {
+            s.bytes()
+                .map(|b| match b {
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => (b as char).to_string(),
+                    _ => format!("%{b:02X}"),
+                })
+                .collect()
+        };
+        let ask = |shape: &str, live: bool| {
+            let follower = follower.clone();
+            let uri: axum::http::Uri = format!(
+                "/sync?s={}{}",
+                encode(shape),
+                if live { "&live=1" } else { "" }
+            )
+            .parse()
+            .unwrap();
+            async move { follower.serve_sync("ds", &uri).await }
+        };
+        let keys_of = |lines: &[serde_json::Value]| -> Vec<String> {
+            lines
+                .iter()
+                .flat_map(|l| l["ops"].as_array().cloned().unwrap_or_default())
+                .map(|op| op["put"]["key"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let read = |resp: Response| async move {
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            std::str::from_utf8(&body)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        // A term: the sealed rows and the hot one, in chain order.
+        let lines =
+            read(ask(r#"{"table":"t__transfer","where":{"from":["0xa"]}}"#, false).await).await;
+        assert_eq!(
+            keys_of(&lines),
+            [
+                Store::entity_key(1, 0),
+                Store::entity_key(2, 0),
+                Store::entity_key(3, 0)
+            ],
+            "{lines:?}"
+        );
+        // A range, answered from sealed rows alone.
+        let lines = read(
+            ask(
+                r#"{"table":"t__transfer","where":{"block_number":{"gte":1,"lte":1}}}"#,
+                false,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            keys_of(&lines),
+            [Store::entity_key(1, 0), Store::entity_key(1, 1)]
+        );
+
+        // Live: what follows the sealed and hot rows is a frame for the next delta.
+        let resp = ask(r#"{"table":"t__transfer","where":{"from":["0xa"]}}"#, true).await;
+        let mut stream = resp.into_body().into_data_stream();
+        let mut seen = String::new();
+        while !seen.contains("up_to_date") {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("the first answer within five seconds")
+                .expect("a body")
+                .unwrap();
+            seen.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        follower
+            .apply_delta("ds", delta(2, vec![put(4, 0, "0xa", "0xb")]))
+            .await
+            .unwrap();
+        let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a frame within five seconds")
+            .expect("a body")
+            .unwrap();
+        let frame: serde_json::Value = serde_json::from_slice(&chunk).unwrap();
+        assert_eq!(frame["ops"][0]["put"]["key"], Store::entity_key(4, 0));
+    }
 }

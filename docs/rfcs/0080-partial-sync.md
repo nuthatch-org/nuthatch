@@ -542,8 +542,12 @@ retraction; the route's layer; the end of the stream on a fresh snapshot. Unit t
 
 **Not tested, and where to look first.**
 
-1. **Sealed rows.** The test has hot rows only. The sealed half is `/sql`'s own, so it should hold, but
-   nothing here has run a shape over a sealed segment.
+1. ~~Sealed rows.~~ Tested since: `sync_answers_sealed_rows_with_the_hot_ones` seals blocks 1 and 2
+   with `seal_range`, gives the copy the catalogue in its snapshot as a follower's would be, and a shape
+   by term answers the sealed rows and the hot one in chain order, a shape by a block range answers from
+   sealed rows alone (so a range on a numeric column is tested against Parquet, item 4's good case),
+   and a live stream gets the frame for the next delta. Not yet tested: a seal that happens while a
+   stream is open (the hot rows moving to a segment under a subscriber).
 2. **The key rule against every writer.** Checked on log rows. A table whose rows are keyed some other
    way (call or trace tables, factory children, offchain rows) is not checked, and fails loudly as
    `no_key` where its rows lack the pair, but a row that has the pair and is keyed otherwise would be
