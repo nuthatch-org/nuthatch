@@ -7788,6 +7788,8 @@ impl nuthatch_core::hooks::WindowHooks for NodeHooks {
         #[cfg(test)]
         if let Some(d) = slowed_by(&self.dir) {
             tokio::time::sleep(d).await;
+            // Armed during the sleep, a panic lands inside a window already under way.
+            panic_if_armed(&self.dir);
         }
         #[cfg(test)]
         if take_injected_failure(&self.dir) {
@@ -15885,6 +15887,64 @@ template = "pool"
         .await;
         assert!(!retired(&health), "b is indexing, so it is not retired");
         slowed_nests().lock().unwrap().retain(|(d, _)| d != &b_dir);
+        task.abort();
+    }
+
+    /// #2593 review: a nest that panics inside its window while an unmount waits on it leaves the
+    /// cursor, and health keeps the fault rather than reporting a clean retirement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_panic_under_a_pending_unmount_is_not_reported_retired() {
+        const TIP: u64 = 45;
+        let root = tempfile::tempdir().unwrap();
+        let nests = s0_nests(root.path(), false).await;
+        let b_dir = nests[1].dir.clone();
+        let b_store = nests[1].store.clone();
+        slowed_nests()
+            .lock()
+            .unwrap()
+            .push((b_dir.clone(), std::time::Duration::from_millis(1500)));
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = spawn_test_cursor(
+            CursorKind::Buffered(4),
+            Arc::new(FilteringSource {
+                logs: three_transfer_chain(TIP),
+            }),
+            nests,
+            Some(TIP - 1),
+            3,
+            health.clone(),
+            false,
+            Some(rx),
+        );
+        let first = last_block_of(b_store.as_ref());
+        wait_for(
+            "b commits a window",
+            std::time::Duration::from_secs(20),
+            || last_block_of(b_store.as_ref()) != first,
+        )
+        .await;
+        drop(b_store);
+        let (ack, acked) = tokio::sync::oneshot::channel();
+        tx.send(CursorCommand::Unmount {
+            name: "b".into(),
+            ack: Some(ack),
+        })
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        panic_in_windows_of(&b_dir);
+        tokio::time::timeout(std::time::Duration::from_secs(20), acked)
+            .await
+            .expect("the unmount is acknowledged once the panicked task has ended")
+            .unwrap();
+        panicking_nests().lock().unwrap().retain(|d| d != &b_dir);
+        slowed_nests().lock().unwrap().retain(|(d, _)| d != &b_dir);
+        let status = health.status("b").expect("b's fault is recorded");
+        assert_ne!(
+            status.class, "retired",
+            "a nest that panicked is reported as a clean retirement: {}",
+            status.reason
+        );
         task.abort();
     }
 

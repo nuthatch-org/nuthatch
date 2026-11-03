@@ -687,9 +687,24 @@ pub(super) async fn runtime_index_loop_buffered(
                                 spawn_nest(&shared, &ctx, &mut tasks, nest, sup, Some(next), seen);
                             task_slots.insert(id, slot);
                         }
-                        (_, _, slot) => {
-                            if let Some(slot) = &slot {
-                                retire(&shared, &ctx, slot);
+                        (_, stopped, slot) => {
+                            // A nest that faulted terminally, whether its panic escaped the task
+                            // or was contained into its quarantine, keeps that in health; it only
+                            // leaves the cursor.
+                            let faulted = stopped.as_ref().is_some_and(|s| {
+                                matches!(s.1.states[0], NestState::Quarantined { retry_at: None, .. })
+                            });
+                            match &slot {
+                                Some(slot)
+                                    if faulted
+                                        || slot.status.load(Ordering::Acquire) == TERMINAL =>
+                                {
+                                    shared.slots.lock().unwrap().retain(|s| !Arc::ptr_eq(s, slot));
+                                    shared.bump();
+                                    shared.trim();
+                                }
+                                Some(slot) => retire(&shared, &ctx, slot),
+                                None => {}
                             }
                             // The task has dropped the store; extraction may not be reading it either.
                             let reading = shared.reading_store.clone();
