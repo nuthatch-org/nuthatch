@@ -340,7 +340,10 @@ unconfigured.
 > unchanged. RFC-0079's IPC answer is default-binary and adds no dependency; Flight SQL is behind an
 > off-by-default `flight` feature. RFC-0080's server half is opt-in per mount and served by followers;
 > its client half is an off-by-default `sync` feature of the engine crate. The gateway's `pin` header
-> keeps identity out of nuthatch. Each S0 can stop its RFC.
+> keeps identity out of nuthatch. Each S0 can stop its RFC. **RFC-0080 S1 is kept as built** (Chief,
+> 2026-11-03, "whatever you think is best", #2620): it landed with #2596 before this was recorded. It
+> stays off unless a mount writes `[mounts.sync]`, and is not for a shared runtime until #2600 and
+> #2612 are fixed.
 
 >
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.

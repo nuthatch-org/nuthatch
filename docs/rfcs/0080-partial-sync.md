@@ -7,7 +7,11 @@
   exact through the reorg suite and 10,000 live streams. **Reopened by Chief the same day; the second
   S0 (§12) narrows it: the gate is met for address-shaped shapes over the busy table (uniform 6.1% and
   5.1% on two boxes), not under fan-out or with every row shaped (hot:100 12.9%, all-tables 12.8 to
-  14.6%).** What remains is per-frame work on the apply; S1 or a third S0 is Chief's call.
+  14.6%).** What remains is per-frame work on the apply. **S1 kept as built, 2026-11-03 (Chief:
+  "whatever you think is best", on #2620):** it reached main with #2596 before the call was recorded.
+  It stays in the default binary, off unless a mount writes `[mounts.sync]`, and is not for a runtime
+  shared between tenants until #2600 and #2612 are fixed. §13's "the gate is met" rests on the
+  denominator #2585 disputes; that question stays open there.
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0079 (Arrow results, the columnar wire), RFC-0077 (the embeddable engine and its
@@ -777,7 +781,8 @@ and ends when a fresh snapshot replaces the copy.
 
 **What this is not, and what is wrong with it as it stands.**
 
-1. **Hot rows only.** `scope` says `hot`. A nest with sealed history gets an answer missing every sealed
+1. ~~**Hot rows only.**~~ Superseded by §17: the first answer reads sealed rows too, and `scope` is
+   `full`. As first cut, `scope` said `hot`. A nest with sealed history gets an answer missing every sealed
    row that matches, which is §5.3's whole sealed half. A client must not treat this as the shape's
    rows until that is built.
 2. ~~No limits on the answer.~~ The first answer now runs under `/sql`'s guards, read from the route's

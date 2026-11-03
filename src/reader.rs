@@ -2184,8 +2184,7 @@ impl Follower {
     /// is scanned, the route's row and byte caps and its timeout, and room in the response-bytes
     /// budget until the answer has been sent.
     ///
-    /// Not yet built: the sealed rows, so `scope` is `hot` and the answer is the copy's hot window only;
-    /// resuming from an offset, so any `offset` is `409 must_refetch`; and Arrow.
+    /// Not yet built: resuming from an offset, so any `offset` is `409 must_refetch`; and Arrow.
     async fn serve_sync(self: &Arc<Self>, route: &str, uri: &axum::http::Uri) -> Response {
         use futures::StreamExt;
         let refuse = |status: StatusCode, error: &str, why: String| {
