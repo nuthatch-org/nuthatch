@@ -142,6 +142,8 @@ pub fn seed_entities<E: SeedEntity>(
     // The hot tail, read once and shared: a seed is a window like any other.
     let hot = decode_stored_rows(&schema, &store.entities_in_range(0, through)?)?;
 
+    // Each entity is seeded on its own: one that fails is abandoned and the rest carry on (#2618).
+    let mut failed: Vec<anyhow::Error> = Vec::new();
     for entity in entities.iter_mut() {
         entity.seed_begin();
         let seeded = (|| {
@@ -175,12 +177,27 @@ pub fn seed_entities<E: SeedEntity>(
             );
             entity.seed_end()
         })();
-        if seeded.is_err() {
+        if let Err(e) = seeded {
             entity.seed_abandon();
+            failed.push(e.context(format!("seeding entity `{}`", entity.name())));
         }
-        seeded?;
     }
-    Ok(())
+    let mut failed = failed.into_iter();
+    match failed.next() {
+        None => Ok(()),
+        Some(first) => {
+            let rest: Vec<String> = failed.map(|e| format!("{e:#}")).collect();
+            if rest.is_empty() {
+                Err(first)
+            } else {
+                Err(first.context(format!(
+                    "{} more entities failed to seed: {}",
+                    rest.len(),
+                    rest.join("; ")
+                )))
+            }
+        }
+    }
 }
 
 /// The derived IVM views a restart reconstructs, and the two things that decide whether each is fed.
