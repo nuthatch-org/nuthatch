@@ -1,0 +1,11 @@
+[nest]
+name = "history-gnosis"
+chain = "gnosis"
+chain_id = 100
+schema_version = 2
+# Both serve debug_traceBlockByNumber and archive state, keyless. NUTHATCH_RPC_100 overrides them.
+rpc_urls = ["https://rpc.gnosischain.com", "https://rpc.gnosis.gateway.fm"]
+
+[address_history]
+addresses = []
+# start_block = 0   # history before it is never fetched; see README

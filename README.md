@@ -6,6 +6,9 @@
 [![ci](https://github.com/nuthatch-org/nuthatch/actions/workflows/ci.yml/badge.svg)](https://github.com/nuthatch-org/nuthatch/actions/workflows/ci.yml)
 · Website: [www.nuthatch-indexer.com](https://www.nuthatch-indexer.com)
 
+**Also:** self-hosted Etherscan-compatible history for the chains that lost their free tier.
+Base and BNB Chain, plus Gnosis, on your own RPC (Base and BNB Chain need an archive node with tracing): [examples/paywalled-chains](examples/paywalled-chains/).
+
 ```sh
 curl -fsSL https://nuthatch-indexer.com/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
