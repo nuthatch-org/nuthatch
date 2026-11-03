@@ -3366,7 +3366,7 @@ async fn build_nest(
             tracing::warn!("segment integrity check failed (continuing): {e:#}");
         }
         // Before the view rebuild below reads cold under the watermark (#2169).
-        finish_unpruned_fold(&dir, store.as_ref())?;
+        nuthatch_core::seal::finish_unpruned_fold(&seal::FsSinks(&dir), store.as_ref())?;
     }
 
     let balances = BalanceView::start(crate::drive::Driver::Threaded)?;
@@ -8379,29 +8379,6 @@ async fn maybe_seal(
         registry_snapshot,
     )
     .await
-}
-
-/// Finish a seal that installed a fold's catalogue and died before its prune (#2169): the prune and
-/// watermark it would have committed next. Until then the folded rows were in no read at all.
-fn finish_unpruned_fold(dir: &std::path::Path, store: &dyn crate::store::HotStore) -> Result<()> {
-    let watermark = store.sealed_through();
-    let (from, cut) = match seal::unpruned_fold(dir, watermark) {
-        Ok(Some(window)) => window,
-        Ok(None) => return Ok(()),
-        Err(e) => {
-            tracing::error!(
-                "a seal past block {watermark} stopped before its prune, and it cannot be finished: \
-                 {e:#}. Hot rows are kept and the watermark stays; restore the segment from a copy \
-                 and restart, or re-index the nest"
-            );
-            return Ok(());
-        }
-    };
-    let pruned = store.prune_and_set_meta(from, cut, SEALED_THROUGH_KEY, &cut.to_string())?;
-    tracing::info!(
-        "finished a seal through block {cut} that stopped before its prune: pruned {pruned} rows from hot"
-    );
-    Ok(())
 }
 
 /// A follower's derived state (RFC-0073 FR1): the views and entities a writer keeps in memory,
