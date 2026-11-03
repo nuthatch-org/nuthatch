@@ -27,7 +27,7 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -259,6 +259,61 @@ fn derive(
             entities: Arc::default(),
             gone,
         }
+    })
+}
+
+/// The rows a delta sealed straight to segments in the tables in `followed`, as the puts they would
+/// have been had they passed through hot: the delta's log never holds them (#2602). Every segment
+/// `after` names and `before` did not is read, so a row of a fold that hot already showed is put
+/// again as it is, which changes no copy.
+fn sealed_touches(
+    dir: &Path,
+    store: &Arc<MemStore>,
+    followed: &BTreeSet<String>,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Result<Vec<crate::feed::Touch>> {
+    let read = |raw: Option<&str>| -> Result<crate::seal::Manifest> {
+        raw.map_or(Ok(Default::default()), |raw| {
+            serde_json::from_str(raw).context("a delta's catalogue")
+        })
+    };
+    let (before, after) = (read(before)?, read(after)?);
+    let held: HashSet<&str> = before
+        .tables
+        .values()
+        .flatten()
+        .map(|s| s.hash.as_str())
+        .collect();
+    let fresh: Vec<(&String, &crate::seal::Segment)> = after
+        .tables
+        .iter()
+        .filter(|(table, _)| followed.contains(*table))
+        .flat_map(|(table, segments)| segments.iter().map(move |s| (table, s)))
+        .filter(|(_, s)| !held.contains(s.hash.as_str()))
+        .collect();
+    if fresh.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut config = crate::config::Config::load(dir)?;
+    config.read_only_role = true;
+    let schema = crate::registry::from_nest(dir, &config)?.schema();
+    crate::seal::within(dir, store.clone(), || {
+        let mut touches = Vec::new();
+        for (table, segment) in fresh {
+            let table_schema = schema
+                .iter()
+                .find(|t| &t.table == table)
+                .with_context(|| format!("`{table}` is sealed and not in this nest's registry"))?;
+            for row in crate::seal::read_segment_decoded(dir, segment, table_schema)? {
+                touches.push(crate::feed::Touch {
+                    key: crate::store::Store::entity_key(row.block_number, row.log_index),
+                    old: None,
+                    new: Some(row.to_json().to_string()),
+                });
+            }
+        }
+        Ok(touches)
     })
 }
 
@@ -1731,15 +1786,34 @@ impl Follower {
             if shapes.is_empty() {
                 data.store.untrack_changes();
             }
-            let changes = data
+            let before = data.store.served_catalogue().flatten();
+            let mut changes = data
                 .store
                 .apply(&delta)
                 .with_context(|| format!("{dataset}: resnapshotting"))?;
             if !shapes.is_empty() {
+                let log = if changes.sealed_unseen {
+                    let followed: BTreeSet<String> = shapes.tables().map(str::to_string).collect();
+                    let after = data.store.served_catalogue().flatten();
+                    sealed_touches(
+                        &self.root.join(&dataset),
+                        &data.store,
+                        &followed,
+                        before.as_deref(),
+                        after.as_deref(),
+                    )
+                    .map(|mut log| {
+                        // Ahead of the hot touches, so a key both touch ends where hot left it.
+                        log.append(&mut changes.log);
+                        log
+                    })
+                } else {
+                    Ok(std::mem::take(&mut changes.log))
+                };
                 // Each row is shown as `/sql` shows it once for the delta, not once a subscriber.
-                match self.show_changes(&dataset, &shapes, &changes.log) {
-                    Ok(shown) => {
-                        shapes.apply(delta.epoch, delta.generation, &changes.log, Some(&shown))
+                match log.and_then(|log| Ok((self.show_changes(&dataset, &shapes, &log)?, log))) {
+                    Ok((shown, log)) => {
+                        shapes.apply(delta.epoch, delta.generation, &log, Some(&shown))
                     }
                     Err(e) => {
                         // Told of nothing rather than told wrongly: their streams end and they fetch
@@ -2122,8 +2196,8 @@ impl Follower {
         dataset: &str,
         shapes: &crate::shape_feed::ShapeHub,
         log: &[crate::feed::Touch],
-    ) -> Result<HashMap<String, Arc<str>>> {
-        use crate::shape::{row_key, table_of};
+    ) -> Result<HashMap<String, crate::shape_feed::Shown>> {
+        use crate::shape::row_key;
         let state = {
             let inner = self.lock();
             inner.routes.values().find_map(|r| match &r.served {
@@ -2145,9 +2219,12 @@ impl Follower {
             by_table.entry(table).or_default();
         }
         for (key, row) in ends {
-            let Some(table) = table_of(row) else { continue };
+            let row: serde_json::Value = serde_json::from_str(row).context("a stored row")?;
+            let Some(table) = row.get("table").and_then(|t| t.as_str()) else {
+                continue;
+            };
             if let Some(rows) = by_table.get_mut(table) {
-                rows.push((key, serde_json::from_str(row).context("a stored row")?));
+                rows.push((key, row));
             }
         }
         let mut shown = HashMap::new();
@@ -2171,7 +2248,8 @@ impl Follower {
                  holds {stored:?} and the shown rows come to {derived:?}"
             );
             for (key, row) in got {
-                shown.insert(key, Arc::from(row.to_string()));
+                let text = Arc::from(row.to_string());
+                shown.insert(key, crate::shape_feed::Shown { text, row });
             }
         }
         Ok(shown)
@@ -2179,8 +2257,8 @@ impl Follower {
 
     /// `GET /<route>/sync?s=<shape>[&live=1]` (RFC-0080 §5.2), answered from this follower's copy.
     ///
-    /// A stream of JSON lines: a header `{"offset":[e,g],"scope":"hot"}`, the rows of the copy the
-    /// shape selects as `{"ops":[{"put":..}]}` chunks, `{"up_to_date":true}`, and with `live=1`
+    /// A stream of JSON lines: a header `{"offset":[e,g],"scope":"full"}`, the rows of the copy, hot
+    /// and sealed, the shape selects as `{"ops":[{"put":..}]}` chunks, `{"up_to_date":true}`, and with `live=1`
     /// a line for each delta that changes the selection until the stream ends. It ends when the queue
     /// fills or the copy is replaced, and the client takes its answer again.
     ///
@@ -2291,7 +2369,8 @@ impl Follower {
             );
         }
         let mut puts: Vec<crate::shape_feed::ShapeOp> = Vec::with_capacity(rows.len());
-        for row in &rows {
+        // The statement narrows; the rows are in the shape by the predicate a live frame uses.
+        for row in rows.iter().filter(|row| shape.matches(row)) {
             let Some(key) = crate::shape::row_key(row) else {
                 return refuse(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -2609,9 +2688,6 @@ fn guarded(
                 if path == "/ready" {
                     return follower.route_ready(&route);
                 }
-                if path == "/sync" {
-                    return follower.serve_sync(&route, req.uri()).await;
-                }
                 // Derived state being rebuilt, or that could not be built, is never served in part.
                 let refusal = match follower.data(&route) {
                     Some(Data {
@@ -2623,6 +2699,23 @@ fn guarded(
                     }) => Some(("writer_only", r.why)),
                     _ => None,
                 };
+                if path == "/sync" {
+                    if let Some((reason, why)) = &refusal {
+                        if sync_names_entity(req.uri(), &declared) {
+                            return derived_refused(reason, "a shape of an entity", why);
+                        }
+                    }
+                    // Answered by the mount's own `/sync` route, inside its layers, so it is
+                    // counted and timed as `/sql` is (#2603).
+                    let (follower, route) = (follower.clone(), route.clone());
+                    let mut req = req;
+                    req.extensions_mut()
+                        .insert(crate::serve::SyncHandler(Arc::new(move |uri| {
+                            let (follower, route) = (follower.clone(), route.clone());
+                            Box::pin(async move { follower.serve_sync(&route, &uri).await })
+                        })));
+                    return next.run(req).await;
+                }
                 let Some((reason, why)) = refusal else {
                     return next.run(req).await;
                 };
@@ -2657,6 +2750,20 @@ fn guarded(
             }
         },
     ))
+}
+
+/// Whether a `/sync` request's shape names one of `entities`. A shape that does not parse names none,
+/// and is refused as `/sync` refuses it.
+fn sync_names_entity(uri: &axum::http::Uri, entities: &BTreeSet<String>) -> bool {
+    let Ok(axum::extract::Query(query)) =
+        axum::extract::Query::<HashMap<String, String>>::try_from_uri(uri)
+    else {
+        return false;
+    };
+    query
+        .get("s")
+        .and_then(|s| serde_json::from_str::<crate::shape::Shape>(s).ok())
+        .is_some_and(|shape| names_entity(&shape.table, entities))
 }
 
 /// Frames a `/sync` subscriber may have waiting before it is closed, and rows in each of the first
@@ -3420,8 +3527,8 @@ mod tests {
         .await;
 
         // The guards `/sql` answers under: a row cap, and the gate.
-        let whole = encode(r#"{"table":"t__transfer"}"#);
-        let too_big = follower.serve_sync("ds", &uri(&format!("s={whole}"))).await;
+        let wide = encode(r#"{"table":"t__transfer","where":{"to":["0xb","0xc"]}}"#);
+        let too_big = follower.serve_sync("ds", &uri(&format!("s={wide}"))).await;
         let too_big_status = too_big.status();
         let too_big_body = axum::body::to_bytes(too_big.into_body(), usize::MAX)
             .await
@@ -3527,7 +3634,7 @@ mod tests {
                 follower.clone(),
                 "ds".into(),
                 Arc::default(),
-                axum::Router::new(),
+                crate::serve::mount_router(shared.clone(), "ds"),
             );
             let req = Request::get(uri(&from("0xa")))
                 .body(axum::body::Body::empty())
@@ -3909,6 +4016,562 @@ mod tests {
             .await
             .expect("the stream ends within five seconds");
         assert!(ended.is_none(), "a mis-keyed row ends the stream");
+    }
+
+    /// A transfer's ABI with a fully-named tuple `a` whose components share names with the event's own
+    /// columns (#2588), and a second table, `t__approval`.
+    const SYNC_ABI: &str = r#"[
+        {"type":"event","name":"Transfer","anonymous":false,"inputs":[
+            {"name":"from","type":"address","indexed":true},
+            {"name":"to","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false},
+            {"name":"a","type":"tuple","indexed":false,"components":[
+                {"name":"from","type":"address"},{"name":"to","type":"address"}]}]},
+        {"type":"event","name":"Approval","anonymous":false,"inputs":[
+            {"name":"owner","type":"address","indexed":true},
+            {"name":"spender","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false}]}]"#;
+
+    /// The fields every stored row carries beside its event's own, as the indexer writes them.
+    fn sync_envelope(block: u64, log: u64) -> String {
+        format!(
+            r#""block_number":{block},"block_hash":"0x{block:064x}","block_timestamp":{},"tx_hash":"0x{:064x}","log_index":{log},"address":"0x0000000000000000000000000000000000000001","_seq":{}"#,
+            1_700_000_000 + block,
+            block * 1000 + log,
+            (block << 20) | log
+        )
+    }
+
+    /// A stored transfer row. `a`'s components are written ahead of the row's own `from` and `to`, as
+    /// a key that sorts first would put them.
+    fn sync_transfer(block: u64, log: u64, from: &str, to: &str, inner: &str) -> String {
+        format!(
+            r#"{{"table":"t__transfer","a":{{"from":"{inner}","to":"{inner}"}},"from":"{from}","to":"{to}","value":"7",{}}}"#,
+            sync_envelope(block, log)
+        )
+    }
+
+    fn sync_approval(block: u64, log: u64, owner: &str) -> String {
+        format!(
+            r#"{{"table":"t__approval","owner":"{owner}","spender":"0xdddddddddddddddddddddddddddddddddddddddd","value":"1",{}}}"#,
+            sync_envelope(block, log)
+        )
+    }
+
+    /// A follower holding dataset `ds` from `snapshot`, with route `route` serving shapes of both
+    /// tables, and the state that route is served from.
+    fn sync_follower(
+        root: &Path,
+        route: &str,
+        snapshot: crate::feed::Snapshot,
+        building: Option<String>,
+    ) -> (Arc<Follower>, SharedNest) {
+        let dir = root.join("ds");
+        let follower =
+            Follower::start_paused(root.to_path_buf(), "http://127.0.0.1:9".into(), "t".into());
+        let sync = "[tables]\nt__transfer = [\"from\", \"to\", \"block_number\"]\n\
+                    t__approval = [\"owner\"]\ntotals = []\n";
+        {
+            let mut inner = follower.lock();
+            inner.routes.insert(
+                route.into(),
+                Route {
+                    spec: Spec {
+                        dataset: "ds".into(),
+                        nid: None,
+                        surface: Default::default(),
+                        tenant: None,
+                        share: None,
+                        limits: None,
+                        chain: Some("mainnet".into()),
+                        isolation: None,
+                        data_identity: None,
+                        sync: Some(toml::from_str(sync).unwrap()),
+                    },
+                    served: None,
+                },
+            );
+            inner.datasets.insert(
+                "ds".into(),
+                Data {
+                    store: Arc::new(MemStore::from_snapshot(&dir, snapshot)),
+                    snapshots: Default::default(),
+                    shapes: Default::default(),
+                    derived: Err(Refused {
+                        why: "not built here".into(),
+                        entities: Arc::default(),
+                        gone: false,
+                    }),
+                    building,
+                },
+            );
+        }
+        follower.realise();
+        let shared = match &follower.lock().routes[route].served {
+            Some(Ok(shared)) => shared.clone(),
+            _ => panic!("the route's state is built"),
+        };
+        (follower, shared)
+    }
+
+    fn sync_dir(root: &Path) -> PathBuf {
+        let dir = root.join("ds");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"ds\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"t\"\naddress = \"0x0000000000000000000000000000000000000001\"\n\
+             abi = \"abi.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("abi.json"), SYNC_ABI).unwrap();
+        dir
+    }
+
+    fn sync_uri(shape: &str, live: bool) -> axum::http::Uri {
+        let encoded: String = shape
+            .bytes()
+            .map(|b| match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        format!("/sync?s={encoded}{}", if live { "&live=1" } else { "" })
+            .parse()
+            .unwrap()
+    }
+
+    /// A `/sync` body read a line at a time.
+    struct SyncLines {
+        stream: axum::body::BodyDataStream,
+        pending: String,
+    }
+
+    impl SyncLines {
+        fn of(resp: Response) -> Self {
+            assert_eq!(resp.status(), StatusCode::OK);
+            Self {
+                stream: resp.into_body().into_data_stream(),
+                pending: String::new(),
+            }
+        }
+
+        /// The next line, waiting at most `wait`; `None` at the end or when none came in time.
+        async fn next_within(&mut self, wait: Duration) -> Option<serde_json::Value> {
+            use futures::StreamExt;
+            loop {
+                if let Some(at) = self.pending.find('\n') {
+                    let line: String = self.pending.drain(..=at).collect();
+                    return Some(serde_json::from_str(&line).unwrap());
+                }
+                let chunk = tokio::time::timeout(wait, self.stream.next())
+                    .await
+                    .ok()??;
+                self.pending
+                    .push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+            }
+        }
+
+        /// Every op through `{"up_to_date":true}`, into `copy`.
+        async fn first_answer(&mut self, copy: &mut BTreeMap<String, serde_json::Value>) {
+            loop {
+                let line = self
+                    .next_within(Duration::from_secs(5))
+                    .await
+                    .expect("a first answer");
+                if line == serde_json::json!({ "up_to_date": true }) {
+                    return;
+                }
+                apply_ops(copy, &line);
+            }
+        }
+    }
+
+    fn apply_ops(copy: &mut BTreeMap<String, serde_json::Value>, line: &serde_json::Value) {
+        for op in line["ops"].as_array().cloned().unwrap_or_default() {
+            if let Some(put) = op.get("put") {
+                copy.insert(put["key"].as_str().unwrap().into(), put["row"].clone());
+            } else {
+                copy.remove(op["retract"]["key"].as_str().unwrap());
+            }
+        }
+    }
+
+    /// What `/sync` answers for `shape` now, from scratch.
+    async fn sync_fresh(
+        follower: &Arc<Follower>,
+        route: &str,
+        shape: &str,
+    ) -> BTreeMap<String, serde_json::Value> {
+        let mut copy = BTreeMap::new();
+        SyncLines::of(follower.serve_sync(route, &sync_uri(shape, false)).await)
+            .first_answer(&mut copy)
+            .await;
+        copy
+    }
+
+    fn sync_delta(generation: u64, ops: Vec<crate::feed::Op>) -> crate::feed::Delta {
+        crate::feed::Delta {
+            epoch: 1,
+            generation,
+            ops,
+            ..Default::default()
+        }
+    }
+
+    fn sync_put(row: String) -> crate::feed::Op {
+        let v: serde_json::Value = serde_json::from_str(&row).unwrap();
+        crate::feed::Op::Put {
+            key: crate::shape::row_key(&v).unwrap(),
+            row,
+        }
+    }
+
+    /// Seals `rows` straight to segments, as `--seal-direct` does, and the delta that tells a follower:
+    /// the grown catalogue and the new watermark, with nothing put or pruned in hot. The writer's own
+    /// directory seals them and its files land in the follower's `dir`, as the mirror would put them.
+    fn sync_seal_direct(
+        dir: &Path,
+        generation: u64,
+        rows: &[String],
+        from: u64,
+        to: u64,
+    ) -> crate::feed::Delta {
+        let writer = dir.with_file_name("writer");
+        if !writer.exists() {
+            std::fs::create_dir_all(&writer).unwrap();
+            for file in [crate::config::CONFIG_FILE, "abi.json"] {
+                std::fs::copy(dir.join(file), writer.join(file)).unwrap();
+            }
+        }
+        crate::seal::seal_range(&writer, rows, from, to).unwrap();
+        let segments = writer.join(crate::seal::SEGMENTS_DIR);
+        std::fs::create_dir_all(dir.join(crate::seal::SEGMENTS_DIR)).unwrap();
+        for file in std::fs::read_dir(&segments).unwrap() {
+            let file = file.unwrap();
+            if file.file_name() != crate::seal::MANIFEST_FILE && file.path().is_file() {
+                std::fs::copy(
+                    file.path(),
+                    dir.join(crate::seal::SEGMENTS_DIR).join(file.file_name()),
+                )
+                .unwrap();
+            }
+        }
+        let catalogue = std::fs::read_to_string(segments.join(crate::seal::MANIFEST_FILE)).unwrap();
+        crate::feed::Delta {
+            catalogue: Some(catalogue),
+            ..sync_delta(
+                generation,
+                vec![crate::feed::Op::Meta {
+                    key: "sealed_through".into(),
+                    value: to.to_string(),
+                }],
+            )
+        }
+    }
+
+    /// #2588: a live frame's membership is the column `/sql` reads, not the first `"from":` in the
+    /// stored text, which here is a component of the tuple `a`.
+    #[tokio::test]
+    async fn a_live_frame_reads_the_column_not_a_tuple_component_of_the_same_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        sync_dir(tmp.path());
+        let (follower, _) = sync_follower(
+            tmp.path(),
+            "ds",
+            crate::feed::Snapshot {
+                epoch: 1,
+                ..Default::default()
+            },
+            None,
+        );
+        let shape = r#"{"table":"t__transfer","where":{"from":["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}"#;
+        let mut lines = SyncLines::of(follower.serve_sync("ds", &sync_uri(shape, true)).await);
+        let mut copy = BTreeMap::new();
+        lines.first_answer(&mut copy).await;
+        follower
+            .apply_delta(
+                "ds",
+                sync_delta(
+                    1,
+                    vec![
+                        // From 0xc, with a component `from` of 0xa: not in the shape.
+                        sync_put(sync_transfer(
+                            1,
+                            0,
+                            "0xcccccccccccccccccccccccccccccccccccccccc",
+                            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        )),
+                        sync_put(sync_transfer(
+                            1,
+                            1,
+                            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                        )),
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+        let line = lines.next_within(Duration::from_secs(5)).await.unwrap();
+        apply_ops(&mut copy, &line);
+        // Held from 0xa and then replaced from 0xc, with the component still 0xa: a retraction.
+        follower
+            .apply_delta(
+                "ds",
+                sync_delta(
+                    2,
+                    vec![sync_put(sync_transfer(
+                        1,
+                        1,
+                        "0xcccccccccccccccccccccccccccccccccccccccc",
+                        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    ))],
+                ),
+            )
+            .await
+            .unwrap();
+        if let Some(line) = lines.next_within(Duration::from_millis(500)).await {
+            apply_ops(&mut copy, &line);
+        }
+        assert_eq!(copy, sync_fresh(&follower, "ds", shape).await);
+        assert!(copy.is_empty(), "{copy:?}");
+    }
+
+    /// #2602: rows sealed straight to a segment, which never pass through hot, still reach a live
+    /// stream whose shape selects them.
+    #[tokio::test]
+    async fn a_row_sealed_straight_to_a_segment_reaches_the_live_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = sync_dir(tmp.path());
+        let (follower, _) = sync_follower(
+            tmp.path(),
+            "ds",
+            crate::feed::Snapshot {
+                epoch: 1,
+                ..Default::default()
+            },
+            None,
+        );
+        let shape = r#"{"table":"t__transfer","where":{"from":["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}"#;
+        let mut lines = SyncLines::of(follower.serve_sync("ds", &sync_uri(shape, true)).await);
+        let mut copy = BTreeMap::new();
+        lines.first_answer(&mut copy).await;
+        let sealed = [
+            sync_transfer(
+                5,
+                0,
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "0xffffffffffffffffffffffffffffffffffffffff",
+            ),
+            sync_transfer(
+                5,
+                1,
+                "0xcccccccccccccccccccccccccccccccccccccccc",
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "0xffffffffffffffffffffffffffffffffffffffff",
+            ),
+        ];
+        follower
+            .apply_delta("ds", sync_seal_direct(&dir, 1, &sealed, 1, 5))
+            .await
+            .unwrap();
+        let line = lines
+            .next_within(Duration::from_secs(5))
+            .await
+            .expect("a frame for the sealed row");
+        apply_ops(&mut copy, &line);
+        let fresh = sync_fresh(&follower, "ds", shape).await;
+        assert_eq!(fresh.len(), 1, "{fresh:?}");
+        assert_eq!(copy, fresh);
+    }
+
+    /// #2603: `/sync` passes through the mount's own layers, so it is counted and timed as `/sql` is,
+    /// and a shape over an entity waits for derived state being rebuilt as `/sql` naming it does.
+    #[tokio::test]
+    async fn sync_is_counted_as_sql_is_and_waits_for_derived_state() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        sync_dir(tmp.path());
+        let entities: BTreeSet<String> = ["totals".to_string()].into();
+        let (follower, shared) = sync_follower(
+            tmp.path(),
+            "sync_metered",
+            crate::feed::Snapshot {
+                epoch: 1,
+                ..Default::default()
+            },
+            Some("rebuilding".into()),
+        );
+        let layered = |follower: &Arc<Follower>| {
+            guarded(
+                follower.clone(),
+                "sync_metered".into(),
+                Arc::new(entities.clone()),
+                crate::serve::mount_router(shared.clone(), "sync_metered"),
+            )
+        };
+        let get = |uri: axum::http::Uri| Request::get(uri).body(axum::body::Body::empty()).unwrap();
+        let entity = layered(&follower)
+            .oneshot(get(sync_uri(r#"{"table":"totals"}"#, false)))
+            .await
+            .unwrap();
+        assert_eq!(entity.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(entity.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["reason"], "catching_up", "{body}");
+
+        let events = layered(&follower)
+            .oneshot(get(sync_uri(
+                r#"{"table":"t__transfer","where":{"from":["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}"#,
+                false,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            events.status(),
+            StatusCode::OK,
+            "an event table is not derived"
+        );
+        axum::body::to_bytes(events.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // The refusal above is the follower's layer's, which counts no request, as for `/sql`.
+        let rendered = crate::metrics::METRICS.render();
+        for counted in [
+            "nuthatch_nest_http_requests_total{nest=\"sync_metered\"} 1",
+            "nuthatch_nest_sql_queries_total{nest=\"sync_metered\"} 1",
+        ] {
+            assert!(rendered.contains(counted), "{counted} not in /metrics");
+        }
+    }
+
+    /// #2602, #2588: every live copy equals what `/sync` answers afresh after each delta, through
+    /// puts, replacements, nested tuples, a second table, reorgs and rows sealed straight to segments.
+    /// The oracle is `serve_sync`'s own first answer, which is `/sql`'s, over hot and sealed alike.
+    #[tokio::test]
+    async fn every_live_copy_equals_a_fresh_answer_through_reorgs_and_direct_seals() {
+        let shapes = [
+            r#"{"table":"t__transfer","where":{"from":["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}"#,
+            r#"{"table":"t__transfer","where":{"to":["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","0xcccccccccccccccccccccccccccccccccccccccc"],"from":["0xcccccccccccccccccccccccccccccccccccccccc"]}}"#,
+            r#"{"table":"t__transfer","where":{"block_number":{"gte":3,"lte":1003}}}"#,
+            r#"{"table":"t__approval","where":{"owner":["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}"#,
+        ];
+        let who = [
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "0xcccccccccccccccccccccccccccccccccccccccc",
+        ];
+        for seed in [1u64, 7, 42] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = sync_dir(tmp.path());
+            let (follower, _) = sync_follower(
+                tmp.path(),
+                "ds",
+                crate::feed::Snapshot {
+                    epoch: 1,
+                    ..Default::default()
+                },
+                None,
+            );
+            let mut streams = Vec::new();
+            for shape in shapes {
+                let mut lines =
+                    SyncLines::of(follower.serve_sync("ds", &sync_uri(shape, true)).await);
+                let mut copy = BTreeMap::new();
+                lines.first_answer(&mut copy).await;
+                streams.push((shape, lines, copy));
+            }
+            let mut state = seed;
+            let mut roll = |n: u64| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) % n
+            };
+            let (mut generation, mut sealed_to, mut tip) = (0u64, 0u64, 1000u64);
+            for _ in 0..14 {
+                generation += 1;
+                let delta = match roll(5) {
+                    // Rows sealed straight to a segment, below every hot row.
+                    0 if sealed_to < 990 => {
+                        let block = sealed_to + 1 + roll(3);
+                        let rows: Vec<String> = (0..1 + roll(3))
+                            .map(|log| {
+                                if roll(4) == 0 {
+                                    sync_approval(block, log, who[roll(3) as usize])
+                                } else {
+                                    sync_transfer(
+                                        block,
+                                        log,
+                                        who[roll(3) as usize],
+                                        who[roll(3) as usize],
+                                        who[roll(3) as usize],
+                                    )
+                                }
+                            })
+                            .collect();
+                        let delta = sync_seal_direct(&dir, generation, &rows, sealed_to + 1, block);
+                        sealed_to = block;
+                        delta
+                    }
+                    // A reorg: every hot row from a block on is dropped.
+                    1 if tip > 1001 => {
+                        let from = 1001 + roll(tip - 1001);
+                        tip = from;
+                        sync_delta(
+                            generation,
+                            vec![crate::feed::Op::Drop {
+                                from: crate::store::Store::entity_key(from, 0),
+                                to: None,
+                            }],
+                        )
+                    }
+                    // Puts at the tip, and replacements of rows already there.
+                    _ => {
+                        tip += 1;
+                        let ops = (0..1 + roll(4))
+                            .map(|log| {
+                                let block = if roll(3) == 0 && tip > 1001 {
+                                    1001 + roll(tip - 1001)
+                                } else {
+                                    tip
+                                };
+                                sync_put(if roll(5) == 0 {
+                                    sync_approval(block, log, who[roll(3) as usize])
+                                } else {
+                                    sync_transfer(
+                                        block,
+                                        log,
+                                        who[roll(3) as usize],
+                                        who[roll(3) as usize],
+                                        who[roll(3) as usize],
+                                    )
+                                })
+                            })
+                            .collect();
+                        sync_delta(generation, ops)
+                    }
+                };
+                follower.apply_delta("ds", delta).await.unwrap();
+                for (shape, lines, copy) in &mut streams {
+                    while let Some(line) = lines.next_within(Duration::from_millis(50)).await {
+                        apply_ops(copy, &line);
+                    }
+                    let fresh = sync_fresh(&follower, "ds", shape).await;
+                    assert_eq!(
+                        *copy, fresh,
+                        "seed {seed}, generation {generation}, shape {shape}"
+                    );
+                }
+            }
+        }
     }
 
     /// What showing stored rows as `/sql` shows them costs, which every live frame pays: the engine

@@ -5,7 +5,7 @@
 //! row up in an index of the shapes (RFC-0080 §5.4). A queue that fills is closed, never waited on.
 
 use crate::feed::Touch;
-use crate::shape::{table_of, Shape, ShapeIndex};
+use crate::shape::{Shape, ShapeIndex};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -80,6 +80,21 @@ pub fn ops_line(offset: Option<(u64, u64)>, ops: &[ShapeOp]) -> Vec<u8> {
 /// A subscriber's end. When it ends, because its queue filled or the hub went, the copy is stale
 /// and must be fetched again.
 pub type Frames = mpsc::Receiver<Frame>;
+
+/// A stored row as `/sql` shows it: the text a subscriber is sent, and the row its membership is
+/// decided on, so a live put is in a shape exactly when the first answer would hold it (#2588).
+#[derive(Debug, Clone)]
+pub struct Shown {
+    pub text: Arc<str>,
+    pub row: serde_json::Value,
+}
+
+/// A stored row's table, from its own top-level `table` field, and the row parsed.
+fn stored(row: &str) -> Option<(String, serde_json::Value)> {
+    let row: serde_json::Value = serde_json::from_str(row).ok()?;
+    let table = row.get("table")?.as_str()?.to_string();
+    Some((table, row))
+}
 
 struct Entry {
     shape: Shape,
@@ -191,14 +206,15 @@ impl ShapeHub {
     /// delta's [`crate::feed::Changes::log`]. Never waits: a subscriber whose queue is full is closed.
     ///
     /// `shown` is each put's row as subscribers are to see it, by the key it is stored under, worked
-    /// out once for the delta; `None` sends the stored rows as they are. A put with no entry in it is
-    /// not sent.
+    /// out once for the delta; `None` sends the stored rows as they are. A put is in a shape by its
+    /// shown row, and a row it replaced or a rollback dropped by that row as stored. A put with no
+    /// entry in `shown` is not sent.
     pub fn apply(
         &mut self,
         epoch: u64,
         generation: u64,
         log: &[Touch],
-        shown: Option<&HashMap<String, Arc<str>>>,
+        shown: Option<&HashMap<String, Shown>>,
     ) {
         if self.tables.is_empty() || log.is_empty() {
             return;
@@ -216,54 +232,56 @@ impl ShapeHub {
                 })
                 .push(touch);
         }
-        let mut pending: HashMap<(&str, usize), Vec<ShapeOp>> = HashMap::new();
-        let mut found = Vec::new();
+        let mut pending: HashMap<(String, usize), Vec<ShapeOp>> = HashMap::new();
         for key in order {
             let touches = &by_key[key];
             // Each held once however many subscribers are told of it.
             let mut key_text: Option<Arc<str>> = None;
-            let mut holds: Vec<(&str, usize)> = Vec::new();
+            let mut holds: Vec<(String, usize)> = Vec::new();
             if let Some(row) = touches.last().and_then(|t| t.new.as_deref()) {
-                if let Some((name, table)) =
-                    table_of(row).and_then(|n| Some((n, self.tables.get(n)?)))
+                if let Some((name, parsed)) =
+                    stored(row).filter(|(n, _)| self.tables.contains_key(n))
                 {
-                    table.index.matching_text(row, &mut found);
-                    for &id in &found {
-                        holds.push((name, id));
-                    }
-                    if !found.is_empty() {
-                        let row_text: Option<Arc<str>> = match shown {
-                            None => Some(Arc::from(row)),
-                            Some(shown) => shown.get(key).cloned(),
-                        };
-                        if let Some(row) = &row_text {
-                            let key = key_text.get_or_insert_with(|| Arc::from(key)).clone();
-                            for &id in &found {
-                                pending.entry((name, id)).or_default().push(ShapeOp::Put {
-                                    key: key.clone(),
-                                    row: row.clone(),
-                                });
+                    let shown_row = match shown {
+                        None => Some((Arc::from(row), &parsed)),
+                        Some(shown) => shown.get(key).map(|s| (s.text.clone(), &s.row)),
+                    };
+                    match shown_row {
+                        Some((text, row)) => {
+                            let found = self.tables[&name].index.matching(row);
+                            if !found.is_empty() {
+                                let key = key_text.get_or_insert_with(|| Arc::from(key)).clone();
+                                for &id in &found {
+                                    pending.entry((name.clone(), id)).or_default().push(
+                                        ShapeOp::Put {
+                                            key: key.clone(),
+                                            row: text.clone(),
+                                        },
+                                    );
+                                }
                             }
-                        } else {
-                            tracing::error!("a row of {name} changed and was not shown: not sent");
+                            holds.extend(found.into_iter().map(|id| (name.clone(), id)));
+                        }
+                        None => {
+                            tracing::error!("a row of {name} changed and was not shown: not sent")
                         }
                     }
                 }
             }
-            let mut retracted: Vec<(&str, usize)> = Vec::new();
+            let mut retracted: Vec<(String, usize)> = Vec::new();
             for old in touches.iter().filter_map(|t| t.old.as_deref()) {
-                let Some((name, table)) =
-                    table_of(old).and_then(|n| Some((n, self.tables.get(n)?)))
-                else {
+                let Some((name, parsed)) = stored(old) else {
                     continue;
                 };
-                table.index.matching_text(old, &mut found);
-                for &id in &found {
-                    let slot = (name, id);
+                let Some(table) = self.tables.get(&name) else {
+                    continue;
+                };
+                for id in table.index.matching(&parsed) {
+                    let slot = (name.clone(), id);
                     if holds.contains(&slot) || retracted.contains(&slot) {
                         continue;
                     }
-                    retracted.push(slot);
+                    retracted.push(slot.clone());
                     let key = key_text.get_or_insert_with(|| Arc::from(key)).clone();
                     pending
                         .entry(slot)
@@ -273,7 +291,7 @@ impl ShapeHub {
             }
         }
         for ((name, id), ops) in pending {
-            let table = self.tables.get_mut(name).expect("a table with shapes");
+            let table = self.tables.get_mut(&name).expect("a table with shapes");
             let entry = &mut table.entries[id];
             let frame = Frame {
                 epoch,

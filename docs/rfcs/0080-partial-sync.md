@@ -897,3 +897,26 @@ retraction; the route's layer; the end of the stream on a fresh snapshot. Unit t
    dropped and every stream ends, so nobody is sent rows in a form their first answer did not use.
 6. Still open from §16: no token check, the live stream's own limits, the one-shape stub of
    `max_shapes_per_connection`, JSON lines and not Arrow, and an offset that is the copy's generation.
+
+## 19. One predicate, the sealed side live, and the route inside the mount (2026-11-03)
+
+Three defects from reading S1 (#2588, #2602, #2603), fixed together.
+
+1. **A row is in a shape by `Shape::matches` alone.** The first answer's statement narrows, and its rows
+   are then kept by `matches`; a live put is decided on the row as `/sql` shows it, and a retraction on
+   the row it replaced as stored. The text scan read the first `"column":` in the stored JSON, which in a
+   row holding a fully-named tuple can be a component of it. A null, a tuple or a list is in no term,
+   which `/sql`'s `CAST(.. AS VARCHAR) IN (..)` cannot equal either. `matching_text` remains for the S0
+   measurements and parses any row with a nested value.
+2. **Rows sealed straight to segments reach live streams.** When a delta's catalogue grows by rows that
+   never passed through hot, every segment it names that the previous catalogue did not is read for the
+   followed tables, and its rows are put as hot puts would be. A fold's rows already held are put again
+   as they are, which changes no copy.
+3. **`/sync` is a route of the mount.** It is answered inside the mount's layers, so it is counted in
+   `/metrics` and timed as `/sql` is, and a shape of an entity waits for derived state being rebuilt as
+   `/sql` naming it does. A table listed with columns is named with a term or a range on one of them;
+   only a table listed with none is named whole.
+
+The oracle that covers them is `serve_sync`'s own first answer: after each delta of seeded runs of puts,
+replacements, tuples, a second table, reorgs and direct seals, every live copy equals what `/sync`
+answers afresh.

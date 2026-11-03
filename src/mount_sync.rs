@@ -16,8 +16,8 @@ use crate::shape::Shape;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MountSync {
-    /// The tables a shape may name, each with the columns it may constrain. A table with no columns
-    /// listed may still be named, with no terms, which is the whole table.
+    /// The tables a shape may name, each with the columns it may constrain. A table listed with
+    /// columns is named with a term on one of them (#2603); one listed with none is named whole.
     pub tables: BTreeMap<String, Vec<String>>,
     #[serde(default = "default_max_shapes")]
     pub max_shapes_per_connection: usize,
@@ -54,6 +54,8 @@ pub enum Refusal {
     TooManyShapes {
         max: usize,
     },
+    /// A table listed with columns, named with no term on any of them.
+    Unconstrained(String),
 }
 
 impl std::fmt::Display for Refusal {
@@ -76,6 +78,10 @@ impl std::fmt::Display for Refusal {
             Refusal::TooManyShapes { max } => {
                 write!(f, "a connection may hold at most {max} shapes")
             }
+            Refusal::Unconstrained(t) => write!(
+                f,
+                "`{t}` is shapeable by its listed columns only, so a shape of it names one"
+            ),
         }
     }
 }
@@ -113,6 +119,9 @@ impl MountSync {
         let Some(columns) = self.tables.get(&shape.table) else {
             return Err(Refusal::Table(shape.table.clone()));
         };
+        if !columns.is_empty() && shape.terms.is_empty() && shape.ranges.is_empty() {
+            return Err(Refusal::Unconstrained(shape.table.clone()));
+        }
         let columns_named = shape.terms.keys().chain(shape.ranges.keys());
         for column in columns_named {
             if !columns.contains(column) {
@@ -261,5 +270,24 @@ mod tests {
             s.admit(2, &shape(r#"{"table":"swaps","where":{"pool":["0xa"]}}"#)),
             Err(Refusal::TooManyShapes { max: 2 })
         );
+    }
+
+    /// #2603: a table listed with columns is named with a term on one of them; only a table listed
+    /// with none may be named whole, as the config reference says.
+    #[test]
+    fn a_table_listed_with_columns_is_not_named_whole() {
+        let s = sync();
+        for whole in [r#"{"table":"swaps"}"#, r#"{"table":"swaps","where":{}}"#] {
+            assert!(s.admit(0, &shape(whole)).is_err(), "{whole}");
+        }
+        assert_eq!(
+            s.admit(
+                0,
+                &shape(r#"{"table":"swaps","where":{"block":{"gte":1}}}"#)
+            ),
+            Ok(()),
+            "a range is a term"
+        );
+        assert_eq!(s.admit(0, &shape(r#"{"table":"transfers"}"#)), Ok(()));
     }
 }
