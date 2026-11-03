@@ -28092,7 +28092,18 @@ rpc_urls = ["https://rpc.example"]
             view(&views, "by_tier").unavailable().is_some(),
             "the entity whose seed failed must hold no answer rather than part of one"
         );
-        assert!(view(&views, "totals").unavailable().is_some());
+        // #2618: one entity's fault does not disable the healthy ones declared after it.
+        let totals = view(&views, "totals");
+        assert!(
+            totals.unavailable().is_none(),
+            "an entity after the failing one is seeded: {:?}",
+            totals.unavailable()
+        );
+        use crate::entity_row::{Row, Scalar};
+        assert_eq!(
+            totals.relation().get(&Row(vec![Scalar::Str(BOB.into())])),
+            Some(&Row(vec![Scalar::Int(100)]))
+        );
     }
 
     const TOTALS: &str = "[[entities]]\nname='totals'\nkey=['to']\nmax_rows=100\n\
