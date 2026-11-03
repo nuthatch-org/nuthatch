@@ -371,6 +371,54 @@ where
     stopped
 }
 
+/// The store a held lease guards. Renewal starts when the lease is taken, before the store is
+/// opened (#2608), so a lapse during boot is remembered and lands on the store when it attaches.
+#[derive(Default)]
+pub struct Guard {
+    state: std::sync::Mutex<GuardState>,
+}
+
+#[derive(Default)]
+struct GuardState {
+    store: Option<Arc<dyn crate::store::HotStore>>,
+    off: bool,
+}
+
+impl Guard {
+    /// Claim `store` for `owner` and guard it from now on; a lease already lost fences it at once.
+    /// Call before anything commits to it.
+    pub fn attach(&self, store: Arc<dyn crate::store::HotStore>, owner: &str) -> Result<()> {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if s.store.is_some() {
+            return Ok(());
+        }
+        store.claim(owner)?;
+        if s.off {
+            store.fence_off()?;
+        }
+        s.store = Some(store);
+        Ok(())
+    }
+
+    pub fn attached(&self) -> bool {
+        self.store().is_some()
+    }
+
+    pub fn store(&self) -> Option<Arc<dyn crate::store::HotStore>> {
+        let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        s.store.clone()
+    }
+
+    pub fn fence_off(&self) -> Result<()> {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        s.off = true;
+        match &s.store {
+            Some(store) => store.fence_off(),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Retried until it lands: a writer that cannot fence itself off must not keep committing.
 async fn fence_until_done(fence_off: &impl Fn() -> Result<()>, fence: u64) {
     while let Err(e) = fence_off() {
@@ -559,6 +607,36 @@ mod tests {
         })
     }
 
+    fn store() -> (tempfile::TempDir, Arc<crate::store::Store>) {
+        let d = tempfile::tempdir().unwrap();
+        let s = Arc::new(crate::store::Store::open(&d.path().join("s.redb")).unwrap());
+        (d, s)
+    }
+
+    /// #2608: renewal starts before the store exists, so a lease lost during boot must still fence
+    /// the store the moment it is attached.
+    #[test]
+    fn a_store_attached_after_its_lease_was_lost_is_fenced_off_at_once() {
+        let (_d, s) = store();
+        let guard = Guard::default();
+        guard.fence_off().unwrap();
+        guard.attach(s.clone(), "a").unwrap();
+        assert!(
+            s.set_meta("k", "v").is_err(),
+            "a fenced store refuses writes"
+        );
+    }
+
+    #[test]
+    fn a_store_attached_to_a_live_lease_is_claimed_and_fenced_when_it_stops() {
+        let (_d, s) = store();
+        let guard = Guard::default();
+        guard.attach(s.clone(), "a").unwrap();
+        s.set_meta("k", "v").unwrap();
+        guard.fence_off().unwrap();
+        assert!(s.set_meta("k", "w").is_err(), "fenced once the lease stops");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_holder_whose_lease_is_taken_fences_off_and_says_so() {
         let (_d, m) = fs_mirror();
@@ -610,7 +688,10 @@ mod tests {
         flaky.stall();
         let start = Instant::now();
         let (fenced, fence_off) = counter();
-        let stopped = hold(a, fence_off).await;
+        // Bounded so a renewal with no deadline fails here rather than hanging the suite (#2604).
+        let stopped = tokio::time::timeout(TERM * 3, hold(a, fence_off))
+            .await
+            .expect("a stalled renewal must not outlive the term");
         assert_eq!(stopped, Stopped::Lapsed { fence: 1 });
         assert_eq!(fenced.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(start.elapsed() <= TERM, "{:?}", start.elapsed());

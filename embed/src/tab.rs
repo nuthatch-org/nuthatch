@@ -492,3 +492,68 @@ pub mod worker {
             .map_err(|e| OpenError::Js(e.to_string()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Sealing, TabNest};
+    use crate::cellar::Cellar;
+    use crate::window::token;
+    use nuthatch_core::redb_store::Store;
+    use nuthatch_core::seal::{seal_range, Sinks};
+    use nuthatch_core::store::{entity_key, SEALED_THROUGH_KEY};
+    use nuthatch_core::window::Finality;
+
+    /// #2604: opening a tab nest finishes a seal that installed a fold's catalogue and died before
+    /// its prune (#2594), through the open path itself and not only the core function.
+    #[test]
+    fn opening_a_nest_finishes_a_fold_that_stopped_before_its_prune() {
+        let db = redb::Builder::new()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .unwrap();
+        let store = Store::from_db(db, None).unwrap();
+        let rows: Vec<(String, String)> = (1..=4)
+            .map(|n| {
+                let row = serde_json::json!({"table": "t", "block_number": n, "log_index": 0});
+                (entity_key(n, 0), row.to_string())
+            })
+            .collect();
+        store.commit_window(&rows, None, 4).unwrap();
+        let sinks = std::sync::Arc::new(Cellar::default());
+        let seal = |from, to| {
+            let rows = store.entities_in_range(from, to).unwrap();
+            seal_range(&mut *sinks.open(), &rows, from, to, None)
+                .unwrap()
+                .expect("rows to seal");
+        };
+        seal(1, 2);
+        store
+            .prune_and_set_meta(1, 2, SEALED_THROUGH_KEY, "2")
+            .unwrap();
+        seal(3, 4);
+        assert_eq!(
+            store.sealed_through(),
+            2,
+            "premise: the watermark did not move"
+        );
+        let spans: Vec<(u64, u64)> = Cellar::manifest(&sinks)
+            .tables
+            .values()
+            .flatten()
+            .map(|s| (s.from_block, s.to_block))
+            .collect();
+        assert_eq!(spans, vec![(1, 4)], "premise: the fold replaced the tail");
+
+        let spec = crate::nest::NestSpec::of_registry(token(), Vec::new(), Vec::new(), 1);
+        let sealing = Sealing {
+            finality: Finality::Depth(1_000_000_000),
+            seal_span: 1,
+            sinks,
+            history: None,
+            verified: None,
+        };
+        let nest = TabNest::open_sealing(store, spec, 1, sealing).unwrap();
+
+        assert_eq!(nest.store.sealed_through(), 4);
+        assert!(nest.store.entities_in_range(1, 4).unwrap().is_empty());
+    }
+}

@@ -22,7 +22,7 @@ if (!out) {
 }
 
 // Each file before anything that uses it; `engine.js` last, and the only one whose exports stay.
-const SOURCES = ["../browser/host.js", "../browser/opfs.js", "../node/fs-storage.mjs", "engine.js"];
+const SOURCES = ["../browser/host.js", "../browser/opfs.js", "../node/fs-storage.mjs", "verify.js", "engine.js"];
 
 const parts = SOURCES.map((rel) => {
   const text = readFileSync(path.join(here, rel), "utf8");

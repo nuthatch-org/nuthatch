@@ -199,6 +199,8 @@ mod sealed_audit;
 mod secret_isolation;
 #[path = "semantic_layer.rs"]
 mod semantic_layer;
+#[path = "shipped_endpoints.rs"]
+mod shipped_endpoints;
 #[path = "tape_clean.rs"]
 mod tape_clean;
 #[path = "tip_gauges_are_published_per_nest.rs"]

@@ -1801,7 +1801,7 @@ async fn reconcile(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::registry::{DecodedRow, Value as DecodedValue};
     use crate::seal::{seal_range, test_set_table_floor};
@@ -1947,7 +1947,7 @@ mod tests {
         Ok(Box::new(Delegate(mirror)))
     }
 
-    fn install(name: &str, mirror: Shared) -> String {
+    pub(crate) fn install(name: &str, mirror: Shared) -> String {
         test_mirrors()
             .lock()
             .unwrap()

@@ -2851,6 +2851,7 @@ pub async fn spawn_runtime(
         health,
         fail_fast,
         false,
+        None,
     )
     .await
 }
@@ -2869,6 +2870,7 @@ pub async fn spawn_runtime_at_boot(
     admin_token: Option<String>,
     health: Arc<crate::health::RuntimeHealth>,
     fail_fast: bool,
+    writer_leases: Option<&crate::runtime::HeldLeases>,
 ) -> Result<ChainCursor> {
     spawn_cursor(
         source,
@@ -2882,6 +2884,7 @@ pub async fn spawn_runtime_at_boot(
         health,
         fail_fast,
         !fail_fast,
+        writer_leases,
     )
     .await
 }
@@ -2899,6 +2902,7 @@ async fn spawn_cursor(
     health: Arc<crate::health::RuntimeHealth>,
     fail_fast: bool,
     spare_co_tenants: bool,
+    writer_leases: Option<&crate::runtime::HeldLeases>,
 ) -> Result<ChainCursor> {
     let mut failed = Vec::new();
     let mut ingests = Vec::new();
@@ -2974,6 +2978,9 @@ async fn spawn_cursor(
         .iter()
         .find_map(|nest| refuse_seal_direct_with_entities(seal_direct, nest).err())
     {
+        return Err(release_unstarted(e, ingests, states, alert_workers).await);
+    }
+    if let Some(Err(e)) = writer_leases.map(|l| l.claim(&states)) {
         return Err(release_unstarted(e, ingests, states, alert_workers).await);
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3366,7 +3373,7 @@ async fn build_nest(
             tracing::warn!("segment integrity check failed (continuing): {e:#}");
         }
         // Before the view rebuild below reads cold under the watermark (#2169).
-        finish_unpruned_fold(&dir, store.as_ref())?;
+        nuthatch_core::seal::finish_unpruned_fold(&seal::FsSinks(&dir), store.as_ref())?;
     }
 
     let balances = BalanceView::start(crate::drive::Driver::Threaded)?;
@@ -7754,7 +7761,9 @@ impl NodeHooks {
             &self.exposure,
             &self.velocity,
             &self.entities,
-        )?;
+        )?
+        .map(|s| s.with_catalogue(&self.dir))
+        .transpose()?;
         self.publisher.snapshots.store(snapshot.map(Arc::new));
         self.publisher.last().at = Some(std::time::Instant::now());
         Ok(())
@@ -8379,29 +8388,6 @@ async fn maybe_seal(
         registry_snapshot,
     )
     .await
-}
-
-/// Finish a seal that installed a fold's catalogue and died before its prune (#2169): the prune and
-/// watermark it would have committed next. Until then the folded rows were in no read at all.
-fn finish_unpruned_fold(dir: &std::path::Path, store: &dyn crate::store::HotStore) -> Result<()> {
-    let watermark = store.sealed_through();
-    let (from, cut) = match seal::unpruned_fold(dir, watermark) {
-        Ok(Some(window)) => window,
-        Ok(None) => return Ok(()),
-        Err(e) => {
-            tracing::error!(
-                "a seal past block {watermark} stopped before its prune, and it cannot be finished: \
-                 {e:#}. Hot rows are kept and the watermark stays; restore the segment from a copy \
-                 and restart, or re-index the nest"
-            );
-            return Ok(());
-        }
-    };
-    let pruned = store.prune_and_set_meta(from, cut, SEALED_THROUGH_KEY, &cut.to_string())?;
-    tracing::info!(
-        "finished a seal through block {cut} that stopped before its prune: pruned {pruned} rows from hot"
-    );
-    Ok(())
 }
 
 /// A follower's derived state (RFC-0073 FR1): the views and entities a writer keeps in memory,
@@ -15614,6 +15600,128 @@ template = "pool"
             "the re-admitted nest must have fetched for itself: {calls:?}"
         );
         assert!(stats.own_fetches.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    /// #2607: a window fetched while b was quarantined holds none of b's logs. A slow co-tenant keeps
+    /// it buffered, so b reaches it on re-admission and must fetch that range itself, not commit it
+    /// empty. `last_block` alone cannot see this; the rows can.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_readmitted_nest_does_not_commit_windows_fetched_without_it() {
+        const TIP: u64 = 45;
+        let root = tempfile::tempdir().unwrap();
+        let nests = s0_nests(root.path(), false).await;
+        let source: Arc<dyn Source> = Arc::new(FilteringSource {
+            logs: three_transfer_chain(TIP),
+        });
+        let dirs: Vec<PathBuf> = nests.iter().map(|n| n.dir.clone()).collect();
+        let stores: Vec<_> = nests.iter().map(|n| n.store.clone()).collect();
+        slowed_nests()
+            .lock()
+            .unwrap()
+            .push((dirs[2].clone(), std::time::Duration::from_millis(600)));
+        fail_windows_of(&dirs[1], 1);
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let task = tokio::spawn(runtime_index_loop_buffered(
+            source,
+            nests,
+            Some(TIP - 1),
+            false,
+            1,
+            3,
+            health,
+            false,
+            None,
+            BufferOptions::for_test(64),
+        ));
+        wait_for(
+            "every nest reaches the tip",
+            std::time::Duration::from_secs(60),
+            || {
+                stores
+                    .iter()
+                    .all(|s| last_block_of(s.as_ref()) == Some(TIP))
+            },
+        )
+        .await;
+        task.abort();
+        let _ = task.await;
+        slowed_nests()
+            .lock()
+            .unwrap()
+            .retain(|(d, _)| d != &dirs[2]);
+        let rows: Vec<usize> = dirs
+            .iter()
+            .zip(&stores)
+            .map(|(d, s)| s0_contents(d, s.as_ref()).values().map(Vec::len).sum())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![TIP as usize; 3],
+            "each nest owns one transfer a block; rows stored for [a, b, c]"
+        );
+    }
+
+    /// #2607, the live-mount path: c is mounted while a slow b keeps windows fetched without c in
+    /// the buffer, so c must fetch those ranges itself rather than commit them empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_mounted_nest_does_not_commit_windows_fetched_without_it() {
+        const TIP: u64 = 45;
+        let root = tempfile::tempdir().unwrap();
+        let mut nests = s0_nests(root.path(), false).await;
+        let mut c = nests.pop().unwrap();
+        let source: Arc<dyn Source> = Arc::new(FilteringSource {
+            logs: three_transfer_chain(TIP),
+        });
+        let b_dir = nests[1].dir.clone();
+        let a_store = nests[0].store.clone();
+        slowed_nests()
+            .lock()
+            .unwrap()
+            .push((b_dir.clone(), std::time::Duration::from_millis(600)));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = spawn_test_cursor(
+            CursorKind::Buffered(64),
+            source.clone(),
+            nests,
+            Some(TIP - 1),
+            3,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            Some(rx),
+        );
+        wait_for(
+            "a reaches the tip",
+            std::time::Duration::from_secs(20),
+            || last_block_of(a_store.as_ref()) == Some(TIP),
+        )
+        .await;
+        let next = c
+            .prepare(source.as_ref(), Some(TIP - 1), false, 1, 3)
+            .await
+            .unwrap();
+        let (c_dir, c_store) = (c.dir.clone(), c.store.clone());
+        let (ack, acked) = tokio::sync::oneshot::channel();
+        tx.send(CursorCommand::Mount {
+            nest: Box::new(c),
+            next,
+            ack: Some(ack),
+        })
+        .unwrap();
+        acked.await.unwrap();
+        wait_for(
+            "the mounted nest catches up",
+            std::time::Duration::from_secs(30),
+            || last_block_of(c_store.as_ref()) == Some(TIP),
+        )
+        .await;
+        task.abort();
+        let _ = task.await;
+        slowed_nests().lock().unwrap().retain(|(d, _)| d != &b_dir);
+        let rows: usize = s0_contents(&c_dir, c_store.as_ref())
+            .values()
+            .map(Vec::len)
+            .sum();
+        assert_eq!(rows, TIP as usize, "c owns one transfer a block");
     }
 
     /// RFC-0076 S2: lifecycle commands on the buffered cursor. A mounted nest behind the buffer

@@ -5,6 +5,7 @@
 // `embed/README.md` ("The host package") is its interface.
 import { fetchRpc, GuestFault, load } from "../browser/host.js";
 import { opfsStorage } from "../browser/opfs.js";
+import { compare, headOf, ordered, statementVerdict } from "./verify.js";
 import { fsStorage } from "../node/fs-storage.mjs";
 
 export { GuestFault };
@@ -244,17 +245,19 @@ class Nest {
         const r = this.ready();
         let mirror = null;
         let identity = null;
+        let verified = null;
         try {
           const report = this.engine.report();
           mirror = report.mirror ?? null;
           identity = report.identity ?? null;
+          verified = report.verified ?? null;
         } catch {
           // A probe; a nest that cannot report still answers.
         }
         return {
           nid: this.nid, storage: this.mode === "host" ? "kept" : "memory", block: r.last_block ?? null,
           tip: r.tip ?? null, requests: this.requests, ms: Math.round(performance.now() - started), mirror,
-          identity,
+          identity, verified,
           ...(s.unverified ? { unverified: s.unverified } : {}),
         };
       } catch (e) {
@@ -434,9 +437,6 @@ function serve() {
   };
 }
 
-/// A value as the wire carries it, compared as text, as RFC-0077 S7's page compares a figure.
-const asText = (v) => (v == null ? null : typeof v === "string" ? v : typeof v === "object" ? JSON.stringify(v) : String(v));
-
 /// A `/sql` answer as a node or a gateway in front of one sends it: `{rows, provenance}`, or with the
 /// rows under `data`. Columns are the answer's own order where it kept one.
 function answerOf(a) {
@@ -453,34 +453,6 @@ function answerOf(a) {
   if (body.truncated || p.truncated) throw new Error("the answer was truncated, so it cannot be compared whole");
   const columns = Array.isArray(body.columns) ? body.columns : Object.keys(rows[0] ?? {});
   return { rows, columns, nid: p.nid.toLowerCase(), as_of: p.as_of };
-}
-
-/// Rows in one order whatever order each side listed them in, so a comparison is of the rows.
-const ordered = (rows, columns) => rows
-  .map((r) => columns.map((c) => asText(r[c])))
-  .sort((a, b) => (JSON.stringify(a) < JSON.stringify(b) ? -1 : JSON.stringify(a) > JSON.stringify(b) ? 1 : 0));
-
-/// Column by column: equal, differs with the values on each side, or not computable here, named.
-function compare(server, here) {
-  const both = server.columns.filter((c) => here.columns.includes(c));
-  const s = ordered(server.rows, both);
-  const h = ordered(here.rows, both);
-  const columns = both.map((column, k) => {
-    const differs = [];
-    for (let i = 0; i < Math.max(s.length, h.length); i++) {
-      const a = s[i]?.[k] ?? null;
-      const b = h[i]?.[k] ?? null;
-      if (a !== b || !s[i] !== !h[i]) differs.push({ row: i, server: a, here: b });
-    }
-    return differs.length ? { column, verdict: "differs", values: differs.slice(0, 20), rows_differing: differs.length } : { column, verdict: "equal" };
-  });
-  for (const column of server.columns.filter((c) => !both.includes(c))) {
-    columns.push({ column, verdict: "not computable", reason: "this nest's answer has no such column" });
-  }
-  for (const column of here.columns.filter((c) => !both.includes(c))) {
-    columns.push({ column, verdict: "not computable", reason: "the server's answer has no such column" });
-  }
-  return { rows: { server: server.rows.length, here: here.rows.length }, columns };
 }
 
 /// What a check ran under, for the result to say every time (RFC-0081 §7.2).
@@ -564,13 +536,13 @@ class Verifier {
         continue;
       }
       const c = compare(p.server, { rows: here.rows, columns: here.columns ?? Object.keys(here.rows[0] ?? {}) });
-      const verdict = c.columns.some((x) => x.verdict === "differs") || c.rows.server !== c.rows.here ? "differs" : "equal";
+      const verdict = statementVerdict(c);
       results.push({ name, verdict, read: here.provenance?.narrowed?.read ?? null, ...c });
     }
     return {
       nid, as_of, source, filters, dataset: followed.identity?.dataset ?? null,
       rpc: hostsOf(this.options.rpc),
-      head: this.options.verified ? "verified" : "the RPC's, unverified",
+      ...headOf(this.options.verified, followed, as_of),
       mirror: followed.mirror
         ? { base: this.options.mirror.base, ...followed.mirror }
         : null,
