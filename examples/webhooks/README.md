@@ -65,8 +65,8 @@ that lands.
 the outbox and it retries. If your handler succeeds and *then* fails to reply 200, you will see
 that payload again. Every delivery carries `X-Nuthatch-Delivery`, the entry's sequence: a retry
 repeats it, and it keeps counting up through a failover takeover, so it is the key to dedupe on.
-After an unplanned crash, the alert sent in the instant before it can share an id with the new
-writer's first, since delivery does not wait for the standby to have the alert.
+The alert sent in the instant before a takeover can share an id with the new writer's first,
+since nothing waits for the standby to have an alert before it is sent.
 It is numbered per nest, so if several nests post to this URL, key on the nest as well (the
 payload's `annotation.nest`, or give each nest its own URL). The header is not signed (#2587); a
 receiver that must trust its key can also key on something stable from the row.

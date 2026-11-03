@@ -427,9 +427,9 @@ registry = "s3://bucket/registry"        # needed with follow
 - **Webhooks** survive a takeover at least once: a delivery the old writer made whose removal had
   not reached the standby is made again. Each delivery carries `X-Nuthatch-Delivery`, its outbox
   sequence, which survives a takeover: a promoted writer numbers on past every id whose push had
-  reached the standby, delivered or not. A planned handover waits for that; after a crash, an alert
-  queued and delivered in the instant before it, whose push the standby never saw, can share an id
-  with the new writer's first delivery. The sequence is per nest, so two nests posting to one URL
+  reached the standby, delivered or not. Nothing waits for the standby to have a push, on a crash or
+  a handover, so an alert queued and delivered in the instant before the takeover, whose push the
+  standby never saw, can share an id with the new writer's first delivery. The sequence is per nest, so two nests posting to one URL
   both start at 0; a receiver should dedupe on the nest and the header together (a URL per nest, or
   the payload's `annotation.nest`) and treat a repeat as harmless. The header is not covered by
   `X-Nuthatch-Signature` (#2587).

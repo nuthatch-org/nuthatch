@@ -419,10 +419,10 @@ writer's did, and a receiver can dedupe on it. `each_delivery_names_its_outbox_s
 header against two queued alerts. A receiver that ignores it sees what it saw before. The writer's
 next-sequence counter is mirrored with the outbox, so a promoted writer numbers past every id whose
 push reached it, including ones delivered and removed before the takeover (#2598,
-`a_promoted_writer_numbers_deliveries_past_every_one_the_old_writer_made`). Delivery does not wait for
-the follower, so after a crash an alert pushed and delivered in the instant before it, which the
-standby never saw, can share an id with the new writer's first; a planned handover drains first and
-cannot. The sequence is per nest; a receiver shared by several dedupes on the nest and the id together.
+`a_promoted_writer_numbers_deliveries_past_every_one_the_old_writer_made`). Neither delivery nor a
+handover waits for the follower to have a push (the handover's drain waits for sealed segments on
+the mirror, not for the feed), so an alert pushed and delivered in the instant before a takeover,
+which the standby never saw, can share an id with the new writer's first. The sequence is per nest; a receiver shared by several dedupes on the nest and the id together.
 
 **The fence a follower compares.** A store claimed under a writer lease records the lease's fence
 beside its local claim counter, and the feed's mount line carries the lease's (#2611). The local
