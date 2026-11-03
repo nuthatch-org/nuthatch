@@ -159,3 +159,20 @@ if [ "$expected" != "$live" ]; then
   exit 1
 fi
 echo "required checks match live protection on main ($(echo "$live" | wc -l | tr -d ' ') contexts)"
+
+# The slow tier reports skipped on an ordinary PR and gates only in the merge queue, so without a
+# queue three required checks can never block a merge (#2609).
+rules=$(curl -fsS -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/repos/${GITHUB_REPOSITORY:-nuthatch-org/nuthatch}/rules/branches/main" \
+  | jq -r '.[].type')
+if ! grep -qx merge_queue <<< "$rules"; then
+  cat >&2 <<'MSG'
+FAIL: main has no merge queue. Scaled mode, the compose fleet and the dense multi-nest budget run
+only in the queue, on main or with full-ci, so on an ordinary PR they report skipped and a skip
+counts as passing (#2609).
+
+  - Fix: gh api -X POST repos/nuthatch-org/nuthatch/rulesets --input .github/merge-queue-ruleset.json
+MSG
+  exit 1
+fi
+echo "main has a merge queue, so the slow tier gates before merge"
