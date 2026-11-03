@@ -9843,7 +9843,7 @@ FROM bet GROUP BY player;
         .unwrap();
         held(dir.path(), 2);
         let tenant: Arc<str> = Arc::from("acme");
-        crate::maintained::seat(dir.path(), tenant.clone(), guard());
+        crate::maintained::seat(dir.path(), "acme/bet", tenant.clone(), guard());
         let refused = |d: &Path| {
             view_failures(d).iter().any(|(file, _, e)| {
                 file.contains("05-table") && e.contains("strict isolation runs only CREATE VIEW")
@@ -9882,12 +9882,61 @@ FROM bet GROUP BY player;
         );
         crate::maintained::wait_idle(dir.path());
         assert!(copies(dir.path(), "bet").is_empty(), "built before a seat");
-        crate::maintained::seat(dir.path(), Arc::from("acme"), guard());
+        crate::maintained::seat(dir.path(), "acme/bet", Arc::from("acme"), guard());
         crate::maintained::wait_idle(dir.path());
         assert_eq!(
             copies(dir.path(), "bet").len(),
             1,
             "the seat plans the build"
+        );
+    }
+
+    /// #2636: a mount that leaves takes its seat with it, so the builds run as a mount still holding
+    /// the dataset, under that mount's limits, and an unheld strict nest builds nothing.
+    #[test]
+    fn an_unmount_takes_back_its_seat() {
+        let dir = nest(Some("[[view]]\nname = \"bet\"\n"));
+        crate::maintained::load(dir.path()).unwrap();
+        crate::maintained::attach(dir.path(), crate::serve::SqlGate::new(2), true);
+        let tight = QueryGuard {
+            timeout: Duration::from_millis(300),
+            ..guard()
+        };
+        crate::maintained::seat(dir.path(), "acme/bet", Arc::from("acme"), tight);
+        crate::maintained::seat(dir.path(), "globex/bet", Arc::from("globex"), guard());
+        let seated = || {
+            crate::maintained::seated_tenant(dir.path())
+                .as_deref()
+                .map(String::from)
+        };
+        assert_eq!(seated().as_deref(), Some("acme"));
+
+        crate::maintained::unseat(dir.path(), "acme/bet");
+        assert_eq!(
+            seated().as_deref(),
+            Some("globex"),
+            "builds run as a mount that still holds the dataset"
+        );
+        assert_eq!(
+            crate::maintained::seated_timeout(dir.path()),
+            Some(guard().timeout),
+            "the departed mount's tighter deadline went with it"
+        );
+
+        crate::maintained::unseat(dir.path(), "globex/bet");
+        assert_eq!(seated(), None);
+        let hot = tip(&[placed(4, "carol", 13, 20)]);
+        crate::maintained::feed(
+            dir.path(),
+            crate::maintained::Feed {
+                read: Box::new(move || Ok((hot.clone(), 10))),
+                declared: Arc::new(Vec::new()),
+            },
+        );
+        crate::maintained::wait_idle(dir.path());
+        assert!(
+            copies(dir.path(), "bet").is_empty(),
+            "a strict nest no mount holds built as someone"
         );
     }
 
@@ -9905,6 +9954,7 @@ FROM bet GROUP BY player;
         let gate = held(dir.path(), 2);
         crate::maintained::seat(
             dir.path(),
+            "acme/slow",
             Arc::from("acme"),
             QueryGuard {
                 timeout: Duration::from_millis(300),
