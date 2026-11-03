@@ -284,8 +284,11 @@ impl Ctx {
 // were deployed; `signalled_tokens` followed on 2026-10-04 (graph-allocations-nest#29). From the
 // nest's `l1_blocks` re-index (#1882) every epoch is placed by its own L1 block: measured against the
 // subgraph on 2026-10-05, signal and curator fees agree on every epoch the network has had, query
-// fees from 290, and the reward trio stays at 1195. A nest from before the re-index starts at 1104
-// with an observed boundary there, so these constants need it.
+// fees from 290, and the reward trio stays at 1195. Measured again on 2026-11-03: query fees now
+// agree on every epoch too, from 1, and the reward trio is still at 1195. Helsinki's runs held at
+// 290 through 2026-10-28 and reported it too high from 2026-10-29 05:31 UTC, on the same nest
+// (5.12.0) and comparison binary, so the subgraph's answers for epochs 1-289 changed. A nest from
+// before the re-index starts at 1104 with an observed boundary there, so these constants need it.
 //
 // Two classes:
 //   gate   directly comparable. **Any** disagreement above the boundary fails the run, except an
@@ -316,12 +319,7 @@ const EPOCH_FIELDS: [(&str, &str, i128, Class); 6] = [
         Class::Gate,
     ),
     ("signalled_tokens", "signalledTokens", 1, Class::Gate),
-    (
-        "query_fees_collected",
-        "queryFeesCollected",
-        290,
-        Class::Gate,
-    ),
+    ("query_fees_collected", "queryFeesCollected", 1, Class::Gate),
     ("curator_query_fees", "curatorQueryFees", 1, Class::Gate),
 ];
 
