@@ -142,9 +142,11 @@ pub mod serve;
 /// RFC-0046 S3: drain and settle recorded authorisations, outside the nest.
 #[cfg(feature = "counter")]
 pub mod settle;
-/// RFC-0080 S0: value-term shapes and their per-delta filter, a spike that nothing serves yet.
+/// RFC-0080: value-term shapes and the rows they select.
+#[cfg(feature = "sync-server")]
 pub mod shape;
 /// RFC-0080 S1: shape subscribers fed from a follower's applied deltas.
+#[cfg(feature = "sync-server")]
 pub mod shape_feed;
 pub mod skill;
 pub mod source;

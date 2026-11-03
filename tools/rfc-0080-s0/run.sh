@@ -129,10 +129,12 @@ until [ $(( $(metric nuthatch_follower_apply_seconds count) - c0 )) -ge "$DELTAS
 done
 a1=$(metric nuthatch_follower_apply_seconds sum); c1=$(metric nuthatch_follower_apply_seconds count)
 s1=$(metric nuthatch_follower_sync_seconds sum); n1=$(metric nuthatch_follower_sync_seconds count)
-kill -TERM "$cpid"; sleep 1
+# With no shapes the client has already exited.
+kill -TERM "$cpid" 2>/dev/null || true
+sleep 1
 client=$(tail -1 "$OUT/client.out")
 rss_med=$(printf '%s\n' "${rss[@]}" | sort -n | awk '{a[NR]=$1} END {print int(a[int((NR+1)/2)]/1024)}')
-load=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}' || cut -d' ' -f1 /proc/loadavg)
+load=$(uptime | sed 's/.*load averages*: *//' | tr -d ',' | awk '{print $1}')
 
 node -e '
 const [mix, shapes, attached, attach_s, a0, a1, c0, c1, s0, s1, n0, n1, rss, client, load] = process.argv.slice(1);

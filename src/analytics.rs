@@ -60,7 +60,7 @@ pub fn uncached<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Whether a session over `dir` for the shared tenant is in the cache now, for tests.
-#[cfg(test)]
+#[cfg(all(test, feature = "sync-server"))]
 pub(crate) fn session_cached(dir: &Path) -> bool {
     session_cache_lock().contains_key(&(dir.to_path_buf(), None))
 }

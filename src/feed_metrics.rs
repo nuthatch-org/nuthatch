@@ -192,6 +192,7 @@ pub struct FeedMetrics {
     delta_bytes: Family,
     encode_seconds: Family,
     apply_seconds: Family,
+    #[cfg(feature = "sync-server")]
     sync_seconds: Family,
     seal_wait_seconds: Family,
     visibility: Mutex<Visibility>,
@@ -209,6 +210,7 @@ pub fn metrics() -> &'static FeedMetrics {
         delta_bytes: Family::new(BYTES),
         encode_seconds: Family::new(SECONDS),
         apply_seconds: Family::new(SECONDS),
+        #[cfg(feature = "sync-server")]
         sync_seconds: Family::new(SECONDS),
         seal_wait_seconds: Family::new(SECONDS),
         visibility: Mutex::default(),
@@ -410,9 +412,9 @@ impl FeedMetrics {
     }
 
     /// The part of one delta's apply spent on its `/sync` subscribers, observed only when it has any.
+    #[cfg(feature = "sync-server")]
     pub fn synced(&self, took: Duration) {
-        self.sync_seconds
-            .observe(String::new(), took.as_secs_f64());
+        self.sync_seconds.observe(String::new(), took.as_secs_f64());
     }
 
     /// How long a sealing delta waited for the mirror to serve every file its catalogue names.
@@ -472,6 +474,7 @@ impl FeedMetrics {
             "nuthatch_follower_apply_seconds",
             "Time a follower took to apply one delta, its derived state included.",
         );
+        #[cfg(feature = "sync-server")]
         self.sync_seconds.render(
             s,
             "nuthatch_follower_sync_seconds",

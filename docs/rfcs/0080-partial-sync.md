@@ -7,11 +7,12 @@
   exact through the reorg suite and 10,000 live streams. **Reopened by Chief the same day; the second
   S0 (§12) narrows it: the gate is met for address-shaped shapes over the busy table (uniform 6.1% and
   5.1% on two boxes), not under fan-out or with every row shaped (hot:100 12.9%, all-tables 12.8 to
-  14.6%).** What remains is per-frame work on the apply. **S1 kept as built, 2026-11-03 (Chief:
-  "whatever you think is best", on #2620):** it reached main with #2596 before the call was recorded.
-  It stays in the default binary, off unless a mount writes `[mounts.sync]`, and is not for a runtime
-  shared between tenants until #2600 and #2612 are fixed. §13's "the gate is met" rests on the
-  denominator #2585 disputes; that question stays open there.
+  14.6%).** What remains is per-frame work on the apply. S1 reached main with #2596 before it was
+  decided, and was first kept as built (#2620). **The third S0 (§20, 2026-11-03) measured S1 as built
+  against the same gate: 461% of the follower's apply for uniform shapes and 509% for hot:100 on the
+  Mac, and no shape class passes.** Chief chose to take the server half out of the default binary: it
+  is built only with the off-by-default `sync-server` feature, and the code stays. A redesign waits for
+  a user who asks for it. §13's figure was not the gate (§20).
 - Author: Pete (cargopete)
 - Date: 2026-10-30
 - Depends on: RFC-0079 (Arrow results, the columnar wire), RFC-0077 (the embeddable engine and its
@@ -557,7 +558,13 @@ If Chief takes the narrowed claim, S1 adds to §11's list:
 3. **A bound a stalled client reaches**: by bytes as well as frames, since socket buffers hold
    thousands of frames before the queue sees any.
 
-## 13. S0 on this branch (2026-11-01): the gate is met
+## 13. A filter benchmark on the S1 branch (2026-11-01), not the gate
+
+> **Superseded by §20.** The figure below is the filter alone against `decode_delta` plus
+> `MemStore::apply` on synthetic deltas, not the follower's whole apply the gate names (#2585), and it
+> left out what S1 then added to every delta. Its test, `a_shape_filter_costs_under_a_tenth_of_the_follower_apply`,
+> is removed. Measured against the gate, S1 as built does not pass (§20). The heading said "the gate
+> is met" until 2026-11-03.
 
 §11 and §12 record the spike on `pete/rfc-0080-s0` and `pete/rfc-0080-s0b`, which is not on `main`.
 This section and those after it are the filter and hub built on this branch, in `src/shape.rs` and
@@ -614,7 +621,7 @@ the tree. S1 filters `Changes.added` and `Changes.removed`, which leaves the wir
 - One machine, one row shape (eight fields, about 300 bytes).
 - Ranges (§5.1) are not built; they are S1.
 
-S0's gate is met on both halves and S1 is next.
+This section concluded that S0's gate was met and S1 was next. It was not met; see §20.
 
 ## 14. S1 in progress (2026-11-01): the follower's half of the filter
 
@@ -920,3 +927,97 @@ Three defects from reading S1 (#2588, #2602, #2603), fixed together.
 The oracle that covers them is `serve_sync`'s own first answer: after each delta of seeded runs of puts,
 replacements, tuples, a second table, reorgs and direct seals, every live copy equals what `/sync`
 answers afresh.
+
+## 20. Third S0 (2026-11-03): S1 as built, against the gate
+
+Chief chose to settle #2585 by measuring once more: S1 as it stands after #2641, on the fixture and
+against the denominator of §11 and §12. **Verdict: no shape class passes.** Uniform shapes cost 461% of
+the follower's apply and hot:100 509%, against a 10% gate. **Decision (Chief): the server half leaves
+the default binary.** It is built only with the off-by-default `sync-server` feature, the code stays,
+and a redesign waits for a user who asks for it.
+
+### Method
+
+The fixture and shape sets are §11's: `fixture-rpc multinest`, one contract with the ten-event
+`PoolManager` ABI at 200 logs a block, a writer that backfills 200 blocks and then follows one block a
+poll, and a follower (`serve --runtime --follow`) with 10,000 live `GET /<route>/sync?live=1`
+streams. The shapes come from §12's generator, ported unchanged except that all-tables draws hashes
+from 800 blocks rather than 300. The gate is read over the 300 deltas after every stream has its first
+answer and the follower is at the writer's tip. The figure is the time `apply_delta` spends on its
+subscribers, `nuthatch_follower_sync_seconds`, over the rest of the same deltas' apply
+(`nuthatch_follower_apply_seconds` minus the sync part), summed over the window. That is §11's
+denominator, the follower's whole apply with the filter taken out, in the same run. The harness is
+`tools/rfc-0080-s0/`; first answers that meet a full SQL gate (`503`) are asked again, as a client
+would. Mac: Apple M5 Pro, 18 cores, 48 GiB, load average about 2 in the gated runs.
+
+### §12 reproduces
+
+§12's own harness and code (`pete/rfc-0080-s0b`, 8054ab4a, rebuilt the same day) on the same Mac, so
+the two measurements can be compared:
+
+| §12 run, uniform | Filter / apply, all | p50 | p99 | Apply p50 | Frames a delta |
+|---|---|---|---|---|---|
+| New filter (columns, delivery task) | **6.6%** (§12: 6.1%) | 6.5% | 10.1% | 1,190 µs | 101 |
+| Old filter (JSON, inline) | 14.0% (§12: 12.7%) | 14.1% | 22.7% | 1,235 µs | 102 |
+
+On the ThinkPad both reproduction runs failed before their clients attached, so §12 was not
+reproduced there, and this S0's runs did not finish there either.
+
+### S1 as built
+
+| Mix, 10,000 shapes, Mac | `/sync` a delta | Rest of the apply | Share | Frames a delta | RSS |
+|---|---|---|---|---|---|
+| uniform | 7,642 µs | 1,657 µs | **461%** | 156 | 881 MiB |
+| hot:100 | 8,598 µs | 1,689 µs | **509%** | 328 | 730 MiB |
+| all-tables | not run | | | | |
+
+One run of each finished before the batch was stopped for the breakdown below; the planned second
+and third runs, all-tables and the ThinkPad were not run. The rest of the apply is the same order as
+§12's apply p50, so the denominator is not what moved. With 200 shapes the share was still 215%, under
+a load of 8: the cost is paid per delta and per followed table, not per shape.
+
+### Where a delta's time goes
+
+Uniform, 10,000 shapes, a separate run of 100 deltas with a timer on each part (not kept in the tree):
+
+| Part | µs a delta |
+|---|---|
+| Showing the rows as `/sql` shows them (`project_rows`), in all | 7,139 |
+| of which, the temporary directory | 206 |
+| of which, opening an uncached engine session (#2627) | 584 |
+| of which, the engine's query over the delta's rows, by difference | about 6,350 |
+| Routing to subscribers (`ShapeHub::apply`: matching, frames, `try_send`) | 853 |
+| Parsing every changed row (`serde_json`) | 419 |
+| **The `/sync` part, in all** | **8,513** |
+| The rest of the apply | 1,573 |
+
+The session opened each delta is real but small: before #2627 the directory was fresh each delta too,
+so its session never came from the cache either. Most of the cost is §18's choice to show each delta's
+rows through `/sql`'s engine. Without it, parsing and routing alone are 1,272 µs, 81% of the
+denominator and about seventeen times §12's whole numerator: §19 replaced §12's column probe with a
+parse of every row and `Shape::matches` on the parsed value.
+
+### What each numerator counts
+
+§12's numerator was the filter on the apply path: probing the delta's columns, checking a shape's
+other terms, encoding each matched row's frame from the stored row and pushing it to its queue.
+Delivery, waking the streams, ran on its own task and was left out. Nothing was projected: a frame
+carried the stored row. This S0's numerator is the whole of `apply_delta`'s subscriber work: reading
+newly sealed segments, parsing the changed rows, showing them through the engine and routing them.
+The socket writes are still the streams' own tasks and are not counted. So it counts everything §12
+did, and the projection that only S1 has.
+
+### What a pass would need
+
+Rows shown without the engine, as the stored row mapped to `/sql`'s columns in memory; §12's column
+probe in place of a parse of every row; and fan-out off the apply, as §12's "What S1 would need"
+already said. Each is measurable with this harness. None is started.
+
+### In a default build now
+
+No `/<route>/sync` route. A mount that writes `[mounts.sync]` is refused at load, naming the
+`sync-server` feature, as `[screening]` is refused by name. With nothing able to set it, the feed's
+`mount` line carries no `sync` field, the follower holds no shape hub and its apply does no
+subscriber work, and `nuthatch_follower_sync_seconds` is not exported. The CLI, the config `init`
+writes and the on-disk layout were never touched by the server half. The engine crate's client half
+was already behind its own `sync` feature.
