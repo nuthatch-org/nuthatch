@@ -1727,6 +1727,10 @@ impl Follower {
         // The old state keeps serving while a new connection takes fresh snapshots.
         let changes = {
             let mut shapes = data.shapes.lock().unwrap_or_else(|e| e.into_inner());
+            shapes.prune();
+            if shapes.is_empty() {
+                data.store.untrack_changes();
+            }
             let changes = data
                 .store
                 .apply(&delta)
@@ -3541,6 +3545,154 @@ mod tests {
             next_line(&mut stream).await.is_none(),
             "the stream ends when the copy is replaced"
         );
+
+        // #2601: a live request refused before its first answer leaves nothing followed once the
+        // next delta is applied, so that delta is not projected.
+        let mut held = Vec::new();
+        while let Ok(permit) = gate.try_admit(None) {
+            held.push(permit);
+        }
+        let refused = follower
+            .serve_sync("ds", &uri(&format!("{}&live=1", from("0xa"))))
+            .await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop((refused, held));
+        let delta = Delta {
+            epoch: 2,
+            generation: 1,
+            ops: vec![transfer(4, 0, "0xa", "0xb")],
+            ..Default::default()
+        };
+        follower.apply_delta("ds", delta).await.unwrap();
+        let data = follower.lock().datasets["ds"].clone();
+        assert!(
+            data.shapes.lock().unwrap().is_empty(),
+            "a table is still followed"
+        );
+        assert!(!data.store.tracking_changes(), "changes are still tracked");
+    }
+
+    /// #2600: a delta with more rows of a followed table than the route's `max_rows` is shown whole
+    /// to the stream, rather than truncated, mis-keyed, and every stream on the dataset ended.
+    #[tokio::test]
+    async fn a_delta_over_the_row_cap_does_not_end_the_streams() {
+        use crate::feed::{Delta, Op, Snapshot};
+        use crate::store::Store;
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ds");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[nest]\nname = \"ds\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"t\"\naddress = \"0x0000000000000000000000000000000000000001\"\n\
+             abi = \"abi.json\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("abi.json"),
+            r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[
+                {"name":"from","type":"address","indexed":true},
+                {"name":"to","type":"address","indexed":true},
+                {"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap();
+        let mut limits: crate::feed::WireLimits = (&crate::limits::Limits::process()).into();
+        limits.max_rows = 2;
+        let follower = Follower::start_paused(
+            tmp.path().to_path_buf(),
+            "http://127.0.0.1:9".into(),
+            "t".into(),
+        );
+        {
+            let mut inner = follower.lock();
+            inner.routes.insert(
+                "ds".into(),
+                Route {
+                    spec: Spec {
+                        dataset: "ds".into(),
+                        nid: None,
+                        surface: Default::default(),
+                        tenant: None,
+                        share: None,
+                        limits: Some(limits),
+                        chain: Some("mainnet".into()),
+                        isolation: None,
+                        data_identity: None,
+                        sync: Some(toml::from_str("[tables]\nt__transfer = [\"from\"]\n").unwrap()),
+                    },
+                    served: None,
+                },
+            );
+            inner.datasets.insert(
+                "ds".into(),
+                Data {
+                    store: Arc::new(MemStore::from_snapshot(
+                        &dir,
+                        Snapshot {
+                            epoch: 1,
+                            ..Default::default()
+                        },
+                    )),
+                    snapshots: Default::default(),
+                    shapes: Default::default(),
+                    derived: Err(Refused {
+                        why: "not built here".into(),
+                        entities: Arc::default(),
+                        gone: false,
+                    }),
+                    building: None,
+                },
+            );
+        }
+        follower.realise();
+        let shape = r#"{"table":"t__transfer","where":{"from":["0xa"]}}"#;
+        let encoded: String = shape
+            .bytes()
+            .map(|b| match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        let uri: axum::http::Uri = format!("/sync?s={encoded}&live=1").parse().unwrap();
+        let resp = follower.serve_sync("ds", &uri).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut stream = resp.into_body().into_data_stream();
+        let mut pending = String::new();
+        let mut next_line =
+            async |stream: &mut axum::body::BodyDataStream| -> Option<serde_json::Value> {
+                loop {
+                    if let Some(at) = pending.find('\n') {
+                        let line: String = pending.drain(..=at).collect();
+                        return Some(serde_json::from_str(&line).unwrap());
+                    }
+                    let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                        .await
+                        .expect("a line within five seconds")?;
+                    pending.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+                }
+            };
+        // Through the end of the (empty) first answer.
+        while next_line(&mut stream).await.unwrap() != serde_json::json!({ "up_to_date": true }) {}
+        let transfer = |log: u64, from: &str| Op::Put {
+            key: Store::entity_key(1, log),
+            row: format!(
+                r#"{{"table":"t__transfer","from":"{from}","to":"0xb","value":"7","block_number":1,"tx_hash":"0xt1","log_index":{log}}}"#
+            ),
+        };
+        let delta = Delta {
+            epoch: 1,
+            generation: 1,
+            ops: (0..5)
+                .map(|i| transfer(i, if i == 4 { "0xa" } else { "0xc" }))
+                .collect(),
+            ..Default::default()
+        };
+        follower.apply_delta("ds", delta).await.unwrap();
+        let line = next_line(&mut stream)
+            .await
+            .expect("the stream outlives a delta over the row cap");
+        assert_eq!(line["ops"][0]["put"]["key"], Store::entity_key(1, 4));
     }
 
     /// RFC-0080 §16: a shape's answer includes the rows already sealed, and keeps following across the
