@@ -7754,7 +7754,9 @@ impl NodeHooks {
             &self.exposure,
             &self.velocity,
             &self.entities,
-        )?;
+        )?
+        .map(|s| s.with_catalogue(&self.dir))
+        .transpose()?;
         self.publisher.snapshots.store(snapshot.map(Arc::new));
         self.publisher.last().at = Some(std::time::Instant::now());
         Ok(())
