@@ -2851,6 +2851,7 @@ pub async fn spawn_runtime(
         health,
         fail_fast,
         false,
+        None,
     )
     .await
 }
@@ -2869,6 +2870,7 @@ pub async fn spawn_runtime_at_boot(
     admin_token: Option<String>,
     health: Arc<crate::health::RuntimeHealth>,
     fail_fast: bool,
+    writer_leases: Option<&crate::runtime::HeldLeases>,
 ) -> Result<ChainCursor> {
     spawn_cursor(
         source,
@@ -2882,6 +2884,7 @@ pub async fn spawn_runtime_at_boot(
         health,
         fail_fast,
         !fail_fast,
+        writer_leases,
     )
     .await
 }
@@ -2899,6 +2902,7 @@ async fn spawn_cursor(
     health: Arc<crate::health::RuntimeHealth>,
     fail_fast: bool,
     spare_co_tenants: bool,
+    writer_leases: Option<&crate::runtime::HeldLeases>,
 ) -> Result<ChainCursor> {
     let mut failed = Vec::new();
     let mut ingests = Vec::new();
@@ -2974,6 +2978,9 @@ async fn spawn_cursor(
         .iter()
         .find_map(|nest| refuse_seal_direct_with_entities(seal_direct, nest).err())
     {
+        return Err(release_unstarted(e, ingests, states, alert_workers).await);
+    }
+    if let Some(Err(e)) = writer_leases.map(|l| l.claim(&states)) {
         return Err(release_unstarted(e, ingests, states, alert_workers).await);
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
