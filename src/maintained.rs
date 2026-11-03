@@ -370,7 +370,7 @@ struct Nest {
 }
 
 impl Nest {
-    /// The first seated route's partition, under the tightest limits of all of them.
+    /// The partition of the seated route that sorts first, under the tightest limits of all of them.
     fn seat(&self) -> Option<Seat> {
         let mut seats = self.seats.values();
         let mut seat = seats.next()?.clone();
