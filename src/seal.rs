@@ -2210,6 +2210,153 @@ mod sealed_rows {
         std::fs::create_dir_all(dir.path()).unwrap();
         assert!(read_table_rows(dir.path(), &schema()).unwrap().is_empty());
     }
+
+    /// One sealed segment of `usdc__transfer` in `dir`, and the catalogue entry naming it.
+    fn sealed_segment(dir: &Path) -> Segment {
+        let json = [row(10, 0, alloy_primitives::U256::from(7u64))
+            .to_json()
+            .to_string()];
+        seal_range(dir, &json, 10, 10)
+            .unwrap()
+            .expect("something sealed");
+        load_manifest(dir).unwrap().tables["usdc__transfer"][0].clone()
+    }
+
+    /// A follower's copy of `dir`: what makes a request served from it a follower's (#1913).
+    fn follower(dir: &Path) -> Arc<dyn crate::store::HotStore> {
+        let catalogue = std::fs::read_to_string(dir.join(SEGMENTS_DIR).join(MANIFEST_FILE)).ok();
+        Arc::new(crate::feed::MemStore::from_snapshot(
+            dir,
+            crate::feed::Snapshot {
+                catalogue,
+                ..Default::default()
+            },
+        ))
+    }
+
+    fn gone(e: &anyhow::Error) -> Option<&SegmentGone> {
+        e.downcast_ref::<SegmentGone>()
+    }
+
+    /// #2580: a segment a follower's catalogue names and the disk lacks is [`SegmentGone`], which
+    /// says which file and that a fresh snapshot follows, and the copy is told.
+    #[test]
+    fn a_follower_missing_a_segment_reads_it_as_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = sealed_segment(dir.path());
+        let path = segment_path(dir.path(), &segment.file, &segment.hash);
+        std::fs::remove_file(&path).unwrap();
+        let copy = follower(dir.path());
+
+        let err = within(dir.path(), copy.clone(), || {
+            read_segment_decoded(dir.path(), &segment, &schema())
+        })
+        .unwrap_err();
+        let gone = gone(&err).unwrap_or_else(|| panic!("not SegmentGone: {err:#}"));
+        assert_eq!(gone.0, path);
+        let said = gone.to_string();
+        assert!(
+            said.contains(&path.display().to_string()) && said.contains("fresh snapshot"),
+            "{said}"
+        );
+    }
+
+    /// #2580: the same missing segment on a writer, served from no follower's copy, is an ordinary
+    /// error, and so is one missing from a nest other than the one the follower serves.
+    #[test]
+    fn a_missing_segment_outside_a_followers_request_is_not_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = sealed_segment(dir.path());
+        std::fs::remove_file(segment_path(dir.path(), &segment.file, &segment.hash)).unwrap();
+
+        let err = read_segment_decoded(dir.path(), &segment, &schema()).unwrap_err();
+        assert!(gone(&err).is_none(), "a writer's read: {err:#}");
+        assert!(
+            format!("{err:#}").contains("opening sealed segment"),
+            "{err:#}"
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        sealed_segment(other.path());
+        let err = within(other.path(), follower(other.path()), || {
+            read_segment_decoded(dir.path(), &segment, &schema())
+        })
+        .unwrap_err();
+        assert!(gone(&err).is_none(), "another nest's follower: {err:#}");
+    }
+
+    /// #2580: a segment a follower has on disk and cannot open is a fault, not one that has gone:
+    /// only `NotFound` is read as gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_follower_segment_that_cannot_be_opened_is_not_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let segment = sealed_segment(dir.path());
+        let path = segment_path(dir.path(), &segment.file, &segment.hash);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            // Running as root, which opens it regardless: nothing here to test.
+            return;
+        }
+        let err = within(dir.path(), follower(dir.path()), || {
+            read_segment_decoded(dir.path(), &segment, &schema())
+        })
+        .unwrap_err();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(gone(&err).is_none(), "{err:#}");
+    }
+
+    /// #2580: removing retired files says nothing of one already gone and warns of one that stays.
+    #[test]
+    fn removing_retired_files_warns_only_of_one_that_stays() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Warnings(Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Msg<'a>(&'a mut String);
+                impl tracing::field::Visit for Msg<'_> {
+                    fn record_debug(
+                        &mut self,
+                        _f: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write as _;
+                        let _ = write!(self.0, "{value:?}");
+                    }
+                }
+                if *event.metadata().level() == tracing::Level::WARN {
+                    let mut line = String::new();
+                    event.record(&mut Msg(&mut line));
+                    self.0.lock().unwrap().push(line);
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("already-gone.parquet");
+        // A directory where a file was: removing it as a file fails, and not as NotFound.
+        let stays = dir.path().join("stays.parquet");
+        std::fs::create_dir(&stays).unwrap();
+        let warnings = Warnings::default();
+        let dispatch =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(warnings.clone()));
+        tracing::dispatcher::with_default(&dispatch, || {
+            remove_retired(vec![gone.clone(), stays.clone()]);
+        });
+        let warned = warnings.0.lock().unwrap().clone();
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].contains(&stays.display().to_string()),
+            "{warned:?}"
+        );
+    }
 }
 
 /// Whether a file's Parquet footer and schema read: what "the segment binds" means, checked without an
