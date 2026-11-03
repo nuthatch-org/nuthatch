@@ -365,7 +365,24 @@ struct Nest {
     /// A strict runtime's nest builds nothing until a mount seats it: until then nothing says whose
     /// partition and limits a build runs under (#2610).
     needs_seat: bool,
-    seat: Option<Seat>,
+    /// One per mount that seated it, by route, so an unmount takes back its own (#2636).
+    seats: BTreeMap<String, Seat>,
+}
+
+impl Nest {
+    /// The first seated route's partition, under the tightest limits of all of them.
+    fn seat(&self) -> Option<Seat> {
+        let mut seats = self.seats.values();
+        let mut seat = seats.next()?.clone();
+        for other in seats {
+            seat.guard.timeout = seat.guard.timeout.min(other.guard.timeout);
+            seat.guard.memory_bytes = match (seat.guard.memory_bytes, other.guard.memory_bytes) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        Some(seat)
+    }
 }
 
 /// Who a build runs as under strict isolation: a mounting tenant's partition and a request's guard.
@@ -433,9 +450,9 @@ pub fn load(dir: &Path) -> Result<()> {
         .iter()
         .map(|v| (v.clone(), Arc::new(ViewStats::default())))
         .collect();
-    let (needs_seat, seat) = all
-        .get(dir)
-        .map_or((false, None), |n| (n.needs_seat, n.seat.clone()));
+    let (needs_seat, seats) = all.get(dir).map_or((false, BTreeMap::new()), |n| {
+        (n.needs_seat, n.seats.clone())
+    });
     all.insert(
         dir.to_path_buf(),
         Nest {
@@ -447,7 +464,7 @@ pub fn load(dir: &Path) -> Result<()> {
             retired: HashSet::new(),
             feed: None,
             needs_seat,
-            seat,
+            seats,
         },
     );
     Ok(())
@@ -671,26 +688,44 @@ pub fn attach(dir: &Path, gate: crate::serve::SqlGate, strict: bool) {
     }
 }
 
-/// Run `dir`'s builds as `tenant`'s strict partition under `guard`, as a request from that mount
-/// runs (#2610). Several mounts of one dataset leave the tightest deadline and memory cap.
-pub fn seat(dir: &Path, tenant: Arc<str>, guard: crate::analytics::QueryGuard) {
+/// Run `dir`'s builds as `tenant`'s strict partition under `guard`, as a request from the mount at
+/// `route` runs (#2610). Several mounts of one dataset leave the tightest deadline and memory cap.
+pub fn seat(dir: &Path, route: &str, tenant: Arc<str>, guard: crate::analytics::QueryGuard) {
     let first = {
         let mut all = lock_nests();
         let Some(n) = all.get_mut(dir) else {
             return;
         };
-        let first = n.seat.is_none();
-        let seat = n.seat.get_or_insert(Seat { tenant, guard });
-        seat.guard.timeout = seat.guard.timeout.min(guard.timeout);
-        seat.guard.memory_bytes = match (seat.guard.memory_bytes, guard.memory_bytes) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let first = n.seats.is_empty();
+        n.seats.insert(route.to_string(), Seat { tenant, guard });
         first
     };
     if first {
         changed(dir);
     }
+}
+
+/// Take back the seat of the mount at `route`, which has gone (#2636). The builds run as a mount
+/// still holding the dataset, or, in a strict runtime, not at all until one seats it again.
+pub fn unseat(dir: &Path, route: &str) {
+    if let Some(n) = lock_nests().get_mut(dir) {
+        n.seats.remove(route);
+    }
+}
+
+/// The partition `dir`'s next build would run as.
+#[cfg(test)]
+pub(crate) fn seated_tenant(dir: &Path) -> Option<Arc<str>> {
+    lock_nests().get(dir).and_then(Nest::seat).map(|s| s.tenant)
+}
+
+/// The deadline `dir`'s next build would run under.
+#[cfg(test)]
+pub(crate) fn seated_timeout(dir: &Path) -> Option<std::time::Duration> {
+    lock_nests()
+        .get(dir)
+        .and_then(Nest::seat)
+        .map(|s| s.guard.timeout)
 }
 
 /// Whether a request that found no copy of `view` at `id` should queue one: the nest has a builder,
@@ -779,8 +814,8 @@ fn drain(cursor: Arc<Cursor>) {
             Next::Build(job) => job,
         };
         let seat = match lock_nests().get(&job.dir) {
-            Some(n) if n.needs_seat && n.seat.is_none() => None,
-            Some(n) => Some(n.seat.clone()),
+            Some(n) if n.needs_seat && n.seats.is_empty() => None,
+            Some(n) => Some(n.seat()),
             None => None,
         };
         // Unseated in a strict runtime: dropped, and [`seat`] plans the nest again. A nest no

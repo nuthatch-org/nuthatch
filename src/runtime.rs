@@ -6226,7 +6226,7 @@ fn overlay_mount_record(
     state.isolation = query_partition(seating.isolation, name, seating.default_tenant);
     if let Some(tenant) = &state.isolation {
         let guard = state.query_guard(state.limits.timeout, state.limits.max_rows);
-        crate::maintained::seat(&state.dir, tenant.clone(), guard);
+        crate::maintained::seat(&state.dir, name, tenant.clone(), guard);
     }
     state.sync = record.and_then(|r| r.sync.clone()).map(Arc::new);
     // A state cloned from a co-tenant's arrives in that tenant's seat; it takes its own.
@@ -7594,6 +7594,7 @@ impl RuntimeHandles {
         // The route key is `tenant/alias` once more than one tenant is mounted, and the record's
         // `alias` is only the second segment. The serving state already knows its dataset (#1531).
         let dataset_dir = self.states[idx].1.dir.clone();
+        crate::maintained::unseat(&dataset_dir, name);
         // The cursor and alert worker know a shared dataset by the mount that first indexed it, which
         // may be this one or another. While any other mount still holds the store, both stay running
         // (RFC-0032 §5): only this mount's routes go.
@@ -7930,8 +7931,12 @@ impl RuntimeHandles {
             .iter()
             .position(|(n, _)| n == name)
             .expect("still mounted");
+        let new_dir = new_state.dir.clone();
         let (_, old_state) =
             std::mem::replace(&mut self.states[old_idx], (name.to_string(), new_state));
+        // The name left the old dataset, and the staging name the new one (#2636).
+        crate::maintained::unseat(&old_state.dir, name);
+        crate::maintained::unseat(&new_dir, &staging);
         if let Some(mb) = self.estimates.remove(&staging) {
             self.estimates.insert(name.to_string(), mb);
         }
