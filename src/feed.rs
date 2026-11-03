@@ -2347,6 +2347,21 @@ mod tests {
         );
     }
 
+    /// #2592: a seal over finalized blocks with nothing to seal only moves the watermark, as
+    /// `core/src/seal.rs` does when `seal_range` returns `None`. It prunes nothing and has no
+    /// manifest to carry, and the follower takes it: the guard is for a prune only.
+    #[test]
+    fn a_seal_that_prunes_nothing_needs_no_catalogue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
+        let mut sub = crate::store::feed_subscribe(&store).unwrap();
+        let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot.clone());
+        store.set_meta("sealed_through", "5").unwrap();
+        let seal = sub.deltas.try_recv().unwrap();
+        assert!(!seal.resync && seal.catalogue.is_none());
+        copy.apply(&seal).unwrap();
+    }
+
     /// #2592, the follower's own guard: a delta that prunes hot rows and carries no catalogue to
     /// read them from instead is refused, so the copy keeps serving what it had and resnapshots.
     #[test]
