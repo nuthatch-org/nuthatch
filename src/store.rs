@@ -1,7 +1,7 @@
 //! The node's hot store: `nuthatch-core`'s redb store (RFC-0075 S2) with the feed's tap behind it,
 //! plus the feed's snapshot reads (RFC-0073 FR1), whose receivers are tokio's and so stay out of a tab.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use redb::ReadableTable;
 use redb::TableDefinition;
 use std::sync::Arc;
@@ -194,7 +194,12 @@ fn feed_begin(store: &Store) -> Result<(FeedDeltas, redb::ReadTransaction, crate
             .get("sealed_through")?
             .and_then(|v| v.value().parse().ok())
             .unwrap_or(0);
-        let catalogue = store.feed().catalogue();
+        // Hot rows past the seal are already pruned, so a snapshot without its catalogue would lack
+        // them (#2592); the follower keeps its copy and retries.
+        let catalogue = store
+            .feed()
+            .catalogue()
+            .context("reading the segment catalogue for a follower's snapshot")?;
         // A seal between its catalogue and its commit: take the snapshot again after the commit.
         if crate::feed::catalogue_ahead(catalogue.as_deref(), sealed) && attempts < 400 {
             attempts += 1;
