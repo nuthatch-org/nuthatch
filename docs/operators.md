@@ -426,10 +426,12 @@ registry = "s3://bucket/registry"        # needed with follow
   the unsealed gap from the chain. Either way the rows are the same; the copy is faster.
 - **Webhooks** survive a takeover at least once: a delivery the old writer made whose removal had
   not reached the standby is made again. Each delivery carries `X-Nuthatch-Delivery`, its outbox
-  sequence, which survives a takeover: a promoted writer numbers on past every id the old one used,
-  delivered or not. The sequence is per nest, so two nests posting to one URL both start at 0; a
-  receiver should dedupe on the nest and the header together (a URL per nest, or the payload's
-  `annotation.nest`) and treat a repeat as harmless. The header is not covered by
+  sequence, which survives a takeover: a promoted writer numbers on past every id whose push had
+  reached the standby, delivered or not. A planned handover waits for that; after a crash, an alert
+  queued and delivered in the instant before it, whose push the standby never saw, can share an id
+  with the new writer's first delivery. The sequence is per nest, so two nests posting to one URL
+  both start at 0; a receiver should dedupe on the nest and the header together (a URL per nest, or
+  the payload's `annotation.nest`) and treat a repeat as harmless. The header is not covered by
   `X-Nuthatch-Signature` (#2587).
 - **A planned move** is `POST /_admin/failover/handover` on the writer
   ([admin-api.md](admin-api.md#failover)): it stops committing, waits for the mirror to have what it
