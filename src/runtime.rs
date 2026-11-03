@@ -1676,7 +1676,7 @@ pub fn spawn_publishers(
     mounts: &[Mount],
     default: Option<&MountPublish>,
     default_tenant: &str,
-    leases: &[WriterLease],
+    leases: &[HeldLease],
 ) -> Result<Vec<(String, crate::publish::Publisher)>> {
     let mut out = Vec::new();
     for m in mounts {
@@ -1688,7 +1688,7 @@ pub fn spawn_publishers(
             let fence = leases
                 .iter()
                 .find(|l| l.route == cursor_key)
-                .and_then(WriterLease::fence);
+                .and_then(HeldLease::fence);
             out.push(spawn_publisher(
                 dir,
                 m,
@@ -1944,46 +1944,106 @@ pub fn promote_warm(
     Ok(true)
 }
 
-/// Claim each leased route's store and renew its lease until it is lost, then fence the store off
-/// and quarantine the nest, so `/ready` says why it stopped.
+/// A writer lease being renewed, and the store it guards once its nest is built.
+pub struct HeldLease {
+    route: String,
+    owner: String,
+    fence: Option<u64>,
+    guard: Arc<crate::lease::Guard>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HeldLease {
+    pub fn fence(&self) -> Option<u64> {
+        self.fence
+    }
+}
+
+/// Every lease [`hold_writer_leases`] is renewing, with a planned-handover sender for each.
+pub struct HeldLeases {
+    pub leases: Vec<HeldLease>,
+    handovers: BTreeMap<String, tokio::sync::mpsc::Sender<crate::lease::Handover>>,
+}
+
+/// Renew each lease from the moment it is taken until it is lost, then fence its store off and
+/// quarantine the nest, so `/ready` says why it stopped. Called straight after
+/// [`take_writer_leases`]: a boot spent seeding and building nests must not eat the term (#2608).
 pub fn hold_writer_leases(
     leases: Vec<WriterLease>,
-    states: &[(String, crate::serve::AppState)],
     health: &Arc<crate::health::RuntimeHealth>,
-) -> Result<BTreeMap<String, tokio::sync::mpsc::Sender<crate::lease::Handover>>> {
-    let mut handovers = BTreeMap::new();
+) -> HeldLeases {
+    let mut held = HeldLeases {
+        leases: Vec::new(),
+        handovers: BTreeMap::new(),
+    };
     for WriterLease { route, lease } in leases {
-        let Some((_, state)) = states.iter().find(|(k, _)| *k == route) else {
-            continue;
-        };
-        let store = state.store.clone();
-        store
-            .claim(lease.owner())
-            .with_context(|| format!("claiming the store of mount '{route}'"))?;
-        let health = health.clone();
+        let guard = Arc::new(crate::lease::Guard::default());
         let (ask, asked) = tokio::sync::mpsc::channel(1);
-        handovers.insert(route.clone(), ask);
-        let drained = store.clone();
-        let nest = route.clone();
-        tokio::spawn(async move {
-            let fenced = store.clone();
+        held.handovers.insert(route.clone(), ask);
+        let (owner, fence) = (lease.owner().to_string(), lease.fence());
+        let health = health.clone();
+        let (fenced, drained, nest) = (guard.clone(), guard.clone(), route.clone());
+        let drain_key = route.clone();
+        let task = tokio::spawn(async move {
             let stopped = crate::lease::hold_with(
                 lease,
                 move || fenced.fence_off(),
                 asked,
-                move || published(nest.clone(), drained.clone()),
-                Some(crate::metrics::METRICS.nest(&route)),
+                move || published(drain_key.clone(), drained.clone()),
+                Some(crate::metrics::METRICS.nest(&nest)),
             )
             .await;
-            health.quarantine_nest(&route, stopped.to_string(), 0, None);
+            health.quarantine_nest(&nest, stopped.to_string(), 0, None);
+        });
+        held.leases.push(HeldLease {
+            route,
+            owner,
+            fence,
+            guard,
+            task,
         });
     }
-    Ok(handovers)
+    held
+}
+
+impl HeldLeases {
+    /// Claim the store of every leased route in `states`. Called before the cursor that commits to
+    /// them is spawned, so nothing is committed to a store the lease does not guard.
+    pub fn claim(&self, states: &[(String, crate::serve::AppState)]) -> Result<()> {
+        for l in &self.leases {
+            if let Some((_, state)) = states.iter().find(|(k, _)| *k == l.route) {
+                l.guard
+                    .attach(state.store.clone(), &l.owner)
+                    .with_context(|| format!("claiming the store of mount '{}'", l.route))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Once every cursor is up: claim any store not yet claimed, and stop renewing the lease of a
+    /// nest that never built, so it lapses for a standby as it always has.
+    pub fn finish(
+        self,
+        states: &[(String, crate::serve::AppState)],
+    ) -> Result<BTreeMap<String, tokio::sync::mpsc::Sender<crate::lease::Handover>>> {
+        self.claim(states)?;
+        let mut handovers = self.handovers;
+        for l in self.leases {
+            if !l.guard.attached() {
+                l.task.abort();
+                handovers.remove(&l.route);
+            }
+        }
+        Ok(handovers)
+    }
 }
 
 /// A handover's drain: wait, up to a minute, until the publisher has mirrored everything the store
 /// sealed, so the standby that takes the lease finds it on the mirror.
-async fn published(route: String, store: Arc<dyn crate::store::HotStore>) {
+async fn published(route: String, guard: Arc<crate::lease::Guard>) {
+    let Some(store) = guard.store() else {
+        return;
+    };
     let metrics = crate::metrics::METRICS.nest(&route);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     while metrics.publish_sealed_through() < store.sealed_through()
@@ -2604,8 +2664,10 @@ pub async fn dev(
     let mut failed: std::collections::BTreeMap<String, String> = Default::default();
     let mut failed_chain: std::collections::HashMap<String, String> = Default::default();
 
-    let writer_leases =
-        take_writer_leases(&dir, &mounts.mounts, meta.publish.as_ref(), default_tenant).await?;
+    let writer_leases = hold_writer_leases(
+        take_writer_leases(&dir, &mounts.mounts, meta.publish.as_ref(), default_tenant).await?,
+        &health,
+    );
 
     for mut group in groups {
         let rpc_urls = rpc::select_rpcs(&rpc_override, group.endpoint.rpc_urls.clone());
@@ -2692,6 +2754,7 @@ pub async fn dev(
             admin_token.clone(),
             health.clone(),
             fail_fast,
+            Some(&writer_leases),
         )
         .await
         .with_context(|| {
@@ -2803,9 +2866,9 @@ pub async fn dev(
         &mounts.mounts,
         meta.publish.as_ref(),
         default_tenant,
-        &writer_leases,
+        &writer_leases.leases,
     )?;
-    let handovers = hold_writer_leases(writer_leases, &all_states, &health)?;
+    let handovers = writer_leases.finish(&all_states)?;
 
     // Roster (`GET /nests`) across every cursor's nests, with per-nest footprint attribution and the
     // mounts's real resident set alongside the projection so operators can calibrate.
@@ -8110,6 +8173,84 @@ mod tests {
         );
     }
 
+    /// Conditional puts answer after 50 ms, as an object store's do: never on the first poll.
+    struct SlowMirror(Box<dyn crate::publish::Mirror>);
+
+    #[async_trait::async_trait]
+    impl crate::publish::Mirror for SlowMirror {
+        async fn get(&self, k: &str) -> Result<Option<Vec<u8>>> {
+            self.0.get(k).await
+        }
+        async fn put(&self, k: &str, b: &[u8]) -> Result<()> {
+            self.0.put(k, b).await
+        }
+        async fn put_file(&self, k: &str, s: &Path) -> Result<()> {
+            self.0.put_file(k, s).await
+        }
+        async fn put_if(&self, k: &str, b: &[u8], e: Option<&[u8]>) -> Result<()> {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.0.put_if(k, b, e).await
+        }
+        async fn head(&self, k: &str) -> Result<Option<crate::publish::Head>> {
+            self.0.head(k).await
+        }
+    }
+
+    /// #2608: a boot longer than term + margin, spent seeding and building nests, neither lapses the
+    /// lease nor lets a standby take it, and the store claimed at the end commits under it.
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_lease_is_renewed_through_a_slow_boot_and_no_standby_gets_in() {
+        use crate::lease::{observe, Lease, Observed, Watch};
+        use crate::store::CoreHotStore as _;
+        let term = std::time::Duration::from_secs(10);
+        let key = "ds/lease.json";
+        let dir = tempfile::tempdir().unwrap();
+        let mirror: Arc<dyn crate::publish::Mirror> = Arc::new(SlowMirror(
+            crate::publish::open_mirror(dir.path().to_str().unwrap()).unwrap(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            let mut lease = Lease::new(mirror.clone(), key, "writer", term);
+            lease.take(&Observed::Absent).await.unwrap();
+            let health = Arc::new(crate::health::RuntimeHealth::new());
+            let held = hold_writer_leases(
+                vec![WriterLease {
+                    route: "default/n".into(),
+                    lease,
+                }],
+                &health,
+            );
+
+            let mut standby = Watch::new();
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                standby.see(&observe(&*mirror, key).await.unwrap());
+                assert!(!standby.takeable(term / 2), "a standby got in during boot");
+            }
+
+            let db = tempfile::tempdir().unwrap();
+            let store = Arc::new(crate::store::Store::open(&db.path().join("s.redb")).unwrap());
+            let l = &held.leases[0];
+            l.guard.attach(store.clone(), &l.owner).unwrap();
+            assert!(store.held_fence() > 0, "claimed");
+            store.set_meta("k", "v").unwrap();
+            tokio::time::sleep(term * 2).await;
+            assert!(
+                !l.task.is_finished(),
+                "the lease neither lapsed nor was lost"
+            );
+            store.set_meta("k", "w").unwrap();
+            let doc = observe(&*mirror, key)
+                .await
+                .unwrap()
+                .doc()
+                .cloned()
+                .unwrap();
+            assert!(doc.renewal > 10, "renewed throughout: {}", doc.renewal);
+        })
+        .await
+        .expect("the boot test hung");
+    }
+
     #[tokio::test]
     async fn spawn_publishers_mirrors_each_mount_that_asks_and_skips_the_rest() {
         let root = tempfile::tempdir().unwrap();
@@ -12065,6 +12206,7 @@ mod tests {
             None,
             handles.health.clone(),
             false,
+            None,
         )
         .await
         .expect("one nest's build failure failed the cursor");
@@ -12290,6 +12432,7 @@ mod fr5_tests {
             None,
             handles.health.clone(),
             false,
+            None,
         )
         .await
         .unwrap();
