@@ -868,6 +868,7 @@ impl std::error::Error for InputsMoved {}
 
 /// Evaluate the maintained view `view` exactly as a request reaching it would, and write its rows to
 /// `to` (RFC-0062 §3.4). Refused unless the inputs it reads hash to `id` before and after.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_maintained(
     dir: &Path,
     view: &str,
@@ -876,11 +877,12 @@ pub(crate) fn write_maintained(
     hot: &HotRows,
     sealed_through: u64,
     declared: &[crate::registry::TableSchema],
+    guard: Option<QueryGuard>,
 ) -> Result<()> {
     run(
         dir,
         &format!("SELECT * FROM \"{view}\""),
-        None,
+        guard,
         hot,
         sealed_through,
         declared,
@@ -9644,7 +9646,7 @@ FROM bet GROUP BY player;
     fn held(dir: &Path, permits: usize) -> crate::serve::SqlGate {
         crate::maintained::load(dir).unwrap();
         let gate = crate::serve::SqlGate::new(permits);
-        crate::maintained::attach(dir, gate.clone());
+        crate::maintained::attach(dir, gate.clone(), false);
         gate
     }
 
@@ -9772,6 +9774,118 @@ FROM bet GROUP BY player;
             "no fallback once built"
         );
         assert_eq!((bet.2, total.2), (1, 1), "one build each");
+    }
+
+    /// #2610: a seated builder runs `views/*.sql` as a strict request does, so a statement strict
+    /// refuses is refused in the build too, rather than executed on every build.
+    #[test]
+    fn audit_strict_maintained_builder_runs_create_table() {
+        let dir = nest(Some("[[view]]\nname = \"bet\"\n"));
+        std::fs::write(
+            dir.path().join("views/05-table.sql"),
+            "CREATE TABLE big AS SELECT 1 AS x;\n",
+        )
+        .unwrap();
+        held(dir.path(), 2);
+        let tenant: Arc<str> = Arc::from("acme");
+        crate::maintained::seat(dir.path(), tenant.clone(), guard());
+        let refused = |d: &Path| {
+            view_failures(d).iter().any(|(file, _, e)| {
+                file.contains("05-table") && e.contains("strict isolation runs only CREATE VIEW")
+            })
+        };
+        let hot = tip(&[placed(4, "carol", 13, 20)]);
+        isolated(Some(&tenant), || ask(dir.path(), SHAPES[0], &hot, 10));
+        assert!(refused(dir.path()), "the strict request refused it");
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(
+            copies(dir.path(), "bet").len(),
+            1,
+            "the view is still built"
+        );
+        assert!(
+            refused(dir.path()),
+            "the build ran the CREATE TABLE strict refuses"
+        );
+    }
+
+    /// #2610: in a strict runtime a nest builds nothing before a mount says whose partition the
+    /// build runs as, and the seat plans it.
+    #[test]
+    fn a_strict_nest_builds_only_once_seated() {
+        let dir = nest(Some("[[view]]\nname = \"bet\"\n"));
+        crate::maintained::load(dir.path()).unwrap();
+        crate::maintained::attach(dir.path(), crate::serve::SqlGate::new(2), true);
+        let hot = tip(&[placed(4, "carol", 13, 20)]);
+        let fed = hot.clone();
+        crate::maintained::feed(
+            dir.path(),
+            crate::maintained::Feed {
+                read: Box::new(move || Ok((fed.clone(), 10))),
+                declared: Arc::new(Vec::new()),
+            },
+        );
+        crate::maintained::wait_idle(dir.path());
+        assert!(copies(dir.path(), "bet").is_empty(), "built before a seat");
+        crate::maintained::seat(dir.path(), Arc::from("acme"), guard());
+        crate::maintained::wait_idle(dir.path());
+        assert_eq!(
+            copies(dir.path(), "bet").len(),
+            1,
+            "the seat plans the build"
+        );
+    }
+
+    /// #2610: a seated build is held to the request deadline, so a slow view gives its permit back
+    /// at the timeout and leaves no copy, rather than holding half the cursor's SQL until it ends.
+    #[test]
+    fn a_strict_build_is_cut_at_the_request_deadline() {
+        let dir = nest(Some("[[view]]\nname = \"slow\"\n"));
+        std::fs::write(
+            dir.path().join("views/20-slow.sql"),
+            "CREATE VIEW slow AS SELECT sum(a.range * b.range) AS s \
+             FROM range(1000000) a CROSS JOIN range(1000000) b;\n",
+        )
+        .unwrap();
+        let gate = held(dir.path(), 2);
+        crate::maintained::seat(
+            dir.path(),
+            Arc::from("acme"),
+            QueryGuard {
+                timeout: Duration::from_millis(300),
+                ..guard()
+            },
+        );
+        let hot = HotRows::new();
+        crate::maintained::feed(
+            dir.path(),
+            crate::maintained::Feed {
+                read: Box::new(move || Ok((hot.clone(), 10))),
+                declared: Arc::new(Vec::new()),
+            },
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            crate::maintained::wait_idle(&d);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("the build outlived its deadline");
+        assert!(
+            copies(dir.path(), "slow").is_empty(),
+            "no copy of a cut build"
+        );
+        assert_eq!(gate.available_permits(), 2, "the permit is back");
+        let error = crate::maintained::report(dir.path())
+            .into_iter()
+            .find(|(v, ..)| v == "slow")
+            .and_then(|(_, s, ..)| s.last_error());
+        assert!(
+            view_failures(dir.path()).is_empty(),
+            "the view itself defines"
+        );
+        assert!(error.is_some(), "the cut build is recorded as failed");
     }
 
     /// A copy built at one set of hot rows is not served at another: the request answers from the
@@ -9955,7 +10069,7 @@ FROM bet GROUP BY player;
     fn a_nest_that_declares_nothing_is_unchanged() {
         let dir = nest(None);
         crate::maintained::load(dir.path()).unwrap();
-        crate::maintained::attach(dir.path(), crate::serve::SqlGate::new(2));
+        crate::maintained::attach(dir.path(), crate::serve::SqlGate::new(2), false);
         let hot = tip(&[placed(4, "carol", 13, 20)]);
         for sql in SHAPES {
             ask(dir.path(), sql, &hot, 10);

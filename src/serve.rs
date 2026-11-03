@@ -466,7 +466,7 @@ impl AppState {
     }
 
     /// An analytics guard under this mount's limits.
-    fn query_guard(&self, timeout: Duration, max_rows: usize) -> analytics::QueryGuard {
+    pub(crate) fn query_guard(&self, timeout: Duration, max_rows: usize) -> analytics::QueryGuard {
         analytics::QueryGuard {
             timeout,
             max_rows,

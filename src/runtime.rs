@@ -2569,6 +2569,7 @@ pub async fn dev(
         );
         config.cursor_max_rss_mb = Some(max_rss);
         config.cursor_sql_permits = Some(sql_permits);
+        config.strict_isolation = meta.isolation == crate::isolation::Isolation::Strict;
     }
     let groups = group_by_chain(&endpoints, mounted)?;
     if meta.isolation == crate::isolation::Isolation::Strict {
@@ -6223,6 +6224,10 @@ fn overlay_mount_record(
         r.limits.resolve(&format!("{}/{}", r.tenant, r.alias))
     });
     state.isolation = query_partition(seating.isolation, name, seating.default_tenant);
+    if let Some(tenant) = &state.isolation {
+        let guard = state.query_guard(state.limits.timeout, state.limits.max_rows);
+        crate::maintained::seat(&state.dir, tenant.clone(), guard);
+    }
     state.sync = record.and_then(|r| r.sync.clone()).map(Arc::new);
     // A state cloned from a co-tenant's arrives in that tenant's seat; it takes its own.
     let tenant = split_route_key(name).0.unwrap_or(seating.default_tenant);
@@ -6987,6 +6992,8 @@ impl RuntimeHandles {
                 );
                 config.runtime_dir = Some(self.mount_ctx.dir.clone());
                 config.cursor_sql_permits = Some(self.mount_ctx.sql_permits);
+                config.strict_isolation =
+                    self.mount_ctx.isolation == crate::isolation::Isolation::Strict;
                 if let Some(e) = self
                     .mount_ctx
                     .chains
