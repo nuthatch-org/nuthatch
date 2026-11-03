@@ -362,6 +362,17 @@ struct Nest {
     /// because a request holding a newer lease would not keep one alive.
     retired: HashSet<PathBuf>,
     feed: Option<Arc<Feed>>,
+    /// A strict runtime's nest builds nothing until a mount seats it: until then nothing says whose
+    /// partition and limits a build runs under (#2610).
+    needs_seat: bool,
+    seat: Option<Seat>,
+}
+
+/// Who a build runs as under strict isolation: a mounting tenant's partition and a request's guard.
+#[derive(Clone)]
+struct Seat {
+    tenant: Arc<str>,
+    guard: crate::analytics::QueryGuard,
 }
 
 /// The nest's current inputs, read as a request reads them: its hot rows and served watermark.
@@ -422,6 +433,9 @@ pub fn load(dir: &Path) -> Result<()> {
         .iter()
         .map(|v| (v.clone(), Arc::new(ViewStats::default())))
         .collect();
+    let (needs_seat, seat) = all
+        .get(dir)
+        .map_or((false, None), |n| (n.needs_seat, n.seat.clone()));
     all.insert(
         dir.to_path_buf(),
         Nest {
@@ -432,6 +446,8 @@ pub fn load(dir: &Path) -> Result<()> {
             failed: HashMap::new(),
             retired: HashSet::new(),
             feed: None,
+            needs_seat,
+            seat,
         },
     );
     Ok(())
@@ -632,8 +648,9 @@ fn cursors() -> &'static Mutex<Vec<Arc<Cursor>>> {
 }
 
 /// Give `dir`'s builds to the builder of the cursor whose analytical gate is `gate`. Without this a
-/// held nest still serves copies it has, and builds none: what a process with no cursor does.
-pub fn attach(dir: &Path, gate: crate::serve::SqlGate) {
+/// held nest still serves copies it has, and builds none: what a process with no cursor does. A
+/// `strict` runtime's nest builds nothing until [`seat`] says whose partition a build runs under.
+pub fn attach(dir: &Path, gate: crate::serve::SqlGate, strict: bool) {
     let cursor = {
         let mut all = cursors().lock().unwrap_or_else(|p| p.into_inner());
         match all.iter().find(|c| Arc::ptr_eq(&*c.gate, &*gate)) {
@@ -650,6 +667,29 @@ pub fn attach(dir: &Path, gate: crate::serve::SqlGate) {
     };
     if let Some(n) = lock_nests().get_mut(dir) {
         n.cursor = Some(cursor);
+        n.needs_seat = strict;
+    }
+}
+
+/// Run `dir`'s builds as `tenant`'s strict partition under `guard`, as a request from that mount
+/// runs (#2610). Several mounts of one dataset leave the tightest deadline and memory cap.
+pub fn seat(dir: &Path, tenant: Arc<str>, guard: crate::analytics::QueryGuard) {
+    let first = {
+        let mut all = lock_nests();
+        let Some(n) = all.get_mut(dir) else {
+            return;
+        };
+        let first = n.seat.is_none();
+        let seat = n.seat.get_or_insert(Seat { tenant, guard });
+        seat.guard.timeout = seat.guard.timeout.min(guard.timeout);
+        seat.guard.memory_bytes = match (seat.guard.memory_bytes, guard.memory_bytes) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        first
+    };
+    if first {
+        changed(dir);
     }
 }
 
@@ -738,6 +778,20 @@ fn drain(cursor: Arc<Cursor>) {
             }
             Next::Build(job) => job,
         };
+        let seat = match lock_nests().get(&job.dir) {
+            Some(n) if n.needs_seat && n.seat.is_none() => None,
+            Some(n) => Some(n.seat.clone()),
+            None => Some(None),
+        };
+        // Unseated in a strict runtime: dropped, and [`seat`] plans the nest again.
+        let Some(seat) = seat else {
+            cursor
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .building = None;
+            continue;
+        };
         // Newer inputs make this job's identity nobody's: drop it, and the plan they wait on
         // queues whatever is current.
         let superseded = || {
@@ -763,7 +817,7 @@ fn drain(cursor: Arc<Cursor>) {
             }
         };
         if permit.is_some() && !superseded() {
-            build(&job);
+            build(&job, seat.as_ref());
         }
         drop(permit);
         cursor
@@ -829,7 +883,7 @@ fn plan(cursor: &Arc<Cursor>, dir: &Path) {
     }
 }
 
-fn build(job: &Job) {
+fn build(job: &Job, seat: Option<&Seat>) {
     let target = copy_path(&job.dir, &job.view, &job.id);
     // Present, or retired and not yet deleted: writing over the second would see it deleted.
     if target.exists() {
@@ -839,15 +893,18 @@ fn build(job: &Job) {
     let tmp = target.with_extension("parquet.tmp");
     let made = (|| -> Result<u64> {
         std::fs::create_dir_all(target.parent().expect("a copy path has a parent"))?;
-        crate::analytics::write_maintained(
-            &job.dir,
-            &job.view,
-            &job.id,
-            &tmp,
-            &job.hot,
-            job.sealed_through,
-            &job.declared,
-        )?;
+        crate::analytics::isolated(seat.map(|s| &s.tenant), || {
+            crate::analytics::write_maintained(
+                &job.dir,
+                &job.view,
+                &job.id,
+                &tmp,
+                &job.hot,
+                job.sealed_through,
+                &job.declared,
+                seat.map(|s| s.guard),
+            )
+        })?;
         std::fs::rename(&tmp, &target)?;
         Ok(std::fs::metadata(&target)?.len())
     })();
