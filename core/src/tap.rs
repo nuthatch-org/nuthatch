@@ -50,8 +50,9 @@ pub enum Op {
     },
 }
 
-/// Meta keys that describe the writer's own process rather than the data: its outbox counter and its
-/// ownership lease. Neither is mirrored, so a reader cannot be mistaken for the owner.
+/// Meta keys that describe the writer's own process rather than the data: its ownership lease, not
+/// mirrored so a reader cannot be mistaken for the owner. The outbox counter is mirrored: a promoted
+/// writer must number past every delivery id the old one used, removed ones included (#2598).
 pub fn mirrored_meta(key: &str) -> bool {
     !matches!(
         key,
@@ -59,7 +60,6 @@ pub fn mirrored_meta(key: &str) -> bool {
             | crate::redb_store::LEASE_OWNER
             | crate::redb_store::LEASE_EXPIRES_AT
             | "owner"
-            | "outbox_next_seq"
     )
 }
 

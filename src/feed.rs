@@ -1973,9 +1973,13 @@ mod tests {
         let now = crate::store::feed_subscribe(&store).unwrap().snapshot;
         assert_eq!(copy.applied(), (now.epoch, now.generation));
         assert_eq!(copy.tables(), MirroredTables::of(&now));
-        assert!(
-            !copy.tables().meta.contains_key("outbox_next_seq"),
-            "the writer's outbox is not mirrored"
+        assert_eq!(
+            copy.tables()
+                .meta
+                .get("outbox_next_seq")
+                .map(String::as_str),
+            Some("1"),
+            "the outbox counter is followed by delta, so a promotion numbers past it (#2598)"
         );
         let ours =
             crate::store::CoreHotStore::hot_rows_by_table_bounded_with_bytes(&copy, 100, u64::MAX)

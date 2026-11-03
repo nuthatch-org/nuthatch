@@ -63,7 +63,13 @@ that lands.
 
 **Delivery is at-least-once, so make your handler idempotent.** A non-2xx leaves the entry in
 the outbox and it retries. If your handler succeeds and *then* fails to reply 200, you will see
-that payload again. Key on something stable from the row rather than counting deliveries.
+that payload again. Every delivery carries `X-Nuthatch-Delivery`, the entry's sequence: a retry
+repeats it, and it keeps counting up through a failover takeover, so it is the key to dedupe on.
+The alert sent in the instant before a takeover can share an id with the new writer's first,
+since nothing waits for the standby to have an alert before it is sent.
+It is numbered per nest, so if several nests post to this URL, key on the nest as well (the
+payload's `annotation.nest`, or give each nest its own URL). The header is not signed (#2587); a
+receiver that must trust its key can also key on something stable from the row.
 
 **Verify the signature against the raw body.** nuthatch signs the exact bytes it sends. Parsing
 the JSON and re-encoding it to check the HMAC produces different bytes and fails for reasons
@@ -87,7 +93,8 @@ HMAC-SHA256 (RFC 2104) over the raw request body, keyed by the webhook's `secret
 HMAC despite being hand-rolled in `src/webhooks.rs`, verified here against RFC 4231 vectors and
 across every key-length branch including keys longer than the 64-byte block, so your language's
 standard library will agree with it. No timestamp is included, so the signature proves origin
-and integrity but not freshness — if you need replay protection, dedupe on row identity.
+and integrity but not freshness — if you need replay protection, dedupe on row identity, or on
+the nest and `X-Nuthatch-Delivery` above.
 
 ## When it is not arriving
 

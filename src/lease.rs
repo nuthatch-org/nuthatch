@@ -385,14 +385,20 @@ struct GuardState {
 }
 
 impl Guard {
-    /// Claim `store` for `owner` and guard it from now on; a lease already lost fences it at once.
-    /// Call before anything commits to it.
-    pub fn attach(&self, store: Arc<dyn crate::store::HotStore>, owner: &str) -> Result<()> {
+    /// Claim `store` for `owner` under the lease's `fence`, which the feed reports to followers
+    /// (#2611), and guard it from now on; a lease already lost fences it at once. Call before
+    /// anything commits to it.
+    pub fn attach(
+        &self,
+        store: Arc<dyn crate::store::HotStore>,
+        owner: &str,
+        fence: u64,
+    ) -> Result<()> {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if s.store.is_some() {
             return Ok(());
         }
-        store.claim(owner)?;
+        store.claim_under(owner, fence)?;
         if s.off {
             store.fence_off()?;
         }
@@ -620,7 +626,7 @@ mod tests {
         let (_d, s) = store();
         let guard = Guard::default();
         guard.fence_off().unwrap();
-        guard.attach(s.clone(), "a").unwrap();
+        guard.attach(s.clone(), "a", 1).unwrap();
         assert!(
             s.set_meta("k", "v").is_err(),
             "a fenced store refuses writes"
@@ -631,7 +637,7 @@ mod tests {
     fn a_store_attached_to_a_live_lease_is_claimed_and_fenced_when_it_stops() {
         let (_d, s) = store();
         let guard = Guard::default();
-        guard.attach(s.clone(), "a").unwrap();
+        guard.attach(s.clone(), "a", 1).unwrap();
         s.set_meta("k", "v").unwrap();
         guard.fence_off().unwrap();
         assert!(s.set_meta("k", "w").is_err(), "fenced once the lease stops");

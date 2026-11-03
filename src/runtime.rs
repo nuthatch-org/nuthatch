@@ -1950,6 +1950,16 @@ impl HeldLease {
     pub fn fence(&self) -> Option<u64> {
         self.fence
     }
+
+    /// Claim `store` under this lease's fence and guard it.
+    fn attach(&self, store: Arc<dyn crate::store::HotStore>) -> Result<()> {
+        let fence = self
+            .fence
+            .with_context(|| format!("the lease of mount '{}' is not held", self.route))?;
+        self.guard
+            .attach(store, &self.owner, fence)
+            .with_context(|| format!("claiming the store of mount '{}'", self.route))
+    }
 }
 
 impl Drop for HeldLease {
@@ -2007,9 +2017,7 @@ impl HeldLeases {
     pub fn claim(&self, states: &[(String, crate::serve::AppState)]) -> Result<()> {
         for l in &self.leases {
             if let Some((_, state)) = states.iter().find(|(k, _)| *k == l.route) {
-                l.guard
-                    .attach(state.store.clone(), &l.owner)
-                    .with_context(|| format!("claiming the store of mount '{}'", l.route))?;
+                l.attach(state.store.clone())?;
             }
         }
         Ok(())
@@ -8337,9 +8345,19 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         let db = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::store::Store::open(&db.path().join("s.redb")).unwrap());
+        // Earlier boots of this host claimed the store locally, so its counter is ahead.
+        store.claim("earlier").unwrap();
+        store.claim("earlier").unwrap();
         let l = &held.leases[0];
-        l.guard.attach(store.clone(), &l.owner).unwrap();
-        assert!(store.held_fence() > 0, "claimed");
+        l.attach(store.clone()).unwrap();
+        assert_eq!(store.held_fence(), 3, "claimed locally a third time");
+        let lease = l.fence().expect("the boot path took the lease");
+        assert_ne!(lease, store.held_fence(), "premise: the two numbers differ");
+        assert_eq!(
+            crate::feed_http::writer_fence(store.as_ref()),
+            Some(lease),
+            "#2611: the mount line carries the lease's fence, not the local claim count"
+        );
         store.set_meta("k", "v").unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         store.set_meta("k", "w").unwrap();
