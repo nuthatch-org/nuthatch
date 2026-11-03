@@ -77,12 +77,13 @@ impl Service {
         Ok(())
     }
 
-    /// `statement` through the router as `/sql` answers it, and the envelope it came with.
+    /// `statement` through the router as `/sql` answers it, the envelope it came with, and the drained
+    /// body, which holds the answer's response-byte permit for as long as it is kept (#2590).
     async fn answer(
         &self,
         statement: &Statement,
         authorization: Option<&str>,
-    ) -> Result<(bytes::Bytes, Option<String>), Status> {
+    ) -> Result<(bytes::Bytes, Option<String>, Hold), Status> {
         use tower::ServiceExt;
         let path = match &statement.route {
             Some(r) => format!("/{}/sql", r.trim_matches('/')),
@@ -110,13 +111,16 @@ impl Service {
             .get(crate::serve::ANSWER_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut body = resp.into_body().into_data_stream();
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            buf.extend_from_slice(&chunk.map_err(|e| Status::internal(e.to_string()))?);
+        }
+        let bytes = buf.freeze();
         if !status.is_success() {
             return Err(refusal(status.as_u16(), &bytes));
         }
-        Ok((bytes, envelope))
+        Ok((bytes, envelope, Hold(body)))
     }
 
     /// The answer to `statement` as Arrow batches.
@@ -124,15 +128,15 @@ impl Service {
         &self,
         statement: &Statement,
         authorization: Option<&str>,
-    ) -> Result<(SchemaRef, Vec<RecordBatch>, Option<String>), Status> {
-        let (bytes, envelope) = self.answer(statement, authorization).await?;
+    ) -> Result<(SchemaRef, Vec<RecordBatch>, Option<String>, Hold), Status> {
+        let (bytes, envelope, hold) = self.answer(statement, authorization).await?;
         let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
             .map_err(|e| Status::internal(e.to_string()))?;
         let schema = reader.schema();
         let batches = reader
             .collect::<Result<_, _>>()
             .map_err(|e| Status::internal(e.to_string()))?;
-        Ok((schema, batches, envelope))
+        Ok((schema, batches, envelope, hold))
     }
 
     /// The relations `/sql` answers on the route `request` names.
@@ -144,7 +148,7 @@ impl Service {
                 .into(),
         };
         let auth = header(request.metadata(), "authorization");
-        let (_, batches, _) = self.batches(&statement, auth.as_deref()).await?;
+        let (_, batches, _, _) = self.batches(&statement, auth.as_deref()).await?;
         let mut out = Vec::new();
         for batch in &batches {
             let cols: Vec<_> = (0..4)
@@ -255,11 +259,19 @@ fn command_info(
     Ok(Response::new(info))
 }
 
-fn stream(schema: SchemaRef, batches: Vec<RecordBatch>) -> DoGetStream {
+/// A drained `/sql` body, kept only so the response-byte permit it carries is released when the
+/// client's stream is, not when the router's copy has been read.
+struct Hold(#[allow(dead_code)] axum::body::BodyDataStream);
+
+fn stream(schema: SchemaRef, batches: Vec<RecordBatch>, hold: Option<Hold>) -> DoGetStream {
     FlightDataEncoderBuilder::new()
         .with_schema(schema)
         .build(futures::stream::iter(batches.into_iter().map(Ok)))
         .map_err(Status::from)
+        .map(move |frame| {
+            let _held = &hold;
+            frame
+        })
         .boxed()
 }
 
@@ -267,7 +279,7 @@ fn one(
     batch: Result<RecordBatch, arrow_flight::error::FlightError>,
 ) -> Result<Response<DoGetStream>, Status> {
     let batch = batch.map_err(|e| Status::internal(e.to_string()))?;
-    Ok(Response::new(stream(batch.schema(), vec![batch])))
+    Ok(Response::new(stream(batch.schema(), vec![batch], None)))
 }
 
 #[tonic::async_trait]
@@ -306,9 +318,9 @@ impl FlightSqlService for Service {
         let statement: Statement = serde_json::from_slice(&ticket.statement_handle)
             .map_err(|e| Status::invalid_argument(format!("not a ticket this node issued: {e}")))?;
         let authorization = header(request.metadata(), "authorization");
-        let (schema, batches, envelope) =
+        let (schema, batches, envelope, hold) =
             self.batches(&statement, authorization.as_deref()).await?;
-        let mut response = Response::new(stream(schema, batches));
+        let mut response = Response::new(stream(schema, batches, Some(hold)));
         if let Some(value) = envelope.and_then(|e| e.parse().ok()) {
             response
                 .metadata_mut()
