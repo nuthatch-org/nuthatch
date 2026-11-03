@@ -1,7 +1,7 @@
 # Are the RPC endpoints we *ship* still able to serve a backfill?
 #
 # Everything else in CI tests our code. This tests the world our code depends on, because the built-in
-# endpoint lists in `src/chains.rs` are the zero-setup path - `init 0xAddr --chain mainnet && dev` uses
+# endpoint lists in `core/src/chains.rs` are the zero-setup path - `init 0xAddr --chain mainnet && dev` uses
 # them, and the founding non-negotiable is a live indexed query in under two minutes with no
 # configuration. They are product surface that rots without anyone touching the repo.
 #
@@ -104,7 +104,7 @@ jobs:
               fail=1
             fi
           }
-          # **The list of endpoints comes from `src/chains.rs`, not from this file.** A copy goes stale
+          # **The list of endpoints comes from `core/src/chains.rs`, not from this file.** A copy goes stale
           # in both directions and did: on 2026-09-07 (#1196) this job was still probing
           # `arbitrum.drpc.org` and `base.drpc.org`, removed on 2026-08-06 under #267, and
           # `eth.api.onfinality.io/public`, removed on 2026-08-23 under #761 - so the weekly run
@@ -120,7 +120,7 @@ jobs:
           # got to before that. Judge the exit status, not the file: a partial list looks exactly like
           # a complete one, and the chain that fell out of it is the one nobody would probe.
           if ! bash .github/workflows/shipped-endpoints.sh > /tmp/shipped.tsv; then
-            echo "::error::could not extract the shipped endpoints from src/chains.rs - see the message above; this job cannot judge anything until it can read the registry"
+            echo "::error::could not extract the shipped endpoints from core/src/chains.rs - see the message above; this job cannot judge anything until it can read the registry"
             exit 1
           fi
           echo "== the endpoints we ship =="
@@ -177,7 +177,7 @@ jobs:
           echo "== polygon archive check =="
           # Whichever endpoint the registry lists *first* for polygon, since "first" is the whole point
           # of this gate. Taken from the same extraction as the probes above so that reordering the
-          # list in `src/chains.rs` moves the gate with it.
+          # list in `core/src/chains.rs` moves the gate with it.
           polygon_first=$(awk -F'\t' '$1 == "polygon" { print $2; exit }' /tmp/shipped.tsv)
           if [ -z "$polygon_first" ]; then
             echo "::error::no polygon endpoints extracted - the archive gate judged nothing"
@@ -199,7 +199,7 @@ jobs:
           fi
           fi
           # Every chain in the registry must have been probed by something above. This is the gate for
-          # the drift that hid the Optimism failure: a chain landing in `src/chains.rs` with no line
+          # the drift that hid the Optimism failure: a chain landing in `core/src/chains.rs` with no line
           # here rots exactly as Optimism's second endpoint did, and the job stays green throughout.
           echo "== every shipped chain was probed =="
           for c in $(cut -f1 /tmp/shipped.tsv | sort -u); do
