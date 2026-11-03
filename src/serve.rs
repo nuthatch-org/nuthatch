@@ -10471,6 +10471,51 @@ mod tests {
         );
     }
 
+    /// #2590: a Flight `DoGet` holds its answer's response bytes until the client's stream is read
+    /// or dropped, as `/sql` holds them until its body is sent.
+    #[cfg(feature = "flight")]
+    #[tokio::test]
+    async fn a_flight_stream_holds_its_response_bytes_until_it_is_dropped() {
+        use arrow_flight::sql::server::FlightSqlService;
+        use arrow_flight::sql::TicketStatementQuery;
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state.sql_response_bytes = ResponseBytes::new(1);
+        let app = router(SharedNest::new(state));
+        let service = crate::flight::Service::new(app.clone());
+        let sql = |q: &str| {
+            let req = axum::http::Request::builder()
+                .uri(format!("/sql?q={q}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            app.clone().oneshot(req)
+        };
+        let ticket = TicketStatementQuery {
+            statement_handle: serde_json::to_vec(
+                &json!({ "route": null, "sql": "SELECT 2590 AS n" }),
+            )
+            .unwrap()
+            .into(),
+        };
+
+        let unread = service
+            .do_get_statement(ticket, tonic::Request::new(Default::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        let refused = sql("SELECT%201%20AS%20m").await.unwrap();
+        assert_eq!(
+            refused.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unread Flight stream must still count against the response budget"
+        );
+
+        drop(unread);
+        let after = sql("SELECT%201%20AS%20m").await.unwrap();
+        assert_eq!(after.status(), StatusCode::OK);
+    }
+
     /// #2213: a memo key is built under the nest's memo gate, so a flood of deterministic statements
     /// waits there; a statement the memo never keeps does not build one.
     #[tokio::test]
