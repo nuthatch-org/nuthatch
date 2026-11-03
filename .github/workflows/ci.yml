@@ -661,6 +661,11 @@ jobs:
           cargo clippy --locked --all-targets --manifest-path core/Cargo.toml -- -D warnings
           cargo test --locked --manifest-path core/Cargo.toml
           cargo test --locked --manifest-path core/Cargo.toml --features checkpoint-hash-index
+      # #2633: `plain/` is linted in wasm-plain; the root crate was linted nowhere and had drifted.
+      - name: fmt · clippy (embed)
+        run: |
+          cargo fmt --check --manifest-path embed/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path embed/Cargo.toml -- -D warnings
       - name: C toolchain for wasm32
         uses: ./.github/actions/wasm32-c-toolchain
       - name: wasm check (core)
