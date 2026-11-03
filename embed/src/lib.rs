@@ -33,9 +33,13 @@ pub mod verified;
 pub mod window;
 pub mod young;
 
+/// What [`run_steps`] answers: the running sum of `doubled` after each step, and the final
+/// `count_by_parity` relation.
+pub type Steps = (Vec<Vec<(u64, ZWeight)>>, Vec<((u64, i64), ZWeight)>);
+
 /// Builds a one-worker circuit, feeds it three batches with a retraction in the middle, and
 /// answers the running sum of `doubled` after each step, plus the final `count_by_parity` relation.
-pub fn run_steps() -> Result<(Vec<Vec<(u64, ZWeight)>>, Vec<((u64, i64), ZWeight)>), String> {
+pub fn run_steps() -> Result<Steps, String> {
     let (mut circuit, (input, doubled_out, parity_out)) = Runtime::init_circuit(1, |circuit| {
         let (stream, handle) = circuit.add_input_zset::<u64>();
         let doubled = stream.map(|x| x * 2);
