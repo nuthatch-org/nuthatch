@@ -328,16 +328,32 @@ fn is_comment(line: &str) -> bool {
 }
 
 #[test]
-fn ci_runs_with_a_read_only_token_unless_a_job_asks() {
+fn ci_runs_with_a_read_only_token() {
     let ci = std::fs::read_to_string(workflows().join("ci.yml")).unwrap();
     let lines: Vec<&str> = ci.lines().collect();
     let at = lines.iter().position(|l| *l == "permissions:").expect(
         "ci.yml has no top-level `permissions:`, so every job gets the default token scope",
     );
+    let block: Vec<&str> = lines[at + 1..]
+        .iter()
+        .take_while(|l| l.starts_with("  ") || l.trim().is_empty())
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
     assert_eq!(
-        lines.get(at + 1).map(|l| l.trim()),
-        Some("contents: read"),
+        block,
+        ["contents: read"],
         "the top-level block should grant `contents: read` and nothing else"
+    );
+    // A job that needs more says so in its own block, beside the job, where review sees it.
+    let job_level = lines
+        .iter()
+        .filter(|l| l.starts_with("    permissions:"))
+        .count();
+    assert_eq!(
+        job_level, 0,
+        "a job now asks for its own token scope; check it needs it, then raise this count with a \
+         note of which job and why"
     );
 }
 
@@ -359,10 +375,17 @@ fn every_archive_ci_fetches_is_checked_against_a_digest() {
                     l.trim()
                 ));
             }
+            // The check must name the file this curl saved, not merely sit nearby.
+            let saved = l
+                .split(" -o ")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .map(|s| s.trim_matches('"'))
+                .unwrap_or("");
             if to_file
                 && !lines[i + 1..(i + 4).min(lines.len())]
                     .iter()
-                    .any(|n| n.contains("sha256sum -c"))
+                    .any(|n| n.contains("sha256sum -c") && !saved.is_empty() && n.contains(saved))
             {
                 bad.push(format!(
                     "{f}:{}: saved with no sha256sum -c after it: {}",
