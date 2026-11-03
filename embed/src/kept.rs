@@ -21,7 +21,8 @@ fn scope(filters: Option<&[FilterSpec]>, verified: bool) -> Value {
                     .args
                     .iter()
                     .map(|(k, vs)| {
-                        let mut vs: Vec<String> = vs.iter().map(|v| v.to_ascii_lowercase()).collect();
+                        let mut vs: Vec<String> =
+                            vs.iter().map(|v| v.to_ascii_lowercase()).collect();
                         vs.sort();
                         vs.dedup();
                         (k.clone(), json!(vs))
@@ -52,7 +53,10 @@ pub fn admit(store: &Store, filters: Option<&[FilterSpec]>, verified: bool) -> R
         Some(held) => {
             let held: Value = serde_json::from_str(&held)?;
             if held != now {
-                let what = match (held["filters"] == now["filters"], held["verified"] == now["verified"]) {
+                let what = match (
+                    held["filters"] == now["filters"],
+                    held["verified"] == now["verified"],
+                ) {
                     (false, false) => "other filters and another `verified` setting",
                     (false, true) => "other filters",
                     _ => "another `verified` setting",
@@ -105,8 +109,13 @@ mod tests {
         let s = store();
         admit(&s, Some(&[filter("0xaa")]), false).unwrap();
         s.set_meta(LAST_BLOCK_KEY, "90").unwrap();
-        let e = admit(&s, Some(&[filter("0xbb")]), false).unwrap_err().to_string();
-        assert!(e.contains("other filters") && e.ends_with("open it fresh"), "{e}");
+        let e = admit(&s, Some(&[filter("0xbb")]), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("other filters") && e.ends_with("open it fresh"),
+            "{e}"
+        );
         let e = admit(&s, None, false).unwrap_err().to_string();
         assert!(e.contains("other filters"), "{e}");
     }
