@@ -2433,7 +2433,10 @@ mod retention_ledger {
             ledger_retained(&store).is_empty(),
             "every follower applied the commit that stopped naming it, past a zero grace"
         );
-        assert!(!store.join(RETAINED_FILE).exists(), "an empty ledger is removed");
+        assert!(
+            !store.join(RETAINED_FILE).exists(),
+            "an empty ledger is removed"
+        );
     }
 
     #[test]
