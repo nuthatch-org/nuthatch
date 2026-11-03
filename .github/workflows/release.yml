@@ -85,7 +85,7 @@ jobs:
     name: ${{ matrix.target }} ${{ matrix.variant }}
     needs: release-notes
     if: ${{ !cancelled() && (needs.release-notes.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.binaries)) }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -111,9 +111,22 @@ jobs:
           # arm64 host otherwise runs the x86_64 binary under qemu, too slow to serve a stopgap nest.
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          # x86_64-apple-darwin (Intel Mac) is intentionally omitted: macos-13 runners are scarce
-          # and Intel Macs are a shrinking minority; those users build from source (cargo install)
-          # or run under a future addition. The installer routes them to the build-from-source path.
+          # Intel Mac, default binary only, cross-compiled on arm64: `macos-15-intel` is the last Intel
+          # image. `os` is only a label here, so the include adds a leg instead of retargeting arm64's.
+          - os: macos-15-x86_64
+            runner: macos-15
+            target: x86_64-apple-darwin
+            variant: default
+            prefix: ''
+            features: ''
+          # Static x86_64 Linux, default binary only, for Alpine and anything below the glibc floor.
+          # musl's allocator, not jemalloc (src/main.rs); `musl-tools` compiles ring, zstd and mimalloc.
+          - os: ubuntu-22.04-musl
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            variant: default
+            prefix: ''
+            features: ''
           - variant: default
             prefix: ''
             features: ''
@@ -167,6 +180,9 @@ jobs:
           sudo mkswap /swapfile.lto
           sudo swapon /swapfile.lto
           free -h
+      - name: musl C toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: build
         run: cargo build --profile dist --locked ${{ matrix.features }} --target ${{ matrix.target }}
       - name: package
@@ -415,7 +431,7 @@ jobs:
           docker push "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-flight"
 
   # The release goes public here and nowhere else (#626). Everything above builds against a draft:
-  # three binary targets with their scaled, graph and flight variants, and three container images that are
+  # five binary targets, three with their scaled, graph and flight variants, and three container images that are
   # smoke-tested before they are pushed, and the embeddable engine's module, gated on the file that
   # ships. Only when all of that has succeeded does the release stop being a draft.
   #
