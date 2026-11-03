@@ -7330,6 +7330,32 @@ template="pool"
         );
     }
 
+    /// #2599: a Utf8View column's strings live in variadic buffers a slice shares with its batch, so
+    /// sizing by views let one row carry the whole batch. The cap holds, and the rows match JSON's.
+    #[test]
+    fn an_arrow_answer_over_a_view_column_holds_the_byte_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = "SELECT arrow_cast(repeat('A', 100000), 'Utf8View') AS x FROM range(32)";
+        let guard = |arrow| QueryGuard {
+            timeout: Duration::from_secs(30),
+            max_rows: 50_000,
+            max_result_bytes: 1 << 20,
+            arrow,
+            ..Default::default()
+        };
+        let json = query_guarded(dir.path(), sql, guard(false)).unwrap();
+        let out = query_guarded(dir.path(), sql, guard(true)).unwrap();
+        let ipc = out.ipc.expect("an Arrow answer");
+        assert!(out.truncated, "the cap was crossed");
+        assert!(
+            ipc.bytes.len() < (1 << 20) + 200_000,
+            "{} bytes written for {} rows",
+            ipc.bytes.len(),
+            ipc.rows
+        );
+        assert_eq!(ipc.rows, json.rows.len(), "row for row equal to JSON");
+    }
+
     /// #1650: one DataFusion batch of 8,192 cells, 100 KB each, before the 64 MiB cap runs.
     /// Ignored because the point is the resident size, and the suite should not allocate it.
     #[test]

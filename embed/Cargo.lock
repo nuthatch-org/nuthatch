@@ -3579,6 +3579,8 @@ dependencies = [
  "alloy-primitives",
  "anyhow",
  "arc-swap",
+ "arrow-array",
+ "arrow-schema 59.3.0",
  "async-trait",
  "bytes",
  "dbsp",

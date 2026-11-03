@@ -187,6 +187,42 @@ fn sql_does_not_encode_the_row_that_would_cross_the_cap() {
     );
 }
 
+/// #2616, the engine's copy of #2589 and #2599: an Arrow answer stops at the row that crosses the
+/// byte cap and says so, for plain strings and for a view column whose slices share their batch's data.
+#[test]
+fn an_arrow_answer_stops_at_the_byte_cap_and_says_so() {
+    use nuthatch_core::answer::SQL_MAX_RESULT_BYTES;
+    use nuthatch_embed::{budget::TabBudget, cellar::Cellar, derived::NestFiles, query::TabQuery};
+    let db = redb::Database::builder()
+        .create_with_backend(nuthatch_core::backend::Bytes::default())
+        .unwrap();
+    let store = nuthatch_core::redb_store::Store::from_db(db, None).unwrap();
+    let cellar = std::sync::Arc::new(Cellar::default());
+    let q = futures::executor::block_on(TabQuery::bind(
+        &store,
+        &cellar,
+        &[],
+        &[],
+        &NestFiles::new(),
+        TabBudget::default(),
+        &[],
+    ))
+    .unwrap();
+    for sql in [
+        "SELECT repeat('A', 4000000) AS x FROM range(32)",
+        "SELECT arrow_cast(repeat('A', 4000000), 'Utf8View') AS x FROM range(32)",
+    ] {
+        let (bytes, _, rows, truncated) =
+            futures::executor::block_on(q.collect_ipc(sql, 50_000, SQL_MAX_RESULT_BYTES)).unwrap();
+        assert!(truncated, "{sql}: {rows} rows, {} bytes", bytes.len());
+        assert!(
+            bytes.len() < SQL_MAX_RESULT_BYTES + 4_200_000,
+            "{sql}: {rows} rows, {} bytes past a {SQL_MAX_RESULT_BYTES} cap",
+            bytes.len()
+        );
+    }
+}
+
 /// Nested values are sized before encoding too: ten rows of a 900,000-element list are ~7 MB each as
 /// `value_bytes` counts them, past the cap together, and what is held stays under it.
 #[test]
