@@ -2239,7 +2239,7 @@ mod sealed_rows {
     }
 
     /// #2580: a segment a follower's catalogue names and the disk lacks is [`SegmentGone`], which
-    /// says which file and that a fresh snapshot follows, and the copy is told.
+    /// says which file and that a fresh snapshot follows.
     #[test]
     fn a_follower_missing_a_segment_reads_it_as_gone() {
         let dir = tempfile::tempdir().unwrap();
@@ -2290,20 +2290,18 @@ mod sealed_rows {
     #[cfg(unix)]
     #[test]
     fn a_follower_segment_that_cannot_be_opened_is_not_gone() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let segment = sealed_segment(dir.path());
         let path = segment_path(dir.path(), &segment.file, &segment.hash);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        if std::fs::File::open(&path).is_ok() {
-            // Running as root, which opens it regardless: nothing here to test.
-            return;
-        }
+        // A link to itself: opening it fails with ELOOP, for root as for anyone, and not NotFound.
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+        let open = std::fs::File::open(&path).unwrap_err();
+        assert_ne!(open.kind(), std::io::ErrorKind::NotFound, "{open}");
         let err = within(dir.path(), follower(dir.path()), || {
             read_segment_decoded(dir.path(), &segment, &schema())
         })
         .unwrap_err();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(gone(&err).is_none(), "{err:#}");
     }
 
