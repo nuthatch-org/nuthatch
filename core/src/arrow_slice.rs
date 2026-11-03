@@ -9,9 +9,7 @@ use std::sync::Arc;
 
 use arrow_array::builder::OffsetBufferBuilder;
 use arrow_array::cast::AsArray;
-use arrow_array::{
-    Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, StructArray,
-};
+use arrow_array::{Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, StructArray};
 use arrow_schema::{ArrowError, DataType, FieldRef};
 
 /// `part` with every view array's data buffers cut down to the rows it holds, inside lists and
@@ -46,7 +44,11 @@ fn compact_array(a: &ArrayRef) -> ArrayRef {
         DataType::Struct(fields) => {
             let s = a.as_struct();
             let columns = s.columns().iter().map(compact_array).collect();
-            Arc::new(StructArray::new(fields.clone(), columns, s.nulls().cloned()))
+            Arc::new(StructArray::new(
+                fields.clone(),
+                columns,
+                s.nulls().cloned(),
+            ))
         }
         // A map or a fixed-size list of views is written as it is, and `estimate` counts it whole.
         _ => a.clone(),
@@ -186,7 +188,10 @@ mod tests {
             .iter()
             .map(|b| b.capacity())
             .sum();
-        assert!(held + child < 300_000, "a compacted row holds {held} + {child}");
+        assert!(
+            held + child < 300_000,
+            "a compacted row holds {held} + {child}"
+        );
         assert_eq!(compacted.column(0).as_list::<i32>().value(0).len(), 1);
     }
 }
