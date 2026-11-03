@@ -104,9 +104,15 @@ fn unreal_flags(
             if real.contains(&flag) {
                 continue;
             }
-            let named = gated
-                .get(&flag)
-                .is_some_and(|f| line.contains(&format!("--features {f}")));
+            // The feature as a whole word: `--features flight` must not satisfy a feature `fl`.
+            let named = gated.get(&flag).is_some_and(|f| {
+                line.match_indices(&format!("--features {f}"))
+                    .any(|(at, m)| {
+                        !line[at + m.len()..].starts_with(|c: char| {
+                            c.is_ascii_alphanumeric() || c == '-' || c == '_'
+                        })
+                    })
+            });
             if !named {
                 out.push(flag);
             }
@@ -172,6 +178,11 @@ fn a_feature_flag_needs_its_feature_named_beside_it() {
     assert_eq!(
         unreal_flags("`--features flight`, then `--warp`.", &real, &gated),
         ["--warp"]
+    );
+    // A feature is matched as a word: `--features flightless` does not name `flight`.
+    assert_eq!(
+        unreal_flags("`--features flightless`, then `--flight`.", &real, &gated),
+        ["--flight"]
     );
 }
 
