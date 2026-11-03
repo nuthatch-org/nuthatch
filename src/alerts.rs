@@ -585,6 +585,65 @@ mod tests {
         assert_eq!(ids, ["0", "1"].map(str::to_string).to_vec());
     }
 
+    /// #2587: a delivery the receiver refused is made again under the same id, so the header is a
+    /// dedupe key across retries and not only across distinct alerts.
+    #[tokio::test]
+    async fn a_retried_delivery_carries_the_same_id() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            routing::post,
+            Router,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let app = Router::new().route(
+            "/hook",
+            post(move |headers: HeaderMap| {
+                let sink = sink.clone();
+                async move {
+                    let id = headers
+                        .get("x-nuthatch-delivery")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let mut seen = sink.lock().unwrap();
+                    seen.push(id);
+                    if seen.len() == 1 {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let url = format!("http://{addr}/hook");
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let payload = json!({ "event": "rows", "url": url, "rows": [1] }).to_string();
+        store.outbox_push(&payload).unwrap();
+
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap();
+        let none = std::collections::HashMap::new();
+        assert_eq!(deliver_pending(&store, &client, &none).await, 0);
+        assert_eq!(deliver_pending(&store, &client, &none).await, 1);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["0", "0"].map(str::to_string).to_vec(),
+            "the refused delivery and its retry carry one id"
+        );
+    }
+
     /// A dead endpoint leaves the alert in the outbox for retry - at-least-once, never dropped on the
     /// first failure.
     #[tokio::test]

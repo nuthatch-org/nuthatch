@@ -174,7 +174,10 @@ committed and not delivered. Deliveries committed in the last moments before a c
 The proposal is to mirror the `outbox` table on the feed as a fourth table, so the promoted writer
 redelivers whatever was pending. That makes delivery across a failover at-least-once rather than
 at-most-once; receivers drop duplicates by the outbox `seq`.
-[VERIFY: that `seq` is on the delivered payload and documented as the idempotency key.]
+~~[VERIFY: that `seq` is on the delivered payload and documented as the idempotency key.]~~
+Answered (#2587): it is not on the payload. It is sent as the `X-Nuthatch-Delivery` header, which is
+also the only place a Discord sink can carry it, and the docs name it as the key. The HMAC in
+`X-Nuthatch-Signature` covers the body only, as it always has, so the header is not signed.
 
 ### 5.6 Planned handover
 
@@ -414,6 +417,9 @@ read the two ops, which is safe under the upgrade order the rolling-upgrade gate
 before the writer.
 
 **The delivery id, built.** Every webhook delivery carries `X-Nuthatch-Delivery`, its outbox sequence.
+The sequence is in the header and not in the body, and the signature covers the body only, so a
+signed receiver cannot trust the id the way it trusts the payload (#2587). A retry repeats it
+(`a_retried_delivery_carries_the_same_id`).
 The sequence survives a takeover, so a delivery made again by the new writer carries the id the old
 writer's did, and a receiver can dedupe on it. `each_delivery_names_its_outbox_sequence` checks the
 header against two queued alerts. A receiver that ignores it sees what it saw before. The writer's
