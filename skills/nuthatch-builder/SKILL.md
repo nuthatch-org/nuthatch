@@ -46,7 +46,7 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT valu
   less `rows` (`count`, `columns`, `truncated`, `degraded`, `provenance` and the others), comes as JSON
   in the `x-nuthatch-answer` header. A refusal is still JSON. Prefer this for exports and columnar
   clients; the values are the same as JSON's.
-- A binary built with `--features flight` can serve Flight SQL beside the HTTP API; see the flight build in `docs/operators.md`.
+- With a binary built with `--features flight`, `dev --flight <addr>` serves Flight SQL beside the HTTP API.
 
 ## When to read what
 
