@@ -7797,7 +7797,13 @@ impl nuthatch_core::hooks::WindowHooks for NodeHooks {
         #[cfg(test)]
         if let Some(d) = slowed_by(&self.dir) {
             tokio::time::sleep(d).await;
-            // Armed during the sleep, a panic lands inside a window already under way.
+        }
+        #[cfg(test)]
+        if let Some(held) = held_window_of(&self.dir) {
+            held.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            held.release.acquire().await.expect("never closed").forget();
+            // Armed while held, a panic lands inside a window already under way.
             panic_if_armed(&self.dir);
         }
         #[cfg(test)]
@@ -8950,6 +8956,54 @@ fn slowed_nests() -> &'static std::sync::Mutex<Vec<(PathBuf, std::time::Duration
     static DIRS: std::sync::OnceLock<std::sync::Mutex<Vec<(PathBuf, std::time::Duration)>>> =
         std::sync::OnceLock::new();
     DIRS.get_or_init(Default::default)
+}
+
+/// A nest whose windows wait at their start until the test releases them, so a test acts while one
+/// is known to be under way rather than guessing from a commit.
+#[cfg(test)]
+struct HeldWindow {
+    dir: PathBuf,
+    entered: std::sync::atomic::AtomicUsize,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+fn held_windows() -> &'static std::sync::Mutex<Vec<Arc<HeldWindow>>> {
+    static HELD: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<HeldWindow>>>> =
+        std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn hold_windows_of(dir: &Path) -> Arc<HeldWindow> {
+    let held = Arc::new(HeldWindow {
+        dir: dir.to_path_buf(),
+        entered: 0.into(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    held_windows().lock().unwrap().push(held.clone());
+    held
+}
+
+/// Stop holding `dir`'s windows and let any that are waiting go.
+#[cfg(test)]
+fn release_windows_of(held: &HeldWindow) {
+    held_windows()
+        .lock()
+        .unwrap()
+        .retain(|h| !std::ptr::eq(h.as_ref(), held));
+    held.release
+        .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+}
+
+#[cfg(test)]
+fn held_window_of(dir: &Path) -> Option<Arc<HeldWindow>> {
+    held_windows()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|h| h.dir == dir)
+        .cloned()
 }
 
 #[cfg(test)]
@@ -15823,12 +15877,8 @@ template = "pool"
         const TIP: u64 = 45;
         let root = tempfile::tempdir().unwrap();
         let nests = s0_nests(root.path(), false).await;
-        let b_dir = nests[1].dir.clone();
         let b_store = nests[1].store.clone();
-        slowed_nests()
-            .lock()
-            .unwrap()
-            .push((b_dir.clone(), std::time::Duration::from_millis(1500)));
+        let held = hold_windows_of(&nests[1].dir);
         let health = Arc::new(crate::health::RuntimeHealth::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let task = spawn_test_cursor(
@@ -15843,12 +15893,10 @@ template = "pool"
             false,
             Some(rx),
         );
-        // Just after a commit, b is at the start of its next window's 1.5 s.
-        let first = last_block_of(b_store.as_ref());
         wait_for(
-            "b commits a window",
+            "b is inside a window",
             std::time::Duration::from_secs(20),
-            || last_block_of(b_store.as_ref()) != first,
+            || held.entered.load(std::sync::atomic::Ordering::SeqCst) > 0,
         )
         .await;
         let (ack, acked) = tokio::sync::oneshot::channel();
@@ -15865,6 +15913,7 @@ template = "pool"
             "b was reported retired while its task was still inside a window"
         );
         drop(acked);
+        release_windows_of(&held);
         wait_for(
             "b indexes on to the tip after the abandoned unmount",
             std::time::Duration::from_secs(60),
@@ -15872,7 +15921,6 @@ template = "pool"
         )
         .await;
         assert!(!retired(&health), "b is indexing, so it is not retired");
-        slowed_nests().lock().unwrap().retain(|(d, _)| d != &b_dir);
         task.abort();
     }
 
@@ -15884,11 +15932,7 @@ template = "pool"
         let root = tempfile::tempdir().unwrap();
         let nests = s0_nests(root.path(), false).await;
         let b_dir = nests[1].dir.clone();
-        let b_store = nests[1].store.clone();
-        slowed_nests()
-            .lock()
-            .unwrap()
-            .push((b_dir.clone(), std::time::Duration::from_millis(1500)));
+        let held = hold_windows_of(&b_dir);
         let health = Arc::new(crate::health::RuntimeHealth::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let task = spawn_test_cursor(
@@ -15903,14 +15947,12 @@ template = "pool"
             false,
             Some(rx),
         );
-        let first = last_block_of(b_store.as_ref());
         wait_for(
-            "b commits a window",
+            "b is inside a window",
             std::time::Duration::from_secs(20),
-            || last_block_of(b_store.as_ref()) != first,
+            || held.entered.load(std::sync::atomic::Ordering::SeqCst) > 0,
         )
         .await;
-        drop(b_store);
         let (ack, acked) = tokio::sync::oneshot::channel();
         tx.send(CursorCommand::Unmount {
             name: "b".into(),
@@ -15919,12 +15961,12 @@ template = "pool"
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         panic_in_windows_of(&b_dir);
+        release_windows_of(&held);
         tokio::time::timeout(std::time::Duration::from_secs(20), acked)
             .await
             .expect("the unmount is acknowledged once the panicked task has ended")
             .unwrap();
         panicking_nests().lock().unwrap().retain(|d| d != &b_dir);
-        slowed_nests().lock().unwrap().retain(|(d, _)| d != &b_dir);
         let status = health.status("b").expect("b's fault is recorded");
         assert_ne!(
             status.class, "retired",
