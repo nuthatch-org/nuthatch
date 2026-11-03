@@ -262,17 +262,19 @@ fn derive(
     })
 }
 
-/// The rows a delta sealed straight to segments in the tables in `followed`, as the puts they would
-/// have been had they passed through hot: the delta's log never holds them (#2602). Every segment
-/// `after` names and `before` did not is read, so a row of a fold that hot already showed is put
-/// again as it is, which changes no copy.
+/// The rows a delta sealed straight to segments that some shape in `shapes` selects, as the puts they
+/// would have been had they passed through hot: the delta's log never holds them (#2602). Every
+/// segment `after` names and `before` did not is visited a row at a time, and only a selected row is
+/// kept, so a large seal holds what subscribers follow rather than the segment. A row of a fold that
+/// hot already showed is put again as it is, which changes no copy.
 fn sealed_touches(
     dir: &Path,
     store: &Arc<MemStore>,
-    followed: &BTreeSet<String>,
+    shapes: &crate::shape_feed::ShapeHub,
     before: Option<&str>,
     after: Option<&str>,
 ) -> Result<Vec<crate::feed::Touch>> {
+    let followed: BTreeSet<&str> = shapes.tables().collect();
     let read = |raw: Option<&str>| -> Result<crate::seal::Manifest> {
         raw.map_or(Ok(Default::default()), |raw| {
             serde_json::from_str(raw).context("a delta's catalogue")
@@ -288,7 +290,7 @@ fn sealed_touches(
     let fresh: Vec<(&String, &crate::seal::Segment)> = after
         .tables
         .iter()
-        .filter(|(table, _)| followed.contains(*table))
+        .filter(|(table, _)| followed.contains(table.as_str()))
         .flat_map(|(table, segments)| segments.iter().map(move |s| (table, s)))
         .filter(|(_, s)| !held.contains(s.hash.as_str()))
         .collect();
@@ -305,13 +307,17 @@ fn sealed_touches(
                 .iter()
                 .find(|t| &t.table == table)
                 .with_context(|| format!("`{table}` is sealed and not in this nest's registry"))?;
-            for row in crate::seal::read_segment_decoded(dir, segment, table_schema)? {
-                touches.push(crate::feed::Touch {
-                    key: crate::store::Store::entity_key(row.block_number, row.log_index),
-                    old: None,
-                    new: Some(row.to_json().to_string()),
-                });
-            }
+            crate::seal::visit_segment_rows(dir, segment, table_schema, None, &mut |row| {
+                let json = row.to_json();
+                if shapes.selects(table, &json) {
+                    touches.push(crate::feed::Touch {
+                        key: crate::store::Store::entity_key(row.block_number, row.log_index),
+                        old: None,
+                        new: Some(json.to_string()),
+                    });
+                }
+                Ok(())
+            })?;
         }
         Ok(touches)
     })
@@ -1793,12 +1799,11 @@ impl Follower {
                 .with_context(|| format!("{dataset}: resnapshotting"))?;
             if !shapes.is_empty() {
                 let log = if changes.sealed_unseen {
-                    let followed: BTreeSet<String> = shapes.tables().map(str::to_string).collect();
                     let after = data.store.served_catalogue().flatten();
                     sealed_touches(
                         &self.root.join(&dataset),
                         &data.store,
-                        &followed,
+                        &shapes,
                         before.as_deref(),
                         after.as_deref(),
                     )
@@ -2702,7 +2707,14 @@ fn guarded(
                 if path == "/sync" {
                     if let Some((reason, why)) = &refusal {
                         if sync_names_entity(req.uri(), &declared) {
-                            return derived_refused(reason, "a shape of an entity", why);
+                            // In `/sync`'s own refusal shape: the code in `error`, the prose in `why`.
+                            let why =
+                                format!("a shape of an entity waits for its derived state: {why}");
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({ "error": reason, "why": why })),
+                            )
+                                .into_response();
                         }
                     }
                     // Answered by the mount's own `/sync` route, inside its layers, so it is
@@ -4341,6 +4353,43 @@ mod tests {
         assert!(copy.is_empty(), "{copy:?}");
     }
 
+    /// #2602: of a segment sealed straight from the chain, only the rows some shape selects are held
+    /// for the delta, so a large seal costs what subscribers follow rather than the segment.
+    #[tokio::test]
+    async fn a_direct_seal_holds_only_the_rows_a_shape_selects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = sync_dir(tmp.path());
+        let (follower, _) = sync_follower(
+            tmp.path(),
+            "ds",
+            crate::feed::Snapshot {
+                epoch: 1,
+                ..Default::default()
+            },
+            None,
+        );
+        let shape = r#"{"table":"t__transfer","where":{"from":["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}"#;
+        let _stream = follower.serve_sync("ds", &sync_uri(shape, true)).await;
+        let others = "0xcccccccccccccccccccccccccccccccccccccccc";
+        let mut sealed: Vec<String> = (1..40)
+            .map(|log| sync_transfer(5, log, others, others, others))
+            .collect();
+        sealed.push(sync_transfer(
+            5,
+            0,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            others,
+            others,
+        ));
+        let delta = sync_seal_direct(&dir, 1, &sealed, 1, 5);
+        let data = follower.lock().datasets["ds"].clone();
+        let shapes = data.shapes.lock().unwrap();
+        let touches =
+            sealed_touches(&dir, &data.store, &shapes, None, delta.catalogue.as_deref()).unwrap();
+        let keys: Vec<&str> = touches.iter().map(|t| t.key.as_str()).collect();
+        assert_eq!(keys, [crate::store::Store::entity_key(5, 0)]);
+    }
+
     /// #2602: rows sealed straight to a segment, which never pass through hot, still reach a live
     /// stream whose shape selects them.
     #[tokio::test]
@@ -4425,7 +4474,7 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["reason"], "catching_up", "{body}");
+        assert_eq!(body["error"], "catching_up", "{body}");
 
         let events = layered(&follower)
             .oneshot(get(sync_uri(

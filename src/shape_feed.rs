@@ -193,6 +193,13 @@ impl ShapeHub {
         self.tables.keys().map(String::as_str)
     }
 
+    /// Whether some shape of `table` selects `row`, a row of it as stored.
+    pub fn selects(&self, table: &str, row: &serde_json::Value) -> bool {
+        self.tables
+            .get(table)
+            .is_some_and(|t| !t.index.matching(row).is_empty())
+    }
+
     /// Subscribers now, counting each of those that share a shape.
     pub fn subscribers(&self) -> usize {
         self.tables
