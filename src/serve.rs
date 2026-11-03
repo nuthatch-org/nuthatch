@@ -396,6 +396,9 @@ pub struct Snapshot {
     pub exposure: crate::exposure::ExposureView,
     pub velocity: crate::velocity::VelocityView,
     pub entities: Arc<Vec<crate::entity_view::EntityView>>,
+    /// A writer's catalogue as it stood with `store`'s watermark (#2613). A follower's copy carries
+    /// its own, so this is `None` there.
+    pub catalogue: Option<Arc<crate::seal::PinnedCatalogue>>,
 }
 
 /// Where a nest's latest [`Snapshot`] is published.
@@ -420,14 +423,28 @@ impl Snapshot {
             exposure: exposure.pinned(),
             velocity: velocity.pinned(),
             entities: Arc::new(entities.iter().map(|e| e.pinned()).collect()),
+            catalogue: None,
         }))
+    }
+
+    /// This snapshot with `dir`'s catalogue as it stands, for a writer whose seals do not run until
+    /// this returns. Without it a request on the snapshot reads the live catalogue against the
+    /// snapshot's watermark, and a fold since then drops the folded rows from its answer.
+    pub fn with_catalogue(mut self, dir: &std::path::Path) -> Result<Snapshot> {
+        if self.store.served_catalogue().is_none() {
+            self.catalogue = Some(Arc::new(crate::seal::PinnedCatalogue::take(dir)?));
+        }
+        Ok(self)
     }
 }
 
-/// `state` reading its nest's latest snapshot, or itself before one is published.
-fn pin_snapshot(state: Arc<AppState>) -> Arc<AppState> {
+/// `state` reading its nest's latest snapshot, or itself before one is published, with the catalogue
+/// that snapshot pinned.
+fn pin_snapshot(
+    state: Arc<AppState>,
+) -> (Arc<AppState>, Option<Arc<crate::seal::PinnedCatalogue>>) {
     let Some(snap) = state.snapshots.as_ref().and_then(|s| s.load_full()) else {
-        return state;
+        return (state, None);
     };
     let mut pinned = AppState::clone(&state);
     pinned.store = snap.store.clone();
@@ -435,7 +452,7 @@ fn pin_snapshot(state: Arc<AppState>) -> Arc<AppState> {
     pinned.exposure = snap.exposure.clone();
     pinned.velocity = snap.velocity.clone();
     pinned.entities = snap.entities.clone();
-    Arc::new(pinned)
+    (Arc::new(pinned), snap.catalogue.clone())
 }
 
 impl AppState {
@@ -632,7 +649,7 @@ async fn pin_request(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let state = pin_snapshot(backing.current());
+    let (state, catalogue) = pin_snapshot(backing.current());
     #[cfg(test)]
     {
         let hook = pin_hooks().lock().unwrap().remove(&state.dir);
@@ -642,7 +659,7 @@ async fn pin_request(
         }
     }
     let (dir, store) = (state.dir.clone(), state.store.clone());
-    let served = crate::seal::serving(dir, store, next.run(req));
+    let served = crate::seal::serving(dir, store, catalogue, next.run(req));
     let (resp, missing) = PINNED.scope((backing, state), served).await;
     if missing {
         // Whatever the route made of it, an answer missing a segment's rows is not one.
@@ -672,9 +689,9 @@ pub(crate) async fn within_pin<T, Fut>(
 where
     Fut: std::future::Future<Output = T>,
 {
-    let state = pin_snapshot(backing.current());
+    let (state, catalogue) = pin_snapshot(backing.current());
     let (dir, store) = (state.dir.clone(), state.store.clone());
-    let served = crate::seal::serving(dir, store, work(state.clone()));
+    let served = crate::seal::serving(dir, store, catalogue, work(state.clone()));
     let (out, missing) = PINNED.scope((backing, state), served).await;
     if missing {
         return Err(Box::new(segment_gone()));

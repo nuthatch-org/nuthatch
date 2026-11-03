@@ -5499,6 +5499,61 @@ template="pool"
         assert_eq!(out.rows[0]["n"], Value::from(5u64));
     }
 
+    /// #2613: a writer's request on a pinned snapshot holds that snapshot's hot rows and watermark,
+    /// so it must read that snapshot's catalogue too. A tip seal that folds the provisional segment
+    /// and prunes hot after the snapshot was taken must not leave the request with neither copy.
+    #[test]
+    fn a_pinned_request_reads_the_catalogue_its_watermark_pairs_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<String> = (10..13).map(fold_row).collect();
+        crate::seal::seal_range(dir.path(), &rows, 10, 12).unwrap();
+        let replaced = only_provisional(dir.path());
+        let hot: HotRows = [(
+            "usdc__transfer".to_string(),
+            (13..15)
+                .map(|b| serde_json::from_str::<Value>(&fold_row(b)).unwrap())
+                .collect(),
+        )]
+        .into_iter()
+        .collect();
+        let guard = || QueryGuard {
+            timeout: Duration::from_secs(30),
+            max_rows: 10,
+            ..Default::default()
+        };
+        let sql = r#"SELECT count(*) AS n FROM "usdc__transfer""#;
+        let db = tempfile::tempdir().unwrap();
+        let store: Arc<dyn crate::store::HotStore> =
+            Arc::new(crate::store::Store::open(&db.path().join("hot.redb")).unwrap());
+        let pinned = Arc::new(crate::seal::PinnedCatalogue::take(dir.path()).unwrap());
+        let on_snapshot = || {
+            crate::seal::within_pinned(dir.path(), store.clone(), Some(pinned.clone()), || {
+                query_hot_cold(dir.path(), sql, guard(), &hot, 12, &[]).unwrap()
+            })
+        };
+        assert_eq!(on_snapshot().rows[0]["n"], Value::from(5u64));
+
+        let more: Vec<String> = (13..15).map(fold_row).collect();
+        crate::seal::seal_range(dir.path(), &more, 13, 14).unwrap();
+        let out = on_snapshot();
+        assert_eq!(
+            out.rows[0]["n"],
+            Value::from(5u64),
+            "the snapshot's watermark is 12, so it must read the catalogue that still names 10..=12"
+        );
+        assert!(out.degraded_tables.is_empty(), "{:?}", out.degraded_tables);
+        assert!(
+            replaced.exists(),
+            "the snapshot's lease keeps the folded-away segment its catalogue names"
+        );
+
+        drop(pinned);
+        assert!(
+            !replaced.exists(),
+            "the folded-away segment goes once no snapshot can read it"
+        );
+    }
+
     fn plus_chain(terms: usize) -> String {
         let mut sql = String::from("SELECT ");
         for i in 0..terms {
