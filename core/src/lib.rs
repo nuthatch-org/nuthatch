@@ -5,6 +5,7 @@
 
 pub mod alerts;
 pub mod answer;
+pub mod arrow_slice;
 pub mod backend;
 pub mod bind;
 pub mod chains;

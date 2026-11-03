@@ -281,15 +281,32 @@ impl TabQuery {
                     over = true;
                     return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
                 }
+                use nuthatch_core::arrow_slice::{compact, slice_bytes};
                 let n = (batch.num_rows() - start)
                     .min(ENCODE_ROWS)
                     .min(cap - written);
-                if let Err(e) = w.write(&batch.slice(start, n)) {
-                    failed = Some(io(e));
-                    return Err(burrmill::BurrmillError::Cancelled);
+                let mut part = compact(&batch.slice(start, n));
+                // As the node's: a slice that would cross the byte cap is written a row at a time, so
+                // the answer ends at the row that crosses it (#2589, #2616).
+                if part
+                    .as_ref()
+                    .is_ok_and(|p| slice_bytes(p) > max_bytes - w.get_ref().len())
+                {
+                    part = compact(&batch.slice(start, 1));
                 }
-                start += n;
-                written += n;
+                let written_now = match part.and_then(|p| w.write(&p).map(|()| p.num_rows())) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        failed = Some(io(e));
+                        return Err(burrmill::BurrmillError::Cancelled);
+                    }
+                };
+                start += written_now;
+                written += written_now;
+                if w.get_ref().len() >= max_bytes {
+                    over = true;
+                    return Err(burrmill::BurrmillError::LimitExceeded("cap".into()));
+                }
             }
             Ok(())
         };
