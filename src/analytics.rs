@@ -8288,10 +8288,7 @@ template="pool"
             ..Default::default()
         };
         let result = {
-            let _env = crate::analytics_budget::tests::env_lock()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let _vars = crate::analytics_budget::tests::EnvVars::set(&[
+            let _vars = crate::analytics_budget::tests::ThreadVars::set(&[
                 (crate::analytics_budget::ENV_MAX_TEMP_SIZE, "4MB"),
                 (crate::analytics_budget::ENV_BURRMILL_MEMORY_LIMIT, "4MB"),
             ]);

@@ -16474,13 +16474,29 @@ template = "pool"
     async fn a_nest_slowed_tenfold_does_not_set_its_siblings_pace_on_the_buffered_cursor() {
         let slow = std::time::Duration::from_millis(150);
         let tick = std::time::Duration::from_millis(40);
+        // Against an unslowed run on the same box, and against the shared cursor's cost, so a loaded
+        // runner's own lag is not read as the slow nest setting the pace (#2644). The absolute bound,
+        // half a slow window, is `s2_one_nest_slowed_tenfold_per_window_size`'s to measure.
+        let base = sibling_tip_lags(
+            CursorKind::Buffered(8),
+            3,
+            4,
+            std::time::Duration::ZERO,
+            tick,
+            25,
+        )
+        .await;
         let buffered = sibling_tip_lags(CursorKind::Buffered(8), 3, 4, slow, tick, 25).await;
         let shared = sibling_tip_lags(CursorKind::Shared, 3, 4, slow, tick, 25).await;
-        let (b50, s50) = (quantile(&buffered, 0.5), quantile(&shared, 0.5));
+        let (base50, b50, s50) = (
+            quantile(&base, 0.5),
+            quantile(&buffered, 0.5),
+            quantile(&shared, 0.5),
+        );
         assert!(
-            b50 < slow / 2 && s50 >= slow / 2,
-            "siblings' p50 tip lag with one nest slowed {slow:?} a window: buffered {b50:?}, shared \
-             {s50:?}"
+            b50.saturating_sub(base50) < s50.saturating_sub(base50) / 2 && s50 >= slow / 2,
+            "siblings' p50 tip lag with one nest slowed {slow:?} a window: buffered {b50:?} against \
+             {base50:?} unslowed, shared {s50:?}"
         );
     }
 
