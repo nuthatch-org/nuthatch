@@ -159,6 +159,8 @@ mod lodestar_panel;
 mod mcp_token;
 #[path = "mutants_check.rs"]
 mod mutants_check;
+#[path = "nextest_archives_carry_parity.rs"]
+mod nextest_archives_carry_parity;
 #[path = "over_i128_is_reported.rs"]
 mod over_i128_is_reported;
 #[path = "parity_epoch_shift.rs"]
