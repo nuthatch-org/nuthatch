@@ -51,8 +51,8 @@ Stdio server bridging to a running `nuthatch dev`. Works offline against the loc
 
 - Every nest `init` creates holds an `llms.txt` and a `.claude/skills/` scaffold. Read them first
   when working inside a nest.
-- The builder skill, for driving the CLI and config: `skills/nuthatch-builder/`. Install with
-  `cp -r skills/nuthatch-builder ~/.claude/skills/`.
+- The builder skill, for driving the CLI and config: `skills/nuthatch-builder/`. Install it from a clone of
+  this repository with `cp -r skills/nuthatch-builder ~/.claude/skills/`; the binary does not carry it.
 - Every flag: `skills/nuthatch-builder/cli-reference.md`, generated from the binary. Every config
   key: `skills/nuthatch-builder/config-reference.md`.
 

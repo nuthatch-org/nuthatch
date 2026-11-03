@@ -51,7 +51,7 @@ start, by name.
 ## The trap: history starts at `start_block`
 
 With no `start_block`, each chain backfills a watched account **from block 0**. That is complete, and
-slow on chains as long as Base and BNB Chain: expect hours, not minutes.
+slow on chains as long as Base and BNB Chain.
 
 Setting `start_block` in a chain's `[address_history]` skips everything before it, for every
 account. A request that starts before it is refused, not answered short:
