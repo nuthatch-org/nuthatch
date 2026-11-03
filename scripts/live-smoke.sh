@@ -55,6 +55,7 @@ fetch_release() {
   case "$(uname -s)/$(uname -m)" in
     Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
     Darwin/arm64) target=aarch64-apple-darwin ;;
+    Darwin/x86_64) target=x86_64-apple-darwin ;;
     *) err "no published binary for $(uname -s)/$(uname -m); set NUTHATCH_BIN"; exit 1 ;;
   esac
   tag="${SMOKE_TAG:-$(gh release view --repo "$REPO" --json tagName --jq .tagName)}"

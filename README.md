@@ -25,8 +25,8 @@ carries no `#` comments because zsh, the macOS default, does not treat a pasted 
 passes the rest of the line on as arguments.
 
 The Linux binary needs glibc 2.35 or newer to run from 4.1.0, which is also what it is built on;
-4.0.x ran on 2.34. No Intel Mac binary is published: there, and on other platforms, build from
-source with Rust 1.95.0 ([docs/install.md](docs/install.md)).
+4.0.x ran on 2.34; older systems and Alpine have a static x86_64 build. On other platforms, build
+from source with Rust 1.95.0 ([docs/install.md](docs/install.md)).
 `init` creates a **nest**: a directory holding the contract's ABI, its config and, once `dev` runs,
 its indexed data. `--backfill 300` starts 300 blocks behind the tip, about an hour of mainnet, so there
 are rows to query within seconds on the bundled public endpoints. Without it, `dev` backfills from the
@@ -99,9 +99,9 @@ curl -fsSL https://nuthatch-indexer.com/install.sh | sh
 That downloads the prebuilt binary for your platform from the latest release, verifies its SHA-256,
 and installs it to `~/.local/bin` (override with `NUTHATCH_INSTALL_DIR`). **No compiler is
 involved.** A stock macOS shell does not have `~/.local/bin` on its `PATH`, which is why the quickstart
-above exports it; add the same line to `~/.zshrc` (or `~/.bashrc`) to keep it for new terminals. Prebuilt binaries cover macOS Apple Silicon and Linux x86_64 and aarch64 (aarch64 from the release after 4.11.0) and are attached to every
-release with their checksums, if you would rather fetch one by hand. **No Intel Mac binary is
-published**; the installer says so and points at the source build below.
+above exports it; add the same line to `~/.zshrc` (or `~/.bashrc`) to keep it for new terminals. Prebuilt binaries cover macOS on Apple Silicon and Intel and Linux x86_64 and aarch64 (aarch64 from the release after 4.11.0, Intel Mac from the release after 5.16.0) and are attached to every
+release with their checksums, if you would rather fetch one by hand. The Intel Mac binary is the
+default build only and has not yet been run on Intel hardware.
 
 **The Linux binary is dynamically linked and needs one thing**, measured off the published
 artifact with `objdump -T` rather than inferred:
@@ -115,7 +115,9 @@ It links `libc`, `libm` and `libgcc` and no C++ runtime. Releases before 4.1 emb
 also needed libstdc++ from GCC 11.
 
 Debian 12 and Ubuntu 22.04 clear it. RHEL 9 and Amazon Linux 2023 ship glibc 2.34 and ran 4.0.x; from
-4.1.0 they need the source build.
+4.1.0 they need the source build, or `nuthatch-x86_64-unknown-linux-musl.tar.gz`, a static build with
+no glibc floor (from the release after 5.16.0; it uses musl's allocator, not jemalloc, so its behaviour
+under load is unmeasured).
 
 **Verify who built it.** Every release binary carries a build provenance attestation, which a
 checksum cannot give you:
@@ -124,8 +126,7 @@ checksum cannot give you:
 gh attestation verify nuthatch-x86_64-unknown-linux-gnu.tar.gz --repo nuthatch-org/nuthatch
 ```
 
-**From source**, which is the only route on a platform we do not publish a binary for, Intel Macs
-included (the Intel build has not been verified on Intel hardware):
+**From source**, which is the only route on a platform we do not publish a binary for:
 
 ```sh
 rustup toolchain install 1.95.0
