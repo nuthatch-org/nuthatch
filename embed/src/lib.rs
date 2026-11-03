@@ -20,6 +20,7 @@ pub mod derived;
 pub mod entity;
 pub mod folds;
 pub mod http;
+pub mod kept;
 #[cfg(all(target_arch = "wasm32", feature = "js"))]
 pub mod live;
 pub mod mirror;
