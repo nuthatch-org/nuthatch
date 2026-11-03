@@ -760,7 +760,10 @@ it is held to the process value at boot, with a warning, rather than refusing th
 
 ### `[mounts.sync]` - letting clients hold part of a table (RFC-0080)
 
-Off unless written. A follower serves `GET /<route>/sync?s=<shape>` for a mount that has it: the rows
+**Absent from an ordinary build.** The server half is behind the off-by-default `sync-server` Cargo
+feature, since its cost gate failed (RFC-0080 §20): a binary built without it has no `/sync` route and
+refuses a mount that writes `[mounts.sync]`, naming the feature. Built with it, it is off unless
+written. A follower serves `GET /<route>/sync?s=<shape>` for a mount that has it: the rows
 of one table that match a shape (value terms, and `gte`/`lte` ranges on integer columns), then a live
 stream of what changes them. The writer serves none of it.
 
@@ -781,8 +784,6 @@ columns can be named with no terms, which is the whole table. A request outside 
 the part at fault. An unknown key is refused at load, and so is `pin`, which RFC-0080 describes and
 this build does not honour, rather than being ignored. This is a first cut: the route does not check
 a bearer token, and a request holds one shape, so `max_shapes_per_connection` is not yet reached.
-Do not enable it on a runtime shared between tenants yet: one mount's streams can disturb another's
-(#2600, #2612).
 
 ### `[mounts.counter]` - charging at your own endpoint (RFC-0046 S2)
 

@@ -130,6 +130,12 @@ unconfigured.
   fail the build on regression. Backfill events/sec is measured on every PR and tracked, not gated:
   the CI fixture cannot see a 4x decode cost (docs/benchmarks.md, #1723). Total tip lag, dominated
   by the poll interval, is tracked, not gated (#1884).
+- Running the whole suite locally on macOS needs three things CI has already (#2606). Put rustup's
+  pinned toolchain first on `PATH`: Homebrew's newer `rustc` ignores `rust-toolchain.toml`, ICEs on
+  dbsp, and mixes artifacts into a shared `target/` (E0514). Raise the open-file limit with
+  `ulimit -n 10240`; at the default 256 about 70 tests fail. And
+  `metrics::tests::process_cpu_seconds_advances_via_the_ps_fallback_off_linux` needs `ps`, so it
+  fails in a sandbox that hides it.
 
 ## AI-native surface (built-in, sovereignty-respecting)
 
@@ -340,10 +346,12 @@ unconfigured.
 > unchanged. RFC-0079's IPC answer is default-binary and adds no dependency; Flight SQL is behind an
 > off-by-default `flight` feature. RFC-0080's server half is opt-in per mount and served by followers;
 > its client half is an off-by-default `sync` feature of the engine crate. The gateway's `pin` header
-> keeps identity out of nuthatch. Each S0 can stop its RFC. **RFC-0080 S1 is kept as built** (Chief,
-> 2026-11-03, "whatever you think is best", #2620): it landed with #2596 before this was recorded. It
-> stays off unless a mount writes `[mounts.sync]`, and is not for a shared runtime until #2600 and
-> #2612 are fixed.
+> keeps identity out of nuthatch. Each S0 can stop its RFC. **RFC-0080's third S0 failed (2026-11-03,
+> §20, #2585)**: the shipped `/sync` cost 461% of a follower's apply on the gate's fixture, against a
+> 10% gate, and no shape class passes. Chief chose to take the server half out of the default binary:
+> it is built only with the off-by-default `sync-server` feature, a default build has no `/sync` route
+> and refuses `[mounts.sync]` by name, and the code stays. A redesign (rows shown without the engine,
+> §12's column probe) waits for a user who asks for it.
 
 >
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.

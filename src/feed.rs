@@ -741,18 +741,35 @@ impl Tap {
         if self.tx.receiver_count() == 0 {
             return Ok(());
         }
+        let resync = Delta {
+            epoch: self.epoch,
+            generation: state.generation,
+            resync: true,
+            ..Delta::default()
+        };
         let delta = match rec.into_ops() {
             Some(ops) => {
                 let seals = ops
                     .iter()
                     .any(|op| matches!(op, Op::Meta { key, .. } if key == "sealed_through"));
-                Delta {
-                    epoch: self.epoch,
-                    generation: state.generation,
-                    catalogue: if seals { self.catalogue() } else { None },
-                    ops,
-                    committed: Some(std::time::Instant::now()),
-                    ..Delta::default()
+                let catalogue = if seals { self.catalogue() } else { Ok(None) };
+                match catalogue {
+                    Ok(catalogue) => Delta {
+                        epoch: self.epoch,
+                        generation: state.generation,
+                        catalogue,
+                        ops,
+                        committed: Some(std::time::Instant::now()),
+                        ..Delta::default()
+                    },
+                    // A prune with no catalogue would leave followers without the rows it sealed.
+                    Err(e) => {
+                        tracing::warn!(
+                            "feed: the segment catalogue could not be read after a seal ({e}); \
+                             followers resnapshot"
+                        );
+                        resync
+                    }
                 }
             }
             None => Delta {
@@ -778,14 +795,20 @@ impl Tap {
         Ok((rx, state.generation, read))
     }
 
-    /// The catalogue on disk now.
-    pub fn catalogue(&self) -> Option<String> {
-        let dir = self.dir.as_ref()?;
-        std::fs::read_to_string(
+    /// The catalogue on disk now: `None` when there is none, an error when it is there and cannot be
+    /// read, which a seal must not treat as absent (#2592).
+    pub fn catalogue(&self) -> std::io::Result<Option<String>> {
+        let Some(dir) = self.dir.as_ref() else {
+            return Ok(None);
+        };
+        match std::fs::read_to_string(
             dir.join(crate::seal::SEGMENTS_DIR)
                 .join(crate::seal::MANIFEST_FILE),
-        )
-        .ok()
+        ) {
+            Ok(raw) => Ok(Some(raw)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -820,11 +843,13 @@ pub fn catalogue_ahead(raw: Option<&str>, sealed_through: u64) -> bool {
         })
 }
 
-/// A delta that does not follow the last generation applied.
+/// A delta that does not follow the last generation applied, or one the copy cannot apply whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gap {
     pub applied: (u64, u64),
     pub got: (u64, u64),
+    /// Why a delta that does follow was refused all the same.
+    pub cause: Option<&'static str>,
 }
 
 impl std::fmt::Display for Gap {
@@ -833,7 +858,11 @@ impl std::fmt::Display for Gap {
             f,
             "feed gap: applied generation {} of epoch {:x}, received {} of epoch {:x}",
             self.applied.1, self.applied.0, self.got.1, self.got.0
-        )
+        )?;
+        if let Some(cause) = self.cause {
+            write!(f, ": {cause}")?;
+        }
+        Ok(())
     }
 }
 
@@ -1275,6 +1304,24 @@ impl MemStore {
             return Err(Gap {
                 applied: (m.epoch, m.generation),
                 got: (delta.epoch, delta.generation),
+                cause: None,
+            });
+        }
+        // A seal's prune with nothing to read the pruned rows from instead (#2592): refused before
+        // anything moves, so the copy keeps serving them while it resnapshots.
+        let seal_prunes = delta
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Drop { to: Some(_), .. }))
+            && delta
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::Meta { key, .. } if key == "sealed_through"));
+        if seal_prunes && delta.catalogue.is_none() {
+            return Err(Gap {
+                applied: (m.epoch, m.generation),
+                got: (delta.epoch, delta.generation),
+                cause: Some("a seal's prune arrived with no segment catalogue to replace the rows"),
             });
         }
         // Bracketed odd while the change lands, as `Store::commit` is, so the memo's fence holds.
@@ -1763,114 +1810,6 @@ mod tests {
     use super::*;
     use crate::store::Store;
 
-    /// RFC-0080 S0's cost gate: what a shape filter adds to a follower's work on the same deltas,
-    /// against what the follower does to them today (decode the v2 frame, apply it to the mirror),
-    /// at 10,000 shapes. Run in release with `--ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn a_shape_filter_costs_under_a_tenth_of_the_follower_apply() {
-        use std::time::{Duration, Instant};
-        const POOLS: u64 = 2_000;
-        const BLOCKS: u64 = 500;
-        const PER_BLOCK: u64 = 200;
-        let address = |n: u64| format!("0x{n:040x}");
-        let mut index = crate::shape::ShapeIndex::default();
-        for s in 0..10_000 {
-            index.insert(crate::shape::Shape {
-                table: "swaps".into(),
-                terms: BTreeMap::from([(
-                    "pool".to_string(),
-                    std::collections::BTreeSet::from([address(s % POOLS)]),
-                )]),
-                ..Default::default()
-            });
-        }
-        // One delta per block, as a follower at the tip receives them, each as its v2 body.
-        let bodies: Vec<Vec<u8>> = (1..=BLOCKS)
-            .map(|block| {
-                let ops = (0..PER_BLOCK)
-                    .map(|log| {
-                        let i = block * PER_BLOCK + log;
-                        Op::Put {
-                            key: Store::entity_key(block, log),
-                            row: serde_json::json!({
-                                "table": "swaps",
-                                "pool": address(i * 7919 % POOLS),
-                                "block_number": block,
-                                "log_index": log,
-                                "tx": format!("0x{i:064x}"),
-                                "sender": address(i),
-                                "amount0": "123456789",
-                                "amount1": "987654321",
-                            })
-                            .to_string(),
-                        }
-                    })
-                    .collect();
-                let delta = Delta {
-                    epoch: 1,
-                    generation: block,
-                    ops,
-                    ..Default::default()
-                };
-                crate::feed_wire::encode_delta(&delta).unwrap()
-            })
-            .collect();
-        let dir = tempfile::tempdir().unwrap();
-        let (mut decode, mut apply) = (Duration::MAX, Duration::MAX);
-        let (mut parsed, mut text) = (Duration::MAX, Duration::MAX);
-        for _ in 0..5 {
-            let store = MemStore::from_snapshot(
-                dir.path(),
-                Snapshot {
-                    epoch: 1,
-                    ..Default::default()
-                },
-            );
-            let (mut d, mut a) = (Duration::ZERO, Duration::ZERO);
-            let (mut p, mut t) = (Duration::ZERO, Duration::ZERO);
-            let (mut hits, mut text_hits) = (0usize, 0usize);
-            let mut found = Vec::new();
-            for body in &bodies {
-                let started = Instant::now();
-                let delta = crate::feed_wire::decode_delta(body, None).unwrap();
-                d += started.elapsed();
-                let started = Instant::now();
-                let changes = store.apply(&delta).unwrap();
-                a += started.elapsed();
-                let started = Instant::now();
-                for raw in &changes.added {
-                    let row: serde_json::Value = serde_json::from_str(raw).unwrap();
-                    hits += index.matching(&row).len();
-                }
-                p += started.elapsed();
-                let started = Instant::now();
-                for raw in &changes.added {
-                    index.matching_text(raw, &mut found);
-                    text_hits += found.len();
-                }
-                t += started.elapsed();
-            }
-            assert_eq!(hits, text_hits, "the two paths find the same shapes");
-            std::hint::black_box(hits);
-            (decode, apply) = (decode.min(d), apply.min(a));
-            (parsed, text) = (parsed.min(p), text.min(t));
-        }
-        let follower = (decode + apply).as_secs_f64();
-        println!(
-            "{} rows: decode {decode:?}, apply {apply:?}; filter parsing each row {parsed:?} ({:.3}), \
-         reading the indexed columns off the text {text:?} ({:.3})",
-            BLOCKS * PER_BLOCK,
-            parsed.as_secs_f64() / follower,
-            text.as_secs_f64() / follower,
-        );
-        let ratio = text.as_secs_f64() / follower;
-        assert!(
-            ratio < 0.10,
-            "the filter costs {ratio:.3} of decode and apply"
-        );
-    }
-
     /// RFC-0080 §5.6: a `mount` line carries `[mounts.sync]`, reads without it from a writer that
     /// does not send it, and reads past a field a later writer adds.
     #[test]
@@ -2257,6 +2196,114 @@ mod tests {
         .unwrap();
         store.set_meta("sealed_through", "9").unwrap();
         assert!(next().sealed_unseen);
+    }
+
+    /// A manifest the writer cannot read, as a directory in its place is: any read fails and none
+    /// reads as absent.
+    fn break_catalogue(dir: &Path) {
+        let manifest = dir
+            .join(crate::seal::SEGMENTS_DIR)
+            .join(crate::seal::MANIFEST_FILE);
+        let _ = std::fs::remove_file(&manifest);
+        std::fs::create_dir_all(&manifest).unwrap();
+    }
+
+    /// #2592: a seal whose catalogue the writer cannot read is sent as a resync, not as a prune the
+    /// follower has no segment to replace, and the follower's copy keeps the row.
+    #[test]
+    fn a_seal_whose_catalogue_cannot_be_read_resyncs_rather_than_prunes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
+        let mut sub = crate::store::feed_subscribe(&store).unwrap();
+        let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot.clone());
+        store
+            .commit_window(&[row(1, 0, "t"), row(2, 0, "t")], None, 2)
+            .unwrap();
+        copy.apply(&sub.deltas.try_recv().unwrap()).unwrap();
+
+        break_catalogue(tmp.path());
+        store
+            .prune_and_set_meta(1, 1, "sealed_through", "1")
+            .unwrap();
+        let seal = sub.deltas.try_recv().unwrap();
+        assert!(
+            seal.resync,
+            "a seal without its catalogue must make followers resnapshot"
+        );
+        assert!(copy.apply(&seal).is_err());
+        assert_eq!(
+            nuthatch_core::store::HotStore::entities_in_range(&copy, 0, 9)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// #2592: a seal over finalized blocks with nothing to seal only moves the watermark, as
+    /// `core/src/seal.rs` does when `seal_range` returns `None`. It prunes nothing and has no
+    /// manifest to carry, and the follower takes it: the guard is for a prune only.
+    #[test]
+    fn a_seal_that_prunes_nothing_needs_no_catalogue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
+        let mut sub = crate::store::feed_subscribe(&store).unwrap();
+        let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot.clone());
+        store.set_meta("sealed_through", "5").unwrap();
+        let seal = sub.deltas.try_recv().unwrap();
+        assert!(!seal.resync && seal.catalogue.is_none());
+        copy.apply(&seal).unwrap();
+    }
+
+    /// #2592, the follower's own guard: a delta that prunes hot rows and carries no catalogue to
+    /// read them from instead is refused, so the copy keeps serving what it had and resnapshots.
+    #[test]
+    fn a_follower_refuses_a_prune_with_no_catalogue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
+        let mut sub = crate::store::feed_subscribe(&store).unwrap();
+        let copy = MemStore::from_snapshot(tmp.path(), sub.snapshot.clone());
+        store
+            .commit_window(&[row(1, 0, "t"), row(2, 0, "t")], None, 2)
+            .unwrap();
+        copy.apply(&sub.deltas.try_recv().unwrap()).unwrap();
+
+        write_catalogue(tmp.path(), 1);
+        store
+            .prune_and_set_meta(1, 1, "sealed_through", "1")
+            .unwrap();
+        let mut seal = (*sub.deltas.try_recv().unwrap()).clone();
+        assert!(seal.catalogue.is_some());
+        seal.catalogue = None;
+        let refused = copy.apply(&seal).unwrap_err();
+        assert!(refused.to_string().contains("catalogue"), "{refused}");
+        assert_eq!(
+            nuthatch_core::store::HotStore::entities_in_range(&copy, 0, 9)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            copy.apply(&seal).is_err(),
+            "refusing changed nothing it would then accept"
+        );
+    }
+
+    /// #2592: the writer does not hand out a snapshot of a sealed nest whose catalogue it cannot
+    /// read, since its hot rows past the seal are already pruned.
+    #[test]
+    fn a_snapshot_is_refused_when_the_catalogue_cannot_be_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("nuthatch.redb")).unwrap();
+        store
+            .commit_window(&[row(1, 0, "t"), row(2, 0, "t")], None, 2)
+            .unwrap();
+        write_catalogue(tmp.path(), 1);
+        store
+            .prune_and_set_meta(1, 1, "sealed_through", "1")
+            .unwrap();
+        break_catalogue(tmp.path());
+        let refused = crate::store::feed_subscribe(&store).err().expect("refused");
+        assert!(format!("{refused:#}").contains("catalogue"), "{refused:#}");
     }
 
     /// A snapshot is read under the cap its dataset is given, a line at a time, its entity rows, meta,

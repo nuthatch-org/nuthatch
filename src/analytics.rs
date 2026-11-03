@@ -60,7 +60,7 @@ pub fn uncached<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Whether a session over `dir` for the shared tenant is in the cache now, for tests.
-#[cfg(test)]
+#[cfg(all(test, feature = "sync-server"))]
 pub(crate) fn session_cached(dir: &Path) -> bool {
     session_cache_lock().contains_key(&(dir.to_path_buf(), None))
 }
@@ -7356,6 +7356,38 @@ template="pool"
         assert_eq!(ipc.rows, json.rows.len(), "row for row equal to JSON");
     }
 
+    /// #2631: a view column inside a list or a struct carries the batch's strings too, and the engine
+    /// produces both from ordinary SQL.
+    #[test]
+    fn an_arrow_answer_over_a_nested_view_column_holds_the_byte_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = |arrow| QueryGuard {
+            timeout: Duration::from_secs(30),
+            max_rows: 50_000,
+            max_result_bytes: 1 << 20,
+            arrow,
+            ..Default::default()
+        };
+        for sql in [
+            "SELECT make_array(arrow_cast(repeat('A', 100000), 'Utf8View')) AS x FROM range(32)",
+            "SELECT named_struct('s', arrow_cast(repeat('A', 100000), 'Utf8View')) AS x FROM range(32)",
+        ] {
+            let out = query_guarded(dir.path(), sql, guard(true)).unwrap();
+            let ipc = out.ipc.expect("an Arrow answer");
+            assert!(out.truncated, "{sql}: the cap was crossed");
+            assert!(
+                ipc.bytes.len() < (1 << 20) + 200_000,
+                "{sql}: {} bytes written for {} rows",
+                ipc.bytes.len(),
+                ipc.rows
+            );
+            // JSON refuses a list of views as outside its subset; where it answers, it agrees.
+            if let Ok(json) = query_guarded(dir.path(), sql, guard(false)) {
+                assert_eq!(ipc.rows, json.rows.len(), "{sql}: row for row equal to JSON");
+            }
+        }
+    }
+
     /// #1650: one DataFusion batch of 8,192 cells, 100 KB each, before the 64 MiB cap runs.
     /// Ignored because the point is the resident size, and the suite should not allocate it.
     #[test]
@@ -8288,10 +8320,7 @@ template="pool"
             ..Default::default()
         };
         let result = {
-            let _env = crate::analytics_budget::tests::env_lock()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let _vars = crate::analytics_budget::tests::EnvVars::set(&[
+            let _vars = crate::analytics_budget::tests::ThreadVars::set(&[
                 (crate::analytics_budget::ENV_MAX_TEMP_SIZE, "4MB"),
                 (crate::analytics_budget::ENV_BURRMILL_MEMORY_LIMIT, "4MB"),
             ]);
@@ -9814,7 +9843,7 @@ FROM bet GROUP BY player;
         .unwrap();
         held(dir.path(), 2);
         let tenant: Arc<str> = Arc::from("acme");
-        crate::maintained::seat(dir.path(), tenant.clone(), guard());
+        crate::maintained::seat(dir.path(), "acme/bet", tenant.clone(), guard());
         let refused = |d: &Path| {
             view_failures(d).iter().any(|(file, _, e)| {
                 file.contains("05-table") && e.contains("strict isolation runs only CREATE VIEW")
@@ -9853,12 +9882,61 @@ FROM bet GROUP BY player;
         );
         crate::maintained::wait_idle(dir.path());
         assert!(copies(dir.path(), "bet").is_empty(), "built before a seat");
-        crate::maintained::seat(dir.path(), Arc::from("acme"), guard());
+        crate::maintained::seat(dir.path(), "acme/bet", Arc::from("acme"), guard());
         crate::maintained::wait_idle(dir.path());
         assert_eq!(
             copies(dir.path(), "bet").len(),
             1,
             "the seat plans the build"
+        );
+    }
+
+    /// #2636: a mount that leaves takes its seat with it, so the builds run as a mount still holding
+    /// the dataset, under that mount's limits, and an unheld strict nest builds nothing.
+    #[test]
+    fn an_unmount_takes_back_its_seat() {
+        let dir = nest(Some("[[view]]\nname = \"bet\"\n"));
+        crate::maintained::load(dir.path()).unwrap();
+        crate::maintained::attach(dir.path(), crate::serve::SqlGate::new(2), true);
+        let tight = QueryGuard {
+            timeout: Duration::from_millis(300),
+            ..guard()
+        };
+        crate::maintained::seat(dir.path(), "acme/bet", Arc::from("acme"), tight);
+        crate::maintained::seat(dir.path(), "globex/bet", Arc::from("globex"), guard());
+        let seated = || {
+            crate::maintained::seated_tenant(dir.path())
+                .as_deref()
+                .map(String::from)
+        };
+        assert_eq!(seated().as_deref(), Some("acme"));
+
+        crate::maintained::unseat(dir.path(), "acme/bet");
+        assert_eq!(
+            seated().as_deref(),
+            Some("globex"),
+            "builds run as a mount that still holds the dataset"
+        );
+        assert_eq!(
+            crate::maintained::seated_timeout(dir.path()),
+            Some(guard().timeout),
+            "the departed mount's tighter deadline went with it"
+        );
+
+        crate::maintained::unseat(dir.path(), "globex/bet");
+        assert_eq!(seated(), None);
+        let hot = tip(&[placed(4, "carol", 13, 20)]);
+        crate::maintained::feed(
+            dir.path(),
+            crate::maintained::Feed {
+                read: Box::new(move || Ok((hot.clone(), 10))),
+                declared: Arc::new(Vec::new()),
+            },
+        );
+        crate::maintained::wait_idle(dir.path());
+        assert!(
+            copies(dir.path(), "bet").is_empty(),
+            "a strict nest no mount holds built as someone"
         );
     }
 
@@ -9876,6 +9954,7 @@ FROM bet GROUP BY player;
         let gate = held(dir.path(), 2);
         crate::maintained::seat(
             dir.path(),
+            "acme/slow",
             Arc::from("acme"),
             QueryGuard {
                 timeout: Duration::from_millis(300),

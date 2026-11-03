@@ -349,7 +349,10 @@ impl Cellar {
                 continue;
             };
             if self.pack_hash(at, len)? != s.hash {
-                bail!("{} in the pack does not hash to its content address", s.file);
+                bail!(
+                    "{} in the pack does not hash to its content address",
+                    s.file
+                );
             }
             count += 1;
             bytes += len;

@@ -560,6 +560,12 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
             .route("/subgraphs/name/{*name}", post(graph_graphql));
         r
     };
+    // RFC-0080 §20: `/sync` exists only in a `sync-server` build.
+    let sync_server = |r: Router<SharedNest>| {
+        #[cfg(feature = "sync-server")]
+        let r = r.route("/sync", get(sync_route));
+        r
+    };
     let admin = |r: Router<SharedNest>| {
         if !admin_enabled {
             return r;
@@ -571,7 +577,7 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
             .route("/_admin/storage", get(admin_storage))
             .route("/_admin/requests", get(admin_requests))
     };
-    admin(graph_facade(
+    admin(sync_server(graph_facade(
         Router::new()
             .route("/", get(summary))
             .route("/health", get(|| async { "ok" }))
@@ -597,9 +603,8 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
             .route("/flags", get(flags))
             .route("/nest", get(nest))
             .route("/shape", get(shape))
-            .route("/sync", get(sync_route))
             .route("/api", get(etherscan_api)),
-    ))
+    )))
     .route_layer(axum::middleware::from_fn(crate::cost::layer))
     // Count every served request for `/metrics` (the operator's billing signal), and keep the last
     // few for `/_admin/requests` (RFC-0069 G1). The ring belongs to the route set, so a hot swap of
@@ -624,6 +629,7 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
 
 /// How a follower answers `GET /<route>/sync` (RFC-0080), put on the request by its own layer so the
 /// route runs inside the mount's: counted, timed and pinned as `/sql` is (#2603).
+#[cfg(feature = "sync-server")]
 #[derive(Clone)]
 pub struct SyncHandler(
     pub  Arc<
@@ -634,6 +640,7 @@ pub struct SyncHandler(
 );
 
 /// `GET /sync`: a follower's shapes. A writer serves none of them.
+#[cfg(feature = "sync-server")]
 async fn sync_route(
     handler: Option<axum::Extension<SyncHandler>>,
     uri: axum::http::Uri,
@@ -711,6 +718,7 @@ fn segment_gone() -> axum::response::Response {
 /// Runs `work` as `pin_request` runs a request: against one version of the nest's state and of the
 /// copy it reads, which a follower's catalogue is only read from (RFC-0080's `/sync` is answered
 /// outside the nest's router, so it takes the pin itself). An answer missing a segment is a `503`.
+#[cfg(feature = "sync-server")]
 pub(crate) async fn within_pin<T, Fut>(
     backing: SharedNest,
     work: impl FnOnce(Arc<AppState>) -> Fut,
@@ -3794,6 +3802,7 @@ async fn admit(s: &AppState) -> std::result::Result<GatePermit, axum::response::
 /// `sql` answered as `/sql` answers it, for a follower's `/sync` (RFC-0080): its gate, caps, timeout,
 /// memo and response-bytes budget, and its rows, with whether they were cut at the cap and the
 /// answer's provenance. A refusal comes back as the response `/sql` would have sent.
+#[cfg(feature = "sync-server")]
 pub(crate) async fn sync_query(
     s: AppState,
     sql: String,
@@ -3817,6 +3826,7 @@ pub(crate) async fn sync_query(
 
 /// Stored `rows` of `table` as `/sql` shows them: the same engine, over those rows alone, so a row
 /// that reaches a subscriber live has the columns of one that came from the first answer.
+#[cfg(feature = "sync-server")]
 pub(crate) fn project_rows(s: &AppState, table: &str, rows: Vec<Value>) -> Result<Vec<Value>> {
     project_rows_in(s, tempfile::tempdir()?.path(), table, rows)
 }
@@ -3824,6 +3834,7 @@ pub(crate) fn project_rows(s: &AppState, table: &str, rows: Vec<Value>) -> Resul
 /// [`project_rows`] over `dir`. The delta's rows are already held, so no row or byte cap applies:
 /// a route's `max_rows` truncating one would end every stream on the dataset (#2600). And the
 /// directory is never asked about again, so its session stays out of the cache (#2612).
+#[cfg(feature = "sync-server")]
 fn project_rows_in(
     s: &AppState,
     dir: &std::path::Path,
@@ -3845,6 +3856,7 @@ fn project_rows_in(
 }
 
 /// Room in the response-bytes budget for `bytes`, held until it is dropped.
+#[cfg(feature = "sync-server")]
 pub(crate) fn reserve_answer(
     s: &AppState,
     bytes: usize,
@@ -6417,6 +6429,7 @@ mod tests {
 
     /// #2600, #2612: a delta's rows are projected whole whatever the route's row and byte caps, and
     /// the directory they are projected over leaves no session in the cache to evict a real nest's.
+    #[cfg(feature = "sync-server")]
     #[test]
     fn a_projected_delta_is_whole_and_leaves_no_cached_session() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7495,6 +7508,30 @@ mod tests {
             .to_string()
             .contains("quarantined"));
         crate::metrics::METRICS.remove_nest(&name);
+    }
+
+    /// RFC-0080 §20: `/sync` is a route only in a `sync-server` build. Without it the router has no
+    /// such path; with it a writer answers its own `sync_off`.
+    #[tokio::test]
+    async fn sync_is_a_route_only_in_a_sync_server_build() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(SharedNest::new(test_state(dir.path(), SQL_MAX_CONCURRENCY)));
+        let req = axum::http::Request::builder()
+            .uri("/sync?s=%7B%7D")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(
+            body.contains("sync_off"),
+            cfg!(feature = "sync-server"),
+            "{body}"
+        );
     }
 
     #[cfg(feature = "graph")]

@@ -287,8 +287,31 @@ pub fn validate_against(cfg: &AnalyticsConfig, pools: usize) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Settings a test gives only the sessions its own thread opens (#2644), read before the process
+    /// environment. A 4 MB pool set with `std::env::set_var` reached every session opened anywhere
+    /// meanwhile, and failed whichever neighbour's query or maintained build it caught.
+    static THREAD_ENV: std::cell::RefCell<Vec<(&'static str, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn var(key: &str) -> Result<String, std::env::VarError> {
+    #[cfg(test)]
+    if let Some(v) = THREAD_ENV.with(|e| {
+        e.borrow()
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.clone())
+    }) {
+        return Ok(v);
+    }
+    std::env::var(key)
+}
+
 fn env_u64_memory(key: &str, default: u64) -> u64 {
-    match std::env::var(key) {
+    match var(key) {
         Err(_) => default,
         Ok(raw) => match parse_memory_mb(&raw) {
             Some(n) if n > 0 => n,
@@ -308,7 +331,7 @@ fn env_u64_memory(key: &str, default: u64) -> u64 {
 /// there, naming the key. Folding it into `None` made it mean "unset", so the derived default
 /// applied and the process started, which is the opposite of what the operator wrote.
 fn env_optional_memory(key: &str) -> Option<u64> {
-    match std::env::var(key) {
+    match var(key) {
         Err(_) => None,
         Ok(raw) if raw.trim().is_empty() => None,
         Ok(raw) => match parse_memory_mb(&raw) {
@@ -326,7 +349,7 @@ fn env_optional_memory(key: &str) -> Option<u64> {
 
 /// `n >= 1` is kept as requested so [`validate_against`] can refuse n above [`THREADS_CEILING`].
 fn env_threads() -> i64 {
-    match std::env::var(ENV_THREADS) {
+    match var(ENV_THREADS) {
         Err(_) => DEFAULT_THREADS,
         Ok(raw) => match raw.trim().parse::<i64>() {
             Ok(n) if n >= 1 => n,
@@ -343,14 +366,14 @@ fn env_threads() -> i64 {
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
-    match std::env::var(key) {
+    match var(key) {
         Ok(raw) if !raw.trim().is_empty() => Some(PathBuf::from(raw.trim())),
         _ => None,
     }
 }
 
 fn env_size(key: &str) -> Option<String> {
-    match std::env::var(key) {
+    match var(key) {
         Err(_) => None,
         Ok(raw) if raw.trim().is_empty() => None,
         Ok(raw) => match parse_size(&raw) {
@@ -444,6 +467,27 @@ pub(crate) mod tests {
             )
         };
         const { assert!(crate::feed_http::FEED_QUEUE_BYTES <= crate::feed_http::FEED_QUEUE_TOTAL_BYTES) };
+    }
+
+    /// Sets each variable for this thread's sessions only, until dropped (#2644). For a test that
+    /// runs queries under a lowered budget; `EnvVars` is for tests of the parsing itself.
+    pub(crate) struct ThreadVars(usize);
+
+    impl ThreadVars {
+        pub(crate) fn set(vars: &[(&'static str, &str)]) -> ThreadVars {
+            super::THREAD_ENV.with(|e| {
+                let mut e = e.borrow_mut();
+                let before = e.len();
+                e.extend(vars.iter().map(|&(k, v)| (k, v.to_string())));
+                ThreadVars(before)
+            })
+        }
+    }
+
+    impl Drop for ThreadVars {
+        fn drop(&mut self) {
+            super::THREAD_ENV.with(|e| e.borrow_mut().truncate(self.0));
+        }
     }
 
     /// Held by every test that sets or reads the `NUTHATCH_ANALYTICS_*` environment.

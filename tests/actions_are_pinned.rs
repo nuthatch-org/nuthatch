@@ -296,3 +296,127 @@ fn a_local_action_is_still_exempt_and_an_action_still_needs_its_sha() {
         "a 40-hex commit sha is the action pin and must still be accepted"
     );
 }
+
+// #2621: the same hazard through the other doors. A browser installed `@stable`, a tool installed
+// with no version, or an archive piped straight into `tar` runs whatever is current that day, with
+// this repository's token. These scan `ci.yml` and the local composite actions it calls.
+
+fn ci_and_local_actions() -> Vec<(String, Vec<String>)> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![root.join(".github/workflows/ci.yml")];
+    for e in std::fs::read_dir(root.join(".github/actions")).unwrap() {
+        let p = e.unwrap().path().join("action.yml");
+        if p.is_file() {
+            files.push(p);
+        }
+    }
+    files
+        .into_iter()
+        .map(|f| {
+            let lines = std::fs::read_to_string(&f)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            (f.display().to_string(), lines)
+        })
+        .collect()
+}
+
+fn is_comment(line: &str) -> bool {
+    line.trim_start().starts_with('#')
+}
+
+#[test]
+fn ci_runs_with_a_read_only_token() {
+    let ci = std::fs::read_to_string(workflows().join("ci.yml")).unwrap();
+    let lines: Vec<&str> = ci.lines().collect();
+    let at = lines.iter().position(|l| *l == "permissions:").expect(
+        "ci.yml has no top-level `permissions:`, so every job gets the default token scope",
+    );
+    let block: Vec<&str> = lines[at + 1..]
+        .iter()
+        .take_while(|l| l.starts_with("  ") || l.trim().is_empty())
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(
+        block,
+        ["contents: read"],
+        "the top-level block should grant `contents: read` and nothing else"
+    );
+    // A job that needs more says so in its own block, beside the job, where review sees it.
+    let job_level = lines
+        .iter()
+        .filter(|l| l.starts_with("    permissions:"))
+        .count();
+    assert_eq!(
+        job_level, 0,
+        "a job now asks for its own token scope; check it needs it, then raise this count with a \
+         note of which job and why"
+    );
+}
+
+#[test]
+fn every_archive_ci_fetches_is_checked_against_a_digest() {
+    let mut bad = Vec::new();
+    for (f, lines) in ci_and_local_actions() {
+        for (i, l) in lines.iter().enumerate() {
+            if is_comment(l) || !l.contains("curl ") {
+                continue;
+            }
+            let remote =
+                l.contains("https://") || lines.get(i + 1).is_some_and(|n| n.contains("https://"));
+            let to_file = l.contains(" -o ");
+            if remote && !to_file {
+                bad.push(format!(
+                    "{f}:{}: fetched without saving it to check: {}",
+                    i + 1,
+                    l.trim()
+                ));
+            }
+            // The check must name the file this curl saved, not merely sit nearby.
+            let saved = l
+                .split(" -o ")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .map(|s| s.trim_matches('"'))
+                .unwrap_or("");
+            if to_file
+                && !lines[i + 1..(i + 4).min(lines.len())]
+                    .iter()
+                    .any(|n| n.contains("sha256sum -c") && !saved.is_empty() && n.contains(saved))
+            {
+                bad.push(format!(
+                    "{f}:{}: saved with no sha256sum -c after it: {}",
+                    i + 1,
+                    l.trim()
+                ));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+#[test]
+fn no_ci_tool_or_browser_is_installed_at_whatever_is_current() {
+    let mut bad = Vec::new();
+    for (f, lines) in ci_and_local_actions() {
+        for (i, l) in lines.iter().enumerate() {
+            if is_comment(l) {
+                continue;
+            }
+            if l.contains("@stable") || l.contains("@latest") {
+                bad.push(format!("{f}:{}: floating channel: {}", i + 1, l.trim()));
+            }
+            if l.contains("cargo install ") && !l.contains("--version") {
+                bad.push(format!(
+                    "{f}:{}: cargo install with no --version: {}",
+                    i + 1,
+                    l.trim()
+                ));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

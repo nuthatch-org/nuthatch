@@ -1,0 +1,10 @@
+[nest]
+name = "history-base"
+chain = "base"
+chain_id = 8453
+schema_version = 2
+# No rpc_urls: NUTHATCH_RPC_8453 and NUTHATCH_TRACE_RPC_8453 name them. See README.
+
+[address_history]
+addresses = []
+# start_block = 0   # history before it is never fetched; see README
