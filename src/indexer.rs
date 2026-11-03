@@ -15827,6 +15827,67 @@ template = "pool"
         task.abort();
     }
 
+    /// #2593: an unmount arriving while the nest is inside a slow window is not reported retired
+    /// before its task has stopped, and one the runtime abandons (its ack timed out, so it kept the
+    /// mount) leaves the nest indexing rather than served with no task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unmount_abandoned_mid_window_leaves_the_nest_indexing() {
+        const TIP: u64 = 45;
+        let root = tempfile::tempdir().unwrap();
+        let nests = s0_nests(root.path(), false).await;
+        let b_dir = nests[1].dir.clone();
+        let b_store = nests[1].store.clone();
+        slowed_nests()
+            .lock()
+            .unwrap()
+            .push((b_dir.clone(), std::time::Duration::from_millis(1500)));
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = spawn_test_cursor(
+            CursorKind::Buffered(4),
+            Arc::new(FilteringSource {
+                logs: three_transfer_chain(TIP),
+            }),
+            nests,
+            Some(TIP - 1),
+            3,
+            health.clone(),
+            false,
+            Some(rx),
+        );
+        // Just after a commit, b is at the start of its next window's 1.5 s.
+        let first = last_block_of(b_store.as_ref());
+        wait_for(
+            "b commits a window",
+            std::time::Duration::from_secs(20),
+            || last_block_of(b_store.as_ref()) != first,
+        )
+        .await;
+        let (ack, acked) = tokio::sync::oneshot::channel();
+        tx.send(CursorCommand::Unmount {
+            name: "b".into(),
+            ack: Some(ack),
+        })
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let retired =
+            |h: &crate::health::RuntimeHealth| h.status("b").is_some_and(|s| s.class == "retired");
+        assert!(
+            !retired(&health),
+            "b was reported retired while its task was still inside a window"
+        );
+        drop(acked);
+        wait_for(
+            "b indexes on to the tip after the abandoned unmount",
+            std::time::Duration::from_secs(60),
+            || last_block_of(b_store.as_ref()) == Some(TIP),
+        )
+        .await;
+        assert!(!retired(&health), "b is indexing, so it is not retired");
+        slowed_nests().lock().unwrap().retain(|(d, _)| d != &b_dir);
+        task.abort();
+    }
+
     /// RFC-0073 FR6 on the buffered cursor: a panic in one nest's window is that nest's terminal
     /// fault, and its co-tenants index on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
