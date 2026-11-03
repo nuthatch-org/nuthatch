@@ -1393,6 +1393,15 @@ jobs:
         with:
           manifest-path: timelapse/Cargo.toml
           command: check advisories licenses bans sources
+      # #2617: the wasm engine every release attaches is two separate trees with their own lockfiles.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          manifest-path: embed/Cargo.toml
+          command: check advisories licenses bans sources
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          manifest-path: embed/plain/Cargo.toml
+          command: check advisories licenses bans sources
 
   build-release:
     name: build release

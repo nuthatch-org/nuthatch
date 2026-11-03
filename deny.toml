@@ -43,6 +43,8 @@ ignore = [
   #     below), and nuthatch serves HTTP with axum.
   #   - zstd is decoded in Parquet pages only: segments this binary sealed, or ones `seed` fetched and
   #     kept only after they hashed to the address the operator's chosen snapshot names (seed.rs).
+  #     The wasm engine (embed/) decodes only what it sealed or what a mirror served and it read back
+  #     against the segment's content address before use (embed/src/mirror.rs). (#2617)
   #   - Nothing here uses the seekable format (0398).
   # Lift these when arrow/parquet move to zstd 0.14. Review by 2026-12-01. (#2411)
   "RUSTSEC-2026-0391", # zstd: abandoned stream data leaks into the next on a reused context
@@ -132,5 +134,14 @@ deny = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Burrmill, the analytical engine, pinned by rev.
-allow-git = ["https://github.com/nuthatch-org/burrmill"]
+# Burrmill, the analytical engine, pinned by rev. The rest are our own forks the wasm engine
+# (embed/, embed/plain/) patches crates.io onto, each pinned by rev in those manifests (#2617).
+allow-git = [
+  "https://github.com/nuthatch-org/burrmill",
+  "https://github.com/nuthatch-org/feldera",
+  "https://github.com/nuthatch-org/size-of",
+  "https://github.com/nuthatch-org/web-time",
+  "https://github.com/nuthatch-org/chrono",
+  "https://github.com/nuthatch-org/uuid",
+  "https://github.com/nuthatch-org/getrandom",
+]
