@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Print `<chain>\t<rpc url>` for every endpoint `src/chains.rs` actually ships.
+# Print `<chain>\t<rpc url>` for every endpoint `core/src/chains.rs` actually ships.
 #
 # `live-endpoints.yml` probes what this prints. It used to carry its own copy of the list, and a copy
 # goes stale in both directions: on 2026-09-07 (#1196) the workflow was still probing three endpoints
@@ -22,11 +22,11 @@ function strip_comment(s,    i) {
 }
 function fail(msg) { print msg > "/dev/stderr"; failed = 1; exit 1 }
 function chain_end(    name, urls, n, lines, i, line, found) {
-  if (!match(body, /name:[[:space:]]*"[^"]+"/)) fail("cannot read the Chain block at line " start " in src/chains.rs: no name. Teach this script that shape rather than letting the chain drop out of the probe list.")
+  if (!match(body, /name:[[:space:]]*"[^"]+"/)) fail("cannot read the Chain block at line " start " in core/src/chains.rs: no name. Teach this script that shape rather than letting the chain drop out of the probe list.")
   name = substr(body, RSTART, RLENGTH); sub(/^name:[[:space:]]*"/, "", name); sub(/"$/, "", name)
   # A `Chain` block this cannot read is a hard failure, never a skip. Skipping is the shape of bug
   # this exists to remove: the chain vanishes from the probe list *and* from the coverage gate.
-  if (!match(body, /rpc_urls:[[:space:]]*&[[][^]]*[]]/)) fail("cannot read the Chain block at line " start " in src/chains.rs: no rpc_urls. Teach this script that shape rather than letting the chain drop out of the probe list.")
+  if (!match(body, /rpc_urls:[[:space:]]*&[[][^]]*[]]/)) fail("cannot read the Chain block at line " start " in core/src/chains.rs: no rpc_urls. Teach this script that shape rather than letting the chain drop out of the probe list.")
   urls = substr(body, RSTART, RLENGTH)
   n = split(urls, lines, "\n")
   found = 0
@@ -55,6 +55,6 @@ match($0, /const[[:space:]]+[A-Za-z0-9_]+:[[:space:]]*Chain[[:space:]]*=[[:space
 }
 END {
   if (failed) exit 1
-  if (chains == 0 || rows == 0) { print "no chains extracted from src/chains.rs" > "/dev/stderr"; exit 1 }
+  if (chains == 0 || rows == 0) { print "no chains extracted from core/src/chains.rs" > "/dev/stderr"; exit 1 }
 }
-' src/chains.rs
+' core/src/chains.rs

@@ -1239,6 +1239,16 @@ impl MemStore {
         self.copy.tracking.store(true, Ordering::SeqCst);
     }
 
+    /// Stops [`MemStore::track_changes`], once nothing follows a shape of this copy.
+    pub fn untrack_changes(&self) {
+        self.copy.tracking.store(false, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub fn tracking_changes(&self) -> bool {
+        self.copy.tracking.load(Ordering::SeqCst)
+    }
+
     /// `(epoch, generation)` of the last delta applied.
     /// Whether a request found a segment this copy names missing since this was last asked.
     pub fn take_missing(&self) -> bool {
@@ -1963,9 +1973,13 @@ mod tests {
         let now = crate::store::feed_subscribe(&store).unwrap().snapshot;
         assert_eq!(copy.applied(), (now.epoch, now.generation));
         assert_eq!(copy.tables(), MirroredTables::of(&now));
-        assert!(
-            !copy.tables().meta.contains_key("outbox_next_seq"),
-            "the writer's outbox is not mirrored"
+        assert_eq!(
+            copy.tables()
+                .meta
+                .get("outbox_next_seq")
+                .map(String::as_str),
+            Some("1"),
+            "the outbox counter is followed by delta, so a promotion numbers past it (#2598)"
         );
         let ours =
             crate::store::CoreHotStore::hot_rows_by_table_bounded_with_bytes(&copy, 100, u64::MAX)

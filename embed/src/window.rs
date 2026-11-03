@@ -34,7 +34,7 @@ fn hash_of(block: u64) -> String {
 
 /// A recorded chain: every block has a hash and a timestamp derived from its number, and `logs` are
 /// answered from the tape by the filter's addresses and topic0s.
-struct Tape(Vec<Log>);
+pub(crate) struct Tape(pub(crate) Vec<Log>);
 
 #[async_trait::async_trait]
 impl Source for Tape {
@@ -92,7 +92,7 @@ impl WindowEntity for NoEntity {
 /// Only what a window reads and writes; the rest is never reached. `committed` keeps every row a
 /// commit wrote, since sealing prunes them from `rows`.
 #[derive(Default)]
-struct Mem {
+pub(crate) struct Mem {
     committed: Mutex<Vec<(String, String)>>,
     rows: Mutex<BTreeMap<(u64, u64), String>>,
     meta: Mutex<HashMap<String, String>>,
@@ -108,11 +108,15 @@ impl Mem {
     fn put(&self, block: u64, log: u64, json: String) {
         self.rows.lock().unwrap().insert((block, log), json);
     }
-    fn set(&self, key: &str, value: u64) {
+    pub(crate) fn set(&self, key: &str, value: u64) {
         self.meta
             .lock()
             .unwrap()
             .insert(key.into(), value.to_string());
+    }
+    #[cfg(test)]
+    pub(crate) fn set_hash(&self, block: u64, hash: &str) {
+        self.hashes.lock().unwrap().insert(block, hash.into());
     }
 }
 

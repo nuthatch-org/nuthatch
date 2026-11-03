@@ -589,6 +589,26 @@ fn lease_key(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
+/// A writer's catalogue as one snapshot saw it, so a request on that snapshot reads the catalogue its
+/// watermark pairs with (#2613). The lease keeps every file it names on disk while it is held.
+pub struct PinnedCatalogue {
+    raw: Option<Arc<[u8]>>,
+    _lease: ReadLease,
+}
+
+impl PinnedCatalogue {
+    /// Taken where nothing seals `dir` until it returns, as a snapshot is.
+    pub fn take(dir: &Path) -> Result<Self> {
+        let lease = read_lease(dir);
+        let raw = match std::fs::read(manifest_path(dir)) {
+            Ok(raw) => Some(Arc::from(raw)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).context("reading the catalogue a snapshot pins"),
+        };
+        Ok(PinnedCatalogue { raw, _lease: lease })
+    }
+}
+
 /// Holds `dir`'s segment set for the lifetime of the value. Take it before reading the manifest.
 pub struct ReadLease {
     key: PathBuf,
@@ -903,6 +923,8 @@ fn checked(m: Manifest) -> Result<Manifest> {
 pub struct Serving {
     dir: PathBuf,
     store: Arc<dyn crate::store::HotStore>,
+    /// A writer's snapshot's catalogue, read in place of the file.
+    catalogue: Option<Arc<PinnedCatalogue>>,
     /// Set when a segment the copy's catalogue names was missing on disk.
     missing: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -954,17 +976,19 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Run `fut` as a request served from `store` over `dir`, and say whether it found a segment its
-/// copy names missing.
+/// Run `fut` as a request served from `store` over `dir`, reading `catalogue` where a writer's
+/// snapshot pinned one, and say whether it found a segment its copy names missing.
 pub async fn serving<F: std::future::Future>(
     dir: PathBuf,
     store: Arc<dyn crate::store::HotStore>,
+    catalogue: Option<Arc<PinnedCatalogue>>,
     fut: F,
 ) -> (F::Output, bool) {
     let missing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let serving = Serving {
         dir,
         store,
+        catalogue,
         missing: missing.clone(),
     };
     let out = SERVING.scope(serving, fut).await;
@@ -992,9 +1016,20 @@ fn on_thread<R>(serving: Option<Serving>, f: impl FnOnce() -> R) -> R {
 
 /// [`serving`] for work on this thread, outside any request.
 pub fn within<R>(dir: &Path, store: Arc<dyn crate::store::HotStore>, f: impl FnOnce() -> R) -> R {
+    within_pinned(dir, store, None, f)
+}
+
+/// [`within`], reading `catalogue` in place of the file.
+pub fn within_pinned<R>(
+    dir: &Path,
+    store: Arc<dyn crate::store::HotStore>,
+    catalogue: Option<Arc<PinnedCatalogue>>,
+    f: impl FnOnce() -> R,
+) -> R {
     let serving = Serving {
         dir: dir.to_path_buf(),
         store,
+        catalogue,
         missing: Default::default(),
     };
     on_thread(Some(serving), f)
@@ -1040,11 +1075,15 @@ pub fn unfollow(dir: &Path) {
 /// read for a directory a follower holds.
 fn read_catalogue(dir: &Path) -> std::io::Result<Vec<u8>> {
     if let Some(s) = current_serving().filter(|s| s.dir == dir) {
-        return match s.store.served_catalogue() {
-            Some(Some(raw)) => Ok(raw.as_bytes().to_vec()),
-            Some(None) => Err(std::io::ErrorKind::NotFound.into()),
-            // The writer's own store: its catalogue is the file.
-            None => std::fs::read(manifest_path(dir)),
+        return match (s.store.served_catalogue(), &s.catalogue) {
+            (Some(Some(raw)), _) => Ok(raw.as_bytes().to_vec()),
+            (Some(None), _) => Err(std::io::ErrorKind::NotFound.into()),
+            (None, Some(pinned)) => match &pinned.raw {
+                Some(raw) => Ok(raw.to_vec()),
+                None => Err(std::io::ErrorKind::NotFound.into()),
+            },
+            // The writer's own store outside a snapshot: its catalogue is the file.
+            (None, None) => std::fs::read(manifest_path(dir)),
         };
     }
     let held = followed()

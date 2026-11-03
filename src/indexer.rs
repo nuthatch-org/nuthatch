@@ -2851,6 +2851,7 @@ pub async fn spawn_runtime(
         health,
         fail_fast,
         false,
+        None,
     )
     .await
 }
@@ -2869,6 +2870,7 @@ pub async fn spawn_runtime_at_boot(
     admin_token: Option<String>,
     health: Arc<crate::health::RuntimeHealth>,
     fail_fast: bool,
+    writer_leases: Option<&crate::runtime::HeldLeases>,
 ) -> Result<ChainCursor> {
     spawn_cursor(
         source,
@@ -2882,6 +2884,7 @@ pub async fn spawn_runtime_at_boot(
         health,
         fail_fast,
         !fail_fast,
+        writer_leases,
     )
     .await
 }
@@ -2899,6 +2902,7 @@ async fn spawn_cursor(
     health: Arc<crate::health::RuntimeHealth>,
     fail_fast: bool,
     spare_co_tenants: bool,
+    writer_leases: Option<&crate::runtime::HeldLeases>,
 ) -> Result<ChainCursor> {
     let mut failed = Vec::new();
     let mut ingests = Vec::new();
@@ -2974,6 +2978,9 @@ async fn spawn_cursor(
         .iter()
         .find_map(|nest| refuse_seal_direct_with_entities(seal_direct, nest).err())
     {
+        return Err(release_unstarted(e, ingests, states, alert_workers).await);
+    }
+    if let Some(Err(e)) = writer_leases.map(|l| l.claim(&states)) {
         return Err(release_unstarted(e, ingests, states, alert_workers).await);
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3366,7 +3373,7 @@ async fn build_nest(
             tracing::warn!("segment integrity check failed (continuing): {e:#}");
         }
         // Before the view rebuild below reads cold under the watermark (#2169).
-        finish_unpruned_fold(&dir, store.as_ref())?;
+        nuthatch_core::seal::finish_unpruned_fold(&seal::FsSinks(&dir), store.as_ref())?;
     }
 
     let balances = BalanceView::start(crate::drive::Driver::Threaded)?;
@@ -7754,7 +7761,9 @@ impl NodeHooks {
             &self.exposure,
             &self.velocity,
             &self.entities,
-        )?;
+        )?
+        .map(|s| s.with_catalogue(&self.dir))
+        .transpose()?;
         self.publisher.snapshots.store(snapshot.map(Arc::new));
         self.publisher.last().at = Some(std::time::Instant::now());
         Ok(())
@@ -8381,29 +8390,6 @@ async fn maybe_seal(
         registry_snapshot,
     )
     .await
-}
-
-/// Finish a seal that installed a fold's catalogue and died before its prune (#2169): the prune and
-/// watermark it would have committed next. Until then the folded rows were in no read at all.
-fn finish_unpruned_fold(dir: &std::path::Path, store: &dyn crate::store::HotStore) -> Result<()> {
-    let watermark = store.sealed_through();
-    let (from, cut) = match seal::unpruned_fold(dir, watermark) {
-        Ok(Some(window)) => window,
-        Ok(None) => return Ok(()),
-        Err(e) => {
-            tracing::error!(
-                "a seal past block {watermark} stopped before its prune, and it cannot be finished: \
-                 {e:#}. Hot rows are kept and the watermark stays; restore the segment from a copy \
-                 and restart, or re-index the nest"
-            );
-            return Ok(());
-        }
-    };
-    let pruned = store.prune_and_set_meta(from, cut, SEALED_THROUGH_KEY, &cut.to_string())?;
-    tracing::info!(
-        "finished a seal through block {cut} that stopped before its prune: pruned {pruned} rows from hot"
-    );
-    Ok(())
 }
 
 /// A follower's derived state (RFC-0073 FR1): the views and entities a writer keeps in memory,

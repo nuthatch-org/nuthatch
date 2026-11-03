@@ -304,6 +304,18 @@ pub trait HotStore: Send + Sync {
     /// The fence *this handle* believes it holds; `0` when it has never claimed.
     fn held_fence(&self) -> u64;
 
+    /// [`claim`](HotStore::claim) under a writer lease taken at `lease_fence` (RFC-0078 §5.2). The
+    /// local fence still guards this store's writes; the lease's is what followers compare (#2611).
+    fn claim_under(&self, owner: &str, lease_fence: u64) -> Result<u64> {
+        let _ = lease_fence;
+        self.claim(owner)
+    }
+
+    /// The writer-lease fence this handle was claimed under; `0` when it was not.
+    fn lease_fence(&self) -> u64 {
+        0
+    }
+
     /// Move the store's fence past the one every handle holds, so each later write is refused with
     /// `LostOwnership`. How a writer that lost a lease held elsewhere stops itself (RFC-0078 §5.2).
     fn fence_off(&self) -> Result<()> {
@@ -516,6 +528,12 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     }
     fn held_fence(&self) -> u64 {
         (**self).held_fence()
+    }
+    fn claim_under(&self, owner: &str, lease_fence: u64) -> Result<u64> {
+        (**self).claim_under(owner, lease_fence)
+    }
+    fn lease_fence(&self) -> u64 {
+        (**self).lease_fence()
     }
     fn fence_off(&self) -> Result<()> {
         (**self).fence_off()

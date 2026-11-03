@@ -138,6 +138,16 @@ impl ShapeHub {
         self.tables.is_empty()
     }
 
+    /// Drops the subscribers whose stream has ended, and every table left with none, so a table
+    /// nobody follows is not projected on each delta (#2601).
+    pub fn prune(&mut self) {
+        for table in self.tables.values_mut() {
+            table.sweep();
+        }
+        self.tables
+            .retain(|_, t| t.entries.iter().any(|e| !e.senders.is_empty()));
+    }
+
     /// Subscribes to `shape` with a queue of `queue` frames. The caller makes the copy it starts from
     /// and subscribes at the same point, so no delta falls between them; frames up to the copy's own
     /// generation are then already in it.
@@ -291,6 +301,21 @@ mod tests {
     use crate::store::Store;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
+
+    /// #2601: a table whose last subscriber has gone, or whose subscriber was refused before reading
+    /// a frame, is dropped, so nothing projects it on later deltas.
+    #[test]
+    fn a_table_with_no_live_subscriber_is_dropped() {
+        let mut hub = ShapeHub::default();
+        let kept = hub.subscribe(shape_of(&["0xa"]), 4);
+        drop(hub.subscribe(shape_of(&["0xb"]), 4));
+        hub.prune();
+        assert_eq!(hub.tables().collect::<Vec<_>>(), ["swaps"]);
+        assert_eq!(hub.subscribers(), 1);
+        drop(kept);
+        hub.prune();
+        assert!(hub.is_empty(), "no subscriber is left");
+    }
 
     fn shape_of(pools: &[&str]) -> Shape {
         Shape {

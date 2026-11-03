@@ -477,13 +477,21 @@ is then one of:
   answer read `whole` differs from its answer through the filters: it depends on rows the filters do
   not select. Nothing is compared. The second rule sees the network only through the mirror's end.
 - **not computable**, with the reason: this nest refused the statement, or answered at another block.
-- **equal** or **differs**, column by column, the rows compared as text in one order whatever order
-  either side gave them. A differing column lists each row's two values; a column only one side has
-  is named as not computable and never shown.
+- **equal**, **differs** or **incomplete**, column by column, the rows compared as text in one order
+  whatever order either side gave them. The server's columns are those it named and every key its rows
+  carry, since a client reads the rows. A differing column lists each row's two values. A column only
+  one side has is named as not computable and never shown, and the statement is **incomplete** rather
+  than equal: a column the server returned and this nest cannot compute, or one the statement selects
+  and the server left out, went unchecked.
 
 The result names the NID, block, source, filters, the mirror's dataset and end, and the RPC's host,
-and says the head is the RPC's unless `verified` was given. Equality says the server and this RPC
-agree, nothing more. `hosts/package/verify-fixture.mjs` is its gate in CI; `verify-gate.mjs` runs
+and says which head it ran under, from what the follow did: `the RPC's, unverified` without
+`verified`; `refused: ` and the reason, also in `unverified`, when the verification was refused; and
+otherwise `verified`, or, when the answer's block is above the verified finalized block
+(`verified_through`), which blocks are still the RPC's. A verified head at or below what the nest has
+sealed that is not this chain's block at that height (the store's hash where it kept one, the RPC's
+otherwise) is refused, as a light client on another chain. Equality
+says the server and this RPC agree, nothing more. `hosts/package/verify-fixture.mjs` is its gate in CI; `verify-gate.mjs` runs
 RFC-0077 S7's seven wallets against a hosted nest.
 
 ## The reference hosts and the gate
