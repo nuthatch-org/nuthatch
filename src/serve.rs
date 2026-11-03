@@ -3772,15 +3772,30 @@ pub(crate) async fn sync_query(
 /// Stored `rows` of `table` as `/sql` shows them: the same engine, over those rows alone, so a row
 /// that reaches a subscriber live has the columns of one that came from the first answer.
 pub(crate) fn project_rows(s: &AppState, table: &str, rows: Vec<Value>) -> Result<Vec<Value>> {
-    let dir = tempfile::tempdir()?;
+    project_rows_in(s, tempfile::tempdir()?.path(), table, rows)
+}
+
+/// [`project_rows`] over `dir`. The delta's rows are already held, so no row or byte cap applies:
+/// a route's `max_rows` truncating one would end every stream on the dataset (#2600). And the
+/// directory is never asked about again, so its session stays out of the cache (#2612).
+fn project_rows_in(
+    s: &AppState,
+    dir: &std::path::Path,
+    table: &str,
+    rows: Vec<Value>,
+) -> Result<Vec<Value>> {
     let mut hot = analytics::HotRows::new();
     hot.insert(table.to_string(), rows);
     let sql = format!(
         "SELECT * FROM \"{}\" ORDER BY \"block_number\", \"log_index\"",
         table.replace('"', "\"\"")
     );
-    let guard = s.query_guard(s.limits.timeout, s.limits.max_rows);
-    Ok(analytics::query_hot_cold(dir.path(), &sql, guard, &hot, 0, &s.tables)?.rows)
+    // Not usize::MAX: the engine asks for one row past the cap to know it was crossed.
+    let mut guard = s.query_guard(s.limits.timeout, usize::MAX - 1);
+    guard.max_result_bytes = usize::MAX;
+    analytics::uncached(|| {
+        Ok(analytics::query_hot_cold(dir, &sql, guard, &hot, 0, &s.tables)?.rows)
+    })
 }
 
 /// Room in the response-bytes budget for `bytes`, held until it is dropped.
@@ -6353,6 +6368,26 @@ fn hot_held_while_running() -> &'static HotHeld {
 mod tests {
     use super::*;
     use crate::store::Store;
+
+    /// #2600, #2612: a delta's rows are projected whole whatever the route's row and byte caps, and
+    /// the directory they are projected over leaves no session in the cache to evict a real nest's.
+    #[test]
+    fn a_projected_delta_is_whole_and_leaves_no_cached_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), 1);
+        state.limits.max_rows = 2;
+        state.limits.max_result_bytes = 64;
+        let rows: Vec<Value> = (0..5)
+            .map(|i| json!({ "table": "t", "who": format!("0x{i}"), "block_number": 1, "log_index": i }))
+            .collect();
+        let over = tempfile::tempdir().unwrap();
+        let shown = project_rows_in(&state, over.path(), "t", rows).unwrap();
+        assert_eq!(shown.len(), 5, "every row of the delta: {shown:?}");
+        assert!(
+            !analytics::session_cached(over.path()),
+            "a projection's session was left in the cache"
+        );
+    }
 
     /// Behind a runtime prefix the ring keeps the nest's own route and the declared name: axum hands
     /// a nested router the prefix-stripped path while `MatchedPath` keeps the prefix.

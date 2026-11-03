@@ -239,6 +239,8 @@ struct BufferedWindow {
     /// The addresses the fetch asked for, lowercased; `None` when it asked by topic0 alone, which
     /// already covers any child a nest discovers later.
     asked: Option<HashSet<String>>,
+    /// The topic0s it asked for, lowercased; `None` when it asked for any.
+    topics: Option<HashSet<String>>,
     /// The topic0s it asked for without an address beside `asked`: a child of a template whose
     /// events are all here is covered too (#2410).
     wide: Vec<String>,
@@ -247,6 +249,35 @@ struct BufferedWindow {
     /// One block over the provider's cap: no logs, and each nest asks for it by its own filter.
     over_cap: bool,
     bytes: u64,
+}
+
+impl BufferedWindow {
+    /// Whether the fetch asked for everything `nest`'s own filter would: extraction builds the
+    /// union from live nests only, so a window fetched while a nest was quarantined or not yet
+    /// mounted holds none of its logs (#2607). Discovered children are `window_logs`'s refetch.
+    fn covers(&self, nest: &NestIngest) -> bool {
+        let has = |set: &Option<HashSet<String>>, x: &str| {
+            set.as_ref()
+                .is_none_or(|s| s.contains(&x.to_ascii_lowercase()))
+        };
+        let topics = if nest.topic0s.is_empty() {
+            self.topics.is_none()
+        } else {
+            nest.topic0s.iter().all(|t| has(&self.topics, t))
+        };
+        let addresses = match &nest.factory {
+            Some(_) => nest
+                .registry
+                .addresses()
+                .iter()
+                .all(|a| has(&self.asked, &format!("0x{}", hex::encode(a)))),
+            None if nest.addresses.is_empty() => self.asked.is_none(),
+            None => nest.addresses.iter().all(|a| has(&self.asked, a)),
+        };
+        let wants_logs =
+            nest.factory.is_some() || !nest.addresses.is_empty() || !nest.topic0s.is_empty();
+        !wants_logs || (topics && addresses)
+    }
 }
 
 impl Drop for BufferedWindow {
@@ -994,7 +1025,7 @@ impl Extraction<'_> {
                 .iter()
                 .for_each(|m| m.set_fetch_window(chunker.window()));
             match self.fetch(&inputs, next, to).await {
-                Ok((logs, asked, wide)) => {
+                Ok((logs, asked, topics, wide)) => {
                     chunker.observed(logs.len() as u64);
                     // After the logs, as a window's checkpoint is read, so its hash is of the chain
                     // they came from or later.
@@ -1048,6 +1079,7 @@ impl Extraction<'_> {
                         tip,
                         logs: WindowLogs::Memory(logs),
                         asked,
+                        topics,
                         wide,
                         header,
                         over_cap: false,
@@ -1072,6 +1104,7 @@ impl Extraction<'_> {
                             tip,
                             logs: WindowLogs::Memory(Vec::new()),
                             asked: None,
+                            topics: None,
                             wide: Vec::new(),
                             header: None,
                             over_cap: true,
@@ -1095,18 +1128,25 @@ impl Extraction<'_> {
         }
     }
 
-    /// The union fetch, as the shared cursor makes it, with the addresses it asked for.
+    /// The union fetch, as the shared cursor makes it, with the addresses and topic0s it asked for.
     async fn fetch(
         &mut self,
         inputs: &[ExtractInputs],
         next: u64,
         to: u64,
-    ) -> Result<(Vec<crate::rpc::Log>, Option<HashSet<String>>, Vec<String>)> {
+    ) -> Result<(
+        Vec<crate::rpc::Log>,
+        Option<HashSet<String>>,
+        Option<HashSet<String>>,
+        Vec<String>,
+    )> {
         let (u_addrs, u_topics) = union_filter(
             inputs
                 .iter()
                 .map(|n| (n.addresses.as_slice(), n.topic0s.as_slice())),
         );
+        let topics: Option<HashSet<String>> = (!u_topics.is_empty())
+            .then(|| u_topics.iter().map(|t| t.to_ascii_lowercase()).collect());
         let fetch_from = overlap_from(
             next,
             inputs
@@ -1141,12 +1181,12 @@ impl Extraction<'_> {
                     &mut self.topic0_refused,
                 )
                 .await?;
-                Ok((f.logs, Some(f.asked), f.wide_topic0s))
+                Ok((f.logs, Some(f.asked), topics, f.wide_topic0s))
             }
             (None, Some(f)) => match self.source.logs(&f, fetch_from, to).await {
                 Ok(logs) => {
                     let asked = (!u_addrs.is_empty()).then(|| u_addrs.iter().map(lower).collect());
-                    Ok((logs, asked, Vec::new()))
+                    Ok((logs, asked, topics, Vec::new()))
                 }
                 Err(e) if u_addrs.is_empty() && crate::rpc::filter_refused(&e) => {
                     tracing::warn!(
@@ -1158,7 +1198,13 @@ impl Extraction<'_> {
                 }
                 Err(e) => Err(e),
             },
-            (None, None) => Ok((Vec::new(), None, Vec::new())),
+            // Asked for nothing, which covers no nest that wants logs.
+            (None, None) => Ok((
+                Vec::new(),
+                Some(HashSet::new()),
+                Some(HashSet::new()),
+                Vec::new(),
+            )),
         }
     }
 
@@ -1736,6 +1782,10 @@ async fn nest_task(
                 },
                 Some(w) if refused => Pick::Own {
                     to: w.to,
+                    tip: w.tip,
+                },
+                Some(w) if !w.covers(&nest) => Pick::Own {
+                    to: (next + chunker.window() - 1).min(w.to),
                     tip: w.tip,
                 },
                 Some(w) => Pick::Buffered(w.clone()),

@@ -776,7 +776,7 @@ async fn serve_connection(
 
 /// The fence a mount line carries, which a follower refuses to go below (RFC-0078 §5.3); `None`
 /// from a store no writer lease claimed.
-fn writer_fence(store: &dyn HotStore) -> Option<u64> {
+pub(crate) fn writer_fence(store: &dyn HotStore) -> Option<u64> {
     Some(store.lease_fence()).filter(|f| *f > 0)
 }
 

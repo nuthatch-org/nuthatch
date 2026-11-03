@@ -407,7 +407,8 @@ async fn a_standby_that_takes_a_dead_writers_lease_seeds_from_the_mirror() {
     .unwrap();
 
     let started = std::time::Instant::now();
-    let leases = runtime::take_writer_leases(roost.path(), &table.mounts, None, "default")
+    let health = Arc::new(nuthatch::health::RuntimeHealth::new());
+    let leases = runtime::take_writer_leases(roost.path(), &table.mounts, None, "default", &health)
         .await
         .expect("the standby takes the lapsed lease");
     assert!(
@@ -415,7 +416,7 @@ async fn a_standby_that_takes_a_dead_writers_lease_seeds_from_the_mirror() {
         "taken before the dead writer's term and margin: {:?}",
         started.elapsed()
     );
-    assert_eq!(leases[0].fence(), Some(2));
+    assert_eq!(leases.leases[0].fence(), Some(2));
     let old = transfers_through(&publisher, 5);
     assert!(
         old.as_array().is_some_and(|rows| !rows.is_empty())

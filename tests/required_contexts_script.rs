@@ -281,26 +281,21 @@ fn a_sort_that_fails_after_partial_output_is_not_treated_as_a_short_list() {
     );
 }
 
-/// #2287: the live path parses the protection answer with `jq`, here from a stubbed `curl`.
-#[test]
-fn the_live_comparison_parses_with_jq() {
+/// Runs the live path against a stubbed `curl` that answers protection with three contexts and the
+/// branch rules with `rules` (a JSON array).
+fn run_live(rules: &str) -> (i32, String) {
     let root = root_with(REQUIRED);
     let bin = root.path().join("stub-bin");
     std::fs::create_dir_all(&bin).unwrap();
-    let stubs = [
-        (
-            "curl",
-            "#!/bin/sh\necho '{\"required_status_checks\":{\"contexts\":[\"Jules approval\",\"fmt · clippy · test\",\"build release\"]}}'\n",
-        ),
-    ];
-    for (name, body) in stubs {
-        let p = bin.join(name);
-        std::fs::write(&p, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+    let curl = format!(
+        "#!/bin/sh\ncase \"$*\" in\n  *rules/branches*) echo '{rules}' ;;\n  *) echo '{{\"required_status_checks\":{{\"contexts\":[\"Jules approval\",\"fmt · clippy · test\",\"build release\"]}}}}' ;;\nesac\n"
+    );
+    let p = bin.join("curl");
+    std::fs::write(&p, curl).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let path = format!(
         "{}:{}",
@@ -319,9 +314,32 @@ fn the_live_comparison_parses_with_jq() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(out.status.code(), Some(0), "{text}");
+    (out.status.code().unwrap_or(-1), text)
+}
+
+/// #2287: the live path parses the protection answer with `jq`, here from a stubbed `curl`.
+#[test]
+fn the_live_comparison_parses_with_jq() {
+    let (code, text) = run_live(r#"[{"type":"merge_queue"},{"type":"pull_request"}]"#);
+    assert_eq!(code, 0, "{text}");
     assert!(
         text.contains("required checks match live protection on main (3 contexts)"),
         "{text}"
+    );
+    assert!(text.contains("main has a merge queue"), "{text}");
+}
+
+/// #2609: the slow tier's required checks skip on a PR and gate only in the queue, so a main with
+/// matching contexts but no queue is a failure, and the message names a fix that exists in the tree.
+#[test]
+fn matching_contexts_without_a_merge_queue_fail() {
+    let (code, text) = run_live(r#"[{"type":"pull_request"}]"#);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("main has no merge queue"), "{text}");
+    assert!(
+        manifest()
+            .join(".github/merge-queue-ruleset.json")
+            .is_file(),
+        "the message points at a ruleset file that must exist"
     );
 }
