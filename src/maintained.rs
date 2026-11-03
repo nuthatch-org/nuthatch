@@ -781,9 +781,10 @@ fn drain(cursor: Arc<Cursor>) {
         let seat = match lock_nests().get(&job.dir) {
             Some(n) if n.needs_seat && n.seat.is_none() => None,
             Some(n) => Some(n.seat.clone()),
-            None => Some(None),
+            None => None,
         };
-        // Unseated in a strict runtime: dropped, and [`seat`] plans the nest again.
+        // Unseated in a strict runtime: dropped, and [`seat`] plans the nest again. A nest no
+        // longer held declares nothing to build, and knows nothing of its seat.
         let Some(seat) = seat else {
             cursor
                 .state
