@@ -10,7 +10,9 @@ Each subdirectory is an address-history nest (RFC-0063): one chain, one cursor, 
 ## Run it
 
 ```sh
-cp -R examples/paywalled-chains ~/history
+mkdir -p ~/history
+curl -fsSL https://codeload.github.com/nuthatch-org/nuthatch/tar.gz/main \
+  | tar -xz -C ~/history --strip-components=3 nuthatch-main/examples/paywalled-chains
 export NUTHATCH_RPC_8453=https://your-base-rpc
 export NUTHATCH_RPC_56=https://your-bsc-rpc
 nuthatch dev --dir ~/history
@@ -49,7 +51,7 @@ start, by name.
 ## The trap: history starts at `start_block`
 
 With no `start_block`, each chain backfills a watched account **from block 0**. That is complete, and
-slow: measured from block 0 for one account, about 9 h on Base and 4 h on BNB Chain.
+slow on chains as long as Base and BNB Chain: expect hours, not minutes.
 
 Setting `start_block` in a chain's `[address_history]` skips everything before it, for every
 account. A request that starts before it is refused, not answered short:
