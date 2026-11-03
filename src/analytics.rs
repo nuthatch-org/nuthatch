@@ -41,6 +41,28 @@ pub fn check_engine_choice(value: Option<&str>) -> Result<()> {
 
 thread_local! {
     static TENANT: std::cell::RefCell<Option<Arc<str>>> = const { std::cell::RefCell::new(None) };
+    static UNCACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the queries it makes on this thread on a session of their own, neither taken from
+/// nor left in the process-wide cache: a query over a directory nothing will ask about again would
+/// otherwise evict every real nest's warm session (#2612).
+pub fn uncached<R>(f: impl FnOnce() -> R) -> R {
+    let previous = UNCACHED.with(|u| u.replace(true));
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UNCACHED.with(|u| u.set(self.0));
+        }
+    }
+    let _restore = Restore(previous);
+    f()
+}
+
+/// Whether a session over `dir` for the shared tenant is in the cache now, for tests.
+#[cfg(test)]
+pub(crate) fn session_cached(dir: &Path) -> bool {
+    session_cache_lock().contains_key(&(dir.to_path_buf(), None))
 }
 
 /// Run `f` with the queries it makes on this thread isolated to `tenant` (RFC-0073 FR8): their own
@@ -1540,7 +1562,10 @@ fn attempt(
     // Taken out of the slot for the query so an interrupt can drop it without fighting the mutex
     // borrow; put back only if the statement was not cancelled underneath us.
     let inputs = cache_inputs(dir);
-    let mut slot = session_cache_lock().remove(&(dir.to_path_buf(), tenant.clone()));
+    let cached = !UNCACHED.with(std::cell::Cell::get);
+    let mut slot = cached
+        .then(|| session_cache_lock().remove(&(dir.to_path_buf(), tenant.clone())))
+        .flatten();
     let reusable = slot.as_ref().is_some_and(|c| {
         c.sealed_through == sealed_through
             && c.as_of == as_of
@@ -1787,7 +1812,7 @@ fn attempt(
         )
     };
     let (referenced, copies) = referenced;
-    if interrupted.load(Ordering::SeqCst) {
+    if interrupted.load(Ordering::SeqCst) || !cached {
         drop(slot);
     } else {
         retain_session_cache(session_cache_lock(), slot);

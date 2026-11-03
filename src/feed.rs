@@ -1239,6 +1239,16 @@ impl MemStore {
         self.copy.tracking.store(true, Ordering::SeqCst);
     }
 
+    /// Stops [`MemStore::track_changes`], once nothing follows a shape of this copy.
+    pub fn untrack_changes(&self) {
+        self.copy.tracking.store(false, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub fn tracking_changes(&self) -> bool {
+        self.copy.tracking.load(Ordering::SeqCst)
+    }
+
     /// `(epoch, generation)` of the last delta applied.
     /// Whether a request found a segment this copy names missing since this was last asked.
     pub fn take_missing(&self) -> bool {
