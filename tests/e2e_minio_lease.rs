@@ -71,40 +71,43 @@ async fn e2e_minio_lease_two_boots_race_and_one_wins_then_a_lapsed_lease_moves()
     let b = tempfile::tempdir().unwrap();
     let ta = runtime_dir(a.path(), &target);
     let tb = runtime_dir(b.path(), &target);
+    let health = std::sync::Arc::new(nuthatch::health::RuntimeHealth::new());
 
     let (ra, rb) = tokio::join!(
-        take_writer_leases(a.path(), &ta.mounts, None, "default"),
-        take_writer_leases(b.path(), &tb.mounts, None, "default"),
+        take_writer_leases(a.path(), &ta.mounts, None, "default", &health),
+        take_writer_leases(b.path(), &tb.mounts, None, "default", &health),
     );
     // Both reading before either writes is the race: one wins, the other loses at the store. One
-    // reading after the other wrote waits out the unrenewed lease and takes the next fence instead.
-    let mut fences: Vec<u64> = [&ra, &rb]
+    // reading after the other wrote finds the winner renewing and is refused (#2608).
+    let fences: Vec<u64> = [&ra, &rb]
         .iter()
         .filter_map(|r| r.as_ref().ok())
-        .map(|w| w[0].fence().unwrap())
+        .map(|w| w.leases[0].fence().unwrap())
         .collect();
-    fences.sort();
-    assert!(
-        fences == [1] || fences == [1, 2],
-        "never two holders at one fence: {fences:?}, {:?} / {:?}",
+    assert_eq!(
+        fences,
+        [1],
+        "one holder: {:?} / {:?}",
         ra.as_ref().err(),
         rb.as_ref().err()
     );
     if let Some(loser) = ra.as_ref().err().or(rb.as_ref().err()) {
+        let why = format!("{loser:#}");
         assert!(
-            format!("{loser:#}").contains("lost the writer lease"),
-            "the loser lost the race rather than failing a request: {loser:#}"
+            why.contains("lost the writer lease") || why.contains("still renewing"),
+            "the loser lost the race or met a renewing holder, not a failed request: {why}"
         );
     }
 
-    // Nobody renews the winner's lease, so a third boot waits out term and margin and takes it.
+    // Dropping the winner stops its renewals, so a third boot waits out term and margin and takes it.
+    drop((ra, rb));
     let c = tempfile::tempdir().unwrap();
     let tc = runtime_dir(c.path(), &target);
     let started = std::time::Instant::now();
-    let taken = take_writer_leases(c.path(), &tc.mounts, None, "default")
+    let taken = take_writer_leases(c.path(), &tc.mounts, None, "default", &health)
         .await
         .expect("a lapsed lease is taken over");
-    assert_eq!(taken.len(), 1);
+    assert_eq!(taken.leases.len(), 1);
     assert!(
         started.elapsed() >= std::time::Duration::from_millis(4_500),
         "taken before term and margin had passed: {:?}",
