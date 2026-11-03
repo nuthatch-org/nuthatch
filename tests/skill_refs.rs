@@ -64,22 +64,114 @@ fn authored_files_only_mention_real_flags() {
     let real: BTreeSet<String> = flags_in(&reference);
     assert!(real.contains("--chain") && real.contains("--seal-direct"));
 
+    let gated = feature_gated_flags(
+        &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/cli.rs")).unwrap(),
+    );
+    assert_eq!(
+        gated.get("--flight").map(String::as_str),
+        Some("flight"),
+        "the src/cli.rs scan stopped finding `--flight` behind its feature: {gated:?}"
+    );
+
     // Scan every authored skill file (everything except the generated reference), including
     // the subgraph-port skill (RFC-0044).
     let mut offenders = Vec::new();
     for (name, path) in authored_skill_md() {
         let text = std::fs::read_to_string(&path).unwrap();
-        for flag in flags_in(&text) {
-            // `--url` etc. are all real; a flag not in the reference is a hallucination.
-            if !real.contains(&flag) {
-                offenders.push(format!("{name}: `{flag}` is not a real nuthatch flag"));
-            }
+        for flag in unreal_flags(&text, &real, &gated) {
+            offenders.push(format!("{name}: `{flag}` is not a real nuthatch flag"));
         }
     }
     assert!(
         offenders.is_empty(),
         "authored skill files reference nonexistent flags:\n{}",
         offenders.join("\n")
+    );
+}
+
+/// #2605: the reference documents the default build, so a flag behind a cargo feature (`dev
+/// --flight`) is absent from it. Such a flag may be named only on a line that also names the
+/// feature it needs (`--features flight`), and only if `src/cli.rs` declares it behind that very
+/// feature: re-parsed from source, so a misspelt or invented one is still refused.
+fn unreal_flags(
+    text: &str,
+    real: &BTreeSet<String>,
+    gated: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        for flag in flags_in(line) {
+            if real.contains(&flag) {
+                continue;
+            }
+            let named = gated
+                .get(&flag)
+                .is_some_and(|f| line.contains(&format!("--features {f}")));
+            if !named {
+                out.push(flag);
+            }
+        }
+    }
+    out
+}
+
+/// Every non-hidden long flag `src/cli.rs` declares under `#[cfg(feature = "...")]`, with its feature.
+fn feature_gated_flags(src: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut feature: Option<String> = None;
+    let mut arg: Option<String> = None;
+    for line in src.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("#[cfg(feature = \"") {
+            feature = rest.split('"').next().map(str::to_string);
+            arg = None;
+        } else if line.starts_with("#[arg(") {
+            arg = Some(line.to_string());
+        } else if line.starts_with("///") || line.starts_with("#[") {
+        } else if let (Some(f), Some(a), Some(rest)) =
+            (feature.take(), arg.take(), line.strip_prefix("pub "))
+        {
+            let named = a
+                .split("long = \"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .map(str::to_string);
+            let field = rest.split(':').next().unwrap_or("").replace('_', "-");
+            if a.contains("long") && !a.contains("hide = true") {
+                out.insert(format!("--{}", named.unwrap_or(field)), f);
+            }
+        } else {
+            feature = None;
+            arg = None;
+        }
+    }
+    out
+}
+
+#[test]
+fn a_feature_flag_needs_its_feature_named_beside_it() {
+    let real: BTreeSet<String> = ["--chain".to_string(), "--features".to_string()].into();
+    let gated = feature_gated_flags(
+        "    #[cfg(feature = \"flight\")]\n    #[arg(long, value_name = \"ADDR\")]\n    pub flight: Option<String>,\n\
+         \n    #[cfg(feature = \"folds\")]\n    #[arg(long, hide = true)]\n    pub folds: bool,\n",
+    );
+    assert_eq!(
+        gated.len(),
+        1,
+        "a hidden feature flag is not documentable: {gated:?}"
+    );
+    let ok = "Built with `--features flight`, `dev --flight <addr>` serves Flight SQL.";
+    assert!(unreal_flags(ok, &real, &gated).is_empty());
+    assert_eq!(
+        unreal_flags("`dev --flight <addr>` serves Flight SQL.", &real, &gated),
+        ["--flight"]
+    );
+    assert_eq!(
+        unreal_flags("`--features folds`, then `--flight`.", &real, &gated),
+        ["--flight"]
+    );
+    assert_eq!(
+        unreal_flags("`--features flight`, then `--warp`.", &real, &gated),
+        ["--warp"]
     );
 }
 
