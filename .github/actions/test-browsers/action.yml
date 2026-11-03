@@ -1,0 +1,35 @@
+name: Chrome, chromedriver, Firefox and geckodriver
+description: >
+  The browsers the embed jobs drive, from their release archives pinned by version and sha256, as
+  wasm-tools pins its tools (#2621). Exports CHROME, CHROMEDRIVER, FIREFOX and GECKODRIVER.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        b="$RUNNER_TEMP/browsers"
+        mkdir -p "$b"
+        fetch() { # <url> <sha256> <file>
+          curl -fsSL -o "$b/$3" "$1"
+          echo "$2  $b/$3" | sha256sum -c
+        }
+        cft=https://storage.googleapis.com/chrome-for-testing-public/156.0.8078.80/linux64
+        fetch "$cft/chrome-linux64.zip" b711c720f774be355197f32edf37e0651418ba036d92446ee2da19ac017540a7 chrome.zip
+        fetch "$cft/chromedriver-linux64.zip" cae58bbd262ba5c8a0ce2540f44254b6e789efc4fe9b18bbb4a00487a9f5859e chromedriver.zip
+        # Mozilla publishes this sum in releases/159.0/SHA256SUMS.
+        fetch https://archive.mozilla.org/pub/firefox/releases/159.0/linux-x86_64/en-US/firefox-159.0.tar.xz \
+          54536fcd120af484d4c56272a5a1cf4af57b9c713d1a3b1e775da192dd541fcd firefox.tar.xz
+        fetch https://github.com/mozilla/geckodriver/releases/download/v0.37.1/geckodriver-v0.37.1-linux64.tar.gz \
+          e815130ea95983e162ae91843b48d3a3ce991735635fce83a647afde21e09f7e geckodriver.tgz
+        unzip -q "$b/chrome.zip" -d "$b"
+        unzip -q "$b/chromedriver.zip" -d "$b"
+        tar -xJf "$b/firefox.tar.xz" -C "$b"
+        tar -xzf "$b/geckodriver.tgz" -C "$b"
+        {
+          echo "CHROME=$b/chrome-linux64/chrome"
+          echo "CHROMEDRIVER=$b/chromedriver-linux64/chromedriver"
+          echo "FIREFOX=$b/firefox/firefox"
+          echo "GECKODRIVER=$b/geckodriver"
+        } >> "$GITHUB_ENV"
