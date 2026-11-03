@@ -6,6 +6,7 @@
 use crate::narrow::{FilterSpec, Privacy};
 use anyhow::{bail, Result};
 use nuthatch_core::redb_store::Store;
+use nuthatch_core::store::LAST_BLOCK_KEY;
 use serde_json::{json, Value};
 
 const OPENED_UNDER_KEY: &str = "opened_under";
@@ -44,9 +45,8 @@ fn scope(filters: Option<&[FilterSpec]>, verified: bool) -> Value {
 }
 
 /// Admit `store` for a nest opened under `filters` and `verified`, recording them on a store's first
-/// open. A store indexed before this record existed carries none; it is recorded as opened now,
-/// since nothing can say what it was opened under, and the package's default name already hashes
-/// both into the store's name.
+/// open. A store that has indexed but carries no record predates it, and nothing says what it was
+/// indexed under, so it is refused as a mismatch would be.
 pub fn admit(store: &Store, filters: Option<&[FilterSpec]>, verified: bool) -> Result<()> {
     let now = scope(filters, verified);
     match store.get_meta(OPENED_UNDER_KEY)? {
@@ -67,6 +67,10 @@ pub fn admit(store: &Store, filters: Option<&[FilterSpec]>, verified: bool) -> R
                 );
             }
         }
+        None if store.get_meta(LAST_BLOCK_KEY)?.is_some() => bail!(
+            "this store has indexed and records no filters or `verified` setting it was opened \
+             under, so a reopen under {now} cannot be checked against them: open it fresh"
+        ),
         None => store.set_meta(OPENED_UNDER_KEY, &now.to_string())?,
     }
     Ok(())
@@ -75,7 +79,6 @@ pub fn admit(store: &Store, filters: Option<&[FilterSpec]>, verified: bool) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nuthatch_core::store::LAST_BLOCK_KEY;
     use std::collections::BTreeMap;
 
     fn store() -> Store {
@@ -130,10 +133,20 @@ mod tests {
     }
 
     #[test]
-    fn a_store_from_before_the_record_is_recorded_and_then_held_to_it() {
+    fn a_store_that_indexed_before_the_record_is_refused() {
         let s = store();
         s.set_meta(LAST_BLOCK_KEY, "90").unwrap();
-        admit(&s, Some(&[filter("0xaa")]), false).unwrap();
-        assert!(admit(&s, Some(&[filter("0xbb")]), false).is_err());
+        let e = admit(&s, Some(&[filter("0xaa")]), false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.ends_with("open it fresh"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_store_is_recorded_on_its_first_open() {
+        let s = store();
+        admit(&s, None, false).unwrap();
+        s.set_meta(LAST_BLOCK_KEY, "90").unwrap();
+        admit(&s, None, false).unwrap();
     }
 }
