@@ -566,16 +566,14 @@ impl Session for BurrmillSession {
                     .min(ENCODE_ROWS)
                     .min(max_rows - written);
                 use nuthatch_core::arrow_slice::{compact, slice_bytes};
-                let mut part = compact(&batch.slice(start, n));
+                let mut slice = batch.slice(start, n);
                 // A slice that would carry the answer past the byte cap is written a row at a time,
-                // so the answer ends at the row that crosses it, as JSON's does (#2589).
-                if part
-                    .as_ref()
-                    .is_ok_and(|p| slice_bytes(p) > max_bytes - w.get_ref().len())
-                {
-                    part = compact(&batch.slice(start, 1));
+                // so the answer ends at the row that crosses it, as JSON's does (#2589). It is sized
+                // before it is copied, so an oversized slice is never compacted (#2631).
+                if slice_bytes(&slice) > max_bytes - w.get_ref().len() {
+                    slice = batch.slice(start, 1);
                 }
-                let part = match part {
+                let part = match compact(&slice) {
                     Ok(p) => p,
                     Err(e) => {
                         failed = Some(e.into());
