@@ -114,6 +114,10 @@ impl Mem {
             .unwrap()
             .insert(key.into(), value.to_string());
     }
+    #[cfg(test)]
+    pub(crate) fn set_hash(&self, block: u64, hash: &str) {
+        self.hashes.lock().unwrap().insert(block, hash.into());
+    }
 }
 
 #[async_trait::async_trait]

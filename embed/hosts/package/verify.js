@@ -35,7 +35,7 @@ export function compare(server, here) {
     return differs.length ? { column, verdict: "differs", values: differs.slice(0, 20), rows_differing: differs.length } : { column, verdict: "equal" };
   });
   for (const column of server.columns.filter((c) => !both.includes(c))) {
-    columns.push({ column, verdict: "not computable", reason: "this nest's answer has no such column", server: true });
+    columns.push({ column, verdict: "not computable", reason: "this nest's answer has no such column" });
   }
   for (const column of here.columns.filter((c) => !both.includes(c))) {
     columns.push({ column, verdict: "not computable", reason: "the server's answer has no such column" });
@@ -43,11 +43,12 @@ export function compare(server, here) {
   return { rows: { server: server.rows.length, here: here.rows.length }, columns };
 }
 
-/// A statement's verdict from its comparison. `incomplete` when nothing differs but a column the
-/// server returned could not be computed here: it was not checked, so the answer is not equal.
+/// A statement's verdict from its comparison. `incomplete` when nothing differs but a column only one
+/// side has went unchecked: one the server returned and this nest cannot compute, or one the
+/// statement selects and the server left out. Either way the answer is not shown equal.
 export function statementVerdict(c) {
   if (c.columns.some((x) => x.verdict === "differs") || c.rows.server !== c.rows.here) return "differs";
-  return c.columns.some((x) => x.server && x.verdict === "not computable") ? "incomplete" : "equal";
+  return c.columns.some((x) => x.verdict === "not computable") ? "incomplete" : "equal";
 }
 
 /// The head a check ran under, from what the follow did rather than what was asked (RFC-0081 §7.2,

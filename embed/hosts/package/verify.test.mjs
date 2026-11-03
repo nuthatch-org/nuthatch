@@ -27,9 +27,13 @@ test("a column the server returned that this nest cannot compute keeps the verdi
   assert.equal(extra.verdict, "not computable");
 });
 
-test("a column only this nest has does not make an honest answer anything but equal", () => {
+test("a column the server left out altogether went unchecked, so the statement is not equal", () => {
   const server = { rows: [{ who: "0x1" }], columns: ["who"] };
-  assert.equal(verdict(server, { rows: [{ who: "0x1", total: "100" }], columns: ["who", "total"] }), "equal");
+  assert.equal(verdict(server), "incomplete");
+});
+
+test("the same columns and rows on both sides are equal", () => {
+  assert.equal(verdict({ rows: [{ total: "100", who: "0x1" }], columns: ["total", "who"] }), "equal");
 });
 
 test("without a verified head the head is the RPC's", () => {

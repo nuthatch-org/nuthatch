@@ -265,21 +265,25 @@ impl Verifier {
                 Err(e) => bail!("the host gave no verified finalized block: {e:#}"),
             }
         };
-        // Below the floor nothing seals, so a light client on another chain would otherwise pass in
-        // silence (#2615): its block must be the RPC's block at that height.
-        if top.0 < floor {
-            let rpc = source.block_hash(top.0).await?;
-            if !rpc
+        // At or below the floor nothing seals, so a light client on another chain would otherwise
+        // pass in silence (#2615): its block must be this chain's block at that height, the store's
+        // where it kept it, the RPC's otherwise.
+        if top.0 <= floor {
+            let ours = match store.get_block_hash(top.0)? {
+                Some(h) => Some(h),
+                None => source.block_hash(top.0).await?,
+            };
+            if !ours
                 .as_deref()
                 .is_some_and(|h| h.eq_ignore_ascii_case(&top.1))
             {
                 bail!(
-                    "the verified finalized block {} ({}) is not the RPC's block {} ({}), and this \
-                     nest is past block {floor}: the light client follows another chain",
+                    "the verified finalized block {} ({}) is not this chain's block {} ({}), and \
+                     this nest is at block {floor}: the light client follows another chain",
                     top.0,
                     top.1,
                     top.0,
-                    rpc.as_deref().unwrap_or("none")
+                    ours.as_deref().unwrap_or("none")
                 );
             }
         }
@@ -648,14 +652,38 @@ mod tests {
         assert_eq!(v.unverified(), None);
     }
 
-    /// The verified head at the seal itself is the ordinary case between finalizations: no refusal.
+    /// The verified head at the seal itself is the ordinary case between finalizations: no refusal,
+    /// and the store's own hash of that block answers it, so no RPC is asked.
     #[test]
     fn a_verified_head_at_the_seal_is_not_refused() {
         let store = crate::window::Mem::default();
         store.set(SEALED_THROUGH_KEY, 300_000_000);
+        let sealed = format!("0x{}", "cd".repeat(32));
+        store.set_hash(300_000_000, &sealed);
         let v = Verifier::new();
-        let top = Ok((300_000_000, format!("0x{}", "ab".repeat(32))));
-        crate::window::block_on(v.refresh(&top, &crate::window::Tape(Vec::new()), &store));
+        crate::window::block_on(v.refresh(
+            &Ok((300_000_000, sealed)),
+            &crate::window::Tape(Vec::new()),
+            &store,
+        ));
         assert_eq!(v.unverified(), None);
+    }
+
+    /// Another chain's head that happens to sit at exactly the sealed height is refused too.
+    #[test]
+    fn a_foreign_verified_head_at_the_seal_is_refused() {
+        let store = crate::window::Mem::default();
+        store.set(SEALED_THROUGH_KEY, 300_000_000);
+        store.set_hash(300_000_000, &format!("0x{}", "cd".repeat(32)));
+        let v = Verifier::new();
+        crate::window::block_on(v.refresh(
+            &Ok((300_000_000, format!("0x{}", "ab".repeat(32)))),
+            &crate::window::Tape(Vec::new()),
+            &store,
+        ));
+        assert!(
+            v.unverified().is_some(),
+            "a foreign head at the seal passed"
+        );
     }
 }
