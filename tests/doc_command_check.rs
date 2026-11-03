@@ -81,8 +81,9 @@ impl Finding {
     }
 }
 
-/// Doc files in scope: `README.md`, the product docs under `docs/`, and the authored files of
-/// `skills/nuthatch-builder/` and `skills/nuthatch-subgraph-port/` (RFC-0017 / RFC-0044).
+/// Doc files in scope: `README.md`, `AGENTS.md`, the product docs under `docs/` and `examples/`, and
+/// the authored files of `skills/nuthatch-builder/` and `skills/nuthatch-subgraph-port/` (RFC-0017 /
+/// RFC-0044).
 /// RFCs, release notes, benchmarks, decisions, validation logs and date-named files are records of
 /// what was true when written, so a command they name may since have gone.
 /// `cli-reference.md` itself is excluded: it's rendered from `Cli::command()` by `src/skill.rs`,
@@ -93,8 +94,9 @@ impl Finding {
 /// check, but the only one that also validates subcommand *names*, which the flags-only check can't.
 fn doc_files() -> Vec<PathBuf> {
     let root = repo_root();
-    let mut out = vec![root.join("README.md")];
+    let mut out = vec![root.join("README.md"), root.join("AGENTS.md")];
     collect_md(&root.join("docs"), &mut out);
+    collect_md(&root.join("examples"), &mut out);
     for dir in nuthatch::skill::AUTHORED_SKILL_DIRS {
         collect_md(&root.join(dir), &mut out);
     }
@@ -143,7 +145,14 @@ fn records_are_out_of_scope_and_product_docs_are_in() {
     assert!(!is_product_doc("docs/security-audit-2026-07-31.md"));
     let files: Vec<String> = doc_files().iter().map(|p| rel(&repo_root(), p)).collect();
     assert!(
-        files.iter().any(|f| f == "docs/operators.md") && files.iter().any(|f| f == "README.md"),
+        [
+            "docs/operators.md",
+            "README.md",
+            "AGENTS.md",
+            "examples/paywalled-chains/README.md"
+        ]
+        .iter()
+        .all(|want| files.iter().any(|f| f == want)),
         "the product docs must still be walked: {files:?}"
     );
 }

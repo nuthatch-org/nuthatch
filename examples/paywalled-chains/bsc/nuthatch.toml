@@ -1,0 +1,10 @@
+[nest]
+name = "history-bsc"
+chain = "bsc"
+chain_id = 56
+schema_version = 2
+# No rpc_urls: NUTHATCH_RPC_56 and NUTHATCH_TRACE_RPC_56 name them. See README.
+
+[address_history]
+addresses = []
+# start_block = 0   # history before it is never fetched; see README
