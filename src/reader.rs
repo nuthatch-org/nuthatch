@@ -1798,6 +1798,7 @@ impl Follower {
                 .apply(&delta)
                 .with_context(|| format!("{dataset}: resnapshotting"))?;
             if !shapes.is_empty() {
+                let synced = Instant::now();
                 let log = if changes.sealed_unseen {
                     let after = data.store.served_catalogue().flatten();
                     sealed_touches(
@@ -1827,6 +1828,7 @@ impl Follower {
                         *shapes = Default::default();
                     }
                 }
+                crate::feed_metrics::metrics().synced(synced.elapsed());
             }
             changes
         };
