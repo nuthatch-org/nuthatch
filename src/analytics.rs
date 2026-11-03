@@ -7356,6 +7356,38 @@ template="pool"
         assert_eq!(ipc.rows, json.rows.len(), "row for row equal to JSON");
     }
 
+    /// #2631: a view column inside a list or a struct carries the batch's strings too, and the engine
+    /// produces both from ordinary SQL.
+    #[test]
+    fn an_arrow_answer_over_a_nested_view_column_holds_the_byte_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = |arrow| QueryGuard {
+            timeout: Duration::from_secs(30),
+            max_rows: 50_000,
+            max_result_bytes: 1 << 20,
+            arrow,
+            ..Default::default()
+        };
+        for sql in [
+            "SELECT make_array(arrow_cast(repeat('A', 100000), 'Utf8View')) AS x FROM range(32)",
+            "SELECT named_struct('s', arrow_cast(repeat('A', 100000), 'Utf8View')) AS x FROM range(32)",
+        ] {
+            let out = query_guarded(dir.path(), sql, guard(true)).unwrap();
+            let ipc = out.ipc.expect("an Arrow answer");
+            assert!(out.truncated, "{sql}: the cap was crossed");
+            assert!(
+                ipc.bytes.len() < (1 << 20) + 200_000,
+                "{sql}: {} bytes written for {} rows",
+                ipc.bytes.len(),
+                ipc.rows
+            );
+            // JSON refuses a list of views as outside its subset; where it answers, it agrees.
+            if let Ok(json) = query_guarded(dir.path(), sql, guard(false)) {
+                assert_eq!(ipc.rows, json.rows.len(), "{sql}: row for row equal to JSON");
+            }
+        }
+    }
+
     /// #1650: one DataFusion batch of 8,192 cells, 100 KB each, before the 64 MiB cap runs.
     /// Ignored because the point is the resident size, and the suite should not allocate it.
     #[test]
