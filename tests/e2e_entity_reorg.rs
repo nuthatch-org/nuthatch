@@ -270,6 +270,32 @@ fn relation(rt: &indexer::NestRuntime) -> Vec<(String, String)> {
 /// serves its own type, so comparing the rendered values is the comparison that would catch a
 /// precision loss on either side rather than papering over it with a float cast.
 async fn sql_pairs(rt: &indexer::NestRuntime, sql: &str) -> Vec<(String, String)> {
+    sql_pairs_as_of(rt, sql).await.0
+}
+
+/// `sql_pairs` once `/sql` answers from the snapshot at `block`. A writer's request reads the latest
+/// published snapshot, which is published after the window commits and its entities fold, so live
+/// watermarks at `block` do not yet mean `/sql` serves it, and two requests taken either side of the
+/// publish compare two snapshots (#1906).
+async fn sql_pairs_at(rt: &indexer::NestRuntime, sql: &str, block: u64) -> Vec<(String, String)> {
+    let deadline = std::time::Instant::now() + POLL_TIMEOUT;
+    loop {
+        let (pairs, as_of) = sql_pairs_as_of(rt, sql).await;
+        if as_of == Some(block) {
+            return pairs;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{sql}: /sql still answers as of {as_of:?}, not {block}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+async fn sql_pairs_as_of(
+    rt: &indexer::NestRuntime,
+    sql: &str,
+) -> (Vec<(String, String)>, Option<u64>) {
     let path = format!("/sql?q={}", urlencoding_lite(sql));
     let (status, body) = get_json(rt, &path).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{sql} -> {body}");
@@ -290,7 +316,7 @@ async fn sql_pairs(rt: &indexer::NestRuntime, sql: &str) -> Vec<(String, String)
         })
         .collect();
     out.sort();
-    out
+    (out, body["provenance"]["as_of"].as_u64())
 }
 
 /// Percent-encode the handful of characters a SQL string puts in a query parameter. Not a general
@@ -1880,11 +1906,11 @@ max_rows = 10000
         "the chain facts are sealed"
     );
     rt.state.entities[0].flush();
-    let one = sql_pairs(&rt, MAINTAINED).await;
+    let one = sql_pairs_at(&rt, MAINTAINED, 12).await;
     agree(
         "after the first snapshot",
         &one,
-        &sql_pairs(&rt, REFERENCE).await,
+        &sql_pairs_at(&rt, REFERENCE, 12).await,
     );
 
     prices("second", &[("USDC", 100_010_000), ("USDCe", 99_990_000)]);
@@ -1905,11 +1931,11 @@ max_rows = 10000
     .await;
     assert!(applied, "the second snapshot never reached the entity");
     entity.flush();
-    let two = sql_pairs(&rt, MAINTAINED).await;
+    let two = sql_pairs_at(&rt, MAINTAINED, 16).await;
     agree(
         "after the second snapshot",
         &two,
-        &sql_pairs(&rt, REFERENCE).await,
+        &sql_pairs_at(&rt, REFERENCE, 16).await,
     );
     assert_ne!(
         one, two,
