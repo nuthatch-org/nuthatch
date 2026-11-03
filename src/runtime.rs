@@ -1957,8 +1957,11 @@ pub fn hold_writer_leases(
             continue;
         };
         let store = state.store.clone();
+        let fence = lease
+            .fence()
+            .with_context(|| format!("the lease of mount '{route}' is not held"))?;
         store
-            .claim(lease.owner())
+            .claim_under(lease.owner(), fence)
             .with_context(|| format!("claiming the store of mount '{route}'"))?;
         let health = health.clone();
         let (ask, asked) = tokio::sync::mpsc::channel(1);

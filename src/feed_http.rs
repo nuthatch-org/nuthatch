@@ -715,7 +715,7 @@ async fn serve_connection(
                         isolation: m.isolation.clone(),
                         sync: m.sync.clone(),
                         data_identity: identities.get(&m.dir).cloned().flatten(),
-                        fence: Some(m.store.held_fence()).filter(|f| *f > 0),
+                        fence: writer_fence(m.store.as_ref()),
                     }, v2);
                     if routes.get(route).is_some_and(|sent| sent[..] == mount[..]) {
                         continue;
@@ -772,6 +772,12 @@ async fn serve_connection(
             _ = tx.gone() => return,
         }
     }
+}
+
+/// The fence a mount line carries, which a follower refuses to go below (RFC-0078 §5.3); `None`
+/// from a store no writer lease claimed.
+fn writer_fence(store: &dyn HotStore) -> Option<u64> {
+    Some(store.lease_fence()).filter(|f| *f > 0)
 }
 
 /// One dataset's snapshot and deltas onto the connection, resnapshotting whenever the deltas cannot
@@ -930,9 +936,31 @@ async fn forward(dataset: String, store: Arc<dyn HotStore>, tx: Queue, v2: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Store;
+    use crate::store::{CoreHotStore, Store};
 
     const KIB: u64 = 1 << 10;
+
+    /// #2611: a mount line carries the fence of the lease its store was claimed under, not how often
+    /// the store was claimed locally. A, booted twice under lease fence 1, has claimed its store
+    /// twice; B, promoted at lease fence 2, has claimed a fresh store once.
+    #[test]
+    fn a_mount_line_carries_the_lease_fence_not_the_local_claim_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = Store::open(&tmp.path().join("a.redb")).unwrap();
+        a.claim_under("a", 1).unwrap();
+        a.claim_under("a", 1).unwrap();
+        let b = Store::open(&tmp.path().join("b.redb")).unwrap();
+        b.claim_under("b", 2).unwrap();
+        assert_eq!(
+            (a.held_fence(), b.held_fence()),
+            (2, 1),
+            "local claim counters"
+        );
+        assert_eq!(writer_fence(&a), Some(1), "A's lease fence");
+        assert_eq!(writer_fence(&b), Some(2), "B took over, so it is above A");
+        let unclaimed = Store::open(&tmp.path().join("c.redb")).unwrap();
+        assert_eq!(writer_fence(&unclaimed), None);
+    }
 
     /// A store holding `rows` rows of 32 KiB each.
     fn store(dir: &Path, rows: usize) -> Arc<Store> {
