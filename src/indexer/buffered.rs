@@ -614,10 +614,7 @@ pub(super) async fn runtime_index_loop_buffered(
         let (id, slot) = spawn_nest(&shared, &ctx, &mut tasks, nest, sup, next, 0);
         task_slots.insert(id, slot);
     }
-    let mut unmounting: std::collections::HashMap<
-        tokio::task::Id,
-        Option<tokio::sync::oneshot::Sender<()>>,
-    > = Default::default();
+    let mut unmounting = Unmounting::default();
     let mut ext = Extraction {
         source: source.as_ref(),
         shared: &shared,
@@ -667,19 +664,62 @@ pub(super) async fn runtime_index_loop_buffered(
                             slot.status.store(TERMINAL, Ordering::Release);
                             shared.bump();
                         }
-                        (id, Ok(()))
+                        (id, Ok(None))
                     }
                 };
-                task_slots.remove(&id);
-                if let Some(ack) = unmounting.remove(&id).flatten() {
-                    // The task has dropped the store; extraction may not be reading it either.
-                    let reading = shared.reading_store.clone();
-                    tokio::spawn(async move {
-                        let _held = reading.lock().await;
-                        let _ = ack.send(());
-                    });
+                let slot = task_slots.remove(&id);
+                let (stopped, failed) = match result {
+                    Ok(s) => (s, None),
+                    Err(e) => (None, Some(e)),
+                };
+                if let Some(acks) = unmounting.remove(&id) {
+                    let abandoned = acks.iter().all(|a| a.as_ref().is_some_and(|s| s.is_closed()));
+                    match (abandoned, stopped, slot) {
+                        // The runtime gave up waiting and kept the mount, so the nest resumes.
+                        (true, Some(state), Some(slot)) => {
+                            let (nest, sup, seen, next) = *state;
+                            shared.slots.lock().unwrap().retain(|s| !Arc::ptr_eq(s, &slot));
+                            tracing::warn!(
+                                "unmount of '{}' was abandoned while its window ran; resuming it",
+                                nest.name
+                            );
+                            let (id, slot) =
+                                spawn_nest(&shared, &ctx, &mut tasks, nest, sup, Some(next), seen);
+                            task_slots.insert(id, slot);
+                        }
+                        (_, stopped, slot) => {
+                            // A nest that faulted terminally, whether its panic escaped the task
+                            // or was contained into its quarantine, keeps that in health; it only
+                            // leaves the cursor.
+                            let faulted = stopped.as_ref().is_some_and(|s| {
+                                matches!(s.1.states[0], NestState::Quarantined { retry_at: None, .. })
+                            });
+                            match &slot {
+                                Some(slot)
+                                    if faulted
+                                        || slot.status.load(Ordering::Acquire) == TERMINAL =>
+                                {
+                                    shared.slots.lock().unwrap().retain(|s| !Arc::ptr_eq(s, slot));
+                                    shared.bump();
+                                    shared.trim();
+                                }
+                                Some(slot) => retire(&shared, &ctx, slot),
+                                None => {}
+                            }
+                            // The task has dropped the store; extraction may not be reading it either.
+                            let reading = shared.reading_store.clone();
+                            tokio::spawn(async move {
+                                let _held = reading.lock().await;
+                                for ack in acks.into_iter().flatten() {
+                                    let _ = ack.send(());
+                                }
+                            });
+                        }
+                    }
                 }
-                result?;
+                if let Some(e) = failed {
+                    return Err(e);
+                }
             }
         }
     }
@@ -689,7 +729,7 @@ pub(super) async fn runtime_index_loop_buffered(
 fn spawn_nest(
     shared: &Arc<BufferShared>,
     ctx: &Arc<TaskCtx>,
-    tasks: &mut tokio::task::JoinSet<Result<()>>,
+    tasks: &mut tokio::task::JoinSet<Result<Option<Resume>>>,
     nest: NestIngest,
     sup: Supervisor,
     next: Option<u64>,
@@ -734,33 +774,39 @@ fn find_slot(shared: &BufferShared, name: &str) -> Option<Arc<NestSlot>> {
         .cloned()
 }
 
-/// A lifecycle command, as [`drain_lifecycle`] applies it to the shared cursor. An unmount is
-/// acknowledged once the nest's task has ended and dropped its store.
+/// A nest task stopped at the operator's request hands its ingest back, so an unmount the runtime
+/// abandoned resumes the nest rather than strand it served and not indexing (#2593).
+type Resume = Box<(NestIngest, Supervisor, u64, u64)>;
+
+/// The acks an unmount is waiting to send; `None` is a caller that does not wait.
+type Unmounting =
+    std::collections::HashMap<tokio::task::Id, Vec<Option<tokio::sync::oneshot::Sender<()>>>>;
+
+fn retire(shared: &BufferShared, ctx: &TaskCtx, slot: &Arc<NestSlot>) {
+    slot.status.store(RETIRED, Ordering::Release);
+    slot.stop.store(true, Ordering::Release);
+    shared
+        .slots
+        .lock()
+        .unwrap()
+        .retain(|s| !Arc::ptr_eq(s, slot));
+    let name = slot.name();
+    ctx.health.retire_nest(&name);
+    tracing::info!("nest '{name}' retired from this cursor at the operator's request");
+    shared.bump();
+    shared.trim();
+}
+
+/// A lifecycle command, as [`drain_lifecycle`] applies it to the shared cursor. An unmount stops
+/// the nest's task and retires it once that task has ended and dropped its store, then acks.
 fn apply_command(
     cmd: CursorCommand,
     shared: &Arc<BufferShared>,
     ctx: &Arc<TaskCtx>,
-    tasks: &mut tokio::task::JoinSet<Result<()>>,
+    tasks: &mut tokio::task::JoinSet<Result<Option<Resume>>>,
     task_slots: &mut std::collections::HashMap<tokio::task::Id, Arc<NestSlot>>,
-    unmounting: &mut std::collections::HashMap<
-        tokio::task::Id,
-        Option<tokio::sync::oneshot::Sender<()>>,
-    >,
+    unmounting: &mut Unmounting,
 ) {
-    let retire = |slot: &Arc<NestSlot>| {
-        slot.status.store(RETIRED, Ordering::Release);
-        slot.stop.store(true, Ordering::Release);
-        shared
-            .slots
-            .lock()
-            .unwrap()
-            .retain(|s| !Arc::ptr_eq(s, slot));
-        let name = slot.name();
-        ctx.health.retire_nest(&name);
-        tracing::info!("nest '{name}' retired from this cursor at the operator's request");
-        shared.bump();
-        shared.trim();
-    };
     match cmd {
         CursorCommand::Unmount { name, ack } => {
             if ack.as_ref().is_some_and(|a| a.is_closed()) {
@@ -774,16 +820,20 @@ fn apply_command(
                 }
                 return;
             };
-            retire(&slot);
             match task_slots
                 .iter()
                 .find(|(_, s)| Arc::ptr_eq(s, &slot))
                 .map(|(id, _)| *id)
             {
+                // Still on the cursor, and still in health, until its task has stopped: retiring
+                // it here left a nest the runtime still served with no task once an ack timed out.
                 Some(id) => {
-                    unmounting.insert(id, ack);
+                    slot.stop.store(true, Ordering::Release);
+                    shared.bump();
+                    unmounting.entry(id).or_default().push(ack);
                 }
                 None => {
+                    retire(shared, ctx, &slot);
                     if let Some(ack) = ack {
                         let _ = ack.send(());
                     }
@@ -821,7 +871,7 @@ fn apply_command(
             tracing::info!("nest '{name}' mounted onto this cursor at block {next}");
             if let Some(ack) = ack {
                 if ack.send(()).is_err() {
-                    retire(&slot);
+                    retire(shared, ctx, &slot);
                 }
             }
         }
@@ -1619,7 +1669,7 @@ async fn nest_task(
     mut nest: NestIngest,
     mut sup: Supervisor,
     mut seen_marker: u64,
-) -> Result<()> {
+) -> Result<Option<Resume>> {
     enum Pick {
         Wait,
         Buffered(Arc<BufferedWindow>),
@@ -1645,7 +1695,7 @@ async fn nest_task(
     loop {
         rx.borrow_and_update();
         if slot.stop.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(Some(Box::new((nest, sup, seen_marker, next))));
         }
         let name = slot.name();
         if name != nest.name {
@@ -1654,7 +1704,7 @@ async fn nest_task(
         }
         match &sup.states[0] {
             NestState::Live => {}
-            NestState::Retired => return Ok(()),
+            NestState::Retired => return Ok(None),
             NestState::Quarantined { reason, retry_at } => {
                 *slot.reason.lock().unwrap() = Some(reason.clone());
                 match retry_at {
@@ -1881,6 +1931,10 @@ async fn nest_task(
                 continue;
             }
         };
+        // A stop that arrived during the fetch skips the window, so the ack waits on no commit.
+        if slot.stop.load(Ordering::Acquire) {
+            continue;
+        }
         let permit = ctx.permits.acquire().await.expect("never closed");
         let done = match &header {
             Some(h) => {
