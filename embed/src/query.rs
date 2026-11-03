@@ -285,15 +285,13 @@ impl TabQuery {
                 let n = (batch.num_rows() - start)
                     .min(ENCODE_ROWS)
                     .min(cap - written);
-                let mut part = compact(&batch.slice(start, n));
+                let mut slice = batch.slice(start, n);
                 // As the node's: a slice that would cross the byte cap is written a row at a time, so
-                // the answer ends at the row that crosses it (#2589, #2616).
-                if part
-                    .as_ref()
-                    .is_ok_and(|p| slice_bytes(p) > max_bytes - w.get_ref().len())
-                {
-                    part = compact(&batch.slice(start, 1));
+                // the answer ends at the row that crosses it (#2589, #2616), sized before it is copied.
+                if slice_bytes(&slice) > max_bytes - w.get_ref().len() {
+                    slice = batch.slice(start, 1);
                 }
+                let part = compact(&slice);
                 let written_now = match part.and_then(|p| w.write(&p).map(|()| p.num_rows())) {
                     Ok(n) => n,
                     Err(e) => {

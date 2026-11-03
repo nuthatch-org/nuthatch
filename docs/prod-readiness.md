@@ -323,6 +323,8 @@ case.
   | `x86_64-unknown-linux-gnu` (scaled) | `release.yml` | the `--features postgres-store` job |
   | `aarch64-unknown-linux-gnu` (default, graph) | `release.yml`, native arm64 runner | no CI test job |
   | `aarch64-apple-darwin` (default, graph) | `release.yml` | no CI test job; manual live runs in [verification.md](verification.md) |
+  | `x86_64-unknown-linux-musl` (default, static) | `release.yml` | no CI test job; musl's allocator, not jemalloc |
+  | `x86_64-apple-darwin` (default) | `release.yml`, cross-compiled on the arm64 macOS runner | no CI test job; not yet run on Intel hardware |
 
   Scaled is x86_64 Linux only. No job in `ci.yml` runs on macOS or arm64 Linux, so a regression
   specific to either reaches a user before CI sees it; the macOS manual runs are dated, not standing.

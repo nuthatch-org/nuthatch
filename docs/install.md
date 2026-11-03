@@ -18,15 +18,19 @@ in `~/.zshrc` (or `~/.bashrc`) to keep it for new terminals. Many Linux distribu
 directory when it exists; if yours does not, the same line applies. The installer itself is served from
 the website and lives in its own repository, so this is documented here rather than changed there.
 
-Prebuilt binaries are published for three targets, attached to every release with their checksums:
+Prebuilt binaries are published for five targets, attached to every release with their checksums:
 
 | Platform | Target | Prebuilt |
 |---|---|---|
 | macOS, Apple Silicon | `aarch64-apple-darwin` | yes |
 | Linux x86_64 | `x86_64-unknown-linux-gnu` | yes |
+| Linux x86_64, static | `x86_64-unknown-linux-musl` | default binary only, from the release after 5.16.0 |
 | Linux aarch64 | `aarch64-unknown-linux-gnu` | yes, from the release after 4.11.0 |
-| macOS, Intel | `x86_64-apple-darwin` | **no** - build from source |
+| macOS, Intel | `x86_64-apple-darwin` | default binary only, from the release after 5.16.0 |
 | anything else | - | **no** - build from source |
+
+The Intel Mac binary is cross-compiled on an Apple Silicon runner and needs macOS 10.12 or newer.
+No CI job runs it, and it has not yet been run on Intel hardware.
 
 On a platform without a prebuilt binary the installer stops and prints the source-build command
 below rather than installing something that will not run.
@@ -51,7 +55,12 @@ and `hypotf` at `GLIBC_2.35` and nothing newer, read the same way off a 4.11.0 b
 which is C++, and also needed libstdc++ from GCC 11 (`GLIBCXX_3.4.29`).
 
 Debian 12 and Ubuntu 22.04 clear it. RHEL 9 and Amazon Linux 2023 ship glibc 2.34: they ran 4.0.x and
-need the source build from 4.1.0 on.
+need the source build from 4.1.0 on, or the static build below.
+
+**The static build.** `nuthatch-x86_64-unknown-linux-musl.tar.gz` is statically linked and needs no glibc,
+so it is the one for Alpine and for distributions older than glibc 2.35. It uses musl's allocator rather than the
+jemalloc the glibc build carries, so its memory and allocation speed under load are unmeasured and it
+publishes no `nuthatch_jemalloc_*` gauges. Prefer the glibc build where it runs; the installer does.
 
 ## Verifying a download
 
@@ -72,7 +81,8 @@ becomes public.
 
 ## Building from source
 
-This is the only route on a platform without a prebuilt binary, **Intel Macs included**:
+This is the only route on a platform without a prebuilt binary, and for the `scaled`, `graph` and
+`flight` variants on an Intel Mac:
 
 ```sh
 rustup toolchain install 1.95.0

@@ -938,6 +938,14 @@ impl MountTable {
                     .settings()
                     .with_context(|| format!("mount '{}': invalid [mounts.publish]", m.alias))?;
             }
+            if m.sync.is_some() && !cfg!(feature = "sync-server") {
+                bail!(
+                    "mount '{}' declares [mounts.sync], RFC-0080's partial sync, which this build does \
+                     not serve: it needs a build with `--features sync-server`. Delete the \
+                     [mounts.sync] table to load this runtime with this binary",
+                    m.alias
+                );
+            }
             if let Some(sync) = &m.sync {
                 sync.validate()
                     .with_context(|| format!("mount '{}': invalid [mounts.sync]", m.alias))?;
@@ -6226,7 +6234,7 @@ fn overlay_mount_record(
     state.isolation = query_partition(seating.isolation, name, seating.default_tenant);
     if let Some(tenant) = &state.isolation {
         let guard = state.query_guard(state.limits.timeout, state.limits.max_rows);
-        crate::maintained::seat(&state.dir, tenant.clone(), guard);
+        crate::maintained::seat(&state.dir, name, tenant.clone(), guard);
     }
     state.sync = record.and_then(|r| r.sync.clone()).map(Arc::new);
     // A state cloned from a co-tenant's arrives in that tenant's seat; it takes its own.
@@ -7594,6 +7602,7 @@ impl RuntimeHandles {
         // The route key is `tenant/alias` once more than one tenant is mounted, and the record's
         // `alias` is only the second segment. The serving state already knows its dataset (#1531).
         let dataset_dir = self.states[idx].1.dir.clone();
+        crate::maintained::unseat(&dataset_dir, name);
         // The cursor and alert worker know a shared dataset by the mount that first indexed it, which
         // may be this one or another. While any other mount still holds the store, both stay running
         // (RFC-0032 §5): only this mount's routes go.
@@ -7930,8 +7939,12 @@ impl RuntimeHandles {
             .iter()
             .position(|(n, _)| n == name)
             .expect("still mounted");
+        let new_dir = new_state.dir.clone();
         let (_, old_state) =
             std::mem::replace(&mut self.states[old_idx], (name.to_string(), new_state));
+        // The name left the old dataset, and the staging name the new one (#2636).
+        crate::maintained::unseat(&old_state.dir, name);
+        crate::maintained::unseat(&new_dir, &staging);
         if let Some(mb) = self.estimates.remove(&staging) {
             self.estimates.insert(name.to_string(), mb);
         }
@@ -9463,6 +9476,7 @@ mod tests {
     /// RFC-0080 §5.6: a mount's `[mounts.sync]` reaches the state it is served from, and the feed's
     /// `mount` line, which is how a follower learns it; a state with no record has none.
     #[test]
+    #[cfg(feature = "sync-server")]
     fn a_mounts_sync_reaches_its_state_and_the_feed_line() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -9502,6 +9516,7 @@ mod tests {
     /// RFC-0080 §5.6: `[mounts.sync]` is read per mount, checked on load, written back, and absent
     /// from a mount that does not set it.
     #[test]
+    #[cfg(feature = "sync-server")]
     fn mounts_sync_is_read_per_mount_checked_and_written_back() {
         let nid = "a".repeat(64);
         let head = format!(
@@ -9535,6 +9550,29 @@ mod tests {
              [mounts.sync.tables]\nswaps = []\n"
         );
         assert!(toml::from_str::<MountTable>(&pinned).is_err());
+    }
+
+    /// RFC-0080 §20: a build without `sync-server` refuses `[mounts.sync]` by name and says what loads
+    /// it, rather than loading a mount whose route it does not serve.
+    #[cfg(not(feature = "sync-server"))]
+    #[test]
+    fn a_default_build_refuses_mounts_sync_by_name() {
+        let nid = "a".repeat(64);
+        let head = format!(
+            "[runtime]\nname = \"r\"\nchain = \"x\"\nchain_id = 1\n\n\
+             [[mounts]]\ntenant = \"default\"\nalias = \"swaps\"\nnid = \"{nid}\"\n"
+        );
+        let plain: MountTable = toml::from_str(&head).unwrap();
+        plain
+            .validate_mounts()
+            .expect("a mount without [mounts.sync] loads");
+        let synced: MountTable =
+            toml::from_str(&format!("{head}[mounts.sync.tables]\nswaps = [\"pool\"]\n")).unwrap();
+        let err = format!("{:#}", synced.validate_mounts().unwrap_err());
+        assert!(
+            err.contains("[mounts.sync]") && err.contains("--features sync-server"),
+            "{err}"
+        );
     }
 
     /// #1565, and the 3.13.0 tyre-kick: a mount's route key depends on its own tenant alone, so it

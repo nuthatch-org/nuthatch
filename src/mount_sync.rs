@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+#[cfg(feature = "sync-server")]
 use crate::shape::Shape;
 
 /// `[mounts.sync]`.
@@ -38,6 +39,7 @@ const MAX_SHAPES_CEILING: usize = 1024;
 const MAX_VALUES_CEILING: usize = 100_000;
 
 /// Why a shape was refused. Each says which part, so a client can fix it.
+#[cfg(feature = "sync-server")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     Table(String),
@@ -58,6 +60,7 @@ pub enum Refusal {
     Unconstrained(String),
 }
 
+#[cfg(feature = "sync-server")]
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -86,6 +89,7 @@ impl std::fmt::Display for Refusal {
     }
 }
 
+#[cfg(feature = "sync-server")]
 impl std::error::Error for Refusal {}
 
 impl MountSync {
@@ -110,6 +114,7 @@ impl MountSync {
     }
 
     /// Whether a connection already holding `held` shapes may add `shape`.
+    #[cfg(feature = "sync-server")]
     pub fn admit(&self, held: usize, shape: &Shape) -> Result<(), Refusal> {
         if held >= self.max_shapes_per_connection {
             return Err(Refusal::TooManyShapes {
@@ -147,7 +152,7 @@ impl MountSync {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sync-server"))]
 mod tests {
     use super::*;
 

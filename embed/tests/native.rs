@@ -211,6 +211,9 @@ fn an_arrow_answer_stops_at_the_byte_cap_and_says_so() {
     for sql in [
         "SELECT repeat('A', 4000000) AS x FROM range(32)",
         "SELECT arrow_cast(repeat('A', 4000000), 'Utf8View') AS x FROM range(32)",
+        // #2631: a view inside a list or a struct.
+        "SELECT make_array(arrow_cast(repeat('A', 4000000), 'Utf8View')) AS x FROM range(32)",
+        "SELECT named_struct('s', arrow_cast(repeat('A', 4000000), 'Utf8View')) AS x FROM range(32)",
     ] {
         let (bytes, _, rows, truncated) =
             futures::executor::block_on(q.collect_ipc(sql, 50_000, SQL_MAX_RESULT_BYTES)).unwrap();

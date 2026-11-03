@@ -17,6 +17,7 @@ use nuthatch_embed::cellar::Cellar;
 use nuthatch_embed::complete::{Completeness, Receipts};
 use nuthatch_embed::derived::NestFiles;
 use nuthatch_embed::http::Scope;
+use nuthatch_embed::kept;
 use nuthatch_embed::mirror::{self, Hydrated, MirrorConfig, MirrorHost};
 use nuthatch_embed::narrow::{self, FilterSpec, Privacy};
 use nuthatch_embed::nest::{NestSpec, CONFIG_FILE};
@@ -759,6 +760,8 @@ async fn open_host(c: Config, spec: NestSpec) -> anyhow::Result<Engine> {
     let handle = open_file(STORE_FILE).await?;
     let db = redb::Builder::new().create_with_backend(HostFile::new(handle, STORE_FILE))?;
     let store = Store::from_db(db, None)?;
+    kept::admit(&store, c.filters.as_deref(), c.verified)
+        .map_err(|e| anyhow::Error::from(fault_of("open_failed", e)))?;
     let Some(m) = c.mirror.clone() else {
         let cellar = Arc::new(Cellar::over(store.clone())?);
         return build(c, spec, store, cellar, None, None);

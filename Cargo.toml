@@ -221,6 +221,10 @@ counter = ["dep:base64", "dep:k256", "alloy-primitives/k256"]
 graph = ["folds", "dep:Inflector", "nuthatch-core/checkpoint-hash-index"]
 # RFC-0059: checkpointed folds. Off by default, and a default build refuses a nest that ships `folds/`.
 folds = []
+# RFC-0080's server half, `GET /<route>/sync` on a follower. Off by default since its third S0 failed
+# (§20): a default build has no route and refuses `[mounts.sync]` by name. The engine's client half is
+# its own crate's `sync` feature.
+sync-server = []
 # #1717: named points where a test build aborts when `NUTHATCH_CRASH_AT` names them. Off by default,
 # and a default build compiles every point to nothing.
 crash-points = []

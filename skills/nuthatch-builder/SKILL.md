@@ -39,10 +39,13 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT valu
 
 ## Reading answers from code
 
-- `POST /sql` and `GET /q/{name}` answer JSON by default. Send `Accept: application/vnd.apache.arrow.stream`
-  (or `format=arrow` in the query or body) for the rows as an Arrow IPC stream, with the rest of the
-  envelope (`provenance`, `truncated`, `degraded`) as JSON in the `x-nuthatch-answer` header. A refusal
-  is still JSON. Prefer this for exports and columnar clients; the values are the same as JSON's.
+- `/sql` and `/q/{name}` answer JSON by default. Send `Accept: application/vnd.apache.arrow.stream`
+  for the rows as an Arrow IPC stream. `/sql` also takes `format=arrow` in the query or the body;
+  `/q/{name}` does not, because a declared query may have a parameter called `format` and a POST
+  body is its argument object, so ask it by `Accept` only. The rest of the answer, the JSON envelope
+  less `rows` (`count`, `columns`, `truncated`, `degraded`, `provenance` and the others), comes as JSON
+  in the `x-nuthatch-answer` header. A refusal is still JSON. Prefer this for exports and columnar
+  clients; the values are the same as JSON's.
 - A binary built with `--features flight` can serve Flight SQL beside the HTTP API; see the flight build in `docs/operators.md`.
 
 ## When to read what
