@@ -243,7 +243,7 @@ jobs:
           PR: ${{ steps.pr.outputs.number }}
           REPO: ${{ github.repository }}
           CHECK_ID: ${{ steps.check.outputs.id }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -uo pipefail
           conclusion=failure
@@ -259,7 +259,7 @@ jobs:
               echo '<!-- pr-review:luna -->'
               jq -r '"### Jules · merge-safety \(.confidence)/100\n\nverdict: **\(.verdict)**\n\n\(.summary)\n"' review.json
               jq -r 'if (.findings | length) == 0 then "No findings.\n" else "#### \(.findings | length) finding(s)\n\n" + ([.findings[] | "- \(.severity) · certainty \(.certainty // "?")/100 · \(.file):\(.line) - **\(.title)**\n  \(.detail)"] | join("\n")) + "\n" end' review.json
-              echo '<sub>Jules · gpt-5.6-luna · required approval · push a fix or comment `/re-review` to run again</sub>'
+              echo '<sub>Jules · claude-haiku-5-5 · required approval · push a fix or comment `/re-review` to run again</sub>'
             } > review.md
             if GH_TOKEN="$JULES_TOKEN" gh pr comment "$PR" --repo "$REPO" --body-file review.md; then
               verdict="$(jq -r '.verdict' review.json)"

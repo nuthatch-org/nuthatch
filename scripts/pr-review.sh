@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Review one pull request's diff with GPT-5.6 Luna and print a Markdown comment.
+# Review one pull request's diff with Claude Haiku 5.5 and print a Markdown comment.
 #
 # Bash+jq port of the retired scripts/pr-review.py (#1372) - same interface, same prompt, same
 # JSON-schema contract with the model. jq's strings are Unicode codepoints, like Python's, so the
@@ -10,22 +10,23 @@
 # green only for a `ship` verdict. A finding, a failed review, or malformed model output is red until
 # the author addresses it and asks for `/re-review`.
 #
-# Model: `gpt-5.6-luna`, $0.20/$1.20 per MTok since 2026-07-30.
+# Model: `claude-haiku-5-5`, $0.10/$0.50 per MTok up to a 100K-token prompt, since 2026-11-03
+# (gpt-5.6-luna until its credits ran out on 2026-10-30).
 #
 # **A review that did not happen must never render as a clean one** (#841). An API error, a truncated
-# response, a missing or out-of-range field: all exit non-zero and print nothing that could be
-# mistaken for a verdict. The schema sent to the model bounds `confidence` and `certainty` to 0-100
-# (#1056: a `certainty: 150` once satisfied "integer" and rendered as a score) - this script also
-# checks the response it gets back, rather than trusting the API's strict mode alone to have held.
+# response, a refusal, a missing or out-of-range field: all exit non-zero and print nothing that could
+# be mistaken for a verdict. The schema bounds `confidence` and `certainty` to 0-100 (#1056: a
+# `certainty: 150` once satisfied "integer" and rendered as a score). Anthropic's structured outputs
+# do not accept `minimum`/`maximum`, so they are stripped from what is sent and enforced here instead.
 #
 # Usage:
 #   pr-review.sh --diff pr.diff --title "feat: ..." [--body-file body.txt] [--json] [--dry-run] ...
 #
-# Reads OPENAI_API_KEY from the environment (not required for --dry-run). Prints Markdown on stdout,
+# Reads ANTHROPIC_API_KEY from the environment (not required for --dry-run). Prints Markdown on stdout,
 # diagnostics on stderr.
 set -euo pipefail
 
-MODEL_DEFAULT="gpt-5.6-luna"
+MODEL_DEFAULT="claude-haiku-5-5"
 CLAUDE_MD_PATH="CLAUDE.md"
 
 # A cap on what is sent, not on what could be afforded - see the jq program's budget_diff for the
@@ -37,7 +38,7 @@ MAX_PRIOR_CHARS_DEFAULT=40000
 
 # Overridable so a canned response can be fed to the response-validation path without a real key or
 # a real API call - see the harness's response-path tests.
-ENDPOINT="${PR_REVIEW_ENDPOINT:-https://api.openai.com/v1/chat/completions}"
+ENDPOINT="${PR_REVIEW_ENDPOINT:-https://api.anthropic.com/v1/messages}"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -88,9 +89,9 @@ done
 [ -n "$diff_file" ] || { echo "pr-review: --diff is required" >&2; usage; }
 [ -f "$diff_file" ] || { echo "pr-review: no such file: $diff_file" >&2; exit 1; }
 
-api_key="${OPENAI_API_KEY:-}"
+api_key="${ANTHROPIC_API_KEY:-}"
 if [ -z "$api_key" ] && [ "$dry_run" -ne 1 ] && [ "$self_test_budget" -ne 1 ]; then
-  echo "pr-review: OPENAI_API_KEY is not set" >&2
+  echo "pr-review: ANTHROPIC_API_KEY is not set" >&2
   exit 1
 fi
 
@@ -599,9 +600,14 @@ jq -n -a \
   --arg model "$model" \
   '{
     model: $model,
-    messages: [ {role: "system", content: $system}, {role: "user", content: $user} ],
-    response_format: { type: "json_schema", json_schema: { name: "pr_review", strict: true, schema: $schema[0] } },
-    max_completion_tokens: 8000
+    max_tokens: 32000,
+    system: $system,
+    messages: [ {role: "user", content: $user} ],
+    output_config: {
+      effort: "high",
+      format: { type: "json_schema",
+                schema: ($schema[0] | walk(if type == "object" then del(.minimum, .maximum) else . end)) }
+    }
   }' > "$tmp/payload.json"
 
 attempts=3
@@ -612,7 +618,8 @@ while [ "$attempt" -le "$attempts" ]; do
   curl_exit=0
   http_code="$(curl -sS -o "$tmp/response.json" -w '%{http_code}' --max-time 300 \
     -X POST "$ENDPOINT" \
-    -H "Authorization: Bearer $api_key" \
+    -H "x-api-key: $api_key" \
+    -H "anthropic-version: 2026-10-21" \
     -H "Content-Type: application/json" \
     --data-binary "@$tmp/payload.json")" || curl_exit=$?
 
@@ -652,22 +659,23 @@ if [ "$success" -ne 1 ]; then
   exit 1
 fi
 
-finish_reason="$(jq -r '.choices[0].finish_reason // "stop"' "$tmp/response.json")"
-if [ "$finish_reason" != "stop" ]; then
+stop_reason="$(jq -r '.stop_reason // "missing"' "$tmp/response.json")"
+if [ "$stop_reason" != "end_turn" ]; then
   # A response cut off at the token ceiling is a partial review, and a partial review that renders
-  # as a whole one is exactly the failure this script refuses to have.
-  echo "pr-review: response did not finish cleanly ($finish_reason)" >&2
+  # as a whole one is exactly the failure this script refuses to have. A refusal is no review at all.
+  echo "pr-review: response did not finish cleanly ($stop_reason)" >&2
   exit 1
 fi
 
-content="$(jq -r '.choices[0].message.content // ""' "$tmp/response.json")"
+# Thinking blocks come first; the review is the text.
+content="$(jq -r '[.content[]? | select(.type == "text") | .text] | join("")' "$tmp/response.json")"
 if [ -z "$content" ]; then
   echo "pr-review: model returned an empty message" >&2
   exit 1
 fi
 
-prompt_tokens="$(jq -r '.usage.prompt_tokens // "?"' "$tmp/response.json")"
-completion_tokens="$(jq -r '.usage.completion_tokens // "?"' "$tmp/response.json")"
+prompt_tokens="$(jq -r '.usage.input_tokens // "?"' "$tmp/response.json")"
+completion_tokens="$(jq -r '.usage.output_tokens // "?"' "$tmp/response.json")"
 echo "pr-review: $prompt_tokens in, $completion_tokens out" >&2
 
 if ! printf '%s' "$content" | jq -e . > /dev/null 2>&1; then
