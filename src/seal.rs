@@ -2357,6 +2357,112 @@ mod sealed_rows {
     }
 }
 
+/// The ledger of segments kept for followers, which a `nuthatch prune` in another process reads (#2580).
+#[cfg(test)]
+mod retention_ledger {
+    use super::*;
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// A mounted dataset `<root>/data/<nid>` with its shared store, followed by connection `conn`.
+    fn followed_dataset(root: &Path, conn: u64) -> (PathBuf, PathBuf) {
+        let dir = root.join(crate::runtime::DATA_DIR).join("nid");
+        let store = root.join(SEGMENTS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        follower_connected(&dir, conn);
+        (dir, std::fs::canonicalize(&store).unwrap())
+    }
+
+    fn ledger(store: &Path) -> BTreeMap<String, u64> {
+        let bytes = std::fs::read(store.join(RETAINED_FILE)).expect("the ledger is written");
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn the_grace_is_the_datasets_own_or_the_default() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, _) = followed_dataset(root.path(), 1);
+        assert_eq!(follower_grace(&dir), FOLLOWER_GRACE);
+        set_follower_retention(&dir, Duration::from_secs(7), Duration::from_secs(60));
+        assert_eq!(follower_grace(&dir), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn a_retained_segment_is_in_the_ledger_until_its_most_is_up() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, store) = followed_dataset(root.path(), 2);
+        set_follower_retention(&dir, FOLLOWER_GRACE, Duration::from_secs(600));
+        let before = now_secs();
+        retain_for_followers(&dir, &store.join("aaaa.parquet"), "aaaa");
+        let after = now_secs();
+
+        assert_eq!(
+            ledger_retained(&store),
+            BTreeSet::from(["aaaa".to_string()])
+        );
+        let until = ledger(&store)["aaaa"];
+        // The most left, rounded down to whole seconds, plus one: 600 s from a retain made just now.
+        assert!(
+            (before + 600..=after + 601).contains(&until),
+            "until {until}, retained between {before} and {after}"
+        );
+        assert!(
+            !store.join(RETAINED_FILE).with_extension("tmp").exists(),
+            "the ledger is renamed into place"
+        );
+    }
+
+    #[test]
+    fn a_released_segment_leaves_the_ledger() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, store) = followed_dataset(root.path(), 3);
+        set_follower_retention(&dir, Duration::ZERO, Duration::from_secs(600));
+        retain_for_followers(&dir, &store.join("bbbb.parquet"), "bbbb");
+        assert!(ledger_retained(&store).contains("bbbb"));
+
+        catalogue_moved(&dir, (1, 1));
+        follower_applied(&dir, 3, (1, 1));
+        release_retained();
+        assert!(
+            ledger_retained(&store).is_empty(),
+            "every follower applied the commit that stopped naming it, past a zero grace"
+        );
+        assert!(!store.join(RETAINED_FILE).exists(), "an empty ledger is removed");
+    }
+
+    #[test]
+    fn the_ledger_keeps_only_what_has_time_left() {
+        let store = tempfile::tempdir().unwrap();
+        // `until == now` must not count as time left; retry if the second turns over mid-check.
+        for _ in 0..20 {
+            let now = now_secs();
+            let entries = BTreeMap::from([
+                ("past".to_string(), now - 1000),
+                ("edge".to_string(), now),
+                ("future".to_string(), now + 1000),
+            ]);
+            std::fs::write(
+                store.path().join(RETAINED_FILE),
+                serde_json::to_vec(&entries).unwrap(),
+            )
+            .unwrap();
+            let kept = ledger_retained(store.path());
+            if now_secs() != now {
+                continue;
+            }
+            assert_eq!(kept, BTreeSet::from(["future".to_string()]));
+            return;
+        }
+        panic!("the clock turned over a second on every attempt");
+    }
+}
+
 /// Whether a file's Parquet footer and schema read: what "the segment binds" means, checked without an
 /// engine, for a test that must know its corrupt fixture is the corruption it claims.
 #[cfg(test)]
