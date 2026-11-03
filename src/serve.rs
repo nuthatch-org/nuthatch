@@ -597,6 +597,7 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
             .route("/flags", get(flags))
             .route("/nest", get(nest))
             .route("/shape", get(shape))
+            .route("/sync", get(sync_route))
             .route("/api", get(etherscan_api)),
     ))
     .route_layer(axum::middleware::from_fn(crate::cost::layer))
@@ -619,6 +620,34 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
         move |req, next| pin_request(backing.clone(), req, next)
     }))
     .with_state(backing)
+}
+
+/// How a follower answers `GET /<route>/sync` (RFC-0080), put on the request by its own layer so the
+/// route runs inside the mount's: counted, timed and pinned as `/sql` is (#2603).
+#[derive(Clone)]
+pub struct SyncHandler(
+    pub  Arc<
+        dyn Fn(axum::http::Uri) -> futures::future::BoxFuture<'static, axum::response::Response>
+            + Send
+            + Sync,
+    >,
+);
+
+/// `GET /sync`: a follower's shapes. A writer serves none of them.
+async fn sync_route(
+    handler: Option<axum::Extension<SyncHandler>>,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    match handler {
+        Some(axum::Extension(SyncHandler(answer))) => answer(uri).await,
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(
+                json!({ "error": "sync_off", "why": "a writer serves no shapes; ask a follower" }),
+            ),
+        )
+            .into_response(),
+    }
 }
 
 tokio::task_local! {

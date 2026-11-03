@@ -1,4 +1,7 @@
-//! RFC-0080 S0: the value-term shape and its per-delta filter, as a spike. Nothing here is served.
+//! RFC-0080: the value-term shape, and the index that finds the shapes a row is in.
+//!
+//! A row is in a shape by [`Shape::matches`] alone: `/sync`'s first answer, its live puts and its
+//! retractions all decide it there, over the columns `/sql` reads (#2588).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -83,10 +86,13 @@ impl Shape {
         format!("{:x}", Sha256::digest(canonical))
     }
 
+    /// Whether `row`, a row of this shape's table, is in it. A null, a tuple or a list is in no term,
+    /// as `/sql`'s `CAST(.. AS VARCHAR) IN (..)` cannot equal one either.
     pub fn matches(&self, row: &Value) -> bool {
         self.terms.iter().all(|(column, values)| {
             row.get(column)
-                .is_some_and(|v| values.contains(text(v).as_ref()))
+                .and_then(text)
+                .is_some_and(|v| values.contains(v.as_ref()))
         }) && self.ranges.iter().all(|(column, range)| {
             row.get(column)
                 .and_then(number)
@@ -109,10 +115,10 @@ impl Shape {
     /// Terms compare as text, as [`Shape::matches`] does; ranges compare as the numbers they bound.
     pub fn select_sql(&self) -> String {
         let name = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-        let text = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let quoted = |s: &str| format!("'{}'", s.replace('\'', "''"));
         let mut wheres: Vec<String> = Vec::new();
         for (column, values) in &self.terms {
-            let listed: Vec<String> = values.iter().map(|v| text(v)).collect();
+            let listed: Vec<String> = values.iter().map(|v| quoted(v)).collect();
             wheres.push(format!(
                 "CAST({} AS VARCHAR) IN ({})",
                 name(column),
@@ -148,11 +154,12 @@ fn number(v: &Value) -> Option<u64> {
     }
 }
 
-/// A column's value as the text a term names it by.
-fn text(v: &Value) -> Cow<'_, str> {
+/// A column's value as the text a term names it by; `None` for a value no term names.
+fn text(v: &Value) -> Option<Cow<'_, str>> {
     match v {
-        Value::String(s) => Cow::Borrowed(s),
-        other => Cow::Owned(other.to_string()),
+        Value::String(s) => Some(Cow::Borrowed(s)),
+        Value::Number(_) | Value::Bool(_) => Some(Cow::Owned(v.to_string())),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
     }
 }
 
@@ -164,17 +171,9 @@ enum Read<'a> {
     Complex,
 }
 
-/// The table a stored row is in, from its `table` field; `None` for a row with none, or one a
-/// plain read cannot take it from, which no shape selects.
-pub fn table_of(row: &str) -> Option<&str> {
-    match scalar_in(row, "\"table\":") {
-        Read::Scalar(table) => Some(table),
-        _ => None,
-    }
-}
-
 /// `needle` is the column's key as the writer spells it, `"name":`. Rows come from `serde_json` and
-/// plain column names are never escaped there, so a key found is the row's own.
+/// plain column names are never escaped there, so a key found in a row with no nested value is the
+/// row's own; [`ShapeIndex::matching_text`] parses any other row whole.
 fn scalar_in<'a>(row: &'a str, needle: &str) -> Read<'a> {
     let Some(at) = row.find(needle) else {
         return Read::Absent;
@@ -192,8 +191,10 @@ fn scalar_in<'a>(row: &'a str, needle: &str) -> Read<'a> {
             let end = rest.find([',', '}']).unwrap_or(rest.len());
             let word = &rest[..end];
             let plain = word.bytes().all(|b| b.is_ascii_digit() || b == b'-')
-                || matches!(word, "true" | "false" | "null");
-            if plain {
+                || matches!(word, "true" | "false");
+            if word == "null" {
+                Read::Absent
+            } else if plain {
                 Read::Scalar(word)
             } else {
                 Read::Complex
@@ -285,8 +286,10 @@ impl ShapeIndex {
                 .filter(|&id| self.shapes[id].matches(row)),
         );
         for (column, indexed) in &self.by_column {
-            let Some(v) = row.get(column) else { continue };
-            if let Some(found) = indexed.by_value.get(text(v).as_ref()) {
+            let Some(v) = row.get(column).and_then(text) else {
+                continue;
+            };
+            if let Some(found) = indexed.by_value.get(v.as_ref()) {
                 out.extend(
                     found
                         .solo
@@ -303,9 +306,11 @@ impl ShapeIndex {
     }
 
     /// [`ShapeIndex::matching`] for a row's JSON text, into `out`. Only the indexed columns are read
-    /// off it, with no parse of the rest; a row that cannot be read that way is parsed whole.
+    /// off it, with no parse of the rest; a row that cannot be read that way is parsed whole. So is
+    /// any row with a nested value, whose components a text read could take for its columns (#2588).
     pub fn matching_text(&self, row: &str, out: &mut Vec<usize>) {
-        if self.read_text(row, out).is_none() {
+        let nested = row.get(1..).is_some_and(|rest| rest.contains(['{', '[']));
+        if nested || self.read_text(row, out).is_none() {
             out.clear();
             if let Ok(parsed) = serde_json::from_str::<Value>(row) {
                 out.extend(self.matching(&parsed));

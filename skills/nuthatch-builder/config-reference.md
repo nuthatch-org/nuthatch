@@ -772,7 +772,8 @@ max_shapes_per_connection = 16                           # optional, 1 to 1024
 max_values_per_term = 1000                               # optional, 1 to 100000
 ```
 
-Only a listed table can be named, and only its listed columns constrained; a table listed with no
+Only a listed table can be named, and only its listed columns constrained; a table listed with
+columns is named with a term or a range on at least one of them, and only a table listed with no
 columns can be named with no terms, which is the whole table. A request outside that is refused with
 the part at fault. An unknown key is refused at load, and so is `pin`, which RFC-0080 describes and
 this build does not honour, rather than being ignored. This is a first cut: the route does not check
