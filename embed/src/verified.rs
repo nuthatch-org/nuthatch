@@ -265,6 +265,24 @@ impl Verifier {
                 Err(e) => bail!("the host gave no verified finalized block: {e:#}"),
             }
         };
+        // Below the floor nothing seals, so a light client on another chain would otherwise pass in
+        // silence (#2615): its block must be the RPC's block at that height.
+        if top.0 < floor {
+            let rpc = source.block_hash(top.0).await?;
+            if !rpc
+                .as_deref()
+                .is_some_and(|h| h.eq_ignore_ascii_case(&top.1))
+            {
+                bail!(
+                    "the verified finalized block {} ({}) is not the RPC's block {} ({}), and this \
+                     nest is past block {floor}: the light client follows another chain",
+                    top.0,
+                    top.1,
+                    top.0,
+                    rpc.as_deref().unwrap_or("none")
+                );
+            }
+        }
         let (from, link) = {
             let mut s = self.state();
             s.top = Some(top.clone());
@@ -598,5 +616,46 @@ mod tests {
         h.remove(1);
         let e = verify_chain(&h, &t).unwrap_err().to_string();
         assert!(e.contains("no header for block 26239808"), "{e}");
+    }
+
+    /// #2615: a verified head below what this nest already sealed, as a mainnet head wired into an
+    /// Arbitrum nest gives, is for another chain or a stale client. It is a refusal, not an idle wait.
+    #[test]
+    fn a_verified_head_below_the_seal_is_refused() {
+        let store = crate::window::Mem::default();
+        store.set(SEALED_THROUGH_KEY, 300_000_000);
+        let v = Verifier::new();
+        let top = Ok((21_000_000, format!("0x{}", "ab".repeat(32))));
+        crate::window::block_on(v.refresh(&top, &crate::window::Tape(Vec::new()), &store));
+        let why = v
+            .unverified()
+            .expect("a head below the seal must be refused");
+        assert!(
+            why.contains("21000000") && why.contains("300000000"),
+            "{why}"
+        );
+    }
+
+    /// A young nest whose start is above the finalized head: the head is below the floor but is the
+    /// RPC's own block there, so it waits for finality and is not refused.
+    #[test]
+    fn a_verified_head_below_a_young_nests_start_on_the_same_chain_is_not_refused() {
+        let store = crate::window::Mem::default();
+        store.set(START_BLOCK_KEY, 1_000);
+        let v = Verifier::new();
+        let top = Ok((990, format!("0x{:064x}", 990u64)));
+        crate::window::block_on(v.refresh(&top, &crate::window::Tape(Vec::new()), &store));
+        assert_eq!(v.unverified(), None);
+    }
+
+    /// The verified head at the seal itself is the ordinary case between finalizations: no refusal.
+    #[test]
+    fn a_verified_head_at_the_seal_is_not_refused() {
+        let store = crate::window::Mem::default();
+        store.set(SEALED_THROUGH_KEY, 300_000_000);
+        let v = Verifier::new();
+        let top = Ok((300_000_000, format!("0x{}", "ab".repeat(32))));
+        crate::window::block_on(v.refresh(&top, &crate::window::Tape(Vec::new()), &store));
+        assert_eq!(v.unverified(), None);
     }
 }

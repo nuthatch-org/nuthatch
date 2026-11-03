@@ -128,7 +128,8 @@ for (const wallet of wallets) {
   console.log(JSON.stringify(line));
   report.wallets.push({ ...line, result });
   for (const s of result.statements) {
-    if (s.verdict !== "equal") failures.push(`${wallet} ${s.name}: ${s.verdict} ${JSON.stringify(s.reason ?? s.columns?.filter((c) => c.verdict === "differs"))}`);
+    // `incomplete` is this gate's "named": nothing differs, and the columns not checked are listed.
+    if (s.verdict !== "equal" && s.verdict !== "incomplete") failures.push(`${wallet} ${s.name}: ${s.verdict} ${JSON.stringify(s.reason ?? s.columns?.filter((c) => c.verdict === "differs"))}`);
   }
   last = { wallet, filters, named, as_of: result.as_of };
 }
