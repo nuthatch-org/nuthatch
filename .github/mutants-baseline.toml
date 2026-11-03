@@ -29,8 +29,11 @@ exactly where that went wrong.
 
 [[survivor]]
 file = "src/seal.rs"
-mutation = "replace != with == in remove_retired"
-reason = "Only decides whether a failed unlink of a retired file is warned about; the function returns nothing."
+mutation = "replace == with != in write_ledgers"
+reason = """
+Only decides whether removing an empty ledger is warned about: `NotFound` (none was there) is taken as
+done, anything else is logged. Either way nothing is returned and the file's state is the same.
+"""
 
 [[survivor]]
 file = "src/seal.rs"
