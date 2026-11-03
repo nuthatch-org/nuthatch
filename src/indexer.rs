@@ -15616,6 +15616,128 @@ template = "pool"
         assert!(stats.own_fetches.load(std::sync::atomic::Ordering::Relaxed) > 0);
     }
 
+    /// #2607: a window fetched while b was quarantined holds none of b's logs. A slow co-tenant keeps
+    /// it buffered, so b reaches it on re-admission and must fetch that range itself, not commit it
+    /// empty. `last_block` alone cannot see this; the rows can.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_readmitted_nest_does_not_commit_windows_fetched_without_it() {
+        const TIP: u64 = 45;
+        let root = tempfile::tempdir().unwrap();
+        let nests = s0_nests(root.path(), false).await;
+        let source: Arc<dyn Source> = Arc::new(FilteringSource {
+            logs: three_transfer_chain(TIP),
+        });
+        let dirs: Vec<PathBuf> = nests.iter().map(|n| n.dir.clone()).collect();
+        let stores: Vec<_> = nests.iter().map(|n| n.store.clone()).collect();
+        slowed_nests()
+            .lock()
+            .unwrap()
+            .push((dirs[2].clone(), std::time::Duration::from_millis(600)));
+        fail_windows_of(&dirs[1], 1);
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let task = tokio::spawn(runtime_index_loop_buffered(
+            source,
+            nests,
+            Some(TIP - 1),
+            false,
+            1,
+            3,
+            health,
+            false,
+            None,
+            BufferOptions::for_test(64),
+        ));
+        wait_for(
+            "every nest reaches the tip",
+            std::time::Duration::from_secs(60),
+            || {
+                stores
+                    .iter()
+                    .all(|s| last_block_of(s.as_ref()) == Some(TIP))
+            },
+        )
+        .await;
+        task.abort();
+        let _ = task.await;
+        slowed_nests()
+            .lock()
+            .unwrap()
+            .retain(|(d, _)| d != &dirs[2]);
+        let rows: Vec<usize> = dirs
+            .iter()
+            .zip(&stores)
+            .map(|(d, s)| s0_contents(d, s.as_ref()).values().map(Vec::len).sum())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![TIP as usize; 3],
+            "each nest owns one transfer a block; rows stored for [a, b, c]"
+        );
+    }
+
+    /// #2607, the live-mount path: c is mounted while a slow b keeps windows fetched without c in
+    /// the buffer, so c must fetch those ranges itself rather than commit them empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_mounted_nest_does_not_commit_windows_fetched_without_it() {
+        const TIP: u64 = 45;
+        let root = tempfile::tempdir().unwrap();
+        let mut nests = s0_nests(root.path(), false).await;
+        let mut c = nests.pop().unwrap();
+        let source: Arc<dyn Source> = Arc::new(FilteringSource {
+            logs: three_transfer_chain(TIP),
+        });
+        let b_dir = nests[1].dir.clone();
+        let a_store = nests[0].store.clone();
+        slowed_nests()
+            .lock()
+            .unwrap()
+            .push((b_dir.clone(), std::time::Duration::from_millis(600)));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = spawn_test_cursor(
+            CursorKind::Buffered(64),
+            source.clone(),
+            nests,
+            Some(TIP - 1),
+            3,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            Some(rx),
+        );
+        wait_for(
+            "a reaches the tip",
+            std::time::Duration::from_secs(20),
+            || last_block_of(a_store.as_ref()) == Some(TIP),
+        )
+        .await;
+        let next = c
+            .prepare(source.as_ref(), Some(TIP - 1), false, 1, 3)
+            .await
+            .unwrap();
+        let (c_dir, c_store) = (c.dir.clone(), c.store.clone());
+        let (ack, acked) = tokio::sync::oneshot::channel();
+        tx.send(CursorCommand::Mount {
+            nest: Box::new(c),
+            next,
+            ack: Some(ack),
+        })
+        .unwrap();
+        acked.await.unwrap();
+        wait_for(
+            "the mounted nest catches up",
+            std::time::Duration::from_secs(30),
+            || last_block_of(c_store.as_ref()) == Some(TIP),
+        )
+        .await;
+        task.abort();
+        let _ = task.await;
+        slowed_nests().lock().unwrap().retain(|(d, _)| d != &b_dir);
+        let rows: usize = s0_contents(&c_dir, c_store.as_ref())
+            .values()
+            .map(Vec::len)
+            .sum();
+        assert_eq!(rows, TIP as usize, "c owns one transfer a block");
+    }
+
     /// RFC-0076 S2: lifecycle commands on the buffered cursor. A mounted nest behind the buffer
     /// catches up by itself, a rename is applied or refused as on the shared cursor, an unmount is
     /// acknowledged only once the cursor holds no reference to the nest's store, and a cursor with
