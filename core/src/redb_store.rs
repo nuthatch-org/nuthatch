@@ -289,6 +289,9 @@ pub struct Store<F = crate::tap::NoFeed> {
     /// Fence this handle holds, shared across clones so every clone of one nest's handle speaks for
     /// the same owner. `0` means unclaimed, which disables enforcement entirely.
     held: Arc<std::sync::atomic::AtomicU64>,
+    /// The writer-lease fence this handle was claimed under (RFC-0078 §5.2), which the feed reports;
+    /// `0` when no lease claimed it. Shared across clones like `held`.
+    lease: Arc<std::sync::atomic::AtomicU64>,
     /// Committed write transactions since this store was opened, shared across clones.
     writes: Arc<std::sync::atomic::AtomicU64>,
     /// [`Store::writes`] for the commits that change a hot row; see [`HotStore::rows_generation`].
@@ -341,6 +344,7 @@ impl<F> Clone for Store<F> {
             db: self.db.clone(),
             released: self.released.clone(),
             held: self.held.clone(),
+            lease: self.lease.clone(),
             writes: self.writes.clone(),
             rows: self.rows.clone(),
             commit_gate: self.commit_gate.clone(),
@@ -540,6 +544,7 @@ impl<F: Feed> Store<F> {
             db,
             released,
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            lease: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rows: Arc::new(std::sync::atomic::AtomicU64::new(rows_epoch())),
             commit_gate: Arc::default(),
@@ -625,6 +630,7 @@ impl<F: Feed> Store<F> {
             db,
             released,
             held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            lease: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rows: Arc::new(std::sync::atomic::AtomicU64::new(rows_epoch())),
             commit_gate: Arc::default(),
@@ -682,10 +688,11 @@ impl<F: Feed> Store<F> {
             .get(OUTBOX_SEQ)?
             .and_then(|v| v.value().parse::<u64>().ok())
             .unwrap_or(0);
-        meta.insert(
-            OUTBOX_SEQ,
-            (first + payloads.len() as u64).to_string().as_str(),
-        )?;
+        let next = (first + payloads.len() as u64).to_string();
+        meta.insert(OUTBOX_SEQ, next.as_str())?;
+        if !payloads.is_empty() {
+            rec.meta(OUTBOX_SEQ, &next);
+        }
         let mut ob = wtx.open_table(OUTBOX)?;
         for (seq, payload) in (first..).zip(payloads) {
             let key = Self::outbox_key(seq);
@@ -2051,6 +2058,17 @@ impl<F: Feed> HotStore for Store<F> {
 
     fn held_fence(&self) -> u64 {
         self.held.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn claim_under(&self, owner: &str, lease_fence: u64) -> Result<u64> {
+        let local = HotStore::claim(self, owner)?;
+        self.lease
+            .store(lease_fence, std::sync::atomic::Ordering::SeqCst);
+        Ok(local)
+    }
+
+    fn lease_fence(&self) -> u64 {
+        self.lease.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn outbox_push(&self, payload: &str) -> Result<u64> {

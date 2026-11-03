@@ -557,6 +557,9 @@ isolation = "strict"          # optional (default "shared"). "strict" gives each
                               # sessions, memory pools and memo entries, and refuses any SQL function
                               # not on the allow-list. For tenants who do not trust each other; read
                               # docs/security/shared-runtime.md first, the guarantee is not yet claimed.
+                              # A maintained view's copy (maintained.toml) is built under the same
+                              # rules, as a mounting tenant with its mount's statement timeout and
+                              # analytics_memory_bytes, and not before a mount is up.
 nests = []                    # pre-2.0: the nests resolved at nests/<name>/. Still read, but only
                               # for an alias no [[mounts]] record names; `migrate` moves them across.
 

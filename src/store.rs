@@ -125,16 +125,24 @@ pub fn import_mirrored(store: &Store, tables: &crate::feed::MirroredTables) -> R
                 t.insert(k.as_str(), v.as_str())?;
             }
         }
-        // The writer's counter is its own and not mirrored; deliveries after promotion number on
-        // from the last one imported, not over it.
-        let next = tables
+        // Past every id the old writer used (#2598): its mirrored counter, or past the last pending
+        // entry for a copy taken from a writer that predates mirroring it.
+        let pending = tables
             .outbox
             .keys()
             .filter_map(|k| k.parse::<u64>().ok())
             .max()
             .map_or(0, |last| last + 1);
-        wtx.open_table(META)?
-            .insert("outbox_next_seq", next.to_string().as_str())?;
+        let counted = tables
+            .meta
+            .get("outbox_next_seq")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let next = pending.max(counted);
+        if next > 0 {
+            wtx.open_table(META)?
+                .insert("outbox_next_seq", next.to_string().as_str())?;
+        }
     }
     wtx.commit()?;
     Ok(())
@@ -276,6 +284,54 @@ mod tests {
             promoted.outbox_push(r#"{"alert":4}"#).unwrap(),
             3,
             "numbered after the imported deliveries"
+        );
+    }
+
+    /// #2598: a delivery id is never reused across a takeover, so a receiver deduping on
+    /// `X-Nuthatch-Delivery` drops nothing new. The writer's counter reaches the follower whether the
+    /// copy came by delta or by snapshot, and whether or not the highest ids were delivered first.
+    #[test]
+    fn a_promoted_writer_numbers_deliveries_past_every_one_the_old_writer_made() {
+        let promote = |copy: &crate::feed::MirroredTables| {
+            let dir = tempfile::tempdir().unwrap();
+            let promoted = Store::open(&dir.path().join("p.redb")).unwrap();
+            import_mirrored(&promoted, copy).unwrap();
+            promoted.outbox_push(r#"{"after":true}"#).unwrap()
+        };
+
+        let a = tempfile::tempdir().unwrap();
+        let writer = Store::open(&a.path().join("w.redb")).unwrap();
+        let sub = feed_subscribe(&writer).unwrap();
+        let follower = crate::feed::MemStore::from_snapshot(a.path(), sub.snapshot);
+        let mut deltas = sub.deltas;
+        for n in 0..100 {
+            assert_eq!(writer.outbox_push(&format!(r#"{{"n":{n}}}"#)).unwrap(), n);
+        }
+        for n in 0..100 {
+            writer.outbox_remove(n).unwrap();
+        }
+        while let Ok(delta) = deltas.try_recv() {
+            follower.apply(&delta).unwrap();
+        }
+        assert!(follower.tables().outbox.is_empty());
+        assert_eq!(promote(&follower.tables()), 100, "followed by delta");
+
+        let snapshot = crate::feed::MirroredTables::of(&feed_subscribe(&writer).unwrap().snapshot);
+        assert_eq!(promote(&snapshot), 100, "copied by snapshot");
+
+        let b = tempfile::tempdir().unwrap();
+        let writer = Store::open(&b.path().join("w.redb")).unwrap();
+        for n in 0..3 {
+            writer.outbox_push(&format!(r#"{{"n":{n}}}"#)).unwrap();
+        }
+        writer.outbox_remove(1).unwrap();
+        writer.outbox_remove(2).unwrap();
+        let copy = crate::feed::MirroredTables::of(&feed_subscribe(&writer).unwrap().snapshot);
+        assert_eq!(copy.outbox.len(), 1, "0 still retrying");
+        assert_eq!(
+            promote(&copy),
+            3,
+            "past 2, which was delivered while 0 retried"
         );
     }
 }

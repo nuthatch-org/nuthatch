@@ -9,7 +9,8 @@
 //     [--mirror url] [--rpc url] [--storage dir] [--out report.json]
 //
 // `--hosted` is a node's base URL, answering `POST /sql` with its envelope. Exits non-zero on a
-// statement that is neither equal nor named, or on either of the two checks failing.
+// statement that is not equal (an incomplete one names its unchecked columns), or on either of the two
+// checks failing.
 import { createServer } from "node:http";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -128,7 +129,8 @@ for (const wallet of wallets) {
   console.log(JSON.stringify(line));
   report.wallets.push({ ...line, result });
   for (const s of result.statements) {
-    if (s.verdict !== "equal") failures.push(`${wallet} ${s.name}: ${s.verdict} ${JSON.stringify(s.reason ?? s.columns?.filter((c) => c.verdict === "differs"))}`);
+    // `incomplete` fails too: a column one side left out went unchecked.
+    if (s.verdict !== "equal") failures.push(`${wallet} ${s.name}: ${s.verdict} ${JSON.stringify(s.reason ?? s.columns?.filter((c) => c.verdict !== "equal"))}`);
   }
   last = { wallet, filters, named, as_of: result.as_of };
 }

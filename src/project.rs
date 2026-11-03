@@ -742,6 +742,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         window_deadline: None,
         runtime_dir: None,
         cursor_sql_permits: None,
+        strict_isolation: false,
         ipfs_gateways: Vec::new(),
         ipfs: Vec::new(),
         nest: Nest {

@@ -416,7 +416,18 @@ before the writer.
 **The delivery id, built.** Every webhook delivery carries `X-Nuthatch-Delivery`, its outbox sequence.
 The sequence survives a takeover, so a delivery made again by the new writer carries the id the old
 writer's did, and a receiver can dedupe on it. `each_delivery_names_its_outbox_sequence` checks the
-header against two queued alerts. A receiver that ignores it sees what it saw before.
+header against two queued alerts. A receiver that ignores it sees what it saw before. The writer's
+next-sequence counter is mirrored with the outbox, so a promoted writer numbers past every id whose
+push reached it, including ones delivered and removed before the takeover (#2598,
+`a_promoted_writer_numbers_deliveries_past_every_one_the_old_writer_made`). Neither delivery nor a
+handover waits for the follower to have a push (the handover's drain waits for sealed segments on
+the mirror, not for the feed), so an alert pushed and delivered in the instant before a takeover,
+which the standby never saw, can share an id with the new writer's first. The sequence is per nest; a receiver shared by several dedupes on the nest and the id together.
+
+**The fence a follower compares.** A store claimed under a writer lease records the lease's fence
+beside its local claim counter, and the feed's mount line carries the lease's (#2611). The local
+counter still guards the store's own writes; it counts claims on one host, so it says nothing about
+which writer took over from which.
 
 **The parity run (§7), built.** `a_promoted_follower_ends_where_an_uninterrupted_writer_does` cuts a
 writer at three points (every row hot; just after a reorg; just after a seal), promotes its
