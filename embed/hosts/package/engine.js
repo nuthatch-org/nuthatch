@@ -116,8 +116,8 @@ function compile(m) {
 /// What a node leaves out of a nest's inputs (`src/blob.rs`), by name at any depth and at the root.
 const NOT_INPUT = ["nuthatch.redb", "segments", ".git", ".DS_Store"];
 const NOT_INPUT_AT_ROOT = ["maintained", "quarantine"];
-/// A spill directory a node made (`spill_dir_pid` in `src/spill.rs`): the prefix, then its pid.
-const SPILL_DIR = /^nuthatch-(spill|duckdb)-\d+(-|$)/;
+/// A spill directory a node made (`is_spill_dir_name` in `src/spill.rs`): `<prefix><pid>-<seq>`.
+const SPILL_DIR = /^nuthatch-(spill|duckdb)-[0-9]+-[0-9]+$/;
 
 /// A nest's files: given by path, or in Node a directory read as a node reads one for its NID, so
 /// the files name the nest a node's `/sql` names (hidden files included).

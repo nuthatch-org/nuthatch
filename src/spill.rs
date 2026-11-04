@@ -44,12 +44,26 @@ fn sweep_dead_spill_dirs(parent: &Path) {
 
 pub(crate) const PREFIX: &str = "nuthatch-spill-";
 
-/// The pid a spill directory's name carries, or `None` for a name spill did not make. The second
-/// prefix is what releases before 4.1 called theirs.
-pub(crate) fn spill_dir_pid(name: &str) -> Option<u32> {
-    let rest = name
+/// Whether a name is one spill makes, `<prefix><pid>-<seq>` in ASCII digits and nothing else. The
+/// second prefix is what releases before 4.1 called theirs. `engine.js` matches the same shape.
+pub(crate) fn is_spill_dir_name(name: &str) -> bool {
+    let Some(rest) = name
         .strip_prefix(PREFIX)
-        .or_else(|| name.strip_prefix("nuthatch-duckdb-"))?;
+        .or_else(|| name.strip_prefix("nuthatch-duckdb-"))
+    else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    rest.split_once('-')
+        .is_some_and(|(pid, seq)| digits(pid) && digits(seq))
+}
+
+/// The pid a spill directory's name carries, or `None` for a name spill did not make.
+fn spill_dir_pid(name: &str) -> Option<u32> {
+    if !is_spill_dir_name(name) {
+        return None;
+    }
+    let rest = name.split_once('-')?.1.split_once('-')?.1;
     rest.split('-').next()?.parse().ok()
 }
 
@@ -142,6 +156,27 @@ fn create_exclusive(parent: &Path, seq: &AtomicU64) -> Result<SpillDir> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2663: exactly the names spill makes, so a nest file that only looks like one keeps counting
+    /// toward the NID. `engine.js`'s `SPILL_DIR` must agree with every row.
+    #[test]
+    fn only_the_names_spill_makes_are_spill_names() {
+        for (name, spill) in [
+            ("nuthatch-spill-4242-0", true),
+            ("nuthatch-duckdb-4242-17", true),
+            ("nuthatch-spill-99999999999-0", true),
+            ("nuthatch-spill-4242", false),
+            ("nuthatch-spill-1-notes.md", false),
+            ("nuthatch-spill-+5-0", false),
+            ("nuthatch-spill--0", false),
+            ("nuthatch-spill-notes.md", false),
+            ("nuthatch-spillover-1-0", false),
+        ] {
+            assert_eq!(is_spill_dir_name(name), spill, "{name}");
+        }
+        assert_eq!(spill_dir_pid("nuthatch-spill-4242-0"), Some(4242));
+        assert_eq!(spill_dir_pid("nuthatch-spill-99999999999-0"), None);
+    }
 
     /// Jules on #1583: on Linux the temp dir is often a tmpfs, where spill is RAM outside the budget.
     #[test]
