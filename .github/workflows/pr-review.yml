@@ -198,9 +198,27 @@ jobs:
             echo "::error::could not fetch the pull request's comments; refusing to review without the replies"
             exit 1
           fi
+          # The changed files at the head, as data, so Jules sees the code around each hunk rather than
+          # guessing at it (#2662: two of four findings were about lines it was never shown). A path is
+          # used only URL-encoded in an API call; files are saved by number, never by path, and gh's
+          # errors are dropped so nothing PR-controlled reaches the log.
+          mkdir -p pr.head && : > pr.head/index.tsv
+          n=0
+          while IFS= read -r path; do
+            n=$((n + 1))
+            enc="$(jq -rn --arg p "$path" '$p | split("/") | map(@uri) | join("/")')"
+            if gh api -H 'Accept: application/vnd.github.raw+json' \
+                 "repos/$REPO/contents/$enc?ref=$(cat head.sha)" > "pr.head/$n" 2>/dev/null \
+               && [ "$(wc -c < "pr.head/$n")" -le 300000 ]; then
+              printf '%s\t%s\n' "$n" "$path" >> pr.head/index.tsv
+            else
+              rm -f "pr.head/$n"
+            fi
+          done < <(grep '^+++ b/' pr.diff | cut -c7- | head -n 60)
           bash scripts/jules-context.sh --diff pr.diff --comments pr.comments.jsonl \
             --review-comments pr.review_comments.jsonl \
-            --replies-out pr.author_replies --callee-out pr.callee_context
+            --replies-out pr.author_replies --callee-out pr.callee_context \
+            --head-dir pr.head --surround-out pr.surrounding
 
           payload="$(jq -n --rawfile sha head.sha --arg id "pr-${PR}-${GITHUB_RUN_ID}" \
             '{name:"Jules approval",head_sha:($sha | rtrimstr("\n")),status:"in_progress",external_id:$id,output:{title:"Jules is reviewing",summary:"The App is reading this pull request."}}')"
@@ -254,11 +272,12 @@ jobs:
               --base-commits-file pr.base_commits --base-range "$(cat pr.base_range)" \
               --own-files-file pr.own_files --prior-reviews-file pr.prior_reviews \
               --author-replies-file pr.author_replies --callee-context-file pr.callee_context \
+              --surrounding-file pr.surrounding \
               --json > review.json; then
             {
               echo '<!-- pr-review:luna -->'
-              jq -r '"### Jules · merge-safety \(.confidence)/100\n\nverdict: **\(.verdict)**\n\n\(.summary)\n"' review.json
-              jq -r 'if (.findings | length) == 0 then "No findings.\n" else "#### \(.findings | length) finding(s)\n\n" + ([.findings[] | "- \(.severity) · certainty \(.certainty // "?")/100 · \(.file):\(.line) - **\(.title)**\n  \(.detail)"] | join("\n")) + "\n" end' review.json
+              jq -r '"### Jules · merge-safety \(.confidence)/100\n\nverdict: **\(.verdict)**\n\n\(.summary)\n" + (if .settled then "\n> \(.settled)\n" else "" end)' review.json
+              jq -r 'if (.findings | length) == 0 then "No findings.\n" else "#### \(.findings | length) finding(s)\n\n" + ([.findings[] | "- \(if .blocking then "" else "note · " end)\(.severity) · certainty \(.certainty // "?")/100 · \(.file):\(.line) - **\(.title)**\n  \(.detail)"] | join("\n")) + "\n" end' review.json
               echo '<sub>Jules · claude-haiku-5-5 · required approval · push a fix or comment `/re-review` to run again</sub>'
             } > review.md
             if GH_TOKEN="$JULES_TOKEN" gh pr comment "$PR" --repo "$REPO" --body-file review.md; then

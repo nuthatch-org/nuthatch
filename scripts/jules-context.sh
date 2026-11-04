@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# What Jules cannot get from a diff: maintainers' replies on the pull request, and the base
-# branch's bodies of the functions the diff calls or names (one hop).
+# What Jules cannot get from a diff: maintainers' replies on the pull request, the base branch's
+# bodies of the functions the diff calls or names (one hop), and the pull request head's lines
+# around each hunk.
 #
 # Runs with secrets on pull_request_target, in the default-branch checkout. Everything from the pull
 # request is data: identifiers are validated before they reach grep, nothing is executed or sourced,
@@ -9,6 +10,7 @@
 # usage: jules-context.sh --diff pr.diff --comments issue-comments.jsonl
 #          --review-comments review-comments.jsonl [--root .]
 #          [--replies-out pr.author_replies] [--callee-out pr.callee_context]
+#          [--head-dir DIR --surround-out pr.surrounding]
 set -euo pipefail
 
 JULES_LOGIN='nuthatch-jules[bot]'
@@ -17,15 +19,18 @@ MAX_REPLIES_CHARS=20000
 MAX_CALLEE_CHARS=40000
 MAX_FN_LINES=80
 MAX_DEFS_PER_NAME=3
+MAX_SURROUND_CHARS=40000
+SURROUND_LINES=30
 ident_re='^[A-Za-z_][A-Za-z0-9_]*$'
 
 usage() {
-  echo "usage: $0 --diff FILE --comments FILE --review-comments FILE [--root DIR] [--replies-out FILE] [--callee-out FILE]" >&2
+  echo "usage: $0 --diff FILE --comments FILE --review-comments FILE [--root DIR] [--replies-out FILE] [--callee-out FILE] [--head-dir DIR] [--surround-out FILE]" >&2
   exit 2
 }
 
 diff_file='' comments='' review_comments='' root='.'
 replies_out='pr.author_replies' callee_out='pr.callee_context'
+head_dir='' surround_out=/dev/null
 while [ $# -gt 0 ]; do
   [ $# -ge 2 ] || usage
   case "$1" in
@@ -35,6 +40,8 @@ while [ $# -gt 0 ]; do
     --root) root=$2 ;;
     --replies-out) replies_out=$2 ;;
     --callee-out) callee_out=$2 ;;
+    --head-dir) head_dir=$2 ;;
+    --surround-out) surround_out=$2 ;;
     *) usage ;;
   esac
   shift 2
@@ -43,6 +50,7 @@ done
 
 : > "$replies_out"
 : > "$callee_out"
+: > "$surround_out"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -212,4 +220,44 @@ if [ -s "$tmp/ambiguous" ] && [ -s "$callee_out" ]; then
     "$MAX_DEFS_PER_NAME" "$(sort -u "$tmp/ambiguous" | paste -sd, - | sed 's/,/, /g')" >> "$callee_out"
 fi
 
-echo "jules-context: $(wc -c < "$replies_out" | tr -d ' ') chars of replies; $shown functions, $(wc -c < "$callee_out" | tr -d ' ') chars of callee context; $rejected tokens rejected" >&2
+# ── Surrounding code ──────────────────────────────────────────────────────────────────────────────
+# The pull request head's lines around each hunk, so a finding about the next function or the start
+# of the same script can be checked rather than guessed. The workflow fetched each changed file as
+# data into `$head_dir/<n>`, with `$head_dir/index.tsv` mapping n to its path; no PR path is used as
+# a filename here.
+if [ -n "$head_dir" ] && [ -r "$head_dir/index.tsv" ]; then
+  awk -v pad="$SURROUND_LINES" '
+    /^diff --git / { path = ""; next }
+    /^\+\+\+ / { path = (substr($0, 5) == "/dev/null") ? "" : substr($0, 7); next }
+    /^@@ / && path != "" {
+      split($3, n, ","); s = substr(n[1], 2) + 0; l = (n[2] == "" ? 1 : n[2] + 0)
+      a = s - pad; if (a < 1) a = 1
+      printf "%s\t%d\t%d\n", path, a, s + l - 1 + pad
+    }' "$diff_file" > "$tmp/windows"
+  used=0 kept=0
+  : > "$tmp/surround_elided"
+  while IFS=$'\t' read -r n path; do
+    [ -r "$head_dir/$n" ] || continue
+    block="$(awk -F'\t' -v p="$path" '$1 == p { print $2 "\t" $3 }' "$tmp/windows" | sort -n | awk -F'\t' '
+      { if (have && $1 <= e + 1) { if ($2 > e) e = $2 } else { if (have) print s "\t" e; s = $1; e = $2; have = 1 } }
+      END { if (have) print s "\t" e }' | while IFS=$'\t' read -r a b; do
+        printf '== %s:%d-%d (pull request head)\n' "$path" "$a" "$b"
+        awk -v a="$a" -v b="$b" 'NR >= a && NR <= b { printf "%6d  %s\n", NR, $0 }' "$head_dir/$n"
+        printf '\n'
+      done)"
+    [ -n "$block" ] || continue
+    size=${#block}
+    if [ $((used + size)) -gt "$MAX_SURROUND_CHARS" ]; then
+      printf '%s\n' "$path" >> "$tmp/surround_elided"
+      continue
+    fi
+    printf '%s\n' "$block" >> "$surround_out"
+    used=$((used + size)) kept=$((kept + 1))
+  done < "$head_dir/index.tsv"
+  if [ -s "$tmp/surround_elided" ]; then
+    printf '[jules-context: surrounding code not shown for %s more files, to fit: %s]\n' \
+      "$(wc -l < "$tmp/surround_elided" | tr -d ' ')" "$(paste -sd, "$tmp/surround_elided" | sed 's/,/, /g')" >> "$surround_out"
+  fi
+fi
+
+echo "jules-context: $(wc -c < "$replies_out" | tr -d ' ') chars of replies; $shown functions, $(wc -c < "$callee_out" | tr -d ' ') chars of callee context; $(wc -c < "$surround_out" | tr -d ' ') chars of surrounding code; $rejected tokens rejected" >&2
