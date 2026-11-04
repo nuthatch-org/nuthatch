@@ -121,6 +121,61 @@ impl FsMirror {
     fn path(&self, key: &str) -> PathBuf {
         self.root.join(key)
     }
+
+    /// Writes beside the key and renames over it, so a reader, or a writer killed mid-write, never
+    /// leaves a truncated object where a whole one was.
+    fn write_whole(
+        &self,
+        key: &str,
+        fill: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let path = self.path(key);
+        let parent = path.parent().unwrap_or(&self.root);
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        sweep_stale_partials(parent, &name);
+        let mut tag = [0u8; 6];
+        let _ = getrandom::fill(&mut tag);
+        let partial = parent.join(format!(".{name}.{}{PARTIAL_SUFFIX}", hex::encode(tag)));
+        let written = std::fs::File::create(&partial).and_then(|mut f| {
+            fill(&mut f)?;
+            f.sync_all()
+        });
+        if let Err(e) = written.and_then(|()| std::fs::rename(&partial, &path)) {
+            let _ = std::fs::remove_file(&partial);
+            return Err(e).with_context(|| format!("writing {key}"));
+        }
+        Ok(())
+    }
+}
+
+const PARTIAL_SUFFIX: &str = ".partial";
+
+/// A writer killed between create and rename leaves its partial behind. One this old is not a live
+/// write, so the next write of the same key removes it.
+const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn sweep_stale_partials(dir: &Path, name: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!(".{name}.");
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let file = file.to_string_lossy();
+        if !(file.starts_with(&prefix) && file.ends_with(PARTIAL_SUFFIX)) {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok());
+        if age.is_some_and(|a| a > STALE_PARTIAL) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[async_trait]
@@ -134,23 +189,15 @@ impl Mirror for FsMirror {
     }
 
     async fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
-        let path = self.path(key);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        std::fs::write(&path, bytes).with_context(|| format!("writing {}", key))
+        use std::io::Write as _;
+        self.write_whole(key, |f| f.write_all(bytes))
     }
 
     async fn put_file(&self, key: &str, src: &Path) -> Result<()> {
-        let path = self.path(key);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        std::fs::copy(src, &path)
-            .with_context(|| format!("copying {} to {}", src.display(), key))?;
-        Ok(())
+        let mut from =
+            std::fs::File::open(src).with_context(|| format!("opening {}", src.display()))?;
+        self.write_whole(key, |f| std::io::copy(&mut from, f).map(|_| ()))
+            .with_context(|| format!("copying {} to {}", src.display(), key))
     }
 
     async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()> {
@@ -205,12 +252,10 @@ impl Mirror for FsMirror {
         let mut out = Vec::new();
         for entry in entries {
             let entry = entry?;
-            if entry.file_type()?.is_file() {
-                out.push(format!(
-                    "{}/{}",
-                    prefix.trim_end_matches('/'),
-                    entry.file_name().to_string_lossy()
-                ));
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let partial = name.starts_with('.') && name.ends_with(PARTIAL_SUFFIX);
+            if entry.file_type()?.is_file() && !partial {
+                out.push(format!("{}/{name}", prefix.trim_end_matches('/')));
             }
         }
         out.sort();
@@ -2874,6 +2919,81 @@ abi = "abis/usdc.json"
             mirror.get(&catalogue).await.unwrap().unwrap(),
             ahead,
             "without failover the publisher's catalogue is the mirror's, as before"
+        );
+    }
+
+    /// The failover gate's standby seeds from a mirror its killed writer was mid-way through
+    /// writing; a truncated object there is a dataset that will not open.
+    #[tokio::test]
+    async fn a_reader_never_sees_a_part_written_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let m = FsMirror { root: root.clone() };
+        let whole = |i: u8| vec![i; 4 << 20];
+        m.put("ds/seed.json", &whole(0)).await.unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = done.clone();
+        let writer = std::thread::spawn(move || {
+            let m = FsMirror { root };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let mut i = 0u8;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                i = i.wrapping_add(1);
+                rt.block_on(m.put("ds/seed.json", &whole(i))).unwrap();
+            }
+        });
+        for read in 0..300 {
+            let got = m
+                .get("ds/seed.json")
+                .await
+                .unwrap()
+                .expect("the key never goes missing");
+            assert_eq!(got.len(), 4 << 20, "read {read} saw a part-written object");
+            assert!(
+                got.iter().all(|b| *b == got[0]),
+                "read {read} mixed two writes"
+            );
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert_eq!(
+            m.list("ds").await.unwrap(),
+            vec!["ds/seed.json".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_clears_its_keys_stale_partials_and_no_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = FsMirror {
+            root: dir.path().to_path_buf(),
+        };
+        let ds = dir.path().join("ds");
+        std::fs::create_dir_all(&ds).unwrap();
+        let old = std::time::SystemTime::now() - STALE_PARTIAL * 2;
+        let leave = |n: &str, at: std::time::SystemTime| {
+            let f = std::fs::File::create(ds.join(n)).unwrap();
+            f.set_modified(at).unwrap();
+        };
+        leave(".seed.json.aaaa.partial", old);
+        leave(".seed.json.bbbb.partial", std::time::SystemTime::now());
+        leave(".manifest.json.cccc.partial", old);
+        m.put("ds/seed.json", b"x").await.unwrap();
+        let mut left: Vec<_> = std::fs::read_dir(&ds)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                ".manifest.json.cccc.partial",
+                ".seed.json.bbbb.partial",
+                "seed.json"
+            ],
+            "only this key's partial older than the stale age goes"
         );
     }
 

@@ -10,9 +10,14 @@ fn names() -> Vec<String> {
 }
 
 #[test]
-fn required_checks_file_names_the_ten_including_jules() {
+fn required_checks_file_names_the_eleven_including_jules() {
     let n = names();
     assert!(n.iter().any(|s| s == "fmt · clippy · test"), "{n:?}");
+    assert!(
+        n.iter()
+            .any(|s| s == "writer failover (two writers, one lease)"),
+        "RFC-0078: a takeover that stops working must block the merge: {n:?}"
+    );
     assert!(
         n.iter().any(|s| s == "Jules approval"),
         "the external review gate is not optional, and since the human `reviewed-by signature` gate \
@@ -26,8 +31,8 @@ fn required_checks_file_names_the_ten_including_jules() {
     );
     assert_eq!(
         n.len(),
-        10,
-        "ten contexts on main after the signature gate was retired: {n:?}"
+        11,
+        "eleven contexts on main, writer failover the newest: {n:?}"
     );
 }
 
