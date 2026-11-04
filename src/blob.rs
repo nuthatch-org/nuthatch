@@ -46,7 +46,9 @@ const EXCLUDE: &[&str] = &[
 /// Whether a file or directory of this name is left out of a nest's inputs, at any depth.
 pub(crate) fn is_excluded(name: &std::ffi::OsStr) -> bool {
     EXCLUDE.iter().any(|x| name == std::ffi::OsStr::new(x))
-        || name.to_str().is_some_and(crate::admin_token::is_own)
+        || name.to_str().is_some_and(|n| {
+            crate::admin_token::is_own(n) || crate::spill::spill_dir_pid(n).is_some()
+        })
 }
 
 /// The **derived state** a dataset accumulates by indexing: the hot store and the sealed segments.
@@ -1302,6 +1304,34 @@ abi = "abis/c.json"
         )
         .unwrap();
         assert_eq!(build_manifest(a.path(), None).unwrap().nid(), before.nid());
+    }
+
+    /// #2663: with `HOME` set to the nest directory, spill lands in `.cache/nuthatch/` inside it, and
+    /// a NID taken while a query spilled would hash the spill files.
+    #[test]
+    fn a_spill_directory_is_not_an_input() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        let before = build_manifest(a.path(), None).unwrap();
+        for dir in [
+            "nuthatch-spill-4242-0/datafusion-x",
+            "nuthatch-duckdb-4242-1",
+        ] {
+            let d = a.path().join(".cache/nuthatch").join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("spill.arrow"), b"rows").unwrap();
+        }
+        assert_eq!(build_manifest(a.path(), None).unwrap().nid(), before.nid());
+    }
+
+    /// A name that only starts like spill's is still an input.
+    #[test]
+    fn a_file_named_like_spill_but_not_by_it_is_an_input() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        let before = build_manifest(a.path(), None).unwrap();
+        std::fs::write(a.path().join("nuthatch-spill-notes.md"), "kept").unwrap();
+        assert_ne!(build_manifest(a.path(), None).unwrap().nid(), before.nid());
     }
 
     /// The committed fixture nests keep the NID and data identity they had before the 2026-10-23
