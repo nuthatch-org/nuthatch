@@ -30,7 +30,7 @@ usage() {
 
 diff_file='' comments='' review_comments='' root='.'
 replies_out='pr.author_replies' callee_out='pr.callee_context'
-head_dir='' surround_out='pr.surrounding'
+head_dir='' surround_out=/dev/null
 while [ $# -gt 0 ]; do
   [ $# -ge 2 ] || usage
   case "$1" in
