@@ -235,7 +235,7 @@ fn the_allocations_nest_is_checked_against_its_production_branch() {
         ssh.contains("NIDDIR='/opt/nuthatch/graph-allocations-nest-next'"),
         "{ssh}"
     );
-    assert!(ssh.contains("--branch production"), "{ssh}");
+    assert!(ssh.contains("scripts/check-production-nid.sh"), "{ssh}");
 
     let r = rig();
     statuses(&r, &[]);

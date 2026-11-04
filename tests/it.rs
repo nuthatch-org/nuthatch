@@ -17,6 +17,8 @@ mod bench_commits;
 mod bench_helpers_reject_failures;
 #[path = "bind_drops_slow_headers.rs"]
 mod bind_drops_slow_headers;
+#[path = "check_production_nid_script.rs"]
+mod check_production_nid_script;
 #[path = "compact_rows_prototype.rs"]
 mod compact_rows_prototype;
 #[path = "concurrent_sql_does_not_corrupt.rs"]

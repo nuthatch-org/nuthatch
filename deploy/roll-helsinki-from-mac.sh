@@ -77,22 +77,15 @@ for u in "${units[@]}"; do [ "$u" != graph-allocations-nest-next ] || niddir=/op
 
 # The smoke files ride over the same connection on stdin, into a directory beside the clone.
 COPYFILE_DISABLE=1 tar -C "$smoke_dir" -cf - -T /dev/null ${smokes[@]+"${smokes[@]}"} | ssh "$host" "V=$v; UNITS='${units[*]}'; OVR='${override:+1}'; NIDDIR='$niddir'; "'set -e
-d=/tmp/nuthatch-roll-$V; rm -rf "$d" "$d-smoke" "$d-production"; mkdir "$d-smoke"; tar -xf - -C "$d-smoke"
+d=/tmp/nuthatch-roll-$V; rm -rf "$d" "$d-smoke"; mkdir "$d-smoke"; tar -xf - -C "$d-smoke"
 git clone -q --depth 1 --branch "v$V" https://github.com/nuthatch-org/nuthatch "$d"; cd "$d"
 u=https://github.com/nuthatch-org/nuthatch/releases/download/v$V/nuthatch-x86_64-unknown-linux-gnu.tar.gz
 curl -fsSL -o n.tgz "$u"; curl -fsSL -o n.sha "$u.sha256"
 echo "$(cut -d" " -f1 n.sha)  n.tgz" | sha256sum -c --quiet
 mkdir x; tar xzf n.tgz -C x; bin=$(find x -type f -name nuthatch | head -1)
 if [ -n "$NIDDIR" ]; then
-  git clone -q --depth 1 --branch production https://github.com/nuthatch-org/graph-allocations-nest "$d-production"
-  want=$("$bin" nest nid --dir "$d-production" | tail -1)
-  have=$("$bin" nest nid --dir "$NIDDIR" | tail -1)
-  if [ "$want" = "$have" ]; then echo "ok   production: the allocations nest is graph-allocations-nest@production ($have)"
-  elif [ -n "$OVR" ]; then echo "*** OVERRIDE: the allocations nest computes $have, production computes $want ***"
-  else
-    echo "refusing: the allocations nest computes NID $have, but the production branch of graph-allocations-nest computes $want. Commit the box'"'"'s files to that branch, or put the branch'"'"'s files on the box; --override rolls anyway" >&2
-    exit 4
-  fi
+  if [ -f scripts/check-production-nid.sh ]; then bash scripts/check-production-nid.sh "$bin" "$NIDDIR" ${OVR:+--override}
+  else echo "note: v$V predates scripts/check-production-nid.sh, so the production NID is not checked" >&2; fi
 fi
 scripts/deploy-nest.sh install "$bin" "$V"
 for unit in $UNITS; do
