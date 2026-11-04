@@ -378,8 +378,7 @@ def build_user($p):
   + ($p.replies | strip | fallback("(none)")) + "\n\n"
   + "Callee context: the base branch's code for functions this diff calls or names, one hop:\n"
   + ($p.callee | strip | fallback("(none)")) + "\n\n"
-  + "Surrounding code: the pull request head's lines around each hunk, with line numbers. Check a
-"
+  + "Surrounding code: the pull request head's lines around each hunk, with line numbers. Check a "
   + "worry about nearby code here before raising it:\n"
   + ($p.surround | strip | fallback("(none)")) + "\n\n"
   + $p.recorded_note
@@ -432,15 +431,18 @@ def validate_review($schema):
   | (.findings | map(validate_integer_fields(.; integer_fields_of($schema.properties.findings.items.properties)))) as $checked_findings
   | .;
 
-# A finding below this certainty is a note: posted, never blocking (#2662-#2665: every false finding
-# that week was a guess about code outside the diff, rated 35 or 40). A `comment` verdict with no
-# finding at or above it settles to `ship`; `changes-requested` is never softened.
+# A finding below this certainty is a note, posted and not blocking, unless it is `high` (#2662-#2665:
+# every false finding that week was a guess about code outside the diff, rated 35 or 40). A `comment`
+# verdict settles to `ship` only when no finding blocks and merge safety is at least this too, so a
+# low score is never approved; `changes-requested` is never softened. A `comment` with no findings
+# settles as well: it named nothing to fix.
 def BLOCKING_CERTAINTY: 50;
 def settle:
-  .findings |= map(.blocking = (.certainty >= BLOCKING_CERTAINTY))
-  | if .verdict == "comment" and (.findings | map(.blocking) | any | not) then
+  .findings |= map(.blocking = (.certainty >= BLOCKING_CERTAINTY or .severity == "high"))
+  | if .verdict == "comment" and .confidence >= BLOCKING_CERTAINTY
+       and (.findings | map(.blocking) | any | not) then
       .verdict = "ship"
-      | .settled = "Settled from comment to ship: no finding is at certainty \(BLOCKING_CERTAINTY) or above, so each is a note."
+      | .settled = "Settled from comment to ship: merge safety is \(.confidence), and no finding is high or at certainty \(BLOCKING_CERTAINTY) or above, so none blocks."
     else . end;
 
 def severity_mark:

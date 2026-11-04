@@ -1046,17 +1046,22 @@ fn a_recorded_fixture_is_stubbed_rather_than_shortened() {
 /// A canned model answer through `--self-test-review`, which validates and settles it exactly as a
 /// live review is and exits before any request. The key is removed so it could not reach the API.
 fn settle(verdict: &str, certainties: &[u32]) -> serde_json::Value {
+    let lows: Vec<(&str, u32)> = certainties.iter().map(|c| ("low", *c)).collect();
+    settle_with(80, verdict, &lows)
+}
+
+fn settle_with(confidence: u32, verdict: &str, findings: &[(&str, u32)]) -> serde_json::Value {
     let dir = fixtures();
-    let findings: Vec<String> = certainties
+    let findings: Vec<String> = findings
         .iter()
-        .map(|c| {
+        .map(|(severity, c)| {
             format!(
-                r#"{{"severity":"low","file":"a","line":1,"title":"t","detail":"d","certainty":{c}}}"#
+                r#"{{"severity":"{severity}","file":"a","line":1,"title":"t","detail":"d","certainty":{c}}}"#
             )
         })
         .collect();
     let answer = format!(
-        r#"{{"confidence":80,"verdict":"{verdict}","summary":"s","findings":[{}]}}"#,
+        r#"{{"confidence":{confidence},"verdict":"{verdict}","summary":"s","findings":[{}]}}"#,
         findings.join(",")
     );
     std::fs::write(dir.path().join("answer.json"), answer).expect("write answer");
@@ -1189,5 +1194,38 @@ fn the_workflow_fetches_the_head_files_and_passes_the_surrounding_code() {
     assert!(
         wf.contains("note · "),
         "a note is marked as one in the comment"
+    );
+}
+
+/// Jules on #2666: a high-severity finding blocks at any certainty, and a low merge-safety score is
+/// never settled to an approval.
+#[test]
+fn a_high_finding_blocks_whatever_its_certainty() {
+    let r = settle_with(80, "comment", &[("high", 45)]);
+    assert_eq!(r["verdict"], "comment", "{r}");
+    assert_eq!(r["findings"][0]["blocking"], true);
+}
+
+#[test]
+fn a_low_merge_safety_score_is_not_settled() {
+    let r = settle_with(25, "comment", &[("low", 30)]);
+    assert_eq!(r["verdict"], "comment", "{r}");
+    assert!(r["settled"].is_null());
+}
+
+#[test]
+fn a_comment_naming_nothing_to_fix_settles() {
+    let r = settle_with(80, "comment", &[]);
+    assert_eq!(r["verdict"], "ship", "{r}");
+}
+
+#[test]
+fn the_surrounding_code_heading_is_one_line_in_the_prompt() {
+    let dir = fixtures();
+    let prompt = dry_run_with(dir.path(), &[]);
+    assert!(
+        prompt
+            .contains("with line numbers. Check a worry about nearby code here before raising it:"),
+        "the heading is split:\n{prompt}"
     );
 }
