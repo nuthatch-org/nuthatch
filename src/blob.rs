@@ -46,9 +46,9 @@ const EXCLUDE: &[&str] = &[
 /// Whether a file or directory of this name is left out of a nest's inputs, at any depth.
 pub(crate) fn is_excluded(name: &std::ffi::OsStr) -> bool {
     EXCLUDE.iter().any(|x| name == std::ffi::OsStr::new(x))
-        || name.to_str().is_some_and(|n| {
-            crate::admin_token::is_own(n) || crate::spill::spill_dir_pid(n).is_some()
-        })
+        || name
+            .to_str()
+            .is_some_and(|n| crate::admin_token::is_own(n) || crate::spill::is_spill_dir_name(n))
 }
 
 /// The **derived state** a dataset accumulates by indexing: the hot store and the sealed segments.
@@ -1330,8 +1330,19 @@ abi = "abis/c.json"
         let a = tempfile::tempdir().unwrap();
         write_nest(a.path());
         let before = build_manifest(a.path(), None).unwrap();
-        std::fs::write(a.path().join("nuthatch-spill-notes.md"), "kept").unwrap();
-        assert_ne!(build_manifest(a.path(), None).unwrap().nid(), before.nid());
+        for name in [
+            "nuthatch-spill-notes.md",
+            "nuthatch-spill-1-notes.md",
+            "nuthatch-spill-+5-0",
+        ] {
+            std::fs::write(a.path().join(name), "kept").unwrap();
+            assert_ne!(
+                build_manifest(a.path(), None).unwrap().nid(),
+                before.nid(),
+                "{name} was dropped from the NID"
+            );
+            std::fs::remove_file(a.path().join(name)).unwrap();
+        }
     }
 
     /// The committed fixture nests keep the NID and data identity they had before the 2026-10-23
