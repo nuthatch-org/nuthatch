@@ -1040,3 +1040,154 @@ fn a_recorded_fixture_is_stubbed_rather_than_shortened() {
         "the last file must still arrive:\n{prompt}"
     );
 }
+
+// ── Notes and surrounding code (#2662 to #2665) ──────────────────────────────────────────────────
+
+/// A canned model answer through `--self-test-review`, which validates and settles it exactly as a
+/// live review is and exits before any request. The key is removed so it could not reach the API.
+fn settle(verdict: &str, certainties: &[u32]) -> serde_json::Value {
+    let dir = fixtures();
+    let findings: Vec<String> = certainties
+        .iter()
+        .map(|c| {
+            format!(
+                r#"{{"severity":"low","file":"a","line":1,"title":"t","detail":"d","certainty":{c}}}"#
+            )
+        })
+        .collect();
+    let answer = format!(
+        r#"{{"confidence":80,"verdict":"{verdict}","summary":"s","findings":[{}]}}"#,
+        findings.join(",")
+    );
+    std::fs::write(dir.path().join("answer.json"), answer).expect("write answer");
+    std::fs::write(dir.path().join("diff"), "diff --git a/x b/x\n+one\n").expect("write diff");
+    let out = Command::new("bash")
+        .arg(script())
+        .arg("--diff")
+        .arg(dir.path().join("diff"))
+        .arg("--self-test-review")
+        .arg(dir.path().join("answer.json"))
+        .env_remove("ANTHROPIC_API_KEY")
+        .output()
+        .expect("run pr-review.sh");
+    assert!(
+        out.status.success(),
+        "self-test failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("a review as JSON")
+}
+
+/// Every false finding that week was a guess about code outside the diff, rated 35 or 40; every
+/// real one was 60 or above. A note is posted and does not block.
+#[test]
+fn a_comment_whose_findings_are_all_notes_settles_to_ship() {
+    let r = settle("comment", &[35, 40]);
+    assert_eq!(r["verdict"], "ship");
+    assert!(
+        r["settled"].as_str().is_some_and(|s| s.contains("50")),
+        "{r}"
+    );
+    assert_eq!(r["findings"][0]["blocking"], false);
+}
+
+#[test]
+fn one_finding_at_fifty_or_above_still_blocks() {
+    let r = settle("comment", &[35, 50]);
+    assert_eq!(r["verdict"], "comment", "{r}");
+    assert_eq!(r["findings"][1]["blocking"], true);
+    assert!(r["settled"].is_null());
+}
+
+#[test]
+fn changes_requested_is_never_softened() {
+    let r = settle("changes-requested", &[20]);
+    assert_eq!(r["verdict"], "changes-requested", "{r}");
+}
+
+#[test]
+fn the_prompt_carries_the_surrounding_code_and_the_note_rule() {
+    let dir = fixtures();
+    let sur = dir.path().join("surrounding");
+    std::fs::write(
+        &sur,
+        "== src/x.rs:1-3 (pull request head)\n     2  fn neighbour() {}\n",
+    )
+    .expect("write surrounding");
+    let prompt = dry_run_with(dir.path(), &[("--surrounding-file", sur.to_str().unwrap())]);
+    assert!(prompt.contains("Surrounding code:"), "{prompt}");
+    assert!(prompt.contains("fn neighbour() {}"), "{prompt}");
+    let src = std::fs::read_to_string(script()).expect("read script");
+    let system = system_prompt_text(&src);
+    assert!(
+        system.contains("A finding about code you were not shown is a question, not a defect"),
+        "the rule that puts an unseen-code finding below 50 is gone"
+    );
+}
+
+/// The head's lines around each hunk, numbered and merged where windows meet, read only from the
+/// files the workflow fetched; a path it did not fetch gets nothing.
+#[test]
+fn surrounding_code_is_the_heads_lines_around_each_hunk() {
+    let dir = fixtures();
+    let head = dir.path().join("head");
+    std::fs::create_dir_all(&head).expect("mkdir head");
+    let file: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(head.join("1"), &file).expect("write head file");
+    std::fs::write(head.join("index.tsv"), "1\tsrc/a.rs\n").expect("write index");
+    let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -100,2 +100,3 @@\n+x\n\
+                diff --git a/src/b.rs b/src/b.rs\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n+y\n";
+    std::fs::write(dir.path().join("pr.diff"), diff).expect("write diff");
+    let out = Command::new("bash")
+        .arg(root().join("scripts/jules-context.sh"))
+        .arg("--diff")
+        .arg(dir.path().join("pr.diff"))
+        .args(["--comments", "/dev/null", "--review-comments", "/dev/null"])
+        .arg("--replies-out")
+        .arg(dir.path().join("r"))
+        .arg("--callee-out")
+        .arg(dir.path().join("c"))
+        .arg("--head-dir")
+        .arg(&head)
+        .arg("--surround-out")
+        .arg(dir.path().join("s"))
+        .output()
+        .expect("run jules-context.sh");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = std::fs::read_to_string(dir.path().join("s")).expect("surrounding");
+    assert!(s.contains("== src/a.rs:70-132 (pull request head)"), "{s}");
+    assert!(
+        s.contains("    70  line 70") && s.contains("   132  line 132"),
+        "{s}"
+    );
+    assert!(!s.contains("line 69\n") && !s.contains("line 133\n"), "{s}");
+    assert!(
+        !s.contains("src/b.rs"),
+        "a file the workflow did not fetch was shown:\n{s}"
+    );
+}
+
+#[test]
+fn the_workflow_fetches_the_head_files_and_passes_the_surrounding_code() {
+    let wf = std::fs::read_to_string(root().join(".github/workflows/pr-review.yml")).expect("read");
+    assert!(
+        wf.contains("--head-dir pr.head --surround-out pr.surrounding"),
+        "context step"
+    );
+    assert!(
+        wf.contains("--surrounding-file pr.surrounding"),
+        "review step"
+    );
+    assert!(
+        wf.contains("contents/$enc?ref="),
+        "the head files are fetched through the API"
+    );
+    assert!(
+        wf.contains("note · "),
+        "a note is marked as one in the comment"
+    );
+}
