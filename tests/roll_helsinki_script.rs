@@ -24,7 +24,7 @@ esac
 "#;
 
 const FAKE_SSH: &str = r#"#!/usr/bin/env bash
-cat >/dev/null
+cat >"$FAKE_STATE/stdin.tar"
 printf '%s\n' "$*" >>"$FAKE_STATE/ssh"
 "#;
 
@@ -235,7 +235,16 @@ fn the_allocations_nest_is_checked_against_its_production_branch() {
         ssh.contains("NIDDIR='/opt/nuthatch/graph-allocations-nest-next'"),
         "{ssh}"
     );
-    assert!(ssh.contains("scripts/check-production-nid.sh"), "{ssh}");
+    assert!(ssh.contains("check-production-nid.sh"), "{ssh}");
+    let shipped = std::process::Command::new("tar")
+        .arg("-tf")
+        .arg(r.state.join("stdin.tar"))
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&shipped.stdout).contains("check-production-nid.sh"),
+        "the check is not shipped with the roll, so an older tag would skip it"
+    );
 
     let r = rig();
     statuses(&r, &[]);

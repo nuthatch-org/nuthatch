@@ -75,8 +75,13 @@ done
 niddir=""
 for u in "${units[@]}"; do [ "$u" != graph-allocations-nest-next ] || niddir=/opt/nuthatch/$u; done
 
-# The smoke files ride over the same connection on stdin, into a directory beside the clone.
-COPYFILE_DISABLE=1 tar -C "$smoke_dir" -cf - -T /dev/null ${smokes[@]+"${smokes[@]}"} | ssh "$host" "V=$v; UNITS='${units[*]}'; OVR='${override:+1}'; NIDDIR='$niddir'; "'set -e
+# The smoke files ride over the same connection on stdin, into a directory beside the clone, with
+# this checkout's production NID check, so a roll back to an older tag is checked too.
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+for s in ${smokes[@]+"${smokes[@]}"}; do cp "$smoke_dir/$s" "$stage/"; done
+cp "$(dirname "$0")/../scripts/check-production-nid.sh" "$stage/"
+COPYFILE_DISABLE=1 tar -C "$stage" -cf - . | ssh "$host" "V=$v; UNITS='${units[*]}'; OVR='${override:+1}'; NIDDIR='$niddir'; "'set -e
 d=/tmp/nuthatch-roll-$V; rm -rf "$d" "$d-smoke"; mkdir "$d-smoke"; tar -xf - -C "$d-smoke"
 git clone -q --depth 1 --branch "v$V" https://github.com/nuthatch-org/nuthatch "$d"; cd "$d"
 u=https://github.com/nuthatch-org/nuthatch/releases/download/v$V/nuthatch-x86_64-unknown-linux-gnu.tar.gz
@@ -84,8 +89,7 @@ curl -fsSL -o n.tgz "$u"; curl -fsSL -o n.sha "$u.sha256"
 echo "$(cut -d" " -f1 n.sha)  n.tgz" | sha256sum -c --quiet
 mkdir x; tar xzf n.tgz -C x; bin=$(find x -type f -name nuthatch | head -1)
 if [ -n "$NIDDIR" ]; then
-  if [ -f scripts/check-production-nid.sh ]; then bash scripts/check-production-nid.sh "$bin" "$NIDDIR" ${OVR:+--override}
-  else echo "note: v$V predates scripts/check-production-nid.sh, so the production NID is not checked" >&2; fi
+  bash "$d-smoke/check-production-nid.sh" "$bin" "$NIDDIR" ${OVR:+--override}
 fi
 scripts/deploy-nest.sh install "$bin" "$V"
 for unit in $UNITS; do
