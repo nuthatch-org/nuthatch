@@ -8,6 +8,8 @@
 #   deploy/roll-helsinki-from-mac.sh 4.3.1 graph-allocations-nest-next
 # Before touching a unit, the tag's commit must carry success on release-gate/<nest> for every rolled
 # unit (#1848); a red, pending or missing status refuses, and --override '<reason>' rolls anyway.
+# The allocations nest's files must also compute the NID of graph-allocations-nest's `production`
+# branch, which is what `verify` checks Lodestar's answers with; a hand edit on the box refuses too.
 # The smoke files carry kittiwake's statements, so they live in the private kittiwake repo:
 # SMOKE_DIR (default ~/Projects/kittiwake/nuthatch-gate/smoke) holds <unit without -next>.sql.
 set -euo pipefail
@@ -69,14 +71,26 @@ for u in "${units[@]}"; do
   else echo "note: no $smoke_dir/${u%-next}.sql, $u rolls without a smoke" >&2; fi
 done
 
-# The smoke files ride over the same connection on stdin, into a directory beside the clone.
-COPYFILE_DISABLE=1 tar -C "$smoke_dir" -cf - -T /dev/null ${smokes[@]+"${smokes[@]}"} | ssh "$host" "V=$v; UNITS='${units[*]}'; "'set -e
+# The allocations nest is checked against its production branch only when it is rolled.
+niddir=""
+for u in "${units[@]}"; do [ "$u" != graph-allocations-nest-next ] || niddir=/opt/nuthatch/$u; done
+
+# The smoke files ride over the same connection on stdin, into a directory beside the clone, with
+# this checkout's production NID check, so a roll back to an older tag is checked too.
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+for s in ${smokes[@]+"${smokes[@]}"}; do cp "$smoke_dir/$s" "$stage/"; done
+cp "$(dirname "$0")/../scripts/check-production-nid.sh" "$stage/"
+COPYFILE_DISABLE=1 tar -C "$stage" -cf - . | ssh "$host" "V=$v; UNITS='${units[*]}'; OVR='${override:+1}'; NIDDIR='$niddir'; "'set -e
 d=/tmp/nuthatch-roll-$V; rm -rf "$d" "$d-smoke"; mkdir "$d-smoke"; tar -xf - -C "$d-smoke"
 git clone -q --depth 1 --branch "v$V" https://github.com/nuthatch-org/nuthatch "$d"; cd "$d"
 u=https://github.com/nuthatch-org/nuthatch/releases/download/v$V/nuthatch-x86_64-unknown-linux-gnu.tar.gz
 curl -fsSL -o n.tgz "$u"; curl -fsSL -o n.sha "$u.sha256"
 echo "$(cut -d" " -f1 n.sha)  n.tgz" | sha256sum -c --quiet
 mkdir x; tar xzf n.tgz -C x; bin=$(find x -type f -name nuthatch | head -1)
+if [ -n "$NIDDIR" ]; then
+  bash "$d-smoke/check-production-nid.sh" "$bin" "$NIDDIR" ${OVR:+--override}
+fi
 scripts/deploy-nest.sh install "$bin" "$V"
 for unit in $UNITS; do
   smoke=$d-smoke/${unit%-next}.sql

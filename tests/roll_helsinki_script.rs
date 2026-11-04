@@ -24,7 +24,7 @@ esac
 "#;
 
 const FAKE_SSH: &str = r#"#!/usr/bin/env bash
-cat >/dev/null
+cat >"$FAKE_STATE/stdin.tar"
 printf '%s\n' "$*" >>"$FAKE_STATE/ssh"
 "#;
 
@@ -220,6 +220,39 @@ fn only_the_rolled_units_nests_decide() {
     let ssh = reached_the_box(&r).unwrap_or_default();
     assert!(ssh.contains("graph-gns-nest-next"), "{out}");
     assert!(!ssh.contains("graph-allocations-nest-next"), "{ssh}");
+}
+
+/// The allocations nest's files are checked against its `production` branch, which `verify` uses for
+/// Lodestar's answers, and only when that nest is rolled.
+#[test]
+fn the_allocations_nest_is_checked_against_its_production_branch() {
+    let r = rig();
+    statuses(&r, &[]);
+    let (ok, out) = roll(&r, &["graph-allocations-nest-next"]);
+    assert!(ok, "{out}");
+    let ssh = reached_the_box(&r).unwrap_or_default();
+    assert!(
+        ssh.contains("NIDDIR='/opt/nuthatch/graph-allocations-nest-next'"),
+        "{ssh}"
+    );
+    assert!(ssh.contains("check-production-nid.sh"), "{ssh}");
+    let shipped = std::process::Command::new("tar")
+        .arg("-tf")
+        .arg(r.state.join("stdin.tar"))
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&shipped.stdout).contains("check-production-nid.sh"),
+        "the check is not shipped with the roll, so an older tag would skip it"
+    );
+
+    let r = rig();
+    statuses(&r, &[]);
+    let (ok, out) = roll(&r, &["graph-gns-nest-next"]);
+    assert!(ok, "{out}");
+    assert!(reached_the_box(&r)
+        .unwrap_or_default()
+        .contains("NIDDIR=''"));
 }
 
 #[test]
