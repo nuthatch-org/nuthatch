@@ -134,6 +134,7 @@ impl FsMirror {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
         let name = path.file_name().unwrap_or_default().to_string_lossy();
+        sweep_stale_partials(parent, &name);
         let mut tag = [0u8; 6];
         let _ = getrandom::fill(&mut tag);
         let partial = parent.join(format!(".{name}.{}{PARTIAL_SUFFIX}", hex::encode(tag)));
@@ -150,6 +151,32 @@ impl FsMirror {
 }
 
 const PARTIAL_SUFFIX: &str = ".partial";
+
+/// A writer killed between create and rename leaves its partial behind. One this old is not a live
+/// write, so the next write of the same key removes it.
+const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn sweep_stale_partials(dir: &Path, name: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!(".{name}.");
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let file = file.to_string_lossy();
+        if !(file.starts_with(&prefix) && file.ends_with(PARTIAL_SUFFIX)) {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok());
+        if age.is_some_and(|a| a > STALE_PARTIAL) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
 
 #[async_trait]
 impl Mirror for FsMirror {
@@ -2934,6 +2961,39 @@ abi = "abis/usdc.json"
         assert_eq!(
             m.list("ds").await.unwrap(),
             vec!["ds/seed.json".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_clears_its_keys_stale_partials_and_no_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = FsMirror {
+            root: dir.path().to_path_buf(),
+        };
+        let ds = dir.path().join("ds");
+        std::fs::create_dir_all(&ds).unwrap();
+        let old = std::time::SystemTime::now() - STALE_PARTIAL * 2;
+        let leave = |n: &str, at: std::time::SystemTime| {
+            let f = std::fs::File::create(ds.join(n)).unwrap();
+            f.set_modified(at).unwrap();
+        };
+        leave(".seed.json.aaaa.partial", old);
+        leave(".seed.json.bbbb.partial", std::time::SystemTime::now());
+        leave(".manifest.json.cccc.partial", old);
+        m.put("ds/seed.json", b"x").await.unwrap();
+        let mut left: Vec<_> = std::fs::read_dir(&ds)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                ".manifest.json.cccc.partial",
+                ".seed.json.bbbb.partial",
+                "seed.json"
+            ],
+            "only this key's partial older than the stale age goes"
         );
     }
 
