@@ -222,6 +222,30 @@ fn only_the_rolled_units_nests_decide() {
     assert!(!ssh.contains("graph-allocations-nest-next"), "{ssh}");
 }
 
+/// The allocations nest's files are checked against its `production` branch, which `verify` uses for
+/// Lodestar's answers, and only when that nest is rolled.
+#[test]
+fn the_allocations_nest_is_checked_against_its_production_branch() {
+    let r = rig();
+    statuses(&r, &[]);
+    let (ok, out) = roll(&r, &["graph-allocations-nest-next"]);
+    assert!(ok, "{out}");
+    let ssh = reached_the_box(&r).unwrap_or_default();
+    assert!(
+        ssh.contains("NIDDIR='/opt/nuthatch/graph-allocations-nest-next'"),
+        "{ssh}"
+    );
+    assert!(ssh.contains("--branch production"), "{ssh}");
+
+    let r = rig();
+    statuses(&r, &[]);
+    let (ok, out) = roll(&r, &["graph-gns-nest-next"]);
+    assert!(ok, "{out}");
+    assert!(reached_the_box(&r)
+        .unwrap_or_default()
+        .contains("NIDDIR=''"));
+}
+
 #[test]
 fn an_override_rolls_a_red_release_and_prints_the_reason() {
     let r = rig();
