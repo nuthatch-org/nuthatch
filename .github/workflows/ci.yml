@@ -1539,9 +1539,17 @@ jobs:
         # RFC-0078 S1: two processes against one mirror; the holder is frozen with SIGSTOP.
         env:
           FIXTURE_RPC: bin/fixture-rpc
+          FAILOVER_OUT: ${{ runner.temp }}/failover
         run: |
           chmod +x bin/nuthatch bin/fixture-rpc
           bash scripts/failover-gate.sh bin/nuthatch
+      - name: upload the writers' logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failover-logs
+          path: ${{ runner.temp }}/failover/*.log
+          retention-days: 7
 
   point-read:
     name: point-read latency

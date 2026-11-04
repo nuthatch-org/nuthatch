@@ -27,8 +27,17 @@ TERM_SECS=3
 READY_SECS=${FAILOVER_READY_SECS:-120}
 
 die() { echo "failover-gate: $*" >&2; exit 2; }
-fail() { echo "failover-gate: FAIL: $*" >&2; exit 1; }
+fail() {
+  echo "failover-gate: FAIL: $*" >&2
+  for f in "$out"/writer-*.log; do
+    [ -f "$f" ] || continue
+    echo "failover-gate: --- last lines of $(basename "$f")" >&2
+    tail -n 15 "$f" >&2
+  done
+  exit 1
+}
 say() { echo "failover-gate: $*" >&2; }
+now_ms() { if [ -n "${EPOCHREALTIME:-}" ]; then local t=${EPOCHREALTIME/[.,]/}; echo $((t / 1000)); else perl -MTime::HiRes=time -e "printf \"%d\\n\", time * 1000"; fi; }
 
 [ $# -eq 1 ] || die "usage: $0 <nuthatch-binary>"
 bin=$1
@@ -266,10 +275,12 @@ asked_at=$(date +%s)
 answer=$(curl -sS -m 90 -X POST -H "authorization: Bearer $NUTHATCH_ADMIN_TOKEN" \
   "http://127.0.0.1:$d_port/_admin/failover/handover")
 printf '%s' "$answer" | grep -q '"released_at_fence":4' || fail "D did not release at fence 4: $answer"
+# Timed from the release, not the request: D's own stop before it releases is not E's wait.
+released_at=$(now_ms)
 e_holds() { [ "$(lease_field fence)" = 5 ]; }
 wait_for "standby E takes the lease at fence 5" e_holds
-taken=$(($(date +%s) - asked_at))
-[ "$taken" -lt "$TERM_SECS" ] || [ "$taken" -le 2 ] || fail "E waited ${taken}s: a released lease is taken at once"
+taken=$(($(now_ms) - released_at))
+[ "$taken" -lt $((TERM_SECS * 1000)) ] || fail "E waited ${taken} ms after the release: a released lease is taken at once"
 e_answers() {
   local n
   n=$(json_get "http://127.0.0.1:$e_port/gate/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20$table" \
