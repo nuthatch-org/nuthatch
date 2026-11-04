@@ -33,17 +33,7 @@ fn sweep_dead_spill_dirs(parent: &Path) {
         return;
     };
     for e in entries.flatten() {
-        let name = e.file_name();
-        // The second prefix is what releases before 4.1 called theirs.
-        let name = name.to_string_lossy();
-        let Some(rest) = name
-            .strip_prefix(PREFIX)
-            .or_else(|| name.strip_prefix("nuthatch-duckdb-"))
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+        let Some(pid) = spill_dir_pid(&e.file_name().to_string_lossy()) else {
             continue;
         };
         if !Path::new(&format!("/proc/{pid}")).exists() {
@@ -53,6 +43,15 @@ fn sweep_dead_spill_dirs(parent: &Path) {
 }
 
 pub(crate) const PREFIX: &str = "nuthatch-spill-";
+
+/// The pid a spill directory's name carries, or `None` for a name spill did not make. The second
+/// prefix is what releases before 4.1 called theirs.
+pub(crate) fn spill_dir_pid(name: &str) -> Option<u32> {
+    let rest = name
+        .strip_prefix(PREFIX)
+        .or_else(|| name.strip_prefix("nuthatch-duckdb-"))?;
+    rest.split('-').next()?.parse().ok()
+}
 
 /// The in-process half of a spill directory's name; the other half is the PID.
 pub(crate) static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
