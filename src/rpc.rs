@@ -596,12 +596,11 @@ mod tests {
     /// A provider key in the URL must not travel with a transport error into logs or stored text.
     #[tokio::test]
     async fn a_transport_error_does_not_carry_the_endpoint_url() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let client = super::RpcClient::new(vec![format!(
-            "http://127.0.0.1:{port}/v3/SECRETKEY?k=SECRETKEY"
-        )])
+        // Port 1, not a freed ephemeral port: a parallel test's mock server took one of those and
+        // answered, and an unprivileged test cannot bind this one.
+        let client = super::RpcClient::new(vec![
+            "http://127.0.0.1:1/v3/SECRETKEY?k=SECRETKEY".to_string()
+        ])
         .unwrap();
         let error = client
             .post_one_for_test(&serde_json::json!({"method":"eth_blockNumber"}))
