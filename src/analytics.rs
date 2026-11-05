@@ -3062,7 +3062,7 @@ fn define_views_bound(
 
         // The view over the sealed files plus whatever hot rows loaded. A segment that will not bind
         // is dropped and the view rebuilt from what remains, below.
-        let e = match session.bind_facts(table, cols, &sealed_files, hot_loaded, window) {
+        let e = match session.bind_facts(table, cols, &sealed, hot_loaded, window) {
             Ok(true) => {
                 bound.insert(table.clone(), table_scan(&sealed));
                 continue;
@@ -3102,8 +3102,7 @@ fn define_views_bound(
             degraded.insert(table.clone());
             continue;
         }
-        let readable_files: Vec<PathBuf> = readable.iter().map(|(file, _)| file.clone()).collect();
-        match session.bind_facts(table, cols, &readable_files, hot_loaded, window) {
+        match session.bind_facts(table, cols, &readable, hot_loaded, window) {
             Err(e) => {
                 tracing::warn!("view {table} skipped after dropping bad segments: {e}");
                 degraded.insert(table.clone());
