@@ -230,7 +230,8 @@ pub(crate) trait Session: Send {
         &self,
         table: &str,
         cols: &[(String, String)],
-        sealed: &[PathBuf],
+        // Each segment with its length in bytes, as the caller found it on disk.
+        sealed: &[(PathBuf, u64)],
         hot: bool,
         window: FactWindow,
     ) -> Result<bool>;
