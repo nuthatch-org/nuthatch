@@ -838,7 +838,7 @@ impl Session for BurrmillSession {
         &self,
         table: &str,
         cols: &[(String, String)],
-        sealed: &[PathBuf],
+        sealed: &[(PathBuf, u64)],
         hot: bool,
         window: FactWindow,
     ) -> Result<bool> {
@@ -863,17 +863,16 @@ impl Session for BurrmillSession {
         if sealed.is_empty() && hot_rows.is_empty() && cols.is_empty() {
             return Ok(false);
         }
-        let bound = sized(sealed).and_then(|files| {
-            self.engine()
-                .register_facts(
-                    table,
-                    cols,
-                    files,
-                    &hot_rows,
-                    (window.after, window.through),
-                )
-                .map_err(engine_err)
-        });
+        let bound = self
+            .engine()
+            .register_facts(
+                table,
+                cols,
+                sealed.to_vec(),
+                &hot_rows,
+                (window.after, window.through),
+            )
+            .map_err(engine_err);
         if bound.is_err() {
             self.restore_hot(table, hot_rows);
         }
@@ -1264,7 +1263,7 @@ mod tests {
         std::fs::write(&bad, b"not parquet").unwrap();
         s.load_hot("u", &refs).unwrap();
         let window = FactWindow::default();
-        assert!(s.bind_facts("u", &[], &[bad], true, window).is_err());
+        assert!(s.bind_facts("u", &[], &[(bad, 11)], true, window).is_err());
         assert!(s.bind_facts("u", &[], &[], true, window).unwrap());
         assert_eq!(
             count("u"),
@@ -1508,7 +1507,13 @@ mod sql_error_hints {
         let c = crate::engine_burrmill::BurrmillEngine.open_bare().unwrap();
         c.load_hot("usdc__transfer", &[]).unwrap();
         assert!(c
-            .bind_facts("usdc__transfer", &[], &[seg], false, FactWindow::default())
+            .bind_facts(
+                "usdc__transfer",
+                &[],
+                &[(seg, len as u64)],
+                false,
+                FactWindow::default(),
+            )
             .unwrap());
         let sql = "SELECT max(value) FROM usdc__transfer";
         let raw = fails(c.as_ref(), sql);
