@@ -5675,9 +5675,9 @@ async fn mount_releasing(
     let fetched = match (&plan.fetch_from, &plan.nid) {
         (Some(registry), Some(n)) => {
             drop(h);
-            fetch_nid(registry, n, &plan.dir, name).await?;
+            let installed = fetch_nid(registry, n, &plan.dir, name).await?;
             h = handles.lock().await;
-            true
+            installed
         }
         _ => false,
     };
@@ -5696,8 +5696,7 @@ async fn mount_releasing(
         }
         Err(e) => Err(e),
     };
-    // Only a fetch no live mount has since taken up is ours to remove.
-    if mounted.is_err() && fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+    if mounted.is_err() && fetched && !h.holds_dataset(&plan.dir) {
         let _ = std::fs::remove_dir_all(&plan.dir);
     }
     mounted
@@ -5724,12 +5723,14 @@ async fn move_releasing(
     h.complete_move(name, &staging, nid).await
 }
 
-async fn fetch_nid(registry: &str, nid: &str, dir: &Path, name: &str) -> Result<()> {
-    crate::distribution::install_by_nid(registry, nid, dir)
+/// `true` when this fetch put the dataset at `dir`; one another mount's fetch put there is not ours
+/// to remove (#2680).
+async fn fetch_nid(registry: &str, nid: &str, dir: &Path, name: &str) -> Result<bool> {
+    let installed = crate::distribution::install_by_nid(registry, nid, dir)
         .await
         .with_context(|| format!("fetching nid {nid} from the registry"))?;
     tracing::info!("fetched nid {nid} from the registry for '{name}'");
-    Ok(())
+    Ok(installed)
 }
 
 /// Fill a mount's dataset from its mirror before it joins (RFC-0073 FR16), with `nuthatch seed`'s
@@ -5935,8 +5936,7 @@ pub fn spawn_mount_job(
             let fetched = match (&plan.fetch_from, &plan.nid) {
                 (Some(registry), Some(n)) => {
                     jobs.advance_if_owned(&name, generation, MountPhase::Fetching, None)?;
-                    fetch_nid(registry, n, &plan.dir, &name).await?;
-                    true
+                    fetch_nid(registry, n, &plan.dir, &name).await?
                 }
                 _ => false,
             };
@@ -5969,7 +5969,7 @@ pub fn spawn_mount_job(
             // The unmount holds this lock across forget. A check before it still joins (#1638).
             let h = handles.lock().await;
             if !jobs.owns(&name, generation) {
-                if fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+                if fetched && !h.holds_dataset(&plan.dir) {
                     let _ = std::fs::remove_dir_all(&plan.dir);
                 }
                 bail!("mount of '{name}' was unmounted before it joined");
@@ -5977,8 +5977,7 @@ pub fn spawn_mount_job(
             let owned = || jobs.owns(&name, generation);
             let mounted = mount_releasing(&handles, h, &name, nid, &owned).await;
             let h = handles.lock().await;
-            // Only a fetch no live mount has since taken up is ours to remove.
-            if mounted.is_err() && fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+            if mounted.is_err() && fetched && !h.holds_dataset(&plan.dir) {
                 let _ = std::fs::remove_dir_all(&plan.dir);
             }
             mounted
@@ -6106,8 +6105,7 @@ pub fn spawn_move_job(
             let fetched = match (&plan.fetch_from, &plan.nid) {
                 (Some(registry), Some(n)) => {
                     jobs.advance_if_owned(&name, generation, MountPhase::Fetching, None)?;
-                    fetch_nid(registry, n, &plan.dir, &name).await?;
-                    true
+                    fetch_nid(registry, n, &plan.dir, &name).await?
                 }
                 _ => false,
             };
@@ -6116,7 +6114,7 @@ pub fn spawn_move_job(
             let h = handles.lock().await;
             // As for a mount: a claim that was forgotten, or replaced, must not move the name (#1638).
             if !jobs.owns(&name, generation) {
-                if fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+                if fetched && !h.holds_dataset(&plan.dir) {
                     let _ = std::fs::remove_dir_all(&plan.dir);
                 }
                 bail!("move of '{name}' was unmounted before it moved");
@@ -6124,8 +6122,7 @@ pub fn spawn_move_job(
             let owned = || jobs.owns(&name, generation);
             let moved = move_releasing(&handles, h, &name, nid, &owned).await;
             let h = handles.lock().await;
-            // As for a mount: a refused move removes only a fetch no live mount has since taken up.
-            if moved.is_err() && fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+            if moved.is_err() && fetched && !h.holds_dataset(&plan.dir) {
                 let _ = std::fs::remove_dir_all(&plan.dir);
             }
             moved
@@ -6411,10 +6408,7 @@ impl RuntimeHandles {
         // A NID this runtime does not hold is fetched first (#1543). Whatever refuses the mount after
         // that removes the fetch again, so a refusal still leaves nothing behind.
         let fetched = match (&plan.fetch_from, &plan.nid) {
-            (Some(registry), Some(nid)) => {
-                fetch_nid(registry, nid, &plan.dir, name).await?;
-                true
-            }
+            (Some(registry), Some(nid)) => fetch_nid(registry, nid, &plan.dir, name).await?,
             _ => false,
         };
         let mounted = match self.begin_mount(name, nid).await {
@@ -6425,7 +6419,7 @@ impl RuntimeHandles {
             }
             Err(e) => Err(e),
         };
-        if mounted.is_err() && fetched {
+        if mounted.is_err() && fetched && !self.holds_dataset(&plan.dir) {
             let _ = std::fs::remove_dir_all(&plan.dir);
         }
         mounted
@@ -7785,6 +7779,13 @@ impl RuntimeHandles {
             None => self.mount_ctx.mounts.push(next),
         }
         Ok(())
+    }
+
+    /// Whether a mount is live on, or joining, the dataset at `dir`: only a fetch none holds is a
+    /// failed mount's to remove.
+    fn holds_dataset(&self, dir: &Path) -> bool {
+        self.states.iter().any(|(_, s)| s.dir == dir)
+            || self.joining.list().iter().any(|j| j.dir == dir)
     }
 
     /// `name`'s mount record, if it has one.
@@ -10924,6 +10925,63 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         assert!(!data.exists(), "a failed job kept its dataset from reclaim");
+    }
+
+    /// #2680: a mount of a NID another mount is still joining is refused, and its failure must not
+    /// delete the dataset from under that join, though it fetched the dataset itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mount_refused_for_a_join_in_progress_keeps_the_dataset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MOUNTS_FILE),
+            "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\n\
+             chain_id = 42161\nrpc_urls = []\n",
+        )
+        .unwrap();
+        let src = tempfile::tempdir().unwrap();
+        write_nest_dir(src.path(), "usdc", "arbitrum-one", 42161);
+        let nest = MountTable::nest_dir(src.path(), "usdc");
+        let nid = crate::blob::nest_nid(&nest).unwrap();
+        let bundle = src.path().join("usdc.bundle");
+        crate::blob::bundle(&nest, Some(&bundle), false, false).unwrap();
+        let registry = tempfile::tempdir().unwrap();
+        let store = crate::distribution::open(registry.path().to_str().unwrap()).unwrap();
+        crate::distribution::publish(store.as_ref(), &bundle, Some("usdc"), None)
+            .await
+            .unwrap();
+
+        let mut handles = idle_handles(dir.path());
+        handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
+        let data = MountTable::data_dir(dir.path(), &nid);
+        // The first mount's catch-up, with its own fetch not yet landed.
+        let _first = handles.joining.reserve(Joining {
+            name: "first".into(),
+            chain: "arbitrum-one".into(),
+            dir: data.clone(),
+            incoming_mb: 0,
+        });
+        let handles = Arc::new(tokio::sync::Mutex::new(handles));
+        let h = handles.lock().await;
+        let err = mount_releasing(
+            &handles,
+            h,
+            "second",
+            Some(Nid::parse(&nid).unwrap()),
+            &|| true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<MountRefusal>(),
+                Some(MountRefusal::Joining { .. })
+            ),
+            "{err:#}"
+        );
+        assert!(
+            data.join(CONFIG_FILE).exists(),
+            "the refused mount deleted the dataset another mount is joining"
+        );
     }
 
     /// RFC-0073 FR2: a share set over the admin API binds running mounts with no restart, is written
