@@ -1428,11 +1428,7 @@ permits and CPU, the engine's own memory safety) and how it is tested are in
 [`docs/security/shared-runtime.md`](security/shared-runtime.md). **The guarantee is not claimed** until
 the independent review that document describes has run.
 
-**Admin surface.** A set `NUTHATCH_ADMIN_TOKEN` is required on every request, on every bind, localhost
-included (#2132); off-localhost the routes are not served without one. Token comparison is
-constant-time. With no token, a localhost bind answers only requests whose `Host` (and `Origin`, if
-sent) is a loopback name or address, so a DNS-rebinding page cannot reach it (#2136). `--no-admin`
-removes the routes entirely rather than merely gating them.
+**Admin surface.** Every admin request needs the token, on every bind, localhost included (#2132, #2354): `NUTHATCH_ADMIN_TOKEN` when set, else the `.admin-token` file the runtime makes beside the nest. Without it the answer is `401`, whatever the `Host`. Token comparison is constant-time. `--no-admin` removes the routes entirely rather than merely gating them.
 
 **`/metrics` and `/health` are unauthenticated by design.** Scope them to your internal network at the
 gateway if you do not want them public.
