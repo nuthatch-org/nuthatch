@@ -1212,7 +1212,13 @@ fn copy_dir_except(src: &Path, dst: &Path, skip: &dyn Fn(&std::ffi::OsStr) -> bo
         }
         let from = entry.path();
         let to = dst.join(&name);
-        if entry.file_type()?.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            // Following a link would copy whatever it points at into the nest, possibly from outside
+            // it (#2692). A nest is plain files, so a link is refused rather than dereferenced.
+            anyhow::bail!("{} is a symbolic link; a nest cannot contain one", from.display());
+        }
+        if file_type.is_dir() {
             copy_dir_except(&from, &to, skip)?;
         } else {
             std::fs::copy(&from, &to)
@@ -1911,6 +1917,21 @@ fn dir_hint(dir: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link in a nest directory is refused, not copied as the file it points at (#2692).
+    #[cfg(unix)]
+    #[test]
+    fn copying_a_nest_refuses_a_symbolic_link_rather_than_dereferencing_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secret = tmp.path().join("outside.txt");
+        std::fs::write(&secret, b"not part of the nest").unwrap();
+        let src = tmp.path().join("nest");
+        std::fs::create_dir(&src).unwrap();
+        std::os::unix::fs::symlink(&secret, src.join("nuthatch.toml")).unwrap();
+
+        let err = copy_dir(&src, &tmp.path().join("copy")).unwrap_err();
+        assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+    }
 
     fn files_under(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
         crate::blob::collect_files(root, None)
