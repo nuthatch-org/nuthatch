@@ -528,6 +528,24 @@ mod tests {
         }
     }
 
+    /// #2703: a multibyte name once panicked the keyword match, which byte-sliced mid-character.
+    #[test]
+    fn a_non_ascii_view_name_splits_without_panicking() {
+        for (stmt, want) in [
+            (
+                "CREATE VIEW \"\u{1F989}\" AS SELECT 1",
+                Some(("\u{1F989}", "SELECT 1")),
+            ),
+            ("CREATE VIEW café AS SELECT 1", Some(("café", "SELECT 1"))),
+            ("CREATE VIEW 日本 AS SELECT 1", Some(("日本", "SELECT 1"))),
+            ("CREATE 日本 AS SELECT 1", None),
+        ] {
+            let got = split_create_view(stmt);
+            let got = got.as_ref().map(|(n, b)| (n.as_str(), b.as_str()));
+            assert_eq!(got, want, "{stmt:?}");
+        }
+    }
+
     /// Slice 2's stated acceptance, half one: a diamond hashes correctly and transitively.
     #[test]
     fn a_diamond_dependency_hashes_transitively() {
@@ -898,14 +916,15 @@ fn split_create_view(stmt: &str) -> Option<(String, String)> {
     }
     rest = strip_kw(rest, "view")?;
 
-    // The name: a bare identifier or a double-quoted one.
+    // The name: a bare identifier or a double-quoted one. The engine takes unquoted non-ASCII
+    // identifiers (`café`), so this must too.
     let rest = rest.trim_start();
     let (name, mut after) = if let Some(body) = rest.strip_prefix('"') {
         let end = body.find('"')?;
         (body[..end].to_string(), &body[end + 1..])
     } else {
         let end = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
             .unwrap_or(rest.len());
         if end == 0 {
             return None;
@@ -944,7 +963,7 @@ fn split_create_view(stmt: &str) -> Option<(String, String)> {
 /// Strip a leading case-insensitive keyword that is followed by whitespace or `(`.
 fn strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
     let s = s.trim_start();
-    if s.len() < kw.len() || !s[..kw.len()].eq_ignore_ascii_case(kw) {
+    if !s.get(..kw.len())?.eq_ignore_ascii_case(kw) {
         return None;
     }
     let rest = &s[kw.len()..];
