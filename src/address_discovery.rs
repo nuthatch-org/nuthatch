@@ -17,7 +17,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::address_history::{Action, AddressHistory, Row};
 
@@ -800,6 +800,8 @@ pub struct Discoverer<M, T> {
     pub residual: bool,
     /// Logs that mint native value outside any call frame, read as credits by the residual.
     pub mint_logs: &'static [crate::address_residual::MintLog],
+    /// Transfer logs naming an address that filed no row: not the standard event, or undecodable data.
+    pub skipped_logs: Arc<AtomicU64>,
 }
 
 impl<M: Rpc, T: Rpc> Discoverer<M, T> {
@@ -811,6 +813,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             log_window: Window::new(100_000),
             residual: false,
             mint_logs: &[],
+            skipped_logs: Arc::default(),
         }
     }
 
@@ -859,7 +862,9 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         }
         let timestamps = self.timestamps(history, &logs, pending).await?;
         for log in &logs {
-            transfer_rows(log, &a, &timestamps, &mut found)?;
+            if !transfer_rows(log, &a, &timestamps, &mut found)? {
+                self.skipped_logs.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(found)
     }
@@ -1063,8 +1068,12 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                     matched.push(p);
                 }
             }
+            let mut filed = matched.is_empty();
             for p in matched {
-                transfer_rows(log, &p, &timestamps, found.entry(p.clone()).or_default())?;
+                filed |= transfer_rows(log, &p, &timestamps, found.entry(p.clone()).or_default())?;
+            }
+            if !filed {
+                self.skipped_logs.fetch_add(1, Ordering::Relaxed);
             }
         }
         if traced {
@@ -2468,12 +2477,16 @@ fn address_mode_order(mut row: Row) -> Row {
 ///
 /// Three topics stay `tokentx`: that is the ERC-20 log shape. Etherscan files by its token
 /// tracker, which this nest does not have. A one-topic `Transfer` (CryptoKitties) is skipped.
+///
+/// Any contract can emit a log under these topics, so data that does not decode as the event files no
+/// row, as on Etherscan, rather than failing the window. Data that is not hex, short or not, is the
+/// provider's fault and fails it. Returns whether the log filed a row.
 fn transfer_rows(
     log: &Value,
     a: &str,
     timestamps: &BTreeMap<u64, u64>,
     found: &mut Found,
-) -> Result<()> {
+) -> Result<bool> {
     let topics: Vec<&str> = log
         .get("topics")
         .and_then(Value::as_array)
@@ -2491,10 +2504,13 @@ fn transfer_rows(
         .get(&block)
         .ok_or_else(|| anyhow!("no timestamp for block {block}"))?;
     let data = str_field(log, "data")?.trim_start_matches("0x");
-    let word = |i: usize| -> Result<String> {
-        data.get(i * 64..(i + 1) * 64)
-            .map(|w| format!("0x{w}"))
-            .ok_or_else(|| anyhow!("log data too short: {log}"))
+    if !data.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("log data is not hex: {log}");
+    }
+    let word = |i: usize| data.get(i * 64..(i + 1) * 64).map(|w| format!("0x{w}"));
+    let skip = |why: &str| {
+        tracing::debug!("address history: skipping {why} transfer log for {a}: {log}");
+        false
     };
     let base = || -> Result<Map<String, Value>> {
         let mut r = Map::new();
@@ -2530,10 +2546,13 @@ fn transfer_rows(
     let party = |t: &str| topic_address(t).map(Value::String);
     match (topics.first().copied(), topics.len()) {
         (Some(TRANSFER), 3) => {
+            let Some(value) = word(0) else {
+                return Ok(skip("an undecodable"));
+            };
             let mut r = base()?;
             r.insert("from".into(), party(topics[1])?);
             r.insert("to".into(), party(topics[2])?);
-            r.insert("value".into(), Value::String(decimal(&word(0)?)?));
+            r.insert("value".into(), Value::String(decimal(&value)?));
             tail(&mut r);
             found.tokentx.push(row(r, 0));
         }
@@ -2546,16 +2565,21 @@ fn transfer_rows(
             found.tokennfttx.push(row(r, 0));
         }
         (Some(TRANSFER_SINGLE), 4) => {
+            let (Some(id), Some(value)) = (word(0), word(1)) else {
+                return Ok(skip("an undecodable"));
+            };
             let mut r = base()?;
             r.insert("from".into(), party(topics[2])?);
             r.insert("to".into(), party(topics[3])?);
-            r.insert("tokenID".into(), Value::String(decimal(&word(0)?)?));
-            r.insert("tokenValue".into(), Value::String(decimal(&word(1)?)?));
+            r.insert("tokenID".into(), Value::String(decimal(&id)?));
+            r.insert("tokenValue".into(), Value::String(decimal(&value)?));
             tail(&mut r);
             found.token1155tx.push(row(r, 0));
         }
         (Some(TRANSFER_BATCH), 4) => {
-            let (ids, values) = batch_arrays(data)?;
+            let Some((ids, values)) = batch_arrays(data)? else {
+                return Ok(skip("an undecodable"));
+            };
             if ids.len() > 1 << 16 {
                 bail!(
                     "a TransferBatch of {} ids is past the row key's room",
@@ -2572,41 +2596,44 @@ fn transfer_rows(
                 found.token1155tx.push(row(r, i as u64));
             }
         }
-        _ => {
-            tracing::debug!(
-                "address history: skipping an unrecognised transfer log for {a}: {log}"
-            );
-        }
+        _ => return Ok(skip("an unrecognised")),
     }
-    Ok(())
+    Ok(true)
 }
 
 /// `TransferBatch` data: two dynamic `uint256[]`, ids then values, as decimal strings.
-fn batch_arrays(data: &str) -> Result<(Vec<String>, Vec<String>)> {
-    let word = |i: usize| -> Result<&str> {
-        data.get(i * 64..(i + 1) * 64)
-            .ok_or_else(|| anyhow!("TransferBatch data too short"))
+/// `None` when the data is not two arrays of one length.
+fn batch_arrays(data: &str) -> Result<Option<(Vec<String>, Vec<String>)>> {
+    let word = |i: usize| -> Option<&str> {
+        data.get(i.checked_mul(64)?..i.checked_add(1)?.checked_mul(64)?)
     };
-    let at = |i: usize| -> Result<usize> {
-        usize::try_from(alloy_primitives::U256::from_str_radix(word(i)?, 16)?)
-            .map_err(|_| anyhow!("TransferBatch offset out of range"))
+    let at = |i: usize| -> Result<Option<usize>> {
+        let Some(w) = word(i) else { return Ok(None) };
+        Ok(usize::try_from(alloy_primitives::U256::from_str_radix(w, 16)?).ok())
     };
-    let array = |offset_word: usize| -> Result<Vec<String>> {
-        let start = at(offset_word)? / 32;
-        let len = at(start)?;
-        (0..len)
-            .map(|k| decimal(&format!("0x{}", word(start + 1 + k)?)))
-            .collect()
+    let array = |offset_word: usize| -> Result<Option<Vec<String>>> {
+        let Some(start) = at(offset_word)?.map(|o| o / 32) else {
+            return Ok(None);
+        };
+        let Some(len) = at(start)? else {
+            return Ok(None);
+        };
+        let Some(end) = start.checked_add(len) else {
+            return Ok(None);
+        };
+        let Some(words) = (start + 1..=end).map(word).collect::<Option<Vec<_>>>() else {
+            return Ok(None);
+        };
+        words
+            .into_iter()
+            .map(|w| decimal(&format!("0x{w}")))
+            .collect::<Result<_>>()
+            .map(Some)
     };
-    let (ids, values) = (array(0)?, array(1)?);
-    if ids.len() != values.len() {
-        bail!(
-            "TransferBatch with {} ids and {} values",
-            ids.len(),
-            values.len()
-        );
-    }
-    Ok((ids, values))
+    Ok(match (array(0)?, array(1)?) {
+        (Some(ids), Some(values)) if ids.len() == values.len() => Some((ids, values)),
+        _ => None,
+    })
 }
 
 /// The first block at or after `start` that some discovered action has not covered for `address`.
@@ -3120,9 +3147,61 @@ mod tests {
     fn a_batch_transfer_decodes_every_id() {
         // ids [1, 2], values [10, 20]
         let words = ["40", "a0", "2", "1", "2", "2", "a", "14"].map(|w| format!("{w:0>64}"));
-        let (ids, values) = batch_arrays(&words.concat()).unwrap();
+        let (ids, values) = batch_arrays(&words.concat()).unwrap().unwrap();
         assert_eq!(ids, ["1", "2"]);
         assert_eq!(values, ["10", "20"]);
+    }
+
+    #[test]
+    fn a_batch_transfer_that_is_not_two_arrays_decodes_to_nothing() {
+        let data = |words: &[&str]| {
+            words
+                .iter()
+                .map(|w| format!("{w:0>64}"))
+                .collect::<String>()
+        };
+        for bad in [
+            data(&["40"]),
+            data(&["40", "a0", "2", "1", "2", "3", "a", "14", "1e"]),
+            data(&[
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "40",
+            ]),
+            data(&["8000000000000000", "40", "1", "1"]),
+        ] {
+            assert_eq!(batch_arrays(&bad).unwrap(), None, "{bad}");
+        }
+        assert!(
+            batch_arrays(&data(&["40", "60", "1", "zz"])).is_err(),
+            "not hex"
+        );
+    }
+
+    /// Data that is not hex is the provider's fault, short or not, so it fails the window; a
+    /// multi-byte character across an interior word boundary of a batch panicked.
+    #[test]
+    fn log_data_that_is_not_hex_is_an_error_not_a_skip() {
+        let mut batch = ["40", "c0", "3", "1", "2", "3", "3", "a", "b", "c"]
+            .map(|w| format!("{w:0>64}"))
+            .concat();
+        batch.replace_range(255..256, "é");
+        assert_eq!(batch_arrays(&batch).unwrap(), None);
+        let log = |topics: Value, data: &str| {
+            json!({"address": "0xT0KEN", "topics": topics, "data": data, "blockNumber": "0x10",
+            "transactionHash": "0xHH", "transactionIndex": "0x1", "logIndex": "0x1",
+            "blockHash": "0xBB", "removed": false})
+        };
+        let timestamps = BTreeMap::from([(16, 32)]);
+        for bad in [
+            log(json!([TRANSFER, padded(A), padded(A)]), "0xzz"),
+            log(
+                json!([TRANSFER_BATCH, padded(A), padded(A), padded(A)]),
+                &format!("0x{batch}"),
+            ),
+        ] {
+            let err = transfer_rows(&bad, A, &timestamps, &mut Found::default()).unwrap_err();
+            assert!(format!("{err:#}").contains("not hex"), "{err:#}");
+        }
     }
 
     /// A type-4 transaction's row carries its authorization list, as rotki's decoder needs to name a
@@ -3796,6 +3875,86 @@ mod tests {
             format!("{err:#}").contains("not a 32-byte topic"),
             "{err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_transfer_log_with_short_data_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let log = |data: &str, index: u64| {
+            json!({"address": "0xT0KEN", "topics": [TRANSFER, padded(A), padded(A)],
+            "data": data, "blockNumber": "0x10", "blockTimestamp": "0x20",
+            "transactionHash": "0xHH", "transactionIndex": "0x1", "logIndex": format!("0x{index:x}"),
+            "blockHash": "0xBB", "removed": false})
+        };
+        let logs = json!([
+            log("0x", 1),
+            log("0x12", 2),
+            log(&format!("0x{:0>64}", "7"), 3)
+        ]);
+        let (main, trace) = chain(false);
+        let main = script(move |m, p| match m {
+            "eth_getLogs" => Ok(logs.clone()),
+            _ => (main.answer)(m, p),
+        });
+        let d = Discoverer::new(main, trace);
+        for _ in 0..2 {
+            let found = d.discover_now(&h, A, 0, 63).await.unwrap();
+            assert_eq!(found.tokentx.len(), 1, "{:?}", found.tokentx);
+            assert_eq!(found.tokentx[0].record["value"], "7");
+        }
+        assert_eq!(d.skipped_logs.load(Ordering::Relaxed), 4);
+    }
+
+    /// One unreadable log naming one address in the set does not stop the sweep for the others.
+    #[tokio::test]
+    async fn a_sweep_skips_a_transfer_batch_it_cannot_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        const B: &str = "0x00000000000000000000000000000000000000b0";
+        let n = 17_000_000u64;
+        let bh = format!("0x{:0>64}", "b1");
+        let log = |topics: Value, data: String, index: u64| {
+            json!({"address": "0x00000000000000000000000000000000000000c0", "topics": topics,
+                   "data": data, "blockNumber": format!("0x{n:x}"),
+                   "transactionHash": format!("0x{:0>64}", 1), "transactionIndex": "0x0",
+                   "logIndex": format!("0x{index:x}"), "blockHash": bh, "removed": false})
+        };
+        // An ids offset of 2^63 words past the start: the word index overflowed `i * 64`.
+        let far = ["8000000000000000", "a0"]
+            .map(|w| format!("{w:0>64}"))
+            .concat();
+        let logs = vec![
+            log(
+                json!([TRANSFER_BATCH, padded(B), padded(B), padded(B)]),
+                format!("0x{far}"),
+                0,
+            ),
+            log(
+                json!([TRANSFER, padded(B), padded(A)]),
+                format!("0x{:0>64}", "64"),
+                1,
+            ),
+        ];
+        let bh2 = bh.clone();
+        let main = script(move |m, _| {
+            Ok(match m {
+                "eth_getBlockByNumber" => {
+                    json!({"number": format!("0x{n:x}"), "hash": bh2, "parentHash": bh2,
+                    "timestamp": "0x64", "transactions": []})
+                }
+                "eth_getLogs" => json!(logs),
+                other => bail!("unexpected {other}"),
+            })
+        });
+        let d = Discoverer::new(main, script(|m, _| bail!("no trace call expected: {m}")));
+        let set: std::collections::HashSet<String> = [A, B].map(String::from).into();
+        let pending = Pending::begin(&h).unwrap();
+        let found = d.sweep(&h, &set, n, n, &pending, false).await.unwrap();
+        assert_eq!(found[A].tokentx.len(), 1);
+        assert_eq!(found[B].tokentx.len(), 1);
+        assert!(found[B].token1155tx.is_empty());
+        assert_eq!(d.skipped_logs.load(Ordering::Relaxed), 1);
     }
 
     /// A traced sweep finds value a contract sends a watched address from inside a call, which no

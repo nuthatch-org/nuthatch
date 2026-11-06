@@ -83,6 +83,8 @@ pub struct ModeState {
     calls: Mutex<BTreeMap<(String, String), u64>>,
     windows: AtomicU64,
     discovery_errors: AtomicU64,
+    /// The discoverer's count of transfer logs that filed no row.
+    skipped_logs: Arc<AtomicU64>,
     /// Forwards `proxy` and `logs` requests to the nest's RPC.
     pub forward: Option<crate::address_proxy::Forward>,
     /// Reads the RPC counters as they stand, so calls forwarded for a request show at once rather
@@ -348,6 +350,7 @@ impl ModeState {
             calls: Mutex::new(BTreeMap::new()),
             windows: AtomicU64::new(0),
             discovery_errors: AtomicU64::new(0),
+            skipped_logs: Arc::default(),
             forward: None,
             relays: None,
             mirror: None,
@@ -520,6 +523,11 @@ impl ModeState {
 
     pub fn with_counter(mut self, counter: Counter) -> Self {
         self.counter = Some(counter);
+        self
+    }
+
+    pub fn with_skipped_logs(mut self, skipped: Arc<AtomicU64>) -> Self {
+        self.skipped_logs = skipped;
         self
     }
 
@@ -4360,6 +4368,9 @@ async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
          nuthatch_address_history_windows_recorded_total {}\n\
          # TYPE nuthatch_address_history_discovery_errors_total counter\n\
          nuthatch_address_history_discovery_errors_total {}\n\
+         # HELP nuthatch_address_history_skipped_logs_total Transfer logs naming a watched address that filed no row, as Etherscan files none.\n\
+         # TYPE nuthatch_address_history_skipped_logs_total counter\n\
+         nuthatch_address_history_skipped_logs_total {}\n\
          # HELP nuthatch_address_history_rpc_requests_total RPC requests sent, startup checks and failovers included.\n\
          # TYPE nuthatch_address_history_rpc_requests_total counter\n\
          nuthatch_address_history_rpc_requests_total {}\n\
@@ -4376,6 +4387,7 @@ async fn metrics(State(s): State<Arc<ModeState>>) -> impl IntoResponse {
          nuthatch_address_history_watched {watched}\n",
         s.windows.load(Ordering::Relaxed),
         s.discovery_errors.load(Ordering::Relaxed),
+        s.skipped_logs.load(Ordering::Relaxed),
         // Every call counted so far, not only those made by the last head read.
         s.rpc_requests
             .load(Ordering::Relaxed)
@@ -5050,6 +5062,7 @@ pub async fn start_nest(
         )
         .with_forward(forward(discovery.clone(), verified.clone()))
         .with_counter(counter(discovery.clone()))
+        .with_skipped_logs(discovery.skipped_logs.clone())
         .with_hash_at({
             let d = discovery.clone();
             let verified = verified.clone();
@@ -7465,8 +7478,10 @@ mod tests {
                 Duration::from_secs(300),
                 true,
             )
-            .with_counter(counter(d.clone())),
+            .with_counter(counter(d.clone()))
+            .with_skipped_logs(d.skipped_logs.clone()),
         );
+        d.skipped_logs.fetch_add(3, Ordering::Relaxed);
         // A forwarded request's calls, with no cursor to report them.
         for _ in 0..4 {
             d.main.call("eth_blockNumber", json!([])).await.unwrap();
@@ -7479,6 +7494,10 @@ mod tests {
         );
         assert!(
             m.contains("{endpoint=\"main\",method=\"eth_blockNumber\"} 4"),
+            "{m}"
+        );
+        assert!(
+            m.contains("nuthatch_address_history_skipped_logs_total 3\n"),
             "{m}"
         );
     }
