@@ -183,6 +183,8 @@ mod pr_review_harness;
 mod reading_published_nest;
 #[path = "release_gate_script.rs"]
 mod release_gate_script;
+#[path = "release_latest_script.rs"]
+mod release_latest_script;
 #[path = "release_provenance.rs"]
 mod release_provenance;
 #[path = "required_checks.rs"]

@@ -440,6 +440,8 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
+      # For scripts/release-latest.sh. First, because checkout cleans the workspace.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # #830 asks the workflow to verify artifact identity **before publishing**, which is the half
       # that makes an attestation load-bearing rather than decorative. This downloads the release's
       # own assets and verifies each against the transparency log - the same command a user runs, run
@@ -487,8 +489,18 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # #2736: only the newest stable release moves `:latest`; a prerelease or an older line's patch does not.
+      - name: does this tag move :latest
+        id: newest
+        run: |
+          set -euo pipefail
+          move=$(git ls-remote --tags --refs origin 'v*' | sed 's#.*refs/tags/##' | scripts/release-latest.sh "$GITHUB_REF_NAME")
+          echo "$GITHUB_REF_NAME moves :latest: $move"
+          echo "move=$move" >> "$GITHUB_OUTPUT"
       - name: push the tested images
         id: push
+        env:
+          MOVE_LATEST: ${{ steps.newest.outputs.move }}
         run: |
           set -euo pipefail
           gunzip -c nuthatch-images.tar.gz | docker load
@@ -502,7 +514,9 @@ jobs:
             done
             echo "$out=$digest" >> "$GITHUB_OUTPUT"
           }
-          push nuthatch:candidate default "$v" latest
+          tags=("$v")
+          if [ "$MOVE_LATEST" = true ]; then tags+=(latest); fi
+          push nuthatch:candidate default "${tags[@]}"
           push nuthatch:scaled scaled "$v-scaled"
           push nuthatch:flight flight "$v-flight"
       - name: attest the image
