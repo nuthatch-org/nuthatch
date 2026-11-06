@@ -104,7 +104,8 @@ async fn bring_up(
     let datasets = mounts.datasets(root);
     let default_tenant_owned = mounts.tenant_default();
     let default_tenant = default_tenant_owned.as_str();
-    let mounted = runtime::load_mounted(root, &datasets, default_tenant).expect("load");
+    let (mounted, failed) = runtime::load_mounted(root, &datasets, default_tenant);
+    assert!(failed.is_empty(), "load: {failed:?}");
 
     let health = Arc::new(RuntimeHealth::new());
     for (name, _, _) in &mounted {
@@ -372,7 +373,8 @@ async fn bring_up_live(
         .into_iter()
         .filter(|d| only.contains(&d.canonical().alias.as_str()))
         .collect();
-    let mounted = runtime::load_mounted(root, &datasets, default_tenant).expect("load");
+    let (mounted, failed) = runtime::load_mounted(root, &datasets, default_tenant);
+    assert!(failed.is_empty(), "load: {failed:?}");
 
     let health = Arc::new(RuntimeHealth::new());
     for (name, _, _) in &mounted {
@@ -687,7 +689,8 @@ async fn a_substantive_edit_does_not_adopt_on_the_mount_path() {
     let dest = MountTable::data_dir(root, &new_nid);
     let mounts = MountTable::load(root).unwrap();
     let datasets = mounts.datasets(root);
-    runtime::load_mounted(root, &datasets, &mounts.tenant_default()).expect("load");
+    let (_, failed) = runtime::load_mounted(root, &datasets, &mounts.tenant_default());
+    assert!(failed.is_empty(), "load: {failed:?}");
 
     assert!(
         !dest.join("nuthatch.redb").exists(),

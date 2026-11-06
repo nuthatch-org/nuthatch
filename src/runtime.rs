@@ -1617,6 +1617,9 @@ fn commit_derived_state(staging: &Path, dataset: &Path, staged: &[&'static str])
     Ok(())
 }
 
+/// A mounted dataset that did not load: its route key and why.
+pub type Unloaded = (String, String);
+
 /// Resolve every mounted dataset to `(route key, directory, config)` - the list the cursors are built
 /// from (RFC-0032 §4).
 ///
@@ -1624,13 +1627,15 @@ fn commit_derived_state(staging: &Path, dataset: &Path, staged: &[&'static str])
 /// what makes the early-cutoff step below reachable in production rather than in `migrate` only.
 ///
 /// Adoption runs **before** the config load, because a dataset that adopts is one whose store the
-/// loader is about to open.
+/// loader is about to open. A dataset that does not load is returned beside the rest as `(route key,
+/// reason)`, so it boots quarantined rather than stopping its co-tenants (RFC-0073 FR6).
 pub fn load_mounted(
     dir: &Path,
     datasets: &[Dataset],
     default_tenant: &str,
-) -> Result<Vec<(String, PathBuf, Config)>> {
+) -> (Vec<(String, PathBuf, Config)>, Vec<Unloaded>) {
     let mut out = Vec::with_capacity(datasets.len());
+    let mut failed = Vec::new();
     for ds in datasets {
         // The cutoff, and the warn-and-carry-on policy behind it, now live in `prepare_dataset` so
         // the mount path gets the same treatment without re-deriving it (#414).
@@ -1640,20 +1645,27 @@ pub fn load_mounted(
             ds.nid.as_deref(),
             &ds.canonical().to_string(),
         );
-        let config = Config::load(&ds.dir).with_context(|| {
+        let key = ds.canonical().route_key(default_tenant);
+        match Config::load(&ds.dir).with_context(|| {
             format!(
                 "loading mounted nest '{}' from {}",
                 ds.canonical(),
                 ds.dir.display()
             )
-        })?;
-        out.push((
-            ds.canonical().route_key(default_tenant),
-            ds.dir.clone(),
-            config,
-        ));
+        }) {
+            Ok(config) => out.push((key, ds.dir.clone(), config)),
+            Err(e) => failed.push((key, format!("{e:#}"))),
+        }
     }
-    Ok(out)
+    (out, failed)
+}
+
+/// The chain a dataset's `nuthatch.toml` names, read without the loader's refusals: a mount that did
+/// not load is still attributed to its chain where the file says which.
+fn declared_chain(dataset: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(dataset.join(crate::config::CONFIG_FILE)).ok()?;
+    let table: toml::Table = toml::from_str(&raw).ok()?;
+    Some(table.get("nest")?.get("chain")?.as_str()?.to_string())
 }
 
 /// Each dataset's window deadline at boot (RFC-0076 §3.2): its indexing mount's, the first in serving
@@ -2365,12 +2377,13 @@ pub struct ChainGroup {
 }
 
 /// Group loaded nests by their declared chain, matching each to a runtime chain endpoint (RFC-0021).
-/// A nest whose chain the runtime doesn't declare is a hard error; declared-but-unused chains are left
-/// out, and [`dev`] keeps them dormant until a mount needs one (#1545). Deterministic order (endpoints as declared).
+/// A nest whose chain the runtime doesn't declare is returned as `(name, chain, reason)` to boot
+/// quarantined; declared-but-unused chains are left out, and [`dev`] keeps them dormant until a mount
+/// needs one (#1545). Deterministic order (endpoints as declared).
 pub fn group_by_chain(
     endpoints: &[ChainEndpoint],
     mounted: Vec<(String, PathBuf, Config)>,
-) -> Result<Vec<ChainGroup>> {
+) -> (Vec<ChainGroup>, Vec<(String, String, String)>) {
     let mut groups: Vec<ChainGroup> = endpoints
         .iter()
         .map(|e| ChainGroup {
@@ -2378,22 +2391,25 @@ pub fn group_by_chain(
             nests: Vec::new(),
         })
         .collect();
+    let mut refused = Vec::new();
     for (name, path, config) in mounted {
         let idx = groups.iter().position(|g| {
             g.endpoint.chain == config.nest.chain && g.endpoint.chain_id == config.nest.chain_id
         });
         match idx {
             Some(i) => groups[i].nests.push((name, path, config)),
-            None => bail!(
-                "nest '{name}' is on {} (chain_id {}), which this runtime doesn't declare - add it under \
-                 [[chains]] (or [mounts] chain/chain_id)",
-                config.nest.chain,
-                config.nest.chain_id
-            ),
+            None => {
+                let reason = format!(
+                    "nest '{name}' is on {} (chain_id {}), which this runtime doesn't declare - add it \
+                     under [[chains]] (or [mounts] chain/chain_id)",
+                    config.nest.chain, config.nest.chain_id
+                );
+                refused.push((name, config.nest.chain, reason));
+            }
         }
     }
     groups.retain(|g| !g.nests.is_empty());
-    Ok(groups)
+    (groups, refused)
 }
 
 /// One cursor's mounts as boot admits them (RFC-0073 FR5).
@@ -2561,7 +2577,7 @@ pub async fn dev(
     // change with a suspend.
     let default_tenant_owned = all_mounts.tenant_default();
     let default_tenant = default_tenant_owned.as_str();
-    let mut mounted = load_mounted(&dir, &datasets, default_tenant)?;
+    let (mut mounted, unloaded) = load_mounted(&dir, &datasets, default_tenant);
     let deadlines = boot_window_deadlines(&mounts, &datasets);
     // The dial is the operator's, not the nest's (RFC-0040), so it is stamped onto every mounted
     // config here rather than read from any of them - `Config::freshness` is `#[serde(skip)]`.
@@ -2579,7 +2595,7 @@ pub async fn dev(
         config.cursor_sql_permits = Some(sql_permits);
         config.strict_isolation = meta.isolation == crate::isolation::Isolation::Strict;
     }
-    let groups = group_by_chain(&endpoints, mounted)?;
+    let (groups, undeclared) = group_by_chain(&endpoints, mounted);
     if meta.isolation == crate::isolation::Isolation::Strict {
         crate::analytics_budget::validate_strict_budget(sql_permits, Some(max_rss))?;
     }
@@ -2676,6 +2692,21 @@ pub async fn dev(
     let health = Arc::new(crate::health::RuntimeHealth::new());
     let mut failed: std::collections::BTreeMap<String, String> = Default::default();
     let mut failed_chain: std::collections::HashMap<String, String> = Default::default();
+    let unloaded = unloaded.into_iter().map(|(name, reason)| {
+        let ds = datasets
+            .iter()
+            .find(|d| d.canonical().route_key(default_tenant) == name);
+        let chain = ds.and_then(|d| declared_chain(&d.dir));
+        (name, chain.unwrap_or_else(|| "unknown".to_string()), reason)
+    });
+    for (name, chain, reason) in unloaded.chain(undeclared) {
+        let reason = format!("did not load at boot: {reason}");
+        tracing::error!("nest '{name}' {reason}");
+        health.register(&name, &chain);
+        health.quarantine_nest(&name, reason.clone(), 0, None);
+        failed_chain.insert(name.clone(), chain);
+        failed.insert(name, reason);
+    }
 
     let writer_leases = take_writer_leases(
         &dir,
@@ -9904,15 +9935,18 @@ mod tests {
     #[test]
     fn rejects_a_nest_whose_chain_isnt_declared() {
         let d = tempfile::tempdir().unwrap();
-        // MountTable declares arbitrum-one; the nest claims mainnet → hard error at grouping.
+        // MountTable declares arbitrum-one; the nest claims mainnet → refused at grouping, alone.
         write_roost(d.path(), "arbitrum-one", 42161, "mainnet", 1);
         let mounts = MountTable::load(d.path()).unwrap();
-        let err = group_by_chain(
+        let (groups, refused) = group_by_chain(
             &mounts.chain_endpoints().unwrap(),
             vec![mounted(d.path(), "a")],
-        )
-        .unwrap_err()
-        .to_string();
+        );
+        assert!(groups.is_empty());
+        let [(name, chain, err)] = &refused[..] else {
+            panic!("expected one refusal: {refused:?}");
+        };
+        assert_eq!((name.as_str(), chain.as_str()), ("a", "mainnet"));
         assert!(err.contains("doesn't declare"), "got: {err}");
     }
 
@@ -9931,11 +9965,11 @@ mod tests {
         let mounts = MountTable::load(d.path()).unwrap();
         let endpoints = mounts.chain_endpoints().unwrap();
         assert_eq!(endpoints.len(), 2, "two declared chains");
-        let groups = group_by_chain(
+        let (groups, refused) = group_by_chain(
             &endpoints,
             vec![mounted(d.path(), "a"), mounted(d.path(), "b")],
-        )
-        .unwrap();
+        );
+        assert!(refused.is_empty(), "{refused:?}");
         assert_eq!(groups.len(), 2, "one cursor per chain");
         for g in &groups {
             assert_eq!(g.nests.len(), 1, "each chain has its one nest");
