@@ -55,27 +55,27 @@ pub fn decode_string(hex: &str) -> Option<String> {
     }
 }
 
-/// Fetch a contract's immutable metadata via `eth_call`. A field whose call answers with a shape we do not
-/// decode stays `None`. A call that errors (a revert or a dropped connection) fails the whole fetch, so
-/// the failure is never cached as an answer (#2720).
+/// Fetch a contract's immutable metadata via `eth_call`. A call that reverts is an answer - the contract
+/// lacks that function - and leaves its field `None`. Any other error fails the fetch, so a dropped
+/// connection is never cached as an answer (#2720).
 pub async fn fetch(rpc: &RpcClient, address: &str) -> Result<TokenMetadata> {
-    let decimals = rpc
-        .eth_call(address, DECIMALS_SELECTOR)
-        .await
-        .context("decimals()")?;
-    let symbol = rpc
-        .eth_call(address, SYMBOL_SELECTOR)
-        .await
-        .context("symbol()")?;
-    let name = rpc
-        .eth_call(address, NAME_SELECTOR)
-        .await
-        .context("name()")?;
+    let decimals = answer(rpc.eth_call(address, DECIMALS_SELECTOR).await, "decimals()")?;
+    let symbol = answer(rpc.eth_call(address, SYMBOL_SELECTOR).await, "symbol()")?;
+    let name = answer(rpc.eth_call(address, NAME_SELECTOR).await, "name()")?;
     Ok(TokenMetadata {
-        decimals: decode_u8(&decimals),
-        symbol: decode_string(&symbol),
-        name: decode_string(&name),
+        decimals: decimals.as_deref().and_then(decode_u8),
+        symbol: symbol.as_deref().and_then(decode_string),
+        name: name.as_deref().and_then(decode_string),
     })
+}
+
+/// One `eth_call`'s return: its hex, `None` when the contract reverted, or the error otherwise.
+fn answer(reply: Result<String>, what: &str) -> Result<Option<String>> {
+    match reply {
+        Ok(hex) => Ok(Some(hex)),
+        Err(e) if format!("{e:#}").contains("revert") => Ok(None),
+        Err(e) => Err(e).with_context(|| what.to_string()),
+    }
 }
 
 /// Load the nest's metadata cache (empty if absent).
@@ -168,6 +168,14 @@ mod tests {
         assert_eq!(decode_string(&hex).as_deref(), Some("USDC"));
         // A bytes32-style / garbage return doesn't decode to a wrong string.
         assert_eq!(decode_string("0x1234"), None);
+    }
+
+    #[test]
+    fn a_reverted_call_is_an_answer_and_a_dropped_one_is_not() {
+        let reverted = Err(anyhow::anyhow!("eth_call: execution reverted"));
+        assert_eq!(answer(reverted, "name()").unwrap(), None);
+        let dropped = Err(anyhow::anyhow!("transport error: connection reset"));
+        assert!(answer(dropped, "name()").is_err());
     }
 
     #[test]
