@@ -4730,10 +4730,13 @@ async fn decode_top_level_calls(
     timestamps: bool,
     fanout: usize,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
-    decode_top_level_calls_upto(source, creg, addresses, from, to, timestamps, fanout, None).await
+    decode_top_level_calls_upto(source, creg, addresses, from, to, timestamps, fanout, None)
+        .await
+        .map(|(rows, _)| rows)
 }
 
-/// [`decode_top_level_calls`], each body batch retried at most `attempts` times when that is set.
+/// [`decode_top_level_calls`], each body batch retried at most `attempts` times when that is set,
+/// with the hash of every body read.
 #[allow(clippy::too_many_arguments)]
 async fn decode_top_level_calls_upto(
     source: &dyn Source,
@@ -4744,9 +4747,13 @@ async fn decode_top_level_calls_upto(
     timestamps: bool,
     fanout: usize,
     attempts: Option<usize>,
-) -> Result<Vec<crate::registry::DecodedRow>> {
+) -> Result<(
+    Vec<crate::registry::DecodedRow>,
+    std::collections::HashMap<u64, String>,
+)> {
     use futures::stream::StreamExt;
     let mut call_rows = Vec::new();
+    let mut hashes = std::collections::HashMap::new();
     let want: Vec<u64> = (from..=to).collect();
     // Fetched and decoded a chunk at a time. Every full body of a 20,000-block Gnosis window held at
     // once reached 2.3 GB with nothing committed (measured 2026-09-13), past the per-cursor budget.
@@ -4767,8 +4774,12 @@ async fn decode_top_level_calls_upto(
             bodies.extend(batch?);
         }
         decode_bodies(creg, addresses, chunk, &bodies, timestamps, &mut call_rows)?;
+        hashes.extend(bodies.iter().map(|(b, body)| {
+            let h = body.get("hash").and_then(|h| h.as_str()).unwrap_or_default();
+            (*b, h.to_string())
+        }));
     }
-    Ok(call_rows)
+    Ok((call_rows, hashes))
 }
 
 async fn fetch_body_batch(
@@ -7614,9 +7625,12 @@ impl nuthatch_core::extra::ExtraRows for NodeRows<'_> {
         source: &dyn Source,
         next: u64,
         to: u64,
-    ) -> Result<Vec<crate::registry::DecodedRow>> {
+    ) -> Result<(
+        Vec<crate::registry::DecodedRow>,
+        std::collections::HashMap<u64, String>,
+    )> {
         let Some(creg) = self.call_registry.filter(|_| self.top_level_calls) else {
-            return Ok(Vec::new());
+            return Ok(Default::default());
         };
         decode_top_level_calls_upto(
             source,

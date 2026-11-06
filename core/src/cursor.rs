@@ -591,16 +591,51 @@ pub async fn process_window<E: WindowEntity>(
             }
             return refuse(source, clock, read_from).await.map(Step::Done);
         }
-        // Every row read before the checkpoint must be on the chain it names, and the window must
-        // extend the stored chain. Hashes read after the checkpoint settle both (#2146).
+        // RFC-0036 §4.2: one row per block in the window for a blocks nest - same logic as the
+        // backfill paths. Must enumerate from the window [next..=to], not from `logs`, because
+        // a blocks table covers blocks that emitted no matching log at all (#447).
+        let mut block_rows = Vec::new();
+        if registry.blocks() {
+            let want: Vec<u64> = (next..=to).collect();
+            // A block without its row would seal as a block the chain never had (#2149).
+            let headers = match source.block_headers(&want).await {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(
+                        "block_headers unavailable for {next}..={to}: {e:#} - retrying window"
+                    );
+                    return refuse(source, clock, read_from).await.map(Step::Done);
+                }
+            };
+            for b in &want {
+                let Some(r) = headers
+                    .get(b)
+                    .and_then(|h| block_row(*b, h, registry.timestamps()))
+                else {
+                    tracing::warn!(
+                        "block {b} has no usable header - retrying window {next}..={to}"
+                    );
+                    return refuse(source, clock, read_from).await.map(Step::Done);
+                };
+                block_rows.push(r);
+            }
+        }
+        // Decoded before IPFS resolution, so an `[[ipfs]]` declaration can name a call table: the QoS
+        // oracle's CIDs arrive as calldata, not as logs.
+        let (call_rows, bodies) = extra.top_level_calls(source, next, to).await?;
+
+        // Every row, header and body read by number must be on the chain it names, and the window
+        // must extend the stored chain. Hashes read after the checkpoint settle both (#2146, #2678).
         let exposed: Vec<_> = rows
             .iter()
+            .chain(&block_rows)
+            .chain(&call_rows)
             .filter(|r| r.block_number > final_through)
             .collect();
         // A row with no hash cannot be checked, so it cannot be committed where a reorg can reach.
         if let Some(r) = exposed.iter().find(|r| r.block_hash.is_empty()) {
             tracing::warn!(
-            "the source gave the log at ({}, {}) no block hash: refusing window {next}..={to}, \
+            "the source gave the row at ({}, {}) no block hash: refusing window {next}..={to}, \
              retrying",
             r.block_number,
             r.log_index
@@ -610,6 +645,12 @@ pub async fn process_window<E: WindowEntity>(
         let mut expected: Vec<(u64, String)> = exposed
             .iter()
             .map(|r| (r.block_number, r.block_hash.clone()))
+            .chain(
+                bodies
+                    .iter()
+                    .filter(|(b, _)| **b > final_through)
+                    .map(|(b, h)| (*b, h.clone())),
+            )
             .collect();
         if let Some(parent) = next.checked_sub(1).filter(|&p| p > final_through) {
             if let Some(h) = store.get_block_hash(parent)? {
@@ -620,11 +661,27 @@ pub async fn process_window<E: WindowEntity>(
             let mut blocks: Vec<u64> = expected.iter().map(|(b, _)| *b).collect();
             blocks.sort_unstable();
             blocks.dedup();
-            let moved = match source.block_hashes(&blocks).await {
+            let moved = match source.block_records(&blocks).await {
                 Ok(now) => expected
                     .iter()
-                    .find(|(b, h)| !now.get(b).is_some_and(|n| n.eq_ignore_ascii_case(h)))
-                    .map(|(b, _)| format!("block {b} is not on the chain the source has now")),
+                    .find(|(b, h)| !now.get(b).is_some_and(|(n, _)| n.eq_ignore_ascii_case(h)))
+                    .map(|(b, _)| format!("block {b} is not on the chain the source has now"))
+                    // A timestamp read by height alone may be another fork's: it must be this hash's.
+                    .or_else(|| {
+                        exposed
+                            .iter()
+                            .filter(|_| registry.timestamps())
+                            .find(|r| {
+                                now.get(&r.block_number).and_then(|(_, t)| *t)
+                                    != Some(r.block_timestamp)
+                            })
+                            .map(|r| {
+                                format!(
+                                    "block {}'s timestamp is not the one its hash has now",
+                                    r.block_number
+                                )
+                            })
+                    }),
                 Err(e) => Some(format!("block hashes unavailable: {e:#}")),
             };
             if let Some(why) = moved {
@@ -713,39 +770,12 @@ pub async fn process_window<E: WindowEntity>(
             stored += 1;
         }
 
-        // RFC-0036 §4.2: one row per block in the window for a blocks nest - same logic as the
-        // backfill paths. Must enumerate from the window [next..=to], not from `logs`, because
-        // a blocks table covers blocks that emitted no matching log at all (#447).
-        let mut block_rows = Vec::new();
-        if registry.blocks() {
-            let want: Vec<u64> = (next..=to).collect();
-            // A block without its row would seal as a block the chain never had (#2149).
-            let headers = match source.block_headers(&want).await {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!(
-                        "block_headers unavailable for {next}..={to}: {e:#} - retrying window"
-                    );
-                    return refuse(source, clock, read_from).await.map(Step::Done);
-                }
-            };
-            for b in &want {
-                let Some(r) = headers
-                    .get(b)
-                    .and_then(|h| block_row(*b, h, registry.timestamps()))
-                else {
-                    tracing::warn!(
-                        "block {b} has no usable header - retrying window {next}..={to}"
-                    );
-                    return refuse(source, clock, read_from).await.map(Step::Done);
-                };
-                to_store.push((
-                    entity_key(r.block_number, r.log_index),
-                    r.to_json().to_string(),
-                ));
-                stored += 1;
-                block_rows.push(r);
-            }
+        for r in &block_rows {
+            to_store.push((
+                entity_key(r.block_number, r.log_index),
+                r.to_json().to_string(),
+            ));
+            stored += 1;
         }
 
         // A derived-view circuit thread that has died silently drops its batches and freezes
@@ -754,9 +784,6 @@ pub async fn process_window<E: WindowEntity>(
         // IVM threads that were previously exempt).
         nest.ensure_views_healthy()?;
 
-        // Decoded before IPFS resolution, so an `[[ipfs]]` declaration can name a call table: the QoS
-        // oracle's CIDs arrive as calldata, not as logs.
-        let call_rows = extra.top_level_calls(source, next, to).await?;
         for row in &call_rows {
             to_store.push((
                 entity_key(row.block_number, row.log_index),
@@ -1591,5 +1618,176 @@ mod tests {
             store.get_meta(LAST_BLOCK_KEY).unwrap().as_deref(),
             Some("9")
         );
+    }
+
+    const FORK_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn stamp_of(block: u64) -> u64 {
+        1_700_000_000 + block * 12
+    }
+
+    /// A pool split across a one-block reorg (#2678): logs, the checkpoint and the hash check are
+    /// answered from fork A, and the by-number read named here from fork B.
+    #[derive(Default)]
+    struct HeadSplit {
+        header: bool,
+        stamp: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for HeadSplit {
+        async fn tip(&self) -> Result<u64> {
+            unreachable!()
+        }
+        async fn block_hash(&self, number: u64) -> Result<Option<String>> {
+            Ok(Some(hash_of(number)))
+        }
+        async fn block_timestamps(&self, blocks: &[u64]) -> Result<HashMap<u64, u64>> {
+            let skew = if self.stamp { 12 } else { 0 };
+            Ok(blocks.iter().map(|&b| (b, stamp_of(b) + skew)).collect())
+        }
+        // One header per block, as the RPC source reads it.
+        async fn block_records(
+            &self,
+            blocks: &[u64],
+        ) -> Result<HashMap<u64, (String, Option<u64>)>> {
+            Ok(blocks
+                .iter()
+                .map(|&b| (b, (hash_of(b), Some(stamp_of(b)))))
+                .collect())
+        }
+        async fn block_headers(&self, blocks: &[u64]) -> Result<HashMap<u64, serde_json::Value>> {
+            let hash_ts = |b: u64| match self.header {
+                true => (FORK_B.to_string(), stamp_of(b) + 12),
+                false => (hash_of(b), stamp_of(b)),
+            };
+            Ok(blocks
+                .iter()
+                .map(|&b| {
+                    let (hash, ts) = hash_ts(b);
+                    let header = serde_json::json!({
+                        "hash": hash,
+                        "timestamp": format!("0x{ts:x}"),
+                        "parentHash": hash_of(b - 1),
+                    });
+                    (b, header)
+                })
+                .collect())
+        }
+        async fn logs(&self, _: &crate::source::LogFilter, _: u64, _: u64) -> Result<Vec<Log>> {
+            unreachable!()
+        }
+    }
+
+    /// One block, 10, above finality, on a `blocks = true` nest.
+    fn split_window(source: &HeadSplit, extra: &dyn ExtraRows) -> (Processed, Mem) {
+        let store = Mem::default();
+        store.set(START_BLOCK_KEY, 10);
+        let registry = token().with_blocks(true).with_timestamps(true);
+        let schema = registry.schema();
+        let balances = BalanceView::start(Driver::Inline).unwrap();
+        let exposure = ExposureView::start(Driver::Inline, false).unwrap();
+        let velocity = VelocityView::start(Driver::Inline, false).unwrap();
+        let labels = LabelSet::default();
+        let entities: Vec<Recorder> = Vec::new();
+        let router = AlertRouter::new(Vec::<alerts::AlertSink>::new());
+        let shelf = Shelf::default();
+        let logs = [transfer_log(10, 0, ZERO, ALICE, 100)];
+        let window = Window {
+            nest: Nest {
+                name: "tok",
+                store: &store,
+                schema: &schema,
+                balances: &balances,
+                exposure: &exposure,
+                velocity: &velocity,
+                labels: &labels,
+                velocity_flag: None,
+                entities: &entities,
+                children: None,
+                router: &router,
+                metrics: &NoMetrics,
+            },
+            registry: &registry,
+            factory: None,
+            threshold: None,
+            finality: Finality::Depth(64),
+            seal_span: 1,
+            sinks: &shelf,
+            extra,
+            hooks: &crate::hooks::NoHooks,
+            faults: &crate::fault::NoFaults,
+            clock: &NoWait,
+            deadline: None,
+        };
+        let processed = block_on(process_window(window, source, &logs, 10, 10, 12)).unwrap();
+        (processed, store)
+    }
+
+    #[test]
+    fn a_window_on_one_fork_commits_its_block_row() {
+        let (processed, store) = split_window(&HeadSplit::default(), &crate::extra::NoExtraRows);
+
+        assert_eq!(processed, Processed::Stored(2));
+        assert_eq!(store.get_block_hash(10).unwrap(), Some(hash_of(10)));
+    }
+
+    #[test]
+    fn a_block_header_from_the_other_side_of_a_head_split_refuses_the_window() {
+        let source = HeadSplit {
+            header: true,
+            ..Default::default()
+        };
+        let (processed, store) = split_window(&source, &crate::extra::NoExtraRows);
+
+        assert_eq!(processed, Processed::Refused);
+        assert_eq!(store.count().unwrap(), 0);
+        assert_eq!(store.get_meta(LAST_BLOCK_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn a_timestamp_from_the_other_side_of_a_head_split_refuses_the_window() {
+        let source = HeadSplit {
+            stamp: true,
+            ..Default::default()
+        };
+        let (processed, store) = split_window(&source, &crate::extra::NoExtraRows);
+
+        assert_eq!(processed, Processed::Refused);
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    /// One top-level call at block 10, read from a body on fork B.
+    struct ForkedCall;
+
+    #[async_trait::async_trait]
+    impl ExtraRows for ForkedCall {
+        async fn top_level_calls(
+            &self,
+            _: &dyn Source,
+            _: u64,
+            _: u64,
+        ) -> Result<(Vec<DecodedRow>, HashMap<u64, String>)> {
+            let row = DecodedRow {
+                table: "tok__call".into(),
+                params: Vec::new(),
+                block_number: 10,
+                block_hash: FORK_B.into(),
+                block_timestamp: stamp_of(10),
+                timestamps: true,
+                log_index: nuthatch_decode::registry::TX_CALL_ROW_LOG_INDEX_BASE,
+                tx_hash: FORK_B.into(),
+                address: TOKEN.into(),
+            };
+            Ok((vec![row], HashMap::from([(10, FORK_B.to_string())])))
+        }
+    }
+
+    #[test]
+    fn a_call_body_from_the_other_side_of_a_head_split_refuses_the_window() {
+        let (processed, store) = split_window(&HeadSplit::default(), &ForkedCall);
+
+        assert_eq!(processed, Processed::Refused);
+        assert_eq!(store.count().unwrap(), 0);
     }
 }
