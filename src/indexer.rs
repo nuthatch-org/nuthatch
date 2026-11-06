@@ -4775,7 +4775,10 @@ async fn decode_top_level_calls_upto(
         }
         decode_bodies(creg, addresses, chunk, &bodies, timestamps, &mut call_rows)?;
         hashes.extend(bodies.iter().map(|(b, body)| {
-            let h = body.get("hash").and_then(|h| h.as_str()).unwrap_or_default();
+            let h = body
+                .get("hash")
+                .and_then(|h| h.as_str())
+                .unwrap_or_default();
             (*b, h.to_string())
         }));
     }

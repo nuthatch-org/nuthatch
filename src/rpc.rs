@@ -1184,6 +1184,41 @@ mod tests {
         assert_eq!(bodies[&5]["transactions"].as_array().map(Vec::len), Some(3));
     }
 
+    /// The timestamp a window is checked against is the header's, not one cached by height (#2678).
+    #[tokio::test]
+    async fn a_block_record_takes_its_timestamp_from_the_header_not_the_cache() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static STAMP: AtomicU64 = AtomicU64::new(7);
+        let app = Router::new().route(
+            "/",
+            post(|Json(req): Json<Value>| async move {
+                let answer = |item: &Value| {
+                    let ts = STAMP.fetch_add(1, Ordering::SeqCst);
+                    json!({"jsonrpc":"2.0","id":item["id"],"result":{
+                        "number":item["params"][0],"hash":"0xaa","timestamp":format!("0x{ts:x}")}})
+                };
+                Json(match &req {
+                    Value::Array(items) => Value::Array(items.iter().map(answer).collect()),
+                    item => answer(item),
+                })
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let c = RpcClient::new(vec![format!("http://{addr}")]).unwrap();
+
+        assert_eq!(c.block_timestamps(&[5]).await.unwrap()[&5], 7);
+        let records = crate::source::Source::block_records(&c, &[5])
+            .await
+            .unwrap();
+        assert_eq!(records[&5], ("0xaa".to_string(), Some(8)));
+        assert_eq!(c.block_timestamps(&[5]).await.unwrap()[&5], 7);
+    }
+
     #[tokio::test]
     async fn timestamps_carried_on_logs_cost_no_header_calls() {
         use axum::{routing::post, Json, Router};

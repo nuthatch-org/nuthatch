@@ -2605,10 +2605,7 @@ impl<T: Transport> crate::source::Source for RpcClient<T> {
             .collect())
     }
 
-    async fn block_records(
-        &self,
-        blocks: &[u64],
-    ) -> Result<HashMap<u64, (String, Option<u64>)>> {
+    async fn block_records(&self, blocks: &[u64]) -> Result<HashMap<u64, (String, Option<u64>)>> {
         Ok(RpcClient::block_headers(self, blocks)
             .await?
             .into_iter()
