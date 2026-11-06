@@ -55,26 +55,27 @@ pub fn decode_string(hex: &str) -> Option<String> {
     }
 }
 
-/// Fetch a contract's immutable metadata via `eth_call`. A failed or non-standard call leaves its field
-/// `None` - best-effort, never a hard error (a token missing `name()` is not a nest failure).
-pub async fn fetch(rpc: &RpcClient, address: &str) -> TokenMetadata {
-    TokenMetadata {
-        decimals: rpc
-            .eth_call(address, DECIMALS_SELECTOR)
-            .await
-            .ok()
-            .and_then(|h| decode_u8(&h)),
-        symbol: rpc
-            .eth_call(address, SYMBOL_SELECTOR)
-            .await
-            .ok()
-            .and_then(|h| decode_string(&h)),
-        name: rpc
-            .eth_call(address, NAME_SELECTOR)
-            .await
-            .ok()
-            .and_then(|h| decode_string(&h)),
-    }
+/// Fetch a contract's immutable metadata via `eth_call`. A field whose call answers with a shape we do not
+/// decode stays `None`. A call that errors (a revert or a dropped connection) fails the whole fetch, so
+/// the failure is never cached as an answer (#2720).
+pub async fn fetch(rpc: &RpcClient, address: &str) -> Result<TokenMetadata> {
+    let decimals = rpc
+        .eth_call(address, DECIMALS_SELECTOR)
+        .await
+        .context("decimals()")?;
+    let symbol = rpc
+        .eth_call(address, SYMBOL_SELECTOR)
+        .await
+        .context("symbol()")?;
+    let name = rpc
+        .eth_call(address, NAME_SELECTOR)
+        .await
+        .context("name()")?;
+    Ok(TokenMetadata {
+        decimals: decode_u8(&decimals),
+        symbol: decode_string(&symbol),
+        name: decode_string(&name),
+    })
 }
 
 /// Load the nest's metadata cache (empty if absent).
@@ -104,12 +105,20 @@ pub async fn fetch_cli(dir: &Path, rpc_override: Vec<String>) -> Result<()> {
 
     let mut cache = load(dir);
     let mut fetched = 0usize;
+    let mut failed = Vec::new();
     for c in &config.contracts {
         let addr = c.address.to_lowercase();
         if cache.contains_key(&addr) {
             continue; // immutable - never re-fetch
         }
-        let md = fetch(&rpc, &c.address).await;
+        let md = match fetch(&rpc, &c.address).await {
+            Ok(md) => md,
+            Err(e) => {
+                println!("  {} {addr}: not cached: {e:#}", c.alias);
+                failed.push(c.alias.clone());
+                continue;
+            }
+        };
         println!(
             "  {} {addr}: decimals={:?} symbol={:?} name={:?}",
             c.alias, md.decimals, md.symbol, md.name
@@ -122,6 +131,12 @@ pub async fn fetch_cli(dir: &Path, rpc_override: Vec<String>) -> Result<()> {
         "✓ cached token metadata for {fetched} new contract(s) → {}",
         dir.join(METADATA_FILE).display()
     );
+    if !failed.is_empty() {
+        anyhow::bail!(
+            "metadata not cached for {}; rerun to retry",
+            failed.join(", ")
+        );
+    }
     Ok(())
 }
 
