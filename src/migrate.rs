@@ -588,10 +588,25 @@ fn relocate(from: &Path, to: &Path) -> Result<()> {
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
     }
-    // Cross-device, or a rename the platform refused. Copy, then remove the source only once the
-    // copy is complete - so an interruption leaves the source intact and the run simply repeatable.
-    crate::project::copy_dir(from, to)
-        .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+    copy_into_place(from, to)
+}
+
+/// Cross-device, or a rename the platform refused. The copy goes to a sibling and is renamed into place
+/// only once complete: a partial `data/<nid>` would read on a retry as a finished dataset (#2689).
+fn copy_into_place(from: &Path, to: &Path) -> Result<()> {
+    let staging = to.with_extension("migrating");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .with_context(|| format!("clearing an interrupted copy at {}", staging.display()))?;
+    }
+    if let Err(e) = crate::project::copy_dir(from, &staging) {
+        std::fs::remove_dir_all(&staging).ok();
+        return Err(e).with_context(|| format!("copying {} to {}", from.display(), to.display()));
+    }
+    if let Err(e) = std::fs::rename(&staging, to) {
+        std::fs::remove_dir_all(&staging).ok();
+        return Err(e).with_context(|| format!("moving {} into place", to.display()));
+    }
     std::fs::remove_dir_all(from)
         .with_context(|| format!("removing {} after copying it", from.display()))?;
     Ok(())
@@ -1416,6 +1431,36 @@ mod tests {
     ///
     /// This was found the useful way round: the first version of the test above used a made-up hash,
     /// and `safe_to_drop_local` refused to delete anything - correctly.
+    /// A copy that fails part-way leaves no `data/<nid>` behind (#2689). It used to copy straight into
+    /// the destination, which a retry then took for a complete dataset and merged onto.
+    #[test]
+    fn an_interrupted_copy_leaves_no_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let from = d.path().join(NESTS_DIR).join("a");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("nuthatch.toml"), "x").unwrap();
+        let unreadable = from.join("store.redb");
+        std::fs::write(&unreadable, "y").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let to = d.path().join(DATA_DIR).join("n");
+
+        copy_into_place(&from, &to).unwrap_err();
+
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !to.exists(),
+            "a partial copy must not sit at the destination"
+        );
+        assert!(from.join("store.redb").exists(), "the source must survive");
+
+        // The retry starts over rather than building on the leftovers.
+        copy_into_place(&from, &to).unwrap();
+        assert_eq!(std::fs::read_to_string(to.join("store.redb")).unwrap(), "y");
+        assert!(!from.exists());
+        assert_eq!(walkdir(d.path().join(DATA_DIR).as_path()).len(), 2);
+    }
+
     #[test]
     fn a_local_copy_is_never_dropped_against_an_unverifiable_shared_one() {
         let d = tempfile::tempdir().unwrap();
