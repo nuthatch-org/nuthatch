@@ -552,6 +552,8 @@ pub fn looks_like_cap(body: &str) -> bool {
         "beyond current head",
         "beyond the current head",
         "beyond head",
+        // Malformed range, not a range too wide: the bare "block range" marker below would match (#2696).
+        "invalid block range",
     ];
     if NOT_CAP.iter().any(|m| s.contains(m)) {
         return false;
@@ -2726,6 +2728,17 @@ fn code_of(result: &Value) -> Result<String> {
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| anyhow!("eth_getCode returned {result}, not bytecode"))
+}
+
+#[cfg(test)]
+mod looks_like_cap_tests {
+    use super::looks_like_cap;
+
+    #[test]
+    fn a_malformed_range_is_not_a_cap() {
+        assert!(!looks_like_cap("invalid block range params"));
+        assert!(looks_like_cap("block range is too wide, max 10000"));
+    }
 }
 
 #[cfg(test)]
