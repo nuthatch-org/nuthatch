@@ -1004,6 +1004,11 @@ fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result
         std::fs::write(&attrs, nuthatch_scaffold::GITATTRIBUTES)
             .context("failed to write .gitattributes")?;
     }
+    let ignore = dir.join(".gitignore");
+    if !ignore.exists() {
+        std::fs::write(&ignore, nuthatch_scaffold::GITIGNORE)
+            .context("failed to write .gitignore")?;
+    }
 
     let views = dir.join("views");
     if views.exists() {
