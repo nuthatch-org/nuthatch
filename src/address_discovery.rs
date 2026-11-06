@@ -2479,7 +2479,8 @@ fn address_mode_order(mut row: Row) -> Row {
 /// tracker, which this nest does not have. A one-topic `Transfer` (CryptoKitties) is skipped.
 ///
 /// Any contract can emit a log under these topics, so data that does not decode as the event files no
-/// row, as on Etherscan, rather than failing the window. Returns whether the log filed a row.
+/// row, as on Etherscan, rather than failing the window. Data that is not hex, short or not, is the
+/// provider's fault and fails it. Returns whether the log filed a row.
 fn transfer_rows(
     log: &Value,
     a: &str,
@@ -2503,6 +2504,9 @@ fn transfer_rows(
         .get(&block)
         .ok_or_else(|| anyhow!("no timestamp for block {block}"))?;
     let data = str_field(log, "data")?.trim_start_matches("0x");
+    if !data.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("log data is not hex: {log}");
+    }
     let word = |i: usize| data.get(i * 64..(i + 1) * 64).map(|w| format!("0x{w}"));
     let skip = |why: &str| {
         tracing::debug!("address history: skipping {why} transfer log for {a}: {log}");
@@ -2614,16 +2618,15 @@ fn batch_arrays(data: &str) -> Result<Option<(Vec<String>, Vec<String>)>> {
         let Some(len) = at(start)? else {
             return Ok(None);
         };
-        if start.checked_add(len).is_none_or(|end| word(end).is_none()) {
+        let Some(end) = start.checked_add(len) else {
             return Ok(None);
-        }
-        (0..len)
-            .map(|k| {
-                decimal(&format!(
-                    "0x{}",
-                    word(start + 1 + k).expect("checked above")
-                ))
-            })
+        };
+        let Some(words) = (start + 1..=end).map(word).collect::<Option<Vec<_>>>() else {
+            return Ok(None);
+        };
+        words
+            .into_iter()
+            .map(|w| decimal(&format!("0x{w}")))
             .collect::<Result<_>>()
             .map(Some)
     };
@@ -3172,6 +3175,33 @@ mod tests {
             batch_arrays(&data(&["40", "60", "1", "zz"])).is_err(),
             "not hex"
         );
+    }
+
+    /// Data that is not hex is the provider's fault, short or not, so it fails the window; a
+    /// multi-byte character across an interior word boundary of a batch panicked.
+    #[test]
+    fn log_data_that_is_not_hex_is_an_error_not_a_skip() {
+        let mut batch = ["40", "c0", "3", "1", "2", "3", "3", "a", "b", "c"]
+            .map(|w| format!("{w:0>64}"))
+            .concat();
+        batch.replace_range(255..256, "é");
+        assert_eq!(batch_arrays(&batch).unwrap(), None);
+        let log = |topics: Value, data: &str| {
+            json!({"address": "0xT0KEN", "topics": topics, "data": data, "blockNumber": "0x10",
+            "transactionHash": "0xHH", "transactionIndex": "0x1", "logIndex": "0x1",
+            "blockHash": "0xBB", "removed": false})
+        };
+        let timestamps = BTreeMap::from([(16, 32)]);
+        for bad in [
+            log(json!([TRANSFER, padded(A), padded(A)]), "0xzz"),
+            log(
+                json!([TRANSFER_BATCH, padded(A), padded(A), padded(A)]),
+                &format!("0x{batch}"),
+            ),
+        ] {
+            let err = transfer_rows(&bad, A, &timestamps, &mut Found::default()).unwrap_err();
+            assert!(format!("{err:#}").contains("not hex"), "{err:#}");
+        }
     }
 
     /// A type-4 transaction's row carries its authorization list, as rotki's decoder needs to name a
