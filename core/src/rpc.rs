@@ -40,6 +40,23 @@ pub async fn retry_pause(pause: Duration) {
 /// a node. Splitting into bounded sub-batches keeps each request within common limits.
 pub const MAX_TIMESTAMP_BATCH: usize = 200;
 
+/// The most of a non-2xx body that is read. It is evidence for the classifier, never a payload, so an
+/// endpoint that streams an error page cannot make the client buffer it whole (#2701).
+const ERROR_BODY_MAX: usize = 64 * 1024;
+
+/// The first [`ERROR_BODY_MAX`] bytes of a failed response, read without buffering the rest.
+async fn read_capped(mut resp: impl Reply) -> String {
+    let mut body = Vec::new();
+    while body.len() < ERROR_BODY_MAX {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    body.truncate(ERROR_BODY_MAX);
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 /// The most of one multi-item `eth_getBlockByNumber` or `eth_call` batch body read before the batch is
 /// narrowed (#2227). Every transaction hash rides in a header, so without it a dense chain at
 /// `--concurrency 8` held over 2 GB of headers in flight.
@@ -1367,7 +1384,7 @@ impl<T: Transport> RpcClient<T> {
         if !(200..300).contains(&status) {
             // Read the body before classifying: a 413 can carry a suggested range, and the text is
             // what makes an otherwise opaque status actionable in the log.
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_capped(resp).await;
             // **The body is classified on a non-2xx too** (RFC-0029 §6a). It used to be inspected only
             // on a 2xx, on the assumption - measured, and correct for the endpoint it was measured
             // against - that providers signal an oversized range as HTTP 200 carrying a JSON-RPC error.
@@ -2653,6 +2670,52 @@ impl<T: Transport> crate::source::Source for RpcClient<T> {
             to,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod error_body_tests {
+    use super::{read_capped, ERROR_BODY_MAX};
+    use crate::transport::{Reply, TransportError};
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// An error page that never ends, counting how much of it was read.
+    struct Endless(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Reply for Endless {
+        fn status(&self) -> u16 {
+            500
+        }
+        fn status_line(&self) -> String {
+            "500 Internal Server Error".into()
+        }
+        fn retry_after(&self) -> Option<String> {
+            None
+        }
+        fn content_length(&self) -> Option<u64> {
+            None
+        }
+        async fn text(self) -> Result<String, TransportError> {
+            unreachable!("a failed response is read through `chunk`")
+        }
+        async fn json(self) -> Result<Value, TransportError> {
+            unreachable!("a failed response is read through `chunk`")
+        }
+        async fn chunk(&mut self) -> Result<Option<bytes::Bytes>, TransportError> {
+            self.0.fetch_add(1024, Ordering::SeqCst);
+            Ok(Some(bytes::Bytes::from(vec![b'x'; 1024])))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_endless_error_body_is_read_only_as_far_as_the_cap() {
+        let read = Arc::new(AtomicUsize::new(0));
+        let text = read_capped(Endless(Arc::clone(&read))).await;
+        assert_eq!(text.len(), ERROR_BODY_MAX);
+        assert!(read.load(Ordering::SeqCst) <= ERROR_BODY_MAX + 1024);
     }
 }
 
