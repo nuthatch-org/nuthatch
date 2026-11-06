@@ -1625,12 +1625,16 @@ fn commit_derived_state(staging: &Path, dataset: &Path, staged: &[&'static str])
 ///
 /// Adoption runs **before** the config load, because a dataset that adopts is one whose store the
 /// loader is about to open.
-pub fn load_mounted(
+///
+/// A dataset that does not load is returned with its reason, for every route it serves, rather than
+/// failing the list: one bad `nuthatch.toml` must not keep its co-tenants down (#2681).
+pub fn load_mounted_each(
     dir: &Path,
     datasets: &[Dataset],
     default_tenant: &str,
-) -> Result<Vec<(String, PathBuf, Config)>> {
+) -> (Vec<(String, PathBuf, Config)>, Vec<(String, String)>) {
     let mut out = Vec::with_capacity(datasets.len());
+    let mut unloadable = Vec::new();
     for ds in datasets {
         // The cutoff, and the warn-and-carry-on policy behind it, now live in `prepare_dataset` so
         // the mount path gets the same treatment without re-deriving it (#414).
@@ -1640,20 +1644,45 @@ pub fn load_mounted(
             ds.nid.as_deref(),
             &ds.canonical().to_string(),
         );
-        let config = Config::load(&ds.dir).with_context(|| {
+        let config = match Config::load(&ds.dir).with_context(|| {
             format!(
                 "loading mounted nest '{}' from {}",
                 ds.canonical(),
                 ds.dir.display()
             )
-        })?;
+        }) {
+            Ok(config) => config,
+            Err(e) => {
+                let reason = format!("refused at boot: {e:#}");
+                tracing::error!("nest '{}' {reason}", ds.canonical());
+                unloadable.extend(
+                    ds.mounts
+                        .iter()
+                        .map(|m| (m.route_key(default_tenant), reason.clone())),
+                );
+                continue;
+            }
+        };
         out.push((
             ds.canonical().route_key(default_tenant),
             ds.dir.clone(),
             config,
         ));
     }
-    Ok(out)
+    (out, unloadable)
+}
+
+/// [`load_mounted_each`], refusing the whole list on the first dataset that does not load.
+pub fn load_mounted(
+    dir: &Path,
+    datasets: &[Dataset],
+    default_tenant: &str,
+) -> Result<Vec<(String, PathBuf, Config)>> {
+    let (mounted, unloadable) = load_mounted_each(dir, datasets, default_tenant);
+    match unloadable.first() {
+        Some((_, reason)) => bail!("{reason}"),
+        None => Ok(mounted),
+    }
 }
 
 /// Each dataset's window deadline at boot (RFC-0076 §3.2): its indexing mount's, the first in serving
@@ -2561,7 +2590,7 @@ pub async fn dev(
     // change with a suspend.
     let default_tenant_owned = all_mounts.tenant_default();
     let default_tenant = default_tenant_owned.as_str();
-    let mut mounted = load_mounted(&dir, &datasets, default_tenant)?;
+    let (mut mounted, unloadable) = load_mounted_each(&dir, &datasets, default_tenant);
     let deadlines = boot_window_deadlines(&mounts, &datasets);
     // The dial is the operator's, not the nest's (RFC-0040), so it is stamped onto every mounted
     // config here rather than read from any of them - `Config::freshness` is `#[serde(skip)]`.
@@ -2579,6 +2608,19 @@ pub async fn dev(
         config.cursor_sql_permits = Some(sql_permits);
         config.strict_isolation = meta.isolation == crate::isolation::Isolation::Strict;
     }
+    // A nest on a chain the runtime does not declare is refused alone, as an unloadable one is (#2681).
+    let (mounted, undeclared): (Vec<_>, Vec<_>) = mounted.into_iter().partition(|(_, _, c)| {
+        endpoints
+            .iter()
+            .any(|e| e.chain == c.nest.chain && e.chain_id == c.nest.chain_id)
+    });
+    let undeclared = undeclared.into_iter().map(|(name, _, c)| {
+        let reason = format!(
+            "refused at boot: nest '{name}' is on {} (chain_id {}), which this runtime doesn't declare",
+            c.nest.chain, c.nest.chain_id
+        );
+        (name, reason)
+    });
     let groups = group_by_chain(&endpoints, mounted)?;
     if meta.isolation == crate::isolation::Isolation::Strict {
         crate::analytics_budget::validate_strict_budget(sql_permits, Some(max_rss))?;
@@ -2676,6 +2718,10 @@ pub async fn dev(
     let health = Arc::new(crate::health::RuntimeHealth::new());
     let mut failed: std::collections::BTreeMap<String, String> = Default::default();
     let mut failed_chain: std::collections::HashMap<String, String> = Default::default();
+    for (key, reason) in unloadable.into_iter().chain(undeclared) {
+        health.quarantine_nest(&key, reason.clone(), 0, None);
+        failed.insert(key, reason);
+    }
 
     let writer_leases = take_writer_leases(
         &dir,
@@ -3471,6 +3517,7 @@ pub fn lifecycle_routes(
         let mut job = MountJob::new(&body.name, nid_str.as_deref(), MountPhase::Accepted);
         job.seed = body.seed;
         job.publish = body.publish;
+        job.config = (!config.is_empty()).then(|| config.clone());
         let job = match jobs.claim(job) {
             Ok(job) => job,
             Err(ClaimError::Persist(e)) => return write_failed(&e),
@@ -5665,7 +5712,7 @@ async fn mount_releasing(
         Err(e) => Err(e),
     };
     // Only a fetch no live mount has since taken up is ours to remove.
-    if mounted.is_err() && fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+    if mounted.is_err() && fetched && !dir_in_use(&h, &plan.dir) {
         let _ = std::fs::remove_dir_all(&plan.dir);
     }
     mounted
@@ -5870,6 +5917,12 @@ fn mount_entries_in(dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// Whether a live mount or a join holds `dir`, so a fetch into it is not a failed job's to remove (#2680).
+fn dir_in_use(h: &RuntimeHandles, dir: &std::path::Path) -> bool {
+    h.states.iter().any(|(_, s)| s.dir.as_path() == dir)
+        || h.joining.list().iter().any(|j| j.dir.as_path() == dir)
+}
+
 /// Run a mount as a job (#1544). The fetch and the catch-up happen with no lock held, so neither holds
 /// up another admin call; only admission and the join take the runtime's lock (#2134).
 pub fn spawn_mount_job(
@@ -5884,11 +5937,18 @@ pub fn spawn_mount_job(
     let asked = jobs
         .get(&name)
         .filter(|j| j.generation == generation)
-        .map(|j| (j.seed, j.publish));
-    let (seed, publish) = asked.unwrap_or_default();
+        .map(|j| (j.seed, j.publish, j.config));
+    let (seed, publish, config) = asked.unwrap_or_default();
     tokio::spawn(async move {
         let outcome = async {
             let plan = handles.lock().await.plan_mount(&name, nid.as_ref())?;
+            // Applied before the mount, as the request applied it, so a resumed job is not open (#2682).
+            if let Some(config) = &config {
+                handles
+                    .lock()
+                    .await
+                    .configure_mount(&name, nid.as_ref(), config)?;
+            }
             let fetched = match (&plan.fetch_from, &plan.nid) {
                 (Some(registry), Some(n)) => {
                     jobs.advance_if_owned(&name, generation, MountPhase::Fetching, None)?;
@@ -5926,7 +5986,7 @@ pub fn spawn_mount_job(
             // The unmount holds this lock across forget. A check before it still joins (#1638).
             let h = handles.lock().await;
             if !jobs.owns(&name, generation) {
-                if fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+                if fetched && !dir_in_use(&h, &plan.dir) {
                     let _ = std::fs::remove_dir_all(&plan.dir);
                 }
                 bail!("mount of '{name}' was unmounted before it joined");
@@ -5934,8 +5994,8 @@ pub fn spawn_mount_job(
             let owned = || jobs.owns(&name, generation);
             let mounted = mount_releasing(&handles, h, &name, nid, &owned).await;
             let h = handles.lock().await;
-            // Only a fetch no live mount has since taken up is ours to remove.
-            if mounted.is_err() && fetched && !h.states.iter().any(|(_, s)| s.dir == plan.dir) {
+            // Only a fetch no live or joining mount has since taken up is ours to remove (#2680).
+            if mounted.is_err() && fetched && !dir_in_use(&h, &plan.dir) {
                 let _ = std::fs::remove_dir_all(&plan.dir);
             }
             mounted
@@ -6111,7 +6171,7 @@ pub fn spawn_move_job(
 
 /// What `POST /_admin/nests` and `PATCH /_admin/mounts/<name>` may set on a mount record
 /// (RFC-0073 FR3). Each field given replaces the record's; `limits` replaces the whole table.
-#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MountConfig {
     #[serde(default)]

@@ -69,6 +69,10 @@ pub struct MountJob {
     pub publish: Option<crate::runtime::MountPublish>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_progress: Option<crate::seed::SeedProgress>,
+    /// The SQL surface, queries and limits the request set, applied again when a restart resumes the
+    /// job, so an interrupted mount does not come back open (#2682).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<crate::runtime::MountConfig>,
 }
 
 impl MountJob {
@@ -85,6 +89,7 @@ impl MountJob {
             seed: false,
             publish: None,
             seed_progress: None,
+            config: None,
         }
     }
 }

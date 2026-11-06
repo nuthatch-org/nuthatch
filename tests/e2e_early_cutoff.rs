@@ -256,6 +256,38 @@ fn data_dirs(root: &Path) -> Vec<String> {
     v
 }
 
+/// One nest whose `nuthatch.toml` will not load refuses only its own routes; its co-tenant still
+/// loads, and the loader does not fail the whole list (#2681).
+#[test]
+fn a_nest_that_does_not_load_is_refused_beside_its_co_tenant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    two_nest_runtime(root);
+
+    let mounts = MountTable::load(root).unwrap();
+    let default_tenant_owned = mounts.tenant_default();
+    let default_tenant = default_tenant_owned.as_str();
+    let datasets = mounts.datasets(root);
+    let alpha = datasets
+        .iter()
+        .find(|d| d.canonical().alias == "alpha")
+        .unwrap();
+    std::fs::write(alpha.dir.join("nuthatch.toml"), "[nest\n").unwrap();
+
+    let (mounted, unloadable) = runtime::load_mounted_each(root, &datasets, default_tenant);
+
+    assert_eq!(
+        mounted.iter().map(|(k, _, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["beta"]
+    );
+    assert_eq!(
+        unloadable.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["alpha"]
+    );
+    assert!(unloadable[0].1.starts_with("refused at boot:"), "{unloadable:?}");
+    assert!(runtime::load_mounted(root, &datasets, default_tenant).is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cosmetic_edit_adopts_the_dataset_it_came_from_instead_of_re_indexing() {
     let tmp = tempfile::tempdir().unwrap();

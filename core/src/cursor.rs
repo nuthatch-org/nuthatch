@@ -591,48 +591,6 @@ pub async fn process_window<E: WindowEntity>(
             }
             return refuse(source, clock, read_from).await.map(Step::Done);
         }
-        // Every row read before the checkpoint must be on the chain it names, and the window must
-        // extend the stored chain. Hashes read after the checkpoint settle both (#2146).
-        let exposed: Vec<_> = rows
-            .iter()
-            .filter(|r| r.block_number > final_through)
-            .collect();
-        // A row with no hash cannot be checked, so it cannot be committed where a reorg can reach.
-        if let Some(r) = exposed.iter().find(|r| r.block_hash.is_empty()) {
-            tracing::warn!(
-            "the source gave the log at ({}, {}) no block hash: refusing window {next}..={to}, \
-             retrying",
-            r.block_number,
-            r.log_index
-        );
-            return refuse(source, clock, read_from).await.map(Step::Done);
-        }
-        let mut expected: Vec<(u64, String)> = exposed
-            .iter()
-            .map(|r| (r.block_number, r.block_hash.clone()))
-            .collect();
-        if let Some(parent) = next.checked_sub(1).filter(|&p| p > final_through) {
-            if let Some(h) = store.get_block_hash(parent)? {
-                expected.push((parent, h));
-            }
-        }
-        if !expected.is_empty() {
-            let mut blocks: Vec<u64> = expected.iter().map(|(b, _)| *b).collect();
-            blocks.sort_unstable();
-            blocks.dedup();
-            let moved = match source.block_hashes(&blocks).await {
-                Ok(now) => expected
-                    .iter()
-                    .find(|(b, h)| !now.get(b).is_some_and(|n| n.eq_ignore_ascii_case(h)))
-                    .map(|(b, _)| format!("block {b} is not on the chain the source has now")),
-                Err(e) => Some(format!("block hashes unavailable: {e:#}")),
-            };
-            if let Some(why) = moved {
-                tracing::warn!("{why}: refusing window {next}..={to}, retrying");
-                return refuse(source, clock, read_from).await.map(Step::Done);
-            }
-        }
-
         let mut stored = 0usize;
         let mut deltas = Vec::new();
         let mut exp_deltas = Vec::new();
@@ -805,6 +763,47 @@ pub async fn process_window<E: WindowEntity>(
             }
             Err(e) => return Err(e),
         };
+        // Every row must be on the chain it names, and the window must extend the stored chain. The
+        // checkpoint is read before these rows, so their hashes are compared only once every read is in:
+        // a header, body or pinned read from a stale backend settles the same way a log does (#2146,
+        // #2678, #2754).
+        let mut expected: Vec<(u64, String)> = rows
+            .iter()
+            .chain(&l1_rows)
+            .chain(&block_rows)
+            .chain(&call_rows)
+            .chain(&read_rows)
+            .filter(|r| r.block_number > final_through)
+            .map(|r| (r.block_number, r.block_hash.clone()))
+            .collect();
+        // A row with no hash cannot be checked, so it cannot be committed where a reorg can reach.
+        if let Some((b, _)) = expected.iter().find(|(_, h)| h.is_empty()) {
+            tracing::warn!(
+                "the source gave block {b} no block hash: refusing window {next}..={to}, retrying"
+            );
+            return refuse(source, clock, read_from).await.map(Step::Done);
+        }
+        if let Some(parent) = next.checked_sub(1).filter(|&p| p > final_through) {
+            if let Some(h) = store.get_block_hash(parent)? {
+                expected.push((parent, h));
+            }
+        }
+        if !expected.is_empty() {
+            let mut blocks: Vec<u64> = expected.iter().map(|(b, _)| *b).collect();
+            blocks.sort_unstable();
+            blocks.dedup();
+            let moved = match source.block_hashes(&blocks).await {
+                Ok(now) => expected
+                    .iter()
+                    .find(|(b, h)| !now.get(b).is_some_and(|n| n.eq_ignore_ascii_case(h)))
+                    .map(|(b, _)| format!("block {b} is not on the chain the source has now")),
+                Err(e) => Some(format!("block hashes unavailable: {e:#}")),
+            };
+            if let Some(why) = moved {
+                tracing::warn!("{why}: refusing window {next}..={to}, retrying");
+                return refuse(source, clock, read_from).await.map(Step::Done);
+            }
+        }
         for row in read_rows {
             to_store.push((
                 entity_key(row.block_number, row.log_index),
@@ -1591,5 +1590,101 @@ mod tests {
             store.get_meta(LAST_BLOCK_KEY).unwrap().as_deref(),
             Some("9")
         );
+    }
+
+    /// The canonical chain, except that the header of `fork_block` is answered from another fork.
+    struct ForkedHeader(u64);
+
+    #[async_trait::async_trait]
+    impl Source for ForkedHeader {
+        async fn tip(&self) -> Result<u64> {
+            unreachable!()
+        }
+        async fn block_hash(&self, number: u64) -> Result<Option<String>> {
+            Chain.block_hash(number).await
+        }
+        async fn block_timestamps(&self, blocks: &[u64]) -> Result<HashMap<u64, u64>> {
+            Chain.block_timestamps(blocks).await
+        }
+        async fn block_headers(&self, blocks: &[u64]) -> Result<HashMap<u64, serde_json::Value>> {
+            Ok(blocks
+                .iter()
+                .map(|&b| {
+                    let hash = if b == self.0 {
+                        format!("0x{:064x}", b + 1_000_000)
+                    } else {
+                        hash_of(b)
+                    };
+                    let header = serde_json::json!({
+                        "hash": hash,
+                        "number": format!("0x{b:x}"),
+                        "timestamp": format!("0x{:x}", 1_700_000_000 + b * 12),
+                    });
+                    (b, header)
+                })
+                .collect())
+        }
+        async fn logs(&self, _: &crate::source::LogFilter, _: u64, _: u64) -> Result<Vec<Log>> {
+            unreachable!()
+        }
+    }
+
+    /// Commits the window 10..=12 of a `blocks` nest read from `source`, and reports how it settled.
+    fn blocks_window(source: &dyn Source) -> (Processed, u64) {
+        let store = Mem::default();
+        store.set(START_BLOCK_KEY, 10);
+        let registry = token().with_blocks(true);
+        let schema = registry.schema();
+        let balances = BalanceView::start(Driver::Inline).unwrap();
+        let exposure = ExposureView::start(Driver::Inline, false).unwrap();
+        let velocity = VelocityView::start(Driver::Inline, false).unwrap();
+        let labels = LabelSet::default();
+        let entities: Vec<Recorder> = Vec::new();
+        let router = AlertRouter::new(Vec::<alerts::AlertSink>::new());
+        let shelf = Shelf::default();
+        let logs = [transfer_log(10, 0, ZERO, ALICE, 100)];
+
+        let window = Window {
+            nest: Nest {
+                name: "tok",
+                store: &store,
+                schema: &schema,
+                balances: &balances,
+                exposure: &exposure,
+                velocity: &velocity,
+                labels: &labels,
+                velocity_flag: None,
+                entities: &entities,
+                children: None,
+                router: &router,
+                metrics: &NoMetrics,
+            },
+            registry: &registry,
+            factory: None,
+            threshold: None,
+            finality: Finality::Depth(64),
+            seal_span: 1,
+            sinks: &shelf,
+            extra: &crate::extra::NoExtraRows,
+            hooks: &crate::hooks::NoHooks,
+            faults: &crate::fault::NoFaults,
+            clock: &NoWait,
+            deadline: None,
+        };
+        let processed = block_on(process_window(window, source, &logs, 10, 12, 12)).unwrap();
+        (processed, store.count().unwrap())
+    }
+
+    #[test]
+    fn a_block_row_read_from_another_fork_refuses_the_window() {
+        let (processed, stored) = blocks_window(&ForkedHeader(11));
+        assert_eq!(processed, Processed::Refused);
+        assert_eq!(stored, 0);
+    }
+
+    #[test]
+    fn a_block_row_read_from_the_chain_it_names_commits_the_window() {
+        let (processed, _) = blocks_window(&ForkedHeader(u64::MAX));
+        assert_eq!(processed, Processed::Stored(4));
     }
 }
