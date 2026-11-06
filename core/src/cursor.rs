@@ -661,16 +661,28 @@ pub async fn process_window<E: WindowEntity>(
             let mut blocks: Vec<u64> = expected.iter().map(|(b, _)| *b).collect();
             blocks.sort_unstable();
             blocks.dedup();
-            let moved = match source.block_records(&blocks).await {
+            // A log row's timestamp was read by height alone, so it may be another fork's: it must be
+            // the one this hash has. Block and call rows took theirs from the header checked here.
+            let stamped: Vec<_> = rows
+                .iter()
+                .filter(|r| registry.timestamps() && r.block_number > final_through)
+                .collect();
+            let now = match stamped.is_empty() {
+                true => source.block_hashes(&blocks).await.map(|now| {
+                    now.into_iter()
+                        .map(|(b, h)| (b, (h, None)))
+                        .collect::<HashMap<_, _>>()
+                }),
+                false => source.block_records(&blocks).await,
+            };
+            let moved = match now {
                 Ok(now) => expected
                     .iter()
                     .find(|(b, h)| !now.get(b).is_some_and(|(n, _)| n.eq_ignore_ascii_case(h)))
                     .map(|(b, _)| format!("block {b} is not on the chain the source has now"))
-                    // A timestamp read by height alone may be another fork's: it must be this hash's.
                     .or_else(|| {
-                        exposed
+                        stamped
                             .iter()
-                            .filter(|_| registry.timestamps())
                             .find(|r| {
                                 now.get(&r.block_number).and_then(|(_, t)| *t)
                                     != Some(r.block_timestamp)
