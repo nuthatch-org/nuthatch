@@ -23,14 +23,14 @@ pub trait ExtraRows: Send + Sync {
         false
     }
 
-    /// The window's top-level call rows (RFC-0038 §5).
+    /// The window's top-level call rows (RFC-0038 §5), and the hash of every body they were read from.
     async fn top_level_calls(
         &self,
         _source: &dyn Source,
         _next: u64,
         _to: u64,
-    ) -> Result<Vec<DecodedRow>> {
-        Ok(Vec::new())
+    ) -> Result<(Vec<DecodedRow>, HashMap<u64, String>)> {
+        Ok(Default::default())
     }
 
     /// How many of `rows` name no document that could be resolved (RFC-0037).
