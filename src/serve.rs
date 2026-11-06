@@ -40,6 +40,14 @@ pub const SQL_MAX_CONCURRENCY: usize = 2;
 /// real client sends it in one write; ten seconds covers a slow link and still frees a stalled socket.
 pub const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a request body may go without a new chunk before it is cut off (#2724). The header
+/// timer alone lets a client send a complete head, then one byte of a larger body, and go quiet.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Connections one listener holds open at once (#2724). Past this, accept waits for one to close, so
+/// idle sockets cannot exhaust the process's descriptors and stall every route on the listener.
+const MAX_CONNECTIONS: usize = 256;
+
 /// How long a stopping server waits for open connections before dropping them (#1964). Inside
 /// Docker's default 10 s stop grace, so the ingest is still stopped by us and not by SIGKILL.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -1296,7 +1304,14 @@ pub async fn bind_and_serve(
              before exposing it publicly. See docs/operators.md."
         );
     }
-    serve_until(listener, app, shutdown_signal(), SHUTDOWN_GRACE).await;
+    serve_until(
+        listener,
+        app,
+        shutdown_signal(),
+        SHUTDOWN_GRACE,
+        BODY_READ_TIMEOUT,
+    )
+    .await;
     tracing::info!("shutdown signal received; API stopped");
     Ok(())
 }
@@ -1312,18 +1327,30 @@ pub async fn serve_bound(
         None => app,
     };
     tracing::info!("API live on http://{}", listener.local_addr()?);
-    serve_until(listener, app, shutdown_signal(), SHUTDOWN_GRACE).await;
+    serve_until(
+        listener,
+        app,
+        shutdown_signal(),
+        SHUTDOWN_GRACE,
+        BODY_READ_TIMEOUT,
+    )
+    .await;
     tracing::info!("shutdown signal received; API stopped");
     Ok(())
 }
 
 /// Serve `app` on `listener` until `shutdown` resolves, then drain connections for at most `grace`.
+///
+/// A request body that stalls for `body_timeout` is cut off, and at most [`MAX_CONNECTIONS`]
+/// connections are open at once.
 async fn serve_until(
     mut listener: tokio::net::TcpListener,
     app: Router,
     shutdown: impl std::future::Future<Output = ()>,
     grace: Duration,
+    body_timeout: Duration,
 ) {
+    use tower::Layer;
     let (stop, stopping) = tokio::sync::watch::channel(false);
     let app = app.layer(axum::Extension(Stopping(stopping)));
     // Not `axum::serve`: it gives hyper no timer, so the header-read timeout never fires (#1660).
@@ -1334,16 +1361,26 @@ async fn serve_until(
     // caller can abort the ingest task(s) (progress is checkpointed, so a restart resumes cleanly).
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown);
+    let open = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut conns = tokio::task::JoinSet::new();
     loop {
-        let (io, _) = tokio::select! {
-            conn = axum::serve::Listener::accept(&mut listener) => conn,
+        let permit = tokio::select! {
+            permit = Arc::clone(&open).acquire_owned() => {
+                permit.expect("the connection semaphore is never closed")
+            }
             Some(_) = conns.join_next(), if !conns.is_empty() => continue,
             _ = &mut shutdown => break,
         };
-        let service = hyper_util::service::TowerToHyperService::new(app.clone());
+        let (io, _) = tokio::select! {
+            conn = axum::serve::Listener::accept(&mut listener) => conn,
+            _ = &mut shutdown => break,
+        };
+        let service = hyper_util::service::TowerToHyperService::new(
+            tower_http::timeout::RequestBodyTimeoutLayer::new(body_timeout).layer(app.clone()),
+        );
         let conn = graceful.watch(http.serve_connection(hyper_util::rt::TokioIo::new(io), service));
         conns.spawn(async move {
+            let _permit = permit;
             if let Err(e) = conn.await {
                 tracing::trace!("connection ended: {e:#}");
             }
@@ -12745,6 +12782,7 @@ mod tests {
     async fn served(
         app: Router,
         grace: Duration,
+        body_timeout: Duration,
     ) -> (
         std::net::SocketAddr,
         tokio::sync::oneshot::Sender<()>,
@@ -12760,6 +12798,7 @@ mod tests {
                 let _ = fired.await;
             },
             grace,
+            body_timeout,
         ));
         (addr, fire, server)
     }
@@ -12772,7 +12811,7 @@ mod tests {
         let mut state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
         state.admin_token = Some("s3cret".into());
         let app = router(SharedNest::new(state));
-        let (addr, fire, server) = served(app, Duration::from_secs(600)).await;
+        let (addr, fire, server) = served(app, Duration::from_secs(600), BODY_READ_TIMEOUT).await;
 
         let mut events = reqwest::get(format!("http://{addr}/_admin/events?token=s3cret"))
             .await
@@ -12804,7 +12843,8 @@ mod tests {
                 >())
             }),
         );
-        let (addr, fire, server) = served(stuck, Duration::from_millis(200)).await;
+        let (addr, fire, server) =
+            served(stuck, Duration::from_millis(200), BODY_READ_TIMEOUT).await;
 
         let mut held = reqwest::get(format!("http://{addr}/stuck")).await.unwrap();
         assert_eq!(held.status(), StatusCode::OK);
@@ -12819,6 +12859,73 @@ mod tests {
             matches!(cut, Ok(Err(_)) | Ok(Ok(None))),
             "the stuck connection was left open: {cut:?}"
         );
+    }
+
+    /// #2724: a complete head followed by a body that stops short is answered, not held open, as a
+    /// quiet head already is. The body never completes, so no `200` can come back.
+    #[tokio::test]
+    async fn a_stalled_request_body_is_cut_off() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let app = Router::new().route(
+            "/up",
+            axum::routing::post(|body: axum::body::Bytes| async move { body.len().to_string() }),
+        );
+        let (addr, fire, server) =
+            served(app, Duration::from_secs(1), Duration::from_millis(300)).await;
+
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\nx")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+            .await
+            .expect("the stalled body was held open")
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&buf[..n]).contains("200 OK"));
+
+        fire.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve did not stop")
+            .unwrap();
+    }
+
+    /// #2724: connections past [`MAX_CONNECTIONS`] wait for a slot, and get one when another closes.
+    #[tokio::test]
+    async fn connections_past_the_cap_wait_for_a_slot() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let app = Router::new().route("/ping", axum::routing::get(|| async { "pong" }));
+        let (addr, fire, server) = served(app, Duration::from_secs(1), BODY_READ_TIMEOUT).await;
+
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        let mut late = tokio::net::TcpStream::connect(addr).await.unwrap();
+        late.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), late.read(&mut buf))
+                .await
+                .is_err(),
+            "a connection past the cap was served"
+        );
+
+        drop(idle.pop());
+        let n = tokio::time::timeout(Duration::from_secs(5), late.read(&mut buf))
+            .await
+            .expect("no slot was freed for the waiting connection")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+
+        fire.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve did not stop")
+            .unwrap();
     }
 
     async fn sql_json(state: &AppState, q: &str) -> (StatusCode, Value) {
