@@ -768,8 +768,9 @@ pub async fn load_pinned_from_registry(
 
 /// Fetch the bundle published under `nid` and install it at `target`, verified as `nest load` does
 /// (#1543). Nothing is written beside `target` until the registry has served a bundle computing to
-/// `nid`, and an install that fails part-way leaves nothing behind.
-pub async fn install_by_nid(registry: &str, nid: &str, target: &Path) -> Result<()> {
+/// `nid`, and an install that fails part-way leaves nothing behind. `true` when this call put the
+/// nest in place, `false` when another install of the NID had.
+pub async fn install_by_nid(registry: &str, nid: &str, target: &Path) -> Result<bool> {
     let store = open(registry)?;
     let (hash, bytes) = pull_by_nid(store.as_ref(), nid).await?;
     let tmp = tempfile::tempdir().context("temp dir for pulled bundle")?;
@@ -798,8 +799,9 @@ pub async fn install_by_nid(registry: &str, nid: &str, target: &Path) -> Result<
             return Err(e)
                 .with_context(|| format!("moving the fetched nest to {}", target.display()));
         }
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The `AWS_*` variables, lower-cased, as `object_store::parse_url_opts` options. Lower case because
@@ -1218,6 +1220,11 @@ abi = "abis/c.json"
         let err = format!("{err:#}");
         assert!(err.contains(&nid_a) && err.contains(&nid_b), "{err}");
         assert!(!installed.join(crate::config::CONFIG_FILE).exists());
+
+        // #2680: a second install of a NID already in place is not the one that put it there.
+        let b_dir = target.path().join("b");
+        assert!(install_by_nid(registry, &nid_b, &b_dir).await.unwrap());
+        assert!(!install_by_nid(registry, &nid_b, &b_dir).await.unwrap());
 
         // Bytes that are not a bundle at all are as unverified as the wrong bundle.
         store
