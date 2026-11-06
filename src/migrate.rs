@@ -24,7 +24,7 @@
 
 use crate::blob;
 use crate::runtime::{
-    adoptable, Mount, MountTable, DATA_DIR, LEGACY_ROOST_FILE, MOUNTS_FILE, NESTS_DIR,
+    adoptable, Mount, MountRef, MountTable, DATA_DIR, LEGACY_ROOST_FILE, MOUNTS_FILE, NESTS_DIR,
 };
 use anyhow::{bail, Context, Result};
 use sha2::Digest;
@@ -35,9 +35,14 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, PartialEq, Eq)]
 pub enum Plan {
     /// Already addressed by identity, at the identity it should have. Nothing to do.
-    AlreadyMigrated { alias: String, nid: String },
+    AlreadyMigrated {
+        tenant: String,
+        alias: String,
+        nid: String,
+    },
     /// Move `nests/<alias>` to `data/<nid>`.
     Move {
+        tenant: String,
         alias: String,
         nid: String,
         from: PathBuf,
@@ -50,6 +55,7 @@ pub enum Plan {
     /// found a **pre-existing double-index**: two names, byte-identical inputs, two backfills of the
     /// same chain data. Both aliases end up serving one dataset.
     Merge {
+        tenant: String,
         alias: String,
         nid: String,
         with: String,
@@ -59,6 +65,7 @@ pub enum Plan {
     /// **byte-identical data** (RFC-0033 §5, early cutoff). Adopt it rather than re-indexing the
     /// chain: the package changed, the data did not.
     Adopt {
+        tenant: String,
         alias: String,
         nid: String,
         from_nid: String,
@@ -71,14 +78,18 @@ pub enum Plan {
         package: PathBuf,
     },
     /// Something is wrong with the nest and it will not be touched.
-    Refuse { alias: String, why: String },
+    Refuse {
+        tenant: String,
+        alias: String,
+        why: String,
+    },
 }
 
 impl Plan {
     /// One line, in the order an operator reads: what happens, to what, and where it lands.
     fn describe(&self) -> String {
         match self {
-            Plan::AlreadyMigrated { alias, nid } => {
+            Plan::AlreadyMigrated { alias, nid, .. } => {
                 format!("  {alias}: already at data/{} - nothing to do", &nid[..12])
             }
             Plan::Adopt {
@@ -112,7 +123,7 @@ impl Plan {
                 "  {alias}: MERGE into data/{} - identical to '{with}', which had its own backfill",
                 &nid[..12]
             ),
-            Plan::Refuse { alias, why } => format!("  {alias}: REFUSED - {why}"),
+            Plan::Refuse { alias, why, .. } => format!("  {alias}: REFUSED - {why}"),
         }
     }
 }
@@ -130,14 +141,12 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
     // `mount_refs()`, **not** `mounts.nests`: once a directory is migrated the mount records are
     // authoritative and `nests` is empty, so iterating the list would see nothing on a second run and
     // then write an empty mount table - turning "migrate twice" from a no-op into data loss.
-    for alias in mounts
-        .mount_refs()
-        .iter()
-        .map(|m| m.alias.clone())
-        .collect::<Vec<_>>()
-    {
-        let alias = &alias;
-        let recorded = mounts.mounts.iter().find(|m| &m.alias == alias);
+    for MountRef { tenant, alias } in mounts.mount_refs() {
+        let (tenant, alias) = (&tenant, &alias);
+        let recorded = mounts
+            .mounts
+            .iter()
+            .find(|m| &m.tenant == tenant && &m.alias == alias);
         let legacy = dir.join(NESTS_DIR).join(alias);
 
         // Already migrated: a record exists, its dataset is on disk, and **nothing is staged**.
@@ -156,6 +165,7 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
             if dir.join(DATA_DIR).join(&m.nid).is_dir() && !staged_differs {
                 claimed.insert(m.nid.clone(), alias.clone());
                 plans.push(Plan::AlreadyMigrated {
+                    tenant: tenant.clone(),
                     alias: alias.clone(),
                     nid: m.nid.clone(),
                 });
@@ -165,6 +175,7 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
 
         if !legacy.is_dir() {
             plans.push(Plan::Refuse {
+                tenant: tenant.clone(),
                 alias: alias.clone(),
                 why: format!("{} does not exist", legacy.display()),
             });
@@ -175,6 +186,7 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
             Ok(nid) => nid,
             Err(e) => {
                 plans.push(Plan::Refuse {
+                    tenant: tenant.clone(),
                     alias: alias.clone(),
                     why: format!("{e:#}"),
                 });
@@ -186,6 +198,7 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
         match claimed.get(&nid) {
             // Another alias in this same mounts is the same nest, byte for byte.
             Some(other) => plans.push(Plan::Merge {
+                tenant: tenant.clone(),
                 alias: alias.clone(),
                 nid: nid.clone(),
                 with: other.clone(),
@@ -195,6 +208,7 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
                 // The dataset exists but no alias in this run claimed it - a previous partial run.
                 claimed.insert(nid.clone(), alias.clone());
                 plans.push(Plan::Merge {
+                    tenant: tenant.clone(),
                     alias: alias.clone(),
                     nid,
                     with: "an existing dataset".to_string(),
@@ -211,6 +225,7 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
                     .and_then(|m| adoptable(dir, &m, &nid));
                 match adopt {
                     Some((from_nid, from)) => plans.push(Plan::Adopt {
+                        tenant: tenant.clone(),
                         alias: alias.clone(),
                         nid,
                         from_nid,
@@ -219,8 +234,9 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
                         package: legacy.clone(),
                     }),
                     None => {
-                        let breaking = breaking_against_current(dir, &mounts, alias, &legacy);
+                        let breaking = breaking_against_current(dir, recorded, &legacy);
                         plans.push(Plan::Move {
+                            tenant: tenant.clone(),
                             alias: alias.clone(),
                             nid,
                             from: legacy,
@@ -235,7 +251,7 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
     Ok(plans)
 }
 
-/// Whether replacing `alias`'s current dataset with the nest staged at `staged` would **break
+/// Whether replacing `current`'s dataset with the nest staged at `staged` would **break
 /// consumers** (RFC-0033 §9), and how.
 ///
 /// This is what `nest diff` used to tell an operator who remembered to run it. Grafting makes the
@@ -247,11 +263,10 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
 /// breaking change, and inventing one would train operators to ignore the warning.
 fn breaking_against_current(
     dir: &Path,
-    mounts: &MountTable,
-    alias: &str,
+    current: Option<&Mount>,
     staged: &Path,
 ) -> Option<Vec<String>> {
-    let current_nid = &mounts.mounts.iter().find(|m| m.alias == alias)?.nid;
+    let current_nid = &current?.nid;
     let old =
         std::fs::read_to_string(MountTable::data_dir(dir, current_nid).join("schema.json")).ok()?;
     let new = std::fs::read_to_string(staged.join("schema.json")).ok()?;
@@ -330,30 +345,45 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Everything an un-migrated mounts held belongs to the default tenant (RFC-0032 §6): migration is
-    // a **relabel, not a migration** - no data moves between tenants, nothing re-indexes, and
-    // enabling hosted tenancy later is another relabel rather than a second migration.
-    let tenant = MountTable::load_for_migration(dir)?.tenant_default();
+    let table = MountTable::load_for_migration(dir)?;
+    // A mount that already has a record keeps all of it but the identity: its tenant, SQL surface,
+    // limits and publish are the operator's, and a layout change must not reset them (#2677).
+    let record = |tenant: &str, alias: &str, nid: &str| match table
+        .mounts
+        .iter()
+        .find(|m| m.tenant == tenant && m.alias == alias)
+    {
+        Some(m) => Mount {
+            nid: nid.to_string(),
+            ..m.clone()
+        },
+        // Everything an un-migrated mounts held belongs to the default tenant (RFC-0032 §6), which
+        // `mount_refs` has already applied: migration is a **relabel, not a migration**.
+        None => Mount {
+            tenant: tenant.to_string(),
+            alias: alias.to_string(),
+            nid: nid.to_string(),
+            // Migration never invents a security posture: an existing deployment keeps the
+            // arbitrary-/sql behaviour it already had. Bounding the surface is an operator's
+            // deliberate act (RFC-0034), not something a layout change does to them.
+            sql: crate::allowlist::SqlAccess::Open,
+            queries: Vec::new(),
+            publish: None,
+            sync: None,
+            limits: Default::default(),
+            #[cfg(feature = "counter")]
+            counter: None,
+        },
+    };
     let mut records: Vec<Mount> = Vec::new();
     let mut refused: Vec<&str> = Vec::new();
     for p in &plans {
         match p {
-            Plan::AlreadyMigrated { alias, nid } => records.push(Mount {
-                tenant: tenant.clone(),
-                alias: alias.clone(),
-                nid: nid.clone(),
-                // Migration never invents a security posture: an existing deployment keeps the
-                // arbitrary-/sql behaviour it already had. Bounding the surface is an operator's
-                // deliberate act (RFC-0034), not something a layout change does to them.
-                sql: crate::allowlist::SqlAccess::Open,
-                queries: Vec::new(),
-                publish: None,
-                sync: None,
-                limits: Default::default(),
-                #[cfg(feature = "counter")]
-                counter: None,
-            }),
+            Plan::AlreadyMigrated { tenant, alias, nid } => {
+                records.push(record(tenant, alias, nid))
+            }
             Plan::Move {
+                tenant,
                 alias,
                 nid,
                 from,
@@ -361,21 +391,14 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                 ..
             } => {
                 relocate(from, to)?;
-                records.push(Mount {
-                    tenant: tenant.clone(),
-                    alias: alias.clone(),
-                    nid: nid.clone(),
-                    sql: crate::allowlist::SqlAccess::Open,
-                    queries: Vec::new(),
-                    publish: None,
-                    sync: None,
-                    limits: Default::default(),
-                    #[cfg(feature = "counter")]
-                    counter: None,
-                });
+                records.push(record(tenant, alias, nid));
             }
             Plan::Merge {
-                alias, nid, from, ..
+                tenant,
+                alias,
+                nid,
+                from,
+                ..
             } => {
                 // The destination already holds this exact nest. The duplicate's *inputs* are
                 // identical by definition, so the only thing lost is its separately-indexed data -
@@ -387,20 +410,10 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                     "  {alias}: duplicate data kept at {} (safe to delete once verified)",
                     aside.display()
                 );
-                records.push(Mount {
-                    tenant: tenant.clone(),
-                    alias: alias.clone(),
-                    nid: nid.clone(),
-                    sql: crate::allowlist::SqlAccess::Open,
-                    queries: Vec::new(),
-                    publish: None,
-                    sync: None,
-                    limits: Default::default(),
-                    #[cfg(feature = "counter")]
-                    counter: None,
-                });
+                records.push(record(tenant, alias, nid));
             }
             Plan::Adopt {
+                tenant,
                 alias,
                 nid,
                 from,
@@ -440,18 +453,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                 } else {
                     println!("  {alias}: adopted without re-indexing");
                 }
-                records.push(Mount {
-                    tenant: tenant.clone(),
-                    alias: alias.clone(),
-                    nid: nid.clone(),
-                    sql: crate::allowlist::SqlAccess::Open,
-                    queries: Vec::new(),
-                    publish: None,
-                    sync: None,
-                    limits: Default::default(),
-                    #[cfg(feature = "counter")]
-                    counter: None,
-                });
+                records.push(record(tenant, alias, nid));
             }
             Plan::Refuse { alias, .. } => refused.push(alias),
         }
@@ -688,6 +690,9 @@ fn write_mounts(dir: &Path, records: &[Mount]) -> Result<bool> {
     // `nests` was the pre-2.0 way to say what is mounted; the records are authoritative now, and a
     // stale list beside them would lie.
     mounts.runtime.nests.clear();
+    mounts.validate_mounts().with_context(|| {
+        format!("the rewritten mount table is invalid, so {MOUNTS_FILE} was left as it was")
+    })?;
     let out = toml::to_string_pretty(&mounts).context("serialising mounts.toml")?;
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
@@ -868,6 +873,105 @@ mod tests {
             crate::runtime::history_head(&d.path().join(DATA_DIR).join(&nid)),
             Some(fixture_head(0))
         );
+    }
+
+    /// A rerun on a 2.0 directory must leave every record as the operator wrote it (#2677): it used
+    /// to rebuild each one from defaults, reopening a `sql = "deny"` surface under the default tenant.
+    #[test]
+    fn a_rerun_keeps_each_record_verbatim() {
+        let d = tempfile::tempdir().unwrap();
+        write_roost(
+            d.path(),
+            &[("a", "0x0000000000000000000000000000000000000001")],
+        );
+        run(d.path(), false, false).unwrap();
+        let mut mounts = MountTable::load(d.path()).unwrap();
+        let m = &mut mounts.mounts[0];
+        m.tenant = "acme".into();
+        m.sql = crate::allowlist::SqlAccess::Deny;
+        m.limits.max_rows = Some(7);
+        m.publish = Some(
+            toml::from_str(&format!(
+                "target = \"{}\"",
+                d.path().join("mirror").display()
+            ))
+            .unwrap(),
+        );
+        let before = mounts.mounts.clone();
+        std::fs::write(
+            d.path().join(MOUNTS_FILE),
+            toml::to_string_pretty(&mounts).unwrap(),
+        )
+        .unwrap();
+
+        run(d.path(), false, false).unwrap();
+
+        assert_eq!(MountTable::load(d.path()).unwrap().mounts, before);
+    }
+
+    /// Two tenants may each call a mount `a` (RFC-0032 §4.1). A rerun must not collapse them onto the
+    /// first tenant's record, which wrote a table the runtime then refused to load (#2677).
+    #[test]
+    fn a_rerun_keeps_two_tenants_with_one_alias_apart() {
+        let d = tempfile::tempdir().unwrap();
+        write_roost(
+            d.path(),
+            &[
+                ("a", "0x0000000000000000000000000000000000000001"),
+                ("b", "0x0000000000000000000000000000000000000002"),
+            ],
+        );
+        run(d.path(), false, false).unwrap();
+        let mut mounts = MountTable::load(d.path()).unwrap();
+        mounts.mounts[0].tenant = "acme".into();
+        mounts.mounts[1].tenant = "globex".into();
+        mounts.mounts[1].alias = "a".into();
+        mounts.mounts[1].sql = crate::allowlist::SqlAccess::Deny;
+        let before = mounts.mounts.clone();
+        std::fs::write(
+            d.path().join(MOUNTS_FILE),
+            toml::to_string_pretty(&mounts).unwrap(),
+        )
+        .unwrap();
+
+        run(d.path(), false, false).unwrap();
+
+        assert_eq!(MountTable::load(d.path()).unwrap().mounts, before);
+    }
+
+    /// An upgrade through a staged `nests/<alias>` changes the identity and nothing else on the record.
+    #[test]
+    fn an_upgrade_keeps_the_record_but_its_identity() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write_roost(root, &[("a", "0x0000000000000000000000000000000000000001")]);
+        run(root, false, false).unwrap();
+        let mut mounts = MountTable::load(root).unwrap();
+        mounts.mounts[0].tenant = "acme".into();
+        mounts.mounts[0].sql = crate::allowlist::SqlAccess::Deny;
+        let mut before = mounts.mounts[0].clone();
+        std::fs::write(
+            root.join(MOUNTS_FILE),
+            toml::to_string_pretty(&mounts).unwrap(),
+        )
+        .unwrap();
+
+        let staged = root.join(NESTS_DIR).join("a");
+        crate::project::copy_dir(&root.join(DATA_DIR).join(&before.nid), &staged).unwrap();
+        let cfg = std::fs::read_to_string(staged.join("nuthatch.toml")).unwrap();
+        std::fs::write(
+            staged.join("nuthatch.toml"),
+            cfg.replace(
+                "0x0000000000000000000000000000000000000001",
+                "0x0000000000000000000000000000000000000002",
+            ),
+        )
+        .unwrap();
+        before.nid = nid_of(&staged).unwrap();
+
+        run(root, false, false).unwrap();
+
+        assert_eq!(MountTable::load(root).unwrap().mounts, vec![before]);
     }
 
     /// Two aliases over byte-identical inputs are one nest that was indexed twice. The migration is
