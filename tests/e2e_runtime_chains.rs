@@ -710,3 +710,109 @@ async fn a_declared_and_repointed_chain_survives_a_restart() {
     let log_text = std::fs::read_to_string(&log).unwrap_or_default();
     assert_redacted("the runtime's log", &log_text);
 }
+
+/// Boot `nuthatch dev --dir` over two mounts on one fake chain, the second broken by `break_it`,
+/// and return the two `/ready` answers once the healthy one serves.
+async fn boot_beside_a_broken_dataset(break_it: impl FnOnce(&std::path::Path)) -> (String, String) {
+    let roost = tempfile::tempdir().unwrap();
+    let chain = fake_chain(42_161, 10).await;
+    let (good, bad) = ("c0de".repeat(16), "dead".repeat(16));
+    scaffold_nest(
+        &runtime::MountTable::data_dir(roost.path(), &good),
+        "good",
+        USDC,
+    );
+    let bad_dir = runtime::MountTable::data_dir(roost.path(), &bad);
+    scaffold_nest(&bad_dir, "bad", ARB);
+    break_it(&bad_dir);
+    std::fs::write(
+        roost.path().join(runtime::MOUNTS_FILE),
+        format!(
+            "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+             rpc_urls = [\"{}\"]\n\n[[mounts]]\nalias = \"good\"\nnid = \"{good}\"\n\n\
+             [[mounts]]\nalias = \"bad\"\nnid = \"{bad}\"\n",
+            chain.shown()
+        ),
+    )
+    .unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let log = roost.path().join("dev.log");
+    let mut child = Reaped(
+        std::process::Command::new(env!("CARGO_BIN_EXE_nuthatch"))
+            .args(["dev", "--dir"])
+            .arg(roost.path())
+            .args(["--listen", &format!("127.0.0.1:{port}")])
+            .args(["--poll-interval", "1s"])
+            .env("NUTHATCH_ADMIN_TOKEN", OPEN)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .expect("spawn dev"),
+    );
+    let client = reqwest::Client::new();
+    let ready = |name: &str| {
+        client
+            .get(format!("http://127.0.0.1:{port}/{name}/ready"))
+            .send()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(resp) = ready("good").await {
+            if resp.status() == 200 {
+                break;
+            }
+        }
+        let exited = child.0.try_wait().unwrap();
+        assert!(
+            exited.is_none() && std::time::Instant::now() < deadline,
+            "the healthy co-tenant never served ({exited:?}): {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let bad_ready = ready("bad").await.unwrap();
+    assert_eq!(bad_ready.status(), 503);
+    let root = client
+        .get(format!("http://127.0.0.1:{port}/ready"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        root.status(),
+        503,
+        "the runtime reads ready with a quarantined mount"
+    );
+    let table = std::fs::read_to_string(roost.path().join(runtime::MOUNTS_FILE)).unwrap();
+    assert!(
+        table.contains(&bad),
+        "the broken mount's record was dropped: {table}"
+    );
+    (bad_ready.text().await.unwrap(), root.text().await.unwrap())
+}
+
+/// #2681: one dataset that no longer loads boots quarantined, naming why, beside a co-tenant that
+/// serves (RFC-0073 FR6). It used to stop the whole runtime booting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unloadable_dataset_boots_quarantined_beside_a_serving_co_tenant() {
+    let (bad, root) = boot_beside_a_broken_dataset(|dir| {
+        let toml = dir.join("nuthatch.toml");
+        let raw = std::fs::read_to_string(&toml).unwrap();
+        std::fs::write(&toml, format!("{raw}\n[screening]\nlists = [\"ab\"]\n")).unwrap();
+    })
+    .await;
+    assert!(bad.contains("[screening]"), "{bad}");
+    assert!(root.contains("bad"), "{root}");
+
+    let (bad, _) = boot_beside_a_broken_dataset(|dir| std::fs::remove_dir_all(dir).unwrap()).await;
+    assert!(bad.contains("loading mounted nest"), "{bad}");
+
+    let (bad, _) = boot_beside_a_broken_dataset(|dir| {
+        scaffold_nest_on_chain(dir, "bad", ARB, "base");
+    })
+    .await;
+    assert!(bad.contains("doesn't declare"), "{bad}");
+}

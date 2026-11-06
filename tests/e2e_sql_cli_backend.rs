@@ -274,7 +274,8 @@ async fn bring_up_mounted_runtime(
     for ds in &datasets {
         health.register(&ds.canonical().route_key(default_tenant), "arbitrum-one");
     }
-    let mounted = runtime::load_mounted(root, &datasets, default_tenant).expect("load_mounted");
+    let (mounted, failed) = runtime::load_mounted(root, &datasets, default_tenant);
+    assert!(failed.is_empty(), "load_mounted: {failed:?}");
     let cursor = indexer::spawn_runtime(
         tape.clone(),
         mounted,
