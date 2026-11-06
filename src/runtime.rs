@@ -895,7 +895,7 @@ impl MountTable {
     /// treatment: hex only, fixed length, no `..`, no separators. The records are written by
     /// `migrate` rather than by hand, but a runtime dir is an operator-editable file and a bundle
     /// roster is untrusted input, so the check is on load, not on write.
-    fn validate_mounts(&self) -> Result<()> {
+    pub(crate) fn validate_mounts(&self) -> Result<()> {
         // The primary key is `(tenant, alias)`: two tenants may each call their mount "usdc" and
         // both must work, so uniqueness is *within* a tenant and never global (RFC-0032 §4.1).
         if let Some(publish) = &self.runtime.publish {
