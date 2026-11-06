@@ -377,6 +377,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
     };
     let mut records: Vec<Mount> = Vec::new();
     let mut refused: Vec<&str> = Vec::new();
+    let mut unmigrated: Vec<String> = Vec::new();
     for p in &plans {
         match p {
             Plan::AlreadyMigrated { tenant, alias, nid } => {
@@ -455,7 +456,19 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                 }
                 records.push(record(tenant, alias, nid));
             }
-            Plan::Refuse { alias, .. } => refused.push(alias),
+            Plan::Refuse { tenant, alias, .. } => {
+                // Refused is not unmounted: a record stays as written and a pre-2.0 name stays in
+                // `nests`, so repairing the nest and rerunning picks it up (#2684).
+                match table
+                    .mounts
+                    .iter()
+                    .find(|m| &m.tenant == tenant && &m.alias == alias)
+                {
+                    Some(m) => records.push(m.clone()),
+                    None => unmigrated.push(alias.clone()),
+                }
+                refused.push(alias);
+            }
         }
     }
 
@@ -475,7 +488,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
         );
     }
 
-    let removed_legacy = write_mounts(dir, &records)?;
+    let removed_legacy = write_mounts(dir, &records, &unmigrated)?;
     println!(
         "\nWrote {} mount record(s) to {MOUNTS_FILE}.",
         records.len()
@@ -493,7 +506,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
     if !refused.is_empty() {
         bail!(
             "migrated what could be migrated, but refused: {}. \
-             The mounts still serves - un-migrated nests resolve through the old layout.",
+             They stay mounted as they were: repair them and run `nuthatch migrate` again.",
             refused.join(", ")
         );
     }
@@ -663,7 +676,7 @@ fn safe_to_drop_local(src: &Path, dest: &Path, hash: &str) -> bool {
 }
 
 /// Rewrite `mounts.toml` with the mount records, temp-then-rename so a crash cannot truncate it.
-fn write_mounts(dir: &Path, records: &[Mount]) -> Result<bool> {
+fn write_mounts(dir: &Path, records: &[Mount], unmigrated: &[String]) -> Result<bool> {
     // Read whichever file this directory has - the migration's whole job is that it may still be the
     // pre-2.0 one - and always *write* the 2.0 name.
     let legacy = dir.join(LEGACY_ROOST_FILE);
@@ -687,9 +700,9 @@ fn write_mounts(dir: &Path, records: &[Mount]) -> Result<bool> {
         mounts.runtime.chain_id = None;
         mounts.runtime.rpc_urls.clear();
     }
-    // `nests` was the pre-2.0 way to say what is mounted; the records are authoritative now, and a
-    // stale list beside them would lie.
-    mounts.runtime.nests.clear();
+    // `nests` was the pre-2.0 way to say what is mounted; the records are authoritative now, so only
+    // a name refused before it got a record stays listed.
+    mounts.runtime.nests = unmigrated.to_vec();
     mounts.validate_mounts().with_context(|| {
         format!("the rewritten mount table is invalid, so {MOUNTS_FILE} was left as it was")
     })?;
@@ -1475,6 +1488,76 @@ mod tests {
         assert!(mounts
             .dir_for(d.path(), "broken")
             .starts_with(d.path().join(NESTS_DIR)));
+    }
+
+    /// A refused nest stays mounted, so repairing it and rerunning migrates it (#2684). It used to be
+    /// dropped from both the records and `nests`, unmounting it while the error said it still served.
+    #[test]
+    fn a_refused_nest_stays_mounted_and_a_rerun_after_repair_migrates_it() {
+        let d = tempfile::tempdir().unwrap();
+        write_roost(
+            d.path(),
+            &[
+                ("good", "0x0000000000000000000000000000000000000001"),
+                ("broken", "0x0000000000000000000000000000000000000002"),
+            ],
+        );
+        let cfg = d
+            .path()
+            .join(NESTS_DIR)
+            .join("broken")
+            .join("nuthatch.toml");
+        let saved = std::fs::read_to_string(&cfg).unwrap();
+        std::fs::remove_file(&cfg).unwrap();
+
+        run(d.path(), false, false).unwrap_err();
+        let aliases = |d: &Path| -> Vec<String> {
+            MountTable::load_for_migration(d)
+                .unwrap()
+                .mount_refs()
+                .into_iter()
+                .map(|m| m.alias)
+                .collect()
+        };
+        assert_eq!(aliases(d.path()), ["good", "broken"]);
+
+        std::fs::write(&cfg, saved).unwrap();
+        run(d.path(), false, false).unwrap();
+        let mounts = MountTable::load(d.path()).unwrap();
+        assert_eq!(aliases(d.path()), ["good", "broken"]);
+        assert!(mounts.runtime.nests.is_empty());
+        assert!(mounts
+            .dir_for(d.path(), "broken")
+            .starts_with(d.path().join(DATA_DIR)));
+    }
+
+    /// A 2.0 record refused because neither its dataset nor a staged nest exists is kept as written,
+    /// not deleted from the table (#2684).
+    #[test]
+    fn a_refused_record_is_kept_verbatim() {
+        let d = tempfile::tempdir().unwrap();
+        write_roost(
+            d.path(),
+            &[
+                ("a", "0x0000000000000000000000000000000000000001"),
+                ("b", "0x0000000000000000000000000000000000000002"),
+            ],
+        );
+        run(d.path(), false, false).unwrap();
+        let mut mounts = MountTable::load(d.path()).unwrap();
+        mounts.mounts[1].sql = crate::allowlist::SqlAccess::Deny;
+        let before = mounts.mounts.clone();
+        std::fs::write(
+            d.path().join(MOUNTS_FILE),
+            toml::to_string_pretty(&mounts).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(d.path().join(DATA_DIR).join(&before[1].nid)).unwrap();
+
+        let err = run(d.path(), false, false).unwrap_err().to_string();
+        assert!(err.contains('b'), "{err}");
+
+        assert_eq!(MountTable::load(d.path()).unwrap().mounts, before);
     }
 
     /// #2362: an adopt takes the source's data and nothing it authored, so a file the new version
