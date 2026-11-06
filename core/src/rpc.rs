@@ -2477,10 +2477,33 @@ impl<T: Transport> RpcClient<T> {
             .ok_or_else(|| anyhow!("eth_getLogs did not return an array"))?;
         self.remember_log_timestamps(arr);
         // A log a reorg took back is not on the chain, whichever call a provider marks it on (#2222).
-        arr.iter()
+        let logs: Vec<Log> = arr
+            .iter()
             .filter(|l| l.get("removed").and_then(Value::as_bool) != Some(true))
             .map(Log::from_rpc)
-            .collect()
+            .collect::<Result<_>>()?;
+        // A log past the range or the filter would be stored again by the window that does ask for
+        // it, and its deltas folded twice (#2695).
+        let filter = crate::source::LogFilter::new(addresses, topic0s)
+            .map(|f| f.with_topics(topics.clone()));
+        let asked = |l: &Log| {
+            (from..=to).contains(&l.block_number) && filter.as_ref().is_none_or(|f| f.matches(l))
+        };
+        let (kept, strays): (Vec<Log>, Vec<Log>) = logs.into_iter().partition(asked);
+        if let Some(l) = strays.first() {
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(crate::window::REPEAT_WARN_EVERY) {
+                tracing::warn!(
+                    "eth_getLogs for {from}..={to} answered {} log(s) it was not asked for (block \
+                     {}, {}); dropped ({n} answer(s) so far)",
+                    strays.len(),
+                    l.block_number,
+                    l.address
+                );
+            }
+        }
+        Ok(kept)
     }
 
     /// Nodes that carry `blockTimestamp` on each log (execution-apis, 2025) answer the header
