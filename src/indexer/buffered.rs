@@ -1625,6 +1625,12 @@ impl Source for HeaderedSource<'_> {
     async fn block_hashes(&self, blocks: &[u64]) -> Result<std::collections::HashMap<u64, String>> {
         self.inner.block_hashes(blocks).await
     }
+    async fn block_records(
+        &self,
+        blocks: &[u64],
+    ) -> Result<std::collections::HashMap<u64, (String, Option<u64>)>> {
+        self.inner.block_records(blocks).await
+    }
     async fn finalized(&self) -> Result<Option<u64>> {
         self.inner.finalized().await
     }

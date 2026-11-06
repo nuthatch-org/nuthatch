@@ -61,6 +61,10 @@ impl Source for LivePool {
         Source::block_hashes(&*self.current(), blocks).await
     }
 
+    async fn block_records(&self, blocks: &[u64]) -> Result<HashMap<u64, (String, Option<u64>)>> {
+        Source::block_records(&*self.current(), blocks).await
+    }
+
     async fn finalized(&self) -> Result<Option<u64>> {
         Source::finalized(&*self.current()).await
     }

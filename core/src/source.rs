@@ -179,6 +179,17 @@ pub trait Source: Send + Sync {
         Ok(Some((hash, ts)))
     }
 
+    /// [`Source::block_hashes`], each with its block's timestamp. A source that can should read both
+    /// from one header: a window's row timestamps are checked against these (#2678).
+    async fn block_records(&self, blocks: &[u64]) -> Result<HashMap<u64, (String, Option<u64>)>> {
+        let hashes = self.block_hashes(blocks).await?;
+        let ts = self.block_timestamps(blocks).await.unwrap_or_default();
+        Ok(hashes
+            .into_iter()
+            .map(|(b, h)| (b, (h, ts.get(&b).copied())))
+            .collect())
+    }
+
     /// Full block headers for the given blocks (RFC-0036 §4.2), for a nest with `[extract] blocks`.
     ///
     /// Default: none, which means a source that cannot answer produces **no block rows** rather than

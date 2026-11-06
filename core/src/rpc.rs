@@ -2605,6 +2605,20 @@ impl<T: Transport> crate::source::Source for RpcClient<T> {
             .collect())
     }
 
+    async fn block_records(&self, blocks: &[u64]) -> Result<HashMap<u64, (String, Option<u64>)>> {
+        Ok(RpcClient::block_headers(self, blocks)
+            .await?
+            .into_iter()
+            .filter_map(|(b, h)| {
+                let ts = h
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(|s| parse_hex_u64(s).ok());
+                Some((b, (h.get("hash")?.as_str()?.to_string(), ts)))
+            })
+            .collect())
+    }
+
     async fn finalized(&self) -> Result<Option<u64>> {
         self.finalized_block().await
     }
