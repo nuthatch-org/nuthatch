@@ -5296,7 +5296,9 @@ pub async fn backfill_direct(
         };
         let logs = match LogFilter::new(addresses, topic0s) {
             None => Vec::new(),
-            Some(filter) => match source.logs(&filter, fetch_from, chunk_to).await {
+            Some(filter) => match logs_with_overlap(source, &filter, next, fetch_from, chunk_to)
+                .await
+            {
                 Ok(logs) => {
                     if let Some(c) = &mut chunker {
                         c.observed(logs.len() as u64);
@@ -5485,6 +5487,33 @@ fn single_block_over_cap(block: u64) -> String {
         "block {block} alone exceeds the provider's getLogs result cap - use a provider with a \
          higher/no cap"
     )
+}
+
+/// A one-block window still asks from `from` for its tail overlap, so the request is three blocks
+/// wide and a cap refusal of it says nothing about `next` alone. Each block is then asked on its own,
+/// overlap kept, and only a block refused alone is over the cap (#2679).
+fn overlap_refused(err: &anyhow::Error, next: u64, from: u64, to: u64) -> bool {
+    from < to && next >= to && narrowing_can_help(err, from, to)
+}
+
+/// `source.logs` for a window starting at `next`, asked from `from`; see [`overlap_refused`].
+async fn logs_with_overlap(
+    source: &dyn Source,
+    filter: &LogFilter,
+    next: u64,
+    from: u64,
+    to: u64,
+) -> Result<Vec<crate::rpc::Log>> {
+    match source.logs(filter, from, to).await {
+        Err(e) if overlap_refused(&e, next, from, to) => {
+            let mut logs = Vec::new();
+            for b in from..=to {
+                logs.extend(source.logs(filter, b, b).await?);
+            }
+            Ok(logs)
+        }
+        r => r,
+    }
 }
 
 /// Fetch logs for `[from, to]`, transparently splitting the range in half and retrying each half when
@@ -7021,6 +7050,27 @@ impl NestIngest {
         nuthatch_core::window::fetch_window(wanted, source, from, to).await
     }
 
+    /// [`Self::fetch_window`] for a window starting at `next`, asked from `from`; see
+    /// [`overlap_refused`].
+    async fn fetch_window_with_overlap(
+        &mut self,
+        source: &dyn Source,
+        next: u64,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<crate::rpc::Log>> {
+        match self.fetch_window(source, from, to).await {
+            Err(e) if overlap_refused(&e, next, from, to) => {
+                let mut logs = Vec::new();
+                for b in from..=to {
+                    logs.extend(self.fetch_window(source, b, b).await?);
+                }
+                Ok(logs)
+            }
+            r => r,
+        }
+    }
+
     /// The policy a seal-direct pass resolves its documents on.
     fn seal_direct_policy(&self) -> crate::ipfs_resolve::Policy {
         crate::ipfs_resolve::Policy::seal_direct_within(self.ipfs_window_deadline)
@@ -7358,10 +7408,8 @@ impl NestIngest {
             progress.get_or_insert_with(|| crate::progress::Backfill::new("catching up", next, at));
             let to = (next + chunker.window() - 1).min(ceiling);
             self.metrics.set_fetch_window(chunker.window());
-            match self
-                .fetch_window(source, overlap_from(next, range_floor), to)
-                .await
-            {
+            let from = overlap_from(next, range_floor);
+            match self.fetch_window_with_overlap(source, next, from, to).await {
                 Ok(logs) => {
                     chunker.observed(logs.len() as u64);
                     let n = logs.len() as u64;
@@ -8070,8 +8118,9 @@ async fn index_loop(
         // fall-through matters more once #447 lands than it does today.
         // The tail of the previous window is asked for again (#1144); `process_window` drops the
         // rows the store already holds before anything is folded into a view.
+        let from = overlap_from(next, range_floor);
         let fetched = nest
-            .fetch_window(source.as_ref(), overlap_from(next, range_floor), to)
+            .fetch_window_with_overlap(source.as_ref(), next, from, to)
             .await;
         match fetched {
             Ok(logs) => {
@@ -20236,6 +20285,116 @@ template = "pool"
         .unwrap();
         assert_eq!(n_pipe, 60);
         assert_eq!(sealed(d_pipe.path()), sealed(d_honest.path()));
+    }
+
+    /// Serves any one block and refuses any wider range as over the cap, as a busy topic0 against a
+    /// 10,000-result cap does (#2679).
+    struct OneBlockAtATime(MockSource);
+
+    #[async_trait::async_trait]
+    impl Source for OneBlockAtATime {
+        async fn tip(&self) -> Result<u64> {
+            self.0.tip().await
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.0.block_hash(n).await
+        }
+        async fn logs(
+            &self,
+            filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            if to > from {
+                anyhow::bail!("query returned more than 10000 results");
+            }
+            self.0.logs(filter, from, to).await
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            self.0.block_timestamps(blocks).await
+        }
+    }
+
+    fn one_block_at_a_time(blocks: std::ops::RangeInclusive<u64>) -> OneBlockAtATime {
+        OneBlockAtATime(MockSource {
+            logs: blocks
+                .flat_map(|b| [transfer_log(b, 0), transfer_log(b, 1)])
+                .collect(),
+        })
+    }
+
+    /// #2679: a one-block window still asks for its overlap tail, so a provider refusing that
+    /// three-block request is not one refusing a single block, and the backfill carries on.
+    #[tokio::test]
+    async fn a_refused_overlap_at_one_block_is_not_a_block_over_the_cap() {
+        let (reg, addresses, topic0s) = erc20_registry_with_filters();
+        let d = tempfile::tempdir().unwrap();
+        let n = backfill_direct(
+            &one_block_at_a_time(10..=15),
+            &reg,
+            d.path(),
+            &addresses,
+            &topic0s,
+            &[],
+            None,
+            0,
+            10,
+            15,
+            1,
+            SPAN_OFF,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 12);
+    }
+
+    /// #2679 on the solo tip loop, where the refusal ended `nuthatch dev`.
+    #[tokio::test]
+    async fn the_tip_loop_survives_a_refused_overlap_at_one_block() {
+        let d = tempfile::tempdir().unwrap();
+        let nest = build_test_nest(d.path(), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
+        let store = nest.store.clone();
+        let task = tokio::spawn(index_loop(
+            Arc::new(one_block_at_a_time(10..=20)),
+            nest,
+            Some(5),
+            false,
+            1,
+            1,
+        ));
+        wait_for(
+            "block 20's rows",
+            std::time::Duration::from_secs(20),
+            || task.is_finished() || store.entities_in_range(20, 20).unwrap().len() == 2,
+        )
+        .await;
+        assert!(!task.is_finished(), "{:?}", task.await);
+        task.abort();
+        assert_eq!(store.entities_in_range(15, 20).unwrap().len(), 12);
+    }
+
+    /// #2679 on a live mount's catch-up, which runs the same window path.
+    #[tokio::test]
+    async fn catch_up_survives_a_refused_overlap_at_one_block() {
+        let d = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(d.path(), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
+        let cursor_at = || Some(30u64);
+        let wanted = || true;
+        let join = CatchUp {
+            cursor_at: &cursor_at,
+            wanted: &wanted,
+        };
+        let next = nest
+            .catch_up(&one_block_at_a_time(10..=40), 12, 1, &join)
+            .await
+            .unwrap();
+        assert_eq!(next, 30);
+        assert_eq!(nest.store.entities_in_range(12, 29).unwrap().len(), 36);
     }
 
     /// #1169 / #1170. What the pipelined backfill tells its caller: every progress tick carries the
