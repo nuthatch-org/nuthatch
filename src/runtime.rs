@@ -3502,6 +3502,7 @@ pub fn lifecycle_routes(
         let mut job = MountJob::new(&body.name, nid_str.as_deref(), MountPhase::Accepted);
         job.seed = body.seed;
         job.publish = body.publish;
+        job.config = (!config.is_empty()).then_some(config);
         let job = match jobs.claim(job) {
             Ok(job) => job,
             Err(ClaimError::Persist(e)) => return write_failed(&e),
@@ -5858,6 +5859,17 @@ pub async fn start_mount_jobs(
                 }
                 (_, nid) => {
                     let generation = job.generation;
+                    if let Some(config) = &job.config {
+                        let configured =
+                            handles
+                                .lock()
+                                .await
+                                .configure_mount(&job.name, nid.as_ref(), config);
+                        if let Err(e) = configured {
+                            jobs.fail_if_owned(&job.name, generation, &e)?;
+                            continue;
+                        }
+                    }
                     spawn_mount_job(handles.clone(), jobs.clone(), job.name, nid, generation);
                 }
             }
@@ -6142,7 +6154,7 @@ pub fn spawn_move_job(
 
 /// What `POST /_admin/nests` and `PATCH /_admin/mounts/<name>` may set on a mount record
 /// (RFC-0073 FR3). Each field given replaces the record's; `limits` replaces the whole table.
-#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MountConfig {
     #[serde(default)]
