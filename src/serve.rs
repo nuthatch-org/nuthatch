@@ -4050,9 +4050,16 @@ async fn bounded_hot_read<T: Send + 'static>(
     }
     let permit = admit(s).await?;
     let cap = s.limits.max_hot_rows;
-    match crate::seal::spawn_blocking(move || read(cap)).await {
-        Ok(Ok(Some(rows))) => Ok((rows, Some(permit))),
-        Ok(Ok(None)) => Err((
+    // The permit moves into the scan, so a caller that stops waiting does not return it while the
+    // scan still runs (#2717).
+    let scan = crate::seal::spawn_blocking(move || {
+        let permit = permit;
+        (read(cap), permit)
+    })
+    .await;
+    match scan {
+        Ok((Ok(Some(rows)), permit)) => Ok((rows, Some(permit))),
+        Ok((Ok(None), _)) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
                 "error": crate::store::HotScanTooLarge { cap }.to_string(),
@@ -4060,7 +4067,7 @@ async fn bounded_hot_read<T: Send + 'static>(
             })),
         )
             .into_response()),
-        Ok(Err(e)) => Err(error(format!("{e:#}"))),
+        Ok((Err(e), _)) => Err(error(format!("{e:#}"))),
         Err(e) => Err(error(format!("{e}"))),
     }
 }
