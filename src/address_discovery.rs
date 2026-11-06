@@ -2597,8 +2597,8 @@ fn transfer_rows(
     Ok(true)
 }
 
-/// `TransferBatch` data: two dynamic `uint256[]`, ids then values, as decimal strings. `None` when
-/// the data is not two arrays of one length, which any contract may emit; only non-hex is an error.
+/// `TransferBatch` data: two dynamic `uint256[]`, ids then values, as decimal strings.
+/// `None` when the data is not two arrays of one length.
 fn batch_arrays(data: &str) -> Result<Option<(Vec<String>, Vec<String>)>> {
     let word = |i: usize| -> Option<&str> {
         data.get(i.checked_mul(64)?..i.checked_add(1)?.checked_mul(64)?)
@@ -3847,8 +3847,6 @@ mod tests {
         );
     }
 
-    /// Anyone can emit a `Transfer` naming a watched address with data no token would write: it is
-    /// skipped and counted, as Etherscan files no row for it, and the window records the rest.
     #[tokio::test]
     async fn a_transfer_log_with_short_data_is_skipped_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
