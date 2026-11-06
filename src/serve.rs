@@ -1289,9 +1289,10 @@ pub async fn bind_and_serve(
     // A loud one-liner when bound off-localhost: the guards bound *how much*, but *who* is the
     // operator's gateway's job - never expose this straight to the internet without one.
     if !is_localhost(listen) {
+        let concurrent = sql_max_concurrency();
         tracing::warn!(
             "listening on {listen} (not localhost): the /sql surface is guarded (timeout + row cap \
-             + {SQL_MAX_CONCURRENCY} concurrent) but has NO authentication - put a gateway in front \
+             + {concurrent} concurrent) but has NO authentication - put a gateway in front \
              before exposing it publicly. See docs/operators.md."
         );
     }
