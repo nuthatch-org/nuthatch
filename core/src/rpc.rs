@@ -1865,7 +1865,7 @@ impl<T: Transport> RpcClient<T> {
         let result = self
             .call("eth_getCode", json!([address, format!("0x{block:x}")]))
             .await?;
-        Ok(result.as_str().unwrap_or("0x").to_string())
+        code_of(&result)
     }
 
     /// Unix timestamps (seconds) for the given block numbers, fetched in a single JSON-RPC batch so
@@ -2716,6 +2716,27 @@ mod error_body_tests {
         let text = read_capped(Endless(Arc::clone(&read))).await;
         assert_eq!(text.len(), ERROR_BODY_MAX);
         assert!(read.load(Ordering::SeqCst) <= ERROR_BODY_MAX + 1024);
+    }
+}
+
+/// The bytecode in an `eth_getCode` result. A `null` or any non-string is an error, not empty code:
+/// reading it as `"0x"` would call a deployed contract undeployed (#2698).
+fn code_of(result: &Value) -> Result<String> {
+    result
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("eth_getCode returned {result}, not bytecode"))
+}
+
+#[cfg(test)]
+mod code_of_tests {
+    use super::code_of;
+    use serde_json::json;
+
+    #[test]
+    fn null_is_an_error_and_empty_code_is_not() {
+        assert_eq!(code_of(&json!("0x")).unwrap(), "0x");
+        assert!(code_of(&json!(null)).is_err());
     }
 }
 
