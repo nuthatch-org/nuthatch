@@ -998,6 +998,7 @@ fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result
 /// derived from the nest's own first table, plus a README. Idempotent: if `views/` already exists (an
 /// `add` on a nest whose author already wrote views), it's left untouched. The starter is entirely
 /// comments, so it's a no-op for the query surface and validates clean until the author uncomments it.
+/// The store and the admin token are local state, not nest inputs (#2722).
 fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result<()> {
     let attrs = dir.join(".gitattributes");
     if !attrs.exists() {
@@ -1006,8 +1007,7 @@ fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result
     }
     let ignore = dir.join(".gitignore");
     if !ignore.exists() {
-        std::fs::write(&ignore, nuthatch_scaffold::GITIGNORE)
-            .context("failed to write .gitignore")?;
+        std::fs::write(&ignore, nuthatch_scaffold::GITIGNORE).context("failed to write .gitignore")?;
     }
 
     let views = dir.join("views");
