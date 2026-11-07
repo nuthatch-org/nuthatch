@@ -1931,13 +1931,25 @@ pub fn promote_warm(
         let to = data.join(crate::seal::SEGMENTS_DIR);
         std::fs::create_dir_all(&to).with_context(|| format!("creating {}", to.display()))?;
         for segment in manifest.tables.values().flatten() {
+            anyhow::ensure!(
+                !segment.file.is_empty()
+                    && !segment.file.contains(['/', '\\'])
+                    && segment.file != "..",
+                "the followed catalogue names a segment outside its directory: {:?}",
+                segment.file
+            );
             let src = crate::seal::segment_path(&followed, &segment.file, &segment.hash);
-            std::fs::copy(&src, to.join(&segment.file)).with_context(|| {
+            let dst = to.join(&segment.file);
+            std::fs::copy(&src, &dst).with_context(|| {
                 format!(
                     "copying the followed segment {} for mount '{route}'",
                     src.display()
                 )
             })?;
+            // Durable before the catalogue that names it is installed (#2706).
+            std::fs::File::open(&dst)
+                .and_then(|f| f.sync_all())
+                .with_context(|| format!("syncing {}", dst.display()))?;
         }
         crate::seal::install_manifest(data, &manifest)?;
     }
