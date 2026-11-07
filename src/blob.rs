@@ -124,6 +124,8 @@ pub fn build_manifest(dir: &Path, skip_out: Option<&Path>) -> Result<Manifest> {
 
     let files = collect_files(dir, skip_out)?
         .into_iter()
+        // Local hygiene, not an authored input: a `.gitignore` must not move the nest's identity (#2722).
+        .filter(|path| path.file_name().and_then(|n| n.to_str()) != Some(".gitignore"))
         .map(|path| {
             let rel = path
                 .strip_prefix(dir)
