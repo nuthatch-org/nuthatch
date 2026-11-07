@@ -1006,7 +1006,8 @@ fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result
             .context("failed to write .gitattributes")?;
     }
     let ignore = dir.join(".gitignore");
-    if !ignore.exists() {
+    // A nest with a store already has an identity its data is keyed by; `add` must not move it.
+    if !ignore.exists() && !dir.join("data").exists() {
         std::fs::write(&ignore, nuthatch_scaffold::GITIGNORE)
             .context("failed to write .gitignore")?;
     }
