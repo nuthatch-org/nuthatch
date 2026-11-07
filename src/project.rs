@@ -1007,7 +1007,8 @@ fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result
     }
     let ignore = dir.join(".gitignore");
     if !ignore.exists() {
-        std::fs::write(&ignore, nuthatch_scaffold::GITIGNORE).context("failed to write .gitignore")?;
+        std::fs::write(&ignore, nuthatch_scaffold::GITIGNORE)
+            .context("failed to write .gitignore")?;
     }
 
     let views = dir.join("views");
@@ -1221,7 +1222,10 @@ fn copy_dir_except(src: &Path, dst: &Path, skip: &dyn Fn(&std::ffi::OsStr) -> bo
         if file_type.is_symlink() {
             // Following a link would copy whatever it points at into the nest, possibly from outside
             // it (#2692). A nest is plain files, so a link is refused rather than dereferenced.
-            anyhow::bail!("{} is a symbolic link; a nest cannot contain one", from.display());
+            anyhow::bail!(
+                "{} is a symbolic link; a nest cannot contain one",
+                from.display()
+            );
         }
         if file_type.is_dir() {
             copy_dir_except(&from, &to, skip)?;
