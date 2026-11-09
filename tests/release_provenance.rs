@@ -277,10 +277,15 @@ fn images_go_public_only_past_the_publish_gate() {
     let push = at("docker push");
     let attest = at("subject-digest:");
     let verify_image = at("gh attestation verify \"oci://");
+    let move_latest = at("- name: move :latest");
     let undraft = at("--draft=false");
     assert!(
-        verify < push && push < attest && attest < verify_image && verify_image < undraft,
-        "the publish job must verify the binaries, push, attest the pushed digest, verify that, and \
-         only then undraft (#2735)"
+        verify < push
+            && push < attest
+            && attest < verify_image
+            && verify_image < move_latest
+            && move_latest < undraft,
+        "the publish job must verify the binaries, push, attest the pushed digest, verify that, \
+         move :latest, and only then undraft (#2735)"
     );
 }

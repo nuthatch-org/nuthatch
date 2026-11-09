@@ -72,7 +72,7 @@ fn a_tag_that_is_not_a_plain_version_does_not_move_latest() {
     }
 }
 
-/// The workflow must ask the script, and its push step may name `latest` only on that answer.
+/// The workflow must ask the script, and `:latest` is pushed only in the step gated on that answer.
 #[test]
 fn release_yml_pushes_latest_only_on_the_scripts_answer() {
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml");
@@ -86,32 +86,30 @@ fn release_yml_pushes_latest_only_on_the_scripts_answer() {
             .any(|l| l.contains("scripts/release-latest.sh \"$GITHUB_REF_NAME\"")),
         "release.yml no longer asks scripts/release-latest.sh whether to move :latest (#2736)"
     );
-    let push: Vec<&&str> = code
+    let step: Vec<&&str> = code
         .iter()
-        .skip_while(|l| l.trim() != "- name: push the tested images")
+        .skip_while(|l| l.trim() != "- name: move :latest")
         .take_while({
             let mut first = true;
             move |l| std::mem::take(&mut first) || !l.starts_with("      - ")
         })
         .collect();
     assert!(
-        push.len() > 3,
-        "release.yml has no `push the tested images` step any more"
+        step.iter().any(|l| l.contains("steps.newest.outputs.move")),
+        "`:latest` is no longer gated on the script's answer (#2736)"
     );
-    let latest: Vec<&&str> = push
-        .into_iter()
-        .filter(|l| {
-            l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-                .any(|w| w == "latest")
-        })
+    assert!(
+        step.iter()
+            .any(|l| l.contains("docker push") && l.contains("latest")),
+        "the gated step no longer pushes :latest (#2736)"
+    );
+    let elsewhere: Vec<&&str> = code
+        .iter()
+        .filter(|l| !step.contains(l))
+        .filter(|l| (l.contains("docker tag") || l.contains("docker push")) && l.contains("latest"))
         .collect();
     assert!(
-        !latest.is_empty(),
-        "release.yml never pushes :latest, so this gate would pass vacuously"
-    );
-    assert!(
-        latest.iter().all(|l| l.contains("MOVE_LATEST")),
-        "these lines name `latest` outside the script's answer, so :latest can move for any tag \
-         (#2736):\n{latest:#?}"
+        elsewhere.is_empty(),
+        "these lines push :latest outside the step the script gates (#2736):\n{elsewhere:#?}"
     );
 }
