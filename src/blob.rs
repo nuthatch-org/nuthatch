@@ -1746,7 +1746,11 @@ abi = "abis/c.json"
         let before = nest_nid(a.path()).unwrap();
         std::fs::create_dir_all(a.path().join("docs")).unwrap();
         std::fs::write(a.path().join("docs/note.txt"), "plain\n").unwrap();
-        assert_ne!(nest_nid(a.path()).unwrap(), before);
+        let text = nest_nid(a.path()).unwrap();
+        assert_ne!(text, before);
+        // A leading BOM is valid UTF-8 and part of the hash. Dropping it would name another nest.
+        std::fs::write(a.path().join("docs/note.txt"), b"\xef\xbb\xbfplain\n").unwrap();
+        assert_ne!(nest_nid(a.path()).unwrap(), text);
         std::fs::write(a.path().join("docs/a.bin"), [0xff]).unwrap();
         let err = format!("{:#}", nest_nid(a.path()).unwrap_err());
         assert!(err.contains("docs/a.bin is not UTF-8"), "{err}");

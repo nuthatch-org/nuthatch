@@ -139,7 +139,8 @@ async function filesOf(nest) {
         // Same refusal as the node's manifest: lossy UTF-8 would hash other bytes (#2739).
         const bytes = readFileSync(`${nest}/${p}`);
         try {
-          out[p] = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+          // ignoreBOM: the default decoder drops a leading EF BB BF, and the node hashes it (#2739).
+          out[p] = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
         } catch {
           throw new Error(`${p} is not UTF-8`);
         }
