@@ -1945,23 +1945,14 @@ pub fn promote_warm(
 }
 
 /// Install a followed catalogue as this dataset's own. Names go through the catalogue check, and
-/// each file is hashed against its entry before it is published, so a torn or retargeted copy is
-/// not what the durable catalogue names (#2706).
+/// each file is hashed while it is copied, before the durable name exists, so a torn or retargeted
+/// copy is not what the catalogue names (#2706).
 fn install_followed_catalogue(followed: &Path, data: &Path, catalogue: &str) -> Result<()> {
-    use sha2::{Digest, Sha256};
     let manifest = crate::seal::parse_manifest(catalogue)?;
     let to = data.join(crate::seal::SEGMENTS_DIR);
     for segment in manifest.tables.values().flatten() {
         let src = crate::seal::segment_path(followed, &segment.file, &segment.hash);
-        let bytes = std::fs::read(&src).with_context(|| format!("reading {}", src.display()))?;
-        let got = hex::encode(Sha256::digest(&bytes));
-        anyhow::ensure!(
-            got == segment.hash,
-            "followed segment {} hashes to {got}, not {}",
-            segment.file,
-            segment.hash
-        );
-        crate::seal::publish_durable(&to, &segment.file, &bytes)?;
+        crate::seal::publish_verified(&to, &segment.file, &src, &segment.hash)?;
     }
     crate::seal::install_manifest(data, &manifest)
 }
@@ -8183,6 +8174,31 @@ mod tests {
         assert_eq!(
             std::fs::read(data.join("segments").join(&file)).unwrap(),
             b"the real bytes"
+        );
+
+        // Larger than one read, and then a torn copy of a file already published.
+        let mut big = vec![0u8; (1 << 16) + 3];
+        big[0] = 1;
+        big[1 << 16] = 2;
+        let big_hash = hex::encode(sha2::Sha256::digest(&big));
+        let big_file = format!("{big_hash}.parquet");
+        std::fs::write(followed.join("segments").join(&big_file), &big).unwrap();
+        let big_catalogue = format!(
+            r#"{{"tables":{{"transfers":[{{"hash":"{big_hash}","from_block":1,"to_block":1,"rows":1,"file":"{big_file}"}}]}}}}"#
+        );
+        install_followed_catalogue(&followed, &data, &big_catalogue).unwrap();
+        assert_eq!(
+            std::fs::read(data.join("segments").join(&big_file)).unwrap(),
+            big
+        );
+        std::fs::write(followed.join("segments").join(&big_file), b"torn").unwrap();
+        let err = install_followed_catalogue(&followed, &data, &big_catalogue)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hashes to"), "{err}");
+        assert_eq!(
+            std::fs::read(data.join("segments").join(&big_file)).unwrap(),
+            big
         );
 
         let outside = r#"{"tables":{"transfers":[{"hash":"abcd","from_block":1,"to_block":1,"rows":1,"file":"../nope.parquet"}]}}"#;

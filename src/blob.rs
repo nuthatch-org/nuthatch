@@ -2218,18 +2218,21 @@ cid_column = "cid"
             }
             let config = Config::load(dir.path()).unwrap();
             crate::project::refresh_stale_artifacts(dir.path(), &config).unwrap();
+            // `build_manifest` is what decides `.gitignore` is not an input (#2722).
+            std::fs::write(dir.path().join(".gitignore"), b"data/\n").unwrap();
             let m = build_manifest(dir.path(), None).unwrap();
-            let files = collect_files(dir.path(), None)
-                .unwrap()
-                .into_iter()
-                .filter(|p| p.file_name().and_then(|n| n.to_str()) != Some(".gitignore"))
-                .map(|p| {
-                    let rel = p
-                        .strip_prefix(dir.path())
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned();
-                    (rel, std::fs::read(&p).unwrap())
+            assert!(
+                m.files.iter().all(|f| f.path != ".gitignore"),
+                ".gitignore is an authored input"
+            );
+            let files = m
+                .files
+                .iter()
+                .map(|f| {
+                    (
+                        f.path.clone(),
+                        std::fs::read(dir.path().join(&f.path)).unwrap(),
+                    )
                 })
                 .collect();
             let tab = nuthatch_timelapse::manifest::identity(files).unwrap();
