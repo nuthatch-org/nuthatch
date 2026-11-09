@@ -28,13 +28,16 @@ pub const PROXY_BEACON_SLOT: &str =
 pub const IMPLEMENTATION_SELECTOR: &str = "0x5c60da1b";
 
 /// Extract a non-zero implementation address from a 32-byte storage word.
+///
+/// Anything else is not a proxy. Slicing the tail of an arbitrary string panics when the
+/// cut falls inside a character, and `init` dies on a bad RPC word (#2690).
 pub fn impl_from_slot(slot: &str) -> Option<String> {
     let h = slot.trim_start_matches("0x");
-    if h.len() < 40 {
+    if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let addr = &h[h.len() - 40..];
-    if addr.chars().all(|c| c == '0') {
+    let addr = &h[24..];
+    if addr.bytes().all(|b| b == b'0') {
         return None;
     }
     Some(format!("0x{addr}"))
@@ -147,4 +150,23 @@ pub fn pick_alias(
         }
     }
     Ok(next_c_alias(used, taken))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_storage_word_that_is_not_64_hex_digits_is_not_a_proxy() {
+        // "é" is two bytes. The old slice cut inside it and panicked init.
+        let split = format!("0xé{}", "0".repeat(39));
+        assert!(impl_from_slot(&split).is_none());
+        assert!(impl_from_slot(&format!("0x{}", "g".repeat(64))).is_none());
+        assert!(impl_from_slot(&format!("0x{}", "a".repeat(40))).is_none());
+        assert!(impl_from_slot("0x").is_none());
+        assert_eq!(
+            impl_from_slot("0x00000000000000000000000043506849d7c04f9138d1a2050bbf3a0c054402dd"),
+            Some("0x43506849d7c04f9138d1a2050bbf3a0c054402dd".into())
+        );
+    }
 }
