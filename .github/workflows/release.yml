@@ -479,7 +479,8 @@ jobs:
           echo "provenance verified for ${#files[@]} artifact(s)"
 
       # #2735: the images are pushed here, past the same gate as the binaries, and attested by the digest
-      # the registry now serves. A push or attestation that fails leaves the release a draft.
+      # the registry now serves. The push makes the image public at once. If the attestation or its
+      # check then fails, that image stays up, unattested, and the release stays a draft.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nuthatch-images

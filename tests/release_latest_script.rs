@@ -51,7 +51,10 @@ fn versions_compare_as_numbers_not_text() {
 #[test]
 fn a_prerelease_never_moves_latest() {
     assert_eq!(moves_latest("v9.9.9-rc.1", &SHIPPED), "false");
-    assert_eq!(moves_latest("v6.0.0-alpha.1", &["v5.17.2", "v6.0.0-alpha.1"]), "false");
+    assert_eq!(
+        moves_latest("v6.0.0-alpha.1", &["v5.17.2", "v6.0.0-alpha.1"]),
+        "false"
+    );
     // Nor does one already out stop the next stable release from moving it.
     assert_eq!(moves_latest("v5.18.0", &["v6.0.0-rc.1", "v5.17.2"]), "true");
 }
