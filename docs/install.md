@@ -101,6 +101,14 @@ with the error is welcome.
 ## Container images
 
 Published per release to `ghcr.io/nuthatch-org/nuthatch`: `:<version>` for embedded mode,
-`:<version>-scaled` for the scaled build. The image ships the same binary attached to the release, so
-the two cannot drift. Its base is `debian:bookworm-slim` (glibc 2.36), which must stay at or above the
-release builder's glibc.
+`:<version>-scaled` for the scaled build and `:<version>-flight` for Flight SQL. The image ships the
+same binary attached to the release, so the two cannot drift. Its base is `debian:bookworm-slim`
+(glibc 2.36), pinned by digest, which must stay at or above the release builder's glibc.
+`:latest` is the newest stable release: a prerelease or a patch on an older line never moves it.
+
+The images are pushed only once the release has passed every gate the binaries pass, and each pushed
+digest carries a build provenance attestation:
+
+```sh
+gh attestation verify oci://ghcr.io/nuthatch-org/nuthatch:<version> --repo nuthatch-org/nuthatch
+```

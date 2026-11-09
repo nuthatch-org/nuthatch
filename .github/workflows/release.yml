@@ -354,8 +354,9 @@ jobs:
             nuthatch-events.wasm
             nuthatch-engine.js
 
-  # Publish the container image (RFC-0005 release engineering). "Build it yourself from this Dockerfile"
-  # is not a deployment story for a platform team, which is what this closes.
+  # Build the container images (RFC-0005 release engineering). "Build it yourself from this Dockerfile"
+  # is not a deployment story for a platform team, which is what this closes. Nothing is pushed here:
+  # the tested images go to `publish` as an artifact and are pushed past its gate (#2735).
   container:
     name: container image
     needs: build
@@ -366,15 +367,6 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nuthatch-linux-binary
-      - name: log in to ghcr
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: version
-        id: v
-        run: echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       # Build locally, prove it runs, and only then publish - in that order. It used to push first and
       # smoke-test the pushed tag, which meant a failing test failed the *job* but left the broken image
       # public: v0.7.0 published a `:0.7.0` and a `:latest` that died with `GLIBC_2.38 not found`, and a
@@ -386,14 +378,6 @@ jobs:
         run: docker build --platform linux/amd64 -t nuthatch:candidate .
       - name: smoke-test before publishing
         run: docker run --rm nuthatch:candidate --version
-      - name: push the tested image
-        run: |
-          # `docker tag` of the smoke-tested image, not a rebuild: what ships is the exact thing that
-          # passed above, same digest.
-          for tag in "${{ steps.v.outputs.tag }}" latest; do
-            docker tag nuthatch:candidate "ghcr.io/${{ github.repository }}:$tag"
-            docker push "ghcr.io/${{ github.repository }}:$tag"
-          done
       # The scaled-mode image, tagged `-scaled`. Same Dockerfile, different binary. **Not** tagged
       # `latest`: the default image stays the one you get by not thinking about it, because embedded
       # mode is the primary deliverable and the scaled one carries a database driver.
@@ -402,7 +386,7 @@ jobs:
         with:
           name: nuthatch-scaled-binary
           path: scaled
-      - name: build, test and push the scaled image
+      - name: build and test the scaled image
         run: |
           cp scaled/nuthatch ./nuthatch
           docker build --platform linux/amd64 -t nuthatch:scaled .
@@ -412,8 +396,6 @@ jobs:
           docker run --rm nuthatch:scaled --version
           docker run --rm nuthatch:scaled worker --help > /dev/null
           docker run --rm nuthatch:scaled control --help > /dev/null
-          docker tag nuthatch:scaled "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-scaled"
-          docker push "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-scaled"
       # The flight image, tagged `-flight` and never `latest`, for the same reason as `-scaled`. Its
       # command is the default image's: an operator adds `--flight 0.0.0.0:8815` and publishes that port.
       - name: fetch the flight binary
@@ -421,28 +403,37 @@ jobs:
         with:
           name: nuthatch-flight-binary
           path: flight
-      - name: build, test and push the flight image
+      - name: build and test the flight image
         run: |
           cp flight/nuthatch ./nuthatch
           docker build --platform linux/amd64 -t nuthatch:flight .
           docker run --rm nuthatch:flight --version
           docker run --rm nuthatch:flight dev --help | grep -q -- '--flight'
-          docker tag nuthatch:flight "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-flight"
-          docker push "ghcr.io/${{ github.repository }}:${{ steps.v.outputs.tag }}-flight"
+      # `docker save` of the tested images, not a rebuild: `publish` pushes the exact images that passed.
+      # `pipefail`, because the default `bash -e` would let gzip succeed after `docker save` failed
+      # and upload a truncated archive (#2735).
+      - name: keep the tested images
+        run: |
+          set -o pipefail
+          docker save nuthatch:candidate nuthatch:scaled nuthatch:flight | gzip > nuthatch-images.tar.gz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nuthatch-images
+          path: nuthatch-images.tar.gz
+          retention-days: 7
 
-  # The release goes public here and nowhere else (#626). Everything above builds against a draft:
-  # five binary targets, three with their scaled, graph and flight variants, and three container images that are
-  # smoke-tested before they are pushed, and the embeddable engine's module, gated on the file that
-  # ships. Only when all of that has succeeded does the release stop being a draft.
+  # The release goes public here and nowhere else (#626), images included (#2735). Everything above
+  # builds against a draft: five binary targets, three with their scaled, graph and flight variants,
+  # three container images smoke-tested and held back, and the embeddable engine's module, gated on the
+  # file that ships. Only when all of that has succeeded are the images pushed and the release undrafted.
   #
   # `needs: container` rather than `needs: build`, and that is a deliberate choice rather than an
   # oversight: an image is part of what a release promises (RFC-0005), so a green matrix with a failed
-  # container job is an incomplete release and a human should decide what to do about it. Which they
-  # can, cheaply - the draft is sitting there with its notes and its binaries already attached, and
-  # the recovery is one command, stated here because a failure message that names an unreachable
-  # recovery path is worse than none:
-  #
-  #     gh release edit v<x.y.z> --draft=false
+  # container job is an incomplete release and a human should decide what to do about it. The draft
+  # has its binaries. It has no images until this job pushes them, and the tested images are kept for
+  # 7 days. `gh release edit v<x.y.z> --draft=false` publishes whatever is already true, so it is the
+  # recovery only after this job has verified the image attestations. Before that, re-run the failed
+  # job. A publish re-run within 7 days pushes the tested images. After that the tag has to be rebuilt.
   #
   # There is no `if: always()`. A failure upstream must leave this job unrun, because "publish it
   # anyway" is the exact behaviour the issue was filed about.
@@ -452,6 +443,8 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
+      # For scripts/release-latest.sh. First, because checkout cleans the workspace.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # #830 asks the workflow to verify artifact identity **before publishing**, which is the half
       # that makes an attestation load-bearing rather than decorative. This downloads the release's
       # own assets and verifies each against the transparency log - the same command a user runs, run
@@ -487,6 +480,81 @@ jobs:
             gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"
           done
           echo "provenance verified for ${#files[@]} artifact(s)"
+
+      # #2735: version tags are pushed here, past the same gate as the binaries, and attested by the
+      # digest the registry serves. The version tag is public before that attestation exists. `:latest`
+      # moves only after the attestation verifies, so a failed attest leaves it where it was and the
+      # release stays a draft.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nuthatch-images
+      - name: log in to ghcr
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # #2736: only the newest stable release moves `:latest`; a prerelease or an older line's patch does not.
+      - name: does this tag move :latest
+        id: newest
+        run: |
+          set -euo pipefail
+          move=$(git ls-remote --tags --refs origin 'v*' | sed 's#.*refs/tags/##' | scripts/release-latest.sh "$GITHUB_REF_NAME")
+          echo "$GITHUB_REF_NAME moves :latest: $move"
+          echo "move=$move" >> "$GITHUB_OUTPUT"
+      - name: push the tested images
+        id: push
+        run: |
+          set -euo pipefail
+          gunzip -c nuthatch-images.tar.gz | docker load
+          repo="ghcr.io/$GITHUB_REPOSITORY" v="${GITHUB_REF_NAME#v}"
+          push() {
+            local image=$1 out=$2 digest=''
+            shift 2
+            for tag in "$@"; do
+              docker tag "$image" "$repo:$tag"
+              digest=$(docker push "$repo:$tag" | tee /dev/stderr | grep -oE 'digest: sha256:[0-9a-f]{64}' | cut -d' ' -f2)
+            done
+            echo "$out=$digest" >> "$GITHUB_OUTPUT"
+          }
+          push nuthatch:candidate default "$v"
+          push nuthatch:scaled scaled "$v-scaled"
+          push nuthatch:flight flight "$v-flight"
+      - name: attest the image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.default }}
+      - name: attest the scaled image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.scaled }}
+      - name: attest the flight image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.flight }}
+      - name: verify the images' provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGESTS: ${{ steps.push.outputs.default }} ${{ steps.push.outputs.scaled }} ${{ steps.push.outputs.flight }}
+        run: |
+          set -euo pipefail
+          for d in $DIGESTS; do
+            gh attestation verify "oci://ghcr.io/$GITHUB_REPOSITORY@$d" --repo "$GITHUB_REPOSITORY"
+          done
+
+      # #2736: `:latest` moves only once that attestation has verified, and only when this tag is the
+      # highest stable release. The digest is the one just attested. A failed attest leaves :latest
+      # where it was.
+      - name: move :latest
+        if: steps.newest.outputs.move == 'true'
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/$GITHUB_REPOSITORY"
+          docker tag nuthatch:candidate "$repo:latest"
+          docker push "$repo:latest"
 
       - name: undraft
         env:

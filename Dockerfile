@@ -7,7 +7,8 @@
 #
 # Deliberately not a builder-stage image: a from-source build here would recompile DataFusion and dbsp on
 # every tag for no benefit, and would make the image's provenance harder to state, not easier.
-FROM debian:bookworm-slim
+# Pinned by digest (#2735) so two builds of one tag share their base; Dependabot moves the pin.
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 # The MCP Registry verifies an image belongs to its entry (server.json) by this label.
 LABEL io.modelcontextprotocol.server.name="io.github.nuthatch-org/nuthatch"

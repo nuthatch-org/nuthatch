@@ -253,3 +253,39 @@ fn a_dispatch_never_releases() {
         "these steps would release from a workflow_dispatch dry run: {ungated:?}"
     );
 }
+
+/// #2735: an image is part of the release, so it goes public at the same gate as the binaries. No
+/// job before `publish` may push one; `publish` pushes only after provenance verifies, attests each
+/// pushed digest, verifies that attestation, and only then undrafts.
+#[test]
+fn images_go_public_only_past_the_publish_gate() {
+    let s = release_yml();
+    let (before, publish) = s
+        .split_once("\n  publish:")
+        .expect("release.yml has no `publish:` job any more");
+    assert!(
+        !before.contains("docker push"),
+        "an image is pushed before the publish gate, so a failed engine or provenance check still \
+         leaves it public (#2735)"
+    );
+    let at = |needle: &str| {
+        publish
+            .find(needle)
+            .unwrap_or_else(|| panic!("the publish job has no `{needle}` (#2735)\n{publish}"))
+    };
+    let verify = at("gh attestation verify");
+    let push = at("docker push");
+    let attest = at("subject-digest:");
+    let verify_image = at("gh attestation verify \"oci://");
+    let move_latest = at("- name: move :latest");
+    let undraft = at("--draft=false");
+    assert!(
+        verify < push
+            && push < attest
+            && attest < verify_image
+            && verify_image < move_latest
+            && move_latest < undraft,
+        "the publish job must verify the binaries, push, attest the pushed digest, verify that, \
+         move :latest, and only then undraft (#2735)"
+    );
+}

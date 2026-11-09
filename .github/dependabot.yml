@@ -28,3 +28,10 @@ updates:
       #
       # Raising these two pins is a hand job, and a rare one: the action changes about twice a year.
       - dependency-name: dtolnay/rust-toolchain
+  # The Dockerfile's base is pinned by digest (#2735); this is what moves it when Debian patches it.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
