@@ -125,6 +125,11 @@ pub fn build_manifest(dir: &Path, skip_out: Option<&Path>) -> Result<Manifest> {
                 .to_string_lossy()
                 .replace('\\', "/"); // stable path separator across platforms
             let bytes = std::fs::read(&path).with_context(|| format!("reading {rel}"))?;
+            // The engine keeps these files as text. A lossy read would hash other bytes and name
+            // another nest (#2739).
+            if std::str::from_utf8(&bytes).is_err() {
+                bail!("{rel} is not UTF-8");
+            }
             Ok((rel, bytes))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1730,6 +1735,21 @@ abi = "abis/c.json"
         std::os::unix::fs::symlink(other.path(), a.path().join("checkpoints")).unwrap();
         let err = format!("{:#}", nest_nid(a.path()).unwrap_err());
         assert!(err.contains("checkpoints is a symbolic link"), "{err}");
+    }
+
+    /// #2739: a binary file is hashed raw by this process and as replacement characters by the
+    /// engine. Refuse it by name so the two cannot publish two NIDs for one directory.
+    #[test]
+    fn a_non_utf8_file_is_refused_by_name() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        let before = nest_nid(a.path()).unwrap();
+        std::fs::create_dir_all(a.path().join("docs")).unwrap();
+        std::fs::write(a.path().join("docs/note.txt"), "plain\n").unwrap();
+        assert_ne!(nest_nid(a.path()).unwrap(), before);
+        std::fs::write(a.path().join("docs/a.bin"), [0xff]).unwrap();
+        let err = format!("{:#}", nest_nid(a.path()).unwrap_err());
+        assert!(err.contains("docs/a.bin is not UTF-8"), "{err}");
     }
 
     #[test]
