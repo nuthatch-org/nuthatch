@@ -5955,6 +5955,29 @@ async fn logs_with_retry(
     }
 }
 
+/// [`logs_with_retry`] for a window starting at `next`, asked from `from`. A cap refusal of the
+/// overlapped request is split per block, as [`logs_with_overlap`] does, so the factory backfill
+/// keeps its transient retry (#2751).
+async fn logs_with_retry_overlap(
+    source: &dyn Source,
+    filter: &LogFilter,
+    next: u64,
+    from: u64,
+    to: u64,
+    base: std::time::Duration,
+) -> Result<Vec<crate::rpc::Log>> {
+    match logs_with_retry(source, filter, from, to, base).await {
+        Err(e) if overlap_refused(&e, next, from, to) => {
+            let mut logs = Vec::new();
+            for b in from..=to {
+                logs.extend(logs_with_retry(source, filter, b, b, base).await?);
+            }
+            Ok(logs)
+        }
+        r => r,
+    }
+}
+
 /// Concurrent-fetch variant of [`backfill_direct`]: up to `concurrency` window fetches are in flight
 /// at once (overlapping the RPC round-trip latency that dominates once the storage path is cheap),
 /// while results are consumed strictly **in block order** - so the buffered rows, the batch
@@ -6569,8 +6592,15 @@ pub async fn backfill_direct_factory_with(
             let logs1 = match LogFilter::new(&current, topic0s) {
                 None => Vec::new(),
                 Some(pass1) => {
-                    match logs_with_retry(source, &pass1, fetch_from, chunk_to, BACKFILL_RETRY_BASE)
-                        .await
+                    match logs_with_retry_overlap(
+                        source,
+                        &pass1,
+                        next,
+                        fetch_from,
+                        chunk_to,
+                        BACKFILL_RETRY_BASE,
+                    )
+                    .await
                     {
                         Ok(l) => {
                             chunker.observed(l.len() as u64);
@@ -6595,7 +6625,16 @@ pub async fn backfill_direct_factory_with(
             if let Some(w) = &wide {
                 let f = LogFilter::new(&[], &w.topic0s)
                     .expect("a wide template decodes at least one event");
-                match logs_with_retry(source, &f, fetch_from, chunk_to, BACKFILL_RETRY_BASE).await {
+                match logs_with_retry_overlap(
+                    source,
+                    &f,
+                    next,
+                    fetch_from,
+                    chunk_to,
+                    BACKFILL_RETRY_BASE,
+                )
+                .await
+                {
                     Ok(l) => {
                         chunker.observed(l.len() as u64);
                         all_logs.extend(l);
@@ -6651,9 +6690,10 @@ pub async fn backfill_direct_factory_with(
                 // the every-log-on-the-chain request that `LogFilter` refuses to build.
                 let child_filter = LogFilter::new(&new, topic0s)
                     .expect("child filter has a non-empty address list");
-                let more = match logs_with_retry(
+                let more = match logs_with_retry_overlap(
                     source,
                     &child_filter,
+                    next,
                     fetch_from,
                     chunk_to,
                     BACKFILL_RETRY_BASE,
@@ -20397,6 +20437,60 @@ template = "pool"
         .await
         .unwrap();
         assert_eq!(n, 12);
+    }
+
+    /// #2751: the factory seal-direct backfill asks the same overlapped window. A provider refusing
+    /// that request is not one refusing the block alone.
+    #[tokio::test]
+    async fn a_factory_backfill_survives_a_refused_overlap_at_one_block() {
+        let (reg, _addresses, topic0s) = erc20_registry_with_filters();
+        let config: Config = toml::from_str(
+            r#"
+[nest]
+name="t"
+chain="mainnet"
+chain_id=1
+rpc_urls=["https://rpc"]
+[[contracts]]
+alias="usdc"
+address="0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+abi="abis/u.json"
+[[templates]]
+name="pool"
+abi="abis/p.json"
+[[factories]]
+watch="usdc"
+event="PoolCreated"
+child_param="pool"
+template="pool"
+"#,
+        )
+        .unwrap();
+        let fs = FactorySet::build(&config).unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let mut children = ChildRegistry::new();
+        let n = backfill_direct_factory(
+            &one_block_at_a_time(10..=15),
+            &reg,
+            &fs,
+            &mut children,
+            d.path(),
+            &topic0s,
+            &[],
+            None,
+            0,
+            10,
+            15,
+            1,
+            SPAN_OFF,
+            false,
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 12);
+        assert_eq!(children.len(), 0);
     }
 
     /// #2679 on the solo tip loop, where the refusal ended `nuthatch dev`.
