@@ -377,6 +377,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
     };
     let mut records: Vec<Mount> = Vec::new();
     let mut refused: Vec<&str> = Vec::new();
+    let mut unmigrated: Vec<String> = Vec::new();
     for p in &plans {
         match p {
             Plan::AlreadyMigrated { tenant, alias, nid } => {
@@ -455,7 +456,19 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
                 }
                 records.push(record(tenant, alias, nid));
             }
-            Plan::Refuse { alias, .. } => refused.push(alias),
+            Plan::Refuse { tenant, alias, .. } => {
+                // Refused is not unmounted: a record stays as written and a pre-2.0 name stays in
+                // `nests`, so repairing the nest and rerunning picks it up (#2684).
+                match table
+                    .mounts
+                    .iter()
+                    .find(|m| &m.tenant == tenant && &m.alias == alias)
+                {
+                    Some(m) => records.push(m.clone()),
+                    None => unmigrated.push(alias.clone()),
+                }
+                refused.push(alias);
+            }
         }
     }
 
@@ -475,7 +488,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
         );
     }
 
-    let removed_legacy = write_mounts(dir, &records)?;
+    let removed_legacy = write_mounts(dir, &records, &unmigrated)?;
     println!(
         "\nWrote {} mount record(s) to {MOUNTS_FILE}.",
         records.len()
@@ -493,7 +506,7 @@ pub fn run(dir: &Path, dry_run: bool, allow_breaking: bool) -> Result<()> {
     if !refused.is_empty() {
         bail!(
             "migrated what could be migrated, but refused: {}. \
-             The mounts still serves - un-migrated nests resolve through the old layout.",
+             They stay mounted as they were: repair them and run `nuthatch migrate` again.",
             refused.join(", ")
         );
     }
@@ -575,10 +588,25 @@ fn relocate(from: &Path, to: &Path) -> Result<()> {
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
     }
-    // Cross-device, or a rename the platform refused. Copy, then remove the source only once the
-    // copy is complete - so an interruption leaves the source intact and the run simply repeatable.
-    crate::project::copy_dir(from, to)
-        .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+    copy_into_place(from, to)
+}
+
+/// Cross-device, or a rename the platform refused. The copy goes to a sibling and is renamed into place
+/// only once complete: a partial `data/<nid>` would read on a retry as a finished dataset (#2689).
+fn copy_into_place(from: &Path, to: &Path) -> Result<()> {
+    let staging = to.with_extension("migrating");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .with_context(|| format!("clearing an interrupted copy at {}", staging.display()))?;
+    }
+    if let Err(e) = crate::project::copy_dir(from, &staging) {
+        std::fs::remove_dir_all(&staging).ok();
+        return Err(e).with_context(|| format!("copying {} to {}", from.display(), to.display()));
+    }
+    if let Err(e) = std::fs::rename(&staging, to) {
+        std::fs::remove_dir_all(&staging).ok();
+        return Err(e).with_context(|| format!("moving {} into place", to.display()));
+    }
     std::fs::remove_dir_all(from)
         .with_context(|| format!("removing {} after copying it", from.display()))?;
     Ok(())
@@ -663,7 +691,7 @@ fn safe_to_drop_local(src: &Path, dest: &Path, hash: &str) -> bool {
 }
 
 /// Rewrite `mounts.toml` with the mount records, temp-then-rename so a crash cannot truncate it.
-fn write_mounts(dir: &Path, records: &[Mount]) -> Result<bool> {
+fn write_mounts(dir: &Path, records: &[Mount], unmigrated: &[String]) -> Result<bool> {
     // Read whichever file this directory has - the migration's whole job is that it may still be the
     // pre-2.0 one - and always *write* the 2.0 name.
     let legacy = dir.join(LEGACY_ROOST_FILE);
@@ -687,9 +715,9 @@ fn write_mounts(dir: &Path, records: &[Mount]) -> Result<bool> {
         mounts.runtime.chain_id = None;
         mounts.runtime.rpc_urls.clear();
     }
-    // `nests` was the pre-2.0 way to say what is mounted; the records are authoritative now, and a
-    // stale list beside them would lie.
-    mounts.runtime.nests.clear();
+    // `nests` was the pre-2.0 way to say what is mounted; the records are authoritative now, so only
+    // a name refused before it got a record stays listed.
+    mounts.runtime.nests = unmigrated.to_vec();
     mounts.validate_mounts().with_context(|| {
         format!("the rewritten mount table is invalid, so {MOUNTS_FILE} was left as it was")
     })?;
@@ -1403,6 +1431,36 @@ mod tests {
     ///
     /// This was found the useful way round: the first version of the test above used a made-up hash,
     /// and `safe_to_drop_local` refused to delete anything - correctly.
+    /// A copy that fails part-way leaves no `data/<nid>` behind (#2689). It used to copy straight into
+    /// the destination, which a retry then took for a complete dataset and merged onto.
+    #[test]
+    fn an_interrupted_copy_leaves_no_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let from = d.path().join(NESTS_DIR).join("a");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("nuthatch.toml"), "x").unwrap();
+        let unreadable = from.join("store.redb");
+        std::fs::write(&unreadable, "y").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let to = d.path().join(DATA_DIR).join("n");
+
+        copy_into_place(&from, &to).unwrap_err();
+
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !to.exists(),
+            "a partial copy must not sit at the destination"
+        );
+        assert!(from.join("store.redb").exists(), "the source must survive");
+
+        // The retry starts over rather than building on the leftovers.
+        copy_into_place(&from, &to).unwrap();
+        assert_eq!(std::fs::read_to_string(to.join("store.redb")).unwrap(), "y");
+        assert!(!from.exists());
+        assert_eq!(walkdir(d.path().join(DATA_DIR).as_path()).len(), 2);
+    }
+
     #[test]
     fn a_local_copy_is_never_dropped_against_an_unverifiable_shared_one() {
         let d = tempfile::tempdir().unwrap();
@@ -1475,6 +1533,76 @@ mod tests {
         assert!(mounts
             .dir_for(d.path(), "broken")
             .starts_with(d.path().join(NESTS_DIR)));
+    }
+
+    /// A refused nest stays mounted, so repairing it and rerunning migrates it (#2684). It used to be
+    /// dropped from both the records and `nests`, unmounting it while the error said it still served.
+    #[test]
+    fn a_refused_nest_stays_mounted_and_a_rerun_after_repair_migrates_it() {
+        let d = tempfile::tempdir().unwrap();
+        write_roost(
+            d.path(),
+            &[
+                ("good", "0x0000000000000000000000000000000000000001"),
+                ("broken", "0x0000000000000000000000000000000000000002"),
+            ],
+        );
+        let cfg = d
+            .path()
+            .join(NESTS_DIR)
+            .join("broken")
+            .join("nuthatch.toml");
+        let saved = std::fs::read_to_string(&cfg).unwrap();
+        std::fs::remove_file(&cfg).unwrap();
+
+        run(d.path(), false, false).unwrap_err();
+        let aliases = |d: &Path| -> Vec<String> {
+            MountTable::load_for_migration(d)
+                .unwrap()
+                .mount_refs()
+                .into_iter()
+                .map(|m| m.alias)
+                .collect()
+        };
+        assert_eq!(aliases(d.path()), ["good", "broken"]);
+
+        std::fs::write(&cfg, saved).unwrap();
+        run(d.path(), false, false).unwrap();
+        let mounts = MountTable::load(d.path()).unwrap();
+        assert_eq!(aliases(d.path()), ["good", "broken"]);
+        assert!(mounts.runtime.nests.is_empty());
+        assert!(mounts
+            .dir_for(d.path(), "broken")
+            .starts_with(d.path().join(DATA_DIR)));
+    }
+
+    /// A 2.0 record refused because neither its dataset nor a staged nest exists is kept as written,
+    /// not deleted from the table (#2684).
+    #[test]
+    fn a_refused_record_is_kept_verbatim() {
+        let d = tempfile::tempdir().unwrap();
+        write_roost(
+            d.path(),
+            &[
+                ("a", "0x0000000000000000000000000000000000000001"),
+                ("b", "0x0000000000000000000000000000000000000002"),
+            ],
+        );
+        run(d.path(), false, false).unwrap();
+        let mut mounts = MountTable::load(d.path()).unwrap();
+        mounts.mounts[1].sql = crate::allowlist::SqlAccess::Deny;
+        let before = mounts.mounts.clone();
+        std::fs::write(
+            d.path().join(MOUNTS_FILE),
+            toml::to_string_pretty(&mounts).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(d.path().join(DATA_DIR).join(&before[1].nid)).unwrap();
+
+        let err = run(d.path(), false, false).unwrap_err().to_string();
+        assert!(err.contains('b'), "{err}");
+
+        assert_eq!(MountTable::load(d.path()).unwrap().mounts, before);
     }
 
     /// #2362: an adopt takes the source's data and nothing it authored, so a file the new version
