@@ -2431,6 +2431,59 @@ async fn a_restart_resumes_an_interrupted_mount() {
     );
 }
 
+/// #2682: a mount accepted with an SQL surface and limits resumes with them after a restart, not
+/// open under the process limits. The 202's job is what the claim persisted, so it is the job file the
+/// killed process would have left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_resumes_an_interrupted_mount_with_its_sql_and_limits() {
+    let registry = tempfile::tempdir().unwrap();
+    let nid = registry_with_one_nest(registry.path()).await;
+    let killed = tempfile::tempdir().unwrap();
+    let (mut first, _tape, _intake) = empty_runtime(killed.path(), &nid).await;
+    std::fs::remove_dir_all(runtime::MountTable::data_dir(killed.path(), &nid)).unwrap();
+    first.mount_ctx.registry = Some(tempfile::tempdir().unwrap().keep().display().to_string());
+    let first = Arc::new(tokio::sync::Mutex::new(first));
+    let jobs = runtime::start_mount_jobs(killed.path(), &first, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(first, jobs, true, Some(OPEN.into()));
+    let body =
+        format!(r#"{{"name":"capped","nid":"{nid}","sql":"deny","limits":{{"max_rows":1}}}}"#);
+    let (code, accepted) = call(&routes, "POST", "/_admin/nests", None, Some(&body)).await;
+    assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{accepted}");
+
+    let roost = tempfile::tempdir().unwrap();
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    std::fs::remove_dir_all(runtime::MountTable::data_dir(roost.path(), &nid)).unwrap();
+    handles.mount_ctx.registry = Some(registry.path().to_str().unwrap().to_string());
+    std::fs::write(
+        roost.path().join(nuthatch::mount_jobs::JOBS_FILE),
+        format!("[{accepted}]"),
+    )
+    .unwrap();
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs, true, Some(OPEN.into()));
+    let job = wait_for_phase(&routes, "capped", "live").await;
+    assert_eq!(job["phase"], "live", "not resumed: {job}");
+
+    let h = handles.lock().await;
+    assert_eq!(
+        surface_of(&h, "capped").access,
+        nuthatch::allowlist::SqlAccess::Deny
+    );
+    assert_ne!(
+        status(&h.live, "/capped/sql?q=SELECT%201").await,
+        axum::http::StatusCode::OK,
+        "a mount accepted with sql = deny answered free-form SQL after the restart"
+    );
+    let record = h.record("capped").expect("the resumed mount has no record");
+    assert_eq!(record.sql, nuthatch::allowlist::SqlAccess::Deny);
+    assert_eq!(record.limits.max_rows, Some(1));
+}
+
 /// `empty_runtime` with a `mounts.toml` declaring its chain, and `usdc` mounted and at the tip.
 async fn one_live_mount(
     roost: &std::path::Path,
