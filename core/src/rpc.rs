@@ -40,6 +40,23 @@ pub async fn retry_pause(pause: Duration) {
 /// a node. Splitting into bounded sub-batches keeps each request within common limits.
 pub const MAX_TIMESTAMP_BATCH: usize = 200;
 
+/// The most of a non-2xx body that is read. It is evidence for the classifier, never a payload, so an
+/// endpoint that streams an error page cannot make the client buffer it whole (#2701).
+const ERROR_BODY_MAX: usize = 64 * 1024;
+
+/// The first [`ERROR_BODY_MAX`] bytes of a failed response, read without buffering the rest.
+async fn read_capped(mut resp: impl Reply) -> String {
+    let mut body = Vec::new();
+    while body.len() < ERROR_BODY_MAX {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    body.truncate(ERROR_BODY_MAX);
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 /// The most of one multi-item `eth_getBlockByNumber` or `eth_call` batch body read before the batch is
 /// narrowed (#2227). Every transaction hash rides in a header, so without it a dense chain at
 /// `--concurrency 8` held over 2 GB of headers in flight.
@@ -535,6 +552,8 @@ pub fn looks_like_cap(body: &str) -> bool {
         "beyond current head",
         "beyond the current head",
         "beyond head",
+        // Malformed range, not a range too wide: the bare "block range" marker below would match (#2696).
+        "invalid block range",
     ];
     if NOT_CAP.iter().any(|m| s.contains(m)) {
         return false;
@@ -1367,7 +1386,7 @@ impl<T: Transport> RpcClient<T> {
         if !(200..300).contains(&status) {
             // Read the body before classifying: a 413 can carry a suggested range, and the text is
             // what makes an otherwise opaque status actionable in the log.
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_capped(resp).await;
             // **The body is classified on a non-2xx too** (RFC-0029 §6a). It used to be inspected only
             // on a 2xx, on the assumption - measured, and correct for the endpoint it was measured
             // against - that providers signal an oversized range as HTTP 200 carrying a JSON-RPC error.
@@ -1848,7 +1867,7 @@ impl<T: Transport> RpcClient<T> {
         let result = self
             .call("eth_getCode", json!([address, format!("0x{block:x}")]))
             .await?;
-        Ok(result.as_str().unwrap_or("0x").to_string())
+        code_of(&result)
     }
 
     /// Unix timestamps (seconds) for the given block numbers, fetched in a single JSON-RPC batch so
@@ -2653,6 +2672,84 @@ impl<T: Transport> crate::source::Source for RpcClient<T> {
             to,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod error_body_tests {
+    use super::{read_capped, ERROR_BODY_MAX};
+    use crate::transport::{Reply, TransportError};
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// An error page that never ends, counting how much of it was read.
+    struct Endless(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Reply for Endless {
+        fn status(&self) -> u16 {
+            500
+        }
+        fn status_line(&self) -> String {
+            "500 Internal Server Error".into()
+        }
+        fn retry_after(&self) -> Option<String> {
+            None
+        }
+        fn content_length(&self) -> Option<u64> {
+            None
+        }
+        async fn text(self) -> Result<String, TransportError> {
+            unreachable!("a failed response is read through `chunk`")
+        }
+        async fn json(self) -> Result<Value, TransportError> {
+            unreachable!("a failed response is read through `chunk`")
+        }
+        async fn chunk(&mut self) -> Result<Option<bytes::Bytes>, TransportError> {
+            self.0.fetch_add(1024, Ordering::SeqCst);
+            Ok(Some(bytes::Bytes::from(vec![b'x'; 1024])))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_endless_error_body_is_read_only_as_far_as_the_cap() {
+        let read = Arc::new(AtomicUsize::new(0));
+        let text = read_capped(Endless(Arc::clone(&read))).await;
+        assert_eq!(text.len(), ERROR_BODY_MAX);
+        assert!(read.load(Ordering::SeqCst) <= ERROR_BODY_MAX + 1024);
+    }
+}
+
+/// The bytecode in an `eth_getCode` result. A `null` or any non-string is an error, not empty code:
+/// reading it as `"0x"` would call a deployed contract undeployed (#2698).
+fn code_of(result: &Value) -> Result<String> {
+    result
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("eth_getCode returned {result}, not bytecode"))
+}
+
+#[cfg(test)]
+mod looks_like_cap_tests {
+    use super::looks_like_cap;
+
+    #[test]
+    fn a_malformed_range_is_not_a_cap() {
+        assert!(!looks_like_cap("invalid block range params"));
+        assert!(looks_like_cap("block range is too wide, max 10000"));
+    }
+}
+
+#[cfg(test)]
+mod code_of_tests {
+    use super::code_of;
+    use serde_json::json;
+
+    #[test]
+    fn null_is_an_error_and_empty_code_is_not() {
+        assert_eq!(code_of(&json!("0x")).unwrap(), "0x");
+        assert!(code_of(&json!(null)).is_err());
     }
 }
 

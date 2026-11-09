@@ -124,6 +124,8 @@ pub fn build_manifest(dir: &Path, skip_out: Option<&Path>) -> Result<Manifest> {
 
     let files = collect_files(dir, skip_out)?
         .into_iter()
+        // Local hygiene, not an authored input: a `.gitignore` must not move the nest's identity (#2722).
+        .filter(|path| path.file_name().and_then(|n| n.to_str()) != Some(".gitignore"))
         .map(|path| {
             let rel = path
                 .strip_prefix(dir)
@@ -1147,7 +1149,7 @@ abi = "abis/c.json"
         .collect();
         let want = [
             (
-                "a0be1608eff7220aaf762ca91a2b987b15c5ab8127f350d1ef67af150fcd1522",
+                "944109352f7e5e92e6307a14ce70c0b58c01f69c4d95644af5fa0bc91755ecad",
                 "1bc66ea1d7ce3e8eb21b2e9c1b9156d1688e77d9c1d7d9c7fc767c86add0d1f0",
             ),
             (
@@ -1374,9 +1376,12 @@ abi = "abis/c.json"
         let a = tempfile::tempdir().unwrap();
         write_nest(a.path());
         let before = build_manifest(a.path(), None).unwrap();
+        std::fs::write(a.path().join(".gitignore"), b"target/\n").unwrap();
+        let ignored = build_manifest(a.path(), None).unwrap();
+        assert_eq!(ignored.nid(), before.nid(), ".gitignore moved the NID");
+        assert_eq!(ignored.data_identity(), before.data_identity());
         std::fs::create_dir_all(a.path().join(".duckdb/extensions")).unwrap();
         std::fs::write(a.path().join(".duckdb/extensions/icu"), b"x").unwrap();
-        std::fs::write(a.path().join(".gitignore"), b"target/\n").unwrap();
         std::fs::create_dir_all(a.path().join("abis/.cache")).unwrap();
         std::fs::write(a.path().join("abis/.cache/x"), b"y").unwrap();
         let after = build_manifest(a.path(), None).unwrap();
@@ -2213,17 +2218,21 @@ cid_column = "cid"
             }
             let config = Config::load(dir.path()).unwrap();
             crate::project::refresh_stale_artifacts(dir.path(), &config).unwrap();
+            // `build_manifest` is what decides `.gitignore` is not an input (#2722).
+            std::fs::write(dir.path().join(".gitignore"), b"data/\n").unwrap();
             let m = build_manifest(dir.path(), None).unwrap();
-            let files = collect_files(dir.path(), None)
-                .unwrap()
-                .into_iter()
-                .map(|p| {
-                    let rel = p
-                        .strip_prefix(dir.path())
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned();
-                    (rel, std::fs::read(&p).unwrap())
+            assert!(
+                m.files.iter().all(|f| f.path != ".gitignore"),
+                ".gitignore is an authored input"
+            );
+            let files = m
+                .files
+                .iter()
+                .map(|f| {
+                    (
+                        f.path.clone(),
+                        std::fs::read(dir.path().join(&f.path)).unwrap(),
+                    )
                 })
                 .collect();
             let tab = nuthatch_timelapse::manifest::identity(files).unwrap();

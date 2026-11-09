@@ -68,6 +68,7 @@ pub fn files(nest: &Nest) -> Result<BTreeMap<String, Vec<u8>>> {
         skill_md(&nest.chain, &contracts, &schema).into_bytes(),
     );
     out.insert(".gitattributes".into(), GITATTRIBUTES.into());
+    out.insert(".gitignore".into(), GITIGNORE.into());
     out.insert("views/README.md".into(), VIEWS_README.into());
     out.insert(
         "views/10-example.sql".into(),
@@ -176,6 +177,8 @@ pub fn schema_json(registry_hash: [u8; 32], schema: &[TableSchema]) -> Result<St
 /// GitHub counts SQL as data, so without this a nest repo shows no language. Hidden, so it stays
 /// outside the data identity. `-text` keeps a CRLF checkout from moving a clone's NID (#2199).
 pub const GITATTRIBUTES: &str = "* -text\n*.sql linguist-detectable\nabis/** linguist-generated\n";
+/// The store and the admin token are local state, not nest inputs (#2722).
+pub const GITIGNORE: &str = "data/\n.admin-token\n";
 
 pub const VIEWS_README: &str =
         "# views/ - this nest's authored logic (RFC-0018 §1)\n\n\
@@ -310,4 +313,36 @@ fn contract_list(contracts: &[(&str, &str)]) -> String {
         .iter()
         .map(|(alias, address)| format!("- `{alias}` = {address}\n"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The store and the admin token are written beside the nest, so a `git add` of a fresh nest
+    /// must leave both out (#2722).
+    #[test]
+    fn a_fresh_nest_ignores_its_store_and_admin_token() {
+        let nest = Nest {
+            name: "demo".into(),
+            chain: "mainnet".into(),
+            chain_id: 1,
+            rpc_urls: Vec::new(),
+            block_timestamps: false,
+            contracts: vec![Contract {
+                alias: "weth".into(),
+                address: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".into(),
+                start_block: None,
+                abi: serde_json::json!([]),
+            }],
+        };
+        let files = files(&nest).unwrap();
+        let ignore = String::from_utf8(files[".gitignore"].clone()).unwrap();
+        for entry in ["data/", ".admin-token"] {
+            assert!(
+                ignore.lines().any(|l| l == entry),
+                "{ignore:?} lacks {entry}"
+            );
+        }
+    }
 }

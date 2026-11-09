@@ -998,11 +998,18 @@ fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result
 /// derived from the nest's own first table, plus a README. Idempotent: if `views/` already exists (an
 /// `add` on a nest whose author already wrote views), it's left untouched. The starter is entirely
 /// comments, so it's a no-op for the query surface and validates clean until the author uncomments it.
+/// The store and the admin token are local state, not nest inputs (#2722).
 fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result<()> {
     let attrs = dir.join(".gitattributes");
     if !attrs.exists() {
         std::fs::write(&attrs, nuthatch_scaffold::GITATTRIBUTES)
             .context("failed to write .gitattributes")?;
+    }
+    let ignore = dir.join(".gitignore");
+    // A nest with a store already has an identity its data is keyed by; `add` must not move it.
+    if !ignore.exists() && !dir.join("data").exists() {
+        std::fs::write(&ignore, nuthatch_scaffold::GITIGNORE)
+            .context("failed to write .gitignore")?;
     }
 
     let views = dir.join("views");
@@ -1212,7 +1219,16 @@ fn copy_dir_except(src: &Path, dst: &Path, skip: &dyn Fn(&std::ffi::OsStr) -> bo
         }
         let from = entry.path();
         let to = dst.join(&name);
-        if entry.file_type()?.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            // Following a link would copy whatever it points at into the nest, possibly from outside
+            // it (#2692). A nest is plain files, so a link is refused rather than dereferenced.
+            anyhow::bail!(
+                "{} is a symbolic link; a nest cannot contain one",
+                from.display()
+            );
+        }
+        if file_type.is_dir() {
             copy_dir_except(&from, &to, skip)?;
         } else {
             std::fs::copy(&from, &to)
@@ -1911,6 +1927,21 @@ fn dir_hint(dir: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link in a nest directory is refused, not copied as the file it points at (#2692).
+    #[cfg(unix)]
+    #[test]
+    fn copying_a_nest_refuses_a_symbolic_link_rather_than_dereferencing_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secret = tmp.path().join("outside.txt");
+        std::fs::write(&secret, b"not part of the nest").unwrap();
+        let src = tmp.path().join("nest");
+        std::fs::create_dir(&src).unwrap();
+        std::os::unix::fs::symlink(&secret, src.join("nuthatch.toml")).unwrap();
+
+        let err = copy_dir(&src, &tmp.path().join("copy")).unwrap_err();
+        assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+    }
 
     fn files_under(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
         crate::blob::collect_files(root, None)

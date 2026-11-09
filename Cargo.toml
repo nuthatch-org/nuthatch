@@ -160,9 +160,10 @@ tower = { version = "0.5", features = ["util"] }
 # Already in the tree via axum; named so `bind_and_serve` can give hyper a timer (#1660).
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-graceful", "service"] }
-# `cors` only. Already in the tree via reqwest, so this adds a feature rather than a crate, and CORS
-# is not worth hand-rolling: getting `Vary: Origin` wrong poisons a shared cache (#1318).
-tower-http = { version = "0.6", features = ["cors"] }
+# `cors` and `timeout`. Already in the tree via reqwest, so this adds features rather than a crate. CORS
+# is not worth hand-rolling: getting `Vary: Origin` wrong poisons a shared cache (#1318). The request
+# body timeout bounds a stalled upload (#2724).
+tower-http = { version = "0.6", features = ["cors", "timeout"] }
 anyhow = "1"
 libc = "0.2"
 tracing = "0.1"

@@ -9,7 +9,7 @@
 //! steps; here we build the state they read and prove its reorg + determinism properties.
 
 use anyhow::{bail, Result};
-use nuthatch_decode::registry::{snake_case, DecodeRegistry, DecodedRow, Value};
+use nuthatch_decode::registry::{snake_case, DecodeRegistry, DecodedRow, StorageKind, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -340,7 +340,27 @@ pub fn announcing_table(f: &FactoryDecl, registry: &DecodeRegistry) -> Result<St
         })
         .collect();
     match matches.as_slice() {
-        [d] => Ok(d.table.clone()),
+        [d] => match d.columns.iter().find(|c| c.name == f.child_param) {
+            Some(c) if matches!(c.kind, StorageKind::Address) => Ok(d.table.clone()),
+            Some(c) => bail!(
+                "factory child_param '{}' on '{}' event '{}' is a {}, not an address: no child would ever be discovered",
+                f.child_param,
+                f.watch,
+                f.event,
+                c.sol_type
+            ),
+            None => bail!(
+                "factory child_param '{}' is not a parameter of '{}' event '{}', which has {}",
+                f.child_param,
+                f.watch,
+                f.event,
+                d.columns
+                    .iter()
+                    .map(|c| format!("'{}'", c.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
         [] => bail!(
             "factory watches '{}' event '{}', which '{}' does not decode: it is not in the ABI, \
              or the `events` allowlist leaves it out. No child would ever be discovered.",
@@ -485,5 +505,55 @@ impl ChildRegistry {
             h.update([e.depth]);
         }
         hex::encode(h.finalize())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nuthatch_decode::registry::ContractSpec;
+
+    const EVENTS: &str = r#"[{"type":"event","name":"Created","anonymous":false,"inputs":[
+        {"name":"child","type":"address","indexed":false},
+        {"name":"salt","type":"uint256","indexed":false}]}]"#;
+
+    fn resolve(child_param: &str) -> Result<FactorySet> {
+        let registry = DecodeRegistry::build(vec![ContractSpec {
+            alias: "fac".into(),
+            address: [0x44; 20].into(),
+            abi: serde_json::from_str(EVENTS).unwrap(),
+            events: Vec::new(),
+        }])
+        .unwrap();
+        FactorySet::resolved(
+            Declared {
+                contracts: vec!["fac".into()],
+                templates: vec![TemplateDecl {
+                    name: "child".into(),
+                    topic0_only: false,
+                }],
+                factories: vec![FactoryDecl {
+                    watch: "fac".into(),
+                    event: "Created".into(),
+                    child_param: child_param.into(),
+                    template: "child".into(),
+                    start: None,
+                }],
+            },
+            &registry,
+        )
+    }
+
+    /// #2699: a misspelt or non-address `child_param` is refused, not left to discover no children.
+    #[test]
+    fn a_child_param_that_is_not_an_address_is_refused() {
+        assert!(resolve("child").is_ok());
+        let typo = resolve("chld").unwrap_err().to_string();
+        assert!(typo.contains("'chld' is not a parameter"), "{typo}");
+        let not_address = resolve("salt").unwrap_err().to_string();
+        assert!(
+            not_address.contains("uint256, not an address"),
+            "{not_address}"
+        );
     }
 }

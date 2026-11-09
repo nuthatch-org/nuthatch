@@ -55,25 +55,26 @@ pub fn decode_string(hex: &str) -> Option<String> {
     }
 }
 
-/// Fetch a contract's immutable metadata via `eth_call`. A failed or non-standard call leaves its field
-/// `None` - best-effort, never a hard error (a token missing `name()` is not a nest failure).
-pub async fn fetch(rpc: &RpcClient, address: &str) -> TokenMetadata {
-    TokenMetadata {
-        decimals: rpc
-            .eth_call(address, DECIMALS_SELECTOR)
-            .await
-            .ok()
-            .and_then(|h| decode_u8(&h)),
-        symbol: rpc
-            .eth_call(address, SYMBOL_SELECTOR)
-            .await
-            .ok()
-            .and_then(|h| decode_string(&h)),
-        name: rpc
-            .eth_call(address, NAME_SELECTOR)
-            .await
-            .ok()
-            .and_then(|h| decode_string(&h)),
+/// Fetch a contract's immutable metadata via `eth_call`. A call that reverts is an answer - the contract
+/// lacks that function - and leaves its field `None`. Any other error fails the fetch, so a dropped
+/// connection is never cached as an answer (#2720).
+pub async fn fetch(rpc: &RpcClient, address: &str) -> Result<TokenMetadata> {
+    let decimals = answer(rpc.eth_call(address, DECIMALS_SELECTOR).await, "decimals()")?;
+    let symbol = answer(rpc.eth_call(address, SYMBOL_SELECTOR).await, "symbol()")?;
+    let name = answer(rpc.eth_call(address, NAME_SELECTOR).await, "name()")?;
+    Ok(TokenMetadata {
+        decimals: decimals.as_deref().and_then(decode_u8),
+        symbol: symbol.as_deref().and_then(decode_string),
+        name: name.as_deref().and_then(decode_string),
+    })
+}
+
+/// One `eth_call`'s return: its hex, `None` when the contract reverted, or the error otherwise.
+fn answer(reply: Result<String>, what: &str) -> Result<Option<String>> {
+    match reply {
+        Ok(hex) => Ok(Some(hex)),
+        Err(e) if format!("{e:#}").contains("revert") => Ok(None),
+        Err(e) => Err(e).with_context(|| what.to_string()),
     }
 }
 
@@ -104,12 +105,20 @@ pub async fn fetch_cli(dir: &Path, rpc_override: Vec<String>) -> Result<()> {
 
     let mut cache = load(dir);
     let mut fetched = 0usize;
+    let mut failed = Vec::new();
     for c in &config.contracts {
         let addr = c.address.to_lowercase();
         if cache.contains_key(&addr) {
             continue; // immutable - never re-fetch
         }
-        let md = fetch(&rpc, &c.address).await;
+        let md = match fetch(&rpc, &c.address).await {
+            Ok(md) => md,
+            Err(e) => {
+                println!("  {} {addr}: not cached: {e:#}", c.alias);
+                failed.push(c.alias.clone());
+                continue;
+            }
+        };
         println!(
             "  {} {addr}: decimals={:?} symbol={:?} name={:?}",
             c.alias, md.decimals, md.symbol, md.name
@@ -122,6 +131,12 @@ pub async fn fetch_cli(dir: &Path, rpc_override: Vec<String>) -> Result<()> {
         "✓ cached token metadata for {fetched} new contract(s) → {}",
         dir.join(METADATA_FILE).display()
     );
+    if !failed.is_empty() {
+        anyhow::bail!(
+            "metadata not cached for {}; rerun to retry",
+            failed.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -153,6 +168,14 @@ mod tests {
         assert_eq!(decode_string(&hex).as_deref(), Some("USDC"));
         // A bytes32-style / garbage return doesn't decode to a wrong string.
         assert_eq!(decode_string("0x1234"), None);
+    }
+
+    #[test]
+    fn a_reverted_call_is_an_answer_and_a_dropped_one_is_not() {
+        let reverted = Err(anyhow::anyhow!("eth_call: execution reverted"));
+        assert_eq!(answer(reverted, "name()").unwrap(), None);
+        let dropped = Err(anyhow::anyhow!("transport error: connection reset"));
+        assert!(answer(dropped, "name()").is_err());
     }
 
     #[test]

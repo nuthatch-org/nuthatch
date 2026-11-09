@@ -901,6 +901,12 @@ pub(crate) fn test_rows_materialised(dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// A catalogue that arrived as text, from a feed rather than this nest's file. The same name rules
+/// as [`load_manifest`] (#2706).
+pub(crate) fn parse_manifest(raw: &str) -> Result<Manifest> {
+    checked(serde_json::from_str(raw).context("the followed catalogue")?)
+}
+
 /// A catalogue is read from the nest's own tree, which a cloned repository supplies, and its names
 /// become paths: each table, hash and file must be one segment under the runtime's rule (#2184).
 fn checked(m: Manifest) -> Result<Manifest> {
@@ -1838,15 +1844,104 @@ fn temp_name(file_name: &str) -> String {
 /// Install `bytes` as `dir/file_name`. The bytes are fsynced before the name exists, and that
 /// directory entry is fsynced before this returns (#1632). A watermark is written only afterwards.
 pub(crate) fn publish_durable(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
-    let created = !dir.exists();
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    if created {
-        if let Some(parent) = dir.parent() {
-            #[cfg(test)]
-            note_durable(Durable::ParentDir(parent.to_path_buf()));
-            sync_dir(parent)?;
+    stage_durable(dir, file_name, |out, tmp| {
+        use std::io::Write;
+        out.write_all(bytes)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        Ok(())
+    })
+}
+
+/// Install the file at `src` as `dir/file_name`. The copy is hashed as it is written, in one pass,
+/// and the durable name is created only when that hash is `expect` (#2706). A sealed segment is
+/// unbounded, so this never holds the file.
+pub(crate) fn publish_verified(
+    dir: &Path,
+    file_name: &str,
+    src: &Path,
+    expect: &str,
+) -> Result<()> {
+    prepare_segment_dir(dir)?;
+    let final_path = dir.join(file_name);
+    // Already published under this content address. The followed copy still has to hash before the
+    // catalogue may name it.
+    if final_path.is_file() {
+        let got = hash_file(src).with_context(|| format!("reading {}", src.display()))?;
+        ensure_segment_hash(file_name, &got, expect)?;
+        sync_segment_dir(dir)?;
+        return Ok(());
+    }
+    let tmp = dir.join(temp_name(file_name));
+    let staged = (|| {
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        let got = hash_copy(src, &mut f)?;
+        f.sync_all()
+            .with_context(|| format!("fsyncing {}", tmp.display()))?;
+        #[cfg(test)]
+        note_durable(Durable::FileSync(tmp.clone()));
+        Ok(got)
+    })();
+    let got = match staged {
+        Ok(got) => got,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    if let Err(e) = ensure_segment_hash(file_name, &got, expect) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    install_staged(&tmp, &final_path, dir)
+}
+
+fn ensure_segment_hash(file_name: &str, got: &str, expect: &str) -> Result<()> {
+    anyhow::ensure!(
+        got == expect,
+        "followed segment {file_name} hashes to {got}, not {expect}"
+    );
+    Ok(())
+}
+
+/// The sha256 of `src`, read a block at a time.
+fn hash_file(src: &Path) -> std::io::Result<String> {
+    let file = std::fs::File::open(src)?;
+    hash_reader(file, None)
+}
+
+/// Copy `src` into `dst` and return the sha256 of the bytes written.
+fn hash_copy(src: &Path, dst: &mut std::fs::File) -> Result<String> {
+    let file = std::fs::File::open(src).with_context(|| format!("reading {}", src.display()))?;
+    hash_reader(file, Some(dst)).with_context(|| format!("copying {}", src.display()))
+}
+
+fn hash_reader(
+    mut src: std::fs::File,
+    mut dst: Option<&mut std::fs::File>,
+) -> std::io::Result<String> {
+    use std::io::{Read, Write};
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        match src.read(&mut buf)? {
+            0 => return Ok(hex::encode(hasher.finalize())),
+            n => {
+                hasher.update(&buf[..n]);
+                if let Some(out) = dst.as_mut() {
+                    out.write_all(&buf[..n])?;
+                }
+            }
         }
     }
+}
+
+fn stage_durable(
+    dir: &Path,
+    file_name: &str,
+    write: impl FnOnce(&mut std::fs::File, &Path) -> Result<()>,
+) -> Result<()> {
+    prepare_segment_dir(dir)?;
     let final_path = dir.join(file_name);
     // The shared store: another nest already published this content. Its bytes were synced before
     // the name existed. The directory entry still has to be, before our manifest names the file.
@@ -1858,20 +1953,34 @@ pub(crate) fn publish_durable(dir: &Path, file_name: &str, bytes: &[u8]) -> Resu
     {
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        use std::io::Write;
-        f.write_all(bytes)
-            .with_context(|| format!("writing {}", tmp.display()))?;
+        write(&mut f, &tmp)?;
         f.sync_all()
             .with_context(|| format!("fsyncing {}", tmp.display()))?;
         #[cfg(test)]
         note_durable(Durable::FileSync(tmp.clone()));
     }
+    install_staged(&tmp, &final_path, dir)
+}
+
+fn prepare_segment_dir(dir: &Path) -> Result<()> {
+    let created = !dir.exists();
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    if created {
+        if let Some(parent) = dir.parent() {
+            #[cfg(test)]
+            note_durable(Durable::ParentDir(parent.to_path_buf()));
+            sync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
+
+fn install_staged(tmp: &Path, final_path: &Path, dir: &Path) -> Result<()> {
     #[cfg(test)]
     before_install();
-    std::fs::rename(&tmp, &final_path)
+    std::fs::rename(tmp, final_path)
         .with_context(|| format!("installing {}", final_path.display()))?;
-    sync_segment_dir(dir)?;
-    Ok(())
+    sync_segment_dir(dir)
 }
 
 /// Replace `path` with `bytes`: written and fsynced under a temp name, renamed over it, and the
