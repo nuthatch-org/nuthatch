@@ -14,8 +14,8 @@ use crate::nest::NestSpec;
 use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use nuthatch_core::mirror::{
-    check_snapshot, cut_catalogue, local_catalogue, postcard_digest, sha256_hex, SeedEnvelope,
-    Unverified, Wanted, CATALOGUE_FILE, SEED_FILE, SEED_PENDING_KEY,
+    check_snapshot, cut_catalogue, limit_to_until, local_catalogue, postcard_digest, sha256_hex,
+    SeedEnvelope, Unverified, Wanted, CATALOGUE_FILE, SEED_FILE, SEED_PENDING_KEY,
 };
 use nuthatch_core::redb_store::Store;
 use nuthatch_core::seal::Manifest;
@@ -201,7 +201,8 @@ async fn read_snapshot(
 }
 
 /// Hydrate `store` and `cellar` from `mirror`: the nest's history through the snapshot's
-/// `complete_through`, or through the postcard's cut, every file checked against its address.
+/// `complete_through`, through `spec.until` when that is earlier, or through the postcard's cut.
+/// Every file is checked against its address.
 pub async fn hydrate(
     host: &dyn MirrorHost,
     store: &Store,
@@ -223,8 +224,19 @@ pub async fn hydrate(
     let indexed_from = snapshot.indexed_from;
     let (catalogue, wanted, complete_through) = match &mirror.postcard {
         None => {
+            // An answer older than the mirror. Segments past `until` would stamp LAST_BLOCK past
+            // it, and the first follow then refuses with "open it fresh" (#2742).
+            let (published, complete) = match spec.until {
+                Some(until) if until < snapshot.complete_through => {
+                    let (cut, end) = limit_to_until(&published, until);
+                    snapshot.tails.clear();
+                    snapshot.complete_through = end.unwrap_or(0);
+                    (cut, end)
+                }
+                _ => (published, Some(snapshot.complete_through)),
+            };
             let (catalogue, wanted) = local_catalogue(published, &snapshot)?;
-            (catalogue, wanted, snapshot.complete_through)
+            (catalogue, wanted, complete)
         }
         Some(pin) => {
             let schema =
@@ -246,7 +258,7 @@ pub async fn hydrate(
             let through = pin.cuts.values().copied().max().unwrap_or(0);
             bare.complete_through = through;
             let (catalogue, wanted) = local_catalogue(cut, &bare)?;
-            (catalogue, wanted, through)
+            (catalogue, wanted, Some(through))
         }
     };
 
@@ -257,29 +269,32 @@ pub async fn hydrate(
     let placed = download(host, cellar, base, &dataset, &wanted).await?;
     let bytes = placed.iter().map(|(_, _, len)| len).sum();
     cellar.install_packed(&catalogue, &placed)?;
-    let through = complete_through.to_string();
+    // No sealed block at or below `until`: leave LAST_BLOCK unset, so follow starts at the nest's
+    // start instead of a block the cut does not hold.
+    let reported = complete_through.unwrap_or(0);
+    let through = reported.to_string();
     let from = indexed_from.to_string();
     let record = json!({
         "dataset": dataset,
         "indexed_from": indexed_from,
-        "complete_through": complete_through,
+        "complete_through": reported,
     })
     .to_string();
-    store.set_metas(
-        &[
-            (START_BLOCK_KEY, &from),
-            (SEALED_THROUGH_KEY, &through),
-            (LAST_BLOCK_KEY, &through),
-            (HYDRATED_KEY, &record),
-        ],
-        &[SEED_PENDING_KEY],
-    )?;
+    let mut metas = vec![
+        (START_BLOCK_KEY, from.as_str()),
+        (HYDRATED_KEY, record.as_str()),
+    ];
+    if complete_through.is_some() {
+        metas.push((SEALED_THROUGH_KEY, through.as_str()));
+        metas.push((LAST_BLOCK_KEY, through.as_str()));
+    }
+    store.set_metas(&metas, &[SEED_PENDING_KEY])?;
     Ok(Hydrated {
         dataset,
         segments: placed.len(),
         bytes,
         indexed_from,
-        complete_through,
+        complete_through: reported,
         pinned: mirror.postcard.is_some(),
         reused: false,
     })

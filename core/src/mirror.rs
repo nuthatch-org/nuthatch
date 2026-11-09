@@ -264,6 +264,64 @@ pub fn cut_catalogue(published: &Manifest, cuts: &BTreeMap<String, u64>) -> Mani
     out
 }
 
+/// `published` limited to what a caller who stops at `until` can seal (#2742). A segment that
+/// crosses `until` is left out whole, as [`cut_catalogue`] leaves out one past a postcard's cut.
+/// The block is the furthest every table that had sealed rows still covers. It is `None` when one
+/// of those tables has nothing left, so the caller does not claim a block that table does not hold.
+pub fn limit_to_until(published: &Manifest, until: u64) -> (Manifest, Option<u64>) {
+    let mut out = published.clone();
+    for segs in out.tables.values_mut() {
+        segs.retain(|s| !s.provisional && s.to_block <= until);
+        segs.sort_by_key(|s| (s.from_block, s.to_block));
+        keep_prefix(segs);
+    }
+    loop {
+        if published.tables.iter().any(|(name, segs)| {
+            segs.iter().any(|s| !s.provisional) && out.tables.get(name).is_none_or(|s| s.is_empty())
+        }) {
+            for segs in out.tables.values_mut() {
+                segs.clear();
+            }
+            return (out, None);
+        }
+        let Some(end) = out
+            .tables
+            .values()
+            .filter_map(|segs| segs.last().map(|s| s.to_block))
+            .min()
+        else {
+            return (out, None);
+        };
+        let mut trimmed = false;
+        for segs in out.tables.values_mut() {
+            let before = segs.len();
+            segs.retain(|s| s.to_block <= end);
+            keep_prefix(segs);
+            trimmed |= segs.len() != before;
+        }
+        if !trimmed {
+            return (out, Some(end));
+        }
+    }
+}
+
+/// The leading run of `segs` with no gap. `segs` is sorted by `from_block`.
+fn keep_prefix(segs: &mut Vec<Segment>) {
+    if segs.is_empty() {
+        return;
+    }
+    let mut keep = 1;
+    let mut next = segs[0].to_block.saturating_add(1);
+    for s in segs.iter().skip(1) {
+        if s.from_block > next {
+            break;
+        }
+        next = s.to_block.saturating_add(1);
+        keep += 1;
+    }
+    segs.truncate(keep);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +363,52 @@ mod tests {
             postcard_digest(br#"{"tables":[]}"#, &cut),
             "YgaCaHn3ZKtBKPrgoI6mR35KJEtsggDxtkJ80fF1A3A"
         );
+    }
+
+    #[test]
+    fn a_limit_keeps_the_segments_that_end_at_or_before_until() {
+        let mut m = Manifest::default();
+        m.tables.insert(
+            "a".into(),
+            vec![seg('1', 1, 10, 1, false), seg('2', 11, 20, 1, false)],
+        );
+        let (cut, through) = limit_to_until(&m, 20);
+        assert_eq!(through, Some(20));
+        assert_eq!(cut.tables["a"].len(), 2);
+        let (cut, through) = limit_to_until(&m, 15);
+        assert_eq!(through, Some(10));
+        assert_eq!(cut.tables["a"].len(), 1);
+        assert_eq!(cut.tables["a"][0].to_block, 10);
+    }
+
+    #[test]
+    fn a_segment_that_crosses_until_and_is_the_only_one_seals_nothing() {
+        let mut m = Manifest::default();
+        m.tables.insert("a".into(), vec![seg('1', 1, 20, 1, false)]);
+        let (cut, through) = limit_to_until(&m, 19);
+        assert_eq!(through, None);
+        assert!(cut.tables["a"].is_empty());
+    }
+
+    #[test]
+    fn a_table_with_nothing_at_or_before_until_seals_nothing() {
+        let mut m = Manifest::default();
+        m.tables.insert("a".into(), vec![seg('1', 1, 10, 1, false)]);
+        m.tables.insert("b".into(), vec![seg('2', 1, 20, 1, false)]);
+        let (cut, through) = limit_to_until(&m, 15);
+        assert_eq!(through, None);
+        assert!(cut.tables.values().all(|segs| segs.is_empty()));
+    }
+
+    #[test]
+    fn a_provisional_tail_is_outside_the_limit() {
+        let mut m = Manifest::default();
+        m.tables.insert(
+            "a".into(),
+            vec![seg('1', 1, 10, 1, false), seg('2', 11, 20, 1, true)],
+        );
+        let (cut, through) = limit_to_until(&m, 20);
+        assert_eq!(through, Some(10));
+        assert_eq!(cut.tables["a"].len(), 1);
     }
 }
