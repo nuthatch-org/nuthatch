@@ -392,6 +392,52 @@ async fn within<F: std::future::Future>(
     .await
 }
 
+/// A pinned read above `final_through` whose header hash is not the chain's now (#2754).
+///
+/// A read that carried no hash had no header to disagree with. A canonical read is refused
+/// before it becomes a row, so an empty hash here is a number-pinned call with nothing to check.
+async fn read_rows_off_chain(
+    source: &dyn Source,
+    rows: &[DecodedRow],
+    final_through: u64,
+) -> Option<String> {
+    let rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.block_number > final_through && !r.block_hash.is_empty())
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    // Same split as the log rows above: a stamped read is checked against the header record,
+    // which is one batch. `block_hashes`'s default is one `block_hash` per block (#720).
+    let now = match rows.iter().any(|r| r.timestamps) {
+        true => source.block_records(&blocks).await.map(|now| {
+            now.into_iter()
+                .map(|(b, (h, _))| (b, h))
+                .collect::<HashMap<_, _>>()
+        }),
+        false => source.block_hashes(&blocks).await,
+    };
+    match now {
+        Ok(now) => rows
+            .iter()
+            .find(|r| {
+                !now.get(&r.block_number)
+                    .is_some_and(|n| n.eq_ignore_ascii_case(&r.block_hash))
+            })
+            .map(|r| {
+                format!(
+                    "block {} is not on the chain the source has now",
+                    r.block_number
+                )
+            }),
+        Err(e) => Some(format!("block hashes unavailable: {e:#}")),
+    }
+}
+
 /// Refuse a window for a retry. What it read may be from a chain that has moved since, and the
 /// timestamp cache is keyed by height, so it forgets from where the window began reading (#2152).
 async fn refuse(source: &dyn Source, clock: &dyn Clock, read_from: u64) -> Result<Processed> {
@@ -625,9 +671,10 @@ pub async fn process_window<E: WindowEntity>(
         let (call_rows, bodies) = extra.top_level_calls(source, next, to).await?;
 
         // Every row, header and body read by number must be on the chain it names, and the window
-        // must extend the stored chain. Hashes read after the checkpoint settle both (#2146, #2678).
+        // must extend the stored chain. An l1_blocks row is that header (#2146, #2678, #2754).
         let exposed: Vec<_> = rows
             .iter()
+            .chain(&l1_rows)
             .chain(&block_rows)
             .chain(&call_rows)
             .filter(|r| r.block_number > final_through)
@@ -844,6 +891,11 @@ pub async fn process_window<E: WindowEntity>(
             }
             Err(e) => return Err(e),
         };
+        // Pinned reads are taken from the same by-number header, after the check above (#2754).
+        if let Some(why) = read_rows_off_chain(source, &read_rows, final_through).await {
+            tracing::warn!("{why}: refusing window {next}..={to}, retrying");
+            return refuse(source, clock, read_from).await.map(Step::Done);
+        }
         for row in read_rows {
             to_store.push((
                 entity_key(row.block_number, row.log_index),
@@ -1640,10 +1692,14 @@ mod tests {
 
     /// A pool split across a one-block reorg (#2678): logs, the checkpoint and the hash check are
     /// answered from fork A, and the by-number read named here from fork B.
+    ///
+    /// `l1` moves only the header hash. The timestamp stays on fork A, so the log-row stamp check
+    /// does not refuse the window ahead of the `l1_blocks` row (#2754).
     #[derive(Default)]
     struct HeadSplit {
         header: bool,
         stamp: bool,
+        l1: bool,
     }
 
     #[async_trait::async_trait]
@@ -1669,18 +1725,22 @@ mod tests {
                 .collect())
         }
         async fn block_headers(&self, blocks: &[u64]) -> Result<HashMap<u64, serde_json::Value>> {
-            let hash_ts = |b: u64| match self.header {
-                true => (FORK_B.to_string(), stamp_of(b) + 12),
-                false => (hash_of(b), stamp_of(b)),
-            };
+            let forked = self.header || self.l1;
+            let skew = self.header;
             Ok(blocks
                 .iter()
                 .map(|&b| {
-                    let (hash, ts) = hash_ts(b);
+                    let hash = if forked {
+                        FORK_B.to_string()
+                    } else {
+                        hash_of(b)
+                    };
+                    let ts = if skew { stamp_of(b) + 12 } else { stamp_of(b) };
                     let header = serde_json::json!({
                         "hash": hash,
                         "timestamp": format!("0x{ts:x}"),
                         "parentHash": hash_of(b - 1),
+                        "l1BlockNumber": "0xa",
                     });
                     (b, header)
                 })
@@ -1693,9 +1753,20 @@ mod tests {
 
     /// One block, 10, above finality, on a `blocks = true` nest.
     fn split_window(source: &HeadSplit, extra: &dyn ExtraRows) -> (Processed, Mem) {
+        split_with(
+            source,
+            extra,
+            token().with_blocks(true).with_timestamps(true),
+        )
+    }
+
+    fn split_with(
+        source: &HeadSplit,
+        extra: &dyn ExtraRows,
+        registry: DecodeRegistry,
+    ) -> (Processed, Mem) {
         let store = Mem::default();
         store.set(START_BLOCK_KEY, 10);
-        let registry = token().with_blocks(true).with_timestamps(true);
         let schema = registry.schema();
         let balances = BalanceView::start(Driver::Inline).unwrap();
         let exposure = ExposureView::start(Driver::Inline, false).unwrap();
@@ -1798,6 +1869,85 @@ mod tests {
     #[test]
     fn a_call_body_from_the_other_side_of_a_head_split_refuses_the_window() {
         let (processed, store) = split_window(&HeadSplit::default(), &ForkedCall);
+
+        assert_eq!(processed, Processed::Refused);
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn an_l1_header_on_the_same_fork_commits_its_row() {
+        let (processed, store) = split_with(
+            &HeadSplit::default(),
+            &crate::extra::NoExtraRows,
+            token().with_l1_blocks(true).with_timestamps(true),
+        );
+
+        assert_eq!(processed, Processed::Stored(2));
+        assert_eq!(store.get_block_hash(10).unwrap(), Some(hash_of(10)));
+    }
+
+    #[test]
+    fn an_l1_header_from_the_other_side_of_a_head_split_refuses_the_window() {
+        let source = HeadSplit {
+            l1: true,
+            ..Default::default()
+        };
+        let (processed, store) = split_with(
+            &source,
+            &crate::extra::NoExtraRows,
+            token().with_l1_blocks(true).with_timestamps(true),
+        );
+
+        assert_eq!(processed, Processed::Refused);
+        assert_eq!(store.count().unwrap(), 0);
+        assert_eq!(store.get_meta(LAST_BLOCK_KEY).unwrap(), None);
+    }
+
+    /// One pinned read at block 10. `fork` claims fork B's hash.
+    struct PinnedRead {
+        fork: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ExtraRows for PinnedRead {
+        async fn pinned_reads(
+            &self,
+            _: &dyn Source,
+            _: &[DecodedRow],
+            _: u64,
+            _: u64,
+            _: &HashMap<u64, u64>,
+            _: Option<&HashMap<u64, serde_json::Value>>,
+        ) -> Result<Vec<DecodedRow>> {
+            Ok(vec![DecodedRow {
+                table: "tok__read".into(),
+                params: Vec::new(),
+                block_number: 10,
+                block_hash: if self.fork {
+                    FORK_B.into()
+                } else {
+                    hash_of(10)
+                },
+                block_timestamp: stamp_of(10),
+                timestamps: true,
+                log_index: nuthatch_decode::registry::CALL_ROW_LOG_INDEX_BASE,
+                tx_hash: String::new(),
+                address: TOKEN.into(),
+            }])
+        }
+    }
+
+    #[test]
+    fn a_pinned_read_on_the_same_fork_commits() {
+        let (processed, store) = split_window(&HeadSplit::default(), &PinnedRead { fork: false });
+
+        assert_eq!(processed, Processed::Stored(3));
+        assert_eq!(store.count().unwrap(), 3);
+    }
+
+    #[test]
+    fn a_pinned_read_from_the_other_side_of_a_head_split_refuses_the_window() {
+        let (processed, store) = split_window(&HeadSplit::default(), &PinnedRead { fork: true });
 
         assert_eq!(processed, Processed::Refused);
         assert_eq!(store.count().unwrap(), 0);
